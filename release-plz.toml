@@ -6,10 +6,8 @@
 git_user_name = "github-actions[bot]"
 git_user_email = "integrations.anveio@gmail.com"
 
-# Enable changelog generation
-changelog_update = true
-# Use git-cliff for changelog
-changelog_config = "cliff.toml"
+# Disable changelog generation (re-enable after first release)
+changelog_update = false
 # Create GitHub releases
 git_release_enable = true
 # Draft releases (review before publishing)
@@ -27,14 +25,11 @@ semver_check = true
 # Package-specific configuration
 [[package]]
 name = "apm2-core"
-changelog_include = ["apm2-core/**"]
 
 [[package]]
 name = "apm2-daemon"
-changelog_include = ["apm2-daemon/**"]
 
 [[package]]
 name = "apm2-cli"
-changelog_include = ["apm2-cli/**"]
 # The main binary - use this as the release name
 git_release_name = "apm2"
