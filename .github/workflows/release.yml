@@ -28,31 +28,67 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux only
+          # Linux x86_64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: apm2-linux-x86_64
+          # Linux aarch64 (cross-compiled)
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: apm2-linux-aarch64
+            cross: true
+          # macOS x86_64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: apm2-darwin-x86_64
+          # macOS aarch64 (Apple Silicon)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: apm2-darwin-aarch64
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: apm2-windows-x86_64
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Build
+      # Install cross for cross-compilation
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }} -p apm2-cli -p apm2-daemon
 
-      - name: Package
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }} -p apm2-cli -p apm2-daemon
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/apm2 dist/${{ matrix.name }}
           cp target/${{ matrix.target }}/release/apm2-daemon dist/${{ matrix.name }}-daemon
           chmod +x dist/*
 
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/${{ matrix.target }}/release/apm2.exe" "dist/${{ matrix.name }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/apm2-daemon.exe" "dist/${{ matrix.name }}-daemon.exe"
+
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries-${{ matrix.target }}
           path: dist/
@@ -66,10 +102,10 @@ jobs:
     outputs:
       hashes: ${{ steps.hash.outputs.hashes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           pattern: binaries-*
@@ -81,9 +117,17 @@ jobs:
           sha256sum * > checksums-sha256.txt
           cat checksums-sha256.txt
 
+      # Vulnerability scan with grype
+      - name: Vulnerability Scan
+        uses: anchore/scan-action@64a33b277ea7a1215a3c142735a1091341939ff5 # v4
+        with:
+          path: "."
+          fail-build: true
+          severity-cutoff: high
+
       # Install Cosign for keyless signing
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
 
       # Sign all binary artifacts with Cosign (keyless via OIDC)
       - name: Sign artifacts with Cosign (keyless)
@@ -101,7 +145,7 @@ jobs:
 
       # Generate SBOM
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@62ad5284b8ced813296287a0b63906cb364b73ee # v0
         with:
           artifact-name: sbom.spdx.json
           output-file: artifacts/sbom.spdx.json
@@ -116,12 +160,12 @@ jobs:
           echo "hashes=$hashes" >> "$GITHUB_OUTPUT"
 
       - name: Generate attestations
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@92c65d2898f1f53cfdc910b962cecff86e7f8fcc # v1
         with:
           subject-path: 'artifacts/*'
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
         with:
           draft: false
           generate_release_notes: true
@@ -138,7 +182,7 @@ jobs:
       actions: read
       id-token: write
       contents: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@5a775b367a56d5bd118a224a811bba288150a563 # v2.0.0
     with:
       base64-subjects: "${{ needs.release.outputs.hashes }}"
       upload-assets: true
@@ -149,9 +193,9 @@ jobs:
   #   needs: release
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@nightly
-  #     - uses: Swatinem/rust-cache@v2
+  #     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+  #     - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
+  #     - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
   #     - name: Publish apm2-core
   #       run: cargo publish -p apm2-core
   #       env:

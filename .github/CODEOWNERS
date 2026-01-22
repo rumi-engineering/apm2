@@ -5,19 +5,19 @@
 # that modifies code that they own.
 
 # Default owners for everything in the repo
-* @your-username
+* @Anveio
 
 # Security-sensitive files require explicit review
-/.github/workflows/ @your-username
-/documents/security/ @your-username
-/deny.toml @your-username
-/Cargo.toml @your-username
-/Cargo.lock @your-username
+/.github/workflows/ @Anveio
+/documents/security/ @Anveio
+/deny.toml @Anveio
+/Cargo.toml @Anveio
+/Cargo.lock @Anveio
 
 # Credentials and security modules
-/crates/apm2-core/src/credentials/ @your-username
-/crates/apm2-core/src/log/redact.rs @your-username
+/crates/apm2-core/src/credentials/ @Anveio
+/crates/apm2-core/src/log/redact.rs @Anveio
 
 # Release configuration
-/release-plz.toml @your-username
-/.github/workflows/release.yml @your-username
+/release-plz.toml @Anveio
+/.github/workflows/release.yml @Anveio

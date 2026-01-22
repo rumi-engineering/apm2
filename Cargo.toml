@@ -5,6 +5,7 @@ members = [
     "crates/apm2-daemon",
     "crates/apm2-cli",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
