@@ -12,8 +12,6 @@ git_release_enable = true
 git_release_draft = false
 # Release type
 git_release_type = "prod"
-# Enable PR creation
-pr_enabled = true
 # PR labels
 pr_labels = ["release"]
 # Commit message format
