@@ -52,7 +52,7 @@ bytes = "1.0"
 
 # Utilities
 uuid = { version = "1.0", features = ["v4", "serde"] }
-nix = { version = "0.29", features = ["signal", "process", "fs"] }
+nix = { version = "0.30", features = ["signal", "process", "fs"] }
 directories = "6"
 humantime = "2.1"
 ctrlc = "3.4"
@@ -66,7 +66,7 @@ proptest = "1.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Internal crates
-apm2-core = { path = "crates/apm2-core" }
+apm2-core = { version = "0.1.0", path = "crates/apm2-core" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
