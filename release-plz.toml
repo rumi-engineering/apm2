@@ -2,6 +2,10 @@
 # https://release-plz.dev/docs/config
 
 [workspace]
+# Git user for commits
+git_user_name = "github-actions[bot]"
+git_user_email = "integrations.anveio@gmail.com"
+
 # Enable changelog generation
 changelog_update = true
 # Use git-cliff for changelog

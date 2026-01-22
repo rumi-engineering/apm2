@@ -240,7 +240,7 @@ jobs:
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "integrations.anveio@gmail.com"
           git add benchmarks/
           git commit -m "Add benchmark results for ${{ github.ref_name }}" || echo "No changes to commit"
           git push
