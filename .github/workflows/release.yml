@@ -1,0 +1,206 @@
+# Release workflow
+# Builds binaries and creates GitHub releases on tag push
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build binaries for all platforms
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: apm2-linux-x86_64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: apm2-linux-x86_64-musl
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: apm2-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: apm2-darwin-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: apm2-darwin-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: apm2-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Install cross-compilation tools for Linux ARM
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # Install musl tools
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p apm2-cli -p apm2-daemon
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/apm2 dist/${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/apm2-daemon dist/${{ matrix.name }}-daemon
+          chmod +x dist/*
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/apm2.exe dist/${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/apm2-daemon.exe dist/${{ matrix.name }}-daemon.exe
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  # Sign artifacts and create GitHub release
+  release:
+    name: Sign and Release
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      # Install Cosign for keyless signing
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Sign all binary artifacts with Cosign (keyless via OIDC)
+      - name: Sign artifacts with Cosign (keyless)
+        run: |
+          cd artifacts
+          for file in *; do
+            if [[ -f "$file" && ! "$file" =~ \.(sig|pem|txt)$ ]]; then
+              echo "Signing $file..."
+              cosign sign-blob --yes \
+                --output-signature "${file}.sig" \
+                --output-certificate "${file}.pem" \
+                "$file"
+            fi
+          done
+
+      # Generate SBOM
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          artifact-name: sbom.spdx.json
+          output-file: artifacts/sbom.spdx.json
+
+      # Generate hashes for SLSA provenance
+      - name: Generate artifact hashes
+        id: hash
+        run: |
+          cd artifacts
+          # Generate hashes for all binary files (not signatures/certs)
+          hashes=$(sha256sum $(find . -type f ! -name "*.sig" ! -name "*.pem" ! -name "*.txt" ! -name "*.json") | base64 -w0)
+          echo "hashes=$hashes" >> "$GITHUB_OUTPUT"
+
+      - name: Generate attestations
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'artifacts/*'
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: |
+            artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Generate SLSA provenance
+  provenance:
+    name: SLSA Provenance
+    needs: release
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: "${{ needs.release.outputs.hashes }}"
+      upload-assets: true
+
+  # Publish to crates.io (disabled for testing)
+  # publish:
+  #   name: Publish to crates.io
+  #   needs: release
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@nightly
+  #     - uses: Swatinem/rust-cache@v2
+  #     - name: Publish apm2-core
+  #       run: cargo publish -p apm2-core
+  #       env:
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  #     - name: Wait for crates.io
+  #       run: sleep 30
+  #     - name: Publish apm2-daemon
+  #       run: cargo publish -p apm2-daemon
+  #       env:
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  #     - name: Wait for crates.io
+  #       run: sleep 30
+  #     - name: Publish apm2-cli
+  #       run: cargo publish -p apm2-cli
+  #       env:
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

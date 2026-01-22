@@ -1,0 +1,96 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/apm2-core",
+    "crates/apm2-daemon",
+    "crates/apm2-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-org/apm2"
+homepage = "https://github.com/your-org/apm2"
+documentation = "https://docs.rs/apm2"
+authors = ["apm2 contributors"]
+keywords = ["process-manager", "cli", "ai", "claude", "daemon"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Security / Credentials
+keyring = "3"
+secrecy = { version = "0.10", features = ["serde"] }
+
+# IPC
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.0"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+nix = { version = "0.29", features = ["signal", "process", "fs"] }
+directories = "6"
+humantime = "2.1"
+ctrlc = "3.4"
+regex = "1.10"
+once_cell = "1.19"
+
+# Testing
+proptest = "1.0"
+
+# Internal crates
+apm2-core = { path = "crates/apm2-core" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+rust_2024_compatibility = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Allow common patterns
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+debug = true
+
+[profile.bench]
+lto = true
+codegen-units = 1

@@ -1,0 +1,38 @@
+# release-plz configuration
+# https://release-plz.dev/docs/config
+
+[workspace]
+# Enable changelog generation
+changelog_update = true
+# Use git-cliff for changelog
+changelog_config = "cliff.toml"
+# Create GitHub releases
+git_release_enable = true
+# Draft releases (review before publishing)
+git_release_draft = false
+# Release type
+git_release_type = "prod"
+# Enable PR creation
+pr_enabled = true
+# PR labels
+pr_labels = ["release"]
+# Commit message format
+publish_timeout = "10m"
+
+# Semver check on release
+semver_check = true
+
+# Package-specific configuration
+[[package]]
+name = "apm2-core"
+changelog_include = ["apm2-core/**"]
+
+[[package]]
+name = "apm2-daemon"
+changelog_include = ["apm2-daemon/**"]
+
+[[package]]
+name = "apm2-cli"
+changelog_include = ["apm2-cli/**"]
+# The main binary - use this as the release name
+git_release_name = "apm2"

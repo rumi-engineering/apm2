@@ -1,0 +1,57 @@
+[package]
+name = "apm2-core"
+description = "Core library for apm2 - AI CLI process manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Security / Credentials
+keyring.workspace = true
+secrecy.workspace = true
+
+# IPC
+bytes.workspace = true
+
+# Utilities
+uuid.workspace = true
+nix.workspace = true
+directories.workspace = true
+humantime.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[features]
+default = []
+# Enable test utilities for deterministic testing
+test-utils = []
+
+[lints]
+workspace = true

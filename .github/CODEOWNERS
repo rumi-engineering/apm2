@@ -1,0 +1,23 @@
+# CODEOWNERS file for APM2
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# These owners will be requested for review when someone opens a pull request
+# that modifies code that they own.
+
+# Default owners for everything in the repo
+* @your-username
+
+# Security-sensitive files require explicit review
+/.github/workflows/ @your-username
+/documents/security/ @your-username
+/deny.toml @your-username
+/Cargo.toml @your-username
+/Cargo.lock @your-username
+
+# Credentials and security modules
+/crates/apm2-core/src/credentials/ @your-username
+/crates/apm2-core/src/log/redact.rs @your-username
+
+# Release configuration
+/release-plz.toml @your-username
+/.github/workflows/release.yml @your-username
