@@ -1,0 +1,16 @@
+[package]
+name = "apm2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+apm2-core = { path = "../crates/apm2-core" }
+
+[[bin]]
+name = "fuzz_cli_args"
+path = "fuzz_targets/cli_args.rs"
