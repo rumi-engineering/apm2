@@ -28,24 +28,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux only
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: apm2-linux-x86_64
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            name: apm2-linux-x86_64-musl
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: apm2-linux-aarch64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: apm2-darwin-x86_64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: apm2-darwin-aarch64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: apm2-windows-x86_64.exe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -55,37 +41,15 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Install cross-compilation tools for Linux ARM
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      # Install musl tools
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p apm2-cli -p apm2-daemon
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/apm2 dist/${{ matrix.name }}
           cp target/${{ matrix.target }}/release/apm2-daemon dist/${{ matrix.name }}-daemon
           chmod +x dist/*
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          mkdir dist
-          cp target/${{ matrix.target }}/release/apm2.exe dist/${{ matrix.name }}
-          cp target/${{ matrix.target }}/release/apm2-daemon.exe dist/${{ matrix.name }}-daemon.exe
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
