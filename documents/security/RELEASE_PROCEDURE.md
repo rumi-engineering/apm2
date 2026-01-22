@@ -20,35 +20,48 @@ Complete checklist for creating a secure APM2 release.
 
 ### Version and Documentation
 
-- [ ] Version bumped in `Cargo.toml` files
-- [ ] `CHANGELOG.md` updated with release notes
+- [ ] release-plz PR is up to date (version bump + changelog handled automatically)
+- [ ] `CHANGELOG.md` updated via release-plz
 - [ ] Breaking changes documented
 - [ ] Migration guide if needed
+- [ ] **Do not** manually edit versions or create tags
 
 ## Release Process
 
-### 1. Create Signed Git Tag
+### 1. Promote Through Channels
 
-```bash
-# Ensure you're on main and up to date
-git checkout main
-git pull origin main
+APM2 uses a three-channel, promotion-based release pipeline. See
+[`/documents/releases/RELEASE_CHANNELS.md`](../releases/RELEASE_CHANNELS.md) and
+[`/documents/releases/ARTIFACT_PROMOTION.md`](../releases/ARTIFACT_PROMOTION.md).
 
-# Create annotated tag
-git tag -a v0.1.0 -m "Release v0.1.0"
+#### Dev (automatic)
 
-# Push tag to trigger release workflow
-git push origin v0.1.0
-```
+- Merges to `main` trigger CI.
+- After CI succeeds, the Dev Release workflow builds binaries and publishes the
+  rolling `dev` release with checksums.
+
+#### Beta (manual)
+
+- Maintainer dispatches the Beta Release workflow with a version like
+  `0.2.0-beta.1`.
+- The workflow downloads artifacts from `dev`, verifies checksums, and creates
+  `vX.Y.Z-beta.N` without rebuilding.
+
+#### Stable (automated via release-plz)
+
+- release-plz creates a release PR with version bumps and changelog.
+- When that PR is merged, release-plz creates a `vX.Y.Z` tag.
+- The Stable Release workflow promotes artifacts from the latest matching beta
+  release (or falls back to `dev`), signs them, generates SBOM + SLSA provenance,
+  and publishes to crates.io.
 
 ### 2. GitHub Actions Release Workflow
 
 The release workflow automatically:
 
-1. **Builds binaries** for all platforms:
-   - Linux (x86_64, aarch64, musl)
-   - macOS (x86_64, aarch64)
-   - Windows (x86_64)
+1. **Promotes binaries** (no rebuild) from beta/dev:
+   - Linux x86_64
+   - Linux aarch64
 
 2. **Signs all artifacts** with Cosign keyless:
    - Each binary gets `.sig` signature file
@@ -79,6 +92,8 @@ on:
   push:
     tags:
       - 'v*'
+    tags-ignore:
+      - 'v*-*'
 
 permissions:
   contents: write
@@ -86,33 +101,28 @@ permissions:
   attestations: write
 
 jobs:
-  build:
-    # ... build steps ...
-
-  sign:
-    needs: build
+  release:
+    # Promote artifacts from beta/dev, verify checksums, sign, SBOM
     steps:
       - uses: sigstore/cosign-installer@v3
       - name: Sign artifacts
         run: |
-          for file in artifacts/*; do
-            cosign sign-blob --yes \
-              --output-signature "${file}.sig" \
-              --output-certificate "${file}.pem" \
-              "$file"
-          done
+          # sign promoted artifacts
+          ...
 
   provenance:
-    needs: build
+    needs: release
     permissions:
       actions: read
       id-token: write
       contents: write
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
     with:
-      base64-subjects: "${{ needs.build.outputs.hashes }}"
+      base64-subjects: "${{ needs.release.outputs.hashes }}"
       upload-assets: true
 ```
+
+See `/documents/releases/README.md` for full channel and artifact details.
 
 ## Post-Release Verification
 
@@ -164,7 +174,7 @@ slsa-verifier verify-artifact \
 ### 4. Check GitHub Release
 
 Verify the release includes:
-- [ ] All platform binaries
+- [ ] All platform binaries (Linux x86_64, Linux aarch64)
 - [ ] Signature files (`.sig`)
 - [ ] Certificate files (`.pem`)
 - [ ] Checksums (`checksums-sha256.txt`)

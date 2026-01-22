@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal crates
-apm2-core.workspace = true
+apm2-core = { version = "0.1.0", path = "../apm2-core" }
 
 # Async runtime
 tokio.workspace = true

@@ -184,6 +184,13 @@ echo "=== All checks passed! ==="
 | Doc errors | Fix documentation syntax |
 | Audit failures | Update dependency or document exception |
 
+### Safe Rust Practices
+
+This project enforces `unsafe_code = "warn"` in workspace lints. See [`/documents/coding/SAFE_RUST_PATTERNS.md`](documents/coding/SAFE_RUST_PATTERNS.md) for:
+- Required safe patterns (Arc+RwLock, newtypes, builders, etc.)
+- When unsafe might be necessary and how to document it
+- Code examples from this codebase
+
 ---
 
 ## 4. Syncing with Main
