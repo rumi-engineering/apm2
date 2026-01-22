@@ -1,0 +1,55 @@
+prd_constraints_invariants:
+  version: 1
+
+  security:
+    posture:
+      default_deny: true
+      fail_closed: true
+      least_privilege: true
+      tamper_evidence_required: true
+    threat_model: "<REFERENCE OR SHORT STRING>" # e.g. "nation-state, novel 0-days, harvest-now/decrypt-later, quantum-capable"
+    invariants:
+      - id: "SECINV-0001"
+        statement: "<SHORT, TESTABLE>"
+      - id: "SECINV-0002"
+        statement: "<SHORT, TESTABLE>"
+    standards_references:
+      - "ACCESS_CONTROL_STANDARD"
+      - "SECRETS_STANDARD"
+      - "SANDBOX_CONTAINER_STANDARD"
+      - "LOGGING_OBSERVABILITY_STANDARD"
+      - "SUPPLY_CHAIN_BUILD_RELEASE_STANDARD"
+      - "SECURE_SDLC_STANDARD"
+
+  data_sensitivity:
+    classes_used:
+      - "Secrets"
+      - "Sensitive"
+      - "Integrity-critical"
+      - "Public"
+    artifact_classification_expectations:
+      - artifact: "state_store"
+        class: "Integrity-critical"
+      - artifact: "audit_log"
+        class: "Integrity-critical"
+      - artifact: "logs_transcripts"
+        class: "Sensitive"
+      - artifact: "capability_tokens"
+        class: "Secrets"
+
+  compatibility:
+    supported_platforms:
+      - os: "linux"
+        arch: "amd64"
+      - os: "darwin"
+        arch: "arm64"
+    backwards_compatibility_required: true
+
+  operational_budgets:
+    gate_e2e_suite_budget_s: 600
+    max_startup_preflight_s: 60
+
+  failure_behavior:
+    fail_closed_cases:
+      - "<CASE>"
+    degraded_mode_allowed: false

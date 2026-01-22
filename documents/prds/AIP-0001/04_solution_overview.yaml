@@ -1,0 +1,70 @@
+prd_solution_overview:
+  version: 1
+
+  solution_one_sentence: "Replace Unix socket IPC with gRPC services, add PTY-based process management, and introduce structured session/conversation tracking with real-time event streaming."
+
+  conceptual_model:
+    concepts:
+      - name: "Agent"
+        definition: "A managed CLI process (e.g., claude, gemini, codex) running in a PTY with lifecycle control and I/O streaming."
+      - name: "Session"
+        definition: "A conversation context with an agent, containing ordered turns and persisting across agent restarts."
+      - name: "Turn"
+        definition: "A single exchange in a conversation - either user input or agent response, with associated tool calls."
+      - name: "ToolCall"
+        definition: "An invocation of a tool/function by the agent, with input parameters, output result, timing, and status."
+      - name: "PTY (Pseudo-Terminal)"
+        definition: "A virtual terminal providing full terminal emulation including ANSI codes, resize signals, and control characters."
+      - name: "OutputParser"
+        definition: "A pluggable component that extracts structured events (turns, tool calls) from raw agent output."
+    invariants_preview:
+      - "An agent is always associated with exactly one session"
+      - "Turns within a session are strictly ordered by timestamp"
+      - "Tool calls are always associated with a turn"
+      - "Agent state transitions follow: STARTING -> RUNNING -> (STOPPING -> STOPPED | CRASHED)"
+      - "gRPC server must be available before any agent operations"
+
+  primary_user_flows:
+    - id: "FLOW-0001"
+      name: "Create and interact with an agent"
+      steps:
+        - "Client calls CreateAgent with command and args"
+        - "Client calls StartAgent to spawn the process in PTY"
+        - "Client calls SendInput to send a prompt"
+        - "Client streams output via StreamOutput or Interact"
+        - "Client calls StopAgent when done"
+      success_outcome: "Client receives structured responses and can query conversation history"
+      failure_outcome: "Error returned with gRPC status code and details"
+    - id: "FLOW-0002"
+      name: "Monitor agent in real-time"
+      steps:
+        - "Client calls WatchSession with session_id"
+        - "Server streams SessionEvents as they occur"
+        - "Client receives new_turn, tool_call_started, tool_call_completed events"
+      success_outcome: "Client has real-time visibility into agent activity"
+      failure_outcome: "Stream terminates with error if session or agent is invalid"
+    - id: "FLOW-0003"
+      name: "Query conversation history"
+      steps:
+        - "Client calls GetTurns with session_id and optional pagination"
+        - "Server returns ordered list of turns with embedded tool calls"
+      success_outcome: "Client can reconstruct or analyze conversation"
+      failure_outcome: "NOT_FOUND if session doesn't exist"
+    - id: "FLOW-0004"
+      name: "Bidirectional interactive session"
+      steps:
+        - "Client opens Interact stream with agent_id"
+        - "Client sends stdin_data, resize, or signal messages"
+        - "Server streams stdout_data, stderr_data, state_change, tool_call events"
+      success_outcome: "Full interactive terminal experience over gRPC"
+      failure_outcome: "Stream terminates if agent crashes or is stopped"
+
+  alternatives_considered:
+    - option: "Keep Unix socket IPC and add REST API"
+      rejected_because: "REST lacks bidirectional streaming; maintaining two IPC mechanisms increases complexity"
+    - option: "Use WebSocket instead of gRPC"
+      rejected_because: "gRPC provides superior code generation, strong typing, and ecosystem tooling"
+    - option: "Use stdio pipes instead of PTY"
+      rejected_because: "Pipes lack terminal emulation needed for ANSI codes, resize, and control characters that CLI agents expect"
+    - option: "Parse agent output with regex only"
+      rejected_because: "Agent output formats vary; pluggable parser framework allows proper abstraction"

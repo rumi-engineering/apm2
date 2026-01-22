@@ -1,0 +1,36 @@
+prd_customer:
+  version: 1
+
+  personas:
+    primary:
+      name: "<PRIMARY PERSONA>"
+      goals:
+        - "<GOAL>"
+      pains:
+        - "<PAIN>"
+    secondary:
+      - name: "<SECONDARY PERSONA>"
+        goals: ["<GOAL>"]
+        pains: ["<PAIN>"]
+
+  narrative:
+    one_sentence: "<ONE SENTENCE VALUE PROP>"
+    why_now:
+      - "<TRIGGER>"
+
+  press_release:
+    headline: "<HEADLINE>"
+    customer_problem: "<SHORT>"
+    whats_new: "<SHORT>"
+    why_better: "<SHORT>"
+    quote_customer: "<SHORT>"
+    quote_internal: "<SHORT>"
+    availability: "<SHORT>"
+
+  faq:
+    - q: "Who is this for?"
+      a: "<SHORT>"
+    - q: "Who is this NOT for?"
+      a: "<SHORT>"
+    - q: "What are the top 3 user journeys?"
+      a: "<SHORT>"

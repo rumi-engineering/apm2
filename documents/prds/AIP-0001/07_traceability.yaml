@@ -1,0 +1,343 @@
+traceability:
+  version: 1
+
+  requirements:
+    # Phase 1: gRPC Foundation
+    - id: "REQ-AIP-0001-0001"
+      priority: "MUST"
+      statement: "System SHALL provide gRPC server with AgentService, SessionService, and MetricsService"
+      acceptance_criteria:
+        - "gRPC server starts on configurable port (default 50051)"
+        - "All three services respond to health checks"
+        - "Proto files compile without errors"
+      ownership:
+        work_item_hint: "phase-1-grpc"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0001", "DELIV-AIP-0001-0002", "DELIV-AIP-0001-0003"]
+        e2e_ids: ["E2E-AIP-0001-0001"]
+
+    - id: "REQ-AIP-0001-0002"
+      priority: "MUST"
+      statement: "AgentService SHALL support CreateAgent, GetAgent, ListAgents, StartAgent, StopAgent, RestartAgent RPCs"
+      acceptance_criteria:
+        - "CreateAgent returns Agent with generated UUID"
+        - "StartAgent spawns process and transitions to RUNNING state"
+        - "StopAgent terminates process and transitions to STOPPED state"
+        - "GetAgent and ListAgents return current agent state"
+      ownership:
+        work_item_hint: "phase-1-grpc"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0004"]
+        e2e_ids: ["E2E-AIP-0001-0002"]
+
+    - id: "REQ-AIP-0001-0003"
+      priority: "MUST"
+      statement: "AgentService SHALL support SendInput and StreamOutput RPCs for basic I/O"
+      acceptance_criteria:
+        - "SendInput writes bytes to agent stdin/PTY"
+        - "StreamOutput returns output chunks with stream type and timestamp"
+      ownership:
+        work_item_hint: "phase-1-grpc"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0004"]
+        e2e_ids: ["E2E-AIP-0001-0003"]
+
+    # Phase 2: PTY Support
+    - id: "REQ-AIP-0001-0004"
+      priority: "MUST"
+      statement: "Agent processes SHALL run in pseudo-terminal (PTY) with full terminal emulation"
+      acceptance_criteria:
+        - "ANSI escape codes pass through correctly"
+        - "Terminal resize (SIGWINCH) is supported via Interact RPC"
+        - "Control characters (Ctrl+C, Ctrl+D) can be sent"
+      ownership:
+        work_item_hint: "phase-2-pty"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0005"]
+        e2e_ids: ["E2E-AIP-0001-0004"]
+
+    - id: "REQ-AIP-0001-0005"
+      priority: "MUST"
+      statement: "AgentService SHALL support bidirectional Interact streaming RPC"
+      acceptance_criteria:
+        - "Client can send stdin_data, resize, and signal messages"
+        - "Server streams stdout_data, stderr_data, state_change, tool_call events"
+        - "Stream terminates cleanly when agent stops"
+      ownership:
+        work_item_hint: "phase-2-pty"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0004", "DELIV-AIP-0001-0005"]
+        e2e_ids: ["E2E-AIP-0001-0005"]
+
+    # Phase 3: Session Model
+    - id: "REQ-AIP-0001-0006"
+      priority: "MUST"
+      statement: "System SHALL track sessions with structured Turn and ToolCall data"
+      acceptance_criteria:
+        - "Each agent has an associated session"
+        - "Turns capture role (USER/AGENT), content, and timestamp"
+        - "ToolCalls capture name, input, output, status, and timing"
+      ownership:
+        work_item_hint: "phase-3-session"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0006", "DELIV-AIP-0001-0007"]
+        e2e_ids: ["E2E-AIP-0001-0006"]
+
+    - id: "REQ-AIP-0001-0007"
+      priority: "MUST"
+      statement: "SessionService SHALL support GetSession, ListSessions, GetTurns, GetToolCalls RPCs"
+      acceptance_criteria:
+        - "GetSession returns session with metadata"
+        - "GetTurns returns ordered turns with pagination support"
+        - "GetToolCalls returns tool calls filtered by session or turn"
+      ownership:
+        work_item_hint: "phase-3-session"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0008"]
+        e2e_ids: ["E2E-AIP-0001-0007"]
+
+    - id: "REQ-AIP-0001-0008"
+      priority: "MUST"
+      statement: "System SHALL provide pluggable output parser framework with Claude Code implementation"
+      acceptance_criteria:
+        - "AgentOutputParser trait defines parse method"
+        - "ClaudeCodeParser extracts turns and tool calls from Claude Code output"
+        - "GenericParser provides fallback for unknown CLIs"
+      ownership:
+        work_item_hint: "phase-3-session"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0009", "DELIV-AIP-0001-0010"]
+        e2e_ids: ["E2E-AIP-0001-0008"]
+
+    # Phase 4: Metrics & Events
+    - id: "REQ-AIP-0001-0009"
+      priority: "SHOULD"
+      statement: "SessionService SHALL support WatchSession streaming RPC for real-time events"
+      acceptance_criteria:
+        - "Client receives new_turn events when turns are added"
+        - "Client receives tool_call_started and tool_call_completed events"
+        - "Stream filters to specified session_id"
+      ownership:
+        work_item_hint: "phase-4-metrics"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0008"]
+        e2e_ids: ["E2E-AIP-0001-0009"]
+
+    - id: "REQ-AIP-0001-0010"
+      priority: "SHOULD"
+      statement: "MetricsService SHALL provide GetAgentMetrics and StreamMetrics RPCs"
+      acceptance_criteria:
+        - "GetAgentMetrics returns CPU, memory, uptime, restart count, turn/tool counts"
+        - "StreamMetrics provides periodic metrics snapshots"
+        - "Tool call counts are broken down by tool name"
+      ownership:
+        work_item_hint: "phase-4-metrics"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0011"]
+        e2e_ids: ["E2E-AIP-0001-0010"]
+
+    # Phase 5: Persistence (Optional)
+    - id: "REQ-AIP-0001-0011"
+      priority: "MAY"
+      statement: "System MAY persist sessions to SQLite for survival across daemon restarts"
+      acceptance_criteria:
+        - "Sessions, turns, tool_calls stored in SQLite tables"
+        - "Data survives daemon restart"
+        - "Historical queries work across sessions"
+      ownership:
+        work_item_hint: "phase-5-persistence"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0012"]
+        e2e_ids: ["E2E-AIP-0001-0011"]
+
+    # Migration & CLI
+    - id: "REQ-AIP-0001-0012"
+      priority: "MUST"
+      statement: "CLI SHALL use gRPC client for all agent operations"
+      acceptance_criteria:
+        - "apm2 daemon accepts --grpc-port flag"
+        - "All agent commands use gRPC instead of Unix socket"
+        - "apm2 attach <agent> uses Interact RPC for interactive sessions"
+      ownership:
+        work_item_hint: "phase-1-grpc"
+        reviewer_hint: "apm2-maintainers"
+      evidence:
+        deliverable_ids: ["DELIV-AIP-0001-0013"]
+        e2e_ids: ["E2E-AIP-0001-0012"]
+
+  deliverables:
+    - id: "DELIV-AIP-0001-0001"
+      kind: "code"
+      path: "proto/apm2/v1/agent.proto"
+      verify_cmd: "protoc --proto_path=proto proto/apm2/v1/agent.proto --descriptor_set_out=/dev/null"
+      max_seconds: 10
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0002"
+      kind: "code"
+      path: "proto/apm2/v1/session.proto"
+      verify_cmd: "protoc --proto_path=proto proto/apm2/v1/session.proto --descriptor_set_out=/dev/null"
+      max_seconds: 10
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0003"
+      kind: "code"
+      path: "proto/apm2/v1/metrics.proto"
+      verify_cmd: "protoc --proto_path=proto proto/apm2/v1/metrics.proto --descriptor_set_out=/dev/null"
+      max_seconds: 10
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0004"
+      kind: "code"
+      path: "crates/apm2-daemon/src/grpc/agent_service.rs"
+      verify_cmd: "cargo check -p apm2-daemon"
+      max_seconds: 120
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0005"
+      kind: "code"
+      path: "crates/apm2-core/src/process/pty.rs"
+      verify_cmd: "cargo check -p apm2-core"
+      max_seconds: 120
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0006"
+      kind: "code"
+      path: "crates/apm2-core/src/session/mod.rs"
+      verify_cmd: "cargo check -p apm2-core"
+      max_seconds: 120
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0007"
+      kind: "code"
+      path: "crates/apm2-core/src/session/store.rs"
+      verify_cmd: "cargo check -p apm2-core"
+      max_seconds: 120
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0008"
+      kind: "code"
+      path: "crates/apm2-daemon/src/grpc/session_service.rs"
+      verify_cmd: "cargo check -p apm2-daemon"
+      max_seconds: 120
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0009"
+      kind: "code"
+      path: "crates/apm2-core/src/parser/mod.rs"
+      verify_cmd: "cargo check -p apm2-core"
+      max_seconds: 120
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0010"
+      kind: "code"
+      path: "crates/apm2-core/src/parser/claude.rs"
+      verify_cmd: "cargo check -p apm2-core"
+      max_seconds: 120
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0011"
+      kind: "code"
+      path: "crates/apm2-daemon/src/grpc/metrics_service.rs"
+      verify_cmd: "cargo check -p apm2-daemon"
+      max_seconds: 120
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0012"
+      kind: "code"
+      path: "crates/apm2-core/src/session/sqlite_store.rs"
+      verify_cmd: "cargo check -p apm2-core --features persistence"
+      max_seconds: 120
+      data_class: "Public"
+    - id: "DELIV-AIP-0001-0013"
+      kind: "code"
+      path: "crates/apm2-cli/src/main.rs"
+      verify_cmd: "cargo check -p apm2-cli"
+      max_seconds: 120
+      data_class: "Public"
+
+  e2e:
+    - id: "E2E-AIP-0001-0001"
+      scenario: "gRPC server starts and responds to health check"
+      deterministic_selectors:
+        - "grpc_server_startup"
+      verify_cmd: "cargo test --test grpc_health"
+      timeout_s: 30
+      data_class: "Public"
+    - id: "E2E-AIP-0001-0002"
+      scenario: "Create, start, and stop agent lifecycle"
+      deterministic_selectors:
+        - "agent_lifecycle"
+      verify_cmd: "cargo test --test agent_lifecycle"
+      timeout_s: 60
+      data_class: "Public"
+    - id: "E2E-AIP-0001-0003"
+      scenario: "Send input and receive output via gRPC"
+      deterministic_selectors:
+        - "agent_io"
+      verify_cmd: "cargo test --test agent_io"
+      timeout_s: 60
+      data_class: "Sensitive"
+    - id: "E2E-AIP-0001-0004"
+      scenario: "PTY supports ANSI escape codes"
+      deterministic_selectors:
+        - "pty_ansi"
+      verify_cmd: "cargo test --test pty_ansi"
+      timeout_s: 30
+      data_class: "Public"
+    - id: "E2E-AIP-0001-0005"
+      scenario: "Bidirectional Interact stream with resize and signals"
+      deterministic_selectors:
+        - "interact_stream"
+      verify_cmd: "cargo test --test interact_stream"
+      timeout_s: 60
+      data_class: "Sensitive"
+    - id: "E2E-AIP-0001-0006"
+      scenario: "Turns and tool calls captured in session store"
+      deterministic_selectors:
+        - "session_capture"
+      verify_cmd: "cargo test --test session_capture"
+      timeout_s: 60
+      data_class: "Sensitive"
+    - id: "E2E-AIP-0001-0007"
+      scenario: "Query turns and tool calls via SessionService"
+      deterministic_selectors:
+        - "session_query"
+      verify_cmd: "cargo test --test session_query"
+      timeout_s: 30
+      data_class: "Sensitive"
+    - id: "E2E-AIP-0001-0008"
+      scenario: "Claude Code parser extracts structured events"
+      deterministic_selectors:
+        - "claude_parser"
+      verify_cmd: "cargo test --test claude_parser"
+      timeout_s: 30
+      data_class: "Public"
+    - id: "E2E-AIP-0001-0009"
+      scenario: "WatchSession streams real-time events"
+      deterministic_selectors:
+        - "watch_session"
+      verify_cmd: "cargo test --test watch_session"
+      timeout_s: 60
+      data_class: "Sensitive"
+    - id: "E2E-AIP-0001-0010"
+      scenario: "MetricsService returns agent metrics"
+      deterministic_selectors:
+        - "metrics_service"
+      verify_cmd: "cargo test --test metrics_service"
+      timeout_s: 30
+      data_class: "Public"
+    - id: "E2E-AIP-0001-0011"
+      scenario: "Sessions persist across daemon restart (SQLite)"
+      deterministic_selectors:
+        - "sqlite_persistence"
+      verify_cmd: "cargo test --test sqlite_persistence --features persistence"
+      timeout_s: 60
+      data_class: "Sensitive"
+    - id: "E2E-AIP-0001-0012"
+      scenario: "CLI commands use gRPC client"
+      deterministic_selectors:
+        - "cli_grpc"
+      verify_cmd: "cargo test --test cli_grpc"
+      timeout_s: 60
+      data_class: "Public"
