@@ -1,6 +1,10 @@
 //! Credential hot-swapping functionality.
 //!
-//! Allows changing credentials for a running process without restarting it.
+//! NOTE: This module contains scaffolding for future credential hot-swap
+//! support. Currently unused pending research into CLI-specific credential
+//! rotation mechanisms.
+
+#![allow(dead_code)] // Scaffolding for future hot-swap feature
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -40,11 +44,11 @@ fn default_signal() -> String {
     "SIGHUP".to_string()
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
-fn default_graceful_drain() -> Duration {
+const fn default_graceful_drain() -> Duration {
     Duration::from_secs(5)
 }
 
@@ -110,7 +114,7 @@ pub struct HotSwapManager {
 impl HotSwapManager {
     /// Create a new hot-swap manager.
     #[must_use]
-    pub fn new(config: HotSwapConfig) -> Self {
+    pub const fn new(config: HotSwapConfig) -> Self {
         Self {
             config,
             state: HotSwapState::Idle,
@@ -120,13 +124,13 @@ impl HotSwapManager {
 
     /// Get the current hot-swap state.
     #[must_use]
-    pub fn state(&self) -> &HotSwapState {
+    pub const fn state(&self) -> &HotSwapState {
         &self.state
     }
 
     /// Check if a hot-swap is in progress.
     #[must_use]
-    pub fn is_in_progress(&self) -> bool {
+    pub const fn is_in_progress(&self) -> bool {
         !matches!(
             self.state,
             HotSwapState::Idle | HotSwapState::Completed | HotSwapState::Failed(_)
@@ -135,7 +139,7 @@ impl HotSwapManager {
 
     /// Get the configuration.
     #[must_use]
-    pub fn config(&self) -> &HotSwapConfig {
+    pub const fn config(&self) -> &HotSwapConfig {
         &self.config
     }
 
@@ -264,7 +268,10 @@ mod tests {
         let result = manager.start_swap("profile-2".to_string());
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), HotSwapError::AlreadyInProgress));
+        assert!(matches!(
+            result.unwrap_err(),
+            HotSwapError::AlreadyInProgress
+        ));
     }
 }
 

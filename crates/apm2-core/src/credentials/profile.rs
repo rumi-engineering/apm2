@@ -3,9 +3,8 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Unique identifier for a credential profile.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,7 +50,7 @@ pub enum Provider {
     Claude,
     /// Google Gemini.
     Gemini,
-    /// OpenAI (GPT, Codex).
+    /// `OpenAI` (GPT, Codex).
     OpenAI,
     /// Custom/other provider.
     Custom,
@@ -123,7 +122,7 @@ impl AuthMethod {
             Self::ApiKey { .. } => return false,
         };
 
-        expires_at.map_or(false, |exp| Utc::now() >= exp)
+        expires_at.is_some_and(|exp| Utc::now() >= exp)
     }
 
     /// Check if credentials will expire within the given duration.
@@ -134,12 +133,12 @@ impl AuthMethod {
             Self::ApiKey { .. } => return false,
         };
 
-        expires_at.map_or(false, |exp| Utc::now() + duration >= exp)
+        expires_at.is_some_and(|exp| Utc::now() + duration >= exp)
     }
 
     /// Get the auth method type as a string.
     #[must_use]
-    pub fn method_type(&self) -> &'static str {
+    pub const fn method_type(&self) -> &'static str {
         match self {
             Self::OAuth { .. } => "oauth",
             Self::SessionToken { .. } => "session_token",
@@ -232,7 +231,7 @@ impl From<&CredentialProfile> for CredentialProfileMetadata {
         let expires_at = match &profile.auth {
             AuthMethod::OAuth { expires_at, .. } | AuthMethod::SessionToken { expires_at, .. } => {
                 *expires_at
-            }
+            },
             AuthMethod::ApiKey { .. } => None,
         };
 

@@ -1,7 +1,7 @@
 //! Process lifecycle management.
 //!
-//! Provides the `ProcessRunner` which manages a single process instance lifecycle,
-//! including starting, stopping, and monitoring.
+//! Provides the `ProcessRunner` which manages a single process instance
+//! lifecycle, including starting, stopping, and monitoring.
 
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -30,7 +30,7 @@ pub struct ProcessRunner {
 impl ProcessRunner {
     /// Create a new process runner for a specification and instance index.
     #[must_use]
-    pub fn new(spec: ProcessSpec, instance: u32) -> Self {
+    pub const fn new(spec: ProcessSpec, instance: u32) -> Self {
         Self {
             spec,
             instance,
@@ -40,7 +40,8 @@ impl ProcessRunner {
         }
     }
 
-    /// Get the display name for this runner (name-instance format for multi-instance).
+    /// Get the display name for this runner (name-instance format for
+    /// multi-instance).
     #[must_use]
     pub fn display_name(&self) -> String {
         if self.spec.instances > 1 {
@@ -88,7 +89,8 @@ impl ProcessRunner {
     ///
     /// # Arguments
     ///
-    /// * `graceful_timeout` - How long to wait for graceful shutdown before force killing.
+    /// * `graceful_timeout` - How long to wait for graceful shutdown before
+    ///   force killing.
     ///
     /// # Errors
     ///
@@ -114,9 +116,10 @@ impl ProcessRunner {
         // Send SIGTERM
         #[cfg(unix)]
         {
-            use nix::sys::signal::{kill, Signal};
+            use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
 
+            #[allow(clippy::cast_possible_wrap)] // PIDs won't exceed i32 range
             if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
                 warn!("Failed to send SIGTERM to {}: {}", self.display_name(), e);
             }
@@ -141,11 +144,11 @@ impl ProcessRunner {
                         exit_code
                     );
                     self.state = ProcessState::Stopped { exit_code };
-                }
+                },
                 Ok(Err(e)) => {
                     warn!("Error waiting for process {}: {}", self.display_name(), e);
                     self.state = ProcessState::Stopped { exit_code: None };
-                }
+                },
                 Err(_) => {
                     // Timeout - force kill
                     warn!(
@@ -153,7 +156,7 @@ impl ProcessRunner {
                         self.display_name()
                     );
                     self.force_kill().await;
-                }
+                },
             }
         }
 
@@ -168,9 +171,10 @@ impl ProcessRunner {
     async fn force_kill(&mut self) {
         #[cfg(unix)]
         if let Some(pid) = self.pid {
-            use nix::sys::signal::{kill, Signal};
+            use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
 
+            #[allow(clippy::cast_possible_wrap)] // PIDs won't exceed i32 range
             if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGKILL) {
                 warn!("Failed to send SIGKILL to {}: {}", self.display_name(), e);
             }
@@ -209,7 +213,8 @@ impl ProcessRunner {
 
     /// Check if the process is still running (non-blocking).
     ///
-    /// Returns `Some(ExitStatus)` if the process has exited, `None` if still running.
+    /// Returns `Some(ExitStatus)` if the process has exited, `None` if still
+    /// running.
     pub fn try_wait(&mut self) -> Option<ExitStatus> {
         let child = self.child.as_mut()?;
         match child.try_wait() {
@@ -222,40 +227,39 @@ impl ProcessRunner {
                 }
                 self.pid = None;
                 Some(status)
-            }
-            Ok(None) => None, // Still running
-            Err(_) => None,
+            },
+            Ok(None) | Err(_) => None, // Still running or error checking
         }
     }
 
     /// Get the current process PID.
     #[must_use]
-    pub fn pid(&self) -> Option<u32> {
+    pub const fn pid(&self) -> Option<u32> {
         self.pid
     }
 
     /// Get the current process state.
     #[must_use]
-    pub fn state(&self) -> &ProcessState {
+    pub const fn state(&self) -> &ProcessState {
         &self.state
     }
 
     /// Get the process specification.
     #[must_use]
-    pub fn spec(&self) -> &ProcessSpec {
+    pub const fn spec(&self) -> &ProcessSpec {
         &self.spec
     }
 
     /// Get the instance index.
     #[must_use]
-    pub fn instance(&self) -> u32 {
+    pub const fn instance(&self) -> u32 {
         self.instance
     }
 
     /// Take ownership of the child process handle.
     ///
     /// This is useful for transferring the child to another manager.
-    pub fn take_child(&mut self) -> Option<Child> {
+    pub const fn take_child(&mut self) -> Option<Child> {
         self.child.take()
     }
 }
@@ -264,6 +268,7 @@ impl ProcessRunner {
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore)] // Miri can't spawn processes
     #[tokio::test]
     async fn test_runner_start_stop() {
         let spec = ProcessSpec::builder()
@@ -286,6 +291,7 @@ mod tests {
         assert!(runner.pid().is_none());
     }
 
+    #[cfg_attr(miri, ignore)] // Miri can't spawn processes
     #[tokio::test]
     async fn test_runner_wait_for_exit() {
         let spec = ProcessSpec::builder()
@@ -303,6 +309,7 @@ mod tests {
         assert!(!runner.state().is_running());
     }
 
+    #[cfg_attr(miri, ignore)] // Miri can't spawn processes
     #[tokio::test]
     async fn test_runner_crashed_exit() {
         let spec = ProcessSpec::builder()

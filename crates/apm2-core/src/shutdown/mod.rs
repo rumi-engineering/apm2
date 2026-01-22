@@ -32,7 +32,7 @@ pub struct ShutdownConfig {
     pub pre_shutdown_commands: Vec<String>,
 }
 
-fn default_timeout() -> Duration {
+const fn default_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
@@ -40,11 +40,11 @@ fn default_signal() -> String {
     "SIGTERM".to_string()
 }
 
-fn default_kill_delay() -> Duration {
+const fn default_kill_delay() -> Duration {
     Duration::from_secs(5)
 }
 
-fn default_force_kill() -> bool {
+const fn default_force_kill() -> bool {
     true
 }
 
@@ -106,7 +106,7 @@ pub struct ShutdownManager {
 impl ShutdownManager {
     /// Create a new shutdown manager.
     #[must_use]
-    pub fn new(config: ShutdownConfig) -> Self {
+    pub const fn new(config: ShutdownConfig) -> Self {
         Self {
             config,
             state: ShutdownState::Running,
@@ -117,14 +117,17 @@ impl ShutdownManager {
 
     /// Get the current shutdown state.
     #[must_use]
-    pub fn state(&self) -> ShutdownState {
+    pub const fn state(&self) -> ShutdownState {
         self.state
     }
 
     /// Check if shutdown is in progress.
     #[must_use]
-    pub fn is_shutting_down(&self) -> bool {
-        !matches!(self.state, ShutdownState::Running | ShutdownState::Completed)
+    pub const fn is_shutting_down(&self) -> bool {
+        !matches!(
+            self.state,
+            ShutdownState::Running | ShutdownState::Completed
+        )
     }
 
     /// Initiate shutdown.
@@ -155,7 +158,7 @@ impl ShutdownManager {
         }
 
         self.graceful_signal_sent_at
-            .map_or(false, |sent_at| sent_at.elapsed() >= self.config.timeout)
+            .is_some_and(|sent_at| sent_at.elapsed() >= self.config.timeout)
     }
 
     /// Transition to force kill state.
@@ -166,12 +169,12 @@ impl ShutdownManager {
     }
 
     /// Mark shutdown as complete.
-    pub fn complete(&mut self) {
+    pub const fn complete(&mut self) {
         self.state = ShutdownState::Completed;
     }
 
     /// Reset the manager to running state.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.state = ShutdownState::Running;
         self.shutdown_started_at = None;
         self.graceful_signal_sent_at = None;
@@ -191,25 +194,25 @@ impl ShutdownManager {
 
     /// Get the timeout duration.
     #[must_use]
-    pub fn timeout(&self) -> Duration {
+    pub const fn timeout(&self) -> Duration {
         self.config.timeout
     }
 
     /// Get the kill delay duration.
     #[must_use]
-    pub fn kill_delay(&self) -> Duration {
+    pub const fn kill_delay(&self) -> Duration {
         self.config.kill_delay
     }
 
     /// Check if force kill is enabled.
     #[must_use]
-    pub fn force_kill_enabled(&self) -> bool {
+    pub const fn force_kill_enabled(&self) -> bool {
         self.config.force_kill
     }
 
     /// Get the shutdown configuration.
     #[must_use]
-    pub fn config(&self) -> &ShutdownConfig {
+    pub const fn config(&self) -> &ShutdownConfig {
         &self.config
     }
 

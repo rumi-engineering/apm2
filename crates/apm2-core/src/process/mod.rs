@@ -149,14 +149,14 @@ impl ProcessSpecBuilder {
 
     /// Set the number of instances.
     #[must_use]
-    pub fn instances(mut self, instances: u32) -> Self {
+    pub const fn instances(mut self, instances: u32) -> Self {
         self.instances = instances;
         self
     }
 
     /// Set the restart configuration.
     #[must_use]
-    pub fn restart(mut self, restart: RestartConfig) -> Self {
+    pub const fn restart(mut self, restart: RestartConfig) -> Self {
         self.restart = restart;
         self
     }
@@ -203,7 +203,11 @@ impl ProcessSpecBuilder {
             args: self.args,
             cwd: self.cwd,
             env: self.env,
-            instances: if self.instances == 0 { 1 } else { self.instances },
+            instances: if self.instances == 0 {
+                1
+            } else {
+                self.instances
+            },
             restart: self.restart,
             health: self.health,
             log: self.log,
@@ -247,14 +251,18 @@ pub enum ProcessState {
 impl ProcessState {
     /// Returns `true` if the process is in a running state.
     #[must_use]
-    pub fn is_running(&self) -> bool {
+    pub const fn is_running(&self) -> bool {
         matches!(self, Self::Starting | Self::Running | Self::Unhealthy)
     }
 
-    /// Returns `true` if the process has exited (stopped, crashed, or terminated).
+    /// Returns `true` if the process has exited (stopped, crashed, or
+    /// terminated).
     #[must_use]
-    pub fn has_exited(&self) -> bool {
-        matches!(self, Self::Stopped { .. } | Self::Crashed { .. } | Self::Terminated)
+    pub const fn has_exited(&self) -> bool {
+        matches!(
+            self,
+            Self::Stopped { .. } | Self::Crashed { .. } | Self::Terminated
+        )
     }
 }
 
@@ -271,14 +279,14 @@ impl std::fmt::Display for ProcessState {
                 } else {
                     write!(f, "stopped")
                 }
-            }
+            },
             Self::Crashed { exit_code } => {
                 if let Some(code) = exit_code {
                     write!(f, "crashed (exit code: {code})")
                 } else {
                     write!(f, "crashed")
                 }
-            }
+            },
             Self::Terminated => write!(f, "terminated"),
         }
     }
@@ -318,9 +326,10 @@ pub struct ProcessHandle {
 impl ProcessHandle {
     /// Create a new process handle.
     ///
-    /// The handle starts in `Stopped` state until the process is actually started.
+    /// The handle starts in `Stopped` state until the process is actually
+    /// started.
     #[must_use]
-    pub fn new(spec: ProcessSpec, instance: u32) -> Self {
+    pub const fn new(spec: ProcessSpec, instance: u32) -> Self {
         Self {
             spec,
             instance,

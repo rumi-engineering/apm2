@@ -8,14 +8,13 @@ mod profile;
 mod refresh;
 mod store;
 
-pub use hotswap::HotSwapConfig;
-pub use profile::{AuthMethod, CredentialProfile, CredentialProfileMetadata, ProfileId, Provider};
-pub use refresh::RefreshConfig;
-pub use store::{CredentialStore, CredentialStoreError};
-
 use std::path::PathBuf;
 
+pub use hotswap::{HotSwapConfig, HotSwapError, HotSwapManager, HotSwapState};
+pub use profile::{AuthMethod, CredentialProfile, CredentialProfileMetadata, ProfileId, Provider};
+pub use refresh::{RefreshConfig, RefreshError, RefreshManager, RefreshState};
 use serde::{Deserialize, Serialize};
+pub use store::{CredentialStore, CredentialStoreError};
 
 /// Credential binding configuration for a process.
 #[derive(Debug, Clone, Serialize, Deserialize)]

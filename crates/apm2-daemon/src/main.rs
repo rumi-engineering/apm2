@@ -11,14 +11,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
-use tokio::signal::unix::{signal, SignalKind};
-use tracing::{error, info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
 use apm2_core::config::EcosystemConfig;
 use apm2_core::process::ProcessState;
 use apm2_core::supervisor::Supervisor;
+use clap::Parser;
+use tokio::signal::unix::{SignalKind, signal};
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::state::{DaemonStateHandle, SharedState};
 
@@ -160,8 +161,7 @@ async fn shutdown_all_processes(state: &SharedState) {
                         inner
                             .supervisor
                             .get_handle(&spec.name, *i)
-                            .map(|h| h.state.is_running())
-                            .unwrap_or(false)
+                            .is_some_and(|h| h.state.is_running())
                     })
                     .map(|i| (spec.name.clone(), i))
             })
@@ -181,11 +181,7 @@ async fn shutdown_all_processes(state: &SharedState) {
         let runner = {
             let mut inner = state.write().await;
             let spec_id = inner.supervisor.get_spec(&name).map(|s| s.id);
-            if let Some(spec_id) = spec_id {
-                inner.remove_runner(spec_id, instance)
-            } else {
-                None
-            }
+            spec_id.and_then(|id| inner.remove_runner(id, instance))
         };
 
         if let Some(mut runner) = runner {
@@ -200,9 +196,11 @@ async fn shutdown_all_processes(state: &SharedState) {
         // Update supervisor state
         {
             let mut inner = state.write().await;
-            inner
-                .supervisor
-                .update_state(&name, instance, ProcessState::Stopped { exit_code: None });
+            inner.supervisor.update_state(
+                &name,
+                instance,
+                ProcessState::Stopped { exit_code: None },
+            );
             inner.supervisor.update_pid(&name, instance, None);
         }
     }
@@ -215,8 +213,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
-    let filter =
-        EnvFilter::try_new(&args.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_new(&args.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
     if let Some(log_file) = &args.log_file {
         // Log to file
@@ -243,10 +240,11 @@ async fn main() -> Result<()> {
     }
 
     // Daemonize if requested
+    #[allow(unsafe_code)] // fork() requires unsafe
     if !args.no_daemon {
         #[cfg(unix)]
         {
-            use nix::unistd::{fork, setsid, ForkResult};
+            use nix::unistd::{ForkResult, fork, setsid};
 
             info!("Daemonizing...");
 
@@ -255,8 +253,8 @@ async fn main() -> Result<()> {
                 ForkResult::Parent { .. } => {
                     // Parent exits
                     std::process::exit(0);
-                }
-                ForkResult::Child => {}
+                },
+                ForkResult::Child => {},
             }
 
             // Create new session
@@ -267,8 +265,8 @@ async fn main() -> Result<()> {
                 ForkResult::Parent { .. } => {
                     // Parent exits
                     std::process::exit(0);
-                }
-                ForkResult::Child => {}
+                },
+                ForkResult::Child => {},
             }
 
             // Change to root directory

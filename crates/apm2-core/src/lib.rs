@@ -1,10 +1,11 @@
 //! # apm2-core
 //!
-//! Core library for apm2 - an AI CLI process manager with credential management.
+//! Core library for apm2 - an AI CLI process manager with credential
+//! management.
 //!
-//! This crate provides the fundamental building blocks for managing AI CLI processes
-//! like Claude Code, Gemini CLI, and Codex CLI, with a focus on credential/login
-//! management and hot-swapping capabilities.
+//! This crate provides the fundamental building blocks for managing AI CLI
+//! processes like Claude Code, Gemini CLI, and Codex CLI, with a focus on
+//! credential/login management and hot-swapping capabilities.
 //!
 //! ## Features
 //!

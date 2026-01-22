@@ -47,6 +47,7 @@ once_cell.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+criterion.workspace = true
 
 [features]
 default = []
@@ -55,3 +56,27 @@ test-utils = []
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "ipc_benchmarks"
+harness = false
+
+[[bench]]
+name = "supervisor_benchmarks"
+harness = false
+
+[[bench]]
+name = "shutdown_benchmarks"
+harness = false
+
+[[bench]]
+name = "spawn_benchmarks"
+harness = false
+
+[[bench]]
+name = "state_benchmarks"
+harness = false
+
+[[bench]]
+name = "hotswap_benchmarks"
+harness = false

@@ -4,15 +4,14 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
-
+use anyhow::{Context, Result, bail};
 use apm2_core::ipc::{IpcRequest, IpcResponse};
 
 /// List credential profiles.
 pub fn list(socket_path: &Path) -> Result<()> {
     let request = IpcRequest::ListCredentials;
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::CredentialList { profiles } => {
             if profiles.is_empty() {
                 println!("No credential profiles configured");
@@ -28,14 +27,14 @@ pub fn list(socket_path: &Path) -> Result<()> {
 
             // Rows
             for profile in profiles {
-                let expires = profile
-                    .expires_at
-                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_else(|| "N/A".to_string());
-                let last_used = profile
-                    .last_used_at
-                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_else(|| "Never".to_string());
+                let expires = profile.expires_at.map_or_else(
+                    || "N/A".to_string(),
+                    |t| t.format("%Y-%m-%d %H:%M").to_string(),
+                );
+                let last_used = profile.last_used_at.map_or_else(
+                    || "Never".to_string(),
+                    |t| t.format("%Y-%m-%d %H:%M").to_string(),
+                );
 
                 println!(
                     "{:<20} {:<12} {:<15} {:<20} {:<20}",
@@ -46,10 +45,10 @@ pub fn list(socket_path: &Path) -> Result<()> {
                     last_used,
                 );
             }
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to list credentials: {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -57,19 +56,14 @@ pub fn list(socket_path: &Path) -> Result<()> {
 }
 
 /// Add a new credential profile.
-pub fn add(
-    socket_path: &Path,
-    profile_id: &str,
-    provider: &str,
-    auth_method: &str,
-) -> Result<()> {
+pub fn add(socket_path: &Path, profile_id: &str, provider: &str, auth_method: &str) -> Result<()> {
     let request = IpcRequest::AddCredential {
         profile_id: profile_id.to_string(),
         provider: provider.to_string(),
         auth_method: auth_method.to_string(),
     };
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::Ok { message } => {
             println!(
                 "Created credential profile '{profile_id}'{}",
@@ -80,10 +74,10 @@ pub fn add(
             println!("  1. Store your credentials securely:");
             println!("     apm2 creds login {provider} --profile-id {profile_id}");
             println!("  2. Or manually add to OS keyring");
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to add credential profile: {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -96,16 +90,16 @@ pub fn remove(socket_path: &Path, profile_id: &str) -> Result<()> {
         profile_id: profile_id.to_string(),
     };
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::Ok { message } => {
             println!(
                 "Removed credential profile '{profile_id}'{}",
                 message.map(|m| format!(": {m}")).unwrap_or_default()
             );
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to remove credential profile: {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -118,16 +112,16 @@ pub fn refresh(socket_path: &Path, profile_id: &str) -> Result<()> {
         profile_id: profile_id.to_string(),
     };
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::Ok { message } => {
             println!(
                 "Refreshed credential profile '{profile_id}'{}",
                 message.map(|m| format!(": {m}")).unwrap_or_default()
             );
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to refresh credential profile: {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -141,16 +135,16 @@ pub fn switch(socket_path: &Path, process: &str, profile: &str) -> Result<()> {
         profile_id: profile.to_string(),
     };
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::Ok { message } => {
             println!(
                 "Switched credentials for '{process}' to profile '{profile}'{}",
                 message.map(|m| format!(": {m}")).unwrap_or_default()
             );
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to switch credentials: {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -158,6 +152,7 @@ pub fn switch(socket_path: &Path, process: &str, profile: &str) -> Result<()> {
 }
 
 /// Interactive login flow.
+#[allow(clippy::unnecessary_wraps)] // Returns Result for consistency with other commands
 pub fn login(provider: &str, profile_id: Option<&str>) -> Result<()> {
     let profile = profile_id.unwrap_or(provider);
 
@@ -179,7 +174,7 @@ pub fn login(provider: &str, profile_id: Option<&str>) -> Result<()> {
             println!("To store credentials, use:");
             println!("  export ANTHROPIC_API_KEY=sk-ant-...");
             println!("  apm2 creds add {profile} --provider claude --auth-method api_key");
-        }
+        },
         "gemini" => {
             println!("Gemini login options:");
             println!();
@@ -193,7 +188,7 @@ pub fn login(provider: &str, profile_id: Option<&str>) -> Result<()> {
             println!("To store credentials, use:");
             println!("  export GEMINI_API_KEY=...");
             println!("  apm2 creds add {profile} --provider gemini --auth-method api_key");
-        }
+        },
         "openai" => {
             println!("OpenAI login options:");
             println!();
@@ -204,12 +199,12 @@ pub fn login(provider: &str, profile_id: Option<&str>) -> Result<()> {
             println!("To store credentials, use:");
             println!("  export OPENAI_API_KEY=sk-...");
             println!("  apm2 creds add {profile} --provider openai --auth-method api_key");
-        }
+        },
         _ => {
             println!("Unknown provider: {provider}");
             println!();
             println!("Supported providers: claude, gemini, openai");
-        }
+        },
     }
 
     Ok(())
@@ -225,7 +220,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 }
 
 /// Send an IPC request to the daemon.
-fn send_request(socket_path: &Path, request: IpcRequest) -> Result<IpcResponse> {
+fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcResponse> {
     // Connect to daemon
     let mut stream = UnixStream::connect(socket_path)
         .context("failed to connect to daemon socket (is the daemon running?)")?;

@@ -14,13 +14,13 @@ pub struct Supervisor {
     /// Process specifications by ID.
     specs: HashMap<ProcessId, ProcessSpec>,
 
-    /// Process handles by (spec_id, instance_index).
+    /// Process handles by (`spec_id`, `instance_index`).
     handles: HashMap<(ProcessId, u32), ProcessHandle>,
 
-    /// Restart managers by (spec_id, instance_index).
+    /// Restart managers by (`spec_id`, `instance_index`).
     restart_managers: HashMap<(ProcessId, u32), RestartManager>,
 
-    /// Shutdown managers by (spec_id, instance_index).
+    /// Shutdown managers by (`spec_id`, `instance_index`).
     shutdown_managers: HashMap<(ProcessId, u32), ShutdownManager>,
 }
 
@@ -44,7 +44,7 @@ impl Supervisor {
     pub fn register(&mut self, spec: ProcessSpec) -> Result<(), SupervisorError> {
         // Check for duplicate names
         if self.specs.values().any(|s| s.name == spec.name) {
-            return Err(SupervisorError::DuplicateName(spec.name.clone()));
+            return Err(SupervisorError::DuplicateName(spec.name));
         }
 
         let spec_id = spec.id;
@@ -92,7 +92,7 @@ impl Supervisor {
         }
 
         // Remove all associated data
-        let instances = self.specs.get(&spec_id).map(|s| s.instances).unwrap_or(0);
+        let instances = self.specs.get(&spec_id).map_or(0, |s| s.instances);
         for i in 0..instances {
             self.handles.remove(&(spec_id, i));
             self.restart_managers.remove(&(spec_id, i));
@@ -123,6 +123,7 @@ impl Supervisor {
     }
 
     /// Get all handles for a process name.
+    #[must_use]
     pub fn get_handles(&self, name: &str) -> Vec<&ProcessHandle> {
         let Some(spec_id) = self.specs.values().find(|s| s.name == name).map(|s| s.id) else {
             return Vec::new();
@@ -136,7 +137,11 @@ impl Supervisor {
     }
 
     /// Get the restart manager for a process instance.
-    pub fn get_restart_manager(&mut self, name: &str, instance: u32) -> Option<&mut RestartManager> {
+    pub fn get_restart_manager(
+        &mut self,
+        name: &str,
+        instance: u32,
+    ) -> Option<&mut RestartManager> {
         let spec_id = self.specs.values().find(|s| s.name == name)?.id;
         self.restart_managers.get_mut(&(spec_id, instance))
     }
@@ -166,7 +171,10 @@ impl Supervisor {
     /// Get the number of running instances.
     #[must_use]
     pub fn running_count(&self) -> usize {
-        self.handles.values().filter(|h| h.state.is_running()).count()
+        self.handles
+            .values()
+            .filter(|h| h.state.is_running())
+            .count()
     }
 
     /// Get all process specifications.
@@ -252,14 +260,8 @@ mod tests {
     fn test_duplicate_name_rejected() {
         let mut supervisor = Supervisor::new();
 
-        let spec1 = ProcessSpec::builder()
-            .name("test")
-            .command("echo")
-            .build();
-        let spec2 = ProcessSpec::builder()
-            .name("test")
-            .command("echo")
-            .build();
+        let spec1 = ProcessSpec::builder().name("test").command("echo").build();
+        let spec2 = ProcessSpec::builder().name("test").command("echo").build();
 
         supervisor.register(spec1).unwrap();
         let result = supervisor.register(spec2);
@@ -271,10 +273,7 @@ mod tests {
     fn test_unregister_process() {
         let mut supervisor = Supervisor::new();
 
-        let spec = ProcessSpec::builder()
-            .name("test")
-            .command("echo")
-            .build();
+        let spec = ProcessSpec::builder().name("test").command("echo").build();
 
         supervisor.register(spec).unwrap();
         supervisor.unregister("test").unwrap();

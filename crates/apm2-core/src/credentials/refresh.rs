@@ -33,19 +33,19 @@ pub struct RefreshConfig {
     pub token_endpoint: Option<String>,
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
-fn default_refresh_before() -> Duration {
+const fn default_refresh_before() -> Duration {
     Duration::from_secs(5 * 60) // 5 minutes
 }
 
-fn default_max_attempts() -> u32 {
+const fn default_max_attempts() -> u32 {
     3
 }
 
-fn default_retry_delay() -> Duration {
+const fn default_retry_delay() -> Duration {
     Duration::from_secs(30)
 }
 
@@ -99,7 +99,7 @@ impl std::fmt::Display for RefreshState {
             Self::Completed { new_expiry } => write!(f, "completed (expires {new_expiry})"),
             Self::Failed { error, attempts } => {
                 write!(f, "failed after {attempts} attempts: {error}")
-            }
+            },
         }
     }
 }
@@ -123,7 +123,7 @@ pub struct RefreshManager {
 impl RefreshManager {
     /// Create a new refresh manager.
     #[must_use]
-    pub fn new(config: RefreshConfig) -> Self {
+    pub const fn new(config: RefreshConfig) -> Self {
         Self {
             config,
             state: RefreshState::NotNeeded,
@@ -134,7 +134,7 @@ impl RefreshManager {
 
     /// Get the current refresh state.
     #[must_use]
-    pub fn state(&self) -> &RefreshState {
+    pub const fn state(&self) -> &RefreshState {
         &self.state
     }
 
@@ -149,8 +149,9 @@ impl RefreshManager {
             return false;
         };
 
-        let refresh_at = expiry - chrono::Duration::from_std(self.config.refresh_before_expiry)
-            .unwrap_or(chrono::Duration::zero());
+        let refresh_at = expiry
+            - chrono::Duration::from_std(self.config.refresh_before_expiry)
+                .unwrap_or(chrono::Duration::zero());
 
         Utc::now() >= refresh_at
     }
@@ -196,7 +197,7 @@ impl RefreshManager {
 
     /// Check if more refresh attempts are allowed.
     #[must_use]
-    pub fn can_retry(&self) -> bool {
+    pub const fn can_retry(&self) -> bool {
         match &self.state {
             RefreshState::Failed { attempts, .. } => *attempts < self.config.max_attempts,
             _ => true,
@@ -205,7 +206,7 @@ impl RefreshManager {
 
     /// Get the delay before the next retry.
     #[must_use]
-    pub fn retry_delay(&self) -> Duration {
+    pub const fn retry_delay(&self) -> Duration {
         self.config.retry_delay
     }
 
@@ -217,7 +218,7 @@ impl RefreshManager {
 
     /// Get the last successful refresh time.
     #[must_use]
-    pub fn last_refresh(&self) -> Option<DateTime<Utc>> {
+    pub const fn last_refresh(&self) -> Option<DateTime<Utc>> {
         self.last_refresh
     }
 }
@@ -282,7 +283,10 @@ mod tests {
         assert!(matches!(manager.state(), RefreshState::Scheduled { .. }));
 
         manager.begin_refresh();
-        assert!(matches!(manager.state(), RefreshState::InProgress { attempt: 1 }));
+        assert!(matches!(
+            manager.state(),
+            RefreshState::InProgress { attempt: 1 }
+        ));
 
         let new_expiry = Utc::now() + chrono::Duration::hours(2);
         manager.complete(new_expiry);
