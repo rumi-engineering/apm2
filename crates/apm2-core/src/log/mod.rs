@@ -7,10 +7,9 @@
 
 mod redact;
 
-pub use redact::{is_sensitive_env_name, redact, SecretRedactor};
-
 use std::path::PathBuf;
 
+pub use redact::{SecretRedactor, is_sensitive_env_name, redact};
 use serde::{Deserialize, Serialize};
 
 /// Log configuration.
@@ -83,11 +82,11 @@ pub struct LogRotationConfig {
     pub mode: RotationMode,
 }
 
-fn default_max_size() -> u64 {
+const fn default_max_size() -> u64 {
     10 * 1024 * 1024 // 10 MB
 }
 
-fn default_max_files() -> u32 {
+const fn default_max_files() -> u32 {
     10
 }
 
@@ -175,7 +174,7 @@ pub struct LogManager {
 impl LogManager {
     /// Create a new log manager.
     #[must_use]
-    pub fn new(config: LogConfig, process_name: String, instance: u32) -> Self {
+    pub const fn new(config: LogConfig, process_name: String, instance: u32) -> Self {
         Self {
             config,
             process_name,
@@ -188,9 +187,10 @@ impl LogManager {
     /// Get the stdout log file path.
     #[must_use]
     pub fn stdout_path(&self) -> Option<PathBuf> {
-        self.config.out_file.clone().or_else(|| {
-            self.config.combined_file.clone()
-        })
+        self.config
+            .out_file
+            .clone()
+            .or_else(|| self.config.combined_file.clone())
     }
 
     /// Get the stderr log file path.
@@ -199,9 +199,10 @@ impl LogManager {
         if self.config.merge_stderr {
             self.stdout_path()
         } else {
-            self.config.err_file.clone().or_else(|| {
-                self.config.combined_file.clone()
-            })
+            self.config
+                .err_file
+                .clone()
+                .or_else(|| self.config.combined_file.clone())
         }
     }
 
@@ -239,29 +240,41 @@ impl LogManager {
     }
 
     /// Record bytes written to stdout.
-    pub fn record_stdout_bytes(&mut self, bytes: u64) {
+    pub const fn record_stdout_bytes(&mut self, bytes: u64) {
         self.stdout_size += bytes;
     }
 
     /// Record bytes written to stderr.
-    pub fn record_stderr_bytes(&mut self, bytes: u64) {
+    pub const fn record_stderr_bytes(&mut self, bytes: u64) {
         self.stderr_size += bytes;
     }
 
     /// Reset file sizes after rotation.
-    pub fn reset_stdout_size(&mut self) {
+    pub const fn reset_stdout_size(&mut self) {
         self.stdout_size = 0;
     }
 
     /// Reset stderr file size after rotation.
-    pub fn reset_stderr_size(&mut self) {
+    pub const fn reset_stderr_size(&mut self) {
         self.stderr_size = 0;
     }
 
     /// Get the log configuration.
     #[must_use]
-    pub fn config(&self) -> &LogConfig {
+    pub const fn config(&self) -> &LogConfig {
         &self.config
+    }
+
+    /// Get the process name.
+    #[must_use]
+    pub fn process_name(&self) -> &str {
+        &self.process_name
+    }
+
+    /// Get the instance index.
+    #[must_use]
+    pub const fn instance(&self) -> u32 {
+        self.instance
     }
 }
 

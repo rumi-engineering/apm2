@@ -4,13 +4,12 @@
 
 use std::time::Duration;
 
-use tracing::{info, warn};
-
 use apm2_core::ipc::{
     ErrorCode, InstanceInfo, IpcRequest, IpcResponse, ProcessInfo, ProcessSummary,
 };
-use apm2_core::process::runner::ProcessRunner;
 use apm2_core::process::ProcessState;
+use apm2_core::process::runner::ProcessRunner;
+use tracing::{info, warn};
 
 use crate::state::SharedState;
 
@@ -47,6 +46,7 @@ fn handle_ping(state: &SharedState) -> IpcResponse {
 }
 
 /// Handle status request.
+#[allow(clippy::cast_possible_truncation)] // Process counts won't exceed u32
 async fn handle_status(state: &SharedState) -> IpcResponse {
     let inner = state.read().await;
 
@@ -63,6 +63,7 @@ async fn handle_status(state: &SharedState) -> IpcResponse {
 }
 
 /// Handle list processes request.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Counts/uptime won't overflow
 async fn handle_list(state: &SharedState) -> IpcResponse {
     let inner = state.read().await;
 
@@ -80,8 +81,9 @@ async fn handle_list(state: &SharedState) -> IpcResponse {
             // Get the first handle's state if available
             handles
                 .first()
-                .map(|h| h.state.clone())
-                .unwrap_or(ProcessState::Stopped { exit_code: None })
+                .map_or(ProcessState::Stopped { exit_code: None }, |h| {
+                    h.state.clone()
+                })
         };
 
         // Sum up CPU and memory usage
@@ -122,13 +124,14 @@ async fn handle_list(state: &SharedState) -> IpcResponse {
 }
 
 /// Handle get process details request.
+#[allow(clippy::cast_sign_loss)] // Uptime won't be negative after max(0)
 async fn handle_get_process(state: &SharedState, name: &str) -> IpcResponse {
     let inner = state.read().await;
 
     let Some(spec) = inner.supervisor.get_spec(name) else {
         return IpcResponse::Error {
             code: ErrorCode::ProcessNotFound,
-            message: format!("Process '{}' not found", name),
+            message: format!("Process '{name}' not found"),
         };
     };
 
@@ -147,10 +150,7 @@ async fn handle_get_process(state: &SharedState, name: &str) -> IpcResponse {
         })
         .collect();
 
-    let credential_profile = spec
-        .credentials
-        .as_ref()
-        .map(|c| c.profile.clone());
+    let credential_profile = spec.credentials.as_ref().map(|c| c.profile.clone());
 
     IpcResponse::ProcessDetails {
         process: ProcessInfo {
@@ -173,7 +173,7 @@ async fn handle_start(state: &SharedState, name: &str) -> IpcResponse {
     let Some(spec) = inner.supervisor.get_spec(name).cloned() else {
         return IpcResponse::Error {
             code: ErrorCode::ProcessNotFound,
-            message: format!("Process '{}' not found", name),
+            message: format!("Process '{name}' not found"),
         };
     };
 
@@ -183,7 +183,7 @@ async fn handle_start(state: &SharedState, name: &str) -> IpcResponse {
     if running > 0 {
         return IpcResponse::Error {
             code: ErrorCode::ProcessAlreadyRunning,
-            message: format!("Process '{}' is already running", name),
+            message: format!("Process '{name}' is already running"),
         };
     }
 
@@ -202,16 +202,18 @@ async fn handle_start(state: &SharedState, name: &str) -> IpcResponse {
                 if let Some(pid) = runner.pid() {
                     inner.supervisor.update_pid(name, i, Some(pid));
                 }
-                inner.supervisor.update_state(name, i, ProcessState::Running);
+                inner
+                    .supervisor
+                    .update_state(name, i, ProcessState::Running);
 
                 // Store the runner
                 inner.insert_runner(spec.id, i, runner);
                 started += 1;
-            }
+            },
             Err(e) => {
                 warn!("Failed to start instance {} of '{}': {}", i, name, e);
                 last_error = Some(e.to_string());
-            }
+            },
         }
     }
 
@@ -229,7 +231,7 @@ async fn handle_start(state: &SharedState, name: &str) -> IpcResponse {
         }
     } else {
         IpcResponse::Ok {
-            message: Some(format!("Process '{}' started", name)),
+            message: Some(format!("Process '{name}' started")),
         }
     }
 }
@@ -243,7 +245,7 @@ async fn handle_stop(state: &SharedState, name: &str) -> IpcResponse {
         let Some(spec) = inner.supervisor.get_spec(name) else {
             return IpcResponse::Error {
                 code: ErrorCode::ProcessNotFound,
-                message: format!("Process '{}' not found", name),
+                message: format!("Process '{name}' not found"),
             };
         };
 
@@ -252,7 +254,7 @@ async fn handle_stop(state: &SharedState, name: &str) -> IpcResponse {
         if running == 0 {
             return IpcResponse::Error {
                 code: ErrorCode::ProcessNotRunning,
-                message: format!("Process '{}' is not running", name),
+                message: format!("Process '{name}' is not running"),
             };
         }
 
@@ -273,7 +275,9 @@ async fn handle_stop(state: &SharedState, name: &str) -> IpcResponse {
         }
         // Mark as stopping in supervisor
         for i in 0..instances {
-            inner.supervisor.update_state(name, i, ProcessState::Stopping);
+            inner
+                .supervisor
+                .update_state(name, i, ProcessState::Stopping);
         }
     }
 
@@ -289,12 +293,14 @@ async fn handle_stop(state: &SharedState, name: &str) -> IpcResponse {
 
         // Update supervisor state
         let mut inner = state.write().await;
-        inner.supervisor.update_state(name, i, ProcessState::Stopped { exit_code: None });
+        inner
+            .supervisor
+            .update_state(name, i, ProcessState::Stopped { exit_code: None });
         inner.supervisor.update_pid(name, i, None);
     }
 
     IpcResponse::Ok {
-        message: Some(format!("Stopped {} instance(s) of '{}'", stopped, name)),
+        message: Some(format!("Stopped {stopped} instance(s) of '{name}'")),
     }
 }
 
@@ -306,7 +312,7 @@ async fn handle_restart(state: &SharedState, name: &str) -> IpcResponse {
         if inner.supervisor.get_spec(name).is_none() {
             return IpcResponse::Error {
                 code: ErrorCode::ProcessNotFound,
-                message: format!("Process '{}' not found", name),
+                message: format!("Process '{name}' not found"),
             };
         }
     }
@@ -316,10 +322,13 @@ async fn handle_restart(state: &SharedState, name: &str) -> IpcResponse {
     // Stop first (if running)
     let stop_result = handle_stop(state, name).await;
     match &stop_result {
-        IpcResponse::Ok { .. } => {}
-        IpcResponse::Error { code: ErrorCode::ProcessNotRunning, .. } => {
-            // Not running is fine for restart
-        }
+        IpcResponse::Ok { .. }
+        | IpcResponse::Error {
+            code: ErrorCode::ProcessNotRunning,
+            ..
+        } => {
+            // Ok or not running is fine for restart
+        },
         _ => return stop_result,
     }
 

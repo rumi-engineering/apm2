@@ -6,11 +6,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use apm2_core::ipc::{IpcRequest, IpcResponse, frame_message, parse_frame_length};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info, warn};
-
-use apm2_core::ipc::{frame_message, parse_frame_length, IpcRequest, IpcResponse};
 
 use crate::handlers::dispatch;
 use crate::state::SharedState;
@@ -65,7 +64,7 @@ pub async fn run(socket_path: &Path, state: SharedState) -> Result<()> {
             }
 
             // Check for shutdown
-            _ = wait_for_shutdown(&state) => {
+            () = wait_for_shutdown(&state) => {
                 info!("IPC server shutting down");
                 break;
             }
@@ -102,11 +101,11 @@ async fn handle_connection(mut stream: UnixStream, state: SharedState) -> Result
                 // Connection closed
                 debug!("IPC connection closed");
                 break;
-            }
+            },
             Err(e) => {
                 warn!("Failed to read request: {}", e);
                 break;
-            }
+            },
         };
 
         debug!("Received request: {:?}", request);
@@ -133,17 +132,17 @@ async fn read_request(stream: &mut UnixStream) -> Result<Option<IpcRequest>> {
     // Read length prefix (4 bytes)
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
-        Ok(_) => {}
+        Ok(_) => {},
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             return Ok(None);
-        }
+        },
         Err(e) => return Err(e.into()),
     }
 
     let len = parse_frame_length(&len_buf).context("invalid frame length")?;
 
     if len > MAX_MESSAGE_SIZE {
-        anyhow::bail!("message too large: {} bytes", len);
+        anyhow::bail!("message too large: {len} bytes");
     }
 
     // Read payload
@@ -151,7 +150,8 @@ async fn read_request(stream: &mut UnixStream) -> Result<Option<IpcRequest>> {
     stream.read_exact(&mut payload).await?;
 
     // Parse JSON
-    let request: IpcRequest = serde_json::from_slice(&payload).context("failed to parse request")?;
+    let request: IpcRequest =
+        serde_json::from_slice(&payload).context("failed to parse request")?;
 
     Ok(Some(request))
 }

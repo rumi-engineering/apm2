@@ -4,9 +4,11 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 mod commands;
 
@@ -114,7 +116,7 @@ enum CredsCommands {
         #[arg(short, long)]
         provider: String,
 
-        /// Auth method (api_key, session_token, oauth)
+        /// Auth method (`api_key`, `session_token`, oauth)
         #[arg(short, long, default_value = "api_key")]
         auth_method: String,
     },
@@ -155,8 +157,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
-    let filter = EnvFilter::try_new(&cli.log_level)
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_new(&cli.log_level).unwrap_or_else(|_| EnvFilter::new("warn"));
 
     tracing_subscriber::registry()
         .with(filter)
@@ -175,52 +176,39 @@ fn main() -> Result<()> {
     });
 
     match cli.command {
-        Commands::Daemon { no_daemon } => {
-            commands::daemon::run(&cli.config, no_daemon)
-        }
-        Commands::Kill => {
-            commands::daemon::kill(&socket_path)
-        }
-        Commands::Start { name } => {
-            commands::process::start(&socket_path, &name)
-        }
-        Commands::Stop { name } => {
-            commands::process::stop(&socket_path, &name)
-        }
-        Commands::Restart { name } => {
-            commands::process::restart(&socket_path, &name)
-        }
-        Commands::Reload { name } => {
-            commands::process::reload(&socket_path, &name)
-        }
-        Commands::List => {
-            commands::process::list(&socket_path)
-        }
-        Commands::Status { name } => {
-            commands::process::status(&socket_path, &name)
-        }
-        Commands::Logs { name, lines, follow } => {
-            commands::process::logs(&socket_path, &name, lines, follow)
-        }
+        Commands::Daemon { no_daemon } => commands::daemon::run(&cli.config, no_daemon),
+        Commands::Kill => commands::daemon::kill(&socket_path),
+        Commands::Start { name } => commands::process::start(&socket_path, &name),
+        Commands::Stop { name } => commands::process::stop(&socket_path, &name),
+        Commands::Restart { name } => commands::process::restart(&socket_path, &name),
+        Commands::Reload { name } => commands::process::reload(&socket_path, &name),
+        Commands::List => commands::process::list(&socket_path),
+        Commands::Status { name } => commands::process::status(&socket_path, &name),
+        Commands::Logs {
+            name,
+            lines,
+            follow,
+        } => commands::process::logs(&socket_path, &name, lines, follow),
         Commands::Creds(creds_cmd) => match creds_cmd {
-            CredsCommands::List => {
-                commands::creds::list(&socket_path)
-            }
-            CredsCommands::Add { profile_id, provider, auth_method } => {
-                commands::creds::add(&socket_path, &profile_id, &provider, &auth_method)
-            }
+            CredsCommands::List => commands::creds::list(&socket_path),
+            CredsCommands::Add {
+                profile_id,
+                provider,
+                auth_method,
+            } => commands::creds::add(&socket_path, &profile_id, &provider, &auth_method),
             CredsCommands::Remove { profile_id } => {
                 commands::creds::remove(&socket_path, &profile_id)
-            }
+            },
             CredsCommands::Refresh { profile_id } => {
                 commands::creds::refresh(&socket_path, &profile_id)
-            }
+            },
             CredsCommands::Switch { process, profile } => {
                 commands::creds::switch(&socket_path, &process, &profile)
-            }
-            CredsCommands::Login { provider, profile_id } => {
-                commands::creds::login(&provider, profile_id.as_deref())
-            }
+            },
+            CredsCommands::Login {
+                provider,
+                profile_id,
+            } => commands::creds::login(&provider, profile_id.as_deref()),
         },
     }
 }

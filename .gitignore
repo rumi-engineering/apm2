@@ -30,6 +30,7 @@ coverage/
 tarpaulin-report.html
 
 # Fuzzing
+fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
 

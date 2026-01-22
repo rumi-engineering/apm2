@@ -1,6 +1,7 @@
 //! Process spawning utilities.
 //!
-//! Provides functionality to spawn child processes with appropriate configuration.
+//! Provides functionality to spawn child processes with appropriate
+//! configuration.
 
 use std::process::Stdio;
 
@@ -62,6 +63,7 @@ pub fn spawn(spec: &ProcessSpec) -> Result<SpawnedProcess, ProcessError> {
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore)] // Miri can't spawn processes
     #[tokio::test]
     async fn test_spawn_simple_process() {
         let spec = ProcessSpec::builder()
@@ -81,6 +83,7 @@ mod tests {
         assert!(status.success());
     }
 
+    #[cfg_attr(miri, ignore)] // Miri can't spawn processes
     #[tokio::test]
     async fn test_spawn_with_env() {
         let spec = ProcessSpec::builder()
@@ -98,6 +101,7 @@ mod tests {
         assert!(status.success());
     }
 
+    #[cfg_attr(miri, ignore)] // Miri can't spawn processes
     #[tokio::test]
     async fn test_spawn_invalid_command() {
         let spec = ProcessSpec::builder()

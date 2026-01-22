@@ -39,23 +39,23 @@ pub struct HealthCheckConfig {
     pub initial_delay: Duration,
 }
 
-fn default_interval() -> Duration {
+const fn default_interval() -> Duration {
     Duration::from_secs(30)
 }
 
-fn default_timeout() -> Duration {
+const fn default_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
-fn default_unhealthy_threshold() -> u32 {
+const fn default_unhealthy_threshold() -> u32 {
     3
 }
 
-fn default_healthy_threshold() -> u32 {
+const fn default_healthy_threshold() -> u32 {
     1
 }
 
-fn default_initial_delay() -> Duration {
+const fn default_initial_delay() -> Duration {
     Duration::from_secs(0)
 }
 
@@ -75,8 +75,10 @@ impl Default for HealthCheckConfig {
 /// Type of health check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HealthCheckType {
     /// No health check.
+    #[default]
     None,
 
     /// HTTP GET health check.
@@ -114,12 +116,6 @@ pub enum HealthCheckType {
 
     /// Process liveness check (just checks if PID exists).
     Liveness,
-}
-
-impl Default for HealthCheckType {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Result of a health check.
@@ -223,7 +219,7 @@ pub struct HealthChecker {
 impl HealthChecker {
     /// Create a new health checker.
     #[must_use]
-    pub fn new(config: HealthCheckConfig) -> Self {
+    pub const fn new(config: HealthCheckConfig) -> Self {
         Self {
             config,
             status: HealthStatus::Unknown,
@@ -236,7 +232,7 @@ impl HealthChecker {
 
     /// Get the current health status.
     #[must_use]
-    pub fn status(&self) -> HealthStatus {
+    pub const fn status(&self) -> HealthStatus {
         self.status
     }
 
@@ -283,7 +279,7 @@ impl HealthChecker {
 
     /// Get the health check configuration.
     #[must_use]
-    pub fn config(&self) -> &HealthCheckConfig {
+    pub const fn config(&self) -> &HealthCheckConfig {
         &self.config
     }
 
@@ -327,11 +323,17 @@ mod tests {
         assert_eq!(checker.status(), HealthStatus::Healthy);
 
         // One failure isn't enough
-        checker.record_result(HealthCheckResult::unhealthy(Duration::from_millis(10), "error"));
+        checker.record_result(HealthCheckResult::unhealthy(
+            Duration::from_millis(10),
+            "error",
+        ));
         assert_eq!(checker.status(), HealthStatus::Healthy);
 
         // Two failures -> unhealthy
-        checker.record_result(HealthCheckResult::unhealthy(Duration::from_millis(10), "error"));
+        checker.record_result(HealthCheckResult::unhealthy(
+            Duration::from_millis(10),
+            "error",
+        ));
         assert_eq!(checker.status(), HealthStatus::Unhealthy);
     }
 }

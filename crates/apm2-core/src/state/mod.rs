@@ -1,6 +1,7 @@
 //! State persistence module.
 //!
-//! Handles saving and restoring process manager state for recovery after restarts.
+//! Handles saving and restoring process manager state for recovery after
+//! restarts.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -145,7 +146,7 @@ pub struct PersistedProcessInstance {
 impl PersistedProcessInstance {
     /// Create a new persisted process instance.
     #[must_use]
-    pub fn new(spec_id: ProcessId, instance_index: u32) -> Self {
+    pub const fn new(spec_id: ProcessId, instance_index: u32) -> Self {
         Self {
             spec_id,
             instance_index,
@@ -200,12 +201,12 @@ impl StateManager {
 
     /// Get a reference to the current state.
     #[must_use]
-    pub fn state(&self) -> &PersistedState {
+    pub const fn state(&self) -> &PersistedState {
         &self.state
     }
 
     /// Get a mutable reference to the current state.
-    pub fn state_mut(&mut self) -> &mut PersistedState {
+    pub const fn state_mut(&mut self) -> &mut PersistedState {
         self.dirty = true;
         &mut self.state
     }
@@ -235,13 +236,13 @@ impl StateManager {
     }
 
     /// Mark state as dirty (needs saving).
-    pub fn mark_dirty(&mut self) {
+    pub const fn mark_dirty(&mut self) {
         self.dirty = true;
     }
 
     /// Check if state is dirty.
     #[must_use]
-    pub fn is_dirty(&self) -> bool {
+    pub const fn is_dirty(&self) -> bool {
         self.dirty
     }
 }
@@ -274,10 +275,7 @@ mod tests {
     fn test_persisted_state_roundtrip() {
         let mut state = PersistedState::new();
 
-        let spec = ProcessSpec::builder()
-            .name("test")
-            .command("echo")
-            .build();
+        let spec = ProcessSpec::builder().name("test").command("echo").build();
         let spec_id = spec.id;
         state.add_spec(spec);
 

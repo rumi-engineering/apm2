@@ -33,15 +33,15 @@ pub struct RestartConfig {
     pub restart_on_success: bool,
 }
 
-fn default_max_restarts() -> u32 {
+const fn default_max_restarts() -> u32 {
     5
 }
 
-fn default_restart_window() -> Duration {
+const fn default_restart_window() -> Duration {
     Duration::from_secs(60)
 }
 
-fn default_min_uptime() -> Duration {
+const fn default_min_uptime() -> Duration {
     Duration::from_secs(30)
 }
 
@@ -99,7 +99,7 @@ pub enum BackoffConfig {
     },
 }
 
-fn default_multiplier() -> f64 {
+const fn default_multiplier() -> f64 {
     2.0
 }
 
@@ -124,10 +124,12 @@ impl BackoffConfig {
                 max_delay,
                 multiplier,
             } => {
-                let delay_secs = initial_delay.as_secs_f64() * multiplier.powi((attempt - 1) as i32);
+                #[allow(clippy::cast_possible_wrap)] // attempt count won't exceed i32
+                let delay_secs =
+                    initial_delay.as_secs_f64() * multiplier.powi((attempt - 1) as i32);
                 let delay = Duration::from_secs_f64(delay_secs);
                 delay.min(*max_delay)
-            }
+            },
             Self::Linear {
                 initial_delay,
                 increment,
@@ -135,7 +137,7 @@ impl BackoffConfig {
             } => {
                 let delay = *initial_delay + *increment * (attempt - 1);
                 delay.min(*max_delay)
-            }
+            },
         }
     }
 }
@@ -178,7 +180,7 @@ pub struct RestartManager {
 impl RestartManager {
     /// Create a new restart manager.
     #[must_use]
-    pub fn new(config: RestartConfig) -> Self {
+    pub const fn new(config: RestartConfig) -> Self {
         Self {
             config,
             history: Vec::new(),
@@ -236,8 +238,8 @@ impl RestartManager {
         delay
     }
 
-    /// Record a successful run (uptime exceeded min_uptime).
-    pub fn record_success(&mut self) {
+    /// Record a successful run (uptime exceeded `min_uptime`).
+    pub const fn record_success(&mut self) {
         // Reset backoff on successful run
         self.backoff_attempt = 0;
         self.circuit_open = false;
@@ -286,7 +288,7 @@ impl RestartManager {
 
     /// Check if the circuit breaker is open.
     #[must_use]
-    pub fn is_circuit_open(&self) -> bool {
+    pub const fn is_circuit_open(&self) -> bool {
         self.circuit_open
     }
 
@@ -300,7 +302,7 @@ impl RestartManager {
 
     /// Get the configuration.
     #[must_use]
-    pub fn config(&self) -> &RestartConfig {
+    pub const fn config(&self) -> &RestartConfig {
         &self.config
     }
 }

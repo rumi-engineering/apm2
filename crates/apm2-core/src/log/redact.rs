@@ -3,36 +3,25 @@
 //! This module provides functionality to filter sensitive data from log output,
 //! preventing accidental exposure of API keys, tokens, and other credentials.
 
-use once_cell::sync::Lazy;
-use regex::Regex;
 use std::borrow::Cow;
+
+use regex::Regex;
 
 /// The replacement text for redacted secrets.
 const REDACTED: &str = "[REDACTED]";
 
 /// Patterns that match sensitive data in log output.
 ///
-/// Each pattern is designed to match common secret formats while minimizing false positives.
-static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
+/// Each pattern is designed to match common secret formats while minimizing
+/// false positives.
+static SECRET_PATTERNS: std::sync::LazyLock<Vec<SecretPattern>> = std::sync::LazyLock::new(|| {
     vec![
         // API Keys with common prefixes
-        SecretPattern::new(
-            "anthropic_api_key",
-            r"sk-ant-[a-zA-Z0-9\-_]{20,}",
-        ),
-        SecretPattern::new(
-            "openai_api_key",
-            r"sk-[a-zA-Z0-9]{20,}",
-        ),
-        SecretPattern::new(
-            "google_api_key",
-            r"AIza[a-zA-Z0-9\-_]{35}",
-        ),
+        SecretPattern::new("anthropic_api_key", r"sk-ant-[a-zA-Z0-9\-_]{20,}"),
+        SecretPattern::new("openai_api_key", r"sk-[a-zA-Z0-9]{20,}"),
+        SecretPattern::new("google_api_key", r"AIza[a-zA-Z0-9\-_]{35}"),
         // AWS credentials
-        SecretPattern::new(
-            "aws_access_key",
-            r"AKIA[A-Z0-9]{16}",
-        ),
+        SecretPattern::new("aws_access_key", r"AKIA[A-Z0-9]{16}"),
         SecretPattern::new(
             "aws_secret_key",
             r#"(?i)aws[_-]?secret[_-]?access[_-]?key['"]?\s*[:=]\s*['"]?([A-Za-z0-9/+=]{40})"#,
@@ -51,25 +40,16 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
             r#"(?i)(secret|password|passwd|pwd)['"]?\s*[:=]\s*['"]?([^\s'"]{8,})['"]?"#,
         ),
         // Bearer tokens in headers
-        SecretPattern::new(
-            "bearer_token",
-            r"(?i)bearer\s+([a-zA-Z0-9_.=-]+)",
-        ),
+        SecretPattern::new("bearer_token", r"(?i)bearer\s+([a-zA-Z0-9_.=-]+)"),
         // Base64 encoded secrets (long base64 strings that look like keys)
         SecretPattern::new(
             "base64_secret",
             r#"(?i)(key|secret|token|credential)['"]?\s*[:=]\s*['"]?([A-Za-z0-9+/]{40,}={0,2})['"]?"#,
         ),
         // Private keys
-        SecretPattern::new(
-            "private_key",
-            r"-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----",
-        ),
+        SecretPattern::new("private_key", r"-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----"),
         // GitHub tokens
-        SecretPattern::new(
-            "github_token",
-            r"gh[pousr]_[A-Za-z0-9_]{36,}",
-        ),
+        SecretPattern::new("github_token", r"gh[pousr]_[A-Za-z0-9_]{36,}"),
         // Slack tokens
         SecretPattern::new(
             "slack_token",
@@ -79,7 +59,7 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
 });
 
 /// Environment variable names that indicate sensitive content.
-static SENSITIVE_ENV_NAMES: Lazy<Vec<Regex>> = Lazy::new(|| {
+static SENSITIVE_ENV_NAMES: std::sync::LazyLock<Vec<Regex>> = std::sync::LazyLock::new(|| {
     [
         r"(?i).*api[_\-]?key.*",
         r"(?i).*secret.*",
@@ -126,7 +106,7 @@ impl SecretPattern {
 /// use apm2_core::log::SecretRedactor;
 ///
 /// let redactor = SecretRedactor::new();
-/// let input = "API key is sk-ant-abc123xyz456...";
+/// let input = "API key is sk-ant-api01-abc123xyz456defghijk";
 /// let output = redactor.redact(input);
 /// assert!(output.contains("[REDACTED]"));
 /// ```
@@ -157,7 +137,8 @@ impl SecretRedactor {
 
     /// Redact sensitive data from a string.
     ///
-    /// Returns a new string with all matched secrets replaced with `[REDACTED]`.
+    /// Returns a new string with all matched secrets replaced with
+    /// `[REDACTED]`.
     #[must_use]
     pub fn redact<'a>(&self, input: &'a str) -> Cow<'a, str> {
         let mut result = Cow::Borrowed(input);
@@ -189,7 +170,8 @@ impl SecretRedactor {
 
     /// Redact a value if the environment variable name is sensitive.
     ///
-    /// Returns `[REDACTED]` if the name is sensitive, otherwise returns the value unchanged.
+    /// Returns `[REDACTED]` if the name is sensitive, otherwise returns the
+    /// value unchanged.
     #[must_use]
     pub fn redact_env_value<'a>(name: &str, value: &'a str) -> Cow<'a, str> {
         if Self::is_sensitive_env_name(name) {
@@ -279,7 +261,9 @@ mod tests {
     fn test_sensitive_env_names() {
         assert!(SecretRedactor::is_sensitive_env_name("ANTHROPIC_API_KEY"));
         assert!(SecretRedactor::is_sensitive_env_name("OPENAI_API_KEY"));
-        assert!(SecretRedactor::is_sensitive_env_name("AWS_SECRET_ACCESS_KEY"));
+        assert!(SecretRedactor::is_sensitive_env_name(
+            "AWS_SECRET_ACCESS_KEY"
+        ));
         assert!(SecretRedactor::is_sensitive_env_name("MY_SECRET_TOKEN"));
         assert!(SecretRedactor::is_sensitive_env_name("password"));
         assert!(SecretRedactor::is_sensitive_env_name("GITHUB_TOKEN"));
@@ -313,7 +297,8 @@ mod tests {
     #[test]
     fn test_multiple_secrets() {
         let redactor = SecretRedactor::new();
-        let input = "Keys: sk-ant-abc123xyz456789012345 and ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let input =
+            "Keys: sk-ant-abc123xyz456789012345 and ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
         let output = redactor.redact(input);
         assert!(!output.contains("sk-ant"));
         assert!(!output.contains("ghp_"));

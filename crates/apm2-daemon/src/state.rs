@@ -3,18 +3,17 @@
 //! Provides thread-safe shared state for the daemon.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use apm2_core::config::EcosystemConfig;
+use apm2_core::process::ProcessId;
+use apm2_core::process::runner::ProcessRunner;
+use apm2_core::supervisor::Supervisor;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
-use apm2_core::config::EcosystemConfig;
-use apm2_core::process::runner::ProcessRunner;
-use apm2_core::process::ProcessId;
-use apm2_core::supervisor::Supervisor;
-
-/// Key for looking up process runners: (ProcessId, instance_index).
+/// Key for looking up process runners: (`ProcessId`, `instance_index`).
 pub type RunnerKey = (ProcessId, u32);
 
 /// Shared daemon state protected by `Arc<RwLock<...>>`.
@@ -68,12 +67,14 @@ impl DaemonStateHandle {
 
     /// Get the daemon start time.
     #[must_use]
-    pub fn started_at(&self) -> DateTime<Utc> {
+    #[allow(dead_code)] // Part of public API for future use
+    pub const fn started_at(&self) -> DateTime<Utc> {
         self.started_at
     }
 
     /// Get daemon uptime in seconds.
     #[must_use]
+    #[allow(clippy::cast_sign_loss)] // max(0) ensures non-negative
     pub fn uptime_secs(&self) -> u64 {
         let now = Utc::now();
         (now - self.started_at).num_seconds().max(0) as u64
@@ -84,21 +85,23 @@ impl DaemonStateHandle {
 pub struct DaemonState {
     /// The supervisor managing process specs and handles.
     pub supervisor: Supervisor,
-    /// Active process runners keyed by (spec_id, instance).
+    /// Active process runners keyed by (`spec_id`, instance).
     pub runners: HashMap<RunnerKey, ProcessRunner>,
     /// Current configuration.
+    #[allow(dead_code)] // Part of public API for future use
     pub config: EcosystemConfig,
 }
 
+#[allow(dead_code)] // Methods are part of public API for future use
 impl DaemonState {
     /// Get a reference to the supervisor.
     #[must_use]
-    pub fn supervisor(&self) -> &Supervisor {
+    pub const fn supervisor(&self) -> &Supervisor {
         &self.supervisor
     }
 
     /// Get a mutable reference to the supervisor.
-    pub fn supervisor_mut(&mut self) -> &mut Supervisor {
+    pub const fn supervisor_mut(&mut self) -> &mut Supervisor {
         &mut self.supervisor
     }
 

@@ -4,8 +4,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
-
+use anyhow::{Context, Result, bail};
 use apm2_core::ipc::{IpcRequest, IpcResponse, ProcessSummary};
 
 /// Start a process.
@@ -14,16 +13,16 @@ pub fn start(socket_path: &Path, name: &str) -> Result<()> {
         name: name.to_string(),
     };
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::Ok { message } => {
             println!(
                 "Started '{name}'{}",
                 message.map(|m| format!(": {m}")).unwrap_or_default()
             );
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to start '{name}': {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -36,16 +35,16 @@ pub fn stop(socket_path: &Path, name: &str) -> Result<()> {
         name: name.to_string(),
     };
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::Ok { message } => {
             println!(
                 "Stopped '{name}'{}",
                 message.map(|m| format!(": {m}")).unwrap_or_default()
             );
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to stop '{name}': {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -58,16 +57,16 @@ pub fn restart(socket_path: &Path, name: &str) -> Result<()> {
         name: name.to_string(),
     };
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::Ok { message } => {
             println!(
                 "Restarted '{name}'{}",
                 message.map(|m| format!(": {m}")).unwrap_or_default()
             );
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to restart '{name}': {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -80,16 +79,16 @@ pub fn reload(socket_path: &Path, name: &str) -> Result<()> {
         name: name.to_string(),
     };
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::Ok { message } => {
             println!(
                 "Reloading '{name}'{}",
                 message.map(|m| format!(": {m}")).unwrap_or_default()
             );
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to reload '{name}': {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -100,13 +99,13 @@ pub fn reload(socket_path: &Path, name: &str) -> Result<()> {
 pub fn list(socket_path: &Path) -> Result<()> {
     let request = IpcRequest::ListProcesses;
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::ProcessList { processes } => {
             print_process_table(&processes);
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to list processes: {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -119,11 +118,15 @@ pub fn status(socket_path: &Path, name: &str) -> Result<()> {
         name: name.to_string(),
     };
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::ProcessDetails { process } => {
             println!("Name:        {}", process.name);
             println!("ID:          {}", process.id);
-            println!("Command:     {} {}", process.command, process.args.join(" "));
+            println!(
+                "Command:     {} {}",
+                process.command,
+                process.args.join(" ")
+            );
             if let Some(cwd) = &process.cwd {
                 println!("Working Dir: {cwd}");
             }
@@ -137,7 +140,7 @@ pub fn status(socket_path: &Path, name: &str) -> Result<()> {
                 println!(
                     "  [{index}] PID: {pid:>6}  State: {state:<12}  CPU: {cpu:>5.1}%  Mem: {mem:>8}  Uptime: {uptime:>8}  Restarts: {restarts}",
                     index = inst.index,
-                    pid = inst.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string()),
+                    pid = inst.pid.map_or_else(|| "-".to_string(), |p| p.to_string()),
                     state = inst.state.to_string(),
                     cpu = inst.cpu_percent.unwrap_or(0.0),
                     mem = format_bytes(inst.memory_bytes.unwrap_or(0)),
@@ -145,10 +148,10 @@ pub fn status(socket_path: &Path, name: &str) -> Result<()> {
                     restarts = inst.restart_count,
                 );
             }
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to get status for '{name}': {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -163,7 +166,7 @@ pub fn logs(socket_path: &Path, name: &str, lines: u32, follow: bool) -> Result<
         follow,
     };
 
-    match send_request(socket_path, request)? {
+    match send_request(socket_path, &request)? {
         IpcResponse::LogLines { lines } => {
             for line in lines {
                 println!(
@@ -175,10 +178,10 @@ pub fn logs(socket_path: &Path, name: &str, lines: u32, follow: bool) -> Result<
                     line.content
                 );
             }
-        }
+        },
         IpcResponse::Error { code, message } => {
             bail!("Failed to get logs for '{name}': {message} ({code:?})");
-        }
+        },
         _ => bail!("Unexpected response"),
     }
 
@@ -215,6 +218,7 @@ fn print_process_table(processes: &[ProcessSummary]) {
 }
 
 /// Format bytes as human-readable string.
+#[allow(clippy::cast_precision_loss)] // Acceptable for human-readable display
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -254,7 +258,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 }
 
 /// Send an IPC request to the daemon.
-fn send_request(socket_path: &Path, request: IpcRequest) -> Result<IpcResponse> {
+fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcResponse> {
     // Connect to daemon
     let mut stream = UnixStream::connect(socket_path)
         .context("failed to connect to daemon socket (is the daemon running?)")?;

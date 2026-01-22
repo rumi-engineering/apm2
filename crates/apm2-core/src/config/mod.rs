@@ -15,7 +15,7 @@ use crate::restart::RestartConfig;
 use crate::shutdown::ShutdownConfig;
 
 /// Top-level ecosystem configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EcosystemConfig {
     /// Daemon configuration.
     #[serde(default)]
@@ -57,16 +57,6 @@ impl EcosystemConfig {
     /// Returns an error if serialization fails.
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         toml::to_string_pretty(self).map_err(ConfigError::Serialize)
-    }
-}
-
-impl Default for EcosystemConfig {
-    fn default() -> Self {
-        Self {
-            daemon: DaemonConfig::default(),
-            credentials: Vec::new(),
-            processes: Vec::new(),
-        }
     }
 }
 
@@ -180,7 +170,7 @@ pub struct ProcessConfig {
     pub credentials: Option<CredentialConfig>,
 }
 
-fn default_instances() -> u32 {
+const fn default_instances() -> u32 {
     1
 }
 

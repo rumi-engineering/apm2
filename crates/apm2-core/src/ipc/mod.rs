@@ -275,6 +275,8 @@ pub struct LogEntry {
 /// Frame a message for IPC transport.
 ///
 /// Format: 4-byte big-endian length prefix + JSON payload.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // IPC messages won't exceed 4GB
 pub fn frame_message(message: &[u8]) -> Vec<u8> {
     let len = message.len() as u32;
     let mut framed = Vec::with_capacity(4 + message.len());
@@ -286,6 +288,7 @@ pub fn frame_message(message: &[u8]) -> Vec<u8> {
 /// Parse a framed message length.
 ///
 /// Returns the payload length if a complete length prefix is present.
+#[must_use]
 pub fn parse_frame_length(buffer: &[u8]) -> Option<usize> {
     if buffer.len() < 4 {
         return None;
