@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 """
 body = """
 {%- macro remote_url() -%}
-  https://github.com/your-org/apm2
+  https://github.com/Anveio/apm2
 {%- endmacro -%}
 
 {% if version -%}
@@ -27,23 +27,12 @@ body = """
     {% for commit in commits %}
         - {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
             {{ commit.message | upper_first }}\
-            {% if commit.github.username %} by @{{ commit.github.username }}{%- endif -%}
-            {% if commit.github.pr_number %} in \
-              [#{{ commit.github.pr_number }}]({{ self::remote_url() }}/pull/{{ commit.github.pr_number }}) \
+            {% if commit.remote.username %} by @{{ commit.remote.username }}{%- endif -%}
+            {% if commit.remote.pr_number %} in \
+              [#{{ commit.remote.pr_number }}]({{ self::remote_url() }}/pull/{{ commit.remote.pr_number }}) \
             {%- endif -%}
     {% endfor %}
 {% endfor %}
-
-{%- if github.contributors | filter(attribute="is_first_time", value=true) | length != 0 %}
-  ### New Contributors
-{%- endif -%}
-
-{% for contributor in github.contributors | filter(attribute="is_first_time", value=true) %}
-  * @{{ contributor.username }} made their first contribution
-    {%- if contributor.pr_number %} in \
-      [#{{ contributor.pr_number }}]({{ self::remote_url() }}/pull/{{ contributor.pr_number }}) \
-    {%- endif %}
-{%- endfor %}
 
 {% if version %}
     **Full Changelog**: {{ self::remote_url() }}/compare/{{ previous.version }}...{{ version }}
@@ -79,5 +68,5 @@ topo_order = false
 sort_commits = "oldest"
 
 [remote.github]
-owner = "your-org"
+owner = "Anveio"
 repo = "apm2"
