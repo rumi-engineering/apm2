@@ -37,6 +37,7 @@ pub mod config;
 pub mod credentials;
 pub mod health;
 pub mod ipc;
+pub mod ledger;
 pub mod log;
 pub mod process;
 pub mod restart;

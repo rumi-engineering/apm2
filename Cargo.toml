@@ -61,9 +61,13 @@ once_cell = "1.19"
 
 # Testing
 proptest = "1.0"
+tempfile = "3.10"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Internal crates
 apm2-core = { version = "0.1.0", path = "crates/apm2-core" }

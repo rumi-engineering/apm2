@@ -45,9 +45,13 @@ humantime.workspace = true
 regex.workspace = true
 once_cell.workspace = true
 
+# Database
+rusqlite.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true
+tempfile.workspace = true
 
 [features]
 default = []
