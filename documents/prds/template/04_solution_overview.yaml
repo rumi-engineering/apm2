@@ -1,0 +1,24 @@
+prd_solution_overview:
+  version: 1
+
+  solution_one_sentence: "<ONE SENTENCE>"
+
+  conceptual_model:
+    concepts:
+      - name: "<CONCEPT>"
+        definition: "<SHORT>"
+    invariants_preview:
+      - "<INVARIANT>"
+
+  primary_user_flows:
+    - id: "FLOW-0001"
+      name: "<FLOW NAME>"
+      steps:
+        - "<STEP>"
+        - "<STEP>"
+      success_outcome: "<SHORT>"
+      failure_outcome: "<SHORT>"
+
+  alternatives_considered:
+    - option: "<OPTION>"
+      rejected_because: "<SHORT>"

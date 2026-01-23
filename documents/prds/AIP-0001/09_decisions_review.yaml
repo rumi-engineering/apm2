@@ -1,0 +1,71 @@
+prd_decisions_review:
+  version: 1
+
+  decisions:
+    - id: "DEC-AIP-0001-0001"
+      date: "2026-01-22"
+      decision: "Use gRPC with tonic/prost instead of REST or WebSocket"
+      rationale: "gRPC provides superior code generation, strong typing, bidirectional streaming, and ecosystem tooling"
+      links: []
+
+    - id: "DEC-AIP-0001-0002"
+      date: "2026-01-22"
+      decision: "Use PTY (pseudo-terminal) instead of stdio pipes for agent processes"
+      rationale: "CLI agents expect terminal environment for ANSI codes, resize handling, and control characters"
+      links: []
+
+    - id: "DEC-AIP-0001-0003"
+      date: "2026-01-22"
+      decision: "Session persistence is optional (in-memory default, SQLite opt-in)"
+      rationale: "Most use cases don't need durability; keep default simple with opt-in complexity"
+      links: []
+
+    - id: "DEC-AIP-0001-0004"
+      date: "2026-01-22"
+      decision: "Remove credentials/ and hotswap/ modules as out of scope"
+      rationale: "These features are not part of the core agent interaction protocol; can be added later if needed"
+      links: []
+
+    - id: "DEC-AIP-0001-0005"
+      date: "2026-01-22"
+      decision: "Maintain backward compatibility with Unix socket during v0.2.x"
+      rationale: "Allows gradual migration for existing users; deprecate in v0.3, remove in v1.0"
+      links: []
+
+    - id: "DEC-AIP-0001-0006"
+      date: "2026-01-22"
+      decision: "Output parsers are compiled-in (not dynamic plugins) for initial release"
+      rationale: "Simplifies implementation; plugin system can be added later based on demand"
+      links: ["Q-AIP-0001-0001"]
+
+    - id: "DEC-AIP-0001-0007"
+      date: "2026-01-22"
+      decision: "gRPC server binds to localhost only in initial release"
+      rationale: "No remote access without authentication; security-first approach"
+      links: ["Q-AIP-0001-0002"]
+
+  review_checklist:
+    - id: "REVIEW-0001"
+      item: "Problem and desired state are explicit"
+      status: "PASS"
+    - id: "REVIEW-0002"
+      item: "REQ/DELIV/E2E IDs are complete and unique"
+      status: "PASS"
+    - id: "REVIEW-0003"
+      item: "Security invariants are testable and fail-closed"
+      status: "PASS"
+    - id: "REVIEW-0004"
+      item: "All MUST requirements have deliverables and E2E tests"
+      status: "PASS"
+    - id: "REVIEW-0005"
+      item: "Non-goals are explicitly documented"
+      status: "PASS"
+    - id: "REVIEW-0006"
+      item: "Migration strategy maintains backward compatibility"
+      status: "PASS"
+    - id: "REVIEW-0007"
+      item: "Risks have mitigations identified"
+      status: "PASS"
+    - id: "REVIEW-0008"
+      item: "Open questions have owners and due dates"
+      status: "PASS"

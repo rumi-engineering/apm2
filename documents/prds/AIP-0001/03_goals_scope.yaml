@@ -1,0 +1,94 @@
+prd_goals_scope:
+  version: 1
+
+  goals_ranked:
+    - id: "GOAL-0001"
+      statement: "Enable programmatic, human-like interaction with AI CLI agents via gRPC"
+      priority: "P0"
+      success_metric_refs: ["METRIC-0001", "METRIC-0002"]
+    - id: "GOAL-0002"
+      statement: "Provide full terminal emulation for managed agents via PTY allocation"
+      priority: "P0"
+      success_metric_refs: ["METRIC-0003"]
+    - id: "GOAL-0003"
+      statement: "Capture and expose structured session/conversation data"
+      priority: "P0"
+      success_metric_refs: ["METRIC-0004"]
+    - id: "GOAL-0004"
+      statement: "Enable real-time monitoring of agent output and tool calls"
+      priority: "P1"
+      success_metric_refs: ["METRIC-0005"]
+    - id: "GOAL-0005"
+      statement: "Provide observability via metrics emission"
+      priority: "P1"
+      success_metric_refs: ["METRIC-0006"]
+    - id: "GOAL-0006"
+      statement: "Support optional session persistence across daemon restarts"
+      priority: "P2"
+      success_metric_refs: []
+
+  non_goals:
+    - "APM2 is NOT an orchestrator - it provides primitives, not orchestration logic"
+    - "APM2 does NOT implement agent-to-agent communication protocols"
+    - "APM2 does NOT modify or patch underlying CLI agents"
+    - "APM2 does NOT provide authentication/authorization in initial release (deferred)"
+    - "APM2 does NOT support remote/distributed agent management in initial release"
+
+  scope:
+    in_scope:
+      - "gRPC service definitions (protobuf schemas)"
+      - "AgentService: lifecycle management, input/output, bidirectional streaming"
+      - "SessionService: conversation history, turn queries, tool call queries, event watching"
+      - "MetricsService: agent metrics, metrics streaming"
+      - "PTY-based process spawning replacing stdio pipes"
+      - "In-memory session store with structured Turn and ToolCall models"
+      - "Output parser framework with Claude Code parser implementation"
+      - "CLI updates to use gRPC client"
+    out_of_scope:
+      - "Authentication and authorization (mTLS, tokens)"
+      - "Multi-daemon coordination"
+      - "Rate limiting and input flooding protection"
+      - "Remote agent management"
+      - "Parser plugins (dynamic loading)"
+    deferred:
+      - item: "SQLite session persistence"
+        revisit_when: "Phase 5 or user demand"
+      - item: "Authentication/mTLS"
+        revisit_when: "Remote access use cases emerge"
+      - item: "Dynamic parser plugins"
+        revisit_when: "Community contributes parsers for other CLIs"
+
+  shipped_surfaces:
+    cli:
+      commands_added:
+        - "apm2 attach <agent> - Interactive session via Interact RPC"
+      commands_changed:
+        - "apm2 daemon - Adds --grpc-port flag (default: 50051)"
+        - "All agent commands - Use gRPC client instead of Unix socket"
+      commands_removed: []
+    apis:
+      public:
+        - "apm2.v1.AgentService"
+        - "apm2.v1.SessionService"
+        - "apm2.v1.MetricsService"
+      internal: []
+    configs:
+      new_files:
+        - "proto/apm2/v1/agent.proto"
+        - "proto/apm2/v1/session.proto"
+        - "proto/apm2/v1/metrics.proto"
+        - "proto/apm2/v1/agent_service.proto"
+        - "proto/apm2/v1/session_service.proto"
+        - "proto/apm2/v1/metrics_service.proto"
+      changed_files:
+        - "Cargo.toml - Add tonic, prost, portable-pty dependencies"
+        - "build.rs - Add protobuf compilation"
+
+  integrations:
+    upstream_dependencies:
+      - "AI CLI agents (Claude Code, Gemini CLI, Codex CLI) - spawned as child processes"
+      - "Operating system PTY subsystem"
+    downstream_dependencies:
+      - "Orchestration tools building on APM2"
+      - "UI/dashboard applications"
+      - "Test harnesses and CI systems"

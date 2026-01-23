@@ -1,0 +1,48 @@
+traceability:
+  version: 1
+
+  requirements:
+    - id: "REQ-<PRD-ID>-0001"
+      priority: "MUST" # MUST | SHOULD | MAY
+      statement: "<SHORT, TESTABLE>"
+      acceptance_criteria:
+        - "<ACCEPTANCE>"
+      ownership:
+        work_item_hint: "<SUBSYSTEM/AREA>"
+        reviewer_hint: "<ROLE OR TEAM>"
+      evidence:
+        deliverable_ids: ["DELIV-<PRD-ID>-0001"]
+        e2e_ids: ["E2E-<PRD-ID>-0001"]
+    - id: "REQ-<PRD-ID>-0002"
+      priority: "SHOULD"
+      statement: "<SHORT, TESTABLE>"
+      acceptance_criteria: ["<ACCEPTANCE>"]
+      ownership:
+        work_item_hint: "<SUBSYSTEM/AREA>"
+        reviewer_hint: "<ROLE OR TEAM>"
+      evidence:
+        deliverable_ids: []
+        e2e_ids: []
+
+  deliverables:
+    - id: "DELIV-<PRD-ID>-0001"
+      kind: "code" # code | doc | runbook | config | migration | test
+      path: "<REPO-RELATIVE PATH>"
+      verify_cmd: "<ARGV-ONLY COMMAND>"
+      max_seconds: 120
+      data_class: "Integrity-critical" # Secrets | Sensitive | Integrity-critical | Public
+    - id: "DELIV-<PRD-ID>-0002"
+      kind: "doc"
+      path: "<REPO-RELATIVE PATH>"
+      verify_cmd: "<ARGV-ONLY COMMAND>"
+      max_seconds: 60
+      data_class: "Public"
+
+  e2e:
+    - id: "E2E-<PRD-ID>-0001"
+      scenario: "<SHORT>"
+      deterministic_selectors:
+        - "<SELECTOR>"
+      verify_cmd: "<ARGV-ONLY COMMAND>"
+      timeout_s: 300
+      data_class: "Sensitive"

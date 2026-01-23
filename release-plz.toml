@@ -2,10 +2,6 @@
 # https://release-plz.dev/docs/config
 
 [workspace]
-# Git user for commits
-git_user_name = "github-actions[bot]"
-git_user_email = "integrations.anveio@gmail.com"
-
 # Disable changelog generation (re-enable after first release)
 changelog_update = false
 # Create GitHub releases

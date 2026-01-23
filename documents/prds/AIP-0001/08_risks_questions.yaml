@@ -1,0 +1,70 @@
+prd_risks_questions:
+  version: 1
+
+  risks:
+    - id: "RISK-AIP-0001-0001"
+      severity: "HIGH"
+      description: "Output parser may fail to correctly parse all CLI agent formats, leading to missing or incorrect structured data"
+      mitigation: "Design parser as best-effort with fallback to raw output; structured data is additive, not required"
+      owner_role: "System Owner"
+      control_refs: []
+
+    - id: "RISK-AIP-0001-0002"
+      severity: "MEDIUM"
+      description: "PTY library (portable-pty) may have platform-specific bugs or limitations"
+      mitigation: "Comprehensive E2E tests on all supported platforms; fallback to stdio pipes if PTY fails"
+      owner_role: "System Owner"
+      control_refs: []
+
+    - id: "RISK-AIP-0001-0003"
+      severity: "MEDIUM"
+      description: "Breaking change for existing Unix socket clients during migration"
+      mitigation: "Parallel operation of Unix socket and gRPC during v0.2.x; clear deprecation timeline"
+      owner_role: "Product Owner"
+      control_refs: []
+
+    - id: "RISK-AIP-0001-0004"
+      severity: "LOW"
+      description: "gRPC adds latency overhead compared to Unix socket"
+      mitigation: "Benchmark shows <10ms overhead is acceptable; optimize hot paths if needed"
+      owner_role: "System Owner"
+      control_refs: []
+
+    - id: "RISK-AIP-0001-0005"
+      severity: "MEDIUM"
+      description: "In-memory session store lost on daemon crash, losing conversation history"
+      mitigation: "Document limitation clearly; SQLite persistence available for users who need durability"
+      owner_role: "Product Owner"
+      control_refs: []
+
+    - id: "RISK-AIP-0001-0006"
+      severity: "LOW"
+      description: "gRPC server binding to localhost only limits future remote use cases"
+      mitigation: "Design supports future --grpc-address flag for remote binding with auth"
+      owner_role: "System Owner"
+      control_refs: []
+
+  open_questions:
+    - id: "Q-AIP-0001-0001"
+      question: "Should parsers be dynamically loadable plugins or compiled-in?"
+      owner_role: "System Owner"
+      decision_driver: "Community demand for custom parsers vs. implementation complexity"
+      due_date: "2026-02-15"
+
+    - id: "Q-AIP-0001-0002"
+      question: "What authentication mechanism for future remote access?"
+      owner_role: "Security Governor"
+      decision_driver: "Use cases that emerge requiring remote access"
+      due_date: "2026-03-01"
+
+    - id: "Q-AIP-0001-0003"
+      question: "Should rate limiting be built into gRPC server or delegated to clients?"
+      owner_role: "System Owner"
+      decision_driver: "Abuse scenarios encountered in practice"
+      due_date: "2026-02-28"
+
+    - id: "Q-AIP-0001-0004"
+      question: "How to handle multi-daemon scenarios for distributed agent management?"
+      owner_role: "System Owner"
+      decision_driver: "User demand for distributed deployments"
+      due_date: "2026-04-01"

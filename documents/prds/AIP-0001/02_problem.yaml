@@ -1,0 +1,47 @@
+prd_problem:
+  version: 1
+
+  problem_statement: "AI CLI tools are designed exclusively for human terminal interaction, with no standard protocol for programmatic control, session introspection, or integration into automated systems."
+
+  current_state:
+    - "AI CLI agents (Claude Code, Gemini CLI, Codex CLI) only support interactive terminal use"
+    - "APM2 daemon uses Unix socket with custom JSON-RPC, limiting cross-language and cross-platform interoperability"
+    - "Agent processes use simple stdio pipes, lacking full terminal emulation (no ANSI, no resize, no signals)"
+    - "No structured representation of conversations, turns, or tool calls"
+    - "No real-time event streaming for monitoring agent activity"
+    - "Session state is ephemeral and lost when daemon restarts"
+
+  desired_state:
+    - "gRPC-based protocol provides language-agnostic, strongly-typed API for agent interaction"
+    - "Agents run in PTY (pseudo-terminal) for full terminal emulation including escape codes, resize, and signals"
+    - "Sessions, turns, and tool calls are captured as structured data"
+    - "Real-time streaming RPCs enable monitoring of agent output and tool invocations"
+    - "Optional persistence layer preserves session history across daemon restarts"
+    - "Pluggable output parsers extract structured events from different CLI tool formats"
+
+  why_now:
+    - "AI CLI tools have reached maturity and widespread adoption"
+    - "Multi-agent architectures require programmatic agent coordination"
+    - "The current Unix socket IPC is a technical debt blocking ecosystem growth"
+    - "gRPC ecosystem provides superior tooling, code generation, and cross-language support"
+
+  cost_of_inaction:
+    qualitative:
+      - "APM2 remains a niche tool instead of foundational infrastructure"
+      - "Multi-agent system developers build proprietary solutions or avoid CLI agents entirely"
+      - "No ecosystem of tools can form around a non-standard IPC mechanism"
+    quantitative:
+      - metric: "Supported client languages"
+        current: "1 (Rust via Unix socket)"
+        projected: "10+ (via gRPC codegen)"
+        window: "v0.2.0 release"
+      - metric: "Integration complexity (lines of client code)"
+        current: "500+ (custom protocol handling)"
+        projected: "50 (generated gRPC stubs)"
+        window: "v0.2.0 release"
+
+  constraints_summary:
+    - "Must maintain backward compatibility during transition (Unix socket + gRPC in parallel)"
+    - "Must support Linux amd64 as primary platform"
+    - "Must not require changes to underlying CLI agents (Claude Code, etc.)"
+    - "Performance: <10ms overhead for message routing"

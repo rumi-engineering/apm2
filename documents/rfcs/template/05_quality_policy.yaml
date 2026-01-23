@@ -1,0 +1,38 @@
+quality_policy:
+  version: 1
+  project_id: "<PROJECT>"
+
+  baseline:
+    static_checks:
+      - name: "<check>"
+        command: "<command>"
+        required: true
+    vuln_checks:
+      - name: "<check>"
+        command: "<command>"
+        required: true
+
+  testing_expectations:
+    unit_tests:
+      required_for_changes: true
+      scope_rule: "<touched_packages>"
+      timeout_s: 60
+    contract_tests:
+      required_when_interfaces_change: true
+    race_tests:
+      required_when_concurrency_changes: true
+      command: "<command-or-null>"
+    fuzz_tests:
+      required_when_parsing_untrusted_input: true
+      command: "<command-or-null>"
+
+  coverage_policy:
+    mode: "diff" # diff | package | global | none
+    diff_min_percent: 85
+    package_min_percent: 75
+    exempt_paths:
+      - "third_party/**"
+      - "**/generated/**"
+
+  determinism_rules:
+    - "<rule>"

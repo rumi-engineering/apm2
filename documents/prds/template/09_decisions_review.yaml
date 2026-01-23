@@ -1,0 +1,20 @@
+prd_decisions_review:
+  version: 1
+
+  decisions:
+    - id: "DEC-<PRD-ID>-0001"
+      date: "<YYYY-MM-DD>"
+      decision: "<SHORT>"
+      rationale: "<SHORT>"
+      links: [] # repo-relative or issue IDs
+
+  review_checklist:
+    - id: "REVIEW-0001"
+      item: "Problem and desired state are explicit"
+      status: "TODO" # TODO | PASS | FAIL
+    - id: "REVIEW-0002"
+      item: "REQ/DELIV/E2E IDs are complete and unique"
+      status: "TODO"
+    - id: "REVIEW-0003"
+      item: "Security invariants are testable and fail-closed"
+      status: "TODO"
