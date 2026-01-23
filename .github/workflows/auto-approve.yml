@@ -1,0 +1,50 @@
+# Auto-approve PRs when CI passes
+# Requires a PAT with repo scope stored as AUTO_APPROVE_PAT secret
+
+name: Auto Approve
+
+on:
+  # Trigger when CI workflow completes
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+jobs:
+  auto-approve:
+    name: Auto Approve PR
+    runs-on: ubuntu-24.04
+    # Only run if CI succeeded and it was a PR
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    steps:
+      - name: Get PR number
+        id: pr
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const { data: pullRequests } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              head: `${context.repo.owner}:${context.payload.workflow_run.head_branch}`
+            });
+            if (pullRequests.length > 0) {
+              return pullRequests[0].number;
+            }
+            return null;
+          result-encoding: string
+
+      - name: Approve PR
+        if: steps.pr.outputs.result != 'null'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          github-token: ${{ secrets.AUTO_APPROVE_PAT }}
+          script: |
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ steps.pr.outputs.result }},
+              event: 'APPROVE',
+              body: '✅ Auto-approved: CI checks passed'
+            });
