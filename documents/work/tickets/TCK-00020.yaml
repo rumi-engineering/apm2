@@ -1,0 +1,34 @@
+ticket_meta:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  ticket:
+    id: "TCK-00020"
+    title: "Implement gate receipt generator"
+    status: "DRAFT"
+  binds:
+    prd_id: "PRD-0001"
+    rfc_id: "RFC-0001"
+    requirements:
+      - requirement_id: "REQ-0016"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0016.yaml#prd_requirement"
+      - requirement_id: "REQ-0031"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0031.yaml#prd_requirement"
+      - requirement_id: "REQ-0032"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0032.yaml#prd_requirement"
+      - requirement_id: "REQ-0038"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0038.yaml#prd_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0016"
+        artifact_ref: "documents/prds/PRD-0001/evidence_artifacts/EVID-0016.yaml#prd_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_KERNEL"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00019"
+        reason: "Requires evidence publisher from 'Implement evidence bundle publisher'"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0016"

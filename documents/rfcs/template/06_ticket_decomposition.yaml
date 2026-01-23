@@ -6,13 +6,13 @@ rfc_ticket_decomposition:
     - "Each ticket MUST reference requirement_ids and evidence_ids."
     - "Cross-ticket dependencies MUST be explicit and minimal."
   ticket_plan:
-    ticket_storage_root: "work/tickets/"
+    ticket_storage_root: "documents/work/tickets/"
     tickets:
       - ticket_id: "TCK-00001"
         title: ""
         ticket_files:
-          meta_ref: "work/tickets/TCK-00001.yaml#ticket_meta"
-          body_path: "work/tickets/TCK-00001.md"
+          meta_ref: "documents/work/tickets/TCK-00001.yaml#ticket_meta"
+          body_path: "documents/work/tickets/TCK-00001.md"
         scope:
           in_scope: []
           out_of_scope: []

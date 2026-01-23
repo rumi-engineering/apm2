@@ -1,0 +1,34 @@
+ticket_meta:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  ticket:
+    id: "TCK-00003"
+    title: "Implement hash-chain and signature primitives"
+    status: "DRAFT"
+  binds:
+    prd_id: "PRD-0001"
+    rfc_id: "RFC-0001"
+    requirements:
+      - requirement_id: "REQ-0006"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0006.yaml#prd_requirement"
+      - requirement_id: "REQ-1004"
+        requirement_ref: "documents/rfcs/RFC-0001/requirements/REQ-1004.yaml#rfc_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0004"
+        artifact_ref: "documents/prds/PRD-0001/evidence_artifacts/EVID-0004.yaml#prd_evidence_artifact"
+      - evidence_id: "EVID-1004"
+        artifact_ref: "documents/rfcs/RFC-0001/evidence_artifacts/EVID-1004.yaml#rfc_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_KERNEL"
+      - "DOMAIN_SECURITY"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00002"
+        reason: "Requires proto event schemas from 'Define kernel event schemas with prost'"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0004"
+      - "EVID-1004"
