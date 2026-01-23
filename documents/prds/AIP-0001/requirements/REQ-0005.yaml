@@ -1,0 +1,18 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0005"
+  type: "FUNCTIONAL"
+  title: "Bidirectional Interact Streaming"
+  statement: "AgentService SHALL support bidirectional Interact streaming RPC"
+  acceptance_criteria:
+    - "Client can send stdin_data, resize, and signal messages"
+    - "Server streams stdout_data, stderr_data, state_change, tool_call events"
+    - "Stream terminates cleanly when agent stops"
+  evidence:
+    evidence_ids:
+      - "EVID-0004"
+      - "EVID-0005"
+      - "EVID-0018"
+    inherited_from_prd: false
+    notes: []

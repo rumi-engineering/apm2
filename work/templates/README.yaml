@@ -1,0 +1,10 @@
+work_templates_readme:
+  schema_version: "2026-01-23"
+  template_version: 2
+  description: "Engineering ticket templates (atomic). Each ticket is Markdown plus a YAML companion metadata file."
+  required_files_per_ticket:
+    - "<ticket_id>.md"
+    - "<ticket_id>.yaml"
+  determinism_notes:
+    - "Ticket YAML is the source of truth for bindings (requirement_ids, evidence_ids)."
+    - "Ticket Markdown MUST NOT contain tables."

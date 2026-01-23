@@ -1,0 +1,9 @@
+waiver_status:
+  version: 1
+  enum_id: "ENUM_WAIVER_STATUS_V1"
+  values:
+    - "REQUESTED"
+    - "APPROVED"
+    - "REJECTED"
+    - "CANCELLED"
+    - "EXPIRED"

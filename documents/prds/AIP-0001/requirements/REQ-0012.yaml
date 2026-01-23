@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0012"
+  type: "FUNCTIONAL"
+  title: "CLI gRPC Migration"
+  statement: "CLI SHALL use gRPC client for all agent operations"
+  acceptance_criteria:
+    - "apm2 daemon accepts --grpc-port flag"
+    - "All agent commands use gRPC instead of Unix socket"
+    - "apm2 attach <agent> uses Interact RPC for interactive sessions"
+  evidence:
+    evidence_ids:
+      - "EVID-0013"
+      - "EVID-0025"
+    inherited_from_prd: false
+    notes: []

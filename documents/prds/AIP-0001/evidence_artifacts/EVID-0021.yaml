@@ -1,0 +1,26 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "EVID-0021"
+  category: "TEST_RESULTS"
+  title: "Claude Code Parser Test"
+  capture:
+    paths:
+      - "tests/claude_parser.rs"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --test claude_parser"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 30
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "claude_parser"
+  data:
+    classification: "PUBLIC"
+    redaction:
+      required: false
+      guidance: []

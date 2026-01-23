@@ -1,0 +1,18 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0002"
+  type: "FUNCTIONAL"
+  title: "AgentService Lifecycle RPCs"
+  statement: "AgentService SHALL support CreateAgent, GetAgent, ListAgents, StartAgent, StopAgent, RestartAgent RPCs"
+  acceptance_criteria:
+    - "CreateAgent returns Agent with generated UUID"
+    - "StartAgent spawns process and transitions to RUNNING state"
+    - "StopAgent terminates process and transitions to STOPPED state"
+    - "GetAgent and ListAgents return current agent state"
+  evidence:
+    evidence_ids:
+      - "EVID-0004"
+      - "EVID-0015"
+    inherited_from_prd: false
+    notes: []

@@ -1,0 +1,9 @@
+
+data_classification:
+  version: 1
+  enum_id: "ENUM_DATA_CLASSIFICATION_V1"
+  values:
+    - "PUBLIC"
+    - "INTERNAL"
+    - "CONFIDENTIAL"
+    - "RESTRICTED"

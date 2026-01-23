@@ -1,0 +1,9 @@
+contract_types:
+  version: 1
+  enum_id: "ENUM_CONTRACT_TYPE_V1"
+  values:
+    - "API"
+    - "EVENT"
+    - "FILE_FORMAT"
+    - "INTERNAL_INTERFACE"
+    - "EXTERNAL_INTERFACE"

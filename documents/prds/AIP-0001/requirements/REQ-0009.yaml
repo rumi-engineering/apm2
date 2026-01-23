@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0009"
+  type: "NON_FUNCTIONAL"
+  title: "WatchSession Real-time Streaming"
+  statement: "SessionService SHALL support WatchSession streaming RPC for real-time events"
+  acceptance_criteria:
+    - "Client receives new_turn events when turns are added"
+    - "Client receives tool_call_started and tool_call_completed events"
+    - "Stream filters to specified session_id"
+  evidence:
+    evidence_ids:
+      - "EVID-0008"
+      - "EVID-0022"
+    inherited_from_prd: false
+    notes: []

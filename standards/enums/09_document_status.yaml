@@ -1,0 +1,10 @@
+document_status:
+  version: 1
+  enum_id: "ENUM_DOCUMENT_STATUS_V1"
+  values:
+    - "DRAFT"
+    - "IN_REVIEW"
+    - "APPROVED"
+    - "IMPLEMENTED"
+    - "SUPERSEDED"
+    - "ARCHIVED"

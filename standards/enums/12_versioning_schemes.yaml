@@ -1,0 +1,8 @@
+versioning_schemes:
+  version: 1
+  enum_id: "ENUM_VERSIONING_SCHEME_V1"
+  values:
+    - "SEMVER"
+    - "CALVER"
+    - "DATE_TAGGED"
+    - "CUSTOM"

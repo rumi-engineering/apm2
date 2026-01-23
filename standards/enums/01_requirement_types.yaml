@@ -1,0 +1,17 @@
+
+requirement_types:
+  version: 1
+  enum_id: "ENUM_REQUIREMENT_TYPE_V1"
+  values:
+    - "FUNCTIONAL"
+    - "NON_FUNCTIONAL"
+    - "INTEROPERABILITY"
+    - "SECURITY"
+    - "COMPLIANCE"
+    - "OPERABILITY"
+    - "OBSERVABILITY"
+    - "PERFORMANCE"
+    - "RELIABILITY"
+    - "DATA_GOVERNANCE"
+    - "COST"
+    - "UX"

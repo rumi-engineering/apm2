@@ -1,0 +1,16 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0003"
+  type: "FUNCTIONAL"
+  title: "AgentService I/O RPCs"
+  statement: "AgentService SHALL support SendInput and StreamOutput RPCs for basic I/O"
+  acceptance_criteria:
+    - "SendInput writes bytes to agent stdin/PTY"
+    - "StreamOutput returns output chunks with stream type and timestamp"
+  evidence:
+    evidence_ids:
+      - "EVID-0004"
+      - "EVID-0016"
+    inherited_from_prd: false
+    notes: []

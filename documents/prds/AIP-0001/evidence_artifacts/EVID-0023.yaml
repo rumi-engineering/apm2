@@ -1,0 +1,26 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "EVID-0023"
+  category: "TEST_RESULTS"
+  title: "MetricsService Test"
+  capture:
+    paths:
+      - "tests/metrics_service.rs"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --test metrics_service"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 30
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "metrics_service"
+  data:
+    classification: "PUBLIC"
+    redaction:
+      required: false
+      guidance: []

@@ -1,0 +1,10 @@
+custody_roles:
+  version: 2
+  enum_id: "ENUM_CUSTODY_ROLE_V2"
+  values:
+    - "AGENT_AUTHOR"
+    - "AGENT_IMPLEMENTER"
+    - "AGENT_QA"
+    - "AGENT_RELEASE"
+    - "AGENT_REVIEWER"
+    - "AGENT_STANDARDS_STEWARD"

@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0010"
+  type: "NON_FUNCTIONAL"
+  title: "MetricsService RPCs"
+  statement: "MetricsService SHALL provide GetAgentMetrics and StreamMetrics RPCs"
+  acceptance_criteria:
+    - "GetAgentMetrics returns CPU, memory, uptime, restart count, turn/tool counts"
+    - "StreamMetrics provides periodic metrics snapshots"
+    - "Tool call counts are broken down by tool name"
+  evidence:
+    evidence_ids:
+      - "EVID-0011"
+      - "EVID-0023"
+    inherited_from_prd: false
+    notes: []

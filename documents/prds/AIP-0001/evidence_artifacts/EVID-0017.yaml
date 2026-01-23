@@ -1,0 +1,26 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "EVID-0017"
+  category: "TEST_RESULTS"
+  title: "PTY ANSI Escape Code Test"
+  capture:
+    paths:
+      - "tests/pty_ansi.rs"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --test pty_ansi"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 30
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "pty_ansi"
+  data:
+    classification: "PUBLIC"
+    redaction:
+      required: false
+      guidance: []

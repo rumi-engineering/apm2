@@ -1,0 +1,26 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "EVID-0025"
+  category: "TEST_RESULTS"
+  title: "CLI gRPC Integration Test"
+  capture:
+    paths:
+      - "tests/cli_grpc.rs"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --test cli_grpc"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 60
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "cli_grpc"
+  data:
+    classification: "PUBLIC"
+    redaction:
+      required: false
+      guidance: []

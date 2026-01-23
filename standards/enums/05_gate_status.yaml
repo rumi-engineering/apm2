@@ -1,0 +1,9 @@
+
+gate_status:
+  version: 1
+  enum_id: "ENUM_GATE_STATUS_V1"
+  values:
+    - "BLOCKED"
+    - "PENDING"
+    - "PASSED"
+    - "WAIVED"

@@ -1,0 +1,21 @@
+aip_rfc_interop_tests:
+  schema_version: "2026-01-23"
+  template_version: 2
+  test_vectors:
+    - id: "TV-0001"
+      message_type: ""
+      vector_path: ""
+      expected_result: ""
+      evidence_ids:
+        - "EVID-0900"
+  deterministic_verification:
+    commands:
+      - id: "CMD-0910"
+        shell: "bash"
+        command: ""
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 600
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints: []

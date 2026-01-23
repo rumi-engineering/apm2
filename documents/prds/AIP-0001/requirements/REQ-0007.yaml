@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0007"
+  type: "FUNCTIONAL"
+  title: "SessionService Query RPCs"
+  statement: "SessionService SHALL support GetSession, ListSessions, GetTurns, GetToolCalls RPCs"
+  acceptance_criteria:
+    - "GetSession returns session with metadata"
+    - "GetTurns returns ordered turns with pagination support"
+    - "GetToolCalls returns tool calls filtered by session or turn"
+  evidence:
+    evidence_ids:
+      - "EVID-0008"
+      - "EVID-0020"
+    inherited_from_prd: false
+    notes: []

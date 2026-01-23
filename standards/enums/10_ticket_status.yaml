@@ -1,0 +1,10 @@
+ticket_status:
+  version: 1
+  enum_id: "ENUM_TICKET_STATUS_V1"
+  values:
+    - "DRAFT"
+    - "READY"
+    - "IN_PROGRESS"
+    - "BLOCKED"
+    - "DONE"
+    - "CANCELLED"

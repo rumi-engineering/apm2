@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0004"
+  type: "FUNCTIONAL"
+  title: "PTY Terminal Emulation"
+  statement: "Agent processes SHALL run in pseudo-terminal (PTY) with full terminal emulation"
+  acceptance_criteria:
+    - "ANSI escape codes pass through correctly"
+    - "Terminal resize (SIGWINCH) is supported via Interact RPC"
+    - "Control characters (Ctrl+C, Ctrl+D) can be sent"
+  evidence:
+    evidence_ids:
+      - "EVID-0005"
+      - "EVID-0017"
+    inherited_from_prd: false
+    notes: []

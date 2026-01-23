@@ -1,0 +1,43 @@
+aip_prd_requirements:
+  schema_version: "2026-01-23"
+  template_version: 2
+  message_schemas:
+    - id: "AIP-SCH-0001"
+      name: ""
+      schema_ref: ""
+      version: ""
+      compatibility: ""
+  requirements:
+    - id: "REQ-0900"
+      type: "INTEROPERABILITY"
+      title: "AIP message schemas are versioned and referenced"
+      statement: "The system SHALL publish and reference versioned message schemas for all AIP messages it emits or consumes."
+      acceptance_criteria:
+        - "All message types have schema_ref and version."
+        - "Backward compatibility rules are documented and enforced."
+      evidence:
+        evidence_ids:
+          - "EVID-0900"
+        inherited_from_prd: false
+    - id: "REQ-0901"
+      type: "SECURITY"
+      title: "AIP authn/authz is explicit and default-deny"
+      statement: "All AIP interactions SHALL require explicit authentication and capability-based authorization with default-deny on unknown principals."
+      acceptance_criteria:
+        - "Unauthenticated requests are rejected deterministically."
+        - "Authorization decisions are logged as audit events."
+      evidence:
+        evidence_ids:
+          - "EVID-0901"
+        inherited_from_prd: false
+    - id: "REQ-0902"
+      type: "OBSERVABILITY"
+      title: "AIP audit and telemetry are emitted"
+      statement: "The system SHALL emit structured audit events and telemetry for all AIP interactions and authorization decisions."
+      acceptance_criteria:
+        - "Audit events include actor, action, resource, decision, and correlation id."
+        - "Telemetry includes latency and error rates per message type."
+      evidence:
+        evidence_ids:
+          - "EVID-0902"
+        inherited_from_prd: false

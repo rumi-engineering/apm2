@@ -1,0 +1,26 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "EVID-0014"
+  category: "TEST_RESULTS"
+  title: "gRPC Server Health Check Test"
+  capture:
+    paths:
+      - "tests/grpc_health.rs"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --test grpc_health"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 30
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "grpc_server_startup"
+  data:
+    classification: "PUBLIC"
+    redaction:
+      required: false
+      guidance: []

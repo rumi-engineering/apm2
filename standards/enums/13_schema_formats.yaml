@@ -1,0 +1,9 @@
+schema_formats:
+  version: 1
+  enum_id: "ENUM_SCHEMA_FORMAT_V1"
+  values:
+    - "JSON_SCHEMA"
+    - "OPENAPI"
+    - "PROTOBUF"
+    - "AVRO"
+    - "IDL"

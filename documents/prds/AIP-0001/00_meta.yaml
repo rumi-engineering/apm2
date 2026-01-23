@@ -1,11 +1,42 @@
 prd_meta:
-  version: 1
-  prd_id: "AIP-0001"
-  project_id: "apm2"
-  title: "Agent Interaction Protocol (AIP) - gRPC Foundation for AI CLI Agent Management"
-  status: "DRAFT"
-  last_updated: "2026-01-22"
-
+  schema_version: "2026-01-23"
+  template_version: 2
+  prd:
+    id: "AIP-0001"
+    title: "Agent Interaction Protocol (AIP) - gRPC Foundation for AI CLI Agent Management"
+    status: "DRAFT"
+    created_date: "2026-01-22"
+    last_updated_date: "2026-01-23"
+  protocol_profile:
+    id: "AIP_PROFILE_V1"
+    applies: true
+    profile_ref: "protocol_profiles/aip/AIP_PROFILE_V1.yaml#aip_profile"
+  custody:
+    producing_agent_roles:
+      - "AGENT_AUTHOR"
+    responsible_domains:
+      - "DOMAIN_PRODUCT"
+      - "DOMAIN_SECURITY"
+    authority_signoffs_required:
+      - "AUTH_PRODUCT"
+      - "AUTH_SECURITY"
+  refs:
+    standards:
+      requirement_schema: "standards/schemas/02_requirement.schema.yaml#requirement_schema"
+      evidence_artifact_schema: "standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema"
+      quality_coverage_schema: "standards/schemas/03_quality_coverage.schema.yaml#quality_coverage_schema"
+      gate_review_schema: "standards/schemas/06_gate_review.schema.yaml#gate_review_schema"
+      waiver_schema: "standards/schemas/05_waiver.schema.yaml#waiver_schema"
+      ticket_meta_schema: "standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema"
+      lint_spec: "standards/lint/LINT_SPEC.yaml#lint_spec"
+  execution_path:
+    mode: "RFC_REQUIRED"
+    rationale: "New gRPC API surface, new PTY-based process model, new session persistence layer"
+    rfc_trigger_conditions:
+      - "New public gRPC API (AgentService, SessionService, MetricsService)"
+      - "New trust boundary between gRPC clients and managed agent processes"
+      - "New persistence format for session/conversation storage"
+      - "Replacement of existing Unix socket IPC with gRPC"
   owners:
     - role: "Product Owner"
       name: "apm2-maintainers"
@@ -15,26 +46,8 @@ prd_meta:
       name: "apm2-maintainers"
     - role: "Ops/SRE Owner"
       name: "apm2-maintainers"
-
   links:
     repo_root: "."
     prd_path: "documents/prds/AIP-0001"
     rfc_path: "documents/rfcs/AIP-0001"
     discussions: []
-
-  id_conventions:
-    requirement_id_format: "REQ-AIP-0001-NNNN"
-    deliverable_id_format: "DELIV-AIP-0001-NNNN"
-    e2e_id_format: "E2E-AIP-0001-NNNN"
-    risk_id_format: "RISK-AIP-0001-NNNN"
-    question_id_format: "Q-AIP-0001-NNNN"
-    decision_id_format: "DEC-AIP-0001-NNNN"
-
-  execution_path:
-    mode: "RFC_REQUIRED"
-    rationale: "New gRPC API surface, new PTY-based process model, new session persistence layer"
-    rfc_trigger_conditions:
-      - "New public gRPC API (AgentService, SessionService, MetricsService)"
-      - "New trust boundary between gRPC clients and managed agent processes"
-      - "New persistence format for session/conversation storage"
-      - "Replacement of existing Unix socket IPC with gRPC"

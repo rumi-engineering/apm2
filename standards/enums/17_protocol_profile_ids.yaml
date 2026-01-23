@@ -1,0 +1,6 @@
+protocol_profile_ids:
+  version: 1
+  enum_id: "ENUM_PROTOCOL_PROFILE_ID_V1"
+  values:
+    - "NONE"
+    - "AIP_PROFILE_V1"

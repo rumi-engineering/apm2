@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0011"
+  type: "NON_FUNCTIONAL"
+  title: "SQLite Session Persistence"
+  statement: "System MAY persist sessions to SQLite for survival across daemon restarts"
+  acceptance_criteria:
+    - "Sessions, turns, tool_calls stored in SQLite tables"
+    - "Data survives daemon restart"
+    - "Historical queries work across sessions"
+  evidence:
+    evidence_ids:
+      - "EVID-0012"
+      - "EVID-0024"
+    inherited_from_prd: false
+    notes: []

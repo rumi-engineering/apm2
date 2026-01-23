@@ -1,0 +1,25 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "EVID-0002"
+  category: "BUILD_ARTIFACTS"
+  title: "Session Proto Definition"
+  capture:
+    paths:
+      - "proto/apm2/v1/session.proto"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "protoc --proto_path=proto proto/apm2/v1/session.proto --descriptor_set_out=/dev/null"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 10
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints: []
+  data:
+    classification: "PUBLIC"
+    redaction:
+      required: false
+      guidance: []

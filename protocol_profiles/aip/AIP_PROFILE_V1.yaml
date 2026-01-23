@@ -1,0 +1,23 @@
+aip_profile:
+  schema_version: "2026-01-23"
+  template_version: 2
+  profile_id: "AIP_PROFILE_V1"
+  intent: "Standardize requirements/evidence for AIP/Bedrock protocol integrations."
+  versioning:
+    compatibility_rules:
+      - "All message schemas MUST be versioned; backward-incompatible changes require a new major version."
+      - "Wire format MUST be deterministic; canonical JSON (if used) MUST be specified."
+  required_sections:
+    prd:
+      - "protocol_profiles/aip/prd_aip_requirements.yaml#aip_prd_requirements"
+      - "protocol_profiles/aip/prd_aip_evidence.yaml#aip_prd_evidence"
+    rfc:
+      - "protocol_profiles/aip/rfc_aip_trust_and_auth.yaml#aip_rfc_trust_and_auth"
+      - "protocol_profiles/aip/rfc_aip_interop_tests.yaml#aip_rfc_interop_tests"
+  security_baselines:
+    authn:
+      - "Mutual authentication or signed requests with replay protection."
+    authz:
+      - "Explicit capability-based authorization; default deny on unknown principals."
+    audit:
+      - "All authorization decisions MUST emit audit events with stable schema."

@@ -1,0 +1,27 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "EVID-0024"
+  category: "TEST_RESULTS"
+  title: "SQLite Persistence Test"
+  capture:
+    paths:
+      - "tests/sqlite_persistence.rs"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --test sqlite_persistence --features persistence"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 60
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "sqlite_persistence"
+  data:
+    classification: "SENSITIVE"
+    redaction:
+      required: true
+      guidance:
+        - "Redact any persisted session data that may contain sensitive information"

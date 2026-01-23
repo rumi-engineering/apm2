@@ -1,0 +1,73 @@
+aip_prd_evidence:
+  schema_version: "2026-01-23"
+  template_version: 2
+  bundle_root: "evidence/aip/"
+  artifacts:
+    - id: "EVID-0900"
+      category: "BUILD_ARTIFACTS"
+      title: "Published message schema artifacts"
+      capture:
+        paths:
+          - "schemas/"
+      verification:
+        commands:
+          - id: "CMD-0900"
+            shell: "bash"
+            command: "ls -R evidence/aip/schemas"
+            expected_exit_code: 0
+            cwd: "."
+            timeout_seconds: 600
+            network_access: "DISALLOWED"
+            allowlist_hosts: []
+            constraints: []
+      data:
+        classification: "INTERNAL"
+        redaction:
+          required: false
+          guidance: []
+    - id: "EVID-0901"
+      category: "SECURITY_SCAN_RESULTS"
+      title: "Authn/authz enforcement tests and logs"
+      capture:
+        paths:
+          - "auth/"
+      verification:
+        commands:
+          - id: "CMD-0901"
+            shell: "bash"
+            command: "cat evidence/aip/auth/authz_tests.jsonl | wc -l"
+            expected_exit_code: 0
+            cwd: "."
+            timeout_seconds: 600
+            network_access: "DISALLOWED"
+            allowlist_hosts: []
+            constraints: []
+      data:
+        classification: "RESTRICTED"
+        redaction:
+          required: true
+          guidance:
+            - "Redact tokens, credentials, and principal identifiers if they are sensitive."
+    - id: "EVID-0902"
+      category: "AUDIT_LOGS"
+      title: "AIP audit event samples and schema"
+      capture:
+        paths:
+          - "audit/"
+      verification:
+        commands:
+          - id: "CMD-0902"
+            shell: "bash"
+            command: "test -f evidence/aip/audit/audit_event_schema.json"
+            expected_exit_code: 0
+            cwd: "."
+            timeout_seconds: 600
+            network_access: "DISALLOWED"
+            allowlist_hosts: []
+            constraints: []
+      data:
+        classification: "CONFIDENTIAL"
+        redaction:
+          required: true
+          guidance:
+            - "Redact customer data payloads; keep only headers and event metadata."

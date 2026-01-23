@@ -1,0 +1,18 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0006"
+  type: "FUNCTIONAL"
+  title: "Session Data Model"
+  statement: "System SHALL track sessions with structured Turn and ToolCall data"
+  acceptance_criteria:
+    - "Each agent has an associated session"
+    - "Turns capture role (USER/AGENT), content, and timestamp"
+    - "ToolCalls capture name, input, output, status, and timing"
+  evidence:
+    evidence_ids:
+      - "EVID-0006"
+      - "EVID-0007"
+      - "EVID-0019"
+    inherited_from_prd: false
+    notes: []

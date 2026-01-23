@@ -1,0 +1,19 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0001"
+  type: "FUNCTIONAL"
+  title: "gRPC Server Foundation"
+  statement: "System SHALL provide gRPC server with AgentService, SessionService, and MetricsService"
+  acceptance_criteria:
+    - "gRPC server starts on configurable port (default 50051)"
+    - "All three services respond to health checks"
+    - "Proto files compile without errors"
+  evidence:
+    evidence_ids:
+      - "EVID-0001"
+      - "EVID-0002"
+      - "EVID-0003"
+      - "EVID-0014"
+    inherited_from_prd: false
+    notes: []

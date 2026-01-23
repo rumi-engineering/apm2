@@ -1,0 +1,7 @@
+command_shells:
+  version: 1
+  enum_id: "ENUM_COMMAND_SHELL_V1"
+  values:
+    - "bash"
+    - "sh"
+    - "pwsh"

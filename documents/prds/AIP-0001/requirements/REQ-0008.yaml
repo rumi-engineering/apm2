@@ -1,0 +1,18 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-0008"
+  type: "FUNCTIONAL"
+  title: "Output Parser Framework"
+  statement: "System SHALL provide pluggable output parser framework with Claude Code implementation"
+  acceptance_criteria:
+    - "AgentOutputParser trait defines parse method"
+    - "ClaudeCodeParser extracts turns and tool calls from Claude Code output"
+    - "GenericParser provides fallback for unknown CLIs"
+  evidence:
+    evidence_ids:
+      - "EVID-0009"
+      - "EVID-0010"
+      - "EVID-0021"
+    inherited_from_prd: false
+    notes: []

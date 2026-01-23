@@ -1,0 +1,12 @@
+rfc_requirement:
+  schema_version: "2026-01-23"
+  template_version: 2
+  id: "REQ-1000"
+  type: "OPERABILITY"
+  title: ""
+  statement: ""
+  acceptance_criteria: []
+  evidence:
+    evidence_ids: []
+    inherited_from_prd: false
+    notes: []
