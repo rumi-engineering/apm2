@@ -1,5 +1,6 @@
 # Auto-approve PRs when CI passes
-# Requires a PAT with repo scope stored as AUTO_APPROVE_PAT secret
+# Requires a GitHub App with pull_request:write permission
+# Secrets needed: APP_ID, APP_PRIVATE_KEY
 
 name: Auto Approve
 
@@ -18,6 +19,13 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request'
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Get PR number
         id: pr
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
@@ -39,12 +47,12 @@ jobs:
         if: steps.pr.outputs.result != 'null'
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
         with:
-          github-token: ${{ secrets.AUTO_APPROVE_PAT }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.pulls.createReview({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: ${{ steps.pr.outputs.result }},
               event: 'APPROVE',
-              body: '✅ Auto-approved: CI checks passed'
+              body: '✅ Auto-approved by APM2 Bot: CI checks passed'
             });

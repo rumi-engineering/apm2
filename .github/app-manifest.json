@@ -1,0 +1,14 @@
+{
+  "name": "APM2 Auto Approve",
+  "url": "https://github.com/Anveio/apm2",
+  "hook_attributes": {
+    "active": false
+  },
+  "redirect_url": "https://github.com/Anveio/apm2",
+  "public": false,
+  "default_permissions": {
+    "pull_requests": "write",
+    "contents": "read"
+  },
+  "default_events": []
+}
