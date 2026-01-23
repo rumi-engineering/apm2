@@ -11,6 +11,10 @@ ticket_meta:
     requirements:
       - requirement_id: "REQ-0016"
         requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0016.yaml#prd_requirement"
+      - requirement_id: "REQ-0031"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0031.yaml#prd_requirement"
+      - requirement_id: "REQ-0032"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0032.yaml#prd_requirement"
       - requirement_id: "REQ-0038"
         requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0038.yaml#prd_requirement"
     evidence_artifacts:

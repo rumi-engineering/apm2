@@ -30,8 +30,9 @@ rfc_ticket_decomposition:
         - "Projection tables (TCK-00004)"
       binds:
         requirement_ids:
-        - REQ-0008
         - REQ-0006
+        - REQ-0008
+        - REQ-1001
         evidence_ids:
         - EVID-0004
       custody_agent_roles:
@@ -65,7 +66,9 @@ rfc_ticket_decomposition:
         - "Tool protocol messages (TCK-00013)"
       binds:
         requirement_ids:
+        - REQ-0002
         - REQ-0012
+        - REQ-0029
         evidence_ids:
         - EVID-0008
       custody_agent_roles:
@@ -140,6 +143,8 @@ rfc_ticket_decomposition:
         requirement_ids:
         - REQ-0007
         - REQ-0025
+        - REQ-1001
+        - REQ-1003
         evidence_ids:
         - EVID-0005
       custody_agent_roles:
@@ -180,6 +185,7 @@ rfc_ticket_decomposition:
         requirement_ids:
         - REQ-0013
         - REQ-0018
+        - REQ-1002
         evidence_ids:
         - EVID-0006
       custody_agent_roles:
@@ -214,8 +220,8 @@ rfc_ticket_decomposition:
         - "Stall detection logic (TCK-00007)"
       binds:
         requirement_ids:
-        - REQ-0035
         - REQ-0019
+        - REQ-0035
         evidence_ids:
         - EVID-0006
         - EVID-0018
@@ -253,6 +259,7 @@ rfc_ticket_decomposition:
         requirement_ids:
         - REQ-0018
         - REQ-0027
+        - REQ-0033
         evidence_ids:
         - EVID-0006
       custody_agent_roles:
@@ -289,6 +296,7 @@ rfc_ticket_decomposition:
         requirement_ids:
         - REQ-0018
         - REQ-0027
+        - REQ-0033
         evidence_ids:
         - EVID-0006
       custody_agent_roles:
@@ -438,7 +446,9 @@ rfc_ticket_decomposition:
       binds:
         requirement_ids:
         - REQ-0017
+        - REQ-0023
         - REQ-0027
+        - REQ-1005
         evidence_ids:
         - EVID-0011
         - EVID-0012
@@ -587,6 +597,7 @@ rfc_ticket_decomposition:
         requirement_ids:
         - REQ-0004
         - REQ-0019
+        - REQ-0034
         evidence_ids:
         - EVID-0003
         - EVID-0018
@@ -627,8 +638,9 @@ rfc_ticket_decomposition:
         - "Evidence publication (TCK-00019)"
       binds:
         requirement_ids:
-        - REQ-0014
         - REQ-0001
+        - REQ-0003
+        - REQ-0014
         evidence_ids:
         - EVID-0001
       custody_agent_roles:
@@ -664,8 +676,13 @@ rfc_ticket_decomposition:
         - "Federation lease reconciliation (RFC-0002)"
       binds:
         requirement_ids:
+        - REQ-0003
+        - REQ-0011
+        - REQ-0020
+        - REQ-0021
         - REQ-0022
         - REQ-0036
+        - REQ-0037
         evidence_ids:
         - EVID-0006
       custody_agent_roles:
@@ -700,8 +717,9 @@ rfc_ticket_decomposition:
         - "Evidence verification scripts (documented in PRD)"
       binds:
         requirement_ids:
-        - REQ-0015
         - REQ-0009
+        - REQ-0015
+        - REQ-0023
         evidence_ids:
         - EVID-0002
         - EVID-0010
@@ -739,6 +757,8 @@ rfc_ticket_decomposition:
       binds:
         requirement_ids:
         - REQ-0016
+        - REQ-0031
+        - REQ-0032
         - REQ-0038
         evidence_ids:
         - EVID-0016
@@ -852,7 +872,10 @@ rfc_ticket_decomposition:
       binds:
         requirement_ids:
         - REQ-0001
+        - REQ-0024
         - REQ-0028
+        - REQ-0030
+        - REQ-1005
         - REQ-1006
         evidence_ids:
         - EVID-0001
@@ -894,6 +917,7 @@ rfc_ticket_decomposition:
         requirement_ids:
         - REQ-0001
         - REQ-0026
+        - REQ-1003
         evidence_ids:
         - EVID-0001
         - EVID-1003
@@ -951,8 +975,7 @@ rfc_ticket_decomposition:
 
     requirement_coverage:
       notes: |
-        All 38 PRD requirements are covered by at least one ticket.
-        REQ-0020 (partition tolerance), REQ-0021 (holonic scaling), REQ-0037
-        (canonical root selection) are partially addressed via lease mechanics
-        (TCK-00018) with full federation deferred to RFC-0002.
+        All PRD-0001 requirements and RFC-0001 requirements are now covered.
+        REQ-0011, REQ-0020, REQ-0021, REQ-0037 are partially addressed via lease
+        mechanics (TCK-00018) with full federation deferred to RFC-0002.
       uncovered_requirements: []

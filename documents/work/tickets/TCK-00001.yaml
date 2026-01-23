@@ -9,10 +9,12 @@ ticket_meta:
     prd_id: "PRD-0001"
     rfc_id: "RFC-0001"
     requirements:
-      - requirement_id: "REQ-0008"
-        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0008.yaml#prd_requirement"
       - requirement_id: "REQ-0006"
         requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0006.yaml#prd_requirement"
+      - requirement_id: "REQ-0008"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0008.yaml#prd_requirement"
+      - requirement_id: "REQ-1001"
+        requirement_ref: "documents/rfcs/RFC-0001/requirements/REQ-1001.yaml#rfc_requirement"
     evidence_artifacts:
       - evidence_id: "EVID-0004"
         artifact_ref: "documents/prds/PRD-0001/evidence_artifacts/EVID-0004.yaml#prd_evidence_artifact"
