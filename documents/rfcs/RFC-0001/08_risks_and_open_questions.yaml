@@ -106,11 +106,15 @@ rfc_risks_and_open_questions:
     question: |
       Should seccomp profiles be included in v0 as defense in depth, or
       deferred to a security hardening follow-up?
-    decision_needed_by: "2026-02-28"
-    resolution_plan: |
-      Evaluate implementation complexity and platform compatibility.
-      If low effort, include in TCK-00021 (black-box adapter).
-      If high effort, document as future enhancement.
+    status: RESOLVED
+    resolution: |
+      Seccomp is deferred from v0 core scope. Rationale:
+      - v0 is Linux-only (seccomp is Linux-specific) - acceptable scope
+      - Bootstrap phases use trusted agents only
+      - "Ship fast, harden later" philosophy accepted for initial rollout
+      - Not a hard gate for ROL-0004 milestone
+
+      TCK-00025 added as optional hardening ticket for pre-production phase.
 
   - id: Q-RFC-0003
     question: |
