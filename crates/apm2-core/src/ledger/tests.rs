@@ -36,7 +36,12 @@ fn test_in_memory_ledger() {
 fn test_append_single_event() {
     let (ledger, _dir) = temp_ledger();
 
-    let event = EventRecord::new("test.event", "session-1", b"test payload".to_vec());
+    let event = EventRecord::new(
+        "test.event",
+        "session-1",
+        "actor-1",
+        b"test payload".to_vec(),
+    );
     let seq_id = ledger.append(&event).expect("failed to append event");
 
     assert_eq!(seq_id, 1);
@@ -51,17 +56,28 @@ fn test_append_preserves_order() {
     let (ledger, _dir) = temp_ledger();
 
     let seq1 = ledger
-        .append(&EventRecord::new("event.1", "session-1", b"first".to_vec()))
+        .append(&EventRecord::new(
+            "event.1",
+            "session-1",
+            "actor-1",
+            b"first".to_vec(),
+        ))
         .expect("failed to append");
     let seq2 = ledger
         .append(&EventRecord::new(
             "event.2",
             "session-1",
+            "actor-1",
             b"second".to_vec(),
         ))
         .expect("failed to append");
     let seq3 = ledger
-        .append(&EventRecord::new("event.3", "session-1", b"third".to_vec()))
+        .append(&EventRecord::new(
+            "event.3",
+            "session-1",
+            "actor-1",
+            b"third".to_vec(),
+        ))
         .expect("failed to append");
 
     assert_eq!(seq1, 1);
@@ -81,9 +97,9 @@ fn test_append_batch() {
     let (ledger, _dir) = temp_ledger();
 
     let events = vec![
-        EventRecord::new("batch.1", "session-1", b"first".to_vec()),
-        EventRecord::new("batch.2", "session-1", b"second".to_vec()),
-        EventRecord::new("batch.3", "session-1", b"third".to_vec()),
+        EventRecord::new("batch.1", "session-1", "actor-1", b"first".to_vec()),
+        EventRecord::new("batch.2", "session-1", "actor-1", b"second".to_vec()),
+        EventRecord::new("batch.3", "session-1", "actor-1", b"third".to_vec()),
     ];
 
     let seq_ids = ledger
@@ -106,6 +122,7 @@ fn test_read_from_cursor() {
             .append(&EventRecord::new(
                 format!("event.{i}"),
                 "session-1",
+                "actor-1",
                 format!("payload-{i}").into_bytes(),
             ))
             .expect("failed to append");
@@ -126,7 +143,7 @@ fn test_read_with_limit() {
     // Append 10 events
     for i in 1..=10 {
         ledger
-            .append(&EventRecord::new("event", "session-1", vec![i]))
+            .append(&EventRecord::new("event", "session-1", "actor-1", vec![i]))
             .expect("failed to append");
     }
 
@@ -141,7 +158,12 @@ fn test_read_with_limit() {
 fn test_read_one() {
     let (ledger, _dir) = temp_ledger();
 
-    let event = EventRecord::new("test.read", "session-1", b"payload data".to_vec());
+    let event = EventRecord::new(
+        "test.read",
+        "session-1",
+        "actor-1",
+        b"payload data".to_vec(),
+    );
     let seq_id = ledger.append(&event).expect("failed to append");
 
     let read_event = ledger.read_one(seq_id).expect("failed to read");
@@ -149,6 +171,7 @@ fn test_read_one() {
     assert_eq!(read_event.seq_id, Some(seq_id));
     assert_eq!(read_event.event_type, "test.read");
     assert_eq!(read_event.session_id, "session-1");
+    assert_eq!(read_event.actor_id, "actor-1");
     assert_eq!(read_event.payload, b"payload data");
 }
 
@@ -170,19 +193,44 @@ fn test_read_session() {
 
     // Append events to different sessions
     ledger
-        .append(&EventRecord::new("event.1", "session-a", b"a1".to_vec()))
+        .append(&EventRecord::new(
+            "event.1",
+            "session-a",
+            "actor-1",
+            b"a1".to_vec(),
+        ))
         .unwrap();
     ledger
-        .append(&EventRecord::new("event.2", "session-b", b"b1".to_vec()))
+        .append(&EventRecord::new(
+            "event.2",
+            "session-b",
+            "actor-1",
+            b"b1".to_vec(),
+        ))
         .unwrap();
     ledger
-        .append(&EventRecord::new("event.3", "session-a", b"a2".to_vec()))
+        .append(&EventRecord::new(
+            "event.3",
+            "session-a",
+            "actor-1",
+            b"a2".to_vec(),
+        ))
         .unwrap();
     ledger
-        .append(&EventRecord::new("event.4", "session-b", b"b2".to_vec()))
+        .append(&EventRecord::new(
+            "event.4",
+            "session-b",
+            "actor-1",
+            b"b2".to_vec(),
+        ))
         .unwrap();
     ledger
-        .append(&EventRecord::new("event.5", "session-a", b"a3".to_vec()))
+        .append(&EventRecord::new(
+            "event.5",
+            "session-a",
+            "actor-1",
+            b"a3".to_vec(),
+        ))
         .unwrap();
 
     // Read session-a
@@ -206,19 +254,44 @@ fn test_read_by_type() {
     let (ledger, _dir) = temp_ledger();
 
     ledger
-        .append(&EventRecord::new("session.start", "s1", b"".to_vec()))
+        .append(&EventRecord::new(
+            "session.start",
+            "s1",
+            "actor-1",
+            b"".to_vec(),
+        ))
         .unwrap();
     ledger
-        .append(&EventRecord::new("tool.request", "s1", b"".to_vec()))
+        .append(&EventRecord::new(
+            "tool.request",
+            "s1",
+            "actor-1",
+            b"".to_vec(),
+        ))
         .unwrap();
     ledger
-        .append(&EventRecord::new("tool.response", "s1", b"".to_vec()))
+        .append(&EventRecord::new(
+            "tool.response",
+            "s1",
+            "actor-1",
+            b"".to_vec(),
+        ))
         .unwrap();
     ledger
-        .append(&EventRecord::new("tool.request", "s1", b"".to_vec()))
+        .append(&EventRecord::new(
+            "tool.request",
+            "s1",
+            "actor-1",
+            b"".to_vec(),
+        ))
         .unwrap();
     ledger
-        .append(&EventRecord::new("session.end", "s1", b"".to_vec()))
+        .append(&EventRecord::new(
+            "session.end",
+            "s1",
+            "actor-1",
+            b"".to_vec(),
+        ))
         .unwrap();
 
     let tool_requests = ledger
@@ -238,6 +311,7 @@ fn test_artifact_ref_crud() {
         .append(&EventRecord::new(
             "event.with.artifact",
             "session-1",
+            "actor-1",
             b"".to_vec(),
         ))
         .expect("failed to append");
@@ -269,7 +343,12 @@ fn test_find_artifact_by_hash() {
     let (ledger, _dir) = temp_ledger();
 
     let seq_id = ledger
-        .append(&EventRecord::new("event", "session-1", b"".to_vec()))
+        .append(&EventRecord::new(
+            "event",
+            "session-1",
+            "actor-1",
+            b"".to_vec(),
+        ))
         .unwrap();
 
     let hash = vec![0xde, 0xad, 0xbe, 0xef];
@@ -302,7 +381,12 @@ fn test_multiple_artifacts_per_event() {
     let (ledger, _dir) = temp_ledger();
 
     let seq_id = ledger
-        .append(&EventRecord::new("event", "session-1", b"".to_vec()))
+        .append(&EventRecord::new(
+            "event",
+            "session-1",
+            "actor-1",
+            b"".to_vec(),
+        ))
         .unwrap();
 
     // Add multiple artifacts
@@ -339,7 +423,12 @@ fn test_concurrent_read_with_wal() {
     // Append some initial events
     for i in 1..=10 {
         ledger
-            .append(&EventRecord::new("init.event", "session-1", vec![i]))
+            .append(&EventRecord::new(
+                "init.event",
+                "session-1",
+                "actor-1",
+                vec![i],
+            ))
             .unwrap();
     }
 
@@ -351,7 +440,12 @@ fn test_concurrent_read_with_wal() {
     let write_handle = thread::spawn(move || {
         for i in 11..=20 {
             write_ledger
-                .append(&EventRecord::new("write.event", "session-2", vec![i]))
+                .append(&EventRecord::new(
+                    "write.event",
+                    "session-2",
+                    "actor-1",
+                    vec![i],
+                ))
                 .unwrap();
             thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -379,11 +473,17 @@ fn test_max_seq_id() {
 
     assert_eq!(ledger.max_seq_id().unwrap(), 0);
 
-    ledger.append(&EventRecord::new("e", "s", vec![])).unwrap();
+    ledger
+        .append(&EventRecord::new("e", "s", "a", vec![]))
+        .unwrap();
     assert_eq!(ledger.max_seq_id().unwrap(), 1);
 
-    ledger.append(&EventRecord::new("e", "s", vec![])).unwrap();
-    ledger.append(&EventRecord::new("e", "s", vec![])).unwrap();
+    ledger
+        .append(&EventRecord::new("e", "s", "a", vec![]))
+        .unwrap();
+    ledger
+        .append(&EventRecord::new("e", "s", "a", vec![]))
+        .unwrap();
     assert_eq!(ledger.max_seq_id().unwrap(), 3);
 }
 
@@ -394,7 +494,7 @@ fn test_stats() {
     // Append events and artifacts
     for i in 1..=5 {
         let seq_id = ledger
-            .append(&EventRecord::new("event", "session", vec![i]))
+            .append(&EventRecord::new("event", "session", "actor", vec![i]))
             .unwrap();
 
         if i % 2 == 0 {
@@ -416,7 +516,8 @@ fn test_event_timestamp_preserved() {
     let ledger = Ledger::in_memory().unwrap();
 
     let timestamp_ns = 1_700_000_000_000_000_000u64;
-    let event = EventRecord::with_timestamp("test", "session", b"data".to_vec(), timestamp_ns);
+    let event =
+        EventRecord::with_timestamp("test", "session", "actor", b"data".to_vec(), timestamp_ns);
 
     let seq_id = ledger.append(&event).unwrap();
     let read_event = ledger.read_one(seq_id).unwrap();
@@ -438,7 +539,7 @@ fn test_payload_preserved() {
     ];
 
     for payload in payloads {
-        let event = EventRecord::new("test", "session", payload.clone());
+        let event = EventRecord::new("test", "session", "actor", payload.clone());
         let seq_id = ledger.append(&event).unwrap();
         let read_event = ledger.read_one(seq_id).unwrap();
         assert_eq!(read_event.payload, payload);
@@ -469,7 +570,7 @@ fn test_reader_isolation() {
     // Add initial events
     for i in 1..=5 {
         ledger
-            .append(&EventRecord::new("event", "session", vec![i]))
+            .append(&EventRecord::new("event", "session", "actor", vec![i]))
             .unwrap();
     }
 
@@ -483,11 +584,23 @@ fn test_reader_isolation() {
     // Add more events via main connection
     for i in 6..=10 {
         ledger
-            .append(&EventRecord::new("event", "session", vec![i]))
+            .append(&EventRecord::new("event", "session", "actor", vec![i]))
             .unwrap();
     }
 
     // Reader should now see all 10 (WAL provides snapshot isolation per query)
     let events = reader.read_from(1, 100).unwrap();
     assert_eq!(events.len(), 10);
+}
+
+#[test]
+fn test_actor_id_preserved() {
+    let ledger = Ledger::in_memory().unwrap();
+
+    let event = EventRecord::new("test", "session-1", "actor-456", b"payload".to_vec());
+    let seq_id = ledger.append(&event).unwrap();
+
+    let read_event = ledger.read_one(seq_id).unwrap();
+    assert_eq!(read_event.actor_id, "actor-456");
+    assert_eq!(read_event.record_version, CURRENT_RECORD_VERSION);
 }

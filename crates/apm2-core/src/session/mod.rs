@@ -61,6 +61,7 @@
 //! let event = EventRecord::with_timestamp(
 //!     "session.started",
 //!     "session-123",
+//!     "actor-456",
 //!     payload,
 //!     1_000_000_000,
 //! );

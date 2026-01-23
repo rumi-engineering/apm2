@@ -1,10 +1,19 @@
 // APM2 Kernel Event Schema
-// Version: 0.1.0
+// Version: 0.2.0
 //
 // This file defines the core event types for the APM2 kernel.
 // All events are stored in the ledger and form a hash chain.
 //
 // IMPORTANT: Maps are forbidden in signed messages to ensure canonical encoding.
+//
+// CANONICAL ENCODING REQUIREMENTS:
+// To ensure deterministic serialization (required for signature verification):
+// 1. Maps are forbidden (non-deterministic key ordering)
+// 2. Repeated fields MUST be sorted before signing:
+//    - String fields: lexicographic ordering
+//    - Numeric fields: ascending order
+// 3. Use BTreeMap for any map-like structures in Rust implementations
+// 4. Empty repeated fields should be omitted from wire format
 
 syntax = "proto3";
 package apm2.kernel.v1;
@@ -28,6 +37,9 @@ message KernelEvent {
   string session_id = 5;
   // Ed25519 signature over canonical bytes of this message
   bytes signature = 6;
+  // Schema version for forward/backward compatibility
+  // Current version: 1
+  uint32 schema_version = 7;
   // Event payload (oneof)
   oneof payload {
     SessionEvent session = 10;
@@ -37,6 +49,7 @@ message KernelEvent {
     PolicyEvent policy = 14;
     AdjudicationEvent adjudication = 15;
     EvidenceEvent evidence = 16;
+    KeyEvent key = 17;
   }
 }
 
@@ -297,4 +310,28 @@ message GateReceiptGenerated {
   string result = 4;  // PASS, FAIL
   repeated string evidence_ids = 5;
   bytes receipt_signature = 6;
+}
+
+// ============================================================
+// KEY EVENTS
+// ============================================================
+message KeyEvent {
+  oneof event {
+    KeyRotated rotated = 1;
+  }
+}
+
+// Event emitted when an actor rotates their signing key.
+// This establishes a chain of custody for key transitions.
+message KeyRotated {
+  // Actor whose key is being rotated
+  string actor_id = 1;
+  // Hash of the old verifying key (for reference)
+  bytes old_key_hash = 2;
+  // New verifying (public) key bytes
+  bytes new_verifying_key = 3;
+  // Timestamp when the rotation occurred (Unix nanos)
+  uint64 rotated_at = 4;
+  // Signature from the OLD key over this message (proves control of old key)
+  bytes old_key_signature = 5;
 }

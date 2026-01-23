@@ -372,7 +372,7 @@ mod unit_tests {
     use super::*;
 
     fn create_event(event_type: &str, session_id: &str, payload: Vec<u8>) -> EventRecord {
-        EventRecord::with_timestamp(event_type, session_id, payload, 1_000_000_000)
+        EventRecord::with_timestamp(event_type, session_id, "test-actor", payload, 1_000_000_000)
     }
 
     #[test]

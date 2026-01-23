@@ -18,20 +18,26 @@ CREATE TABLE IF NOT EXISTS events (
     -- Session identifier this event belongs to
     session_id TEXT NOT NULL,
 
+    -- Actor ID that signed this event (signer identity)
+    actor_id TEXT NOT NULL,
+
+    -- Record version for schema compatibility (current: 1)
+    record_version INTEGER NOT NULL DEFAULT 1,
+
     -- Event payload as JSON (flexible schema per event type)
     payload BLOB NOT NULL,
 
     -- Timestamp when event was recorded (nanoseconds since Unix epoch)
     timestamp_ns INTEGER NOT NULL,
 
-    -- Hash of the previous event (for hash chaining in TCK-00003)
+    -- Hash of the previous event (for hash chaining)
     -- NULL for the first event in the ledger
     prev_hash BLOB,
 
-    -- Hash of this event's content (computed in TCK-00003)
+    -- Hash of this event's content
     event_hash BLOB,
 
-    -- Signature over the event (added in TCK-00003)
+    -- Ed25519 signature over the event
     signature BLOB
 );
 
@@ -46,6 +52,10 @@ ON events (timestamp_ns);
 -- Index for event type queries
 CREATE INDEX IF NOT EXISTS idx_events_type
 ON events (event_type, seq_id);
+
+-- Index for actor-based queries
+CREATE INDEX IF NOT EXISTS idx_events_actor
+ON events (actor_id, seq_id);
 
 -- Artifact references table: content-addressable storage references
 -- Links events to their associated artifacts stored in CAS

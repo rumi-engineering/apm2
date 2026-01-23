@@ -52,7 +52,32 @@ pub enum LedgerError {
         /// The sequence ID that was not found.
         seq_id: u64,
     },
+
+    /// Hash chain verification failed.
+    #[error("hash chain broken at seq_id={seq_id}: {details}")]
+    HashChainBroken {
+        /// The sequence ID where the chain broke.
+        seq_id: u64,
+        /// Details about the failure.
+        details: String,
+    },
+
+    /// Signature verification failed.
+    #[error("signature verification failed at seq_id={seq_id}: {details}")]
+    SignatureInvalid {
+        /// The sequence ID with the invalid signature.
+        seq_id: u64,
+        /// Details about the failure.
+        details: String,
+    },
+
+    /// Crypto operation failed.
+    #[error("crypto error: {0}")]
+    Crypto(String),
 }
+
+/// Current record version for the event schema.
+pub const CURRENT_RECORD_VERSION: u32 = 1;
 
 /// A single event record in the ledger.
 #[derive(Debug, Clone)]
@@ -65,6 +90,12 @@ pub struct EventRecord {
 
     /// Session this event belongs to.
     pub session_id: String,
+
+    /// Actor ID that signed this event (signer identity).
+    pub actor_id: String,
+
+    /// Record version for schema compatibility.
+    pub record_version: u32,
 
     /// Event payload (typically JSON).
     pub payload: Vec<u8>,
@@ -87,11 +118,12 @@ impl EventRecord {
     ///
     /// The `seq_id`, `prev_hash`, `event_hash`, and `signature` fields
     /// are populated when the event is appended to the ledger or
-    /// when hash chaining is applied (TCK-00003).
+    /// when using `append_signed()` for crypto integration.
     #[must_use]
     pub fn new(
         event_type: impl Into<String>,
         session_id: impl Into<String>,
+        actor_id: impl Into<String>,
         payload: Vec<u8>,
     ) -> Self {
         let timestamp_ns = SystemTime::now()
@@ -103,6 +135,8 @@ impl EventRecord {
             seq_id: None,
             event_type: event_type.into(),
             session_id: session_id.into(),
+            actor_id: actor_id.into(),
+            record_version: CURRENT_RECORD_VERSION,
             payload,
             timestamp_ns,
             prev_hash: None,
@@ -116,6 +150,7 @@ impl EventRecord {
     pub fn with_timestamp(
         event_type: impl Into<String>,
         session_id: impl Into<String>,
+        actor_id: impl Into<String>,
         payload: Vec<u8>,
         timestamp_ns: u64,
     ) -> Self {
@@ -123,6 +158,8 @@ impl EventRecord {
             seq_id: None,
             event_type: event_type.into(),
             session_id: session_id.into(),
+            actor_id: actor_id.into(),
+            record_version: CURRENT_RECORD_VERSION,
             payload,
             timestamp_ns,
             prev_hash: None,
@@ -270,11 +307,13 @@ impl Ledger {
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
-            "INSERT INTO events (event_type, session_id, payload, timestamp_ns, prev_hash, event_hash, signature)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO events (event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 event.event_type,
                 event.session_id,
+                event.actor_id,
+                event.record_version,
                 event.payload,
                 event.timestamp_ns,
                 event.prev_hash,
@@ -302,14 +341,16 @@ impl Ledger {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO events (event_type, session_id, payload, timestamp_ns, prev_hash, event_hash, signature)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO events (event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
 
             for event in events {
                 stmt.execute(params![
                     event.event_type,
                     event.session_id,
+                    event.actor_id,
+                    event.record_version,
                     event.payload,
                     event.timestamp_ns,
                     event.prev_hash,
@@ -335,7 +376,7 @@ impl Ledger {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
              FROM events
              WHERE seq_id >= ?1
              ORDER BY seq_id ASC
@@ -348,11 +389,13 @@ impl Ledger {
                     seq_id: Some(row.get::<_, i64>(0)? as u64),
                     event_type: row.get(1)?,
                     session_id: row.get(2)?,
-                    payload: row.get(3)?,
-                    timestamp_ns: row.get::<_, i64>(4)? as u64,
-                    prev_hash: row.get(5)?,
-                    event_hash: row.get(6)?,
-                    signature: row.get(7)?,
+                    actor_id: row.get(3)?,
+                    record_version: row.get::<_, i64>(4)? as u32,
+                    payload: row.get(5)?,
+                    timestamp_ns: row.get::<_, i64>(6)? as u64,
+                    prev_hash: row.get(7)?,
+                    event_hash: row.get(8)?,
+                    signature: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -369,7 +412,7 @@ impl Ledger {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
              FROM events
              WHERE seq_id = ?1",
         )?;
@@ -379,11 +422,13 @@ impl Ledger {
                 seq_id: Some(row.get::<_, i64>(0)? as u64),
                 event_type: row.get(1)?,
                 session_id: row.get(2)?,
-                payload: row.get(3)?,
-                timestamp_ns: row.get::<_, i64>(4)? as u64,
-                prev_hash: row.get(5)?,
-                event_hash: row.get(6)?,
-                signature: row.get(7)?,
+                actor_id: row.get(3)?,
+                record_version: row.get::<_, i64>(4)? as u32,
+                payload: row.get(5)?,
+                timestamp_ns: row.get::<_, i64>(6)? as u64,
+                prev_hash: row.get(7)?,
+                event_hash: row.get(8)?,
+                signature: row.get(9)?,
             })
         })
         .map_err(|e| match e {
@@ -407,7 +452,7 @@ impl Ledger {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
              FROM events
              WHERE session_id = ?1
              ORDER BY seq_id ASC
@@ -420,11 +465,13 @@ impl Ledger {
                     seq_id: Some(row.get::<_, i64>(0)? as u64),
                     event_type: row.get(1)?,
                     session_id: row.get(2)?,
-                    payload: row.get(3)?,
-                    timestamp_ns: row.get::<_, i64>(4)? as u64,
-                    prev_hash: row.get(5)?,
-                    event_hash: row.get(6)?,
-                    signature: row.get(7)?,
+                    actor_id: row.get(3)?,
+                    record_version: row.get::<_, i64>(4)? as u32,
+                    payload: row.get(5)?,
+                    timestamp_ns: row.get::<_, i64>(6)? as u64,
+                    prev_hash: row.get(7)?,
+                    event_hash: row.get(8)?,
+                    signature: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -446,7 +493,7 @@ impl Ledger {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
              FROM events
              WHERE event_type = ?1 AND seq_id >= ?2
              ORDER BY seq_id ASC
@@ -459,11 +506,13 @@ impl Ledger {
                     seq_id: Some(row.get::<_, i64>(0)? as u64),
                     event_type: row.get(1)?,
                     session_id: row.get(2)?,
-                    payload: row.get(3)?,
-                    timestamp_ns: row.get::<_, i64>(4)? as u64,
-                    prev_hash: row.get(5)?,
-                    event_hash: row.get(6)?,
-                    signature: row.get(7)?,
+                    actor_id: row.get(3)?,
+                    record_version: row.get::<_, i64>(4)? as u32,
+                    payload: row.get(5)?,
+                    timestamp_ns: row.get::<_, i64>(6)? as u64,
+                    prev_hash: row.get(7)?,
+                    event_hash: row.get(8)?,
+                    signature: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -650,6 +699,180 @@ impl Ledger {
             conn: Arc::new(std::sync::Mutex::new(conn)),
         })
     }
+
+    /// Gets the hash of the last event in the ledger.
+    ///
+    /// Returns the genesis hash (32 zero bytes) if the ledger is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn last_event_hash(&self) -> Result<Vec<u8>, LedgerError> {
+        let conn = self.conn.lock().unwrap();
+
+        let result: Option<Option<Vec<u8>>> = conn
+            .query_row(
+                "SELECT event_hash FROM events ORDER BY seq_id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        // If no events, or event_hash is NULL, return genesis hash
+        Ok(result.flatten().unwrap_or_else(|| vec![0u8; 32]))
+    }
+
+    /// Appends a signed event to the ledger with full crypto integration.
+    ///
+    /// This method:
+    /// 1. Fetches the previous event's hash (or genesis hash if empty)
+    /// 2. Computes the event hash using `EventHasher`
+    /// 3. Signs the hash using the provided `Signer`
+    /// 4. Appends the event with all crypto fields populated
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The event to append (payload should already be
+    ///   canonicalized)
+    /// * `hasher_fn` - Function to compute the event hash
+    /// * `sign_fn` - Function to sign the hash and return signature bytes
+    ///
+    /// # Returns
+    ///
+    /// The sequence ID assigned to the event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event cannot be inserted or if crypto operations
+    /// fail.
+    pub fn append_signed<F, S>(
+        &self,
+        mut event: EventRecord,
+        hasher_fn: F,
+        sign_fn: S,
+    ) -> Result<u64, LedgerError>
+    where
+        F: FnOnce(&[u8], &[u8]) -> Vec<u8>,
+        S: FnOnce(&[u8]) -> Vec<u8>,
+    {
+        // Get the previous event's hash
+        let prev_hash = self.last_event_hash()?;
+
+        // Compute event hash
+        let event_hash = hasher_fn(&event.payload, &prev_hash);
+
+        // Sign the hash
+        let signature = sign_fn(&event_hash);
+
+        // Populate crypto fields
+        event.prev_hash = Some(prev_hash);
+        event.event_hash = Some(event_hash);
+        event.signature = Some(signature);
+
+        // Append the event
+        self.append(&event)
+    }
+
+    /// Verifies a single event's hash and signature.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The event to verify
+    /// * `expected_prev_hash` - The expected previous hash
+    /// * `verify_hash_fn` - Function to verify the event hash
+    /// * `verify_sig_fn` - Function to verify the signature (returns true if
+    ///   valid)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if verification fails.
+    pub fn verify_event<H, V>(
+        &self,
+        event: &EventRecord,
+        expected_prev_hash: &[u8],
+        verify_hash_fn: H,
+        verify_sig_fn: V,
+    ) -> Result<(), LedgerError>
+    where
+        H: FnOnce(&[u8], &[u8]) -> Vec<u8>,
+        V: FnOnce(&[u8], &[u8]) -> bool,
+    {
+        let seq_id = event.seq_id.unwrap_or(0);
+
+        // Verify prev_hash matches expected
+        let actual_prev_hash = event.prev_hash.as_deref().unwrap_or(&[]);
+        if actual_prev_hash != expected_prev_hash {
+            return Err(LedgerError::HashChainBroken {
+                seq_id,
+                details: "prev_hash mismatch".to_string(),
+            });
+        }
+
+        // Compute expected hash and verify
+        let computed_hash = verify_hash_fn(&event.payload, expected_prev_hash);
+        let actual_hash = event.event_hash.as_deref().unwrap_or(&[]);
+        if computed_hash != actual_hash {
+            return Err(LedgerError::HashChainBroken {
+                seq_id,
+                details: "event_hash mismatch".to_string(),
+            });
+        }
+
+        // Verify signature if present
+        if let Some(signature) = &event.signature {
+            if !verify_sig_fn(&computed_hash, signature) {
+                return Err(LedgerError::SignatureInvalid {
+                    seq_id,
+                    details: "signature verification failed".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verifies the entire hash chain from the beginning of the ledger.
+    ///
+    /// # Arguments
+    ///
+    /// * `verify_hash_fn` - Function to compute event hash given payload and
+    ///   `prev_hash`
+    /// * `verify_sig_fn` - Function to verify signature (returns true if valid)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any event fails verification.
+    pub fn verify_chain<H, V>(&self, verify_hash_fn: H, verify_sig_fn: V) -> Result<(), LedgerError>
+    where
+        H: Fn(&[u8], &[u8]) -> Vec<u8>,
+        V: Fn(&[u8], &[u8]) -> bool,
+    {
+        // Genesis hash (32 zero bytes)
+        let mut expected_prev_hash: Vec<u8> = vec![0u8; 32];
+
+        // Read all events in batches
+        let mut cursor = 1u64;
+        let batch_size = 1000u64;
+
+        loop {
+            let events = self.read_from(cursor, batch_size)?;
+            if events.is_empty() {
+                break;
+            }
+
+            for event in &events {
+                // Verify this event
+                self.verify_event(event, &expected_prev_hash, &verify_hash_fn, &verify_sig_fn)?;
+
+                // Update expected_prev_hash for next event
+                expected_prev_hash = event.event_hash.clone().unwrap_or_else(|| vec![0u8; 32]);
+            }
+
+            cursor = events.last().map_or(cursor, |e| e.seq_id.unwrap_or(0) + 1);
+        }
+
+        Ok(())
+    }
 }
 
 /// A read-only view of the ledger for concurrent reads.
@@ -667,7 +890,7 @@ impl LedgerReader {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
              FROM events
              WHERE seq_id >= ?1
              ORDER BY seq_id ASC
@@ -680,11 +903,13 @@ impl LedgerReader {
                     seq_id: Some(row.get::<_, i64>(0)? as u64),
                     event_type: row.get(1)?,
                     session_id: row.get(2)?,
-                    payload: row.get(3)?,
-                    timestamp_ns: row.get::<_, i64>(4)? as u64,
-                    prev_hash: row.get(5)?,
-                    event_hash: row.get(6)?,
-                    signature: row.get(7)?,
+                    actor_id: row.get(3)?,
+                    record_version: row.get::<_, i64>(4)? as u32,
+                    payload: row.get(5)?,
+                    timestamp_ns: row.get::<_, i64>(6)? as u64,
+                    prev_hash: row.get(7)?,
+                    event_hash: row.get(8)?,
+                    signature: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -701,7 +926,7 @@ impl LedgerReader {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
              FROM events
              WHERE seq_id = ?1",
         )?;
@@ -711,11 +936,13 @@ impl LedgerReader {
                 seq_id: Some(row.get::<_, i64>(0)? as u64),
                 event_type: row.get(1)?,
                 session_id: row.get(2)?,
-                payload: row.get(3)?,
-                timestamp_ns: row.get::<_, i64>(4)? as u64,
-                prev_hash: row.get(5)?,
-                event_hash: row.get(6)?,
-                signature: row.get(7)?,
+                actor_id: row.get(3)?,
+                record_version: row.get::<_, i64>(4)? as u32,
+                payload: row.get(5)?,
+                timestamp_ns: row.get::<_, i64>(6)? as u64,
+                prev_hash: row.get(7)?,
+                event_hash: row.get(8)?,
+                signature: row.get(9)?,
             })
         })
         .map_err(|e| match e {
@@ -731,11 +958,13 @@ mod unit_tests {
 
     #[test]
     fn test_event_record_new() {
-        let event = EventRecord::new("test.event", "session-1", b"payload".to_vec());
+        let event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
 
         assert!(event.seq_id.is_none());
         assert_eq!(event.event_type, "test.event");
         assert_eq!(event.session_id, "session-1");
+        assert_eq!(event.actor_id, "actor-1");
+        assert_eq!(event.record_version, CURRENT_RECORD_VERSION);
         assert_eq!(event.payload, b"payload");
         assert!(event.timestamp_ns > 0);
     }

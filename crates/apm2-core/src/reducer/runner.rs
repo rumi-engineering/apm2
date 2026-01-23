@@ -350,7 +350,7 @@ mod unit_tests {
                 } else {
                     "session.end"
                 };
-                EventRecord::new(event_type, "session-1", vec![])
+                EventRecord::new(event_type, "session-1", "test-actor", vec![])
             })
             .collect()
     }
@@ -472,7 +472,7 @@ mod unit_tests {
 
     #[test]
     fn test_apply_event_standalone() {
-        let event = EventRecord::new("session.start", "session-1", vec![]);
+        let event = EventRecord::new("session.start", "session-1", "test-actor", vec![]);
         let mut reducer = TestReducer::default();
 
         apply_event(&mut reducer, &event, 1).unwrap();

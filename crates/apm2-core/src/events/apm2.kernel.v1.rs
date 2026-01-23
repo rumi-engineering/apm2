@@ -24,8 +24,12 @@ pub struct KernelEvent {
     /// Ed25519 signature over canonical bytes of this message
     #[prost(bytes = "vec", tag = "6")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
+    /// Schema version for forward/backward compatibility
+    /// Current version: 1
+    #[prost(uint32, tag = "7")]
+    pub schema_version: u32,
     /// Event payload (oneof)
-    #[prost(oneof = "kernel_event::Payload", tags = "10, 11, 12, 13, 14, 15, 16")]
+    #[prost(oneof = "kernel_event::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17")]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
 /// Nested message and enum types in `KernelEvent`.
@@ -48,6 +52,8 @@ pub mod kernel_event {
         Adjudication(super::AdjudicationEvent),
         #[prost(message, tag = "16")]
         Evidence(super::EvidenceEvent),
+        #[prost(message, tag = "17")]
+        Key(super::KeyEvent),
     }
 }
 /// ============================================================
@@ -533,4 +539,43 @@ pub struct GateReceiptGenerated {
     pub evidence_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bytes = "vec", tag = "6")]
     pub receipt_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// ============================================================
+/// KEY EVENTS
+/// ============================================================
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct KeyEvent {
+    #[prost(oneof = "key_event::Event", tags = "1")]
+    pub event: ::core::option::Option<key_event::Event>,
+}
+/// Nested message and enum types in `KeyEvent`.
+pub mod key_event {
+    #[derive(Eq, Hash)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        Rotated(super::KeyRotated),
+    }
+}
+/// Event emitted when an actor rotates their signing key.
+/// This establishes a chain of custody for key transitions.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct KeyRotated {
+    /// Actor whose key is being rotated
+    #[prost(string, tag = "1")]
+    pub actor_id: ::prost::alloc::string::String,
+    /// Hash of the old verifying key (for reference)
+    #[prost(bytes = "vec", tag = "2")]
+    pub old_key_hash: ::prost::alloc::vec::Vec<u8>,
+    /// New verifying (public) key bytes
+    #[prost(bytes = "vec", tag = "3")]
+    pub new_verifying_key: ::prost::alloc::vec::Vec<u8>,
+    /// Timestamp when the rotation occurred (Unix nanos)
+    #[prost(uint64, tag = "4")]
+    pub rotated_at: u64,
+    /// Signature from the OLD key over this message (proves control of old key)
+    #[prost(bytes = "vec", tag = "5")]
+    pub old_key_signature: ::prost::alloc::vec::Vec<u8>,
 }
