@@ -1,0 +1,300 @@
+// APM2 Kernel Event Schema
+// Version: 0.1.0
+//
+// This file defines the core event types for the APM2 kernel.
+// All events are stored in the ledger and form a hash chain.
+//
+// IMPORTANT: Maps are forbidden in signed messages to ensure canonical encoding.
+
+syntax = "proto3";
+package apm2.kernel.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Common envelope for all kernel events
+message KernelEvent {
+  // Monotonic sequence number within this ledger
+  uint64 sequence = 1;
+  // Hash of the previous event.
+  // For genesis events: use 32 zero bytes (canonical representation).
+  // Note: The ledger may store NULL for genesis as a storage optimization,
+  // but it must be normalized to 32 zero bytes at API boundaries.
+  bytes previous_hash = 2;
+  // Timestamp when event was created
+  google.protobuf.Timestamp timestamp = 3;
+  // Actor ID that produced this event
+  string actor_id = 4;
+  // Session ID (if applicable)
+  string session_id = 5;
+  // Ed25519 signature over canonical bytes of this message
+  bytes signature = 6;
+  // Event payload (oneof)
+  oneof payload {
+    SessionEvent session = 10;
+    WorkEvent work = 11;
+    ToolEvent tool = 12;
+    LeaseEvent lease = 13;
+    PolicyEvent policy = 14;
+    AdjudicationEvent adjudication = 15;
+    EvidenceEvent evidence = 16;
+  }
+}
+
+// ============================================================
+// SESSION EVENTS
+// ============================================================
+message SessionEvent {
+  oneof event {
+    SessionStarted started = 1;
+    SessionProgress progress = 2;
+    SessionTerminated terminated = 3;
+    SessionQuarantined quarantined = 4;
+  }
+}
+
+message SessionStarted {
+  string session_id = 1;
+  string actor_id = 2;
+  string adapter_type = 3;
+  string work_id = 4;
+  string lease_id = 5;
+  uint64 entropy_budget = 6;
+}
+
+message SessionProgress {
+  string session_id = 1;
+  uint64 progress_sequence = 2;
+  string progress_type = 3;  // HEARTBEAT, TOOL_COMPLETE, MILESTONE
+  uint64 entropy_consumed = 4;
+}
+
+message SessionTerminated {
+  string session_id = 1;
+  string exit_classification = 2;  // SUCCESS, FAILURE, TIMEOUT, ENTROPY_EXCEEDED
+  string rationale_code = 3;
+  uint64 final_entropy = 4;
+}
+
+message SessionQuarantined {
+  string session_id = 1;
+  string reason = 2;
+  uint64 quarantine_until = 3;
+}
+
+// ============================================================
+// WORK EVENTS
+// ============================================================
+message WorkEvent {
+  oneof event {
+    WorkOpened opened = 1;
+    WorkTransitioned transitioned = 2;
+    WorkCompleted completed = 3;
+    WorkAborted aborted = 4;
+  }
+}
+
+message WorkOpened {
+  string work_id = 1;
+  string work_type = 2;  // TICKET, PRD_REFINEMENT, RFC_REFINEMENT, REVIEW
+  bytes spec_snapshot_hash = 3;
+  repeated string requirement_ids = 4;
+  repeated string parent_work_ids = 5;
+}
+
+message WorkTransitioned {
+  string work_id = 1;
+  string from_state = 2;
+  string to_state = 3;  // OPEN, CLAIMED, IN_PROGRESS, REVIEW, NEEDS_INPUT, NEEDS_ADJUDICATION
+  string rationale_code = 4;
+}
+
+message WorkCompleted {
+  string work_id = 1;
+  bytes evidence_bundle_hash = 2;
+  repeated string evidence_ids = 3;
+  string gate_receipt_id = 4;
+}
+
+message WorkAborted {
+  string work_id = 1;
+  string abort_reason = 2;  // POLICY_DENY, TIMEOUT, ENTROPY_EXCEEDED, MANUAL
+  string rationale_code = 3;
+}
+
+// ============================================================
+// TOOL EVENTS
+// ============================================================
+message ToolEvent {
+  oneof event {
+    ToolRequested requested = 1;
+    ToolDecided decided = 2;
+    ToolExecuted executed = 3;
+  }
+}
+
+message ToolRequested {
+  string request_id = 1;
+  string session_id = 2;
+  string tool_name = 3;
+  bytes tool_args_hash = 4;  // Hash of arguments (full args stored in CAS)
+  string dedupe_key = 5;
+}
+
+message ToolDecided {
+  string request_id = 1;
+  string decision = 2;  // ALLOW, DENY
+  string rule_id = 3;
+  bytes policy_hash = 4;
+  string rationale_code = 5;
+  uint64 budget_consumed = 6;
+}
+
+message ToolExecuted {
+  string request_id = 1;
+  string outcome = 2;  // SUCCESS, FAILURE, TIMEOUT
+  bytes result_hash = 3;  // Hash of result (full result stored in CAS)
+  uint64 duration_ms = 4;
+}
+
+// ============================================================
+// LEASE EVENTS
+// ============================================================
+message LeaseEvent {
+  oneof event {
+    LeaseIssued issued = 1;
+    LeaseRenewed renewed = 2;
+    LeaseReleased released = 3;
+    LeaseExpired expired = 4;
+    LeaseConflict conflict = 5;
+  }
+}
+
+message LeaseIssued {
+  string lease_id = 1;
+  string work_id = 2;
+  string actor_id = 3;
+  uint64 issued_at = 4;
+  uint64 expires_at = 5;
+  bytes registrar_signature = 6;
+}
+
+message LeaseRenewed {
+  string lease_id = 1;
+  uint64 new_expires_at = 2;
+  bytes registrar_signature = 3;
+}
+
+message LeaseReleased {
+  string lease_id = 1;
+  string release_reason = 2;  // COMPLETED, ABORTED, VOLUNTARY
+}
+
+message LeaseExpired {
+  string lease_id = 1;
+  uint64 expired_at = 2;
+}
+
+message LeaseConflict {
+  string work_id = 1;
+  repeated string conflicting_lease_ids = 2;
+  string resolution = 3;  // CANONICAL_ROOT, ADJUDICATION_REQUIRED
+}
+
+// ============================================================
+// POLICY EVENTS
+// ============================================================
+message PolicyEvent {
+  oneof event {
+    PolicyLoaded loaded = 1;
+    PolicyViolation violation = 2;
+    BudgetExceeded budget_exceeded = 3;
+  }
+}
+
+message PolicyLoaded {
+  bytes policy_hash = 1;
+  string policy_version = 2;
+  uint64 rule_count = 3;
+}
+
+message PolicyViolation {
+  string session_id = 1;
+  string violation_type = 2;
+  string rule_id = 3;
+  string details = 4;
+}
+
+message BudgetExceeded {
+  string session_id = 1;
+  string budget_type = 2;  // TOKEN, TIME, TOOL_CALLS
+  uint64 limit = 3;
+  uint64 consumed = 4;
+}
+
+// ============================================================
+// ADJUDICATION EVENTS
+// ============================================================
+message AdjudicationEvent {
+  oneof event {
+    AdjudicationRequested requested = 1;
+    AdjudicationVote vote = 2;
+    AdjudicationResolved resolved = 3;
+    AdjudicationTimeout timeout = 4;
+  }
+}
+
+message AdjudicationRequested {
+  string adjudication_id = 1;
+  string work_id = 2;
+  string request_type = 3;  // BOUNDED_CHOICE, WAIVER, GATE_REVIEW
+  repeated string options = 4;
+  uint64 deadline = 5;
+  string fallback_policy = 6;
+}
+
+message AdjudicationVote {
+  string adjudication_id = 1;
+  string voter_actor_id = 2;
+  string chosen_option = 3;
+  bytes voter_signature = 4;
+}
+
+message AdjudicationResolved {
+  string adjudication_id = 1;
+  string chosen_option = 2;
+  uint64 votes_for = 3;
+  uint64 votes_against = 4;
+  bytes quorum_signature = 5;
+}
+
+message AdjudicationTimeout {
+  string adjudication_id = 1;
+  string applied_fallback = 2;
+}
+
+// ============================================================
+// EVIDENCE EVENTS
+// ============================================================
+message EvidenceEvent {
+  oneof event {
+    EvidencePublished published = 1;
+    GateReceiptGenerated gate_receipt = 2;
+  }
+}
+
+message EvidencePublished {
+  string evidence_id = 1;
+  string work_id = 2;
+  string category = 3;
+  bytes artifact_hash = 4;
+  repeated string verification_command_ids = 5;
+}
+
+message GateReceiptGenerated {
+  string receipt_id = 1;
+  string gate_id = 2;
+  string work_id = 3;
+  string result = 4;  // PASS, FAIL
+  repeated string evidence_ids = 5;
+  bytes receipt_signature = 6;
+}
