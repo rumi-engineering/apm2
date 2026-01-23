@@ -441,6 +441,151 @@ pub fn should_restart(&self, exit_code: Option<i32>) -> bool { ... }
 
 **Why it's safe:** The compiler warns when return values are ignored, catching bugs where callers forget to handle results.
 
+### 2.10 Safe Path Construction
+
+**Pattern:** Never interpolate user-provided identifiers directly into file paths. Sanitize input or use a mapping to prevent path traversal.
+
+**Example of what to avoid:**
+```rust
+// UNSAFE: actor_id could be "../../../etc/passwd"
+let path = PathBuf::from("keys").join(actor_id);
+```
+
+**Safe Alternative:**
+```rust
+// Validate the identifier format
+if !actor_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+    return Err(Error::InvalidId);
+}
+let path = PathBuf::from("keys").join(actor_id);
+```
+
+**When to use:**
+- Any time a file path is constructed from external input (IDs, names, etc.)
+- When storing user-specific data on disk
+
+**Why it's safe:** Prevents path traversal vulnerabilities where an attacker can escape the intended directory.
+
+---
+
+### 2.11 Canonical Data Representation
+
+**Pattern:** Define a single, canonical representation for critical constants (like genesis hashes) and normalize data at system boundaries.
+
+**Example:**
+```rust
+/// The canonical representation of the genesis previous hash (32 zero bytes).
+pub const GENESIS_PREV_HASH: [u8; 32] = [0u8; 32];
+
+pub fn normalize_hash(hash: Option<&[u8]>) -> [u8; 32] {
+    match hash {
+        Some(h) if h.len() == 32 => {
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(h);
+            buf
+        }
+        _ => GENESIS_PREV_HASH,
+    }
+}
+```
+
+**When to use:**
+- Cross-layer data exchange (Crypto -> Proto -> DB)
+- Default or "null" values for cryptographic identifiers
+
+**Why it's safe:** Prevents verification failures caused by inconsistent representations of the same semantic value.
+
+---
+
+### 2.12 Secure Directory Creation
+
+**Pattern:** Use platform-specific extensions like `DirBuilderExt` to set restrictive permissions *atomically* during directory creation.
+
+**Example (Unix):**
+```rust
+#[cfg(unix)]
+{
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700); // Private to the user
+    builder.create(path)?;
+}
+```
+
+**When to use:**
+- Creating directories for sensitive data (keys, credentials)
+- Multi-user environments where default permissions are too permissive
+
+**Why it's safe:** Prevents a race condition where a directory is created with wide permissions before `chmod` can restrict it.
+
+---
+
+### 2.13 Cryptographic Canonicalization (Ordering)
+
+**Pattern:** When signing or hashing collections of items, always apply a deterministic sort order before serialization.
+
+**Example:**
+```rust
+pub fn prepare_for_signing(mut items: Vec<Item>) -> Vec<u8> {
+    // Sort by a stable key to ensure deterministic output
+    items.sort_by(|a, b| a.id.cmp(&b.id));
+    serialize(&items)
+}
+```
+
+**When to use:**
+- Signing Protobuf repeated fields
+- Hashing sets or maps
+- Any multi-party signature verification
+
+**Why it's safe:** Ensures that semantically identical data always produces the same signature, regardless of how it was collected in memory.
+
+---
+
+### 2.14 Platform Portability Guards
+
+**Pattern:** Explicitly gate any use of platform-specific modules or extensions with `#[cfg(...)]`.
+
+**Example:**
+```rust
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
+pub fn get_inode(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+```
+
+**When to use:**
+- Using `std::os::unix` or `std::os::windows`
+- Calling platform-specific syscalls
+- File system operations that vary by OS
+
+**Why it's safe:** Prevents compilation failures and unexpected behavior when the code is ported to other operating systems.
+
+---
+
+### 2.15 Consistency in State Management
+
+**Pattern:** Ensure that in-memory state implementations and persistent storage implementations exhibit identical behavior for edge cases (e.g., overwrites).
+
+**Pattern:** If a `FileStore` returns an error on an existing key, the `MemoryStore` should not silently overwrite it.
+
+**When to use:**
+- Implementing traits for multiple backends
+- Switching between mock and production implementations
+
+**Why it's safe:** Prevents "it works in tests but fails in production" bugs where the mock behavior diverges from real-world constraints.
+
 ---
 
 ## 3. The fork() Exception: Case Study
