@@ -1,0 +1,57 @@
+prd_customer:
+  version: 1
+
+  personas:
+    primary:
+      name: "Multi-Agent System Developer"
+      goals:
+        - "Programmatically orchestrate multiple AI CLI agents"
+        - "Build automation pipelines that interact with Claude Code, Gemini CLI, Codex CLI"
+        - "Monitor and introspect agent conversations and tool usage"
+        - "Create higher-level abstractions on top of CLI agents"
+      pains:
+        - "CLI agents are designed for human terminal interaction only"
+        - "No structured API to send prompts and receive responses"
+        - "Cannot query conversation history or session state programmatically"
+        - "No way to monitor tool calls in real-time"
+        - "Building multi-agent systems requires fragile screen-scraping or custom hacks"
+    secondary:
+      - name: "AI Tool Developer"
+        goals:
+          - "Build UIs and dashboards for AI CLI agents"
+          - "Create testing harnesses for agent behaviors"
+        pains:
+          - "Must parse raw terminal output to understand agent state"
+          - "No event stream for real-time updates"
+      - name: "DevOps/Platform Engineer"
+        goals:
+          - "Deploy and manage AI agents in production environments"
+          - "Collect metrics and observability data from agents"
+        pains:
+          - "No standard metrics emission from CLI agents"
+          - "Difficult to integrate agents into existing monitoring stacks"
+
+  narrative:
+    one_sentence: "APM2 provides a gRPC-based protocol that enables programmatic, human-like interaction with AI CLI agents, turning terminal-only tools into building blocks for automation and multi-agent systems."
+    why_now:
+      - "AI CLI agents (Claude Code, Gemini CLI, Codex CLI) are maturing rapidly"
+      - "Multi-agent architectures are emerging as the dominant pattern for complex AI tasks"
+      - "No standard protocol exists for programmatic agent interaction"
+      - "Current APM2 uses Unix socket IPC which limits interoperability"
+
+  press_release:
+    headline: "APM2 Introduces Agent Interaction Protocol - The gRPC API for AI CLI Agents"
+    customer_problem: "Developers building multi-agent systems must resort to fragile hacks to interact with AI CLI tools programmatically."
+    whats_new: "APM2 now exposes a gRPC-based Agent Interaction Protocol (AIP) that provides structured APIs for agent lifecycle management, interactive I/O, session introspection, and metrics collection."
+    why_better: "AIP treats CLI agents as first-class programmatic resources with proper APIs, not terminal applications requiring screen-scraping."
+    quote_customer: "We can finally build reliable multi-agent workflows without wrestling with terminal escape codes."
+    quote_internal: "AIP is the missing foundation layer that makes AI CLI agents composable."
+    availability: "Available in APM2 v0.2.0"
+
+  faq:
+    - q: "Who is this for?"
+      a: "Developers building automation, orchestration, or multi-agent systems on top of AI CLI tools like Claude Code, Gemini CLI, or Codex CLI."
+    - q: "Who is this NOT for?"
+      a: "End users who interact with AI CLI tools directly in their terminal. AIP is infrastructure for tool builders, not a replacement for the terminal experience."
+    - q: "What are the top 3 user journeys?"
+      a: "1) Spawn an agent, send a prompt, receive structured response. 2) Stream agent output and tool calls in real-time. 3) Query conversation history for a session."

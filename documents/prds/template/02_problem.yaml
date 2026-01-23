@@ -1,0 +1,25 @@
+prd_problem:
+  version: 1
+
+  problem_statement: "<ONE SENTENCE>"
+  current_state:
+    - "<FACT 1>"
+    - "<FACT 2>"
+  desired_state:
+    - "<FACT 1>"
+    - "<FACT 2>"
+
+  why_now:
+    - "<REASON>"
+
+  cost_of_inaction:
+    qualitative:
+      - "<COST>"
+    quantitative:
+      - metric: "<METRIC NAME>"
+        current: "<VALUE>"
+        projected: "<VALUE>"
+        window: "<TIME WINDOW>"
+
+  constraints_summary:
+    - "<TOP CONSTRAINT>"

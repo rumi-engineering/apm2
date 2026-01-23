@@ -1,0 +1,37 @@
+prd_meta:
+  version: 1
+  prd_id: "<PRD-ID>" # e.g., "DMIFF-PRD-0001" or "DMIFF-0001"
+  project_id: "<PROJECT-ID>" # stable product/workstream name
+  title: "<TITLE>"
+  status: "DRAFT" # DRAFT | IN_REVIEW | APPROVED | REJECTED | SUPERSEDED
+  last_updated: "<YYYY-MM-DD>"
+
+  owners:
+    - role: "Product Owner"
+      name: "<TEAM-OR-PERSON>"
+    - role: "System Owner"
+      name: "<TEAM-OR-PERSON>"
+    - role: "Security Governor"
+      name: "<TEAM-OR-PERSON>"
+    - role: "Ops/SRE Owner"
+      name: "<TEAM-OR-PERSON>"
+
+  links:
+    repo_root: "."
+    prd_path: "rfcs/<PRD-ID>/PRD.yaml"
+    rfc_path: "" # "rfcs/<PRD-ID>/RFC.yaml" if RFC exists or is planned
+    discussions: [] # repo-relative paths or issue IDs
+
+  id_conventions:
+    requirement_id_format: "REQ-<PRD-ID>-NNNN"
+    deliverable_id_format: "DELIV-<PRD-ID>-NNNN"
+    e2e_id_format: "E2E-<PRD-ID>-NNNN"
+    risk_id_format: "RISK-<PRD-ID>-NNNN"
+    question_id_format: "Q-<PRD-ID>-NNNN"
+    decision_id_format: "DEC-<PRD-ID>-NNNN"
+
+  execution_path:
+    mode: "RFC_REQUIRED" # DIRECT_TASKS | RFC_REQUIRED
+    rationale: "<SHORT STRING>"
+    rfc_trigger_conditions:
+      - "<CONDITION>" # e.g., "new persistence format", "new trust boundary", "new public API"

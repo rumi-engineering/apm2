@@ -1,0 +1,65 @@
+prd_constraints_invariants:
+  version: 1
+
+  security:
+    posture:
+      default_deny: false  # Local-only daemon, no remote access in v1
+      fail_closed: true
+      least_privilege: true
+      tamper_evidence_required: false  # No persistence integrity requirements yet
+    threat_model: "Local attacker with user-level access; no remote attack surface in initial release"
+    invariants:
+      - id: "SECINV-0001"
+        statement: "gRPC server binds to localhost only by default"
+      - id: "SECINV-0002"
+        statement: "Agent processes run with same privileges as daemon (no privilege escalation)"
+      - id: "SECINV-0003"
+        statement: "No credentials or secrets are stored or transmitted by AIP protocol"
+      - id: "SECINV-0004"
+        statement: "Input to agents is not sanitized (pass-through to PTY) - clients responsible for content"
+    standards_references:
+      - "SANDBOX_CONTAINER_STANDARD - agents inherit daemon sandbox if any"
+      - "LOGGING_OBSERVABILITY_STANDARD - structured logging for all operations"
+
+  data_sensitivity:
+    classes_used:
+      - "Sensitive"
+      - "Public"
+    artifact_classification_expectations:
+      - artifact: "session_store (in-memory)"
+        class: "Sensitive"
+      - artifact: "conversation_history"
+        class: "Sensitive"
+      - artifact: "agent_output"
+        class: "Sensitive"
+      - artifact: "proto_definitions"
+        class: "Public"
+      - artifact: "metrics_data"
+        class: "Public"
+
+  compatibility:
+    supported_platforms:
+      - os: "linux"
+        arch: "amd64"
+      - os: "linux"
+        arch: "arm64"
+      - os: "darwin"
+        arch: "arm64"
+    backwards_compatibility_required: true
+    compatibility_notes:
+      - "Unix socket IPC remains functional during v0.2.x"
+      - "Unix socket deprecated in v0.3.0, removed in v1.0.0"
+      - "gRPC runs on separate port (50051) to avoid conflicts"
+
+  operational_budgets:
+    gate_e2e_suite_budget_s: 120
+    max_startup_preflight_s: 5
+
+  failure_behavior:
+    fail_closed_cases:
+      - "gRPC server fails to bind - daemon exits"
+      - "PTY allocation fails - CreateAgent returns error"
+      - "Agent process spawn fails - StartAgent returns error"
+      - "Session store corruption - operations return INTERNAL error"
+    degraded_mode_allowed: true
+    degraded_mode_description: "If output parser fails, raw output still streamed; structured data may be incomplete"

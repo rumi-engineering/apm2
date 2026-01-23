@@ -1,0 +1,16 @@
+rfc_meta:
+  version: 1
+  rfc_id: "<RFC-ID>"
+  project_id: "<PROJECT>"
+  title: "<Title>"
+  status: "DRAFT" # DRAFT | IN_REVIEW | APPROVED | REJECTED | SUPERSEDED
+  owners:
+    - "<name-or-team>"
+  last_updated: "<YYYY-MM-DD>"
+  links:
+    prd: "rfcs/<RFC-ID>/PRD.md"
+    repo_root: "."
+  intent:
+    one_sentence: "<What this RFC accomplishes>"
+    success_criteria_brief:
+      - "<brief, measurable>"
