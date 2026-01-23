@@ -1,26 +1,17 @@
 prd_success_metrics:
-  version: 1
-
-  outcome_metrics:
-    - id: "METRIC-0001"
-      name: "<NAME>"
-      baseline: "<VALUE>"
-      target: "<VALUE>"
-      measurement_window: "<TIME WINDOW>"
-      source_of_truth: "<SYSTEM>"
-
-  quality_metrics:
-    - id: "SLO-0001"
-      name: "<NAME>"
-      sli: "<SHORT>"
-      objective: "<VALUE>"
-      window: "<TIME WINDOW>"
-      alerting_required: true
-
-  adoption_metrics:
-    - id: "ADOPT-0001"
-      name: "<NAME>"
-      baseline: "<VALUE>"
-      target: "<VALUE>"
-      window: "<TIME WINDOW>"
-      source_of_truth: "<SYSTEM>"
+  schema_version: "2026-01-23"
+  template_version: 2
+  metrics:
+    - id: "MET-0001"
+      name: ""
+      description: ""
+      baseline: ""
+      target: ""
+      measurement_method: ""
+      evidence_ids: []
+  guardrails:
+    - id: "GRD-0001"
+      name: ""
+      threshold: ""
+      response_plan: ""
+      evidence_ids: []

@@ -1,37 +1,31 @@
 prd_meta:
-  version: 1
-  prd_id: "<PRD-ID>" # e.g., "DMIFF-PRD-0001" or "DMIFF-0001"
-  project_id: "<PROJECT-ID>" # stable product/workstream name
-  title: "<TITLE>"
-  status: "DRAFT" # DRAFT | IN_REVIEW | APPROVED | REJECTED | SUPERSEDED
-  last_updated: "<YYYY-MM-DD>"
-
-  owners:
-    - role: "Product Owner"
-      name: "<TEAM-OR-PERSON>"
-    - role: "System Owner"
-      name: "<TEAM-OR-PERSON>"
-    - role: "Security Governor"
-      name: "<TEAM-OR-PERSON>"
-    - role: "Ops/SRE Owner"
-      name: "<TEAM-OR-PERSON>"
-
-  links:
-    repo_root: "."
-    prd_path: "rfcs/<PRD-ID>/PRD.yaml"
-    rfc_path: "" # "rfcs/<PRD-ID>/RFC.yaml" if RFC exists or is planned
-    discussions: [] # repo-relative paths or issue IDs
-
-  id_conventions:
-    requirement_id_format: "REQ-<PRD-ID>-NNNN"
-    deliverable_id_format: "DELIV-<PRD-ID>-NNNN"
-    e2e_id_format: "E2E-<PRD-ID>-NNNN"
-    risk_id_format: "RISK-<PRD-ID>-NNNN"
-    question_id_format: "Q-<PRD-ID>-NNNN"
-    decision_id_format: "DEC-<PRD-ID>-NNNN"
-
-  execution_path:
-    mode: "RFC_REQUIRED" # DIRECT_TASKS | RFC_REQUIRED
-    rationale: "<SHORT STRING>"
-    rfc_trigger_conditions:
-      - "<CONDITION>" # e.g., "new persistence format", "new trust boundary", "new public API"
+  schema_version: "2026-01-23"
+  template_version: 2
+  prd:
+    id: ""
+    title: ""
+    status: "DRAFT"
+    created_date: ""
+    last_updated_date: ""
+  protocol_profile:
+    id: "NONE"
+    applies: false
+    profile_ref: ""
+  custody:
+    producing_agent_roles:
+      - "AGENT_AUTHOR"
+    responsible_domains:
+      - "DOMAIN_PRODUCT"
+      - "DOMAIN_SECURITY"
+    authority_signoffs_required:
+      - "AUTH_PRODUCT"
+      - "AUTH_SECURITY"
+  refs:
+    standards:
+      requirement_schema: "standards/schemas/02_requirement.schema.yaml#requirement_schema"
+      evidence_artifact_schema: "standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema"
+      quality_coverage_schema: "standards/schemas/03_quality_coverage.schema.yaml#quality_coverage_schema"
+      gate_review_schema: "standards/schemas/06_gate_review.schema.yaml#gate_review_schema"
+      waiver_schema: "standards/schemas/05_waiver.schema.yaml#waiver_schema"
+      ticket_meta_schema: "standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema"
+      lint_spec: "standards/lint/LINT_SPEC.yaml#lint_spec"
