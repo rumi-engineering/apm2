@@ -355,7 +355,7 @@ fn test_large_payload() {
     let opened = WorkOpened {
         work_id: "work-large".to_string(),
         work_type: "TICKET".to_string(),
-        spec_snapshot_hash: large_hash.clone(),
+        spec_snapshot_hash: large_hash,
         requirement_ids: (0..100).map(|i| format!("REQ-{i:04}")).collect(),
         parent_work_ids: vec![],
     };
