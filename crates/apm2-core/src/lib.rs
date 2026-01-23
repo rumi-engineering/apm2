@@ -44,6 +44,7 @@ pub mod log;
 pub mod process;
 pub mod reducer;
 pub mod restart;
+pub mod session;
 pub mod shutdown;
 pub mod state;
 pub mod supervisor;

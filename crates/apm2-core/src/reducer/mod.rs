@@ -64,4 +64,4 @@ pub use checkpoint::{Checkpoint, CheckpointStore, CheckpointStoreError};
 pub use runner::{
     ReducerRunResult, ReducerRunner, ReducerRunnerConfig, ReducerRunnerError, apply_event,
 };
-pub use traits::{Reducer, ReducerContext};
+pub use traits::{CheckpointableReducer, Reducer, ReducerContext};
