@@ -74,6 +74,12 @@ prost = "0.13"
 prost-types = "0.13"
 prost-build = "0.13"
 
+# Cryptography
+blake3 = "1.5"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+zeroize = { version = "1.8", features = ["derive"] }
+
 # Internal crates
 apm2-core = { version = "0.1.0", path = "crates/apm2-core" }
 
