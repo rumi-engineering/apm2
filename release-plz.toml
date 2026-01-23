@@ -2,6 +2,8 @@
 # https://release-plz.dev/docs/config
 
 [workspace]
+# Disable crates.io publishing until v1.0.0
+publish = false
 # Disable changelog generation (re-enable after first release)
 changelog_update = false
 # Create GitHub releases
