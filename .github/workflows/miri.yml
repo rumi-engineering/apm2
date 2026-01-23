@@ -29,6 +29,8 @@ jobs:
         with:
           toolchain: nightly
           components: miri
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
       - name: Setup Miri
         run: cargo miri setup
