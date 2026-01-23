@@ -1,6 +1,6 @@
 aip_rfc_interop_tests:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   test_vectors:
     - id: "TV-0001"
       message_type: ""

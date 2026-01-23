@@ -1,5 +1,5 @@
 quality_applicability:
-  version: 1
+  schema_version: "2026-01-23"
   enum_id: "ENUM_QUALITY_APPLICABILITY_V1"
   values:
     - "APPLIES"

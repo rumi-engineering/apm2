@@ -1,6 +1,6 @@
 requirements_index:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   prd_id: "AIP-0001"
   description: "Individual requirement files for AIP-0001 PRD"
   requirements:

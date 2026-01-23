@@ -1,6 +1,6 @@
 rfc_rollout_and_ops:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   rollout_plan:
     phases:
       - id: "ROL-0001"
@@ -8,7 +8,7 @@ rfc_rollout_and_ops:
         steps: []
         guardrails: []
         rollback_steps: []
-        required_evidence_ids: []
+        evidence_ids: []
   operability:
     runbooks: []
     alarms: []

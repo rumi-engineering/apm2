@@ -1,6 +1,6 @@
 
 authority_roles:
-  version: 1
+  schema_version: "2026-01-23"
   enum_id: "ENUM_AUTHORITY_ROLE_V1"
   values:
     - "AUTH_ARCHITECTURE"

@@ -1,5 +1,5 @@
 ticket_status:
-  version: 1
+  schema_version: "2026-01-23"
   enum_id: "ENUM_TICKET_STATUS_V1"
   values:
     - "DRAFT"

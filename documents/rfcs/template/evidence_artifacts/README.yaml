@@ -1,6 +1,6 @@
 rfc_evidence_artifacts_readme:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   description: "RFC evidence artifact definition files (one artifact per file). Filenames MUST be <evidence_id>.yaml."
   required_conventions:
     - "Root key MUST be rfc_evidence_artifact."

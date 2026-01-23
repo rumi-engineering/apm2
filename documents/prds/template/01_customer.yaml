@@ -1,6 +1,6 @@
 prd_customer:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   segments:
     - id: "CUST-0001"
       name: ""

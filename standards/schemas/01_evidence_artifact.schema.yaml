@@ -1,5 +1,5 @@
 evidence_artifact_schema:
-  version: 2
+  schema_version: "2026-01-23"
   schema_id: "SCHEMA_EVIDENCE_ARTIFACT_V2"
   required_keys:
     - "id"

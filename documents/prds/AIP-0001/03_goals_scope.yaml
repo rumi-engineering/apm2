@@ -1,5 +1,5 @@
 prd_goals_scope:
-  version: 1
+  version: "2026-01-23"
 
   goals_ranked:
     - id: "GOAL-0001"

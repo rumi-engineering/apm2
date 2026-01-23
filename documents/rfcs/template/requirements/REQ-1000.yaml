@@ -1,6 +1,6 @@
 rfc_requirement:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   id: "REQ-1000"
   type: "OPERABILITY"
   title: ""

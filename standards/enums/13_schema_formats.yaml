@@ -1,5 +1,5 @@
 schema_formats:
-  version: 1
+  schema_version: "2026-01-23"
   enum_id: "ENUM_SCHEMA_FORMAT_V1"
   values:
     - "JSON_SCHEMA"

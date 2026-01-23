@@ -1,5 +1,5 @@
-prd_meta_schema:
-  version: 1
+prd_meta:
+  schema_version: "2026-01-23"
   schema_id: "SCHEMA_PRD_META_V1"
   required_keys:
     - "prd"

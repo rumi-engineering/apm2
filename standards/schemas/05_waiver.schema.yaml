@@ -1,5 +1,5 @@
 waiver_schema:
-  version: 1
+  schema_version: "2026-01-23"
   schema_id: "SCHEMA_WAIVER_V1"
   required_keys:
     - "id"

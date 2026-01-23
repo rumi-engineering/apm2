@@ -1,6 +1,6 @@
 work_templates_readme:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   description: "Engineering ticket templates (atomic). Each ticket is Markdown plus a YAML companion metadata file."
   required_files_per_ticket:
     - "<ticket_id>.md"

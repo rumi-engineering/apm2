@@ -1,6 +1,6 @@
 rfc_trust_boundaries:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   boundaries:
     - id: "TB-0001"
       name: ""
@@ -12,4 +12,4 @@ rfc_trust_boundaries:
         authn: ""
         authz: ""
       risks: []
-      required_evidence_ids: []
+      evidence_ids: []

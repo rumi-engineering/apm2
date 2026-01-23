@@ -1,6 +1,6 @@
 rfc_governance_and_gates:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   governance_id: "RFC_GOVERNANCE_V1"
   gates:
     - gate_id: "GATE-RFC-ARCHITECTURE"

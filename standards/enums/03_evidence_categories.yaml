@@ -1,5 +1,5 @@
 evidence_categories:
-  version: 2
+  schema_version: "2026-01-23"
   enum_id: "ENUM_EVIDENCE_CATEGORY_V2"
   values:
     - "AUDIT_LOGS"

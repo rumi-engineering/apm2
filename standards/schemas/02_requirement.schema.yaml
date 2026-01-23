@@ -1,5 +1,5 @@
 requirement_schema:
-  version: 2
+  schema_version: "2026-01-23"
   schema_id: "SCHEMA_REQUIREMENT_V2"
   required_keys:
     - "id"

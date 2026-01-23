@@ -1,5 +1,5 @@
 prd_problem:
-  version: 1
+  version: "2026-01-23"
 
   problem_statement: "AI CLI tools are designed exclusively for human terminal interaction, with no standard protocol for programmatic control, session introspection, or integration into automated systems."
 

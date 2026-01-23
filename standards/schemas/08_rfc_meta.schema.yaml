@@ -1,5 +1,5 @@
-rfc_meta_schema:
-  version: 1
+rfc_meta:
+  schema_version: "2026-01-23"
   schema_id: "SCHEMA_RFC_META_V1"
   required_keys:
     - "rfc"

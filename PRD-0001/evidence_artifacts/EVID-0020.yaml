@@ -1,0 +1,25 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: EVID-0020
+  category: CHANGELOG_ENTRIES
+  title: Versioned documentation and changelog entries for contracts and releases
+  capture:
+    paths:
+    - docs/
+  verification:
+    commands:
+    - id: CMD-0020
+      shell: bash
+      command: ./scripts/evidence/verify_docs_and_changelog.sh --required CHANGELOG.md
+      expected_exit_code: 0
+      cwd: .
+      timeout_seconds: 300
+      network_access: DISALLOWED
+  data:
+    classification: INTERNAL
+    redaction:
+      required: false
+      guidance:
+      - Documentation must not include secrets; ensure examples use placeholders or
+        synthetic data.

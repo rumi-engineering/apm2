@@ -1,5 +1,5 @@
 custody_roles:
-  version: 2
+  schema_version: "2026-01-23"
   enum_id: "ENUM_CUSTODY_ROLE_V2"
   values:
     - "AGENT_AUTHOR"

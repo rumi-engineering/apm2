@@ -1,6 +1,6 @@
 aip_profile:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   profile_id: "AIP_PROFILE_V1"
   intent: "Standardize requirements/evidence for AIP/Bedrock protocol integrations."
   versioning:

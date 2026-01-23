@@ -1,13 +1,13 @@
 rfc_risks_and_open_questions:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   risks:
     - id: "RSK-0001"
       statement: ""
       impact: ""
       likelihood: ""
       mitigations: []
-      required_evidence_ids: []
+      evidence_ids: []
   open_questions:
     - id: "Q-0001"
       question: ""

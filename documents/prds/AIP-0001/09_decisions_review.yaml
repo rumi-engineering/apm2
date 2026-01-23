@@ -1,5 +1,5 @@
 prd_decisions_review:
-  version: 1
+  version: "2026-01-23"
 
   decisions:
     - id: "DEC-AIP-0001-0001"

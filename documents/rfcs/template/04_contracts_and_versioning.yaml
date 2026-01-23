@@ -1,6 +1,6 @@
 rfc_contracts_and_versioning:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   contracts:
     - id: "CTR-0001"
       name: ""
@@ -14,7 +14,7 @@ rfc_contracts_and_versioning:
           path: ""
           format: "JSON_SCHEMA"
           description: ""
-      required_evidence_ids: []
+      evidence_ids: []
   outputs:
     artifacts_produced: []
     failure_modes: []

@@ -1,6 +1,6 @@
 prd_traceability:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   requirement_registry:
     mode: "FILE_PER_REQUIREMENT"
     local_root: "requirements/"

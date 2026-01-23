@@ -1,6 +1,6 @@
 aip_rfc_trust_and_auth:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   trust_boundary_overrides:
     - trust_boundary_id: "TB-0001"
       requires:
@@ -8,6 +8,6 @@ aip_rfc_trust_and_auth:
         authz: "capability tokens scoped to message types"
         replay_protection: true
         key_management: "rotated keys; no long-lived shared secrets"
-      required_evidence_ids:
+      evidence_ids:
         - "EVID-0901"
         - "EVID-0902"

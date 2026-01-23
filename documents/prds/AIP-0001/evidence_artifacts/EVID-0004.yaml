@@ -1,6 +1,6 @@
 prd_evidence_artifact:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   id: "EVID-0004"
   category: "BUILD_ARTIFACTS"
   title: "AgentService gRPC Implementation"

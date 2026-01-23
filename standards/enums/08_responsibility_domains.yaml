@@ -1,5 +1,5 @@
 responsibility_domains:
-  version: 2
+  schema_version: "2026-01-23"
   enum_id: "ENUM_RESPONSIBILITY_DOMAIN_V2"
   values:
     - "DOMAIN_API"

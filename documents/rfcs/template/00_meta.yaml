@@ -1,6 +1,6 @@
 rfc_meta:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   rfc:
     id: ""
     title: ""
@@ -9,7 +9,9 @@ rfc_meta:
     last_updated_date: ""
   binds_to_prd:
     prd_id: ""
+    # prd_base_path is relative to the project root (e.g., documents/prds/PRD-0001/)
     prd_base_path: ""
+    # The refs below are relative to prd_base_path
     requirement_registry_ref: "07_traceability.yaml#prd_traceability.requirement_registry"
     evidence_bundle_ref: "12_evidence_bundle.yaml#prd_evidence_bundle.bundle"
     prd_meta_ref: "00_meta.yaml#prd_meta"

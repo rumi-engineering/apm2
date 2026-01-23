@@ -1,6 +1,6 @@
 prd_quality_framework:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   profile_id: "PRD_QUALITY_FRAMEWORK_V2"
   dimensions:
     - dimension_id: "AGENT_FRIENDLY_UX"

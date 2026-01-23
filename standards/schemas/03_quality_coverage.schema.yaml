@@ -1,5 +1,5 @@
 quality_coverage_schema:
-  version: 2
+  schema_version: "2026-01-23"
   schema_id: "SCHEMA_QUALITY_COVERAGE_V2"
   required_keys:
     - "dimension_id"

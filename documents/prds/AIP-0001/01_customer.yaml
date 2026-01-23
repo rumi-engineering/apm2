@@ -1,5 +1,5 @@
 prd_customer:
-  version: 1
+  version: "2026-01-23"
 
   personas:
     primary:

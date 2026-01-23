@@ -1,7 +1,7 @@
 standards_meta:
   schema_version: "2026-01-23"
   suite_id: "AGENT_FACTORY_TEMPLATE_SUITE"
-  suite_version: 2
+  suite_version: "2026-01-23"
   determinism:
     ordering_rules:
       - "All lists MUST be sorted deterministically unless explicitly noted."

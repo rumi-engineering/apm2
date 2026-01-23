@@ -1,5 +1,6 @@
 lint_spec:
-  version: 2
+  schema_version: "2026-01-23"
+  lint_rules:
   lint_id: "LINT_SPEC_V2"
   posture:
     default: "FAIL_CLOSED"

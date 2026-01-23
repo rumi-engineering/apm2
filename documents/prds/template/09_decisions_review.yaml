@@ -1,6 +1,6 @@
 prd_decisions_review:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   decisions:
     - id: "DEC-0001"
       statement: ""

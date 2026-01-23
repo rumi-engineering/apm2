@@ -1,5 +1,5 @@
 prd_risks_questions:
-  version: 1
+  version: "2026-01-23"
 
   risks:
     - id: "RISK-AIP-0001-0001"

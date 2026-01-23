@@ -1,5 +1,7 @@
 See @CONTRIBUTING.md on how to work within this software project.
 
+# Critical instructions
+
 ## Coding & Process
 
 - Coding guidelines: @documents/coding

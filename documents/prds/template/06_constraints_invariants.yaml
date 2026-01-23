@@ -1,6 +1,6 @@
 prd_constraints_invariants:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   constraints:
     - id: "CNS-0001"
       statement: ""

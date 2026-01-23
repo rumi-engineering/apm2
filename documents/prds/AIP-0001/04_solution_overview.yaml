@@ -1,5 +1,5 @@
 prd_solution_overview:
-  version: 1
+  version: "2026-01-23"
 
   solution_one_sentence: "Replace Unix socket IPC with gRPC services, add PTY-based process management, and introduce structured session/conversation tracking with real-time event streaming."
 

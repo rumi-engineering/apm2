@@ -1,6 +1,6 @@
 prd_success_metrics:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   metrics:
     - id: "MET-0001"
       name: ""

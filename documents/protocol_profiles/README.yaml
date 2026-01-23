@@ -1,6 +1,6 @@
 protocol_profiles_readme:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   description: "Protocol profiles extend PRD/RFC requirements for specific protocol families (e.g., AIP). Profiles are layered extensions, not forks."
   usage:
     - "Set prd_meta.protocol_profile.applies=true and prd_meta.protocol_profile.id to a value from standards/enums/17_protocol_profile_ids.yaml."

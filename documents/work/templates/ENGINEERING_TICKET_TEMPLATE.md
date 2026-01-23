@@ -29,7 +29,7 @@ Steps (deterministic, ordered):
 ## Definition of Done (Evidence-based)
 The ticket is complete only when all required evidence artifacts are captured and verification commands succeed.
 
-Required evidence_ids:
+evidence_ids:
 - 
 
 ## Verification

@@ -1,7 +1,8 @@
 rfc_problem_and_imports:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   imported_from_prd:
+    # All refs below are relative to binds_to_prd.prd_base_path defined in 00_meta.yaml
     problem_ref: "02_problem.yaml#prd_problem"
     goals_scope_ref: "03_goals_scope.yaml#prd_goals_scope"
     constraints_invariants_ref: "06_constraints_invariants.yaml#prd_constraints_invariants"

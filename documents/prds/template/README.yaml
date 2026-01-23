@@ -1,6 +1,6 @@
 prd_template_readme:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   description: "PRD template family (YAML, decomposed). Instances MUST copy these files into documents/prds/<PRD-ID>/ and fill values."
   decomposition:
     - "requirements/: one file per requirement (low-context friendly)."

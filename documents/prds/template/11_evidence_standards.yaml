@@ -1,6 +1,6 @@
 prd_evidence_standards:
   schema_version: "2026-01-23"
-  template_version: 2
+  template_version: "2026-01-23"
   evidence_policy_id: "EVIDENCE_POLICY_V2"
   requirements:
     - id: "EPOL-0001"
