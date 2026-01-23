@@ -36,6 +36,14 @@
 //!
 //! Invalid transitions return `SessionError::InvalidTransition`.
 //!
+//! # Entropy Budget
+//!
+//! Sessions operate under an entropy budget that tracks accumulated "chaos"
+//! (errors, stalls, violations). When the budget is exceeded, the session
+//! must be terminated with exit classification `EntropyExceeded`.
+//!
+//! See the [`entropy`] module for the `EntropyTracker` and configuration.
+//!
 //! # Example
 //!
 //! ```rust
@@ -71,6 +79,7 @@
 //! assert!(reducer.state().get("session-123").unwrap().is_active());
 //! ```
 
+pub mod entropy;
 pub mod error;
 pub mod reducer;
 pub mod state;
@@ -79,6 +88,9 @@ pub mod state;
 mod tests;
 
 // Re-export main types
+pub use entropy::{
+    EntropyBudgetConfig, EntropyEvent, EntropySource, EntropyTracker, EntropyTrackerSummary,
+};
 pub use error::{SessionError, StateName};
 pub use reducer::{SessionReducer, SessionReducerState, helpers};
 pub use state::{ExitClassification, SessionState};
