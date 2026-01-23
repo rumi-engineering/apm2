@@ -1,0 +1,30 @@
+ticket_meta:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  ticket:
+    id: "TCK-00008"
+    title: "Implement quarantine mechanism"
+    status: "DRAFT"
+  binds:
+    prd_id: "PRD-0001"
+    rfc_id: "RFC-0001"
+    requirements:
+      - requirement_id: "REQ-0018"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0018.yaml#prd_requirement"
+      - requirement_id: "REQ-0027"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0027.yaml#prd_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0006"
+        artifact_ref: "documents/prds/PRD-0001/evidence_artifacts/EVID-0006.yaml#prd_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_KERNEL"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00007"
+        reason: "Requires crash detection from 'Implement crash detection and restart logic'"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0006"
