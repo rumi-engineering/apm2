@@ -55,8 +55,8 @@ rfc_design_decisions:
       the operational complexity of separate processes. The kernel is a single
       trust domain; internal module isolation is for engineering, not security.
     impacted_requirement_ids:
-    - REQ-1001
     - REQ-0007
+    - REQ-1001
     evidence_ids:
     - EVID-1001
 
@@ -113,8 +113,8 @@ rfc_design_decisions:
       durability and query performance. WAL mode enables concurrent reads.
     impacted_requirement_ids:
     - REQ-0006
-    - REQ-0008
     - REQ-0007
+    - REQ-0008
     evidence_ids:
     - EVID-0004
     - EVID-0005
@@ -171,8 +171,8 @@ rfc_design_decisions:
       Rust tooling (prost). Determinism is achieved by forbidding maps in signed
       payloads and using sorted repeated fields where order matters.
     impacted_requirement_ids:
-    - REQ-0012
     - REQ-0006
+    - REQ-0012
     evidence_ids:
     - EVID-0008
 
@@ -347,8 +347,8 @@ rfc_design_decisions:
       hidden state issues. The ledger is always authoritative. Entropy budgets
       provide deterministic termination before sessions degrade significantly.
     impacted_requirement_ids:
+    - REQ-0013
     - REQ-0018
     - REQ-0035
-    - REQ-0013
     evidence_ids:
     - EVID-0006

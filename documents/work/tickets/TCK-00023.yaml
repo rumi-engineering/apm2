@@ -11,8 +11,14 @@ ticket_meta:
     requirements:
       - requirement_id: "REQ-0001"
         requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0001.yaml#prd_requirement"
+      - requirement_id: "REQ-0024"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0024.yaml#prd_requirement"
       - requirement_id: "REQ-0028"
         requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0028.yaml#prd_requirement"
+      - requirement_id: "REQ-0030"
+        requirement_ref: "documents/prds/PRD-0001/requirements/REQ-0030.yaml#prd_requirement"
+      - requirement_id: "REQ-1005"
+        requirement_ref: "documents/rfcs/RFC-0001/requirements/REQ-1005.yaml#rfc_requirement"
       - requirement_id: "REQ-1006"
         requirement_ref: "documents/rfcs/RFC-0001/requirements/REQ-1006.yaml#rfc_requirement"
     evidence_artifacts:
