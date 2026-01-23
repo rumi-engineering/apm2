@@ -1,6 +1,8 @@
-See @CONTRIBUTING.md on how to work within this software project.
+Please see @documents/skills/holonic-agent-network/SKILL.md for core philosophy.
 
-# Critical instructions
+This is a 100% Rust + Markdown + YAML project.
+
+See @CONTRIBUTING.md on how to work within this software project.
 
 ## Coding & Process
 
