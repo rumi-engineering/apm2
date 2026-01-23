@@ -299,18 +299,15 @@ mod unit_tests {
     /// A simple test reducer that counts events by type.
     #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
     struct TestState {
-        total_count: u64,
-        start_count: u64,
-        end_count: u64,
+        total: u64,
+        start: u64,
+        end: u64,
     }
 
-    #[derive(Debug)]
-    #[derive(Default)]
+    #[derive(Debug, Default)]
     struct TestReducer {
         state: TestState,
     }
-
-    
 
     impl Reducer for TestReducer {
         type State = TestState;
@@ -321,10 +318,10 @@ mod unit_tests {
         }
 
         fn apply(&mut self, event: &EventRecord, _ctx: &ReducerContext) -> Result<(), Self::Error> {
-            self.state.total_count += 1;
+            self.state.total += 1;
             match event.event_type.as_str() {
-                "session.start" => self.state.start_count += 1,
-                "session.end" => self.state.end_count += 1,
+                "session.start" => self.state.start += 1,
+                "session.end" => self.state.end += 1,
                 _ => {},
             }
             Ok(())
@@ -374,9 +371,9 @@ mod unit_tests {
 
         assert_eq!(result.events_processed, 10);
         assert!(!result.resumed_from_checkpoint);
-        assert_eq!(reducer.state().total_count, 10);
-        assert_eq!(reducer.state().start_count, 4); // 0, 3, 6, 9
-        assert_eq!(reducer.state().end_count, 3); // 2, 5, 8
+        assert_eq!(reducer.state().total, 10);
+        assert_eq!(reducer.state().start, 4); // 0, 3, 6, 9
+        assert_eq!(reducer.state().end, 3); // 2, 5, 8
     }
 
     #[test]
@@ -406,7 +403,7 @@ mod unit_tests {
 
         assert_eq!(result2.events_processed, 5);
         assert!(result2.resumed_from_checkpoint);
-        assert_eq!(reducer2.state().total_count, 15);
+        assert_eq!(reducer2.state().total, 15);
     }
 
     #[test]
@@ -428,7 +425,7 @@ mod unit_tests {
 
         assert_eq!(result.events_processed, 10);
         assert!(!result.resumed_from_checkpoint);
-        assert_eq!(reducer2.state().total_count, 10);
+        assert_eq!(reducer2.state().total, 10);
     }
 
     #[test]
@@ -470,7 +467,7 @@ mod unit_tests {
 
         assert_eq!(result.events_processed, 0);
         assert!(!result.checkpoint_created);
-        assert_eq!(reducer.state().total_count, 0);
+        assert_eq!(reducer.state().total, 0);
     }
 
     #[test]
@@ -480,7 +477,7 @@ mod unit_tests {
 
         apply_event(&mut reducer, &event, 1).unwrap();
 
-        assert_eq!(reducer.state().total_count, 1);
-        assert_eq!(reducer.state().start_count, 1);
+        assert_eq!(reducer.state().total, 1);
+        assert_eq!(reducer.state().start, 1);
     }
 }
