@@ -42,6 +42,7 @@ pub mod ipc;
 pub mod ledger;
 pub mod log;
 pub mod process;
+pub mod reducer;
 pub mod restart;
 pub mod shutdown;
 pub mod state;
