@@ -55,3 +55,5 @@ prd_customer:
       a: "End users who interact with AI CLI tools directly in their terminal. AIP is infrastructure for tool builders, not a replacement for the terminal experience."
     - q: "What are the top 3 user journeys?"
       a: "1) Spawn an agent, send a prompt, receive structured response. 2) Stream agent output and tool calls in real-time. 3) Query conversation history for a session."
+
+
