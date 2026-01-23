@@ -1,16 +1,38 @@
 rfc_meta:
-  version: 1
-  rfc_id: "<RFC-ID>"
-  project_id: "<PROJECT>"
-  title: "<Title>"
-  status: "DRAFT" # DRAFT | IN_REVIEW | APPROVED | REJECTED | SUPERSEDED
-  owners:
-    - "<name-or-team>"
-  last_updated: "<YYYY-MM-DD>"
-  links:
-    prd: "rfcs/<RFC-ID>/PRD.md"
-    repo_root: "."
-  intent:
-    one_sentence: "<What this RFC accomplishes>"
-    success_criteria_brief:
-      - "<brief, measurable>"
+  schema_version: "2026-01-23"
+  template_version: 2
+  rfc:
+    id: ""
+    title: ""
+    status: "DRAFT"
+    created_date: ""
+    last_updated_date: ""
+  binds_to_prd:
+    prd_id: ""
+    prd_base_path: ""
+    requirement_registry_ref: "07_traceability.yaml#prd_traceability.requirement_registry"
+    evidence_bundle_ref: "12_evidence_bundle.yaml#prd_evidence_bundle.bundle"
+    prd_meta_ref: "00_meta.yaml#prd_meta"
+  protocol_profile:
+    id: "NONE"
+    applies: false
+    inherited_from_prd: true
+    profile_ref: ""
+  custody:
+    producing_agent_roles:
+      - "AGENT_AUTHOR"
+    responsible_domains:
+      - "DOMAIN_API"
+      - "DOMAIN_SECURITY"
+    authority_signoffs_required:
+      - "AUTH_ARCHITECTURE"
+      - "AUTH_SECURITY"
+  refs:
+    standards:
+      requirement_schema: "standards/schemas/02_requirement.schema.yaml#requirement_schema"
+      evidence_artifact_schema: "standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema"
+      quality_coverage_schema: "standards/schemas/03_quality_coverage.schema.yaml#quality_coverage_schema"
+      gate_review_schema: "standards/schemas/06_gate_review.schema.yaml#gate_review_schema"
+      waiver_schema: "standards/schemas/05_waiver.schema.yaml#waiver_schema"
+      ticket_meta_schema: "standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema"
+      lint_spec: "standards/lint/LINT_SPEC.yaml#lint_spec"

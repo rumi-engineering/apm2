@@ -1,13 +1,15 @@
-risks_and_open_questions:
+rfc_risks_and_open_questions:
+  schema_version: "2026-01-23"
+  template_version: 2
   risks:
-    - id: "<RISK-001>"
-      severity: "<low | medium | high>"
-      description: "<risk>"
-      mitigation: "<mitigation>"
-      residual_risk: "<what remains>"
+    - id: "RSK-0001"
+      statement: ""
+      impact: ""
+      likelihood: ""
+      mitigations: []
+      required_evidence_ids: []
   open_questions:
-    - id: "<Q-001>"
-      question: "<question>"
-      decision_driver: "<what determines answer>"
-      owner: "<owner>"
-      deadline: "<YYYY-MM-DD-or-null>"
+    - id: "Q-0001"
+      question: ""
+      decision_needed_by: ""
+      resolution_plan: ""

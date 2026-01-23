@@ -1,17 +1,15 @@
 prd_risks_questions:
-  version: 1
-
+  schema_version: "2026-01-23"
+  template_version: 2
   risks:
-    - id: "RISK-<PRD-ID>-0001"
-      severity: "HIGH" # LOW | MEDIUM | HIGH | CRITICAL
-      description: "<SHORT>"
-      mitigation: "<SHORT>"
-      owner_role: "<ROLE>"
-      control_refs: [] # e.g., ["CTRL-DATA-0001"]
-
+    - id: "RSK-0001"
+      statement: ""
+      impact: ""
+      likelihood: ""
+      mitigations: []
+      evidence_ids: []
   open_questions:
-    - id: "Q-<PRD-ID>-0001"
-      question: "<SHORT>"
-      owner_role: "<ROLE>"
-      decision_driver: "<SHORT>" # what determines the answer
-      due_date: "<YYYY-MM-DD>"
+    - id: "Q-0001"
+      question: ""
+      decision_needed_by: ""
+      resolution_plan: ""
