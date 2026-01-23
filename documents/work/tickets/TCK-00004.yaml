@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00004"
     title: "Implement reducer framework with checkpointing"
-    status: "DONE"
+    status: "COMPLETED"
   binds:
     prd_id: "PRD-0001"
     rfc_id: "RFC-0001"

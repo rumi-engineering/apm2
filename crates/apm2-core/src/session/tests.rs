@@ -57,14 +57,17 @@ enum SessionEventType {
     },
     Progress {
         session_id: String,
+        actor_id: String,
         entropy_consumed: u64,
     },
     Terminated {
         session_id: String,
+        actor_id: String,
         classification: String,
     },
     Quarantined {
         session_id: String,
+        actor_id: String,
     },
 }
 
@@ -86,10 +89,17 @@ impl SessionEventType {
                     &format!("lease-{seq}"),
                     *entropy_budget,
                 );
-                EventRecord::with_timestamp("session.started", session_id, payload, timestamp)
+                EventRecord::with_timestamp(
+                    "session.started",
+                    session_id,
+                    actor_id,
+                    payload,
+                    timestamp,
+                )
             },
             Self::Progress {
                 session_id,
+                actor_id,
                 entropy_consumed,
             } => {
                 let payload = helpers::session_progress_payload(
@@ -98,23 +108,45 @@ impl SessionEventType {
                     "HEARTBEAT",
                     *entropy_consumed,
                 );
-                EventRecord::with_timestamp("session.progress", session_id, payload, timestamp)
+                EventRecord::with_timestamp(
+                    "session.progress",
+                    session_id,
+                    actor_id,
+                    payload,
+                    timestamp,
+                )
             },
             Self::Terminated {
                 session_id,
+                actor_id,
                 classification,
             } => {
                 let payload =
                     helpers::session_terminated_payload(session_id, classification, "done", seq);
-                EventRecord::with_timestamp("session.terminated", session_id, payload, timestamp)
+                EventRecord::with_timestamp(
+                    "session.terminated",
+                    session_id,
+                    actor_id,
+                    payload,
+                    timestamp,
+                )
             },
-            Self::Quarantined { session_id } => {
+            Self::Quarantined {
+                session_id,
+                actor_id,
+            } => {
                 let payload = helpers::session_quarantined_payload(
                     session_id,
                     "violation",
                     timestamp + 1_000_000_000,
                 );
-                EventRecord::with_timestamp("session.quarantined", session_id, payload, timestamp)
+                EventRecord::with_timestamp(
+                    "session.quarantined",
+                    session_id,
+                    actor_id,
+                    payload,
+                    timestamp,
+                )
             },
         }
     }
@@ -149,18 +181,19 @@ fn arb_valid_session_events(
                                 do_end,
                                 is_terminate,
                             )| {
+                                let session_id = format!("{session_id}-{i}");
                                 let mut events = vec![SessionEventType::Started {
-                                    session_id: format!("{session_id}-{i}"),
-                                    actor_id,
+                                    session_id: session_id.clone(),
+                                    actor_id: actor_id.clone(),
                                     adapter_type: adapter_type.to_string(),
                                     entropy_budget,
                                 }];
 
                                 // Add progress events
-                                let session_id = format!("{session_id}-{i}");
                                 for p in 0..progress_per_session {
                                     events.push(SessionEventType::Progress {
                                         session_id: session_id.clone(),
+                                        actor_id: actor_id.clone(),
                                         entropy_consumed: (p as u64 + 1) * 100,
                                     });
                                 }
@@ -170,10 +203,14 @@ fn arb_valid_session_events(
                                     if is_terminate {
                                         events.push(SessionEventType::Terminated {
                                             session_id,
+                                            actor_id,
                                             classification: "SUCCESS".to_string(),
                                         });
                                     } else {
-                                        events.push(SessionEventType::Quarantined { session_id });
+                                        events.push(SessionEventType::Quarantined {
+                                            session_id,
+                                            actor_id,
+                                        });
                                     }
                                 }
 
@@ -345,8 +382,13 @@ fn test_full_session_lifecycle() {
         "lease-1",
         1000,
     );
-    let start_event =
-        EventRecord::with_timestamp("session.started", "session-1", start_payload, 1_000_000_000);
+    let start_event = EventRecord::with_timestamp(
+        "session.started",
+        "session-1",
+        "actor-1",
+        start_payload,
+        1_000_000_000,
+    );
     reducer.apply(&start_event, &ctx).unwrap();
 
     // Verify running state
@@ -361,6 +403,7 @@ fn test_full_session_lifecycle() {
         let progress_event = EventRecord::with_timestamp(
             "session.progress",
             "session-1",
+            "actor-1",
             progress_payload,
             1_000_000_000 + i * 1000,
         );
@@ -386,6 +429,7 @@ fn test_full_session_lifecycle() {
     let term_event = EventRecord::with_timestamp(
         "session.terminated",
         "session-1",
+        "actor-1",
         term_payload,
         2_000_000_000,
     );
@@ -424,6 +468,7 @@ fn test_multiple_concurrent_sessions() {
         let start_event = EventRecord::with_timestamp(
             "session.started",
             format!("session-{i}"),
+            format!("actor-{i}"),
             start_payload,
             1_000_000_000,
         );
@@ -438,6 +483,7 @@ fn test_multiple_concurrent_sessions() {
     let term_event = EventRecord::with_timestamp(
         "session.terminated",
         "session-1",
+        "actor-1",
         term_payload,
         2_000_000_000,
     );
@@ -448,6 +494,7 @@ fn test_multiple_concurrent_sessions() {
     let term_event2 = EventRecord::with_timestamp(
         "session.terminated",
         "session-2",
+        "actor-2",
         term_payload2,
         2_000_000_000,
     );
@@ -459,6 +506,7 @@ fn test_multiple_concurrent_sessions() {
     let quar_event = EventRecord::with_timestamp(
         "session.quarantined",
         "session-3",
+        "actor-3",
         quar_payload,
         2_000_000_000,
     );
@@ -500,11 +548,12 @@ fn test_crash_recovery_simulation() {
     let events1: Vec<EventRecord> = (0..10)
         .map(|i| {
             let session_id = format!("session-{}", i % 3);
+            let actor_id = format!("actor-{}", i % 3);
             if i < 3 {
                 // Start events for sessions 0, 1, 2
                 let payload = helpers::session_started_payload(
                     &session_id,
-                    &format!("actor-{i}"),
+                    &actor_id,
                     "claude-code",
                     &format!("work-{i}"),
                     &format!("lease-{i}"),
@@ -513,6 +562,7 @@ fn test_crash_recovery_simulation() {
                 EventRecord::with_timestamp(
                     "session.started",
                     &session_id,
+                    &actor_id,
                     payload,
                     1_000_000_000 + i * 1000,
                 )
@@ -523,6 +573,7 @@ fn test_crash_recovery_simulation() {
                 EventRecord::with_timestamp(
                     "session.progress",
                     &session_id,
+                    &actor_id,
                     payload,
                     1_000_000_000 + i * 1000,
                 )
@@ -548,10 +599,12 @@ fn test_crash_recovery_simulation() {
     let events2: Vec<EventRecord> = (0..3)
         .map(|i| {
             let session_id = format!("session-{i}");
+            let actor_id = format!("actor-{i}");
             let payload = helpers::session_terminated_payload(&session_id, "SUCCESS", "done", 500);
             EventRecord::with_timestamp(
                 "session.terminated",
                 &session_id,
+                &actor_id,
                 payload,
                 2_000_000_000 + i * 1000,
             )
@@ -600,6 +653,7 @@ fn test_exit_classifications() {
         let start_event = EventRecord::with_timestamp(
             "session.started",
             &session_id,
+            "actor-1",
             start_payload,
             1_000_000_000,
         );
@@ -611,6 +665,7 @@ fn test_exit_classifications() {
         let term_event = EventRecord::with_timestamp(
             "session.terminated",
             &session_id,
+            "actor-1",
             term_payload,
             2_000_000_000,
         );

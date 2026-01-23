@@ -71,6 +71,9 @@ mod generated {
     include!("apm2.kernel.v1.rs");
 }
 
+mod canonical;
+
+pub use canonical::Canonicalize;
 pub use generated::*;
 
 #[cfg(test)]

@@ -183,7 +183,7 @@ mod unit_tests {
     #[test]
     fn test_counting_reducer() {
         let mut reducer = CountingReducer::default();
-        let event = EventRecord::new("test", "session-1", vec![]);
+        let event = EventRecord::new("test", "session-1", "test-actor", vec![]);
         let ctx = ReducerContext::new(1);
 
         assert_eq!(*reducer.state(), 0);

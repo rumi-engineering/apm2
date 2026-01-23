@@ -31,6 +31,7 @@ fn test_session_started_roundtrip() {
         actor_id: "actor-456".to_string(),
         session_id: "session-123".to_string(),
         signature: vec![],
+        schema_version: 1,
         payload: Some(kernel_event::Payload::Session(session_event)),
     };
 
@@ -285,6 +286,7 @@ fn test_canonical_encoding_deterministic() {
         actor_id: "actor-test".to_string(),
         session_id: "session-test".to_string(),
         signature: vec![0u8; 64],
+        schema_version: 1,
         payload: Some(kernel_event::Payload::Session(SessionEvent {
             event: Some(session_event::Event::Progress(SessionProgress {
                 session_id: "session-test".to_string(),
@@ -310,10 +312,12 @@ fn test_canonical_encoding_deterministic() {
     assert_eq!(bytes1, bytes4);
 }
 
-/// Test that repeated fields are ordered correctly.
+/// Test that repeated fields are ordered correctly after canonicalization.
 #[test]
 fn test_repeated_fields_ordering() {
-    let opened = WorkOpened {
+    use super::Canonicalize;
+
+    let mut opened = WorkOpened {
         work_id: "work-1".to_string(),
         work_type: "TICKET".to_string(),
         spec_snapshot_hash: vec![],
@@ -325,13 +329,28 @@ fn test_repeated_fields_ordering() {
         parent_work_ids: vec!["parent-2".to_string(), "parent-1".to_string()],
     };
 
-    let bytes = opened.encode_to_vec();
-    let decoded = WorkOpened::decode(bytes.as_slice()).expect("decode failed");
+    // Before canonicalization: protobuf preserves insertion order
+    let bytes_before = opened.encode_to_vec();
+    let decoded_before = WorkOpened::decode(bytes_before.as_slice()).expect("decode failed");
+    assert_eq!(decoded_before.requirement_ids[0], "REQ-C");
+    assert_eq!(decoded_before.requirement_ids[1], "REQ-A");
+    assert_eq!(decoded_before.requirement_ids[2], "REQ-B");
 
-    // Repeated fields preserve order (not sorted by protobuf)
-    assert_eq!(decoded.requirement_ids[0], "REQ-C");
-    assert_eq!(decoded.requirement_ids[1], "REQ-A");
-    assert_eq!(decoded.requirement_ids[2], "REQ-B");
+    // After canonicalization: fields are sorted
+    opened.canonicalize();
+
+    assert_eq!(opened.requirement_ids[0], "REQ-A");
+    assert_eq!(opened.requirement_ids[1], "REQ-B");
+    assert_eq!(opened.requirement_ids[2], "REQ-C");
+    assert_eq!(opened.parent_work_ids[0], "parent-1");
+    assert_eq!(opened.parent_work_ids[1], "parent-2");
+
+    // Encoding canonicalized data produces deterministic bytes
+    let bytes_after = opened.encode_to_vec();
+    let decoded_after = WorkOpened::decode(bytes_after.as_slice()).expect("decode failed");
+    assert_eq!(decoded_after.requirement_ids[0], "REQ-A");
+    assert_eq!(decoded_after.requirement_ids[1], "REQ-B");
+    assert_eq!(decoded_after.requirement_ids[2], "REQ-C");
 }
 
 /// Test empty/default event encoding.

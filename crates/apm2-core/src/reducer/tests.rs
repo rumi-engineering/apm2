@@ -154,6 +154,11 @@ fn arb_session_id() -> impl Strategy<Value = String> {
     "[a-z]{3}-[0-9]{4}".prop_map(|s| s)
 }
 
+/// Generates a random actor ID.
+fn arb_actor_id() -> impl Strategy<Value = String> {
+    "actor-[a-z]{3}".prop_map(|s| s)
+}
+
 /// Generates a random payload.
 fn arb_payload() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..100)
@@ -161,9 +166,15 @@ fn arb_payload() -> impl Strategy<Value = Vec<u8>> {
 
 /// Generates a single random event.
 fn arb_event() -> impl Strategy<Value = EventRecord> {
-    (arb_event_type(), arb_session_id(), arb_payload()).prop_map(
-        |(event_type, session_id, payload)| EventRecord::new(event_type, session_id, payload),
+    (
+        arb_event_type(),
+        arb_session_id(),
+        arb_actor_id(),
+        arb_payload(),
     )
+        .prop_map(|(event_type, session_id, actor_id, payload)| {
+            EventRecord::new(event_type, session_id, actor_id, payload)
+        })
 }
 
 /// Generates a sequence of random events.
@@ -353,7 +364,12 @@ fn test_multiple_reducers_independent() {
             } else {
                 "session.end"
             };
-            EventRecord::new(event_type, format!("session-{}", i / 2), vec![])
+            EventRecord::new(
+                event_type,
+                format!("session-{}", i / 2),
+                "test-actor",
+                vec![],
+            )
         })
         .collect::<Vec<_>>();
     ledger.append_batch(&events).unwrap();
@@ -385,7 +401,14 @@ fn test_determinism_after_crash_recovery_simulation() {
 
     // Add initial events
     let events1: Vec<EventRecord> = (0u8..50)
-        .map(|i| EventRecord::new(format!("event.{}", i % 5), "session-1", vec![i]))
+        .map(|i| {
+            EventRecord::new(
+                format!("event.{}", i % 5),
+                "session-1",
+                "test-actor",
+                vec![i],
+            )
+        })
         .collect();
     ledger.append_batch(&events1).unwrap();
 
@@ -405,7 +428,14 @@ fn test_determinism_after_crash_recovery_simulation() {
     // Simulate crash by creating a new reducer instance
     // Add more events
     let events2: Vec<EventRecord> = (50u8..75)
-        .map(|i| EventRecord::new(format!("event.{}", i % 5), "session-1", vec![i]))
+        .map(|i| {
+            EventRecord::new(
+                format!("event.{}", i % 5),
+                "session-1",
+                "test-actor",
+                vec![i],
+            )
+        })
         .collect();
     ledger.append_batch(&events2).unwrap();
 
@@ -461,14 +491,14 @@ fn test_session_count_invariants() {
 
     // Create a specific sequence: 5 starts, 3 ends
     let events = vec![
-        EventRecord::new("session.start", "s1", vec![]),
-        EventRecord::new("session.start", "s2", vec![]),
-        EventRecord::new("session.end", "s1", vec![]),
-        EventRecord::new("session.start", "s3", vec![]),
-        EventRecord::new("session.end", "s2", vec![]),
-        EventRecord::new("session.start", "s4", vec![]),
-        EventRecord::new("session.start", "s5", vec![]),
-        EventRecord::new("session.end", "s3", vec![]),
+        EventRecord::new("session.start", "s1", "actor-1", vec![]),
+        EventRecord::new("session.start", "s2", "actor-1", vec![]),
+        EventRecord::new("session.end", "s1", "actor-1", vec![]),
+        EventRecord::new("session.start", "s3", "actor-1", vec![]),
+        EventRecord::new("session.end", "s2", "actor-1", vec![]),
+        EventRecord::new("session.start", "s4", "actor-1", vec![]),
+        EventRecord::new("session.start", "s5", "actor-1", vec![]),
+        EventRecord::new("session.end", "s3", "actor-1", vec![]),
     ];
     ledger.append_batch(&events).unwrap();
 
@@ -515,6 +545,7 @@ fn test_large_batch_processing() {
             EventRecord::new(
                 event_type,
                 format!("session-{}", i % 10),
+                "test-actor",
                 vec![(i % 256) as u8],
             )
         })

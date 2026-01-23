@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00002"
     title: "Define kernel event schemas with prost"
-    status: "DRAFT"
+    status: "COMPLETED"
   binds:
     prd_id: "PRD-0001"
     rfc_id: "RFC-0001"

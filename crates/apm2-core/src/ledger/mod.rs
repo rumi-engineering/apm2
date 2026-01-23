@@ -27,6 +27,7 @@
 //! let event = EventRecord::new(
 //!     "session.start",
 //!     "session-123",
+//!     "actor-456",
 //!     b"{\"user\": \"alice\"}".to_vec(),
 //! );
 //! let seq_id = ledger.append(&event)?;
@@ -42,4 +43,6 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
-pub use storage::{ArtifactRef, EventRecord, Ledger, LedgerError, LedgerStats};
+pub use storage::{
+    ArtifactRef, CURRENT_RECORD_VERSION, EventRecord, Ledger, LedgerError, LedgerStats,
+};
