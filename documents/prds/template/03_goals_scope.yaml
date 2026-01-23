@@ -1,40 +1,11 @@
 prd_goals_scope:
-  version: 1
-
-  goals_ranked:
-    - id: "GOAL-0001"
-      statement: "<SHORT>"
-      priority: "P0" # P0 | P1 | P2 | P3
-      success_metric_refs: [] # e.g., ["METRIC-0001"]
-    - id: "GOAL-0002"
-      statement: "<SHORT>"
-      priority: "P1"
-      success_metric_refs: []
-
-  non_goals:
-    - "<EXPLICIT NON-GOAL>"
-
+  schema_version: "2026-01-23"
+  template_version: 2
+  goals:
+    - id: "G-0001"
+      statement: ""
+      measurable_outcomes: []
   scope:
-    in_scope:
-      - "<IN-SCOPE ITEM>"
-    out_of_scope:
-      - "<OUT-OF-SCOPE ITEM>"
-    deferred:
-      - item: "<DEFERRED ITEM>"
-        revisit_when: "<CRITERIA>"
-
-  shipped_surfaces:
-    cli:
-      commands_added: []
-      commands_changed: []
-      commands_removed: []
-    apis:
-      public: []
-      internal: []
-    configs:
-      new_files: []
-      changed_files: []
-
-  integrations:
-    upstream_dependencies: [] # systems/services you depend on
-    downstream_dependencies: [] # consumers impacted
+    in_scope: []
+    out_of_scope: []
+  success_criteria_summary: []
