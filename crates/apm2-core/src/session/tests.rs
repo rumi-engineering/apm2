@@ -518,12 +518,8 @@ fn test_crash_recovery_simulation() {
                 )
             } else {
                 // Progress events
-                let payload = helpers::session_progress_payload(
-                    &session_id,
-                    i,
-                    "HEARTBEAT",
-                    i * 50,
-                );
+                let payload =
+                    helpers::session_progress_payload(&session_id, i, "HEARTBEAT", i * 50);
                 EventRecord::with_timestamp(
                     "session.progress",
                     &session_id,
