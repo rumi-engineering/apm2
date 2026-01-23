@@ -156,3 +156,23 @@ jobs:
         with:
           baseline-rev: ${{ github.event.pull_request.base.sha }}
           rust-toolchain: "1.92.0"
+
+  # Final check that all CI jobs passed
+  ci-success:
+    name: CI Success
+    needs: [fmt, clippy, doc, test, msrv, security, deny, coverage, secrets, semver]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check all jobs
+        run: |
+          if [[ "${{ needs.fmt.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.clippy.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.doc.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.test.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.msrv.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.security.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.deny.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.coverage.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.secrets.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.semver.result }}" != "success" && "${{ needs.semver.result }}" != "skipped" ]]; then exit 1; fi
