@@ -1,0 +1,185 @@
+#!/bin/bash
+# Usage: ./scripts/dev <RFC_ID>
+# Sets up development environment for the next unblocked ticket in an RFC
+#
+# This script:
+# 1. Outputs context (AGENTS.md, RFC meta, design decisions, ticket details)
+# 2. Finds the next unblocked ticket (status != COMPLETED, all dependencies COMPLETED)
+# 3. Creates a worktree with proper branch naming
+# 4. Configures pre-commit hooks
+
+set -e
+
+RFC_ID="${1:?Usage: $0 <RFC_ID>}"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Paths
+RFC_DIR="$REPO_ROOT/documents/rfcs/$RFC_ID"
+TICKETS_DIR="$REPO_ROOT/documents/work/tickets"
+DECOMP_FILE="$RFC_DIR/06_ticket_decomposition.yaml"
+
+# Validate RFC exists
+if [[ ! -d "$RFC_DIR" ]]; then
+    echo "ERROR: RFC not found: $RFC_DIR" >&2
+    exit 1
+fi
+
+if [[ ! -f "$DECOMP_FILE" ]]; then
+    echo "ERROR: Ticket decomposition not found: $DECOMP_FILE" >&2
+    exit 1
+fi
+
+# --- Context Output ---
+echo "═══════════════════════════════════════════════════════════════"
+echo "AGENTS.md"
+echo "═══════════════════════════════════════════════════════════════"
+cat "$REPO_ROOT/AGENTS.md"
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "RFC: $RFC_ID - Meta & Design"
+echo "═══════════════════════════════════════════════════════════════"
+cat "$RFC_DIR/00_meta.yaml"
+echo "---"
+cat "$RFC_DIR/02_design_decisions.yaml"
+
+# --- Find Next Ticket ---
+# Extract ticket IDs from decomposition file (format: ticket_id: TCK-XXXXX or ticket_id: "TCK-XXXXX")
+TICKET_IDS=$(grep -oP 'ticket_id:\s*"?\K[A-Z]+-[0-9]+' "$DECOMP_FILE" | head -50)
+
+# Helper function to get ticket status
+get_ticket_status() {
+    local ticket_yaml="$1"
+    # Status is under ticket_meta.ticket.status
+    grep -A20 '^ticket_meta:' "$ticket_yaml" | grep -oP 'status:\s*"?\K[A-Z_]+' | head -1
+}
+
+# Helper function to get ticket dependencies
+get_ticket_dependencies() {
+    local ticket_yaml="$1"
+    # Dependencies are under ticket_meta.dependencies.tickets[].ticket_id
+    sed -n '/^  dependencies:/,/^  [a-z]/p' "$ticket_yaml" | grep -oP 'ticket_id:\s*"?\K[A-Z]+-[0-9]+' || true
+}
+
+NEXT_TICKET=""
+for TICKET_ID in $TICKET_IDS; do
+    TICKET_YAML="$TICKETS_DIR/$TICKET_ID.yaml"
+
+    if [[ ! -f "$TICKET_YAML" ]]; then
+        continue
+    fi
+
+    # Check status
+    STATUS=$(get_ticket_status "$TICKET_YAML")
+    if [[ "$STATUS" == "COMPLETED" ]]; then
+        continue
+    fi
+
+    # Check dependencies - all must be COMPLETED
+    ALL_DEPS_MET=true
+    DEP_IDS=$(get_ticket_dependencies "$TICKET_YAML")
+    for DEP_ID in $DEP_IDS; do
+        DEP_YAML="$TICKETS_DIR/$DEP_ID.yaml"
+        if [[ -f "$DEP_YAML" ]]; then
+            DEP_STATUS=$(get_ticket_status "$DEP_YAML")
+            if [[ "$DEP_STATUS" != "COMPLETED" ]]; then
+                ALL_DEPS_MET=false
+                break
+            fi
+        fi
+    done
+
+    if $ALL_DEPS_MET; then
+        NEXT_TICKET="$TICKET_ID"
+        break
+    fi
+done
+
+if [[ -z "$NEXT_TICKET" ]]; then
+    echo ""
+    echo "ERROR: No unblocked tickets found for $RFC_ID" >&2
+    exit 1
+fi
+
+# --- Output Ticket Context ---
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "NEXT TICKET: $NEXT_TICKET"
+echo "═══════════════════════════════════════════════════════════════"
+cat "$TICKETS_DIR/$NEXT_TICKET.yaml"
+echo "---"
+if [[ -f "$TICKETS_DIR/$NEXT_TICKET.md" ]]; then
+    cat "$TICKETS_DIR/$NEXT_TICKET.md"
+fi
+
+# --- Output PRD Requirements ---
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "REFERENCED REQUIREMENTS"
+echo "═══════════════════════════════════════════════════════════════"
+# Requirements are under ticket_meta.binds.requirements[].requirement_id
+REQ_IDS=$(grep -oP 'requirement_id:\s*"?\K[A-Z]+-[0-9]+' "$TICKETS_DIR/$NEXT_TICKET.yaml" || true)
+for REQ_ID in $REQ_IDS; do
+    # Search for requirement file in documents/prds/*/requirements/
+    REQ_FILE=$(find "$REPO_ROOT/documents/prds" -path "*requirements/$REQ_ID.yaml" 2>/dev/null | head -1)
+    if [[ -z "$REQ_FILE" ]]; then
+        # Also check RFC requirements
+        REQ_FILE=$(find "$REPO_ROOT/documents/rfcs" -path "*requirements/$REQ_ID.yaml" 2>/dev/null | head -1)
+    fi
+    if [[ -n "$REQ_FILE" && -f "$REQ_FILE" ]]; then
+        echo "--- $REQ_ID ---"
+        cat "$REQ_FILE"
+    fi
+done
+
+# --- Create Worktree ---
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "CREATING WORKTREE"
+echo "═══════════════════════════════════════════════════════════════"
+
+BRANCH="ticket/$RFC_ID/$NEXT_TICKET"
+WORKTREE_DIR="$(dirname "$REPO_ROOT")/apm2-$NEXT_TICKET"
+
+# Fetch latest main
+git fetch origin main
+
+# Create branch if it doesn't exist
+if ! git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    git branch "$BRANCH" origin/main
+    echo "Created branch: $BRANCH"
+else
+    echo "Branch exists: $BRANCH"
+fi
+
+# Create worktree if it doesn't exist
+if [[ ! -d "$WORKTREE_DIR" ]]; then
+    git worktree add "$WORKTREE_DIR" "$BRANCH"
+    echo "Created worktree: $WORKTREE_DIR"
+else
+    echo "Worktree exists: $WORKTREE_DIR"
+fi
+
+# Configure pre-commit hooks in worktree
+# Use absolute path since .githooks may be untracked and not present in worktree
+HOOKS_DIR="$REPO_ROOT/.githooks"
+if [[ -d "$HOOKS_DIR" ]]; then
+    (cd "$WORKTREE_DIR" && git config core.hooksPath "$HOOKS_DIR")
+    echo "Configured pre-commit hooks: $HOOKS_DIR"
+elif [[ -d "$WORKTREE_DIR/.githooks" ]]; then
+    (cd "$WORKTREE_DIR" && git config core.hooksPath .githooks)
+    echo "Configured pre-commit hooks"
+else
+    echo "Note: No .githooks directory found"
+fi
+
+# --- Final Instructions ---
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "READY"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+echo "Run:"
+echo "  cd $WORKTREE_DIR"
+echo ""
+echo "Then implement $NEXT_TICKET following the ticket scope and definition of done."
