@@ -57,4 +57,5 @@ prd_evidence_bundle:
           artifact_ref: "evidence_artifacts/EVID-0024.yaml#prd_evidence_artifact"
         - evidence_id: "EVID-0025"
           artifact_ref: "evidence_artifacts/EVID-0025.yaml#prd_evidence_artifact"
-      imports: []
+      imports:
+        - "protocol_profiles/aip/prd_aip_evidence.yaml#aip_prd_evidence"

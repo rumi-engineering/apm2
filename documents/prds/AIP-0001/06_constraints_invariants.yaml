@@ -3,18 +3,18 @@ prd_constraints_invariants:
 
   security:
     posture:
-      default_deny: false  # Local-only daemon, no remote access in v1
+      default_deny: true  # All requests must be authenticated
       fail_closed: true
       least_privilege: true
       tamper_evidence_required: false  # No persistence integrity requirements yet
-    threat_model: "Local attacker with user-level access; no remote attack surface in initial release"
+    threat_model: "Local attacker with user-level access; Remote attacker if port exposed"
     invariants:
       - id: "SECINV-0001"
         statement: "gRPC server binds to localhost only by default"
       - id: "SECINV-0002"
         statement: "Agent processes run with same privileges as daemon (no privilege escalation)"
       - id: "SECINV-0003"
-        statement: "No credentials or secrets are stored or transmitted by AIP protocol"
+        statement: "All API calls must include valid authentication metadata"
       - id: "SECINV-0004"
         statement: "Input to agents is not sanitized (pass-through to PTY) - clients responsible for content"
     standards_references:

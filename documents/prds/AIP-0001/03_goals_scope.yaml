@@ -31,7 +31,6 @@ prd_goals_scope:
     - "APM2 is NOT an orchestrator - it provides primitives, not orchestration logic"
     - "APM2 does NOT implement agent-to-agent communication protocols"
     - "APM2 does NOT modify or patch underlying CLI agents"
-    - "APM2 does NOT provide authentication/authorization in initial release (deferred)"
     - "APM2 does NOT support remote/distributed agent management in initial release"
 
   scope:
@@ -42,18 +41,17 @@ prd_goals_scope:
       - "MetricsService: agent metrics, metrics streaming"
       - "PTY-based process spawning replacing stdio pipes"
       - "In-memory session store with structured Turn and ToolCall models"
+      - "SQLite session persistence for survival across daemon restarts"
+      - "Authentication and authorization (Simple Token/Key-based)"
       - "Output parser framework with Claude Code parser implementation"
       - "CLI updates to use gRPC client"
     out_of_scope:
-      - "Authentication and authorization (mTLS, tokens)"
       - "Multi-daemon coordination"
       - "Rate limiting and input flooding protection"
-      - "Remote agent management"
+      - "Remote agent management (Orchestration logic)"
       - "Parser plugins (dynamic loading)"
     deferred:
-      - item: "SQLite session persistence"
-        revisit_when: "Phase 5 or user demand"
-      - item: "Authentication/mTLS"
+      - item: "mTLS / Certificate Management"
         revisit_when: "Remote access use cases emerge"
       - item: "Dynamic parser plugins"
         revisit_when: "Community contributes parsers for other CLIs"

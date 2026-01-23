@@ -29,7 +29,8 @@ prd_traceability:
         requirement_ref: "requirements/REQ-0011.yaml#prd_requirement"
       - requirement_id: "REQ-0012"
         requirement_ref: "requirements/REQ-0012.yaml#prd_requirement"
-    imports: []
+    imports:
+      - "protocol_profiles/aip/prd_aip_requirements.yaml#aip_prd_requirements"
   mapping:
     requirement_to_sections:
       - requirement_id: "REQ-0001"
