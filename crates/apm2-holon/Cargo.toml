@@ -1,0 +1,40 @@
+[package]
+name = "apm2-holon"
+description = "Holon trait and core types for holonic agent coordination"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Error handling
+thiserror.workspace = true
+
+# Serialization
+serde.workspace = true
+
+# Async runtime
+tokio = { workspace = true, features = ["sync"] }
+
+# Time
+chrono.workspace = true
+
+# Utilities
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[features]
+default = []
+# Enable test utilities for deterministic testing
+test-utils = []
+
+[lints]
+workspace = true

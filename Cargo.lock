@@ -161,6 +161,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "apm2-holon"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
