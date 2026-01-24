@@ -317,6 +317,40 @@ rfc_ticket_decomposition:
         - "Unit tests for PR URL parsing and review type logic"
         evidence_ids: []
 
+    - ticket_id: TCK-00035
+      title: "Implement security review exec command"
+      ticket_files:
+        meta_ref: "documents/work/tickets/TCK-00035.yaml#ticket_meta"
+        body_path: "documents/work/tickets/TCK-00035.md"
+      scope:
+        in_scope:
+        - "cargo xtask security-review-exec approve <PR_URL> - Approve PR after security review"
+        - "cargo xtask security-review-exec deny <PR_URL> --reason <reason> - Deny PR with reason"
+        - "cargo xtask security-review-exec onboard - Show required reading paths"
+        - "Validate PR exists and is OPEN before posting"
+        - "--dry-run flag for all approve/deny commands"
+        - "Post detailed PR comments explaining approval/denial"
+        out_of_scope:
+        - "Automated review logic (this is for human/AI reviewer execution)"
+      binds:
+        requirement_ids: []
+        evidence_ids: []
+      custody_agent_roles:
+      - AGENT_IMPLEMENTER
+      responsibility_domains:
+      - DOMAIN_TOOLING
+      dependencies:
+      - TCK-00034
+      definition_of_done:
+        criteria:
+        - "cargo xtask security-review-exec approve <PR> posts approval comment and updates status"
+        - "cargo xtask security-review-exec deny <PR> --reason <reason> posts denial comment"
+        - "cargo xtask security-review-exec onboard prints required reading paths"
+        - "PR validation fails with error for closed/merged/missing PRs"
+        - "--dry-run flag prevents API calls while showing what would happen"
+        - "Unit tests for required reading file existence"
+        evidence_ids: []
+
     verification:
       acceptance_criteria:
       - "cargo build -p xtask compiles without warnings"

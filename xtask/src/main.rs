@@ -91,6 +91,49 @@ enum Commands {
         #[command(subcommand)]
         review_type: ReviewCommands,
     },
+
+    /// Security review execution commands for human/AI reviewers.
+    ///
+    /// Provides commands to approve or deny PRs after security review,
+    /// with robust validation and dry-run support.
+    #[command(name = "security-review-exec")]
+    SecurityReviewExec {
+        #[command(subcommand)]
+        action: SecurityReviewExecCommands,
+    },
+}
+
+/// Security review exec subcommands.
+#[derive(Subcommand)]
+enum SecurityReviewExecCommands {
+    /// Approve the PR (set ai-review/security to success).
+    ///
+    /// Posts an approval comment and updates the status check.
+    Approve {
+        /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
+        pr_url: String,
+        /// Preview what would happen without making API calls
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Deny the PR (set ai-review/security to failure).
+    ///
+    /// Posts a denial comment with the reason and updates the status check.
+    Deny {
+        /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
+        pr_url: String,
+        /// Reason for denying the security review (required)
+        #[arg(long)]
+        reason: String,
+        /// Preview what would happen without making API calls
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show required reading for security reviewers.
+    ///
+    /// Prints the file paths that security reviewers should read
+    /// before conducting reviews.
+    Onboard,
 }
 
 /// Review subcommands.
@@ -139,6 +182,17 @@ fn main() -> Result<()> {
             ReviewCommands::Security { pr_url } => tasks::review_security(&pr_url),
             ReviewCommands::Quality { pr_url } => tasks::review_quality(&pr_url),
             ReviewCommands::Uat { pr_url } => tasks::review_uat(&pr_url),
+        },
+        Commands::SecurityReviewExec { action } => match action {
+            SecurityReviewExecCommands::Approve { pr_url, dry_run } => {
+                tasks::security_review_exec_approve(&pr_url, dry_run)
+            },
+            SecurityReviewExecCommands::Deny {
+                pr_url,
+                reason,
+                dry_run,
+            } => tasks::security_review_exec_deny(&pr_url, &reason, dry_run),
+            SecurityReviewExecCommands::Onboard => tasks::security_review_exec_onboard(),
         },
     }
 }

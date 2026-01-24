@@ -30,6 +30,12 @@ It is optimized for two outcomes:
 * PR number/URL
 * Branch / merge base
 * The set of commits included in the review
+* Required reading (run `cargo xtask security-review-exec onboard` to see paths):
+
+a. @documents/security/SECURITY_POLICY.md
+b. @documents/security/CI_SECURITY_GATES.md
+c. @documents/security/THREAT_MODEL.md
+d. @documents/security/SECRETS_MANAGEMENT.md
 
 **0.2 Binding work items**
 
@@ -391,22 +397,23 @@ gh pr comment $PR_URL --body "## Security Review
 
 ### 15.2 Update the status check
 
-Based on your findings, update the `ai-review/security` status check:
+Based on your findings, use the security review exec command to post the final status:
 
 **If no CRITICAL or HIGH findings (review passed):**
 ```bash
-gh api --method POST "/repos/{owner}/{repo}/statuses/$HEAD_SHA" \
-  -f state="success" \
-  -f context="ai-review/security" \
-  -f description="Security review passed"
+cargo xtask security-review-exec approve $PR_URL
 ```
 
 **If any CRITICAL or HIGH findings (review failed):**
 ```bash
-gh api --method POST "/repos/{owner}/{repo}/statuses/$HEAD_SHA" \
-  -f state="failure" \
-  -f context="ai-review/security" \
-  -f description="Security review found issues - see PR comments"
+cargo xtask security-review-exec deny $PR_URL --reason "Security review found issues - see PR comments"
 ```
 
-**IMPORTANT:** You must execute both commands. The PR comment provides actionable feedback to the author. The status check gates the merge.
+These commands will:
+- Validate the PR exists and is open
+- Post an approval/denial comment to the PR
+- Update the `ai-review/security` status check
+
+Use `--dry-run` to preview the actions without making API calls.
+
+**IMPORTANT:** You must execute both the review comment (15.1) and the status update (15.2). The PR comment provides detailed actionable feedback to the author. The status check gates the merge.

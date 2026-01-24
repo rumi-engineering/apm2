@@ -1,0 +1,22 @@
+ticket_meta:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  ticket:
+    id: "TCK-00035"
+    title: "Implement security review exec command"
+    status: "IN_PROGRESS"
+  binds:
+    prd_id: ""
+    rfc_id: "RFC-0002"
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_TOOLING"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00034"
+  definition_of_done:
+    evidence_ids: []
