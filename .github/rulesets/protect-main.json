@@ -25,6 +25,12 @@
         "required_status_checks": [
           {
             "context": "CI Success"
+          },
+          {
+            "context": "ai-review/security"
+          },
+          {
+            "context": "ai-review/code-quality"
           }
         ],
         "strict_required_status_checks_policy": true

@@ -1,0 +1,114 @@
+---
+name: development-loop
+description: Orchestrate full development workflow for an RFC's engineering tickets. Processes tickets in dependency order, implements each, creates PRs, runs AI reviews, iterates until merged, then continues to next ticket.
+user-invocable: true
+---
+
+## Procedure
+
+### 1. Parse Arguments
+
+- `$ARGUMENTS[0]`: RFC ID (e.g., `RFC-0001`)
+
+### 2. Initialize Development Environment
+
+```bash
+cd "$(./scripts/dev/start-eng-ticket.sh {RFC_ID} --print-path)"
+```
+
+Read the output carefully. It provides all context needed to implement the ticket. If no tickets remain, the loop is complete.
+
+### 3. Process Ticket
+
+a. **Update status** to `IN_PROGRESS` in `documents/work/tickets/{TICKET_ID}.yaml` (in main worktree)
+
+b. **Implement** following coding standards in `documents/coding/SKILL.md`:
+   - Use the prompt from `references/IMPLEMENT_TICKET_PROMPT.md`
+   - Substitute `$TICKET_ID` and `$RFC_ID` with actual values
+   - Follow the implementation guidelines in that prompt
+
+c. **Run automated checks, sync your branch, and commit** using the commit script. Expect errors to occur during automated checks. We maintain an extremely high bar for code, and it is up to you to maintain that bar.:
+   ```bash
+   ./scripts/dev/commit-eng-ticket.sh "<description>"
+   ```
+
+### 4. Push, Create PR, and Run AI Reviews
+
+```bash
+./scripts/dev/push-eng-ticket.sh
+```
+
+This pushes your branch, creates/updates the PR, requests security + code quality reviews, and enables auto-merge. The PR will merge automatically once CI and reviews pass. Use `--force-review` to re-run reviews on the same commit.
+
+### 5. CI → Review → Merge Loop
+
+Use the status check script to monitor progress and get actionable guidance:
+
+```bash
+./scripts/dev/check-eng-ticket.sh
+```
+
+The script reports current state and suggests the next action:
+
+| State | Suggested Action |
+|-------|------------------|
+| Uncommitted changes | `./scripts/dev/commit-eng-ticket.sh '<message>'` |
+| No PR exists | `./scripts/dev/push-eng-ticket.sh` |
+| CI running | Wait (use `--watch` to poll) |
+| CI failed | See `documents/coding/references/CI_EXPECTATIONS.md` |
+| Reviews pending | Wait for reviews (auto-merge enabled) |
+| Reviews failed | Address feedback, commit, re-push with `--force-review` |
+| All passed | Wait for auto-merge, then cleanup worktree |
+| Already merged | Cleanup worktree and continue to next ticket |
+
+For continuous monitoring: `./scripts/dev/check-eng-ticket.sh --watch`
+
+#### After Merge
+
+1. Cleanup and continue:
+   ```bash
+   ./scripts/dev/finish-eng-ticket.sh
+   ```
+2. Return to step 2 (initialize next ticket)
+
+Note: Ticket status is automatically set to `IN_REVIEW` by the push script. A third party will verify and update to `COMPLETED` after merge.
+
+### 6. Complete
+
+When all tickets are done (no more processable tickets in step 2), report completion.
+
+---
+
+## Scripts Reference
+
+| Script | Purpose |
+|--------|---------|
+| `./scripts/dev/start-eng-ticket.sh {RFC_ID}` | Setup dev environment for next unblocked ticket |
+| `./scripts/dev/start-eng-ticket.sh {RFC_ID} -p` | Output only worktree path (for `cd "$(...)"`) |
+| `./scripts/dev/commit-eng-ticket.sh "<msg>"` | Verify, sync with main, and commit |
+| `./scripts/dev/push-eng-ticket.sh` | Push, create/update PR, run AI reviews, enable auto-merge, set status to IN_REVIEW |
+| `./scripts/dev/push-eng-ticket.sh --force-review` | Force re-run reviews even if already completed |
+| `./scripts/dev/check-eng-ticket.sh` | Check CI/review status and get next action |
+| `./scripts/dev/check-eng-ticket.sh --watch` | Continuously poll status every 10s |
+| `./scripts/dev/finish-eng-ticket.sh` | Cleanup worktree and branch after PR merges |
+
+---
+
+## Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Worktree isolation | Prevents conflicts between parallel agents, enables independent CI |
+| Branch naming: `ticket/{RFC_ID}/{TICKET_ID}` | Traceable to RFC and ticket |
+| Worktree naming: `apm2-{TICKET_ID}` | Clear association with ticket |
+| Use ticket YAML `status` field | Persistent, auditable, already in data model |
+| Idempotent scripts | Safe to re-run, handles existing state gracefully |
+| AI reviews via local CLIs | No self-hosted runners needed, uses local auth |
+| Status checks for merge gating | Reviews block merge until passed |
+| Strict dependency ordering | Prevents invalid implementation sequences |
+| Rebase before push | Keeps history linear, catches conflicts early |
+| Poll CI every 10s for first failure | Errors surface in seconds; don't wait for full run |
+| Use `--log-failed` flag | Returns only failed step logs, not entire run output |
+| Verify fmt+clippy+test BEFORE commit | Catches 90% of CI failures locally |
+| CI must pass before review matters | Never waste time on broken code |
+| Cleanup after merge | Remove worktree and branch to avoid clutter |

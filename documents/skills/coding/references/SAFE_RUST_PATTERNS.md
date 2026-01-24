@@ -1,62 +1,10 @@
-# Safe Rust Patterns for APM2
+# Safe Rust Patterns Catalog
 
-This document catalogs safe Rust patterns used throughout the APM2 codebase. Coding agents should use these patterns to avoid introducing unsafe code.
-
-## 1. Unsafe Code Policy
-
-### Workspace Lint Configuration
-
-APM2 enforces safe code through workspace-level lints in `Cargo.toml`:
-
-```toml
-[workspace.lints.rust]
-unsafe_code = "warn"
-```
-
-This causes the compiler to emit warnings for any `unsafe` blocks, ensuring they are intentional and reviewed.
-
-### When Unsafe is Prohibited
-
-Avoid `unsafe` for:
-- Memory management (use standard collections, `Box`, `Arc`, `Rc`)
-- Pointer manipulation (use references and slices)
-- Type coercion (use `From`/`Into` traits)
-- FFI unless absolutely necessary (prefer safe crate wrappers)
-- Performance optimization (profile first; safe code is usually fast enough)
-
-### When Unsafe May Be Necessary
-
-Unsafe might be justified for:
-- System calls with no safe wrapper (e.g., `fork()`)
-- Performance-critical hot paths (only after profiling proves necessity)
-- Interfacing with C libraries that lack safe Rust bindings
-
-### Required Documentation for Unsafe Code
-
-Any `unsafe` block must:
-1. Have `#[allow(unsafe_code)]` with a comment explaining why it's necessary
-2. Be isolated to the smallest possible scope
-3. Use platform gates (`#[cfg(unix)]`) when platform-specific
-4. Include a safety comment explaining invariants
-
-Example from our codebase:
-```rust
-#[allow(unsafe_code)] // fork() requires unsafe
-if !args.no_daemon {
-    #[cfg(unix)]
-    {
-        match unsafe { fork() }? {
-            // ...
-        }
-    }
-}
-```
+This document catalogs 15 safe Rust patterns used throughout the APM2 codebase. Use these patterns to avoid introducing unsafe code.
 
 ---
 
-## 2. Safe Alternatives Catalog
-
-### 2.1 Concurrent State: Arc + RwLock
+## 2.1 Concurrent State: Arc + RwLock
 
 **Pattern:** Wrap shared state in `Arc<T>` for shared ownership and `RwLock<T>` for interior mutability with multiple readers.
 
@@ -86,7 +34,7 @@ pub struct DaemonStateHandle {
 
 ---
 
-### 2.2 Type-Safe Identifiers: Newtype Pattern
+## 2.2 Type-Safe Identifiers: Newtype Pattern
 
 **Pattern:** Wrap primitive types in single-field structs to prevent mixing up semantically different IDs.
 
@@ -131,7 +79,7 @@ impl ProfileId {
 
 ---
 
-### 2.3 Safe Object Construction: Builder Pattern
+## 2.3 Safe Object Construction: Builder Pattern
 
 **Pattern:** Use a builder struct with fluent methods to construct complex objects, validating required fields at build time.
 
@@ -189,7 +137,7 @@ let spec = ProcessSpec::builder()
 
 ---
 
-### 2.4 Sensitive Data: Secrecy Crate
+## 2.4 Sensitive Data: Secrecy Crate
 
 **Pattern:** Use `SecretString` from the `secrecy` crate to hold sensitive data, preventing accidental logging.
 
@@ -233,7 +181,7 @@ let key: &str = api_key.expose_secret();
 
 ---
 
-### 2.5 State Machines: Enum with Predicates
+## 2.5 State Machines: Enum with Predicates
 
 **Pattern:** Model states as enum variants with predicate methods for querying state categories.
 
@@ -286,7 +234,7 @@ impl ProcessState {
 
 ---
 
-### 2.6 Error Handling: Result + thiserror
+## 2.6 Error Handling: Result + thiserror
 
 **Pattern:** Define custom error enums with `#[derive(thiserror::Error)]` for structured error handling.
 
@@ -331,7 +279,7 @@ pub fn get(&self, profile_id: &ProfileId) -> Result<CredentialProfile, Credentia
 
 ---
 
-### 2.7 Atomic File Operations: Write-Then-Rename
+## 2.7 Atomic File Operations: Write-Then-Rename
 
 **Pattern:** Write to a temporary file, then atomically rename to the target path.
 
@@ -365,7 +313,7 @@ pub fn save(&mut self, path: &std::path::Path) -> Result<(), StateError> {
 
 ---
 
-### 2.8 Failure Containment: Circuit Breaker
+## 2.8 Failure Containment: Circuit Breaker
 
 **Pattern:** Track failures and stop retrying when a threshold is reached.
 
@@ -415,7 +363,7 @@ impl RestartManager {
 
 ---
 
-### 2.9 Compiler Enforcement: #[must_use]
+## 2.9 Compiler Enforcement: #[must_use]
 
 **Pattern:** Annotate functions whose return values should not be ignored.
 
@@ -441,7 +389,9 @@ pub fn should_restart(&self, exit_code: Option<i32>) -> bool { ... }
 
 **Why it's safe:** The compiler warns when return values are ignored, catching bugs where callers forget to handle results.
 
-### 2.10 Safe Path Construction
+---
+
+## 2.10 Safe Path Construction
 
 **Pattern:** Never interpolate user-provided identifiers directly into file paths. Sanitize input or use a mapping to prevent path traversal.
 
@@ -468,7 +418,7 @@ let path = PathBuf::from("keys").join(actor_id);
 
 ---
 
-### 2.11 Canonical Data Representation
+## 2.11 Canonical Data Representation
 
 **Pattern:** Define a single, canonical representation for critical constants (like genesis hashes) and normalize data at system boundaries.
 
@@ -497,7 +447,7 @@ pub fn normalize_hash(hash: Option<&[u8]>) -> [u8; 32] {
 
 ---
 
-### 2.12 Secure Directory Creation
+## 2.12 Secure Directory Creation
 
 **Pattern:** Use platform-specific extensions like `DirBuilderExt` to set restrictive permissions *atomically* during directory creation.
 
@@ -521,7 +471,7 @@ pub fn normalize_hash(hash: Option<&[u8]>) -> [u8; 32] {
 
 ---
 
-### 2.13 Cryptographic Canonicalization (Ordering)
+## 2.13 Cryptographic Canonicalization (Ordering)
 
 **Pattern:** When signing or hashing collections of items, always apply a deterministic sort order before serialization.
 
@@ -543,7 +493,7 @@ pub fn prepare_for_signing(mut items: Vec<Item>) -> Vec<u8> {
 
 ---
 
-### 2.14 Platform Portability Guards
+## 2.14 Platform Portability Guards
 
 **Pattern:** Explicitly gate any use of platform-specific modules or extensions with `#[cfg(...)]`.
 
@@ -574,7 +524,7 @@ pub fn get_inode(path: &Path) -> Option<u64> {
 
 ---
 
-### 2.15 Consistency in State Management
+## 2.15 Consistency in State Management
 
 **Pattern:** Ensure that in-memory state implementations and persistent storage implementations exhibit identical behavior for edge cases (e.g., overwrites).
 
@@ -585,80 +535,3 @@ pub fn get_inode(path: &Path) -> Option<u64> {
 - Switching between mock and production implementations
 
 **Why it's safe:** Prevents "it works in tests but fails in production" bugs where the mock behavior diverges from real-world constraints.
-
----
-
-## 3. The fork() Exception: Case Study
-
-The only `unsafe` code in APM2 is the Unix daemonization in `crates/apm2-daemon/src/main.rs:243-274`.
-
-### Why fork() Requires Unsafe
-
-The POSIX `fork()` system call has semantics that cannot be expressed safely in Rust:
-- It duplicates the entire process, including memory state
-- The parent and child share file descriptors
-- Thread safety guarantees are complex
-
-The `nix` crate provides a wrapper, but the call itself is inherently `unsafe`.
-
-### How It's Isolated
-
-```rust
-#[allow(unsafe_code)] // fork() requires unsafe
-if !args.no_daemon {
-    #[cfg(unix)]
-    {
-        use nix::unistd::{ForkResult, fork, setsid};
-
-        match unsafe { fork() }? {
-            ForkResult::Parent { .. } => std::process::exit(0),
-            ForkResult::Child => {},
-        }
-
-        setsid()?;
-
-        match unsafe { fork() }? {
-            ForkResult::Parent { .. } => std::process::exit(0),
-            ForkResult::Child => {},
-        }
-    }
-}
-```
-
-**Isolation strategies used:**
-1. **Smallest scope:** `unsafe` wraps only the `fork()` call, not surrounding logic
-2. **Platform-gated:** `#[cfg(unix)]` ensures this only compiles on Unix
-3. **Documented:** The `#[allow(unsafe_code)]` comment explains necessity
-4. **Fallback:** Non-Unix platforms get a warning and run in foreground
-
-### Review Checklist for Similar Future Cases
-
-Before adding `unsafe` code, verify:
-- [ ] No safe alternative exists (checked crates.io, std library)
-- [ ] The unsafe operation is isolated to minimum scope
-- [ ] Platform gates are used if platform-specific
-- [ ] Safety invariants are documented in comments
-- [ ] The `#[allow(unsafe_code)]` annotation includes justification
-- [ ] Tests exist for both the happy path and error cases
-
----
-
-## 4. Quick Reference Checklist
-
-When writing new code, ask yourself:
-
-- [ ] **Shared state?** Use `Arc<RwLock<T>>` instead of raw pointers or global mutable state
-- [ ] **Multiple ID types?** Use newtype wrappers to prevent mixing them up
-- [ ] **Complex construction?** Use the builder pattern with validation
-- [ ] **Sensitive data?** Use `SecretString` from the `secrecy` crate
-- [ ] **Distinct states?** Use an enum with predicate methods
-- [ ] **Fallible operation?** Return `Result<T, E>` with a custom error type
-- [ ] **File writes?** Use write-then-rename for atomicity
-- [ ] **Retry logic?** Implement a circuit breaker to prevent runaway failures
-- [ ] **Return value matters?** Add `#[must_use]` to the function
-
-If you find yourself reaching for `unsafe`:
-1. Stop and search for a safe crate that wraps the functionality
-2. Check if std library provides a safe alternative
-3. If truly necessary, follow the isolation and documentation patterns above
-4. Request review from a maintainer before merging

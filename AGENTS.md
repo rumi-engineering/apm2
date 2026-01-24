@@ -6,7 +6,7 @@ See @CONTRIBUTING.md on how to work within this software project.
 
 ## Coding & Process
 
-- Coding guidelines: @documents/coding
+- Coding guidelines: @documents/coding/SKILL.md
 - Release process: @documents/releases
 - IMPORTANT - Security invariants: @documents/security
 

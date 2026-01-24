@@ -52,3 +52,6 @@ dist/
 *.key
 credentials.json
 secrets.json
+
+# Development script state
+.check-eng-ticket-state
