@@ -4,4 +4,5 @@
 //! as defined in PRD-0003. The AAT system verifies PRs through
 //! hypothesis-driven testing before they can merge.
 
+pub mod anti_gaming;
 pub mod types;
