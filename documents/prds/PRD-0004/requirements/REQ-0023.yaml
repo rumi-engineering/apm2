@@ -1,0 +1,24 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0023
+  type: FUNCTIONAL
+  title: Question Lifecycle
+  statement: System MUST support typed Question objects with lifecycle.
+  acceptance_criteria:
+  - Question objects support OPEN, ANSWERED, and VERIFIED states.
+  - Question objects support a BLOCKING flag that indicates the question blocks plan
+    progress.
+  - QuestionAsked event is emitted when a Question is created with OPEN state.
+  - QuestionAnswered event is emitted when a Question transitions to ANSWERED state.
+  - BLOCKING questions in OPEN state prevent plan completion predicate from returning
+    true.
+  - Question state transitions are recorded in the ledger and are deterministically
+    replayable.
+  evidence:
+    evidence_ids:
+    - EVID-0010
+    inherited_from_prd: false
+    notes:
+    - BLOCKING questions are referenced in plan completion logic.
+    - EVID-0010 verifies Question lifecycle state transitions and BLOCKING behavior.

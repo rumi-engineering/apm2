@@ -1,0 +1,453 @@
+rfc_trust_boundaries:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  boundaries:
+  - id: TB-001
+    name: "PR Content Boundary (Untrusted Input)"
+    description: |
+      All PR content from GitHub (description, code changes, comments) is untrusted
+      input. PR descriptions may be malicious: contain misleading section content,
+      fake usage examples, or manipulated Expected Outcomes to deceive the AAT skill.
+      Code changes may contain test-gaming patterns (hardcoded results, mock data).
+    actors:
+    - id: ACTOR-PR-AUTHOR
+      name: "PR Author (Agent or Human)"
+      trust_level: UNTRUSTED
+      description: "Submits PR with potentially misleading claims or gaming patterns"
+    - id: ACTOR-AAT-PARSER
+      name: "AAT Parser (cargo xtask, Rust)"
+      trust_level: TRUSTED
+      description: "Parses PR description and extracts sections; validates format"
+    - id: ACTOR-AAT-SKILL
+      name: "AAT Skill (LLM-driven)"
+      trust_level: SEMI_TRUSTED
+      description: "Receives parsed sections; generates hypotheses and executes tests"
+    entrypoints:
+    - id: EP-001
+      name: "PR description fetch"
+      protocol: "GitHub API via gh CLI"
+      authentication: "gh credential helper (configured by CI/CD)"
+      authorization: "Public repo access; no elevated scope"
+    - id: EP-002
+      name: "Code diff fetch"
+      protocol: "GitHub API via gh CLI"
+      authentication: "gh credential helper"
+      authorization: "Read-only; no write access to PR"
+    data_flows:
+    - id: DF-001
+      name: "PR description text"
+      source: ACTOR-PR-AUTHOR
+      destination: ACTOR-AAT-PARSER
+      data_classification: UNTRUSTED
+      description: "Markdown text containing Usage, Expected Outcomes, Evidence Script sections"
+    - id: DF-002
+      name: "Code diff"
+      source: ACTOR-PR-AUTHOR
+      destination: ACTOR-AAT-SKILL
+      data_classification: UNTRUSTED
+      description: "Changed files; subject to static analysis for anti-gaming patterns"
+    authn_authz:
+      authn: "No authentication of PR author; all content assumed potentially adversarial"
+      authz: "AAT processes all PRs; policy engine does not gate on author trust"
+    controls:
+    - id: CTL-001
+      name: "Section Format Validation"
+      description: |
+        Regex parser enforces strict section header format (## Usage, ## Expected Outcomes, etc.).
+        Malformed PRs are rejected with actionable error messages. No fallback to inference.
+    - id: CTL-002
+      name: "Code Block Extraction"
+      description: |
+        Usage section code blocks extracted via regex; no interpretation of block language tags.
+        Evidence Script path validated to exist in worktree.
+    - id: CTL-003
+      name: "Skill Input Validation"
+      description: |
+        Extracted sections passed to AAT skill; skill validates section content before processing.
+        Malicious or malformed sections cause skill to set status to failure with clear error.
+    - id: CTL-004
+      name: "Diff Anti-Gaming Analysis"
+      description: |
+        Static analysis patterns (test-condition checks, hardcoded values, mock patterns)
+        applied to code diff. Results recorded in evidence bundle for review.
+    risks:
+    - id: RSK-TB-001
+      statement: "PR author crafts misleading Expected Outcomes section"
+      mitigation: |
+        AAT skill validates each hypothesis against Expected Outcomes and actual execution.
+        Hypothesis that doesn't match Expected Outcomes will fail. Author cannot fake passing test.
+    - id: RSK-TB-002
+      statement: "PR author embeds test-gaming patterns in code (e.g., if(TEST) hardcoded_result)"
+      mitigation: |
+        Anti-gaming static analysis detects test-condition patterns.
+        Undocumented TODOs in code trigger violations. Evidence bundle flags patterns for review.
+    - id: RSK-TB-003
+      statement: "PR author provides fake Evidence Script path or path to unrelated file"
+      mitigation: |
+        Evidence Script path validated to exist in PR worktree. Execution of script
+        must produce verifiable output. If script doesn't exist, evidence bundle shows failure.
+    - id: RSK-TB-004
+      statement: "PR author submits PR with no Evidence Script (claims not needed)"
+      mitigation: |
+        Evidence Script is required by AAT protocol. Missing script causes parse failure.
+        Parser rejects PR immediately. Author must revise.
+    evidence_ids:
+    - EVID-4001
+    - EVID-4003
+
+  - id: TB-002
+    name: "Skill Invocation Boundary (LLM Output Validation)"
+    description: |
+      The AAT skill is invoked via the skill subsystem to generate hypotheses, execute
+      verification, and produce evidence bundles. The skill's output (hypotheses, verdicts)
+      must be validated before being trusted. The skill may produce malformed output or
+      reach incorrect conclusions if confused by PR content.
+    actors:
+    - id: ACTOR-XTASK
+      name: "xtask AAT Command (Rust)"
+      trust_level: TRUSTED
+      description: "Orchestrator; invokes skill and processes its output"
+    - id: ACTOR-AAT-SKILL
+      name: "AAT Skill Agent"
+      trust_level: SEMI_TRUSTED
+      description: "LLM-driven; generates hypotheses and evidence bundle"
+    - id: ACTOR-SKILL-SUBSYSTEM
+      name: "Skill Invocation Subsystem"
+      trust_level: TRUSTED
+      description: "Routes invocation, manages token budget, captures stderr/stdout"
+    entrypoints:
+    - id: EP-001
+      name: "Skill invocation with parsed PR content"
+      protocol: "Skill subsystem protocol (JSON or internal struct)"
+      authentication: "Xtask has kernel permission to invoke skills"
+      authorization: "AAT skill is whitelisted for PR verification"
+    - id: EP-002
+      name: "Skill output (evidence bundle JSON)"
+      protocol: "Structured JSON conforming to skill schema"
+      authentication: "Skill output signed/timestamped (trust marker)"
+      authorization: "Xtask validates schema before accepting output"
+    data_flows:
+    - id: DF-001
+      name: "Parsed PR sections to skill"
+      source: ACTOR-XTASK
+      destination: ACTOR-AAT-SKILL
+      data_classification: INTERNAL
+      description: |
+        Usage, Expected Outcomes, Evidence Script, Known Limitations sections
+        + PR metadata (number, commit SHA, author)
+    - id: DF-002
+      name: "Evidence bundle from skill"
+      source: ACTOR-AAT-SKILL
+      destination: ACTOR-XTASK
+      data_classification: INTERNAL
+      description: "JSON bundle with hypotheses, execution results, verdict, anti-gaming analysis"
+    authn_authz:
+      authn: "Skill identified by skill subsystem; no credential exchange at xtask level"
+      authz: "Xtask trusts skill subsystem to enforce skill permissions; does not re-check"
+    controls:
+    - id: CTL-001
+      name: "Evidence Bundle Schema Validation"
+      description: |
+        Evidence bundle JSON validated against skill schema. Missing required fields
+        (schema_version, pr_number, verdict, hypotheses, etc.) cause rejection.
+    - id: CTL-002
+      name: "Hypothesis Timestamp Validation"
+      description: |
+        Each hypothesis must have formed_at < executed_at. Violations indicate
+        skill did not follow protocol (hypothesis formed after execution). Flag as violation.
+    - id: CTL-003
+      name: "Verdict Consistency Check"
+      description: |
+        Verdict (PASSED/FAILED/NEEDS_ADJUDICATION) must be consistent with
+        hypothesis results and anti-gaming analysis. Inconsistencies logged as warnings.
+    - id: CTL-004
+      name: "Skill Invocation Timeout"
+      description: |
+        Skill invocation subject to timeout (e.g., 5 minutes). Timeouts result in
+        NEEDS_ADJUDICATION verdict. Skill must complete in bounded time.
+    - id: CTL-005
+      name: "Skill Error Output Capture"
+      description: |
+        Skill stderr and stdout captured by skill subsystem. If skill encounters
+        error (exception, panic), error log included in evidence bundle context.
+    risks:
+    - id: RSK-TB-001
+      statement: "Skill produces malformed evidence bundle (invalid JSON)"
+      mitigation: |
+        JSON parsing with strict schema validation. Malformed bundles rejected.
+        Error logged; verdict set to NEEDS_ADJUDICATION.
+    - id: RSK-TB-002
+      statement: "Skill reaches incorrect conclusion (e.g., passes malicious PR)"
+      mitigation: |
+        Evidence bundle includes full hypothesis details, execution logs, and anti-gaming
+        analysis. Human reviewers can examine evidence and override verdict if needed.
+        Evidence bundle is auditable.
+    - id: RSK-TB-003
+      statement: "Skill skips anti-gaming checks or produces incomplete analysis"
+      mitigation: |
+        Evidence bundle schema requires anti_gaming section. Missing or incomplete
+        anti-gaming analysis causes schema validation failure. Xtask rejects bundle.
+    - id: RSK-TB-004
+      statement: "Skill records false timestamps (e.g., executed_at before formed_at)"
+      mitigation: |
+        Xtask validates timestamp ordering. Violations indicate protocol breach.
+        Evidence is still recorded (humans can see the inconsistency).
+    evidence_ids:
+    - EVID-4004
+
+  - id: TB-003
+    name: "Command Execution Boundary (Evidence Script Worktree)"
+    description: |
+      Evidence scripts run in an isolated worktree (PR branch checked out) under AAT skill.
+      The script execution is sandboxed: limited filesystem access, no network, no access to
+      secrets. Scripts are untrusted code from PR author.
+    actors:
+    - id: ACTOR-AAT-SKILL
+      name: "AAT Skill"
+      trust_level: SEMI_TRUSTED
+      description: "Executes evidence scripts; captures output and exit code"
+    - id: ACTOR-SCRIPT-AUTHOR
+      name: "Evidence Script (from PR)"
+      trust_level: UNTRUSTED
+      description: "Arbitrary executable code; may attempt to escape sandbox or access secrets"
+    - id: ACTOR-WORKTREE
+      name: "Isolated Worktree"
+      trust_level: STORAGE
+      description: "Temporary directory with PR branch checked out; read-write sandbox"
+    - id: ACTOR-HOST-SYSTEM
+      name: "Host OS / Container"
+      trust_level: TRUSTED
+      description: "Provides process isolation and resource limits"
+    entrypoints:
+    - id: EP-001
+      name: "Evidence script execution"
+      protocol: "subprocess spawn with environment isolation"
+      authentication: "Script runs as non-root user (if possible)"
+      authorization: "Script can only read/write within worktree; no external access"
+    - id: EP-002
+      name: "Script exit code and output capture"
+      protocol: "Process stdout/stderr redirection"
+      authentication: "N/A"
+      authorization: "Output captured; no feedback to script about system state"
+    data_flows:
+    - id: DF-001
+      name: "Script input (argv, ENV)"
+      source: ACTOR-AAT-SKILL
+      destination: ACTOR-SCRIPT-AUTHOR
+      data_classification: INTERNAL
+      description: |
+        Script invoked with controlled environment. No secrets in ENV.
+        PR metadata (number, commit SHA) passed via argv or read from worktree.
+    - id: DF-002
+      name: "Script output"
+      source: ACTOR-SCRIPT-AUTHOR
+      destination: ACTOR-AAT-SKILL
+      data_classification: INTERNAL
+      description: |
+        stdout and stderr captured and included in evidence bundle.
+        Exit code recorded.
+    - id: DF-003
+      name: "Worktree filesystem access"
+      source: ACTOR-SCRIPT-AUTHOR
+      destination: ACTOR-WORKTREE
+      data_classification: INTERNAL
+      description: |
+        Script can read/write files in worktree. Worktree contains PR code and artifacts.
+        Writes do not persist after AAT completes.
+    authn_authz:
+      authn: "Script runs with identity of process executing AAT (CI user, not root)"
+      authz: "Filesystem ACLs restrict script to worktree directory; chroot or seccomp adds enforcement"
+    controls:
+    - id: CTL-001
+      name: "Worktree Isolation"
+      description: |
+        Evidence script runs in dedicated temporary worktree with PR branch checked out.
+        Worktree is separate from main repository. Changes to worktree do not affect repo.
+    - id: CTL-002
+      name: "Resource Limits"
+      description: |
+        Script execution subject to resource limits (CPU, memory, wall-clock time).
+        ulimit, cgroup, or similar mechanism enforces limits. Timeout terminates script.
+    - id: CTL-003
+      name: "No Network Access"
+      description: |
+        Evidence script execution environment has no network access.
+        iptables rules, network namespaces, or sandbox tools (firejail, nix) enforce this.
+    - id: CTL-004
+      name: "No Access to Credentials"
+      description: |
+        No secrets (GitHub tokens, SSH keys, AWS credentials) available in script environment.
+        SSH_AUTH_SOCK, AWS_PROFILE, etc. not set. Script cannot exfiltrate credentials.
+    - id: CTL-005
+      name: "Filesystem Read-Only for System"
+      description: |
+        System root filesystem mounted read-only (if using container sandbox).
+        Script can only write to worktree. System libraries, binaries not modifiable.
+    - id: CTL-006
+      name: "Output Capture and Size Limits"
+      description: |
+        Script stdout/stderr captured to bounded buffer (e.g., 100MB). Overflow truncates output.
+        Prevents script from exhausting disk space with massive output.
+    risks:
+    - id: RSK-TB-001
+      statement: "Script attempts to access host filesystem outside worktree"
+      mitigation: |
+        Chroot or container isolation prevents access. If escaping containment,
+        host firewall rules prevent network exfiltration.
+    - id: RSK-TB-002
+      statement: "Script runs fork bomb or infinite loop"
+      mitigation: |
+        Resource limits (ulimit, cgroup) enforced. Process count limited; memory/CPU
+        limits trigger OOM or timeout. Script terminates forcefully.
+    - id: RSK-TB-003
+      statement: "Script reads /etc/passwd or other sensitive system files"
+      mitigation: |
+        Worktree mounted with filesystem restrictions (overlayfs, bind mount read-only root).
+        Script sees only worktree contents. System files not accessible.
+    - id: RSK-TB-004
+      statement: "Script steals credentials from environment"
+      mitigation: |
+        Credentials never placed in script environment. Script runs with blank, minimal ENV.
+        SSH_AUTH_SOCK, AWS credentials, tokens not passed.
+    - id: RSK-TB-005
+      statement: "Script writes malicious code to worktree and executes"
+      mitigation: |
+        Worktree is temporary and discarded after AAT. Script writes do not persist.
+        Malicious payloads do not affect repository or future runs.
+    evidence_ids:
+    - EVID-4005
+
+  - id: TB-004
+    name: "GitHub API Boundary (Status Check Authentication)"
+    description: |
+      All GitHub API calls (fetch PR, fetch diff, set status check) made via gh CLI
+      with inherited credential helper authentication. Credentials never in xtask process.
+      Status check updates are the critical operation: setting commit status to success/failure.
+    actors:
+    - id: ACTOR-XTASK
+      name: "xtask AAT Command"
+      trust_level: TRUSTED
+      description: "Requests GitHub API operations via gh CLI"
+    - id: ACTOR-GH-CLI
+      name: "gh CLI (GitHub Command)"
+      trust_level: TRUSTED
+      description: "Handles authentication; manages credential helpers; executes GitHub API calls"
+    - id: ACTOR-GITHUB-API
+      name: "GitHub API / Enterprise"
+      trust_level: EXTERNAL
+      description: "Endpoint for PR data and status check updates; subject to OIDC/OAuth auth"
+    - id: ACTOR-GIT-REPO
+      name: "Git Repository (GitHub)"
+      trust_level: EXTERNAL
+      description: "Source of truth for PR metadata, code, and branch protection rules"
+    entrypoints:
+    - id: EP-001
+      name: "Fetch PR metadata (title, body, state)"
+      protocol: "GitHub REST API via gh"
+      authentication: "OIDC token (GitHub Actions) or stored credential (local)"
+      authorization: "Read access to public repo; no special scope needed"
+    - id: EP-002
+      name: "Fetch PR diff"
+      protocol: "GitHub REST API via gh"
+      authentication: "Same token as EP-001"
+      authorization: "Read access to PR; no write needed"
+    - id: EP-003
+      name: "Set commit status check"
+      protocol: "GitHub REST API via gh (statuses endpoint)"
+      authentication: "Token must have repo:status or repo scope"
+      authorization: "Commit author or repo maintainer can set status on their commits"
+    data_flows:
+    - id: DF-001
+      name: "PR metadata request"
+      source: ACTOR-XTASK
+      destination: ACTOR-GH-CLI
+      data_classification: INTERNAL
+      description: "xtask invokes: gh pr view <PR_URL> --json title,body,number,commits"
+    - id: DF-002
+      name: "PR metadata response"
+      source: ACTOR-GH-CLI
+      destination: ACTOR-XTASK
+      data_classification: INTERNAL
+      description: "gh returns JSON with PR info; xtask parses"
+    - id: DF-003
+      name: "Status check request"
+      source: ACTOR-XTASK
+      destination: ACTOR-GH-CLI
+      data_classification: INTERNAL
+      description: |
+        xtask invokes: gh api repos/{owner}/{repo}/statuses/{sha}
+        -f state={success|failure} -f context=aat/acceptance -f description=...
+    - id: DF-004
+      name: "Status check response"
+      source: ACTOR-GH-CLI
+      destination: ACTOR-XTASK
+      data_classification: INTERNAL
+      description: "gh confirms status update successful or returns error"
+    authn_authz:
+      authn: |
+        Authentication via gh credential helper. gh reads token from:
+        1. GITHUB_TOKEN environment variable (GitHub Actions)
+        2. ~/.config/gh/hosts.yml (local oauth token)
+        3. System credential manager (Windows/Mac)
+      authz: |
+        Token scope determines available operations. For AAT:
+        - Read PR metadata: public_repo scope sufficient
+        - Set status check: repo:status or repo scope required
+        - Scope determined at token creation time; xtask does not request additional scopes
+    controls:
+    - id: CTL-001
+      name: "Credential Isolation"
+      description: |
+        Credentials managed entirely by gh CLI. xtask never sees raw tokens.
+        xtask invokes gh via subprocess; token stays in gh process memory.
+    - id: CTL-002
+      name: "Scope Validation"
+      description: |
+        Before running AAT, CI/CD environment must have GITHUB_TOKEN with
+        repo:status scope. If token lacks scope, gh returns 403 Forbidden.
+        Xtask catches error and reports missing scope.
+    - id: CTL-003
+      name: "Status Check Description Validation"
+      description: |
+        Status check description (set by xtask) is validated before submission.
+        Description includes: verdict (PASSED/FAILED), reason, evidence URL.
+        Description length limited to 140 characters (GitHub limit).
+    - id: CTL-004
+      name: "Idempotent Status Updates"
+      description: |
+        Status check updates are idempotent: same commit SHA, same status context,
+        can be called multiple times without side effects. gh API overwrites previous status.
+    - id: CTL-005
+      name: "Audit Logging of Status Changes"
+      description: |
+        All status check API calls logged by xtask (who set it, when, to what state).
+        Logs retained for audit trail. No secrets logged (tokens not printed).
+    risks:
+    - id: RSK-TB-001
+      statement: "Malicious actor sets AAT status without authorization"
+      mitigation: |
+        GitHub API requires authentication token with repo:status scope.
+        Attacker cannot set status without valid token. CI/CD manages token lifecycle.
+    - id: RSK-TB-002
+      statement: "Token credential extracted from gh process"
+      mitigation: |
+        Token stored in gh process memory; never written to disk or logs.
+        xtask has no access to token. Requires compromising gh binary or host.
+    - id: RSK-TB-003
+      statement: "Status check set incorrectly (success when should be failure)"
+      mitigation: |
+        Evidence bundle schema and verdict logic validated by xtask before setting status.
+        If verdict is FAILED, status set to failure. Mismatch caught by code review.
+    - id: RSK-TB-004
+      statement: "Race condition: two AAT runs race to set status on same commit"
+      mitigation: |
+        Status check API is last-write-wins. Final status determined by whichever
+        AAT run completes last. To avoid confusion, enforce one AAT per PR at a time
+        (via workflow concurrency limits or queueing).
+    - id: RSK-TB-005
+      statement: "gh CLI not installed or credential helper misconfigured in CI/CD"
+      mitigation: |
+        CI/CD setup documents required tools and credential configuration.
+        xtask checks for gh availability at startup. Missing credentials cause early exit.
+    evidence_ids:
+    - EVID-4002

@@ -1,0 +1,26 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: EVID-0005
+  category: TEST_RESULTS
+  title: Countermeasure regression test suite
+  capture:
+    paths:
+    - tests/countermeasure/
+  verification:
+    commands:
+    - id: CMD-0005
+      shell: bash
+      command: cargo test --package apm2-core --lib work::countermeasure::tests
+      expected_exit_code: 0
+      cwd: .
+      timeout_seconds: 900
+      network_access: DISALLOWED
+  data:
+    classification: INTERNAL
+    redaction:
+      required: false
+      guidance:
+      - Tests must verify countermeasure effectiveness tracking.
+      - Include regression tests for countermeasure deployment scenarios.
+      - Verify recurrence rate measurement before and after countermeasure.

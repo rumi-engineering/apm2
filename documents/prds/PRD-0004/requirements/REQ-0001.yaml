@@ -1,0 +1,16 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0001
+  type: FUNCTIONAL
+  title: Plan creation from template via single command
+  statement: 'The system MUST provide a single command that creates a new PRD from template given a low-fidelity idea (title and rough problem statement). The command MUST create the full PRD directory structure, populate metadata, and emit a PlanCreated event to the ledger.'
+  acceptance_criteria:
+    - 'Command `apm2 plan new "<title>" --idea "<problem>"` creates PRD-XXXX directory with all template files.'
+    - The command assigns the next available PRD ID following the PRD-[0-9]{4} pattern.
+    - A PlanCreated event is emitted to the ledger with plan_id and spec_snapshot_hash.
+    - The created PRD passes basic lint validation (YAML parses, required fields present).
+    - The command completes in <5 seconds on local filesystem.
+  evidence:
+    evidence_ids:
+      - EVID-0001

@@ -1,0 +1,23 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0004
+  type: FUNCTIONAL
+  title: Gated plan completion with deterministic predicate
+  statement: 'Plan completion MUST be determined by a deterministic predicate over lint outcomes and blockers, not aesthetic judgment. The predicate evaluates: (1) lint passes with zero blocking violations, (2) no BLOCKING questions remain, (3) required evidence stubs exist, (4) all cross-references resolve.'
+  acceptance_criteria:
+    - Plan status transitions to READY_FOR_REVIEW only when stop predicate returns true.
+    - Stop predicate is a pure function of lint outcomes and blocking question count.
+    - 'Predicate components are individually queryable: `apm2 plan validate <prd_id>` shows each condition.'
+    - Plan completion or abort MUST release any held refinement lease (per REQ-0002 lease semantics).
+    - PlanApproved event requires human/authority agent signature; approval is recorded to ledger.
+    - Approval cannot be forged; requires valid signature from authorized role.
+    - Approval signatures MUST be Ed25519 over canonical protobuf-encoded event bytes with
+      domain separator "PLAN_APPROVED:".
+    - Signature verification is mandatory on event ingestion; invalid signatures cause
+      rejection with audit log entry and reason code INVALID_SIGNATURE.
+    - Multi-party approvals require N-of-M valid signatures per INV-0007 quorum rules.
+  evidence:
+    evidence_ids:
+      - EVID-0001
+      - EVID-0006

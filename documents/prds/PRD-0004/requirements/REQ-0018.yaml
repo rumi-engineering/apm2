@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0018
+  type: OPERABILITY
+  title: Audit timeline for any work object
+  statement: 'Operators MUST be able to query a complete audit timeline for any work object (plan, changeset, gate run, finding). The timeline shows all events, gate results, and evidence references in chronological order.'
+  acceptance_criteria:
+    - 'Command `apm2 audit timeline <object_id>` returns ordered events for the object.'
+    - Timeline includes event type, timestamp, actor, and summary.
+    - Evidence references are included with content-addressed hashes for retrieval.
+    - Timeline can be filtered by event type or time range.
+    - Output formats include human-readable and JSON for scripting.
+    - Timeline is computed entirely from ledger events (no external queries).
+  evidence:
+    evidence_ids:
+      - EVID-0008

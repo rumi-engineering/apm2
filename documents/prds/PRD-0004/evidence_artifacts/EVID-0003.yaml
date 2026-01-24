@@ -1,0 +1,25 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: EVID-0003
+  category: TEST_RESULTS
+  title: GitHub sync adapter consistency tests
+  capture:
+    paths:
+    - tests/github_sync/
+  verification:
+    commands:
+    - id: CMD-0003
+      shell: bash
+      command: cargo test --package apm2-adapters --lib github::sync::tests
+      expected_exit_code: 0
+      cwd: .
+      timeout_seconds: 900
+      network_access: DISALLOWED
+  data:
+    classification: INTERNAL
+    redaction:
+      required: false
+      guidance:
+      - Redact any GitHub tokens or authentication credentials from test fixtures.
+      - Ensure tests verify eventual consistency and divergence detection.

@@ -1,0 +1,283 @@
+rfc_test_and_evidence:
+  test_strategy:
+    overview: |
+      Testing strategy extends the xtask-scripting framework to provide
+      comprehensive validation of AAT components and end-to-end workflows.
+      Tests follow the standard xtask execution model with event streaming,
+      checkpoints, and structured validation.
+
+    unit_tests:
+      - component: "PR Description Parser"
+        coverage_target: "90%"
+        implementation: "cargo xtask test parser"
+        test_cases:
+          - name: "Parse well-formed PR with all sections"
+            setup: "Fixture with complete PR description"
+            validation: |
+              - All sections extracted correctly
+              - Usage, Expected Outcomes, Evidence Script, Known Limitations present
+              - Metadata timestamps recorded
+
+          - name: "Handle missing optional sections"
+            setup: "PR without Known Limitations section"
+            validation: |
+              - Parser continues with default empty limitations
+              - Warning event emitted
+              - Parsing succeeds
+
+          - name: "Reject PR missing required sections"
+            setup: "PR without Evidence Script"
+            validation: |
+              - Parser rejects input
+              - Error event with clear reason
+              - Exit code non-zero
+
+          - name: "Handle malformed markdown"
+            setup: "PR with unclosed code blocks and invalid YAML"
+            validation: |
+              - Graceful degradation with fallback parsing
+              - Error-level event emitted
+              - Partial parse succeeds with warnings
+
+      - component: "Anti-Gaming Detector"
+        coverage_target: "90%"
+        implementation: "cargo xtask test anti-gaming"
+        test_cases:
+          - name: "Detect if-test conditionals"
+            setup: "Diff with pattern 'if test_name in argv'"
+            validation: |
+              - Detection identifies specific line and function
+              - Severity HIGH
+              - Evidence includes code context
+
+          - name: "Detect hardcoded UUIDs"
+            setup: "Diff with pattern 'mock_uuid = UUID(...)'"
+            validation: |
+              - Detection identifies hardcoded constant
+              - Classification: mock data
+              - False positive rate < 5%
+
+          - name: "Extract TODOs from diff"
+            setup: "Diff with TODO and FIXME comments"
+            validation: |
+              - All comments extracted
+              - Matched against Known Limitations
+              - Report uncovered TODOs
+
+          - name: "Pass clean code"
+            setup: "Legitimate production code diff"
+            validation: |
+              - No detections
+              - Exit code 0
+              - Performance < 500ms for 10KB diff
+
+      - component: "Hypothesis Generator"
+        coverage_target: "85%"
+        implementation: "cargo xtask test hypothesis"
+        test_cases:
+          - name: "Generate 3+ hypotheses from outcomes"
+            setup: "Parsed PR with 5 Expected Outcomes"
+            validation: |
+              - Minimum 3 hypotheses generated
+              - Each hypothesis testable
+              - Outcomes covered
+
+          - name: "Include error handling hypothesis"
+            setup: "Any parsed PR"
+            validation: |
+              - Minimum 1 hypothesis tests error path
+              - Explicitly named "error_handling"
+              - Distinct from happy-path hypotheses
+
+          - name: "Timestamp and hash correctly"
+            setup: "Generated hypothesis set"
+            validation: |
+              - Timestamps within 1 second of generation
+              - Cryptographic SHA256 hash matches content
+              - Hash immutable across re-serialization
+
+    integration_tests:
+      - scenario: "End-to-end AAT pass"
+        implementation: "cargo xtask test e2e --pass"
+        description: |
+          Submit valid PR with all sections, verify AAT completes successfully
+        steps:
+          - Create mock PR with complete sections
+          - Parse PR description
+          - Generate hypotheses
+          - Run anti-gaming detection (pass)
+          - Execute evidence script in sandbox
+          - Generate evidence bundle
+          - Verify all gates pass
+        validation: |
+          - Exit code 0
+          - Evidence bundle tarball created
+          - Manifest validates
+          - All artifact hashes match content
+          - Execution time < 2 minutes
+        expected_artifacts:
+          - evidence_bundle.tar.gz
+          - manifest.yaml
+          - hypothesis.yaml
+          - execution.log
+
+      - scenario: "End-to-end AAT fail - gaming detected"
+        implementation: "cargo xtask test e2e --gaming"
+        description: |
+          Submit PR with hardcoded logic, verify AAT detects and blocks
+        steps:
+          - Create mock PR with if-test conditional
+          - Parse PR description
+          - Generate hypotheses
+          - Run anti-gaming detection (fail)
+          - Emit GATE-AAT-ANTI-GAMING failure
+          - Do not execute evidence script
+        validation: |
+          - Exit code non-zero
+          - Detection reason clearly documented
+          - Evidence bundle NOT generated
+          - Status check set to failure
+          - Clear guidance for remediation
+        expected_artifacts:
+          - detection_report.yaml
+
+      - scenario: "End-to-end AAT with flaky test"
+        implementation: "cargo xtask test e2e --flaky"
+        description: |
+          Evidence script fails intermittently, verify retry mechanism
+        steps:
+          - Create mock PR with non-deterministic script
+          - Parse and validate
+          - Execute evidence script (fail attempt 1)
+          - Retry with same seed (fail attempt 2)
+          - Retry with same seed (pass attempt 3)
+          - Record retry history
+        validation: |
+          - Final exit code 0
+          - Retry log shows all 3 attempts
+          - Seed used for all attempts identical
+          - Determinism verified
+          - Evidence bundle generated
+        max_retries: 3
+        expected_artifacts:
+          - execution.log with retry history
+
+      - scenario: "Waiver flow"
+        implementation: "cargo xtask test e2e --waiver"
+        description: |
+          Request waiver for legitimate gaming exception, grant, verify merge allowed
+        steps:
+          - AAT fails with detected gaming pattern
+          - Request waiver with rationale
+          - Approve waiver (AUTH_SECURITY)
+          - Re-run AAT with waiver active
+          - Verify GATE-AAT-ACCEPTANCE passes
+        validation: |
+          - Waiver request stored with timestamp
+          - Approver role verified
+          - Waiver appears in audit log
+          - 30-day expiration set
+          - Gate bypassed with waiver documented
+        expected_artifacts:
+          - waiver_record.yaml
+          - audit_log_entry.json
+
+  evidence_requirements:
+    - evidence_id: EVID-0001
+      description: "PR parser unit test results"
+      format: "xunit XML + event stream (NDJSON)"
+      location: "target/xtask/evidence/test_parser.ndjson"
+      validation: |
+        - All test cases executed
+        - Coverage metric included
+        - Zero tolerance for malformed tests
+
+    - evidence_id: EVID-0002
+      description: "Anti-gaming detector unit test results"
+      format: "xunit XML + detection report YAML"
+      location: "target/xtask/evidence/test_anti_gaming.ndjson"
+      validation: |
+        - Detection matrix with true/false positives
+        - Performance metrics for detection
+        - Coverage of all detector types
+
+    - evidence_id: EVID-0003
+      description: "Hypothesis generator unit test results"
+      format: "NDJSON event stream + sample hypotheses"
+      location: "target/xtask/evidence/test_hypothesis.ndjson"
+      validation: |
+        - Generation consistency verified
+        - Hash stability proven
+        - Timestamp accuracy verified
+
+    - evidence_id: EVID-0004
+      description: "Integration test execution logs"
+      format: "NDJSON xtask event stream"
+      location: "target/xtask/evidence/e2e_execution.ndjson"
+      validation: |
+        - All scenarios completed
+        - Event ordering preserved
+        - Step completion times recorded
+        - Artifact checksums included
+
+    - evidence_id: EVID-0005
+      description: "Test coverage report"
+      format: "lcov + HTML report"
+      location: "target/coverage/coverage.lcov"
+      validation: |
+        - Parser coverage >= 90%
+        - Anti-gaming coverage >= 90%
+        - Hypothesis coverage >= 85%
+        - Overall coverage >= 85%
+
+    - evidence_id: EVID-0006
+      description: "Benchmark results"
+      format: "JSON with timing statistics"
+      location: "target/xtask/evidence/benchmarks.json"
+      validation: |
+        - Parser performance: < 100ms per KB of PR
+        - Anti-gaming detection: < 500ms per KB of diff
+        - Evidence execution: < 2 minutes per PR
+        - Evidence bundle generation: < 1 minute
+
+  test_execution:
+    framework: "cargo xtask test"
+    command_structure: |
+      cargo xtask test <component> [--pass|--fail|--gaming|--flaky|--waiver]
+      cargo xtask test all           # Run all test suites
+      cargo xtask test unit          # Unit tests only
+      cargo xtask test integration   # Integration tests only
+      cargo xtask test e2e           # End-to-end scenarios only
+
+    xtask_integration:
+      checkpoint_behavior: |
+        - Each test component creates checkpoint on completion
+        - Checkpoint includes: test_id, duration, result_summary
+        - Rollback on failure: cleanup temp fixtures and sandboxes
+        - Evidence artifacts persisted even on rollback
+
+      event_streaming: |
+        - Console mode: Human-readable output with progress spinners
+        - Machine mode: NDJSON stream for CI/CD integration
+        - Each event includes: step_id, timestamp, test_name, status
+        - Output streams multiplexed by test component
+
+      cancellation: |
+        - SIGINT triggers graceful shutdown
+        - Grace period: 10 seconds for test cleanup
+        - SIGKILL after grace period
+        - Checkpoint records cancellation status
+
+    ci_integration:
+      github_actions: |
+        - Run on every PR: cargo xtask test all
+        - Fail-fast on unit test failure
+        - Continue integration tests even if one fails
+        - Post summary as PR check
+
+      success_criteria: |
+        - All unit tests pass (EVID-0001, EVID-0002, EVID-0003)
+        - All integration tests pass (EVID-0004)
+        - Coverage meets targets (EVID-0005)
+        - Benchmarks within bounds (EVID-0006)
+        - All artifacts present and valid

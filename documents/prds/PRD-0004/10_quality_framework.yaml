@@ -1,0 +1,573 @@
+prd_quality_framework:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  profile_id: PRD_QUALITY_FRAMEWORK_V2
+
+  # Requirement Coverage Mapping
+  requirement_coverage:
+    - requirement_id: REQ-0001
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0001
+      notes: Plan creation from template with single command - core workflow requirement
+    - requirement_id: REQ-0002
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0001
+        - EVID-0002
+      notes: Bounded holonic refinement passes - core workflow requirement
+    - requirement_id: REQ-0003
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0001
+        - EVID-0002
+      notes: Deterministic patches and decisions - ensures reproducibility
+    - requirement_id: REQ-0004
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0001
+        - EVID-0006
+      notes: Gated plan completion with deterministic predicate - governance requirement
+    - requirement_id: REQ-0005
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0002
+        - EVID-0003
+      notes: ChangeSet abstraction decoupled from git branches - core abstraction
+    - requirement_id: REQ-0006
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0002
+      notes: Spec snapshot hash binding for reproducibility - cryptographic binding
+    - requirement_id: REQ-0007
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0004
+        - EVID-0006
+      notes: ChangeSet reviews produce typed findings - no prose comments
+    - requirement_id: REQ-0008
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0006
+      notes: Gates execute as bounded holonic episodes - budget constraints
+    - requirement_id: REQ-0009
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0004
+        - EVID-0016
+      notes: Signed GateRunCompleted events - cryptographic attestation
+    - requirement_id: REQ-0010
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0006
+      notes: AAT gate with falsifiable hypotheses - testability requirement
+    - requirement_id: REQ-0011
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0006
+        - EVID-0008
+      notes: Security gate enforces invariant compliance - security validation
+    - requirement_id: REQ-0012
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0004
+      notes: Deterministic finding signatures for clustering - recurrence detection
+    - requirement_id: REQ-0013
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0004
+        - EVID-0016
+      notes: Signed CountermeasureProposed events - cryptographic attestation
+    - requirement_id: REQ-0014
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0005
+      notes: Countermeasure effectiveness tracking - feedback loop closure
+    - requirement_id: REQ-0015
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0003
+        - EVID-0007
+      notes: GitHub sync adapter projects ledger state - interoperability
+    - requirement_id: REQ-0016
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0003
+        - EVID-0007
+      notes: Internal state authoritative over GitHub - reliability and resilience
+    - requirement_id: REQ-0017
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0003
+      notes: Agents never call GitHub APIs directly - security isolation
+    - requirement_id: REQ-0018
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0008
+      notes: Audit timeline for any work object - observability requirement
+    - requirement_id: REQ-0019
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0004
+        - EVID-0016
+      notes: Signed operator freeze commands - accountability and safety
+    - requirement_id: REQ-0020
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0004
+        - EVID-0016
+      notes: Signed operator override commands with authority verification - governance
+    - requirement_id: REQ-0021
+      coverage_level: PARTIAL
+      evidence_ids: []
+      notes: WorkReducer state replay - requires integration tests for checkpoint/replay logic
+    - requirement_id: REQ-0022
+      coverage_level: PARTIAL
+      evidence_ids: []
+      notes: MergeReceipt - requires integration tests binding all digests
+    - requirement_id: REQ-0023
+      coverage_level: PARTIAL
+      evidence_ids: []
+      notes: Question lifecycle - requires integration tests for state transitions
+    - requirement_id: REQ-0024
+      coverage_level: PARTIAL
+      evidence_ids: []
+      notes: Countermeasure validation gate - requires corpus replay evidence
+    - requirement_id: REQ-0025
+      coverage_level: FULL
+      evidence_ids:
+        - EVID-0004
+        - EVID-0016
+      notes: Critical event signing - cryptographic binding for critical events
+
+  # Invariant Coverage Mapping
+  invariant_coverage:
+    - invariant_id: INV-0001
+      verification_approach: PROPERTY_TESTS
+      evidence_ids:
+        - EVID-0002
+      notes: Work state reproducible from ledger events - deterministic replay verified
+    - invariant_id: INV-0002
+      verification_approach: INTEGRATION_TESTS
+      evidence_ids:
+        - EVID-0006
+      notes: Every gate outcome backed by evidence - gate runner validates evidence bundles
+    - invariant_id: INV-0003
+      verification_approach: UNIT_TESTS
+      evidence_ids:
+        - EVID-0001
+      notes: Spec snapshots are content-addressed - blake3 hash verification
+    - invariant_id: INV-0004
+      verification_approach: PROPERTY_TESTS
+      evidence_ids:
+        - EVID-0004
+      notes: FindingSignature normalization is canonical - determinism verified
+    - invariant_id: INV-0005
+      verification_approach: INTEGRATION_TESTS
+      evidence_ids:
+        - EVID-0005
+      notes: Countermeasure effectiveness tracked - pre/post recurrence rates measured
+    - invariant_id: INV-0006
+      verification_approach: AUDIT_LOG_VALIDATION
+      evidence_ids:
+        - EVID-0008
+      notes: Operator interventions auditable - all actions recorded with rationale
+    - invariant_id: INV-0007
+      verification_approach: CRYPTOGRAPHIC_VERIFICATION
+      evidence_ids:
+        - EVID-0004
+        - EVID-0016
+      notes: Event chain cryptographic binding - BLAKE3 hash chain validation
+
+  # Test Categories
+  test_categories:
+    unit:
+      scope: Individual components and functions
+      examples:
+        - SpecSnapshot blake3 hash computation
+        - FindingSignature determinism
+        - Event serialization and deserialization
+        - YAML canonicalization
+      required_coverage: 80%
+      execution_frequency: On every commit
+    integration:
+      scope: Component interactions and workflows
+      examples:
+        - Plan creation and refinement workflows
+        - Gate execution with evidence bundles
+        - ChangeSet lifecycle transitions
+        - GitHub sync adapter projection
+        - Ledger event replay from checkpoints
+      required_coverage: 70%
+      execution_frequency: On every PR
+    property:
+      scope: Invariant verification across input space
+      examples:
+        - Finding signature determinism across equivalent code
+        - Event replay produces identical state
+        - Canonicalization produces identical output
+        - Hash chain integrity verification
+      required_coverage: 100% of defined invariants
+      execution_frequency: On every PR
+    e2e:
+      scope: Complete user workflows end-to-end
+      examples:
+        - Plan creation → refinement → approval → changeset → merge
+        - Finding detection → recurrence → countermeasure → validation
+        - Offline operation without GitHub availability
+        - Operator intervention workflows
+      required_coverage: Critical paths covered
+      execution_frequency: Nightly and on release candidates
+    security:
+      scope: Security invariant compliance and cryptographic verification
+      examples:
+        - Ed25519 signature verification for critical events
+        - Authority verification for operator commands
+        - Policy engine blocking unauthorized API calls
+        - Event chain integrity validation
+      required_coverage: 100% of security requirements
+      execution_frequency: On every PR and release
+
+  # Coverage Thresholds
+  coverage_thresholds:
+    unit_tests:
+      line_coverage: 80%
+      branch_coverage: 75%
+      enforcement: BLOCKING
+      notes: Core business logic must have high coverage
+    integration_tests:
+      workflow_coverage: 70%
+      enforcement: BLOCKING
+      notes: All critical workflows must have integration tests
+    property_tests:
+      invariant_coverage: 100%
+      enforcement: BLOCKING
+      notes: All defined invariants must have property test verification
+    security_tests:
+      requirement_coverage: 100%
+      enforcement: BLOCKING
+      notes: All security requirements must have test coverage
+    e2e_tests:
+      critical_path_coverage: 100%
+      enforcement: ADVISORY
+      notes: E2E tests validate full workflows but may be slower
+
+  # Quality Dimensions
+  dimensions:
+  - dimension_id: AGENT_FRIENDLY_UX
+    applicability: APPLIES
+    disposition: EXPLICIT_REQUIREMENTS
+    coverage:
+      requirement_ids:
+      - REQ-0001
+      - REQ-0002
+      - REQ-0007
+      evidence_ids:
+      - EVID-0001
+      - EVID-0002
+      - EVID-0004
+    delegation:
+      guardrails: []
+      required_evidence_categories: []
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: ACCESSIBILITY
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids: []
+      evidence_ids: []
+    delegation:
+      guardrails:
+      - All user-visible text outputs MUST be screen-reader compatible in terminal
+        contexts.
+      - All error messages MUST include actionable next steps.
+      required_evidence_categories:
+      - TEST_RESULTS
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: BACKWARD_COMPATIBILITY
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids: []
+      evidence_ids: []
+    delegation:
+      guardrails:
+      - If any external contract changes, document compatibility impact and provide
+        a migration path.
+      - Backward-incompatible changes require explicit version bump and compatibility
+        tests.
+      required_evidence_categories:
+      - INTEGRATION_TEST_RESULTS
+      - CHANGELOG_ENTRIES
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: COST_EFFICIENCY
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids: []
+      evidence_ids: []
+    delegation:
+      guardrails:
+      - Define cost drivers and provide measurable cost targets or explicitly waive
+        with signoff.
+      required_evidence_categories:
+      - METRICS_DASHBOARDS
+      - BENCHMARK_RESULTS
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: DATA_PRIVACY
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids: []
+      evidence_ids: []
+    delegation:
+      guardrails:
+      - Minimize data collection; classify data; specify retention; specify redaction.
+      required_evidence_categories:
+      - AUDIT_LOGS
+      - POLICY_CHECK_RESULTS
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs:
+      - AUTH_SECURITY
+      - AUTH_DATA_GOVERNANCE
+  - dimension_id: DEFAULT_DENY_SECURITY
+    applicability: APPLIES
+    disposition: EXPLICIT_REQUIREMENTS
+    coverage:
+      requirement_ids:
+      - REQ-0011
+      - REQ-0017
+      evidence_ids:
+      - EVID-0003
+      - EVID-0006
+      - EVID-0008
+    delegation:
+      guardrails: []
+      required_evidence_categories: []
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: DETERMINISM
+    applicability: APPLIES
+    disposition: EXPLICIT_REQUIREMENTS
+    coverage:
+      requirement_ids:
+      - REQ-0003
+      - REQ-0006
+      - REQ-0012
+      evidence_ids:
+      - EVID-0001
+      - EVID-0002
+      - EVID-0004
+    delegation:
+      guardrails: []
+      required_evidence_categories: []
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: DOCUMENTATION
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids: []
+      evidence_ids: []
+    delegation:
+      guardrails:
+      - All externally-consumed contracts MUST have versioned documentation.
+      - All operational procedures MUST be documented as executable runbooks where
+        applicable.
+      required_evidence_categories:
+      - BUILD_ARTIFACTS
+      - CHANGELOG_ENTRIES
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: ERROR_HANDLING
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids: []
+      evidence_ids: []
+    delegation:
+      guardrails:
+      - All errors MUST be typed/classified and mapped to deterministic handling paths.
+      - Error outputs MUST be safe (no secrets) and actionable.
+      required_evidence_categories:
+      - TEST_RESULTS
+      - RUNTIME_LOGS
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: INTEROPERABILITY
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids:
+      - REQ-0015
+      - REQ-0016
+      evidence_ids:
+      - EVID-0003
+      - EVID-0007
+    delegation:
+      guardrails:
+      - Define external interface contracts and provide interop test coverage for
+        supported versions.
+      required_evidence_categories:
+      - INTEGRATION_TEST_RESULTS
+      - BUILD_ARTIFACTS
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: OBSERVABILITY
+    applicability: APPLIES
+    disposition: EXPLICIT_REQUIREMENTS
+    coverage:
+      requirement_ids:
+      - REQ-0009
+      - REQ-0018
+      evidence_ids:
+      - EVID-0006
+      - EVID-0008
+    delegation:
+      guardrails: []
+      required_evidence_categories: []
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: OPERATIONAL_READINESS
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids: []
+      evidence_ids: []
+    delegation:
+      guardrails:
+      - Define alarms/guardrails and automated response procedures for critical paths.
+      - Provide rollback/recovery procedures for each rollout phase.
+      required_evidence_categories:
+      - CONFIG_SNAPSHOTS
+      - METRICS_DASHBOARDS
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: PERFORMANCE
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids: []
+      evidence_ids: []
+    delegation:
+      guardrails:
+      - Define explicit latency/throughput targets or explicitly waive with signoff.
+      required_evidence_categories:
+      - BENCHMARK_RESULTS
+      - LOAD_TEST_RESULTS
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: RECOVERY_ROLLBACK
+    applicability: APPLIES
+    disposition: EXPLICIT_REQUIREMENTS
+    coverage:
+      requirement_ids:
+      - REQ-0024
+      evidence_ids: []
+    delegation:
+      guardrails: []
+      required_evidence_categories: []
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: RELIABILITY
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids:
+      - REQ-0016
+      - REQ-0021
+      evidence_ids:
+      - EVID-0003
+      - EVID-0007
+    delegation:
+      guardrails:
+      - Define failure budgets and recovery behavior for all critical paths.
+      required_evidence_categories:
+      - INTEGRATION_TEST_RESULTS
+      - RUNTIME_LOGS
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: RESILIENCE
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids:
+      - REQ-0016
+      evidence_ids:
+      - EVID-0003
+      - EVID-0007
+    delegation:
+      guardrails:
+      - Demonstrate behavior under dependency failures and resource pressure.
+      required_evidence_categories:
+      - CHAOS_TEST_RESULTS
+      - RUNTIME_LOGS
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: SCALABILITY
+    applicability: APPLIES
+    disposition: DELEGATED_WITH_GUARDRAILS
+    coverage:
+      requirement_ids: []
+      evidence_ids: []
+    delegation:
+      guardrails:
+      - Define scaling model and validate behavior at expected peak load.
+      required_evidence_categories:
+      - LOAD_TEST_RESULTS
+      - BENCHMARK_RESULTS
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []
+  - dimension_id: TESTABILITY
+    applicability: APPLIES
+    disposition: EXPLICIT_REQUIREMENTS
+    coverage:
+      requirement_ids:
+      - REQ-0010
+      evidence_ids:
+      - EVID-0006
+    delegation:
+      guardrails: []
+      required_evidence_categories: []
+    exception:
+      requested: false
+      rationale: ''
+      required_signoffs: []

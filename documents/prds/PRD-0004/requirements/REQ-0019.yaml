@@ -1,0 +1,33 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0019
+  type: SECURITY
+  title: Signed and recorded operator freeze commands
+  statement: Operator freeze commands MUST be cryptographically signed by an authorized
+    operator identity using Ed25519 signatures and recorded in the ledger with full
+    attribution before taking effect; the signature binds the freeze scope, reason,
+    and duration to the operator's authority.
+  acceptance_criteria:
+  - OperatorFreeze events include operator_actor_id, operator_signature, and
+    authority_delegation_chain fields.
+  - Signatures are Ed25519 over canonical protobuf-encoded event bytes with domain
+    separator "OPERATOR_FREEZE:".
+  - Signature verification is mandatory; unsigned or invalid-signature freeze commands
+    are rejected with reason code INVALID_SIGNATURE.
+  - The operator_actor_id MUST hold OPERATOR_FREEZE authority in the governance
+    profile; unauthorized freeze attempts are rejected with reason code UNAUTHORIZED_OPERATOR.
+  - Freeze scope (work_ids, actor_ids, or scope_pattern) and freeze_reason are covered
+    by the signature and immutably recorded.
+  - Freeze commands take effect only after successful ledger append with valid signature;
+    the system never honors unrecorded freeze requests.
+  - Freeze duration and auto-unfreeze conditions are specified in the signed payload.
+  - Audit log records all freeze command attempts including rejections with full attribution.
+  evidence:
+    evidence_ids:
+    - EVID-0004
+    - EVID-0016
+    inherited_from_prd: true
+    notes:
+    - "Operator freeze is a critical safety mechanism; signing ensures accountability"
+    - "Authority delegation chain enables tracing freeze authority to root"

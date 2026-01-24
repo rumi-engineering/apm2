@@ -1,0 +1,83 @@
+prd_success_metrics:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  metrics:
+    - id: MET-0001
+      name: PRD refinement tool invocation count
+      description: |
+        Number of CLI command invocations required for an agent to produce a high-fidelity PRD from a low-fidelity idea.
+        Clarification: "tool invocations" means apm2 CLI commands (e.g., `apm2 plan new`, `apm2 plan refine`),
+        NOT internal LLM API calls within a command. Internal LLM calls during plan refinement do not count.
+        Example: `plan new` (1) + `plan refine` (up to 3x) + `plan validate` (1) = 5 commands max.
+      baseline: Manual PRD creation requires extensive back-and-forth; no automated baseline.
+      target: Agent produces lint-passing PRD in <=5 CLI command invocations.
+      measurement_method: |
+        Count PlanCreated, PlanRefined, and PlanValidated events from ledger for successful PRD completions.
+        Each event represents one CLI command invocation. Internal LLM calls within commands are not counted.
+      evidence_ids:
+        - EVID-0001
+    - id: MET-0002
+      name: Work state query latency
+      description: Time to answer work lifecycle queries (status, history, findings) from ledger projections.
+      baseline: Current queries hit GitHub API with variable latency (100ms-2s).
+      target: All work state queries answered from local projections in <100ms p99.
+      measurement_method: Instrument CLI commands with timing; collect p50/p95/p99 latencies.
+      evidence_ids:
+        - EVID-0002
+    - id: MET-0003
+      name: GitHub independence rate
+      description: Fraction of work operations that proceed without GitHub API dependency.
+      baseline: 100% GitHub-dependent for work state.
+      target: 100% of work state operations use internal projections; GitHub is sync-only.
+      measurement_method: Audit agent code and ledger events for GitHub API calls; should be zero except sync adapter.
+      evidence_ids:
+        - EVID-0003
+    - id: MET-0004
+      name: Finding recurrence detection rate
+      description: Fraction of recurring issues (same FindingSignature 3+ times) that are detected and trigger countermeasure work.
+      baseline: 0% - no recurrence detection system exists.
+      target: '>=95% of recurring signatures (threshold=3) trigger countermeasure work creation.'
+      measurement_method: Compare RecurrenceReducer projections to countermeasure work creation events.
+      evidence_ids:
+        - EVID-0004
+    - id: MET-0005
+      name: Countermeasure effectiveness rate
+      description: Reduction in recurrence rate for finding signatures after countermeasure deployment.
+      baseline: Not measured.
+      target: '>=80% reduction in recurrence rate within 30 days of countermeasure deployment.'
+      measurement_method: Compare pre/post recurrence rates by signature from RecurrenceReducer projections.
+      evidence_ids:
+        - EVID-0005
+    - id: MET-0006
+      name: Gate structured feedback rate
+      description: Fraction of gate failures that provide structured (typed) feedback vs. prose.
+      baseline: 100% prose feedback in PR comments.
+      target: 100% of gate failures emit typed Finding objects with deterministic signatures.
+      measurement_method: Verify all GateRunCompleted events with result=FAIL reference typed Finding artifacts.
+      evidence_ids:
+        - EVID-0006
+  guardrails:
+    - id: GRD-0001
+      name: No direct forge API calls
+      threshold: 0 GitHub/GitLab API calls made directly by agents; all forge interaction via sync adapter.
+      response_plan: Audit reveals direct call -> block agent, open remediation ticket, update policy.
+      evidence_ids:
+        - EVID-0003
+    - id: GRD-0002
+      name: Internal state is authoritative
+      threshold: 0 cases where GitHub state contradicts ledger state after sync completes.
+      response_plan: Sync conflict detected -> log conflict, force internal state to GitHub, alert operator.
+      evidence_ids:
+        - EVID-0007
+    - id: GRD-0003
+      name: Recurrence threshold enforced
+      threshold: 0 finding signatures exceeding threshold (default=3) without countermeasure work created.
+      response_plan: Threshold exceeded without countermeasure -> auto-create countermeasure, alert coordinator.
+      evidence_ids:
+        - EVID-0004
+    - id: GRD-0004
+      name: Gate evidence completeness
+      threshold: 0 GateRunCompleted events without referenced evidence bundle.
+      response_plan: Gate completes without evidence -> block downstream, open NEEDS_INPUT for evidence production.
+      evidence_ids:
+        - EVID-0006

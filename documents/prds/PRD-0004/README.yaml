@@ -1,0 +1,11 @@
+prd_template_readme:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  description: "PRD template family (YAML, decomposed). Instances MUST copy these files into documents/prds/<PRD-ID>/ and fill values."
+  decomposition:
+    - "requirements/: one file per requirement (low-context friendly)."
+    - "evidence_artifacts/: one file per evidence artifact definition (low-context friendly)."
+  binding:
+    standards:
+      - "standards/00_standards_meta.yaml#standards_meta"
+      - "standards/lint/LINT_SPEC.yaml#lint_spec"

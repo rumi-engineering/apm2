@@ -1,0 +1,98 @@
+prd_customer:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  segments:
+    - id: CUST-0001
+      name: Autonomous worker agents
+      description: Holonic agents responsible for executing work units (tickets, refinements, reviews). They require stable, deterministic interfaces for submitting changes, receiving structured feedback, and learning from outcomes.
+      primary_jobs_to_be_done:
+        - Turn low-fidelity ideas into high-fidelity PRDs via bounded refinement episodes.
+        - Submit changes for review without understanding external forge APIs.
+        - Receive structured gate feedback to improve subsequent attempts.
+        - Cluster and learn from recurring findings across the factory.
+      constraints:
+        - Must not require knowledge of GitHub, GitLab, or other external forge APIs.
+        - All work state must be queryable from ledger projections, not external systems.
+        - Feedback must be typed and deterministic (not freeform prose).
+    - id: CUST-0002
+      name: Supervising coordinator agents
+      description: Higher-level holonic nodes that orchestrate worker agents, manage budgets, detect parallel workstream conflicts, and initiate countermeasure work when recurrence thresholds are exceeded.
+      primary_jobs_to_be_done:
+        - Monitor gate outcomes and finding recurrence across the factory.
+        - Detect and resolve conflicts between parallel workstreams.
+        - Automatically schedule countermeasure work when issues recur.
+        - Provide intervention capabilities for human operators.
+      constraints:
+        - Must operate from ledger projections, not external system state.
+        - Conflict detection must be deterministic and auditable.
+  stakeholder_entities:
+    - id: STKH-0001
+      name: GitHub (external forge adapter)
+      entity_type: EXTERNAL_SYSTEM
+      description: The current source control and code hosting service. Becomes a sync adapter that projects internal ledger state to PRs/issues, rather than being the source of truth.
+      constraints:
+        - Agents never call GitHub APIs directly; all interaction via internal adapters.
+        - GitHub state is a projection of internal state, not authoritative.
+        - Sync failures do not block internal work progression.
+    - id: STKH-0002
+      name: APM2 Kernel (PRD-0001)
+      entity_type: INTERNAL_COMPONENT
+      description: The completed kernel providing ledger, reducers, process management, crypto, and holonic execution. Work substrate builds on this foundation.
+      constraints:
+        - All work events must be recorded in the kernel ledger.
+        - All work state must be projectable via kernel reducers.
+        - All external tool execution via kernel ProcessRunner.
+  user_journeys:
+    - id: UJ-0001
+      name: Agent refines idea to approved PRD
+      steps:
+        - Agent receives low-fidelity idea (title, rough problem statement).
+        - Agent invokes plan create command with idea as input.
+        - System creates PRD from template and schedules refinement episodes.
+        - Refinement passes execute as bounded holonic episodes (scope, criteria, constraints, coherence).
+        - Each pass produces typed patches and decisions recorded to ledger.
+        - System runs lint gates after each pass to check completion predicate.
+        - When stop condition met (lint passes, no blockers, evidence stubs exist), PRD marked ready for review.
+        - Human or authority agent approves PRD; approval event recorded.
+      failure_modes:
+        - 'Refinement budget exhausted before completion: work marked NEEDS_INPUT with outstanding blockers listed.'
+        - 'Lint gate fails persistently: work escalated to coordinator with finding details.'
+        - 'Ambiguity cannot be resolved: blocking question artifact created requiring human input.'
+      observability_notes:
+        - Every refinement pass outcome is a ledger event queryable by plan_id.
+        - Patches and decisions are content-addressed artifacts.
+        - Progress visible via plan status projection.
+    - id: UJ-0002
+      name: Agent submits change for internal review
+      steps:
+        - Agent completes implementation work and creates ChangeSet.
+        - ChangeSet binds spec snapshot hash to commit range for reproducibility.
+        - Agent requests gate runs (AAT, security, code quality).
+        - Gates execute as bounded holonic episodes producing evidence bundles.
+        - Findings are normalized with signatures for clustering.
+        - Gate outcomes recorded as ledger events.
+        - If all gates pass, ChangeSet eligible for merge.
+        - GitHub adapter syncs final state to external PR.
+      failure_modes:
+        - 'Gate fails with blocking findings: agent receives structured feedback for remediation.'
+        - 'Finding matches recurring signature: countermeasure work auto-created.'
+        - 'Gate budget exceeded: work marked NEEDS_INPUT.'
+      observability_notes:
+        - Gate runs are traceable via changeset_id.
+        - Findings are clusterable by signature for recurrence analysis.
+        - Evidence bundles are content-addressed and verifiable.
+    - id: UJ-0003
+      name: Recurrence triggers countermeasure
+      steps:
+        - RecurrenceReducer detects finding signature exceeding threshold.
+        - System auto-creates countermeasure work item with signature context.
+        - Countermeasure work specifies required remediation type (lint rule, template update, safe API, etc.).
+        - Agent claims and implements countermeasure.
+        - Countermeasure gate verifies fix addresses the signature.
+        - System tracks recurrence rate post-deployment to verify effectiveness.
+      failure_modes:
+        - 'Countermeasure does not reduce recurrence: escalate for design review.'
+        - 'Multiple countermeasures target same signature: coordinator merges approaches.'
+      observability_notes:
+        - Recurrence stats queryable by signature and time window.
+        - Countermeasure effectiveness tracked as reduction in recurrence rate.

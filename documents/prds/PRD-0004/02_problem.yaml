@@ -1,0 +1,33 @@
+prd_problem:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  context:
+    background: 'The APM2 kernel (PRD-0001) provides foundational primitives: append-only ledger, hash-chained events, holonic execution, process management, and credential handling. However, agents still lack a stable, deterministic interface for the full work lifecycle. They must understand GitHub APIs, parse PR comments for feedback, and infer work state from external systems. This coupling to external forges prevents the holonic network from operating as a true closed-loop system.'
+    current_state: 'Agents interact with work through external forge APIs (GitHub PRs, issues, checks). Review feedback is unstructured prose in PR comments. Recurring issues are not systematically detected or addressed. Work state is scattered across GitHub, local branches, and ad-hoc status files. Parallel workstreams create conflicts and duplicated solutions discovered only at merge time.'
+    why_now: 'With PRD-0001 (kernel) complete, the ledger and reducer infrastructure exists to internalize work state. GitHub can become a projection adapter rather than the source of truth. This enables: (1) agent-friendly typed interfaces, (2) systematic recurrence detection, (3) deterministic work state, (4) decoupling from external service availability.'
+  problem_statement:
+    primary: 'Build the Work Substrate: an internally closed-loop system where plans, changesets, reviews, findings, and evidence are first-class typed objects in the ledger. Agents interact via stable internal APIs; GitHub becomes a projection adapter preserving external compatibility while the internal ledger is authoritative.'
+    supporting_details:
+      - 'Agents currently lack a stable interface for turning ideas into PRDs. The system should provide bounded refinement passes that produce high-fidelity PRDs in <5 tool invocations.'
+      - 'Agents currently submit changes via GitHub PRs and parse prose feedback. The system should provide typed gate outcomes and structured findings.'
+      - 'Recurring issues are not detected. The system should normalize findings into signatures and automatically create countermeasure work when recurrence thresholds are exceeded.'
+      - 'Work state is scattered. The system should provide a single source of truth (ledger projections) for all work lifecycle queries.'
+      - 'GitHub coupling creates brittleness. The system should preserve GitHub compatibility via a sync adapter while being correct without it.'
+  non_goals:
+    - id: NG-0001
+      statement: Full GitHub replacement including CI runner, artifact storage, and team management. GitHub remains for CI execution; this PRD focuses on decoupling work state and review.
+      clarification: |
+        CI result handling: GitHub Actions executes CI pipelines (near-term).
+        CI results ARE imported as external evidence artifacts via explicit import.
+        Import is explicit (not automatic sync) and tagged with external provenance.
+        This is not bidirectional sync: the ledger remains authoritative, but accepts
+        external evidence with clear provenance marking. Long-term internal CI execution
+        is future scope (separate PRD).
+    - id: NG-0002
+      statement: Browser-based UI for work management. The interface is CLI commands and ledger projections; UI can be built later on top of projections.
+    - id: NG-0003
+      statement: Multi-tenant or multi-repository support. The work substrate operates on a single repository/factory initially.
+    - id: NG-0004
+      statement: Replacing the credential management system (covered in PRD-0001). This PRD uses existing kernel credential primitives.
+    - id: NG-0005
+      statement: Real-time collaboration or notification system. Work state changes are eventually consistent via ledger sync; push notifications are out of scope.

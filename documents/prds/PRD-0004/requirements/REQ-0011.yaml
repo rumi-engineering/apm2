@@ -1,0 +1,18 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0011
+  type: SECURITY
+  title: Security gate enforces invariant compliance
+  statement: 'The security gate MUST verify that changes comply with security invariants defined in the PRD/RFC (default-deny, fail-closed, etc.). Violations produce typed Findings with severity and remediation requirements.'
+  acceptance_criteria:
+    - Security gate checks code against defined security invariants from 06_constraints_invariants.yaml.
+    - Default-deny and fail-closed patterns are verified for new code paths.
+    - Security findings have SECURITY category and appropriate severity (CRITICAL, HIGH, MEDIUM, LOW).
+    - Threat model coverage is verified if threat model is referenced.
+    - No security gate PASS without evidence of invariant compliance.
+    - Security findings block merge until resolved or explicitly waived with authority signoff.
+  evidence:
+    evidence_ids:
+      - EVID-0006
+      - EVID-0008
