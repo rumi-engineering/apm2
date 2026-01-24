@@ -1,7 +1,10 @@
 //! Task implementations for xtask commands.
 //!
 //! Each function corresponds to a subcommand in the CLI.
-//! These are stubs that will be implemented in subsequent tickets.
+//! Implemented commands have their own modules; stubs remain for unimplemented
+//! ones.
+
+mod finish;
 
 use anyhow::{Result, bail};
 
@@ -55,12 +58,11 @@ pub fn check() -> Result<()> {
 
 /// Clean up after PR merge.
 ///
+/// Delegates to the finish module for the actual implementation.
+///
 /// # Errors
 ///
-/// Returns an error as this is not yet implemented.
+/// Returns an error if the cleanup fails. See [`finish::run`] for details.
 pub fn finish() -> Result<()> {
-    bail!(
-        "finish command not yet implemented\n\
-         This will be implemented in TCK-00028."
-    );
+    finish::run()
 }
