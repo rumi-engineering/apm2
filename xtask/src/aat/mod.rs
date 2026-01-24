@@ -5,4 +5,5 @@
 //! hypothesis-driven testing before they can merge.
 
 pub mod evidence;
+pub mod parser;
 pub mod types;
