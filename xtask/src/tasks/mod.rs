@@ -6,19 +6,24 @@
 
 mod check;
 mod finish;
+mod start_ticket;
 
 use anyhow::{Result, bail};
 
 /// Start work on the next unblocked ticket for an RFC.
 ///
+/// Delegates to the `start_ticket` module for the actual implementation.
+///
+/// # Arguments
+///
+/// * `rfc_id` - The RFC ID (e.g., "RFC-0002")
+/// * `print_path_only` - If true, only print the worktree path (for scripting)
+///
 /// # Errors
 ///
-/// Returns an error as this is not yet implemented.
-pub fn start_ticket(rfc_id: &str) -> Result<()> {
-    bail!(
-        "start-ticket command not yet implemented (RFC: {rfc_id})\n\
-         This will be implemented in TCK-00030."
-    );
+/// Returns an error if the setup fails. See [`start_ticket::run`] for details.
+pub fn start_ticket(rfc_id: &str, print_path_only: bool) -> Result<()> {
+    start_ticket::run(rfc_id, print_path_only)
 }
 
 /// Run checks and create a commit.

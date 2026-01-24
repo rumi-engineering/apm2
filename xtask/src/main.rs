@@ -43,6 +43,10 @@ enum Commands {
     StartTicket {
         /// The RFC ID (e.g., RFC-0001)
         rfc_id: String,
+
+        /// Only print the worktree path (for scripting)
+        #[arg(short = 'p', long = "print-path")]
+        print_path: bool,
     },
 
     /// Run checks and create a commit.
@@ -81,7 +85,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::StartTicket { rfc_id } => tasks::start_ticket(&rfc_id),
+        Commands::StartTicket { rfc_id, print_path } => tasks::start_ticket(&rfc_id, print_path),
         Commands::Commit { message } => tasks::commit(&message),
         Commands::Push => tasks::push(),
         Commands::Check { watch } => tasks::check(watch),
