@@ -1,4 +1,4 @@
-## Release Manager Procedure
+## Release Procedure
 
 The following procedure is the required operational sequence for publishing an APM2 release under **MODE_HIGH_ASSURANCE**. If any mandatory step fails, the correct response is to stop, remediate, and restart the procedure.
 
@@ -18,7 +18,9 @@ The following procedure is the required operational sequence for publishing an A
    * If any check is failing, do not proceed.
 
 4. **Re-validate security gates (release-candidate confidence check)**
+
    * Confirm the CI results include the required security gates:
+
      * `cargo clippy --all-targets -- -D warnings`
      * `cargo deny check`
      * `cargo audit`
@@ -99,10 +101,7 @@ The following procedure is the required operational sequence for publishing an A
     * Confirm no subsequent edits were made to release assets that would invalidate published signatures or provenance.
 
 17. **If a security issue is discovered during or after release**
-
     * Stop further releases.
     * Open a GitHub Security Advisory if appropriate.
     * Classify severity and follow the response-time table (Critical: 24h; High: 7d; Medium: 30d; Low: 90d).
     * Coordinate disclosure per policy: acknowledge within 48h and disclose publicly after a patch is available.
-
-If you want, I can also add a one-page “Release Checklist” version of the procedure above (same requirements, condensed into a minimal go/no-go checklist) for operational use.
