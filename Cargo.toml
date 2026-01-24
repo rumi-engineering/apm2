@@ -8,7 +8,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -81,7 +81,7 @@ rand = "0.8"
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Internal crates
-apm2-core = { version = "0.2.0", path = "crates/apm2-core" }
+apm2-core = { version = "0.3.0", path = "crates/apm2-core" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
