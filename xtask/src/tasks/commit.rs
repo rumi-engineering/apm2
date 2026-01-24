@@ -39,6 +39,15 @@ pub fn run(message: &str) -> Result<()> {
     let branch_name = current_branch(&sh)?;
     let ticket_branch = validate_ticket_branch(&branch_name)?;
 
+    // Check if there are any changes to commit (before running expensive checks)
+    let status = cmd!(sh, "git status --porcelain")
+        .read()
+        .context("Failed to check git status")?;
+
+    if status.trim().is_empty() {
+        bail!("No changes to commit. Make some changes first.");
+    }
+
     println!(
         "Running checks for ticket {} (RFC: {})",
         ticket_branch.ticket_id, ticket_branch.rfc_id
@@ -67,17 +76,9 @@ pub fn run(message: &str) -> Result<()> {
 
     println!("\nAll checks passed. Creating commit...");
 
-    // Check if there are any changes to commit
-    let status = cmd!(sh, "git status --porcelain")
-        .read()
-        .context("Failed to check git status")?;
-
-    if status.trim().is_empty() {
-        bail!("No changes to commit. Make some changes first.");
-    }
-
-    // Stage all changes
-    cmd!(sh, "git add -A")
+    // Stage modified and deleted tracked files only (not untracked files to avoid
+    // staging secrets)
+    cmd!(sh, "git add -u")
         .run()
         .context("Failed to stage changes")?;
 
