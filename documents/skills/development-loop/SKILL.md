@@ -20,14 +20,12 @@ Read the output carefully. It provides all context needed to implement the ticke
 
 ### 3. Process Ticket
 
-a. **Update status** to `IN_PROGRESS` in `documents/work/tickets/{TICKET_ID}.yaml` (in main worktree)
-
-b. **Implement** following coding standards in `documents/coding/SKILL.md`:
+a. **Implement** following coding standards in `documents/coding/SKILL.md`:
    - Use the prompt from `references/IMPLEMENT_TICKET_PROMPT.md`
    - Substitute `$TICKET_ID` and `$RFC_ID` with actual values
    - Follow the implementation guidelines in that prompt
 
-c. **Run automated checks, sync your branch, and commit** using the commit command. Expect errors to occur during automated checks. We maintain an extremely high bar for code, and it is up to you to maintain that bar.:
+b. **Run automated checks, sync your branch, and commit** using the commit command. Expect errors to occur during automated checks. We maintain an extremely high bar for code, and it is up to you to maintain that bar.:
    ```bash
    cargo xtask commit "<description>"
    ```
@@ -71,7 +69,7 @@ For continuous monitoring: `cargo xtask check --watch`
    ```
 2. Return to step 2 (initialize next ticket)
 
-Note: Ticket status is automatically set to `IN_REVIEW` by the push command. A third party will verify and update to `COMPLETED` after merge.
+Note: Ticket status is derived from git state - branches indicate IN_PROGRESS, merged PRs indicate COMPLETED.
 
 ### 6. Complete
 
@@ -101,7 +99,7 @@ When all tickets are done (no more processable tickets in step 2), report comple
 | Worktree isolation | Prevents conflicts between parallel agents, enables independent CI |
 | Branch naming: `ticket/{RFC_ID}/{TICKET_ID}` | Traceable to RFC and ticket |
 | Worktree naming: `apm2-{TICKET_ID}` | Clear association with ticket |
-| Use ticket YAML `status` field | Persistent, auditable, already in data model |
+| Derive status from git state | Single source of truth, no manual updates needed |
 | Idempotent commands | Safe to re-run, handles existing state gracefully |
 | AI reviews via local CLIs | No self-hosted runners needed, uses local auth |
 | Status checks for merge gating | Reviews block merge until passed |

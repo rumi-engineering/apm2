@@ -4,7 +4,6 @@ ticket_meta:
   ticket:
     id: "TCK-00011"
     title: "Implement budget enforcement"
-    status: "DRAFT"
   binds:
     prd_id: "PRD-0001"
     rfc_id: "RFC-0001"

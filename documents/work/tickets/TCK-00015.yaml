@@ -4,7 +4,6 @@ ticket_meta:
   ticket:
     id: "TCK-00015"
     title: "Implement shell command mediation adapter"
-    status: "DRAFT"
   binds:
     prd_id: "PRD-0001"
     rfc_id: "RFC-0001"

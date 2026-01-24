@@ -4,7 +4,6 @@ ticket_meta:
   ticket:
     id: "TCK-00025"
     title: "Implement seccomp sandbox for black-box adapter"
-    status: "DRAFT"
   binds:
     prd_id: "PRD-0001"
     rfc_id: "RFC-0001"

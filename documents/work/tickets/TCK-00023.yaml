@@ -4,7 +4,6 @@ ticket_meta:
   ticket:
     id: "TCK-00023"
     title: "Implement factory run CLI command"
-    status: "DRAFT"
   binds:
     prd_id: "PRD-0001"
     rfc_id: "RFC-0001"

@@ -55,3 +55,9 @@ secrets.json
 
 # Development script state
 .check-eng-ticket-state
+
+# Ticket worktree metadata
+.ticket-state.json
+
+# Claude Code local config
+.claude/

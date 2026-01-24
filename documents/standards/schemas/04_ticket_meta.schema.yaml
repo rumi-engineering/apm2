@@ -12,7 +12,6 @@ ticket_meta_schema:
       required_keys:
         - "id"
         - "title"
-        - "status"
       keys:
         id:
           type: "string"
@@ -20,9 +19,6 @@ ticket_meta_schema:
         title:
           type: "string"
           min_length: 3
-        status:
-          type: "string"
-          enum_ref: "standards/enums/10_ticket_status.yaml#ticket_status.values"
     binds:
       type: "object"
       required_keys:

@@ -3,17 +3,17 @@
 //! This command sets up the development environment for the next unblocked
 //! ticket:
 //! - Scans ticket YAML files to find pending tickets for the RFC
-//! - Filters to tickets with all dependencies completed
+//! - Derives ticket status from git state (merged PRs, existing branches)
 //! - Creates a worktree and branch for the selected ticket
 //! - Outputs context needed to implement the ticket
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
+use crate::ticket_status::{get_completed_tickets, get_in_progress_tickets};
 use crate::util::main_worktree;
 
 /// Minimal ticket info parsed from YAML.
@@ -21,7 +21,6 @@ use crate::util::main_worktree;
 struct TicketInfo {
     id: String,
     title: String,
-    status: String,
     rfc_id: String,
     dependencies: Vec<String>,
 }
@@ -30,8 +29,9 @@ struct TicketInfo {
 ///
 /// This function:
 /// 1. Scans all ticket YAML files
-/// 2. Filters to PENDING tickets for the given RFC
-/// 3. Finds tickets with all dependencies COMPLETED
+/// 2. Derives status from git state (merged PRs = completed, branches = in
+///    progress)
+/// 3. Finds tickets with all dependencies completed and no branch yet
 /// 4. Creates a worktree and branch for the first unblocked ticket
 /// 5. Outputs context for implementation
 ///
@@ -62,17 +62,17 @@ pub fn run(rfc_id: &str, print_path_only: bool) -> Result<()> {
     let tickets_dir = main_worktree_path.join("documents/work/tickets");
     let tickets = scan_tickets(&tickets_dir)?;
 
-    // Build set of completed ticket IDs
-    let completed: HashSet<String> = tickets
-        .iter()
-        .filter(|t| t.status == "COMPLETED")
-        .map(|t| t.id.clone())
-        .collect();
+    // Get ticket status from git state
+    let completed = get_completed_tickets(&sh).context("Failed to get completed tickets")?;
+    let in_progress =
+        get_in_progress_tickets(&sh, &completed).context("Failed to get in-progress tickets")?;
 
     // Find pending tickets for this RFC with all dependencies completed
+    // A ticket is pending if it's not completed and not in progress
     let unblocked: Vec<&TicketInfo> = tickets
         .iter()
-        .filter(|t| t.rfc_id == rfc_id && t.status == "PENDING")
+        .filter(|t| t.rfc_id == rfc_id)
+        .filter(|t| !completed.contains(&t.id) && !in_progress.contains(&t.id))
         .filter(|t| t.dependencies.iter().all(|dep| completed.contains(dep)))
         .collect();
 
@@ -80,7 +80,8 @@ pub fn run(rfc_id: &str, print_path_only: bool) -> Result<()> {
         // Check if there are any pending tickets at all
         let pending_count = tickets
             .iter()
-            .filter(|t| t.rfc_id == rfc_id && t.status == "PENDING")
+            .filter(|t| t.rfc_id == rfc_id)
+            .filter(|t| !completed.contains(&t.id) && !in_progress.contains(&t.id))
             .count();
 
         if pending_count == 0 {
@@ -222,7 +223,6 @@ fn parse_ticket_yaml(path: &PathBuf) -> Result<Option<TicketInfo>> {
 
     // Extract other fields
     let title = extract_yaml_value(&content, "title:").unwrap_or_default();
-    let status = extract_yaml_value(&content, "status:").unwrap_or_else(|| "PENDING".to_string());
     let rfc_id = extract_yaml_value(&content, "rfc_id:").unwrap_or_default();
 
     // Extract dependencies
@@ -231,7 +231,6 @@ fn parse_ticket_yaml(path: &PathBuf) -> Result<Option<TicketInfo>> {
     Ok(Some(TicketInfo {
         id,
         title,
-        status,
         rfc_id,
         dependencies,
     }))

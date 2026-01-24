@@ -4,7 +4,6 @@ ticket_meta:
   ticket:
     id: "TCK-00021"
     title: "Implement black-box adapter (observation-based)"
-    status: "DRAFT"
   binds:
     prd_id: "PRD-0001"
     rfc_id: "RFC-0001"
