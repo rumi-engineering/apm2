@@ -6,6 +6,9 @@
 //! - Pushes to remote with tracking
 //! - Creates a PR if one doesn't exist
 //! - Enables auto-merge if available
+//! - Triggers AI reviews (security and code quality)
+
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
@@ -48,37 +51,56 @@ pub fn run() -> Result<()> {
 
     // Rebase on main for clean history
     println!("\n[2/4] Rebasing on main...");
-    let rebase_result = cmd!(sh, "git rebase origin/main").ignore_status().run();
+    let rebase_output = cmd!(sh, "git rebase origin/main").ignore_status().output();
 
-    if rebase_result.is_err() {
-        // Check if there's a rebase in progress
-        let rebase_in_progress = cmd!(sh, "git rev-parse --git-path rebase-merge")
-            .read()
-            .ok()
-            .is_some_and(|p| std::path::Path::new(p.trim()).exists());
+    match rebase_output {
+        Ok(output) => {
+            if !output.status.success() {
+                // Rebase failed - check if there's a rebase in progress and abort it
+                let rebase_merge_path = cmd!(sh, "git rev-parse --git-path rebase-merge")
+                    .read()
+                    .ok();
+                let rebase_apply_path = cmd!(sh, "git rev-parse --git-path rebase-apply")
+                    .read()
+                    .ok();
 
-        if rebase_in_progress {
-            // Abort the failed rebase
-            let _ = cmd!(sh, "git rebase --abort").run();
-            bail!(
-                "Rebase on main failed due to conflicts.\n\
-                 Please resolve conflicts manually:\n\
-                 1. Run: git rebase origin/main\n\
-                 2. Resolve conflicts\n\
-                 3. Run: git rebase --continue\n\
-                 4. Run: cargo xtask push"
-            );
-        }
+                let rebase_in_progress = rebase_merge_path
+                    .as_ref()
+                    .is_some_and(|p| std::path::Path::new(p.trim()).exists())
+                    || rebase_apply_path
+                        .as_ref()
+                        .is_some_and(|p| std::path::Path::new(p.trim()).exists());
+
+                if rebase_in_progress {
+                    // Abort the failed rebase
+                    let _ = cmd!(sh, "git rebase --abort").run();
+                }
+
+                bail!(
+                    "Rebase on main failed due to conflicts.\n\
+                     Please resolve conflicts manually:\n\
+                     1. Run: git rebase origin/main\n\
+                     2. Resolve conflicts\n\
+                     3. Run: git rebase --continue\n\
+                     4. Run: cargo xtask push"
+                );
+            }
+        },
+        Err(e) => {
+            bail!("Failed to execute git rebase: {e}");
+        },
     }
     println!("  Rebased on main successfully.");
 
     // Push to remote with tracking
     println!("\n[3/4] Pushing to remote...");
-    let push_result = cmd!(sh, "git push -u origin {branch_name}")
+    let push_output = cmd!(sh, "git push -u origin {branch_name}")
         .ignore_status()
-        .run();
+        .output();
 
-    if push_result.is_err() {
+    let push_succeeded = push_output.is_ok_and(|output| output.status.success());
+
+    if !push_succeeded {
         // Try force push if needed (rebase may have changed history)
         println!("  Regular push failed, attempting force push with lease...");
         cmd!(sh, "git push -u origin {branch_name} --force-with-lease")
@@ -134,6 +156,10 @@ pub fn run() -> Result<()> {
             println!("  Note: Auto-merge not available (may require branch protection rules).");
         },
     }
+
+    // Trigger AI reviews
+    println!("\nTriggering AI reviews...");
+    trigger_ai_reviews(&sh, &pr_url)?;
 
     println!();
     println!("Push complete!");
@@ -201,6 +227,91 @@ fn create_pr(sh: &Shell, branch_name: &str, ticket_id: &str) -> Result<String> {
     println!("  Created PR: {pr_url}");
 
     Ok(pr_url)
+}
+
+/// Trigger AI reviews for the PR.
+///
+/// Spawns background processes to run security review (Gemini) and code quality
+/// review (Codex) using the prompts from `documents/reviews/`.
+fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
+    let head_sha = cmd!(sh, "git rev-parse HEAD")
+        .read()
+        .context("Failed to get HEAD SHA")?
+        .trim()
+        .to_string();
+
+    let repo_root = cmd!(sh, "git rev-parse --show-toplevel")
+        .read()
+        .context("Failed to get repository root")?
+        .trim()
+        .to_string();
+
+    let security_prompt_path = format!("{repo_root}/documents/reviews/SECURITY_REVIEW_PROMPT.md");
+    let code_quality_prompt_path = format!("{repo_root}/documents/reviews/CODE_QUALITY_PROMPT.md");
+
+    // Check if prompt files exist
+    if !Path::new(&security_prompt_path).exists() {
+        println!("  Warning: Security review prompt not found at {security_prompt_path}");
+    }
+
+    if !Path::new(&code_quality_prompt_path).exists() {
+        println!("  Warning: Code quality review prompt not found at {code_quality_prompt_path}");
+    }
+
+    // Try to spawn Gemini for security review
+    let gemini_available = cmd!(sh, "which gemini").ignore_status().read().is_ok();
+    if gemini_available && Path::new(&security_prompt_path).exists() {
+        println!("  Spawning Gemini security review...");
+        // Read and substitute variables in the prompt
+        if let Ok(prompt_content) = std::fs::read_to_string(&security_prompt_path) {
+            let prompt = prompt_content
+                .replace("$PR_URL", pr_url)
+                .replace("$HEAD_SHA", &head_sha);
+            // Spawn Gemini in background - it will post its own PR comment and status
+            let _ = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &format!("echo '{}' | gemini &", prompt.replace('\'', "'\\''")),
+                ])
+                .spawn();
+            println!("    Security review started in background");
+        }
+    } else if !gemini_available {
+        println!("  Note: Gemini CLI not available, skipping security review");
+    }
+
+    // Try to spawn Codex for code quality review
+    let codex_available = cmd!(sh, "which codex").ignore_status().read().is_ok();
+    if codex_available && Path::new(&code_quality_prompt_path).exists() {
+        println!("  Spawning Codex code quality review...");
+        // Read and substitute variables in the prompt
+        if let Ok(prompt_content) = std::fs::read_to_string(&code_quality_prompt_path) {
+            let prompt = prompt_content
+                .replace("$PR_URL", pr_url)
+                .replace("$HEAD_SHA", &head_sha);
+            // Spawn Codex review in background
+            let _ = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "codex -m o3 --approval-mode full-auto '{}' &",
+                        prompt.replace('\'', "'\\''")
+                    ),
+                ])
+                .spawn();
+            println!("    Code quality review started in background");
+        }
+    } else if !codex_available {
+        println!("  Note: Codex CLI not available, skipping code quality review");
+    }
+
+    if !gemini_available && !codex_available {
+        println!(
+            "  No AI review tools available. Install gemini and/or codex CLI to enable reviews."
+        );
+    }
+
+    Ok(())
 }
 
 /// Extract the ticket title from YAML content.

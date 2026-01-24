@@ -10,7 +10,7 @@ mod finish;
 mod push;
 mod start_ticket;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 /// Start work on the next unblocked ticket for an RFC.
 ///
