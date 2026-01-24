@@ -269,10 +269,13 @@ fn parse_ci_status(output: &str) -> CiStatus {
         return CiStatus::Pending;
     }
 
-    // Check for any failures first (bucket=fail or state=FAILURE)
+    // Check for any failures first (bucket=fail/cancel or state=FAILURE)
+    // Per gh pr checks --help: bucket can be pass, fail, pending, skipping, or
+    // cancel
     for check in &checks {
         if let Some(bucket) = &check.bucket {
-            if bucket == "fail" {
+            // Both "fail" and "cancel" should be treated as failures
+            if bucket == "fail" || bucket == "cancel" {
                 return CiStatus::Failure;
             }
         }
@@ -551,6 +554,24 @@ mod tests {
             {"bucket":"pass","name":"Secret Scan","state":"SUCCESS"}
         ]"#;
         assert_eq!(parse_ci_status(json), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_cancelled() {
+        // Per gh pr checks --help, "cancel" bucket indicates cancelled check
+        let json = r#"[
+            {"name": "build", "state": "COMPLETED", "bucket": "cancel"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+    }
+
+    #[test]
+    fn test_parse_ci_status_skipping() {
+        // "skipping" bucket should be treated as success (not blocking)
+        let json = r#"[
+            {"name": "optional-check", "state": "COMPLETED", "bucket": "skipping"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Success);
     }
 
     #[test]
