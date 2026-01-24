@@ -19,8 +19,12 @@ prd_requirement:
     - "Policy engine governs high-impact guardrail changes"
 
   evidence:
-    evidence_ids: []
+    evidence_ids:
+    - EVID-0005
+    - EVID-0011
     inherited_from_prd: false
     notes:
       - "Countermeasure acceptance should require corpus replay evidence and an explicit rollback plan"
       - "Gate evolution must itself be governed"
+      - "EVID-0005 verifies countermeasure effectiveness tracking and regression prevention"
+      - "EVID-0011 verifies corpus replay validation and gate governance requirements"

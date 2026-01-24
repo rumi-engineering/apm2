@@ -14,8 +14,10 @@ prd_requirement:
   - MergeReceipt replaces 'the PR merged' as the canonical acceptance fact; downstream
     systems rely on MergeReceipt events, not VCS merge status.
   evidence:
-    evidence_ids: []
+    evidence_ids:
+    - EVID-0009
     inherited_from_prd: false
     notes:
     - Per doctrine, MergeReceipt replaces 'the PR merged' as the canonical acceptance
       fact.
+    - EVID-0009 verifies MergeReceipt event structure and digest bindings.

@@ -10,16 +10,24 @@ prd_traceability:
         requirement_ref: "requirements/REQ-0001.yaml#prd_requirement"
       - requirement_id: "REQ-0002"
         requirement_ref: "requirements/REQ-0002.yaml#prd_requirement"
+      - requirement_id: "REQ-0003"
+        requirement_ref: "requirements/REQ-0003.yaml#prd_requirement"
+      - requirement_id: "REQ-0004"
+        requirement_ref: "requirements/REQ-0004.yaml#prd_requirement"
       - requirement_id: "REQ-0005"
         requirement_ref: "requirements/REQ-0005.yaml#prd_requirement"
       - requirement_id: "REQ-0006"
         requirement_ref: "requirements/REQ-0006.yaml#prd_requirement"
+      - requirement_id: "REQ-0007"
+        requirement_ref: "requirements/REQ-0007.yaml#prd_requirement"
       - requirement_id: "REQ-0008"
         requirement_ref: "requirements/REQ-0008.yaml#prd_requirement"
       - requirement_id: "REQ-0009"
         requirement_ref: "requirements/REQ-0009.yaml#prd_requirement"
       - requirement_id: "REQ-0010"
         requirement_ref: "requirements/REQ-0010.yaml#prd_requirement"
+      - requirement_id: "REQ-0011"
+        requirement_ref: "requirements/REQ-0011.yaml#prd_requirement"
       - requirement_id: "REQ-0012"
         requirement_ref: "requirements/REQ-0012.yaml#prd_requirement"
       - requirement_id: "REQ-0013"
@@ -32,6 +40,26 @@ prd_traceability:
         requirement_ref: "requirements/REQ-0016.yaml#prd_requirement"
       - requirement_id: "REQ-0017"
         requirement_ref: "requirements/REQ-0017.yaml#prd_requirement"
+      - requirement_id: "REQ-0018"
+        requirement_ref: "requirements/REQ-0018.yaml#prd_requirement"
+      - requirement_id: "REQ-0019"
+        requirement_ref: "requirements/REQ-0019.yaml#prd_requirement"
+      - requirement_id: "REQ-0020"
+        requirement_ref: "requirements/REQ-0020.yaml#prd_requirement"
+      - requirement_id: "REQ-0021"
+        requirement_ref: "requirements/REQ-0021.yaml#prd_requirement"
+      - requirement_id: "REQ-0022"
+        requirement_ref: "requirements/REQ-0022.yaml#prd_requirement"
+      - requirement_id: "REQ-0023"
+        requirement_ref: "requirements/REQ-0023.yaml#prd_requirement"
+      - requirement_id: "REQ-0024"
+        requirement_ref: "requirements/REQ-0024.yaml#prd_requirement"
+      - requirement_id: "REQ-0025"
+        requirement_ref: "requirements/REQ-0025.yaml#prd_requirement"
+      - requirement_id: "REQ-0026"
+        requirement_ref: "requirements/REQ-0026.yaml#prd_requirement"
+      - requirement_id: "REQ-0027"
+        requirement_ref: "requirements/REQ-0027.yaml#prd_requirement"
     imports: []
 
   mapping:
@@ -83,6 +111,81 @@ prd_traceability:
       - requirement_id: "REQ-0017"
         section_refs:
           - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+      - requirement_id: "REQ-0003"
+        section_refs:
+          - "03_goals_scope.yaml#prd_goals_scope"
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+      - requirement_id: "REQ-0004"
+        section_refs:
+          - "03_goals_scope.yaml#prd_goals_scope"
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+          - "13_governance_model.yaml#prd_governance_model"
+      - requirement_id: "REQ-0007"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+          - "10_quality_framework.yaml#prd_quality_framework"
+      - requirement_id: "REQ-0011"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+          - "10_quality_framework.yaml#prd_quality_framework"
+      - requirement_id: "REQ-0018"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "11_evidence_standards.yaml#prd_evidence_standards"
+          - "12_evidence_bundle.yaml#prd_evidence_bundle"
+      - requirement_id: "REQ-0019"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+          - "11_evidence_standards.yaml#prd_evidence_standards"
+          - "13_governance_model.yaml#prd_governance_model"
+      - requirement_id: "REQ-0020"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+          - "11_evidence_standards.yaml#prd_evidence_standards"
+          - "13_governance_model.yaml#prd_governance_model"
+      - requirement_id: "REQ-0021"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+      - requirement_id: "REQ-0022"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+          - "11_evidence_standards.yaml#prd_evidence_standards"
+      - requirement_id: "REQ-0023"
+        section_refs:
+          - "03_goals_scope.yaml#prd_goals_scope"
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+      - requirement_id: "REQ-0024"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+          - "10_quality_framework.yaml#prd_quality_framework"
+          - "13_governance_model.yaml#prd_governance_model"
+      - requirement_id: "REQ-0025"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+          - "11_evidence_standards.yaml#prd_evidence_standards"
+          - "13_governance_model.yaml#prd_governance_model"
+      - requirement_id: "REQ-0026"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants"
+          - "08_risks_questions.yaml#prd_risks_questions"
+      - requirement_id: "REQ-0027"
+        section_refs:
+          - "03_goals_scope.yaml#prd_goals_scope"
+          - "04_solution_overview.yaml#prd_solution_overview"
+          - "05_success_metrics.yaml#prd_success_metrics"
           - "06_constraints_invariants.yaml#prd_constraints_invariants"
 
     metric_to_requirements:
@@ -190,6 +293,7 @@ prd_traceability:
           - "REQ-0003"
           - "REQ-0005"
           - "REQ-0006"
+          - "REQ-0021"
         description: "Evidence for bounded episode execution and spec snapshot reproducibility"
       # ChangeSet & GitHub Adapter Independence Evidence
       - evidence_id: "EVID-0003"
@@ -198,6 +302,7 @@ prd_traceability:
           - "REQ-0015"
           - "REQ-0016"
           - "REQ-0017"
+          - "REQ-0026"
         description: "Evidence for ChangeSet abstraction and GitHub adapter independence"
       # Finding Signatures & Clustering Evidence
       - evidence_id: "EVID-0004"
@@ -205,12 +310,16 @@ prd_traceability:
           - "REQ-0007"
           - "REQ-0012"
           - "REQ-0013"
+          - "REQ-0025"
+          - "REQ-0027"
         description: "Evidence for deterministic finding signatures and clustering"
       # Countermeasure Effectiveness Evidence
       - evidence_id: "EVID-0005"
         requirement_ids:
           - "REQ-0013"
           - "REQ-0014"
+          - "REQ-0024"
+          - "REQ-0027"
         description: "Evidence for countermeasure effectiveness tracking"
       # Internal Gate System Evidence
       - evidence_id: "EVID-0006"
@@ -228,6 +337,7 @@ prd_traceability:
         requirement_ids:
           - "REQ-0015"
           - "REQ-0016"
+          - "REQ-0026"
         description: "Evidence for GitHub sync adapter projection"
       # Operator Console & Audit Evidence
       - evidence_id: "EVID-0008"
@@ -244,4 +354,20 @@ prd_traceability:
           - "REQ-0013"
           - "REQ-0019"
           - "REQ-0020"
+          - "REQ-0025"
         description: "Evidence for Ed25519 signature verification and authority checks"
+      # MergeReceipt Evidence
+      - evidence_id: "EVID-0009"
+        requirement_ids:
+          - "REQ-0022"
+        description: "Evidence for MergeReceipt event structure and digest bindings"
+      # Question Lifecycle Evidence
+      - evidence_id: "EVID-0010"
+        requirement_ids:
+          - "REQ-0023"
+        description: "Evidence for Question lifecycle state transitions and BLOCKING behavior"
+      # Countermeasure Validation Gate Evidence
+      - evidence_id: "EVID-0011"
+        requirement_ids:
+          - "REQ-0024"
+        description: "Evidence for countermeasure corpus replay validation and gate governance"

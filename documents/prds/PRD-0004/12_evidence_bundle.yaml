@@ -23,6 +23,12 @@ prd_evidence_bundle:
           artifact_ref: "evidence_artifacts/EVID-0007.yaml#prd_evidence_artifact"
         - evidence_id: "EVID-0008"
           artifact_ref: "evidence_artifacts/EVID-0008.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0009"
+          artifact_ref: "evidence_artifacts/EVID-0009.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0010"
+          artifact_ref: "evidence_artifacts/EVID-0010.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0011"
+          artifact_ref: "evidence_artifacts/EVID-0011.yaml#prd_evidence_artifact"
         - evidence_id: "EVID-0016"
           artifact_ref: "evidence_artifacts/EVID-0016.yaml#prd_evidence_artifact"
       imports: []

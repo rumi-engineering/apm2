@@ -15,7 +15,9 @@ prd_requirement:
     before replay.
   - Replay is idempotent and side-effect free on the ledger itself.
   evidence:
-    evidence_ids: []
+    evidence_ids:
+    - EVID-0002
     inherited_from_prd: false
     notes:
     - References INV-0004 deterministic reducer invariant from PRD-0001 constraints.
+    - EVID-0002 verifies reducer determinism and replay-from-genesis capability.

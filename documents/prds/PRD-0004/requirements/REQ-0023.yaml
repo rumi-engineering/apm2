@@ -16,7 +16,9 @@ prd_requirement:
   - Question state transitions are recorded in the ledger and are deterministically
     replayable.
   evidence:
-    evidence_ids: []
+    evidence_ids:
+    - EVID-0010
     inherited_from_prd: false
     notes:
     - BLOCKING questions are referenced in plan completion logic.
+    - EVID-0010 verifies Question lifecycle state transitions and BLOCKING behavior.

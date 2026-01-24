@@ -304,14 +304,4 @@ prd_decisions_review:
     - gate_id: "GATE-PRD-PRODUCT"
       status: "PENDING"
       evidence_ids: []
-  waivers:
-    - id: "WVR-0001"
-      scope:
-        gate_ids: []
-        requirement_ids: []
-        quality_dimension_ids: []
-      rationale: ""
-      expiration_date: ""
-      required_signoffs: []
-      status: "REQUESTED"
-      evidence_ids: []
+  waivers: []
