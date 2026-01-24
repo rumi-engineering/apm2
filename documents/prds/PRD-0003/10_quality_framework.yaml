@@ -1,0 +1,183 @@
+prd_quality_framework:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  quality_dimensions:
+    - dimension_id: "AGENT_FRIENDLY_UX"
+      applicability: "APPLIES"
+      disposition: "EXPLICIT_REQUIREMENTS"
+      coverage:
+        requirement_ids:
+          - "REQ-0001"
+          - "REQ-0007"
+        evidence_ids:
+          - "EVID-0001"
+          - "EVID-0002"
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+        evidence_ids: []
+
+    - dimension_id: "TESTABILITY"
+      applicability: "APPLIES"
+      disposition: "EXPLICIT_REQUIREMENTS"
+      coverage:
+        requirement_ids:
+          - "REQ-0003"
+          - "REQ-0006"
+        evidence_ids:
+          - "EVID-0005"
+          - "EVID-0006"
+          - "EVID-0010"
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+        evidence_ids: []
+
+    - dimension_id: "DETERMINISM"
+      applicability: "APPLIES"
+      disposition: "EXPLICIT_REQUIREMENTS"
+      coverage:
+        requirement_ids:
+          - "REQ-0009"
+        evidence_ids:
+          - "EVID-0003"
+          - "EVID-0006"
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+        evidence_ids: []
+
+    - dimension_id: "DEFAULT_DENY_SECURITY"
+      applicability: "APPLIES"
+      disposition: "EXPLICIT_REQUIREMENTS"
+      coverage:
+        requirement_ids:
+          - "REQ-0004"
+          - "REQ-0005"
+        evidence_ids:
+          - "EVID-0007"
+          - "EVID-0008"
+          - "EVID-0009"
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+        evidence_ids: []
+
+    - dimension_id: "OBSERVABILITY"
+      applicability: "APPLIES"
+      disposition: "DELEGATED_WITH_GUARDRAILS"
+      coverage:
+        requirement_ids: []
+        evidence_ids:
+          - "EVID-0003"
+          - "EVID-0004"
+      delegation:
+        guardrails:
+          - "All AAT runs produce evidence bundles with execution traces"
+          - "Status check changes are logged with timestamps"
+        required_evidence_categories:
+          - "AUDIT_LOGS"
+          - "RECORDINGS"
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+        evidence_ids: []
+
+    - dimension_id: "ERROR_HANDLING"
+      applicability: "APPLIES"
+      disposition: "DELEGATED_WITH_GUARDRAILS"
+      coverage:
+        requirement_ids:
+          - "REQ-0010"
+        evidence_ids:
+          - "EVID-0003"
+      delegation:
+        guardrails:
+          - "AAT failures produce actionable error messages"
+          - "Escalation path defined for ambiguous cases"
+        required_evidence_categories:
+          - "TEST_RESULTS"
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+        evidence_ids: []
+
+    - dimension_id: "PERFORMANCE"
+      applicability: "APPLIES"
+      disposition: "DELEGATED_WITH_GUARDRAILS"
+      coverage:
+        requirement_ids: []
+        evidence_ids:
+          - "EVID-0003"
+      delegation:
+        guardrails:
+          - "AAT execution completes within 15 minutes"
+          - "P95 execution time tracked and alerted"
+        required_evidence_categories:
+          - "BENCHMARK_RESULTS"
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+        evidence_ids: []
+
+    - dimension_id: "RELIABILITY"
+      applicability: "APPLIES"
+      disposition: "DELEGATED_WITH_GUARDRAILS"
+      coverage:
+        requirement_ids:
+          - "REQ-0009"
+        evidence_ids:
+          - "EVID-0003"
+          - "EVID-0006"
+      delegation:
+        guardrails:
+          - "Deterministic execution with fixed random seeds"
+          - "Retry logic for transient failures"
+        required_evidence_categories:
+          - "TEST_RESULTS"
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+        evidence_ids: []
+
+    - dimension_id: "OPERATIONAL_READINESS"
+      applicability: "APPLIES"
+      disposition: "DELEGATED_WITH_GUARDRAILS"
+      coverage:
+        requirement_ids:
+          - "REQ-0008"
+          - "REQ-0010"
+        evidence_ids:
+          - "EVID-0004"
+      delegation:
+        guardrails:
+          - "Manual override capability for authorized reviewers"
+          - "Escalation path for disputed results"
+        required_evidence_categories:
+          - "AUDIT_LOGS"
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+        evidence_ids: []

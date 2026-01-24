@@ -1,0 +1,59 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  id: "EVID-0010"
+  category: "TEST_RESULTS"
+  title: "Evidence Script Validation"
+
+  capture:
+    paths:
+      - "evidence/aat/evidence_script_validation/"
+
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: |
+          # Verify evidence script exists and is valid
+          set -euo pipefail
+          SCRIPT_PATH="$1"
+
+          if [[ ! -f "$SCRIPT_PATH" ]]; then
+            echo "Evidence script not found: $SCRIPT_PATH"
+            exit 1
+          fi
+
+          # Check script is executable
+          if [[ ! -x "$SCRIPT_PATH" ]]; then
+            echo "Evidence script is not executable: $SCRIPT_PATH"
+            exit 1
+          fi
+
+          # Check script has shebang
+          head -1 "$SCRIPT_PATH" | grep -q "^#!" || {
+            echo "Evidence script missing shebang"
+            exit 1
+          }
+
+          # Validate script syntax (for bash scripts)
+          if head -1 "$SCRIPT_PATH" | grep -q "bash"; then
+            bash -n "$SCRIPT_PATH" || {
+              echo "Evidence script has syntax errors"
+              exit 1
+            }
+          fi
+
+          echo "Evidence script validation passed"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 30
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints: []
+
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

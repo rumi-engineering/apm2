@@ -1,0 +1,65 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  id: "EVID-0007"
+  category: "SECURITY_SCAN_RESULTS"
+  title: "Anti-Gaming Static Analysis"
+
+  capture:
+    paths:
+      - "evidence/aat/anti_gaming_static/"
+
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: |
+          # Verify anti-gaming static analysis results
+          set -euo pipefail
+          SCAN_FILE="$1"
+
+          if [[ ! -f "$SCAN_FILE" ]]; then
+            echo "Scan file not found: $SCAN_FILE"
+            exit 1
+          fi
+
+          # Validate JSON
+          jq empty "$SCAN_FILE" || { echo "Invalid JSON"; exit 1; }
+
+          # Check required sections
+          jq -e '.static_analysis' "$SCAN_FILE" > /dev/null || {
+            echo "Missing static_analysis section"
+            exit 1
+          }
+
+          # Check for detection categories
+          jq -e '.static_analysis.if_test_patterns' "$SCAN_FILE" > /dev/null || {
+            echo "Missing if_test_patterns check"
+            exit 1
+          }
+
+          jq -e '.static_analysis.hardcoded_values' "$SCAN_FILE" > /dev/null || {
+            echo "Missing hardcoded_values check"
+            exit 1
+          }
+
+          jq -e '.static_analysis.mock_patterns' "$SCAN_FILE" > /dev/null || {
+            echo "Missing mock_patterns check"
+            exit 1
+          }
+
+          echo "Anti-gaming static analysis validation passed"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 120
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Requires jq installed"
+
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

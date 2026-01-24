@@ -1,0 +1,108 @@
+prd_solution_overview:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  proposed_solution:
+    overview: |
+      Agent Acceptance Testing (AAT) is an automated quality gate that performs
+      hypothesis-driven verification of PR claims before merge. Unlike traditional
+      UAT performed by humans, AAT uses an agent to parse PR descriptions, form
+      testable predictions, execute verification, detect gaming patterns, and
+      produce structured evidence bundles.
+
+      The AAT agent operates as a GitHub status check (aat/acceptance) that blocks
+      merge until verification passes. The agent follows a deterministic protocol:
+      parse, hypothesize, execute, verify, evidence, status.
+
+    key_components:
+      - name: "PR Description Template"
+        description: |
+          Structured markdown sections that AAT agent can parse:
+          - ## Usage: Exact CLI invocations with examples
+          - ## Expected Outcomes: Verifiable predicates (When X, then Y)
+          - ## Evidence Script: Path and status of verification script
+          - ## Known Limitations: Documented TODOs with waivers
+
+      - name: "AAT Agent Protocol"
+        description: |
+          Six-step verification protocol:
+          1. Parse PR Description - Extract structured sections
+          2. Form Hypotheses - At least 3 testable predictions BEFORE execution
+          3. Execute Verification - Run CLI commands, vary inputs
+          4. Anti-Gaming Checks - Static analysis for hardcoded patterns
+          5. Produce Evidence Bundle - Structured JSON with results
+          6. Set Status Check - success/failure/pending based on results
+
+      - name: "Anti-Gaming Detection"
+        description: |
+          Static and dynamic analysis to detect:
+          - Hardcoded values (if test, hardcoded UUIDs)
+          - Mock returns (mock_*, stub patterns)
+          - Undocumented TODOs (FIXME, TODO without Known Limitations entry)
+          - Input invariance (same output regardless of input variation)
+
+      - name: "Evidence Bundle"
+        description: |
+          Structured JSON output at evidence/aat/PR-{number}_{timestamp}.json:
+          - hypotheses: array of {id, prediction, result, actual_outcome}
+          - anti_gaming: {hardcoded_found, undocumented_todos, result}
+          - verdict: PASSED | FAILED | NEEDS_ADJUDICATION
+
+      - name: "Status Check Integration"
+        description: |
+          GitHub status check (aat/acceptance) with states:
+          - success: All hypotheses passed, no anti-gaming violations
+          - failure: Any hypothesis failed or anti-gaming violation
+          - pending: Needs human/supervisor adjudication
+
+      - name: "Manual Toggle"
+        description: |
+          Authorized reviewers can manually set AAT status for:
+          - Adjudication of ambiguous cases
+          - Override with documented rationale
+          - Waiver approval for known limitations
+
+    external_dependencies:
+      - name: "GitHub API"
+        description: "Status check API for setting aat/acceptance status"
+      - name: "GitHub Actions"
+        description: "CI trigger for AAT agent execution on PR events"
+      - name: "Evidence Storage"
+        description: "Persistent storage for AAT evidence bundles"
+
+  interfaces:
+    external_apis:
+      - name: "GitHub Status Check API"
+        description: "POST /repos/{owner}/{repo}/statuses/{sha}"
+        operations:
+          - "Set aat/acceptance status (success, failure, pending)"
+          - "Include target_url to evidence bundle"
+          - "Include description with summary"
+
+      - name: "GitHub PR API"
+        description: "GET /repos/{owner}/{repo}/pulls/{number}"
+        operations:
+          - "Retrieve PR description for parsing"
+          - "Get PR branch and SHA for checkout"
+
+    user_surfaces:
+      - name: "PR Status Checks"
+        description: "AAT status visible in PR status checks section"
+        operations:
+          - "View AAT pass/fail status"
+          - "Click through to evidence bundle"
+          - "See summary of hypothesis results"
+
+      - name: "Evidence Bundle Viewer"
+        description: "JSON evidence bundle accessible via status check link"
+        operations:
+          - "Review hypothesis predictions and results"
+          - "Inspect anti-gaming check findings"
+          - "Download full execution trace"
+
+      - name: "Manual Toggle Interface"
+        description: "CLI or web interface for manual status override"
+        operations:
+          - "Set AAT status with rationale"
+          - "Approve waiver for known limitations"
+          - "Record adjudication decision"
