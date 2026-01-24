@@ -231,8 +231,14 @@ fn create_pr(sh: &Shell, branch_name: &str, ticket_id: &str) -> Result<String> {
 
 /// Trigger AI reviews for the PR.
 ///
-/// Spawns background processes to run security review (Gemini) and code quality
-/// review (Codex) using the prompts from `documents/reviews/`.
+/// This function:
+/// 1. Creates PENDING status checks for both reviews (blocks merge until
+///    complete)
+/// 2. Spawns background processes to run security review (Gemini) and code
+///    quality review (Codex) using the prompts from `documents/reviews/`
+///
+/// The AI reviewers are responsible for updating their status to
+/// success/failure.
 fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
     let head_sha = cmd!(sh, "git rev-parse HEAD")
         .read()
@@ -256,6 +262,56 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
 
     if !Path::new(&code_quality_prompt_path).exists() {
         println!("  Warning: Code quality review prompt not found at {code_quality_prompt_path}");
+    }
+
+    // Create PENDING status checks BEFORE spawning reviewers
+    // This ensures GitHub knows to wait for these checks before allowing merge
+    println!("  Creating pending status checks...");
+
+    // Get owner/repo from git remote
+    let remote_url = cmd!(sh, "git remote get-url origin")
+        .read()
+        .unwrap_or_default();
+
+    // Parse owner/repo from remote URL (handles both HTTPS and SSH formats)
+    let owner_repo = if remote_url.contains("github.com") {
+        remote_url
+            .trim()
+            .trim_end_matches(".git")
+            .split("github.com")
+            .last()
+            .map(|s| s.trim_start_matches(['/', ':']))
+            .unwrap_or("")
+    } else {
+        ""
+    };
+
+    if !owner_repo.is_empty() {
+        let security_endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
+        let security_pending = cmd!(
+            sh,
+            "gh api --method POST {security_endpoint} -f state=pending -f context=ai-review/security -f description=Waiting for security review"
+        )
+        .ignore_status()
+        .run();
+
+        if security_pending.is_ok() {
+            println!("    Created pending status: ai-review/security");
+        }
+
+        let quality_endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
+        let quality_pending = cmd!(
+            sh,
+            "gh api --method POST {quality_endpoint} -f state=pending -f context=ai-review/code-quality -f description=Waiting for code quality review"
+        )
+        .ignore_status()
+        .run();
+
+        if quality_pending.is_ok() {
+            println!("    Created pending status: ai-review/code-quality");
+        }
+    } else {
+        println!("    Warning: Could not determine owner/repo from remote URL");
     }
 
     // Try to spawn Gemini for security review
