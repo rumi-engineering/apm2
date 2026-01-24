@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Development automation tasks for apm2"
+publish = false
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+xshell = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+
+[lints]
+workspace = true
