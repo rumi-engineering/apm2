@@ -96,7 +96,7 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "apm2-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "apm2-core",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "apm2-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "apm2-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "apm2-core",

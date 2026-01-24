@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::SessionError;
 use super::state::{ExitClassification, SessionState};
-use crate::events::{SessionEvent, session_event};
+use crate::events::{PolicyEvent, SessionEvent, policy_event, session_event};
 use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
@@ -116,6 +116,10 @@ impl SessionReducer {
             entropy_budget: event.entropy_budget,
             progress_count: 0,
             entropy_consumed: 0,
+            error_count: 0,
+            violation_count: 0,
+            stall_count: 0,
+            timeout_count: 0,
         };
 
         self.state.sessions.insert(session_id, state);
@@ -232,6 +236,79 @@ impl SessionReducer {
         self.state.sessions.insert(session_id.clone(), new_state);
         Ok(())
     }
+
+    /// Handles a policy violation event by incrementing the violation counter.
+    ///
+    /// Note: This only increments the count. Entropy consumption is tracked
+    /// via `SessionProgress` events which contain the canonical
+    /// `entropy_consumed` value from the actual tracker (which uses the
+    /// session's configured weights).
+    fn handle_policy_violation(
+        &mut self,
+        event: &crate::events::PolicyViolation,
+    ) -> Result<(), SessionError> {
+        let session_id = &event.session_id;
+
+        let state = self.state.sessions.get_mut(session_id).ok_or_else(|| {
+            SessionError::SessionNotFound {
+                session_id: session_id.clone(),
+            }
+        })?;
+
+        // Can only record violations for Running sessions
+        match state {
+            SessionState::Running {
+                violation_count, ..
+            } => {
+                *violation_count += 1;
+                // Note: entropy_consumed is NOT updated here - that's tracked via
+                // SessionProgress events which contain the authoritative value
+                // from the EntropyTracker with the session's configured weights.
+                Ok(())
+            },
+            other => Err(SessionError::InvalidTransition {
+                from_state: other.state_name().to_string(),
+                event_type: "policy.violation".to_string(),
+            }),
+        }
+    }
+
+    /// Handles a budget exceeded event by updating entropy consumption.
+    fn handle_budget_exceeded(
+        &mut self,
+        event: &crate::events::BudgetExceeded,
+    ) -> Result<(), SessionError> {
+        let session_id = &event.session_id;
+
+        let state = self.state.sessions.get_mut(session_id).ok_or_else(|| {
+            SessionError::SessionNotFound {
+                session_id: session_id.clone(),
+            }
+        })?;
+
+        // Update entropy consumed based on budget type
+        match state {
+            SessionState::Running {
+                entropy_consumed,
+                error_count,
+                timeout_count,
+                ..
+            } => {
+                // Record the budget exceeded event based on type
+                match event.budget_type.as_str() {
+                    "TIME" | "TIMEOUT" => *timeout_count += 1,
+                    _ => *error_count += 1,
+                }
+                // Set consumed to the reported value
+                *entropy_consumed = event.consumed;
+                Ok(())
+            },
+            other => Err(SessionError::InvalidTransition {
+                from_state: other.state_name().to_string(),
+                event_type: "policy.budget_exceeded".to_string(),
+            }),
+        }
+    }
 }
 
 impl Reducer for SessionReducer {
@@ -243,23 +320,32 @@ impl Reducer for SessionReducer {
     }
 
     fn apply(&mut self, event: &EventRecord, _ctx: &ReducerContext) -> Result<(), Self::Error> {
-        // Only process session events
-        if !event.event_type.starts_with("session.") {
-            return Ok(());
+        // Handle session events
+        if event.event_type.starts_with("session.") {
+            let session_event = SessionEvent::decode(&event.payload[..])?;
+            let timestamp = event.timestamp_ns;
+
+            return match session_event.event {
+                Some(session_event::Event::Started(e)) => self.handle_started(e, timestamp),
+                Some(session_event::Event::Progress(ref e)) => self.handle_progress(e, timestamp),
+                Some(session_event::Event::Terminated(e)) => self.handle_terminated(e, timestamp),
+                Some(session_event::Event::Quarantined(e)) => self.handle_quarantined(e, timestamp),
+                None => Ok(()),
+            };
         }
 
-        // Decode the session event from the payload
-        let session_event = SessionEvent::decode(&event.payload[..])?;
-        let timestamp = event.timestamp_ns;
+        // Handle policy events (for entropy tracking)
+        if event.event_type.starts_with("policy.") {
+            let policy_event = PolicyEvent::decode(&event.payload[..])?;
 
-        // Dispatch to the appropriate handler
-        match session_event.event {
-            Some(session_event::Event::Started(e)) => self.handle_started(e, timestamp),
-            Some(session_event::Event::Progress(ref e)) => self.handle_progress(e, timestamp),
-            Some(session_event::Event::Terminated(e)) => self.handle_terminated(e, timestamp),
-            Some(session_event::Event::Quarantined(e)) => self.handle_quarantined(e, timestamp),
-            None => Ok(()),
+            return match policy_event.event {
+                Some(policy_event::Event::Violation(ref e)) => self.handle_policy_violation(e),
+                Some(policy_event::Event::BudgetExceeded(ref e)) => self.handle_budget_exceeded(e),
+                Some(policy_event::Event::Loaded(_)) | None => Ok(()),
+            };
         }
+
+        Ok(())
     }
 
     fn state(&self) -> &Self::State {
@@ -280,8 +366,8 @@ pub mod helpers {
     use prost::Message;
 
     use crate::events::{
-        SessionEvent, SessionProgress, SessionQuarantined, SessionStarted, SessionTerminated,
-        session_event,
+        BudgetExceeded, PolicyEvent, PolicyViolation, SessionEvent, SessionProgress,
+        SessionQuarantined, SessionStarted, SessionTerminated, policy_event, session_event,
     };
 
     /// Creates a `SessionStarted` event payload.
@@ -362,6 +448,46 @@ pub mod helpers {
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Quarantined(quarantined)),
+        };
+        event.encode_to_vec()
+    }
+
+    /// Creates a `PolicyViolation` event payload.
+    #[must_use]
+    pub fn policy_violation_payload(
+        session_id: &str,
+        violation_type: &str,
+        rule_id: &str,
+        details: &str,
+    ) -> Vec<u8> {
+        let violation = PolicyViolation {
+            session_id: session_id.to_string(),
+            violation_type: violation_type.to_string(),
+            rule_id: rule_id.to_string(),
+            details: details.to_string(),
+        };
+        let event = PolicyEvent {
+            event: Some(policy_event::Event::Violation(violation)),
+        };
+        event.encode_to_vec()
+    }
+
+    /// Creates a `BudgetExceeded` event payload.
+    #[must_use]
+    pub fn budget_exceeded_payload(
+        session_id: &str,
+        budget_type: &str,
+        limit: u64,
+        consumed: u64,
+    ) -> Vec<u8> {
+        let exceeded = BudgetExceeded {
+            session_id: session_id.to_string(),
+            budget_type: budget_type.to_string(),
+            limit,
+            consumed,
+        };
+        let event = PolicyEvent {
+            event: Some(policy_event::Event::BudgetExceeded(exceeded)),
         };
         event.encode_to_vec()
     }
@@ -753,5 +879,307 @@ mod unit_tests {
         assert_eq!(reducer.state().active_count(), 1);
         assert_eq!(reducer.state().terminated_count(), 1);
         assert_eq!(reducer.state().quarantined_count(), 1);
+    }
+
+    // ========================================================================
+    // Entropy Budget Tracking Tests
+    // ========================================================================
+
+    #[test]
+    fn test_policy_violation_increments_counter() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Record policy violation
+        let violation_payload =
+            helpers::policy_violation_payload("session-1", "UNAUTHORIZED_ACCESS", "rule-1", "test");
+        let violation_event = create_event("policy.violation", "session-1", violation_payload);
+        reducer.apply(&violation_event, &ctx).unwrap();
+
+        let state = reducer.state().get("session-1").unwrap();
+        match state {
+            SessionState::Running {
+                violation_count,
+                entropy_consumed,
+                ..
+            } => {
+                assert_eq!(*violation_count, 1);
+                // entropy_consumed is NOT updated by policy violations directly;
+                // it's updated via SessionProgress events from the tracker
+                assert_eq!(*entropy_consumed, 0);
+            },
+            _ => panic!("Expected Running state"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_violations_accumulate() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Record multiple violations
+        for i in 1..=3 {
+            let violation_payload = helpers::policy_violation_payload(
+                "session-1",
+                "UNAUTHORIZED_ACCESS",
+                &format!("rule-{i}"),
+                &format!("violation {i}"),
+            );
+            let violation_event = create_event("policy.violation", "session-1", violation_payload);
+            reducer.apply(&violation_event, &ctx).unwrap();
+        }
+
+        let state = reducer.state().get("session-1").unwrap();
+        match state {
+            SessionState::Running {
+                violation_count,
+                entropy_consumed,
+                ..
+            } => {
+                assert_eq!(*violation_count, 3);
+                // Violations only increment count; entropy is tracked via SessionProgress
+                assert_eq!(*entropy_consumed, 0);
+            },
+            _ => panic!("Expected Running state"),
+        }
+    }
+
+    #[test]
+    fn test_budget_exceeded_updates_consumed() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Record budget exceeded
+        let exceeded_payload = helpers::budget_exceeded_payload("session-1", "TOKEN", 1000, 1500);
+        let exceeded_event = create_event("policy.budget_exceeded", "session-1", exceeded_payload);
+        reducer.apply(&exceeded_event, &ctx).unwrap();
+
+        let state = reducer.state().get("session-1").unwrap();
+        match state {
+            SessionState::Running {
+                error_count,
+                entropy_consumed,
+                ..
+            } => {
+                assert_eq!(*error_count, 1);
+                assert_eq!(*entropy_consumed, 1500);
+            },
+            _ => panic!("Expected Running state"),
+        }
+    }
+
+    #[test]
+    fn test_budget_exceeded_timeout_type() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Record timeout budget exceeded
+        let exceeded_payload =
+            helpers::budget_exceeded_payload("session-1", "TIMEOUT", 60000, 75000);
+        let exceeded_event = create_event("policy.budget_exceeded", "session-1", exceeded_payload);
+        reducer.apply(&exceeded_event, &ctx).unwrap();
+
+        let state = reducer.state().get("session-1").unwrap();
+        match state {
+            SessionState::Running {
+                timeout_count,
+                error_count,
+                entropy_consumed,
+                ..
+            } => {
+                assert_eq!(*timeout_count, 1);
+                assert_eq!(*error_count, 0); // Timeout doesn't increment error count
+                assert_eq!(*entropy_consumed, 75000);
+            },
+            _ => panic!("Expected Running state"),
+        }
+    }
+
+    #[test]
+    fn test_policy_violation_on_unknown_session_errors() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        let violation_payload = helpers::policy_violation_payload(
+            "unknown-session",
+            "UNAUTHORIZED_ACCESS",
+            "rule-1",
+            "test",
+        );
+        let violation_event =
+            create_event("policy.violation", "unknown-session", violation_payload);
+        let result = reducer.apply(&violation_event, &ctx);
+        assert!(matches!(result, Err(SessionError::SessionNotFound { .. })));
+    }
+
+    #[test]
+    fn test_policy_violation_on_terminated_session_errors() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start and terminate session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        let term_payload =
+            helpers::session_terminated_payload("session-1", "SUCCESS", "completed", 500);
+        let term_event = create_event("session.terminated", "session-1", term_payload);
+        reducer.apply(&term_event, &ctx).unwrap();
+
+        // Try to record violation on terminated session
+        let violation_payload =
+            helpers::policy_violation_payload("session-1", "UNAUTHORIZED_ACCESS", "rule-1", "test");
+        let violation_event = create_event("policy.violation", "session-1", violation_payload);
+        let result = reducer.apply(&violation_event, &ctx);
+        assert!(matches!(
+            result,
+            Err(SessionError::InvalidTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn test_entropy_exceeded_leads_to_termination() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session with small budget
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            100,
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Simulate entropy consumption via SessionProgress events
+        // (in real usage, the EntropyTracker emits progress events with updated
+        // entropy)
+        let progress_payload = helpers::session_progress_payload("session-1", 1, "VIOLATION", 150);
+        let progress_event = create_event("session.progress", "session-1", progress_payload);
+        reducer.apply(&progress_event, &ctx).unwrap();
+
+        // Check entropy exceeded
+        let state = reducer.state().get("session-1").unwrap();
+        assert!(state.is_entropy_exceeded());
+
+        // Terminate with ENTROPY_EXCEEDED classification
+        let term_payload = helpers::session_terminated_payload(
+            "session-1",
+            "ENTROPY_EXCEEDED",
+            "entropy_budget_exhausted",
+            150,
+        );
+        let term_event = create_event("session.terminated", "session-1", term_payload);
+        reducer.apply(&term_event, &ctx).unwrap();
+
+        let final_state = reducer.state().get("session-1").unwrap();
+        assert!(final_state.is_terminal());
+        match final_state {
+            SessionState::Terminated {
+                exit_classification,
+                ..
+            } => {
+                assert_eq!(*exit_classification, ExitClassification::EntropyExceeded);
+            },
+            _ => panic!("Expected Terminated state"),
+        }
+    }
+
+    #[test]
+    fn test_session_entropy_summary() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Record violation (only increments count)
+        let violation_payload =
+            helpers::policy_violation_payload("session-1", "UNAUTHORIZED_ACCESS", "rule-1", "test");
+        let violation_event = create_event("policy.violation", "session-1", violation_payload);
+        reducer.apply(&violation_event, &ctx).unwrap();
+
+        // Record entropy via SessionProgress
+        let progress_payload = helpers::session_progress_payload("session-1", 1, "HEARTBEAT", 50);
+        let progress_event = create_event("session.progress", "session-1", progress_payload);
+        reducer.apply(&progress_event, &ctx).unwrap();
+
+        let state = reducer.state().get("session-1").unwrap();
+        let summary = state.entropy_summary("session-1").unwrap();
+
+        assert_eq!(summary.session_id, "session-1");
+        assert_eq!(summary.budget, 1000);
+        assert_eq!(summary.consumed, 50);
+        assert_eq!(summary.remaining, 950);
+        assert!(!summary.is_exceeded);
+        assert_eq!(summary.violation_count, 1);
     }
 }
