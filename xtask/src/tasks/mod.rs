@@ -4,6 +4,7 @@
 //! Implemented commands have their own modules; stubs remain for unimplemented
 //! ones.
 
+mod aat;
 mod check;
 mod commit;
 mod finish;
@@ -164,4 +165,34 @@ pub fn security_review_exec_deny(
 /// details.
 pub fn security_review_exec_onboard() -> Result<()> {
     security_review_exec::onboard()
+}
+
+/// Run Agent Acceptance Testing (AAT) on a PR.
+///
+/// Delegates to the `aat` module for the actual implementation.
+///
+/// # Arguments
+///
+/// * `pr_url` - GitHub PR URL
+/// * `dry_run` - If true, don't set status check or write evidence
+///
+/// # Returns
+///
+/// Returns `Ok(())` on completion. The verdict is printed to stdout.
+/// The process exits with appropriate code:
+/// - 0: Success (PASSED verdict)
+/// - 1: Failure (FAILED verdict)
+/// - 2: Invalid arguments or `NEEDS_ADJUDICATION`
+///
+/// # Errors
+///
+/// Returns an error if the AAT process fails. See [`aat::run`] for details.
+pub fn aat(pr_url: &str, dry_run: bool) -> Result<()> {
+    let result = aat::run(pr_url, dry_run)?;
+    // Exit with appropriate code based on verdict
+    match result.verdict {
+        crate::aat::types::Verdict::Passed => Ok(()),
+        crate::aat::types::Verdict::Failed => std::process::exit(1),
+        crate::aat::types::Verdict::NeedsAdjudication => std::process::exit(2),
+    }
 }

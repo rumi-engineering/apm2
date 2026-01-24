@@ -27,6 +27,8 @@
 //!   review
 //! - `security-review-exec deny [TCK-XXXXX] --reason <reason>` - Deny PR with
 //!   reason
+//! - `aat <PR_URL>` - Run Agent Acceptance Testing on a PR
+//! - `aat <PR_URL> --dry-run` - Preview AAT without setting status
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -116,6 +118,22 @@ enum Commands {
     SecurityReviewExec {
         #[command(subcommand)]
         action: SecurityReviewExecCommands,
+    },
+
+    /// Run Agent Acceptance Testing (AAT) on a PR.
+    ///
+    /// Verifies a PR meets acceptance criteria through hypothesis-driven
+    /// testing. Parses the PR description, runs anti-gaming analysis,
+    /// generates hypotheses, and produces an evidence bundle.
+    ///
+    /// Sets the `aat/acceptance` status check based on the verdict.
+    Aat {
+        /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
+        pr_url: String,
+
+        /// Preview without setting status check or writing evidence
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -214,5 +232,6 @@ fn main() -> Result<()> {
             } => tasks::security_review_exec_deny(ticket_id.as_deref(), &reason, dry_run),
             SecurityReviewExecCommands::Onboard => tasks::security_review_exec_onboard(),
         },
+        Commands::Aat { pr_url, dry_run } => tasks::aat(&pr_url, dry_run),
     }
 }
