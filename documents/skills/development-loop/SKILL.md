@@ -13,7 +13,7 @@ user-invocable: true
 ### 2. Initialize Development Environment
 
 ```bash
-cd "$(./scripts/dev/start-eng-ticket.sh {RFC_ID} --print-path)"
+cd "$(cargo xtask start-ticket {RFC_ID} --print-path)"
 ```
 
 Read the output carefully. It provides all context needed to implement the ticket. If no tickets remain, the loop is complete.
@@ -27,33 +27,33 @@ b. **Implement** following coding standards in `documents/coding/SKILL.md`:
    - Substitute `$TICKET_ID` and `$RFC_ID` with actual values
    - Follow the implementation guidelines in that prompt
 
-c. **Run automated checks, sync your branch, and commit** using the commit script. Expect errors to occur during automated checks. We maintain an extremely high bar for code, and it is up to you to maintain that bar.:
+c. **Run automated checks, sync your branch, and commit** using the commit command. Expect errors to occur during automated checks. We maintain an extremely high bar for code, and it is up to you to maintain that bar.:
    ```bash
-   ./scripts/dev/commit-eng-ticket.sh "<description>"
+   cargo xtask commit "<description>"
    ```
 
 ### 4. Push, Create PR, and Run AI Reviews
 
 ```bash
-./scripts/dev/push-eng-ticket.sh
+cargo xtask push
 ```
 
 This pushes your branch, creates/updates the PR, requests security + code quality reviews, and enables auto-merge. The PR will merge automatically once CI and reviews pass. Use `--force-review` to re-run reviews on the same commit.
 
 ### 5. CI → Review → Merge Loop
 
-Use the status check script to monitor progress and get actionable guidance:
+Use the status check command to monitor progress and get actionable guidance:
 
 ```bash
-./scripts/dev/check-eng-ticket.sh
+cargo xtask check
 ```
 
-The script reports current state and suggests the next action:
+The command reports current state and suggests the next action:
 
 | State | Suggested Action |
 |-------|------------------|
-| Uncommitted changes | `./scripts/dev/commit-eng-ticket.sh '<message>'` |
-| No PR exists | `./scripts/dev/push-eng-ticket.sh` |
+| Uncommitted changes | `cargo xtask commit '<message>'` |
+| No PR exists | `cargo xtask push` |
 | CI running | Wait (use `--watch` to poll) |
 | CI failed | See `documents/coding/references/CI_EXPECTATIONS.md` |
 | Reviews pending | Wait for reviews (auto-merge enabled) |
@@ -61,17 +61,17 @@ The script reports current state and suggests the next action:
 | All passed | Wait for auto-merge, then cleanup worktree |
 | Already merged | Cleanup worktree and continue to next ticket |
 
-For continuous monitoring: `./scripts/dev/check-eng-ticket.sh --watch`
+For continuous monitoring: `cargo xtask check --watch`
 
 #### After Merge
 
 1. Cleanup and continue:
    ```bash
-   ./scripts/dev/finish-eng-ticket.sh
+   cargo xtask finish
    ```
 2. Return to step 2 (initialize next ticket)
 
-Note: Ticket status is automatically set to `IN_REVIEW` by the push script. A third party will verify and update to `COMPLETED` after merge.
+Note: Ticket status is automatically set to `IN_REVIEW` by the push command. A third party will verify and update to `COMPLETED` after merge.
 
 ### 6. Complete
 
@@ -79,18 +79,18 @@ When all tickets are done (no more processable tickets in step 2), report comple
 
 ---
 
-## Scripts Reference
+## Commands Reference
 
-| Script | Purpose |
-|--------|---------|
-| `./scripts/dev/start-eng-ticket.sh {RFC_ID}` | Setup dev environment for next unblocked ticket |
-| `./scripts/dev/start-eng-ticket.sh {RFC_ID} -p` | Output only worktree path (for `cd "$(...)"`) |
-| `./scripts/dev/commit-eng-ticket.sh "<msg>"` | Verify, sync with main, and commit |
-| `./scripts/dev/push-eng-ticket.sh` | Push, create/update PR, run AI reviews, enable auto-merge, set status to IN_REVIEW |
-| `./scripts/dev/push-eng-ticket.sh --force-review` | Force re-run reviews even if already completed |
-| `./scripts/dev/check-eng-ticket.sh` | Check CI/review status and get next action |
-| `./scripts/dev/check-eng-ticket.sh --watch` | Continuously poll status every 10s |
-| `./scripts/dev/finish-eng-ticket.sh` | Cleanup worktree and branch after PR merges |
+| Command | Purpose |
+|---------|---------|
+| `cargo xtask start-ticket {RFC_ID}` | Setup dev environment for next unblocked ticket |
+| `cargo xtask start-ticket {RFC_ID} -p` | Output only worktree path (for `cd "$(...)"`) |
+| `cargo xtask commit "<msg>"` | Verify, sync with main, and commit |
+| `cargo xtask push` | Push, create/update PR, run AI reviews, enable auto-merge, set status to IN_REVIEW |
+| `cargo xtask push --force-review` | Force re-run reviews even if already completed |
+| `cargo xtask check` | Check CI/review status and get next action |
+| `cargo xtask check --watch` | Continuously poll status every 10s |
+| `cargo xtask finish` | Cleanup worktree and branch after PR merges |
 
 ---
 
@@ -102,7 +102,7 @@ When all tickets are done (no more processable tickets in step 2), report comple
 | Branch naming: `ticket/{RFC_ID}/{TICKET_ID}` | Traceable to RFC and ticket |
 | Worktree naming: `apm2-{TICKET_ID}` | Clear association with ticket |
 | Use ticket YAML `status` field | Persistent, auditable, already in data model |
-| Idempotent scripts | Safe to re-run, handles existing state gracefully |
+| Idempotent commands | Safe to re-run, handles existing state gracefully |
 | AI reviews via local CLIs | No self-hosted runners needed, uses local auth |
 | Status checks for merge gating | Reviews block merge until passed |
 | Strict dependency ordering | Prevents invalid implementation sequences |

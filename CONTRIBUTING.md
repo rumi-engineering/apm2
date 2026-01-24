@@ -207,7 +207,7 @@ timeout 60s cargo test --test '*'
 
 ```bash
 # Start work on RFC (auto-detects next unblocked ticket, creates worktree)
-./scripts/dev RFC-0001
+cargo xtask start-ticket RFC-0001
 
 # Manual setup
 git worktree add ../apm2-<branch> <branch>

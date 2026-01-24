@@ -18,10 +18,10 @@ The context above includes AGENTS.md, RFC meta/design, ticket details, and requi
 
 6. Verify, sync, and commit:
    ```bash
-   ./scripts/dev/commit-eng-ticket.sh "<description>"
+   cargo xtask commit "<description>"
    ```
 
 7. Push and run AI reviews:
    ```bash
-   ./scripts/dev/push-eng-ticket.sh
+   cargo xtask push
    ```
