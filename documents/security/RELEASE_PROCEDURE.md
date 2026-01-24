@@ -1,218 +1,108 @@
-# Release Procedure
+## Release Manager Procedure
 
-Complete checklist for creating a secure APM2 release.
+The following procedure is the required operational sequence for publishing an APM2 release under **MODE_HIGH_ASSURANCE**. If any mandatory step fails, the correct response is to stop, remediate, and restart the procedure.
 
-## Pre-Release Checklist
+1. **Confirm release intent and scope**
 
-### Code Quality
+   * Identify the release type (patch/minor/major) and the exact commit range to be included.
+   * Confirm that the release corresponds to a known baseline (e.g., main branch HEAD or a designated release branch).
 
-- [ ] All CI gates pass on `main` branch
-- [ ] `cargo clippy --all-targets -- -D warnings` passes
-- [ ] `cargo test --workspace --all-features` passes
-- [ ] No open security advisories for dependencies
+2. **Confirm the repository is in High Assurance posture**
 
-### Dependency Audit
+   * Ensure the release is executed under the release workflow that enforces **MODE_HIGH_ASSURANCE** (the default release posture).
+   * Do not rely on local `APM2_SECURITY_MODE=developer` behavior for release validation.
 
-- [ ] `cargo deny check` passes
-- [ ] `cargo audit` passes
-- [ ] Review any new dependencies added since last release
-- [ ] Verify licenses of new dependencies
+3. **Ensure the mainline is green**
 
-### Version and Documentation
+   * Confirm all required CI checks are green on the commit you intend to release.
+   * If any check is failing, do not proceed.
 
-- [ ] release-plz PR is up to date (version bump + changelog handled automatically)
-- [ ] `CHANGELOG.md` updated via release-plz
-- [ ] Breaking changes documented
-- [ ] Migration guide if needed
-- [ ] **Do not** manually edit versions or create tags
+4. **Re-validate security gates (release-candidate confidence check)**
+   * Confirm the CI results include the required security gates:
+     * `cargo clippy --all-targets -- -D warnings`
+     * `cargo deny check`
+     * `cargo audit`
+     * `gitleaks detect`
+   * Ensure the results are for the exact commit to be released (not a prior commit).
 
-## Release Process
+5. **Confirm dependency policy compliance**
 
-### 1. Promote Through Channels
+   * Inspect `Cargo.lock` changes included in the release scope.
+   * Confirm there are no unexpected dependency additions or feature flag expansions that violate policy.
+   * If the release includes dependency upgrades, confirm `cargo-deny` and `cargo-audit` were run successfully for that exact lockfile.
 
-APM2 uses a three-channel, promotion-based release pipeline. See
-[`/documents/releases/RELEASE_CHANNELS.md`](../releases/RELEASE_CHANNELS.md) and
-[`/documents/releases/ARTIFACT_PROMOTION.md`](../releases/ARTIFACT_PROMOTION.md).
+6. **Confirm secret hygiene prerequisites**
 
-#### Dev (automatic)
+   * Confirm the CI secret scanning gate (gitleaks) is green.
+   * If release artifacts are built outside CI for any reason, stop; releases should be produced only by the controlled CI pipeline.
 
-- Merges to `main` trigger CI.
-- After CI succeeds, the Dev Release workflow builds binaries and publishes the
-  rolling `dev` release with checksums.
+7. **Prepare release metadata**
 
-#### Beta (manual)
+   * Update versioning and changelog/release notes according to your project’s release conventions (if applicable).
+   * Ensure release notes do not include secrets or sensitive operational details.
 
-- Maintainer dispatches the Beta Release workflow with a version like
-  `0.2.0-beta.1`.
-- The workflow downloads artifacts from `dev`, verifies checksums, and creates
-  `vX.Y.Z-beta.N` without rebuilding.
+8. **Create the release tag**
 
-#### Stable (automated via release-plz)
+   * Create an annotated tag for the release (recommended) pointing to the release commit.
+   * Push the tag to the canonical repository so that the release automation triggers from the authoritative source.
 
-- release-plz creates a release PR with version bumps and changelog.
-- When that PR is merged, release-plz creates a `vX.Y.Z` tag.
-- The Stable Release workflow promotes artifacts from the latest matching beta
-  release (or falls back to `dev`), signs them, generates SBOM + SLSA provenance,
-  and publishes to crates.io.
+9. **Trigger the release workflow**
 
-### 2. GitHub Actions Release Workflow
+   * Confirm that the GitHub Actions release workflow runs for the pushed tag.
+   * Monitor the workflow execution until completion.
 
-The release workflow automatically:
+10. **Verify Sigstore signing outputs**
 
-1. **Promotes binaries** (no rebuild) from beta/dev:
-   - Linux x86_64
-   - Linux aarch64
+    * Confirm that each release artifact has:
 
-2. **Signs all artifacts** with Cosign keyless:
-   - Each binary gets `.sig` signature file
-   - Each binary gets `.pem` certificate file
+      * a corresponding `.sig` signature file
+      * a corresponding `.pem` certificate file
+    * Confirm these files are attached/published alongside the artifacts as required.
 
-3. **Generates SLSA provenance**:
-   - Creates `provenance.intoto.jsonl`
-   - Proves artifacts came from this repository
+11. **Verify SLSA provenance outputs**
 
-4. **Generates SBOM**:
-   - Creates `sbom.spdx.json` (SPDX format)
-   - Lists all dependencies
+    * Confirm that SLSA Level 3 provenance was generated by `slsa-github-generator`.
+    * Confirm the provenance is attached to the GitHub release (or otherwise published in the expected location).
 
-5. **Creates GitHub Release**:
-   - Attaches all artifacts
-   - Generates release notes
-   - Includes checksums
+12. **Verify SBOM outputs**
 
-6. **Publishes to crates.io** (if configured)
+    * Confirm SBOM generation completed successfully via `syft`.
+    * Confirm both CycloneDX and SPDX formats are present and attached to the release artifacts.
 
-### 3. Workflow Configuration
+13. **Perform cryptographic verification of at least one artifact (spot-check)**
 
-```yaml
-# .github/workflows/release.yml
-name: Release
+    * Using the published `.pem` and `.sig`, verify the artifact signature using `cosign verify-blob` with the required identity and issuer constraints:
 
-on:
-  push:
-    tags:
-      - 'v*'
-    tags-ignore:
-      - 'v*-*'
+      ```bash
+      cosign verify-blob \
+        --certificate <artifact>.pem \
+        --signature <artifact>.sig \
+        --certificate-identity-regexp "https://github.com/.*/apm2/.*" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        <artifact>
+      ```
+    * If verification fails, treat as a release integrity incident and halt publication.
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
+14. **Confirm artifact set completeness**
 
-jobs:
-  release:
-    # Promote artifacts from beta/dev, verify checksums, sign, SBOM
-    steps:
-      - uses: sigstore/cosign-installer@v3
-      - name: Sign artifacts
-        run: |
-          # sign promoted artifacts
-          ...
+    * Ensure the release contains all expected build outputs for supported targets.
+    * Ensure each artifact has its associated signature, certificate, provenance, and SBOMs as required.
 
-  provenance:
-    needs: release
-    permissions:
-      actions: read
-      id-token: write
-      contents: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
-    with:
-      base64-subjects: "${{ needs.release.outputs.hashes }}"
-      upload-assets: true
-```
+15. **Final publication**
 
-See `/documents/releases/README.md` for full channel and artifact details.
+    * Publish the GitHub release if it is still in draft state.
+    * Ensure release notes and assets match the verified artifacts.
 
-## Post-Release Verification
+16. **Post-release integrity check (administrative)**
 
-### 1. Verify Signatures
+    * Record the release tag, artifact digests, and verification evidence (e.g., output of `cosign verify-blob`) in your release tracking system.
+    * Confirm no subsequent edits were made to release assets that would invalidate published signatures or provenance.
 
-```bash
-# Download release artifacts
-VERSION=v0.1.0
-BASE_URL="https://github.com/USER/apm2/releases/download/${VERSION}"
+17. **If a security issue is discovered during or after release**
 
-curl -LO "${BASE_URL}/apm2-linux-x86_64"
-curl -LO "${BASE_URL}/apm2-linux-x86_64.sig"
-curl -LO "${BASE_URL}/apm2-linux-x86_64.pem"
+    * Stop further releases.
+    * Open a GitHub Security Advisory if appropriate.
+    * Classify severity and follow the response-time table (Critical: 24h; High: 7d; Medium: 30d; Low: 90d).
+    * Coordinate disclosure per policy: acknowledge within 48h and disclose publicly after a patch is available.
 
-# Verify signature
-cosign verify-blob \
-  --certificate apm2-linux-x86_64.pem \
-  --signature apm2-linux-x86_64.sig \
-  --certificate-identity-regexp "https://github.com/.*/apm2/.*" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  apm2-linux-x86_64
-
-# Expected: Verified OK
-```
-
-### 2. Verify Checksums
-
-```bash
-# Download checksums
-curl -LO "${BASE_URL}/checksums-sha256.txt"
-
-# Verify
-sha256sum -c checksums-sha256.txt
-```
-
-### 3. Verify SLSA Provenance
-
-```bash
-# Download provenance
-curl -LO "${BASE_URL}/provenance.intoto.jsonl"
-
-# Verify with slsa-verifier
-slsa-verifier verify-artifact \
-  --provenance-path provenance.intoto.jsonl \
-  --source-uri github.com/USER/apm2 \
-  apm2-linux-x86_64
-```
-
-### 4. Check GitHub Release
-
-Verify the release includes:
-- [ ] All platform binaries (Linux x86_64, Linux aarch64)
-- [ ] Signature files (`.sig`)
-- [ ] Certificate files (`.pem`)
-- [ ] Checksums (`checksums-sha256.txt`)
-- [ ] SLSA provenance (`provenance.intoto.jsonl`)
-- [ ] SBOM (`sbom.spdx.json`)
-- [ ] Generated release notes
-
-### 5. Verify crates.io Publication
-
-```bash
-cargo search apm2
-# Should show new version
-```
-
-## Announcement
-
-After verification:
-
-1. Update project documentation with new version
-2. Announce on relevant channels
-3. Monitor for issues
-
-## Rollback Procedure
-
-If a release has critical issues:
-
-1. **Do NOT delete the release** - transparency log has the signing record
-2. Yank the crates.io release: `cargo yank --version 0.1.0 apm2`
-3. Create a new patch release with fix
-4. Update release notes to warn about affected version
-
-## Release Artifacts Summary
-
-| Artifact | Purpose | Format |
-|----------|---------|--------|
-| `apm2-<platform>` | Binary executable | ELF/Mach-O/PE |
-| `*.sig` | Cosign signature | Base64 |
-| `*.pem` | Signing certificate | PEM |
-| `checksums-sha256.txt` | Integrity verification | Text |
-| `provenance.intoto.jsonl` | SLSA provenance | JSON |
-| `sbom.spdx.json` | Software bill of materials | SPDX JSON |
+If you want, I can also add a one-page “Release Checklist” version of the procedure above (same requirements, condensed into a minimal go/no-go checklist) for operational use.
