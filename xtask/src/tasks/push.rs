@@ -299,7 +299,7 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
             let _ = std::process::Command::new("sh")
                 .args([
                     "-c",
-                    &format!("echo '{}' | gemini &", prompt.replace('\'', "'\\''")),
+                    &format!("echo '{}' | gemini --yolo &", prompt.replace('\'', "'\\''")),
                 ])
                 .spawn();
             println!("    Security review started in background");
@@ -314,7 +314,7 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
         println!("  Spawning Codex code quality review...");
         // Spawn Codex review in background using the review subcommand
         let _ = std::process::Command::new("sh")
-            .args(["-c", "codex review --base main &"])
+            .args(["-c", "codex review --base main -c 'full_auto=true' &"])
             .spawn();
         println!("    Code quality review started in background");
     } else if !codex_available {

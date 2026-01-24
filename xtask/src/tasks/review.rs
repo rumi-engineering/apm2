@@ -259,7 +259,7 @@ fn run_ai_review(
         ReviewType::Security => {
             // Gemini takes input via stdin
             let escaped_prompt = prompt.replace('\'', "'\\''");
-            let shell_cmd = format!("echo '{escaped_prompt}' | gemini");
+            let shell_cmd = format!("echo '{escaped_prompt}' | gemini --yolo");
             let result = std::process::Command::new("sh")
                 .args(["-c", &shell_cmd])
                 .status();
@@ -288,7 +288,7 @@ fn run_ai_review(
         ReviewType::Quality => {
             // Codex uses the 'review' subcommand to review changes against base branch
             let result = std::process::Command::new("codex")
-                .args(["review", "--base", "main"])
+                .args(["review", "--base", "main", "-c", "full_auto=true"])
                 .status();
 
             match result {
