@@ -1,0 +1,87 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: "TCK-00050"
+    title: "Define AAT shared types"
+  binds:
+    prd_id: "PRD-0003"
+    rfc_id: "RFC-0004"
+    requirements:
+      - requirement_id: "REQ-0001"
+        requirement_ref: "documents/prds/PRD-0003/requirements/REQ-0001.yaml#prd_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0001"
+        artifact_ref: "documents/prds/PRD-0003/evidence_artifacts/EVID-0001.yaml#prd_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_BUILD_RELEASE"
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Create xtask/src/aat/ module directory"
+      - "Create xtask/src/aat/mod.rs with module declarations"
+      - "Create xtask/src/aat/types.rs with ALL shared types"
+      - "Define ParsedPRDescription struct with: usage, expected_outcomes, evidence_script, known_limitations"
+      - "Define OutcomeItem struct with: text, checked (checkbox state)"
+      - "Define KnownLimitation struct with: text, waiver_id (optional)"
+      - "Define ParseError enum with variants: MissingUsage, MissingExpectedOutcomes, MalformedSection"
+      - "Define GamingViolation enum: IfTestConditional, HardcodedUuid, MockPattern, UndocumentedTodo"
+      - "Define TodoItem struct with: text, file, line"
+      - "Define AntiGamingResult struct with: violations Vec, passed bool"
+      - "Define EvidenceBundle struct matching schema from documents/skills/aat/SKILL.md"
+      - "Define Hypothesis struct with: id, prediction, verification_method, tests_error_handling, formed_at, executed_at, result, actual_outcome, stdout, stderr, exit_code"
+      - "Define PrDescriptionParse struct for section validation status"
+      - "Define Verdict enum: Passed, Failed, NeedsAdjudication"
+      - "Add serde Serialize/Deserialize derives to all types"
+      - "Add mod aat to xtask/src/lib.rs or xtask/src/main.rs"
+    out_of_scope:
+      - "Any logic or function implementations"
+      - "Parser implementation (TCK-00051)"
+      - "Anti-gaming logic (TCK-00052)"
+      - "Evidence bundle logic (TCK-00053)"
+      - "AAT command integration (TCK-00054)"
+  plan:
+    steps:
+      - "Create xtask/src/aat/mod.rs with pub mod types"
+      - "Create xtask/src/aat/types.rs"
+      - "Add mod aat to xtask/src/lib.rs (or main.rs if no lib.rs exists)"
+      - "Define ParsedPRDescription struct with serde derives"
+      - "Define OutcomeItem struct with serde derives"
+      - "Define KnownLimitation struct with serde derives"
+      - "Define ParseError enum"
+      - "Define GamingViolation enum with location info (file, line, snippet)"
+      - "Define TodoItem struct"
+      - "Define AntiGamingResult struct"
+      - "Define Hypothesis struct with all fields"
+      - "Define PrDescriptionParse struct"
+      - "Define Verdict enum"
+      - "Define EvidenceBundle struct with all fields from skill schema"
+      - "Ensure cargo build succeeds"
+      - "Ensure cargo clippy passes"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0001"
+    criteria:
+      - "xtask/src/aat/mod.rs exists with pub mod types"
+      - "xtask/src/aat/types.rs exists with all type definitions"
+      - "ParsedPRDescription struct has: usage, expected_outcomes, evidence_script, known_limitations"
+      - "OutcomeItem struct has: text, checked"
+      - "KnownLimitation struct has: text, waiver_id"
+      - "ParseError enum has: MissingUsage, MissingExpectedOutcomes, MalformedSection"
+      - "GamingViolation enum has: IfTestConditional, HardcodedUuid, MockPattern, UndocumentedTodo"
+      - "TodoItem struct has: text, file, line"
+      - "AntiGamingResult struct has: violations, passed"
+      - "Hypothesis struct has all required fields"
+      - "Verdict enum has: Passed, Failed, NeedsAdjudication"
+      - "EvidenceBundle struct has all fields from skill schema"
+      - "All types have serde Serialize/Deserialize derives"
+      - "cargo build succeeds"
+      - "cargo clippy passes with no warnings"
+  notes:
+    security: "Types are data definitions only - no security-sensitive logic"
+    verification: "Compile check is sufficient - no runtime behavior"
+    general: "This ticket enables parallel development of TCK-00051, TCK-00052, TCK-00053"

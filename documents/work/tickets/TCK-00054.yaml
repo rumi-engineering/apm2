@@ -1,0 +1,101 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: "TCK-00054"
+    title: "Implement AAT xtask command"
+  binds:
+    prd_id: "PRD-0003"
+    rfc_id: "RFC-0004"
+    requirements:
+      - requirement_id: "REQ-0002"
+        requirement_ref: "documents/prds/PRD-0003/requirements/REQ-0002.yaml#prd_requirement"
+      - requirement_id: "REQ-0008"
+        requirement_ref: "documents/prds/PRD-0003/requirements/REQ-0008.yaml#prd_requirement"
+      - requirement_id: "REQ-0003"
+        requirement_ref: "documents/prds/PRD-0003/requirements/REQ-0003.yaml#prd_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0002"
+        artifact_ref: "documents/prds/PRD-0003/evidence_artifacts/EVID-0002.yaml#prd_evidence_artifact"
+      - evidence_id: "EVID-0008"
+        artifact_ref: "documents/prds/PRD-0003/evidence_artifacts/EVID-0008.yaml#prd_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_BUILD_RELEASE"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00051"
+        reason: "Requires PR parser module for parse_pr_description()"
+      - ticket_id: "TCK-00052"
+        reason: "Requires anti-gaming analyzer module for analyze_diff()"
+      - ticket_id: "TCK-00053"
+        reason: "Requires evidence bundle generator module"
+  scope:
+    in_scope:
+      - "Add Aat subcommand to xtask/src/main.rs CLI definition"
+      - "Create xtask/src/tasks/aat.rs task module"
+      - "Implement PR URL parsing to extract owner/repo/number"
+      - "Fetch PR description via gh pr view --json body"
+      - "Fetch PR diff via gh pr diff"
+      - "Fetch PR commit SHA via gh pr view --json headRefOid"
+      - "Call parser::parse_pr_description() and validate sections"
+      - "Call anti_gaming::analyze_diff() with diff and known_limitations"
+      - "Invoke AAT skill for hypothesis generation and execution"
+      - "Collect hypotheses from skill output"
+      - "Generate evidence bundle with all results"
+      - "Write evidence bundle to evidence/aat/PR-{n}_{ts}.json"
+      - "Set GitHub status check via gh api repos/{owner}/{repo}/statuses/{sha}"
+      - "Exit with appropriate code: 0=success, 1=failure, 2=invalid args"
+      - "Support --dry-run flag to preview without setting status"
+    out_of_scope:
+      - "Type definitions (TCK-00050)"
+      - "Parser implementation (TCK-00051)"
+      - "Anti-gaming implementation (TCK-00052)"
+      - "Evidence bundle implementation (TCK-00053)"
+      - "GitHub Action workflow (.github/workflows/aat.yml)"
+      - "Branch protection configuration"
+      - "Waiver management system"
+      - "Escalation protocol automation"
+  plan:
+    steps:
+      - "Add Aat variant to Commands enum in xtask/src/main.rs"
+      - "Add aat() function to xtask/src/tasks/mod.rs"
+      - "Create xtask/src/tasks/aat.rs"
+      - "Implement parse_pr_url(url: &str) -> Result<(owner, repo, number)>"
+      - "Implement fetch_pr_description(owner, repo, number) using gh pr view"
+      - "Implement fetch_pr_diff(owner, repo, number) using gh pr diff"
+      - "Implement fetch_pr_sha(owner, repo, number) using gh pr view --json headRefOid"
+      - "Orchestrate: fetch -> parse -> anti_gaming -> skill_invoke -> evidence -> status"
+      - "Implement invoke_aat_skill(parsed_pr, diff) that invokes Claude Code with AAT skill"
+      - "Parse skill output to extract hypotheses array"
+      - "Implement set_status_check(owner, repo, sha, state, description, target_url)"
+      - "Map Verdict to GitHub status: Passed->success, Failed->failure, NeedsAdjudication->pending"
+      - "Write integration test with mock gh commands"
+      - "Document command usage in main.rs docstring"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0002"
+      - "EVID-0008"
+    criteria:
+      - "cargo xtask aat <PR_URL> command exists and is documented"
+      - "Command parses GitHub PR URLs correctly (https://github.com/owner/repo/pull/123)"
+      - "PR description fetched via gh CLI"
+      - "PR diff fetched via gh CLI"
+      - "Parser validates required sections, fails with actionable error if missing"
+      - "Anti-gaming analysis runs on diff and cross-references Known Limitations"
+      - "AAT skill invoked for hypothesis generation and execution"
+      - "Evidence bundle written to evidence/aat/ directory"
+      - "GitHub status check set on PR commit SHA"
+      - "Status is success when all hypotheses pass and no anti-gaming violations"
+      - "Status is failure when any hypothesis fails or anti-gaming violation found"
+      - "--dry-run flag prevents status update"
+      - "Exit code reflects outcome (0=success, 1=failure)"
+      - "cargo build succeeds"
+      - "cargo test passes"
+      - "cargo clippy passes with no warnings"
+  notes:
+    security: "Use gh CLI for GitHub API - credentials managed externally, never in process memory"
+    verification: "Test with real PRs from this repository"
+    general: "This is the main entry point for AAT. Integrates parser, anti-gaming, evidence modules."

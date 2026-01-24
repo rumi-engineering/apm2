@@ -8,25 +8,15 @@ user-invocable: true
 
 ### 1. Parse Arguments
 
-- `$ARGUMENTS[0]`: Optional. Can be:
-  - RFC ID (e.g., `RFC-0001`) - filter to specific RFC
-  - Ticket ID (e.g., `TCK-00049`) - start specific ticket
-  - Omitted - find earliest unblocked ticket globally
+- `$1`: Ticket ID (e.g., `TCK-00049`) - the ticket to implement
 
 ### 2. Initialize Development Environment
 
 ```bash
-# Start next unblocked ticket globally
-cd "$(cargo xtask start-ticket --print-path)"
-
-# Or filter to specific RFC
-cd "$(cargo xtask start-ticket RFC-0001 --print-path)"
-
-# Or start specific ticket
-cd "$(cargo xtask start-ticket TCK-00049 --print-path)"
+cd "$(cargo xtask start-ticket $1 --print-path)"
 ```
 
-Read the output carefully. It provides all context needed to implement the ticket. If no tickets remain, the loop is complete.
+Read the output carefully. It provides all context needed to implement the ticket.
 
 ### 3. Process Ticket
 
