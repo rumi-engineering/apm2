@@ -64,7 +64,11 @@ enum Commands {
     ///
     /// Displays the current ticket status, PR checks,
     /// and review status.
-    Check,
+    Check {
+        /// Continuously poll status every 10 seconds
+        #[arg(short, long)]
+        watch: bool,
+    },
 
     /// Clean up after PR merge.
     ///
@@ -80,7 +84,7 @@ fn main() -> Result<()> {
         Commands::StartTicket { rfc_id } => tasks::start_ticket(&rfc_id),
         Commands::Commit { message } => tasks::commit(&message),
         Commands::Push => tasks::push(),
-        Commands::Check => tasks::check(),
+        Commands::Check { watch } => tasks::check(watch),
         Commands::Finish => tasks::finish(),
     }
 }

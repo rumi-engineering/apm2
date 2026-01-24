@@ -4,6 +4,7 @@
 //! Implemented commands have their own modules; stubs remain for unimplemented
 //! ones.
 
+mod check;
 mod finish;
 
 use anyhow::{Result, bail};
@@ -46,14 +47,17 @@ pub fn push() -> Result<()> {
 
 /// Show ticket and PR status.
 ///
+/// Delegates to the check module for the actual implementation.
+///
+/// # Arguments
+///
+/// * `watch` - If true, continuously poll status every 10 seconds
+///
 /// # Errors
 ///
-/// Returns an error as this is not yet implemented.
-pub fn check() -> Result<()> {
-    bail!(
-        "check command not yet implemented\n\
-         This will be implemented in TCK-00029."
-    );
+/// Returns an error if the status check fails. See [`check::run`] for details.
+pub fn check(watch: bool) -> Result<()> {
+    check::run(watch)
 }
 
 /// Clean up after PR merge.
