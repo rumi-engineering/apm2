@@ -48,10 +48,14 @@ pub fn run(message: &str) -> Result<()> {
         bail!("No changes to commit. Make some changes first.");
     }
 
-    println!(
-        "Running checks for ticket {} (RFC: {})",
-        ticket_branch.ticket_id, ticket_branch.rfc_id
-    );
+    if let Some(rfc_id) = &ticket_branch.rfc_id {
+        println!(
+            "Running checks for ticket {} (RFC: {})",
+            ticket_branch.ticket_id, rfc_id
+        );
+    } else {
+        println!("Running checks for ticket {}", ticket_branch.ticket_id);
+    }
 
     // Run cargo fmt --check
     println!("\n[1/3] Running cargo fmt --check...");

@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00022"
     title: "Implement Claude Code instrumented adapter"
@@ -24,7 +24,25 @@ ticket_meta:
     tickets:
       - ticket_id: "TCK-00021"
         reason: "Requires black-box adapter from 'Implement black-box adapter (observation-based)'"
+  scope:
+    in_scope:
+      - "Integrate with Claude Code hook system"
+      - "Receive native tool requests"
+      - "Send tool responses"
+      - "Rich progress signals"
+    out_of_scope:
+      - "Other vendor adapters"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0001"
       - "EVID-0002"
+    criteria:
+      - "Claude Code hooks integrated"
+      - "Tool requests received natively"
+      - "Tool responses delivered"
+      - "Rich progress signals captured"
+      - "Session lifecycle managed"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

@@ -44,10 +44,14 @@ pub fn run(watch: bool) -> Result<()> {
     let branch_name = current_branch(&sh)?;
     let ticket_branch = validate_ticket_branch(&branch_name)?;
 
-    println!(
-        "Checking status for {} (RFC: {})",
-        ticket_branch.ticket_id, ticket_branch.rfc_id
-    );
+    if let Some(rfc_id) = &ticket_branch.rfc_id {
+        println!(
+            "Checking status for {} (RFC: {})",
+            ticket_branch.ticket_id, rfc_id
+        );
+    } else {
+        println!("Checking status for {}", ticket_branch.ticket_id);
+    }
     println!();
 
     if watch {
@@ -65,10 +69,14 @@ pub fn run(watch: bool) -> Result<()> {
 
             // Clear terminal for next iteration
             print!("\x1B[2J\x1B[1;1H");
-            println!(
-                "Checking status for {} (RFC: {})",
-                ticket_branch.ticket_id, ticket_branch.rfc_id
-            );
+            if let Some(rfc_id) = &ticket_branch.rfc_id {
+                println!(
+                    "Checking status for {} (RFC: {})",
+                    ticket_branch.ticket_id, rfc_id
+                );
+            } else {
+                println!("Checking status for {}", ticket_branch.ticket_id);
+            }
             println!();
         }
     } else {

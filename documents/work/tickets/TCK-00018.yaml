@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00018"
     title: "Implement lease registrar"
@@ -36,6 +36,25 @@ ticket_meta:
         reason: "Requires work data model from 'Implement work contract data model'"
       - ticket_id: "TCK-00003"
         reason: "Requires signature primitives from 'Implement hash-chain and signature primitives'"
+  scope:
+    in_scope:
+      - "Implement lease issuance"
+      - "Implement lease renewal"
+      - "Implement lease release"
+      - "Enforce at-most-one lease per work_id"
+      - "Registrar signing of leases"
+    out_of_scope:
+      - "Federation lease reconciliation (RFC-0002)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0006"
+    criteria:
+      - "LeaseIssued event with registrar signature"
+      - "Duplicate claims rejected"
+      - "LeaseRenewed extends expiration"
+      - "LeaseReleased frees work_id"
+      - "LeaseExpired auto-triggers on timeout"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

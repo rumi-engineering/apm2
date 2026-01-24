@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00007"
     title: "Implement crash detection and restart logic"
@@ -28,6 +28,24 @@ ticket_meta:
         reason: "Requires session lifecycle from 'Implement session lifecycle state machine'"
       - ticket_id: "TCK-00006"
         reason: "Requires entropy budget from 'Implement entropy budget tracker'"
+  scope:
+    in_scope:
+      - "Detect session process exit"
+      - "Classify exit (success, failure, signal)"
+      - "Implement exponential backoff for restarts"
+      - "Recovery from ledger state"
+    out_of_scope:
+      - "Quarantine logic (TCK-00008)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0006"
+    criteria:
+      - "Process exit detected and classified"
+      - "Exit classification emitted as event"
+      - "Backoff applied between restarts"
+      - "Session resumes from ledger cursor"
+      - "Restart limit configurable"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

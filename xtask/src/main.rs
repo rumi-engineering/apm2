@@ -11,7 +11,11 @@
 //!
 //! # Commands
 //!
-//! - `start-ticket <RFC_ID>` - Start work on the next unblocked ticket
+//! - `start-ticket` - Start work on the next unblocked ticket (finds earliest
+//!   globally)
+//! - `start-ticket RFC-XXXX` - Start work on the next unblocked ticket for an
+//!   RFC
+//! - `start-ticket TCK-XXXXX` - Start work on a specific ticket
 //! - `commit <message>` - Run checks and create a commit
 //! - `push` - Push branch, create PR, and request reviews
 //! - `check` - Show ticket and PR status
@@ -19,6 +23,10 @@
 //! - `review security <PR_URL>` - Run security review for a PR
 //! - `review quality <PR_URL>` - Run code quality review for a PR
 //! - `review uat <PR_URL>` - Run UAT sign-off for a PR
+//! - `security-review-exec approve [TCK-XXXXX]` - Approve PR after security
+//!   review
+//! - `security-review-exec deny [TCK-XXXXX] --reason <reason>` - Deny PR with
+//!   reason
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -39,14 +47,20 @@ struct Cli {
 /// Available xtask commands.
 #[derive(Subcommand)]
 enum Commands {
-    /// Start work on the next unblocked ticket for an RFC.
+    /// Start work on the next unblocked ticket.
     ///
     /// Creates a worktree and branch for the next pending ticket
     /// that has all dependencies completed.
+    ///
+    /// With no arguments, finds the earliest unblocked ticket across all RFCs.
+    /// With an RFC ID (RFC-XXXX), filters to that RFC.
+    /// With a ticket ID (TCK-XXXXX), starts that specific ticket.
     #[command(name = "start-ticket")]
     StartTicket {
-        /// The RFC ID (e.g., RFC-0001)
-        rfc_id: String,
+        /// Optional: RFC ID (RFC-XXXX) to filter, or ticket ID (TCK-XXXXX) to
+        /// start directly. If omitted, finds earliest unblocked ticket
+        /// across all RFCs.
+        target: Option<String>,
 
         /// Only print the worktree path (for scripting)
         #[arg(short = 'p', long = "print-path")]
@@ -110,9 +124,10 @@ enum SecurityReviewExecCommands {
     /// Approve the PR (set ai-review/security to success).
     ///
     /// Posts an approval comment and updates the status check.
+    /// If no ticket ID is provided, uses the current branch.
     Approve {
-        /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
-        pr_url: String,
+        /// Ticket ID (e.g., TCK-00049). If omitted, uses current branch.
+        ticket_id: Option<String>,
         /// Preview what would happen without making API calls
         #[arg(long)]
         dry_run: bool,
@@ -120,9 +135,10 @@ enum SecurityReviewExecCommands {
     /// Deny the PR (set ai-review/security to failure).
     ///
     /// Posts a denial comment with the reason and updates the status check.
+    /// If no ticket ID is provided, uses the current branch.
     Deny {
-        /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
-        pr_url: String,
+        /// Ticket ID (e.g., TCK-00049). If omitted, uses current branch.
+        ticket_id: Option<String>,
         /// Reason for denying the security review (required)
         #[arg(long)]
         reason: String,
@@ -174,7 +190,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::StartTicket { rfc_id, print_path } => tasks::start_ticket(&rfc_id, print_path),
+        Commands::StartTicket { target, print_path } => {
+            tasks::start_ticket(target.as_deref(), print_path)
+        },
         Commands::Commit { message } => tasks::commit(&message),
         Commands::Push => tasks::push(),
         Commands::Check { watch } => tasks::check(watch),
@@ -185,14 +203,14 @@ fn main() -> Result<()> {
             ReviewCommands::Uat { pr_url } => tasks::review_uat(&pr_url),
         },
         Commands::SecurityReviewExec { action } => match action {
-            SecurityReviewExecCommands::Approve { pr_url, dry_run } => {
-                tasks::security_review_exec_approve(&pr_url, dry_run)
+            SecurityReviewExecCommands::Approve { ticket_id, dry_run } => {
+                tasks::security_review_exec_approve(ticket_id.as_deref(), dry_run)
             },
             SecurityReviewExecCommands::Deny {
-                pr_url,
+                ticket_id,
                 reason,
                 dry_run,
-            } => tasks::security_review_exec_deny(&pr_url, &reason, dry_run),
+            } => tasks::security_review_exec_deny(ticket_id.as_deref(), &reason, dry_run),
             SecurityReviewExecCommands::Onboard => tasks::security_review_exec_onboard(),
         },
     }

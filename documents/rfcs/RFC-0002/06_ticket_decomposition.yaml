@@ -1,6 +1,6 @@
 rfc_ticket_decomposition:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   principles:
   - "Tickets are atomic and independently verifiable"
   - "Shared utilities implemented before commands that depend on them"
@@ -16,7 +16,6 @@ rfc_ticket_decomposition:
       title: "Create xtask crate structure"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00026.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00026.md"
       scope:
         in_scope:
         - "Add xshell to workspace Cargo.toml dependencies"
@@ -46,7 +45,6 @@ rfc_ticket_decomposition:
       title: "Implement shared utilities"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00027.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00027.md"
       scope:
         in_scope:
         - "Create xtask/src/util.rs module"
@@ -81,7 +79,6 @@ rfc_ticket_decomposition:
       title: "Implement finish command"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00028.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00028.md"
       scope:
         in_scope:
         - "Validate current branch is a ticket branch"
@@ -113,7 +110,6 @@ rfc_ticket_decomposition:
       title: "Implement check command"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00029.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00029.md"
       scope:
         in_scope:
         - "Validate current branch is a ticket branch"
@@ -146,7 +142,6 @@ rfc_ticket_decomposition:
       title: "Implement start-ticket command"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00030.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00030.md"
       scope:
         in_scope:
         - "Accept RFC_ID argument"
@@ -179,7 +174,6 @@ rfc_ticket_decomposition:
       title: "Implement commit command"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00031.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00031.md"
       scope:
         in_scope:
         - "Validate current branch is a ticket branch"
@@ -213,7 +207,6 @@ rfc_ticket_decomposition:
       title: "Implement push command"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00032.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00032.md"
       scope:
         in_scope:
         - "Validate current branch is a ticket branch"
@@ -251,7 +244,6 @@ rfc_ticket_decomposition:
       title: "Update docs and delete bash scripts"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00033.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00033.md"
       scope:
         in_scope:
         - "Update SKILL.md with xtask command references"
@@ -288,7 +280,6 @@ rfc_ticket_decomposition:
       title: "Implement review sign-off commands"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00034.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00034.md"
       scope:
         in_scope:
         - "cargo xtask review security <PR_URL> - Run security review"
@@ -321,7 +312,6 @@ rfc_ticket_decomposition:
       title: "Implement security review exec command"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00035.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00035.md"
       scope:
         in_scope:
         - "cargo xtask security-review-exec approve <PR_URL> - Approve PR after security review"

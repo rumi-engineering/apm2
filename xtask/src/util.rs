@@ -14,18 +14,22 @@ use xshell::{Shell, cmd};
 
 /// Regex pattern for validating ticket branch names.
 ///
-/// Valid format: `ticket/RFC-XXXX/TCK-XXXXX`
+/// Valid formats:
+/// - `ticket/RFC-XXXX/TCK-XXXXX` (with RFC)
+/// - `ticket/TCK-XXXXX` (standalone ticket)
+///
 /// Where XXXX is 4 digits and XXXXX is 5 digits.
 static TICKET_BRANCH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^ticket/(RFC-\d{4})/(TCK-\d{5})$")
+    Regex::new(r"^ticket/(?:(RFC-\d{4})/)?(TCK-\d{5})$")
         .expect("Invalid regex pattern for ticket branch")
 });
 
 /// Parsed ticket branch information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketBranch {
-    /// The RFC ID (e.g., "RFC-0002")
-    pub rfc_id: String,
+    /// The RFC ID (e.g., "RFC-0002"), if present.
+    /// None for standalone tickets without an RFC.
+    pub rfc_id: Option<String>,
     /// The ticket ID (e.g., "TCK-00027")
     pub ticket_id: String,
 }
@@ -39,7 +43,9 @@ pub struct TicketBranch {
 /// # Returns
 ///
 /// Returns `Ok(TicketBranch)` with the parsed IDs if the branch name matches
-/// the expected format `ticket/RFC-XXXX/TCK-XXXXX`.
+/// one of the expected formats:
+/// - `ticket/RFC-XXXX/TCK-XXXXX` (with RFC)
+/// - `ticket/TCK-XXXXX` (standalone ticket)
 ///
 /// # Errors
 ///
@@ -49,27 +55,31 @@ pub struct TicketBranch {
 ///
 /// ```
 /// # use xtask::util::validate_ticket_branch;
+/// // With RFC
 /// let result = validate_ticket_branch("ticket/RFC-0002/TCK-00027");
 /// assert!(result.is_ok());
 /// let branch = result.unwrap();
-/// assert_eq!(branch.rfc_id, "RFC-0002");
+/// assert_eq!(branch.rfc_id, Some("RFC-0002".to_string()));
 /// assert_eq!(branch.ticket_id, "TCK-00027");
+///
+/// // Standalone ticket (no RFC)
+/// let result = validate_ticket_branch("ticket/TCK-00049");
+/// assert!(result.is_ok());
+/// let branch = result.unwrap();
+/// assert_eq!(branch.rfc_id, None);
+/// assert_eq!(branch.ticket_id, "TCK-00049");
 /// ```
 pub fn validate_ticket_branch(branch_name: &str) -> Result<TicketBranch> {
     let captures = TICKET_BRANCH_REGEX.captures(branch_name).with_context(|| {
         format!(
             "Invalid branch name: '{branch_name}'\n\
-                 Expected format: ticket/RFC-XXXX/TCK-XXXXX\n\
-                 Example: ticket/RFC-0002/TCK-00027"
+                 Expected format: ticket/RFC-XXXX/TCK-XXXXX or ticket/TCK-XXXXX\n\
+                 Examples: ticket/RFC-0002/TCK-00027, ticket/TCK-00049"
         )
     })?;
 
     Ok(TicketBranch {
-        rfc_id: captures
-            .get(1)
-            .expect("RFC ID capture group missing")
-            .as_str()
-            .to_string(),
+        rfc_id: captures.get(1).map(|m| m.as_str().to_string()),
         ticket_id: captures
             .get(2)
             .expect("Ticket ID capture group missing")
@@ -174,12 +184,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_ticket_branch_valid() {
+    fn test_validate_ticket_branch_valid_with_rfc() {
         let result = validate_ticket_branch("ticket/RFC-0002/TCK-00027");
         assert!(result.is_ok());
         let branch = result.unwrap();
-        assert_eq!(branch.rfc_id, "RFC-0002");
+        assert_eq!(branch.rfc_id, Some("RFC-0002".to_string()));
         assert_eq!(branch.ticket_id, "TCK-00027");
+    }
+
+    #[test]
+    fn test_validate_ticket_branch_valid_standalone() {
+        let result = validate_ticket_branch("ticket/TCK-00049");
+        assert!(result.is_ok());
+        let branch = result.unwrap();
+        assert_eq!(branch.rfc_id, None);
+        assert_eq!(branch.ticket_id, "TCK-00049");
     }
 
     #[test]
@@ -187,7 +206,7 @@ mod tests {
         let result = validate_ticket_branch("ticket/RFC-0001/TCK-00001");
         assert!(result.is_ok());
         let branch = result.unwrap();
-        assert_eq!(branch.rfc_id, "RFC-0001");
+        assert_eq!(branch.rfc_id, Some("RFC-0001".to_string()));
         assert_eq!(branch.ticket_id, "TCK-00001");
     }
 
@@ -196,7 +215,7 @@ mod tests {
         let result = validate_ticket_branch("ticket/RFC-9999/TCK-99999");
         assert!(result.is_ok());
         let branch = result.unwrap();
-        assert_eq!(branch.rfc_id, "RFC-9999");
+        assert_eq!(branch.rfc_id, Some("RFC-9999".to_string()));
         assert_eq!(branch.ticket_id, "TCK-99999");
     }
 
@@ -242,6 +261,15 @@ mod tests {
     fn test_validate_ticket_branch_invalid_lowercase() {
         let result = validate_ticket_branch("ticket/rfc-0002/tck-00027");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_ticket_branch_standalone_high_number() {
+        let result = validate_ticket_branch("ticket/TCK-99999");
+        assert!(result.is_ok());
+        let branch = result.unwrap();
+        assert_eq!(branch.rfc_id, None);
+        assert_eq!(branch.ticket_id, "TCK-99999");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00016"
     title: "Implement inference syscall adapter"
@@ -30,7 +30,25 @@ ticket_meta:
         reason: "Requires tool contract from 'Define tool request/response contract'"
       - ticket_id: "TCK-00011"
         reason: "Requires budget enforcement from 'Implement budget enforcement'"
+  scope:
+    in_scope:
+      - "Implement InferenceCall tool"
+      - "Provider abstraction (local, remote)"
+      - "Token budget deduction"
+      - "Prompt/response logging"
+    out_of_scope:
+      - "Specific provider implementations (adapter code)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0003"
       - "EVID-0018"
+    criteria:
+      - "InferenceCall submits to provider"
+      - "Token budget deducted"
+      - "Prompts/responses logged (hashed)"
+      - "Provider switchable via config"
+      - "Timeout handling"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

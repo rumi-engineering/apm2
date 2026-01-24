@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00024"
     title: "End-to-end integration tests"
@@ -28,7 +28,26 @@ ticket_meta:
     tickets:
       - ticket_id: "TCK-00023"
         reason: "Requires factory CLI from 'Implement factory run CLI command'"
+  scope:
+    in_scope:
+      - "E2E test with simulated agent"
+      - "Full workflow from spec to evidence"
+      - "Policy enforcement validation"
+      - "Evidence bundle verification"
+      - "Failure mode testing"
+    out_of_scope:
+      - "Performance benchmarks"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0001"
       - "EVID-1003"
+    criteria:
+      - "E2E test completes full workflow"
+      - "Evidence bundle generated"
+      - "Gate receipt passes"
+      - "Policy denials tested"
+      - "Failure modes (timeout, entropy) tested"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

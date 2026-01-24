@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00012"
     title: "Implement audit event emission"
@@ -30,7 +30,25 @@ ticket_meta:
     tickets:
       - ticket_id: "TCK-00010"
         reason: "Requires policy evaluation from 'Implement default-deny evaluation engine'"
+  scope:
+    in_scope:
+      - "Emit PolicyViolation events"
+      - "Include rationale codes in all decisions"
+      - "Structured logging with tracing"
+      - "Audit event retention configuration"
+    out_of_scope:
+      - "External audit log shipping"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0011"
       - "EVID-0012"
+    criteria:
+      - "PolicyViolation events emitted on violations"
+      - "All events include rationale_code"
+      - "Structured logs via tracing"
+      - "Audit events queryable by type"
+      - "Retention policy documented"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

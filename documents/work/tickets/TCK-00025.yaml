@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00025"
     title: "Implement seccomp sandbox for black-box adapter"
@@ -23,6 +23,22 @@ ticket_meta:
     tickets:
       - ticket_id: "TCK-00021"
         reason: "Requires black-box adapter from 'Implement black-box adapter (observation-based)'"
+  scope:
+    in_scope:
+      - "Define seccomp profile for agent processes"
+      - "Restrict syscalls to minimum required set"
+      - "Allow only mediated I/O paths"
+    out_of_scope:
+      - "Other platform sandboxing (macOS, Windows)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0014"
+    criteria:
+      - "Seccomp profile blocks direct network/filesystem syscalls"
+      - "Agent can only communicate via mediated channels"
+      - "Profile violations logged and session terminated"
+  notes:
+    security: "default-deny, least privilege, fail-closed"
+    general: "OPTIONAL: This ticket is part of the pre-production hardening phase and is not required for initial release."

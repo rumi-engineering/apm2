@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00020"
     title: "Implement gate receipt generator"
@@ -28,6 +28,24 @@ ticket_meta:
     tickets:
       - ticket_id: "TCK-00019"
         reason: "Requires evidence publisher from 'Implement evidence bundle publisher'"
+  scope:
+    in_scope:
+      - "Generate GateReceipt from evidence"
+      - "Auto-populate from harness data"
+      - "Emit GateReceiptGenerated event"
+      - "Validate evidence completeness"
+    out_of_scope:
+      - "Gate review UI (CLI only)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0016"
+    criteria:
+      - "Gate receipt generated from evidence bundle"
+      - "80-95% of receipt auto-populated"
+      - "PASS/FAIL result computed"
+      - "Receipt signed"
+      - "Work blocked if evidence incomplete"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

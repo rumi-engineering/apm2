@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00023"
     title: "Implement factory run CLI command"
@@ -38,7 +38,26 @@ ticket_meta:
         reason: "Requires lease registrar from 'Implement lease registrar'"
       - ticket_id: "TCK-00022"
         reason: "Requires Claude Code adapter from 'Implement Claude Code instrumented adapter'"
+  scope:
+    in_scope:
+      - "apm2 factory run command"
+      - "Load PRD/RFC/ticket spec"
+      - "Spawn session"
+      - "Monitor to completion"
+      - "Machine-readable output"
+    out_of_scope:
+      - "Multi-work orchestration (future)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0001"
       - "EVID-1006"
+    criteria:
+      - "apm2 factory run <spec> works"
+      - "Spec loaded and validated"
+      - "Session spawned with correct context"
+      - "Completion status reported"
+      - "JSON output mode supported"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

@@ -33,10 +33,14 @@ pub fn run() -> Result<()> {
     let branch_name = current_branch(&sh)?;
     let ticket_branch = validate_ticket_branch(&branch_name)?;
 
-    println!(
-        "Finishing ticket {} (RFC: {})",
-        ticket_branch.ticket_id, ticket_branch.rfc_id
-    );
+    if let Some(rfc_id) = &ticket_branch.rfc_id {
+        println!(
+            "Finishing ticket {} (RFC: {})",
+            ticket_branch.ticket_id, rfc_id
+        );
+    } else {
+        println!("Finishing ticket {}", ticket_branch.ticket_id);
+    }
 
     // Check if we're in a worktree
     let current_worktree = cmd!(sh, "git rev-parse --show-toplevel")
@@ -65,10 +69,14 @@ pub fn run() -> Result<()> {
             );
         },
         "" => {
-            bail!(
-                "No PR found for branch '{branch_name}'. \
-                 Create a PR first with `cargo xtask push`."
-            );
+            println!("No PR found for this branch.\n");
+            println!("To complete your ticket workflow:");
+            println!("  1. Implement the ticket requirements");
+            println!("  2. Run: cargo xtask commit '<message>'");
+            println!("  3. Run: cargo xtask push");
+            println!("  4. Wait for CI and reviews");
+            println!("  5. After merge: cargo xtask finish");
+            return Ok(());
         },
         _ => {
             bail!("Unknown PR state: {pr_state}");

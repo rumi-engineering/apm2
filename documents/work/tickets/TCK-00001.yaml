@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00001"
     title: "Implement ledger storage layer with SQLite WAL"
@@ -24,6 +24,26 @@ ticket_meta:
       - "DOMAIN_KERNEL"
   dependencies:
     tickets: []
+  scope:
+    in_scope:
+      - "Create SQLite database with events table"
+      - "Implement append-only write semantics"
+      - "Implement cursor-based read"
+      - "Enable WAL mode for concurrent reads"
+      - "Create artifact_refs table for CAS"
+    out_of_scope:
+      - "Hash chaining (TCK-00003)"
+      - "Projection tables (TCK-00004)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0004"
+    criteria:
+      - "SQLite database created with correct schema"
+      - "Events can be appended in order"
+      - "Events can be read by sequence number or cursor"
+      - "WAL mode verified with concurrent read test"
+      - "Unit tests for all CRUD operations"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

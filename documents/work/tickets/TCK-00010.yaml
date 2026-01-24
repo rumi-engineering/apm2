@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00010"
     title: "Implement default-deny evaluation engine"
@@ -27,7 +27,25 @@ ticket_meta:
     tickets:
       - ticket_id: "TCK-00009"
         reason: "Requires policy parser from 'Implement policy DSL parser'"
+  scope:
+    in_scope:
+      - "Evaluate tool requests against policy rules"
+      - "Default-deny if no rule matches"
+      - "Emit ToolDecided event with rule_id"
+      - "Track which rule matched"
+    out_of_scope:
+      - "Budget enforcement (TCK-00011)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0003"
       - "EVID-0013"
+    criteria:
+      - "Default-deny for unmatched requests"
+      - "Allow rules grant specific permissions"
+      - "Deny rules override allow rules"
+      - "ToolDecided event includes rule_id"
+      - "Fuzz tests for policy evaluation"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

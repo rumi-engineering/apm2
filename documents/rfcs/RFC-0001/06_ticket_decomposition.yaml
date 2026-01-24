@@ -1,6 +1,6 @@
 rfc_ticket_decomposition:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   principles:
   - "Tickets are atomic and independently verifiable"
   - "Each ticket references requirement_ids and evidence_ids"
@@ -17,8 +17,7 @@ rfc_ticket_decomposition:
       title: "Implement ledger storage layer with SQLite WAL"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00001.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00001.md"
-      scope:
+              scope:
         in_scope:
         - "Create SQLite database with events table"
         - "Implement append-only write semantics"
@@ -54,7 +53,6 @@ rfc_ticket_decomposition:
       title: "Define kernel event schemas with prost"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00002.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00002.md"
       scope:
         in_scope:
         - "Create proto/ directory with .proto files"
@@ -90,7 +88,6 @@ rfc_ticket_decomposition:
       title: "Implement hash-chain and signature primitives"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00003.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00003.md"
       scope:
         in_scope:
         - "Implement Blake3 hashing for events"
@@ -129,7 +126,6 @@ rfc_ticket_decomposition:
       title: "Implement reducer framework with checkpointing"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00004.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00004.md"
       scope:
         in_scope:
         - "Define Reducer trait"
@@ -171,7 +167,6 @@ rfc_ticket_decomposition:
       title: "Implement session lifecycle state machine"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00005.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00005.md"
       scope:
         in_scope:
         - "Define session states (Starting, Running, Terminating, Terminated)"
@@ -209,7 +204,6 @@ rfc_ticket_decomposition:
       title: "Implement entropy budget tracker"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00006.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00006.md"
       scope:
         in_scope:
         - "Define entropy budget configuration"
@@ -246,7 +240,6 @@ rfc_ticket_decomposition:
       title: "Implement crash detection and restart logic"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00007.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00007.md"
       scope:
         in_scope:
         - "Detect session process exit"
@@ -283,7 +276,6 @@ rfc_ticket_decomposition:
       title: "Implement quarantine mechanism"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00008.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00008.md"
       scope:
         in_scope:
         - "Define quarantine triggers (entropy exceeded, violations)"
@@ -322,7 +314,6 @@ rfc_ticket_decomposition:
       title: "Implement policy DSL parser"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00009.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00009.md"
       scope:
         in_scope:
         - "Define policy YAML schema"
@@ -360,7 +351,6 @@ rfc_ticket_decomposition:
       title: "Implement default-deny evaluation engine"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00010.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00010.md"
       scope:
         in_scope:
         - "Evaluate tool requests against policy rules"
@@ -398,7 +388,6 @@ rfc_ticket_decomposition:
       title: "Implement budget enforcement"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00011.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00011.md"
       scope:
         in_scope:
         - "Track token budgets per session"
@@ -434,7 +423,6 @@ rfc_ticket_decomposition:
       title: "Implement audit event emission"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00012.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00012.md"
       scope:
         in_scope:
         - "Emit PolicyViolation events"
@@ -476,7 +464,6 @@ rfc_ticket_decomposition:
       title: "Define tool request/response contract"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00013.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00013.md"
       scope:
         in_scope:
         - "Define ToolRequest protobuf messages"
@@ -511,7 +498,6 @@ rfc_ticket_decomposition:
       title: "Implement filesystem mediation adapter"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00014.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00014.md"
       scope:
         in_scope:
         - "Implement FileRead tool"
@@ -547,7 +533,6 @@ rfc_ticket_decomposition:
       title: "Implement shell command mediation adapter"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00015.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00015.md"
       scope:
         in_scope:
         - "Implement ShellExec tool"
@@ -584,7 +569,6 @@ rfc_ticket_decomposition:
       title: "Implement inference syscall adapter"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00016.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00016.md"
       scope:
         in_scope:
         - "Implement InferenceCall tool"
@@ -626,7 +610,6 @@ rfc_ticket_decomposition:
       title: "Implement work contract data model"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00017.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00017.md"
       scope:
         in_scope:
         - "Define Work struct with states"
@@ -664,7 +647,6 @@ rfc_ticket_decomposition:
       title: "Implement lease registrar"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00018.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00018.md"
       scope:
         in_scope:
         - "Implement lease issuance"
@@ -706,7 +688,6 @@ rfc_ticket_decomposition:
       title: "Implement evidence bundle publisher"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00019.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00019.md"
       scope:
         in_scope:
         - "Implement ArtifactPublish tool"
@@ -745,7 +726,6 @@ rfc_ticket_decomposition:
       title: "Implement gate receipt generator"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00020.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00020.md"
       scope:
         in_scope:
         - "Generate GateReceipt from evidence"
@@ -785,7 +765,6 @@ rfc_ticket_decomposition:
       title: "Implement black-box adapter (observation-based)"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00021.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00021.md"
       scope:
         in_scope:
         - "Spawn agent process"
@@ -820,7 +799,6 @@ rfc_ticket_decomposition:
       title: "Implement Claude Code instrumented adapter"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00022.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00022.md"
       scope:
         in_scope:
         - "Integrate with Claude Code hook system"
@@ -859,7 +837,6 @@ rfc_ticket_decomposition:
       title: "Implement factory run CLI command"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00023.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00023.md"
       scope:
         in_scope:
         - "apm2 factory run command"
@@ -903,7 +880,6 @@ rfc_ticket_decomposition:
       title: "End-to-end integration tests"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00024.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00024.md"
       scope:
         in_scope:
         - "E2E test with simulated agent"
@@ -945,7 +921,6 @@ rfc_ticket_decomposition:
       title: "Implement seccomp sandbox for black-box adapter"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00025.yaml#ticket_meta"
-        body_path: "documents/work/tickets/TCK-00025.md"
       scope:
         in_scope:
         - "Define seccomp profile for agent processes"

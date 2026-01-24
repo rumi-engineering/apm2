@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00011"
     title: "Implement budget enforcement"
@@ -24,6 +24,25 @@ ticket_meta:
     tickets:
       - ticket_id: "TCK-00010"
         reason: "Requires policy evaluation from 'Implement default-deny evaluation engine'"
+  scope:
+    in_scope:
+      - "Track token budgets per session"
+      - "Track tool call budgets"
+      - "Track time budgets"
+      - "Deny requests exceeding budget"
+      - "Emit BudgetExceeded event"
+    out_of_scope:
+      - "Budget reporting in projections (TCK-00004 handled this)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0018"
+    criteria:
+      - "Token budget tracked per session"
+      - "Tool call budget tracked"
+      - "Time budget tracked"
+      - "Requests denied when budget exceeded"
+      - "BudgetExceeded event emitted"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

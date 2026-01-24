@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00017"
     title: "Implement work contract data model"
@@ -28,6 +28,25 @@ ticket_meta:
         reason: "Requires proto event schemas from 'Define kernel event schemas with prost'"
       - ticket_id: "TCK-00004"
         reason: "Requires reducer framework from 'Implement reducer framework with checkpointing'"
+  scope:
+    in_scope:
+      - "Define Work struct with states"
+      - "Implement WorkOpened, WorkTransitioned events"
+      - "Spec snapshot handling"
+      - "Requirement binding"
+    out_of_scope:
+      - "Lease integration (TCK-00018)"
+      - "Evidence publication (TCK-00019)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0001"
+    criteria:
+      - "Work states defined (OPEN, CLAIMED, IN_PROGRESS, REVIEW, NEEDS_INPUT, COMPLETED, ABORTED)"
+      - "WorkOpened includes spec_snapshot_hash"
+      - "State transitions validated"
+      - "Work projection tracks all active work"
+      - "Requirement IDs linked to work"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

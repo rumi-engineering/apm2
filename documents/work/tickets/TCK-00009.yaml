@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00009"
     title: "Implement policy DSL parser"
@@ -25,6 +25,26 @@ ticket_meta:
     tickets:
       - ticket_id: "TCK-00002"
         reason: "Requires proto event schemas from 'Define kernel event schemas with prost'"
+  scope:
+    in_scope:
+      - "Define policy YAML schema"
+      - "Parse policy files with serde_yaml"
+      - "Validate policy structure"
+      - "Load policy at startup"
+      - "Emit PolicyLoaded event"
+    out_of_scope:
+      - "Rule evaluation (TCK-00010)"
+      - "Hot reload (future enhancement)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0003"
+    criteria:
+      - "Policy YAML schema documented"
+      - "Parser handles all rule types"
+      - "Invalid policies rejected with clear errors"
+      - "PolicyLoaded event includes hash"
+      - "Example policy files created"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

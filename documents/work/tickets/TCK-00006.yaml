@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00006"
     title: "Implement entropy budget tracker"
@@ -26,7 +26,25 @@ ticket_meta:
     tickets:
       - ticket_id: "TCK-00005"
         reason: "Requires session lifecycle from 'Implement session lifecycle state machine'"
+  scope:
+    in_scope:
+      - "Define entropy budget configuration"
+      - "Track entropy consumption (errors, stalls, violations)"
+      - "Emit BudgetExceeded event"
+      - "Integrate with session lifecycle"
+    out_of_scope:
+      - "Stall detection logic (TCK-00007)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0006"
       - "EVID-0018"
+    criteria:
+      - "Entropy budget configurable per session"
+      - "Entropy increments on errors and violations"
+      - "BudgetExceeded event emitted at threshold"
+      - "Session terminated when budget exceeded"
+      - "Budget visible in session_health projection"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00005"
     title: "Implement session lifecycle state machine"
@@ -28,6 +28,25 @@ ticket_meta:
         reason: "Requires proto event schemas from 'Define kernel event schemas with prost'"
       - ticket_id: "TCK-00003"
         reason: "Requires hash-chain primitives from 'Implement hash-chain and signature primitives'"
+  scope:
+    in_scope:
+      - "Define session states (Starting, Running, Terminating, Terminated)"
+      - "Implement state transitions"
+      - "Emit SessionStarted, SessionTerminated events"
+      - "Track session metadata"
+    out_of_scope:
+      - "Entropy budget (TCK-00006)"
+      - "Crash detection (TCK-00007)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0006"
+    criteria:
+      - "Session state machine implemented"
+      - "State transitions emit correct events"
+      - "Actor identity persists across restarts"
+      - "Session metadata tracked correctly"
+      - "Unit tests for all state transitions"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

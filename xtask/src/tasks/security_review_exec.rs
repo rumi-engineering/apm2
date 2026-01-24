@@ -1,18 +1,21 @@
 //! Implementation of the `security-review-exec` command.
 //!
 //! This command provides execution tools for security reviewers:
-//! - `cargo xtask security-review-exec approve <PR_URL>` - Approve PR after
+//! - `cargo xtask security-review-exec approve [TCK-XXXXX]` - Approve PR after
 //!   security review
-//! - `cargo xtask security-review-exec deny <PR_URL> --reason <reason>` - Deny
-//!   PR with reason
+//! - `cargo xtask security-review-exec deny [TCK-XXXXX] --reason <reason>` -
+//!   Deny PR with reason
 //! - `cargo xtask security-review-exec onboard` - Show required reading for
 //!   reviewers
 //!
+//! If no ticket ID is provided, the commands use the current branch.
 //! All commands support `--dry-run` to preview actions without making API
 //! calls.
 
 use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
+
+use crate::util::{current_branch, validate_ticket_branch};
 
 /// Required reading paths for security reviewers.
 pub const REQUIRED_READING: &[&str] = &[
@@ -51,61 +54,178 @@ Please address the security concerns above before this PR can be approved.
     )
 }
 
+/// Resolved PR information.
+struct ResolvedPr {
+    owner_repo: String,
+    pr_number: u32,
+    ticket_id: String,
+    pr_url: String,
+}
+
+/// Resolve ticket ID (or current branch) to PR information.
+///
+/// If `ticket_id` is provided, finds the branch for that ticket.
+/// If None, uses the current branch and validates it's a ticket branch.
+fn resolve_ticket_pr(sh: &Shell, ticket_id: Option<&str>) -> Result<ResolvedPr> {
+    let (branch_name, resolved_ticket_id) = if let Some(id) = ticket_id {
+        // Find the branch for this ticket
+        let branch = find_branch_for_ticket(sh, id)?;
+        (branch, id.to_string())
+    } else {
+        // Use current branch
+        let branch = current_branch(sh)?;
+        let ticket_branch = validate_ticket_branch(&branch)?;
+        (branch, ticket_branch.ticket_id)
+    };
+
+    // Get PR number for the branch
+    let pr_number_output = cmd!(sh, "gh pr view {branch_name} --json number --jq .number")
+        .read()
+        .with_context(|| format!("No PR found for branch '{branch_name}'"))?;
+
+    let pr_number: u32 = pr_number_output
+        .trim()
+        .parse()
+        .with_context(|| format!("Invalid PR number: {}", pr_number_output.trim()))?;
+
+    // Get PR URL
+    let pr_url = cmd!(sh, "gh pr view {branch_name} --json url --jq .url")
+        .read()
+        .context("Failed to get PR URL")?
+        .trim()
+        .to_string();
+
+    // Get owner/repo from git remote
+    let remote_url = cmd!(sh, "git remote get-url origin")
+        .read()
+        .context("Failed to get remote URL")?;
+
+    let owner_repo = parse_owner_repo(&remote_url)?;
+
+    Ok(ResolvedPr {
+        owner_repo,
+        pr_number,
+        ticket_id: resolved_ticket_id,
+        pr_url,
+    })
+}
+
+/// Find the branch name for a given ticket ID.
+///
+/// Searches local and remote branches for patterns:
+/// - `ticket/RFC-XXXX/{ticket_id}`
+/// - `ticket/{ticket_id}`
+fn find_branch_for_ticket(sh: &Shell, ticket_id: &str) -> Result<String> {
+    // First try local branches
+    let local_branches = cmd!(sh, "git branch --list *{ticket_id}*")
+        .read()
+        .context("Failed to list local branches")?;
+
+    for line in local_branches.lines() {
+        let branch = line.trim().trim_start_matches("* ");
+        if branch.contains(ticket_id) && branch.starts_with("ticket/") {
+            return Ok(branch.to_string());
+        }
+    }
+
+    // Try remote branches
+    let remote_branches = cmd!(sh, "git branch -r --list *{ticket_id}*")
+        .read()
+        .context("Failed to list remote branches")?;
+
+    for line in remote_branches.lines() {
+        let branch = line.trim().trim_start_matches("origin/");
+        if branch.contains(ticket_id) && branch.starts_with("ticket/") {
+            return Ok(branch.to_string());
+        }
+    }
+
+    bail!(
+        "No branch found for ticket {ticket_id}.\n\
+         Expected branch format: ticket/RFC-XXXX/{ticket_id} or ticket/{ticket_id}"
+    )
+}
+
+/// Parse owner/repo from a GitHub remote URL.
+fn parse_owner_repo(remote_url: &str) -> Result<String> {
+    let url = remote_url.trim();
+
+    if !url.contains("github.com") {
+        bail!("Remote URL is not a GitHub URL: {url}");
+    }
+
+    let path = url
+        .trim_end_matches(".git")
+        .split("github.com")
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("Invalid GitHub URL format"))?
+        .trim_start_matches(['/', ':']);
+
+    Ok(path.to_string())
+}
+
 /// Approve a PR after security review passes.
 ///
 /// # Arguments
 ///
-/// * `pr_url` - The GitHub PR URL
+/// * `ticket_id` - Optional ticket ID. If None, uses current branch.
 /// * `dry_run` - If true, preview without making API calls
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - The PR URL is invalid
+/// - The ticket/branch has no PR
 /// - The PR is not open (closed/merged/missing)
 /// - The API calls fail
-pub fn approve(pr_url: &str, dry_run: bool) -> Result<()> {
+pub fn approve(ticket_id: Option<&str>, dry_run: bool) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
 
     println!("Security Review: APPROVE");
-    println!("  PR: {pr_url}");
+    if let Some(id) = ticket_id {
+        println!("  Ticket: {id}");
+    } else {
+        println!("  Using current branch");
+    }
     if dry_run {
         println!("  Mode: DRY RUN (no API calls will be made)");
     }
     println!();
 
-    // Parse PR URL
-    let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
-    println!("[1/4] Parsed PR URL");
-    println!("  Repository: {owner_repo}");
-    println!("  PR Number: {pr_number}");
+    // Resolve ticket to PR
+    println!("[1/4] Resolving ticket to PR...");
+    let pr = resolve_ticket_pr(&sh, ticket_id)?;
+    println!("  Ticket: {}", pr.ticket_id);
+    println!("  Repository: {}", pr.owner_repo);
+    println!("  PR Number: {}", pr.pr_number);
+    println!("  PR URL: {}", pr.pr_url);
 
     // Validate PR is open
     println!("\n[2/4] Validating PR state...");
-    validate_pr_is_open(&sh, &owner_repo, pr_number)?;
+    validate_pr_is_open(&sh, &pr.owner_repo, pr.pr_number)?;
     println!("  PR is open.");
 
     // Get HEAD SHA
     println!("\n[3/4] Getting HEAD SHA...");
-    let head_sha = get_pr_head_sha(&sh, &owner_repo, pr_number)?;
+    let head_sha = get_pr_head_sha(&sh, &pr.owner_repo, pr.pr_number)?;
     println!("  HEAD SHA: {head_sha}");
 
     if dry_run {
         println!("\n[4/4] DRY RUN - Would perform:");
-        println!("  - Post approval comment to PR #{pr_number}");
+        println!("  - Post approval comment to PR #{}", pr.pr_number);
         println!("  - Update status {STATUS_CONTEXT} to 'success' on {head_sha}");
         println!("\nDry run complete. No changes were made.");
     } else {
         println!("\n[4/4] Posting approval...");
 
         // Post approval comment
+        let pr_url = &pr.pr_url;
         cmd!(sh, "gh pr comment {pr_url} --body {APPROVE_COMMENT}")
             .run()
             .context("Failed to post approval comment")?;
         println!("  Comment posted.");
 
         // Update status to success
-        update_status(&sh, &owner_repo, &head_sha, true, "Approved")?;
+        update_status(&sh, &pr.owner_repo, &head_sha, true, "Approved")?;
 
         println!("\nSecurity review approval complete!");
         println!("  Status: {STATUS_CONTEXT} = success");
@@ -118,46 +238,52 @@ pub fn approve(pr_url: &str, dry_run: bool) -> Result<()> {
 ///
 /// # Arguments
 ///
-/// * `pr_url` - The GitHub PR URL
+/// * `ticket_id` - Optional ticket ID. If None, uses current branch.
 /// * `reason` - The reason for denial
 /// * `dry_run` - If true, preview without making API calls
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - The PR URL is invalid
+/// - The ticket/branch has no PR
 /// - The PR is not open (closed/merged/missing)
 /// - The API calls fail
-pub fn deny(pr_url: &str, reason: &str, dry_run: bool) -> Result<()> {
+pub fn deny(ticket_id: Option<&str>, reason: &str, dry_run: bool) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
 
     println!("Security Review: DENY");
-    println!("  PR: {pr_url}");
+    if let Some(id) = ticket_id {
+        println!("  Ticket: {id}");
+    } else {
+        println!("  Using current branch");
+    }
     println!("  Reason: {reason}");
     if dry_run {
         println!("  Mode: DRY RUN (no API calls will be made)");
     }
     println!();
 
-    // Parse PR URL
-    let (owner_repo, pr_number) = parse_pr_url(pr_url)?;
-    println!("[1/4] Parsed PR URL");
-    println!("  Repository: {owner_repo}");
-    println!("  PR Number: {pr_number}");
+    // Resolve ticket to PR
+    println!("[1/4] Resolving ticket to PR...");
+    let pr = resolve_ticket_pr(&sh, ticket_id)?;
+    println!("  Ticket: {}", pr.ticket_id);
+    println!("  Repository: {}", pr.owner_repo);
+    println!("  PR Number: {}", pr.pr_number);
+    println!("  PR URL: {}", pr.pr_url);
 
     // Validate PR is open
     println!("\n[2/4] Validating PR state...");
-    validate_pr_is_open(&sh, &owner_repo, pr_number)?;
+    validate_pr_is_open(&sh, &pr.owner_repo, pr.pr_number)?;
     println!("  PR is open.");
 
     // Get HEAD SHA
     println!("\n[3/4] Getting HEAD SHA...");
-    let head_sha = get_pr_head_sha(&sh, &owner_repo, pr_number)?;
+    let head_sha = get_pr_head_sha(&sh, &pr.owner_repo, pr.pr_number)?;
     println!("  HEAD SHA: {head_sha}");
 
     if dry_run {
         println!("\n[4/4] DRY RUN - Would perform:");
-        println!("  - Post denial comment to PR #{pr_number}");
+        println!("  - Post denial comment to PR #{}", pr.pr_number);
         println!("  - Update status {STATUS_CONTEXT} to 'failure' on {head_sha}");
         println!("\nDry run complete. No changes were made.");
     } else {
@@ -165,13 +291,14 @@ pub fn deny(pr_url: &str, reason: &str, dry_run: bool) -> Result<()> {
 
         // Post denial comment
         let comment = denial_comment(reason);
+        let pr_url = &pr.pr_url;
         cmd!(sh, "gh pr comment {pr_url} --body {comment}")
             .run()
             .context("Failed to post denial comment")?;
         println!("  Comment posted.");
 
         // Update status to failure
-        update_status(&sh, &owner_repo, &head_sha, false, "Denied")?;
+        update_status(&sh, &pr.owner_repo, &head_sha, false, "Denied")?;
 
         println!("\nSecurity review denial complete!");
         println!("  Status: {STATUS_CONTEXT} = failure");
@@ -198,46 +325,14 @@ pub fn onboard() -> Result<()> {
     println!();
     println!("After reading these documents, you will be prepared to:");
     println!("  - Evaluate PRs for security vulnerabilities");
-    println!("  - Use `cargo xtask security-review-exec approve <PR_URL>` to approve");
-    println!("  - Use `cargo xtask security-review-exec deny <PR_URL> --reason <reason>` to deny");
+    println!("  - Use `cargo xtask security-review-exec approve [TCK-XXXXX]` to approve");
+    println!(
+        "  - Use `cargo xtask security-review-exec deny [TCK-XXXXX] --reason <reason>` to deny"
+    );
+    println!();
+    println!("If no ticket ID is provided, the current branch will be used.");
 
     Ok(())
-}
-
-/// Parse a GitHub PR URL to extract owner/repo and PR number.
-///
-/// Handles URLs like:
-/// - `https://github.com/owner/repo/pull/123`
-/// - `github.com/owner/repo/pull/123`
-fn parse_pr_url(pr_url: &str) -> Result<(String, u32)> {
-    let url = pr_url.trim();
-
-    // Remove protocol if present
-    let path = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-
-    // Remove github.com prefix
-    let path = path
-        .strip_prefix("github.com/")
-        .ok_or_else(|| anyhow::anyhow!("Invalid PR URL: must be a GitHub URL"))?;
-
-    // Split into parts: owner/repo/pull/number
-    let parts: Vec<&str> = path.split('/').collect();
-
-    if parts.len() < 4 || parts[2] != "pull" {
-        bail!(
-            "Invalid PR URL format. Expected: https://github.com/owner/repo/pull/123\n\
-             Got: {pr_url}"
-        );
-    }
-
-    let owner = parts[0];
-    let repo = parts[1];
-    let pr_number: u32 = parts[3].parse().context("Invalid PR number in URL")?;
-
-    Ok((format!("{owner}/{repo}"), pr_number))
 }
 
 /// Validate that a PR is open (not closed or merged).
@@ -312,43 +407,32 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_pr_url_https() {
-        let (owner_repo, pr_number) =
-            parse_pr_url("https://github.com/owner/repo/pull/123").unwrap();
+    fn test_parse_owner_repo_https() {
+        let owner_repo = parse_owner_repo("https://github.com/owner/repo.git").unwrap();
         assert_eq!(owner_repo, "owner/repo");
-        assert_eq!(pr_number, 123);
     }
 
     #[test]
-    fn test_parse_pr_url_no_protocol() {
-        let (owner_repo, pr_number) = parse_pr_url("github.com/owner/repo/pull/456").unwrap();
+    fn test_parse_owner_repo_https_no_git_suffix() {
+        let owner_repo = parse_owner_repo("https://github.com/owner/repo").unwrap();
         assert_eq!(owner_repo, "owner/repo");
-        assert_eq!(pr_number, 456);
     }
 
     #[test]
-    fn test_parse_pr_url_with_trailing_path() {
-        let (owner_repo, pr_number) =
-            parse_pr_url("https://github.com/owner/repo/pull/789/files").unwrap();
+    fn test_parse_owner_repo_ssh() {
+        let owner_repo = parse_owner_repo("git@github.com:owner/repo.git").unwrap();
         assert_eq!(owner_repo, "owner/repo");
-        assert_eq!(pr_number, 789);
     }
 
     #[test]
-    fn test_parse_pr_url_invalid_not_github() {
-        let result = parse_pr_url("https://gitlab.com/owner/repo/pull/123");
-        assert!(result.is_err());
+    fn test_parse_owner_repo_ssh_no_git_suffix() {
+        let owner_repo = parse_owner_repo("git@github.com:owner/repo").unwrap();
+        assert_eq!(owner_repo, "owner/repo");
     }
 
     #[test]
-    fn test_parse_pr_url_invalid_not_pull() {
-        let result = parse_pr_url("https://github.com/owner/repo/issues/123");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_pr_url_invalid_no_number() {
-        let result = parse_pr_url("https://github.com/owner/repo/pull/");
+    fn test_parse_owner_repo_invalid_not_github() {
+        let result = parse_owner_repo("https://gitlab.com/owner/repo.git");
         assert!(result.is_err());
     }
 

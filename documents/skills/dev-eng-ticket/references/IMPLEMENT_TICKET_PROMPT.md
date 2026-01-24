@@ -5,8 +5,7 @@ The context above includes AGENTS.md, RFC meta/design, ticket details, and requi
 ## Your Task
 
 1. Read the ticket definition:
-   - `documents/work/tickets/$TICKET_ID.yaml` (metadata, requirements, dependencies)
-   - `documents/work/tickets/$TICKET_ID.md` (detailed scope and plan)
+   - `documents/work/tickets/$TICKET_ID.yaml` (complete ticket: metadata, scope, plan, criteria)
 
 2. Read all referenced requirements in `binds.requirements[]`
 

@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00019"
     title: "Implement evidence bundle publisher"
@@ -30,7 +30,25 @@ ticket_meta:
         reason: "Requires work data model from 'Implement work contract data model'"
       - ticket_id: "TCK-00013"
         reason: "Requires tool contract from 'Define tool request/response contract'"
+  scope:
+    in_scope:
+      - "Implement ArtifactPublish tool"
+      - "Content-addressed storage"
+      - "EvidencePublished event"
+      - "Evidence bundle assembly"
+    out_of_scope:
+      - "Evidence verification scripts (documented in PRD)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0002"
       - "EVID-0010"
+    criteria:
+      - "Artifacts stored in CAS"
+      - "EvidencePublished links work_id to artifact"
+      - "Evidence bundle indexed in projection"
+      - "Verification commands documented"
+      - "Category classification enforced"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

@@ -38,10 +38,14 @@ pub fn run() -> Result<()> {
     let branch_name = current_branch(&sh)?;
     let ticket_branch = validate_ticket_branch(&branch_name)?;
 
-    println!(
-        "Pushing ticket {} (RFC: {})",
-        ticket_branch.ticket_id, ticket_branch.rfc_id
-    );
+    if let Some(rfc_id) = &ticket_branch.rfc_id {
+        println!(
+            "Pushing ticket {} (RFC: {})",
+            ticket_branch.ticket_id, rfc_id
+        );
+    } else {
+        println!("Pushing ticket {}", ticket_branch.ticket_id);
+    }
 
     // Fetch latest from origin
     println!("\n[1/4] Fetching latest from origin...");

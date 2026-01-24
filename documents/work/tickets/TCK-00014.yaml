@@ -1,6 +1,6 @@
 ticket_meta:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
   ticket:
     id: "TCK-00014"
     title: "Implement filesystem mediation adapter"
@@ -24,6 +24,25 @@ ticket_meta:
         reason: "Requires tool contract from 'Define tool request/response contract'"
       - ticket_id: "TCK-00010"
         reason: "Requires policy evaluation from 'Implement default-deny evaluation engine'"
+  scope:
+    in_scope:
+      - "Implement FileRead tool"
+      - "Implement FileWrite tool"
+      - "Implement FileEdit tool"
+      - "Restrict paths to workspace"
+      - "Track file modifications"
+    out_of_scope:
+      - "Diff generation (part of review flow)"
+  plan:
+    steps: []
   definition_of_done:
     evidence_ids:
       - "EVID-0003"
+    criteria:
+      - "FileRead returns file contents"
+      - "FileWrite writes to allowed paths"
+      - "FileEdit applies text replacements"
+      - "Paths outside workspace rejected"
+      - "File operations logged"
+  notes:
+    security: "default-deny, least privilege, fail-closed"

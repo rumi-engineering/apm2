@@ -1,5 +1,5 @@
 ---
-name: development-loop
+name: dev-eng-ticket
 description: Orchestrate full development workflow for an RFC's engineering tickets. Processes tickets in dependency order, implements each, creates PRs, runs AI reviews, iterates until merged, then continues to next ticket.
 user-invocable: true
 ---
@@ -8,12 +8,22 @@ user-invocable: true
 
 ### 1. Parse Arguments
 
-- `$ARGUMENTS[0]`: RFC ID (e.g., `RFC-0001`)
+- `$ARGUMENTS[0]`: Optional. Can be:
+  - RFC ID (e.g., `RFC-0001`) - filter to specific RFC
+  - Ticket ID (e.g., `TCK-00049`) - start specific ticket
+  - Omitted - find earliest unblocked ticket globally
 
 ### 2. Initialize Development Environment
 
 ```bash
-cd "$(cargo xtask start-ticket {RFC_ID} --print-path)"
+# Start next unblocked ticket globally
+cd "$(cargo xtask start-ticket --print-path)"
+
+# Or filter to specific RFC
+cd "$(cargo xtask start-ticket RFC-0001 --print-path)"
+
+# Or start specific ticket
+cd "$(cargo xtask start-ticket TCK-00049 --print-path)"
 ```
 
 Read the output carefully. It provides all context needed to implement the ticket. If no tickets remain, the loop is complete.
@@ -81,14 +91,18 @@ When all tickets are done (no more processable tickets in step 2), report comple
 
 | Command | Purpose |
 |---------|---------|
-| `cargo xtask start-ticket {RFC_ID}` | Setup dev environment for next unblocked ticket |
-| `cargo xtask start-ticket {RFC_ID} -p` | Output only worktree path (for `cd "$(...)"`) |
+| `cargo xtask start-ticket` | Setup dev environment for next unblocked ticket (global) |
+| `cargo xtask start-ticket RFC-XXXX` | Setup dev environment for next unblocked ticket in RFC |
+| `cargo xtask start-ticket TCK-XXXXX` | Setup dev environment for specific ticket |
+| `cargo xtask start-ticket [target] -p` | Output only worktree path (for `cd "$(...)"`) |
 | `cargo xtask commit "<msg>"` | Verify, sync with main, and commit |
-| `cargo xtask push` | Push, create/update PR, run AI reviews, enable auto-merge, set status to IN_REVIEW |
+| `cargo xtask push` | Push, create/update PR, run AI reviews, enable auto-merge |
 | `cargo xtask push --force-review` | Force re-run reviews even if already completed |
 | `cargo xtask check` | Check CI/review status and get next action |
 | `cargo xtask check --watch` | Continuously poll status every 10s |
 | `cargo xtask finish` | Cleanup worktree and branch after PR merges |
+| `cargo xtask security-review-exec approve [TCK-XXXXX]` | Approve PR after security review |
+| `cargo xtask security-review-exec deny [TCK-XXXXX] --reason <reason>` | Deny PR with reason |
 
 ---
 
@@ -97,7 +111,7 @@ When all tickets are done (no more processable tickets in step 2), report comple
 | Decision | Rationale |
 |----------|-----------|
 | Worktree isolation | Prevents conflicts between parallel agents, enables independent CI |
-| Branch naming: `ticket/{RFC_ID}/{TICKET_ID}` | Traceable to RFC and ticket |
+| Branch naming: `ticket/[RFC-XXXX/]TCK-XXXXX` | Traceable to RFC (if present) and ticket |
 | Worktree naming: `apm2-{TICKET_ID}` | Clear association with ticket |
 | Derive status from git state | Single source of truth, no manual updates needed |
 | Idempotent commands | Safe to re-run, handles existing state gracefully |
