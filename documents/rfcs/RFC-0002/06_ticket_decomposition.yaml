@@ -281,6 +281,42 @@ rfc_ticket_decomposition:
         - "Full workflow tested with new commands"
         evidence_ids: []
 
+    # =================================================================
+    # PHASE 4: Review Gate Enforcement
+    # =================================================================
+    - ticket_id: TCK-00034
+      title: "Implement review sign-off commands"
+      ticket_files:
+        meta_ref: "documents/work/tickets/TCK-00034.yaml#ticket_meta"
+        body_path: "documents/work/tickets/TCK-00034.md"
+      scope:
+        in_scope:
+        - "cargo xtask review security <PR_URL> - Run security review"
+        - "cargo xtask review quality <PR_URL> - Run code quality review"
+        - "cargo xtask review uat <PR_URL> - Manual UAT sign-off"
+        - "Each command reads appropriate prompt, runs review, posts comment, updates status"
+        - "Commands are idempotent (can re-run to update review)"
+        out_of_scope:
+        - "Branch protection configuration (manual step)"
+        - "Automated retry logic"
+      binds:
+        requirement_ids: []
+        evidence_ids: []
+      custody_agent_roles:
+      - AGENT_IMPLEMENTER
+      responsibility_domains:
+      - DOMAIN_TOOLING
+      dependencies:
+      - TCK-00032
+      definition_of_done:
+        criteria:
+        - "cargo xtask review security <PR> runs Gemini security review"
+        - "cargo xtask review quality <PR> runs Codex code quality review"
+        - "cargo xtask review uat <PR> posts UAT approval and updates status"
+        - "Each command updates the corresponding ai-review/* status check"
+        - "Unit tests for PR URL parsing and review type logic"
+        evidence_ids: []
+
     verification:
       acceptance_criteria:
       - "cargo build -p xtask compiles without warnings"

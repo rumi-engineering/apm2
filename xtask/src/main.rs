@@ -16,6 +16,9 @@
 //! - `push` - Push branch, create PR, and request reviews
 //! - `check` - Show ticket and PR status
 //! - `finish` - Clean up after PR merge
+//! - `review security <PR_URL>` - Run security review for a PR
+//! - `review quality <PR_URL>` - Run code quality review for a PR
+//! - `review uat <PR_URL>` - Run UAT sign-off for a PR
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -79,6 +82,48 @@ enum Commands {
     /// Removes the worktree and local branch after
     /// verifying the PR has been merged.
     Finish,
+
+    /// Run or re-run AI reviews for a PR.
+    ///
+    /// Manually invoke AI reviews. Useful for re-running failed reviews
+    /// or running reviews from a different machine.
+    Review {
+        #[command(subcommand)]
+        review_type: ReviewCommands,
+    },
+}
+
+/// Review subcommands.
+#[derive(Subcommand)]
+enum ReviewCommands {
+    /// Run security review using Gemini.
+    ///
+    /// Reads `SECURITY_REVIEW_PROMPT.md`, runs the review,
+    /// posts findings as a PR comment, and updates the
+    /// ai-review/security status check.
+    Security {
+        /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
+        pr_url: String,
+    },
+
+    /// Run code quality review using Codex.
+    ///
+    /// Reads `CODE_QUALITY_PROMPT.md`, runs the review,
+    /// posts findings as a PR comment, and updates the
+    /// ai-review/code-quality status check.
+    Quality {
+        /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
+        pr_url: String,
+    },
+
+    /// Run UAT (User Acceptance Testing) sign-off.
+    ///
+    /// Posts an approval comment and updates the
+    /// ai-review/uat status check to success.
+    Uat {
+        /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
+        pr_url: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -90,5 +135,10 @@ fn main() -> Result<()> {
         Commands::Push => tasks::push(),
         Commands::Check { watch } => tasks::check(watch),
         Commands::Finish => tasks::finish(),
+        Commands::Review { review_type } => match review_type {
+            ReviewCommands::Security { pr_url } => tasks::review_security(&pr_url),
+            ReviewCommands::Quality { pr_url } => tasks::review_quality(&pr_url),
+            ReviewCommands::Uat { pr_url } => tasks::review_uat(&pr_url),
+        },
     }
 }

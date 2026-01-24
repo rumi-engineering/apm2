@@ -8,6 +8,7 @@ mod check;
 mod commit;
 mod finish;
 mod push;
+mod review;
 mod start_ticket;
 
 use anyhow::Result;
@@ -75,4 +76,39 @@ pub fn check(watch: bool) -> Result<()> {
 /// Returns an error if the cleanup fails. See [`finish::run`] for details.
 pub fn finish() -> Result<()> {
     finish::run()
+}
+
+/// Run a security review for a PR.
+///
+/// Delegates to the review module for the actual implementation.
+///
+/// # Errors
+///
+/// Returns an error if the review fails. See [`review::run_security`] for
+/// details.
+pub fn review_security(pr_url: &str) -> Result<()> {
+    review::run_security(pr_url)
+}
+
+/// Run a code quality review for a PR.
+///
+/// Delegates to the review module for the actual implementation.
+///
+/// # Errors
+///
+/// Returns an error if the review fails. See [`review::run_quality`] for
+/// details.
+pub fn review_quality(pr_url: &str) -> Result<()> {
+    review::run_quality(pr_url)
+}
+
+/// Run a UAT sign-off for a PR.
+///
+/// Delegates to the review module for the actual implementation.
+///
+/// # Errors
+///
+/// Returns an error if the review fails. See [`review::run_uat`] for details.
+pub fn review_uat(pr_url: &str) -> Result<()> {
+    review::run_uat(pr_url)
 }
