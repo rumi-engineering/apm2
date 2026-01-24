@@ -1,0 +1,25 @@
+ticket_meta:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  ticket:
+    id: "TCK-00046"
+    title: "Add holon: field to skill frontmatter schema"
+    status: "PENDING"
+  binds:
+    prd_id: ""
+    rfc_id: "RFC-0003"
+    requirements:
+      - "REQ-3001"
+    evidence_artifacts:
+      - "EVID-3001"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_KERNEL"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00040"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-3001"
