@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00031"
     title: "Implement commit command"
-    status: "PENDING"
+    status: "IN_REVIEW"
   binds:
     prd_id: ""
     rfc_id: "RFC-0002"

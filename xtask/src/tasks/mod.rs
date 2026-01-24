@@ -5,6 +5,7 @@
 //! ones.
 
 mod check;
+mod commit;
 mod finish;
 mod start_ticket;
 
@@ -28,14 +29,14 @@ pub fn start_ticket(rfc_id: &str, print_path_only: bool) -> Result<()> {
 
 /// Run checks and create a commit.
 ///
+/// Delegates to the commit module for the actual implementation.
+///
 /// # Errors
 ///
-/// Returns an error as this is not yet implemented.
+/// Returns an error if the checks or commit fail. See [`commit::run`] for
+/// details.
 pub fn commit(message: &str) -> Result<()> {
-    bail!(
-        "commit command not yet implemented (message: {message:?})\n\
-         This will be implemented in TCK-00031."
-    );
+    commit::run(message)
 }
 
 /// Push branch and create PR with AI reviews.
