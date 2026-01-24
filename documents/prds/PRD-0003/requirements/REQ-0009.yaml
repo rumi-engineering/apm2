@@ -1,0 +1,28 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  id: "REQ-0009"
+  type: "NON_FUNCTIONAL"
+  title: "Deterministic Verification"
+  statement: |
+    AAT verification MUST be deterministic: given the same PR content and
+    execution environment, the AAT agent MUST produce the same verdict.
+    Non-determinism sources (random seeds, timestamps, network calls) MUST
+    be controlled or eliminated.
+
+  acceptance_criteria:
+    - "AAT agent uses fixed random seeds for any randomized operations"
+    - "Timestamps are captured but not used in pass/fail logic"
+    - "Network access is DISALLOWED unless explicitly permitted"
+    - "Dependencies are pinned to specific versions"
+    - "Re-running AAT on same commit produces same verdict"
+    - "Evidence bundle includes environment snapshot for reproducibility"
+
+  evidence:
+    evidence_ids:
+      - "EVID-0003"
+      - "EVID-0006"
+    inherited_from_prd: false
+    notes:
+      - "Determinism is required for auditability and debugging"

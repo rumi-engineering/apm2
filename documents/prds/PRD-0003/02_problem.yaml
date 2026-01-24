@@ -1,0 +1,57 @@
+prd_problem:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  context:
+    background: |
+      Pull requests are the primary mechanism for introducing changes to the codebase.
+      Traditional human-driven User Acceptance Testing (UAT) does not scale for
+      high-velocity agent-assisted development. Without automated acceptance testing,
+      PRs may merge with untested claims, gaming vulnerabilities, or missing evidence.
+
+    current_state: |
+      Currently, PR acceptance relies on:
+      - Human code review (subjective, time-consuming, inconsistent)
+      - CI unit/integration tests (necessary but not sufficient for acceptance)
+      - Manual testing by authors (often undocumented, not reproducible)
+
+      This leaves gaps:
+      - No verification that PR descriptions match actual behavior
+      - No detection of hardcoded values that pass tests but fail in production
+      - No structured evidence that claims are verified
+      - No agent-consumable acceptance criteria format
+
+    why_now: |
+      As agent-assisted development scales, we need agent-consumable quality gates.
+      The autonomous factory loop requires machine-verifiable acceptance criteria.
+      Human bottlenecks in review cycles slow delivery velocity.
+      Evidence-based verification is required for audit and compliance.
+
+  problem_statement:
+    primary: |
+      PRs merge without agent-verifiable acceptance testing, allowing untested claims,
+      gaming vulnerabilities, and undocumented limitations to reach production.
+
+    supporting_details:
+      - "PR descriptions are not structured for agent consumption"
+      - "No hypothesis-driven verification of claimed behavior"
+      - "Hardcoded values and mock returns can pass tests without real functionality"
+      - "TODOs and known limitations are not systematically documented or waived"
+      - "No structured evidence bundle linking claims to verification results"
+      - "No mandatory quality gate that blocks merge until acceptance testing passes"
+
+  non_goals:
+    - id: "NG-0001"
+      statement: "AAT does not replace unit tests, integration tests, or security scans"
+
+    - id: "NG-0002"
+      statement: "AAT does not perform deep semantic understanding of code correctness"
+
+    - id: "NG-0003"
+      statement: "AAT does not handle authentication or authorization for external services"
+
+    - id: "NG-0004"
+      statement: "AAT does not define CI workflow implementation details (delegated to RFC)"
+
+    - id: "NG-0005"
+      statement: "AAT does not implement specific anti-gaming detection algorithms (delegated to implementation)"

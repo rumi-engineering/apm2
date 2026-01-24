@@ -1,0 +1,28 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  id: "REQ-0003"
+  type: "FUNCTIONAL"
+  title: "Hypothesis-Driven Testing Protocol"
+  statement: |
+    The AAT agent MUST form at least 3 testable hypotheses BEFORE executing any
+    verification commands. Each hypothesis MUST include a prediction, verification
+    method, and be recorded with timestamp prior to execution. At least one
+    hypothesis MUST test error handling or edge case behavior.
+
+  acceptance_criteria:
+    - "AAT agent generates minimum 3 hypotheses per PR"
+    - "Hypothesis formation timestamp precedes execution timestamp"
+    - "Each hypothesis includes: ID, prediction, verification method"
+    - "At least one hypothesis tests error handling or edge case"
+    - "Evidence bundle includes all hypotheses with predictions and results"
+    - "Hypothesis verification produces expected vs actual comparison"
+
+  evidence:
+    evidence_ids:
+      - "EVID-0005"
+      - "EVID-0006"
+    inherited_from_prd: false
+    notes:
+      - "Hypothesis quality is auditable through evidence bundle"

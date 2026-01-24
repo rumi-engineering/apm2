@@ -1,0 +1,87 @@
+prd_risks_questions:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  risks:
+    - id: "RSK-0001"
+      statement: "Flaky AAT tests may block legitimate PRs"
+      impact: "High"
+      likelihood: "Medium"
+      mitigations:
+        - "Deterministic execution environment with pinned dependencies"
+        - "Retry logic for transient failures"
+        - "Clear escalation path for flaky test investigation"
+        - "Manual override capability for authorized reviewers"
+      evidence_ids:
+        - "EVID-0003"
+        - "EVID-0006"
+
+    - id: "RSK-0002"
+      statement: "Gaming techniques may evolve to evade detection"
+      impact: "High"
+      likelihood: "Medium"
+      mitigations:
+        - "Input variation testing to detect mock returns"
+        - "Static analysis patterns updated based on observed evasion"
+        - "Human review of AAT-passed PRs as secondary check"
+        - "Metrics tracking for post-merge defect correlation"
+      evidence_ids:
+        - "EVID-0007"
+        - "EVID-0008"
+
+    - id: "RSK-0003"
+      statement: "PR authors may game PR descriptions to pass AAT"
+      impact: "Medium"
+      likelihood: "Medium"
+      mitigations:
+        - "Hypothesis diversity requirement (at least 3 hypotheses)"
+        - "Anti-gaming checks on PR description content"
+        - "Cross-reference with actual code changes"
+        - "Post-merge validation sampling"
+      evidence_ids:
+        - "EVID-0001"
+        - "EVID-0005"
+
+    - id: "RSK-0004"
+      statement: "AAT execution may be too slow for fast iteration"
+      impact: "Medium"
+      likelihood: "Low"
+      mitigations:
+        - "Timeout limits with escalation to pending state"
+        - "Parallel hypothesis verification where possible"
+        - "Caching of static analysis results"
+        - "P95 execution time monitoring"
+      evidence_ids:
+        - "EVID-0003"
+
+    - id: "RSK-0005"
+      statement: "Evidence bundle storage costs may grow unbounded"
+      impact: "Low"
+      likelihood: "Medium"
+      mitigations:
+        - "90-day retention policy with archival to cold storage"
+        - "Compression of evidence bundles"
+        - "Sampling for long-term retention"
+      evidence_ids:
+        - "EVID-0003"
+
+  open_questions:
+    - id: "Q-0001"
+      question: "How should AAT handle external service dependencies (APIs, databases)?"
+      decision_needed_by: "Before implementation"
+      resolution_plan: "Define mock/stub policy for external dependencies in RFC"
+
+    - id: "Q-0002"
+      question: "What is the right balance between hypothesis count and execution time?"
+      decision_needed_by: "During pilot phase"
+      resolution_plan: "A/B test different hypothesis counts and measure false positive rates"
+
+    - id: "Q-0003"
+      question: "How should AAT integrate with existing CI jobs (unit tests, security scans)?"
+      decision_needed_by: "Before implementation"
+      resolution_plan: "Define job dependencies and parallelization in RFC"
+
+    - id: "Q-0004"
+      question: "What authority roles should have manual toggle access?"
+      decision_needed_by: "Before implementation"
+      resolution_plan: "Define AUTH_AAT role and membership criteria"

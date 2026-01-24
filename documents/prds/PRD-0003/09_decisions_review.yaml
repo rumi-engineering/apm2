@@ -1,0 +1,90 @@
+prd_decisions_review:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  decisions:
+    - id: "DEC-0001"
+      statement: "AAT uses hypothesis-driven testing rather than specification matching"
+      rationale: |
+        Hypothesis-driven testing requires predictions before observations, which:
+        - Prevents retrofitting tests to match observed behavior
+        - Forces explicit articulation of expected outcomes
+        - Creates auditable evidence of prediction accuracy
+      alternatives_considered:
+        - "Specification matching: Match PR claims against test results (rejected: too easy to game)"
+        - "Fuzzing-based testing: Random input generation (rejected: not targeted to PR claims)"
+      evidence_ids:
+        - "EVID-0005"
+        - "EVID-0006"
+
+    - id: "DEC-0002"
+      statement: "AAT is a blocking status check rather than advisory"
+      rationale: |
+        Advisory status allows merge without verification, defeating the purpose.
+        Blocking status ensures all PRs receive acceptance testing before merge.
+        Waiver process provides escape hatch for exceptional cases.
+      alternatives_considered:
+        - "Advisory status with metrics tracking (rejected: does not enforce gate)"
+        - "Post-merge AAT with revert on failure (rejected: too disruptive)"
+      evidence_ids:
+        - "EVID-0004"
+
+    - id: "DEC-0003"
+      statement: "Anti-gaming checks use static analysis and input variation"
+      rationale: |
+        Static analysis catches hardcoded values and mock patterns.
+        Input variation detects implementations that ignore inputs.
+        Combined approach provides defense in depth.
+      alternatives_considered:
+        - "Static analysis only (rejected: misses runtime gaming)"
+        - "Dynamic analysis only (rejected: misses source-level patterns)"
+      evidence_ids:
+        - "EVID-0007"
+        - "EVID-0008"
+
+    - id: "DEC-0004"
+      statement: "Evidence bundles use JSON format"
+      rationale: |
+        JSON is machine-parseable and human-readable.
+        Wide tooling support for JSON processing.
+        Schema validation ensures consistent structure.
+      alternatives_considered:
+        - "YAML evidence bundles (rejected: less tooling support)"
+        - "Binary format (rejected: not human-readable)"
+      evidence_ids:
+        - "EVID-0003"
+
+  gate_reviews:
+    - gate_id: "GATE-AAT-ACCEPTANCE"
+      status: "PENDING"
+      evidence_ids:
+        - "EVID-0003"
+        - "EVID-0005"
+        - "EVID-0006"
+
+    - gate_id: "GATE-AAT-ANTI-GAMING"
+      status: "PENDING"
+      evidence_ids:
+        - "EVID-0007"
+        - "EVID-0008"
+        - "EVID-0009"
+
+    - gate_id: "GATE-AAT-EVIDENCE"
+      status: "PENDING"
+      evidence_ids:
+        - "EVID-0003"
+        - "EVID-0010"
+
+    - gate_id: "GATE-PRD-SECURITY"
+      status: "PENDING"
+      evidence_ids:
+        - "EVID-0007"
+        - "EVID-0008"
+
+    - gate_id: "GATE-PRD-PRODUCT"
+      status: "PENDING"
+      evidence_ids:
+        - "EVID-0001"
+        - "EVID-0002"
+
+  waivers: []

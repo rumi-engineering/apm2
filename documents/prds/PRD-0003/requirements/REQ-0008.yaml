@@ -1,0 +1,26 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  id: "REQ-0008"
+  type: "FUNCTIONAL"
+  title: "AAT Status Check Manual Toggle"
+  statement: |
+    Authorized reviewers (AUTH_AAT, AUTH_SECURITY) MUST be able to manually
+    set the aat/acceptance status check for adjudication and override scenarios.
+    All manual toggles MUST be logged with timestamp, authority, and rationale.
+
+  acceptance_criteria:
+    - "Manual toggle available via CLI or web interface"
+    - "Toggle requires AUTH_AAT or AUTH_SECURITY role"
+    - "Toggle accepts status (success/failure) and rationale"
+    - "Toggle operation logged to audit trail"
+    - "Audit log includes: timestamp, authority, PR, old_status, new_status, rationale"
+    - "Toggle cannot be performed by PR author"
+
+  evidence:
+    evidence_ids:
+      - "EVID-0004"
+    inherited_from_prd: false
+    notes:
+      - "Manual toggle is escape hatch for exceptional cases"

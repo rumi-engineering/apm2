@@ -1,0 +1,43 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  id: "EVID-0001"
+  category: "POLICY_CHECK_RESULTS"
+  title: "PR Description Schema Validation"
+
+  capture:
+    paths:
+      - "evidence/aat/pr_description_validation/"
+
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: |
+          # Validate PR description contains required AAT sections
+          # Usage: verify_pr_description.sh <pr_number>
+          set -euo pipefail
+          PR_DESC=$(gh pr view "$1" --json body --jq '.body')
+
+          # Check for required sections
+          echo "$PR_DESC" | grep -q "## Usage" || { echo "Missing ## Usage section"; exit 1; }
+          echo "$PR_DESC" | grep -q "## Expected Outcomes" || { echo "Missing ## Expected Outcomes section"; exit 1; }
+          echo "$PR_DESC" | grep -q "## Evidence Script" || { echo "Missing ## Evidence Script section"; exit 1; }
+          echo "$PR_DESC" | grep -q "## Known Limitations" || { echo "Missing ## Known Limitations section"; exit 1; }
+
+          echo "PR description schema validation passed"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 60
+        network_access: "ALLOW_LISTED_ONLY"
+        allowlist_hosts:
+          - "api.github.com"
+        constraints:
+          - "Requires gh CLI authenticated"
+
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

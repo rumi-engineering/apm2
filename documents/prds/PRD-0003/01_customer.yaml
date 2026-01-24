@@ -1,0 +1,107 @@
+prd_customer:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  segments:
+    - id: "CUST-0001"
+      name: "PR Authors"
+      description: "Developers and agents who submit pull requests and need clear feedback on acceptance criteria verification"
+      primary_jobs_to_be_done:
+        - "Submit PRs with verifiable acceptance criteria"
+        - "Receive actionable feedback on PR verification status"
+        - "Understand what needs to be fixed when AAT fails"
+      constraints:
+        - "Must not require manual intervention for standard PR workflows"
+        - "Feedback must be agent-consumable (structured, deterministic)"
+
+    - id: "CUST-0002"
+      name: "AAT Agents"
+      description: "Automated agents that perform hypothesis-driven acceptance testing on PRs"
+      primary_jobs_to_be_done:
+        - "Parse PR descriptions for testable claims"
+        - "Form and verify hypotheses about expected behavior"
+        - "Detect anti-gaming patterns (hardcoded values, mock returns)"
+        - "Produce structured evidence bundles"
+      constraints:
+        - "Must operate deterministically given same inputs"
+        - "Must complete verification within reasonable time bounds"
+        - "Must not require human intervention for standard cases"
+
+    - id: "CUST-0003"
+      name: "Code Reviewers"
+      description: "Human and agent reviewers who rely on AAT status to make merge decisions"
+      primary_jobs_to_be_done:
+        - "Trust AAT status as reliable quality signal"
+        - "Understand AAT failures to guide review focus"
+        - "Override AAT in exceptional cases with proper justification"
+      constraints:
+        - "Must have clear escalation path for disputed AAT results"
+        - "Must be able to request re-run of AAT verification"
+
+  stakeholder_entities:
+    - id: "STKH-0001"
+      name: "GitHub Actions CI"
+      entity_type: "EXTERNAL_SYSTEM"
+      description: "CI system that triggers AAT agent execution and receives status check updates"
+      constraints:
+        - "Must support status check API for blocking merges"
+        - "Must provide PR context (number, branch, description)"
+
+    - id: "STKH-0002"
+      name: "Evidence Bundle Storage"
+      entity_type: "INTERNAL_COMPONENT"
+      description: "Storage system for AAT evidence bundles and verification artifacts"
+      constraints:
+        - "Must persist evidence for audit and debugging"
+        - "Must support structured JSON evidence format"
+
+  user_journeys:
+    - id: "UJ-0001"
+      name: "Standard PR Submission with AAT"
+      steps:
+        - "Author opens PR with Usage, Expected Outcomes, Evidence Script sections"
+        - "CI triggers AAT agent on PR creation/update"
+        - "AAT agent parses PR description and forms hypotheses"
+        - "AAT agent executes verification commands"
+        - "AAT agent performs anti-gaming checks"
+        - "AAT agent produces evidence bundle"
+        - "AAT agent sets status check based on results"
+        - "Author sees pass/fail status and can merge if passed"
+      failure_modes:
+        - "PR description missing required sections"
+        - "Hypothesis verification fails"
+        - "Anti-gaming check detects violations"
+        - "Evidence script missing or invalid"
+      observability_notes:
+        - "All hypothesis results logged to evidence bundle"
+        - "Status check includes summary of pass/fail reasons"
+
+    - id: "UJ-0002"
+      name: "AAT Failure Investigation"
+      steps:
+        - "Author sees AAT status check failed"
+        - "Author clicks status check link to view evidence bundle"
+        - "Author reviews hypothesis results and failure details"
+        - "Author fixes issues or documents known limitations"
+        - "Author pushes update, triggering AAT re-run"
+      failure_modes:
+        - "Evidence bundle not accessible"
+        - "Failure reason unclear from evidence"
+      observability_notes:
+        - "Evidence bundle includes full execution trace"
+        - "Hypothesis failures include expected vs actual"
+
+    - id: "UJ-0003"
+      name: "AAT Escalation and Adjudication"
+      steps:
+        - "AAT agent cannot determine pass/fail (ambiguous case)"
+        - "AAT agent sets status to NEEDS_ADJUDICATION"
+        - "Human reviewer investigates evidence bundle"
+        - "Reviewer uses manual toggle to set final status"
+        - "Reviewer documents adjudication rationale"
+      failure_modes:
+        - "No reviewer available for adjudication"
+        - "Adjudication rationale not recorded"
+      observability_notes:
+        - "Adjudication events logged with reviewer identity"
+        - "Manual overrides tracked in audit log"

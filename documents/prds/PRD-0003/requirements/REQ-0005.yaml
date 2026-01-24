@@ -1,0 +1,26 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  id: "REQ-0005"
+  type: "SECURITY"
+  title: "Anti-Gaming: TODO Documentation Requirement"
+  statement: |
+    The AAT agent MUST extract all TODO, FIXME, and HACK comments from changed
+    files and verify each is documented in the Known Limitations section of the
+    PR description with an associated waiver ID if shipping with the limitation.
+
+  acceptance_criteria:
+    - "AAT agent extracts TODO/FIXME/HACK comments from diff"
+    - "Each extracted comment compared against Known Limitations section"
+    - "Undocumented TODOs cause AAT to fail"
+    - "Documented TODOs without waiver ID flagged as warning"
+    - "Evidence bundle includes todo_check results"
+    - "Waiver process available for shipping with known limitations"
+
+  evidence:
+    evidence_ids:
+      - "EVID-0009"
+    inherited_from_prd: false
+    notes:
+      - "Prevents silent introduction of technical debt"

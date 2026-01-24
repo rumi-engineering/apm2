@@ -1,0 +1,38 @@
+prd_meta:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  prd:
+    id: "PRD-0003"
+    title: "Agent Acceptance Testing (AAT) Quality Gate"
+    status: "DRAFT"
+    created_date: "2026-01-24"
+    last_updated_date: "2026-01-24"
+
+  protocol_profile:
+    id: "NONE"
+    applies: false
+    profile_ref: ""
+
+  custody:
+    producing_agent_roles:
+      - "AGENT_AUTHOR"
+      - "AGENT_REVIEWER"
+    responsible_domains:
+      - "DOMAIN_BUILD_RELEASE"
+      - "DOMAIN_PRODUCT"
+      - "DOMAIN_SECURITY"
+    authority_signoffs_required:
+      - "AUTH_PRODUCT"
+      - "AUTH_SECURITY"
+      - "AUTH_ARCHITECTURE"
+
+  refs:
+    standards:
+      requirement_schema: "standards/schemas/02_requirement.schema.yaml#requirement_schema"
+      evidence_artifact_schema: "standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema"
+      quality_coverage_schema: "standards/schemas/03_quality_coverage.schema.yaml#quality_coverage_schema"
+      gate_review_schema: "standards/schemas/06_gate_review.schema.yaml#gate_review_schema"
+      waiver_schema: "standards/schemas/05_waiver.schema.yaml#waiver_schema"
+      ticket_meta_schema: "standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema"
+      lint_spec: "standards/lint/LINT_SPEC.yaml#lint_spec"

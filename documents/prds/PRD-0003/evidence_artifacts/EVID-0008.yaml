@@ -1,0 +1,62 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  id: "EVID-0008"
+  category: "TEST_RESULTS"
+  title: "Input Variation Detection"
+
+  capture:
+    paths:
+      - "evidence/aat/input_variation/"
+
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: |
+          # Verify input variation detection results
+          set -euo pipefail
+          VARIATION_FILE="$1"
+
+          if [[ ! -f "$VARIATION_FILE" ]]; then
+            echo "Variation file not found: $VARIATION_FILE"
+            exit 1
+          fi
+
+          # Validate JSON
+          jq empty "$VARIATION_FILE" || { echo "Invalid JSON"; exit 1; }
+
+          # Check input variations were tested
+          VARIATION_COUNT=$(jq '.input_variations | length' "$VARIATION_FILE")
+          if [[ "$VARIATION_COUNT" -lt 2 ]]; then
+            echo "Insufficient input variations tested: $VARIATION_COUNT (minimum 2)"
+            exit 1
+          fi
+
+          # Check for invariance detection
+          jq -e '.invariance_detected' "$VARIATION_FILE" > /dev/null || {
+            echo "Missing invariance_detected field"
+            exit 1
+          }
+
+          # Check each variation has input/output
+          jq -e '.input_variations[] | .input, .output' "$VARIATION_FILE" > /dev/null || {
+            echo "Variation missing input/output"
+            exit 1
+          }
+
+          echo "Input variation detection validation passed"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 120
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Requires jq installed"
+
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []
