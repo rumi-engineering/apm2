@@ -7,9 +7,10 @@
 mod check;
 mod commit;
 mod finish;
+mod push;
 mod start_ticket;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 /// Start work on the next unblocked ticket for an RFC.
 ///
@@ -41,14 +42,13 @@ pub fn commit(message: &str) -> Result<()> {
 
 /// Push branch and create PR with AI reviews.
 ///
+/// Delegates to the push module for the actual implementation.
+///
 /// # Errors
 ///
-/// Returns an error as this is not yet implemented.
+/// Returns an error if the push fails. See [`push::run`] for details.
 pub fn push() -> Result<()> {
-    bail!(
-        "push command not yet implemented\n\
-         This will be implemented in TCK-00032."
-    );
+    push::run()
 }
 
 /// Show ticket and PR status.
