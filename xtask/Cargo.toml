@@ -14,9 +14,8 @@ xshell = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
+chrono = { workspace = true }
 
 [lints]
 workspace = true
