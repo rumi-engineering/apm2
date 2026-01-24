@@ -1,0 +1,25 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: EVID-0002
+  category: TEST_RESULTS
+  title: Work state reproducibility and reducer determinism tests
+  capture:
+    paths:
+    - tests/reducer_determinism/
+  verification:
+    commands:
+    - id: CMD-0002
+      shell: bash
+      command: cargo test --package apm2-core --lib work::reducer::tests -- --test-threads=1
+      expected_exit_code: 0
+      cwd: .
+      timeout_seconds: 900
+      network_access: DISALLOWED
+  data:
+    classification: INTERNAL
+    redaction:
+      required: false
+      guidance:
+      - Ensure determinism tests include replay-from-genesis verification.
+      - Redact any sensitive ledger state if tests use real data.

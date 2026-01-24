@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0008
+  type: FUNCTIONAL
+  title: Gates execute as bounded holonic episodes
+  statement: 'Each gate (AAT, security, code quality) MUST execute as a bounded holonic episode with defined budget constraints. Gates implement the Gate trait and are invoked by GateRunner. Episode execution respects token, time, and max_episode limits.'
+  acceptance_criteria:
+    - Gate trait defines gate_type(), required_evidence_categories(), and run() method.
+    - GateRunner orchestrates gate execution with budget enforcement.
+    - Each gate run creates EpisodeContext with work_id, lease_id, and budget limits.
+    - Gate execution terminates gracefully when budget exhausted (not hard-kill).
+    - GateRunStarted event emitted at start; GateRunCompleted at end.
+    - Multiple gates can run in parallel if independent.
+  evidence:
+    evidence_ids:
+      - EVID-0006

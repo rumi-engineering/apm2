@@ -1,0 +1,26 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: EVID-0008
+  category: TEST_RESULTS
+  title: Operator intervention audit and authorization tests
+  capture:
+    paths:
+    - tests/operator_console/
+  verification:
+    commands:
+    - id: CMD-0008
+      shell: bash
+      command: cargo test --package apm2-core --lib work::operator::tests
+      expected_exit_code: 0
+      cwd: .
+      timeout_seconds: 600
+      network_access: DISALLOWED
+  data:
+    classification: INTERNAL
+    redaction:
+      required: false
+      guidance:
+      - Tests must verify all operator interventions emit ledger events.
+      - Include tests for freeze, override, and unfreeze with required rationale.
+      - Verify operator identity signing and audit trail completeness.

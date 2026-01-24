@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0006
+  type: FUNCTIONAL
+  title: Spec snapshot hash binding for reproducibility
+  statement: 'ChangeSets MUST track spec_snapshot_hash computed via blake3 over canonicalized spec content. This enables exact reproduction of the spec that was reviewed/implemented, preventing confusion about which version of requirements was addressed.'
+  acceptance_criteria:
+    - SpecSnapshot computes blake3 hash of canonicalized (sorted, normalized) YAML content.
+    - ChangeSetOpened event includes spec_snapshot_hash field.
+    - Spec content is stored in CAS; hash enables retrieval.
+    - 'Verification command can reconstruct spec from hash: `apm2 changeset verify-spec <id>`.'
+    - Hash collision (different content, same hash) is cryptographically infeasible.
+    - Canonicalization is deterministic; same logical spec always produces same hash.
+  evidence:
+    evidence_ids:
+      - EVID-0002

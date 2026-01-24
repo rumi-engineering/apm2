@@ -1,0 +1,222 @@
+prd_solution_overview:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  proposed_solution:
+    overview: 'The Work Substrate extends the APM2 kernel (PRD-0001) to internalize the full work lifecycle. Plans, changesets, reviews, findings, and evidence become first-class typed objects in the ledger with deterministic projections. Agents interact via stable internal APIs; GitHub becomes a sync adapter that projects internal state to external PRs/issues. The system provides bounded refinement passes for PRD creation, internal gates for review, finding normalization for recurrence detection, and automatic countermeasure work creation. The north-star behavior is that agents operate entirely through internal interfaces, producing auditable event trails, while external forge compatibility is maintained through projection adapters.'
+    key_components:
+      - 'Work Domain Module: Core types (Plan, ChangeSet, Finding, Evidence) with spec canonicalization, hashing, and event emission APIs.'
+      - 'WorkReducer: Deterministic projection of work state from ledger events, maintaining plan status, gate readiness, and traceability closure indexes.'
+      - 'FindingSignature: Deterministic normalization of findings into clusterable signatures for recurrence detection.'
+      - 'RecurrenceReducer: Projection tracking finding recurrence by signature with threshold-triggered countermeasure work creation.'
+      - 'Gate System: Gate trait with AAT, security, and code quality implementations executing as bounded holonic episodes.'
+      - 'GateRunner: Orchestrator that runs gates against changesets, emitting GateRunStarted/Completed events and evidence bundles.'
+      - 'Plan Refinement Holon: Supervising holon that coordinates multi-pass PRD refinement (scope, criteria, constraints, coherence) with deterministic stop conditions.'
+      - name: "GitHub Sync Adapter"
+        description: |
+          Projects ledger state to GitHub PRs/issues; preserves compatibility
+          while internal ledger is authoritative. Implements Principia Holonica
+          Axiom VI (Selective Permeability) with distinct channel classes.
+
+        channel_classes:
+          # Per Principia Holonica Axiom VI: "Not all connections are equal.
+          # A holon maintains distinct channel classes... Each channel class
+          # has different budgets, retention, and allowed semantics."
+
+          - class: "discovery"
+            trust_level: "low"
+            bandwidth: "low"
+            question: "Who is out there?"
+            description: |
+              Repository and organization enumeration during initial setup
+              and periodic health checks. Verifies connectivity and permissions.
+            operations:
+              - "List accessible repositories"
+              - "Check rate limit status"
+              - "Verify authentication validity"
+            semantics:
+              allowed:
+                - "Read-only enumeration"
+                - "Cacheable responses"
+              prohibited:
+                - "State mutation"
+                - "Credential storage"
+            budget:
+              requests_per_hour: 60
+              max_payload_bytes: 65536
+            retention:
+              log_retention_days: 7
+              cache_ttl_seconds: 3600
+
+          - class: "handshake"
+            trust_level: "medium"
+            bandwidth: "low"
+            question: "Who are you, what can you do, what do you claim?"
+            description: |
+              Identity and capability exchange during adapter initialization.
+              Establishes permitted operations and repository permissions.
+            operations:
+              - "Fetch authenticated user identity"
+              - "Query repository permissions"
+              - "Enumerate available webhooks"
+              - "Verify required OAuth scopes"
+            semantics:
+              allowed:
+                - "Identity verification"
+                - "Capability discovery"
+                - "Permission attestation"
+              prohibited:
+                - "Credential rotation without audit"
+                - "Permission elevation"
+            budget:
+              requests_per_hour: 30
+              max_payload_bytes: 32768
+            retention:
+              log_retention_days: 30
+              credential_rotation_days: 90
+
+          - class: "work"
+            trust_level: "high"
+            bandwidth: "medium"
+            question: "Here is a WorkID; claim/execute/respond."
+            description: |
+              Contract-bound operations for PR and issue synchronization.
+              Each operation is tied to a WorkID from the holonic work protocol.
+
+            sub_channels:
+              - name: "pr_sync"
+                description: |
+                  Pull request lifecycle management. Maps holonic work
+                  contracts to GitHub PR state.
+                operations:
+                  - "Create PR from work contract"
+                  - "Update PR description/title from spec changes"
+                  - "Set PR labels and assignees"
+                  - "Post review comments"
+                  - "Merge PR on gate approval"
+                  - "Close/reopen PR on lifecycle events"
+                semantics:
+                  allowed:
+                    - "Each PR maps to exactly one WorkID"
+                    - "PR description contains work contract hash"
+                    - "All mutations logged with provenance"
+                    - "Merge requires evidence bundle hash"
+                  prohibited:
+                    - "PR without WorkID binding"
+                    - "Direct merge without gate approval"
+                budget:
+                  requests_per_hour: 300
+                  max_payload_bytes: 1048576
+                  max_concurrent_prs: 50
+
+              - name: "issue_sync"
+                description: |
+                  Issue tracking for non-code work items (documentation,
+                  planning, research). Comments reflect holonic event log.
+                operations:
+                  - "Create issue from work contract"
+                  - "Update issue body/title"
+                  - "Set issue labels and milestones"
+                  - "Post status update comments"
+                  - "Close issue on work completion"
+                semantics:
+                  allowed:
+                    - "Issues map to non-code work objects"
+                    - "Issue body contains work contract reference"
+                    - "Comments reflect holonic event log"
+                  prohibited:
+                    - "Issue without work contract binding"
+                    - "Manual close without completion event"
+                budget:
+                  requests_per_hour: 200
+                  max_payload_bytes: 524288
+                  max_concurrent_issues: 100
+
+              - name: "ci_result_import"
+                description: |
+                  Ingestion of CI/CD results as evidence artifacts.
+                  Translates GitHub Actions conclusions to holonic evidence.
+                operations:
+                  - "Poll workflow run status"
+                  - "Fetch check run conclusions"
+                  - "Download workflow artifacts"
+                  - "Import test result summaries"
+                semantics:
+                  allowed:
+                    - "CI results become evidence artifacts"
+                    - "Artifact hashes verified on import"
+                    - "Failed checks block gate progression"
+                    - "Results immutable once recorded"
+                  prohibited:
+                    - "Evidence modification after recording"
+                    - "CI bypass without explicit waiver"
+                budget:
+                  requests_per_hour: 500
+                  max_artifact_bytes: 10485760
+                  poll_interval_seconds: 30
+
+            retention:
+              work_log_retention_days: 365
+              artifact_retention_days: 90
+
+          - class: "evidence"
+            trust_level: "high"
+            bandwidth: "high"
+            question: "Here are hashes and proofs; reconcile state."
+            description: |
+              Replication of hashes, proofs, and artifact references between
+              the holonic ledger and GitHub. Supports state reconciliation
+              and audit trail synchronization.
+            operations:
+              - "Publish evidence bundle hash to PR"
+              - "Verify artifact integrity via API"
+              - "Reconcile ledger state with PR history"
+              - "Export audit log to repository"
+            semantics:
+              allowed:
+                - "All evidence is content-addressed"
+                - "Hash mismatches trigger reconciliation"
+                - "Evidence publication is append-only"
+                - "Proofs are cryptographically verifiable"
+              prohibited:
+                - "Evidence deletion"
+                - "Hash modification"
+                - "Reconciliation without audit trail"
+            budget:
+              requests_per_hour: 100
+              max_payload_bytes: 5242880
+            retention:
+              evidence_retention_days: 730
+              audit_log_retention_days: 2555
+
+        rate_limiting:
+          strategy: "token_bucket"
+          burst_capacity: 100
+          refill_rate_per_second: 1.0
+          backoff_policy: "exponential"
+          max_backoff_seconds: 3600
+
+        error_handling:
+          retry_policy:
+            max_retries: 3
+            initial_delay_ms: 1000
+            max_delay_ms: 60000
+          circuit_breaker:
+            failure_threshold: 5
+            reset_timeout_seconds: 300
+          fallback_behavior: "queue_for_retry"
+      - 'Operator Console: CLI commands for audit (timeline, why), stats (findings, gates), and intervention (freeze, override).'
+    external_dependencies:
+      - 'APM2 Kernel (PRD-0001): Ledger, reducers, process management, crypto, holonic execution primitives.'
+      - 'GitHub (sync target): Current source control; becomes projection target, not source of truth.'
+      - 'LLM adapters: Claude CLI, Gemini CLI for refinement passes; invoked via kernel ProcessRunner.'
+  interfaces:
+    external_apis:
+      - 'GitHub API: Accessed only via GitHub sync adapter for projection; never called directly by agents.'
+      - 'LLM CLI adapters: Claude/Gemini invoked via ProcessRunner with credential sourcing and log redaction.'
+    user_surfaces:
+      - 'CLI plan commands: plan new, plan refine, plan validate, plan status.'
+      - 'CLI gate commands: gate run, gate status.'
+      - 'CLI audit commands: audit timeline, audit why.'
+      - 'CLI stats commands: stats findings, stats gates, stats countermeasures.'
+      - 'CLI intervention commands: intervene freeze, intervene override, intervene unfreeze.'
+      - 'CLI countermeasure commands: countermeasure propose, countermeasure list, countermeasure verify.'

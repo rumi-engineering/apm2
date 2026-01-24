@@ -1,0 +1,85 @@
+prd_constraints_invariants:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  constraints:
+    - id: CNS-0001
+      statement: 'Agents never call external forge APIs directly: all GitHub/GitLab interaction is mediated through the sync adapter.'
+      rationale: Decouples agents from external service APIs and availability; enables the internal ledger to be authoritative.
+      enforcement: Agent code audit verifies no forge API imports; policy engine blocks direct forge network calls.
+      evidence_ids:
+        - EVID-0003
+    - id: CNS-0002
+      statement: 'Internal ledger is authoritative for work state: GitHub is a projection that must match internal state after sync.'
+      rationale: Enables offline operation, deterministic state, and removes dependency on external service availability.
+      enforcement: Sync adapter always pushes internal state to GitHub; never reads GitHub as source of truth for work state.
+      evidence_ids:
+        - EVID-0007
+    - id: CNS-0003
+      statement: 'Findings have deterministic signatures: same issue produces same FindingSignature regardless of when or where detected.'
+      rationale: Enables reliable recurrence detection and clustering; prevents false negatives from non-determinism.
+      enforcement: FindingSignature computation uses only canonical fields; property tests verify determinism.
+      evidence_ids:
+        - EVID-0004
+    - id: CNS-0004
+      statement: 'Gate feedback is typed, not prose: all gate failures emit structured Finding objects.'
+      rationale: Enables agents to programmatically remediate issues; prose feedback requires human interpretation.
+      enforcement: Gate trait requires typed Finding output; GateRunner validates findings before emitting GateRunCompleted.
+      evidence_ids:
+        - EVID-0006
+    - id: CNS-0005
+      statement: 'Recurrence threshold triggers automatic countermeasure: when threshold exceeded, system creates work without human intervention.'
+      rationale: Closes the feedback loop automatically; prevents recurring issues from becoming technical debt.
+      enforcement: RecurrenceReducer monitors thresholds and emits CountermeasureProposed events automatically.
+      evidence_ids:
+        - EVID-0004
+        - EVID-0005
+  invariants:
+    - id: INV-0001
+      statement: 'Work state is reproducible from ledger events: replaying ledger from genesis produces identical WorkReducer state.'
+      rationale: Enables debugging, auditing, and recovery from any point in history.
+      enforcement: Property tests verify deterministic replay; reducers use checkpoint + incremental replay pattern.
+      evidence_ids:
+        - EVID-0002
+    - id: INV-0002
+      statement: 'Every gate outcome is backed by evidence: GateRunCompleted events reference an evidence bundle that can reproduce the result.'
+      rationale: Evidence enables independent verification; prevents "tests passed" assertions without proof.
+      enforcement: GateRunner validates evidence bundle before emitting completion event; gates without evidence are blocked.
+      evidence_ids:
+        - EVID-0006
+    - id: INV-0003
+      statement: 'Spec snapshots are content-addressed: Plan and ChangeSet events reference spec by hash, enabling exact reproduction.'
+      rationale: Ensures work is tied to exact spec version; prevents confusion about which spec was reviewed/implemented.
+      enforcement: SpecSnapshot computes blake3 hash of canonicalized content; events store hash, CAS stores content.
+      evidence_ids:
+        - EVID-0001
+    - id: INV-0004
+      statement: 'FindingSignature normalization is canonical: equivalent code issues produce identical signatures regardless of context.'
+      rationale: Enables accurate recurrence tracking without false positives from minor variations.
+      enforcement: Signature computation normalizes snippets (whitespace, variable names); determinism verified by property tests.
+      evidence_ids:
+        - EVID-0004
+    - id: INV-0005
+      statement: 'Countermeasure effectiveness is tracked: recurrence rate is measured before and after countermeasure deployment.'
+      rationale: Closes the feedback loop; proves countermeasures actually reduce recurrence.
+      enforcement: RecurrenceReducer maintains pre/post recurrence rates per signature; stats commands expose effectiveness.
+      evidence_ids:
+        - EVID-0005
+    - id: INV-0006
+      statement: 'Operator interventions are auditable: freeze, override, and unfreeze actions are ledger events with required rationale.'
+      rationale: Enables accountability and learning from interventions; prevents silent overrides.
+      enforcement: Intervention commands require rationale parameter; events are signed and include operator identity.
+      evidence_ids:
+        - EVID-0008
+    - id: INV-0007
+      title: 'Event Chain Cryptographic Binding'
+      statement: 'Every work substrate event E[n] MUST include a BLAKE3 hash of its predecessor E[n-1]; chain verification is mandatory before event acceptance; chain breaks MUST be detected and trigger alerts.'
+      rationale: 'Per Principia Holonica (Chain of Causality): "Every event E[n] you emit is cryptographically bound to E[n-1]. To forge history is to break the chain." Cryptographic binding ensures tamper-evidence, enables dispute resolution, and maintains an immutable audit trail.'
+      verification_method: |
+        1. Unit tests verify each emitted event contains prev_event_hash field with valid BLAKE3 hash
+        2. Integration tests confirm BLAKE3 hash of E[n-1] canonical bytes matches E[n].prev_event_hash
+        3. Ledger writer rejects events where prev_event_hash validation fails
+        4. Chain integrity scanner runs on ledger open and detects hash discontinuities
+        5. Alert subsystem triggers on chain break detection with event IDs and expected vs actual hashes
+      evidence_ids:
+        - EVID-0004
+        - EVID-0016

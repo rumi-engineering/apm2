@@ -1,0 +1,30 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  id: "REQ-0024"
+  type: "FUNCTIONAL"
+  title: "Countermeasure Validation Gate"
+  statement: |
+    Countermeasure acceptance MUST require corpus replay evidence showing the
+    countermeasure prevents the target FindingSignature without introducing new
+    blocking findings. Gate evolution must itself be governed.
+
+  acceptance_criteria:
+    - "Corpus replay on representative sample before acceptance"
+    - "Must demonstrate FindingSignature no longer triggers"
+    - "Must not introduce new BLOCKING findings"
+    - "Rollback plan required and validated"
+    - "Canary validation period before full deployment"
+    - "Policy engine governs high-impact guardrail changes"
+
+  evidence:
+    evidence_ids:
+    - EVID-0005
+    - EVID-0011
+    inherited_from_prd: false
+    notes:
+      - "Countermeasure acceptance should require corpus replay evidence and an explicit rollback plan"
+      - "Gate evolution must itself be governed"
+      - "EVID-0005 verifies countermeasure effectiveness tracking and regression prevention"
+      - "EVID-0011 verifies corpus replay validation and gate governance requirements"

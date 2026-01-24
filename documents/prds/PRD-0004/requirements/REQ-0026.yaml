@@ -1,0 +1,32 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  id: "REQ-0026"
+  type: "RELIABILITY"
+  title: "Sync conflict resolution with ledger authority"
+  statement: |
+    When GitHub state diverges from internal ledger state, the ledger MUST be
+    authoritative and GitHub state MUST be overwritten. All sync conflicts MUST
+    be logged as SyncConflict events with before/after state snapshots for operator
+    review and debugging.
+
+  acceptance_criteria:
+    - "Sync adapter detects state divergence by comparing ledger projection hash with GitHub state fingerprint."
+    - "On divergence detection, ledger state overwrites GitHub state (PR status, labels, comments, issue state)."
+    - "SyncConflict event is emitted to ledger with: conflict_type, github_state_before, ledger_state, github_state_after, reconciliation_timestamp."
+    - "Operator can query conflict history via `apm2 audit sync-conflicts [--work-id WORK_ID]`."
+    - "Conflict events include full state diff to enable root cause analysis of divergence."
+    - "Repeated conflicts for same WorkID trigger alert for operator investigation."
+    - "Sync conflicts do not block internal work progression; reconciliation proceeds automatically."
+    - "Manual GitHub changes (labels, status, comments) are overwritten on next sync cycle."
+
+  evidence:
+    evidence_ids:
+      - "EVID-0003"
+      - "EVID-0007"
+    inherited_from_prd: false
+    notes:
+      - "Implements ledger-authoritative model per REQ-0016"
+      - "Supports RSK-0002 mitigation for sync consistency window"
+      - "Conflict logging enables debugging of external interference or sync bugs"

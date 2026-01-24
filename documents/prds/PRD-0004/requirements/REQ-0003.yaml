@@ -1,0 +1,18 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0003
+  type: FUNCTIONAL
+  title: Deterministic patches and decisions from refinement
+  statement: 'Each refinement pass MUST produce deterministic, typed outputs: patches (file + yaml_path + old_value + new_value + rationale) and decisions (description + rationale + alternatives considered). These outputs MUST be content-addressed artifacts stored in CAS and referenced from ledger events.'
+  acceptance_criteria:
+    - Patches are structured objects with file, yaml_path, old_value, new_value, rationale, source_pass.
+    - Decisions are structured objects with id, description, rationale, alternatives, source_pass.
+    - Both are serialized to canonical JSON and stored in CAS.
+    - Ledger events reference patches/decisions by content hash.
+    - Replaying ledger produces identical patch/decision references.
+    - No freeform prose output; all refinement output is typed.
+  evidence:
+    evidence_ids:
+      - EVID-0001
+      - EVID-0002

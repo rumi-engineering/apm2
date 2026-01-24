@@ -1,0 +1,70 @@
+rfc_governance_and_gates:
+  governance:
+    authorities:
+      - id: AUTH_AAT
+        role: "AAT Adjudicator"
+        responsibilities:
+          - "Approve waivers for legitimate exceptions"
+          - "Adjudicate disputed AAT results"
+          - "Approve anti-gaming rule changes"
+
+      - id: AUTH_SECURITY
+        role: "Security Reviewer"
+        responsibilities:
+          - "Approve anti-gaming exceptions"
+          - "Review evidence bundle integrity"
+
+      - id: AUTH_PRODUCT
+        role: "Product Owner"
+        responsibilities:
+          - "Approve AAT protocol changes"
+          - "Final escalation authority"
+
+    waiver_policy:
+      max_duration_days: 30
+      max_waiver_rate: "5% of PRs"
+      required_fields:
+        - rationale
+        - expiration_date
+        - granting_authority
+
+  gates:
+    - id: GATE-AAT-PARSE
+      name: "PR Description Parse Gate"
+      trigger: "AAT initialization"
+      blocking: true
+      criteria:
+        - "PR description has Usage section"
+        - "PR description has Expected Outcomes section"
+        - "PR description has Evidence Script section"
+        - "PR description has Known Limitations section"
+
+    - id: GATE-AAT-HYPOTHESIS
+      name: "Hypothesis Formation and Testing Gate"
+      trigger: "After parsing PR description"
+      blocking: true
+      criteria:
+        - "At least 3 hypotheses formed from Expected Outcomes"
+        - "At least 1 hypothesis tests error handling"
+        - "All hypotheses recorded with cryptographic proof of pre-execution"
+        - "Evidence script executed against all hypotheses"
+
+    - id: GATE-AAT-ANTI-GAMING
+      name: "Anti-Gaming Detection Gate"
+      trigger: "During PR diff analysis"
+      blocking: true
+      criteria:
+        - "No if-test conditionals detected in diff"
+        - "No hardcoded UUIDs or mock_* prefixes detected"
+        - "All TODO/FIXME/HACK comments documented in Known Limitations"
+        - "No violations detected OR documented waiver granted by AUTH_SECURITY"
+
+    - id: GATE-AAT-EVIDENCE
+      name: "Evidence Bundle Completeness Gate"
+      trigger: "After AAT execution"
+      blocking: true
+      criteria:
+        - "Evidence bundle produced with all required artifacts"
+        - "Evidence bundle manifest validates against schema"
+        - "All hypothesis results recorded in bundle"
+        - "Evidence script execution logs included"

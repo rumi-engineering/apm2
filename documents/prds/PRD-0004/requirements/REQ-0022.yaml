@@ -1,0 +1,23 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0022
+  type: FUNCTIONAL
+  title: MergeReceipt
+  statement: Merge acceptance MUST produce a MergeReceipt event.
+  acceptance_criteria:
+  - MergeReceipt binds the Plan-of-Record digest to the accepted change.
+  - MergeReceipt binds the ChangeSet digest representing the merged code delta.
+  - MergeReceipt binds all GateRun digests that were satisfied for merge approval.
+  - MergeReceipt binds all approval Decision digests from the quorum.
+  - MergeReceipt binds the output repository state digest (post-merge commit hash).
+  - MergeReceipt replaces 'the PR merged' as the canonical acceptance fact; downstream
+    systems rely on MergeReceipt events, not VCS merge status.
+  evidence:
+    evidence_ids:
+    - EVID-0009
+    inherited_from_prd: false
+    notes:
+    - Per doctrine, MergeReceipt replaces 'the PR merged' as the canonical acceptance
+      fact.
+    - EVID-0009 verifies MergeReceipt event structure and digest bindings.

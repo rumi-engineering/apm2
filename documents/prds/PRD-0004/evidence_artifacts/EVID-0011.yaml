@@ -1,0 +1,29 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: EVID-0011
+  category: TEST_RESULTS
+  title: Countermeasure validation gate and corpus replay tests
+  capture:
+    paths:
+    - tests/countermeasure_validation/
+  verification:
+    commands:
+    - id: CMD-0011
+      shell: bash
+      command: cargo test --package apm2-core --lib work::countermeasure::validation::tests
+      expected_exit_code: 0
+      cwd: .
+      timeout_seconds: 1200
+      network_access: DISALLOWED
+  data:
+    classification: INTERNAL
+    redaction:
+      required: false
+      guidance:
+      - Tests must verify corpus replay on representative sample before acceptance.
+      - Tests must verify countermeasure prevents target FindingSignature.
+      - Tests must verify no new BLOCKING findings are introduced.
+      - Tests must verify rollback plan validation.
+      - Tests must verify canary validation period enforcement.
+      - Tests must verify policy engine governance for high-impact guardrail changes.

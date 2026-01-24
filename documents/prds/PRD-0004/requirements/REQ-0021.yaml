@@ -1,0 +1,23 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0021
+  type: FUNCTIONAL
+  title: WorkReducer State Replay
+  statement: WorkReducer MUST support deterministic replay from genesis or any checkpoint.
+  acceptance_criteria:
+  - Replay from genesis produces identical projections to incremental application of
+    events.
+  - Replay from any valid checkpoint produces identical projections to replay from
+    genesis.
+  - Checkpoint creation is atomic and includes all reducer state required for resumption.
+  - Reducer version is recorded with each checkpoint; version compatibility is validated
+    before replay.
+  - Replay is idempotent and side-effect free on the ledger itself.
+  evidence:
+    evidence_ids:
+    - EVID-0002
+    inherited_from_prd: false
+    notes:
+    - References INV-0004 deterministic reducer invariant from PRD-0001 constraints.
+    - EVID-0002 verifies reducer determinism and replay-from-genesis capability.

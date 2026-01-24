@@ -1,0 +1,24 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0002
+  type: FUNCTIONAL
+  title: Bounded holonic refinement passes
+  statement: 'The system MUST refine PRDs through bounded holonic episodes. Each refinement pass executes within episode budget constraints (tokens, time, max_episodes) and produces typed patches and decisions. The supervisor holon coordinates passes in sequence: scope normalization, acceptance criteria, constraints, ambiguity detection, and coherence closure.'
+  acceptance_criteria:
+    - 'Command `apm2 plan refine <prd_id> --passes N` executes up to N refinement cycles.'
+    - Each pass is a bounded holonic episode with configurable token/time limits.
+    - Passes execute in defined order (scope → criteria → constraints → ambiguity → coherence).
+    - Each pass emits PlanRefined event with pass_type, patches_hash, and decisions.
+    - Pass execution respects entropy budget; exceeding budget triggers episode termination.
+    - Refinement can be resumed from checkpoint if interrupted.
+    - Agent MUST acquire exclusive refinement lease before beginning refinement episode.
+    - Lease has bounded duration with configurable timeout (default: episode time budget).
+    - Lease can be extended via heartbeat mechanism during active refinement.
+    - Lease expiration triggers immediate episode abort and rollback of uncommitted changes.
+    - Only one agent can hold refinement lease per plan at a time; concurrent acquisition attempts fail with LEASE_HELD error.
+    - Lease is released automatically on episode completion (success or failure) or can be explicitly released via lease surrender.
+  evidence:
+    evidence_ids:
+      - EVID-0001
+      - EVID-0002
