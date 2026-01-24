@@ -74,6 +74,12 @@ test-utils = []
 [lints]
 workspace = true
 
+# Proto-generated types are expected to evolve with new fields and enum variants.
+# These are internal to the kernel and adding new message types/fields is standard proto evolution.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+enum_variant_added = "allow"
+
 [[bench]]
 name = "ipc_benchmarks"
 harness = false
