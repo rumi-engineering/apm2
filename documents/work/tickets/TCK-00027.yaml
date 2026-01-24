@@ -4,7 +4,7 @@ ticket_meta:
   ticket:
     id: "TCK-00027"
     title: "Implement shared utilities"
-    status: "PENDING"
+    status: "IN_PROGRESS"
   binds:
     prd_id: ""
     rfc_id: "RFC-0002"

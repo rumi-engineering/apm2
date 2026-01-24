@@ -21,6 +21,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod tasks;
+pub mod util;
 
 /// Development automation for apm2.
 #[derive(Parser)]
