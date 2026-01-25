@@ -535,3 +535,234 @@ pub fn get_inode(path: &Path) -> Option<u64> {
 - Switching between mock and production implementations
 
 **Why it's safe:** Prevents "it works in tests but fails in production" bugs where the mock behavior diverges from real-world constraints.
+
+---
+
+## 2.16 Restart Monotonicity
+
+**Pattern:** Ensure restart counters and attempt numbers always increase monotonically, never resetting unintentionally.
+
+**Example from:** `crates/apm2-ledger/src/reducers/session.rs`
+
+```rust
+/// Error when restart attempt is not greater than previous.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    #[error("restart attempt {attempted} must be greater than previous attempt {previous}")]
+    RestartAttemptNotMonotonic { attempted: u32, previous: u32 },
+    // ...
+}
+
+/// Store last_restart_attempt in terminal states.
+pub enum SessionState {
+    Terminated {
+        terminated_at: DateTime<Utc>,
+        last_restart_attempt: u32,
+    },
+    Quarantined {
+        quarantined_at: DateTime<Utc>,
+        last_restart_attempt: u32,
+    },
+    // ...
+}
+
+impl SessionState {
+    /// Get the last restart attempt number for terminal states.
+    pub fn last_restart_attempt(&self) -> Option<u32> {
+        match self {
+            Self::Terminated { last_restart_attempt, .. } => Some(*last_restart_attempt),
+            Self::Quarantined { last_restart_attempt, .. } => Some(*last_restart_attempt),
+            _ => None,
+        }
+    }
+}
+
+/// In the reducer, enforce monotonicity.
+fn handle_started(&mut self, event: SessionStarted) -> Result<(), SessionError> {
+    if let Some(prev) = self.state.last_restart_attempt() {
+        if event.restart_attempt <= prev {
+            return Err(SessionError::RestartAttemptNotMonotonic {
+                attempted: event.restart_attempt,
+                previous: prev,
+            });
+        }
+    }
+    // ... proceed with state transition
+}
+```
+
+**When to use:**
+- Session restart logic with attempt counters
+- Any counter that should never decrease (sequence numbers, version numbers)
+- Event sourcing systems where replay attacks must be prevented
+
+**Why it's safe:** Prevents "zombie session" replay attacks where a terminated session restarts with a stale attempt number, potentially resetting state and violating ledger immutability.
+
+---
+
+# Anti-Patterns (Lessons Learned)
+
+This section documents patterns that have caused real bugs in the APM2 codebase. Learn from these mistakes to avoid repeating them.
+
+---
+
+## ANTI-1: Shell Argument Escaping for Complex Strings
+
+**Anti-Pattern:** Passing complex strings (containing quotes, backticks, special characters) directly as shell command arguments.
+
+**Real Example (from PR #59):**
+
+The security review prompt contained markdown with backticks, nested quotes, and special characters that broke shell escaping:
+
+```rust
+// BROKEN: Complex string passed as shell argument
+let prompt = r#"Review the following code for:
+- SQL injection via `user_input`
+- Command injection in `shell_exec()`
+"#;
+
+cmd!("gemini", "-p", prompt).run()?;
+// Fails with: "Syntax error: end of file unexpected"
+```
+
+**Fix:** Write complex strings to a temporary file and use stdin redirection:
+
+```rust
+use tempfile::NamedTempFile;
+use std::io::Write;
+
+// Write prompt to temp file
+let mut temp = NamedTempFile::new()?;
+temp.write_all(prompt.as_bytes())?;
+let temp_path = temp.path();
+
+// Redirect from file instead of passing as argument
+cmd!("sh", "-c", format!("gemini --yolo < '{}'", temp_path.display())).run()?;
+```
+
+**When this matters:**
+- Invoking AI CLI tools (Gemini, Claude, Codex) with prompts
+- Any string containing backticks, quotes, or shell metacharacters
+- Multi-line strings with complex formatting
+
+**Prevention:**
+- Use file-based input for any prompt longer than one line
+- Test with prompts containing: backticks, single quotes, double quotes, dollar signs, newlines
+- Consider using `std::process::Command` with `.stdin(Stdio::piped())` for programmatic input
+
+---
+
+## ANTI-2: Predictable Temp File Names
+
+**Anti-Pattern:** Creating temporary files with predictable names based on PID or timestamp.
+
+**Real Example (from PR #59):**
+
+```rust
+// VULNERABLE: Predictable temp file path
+let temp_path = std::env::temp_dir().join(format!("prompt-{}.txt", std::process::id()));
+std::fs::write(&temp_path, prompt)?;
+// Attacker can predict path and create symlink before this runs
+```
+
+**Attack Scenario:**
+1. Attacker predicts next PID (or just creates symlinks for PID range)
+2. Creates symlink: `/tmp/prompt-12345.txt -> /etc/cron.d/malicious`
+3. Your process writes "prompt" content to the symlink target
+4. Attacker gains code execution via cron
+
+**Fix:** Use the `tempfile` crate which creates files with random names and restrictive permissions:
+
+```rust
+use tempfile::NamedTempFile;
+use std::io::Write;
+
+// SAFE: Random filename, restrictive permissions (0600), RAII cleanup
+let mut temp = NamedTempFile::new()?;
+temp.write_all(prompt.as_bytes())?;
+
+// For background processes that outlive the current scope:
+let (_, path) = temp.keep()?;  // Transfers ownership, file persists
+// Remember to clean up `path` when done
+```
+
+**When this matters:**
+- Any temporary file in a shared directory (`/tmp`, `std::env::temp_dir()`)
+- Multi-user systems or containers with shared temp directories
+- Background processes that create files before forking
+
+**Prevention:**
+- Always use `tempfile::NamedTempFile` or `tempfile::TempDir`
+- Never construct temp paths from predictable values (PID, timestamp, username)
+- Set restrictive permissions (0600) if you must create files manually
+
+---
+
+## ANTI-3: Incomplete Struct Field Updates
+
+**Anti-Pattern:** Adding a new field to a struct but missing updates in some code paths (constructors, pattern matches, serialization).
+
+**Real Example (from PR #58):**
+
+When adding restart tracking to `SessionState`, the initial implementation forgot to:
+1. Store `last_restart_attempt` in `Terminated` and `Quarantined` variants
+2. Add a helper method to retrieve it from terminal states
+3. Update all match arms that destructure the enum
+
+```rust
+// INCOMPLETE: New field added to Running but not to terminal states
+pub enum SessionState {
+    Running {
+        started_at: DateTime<Utc>,
+        restart_attempt: u32,  // New field added here
+    },
+    Terminated {
+        terminated_at: DateTime<Utc>,
+        // Missing: last_restart_attempt
+    },
+}
+
+// Later code can't check monotonicity because terminal states don't track it!
+```
+
+**Fix:** Add the field to ALL relevant variants and add exhaustive helpers:
+
+```rust
+pub enum SessionState {
+    Running {
+        started_at: DateTime<Utc>,
+        restart_attempt: u32,
+    },
+    Terminated {
+        terminated_at: DateTime<Utc>,
+        last_restart_attempt: u32,  // Now tracked
+    },
+    Quarantined {
+        quarantined_at: DateTime<Utc>,
+        last_restart_attempt: u32,  // Now tracked
+    },
+}
+
+impl SessionState {
+    /// Exhaustive helper ensures all variants are considered.
+    pub fn last_restart_attempt(&self) -> Option<u32> {
+        match self {
+            Self::Running { restart_attempt, .. } => Some(*restart_attempt),
+            Self::Terminated { last_restart_attempt, .. } => Some(*last_restart_attempt),
+            Self::Quarantined { last_restart_attempt, .. } => Some(*last_restart_attempt),
+            Self::Starting | Self::Pending => None,
+        }
+    }
+}
+```
+
+**When this matters:**
+- Enums with data-carrying variants
+- Structs with many fields (especially builders)
+- State machines where invariants must hold across all states
+
+**Prevention:**
+- Use `#[non_exhaustive]` on public enums to force explicit handling of new variants
+- Write exhaustive match statements (avoid `_ =>` wildcards for enums you control)
+- Add a test that constructs every variant and round-trips through serialization
+- Run `cargo clippy` with `clippy::match_wildcard_for_single_variants`
