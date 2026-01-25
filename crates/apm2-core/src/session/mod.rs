@@ -79,18 +79,34 @@
 //! assert!(reducer.state().get("session-123").unwrap().is_active());
 //! ```
 
+pub mod crash;
 pub mod entropy;
 pub mod error;
+pub mod recovery;
 pub mod reducer;
+pub mod restart_coordinator;
 pub mod state;
 
 #[cfg(test)]
 mod tests;
 
 // Re-export main types
+pub use crash::{
+    CrashDetectionConfig, CrashEvent, CrashType, ExitStatus, classify_exit_status, classify_signal,
+    is_signal_restartable, to_exit_classification,
+};
 pub use entropy::{
     EntropyBudgetConfig, EntropyEvent, EntropySource, EntropyTracker, EntropyTrackerSummary,
 };
 pub use error::{SessionError, StateName};
+pub use recovery::{
+    RecoveryError, SessionRecoveryState, collect_session_cursors, count_events_since,
+    find_last_progress_cursor, find_last_session_cursor, group_by_session, replay_session_state,
+    validate_recovery_point,
+};
 pub use reducer::{SessionReducer, SessionReducerState, helpers};
+pub use restart_coordinator::{
+    RestartCoordinator, RestartDecision, TerminateReason, find_last_session_cursor as find_cursor,
+    get_resume_cursor,
+};
 pub use state::{ExitClassification, SessionState};

@@ -62,7 +62,7 @@ pub mod kernel_event {
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionEvent {
-    #[prost(oneof = "session_event::Event", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "session_event::Event", tags = "1, 2, 3, 4, 5, 6")]
     pub event: ::core::option::Option<session_event::Event>,
 }
 /// Nested message and enum types in `SessionEvent`.
@@ -78,7 +78,49 @@ pub mod session_event {
         Terminated(super::SessionTerminated),
         #[prost(message, tag = "4")]
         Quarantined(super::SessionQuarantined),
+        #[prost(message, tag = "5")]
+        CrashDetected(super::SessionCrashDetected),
+        #[prost(message, tag = "6")]
+        RestartScheduled(super::SessionRestartScheduled),
     }
+}
+/// Emitted when a session process exits unexpectedly or crashes.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionCrashDetected {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// CLEAN_EXIT, ERROR_EXIT, SIGNAL, TIMEOUT, ENTROPY_EXCEEDED
+    #[prost(string, tag = "2")]
+    pub crash_type: ::prost::alloc::string::String,
+    #[prost(int32, tag = "3")]
+    pub exit_code: i32,
+    #[prost(int32, tag = "4")]
+    pub signal: i32,
+    #[prost(uint64, tag = "5")]
+    pub uptime_ms: u64,
+    #[prost(uint64, tag = "6")]
+    pub last_cursor: u64,
+    #[prost(uint32, tag = "7")]
+    pub restart_count: u32,
+}
+/// Emitted when a restart has been scheduled for a crashed session.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionRestartScheduled {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub scheduled_at: u64,
+    #[prost(uint64, tag = "3")]
+    pub restart_at: u64,
+    #[prost(uint64, tag = "4")]
+    pub resume_cursor: u64,
+    #[prost(uint32, tag = "5")]
+    pub attempt_number: u32,
+    /// FIXED, EXPONENTIAL, LINEAR
+    #[prost(string, tag = "6")]
+    pub backoff_type: ::prost::alloc::string::String,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -95,6 +137,12 @@ pub struct SessionStarted {
     pub lease_id: ::prost::alloc::string::String,
     #[prost(uint64, tag = "6")]
     pub entropy_budget: u64,
+    /// For restarted sessions: cursor to resume from
+    #[prost(uint64, tag = "7")]
+    pub resume_cursor: u64,
+    /// For restarted sessions: restart attempt number (0 = first start)
+    #[prost(uint32, tag = "8")]
+    pub restart_attempt: u32,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -30,6 +30,22 @@ pub enum SessionError {
         session_id: String,
     },
 
+    /// Restart attempt is not monotonically increasing.
+    ///
+    /// When restarting a session, the new `restart_attempt` must be strictly
+    /// greater than the previous attempt to prevent replay attacks.
+    #[error(
+        "restart attempt not monotonic for {session_id}: previous={previous_attempt}, new={new_attempt}"
+    )]
+    RestartAttemptNotMonotonic {
+        /// The session ID.
+        session_id: String,
+        /// The previous restart attempt number.
+        previous_attempt: u32,
+        /// The new restart attempt number (which is <= previous).
+        new_attempt: u32,
+    },
+
     /// Failed to decode protobuf message.
     #[error("decode error: {0}")]
     DecodeError(#[from] prost::DecodeError),

@@ -86,6 +86,11 @@ pub enum SessionState {
         stall_count: u64,
         /// Count of timeouts recorded against entropy budget.
         timeout_count: u64,
+        /// Cursor position to resume from (for crash recovery).
+        /// 0 indicates a fresh start, non-zero indicates resumption.
+        resume_cursor: u64,
+        /// Number of restart attempts (0 for initial start).
+        restart_attempt: u32,
     },
     /// Session has terminated (final state).
     #[non_exhaustive]
@@ -100,6 +105,9 @@ pub enum SessionState {
         rationale_code: String,
         /// Final entropy consumed when session ended.
         final_entropy: u64,
+        /// Last restart attempt number (for monotonicity enforcement on
+        /// restart).
+        last_restart_attempt: u32,
     },
     /// Session is quarantined (blocked from execution).
     #[non_exhaustive]
@@ -114,6 +122,9 @@ pub enum SessionState {
         /// Timestamp until which the session is quarantined (nanoseconds since
         /// epoch).
         quarantine_until: u64,
+        /// Last restart attempt number (for monotonicity enforcement on
+        /// restart).
+        last_restart_attempt: u32,
     },
 }
 
@@ -171,6 +182,28 @@ impl SessionState {
                 ..
             } => Some(entropy_budget.saturating_sub(*entropy_consumed)),
             Self::Terminated { .. } | Self::Quarantined { .. } => None,
+        }
+    }
+
+    /// Returns the last restart attempt number for this session.
+    ///
+    /// For Running states, returns the current `restart_attempt`.
+    /// For terminal states (Terminated/Quarantined), returns
+    /// `last_restart_attempt`.
+    #[must_use]
+    pub const fn last_restart_attempt(&self) -> u32 {
+        match self {
+            Self::Running {
+                restart_attempt, ..
+            } => *restart_attempt,
+            Self::Terminated {
+                last_restart_attempt,
+                ..
+            }
+            | Self::Quarantined {
+                last_restart_attempt,
+                ..
+            } => *last_restart_attempt,
         }
     }
 
@@ -277,6 +310,8 @@ mod unit_tests {
             violation_count: 0,
             stall_count: 0,
             timeout_count: 0,
+            resume_cursor: 0,
+            restart_attempt: 0,
         }
     }
 
@@ -291,6 +326,7 @@ mod unit_tests {
             exit_classification: ExitClassification::Success,
             rationale_code: "completed".to_string(),
             final_entropy: 500,
+            last_restart_attempt: 0,
         };
         assert!(!terminated.is_active());
 
@@ -299,6 +335,7 @@ mod unit_tests {
             quarantined_at: 2000,
             reason: "policy violation".to_string(),
             quarantine_until: 3000,
+            last_restart_attempt: 0,
         };
         assert!(!quarantined.is_active());
     }
@@ -314,6 +351,7 @@ mod unit_tests {
             exit_classification: ExitClassification::Success,
             rationale_code: "completed".to_string(),
             final_entropy: 500,
+            last_restart_attempt: 0,
         };
         assert!(terminated.is_terminal());
 
@@ -322,6 +360,7 @@ mod unit_tests {
             quarantined_at: 2000,
             reason: "policy violation".to_string(),
             quarantine_until: 3000,
+            last_restart_attempt: 0,
         };
         assert!(quarantined.is_terminal());
     }
@@ -337,6 +376,7 @@ mod unit_tests {
             exit_classification: ExitClassification::Success,
             rationale_code: "completed".to_string(),
             final_entropy: 500,
+            last_restart_attempt: 0,
         };
         assert_eq!(terminated.state_name(), StateName::Terminated);
 
@@ -345,6 +385,7 @@ mod unit_tests {
             quarantined_at: 2000,
             reason: "policy violation".to_string(),
             quarantine_until: 3000,
+            last_restart_attempt: 0,
         };
         assert_eq!(quarantined.state_name(), StateName::Quarantined);
     }
@@ -373,6 +414,8 @@ mod unit_tests {
             violation_count: 0,
             stall_count: 0,
             timeout_count: 0,
+            resume_cursor: 0,
+            restart_attempt: 0,
         };
         assert!(running.is_entropy_exceeded());
         assert_eq!(running.entropy_remaining(), Some(0));
@@ -393,6 +436,8 @@ mod unit_tests {
             violation_count: 2,
             stall_count: 1,
             timeout_count: 3,
+            resume_cursor: 0,
+            restart_attempt: 0,
         };
 
         let summary = running.entropy_summary("session-1").unwrap();
@@ -415,6 +460,7 @@ mod unit_tests {
             exit_classification: ExitClassification::EntropyExceeded,
             rationale_code: "entropy_budget_exhausted".to_string(),
             final_entropy: 1000,
+            last_restart_attempt: 0,
         };
         assert!(terminated.is_entropy_exceeded());
         assert_eq!(terminated.entropy_consumed(), Some(1000));
@@ -428,6 +474,7 @@ mod unit_tests {
             exit_classification: ExitClassification::Success,
             rationale_code: "completed".to_string(),
             final_entropy: 500,
+            last_restart_attempt: 0,
         };
         assert!(!terminated.is_entropy_exceeded());
     }
