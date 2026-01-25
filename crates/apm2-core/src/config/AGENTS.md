@@ -51,12 +51,29 @@ pub struct DaemonConfig {
     pub log_dir: PathBuf,       // Default: /var/log/apm2
     #[serde(default = "default_state_file")]
     pub state_file: PathBuf,    // Default: /var/lib/apm2/state.json
+    #[serde(default)]
+    pub audit: AuditConfig,     // Audit event retention policy
 }
 ```
 
 **Invariants:**
 - [INV-CFG-03] All paths have sensible FHS-compliant defaults for Unix systems
 - [INV-CFG-04] `Default` implementation matches field-level `serde(default)` behavior
+
+### `AuditConfig`
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    #[serde(default = "default_audit_retention_days")]
+    pub retention_days: u32,    // Default: 30 days
+    #[serde(default = "default_audit_max_size_bytes")]
+    pub max_size_bytes: u64,    // Default: 1 GB
+}
+```
+
+**Invariants:**
+- [INV-CFG-09] Retention policy defaults to 30 days / 1GB to prevent disk exhaustion
 
 ### `CredentialProfileConfig`
 
