@@ -23,7 +23,7 @@ rfc_ticket_decomposition:
             Update coding guidelines with anti-patterns discovered during PR #58 and #59:
 
             Files to modify:
-            - documents/skills/coding/references/SAFE_RUST_PATTERNS.md
+            - documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md
             - documents/skills/coding/SKILL.md (add reference to anti-patterns section)
 
             Add "Anti-Patterns (Lessons Learned)" section:
@@ -37,13 +37,13 @@ rfc_ticket_decomposition:
               Problem: Adding struct fields without updating all pattern matches
               Solution: Use .. to ignore unmatched fields, run cargo check
 
-            Add SAFE-16: Restart Monotonicity pattern
+            Add INV-2615: Counters and Attempts Are Monotonic
             - Invariant: new_restart_attempt > old_restart_attempt (unless terminal)
             - Implementation: Check in reducer before state transition
 
             Acceptance Criteria:
             - Anti-patterns section exists with 3 documented patterns
-            - SAFE-16 pattern exists for restart monotonicity
+            - INV-2615 exists for restart monotonicity (APPLY: INV-2502)
             - Referenced from main SKILL.md
 
         - ticket_id: "TCK-00060"

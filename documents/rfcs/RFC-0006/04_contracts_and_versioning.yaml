@@ -79,12 +79,12 @@ rfc_contracts_and_versioning:
       description: |
         Documentation additions required by this RFC.
       documents:
-        - path: "documents/skills/coding/references/SAFE_RUST_PATTERNS.md"
+        - path: "documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md"
           additions:
             - section: "Anti-Patterns (Lessons Learned)"
               content: "ANTI-1 through ANTI-3 patterns"
-            - pattern: "SAFE-16"
-              content: "Restart Monotonicity pattern"
+            - pattern: "INV-2615"
+              content: "Counters and Attempts Are Monotonic (APPLY: INV-2502)"
         - path: "documents/reviews/SECURITY_REVIEW_PROMPT.md"
           additions:
             - section: "Historical Issue Patterns (Check First)"

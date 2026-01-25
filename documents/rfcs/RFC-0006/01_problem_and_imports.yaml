@@ -194,11 +194,11 @@ rfc_problem_and_imports:
           covering: shell argument escaping for complex strings, predictable temp
           file names, and incomplete struct field updates.
         acceptance_criteria:
-          - "Anti-patterns section exists in SAFE_RUST_PATTERNS.md with 3 documented patterns"
-          - "SAFE-16 pattern exists for restart monotonicity"
+          - "Anti-patterns section exists in documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md with 3 documented patterns"
+          - "INV-2615 exists for restart monotonicity (APPLY: INV-2502)"
           - "Referenced from main coding SKILL.md"
         verification:
-          command: "grep 'Anti-Patterns' documents/skills/coding/references/SAFE_RUST_PATTERNS.md"
+          command: "grep 'Anti-Patterns' documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md"
           pass_condition: "Anti-patterns section found with documented patterns"
 
       - id: MAINT-007
@@ -386,7 +386,7 @@ rfc_problem_and_imports:
         type: ENHANCEMENT
         title: "Documentation examples MUST pass lint checks"
         statement: |
-          Code examples in documentation (especially SAFE_RUST_PATTERNS.md)
+          Code examples in documentation (especially 26_apm2_safe_patterns_and_anti_patterns.md)
           MUST pass the same anti-pattern lint checks as production code
           to prevent documentation from teaching bad patterns.
         acceptance_criteria:

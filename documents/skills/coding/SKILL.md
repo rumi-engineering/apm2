@@ -15,7 +15,7 @@ description: Coding guidelines for APM2 development. Points to language-specific
 
 | Document | Purpose |
 |----------|---------|
-| [SAFE_RUST_PATTERNS.md](references/SAFE_RUST_PATTERNS.md) | APM2-specific safe patterns and anti-patterns |
+| [APM2 Safe Patterns and Anti-Patterns](../rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md) | Project-specific safe patterns and anti-patterns (token-efficient index) |
 | [CI_EXPECTATIONS.md](references/CI_EXPECTATIONS.md) | CI pipeline checks and fix procedures |
 | [SECURITY_CHECKLIST.md](references/SECURITY_CHECKLIST.md) | Security review checklist |
-| [UNSAFE_CODE_POLICY.md](references/UNSAFE_CODE_POLICY.md) | Policy for unsafe code usage |
+| [Unsafe Rust Obligations](../rust-textbook/09_unsafe_rust_obligations.md) | Unsafe proof obligations + APM2 unsafe policy |

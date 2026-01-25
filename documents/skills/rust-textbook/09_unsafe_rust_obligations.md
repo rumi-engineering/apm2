@@ -34,6 +34,36 @@
 [PROVENANCE] Rust Reference: Behavior considered undefined; Expressions and destructors define many preconditions.
 [VERIFICATION] Miri for UB classes; Proptest for state machines; Loom for concurrent unsafe protocols.
 
+[CONTRACT: CTR-0903] APM2 Unsafe Policy (Lints + Justification).
+- REJECT IF: new unsafe code is introduced without:
+  - workspace lint visibility (`unsafe_code = "warn"`),
+  - minimal unsafe scope (unsafe wraps only the unsafe op),
+  - a local `// SAFETY:` comment (CTR-0902),
+  - and a local `#[allow(unsafe_code)]` (or equivalent lint suppression) with a justification comment.
+- ENFORCE BY:
+  - keep `[workspace.lints.rust] unsafe_code = "warn"` enabled in root `Cargo.toml`,
+  - isolate unsafe behind safe APIs,
+  - treat new unsafe sites as security-critical (Chapter 19).
+[PROVENANCE] Rust Reference: lint attributes; `unsafe` shifts responsibility, not rules.
+
+[CONTRACT: CTR-0904] Unsafe Is Not a Convenience or Speculation Optimization.
+- REJECT IF: unsafe is used for tasks that have safe primitives in std/ecosystem (collections/memory mgmt, pointer math, unchecked indexing, type coercion/transmute).
+- REJECT IF: unsafe is introduced for "performance" without profiling evidence and an evaluated safe alternative.
+- ALLOW IF: required for a boundary with no safe alternative (syscalls/FFI) AND isolated behind a safe API with targeted tests.
+- ENFORCE BY: measure first; isolate; add negative tests and (when applicable) Miri coverage (Chapter 17).
+[PROVENANCE] Rust Reference: unsafe does not relax UB; miscompilation is a correctness and security risk.
+
+[INVARIANT: INV-0903] Unsafe Review Checklist (Minimum Bar).
+- REJECT IF: any item is missing for new/modified unsafe:
+  - local safety proof (CTR-0902) + obligation checklist (INV-0902),
+  - minimal scope + justified `#[allow(unsafe_code)]` (CTR-0903),
+  - correct cfg/platform gating (Chapter 20),
+  - panic/unwind safety is addressed (INV-0701),
+  - verification exists (Miri when applicable; Chapter 17).
+[VERIFICATION] `cargo test`; Miri for unsafe/memory/provenance hazards; fuzz/property tests for protocols/state machines.
+
+NOTE (APM2): Unix daemonization uses `unsafe { fork() }` and is intentionally isolated; see `crates/apm2-daemon/src/main.rs`.
+
 [HAZARD: RSK-0901] Invalid Reference Creation (Immediate UB When Used as Reference).
 - TRIGGER: `&*ptr`, `&mut *ptr`, references to packed fields, references to uninitialized memory, references into freed/allocation-unknown memory.
 - REJECT IF: unsafe code creates references without proving reference validity and aliasing exclusivity for the full reference lifetime.

@@ -31,6 +31,11 @@
 [PROVENANCE] `SystemTime` carries no global correctness guarantee across machines; ordering requires protocol-defined semantics.
 [VERIFICATION] Simulation tests with skewed clocks; property tests for ordering invariants under skew.
 
+[INVARIANT: INV-2502] Protocol Counters and Attempts Are Monotonic.
+- REJECT IF: restart attempts / sequence numbers can decrease or reset across terminal states, restarts, or replays.
+- ENFORCE BY: persist last-seen counter in terminal states; require strict increase (`next > previous`); never derive ordering counters from wall-clock time.
+[VERIFICATION] Reducer/state-machine tests that cover terminal->restart transitions; crash/restart simulation with persisted state; property tests for monotonicity.
+
 [CONTRACT: CTR-2502] Timestamp Semantics Must Be Specified.
 - REJECT IF: an API accepts/returns "timestamp" without specifying:
   - time source (wall-clock vs monotonic)

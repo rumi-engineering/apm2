@@ -23,7 +23,7 @@ ticket_meta:
     in_scope:
       - "Extend cargo xtask lint to extract code blocks from markdown files"
       - "Add pattern checks for common issues in documentation examples"
-      - "Check SAFE_RUST_PATTERNS.md and other coding guidelines for anti-patterns"
+      - "Check 26_apm2_safe_patterns_and_anti_patterns.md and other coding guidelines for anti-patterns"
       - "Add to cargo xtask commit pre-flight checks"
       - "Detect unquoted shell paths in documentation examples"
       - "Detect insecure temp file patterns in documentation examples"
@@ -61,7 +61,7 @@ ticket_meta:
       - "Detects insecure temp file patterns in markdown Rust code blocks"
       - "Reports warnings with: file path, line number, violation description"
       - "Warnings include suggestion text for proper pattern to use"
-      - "SAFE_RUST_PATTERNS.md is checked for self-consistency"
+      - "26_apm2_safe_patterns_and_anti_patterns.md is checked for self-consistency"
       - "cargo xtask commit displays warning if doc examples violate patterns"
       - "pulldown-cmark dependency added to xtask/Cargo.toml"
       - "--include-docs flag added to LintArgs struct"

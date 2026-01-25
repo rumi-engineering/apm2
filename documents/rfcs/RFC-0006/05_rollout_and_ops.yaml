@@ -21,7 +21,7 @@ rfc_rollout_and_ops:
           - "TCK-00060: Add Historical Issue Patterns to Security Review Prompt"
         parallelism: "Both tickets can execute in parallel"
         success_criteria:
-          - "Anti-patterns section exists in SAFE_RUST_PATTERNS.md"
+          - "Anti-patterns section exists in documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md"
           - "Historical patterns section exists in SECURITY_REVIEW_PROMPT.md"
 
       - phase: 1
@@ -103,7 +103,7 @@ rfc_rollout_and_ops:
     verification_after_rollout:
       commands:
         - description: "Verify documentation"
-          command: "grep 'Anti-Patterns' documents/skills/coding/references/SAFE_RUST_PATTERNS.md"
+          command: "grep 'Anti-Patterns' documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md"
         - description: "Verify historical patterns"
           command: "grep 'Historical Issue Patterns' documents/reviews/SECURITY_REVIEW_PROMPT.md"
         - description: "Verify pre-commit catches issues"
