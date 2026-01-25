@@ -390,13 +390,13 @@ impl BudgetTracker {
     }
 
     /// Returns the elapsed time in milliseconds since the session started.
-        #[must_use]
-        pub fn elapsed_ms(&self) -> u64 {
-            // Saturate at u64::MAX for extremely long sessions (unlikely in practice)
-            let current_run_ms =
-                u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            self.time_offset_ms.saturating_add(current_run_ms)
-        }
+    #[must_use]
+    pub fn elapsed_ms(&self) -> u64 {
+        // Saturate at u64::MAX for extremely long sessions (unlikely in practice)
+        let current_run_ms =
+            u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.time_offset_ms.saturating_add(current_run_ms)
+    }
 
     /// Returns `true` if the given budget type is exceeded.
     #[must_use]
