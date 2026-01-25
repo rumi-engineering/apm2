@@ -172,6 +172,13 @@ fn validate_filesystem_rule(rule: &Rule) -> Result<(), PolicyError> {
 }
 
 /// Validates a glob pattern is syntactically correct.
+///
+/// # Security
+///
+/// This function rejects patterns containing `..` components, which could
+/// indicate an attempt to create rules that match path traversal attacks.
+/// While the engine blocks traversal in input paths, rejecting `..` in
+/// patterns provides defense-in-depth and better policy hygiene.
 fn validate_glob_pattern(rule_id: &str, pattern: &str) -> Result<(), PolicyError> {
     // Empty patterns are invalid
     if pattern.is_empty() {
@@ -180,6 +187,18 @@ fn validate_glob_pattern(rule_id: &str, pattern: &str) -> Result<(), PolicyError
             pattern: pattern.to_string(),
             reason: "pattern cannot be empty".to_string(),
         });
+    }
+
+    // Security: Reject patterns containing ".." path traversal components
+    // This prevents creation of rules that might match malicious paths
+    for component in pattern.split(['/', '\\']) {
+        if component == ".." {
+            return Err(PolicyError::InvalidGlobPattern {
+                rule_id: rule_id.to_string(),
+                pattern: pattern.to_string(),
+                reason: "pattern cannot contain '..' path traversal".to_string(),
+            });
+        }
     }
 
     // Check for unbalanced brackets
@@ -543,5 +562,42 @@ mod tests {
         assert!(validate_glob_pattern("RULE-001", "[a-z]*").is_ok());
         assert!(validate_glob_pattern("RULE-001", "{foo,bar}").is_ok());
         assert!(validate_glob_pattern("RULE-001", "\\[escaped\\]").is_ok());
+    }
+
+    #[test]
+    fn test_validate_glob_pattern_rejects_path_traversal() {
+        // Security: Patterns with ".." should be rejected
+        let result = validate_glob_pattern("RULE-001", "/workspace/../secret");
+        assert!(matches!(
+            result,
+            Err(PolicyError::InvalidGlobPattern { reason, .. }) if reason.contains("traversal")
+        ));
+
+        let result = validate_glob_pattern("RULE-001", "../relative");
+        assert!(matches!(
+            result,
+            Err(PolicyError::InvalidGlobPattern { reason, .. }) if reason.contains("traversal")
+        ));
+
+        let result = validate_glob_pattern("RULE-001", "/path/to/../escape/**");
+        assert!(matches!(
+            result,
+            Err(PolicyError::InvalidGlobPattern { reason, .. }) if reason.contains("traversal")
+        ));
+
+        // Windows-style separators should also be rejected
+        let result = validate_glob_pattern("RULE-001", "..\\windows\\path");
+        assert!(matches!(
+            result,
+            Err(PolicyError::InvalidGlobPattern { reason, .. }) if reason.contains("traversal")
+        ));
+
+        // Single dot should be OK (current directory reference)
+        assert!(validate_glob_pattern("RULE-001", "./relative").is_ok());
+        assert!(validate_glob_pattern("RULE-001", "/path/./here").is_ok());
+
+        // Dots in file names should be OK
+        assert!(validate_glob_pattern("RULE-001", "/path/..hidden").is_ok());
+        assert!(validate_glob_pattern("RULE-001", "/path/file..txt").is_ok());
     }
 }
