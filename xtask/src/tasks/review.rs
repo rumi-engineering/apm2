@@ -302,9 +302,10 @@ fn run_ai_review(
             }
         },
         ReviewType::Quality => {
-            // Codex uses the 'review' subcommand to review changes against base branch
+            // Codex uses the 'review' subcommand to review changes against base branch.
+            // The review subcommand runs non-interactively by default.
             let result = std::process::Command::new("codex")
-                .args(["review", "--base", "main", "-c", "full_auto=true"])
+                .args(["review", "--base", "main"])
                 .status();
 
             match result {
