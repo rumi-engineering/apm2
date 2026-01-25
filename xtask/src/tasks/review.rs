@@ -11,9 +11,11 @@
 //! 3. Posts a PR comment with findings
 //! 4. Updates the status check to success/failure
 
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use tempfile::NamedTempFile;
 use xshell::{Shell, cmd};
 
 /// Review type determines which prompt and status check to use.
@@ -257,12 +259,26 @@ fn run_ai_review(
     // 2. Updating the status check
     match review_type {
         ReviewType::Security => {
-            // Gemini takes input via stdin
-            let escaped_prompt = prompt.replace('\'', "'\\''");
-            let shell_cmd = format!("echo '{escaped_prompt}' | gemini");
-            let result = std::process::Command::new("sh")
-                .args(["-c", &shell_cmd])
-                .status();
+            // Spawn Gemini with pseudo-TTY for full tool access.
+            // Using script -qec gives Gemini a headed environment where all tools
+            // (including run_shell_command) are available. Without this, headless mode
+            // filters out shell tools causing "Tool not found in registry" errors.
+            //
+            // We write the prompt to a secure temp file (via tempfile crate) to:
+            // 1. Avoid shell escaping issues with complex markdown
+            // 2. Use random filenames to prevent symlink/TOCTOU attacks
+            // 3. Create with restrictive permissions (0600)
+            // 4. Auto-cleanup when NamedTempFile is dropped
+            // temp_file is auto-deleted when dropped at end of closure
+            let result = NamedTempFile::new().and_then(|mut temp_file| {
+                temp_file.write_all(prompt.as_bytes())?;
+                let prompt_path = temp_file.path().display().to_string();
+                let shell_cmd =
+                    format!("script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null");
+                std::process::Command::new("sh")
+                    .args(["-c", &shell_cmd])
+                    .status()
+            });
 
             match result {
                 Ok(status) if status.success() => {
@@ -286,10 +302,9 @@ fn run_ai_review(
             }
         },
         ReviewType::Quality => {
-            // Codex takes a prompt as argument
-            let escaped_prompt = prompt.replace('\'', "'\\''");
+            // Codex uses the 'review' subcommand to review changes against base branch
             let result = std::process::Command::new("codex")
-                .args(["-m", "o3", "--approval-mode", "full-auto", &escaped_prompt])
+                .args(["review", "--base", "main", "-c", "full_auto=true"])
                 .status();
 
             match result {

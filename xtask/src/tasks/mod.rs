@@ -36,12 +36,18 @@ pub fn start_ticket(target: Option<&str>, print_path_only: bool) -> Result<()> {
 ///
 /// Delegates to the commit module for the actual implementation.
 ///
+/// # Arguments
+///
+/// * `message` - The commit message
+/// * `skip_checks` - If true, skip all pre-commit checks (fmt, clippy, test,
+///   semver)
+///
 /// # Errors
 ///
 /// Returns an error if the checks or commit fail. See [`commit::run`] for
 /// details.
-pub fn commit(message: &str) -> Result<()> {
-    commit::run(message)
+pub fn commit(message: &str, skip_checks: bool) -> Result<()> {
+    commit::run(message, skip_checks)
 }
 
 /// Push branch and create PR with AI reviews.

@@ -20,9 +20,25 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use xshell::{Shell, cmd};
 
 use crate::util::{current_branch, validate_ticket_branch};
+
+/// A single check run from GitHub's API.
+///
+/// The `gh pr checks --json` command returns these fields:
+/// - `state`: PENDING, `IN_PROGRESS`, SUCCESS, FAILURE, etc.
+/// - `bucket`: pending, pass, fail
+#[derive(Debug, Deserialize)]
+struct CheckRun {
+    #[allow(dead_code)]
+    name: String,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    bucket: Option<String>,
+}
 
 /// Check ticket and PR status.
 ///
@@ -214,37 +230,80 @@ fn get_pr_state(sh: &Shell, branch_name: &str) -> Result<Option<PrState>> {
 /// Get the CI check status.
 fn get_ci_status(sh: &Shell, branch_name: &str) -> Result<CiStatus> {
     // Get all check runs status
-    let output = cmd!(
-        sh,
-        "gh pr checks {branch_name} --json name,state,conclusion"
-    )
-    .ignore_status()
-    .read()
-    .context("Failed to query PR checks")?;
+    // Note: gh pr checks uses 'state' and 'bucket' fields, not 'conclusion'
+    let output = cmd!(sh, "gh pr checks {branch_name} --json name,state,bucket")
+        .ignore_status()
+        .read()
+        .context("Failed to query PR checks")?;
+
+    Ok(parse_ci_status(&output))
+}
+
+/// Parse CI status from JSON output.
+///
+/// This function parses the JSON output from `gh pr checks --json` and
+/// determines the overall CI status:
+/// - If any check has bucket=pending or state is PENDING/`IN_PROGRESS`: return
+///   Pending
+/// - If any check has bucket=fail or state is FAILURE: return Failure
+/// - Otherwise: return Success
+fn parse_ci_status(output: &str) -> CiStatus {
+    let trimmed = output.trim();
 
     // If the output is empty or an error, assume pending
-    if output.trim().is_empty() || output.contains("no checks") {
-        return Ok(CiStatus::Pending);
+    if trimmed.is_empty() || trimmed.contains("no checks") {
+        return CiStatus::Pending;
     }
 
-    // Parse the JSON output
-    // States: PENDING, COMPLETED
-    // Conclusions (when COMPLETED): SUCCESS, FAILURE, CANCELLED, etc.
-    if output.contains("\"state\":\"PENDING\"")
-        || output.contains("\"state\":\"IN_PROGRESS\"")
-        || output.contains("\"state\":\"QUEUED\"")
-    {
-        return Ok(CiStatus::Pending);
+    // Parse the JSON array of check runs
+    let checks: Vec<CheckRun> = match serde_json::from_str(trimmed) {
+        Ok(checks) => checks,
+        Err(_) => {
+            // If parsing fails, fall back to pending (infrastructure error)
+            return CiStatus::Pending;
+        },
+    };
+
+    // If no checks, return pending
+    if checks.is_empty() {
+        return CiStatus::Pending;
     }
 
-    if output.contains("\"conclusion\":\"FAILURE\"")
-        || output.contains("\"conclusion\":\"CANCELLED\"")
-        || output.contains("\"conclusion\":\"TIMED_OUT\"")
-    {
-        return Ok(CiStatus::Failure);
+    // Check for any failures first (bucket=fail/cancel or state=FAILURE)
+    // Per gh pr checks --help: bucket can be pass, fail, pending, skipping, or
+    // cancel
+    for check in &checks {
+        if let Some(bucket) = &check.bucket {
+            // Both "fail" and "cancel" should be treated as failures
+            if bucket == "fail" || bucket == "cancel" {
+                return CiStatus::Failure;
+            }
+        }
+        if let Some(state) = &check.state {
+            let state_upper = state.to_uppercase();
+            if state_upper == "FAILURE" {
+                return CiStatus::Failure;
+            }
+        }
     }
 
-    Ok(CiStatus::Success)
+    // Check for any pending/in-progress checks
+    for check in &checks {
+        if let Some(bucket) = &check.bucket {
+            if bucket == "pending" {
+                return CiStatus::Pending;
+            }
+        }
+        if let Some(state) = &check.state {
+            let state_upper = state.to_uppercase();
+            if state_upper == "PENDING" || state_upper == "IN_PROGRESS" || state_upper == "QUEUED" {
+                return CiStatus::Pending;
+            }
+        }
+    }
+
+    // All checks completed successfully
+    CiStatus::Success
 }
 
 /// Get the review status.
@@ -374,16 +433,149 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ci_status_parsing() {
-        // Unit test for CiStatus
-        assert_eq!(CiStatus::Pending, CiStatus::Pending);
-        assert_eq!(CiStatus::Success, CiStatus::Success);
-        assert_eq!(CiStatus::Failure, CiStatus::Failure);
+    fn test_parse_ci_status_empty_output() {
+        assert_eq!(parse_ci_status(""), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_no_checks_message() {
+        assert_eq!(parse_ci_status("no checks reported"), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_empty_array() {
+        assert_eq!(parse_ci_status("[]"), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_all_success() {
+        let json = r#"[
+            {"name": "build", "state": "SUCCESS", "bucket": "pass"},
+            {"name": "test", "state": "SUCCESS", "bucket": "pass"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Success);
+    }
+
+    #[test]
+    fn test_parse_ci_status_one_pending() {
+        let json = r#"[
+            {"name": "build", "state": "SUCCESS", "bucket": "pass"},
+            {"name": "test", "state": "PENDING", "bucket": "pending"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_in_progress() {
+        let json = r#"[
+            {"name": "build", "state": "IN_PROGRESS", "bucket": "pending"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_queued() {
+        let json = r#"[
+            {"name": "build", "state": "QUEUED", "bucket": "pending"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_one_failure() {
+        let json = r#"[
+            {"name": "build", "state": "SUCCESS", "bucket": "pass"},
+            {"name": "test", "state": "FAILURE", "bucket": "fail"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+    }
+
+    #[test]
+    fn test_parse_ci_status_bucket_fail() {
+        let json = r#"[
+            {"name": "build", "state": "SUCCESS", "bucket": "fail"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+    }
+
+    #[test]
+    fn test_parse_ci_status_bucket_pending() {
+        let json = r#"[
+            {"name": "build", "state": "SUCCESS", "bucket": "pending"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_lowercase_state() {
+        let json = r#"[
+            {"name": "build", "state": "pending", "bucket": "pending"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_failure_state() {
+        let json = r#"[
+            {"name": "build", "state": "FAILURE", "bucket": "fail"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+    }
+
+    #[test]
+    fn test_parse_ci_status_missing_fields() {
+        // Check with missing optional fields
+        let json = r#"[{"name": "build"}]"#;
+        // Missing state/bucket means no pending or failure detected, so success
+        assert_eq!(parse_ci_status(json), CiStatus::Success);
+    }
+
+    #[test]
+    fn test_parse_ci_status_invalid_json() {
+        assert_eq!(parse_ci_status("not valid json"), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_mixed_states() {
+        // If any check is failing, report failure even if others are pending
+        let json = r#"[
+            {"name": "build", "state": "SUCCESS", "bucket": "pass"},
+            {"name": "lint", "state": "IN_PROGRESS", "bucket": "pending"},
+            {"name": "test", "state": "FAILURE", "bucket": "fail"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+    }
+
+    #[test]
+    fn test_parse_ci_status_real_gh_output() {
+        // Test with actual gh pr checks output format
+        let json = r#"[
+            {"bucket":"pending","name":"Documentation","state":"IN_PROGRESS"},
+            {"bucket":"pass","name":"Secret Scan","state":"SUCCESS"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Pending);
+    }
+
+    #[test]
+    fn test_parse_ci_status_cancelled() {
+        // Per gh pr checks --help, "cancel" bucket indicates cancelled check
+        let json = r#"[
+            {"name": "build", "state": "COMPLETED", "bucket": "cancel"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+    }
+
+    #[test]
+    fn test_parse_ci_status_skipping() {
+        // "skipping" bucket should be treated as success (not blocking)
+        let json = r#"[
+            {"name": "optional-check", "state": "COMPLETED", "bucket": "skipping"}
+        ]"#;
+        assert_eq!(parse_ci_status(json), CiStatus::Success);
     }
 
     #[test]
     fn test_pr_state_parsing() {
-        // Unit test for PrState
         assert_eq!(PrState::Open, PrState::Open);
         assert_eq!(PrState::Merged, PrState::Merged);
         assert_eq!(PrState::Closed, PrState::Closed);
@@ -391,7 +583,6 @@ mod tests {
 
     #[test]
     fn test_review_status_parsing() {
-        // Unit test for ReviewStatus
         assert_eq!(ReviewStatus::Pending, ReviewStatus::Pending);
         assert_eq!(ReviewStatus::Approved, ReviewStatus::Approved);
         assert_eq!(

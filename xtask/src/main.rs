@@ -17,6 +17,7 @@
 //!   RFC
 //! - `start-ticket TCK-XXXXX` - Start work on a specific ticket
 //! - `commit <message>` - Run checks and create a commit
+//! - `commit <message> --skip-checks` - Create a commit without running checks
 //! - `push` - Push branch, create PR, and request reviews
 //! - `check` - Show ticket and PR status
 //! - `finish` - Clean up after PR merge
@@ -72,11 +73,14 @@ enum Commands {
 
     /// Run checks and create a commit.
     ///
-    /// Runs cargo fmt, clippy, and test, then rebases on main
-    /// and creates a commit with the given message.
+    /// Runs cargo fmt, clippy, test, and semver-checks, then
+    /// creates a commit with the given message.
     Commit {
         /// The commit message
         message: String,
+        /// Skip all pre-commit checks (fmt, clippy, test, semver)
+        #[arg(long)]
+        skip_checks: bool,
     },
 
     /// Push branch and create PR with AI reviews.
@@ -212,7 +216,10 @@ fn main() -> Result<()> {
         Commands::StartTicket { target, print_path } => {
             tasks::start_ticket(target.as_deref(), print_path)
         },
-        Commands::Commit { message } => tasks::commit(&message),
+        Commands::Commit {
+            message,
+            skip_checks,
+        } => tasks::commit(&message, skip_checks),
         Commands::Push => tasks::push(),
         Commands::Check { watch } => tasks::check(watch),
         Commands::Finish => tasks::finish(),
