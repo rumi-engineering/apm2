@@ -52,6 +52,79 @@ d. @documents/security/SECRETS_MANAGEMENT.md
 
 ---
 
+## 0.5) Historical Issue Patterns (Check First)
+
+Before diving into the full review, **scan the diff for these recurring patterns** that have caused issues in past PRs (PR #58, #59). These are high-signal checks that often catch subtle bugs early.
+
+### 0.5.1 State Machine Restart Logic
+
+**What to look for:**
+* Session/process restart or recovery code paths
+* State reducers handling transitions from terminal states
+* Fields tracking restart attempts, resume cursors, or recovery state
+
+**Why it's a problem:**
+* **Session ID collision** (B1): Reducer may reject valid restarts of terminal sessions if it doesn't distinguish "new session" from "resume session"
+* **Missing state tracking fields** (B2): New fields like `resume_cursor` or `restart_attempt` may not be added to all relevant state structs
+* **Monotonicity violation** (B3): Restart counters must be strictly increasing to prevent replay/confusion attacks
+
+**How to verify:**
+* Check that terminal state transitions explicitly handle restart scenarios
+* Confirm new state fields are present in all state structs and all match arms
+* Verify restart counter comparisons use strict inequality (`>` not `>=`)
+
+### 0.5.2 Temp File Handling
+
+**What to look for:**
+* Uses of `std::env::temp_dir()` or direct `/tmp/` paths
+* File creation with predictable names
+* Missing cleanup on error paths or panics
+
+**Why it's a problem:**
+* **Predictable names** (A3): Allows symlink attacks or information disclosure via race conditions
+* **World-readable permissions**: Default file creation may expose sensitive data (prompts, credentials, state)
+* **Missing cleanup**: Temp files persist after crashes, leaking state or filling disk
+
+**How to verify:**
+* Confirm use of `tempfile::NamedTempFile` or equivalent which provides: unpredictable names, 0600 permissions, automatic cleanup
+* Check for explicit cleanup in error handlers if manual temp files are used
+* Verify no sensitive data is written to predictable paths
+
+### 0.5.3 Shell/Process Spawning
+
+**What to look for:**
+* `Command::new()` calls with user-controlled or complex arguments
+* Prompts or markdown passed as CLI arguments
+* Environment variable inheritance or headless mode execution
+
+**Why it's a problem:**
+* **Argument escaping** (A2): Markdown content with backticks, quotes, or special chars breaks when passed as CLI args
+* **Environment inheritance** (A1): Child processes may inherit sensitive env vars or conflicting config
+* **Headless mode failures** (A1): Some tools filter capabilities in headless mode (e.g., no shell access)
+
+**How to verify:**
+* Complex strings (prompts, markdown) should be written to temp files and redirected via stdin
+* Explicitly manage environment: clear or allowlist specific vars
+* Test headless execution path if the code may run in CI or automated contexts
+
+### 0.5.4 Struct Field Addition
+
+**What to look for:**
+* New fields added to structs that appear in `match` expressions
+* Enums with new variants
+* State objects with added tracking fields
+
+**Why it's a problem:**
+* **Incomplete pattern matches** (C1): Rust compiler may not catch all cases if patterns use `..` or default arms
+* **Missing field handling**: New fields may not be initialized, compared, or serialized in all code paths
+
+**How to verify:**
+* Search for all `match` expressions on the modified struct/enum
+* Confirm each arm explicitly handles or acknowledges the new field
+* Check serialization, comparison, and clone implementations include the new field
+
+---
+
 ## 1) Determine whether this PR is Security-Critical Path (SCP)
 
 A PR is SCP if it **touches any** of the following areas (directly or by dependency):
