@@ -549,12 +549,32 @@ fn remediate_reviewer(
         return Ok(());
     };
 
+    // Check if the GitHub status is already completed (success or failure)
+    // If so, the reviewer finished successfully and we don't need to restart
+    let status_context = match reviewer_type {
+        "security" => "ai-review/security",
+        "quality" => "ai-review/code-quality",
+        _ => return Ok(()),
+    };
+
+    if is_review_completed(sh, &entry.head_sha, status_context) {
+        // Review completed, just clean up the state entry
+        let mut state = ReviewerStateFile::load()?;
+        state.remove_reviewer(reviewer_type);
+        state.save()?;
+        println!(
+            "      {} review completed, cleaning up state",
+            capitalize(reviewer_type)
+        );
+        return Ok(());
+    }
+
     let elapsed = entry
         .get_log_mtime_elapsed()
         .map_or_else(|| "unknown".to_string(), |s| format!("{s}s"));
 
     println!(
-        "  [!] {} reviewer {} ({}), restarting...",
+        "      {} reviewer {} ({}), restarting...",
         capitalize(reviewer_type),
         if health == HealthStatus::Stale {
             "stale"
@@ -586,6 +606,66 @@ fn remediate_reviewer(
     restart_review(sh, reviewer_type, &entry.pr_url, &entry.head_sha)?;
 
     Ok(())
+}
+
+/// Check if a review status on GitHub is already completed (success or
+/// failure).
+///
+/// Returns true if the status is not pending, false otherwise.
+fn is_review_completed(sh: &Shell, head_sha: &str, status_context: &str) -> bool {
+    // Get owner/repo from git remote
+    let remote_url = cmd!(sh, "git remote get-url origin")
+        .read()
+        .unwrap_or_default();
+
+    let owner_repo = parse_owner_repo_for_check(&remote_url);
+    if owner_repo.is_empty() {
+        return false;
+    }
+
+    // Build the jq filter
+    let jq_filter = format!(".statuses[] | select(.context == \"{status_context}\") | .state");
+
+    // Get the status from GitHub
+    let api_path = format!("/repos/{owner_repo}/commits/{head_sha}/status");
+    let output = cmd!(sh, "gh api {api_path} --jq {jq_filter}")
+        .ignore_status()
+        .read();
+
+    // Couldn't check, assume not completed
+    output.is_ok_and(|state| {
+        let state = state.trim();
+        // If state is "success" or "failure", the review is completed
+        state == "success" || state == "failure"
+    })
+}
+
+/// Parse owner/repo from a GitHub remote URL (for check module).
+fn parse_owner_repo_for_check(url: &str) -> String {
+    // Parse formats like:
+    // - git@github.com:owner/repo.git
+    // - https://github.com/owner/repo.git
+    // - https://github.com/owner/repo
+    let url = url.trim();
+
+    // Extract the owner/repo part
+    let owner_repo = if url.contains("github.com:") {
+        // SSH format: git@github.com:owner/repo.git
+        url.split("github.com:")
+            .nth(1)
+            .unwrap_or("")
+            .trim_end_matches(".git")
+    } else if url.contains("github.com/") {
+        // HTTPS format: https://github.com/owner/repo.git
+        url.split("github.com/")
+            .nth(1)
+            .unwrap_or("")
+            .trim_end_matches(".git")
+    } else {
+        ""
+    };
+
+    owner_repo.to_string()
 }
 
 /// Restart a review using the PR URL and HEAD SHA from the state file.
