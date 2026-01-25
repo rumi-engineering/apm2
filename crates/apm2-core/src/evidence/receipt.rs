@@ -54,7 +54,9 @@
 //!     1_000_000_000,
 //! );
 //!
-//! let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+//! let receipt = generator
+//!     .generate("gate-001", &bundle, 2_000_000_000)
+//!     .unwrap();
 //! assert!(receipt.is_signed());
 //! ```
 
@@ -64,9 +66,92 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 
 use super::category::EvidenceCategory;
+use super::error::EvidenceError;
 use super::state::EvidenceBundle;
 use crate::crypto::{Hash, SIGNATURE_SIZE, Signature, Signer};
 use crate::events::{EvidenceEvent, GateReceiptGenerated, evidence_event};
+
+/// Maximum length for gate IDs and receipt IDs.
+const MAX_ID_LEN: usize = 256;
+
+/// Characters that are forbidden in IDs because they break canonical
+/// serialization or could be used for injection attacks.
+///
+/// - `|` is the field separator in canonical format
+/// - `/` and `\` could enable path traversal
+/// - `..` sequences could enable directory traversal (handled separately)
+/// - Control characters (< 0x20) could be used for log injection
+/// - Newlines and carriage returns break log formatting
+const FORBIDDEN_ID_CHARS: &[char] = &['|', '/', '\\', '\n', '\r', '\0'];
+
+/// Validates an identifier string for use in gate receipts.
+///
+/// # Validation Rules
+///
+/// - Must not be empty
+/// - Must not exceed `MAX_ID_LEN` bytes
+/// - Must not contain forbidden characters (see `FORBIDDEN_ID_CHARS`)
+/// - Must not contain `..` sequences (path traversal)
+/// - Must only contain ASCII printable characters (0x20-0x7E)
+///
+/// # Arguments
+///
+/// * `id` - The identifier to validate
+/// * `id_type` - Human-readable type name for error messages (e.g., "gate ID")
+///
+/// # Returns
+///
+/// `Ok(())` if valid, or an appropriate `EvidenceError` if invalid.
+fn validate_id(id: &str, id_type: &str) -> Result<(), String> {
+    // Check for empty ID
+    if id.is_empty() {
+        return Err(format!("{id_type} cannot be empty"));
+    }
+
+    // Check length limit
+    if id.len() > MAX_ID_LEN {
+        return Err(format!(
+            "{id_type} exceeds maximum length of {MAX_ID_LEN} bytes: {} bytes",
+            id.len()
+        ));
+    }
+
+    // Check for forbidden characters
+    for forbidden in FORBIDDEN_ID_CHARS {
+        if id.contains(*forbidden) {
+            return Err(format!(
+                "{id_type} contains forbidden character: {forbidden:?}"
+            ));
+        }
+    }
+
+    // Check for path traversal sequences
+    if id.contains("..") {
+        return Err(format!("{id_type} contains path traversal sequence: .."));
+    }
+
+    // Check for non-ASCII printable characters
+    for (i, c) in id.chars().enumerate() {
+        if !c.is_ascii() || c.is_ascii_control() {
+            return Err(format!(
+                "{id_type} contains invalid character at position {i}: {c:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates a gate ID.
+fn validate_gate_id(gate_id: &str) -> Result<(), EvidenceError> {
+    validate_id(gate_id, "gate ID").map_err(|reason| EvidenceError::InvalidGateId { value: reason })
+}
+
+/// Validates a receipt ID.
+fn validate_receipt_id(receipt_id: &str) -> Result<(), EvidenceError> {
+    validate_id(receipt_id, "receipt ID")
+        .map_err(|reason| EvidenceError::InvalidReceiptId { value: reason })
+}
 
 /// Encodes bytes as a hex string.
 fn hex_encode(bytes: &[u8]) -> String {
@@ -413,22 +498,37 @@ impl GateReceiptGenerator {
     /// Generates a gate receipt from an evidence bundle.
     ///
     /// This method:
-    /// 1. Validates evidence completeness against requirements
-    /// 2. Computes the PASS/FAIL result
-    /// 3. Auto-populates receipt fields from bundle data
-    /// 4. Signs the receipt
+    /// 1. Validates the gate ID
+    /// 2. Validates evidence completeness against requirements
+    /// 3. Computes the PASS/FAIL result
+    /// 4. Auto-populates receipt fields from bundle data
+    /// 5. Signs the receipt
     ///
     /// # Arguments
     ///
-    /// * `gate_id` - Identifier for the gate being reviewed
+    /// * `gate_id` - Identifier for the gate being reviewed. Must be non-empty,
+    ///   at most 256 bytes, and contain only ASCII printable characters without
+    ///   path separators or the canonical format delimiter (`|`).
     /// * `bundle` - The evidence bundle to review
     /// * `timestamp` - Timestamp for the receipt (Unix nanos)
     ///
     /// # Returns
     ///
-    /// A signed gate receipt ready for event emission.
-    #[must_use]
-    pub fn generate(&self, gate_id: &str, bundle: &EvidenceBundle, timestamp: u64) -> GateReceipt {
+    /// A signed gate receipt ready for event emission, or an error if
+    /// validation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceError::InvalidGateId`] if the gate ID is invalid.
+    pub fn generate(
+        &self,
+        gate_id: &str,
+        bundle: &EvidenceBundle,
+        timestamp: u64,
+    ) -> Result<GateReceipt, EvidenceError> {
+        // Validate gate ID first (fail-closed)
+        validate_gate_id(gate_id)?;
+
         // Generate receipt ID deterministically from bundle hash and gate
         let receipt_id = self.generate_receipt_id(gate_id, &bundle.bundle_hash);
 
@@ -455,20 +555,38 @@ impl GateReceiptGenerator {
         let signature = self.signer.sign(&canonical);
         receipt.signature = signature.to_bytes();
 
-        receipt
+        Ok(receipt)
     }
 
     /// Generates a gate receipt with a specific receipt ID.
     ///
     /// Use this when you need deterministic receipt IDs for testing.
-    #[must_use]
+    ///
+    /// # Arguments
+    ///
+    /// * `receipt_id` - Custom receipt identifier. Must be non-empty, at most
+    ///   256 bytes, and contain only ASCII printable characters without path
+    ///   separators or the canonical format delimiter (`|`).
+    /// * `gate_id` - Identifier for the gate being reviewed
+    /// * `bundle` - The evidence bundle to review
+    /// * `timestamp` - Timestamp for the receipt (Unix nanos)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceError::InvalidReceiptId`] if the receipt ID is
+    /// invalid. Returns [`EvidenceError::InvalidGateId`] if the gate ID is
+    /// invalid.
     pub fn generate_with_id(
         &self,
         receipt_id: &str,
         gate_id: &str,
         bundle: &EvidenceBundle,
         timestamp: u64,
-    ) -> GateReceipt {
+    ) -> Result<GateReceipt, EvidenceError> {
+        // Validate both IDs first (fail-closed)
+        validate_receipt_id(receipt_id)?;
+        validate_gate_id(gate_id)?;
+
         let (result, reason_code) = self.evaluate_bundle(bundle);
 
         let mut receipt = GateReceipt {
@@ -489,7 +607,7 @@ impl GateReceiptGenerator {
         let signature = self.signer.sign(&canonical);
         receipt.signature = signature.to_bytes();
 
-        receipt
+        Ok(receipt)
     }
 
     /// Verifies a gate receipt's signature.
@@ -632,7 +750,9 @@ mod tests {
             vec![EvidenceCategory::TestResults],
         );
 
-        let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         assert!(receipt.passed());
         assert!(!receipt.failed());
@@ -659,7 +779,9 @@ mod tests {
             vec![EvidenceCategory::LintReports],
         );
 
-        let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         assert!(receipt.failed());
         assert_eq!(receipt.result, GateResult::Fail);
@@ -678,7 +800,9 @@ mod tests {
 
         let bundle = make_test_bundle("work-123", vec![], vec![]);
 
-        let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         assert!(receipt.failed());
         assert!(matches!(receipt.reason_code, GateReasonCode::EmptyBundle));
@@ -697,7 +821,9 @@ mod tests {
             vec![EvidenceCategory::TestResults],
         );
 
-        let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         assert!(receipt.failed());
     }
@@ -718,7 +844,9 @@ mod tests {
             ],
         );
 
-        let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         assert!(receipt.passed());
     }
@@ -736,7 +864,9 @@ mod tests {
             vec![EvidenceCategory::TestResults, EvidenceCategory::LintReports],
         );
 
-        let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         assert!(receipt.failed());
         if let GateReasonCode::MissingRequiredCategory { missing } = &receipt.reason_code {
@@ -758,7 +888,9 @@ mod tests {
             vec![EvidenceCategory::TestResults],
         );
 
-        let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         // Generator can verify its own receipts
         assert!(generator.verify(&receipt));
@@ -779,7 +911,9 @@ mod tests {
             vec![EvidenceCategory::TestResults],
         );
 
-        let receipt = generator1.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator1
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         // generator2 should NOT verify generator1's receipt
         assert!(!generator2.verify(&receipt));
@@ -797,8 +931,9 @@ mod tests {
             vec![EvidenceCategory::TestResults],
         );
 
-        let receipt =
-            generator.generate_with_id("custom-id-001", "gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate_with_id("custom-id-001", "gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         assert_eq!(receipt.receipt_id, "custom-id-001");
         assert!(receipt.is_signed());
@@ -817,7 +952,9 @@ mod tests {
             vec![EvidenceCategory::TestResults],
         );
 
-        let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
         let payload = receipt.to_event_payload();
 
         // Decode and verify
@@ -845,8 +982,12 @@ mod tests {
             vec![EvidenceCategory::TestResults],
         );
 
-        let receipt1 = generator.generate("gate-001", &bundle, 1_000_000_000);
-        let receipt2 = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt1 = generator
+            .generate("gate-001", &bundle, 1_000_000_000)
+            .unwrap();
+        let receipt2 = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         // Same gate + bundle should produce same receipt ID (timestamp differs)
         assert_eq!(receipt1.receipt_id, receipt2.receipt_id);
@@ -880,7 +1021,9 @@ mod tests {
             vec![EvidenceCategory::TestResults, EvidenceCategory::LintReports],
         );
 
-        let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         // Auto-populated from bundle:
         // - work_id (from bundle)
@@ -923,7 +1066,9 @@ mod tests {
             vec![EvidenceCategory::TestResults],
         );
 
-        let receipt = generator.generate("gate-001", &bundle, 2_000_000_000);
+        let receipt = generator
+            .generate("gate-001", &bundle, 2_000_000_000)
+            .unwrap();
 
         // Canonical bytes should always have sorted evidence IDs
         let canonical1 = receipt.canonical_bytes();
@@ -933,5 +1078,249 @@ mod tests {
         // Should contain sorted evidence IDs
         let canonical_str = String::from_utf8(canonical1).unwrap();
         assert!(canonical_str.contains("evid-001,evid-002"));
+    }
+
+    // =========================================================================
+    // Security tests for input validation (CRITICAL: Canonicalization Injection)
+    // =========================================================================
+
+    #[test]
+    fn test_generate_rejects_empty_gate_id() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        let bundle = make_test_bundle(
+            "work-123",
+            vec!["evid-001"],
+            vec![EvidenceCategory::TestResults],
+        );
+
+        let result = generator.generate("", &bundle, 2_000_000_000);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EvidenceError::InvalidGateId { .. }
+        ));
+    }
+
+    #[test]
+    fn test_generate_rejects_gate_id_with_pipe_separator() {
+        // Pipe is used as field separator in canonical format - injection attack vector
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        let bundle = make_test_bundle(
+            "work-123",
+            vec!["evid-001"],
+            vec![EvidenceCategory::TestResults],
+        );
+
+        let result = generator.generate("gate|injection", &bundle, 2_000_000_000);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EvidenceError::InvalidGateId { .. }
+        ));
+    }
+
+    #[test]
+    fn test_generate_rejects_gate_id_with_path_traversal() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        let bundle = make_test_bundle(
+            "work-123",
+            vec!["evid-001"],
+            vec![EvidenceCategory::TestResults],
+        );
+
+        // Test forward slash
+        let result = generator.generate("gate/traversal", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+
+        // Test backslash
+        let result = generator.generate("gate\\traversal", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+
+        // Test parent directory traversal
+        let result = generator.generate("gate..traversal", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_rejects_gate_id_with_control_characters() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        let bundle = make_test_bundle(
+            "work-123",
+            vec!["evid-001"],
+            vec![EvidenceCategory::TestResults],
+        );
+
+        // Test newline (log injection)
+        let result = generator.generate("gate\ninjection", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+
+        // Test carriage return
+        let result = generator.generate("gate\rinjection", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+
+        // Test null byte
+        let result = generator.generate("gate\0injection", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_rejects_gate_id_too_long() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        let bundle = make_test_bundle(
+            "work-123",
+            vec!["evid-001"],
+            vec![EvidenceCategory::TestResults],
+        );
+
+        // Create a gate ID that exceeds the maximum length
+        let long_gate_id = "g".repeat(257);
+        let result = generator.generate(&long_gate_id, &bundle, 2_000_000_000);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EvidenceError::InvalidGateId { .. }
+        ));
+    }
+
+    #[test]
+    fn test_generate_with_id_rejects_invalid_receipt_id() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        let bundle = make_test_bundle(
+            "work-123",
+            vec!["evid-001"],
+            vec![EvidenceCategory::TestResults],
+        );
+
+        // Empty receipt ID
+        let result = generator.generate_with_id("", "gate-001", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EvidenceError::InvalidReceiptId { .. }
+        ));
+
+        // Receipt ID with pipe separator
+        let result =
+            generator.generate_with_id("rcpt|injection", "gate-001", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+
+        // Receipt ID with path traversal
+        let result =
+            generator.generate_with_id("rcpt/../attack", "gate-001", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_with_id_rejects_invalid_gate_id() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        let bundle = make_test_bundle(
+            "work-123",
+            vec!["evid-001"],
+            vec![EvidenceCategory::TestResults],
+        );
+
+        // Valid receipt ID but invalid gate ID
+        let result =
+            generator.generate_with_id("rcpt-001", "gate|injection", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EvidenceError::InvalidGateId { .. }
+        ));
+    }
+
+    #[test]
+    fn test_generate_accepts_valid_gate_id_with_hyphens_and_dots() {
+        // Valid gate IDs should work: alphanumeric, hyphens, underscores, dots
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        let bundle = make_test_bundle(
+            "work-123",
+            vec!["evid-001"],
+            vec![EvidenceCategory::TestResults],
+        );
+
+        // These should all succeed
+        let result = generator.generate("gate-001", &bundle, 2_000_000_000);
+        assert!(result.is_ok());
+
+        let result = generator.generate("gate_001", &bundle, 2_000_000_000);
+        assert!(result.is_ok());
+
+        let result = generator.generate("gate.v1.0", &bundle, 2_000_000_000);
+        assert!(result.is_ok());
+
+        let result = generator.generate("GATE-001-PROD", &bundle, 2_000_000_000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_generate_rejects_non_ascii_characters() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        let bundle = make_test_bundle(
+            "work-123",
+            vec!["evid-001"],
+            vec![EvidenceCategory::TestResults],
+        );
+
+        // Unicode characters are not allowed
+        let result = generator.generate("gate-\u{0080}", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+
+        // Emoji is not allowed
+        let result = generator.generate("gate-\u{1F600}", &bundle, 2_000_000_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_id_boundary_length() {
+        let signer = Signer::generate();
+        let requirements = GateRequirements::default();
+        let generator = GateReceiptGenerator::new(signer, requirements);
+
+        let bundle = make_test_bundle(
+            "work-123",
+            vec!["evid-001"],
+            vec![EvidenceCategory::TestResults],
+        );
+
+        // Exactly 256 bytes should succeed
+        let max_gate_id = "g".repeat(256);
+        let result = generator.generate(&max_gate_id, &bundle, 2_000_000_000);
+        assert!(result.is_ok());
+
+        // 257 bytes should fail
+        let over_max_gate_id = "g".repeat(257);
+        let result = generator.generate(&over_max_gate_id, &bundle, 2_000_000_000);
+        assert!(result.is_err());
     }
 }
