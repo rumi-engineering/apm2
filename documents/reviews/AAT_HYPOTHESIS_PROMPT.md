@@ -39,19 +39,19 @@ Each hypothesis object must have these fields:
 [
   {
     "id": "H-001",
-    "prediction": "When running cargo build, the project compiles without errors",
+    "prediction": "When running cargo build, then the project compiles without errors",
     "verification_method": "cargo build --release 2>&1",
     "tests_error_handling": false
   },
   {
     "id": "H-002",
-    "prediction": "When running cargo test, all unit tests pass",
+    "prediction": "When running cargo test, then all unit tests pass",
     "verification_method": "cargo test --workspace 2>&1",
     "tests_error_handling": false
   },
   {
     "id": "H-003",
-    "prediction": "When providing invalid input, the command returns a non-zero exit code with error message",
+    "prediction": "When providing invalid input, then the command returns a non-zero exit code with error message",
     "verification_method": "cargo xtask aat invalid-url 2>&1; echo \"Exit code: $?\"",
     "tests_error_handling": true
   }

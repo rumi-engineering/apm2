@@ -817,8 +817,8 @@ rfc_ticket_decomposition:
           scope_summary: |
             Replace stub generate_hypotheses() in aat.rs:207-251:
 
-            Files to create:
-            - documents/reviews/AAT_HYPOTHESIS_PROMPT.md
+            Existing files to verify/update:
+            - documents/reviews/AAT_HYPOTHESIS_PROMPT.md (already exists)
 
             Files to modify:
             - xtask/src/tasks/aat.rs (replace stub)
@@ -847,7 +847,8 @@ rfc_ticket_decomposition:
             - xtask/src/aat/executor.rs
 
             Files to modify:
-            - xtask/src/tasks/aat.rs (integrate executor)
+            - xtask/src/aat/mod.rs (add executor module export)
+            - xtask/src/tasks/aat.rs (integrate executor into run())
 
             Implementation:
             1. Create execute_hypothesis() function
@@ -875,7 +876,9 @@ rfc_ticket_decomposition:
             - xtask/src/aat/variation.rs
 
             Files to modify:
+            - xtask/src/aat/mod.rs (add variation module export)
             - xtask/src/aat/evidence.rs (populate InputVariation)
+            - xtask/src/tasks/aat.rs (integrate variation testing)
 
             Implementation:
             1. For each CLI command, generate at least 3 input variations
@@ -925,12 +928,12 @@ rfc_ticket_decomposition:
             Implementation:
             1. Validate evidence script path exists and is executable
             2. Validate Usage section contains at least 1 code block
-            3. Validate Expected Outcomes follow When/Then format
+            3. Validate Expected Outcomes contain BOTH When AND Then keywords
             4. Return actionable errors for each validation failure
 
             Acceptance Criteria:
             - Evidence script validated
-            - PR format validated
+            - PR format validated (When/Then requirement enforced)
             - Actionable error messages
 
         - ticket_id: "TCK-00079"

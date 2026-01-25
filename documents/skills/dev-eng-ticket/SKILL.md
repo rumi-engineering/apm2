@@ -11,23 +11,61 @@ description: Orchestrate full development workflow for an RFC's engineering tick
 
 ### 2. Initialize Development Environment
 
+First, create the worktree and read the context:
+```bash
+cargo xtask start-ticket $1
+```
+
+Read the output carefully - it provides ticket details, RFC context, and file paths.
+
+Then change to the worktree directory:
 ```bash
 cd "$(cargo xtask start-ticket $1 --print-path)"
 ```
 
-Read the output carefully. It provides all context needed to implement the ticket.
-
 ### 3. Process Ticket
 
-a. **Implement** following coding standards in `documents/coding/SKILL.md`:
-   - Use the prompt from `references/IMPLEMENT_TICKET_PROMPT.md`
-   - Substitute `$TICKET_ID` and `$RFC_ID` with actual values
-   - Follow the implementation guidelines in that prompt
+#### 3.1 Read Ticket Definition
 
-b. **Run automated checks, sync your branch, and commit** using the commit command. Expect errors to occur during automated checks. We maintain an extremely high bar for code, and it is up to you to maintain that bar.:
-   ```bash
-   cargo xtask commit "<description>"
-   ```
+- Read `documents/work/tickets/$TICKET_ID.yaml` (complete ticket: metadata, scope, plan, criteria)
+- Read all referenced requirements in `binds.requirements[]`
+- Note: Implement ONLY `scope.in_scope`. Do NOT implement `scope.out_of_scope`.
+
+#### 3.2 Quality Bar: Standard-Library Quality
+
+Your code must be suitable for **deterministic simulated testing**:
+
+- **Determinism by default**: No hidden time, randomness, or IO in core logic
+  - Inject `Clock`, `IdGenerator`, `FileSystem` traits instead of calling directly
+  - Core logic must be Markov-clean (same input → same output, always)
+
+- **Evidence over narrative**: Prove correctness through:
+  - Types and ownership (compile-time guarantees)
+  - Tests (negative cases, boundaries, regression tests that fail without fix)
+  - Tooling (clippy, miri for unsafe, property tests for state machines)
+
+- **Local reasoning**: Correctness must not depend on hidden state or call ordering
+
+#### 3.3 Write Tests First
+
+- Tests must defend invariants, not just "doesn't panic"
+- Include negative cases and boundary conditions
+- State machines need property tests with reference model
+- Happy-path-only = insufficient evidence
+
+#### 3.4 Implement
+
+Read `documents/skills/rust-textbook/SKILL.md` for comprehensive Rust reference. Follow reference documents as appropriate for the engineering task you're working on.
+
+#### 3.5 Verify and Commit
+
+Satisfy all criteria in `definition_of_done.criteria[]`, then:
+
+```bash
+cargo xtask commit "<description>"
+```
+
+Expect errors during automated checks. We maintain an extremely high bar for code.
 
 ### 4. Push, Create PR, and Run AI Reviews
 
@@ -42,8 +80,10 @@ This pushes your branch, creates/updates the PR, requests security + code qualit
 Use the status check command to monitor progress and get actionable guidance:
 
 ```bash
-cargo xtask check
+timeout 30s cargo xtask check
 ```
+
+**Important**: Always run with `timeout 30s` - the command can hang indefinitely on certain states.
 
 The command reports current state and suggests the next action:
 
@@ -52,13 +92,13 @@ The command reports current state and suggests the next action:
 | Uncommitted changes | `cargo xtask commit '<message>'` |
 | No PR exists | `cargo xtask push` |
 | CI running | Wait (use `--watch` to poll) |
-| CI failed | See `documents/coding/references/CI_EXPECTATIONS.md` |
+| CI failed | See `documents/skills/coding/references/CI_EXPECTATIONS.md` |
 | Reviews pending | Wait for reviews (auto-merge enabled) |
 | Reviews failed | Address feedback, commit, re-push with `--force-review` |
 | All passed | Wait for auto-merge, then cleanup worktree |
 | Already merged | Cleanup worktree and continue to next ticket |
 
-For continuous monitoring: `cargo xtask check --watch`
+For continuous monitoring: `timeout 180s cargo xtask check --watch` (will exit on timeout)
 
 #### After Merge
 
@@ -72,7 +112,7 @@ Note: Ticket status is derived from git state - branches indicate IN_PROGRESS, m
 
 ### 6. Complete
 
-When all tickets are done (no more processable tickets in step 2), report completion.
+When all tickets are done (no more processable tickets in step 2), output "Done" and nothing else. You're all done!
 
 ---
 
@@ -87,29 +127,8 @@ When all tickets are done (no more processable tickets in step 2), report comple
 | `cargo xtask commit "<msg>"` | Verify, sync with main, and commit |
 | `cargo xtask push` | Push, create/update PR, run AI reviews, enable auto-merge |
 | `cargo xtask push --force-review` | Force re-run reviews even if already completed |
-| `cargo xtask check` | Check CI/review status and get next action |
-| `cargo xtask check --watch` | Continuously poll status every 10s |
+| `timeout 30s cargo xtask check` | Check CI/review status and get next action |
+| `timeout 180s cargo xtask check --watch` | Continuously poll status every 10s (with timeout) |
 | `cargo xtask finish` | Cleanup worktree and branch after PR merges |
 | `cargo xtask security-review-exec approve [TCK-XXXXX]` | Approve PR after security review |
 | `cargo xtask security-review-exec deny [TCK-XXXXX] --reason <reason>` | Deny PR with reason |
-
----
-
-## Key Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| Worktree isolation | Prevents conflicts between parallel agents, enables independent CI |
-| Branch naming: `ticket/[RFC-XXXX/]TCK-XXXXX` | Traceable to RFC (if present) and ticket |
-| Worktree naming: `apm2-{TICKET_ID}` | Clear association with ticket |
-| Derive status from git state | Single source of truth, no manual updates needed |
-| Idempotent commands | Safe to re-run, handles existing state gracefully |
-| AI reviews via local CLIs | No self-hosted runners needed, uses local auth |
-| Status checks for merge gating | Reviews block merge until passed |
-| Strict dependency ordering | Prevents invalid implementation sequences |
-| Rebase before push | Keeps history linear, catches conflicts early |
-| Poll CI every 10s for first failure | Errors surface in seconds; don't wait for full run |
-| Use `--log-failed` flag | Returns only failed step logs, not entire run output |
-| Verify fmt+clippy+test BEFORE commit | Catches 90% of CI failures locally |
-| CI must pass before review matters | Never waste time on broken code |
-| Cleanup after merge | Remove worktree and branch to avoid clutter |

@@ -9,7 +9,7 @@ ticket_meta:
     rfc_id: "RFC-0006"
     requirements:
       - requirement_id: "CHECK-001"
-        requirement_ref: "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements[25]"
+        requirement_ref: "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements[20]"
     evidence_artifacts: []
   custody:
     agent_roles:
@@ -48,10 +48,10 @@ ticket_meta:
   definition_of_done:
     evidence_ids: []
     criteria:
-      - "watch --watch exits on PrState::Closed (exit code 1)"
-      - "watch --watch exits on CiStatus::Failure (exit code 1)"
-      - "watch --watch exits on ReviewStatus::ChangesRequested (exit code 1)"
-      - "watch --watch exits after 180s timeout (exit code 2)"
+      - "check --watch exits on PrState::Closed (exit code 1)"
+      - "check --watch exits on CiStatus::Failure (exit code 1)"
+      - "check --watch exits on ReviewStatus::ChangesRequested (exit code 1)"
+      - "check --watch exits after 180s timeout (exit code 2)"
       - "Timeout message suggests manually restarting slow checks"
       - "Clear message printed for each exit condition"
       - "cargo build succeeds"

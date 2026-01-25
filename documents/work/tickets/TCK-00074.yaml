@@ -9,7 +9,7 @@ ticket_meta:
     rfc_id: "RFC-0006"
     requirements:
       - requirement_id: "AAT-002"
-        requirement_ref: "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements[20]"
+        requirement_ref: "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements[15]"
     evidence_artifacts: []
   custody:
     agent_roles:
@@ -31,7 +31,7 @@ ticket_meta:
       - "Multiple prompt template variants"
   plan:
     steps:
-      - "Create documents/reviews/AAT_HYPOTHESIS_PROMPT.md with prompt template"
+      - "Verify documents/reviews/AAT_HYPOTHESIS_PROMPT.md exists and update if needed"
       - "Template includes: PR description, diff summary, expected output format"
       - "Output format: JSON array of hypothesis objects"
       - "Replace generate_hypotheses() stub with AI invocation"
@@ -46,7 +46,7 @@ ticket_meta:
   definition_of_done:
     evidence_ids: []
     criteria:
-      - "AAT_HYPOTHESIS_PROMPT.md exists with structured prompt template"
+      - "AAT_HYPOTHESIS_PROMPT.md verified and updated if needed"
       - "generate_hypotheses() invokes configured AI tool"
       - "AI response is parsed into Vec<Hypothesis>"
       - "At least 3 hypotheses are generated"
@@ -104,5 +104,5 @@ ticket_meta:
           .output()?;
       ```
     affected_files: |
-      New: documents/reviews/AAT_HYPOTHESIS_PROMPT.md
+      Existing: documents/reviews/AAT_HYPOTHESIS_PROMPT.md (verify and update if needed)
       Modified: xtask/src/tasks/aat.rs (replace generate_hypotheses stub)

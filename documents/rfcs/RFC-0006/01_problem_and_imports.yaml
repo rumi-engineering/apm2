@@ -489,7 +489,7 @@ rfc_problem_and_imports:
           - "Evidence script path validated for existence"
           - "Evidence script validated for executable permission"
           - "Usage section requires at least 1 code block"
-          - "Expected outcomes checked for When/Then keywords"
+          - "Expected outcomes require BOTH When AND Then keywords"
           - "Actionable error messages for each failure"
         verification:
           command: "cargo xtask aat <PR_URL> --dry-run"

@@ -9,7 +9,7 @@ ticket_meta:
     rfc_id: "RFC-0006"
     requirements:
       - requirement_id: "AAT-004"
-        requirement_ref: "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements[22]"
+        requirement_ref: "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements[17]"
     evidence_artifacts: []
   custody:
     agent_roles:

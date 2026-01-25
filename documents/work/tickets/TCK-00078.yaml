@@ -9,7 +9,7 @@ ticket_meta:
     rfc_id: "RFC-0006"
     requirements:
       - requirement_id: "AAT-006"
-        requirement_ref: "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements[24]"
+        requirement_ref: "documents/rfcs/RFC-0006/01_problem_and_imports.yaml#rfc_local_requirements.requirements[19]"
     evidence_artifacts: []
   custody:
     agent_roles:
@@ -22,7 +22,7 @@ ticket_meta:
     in_scope:
       - "Validate evidence script path exists and is executable"
       - "Validate Usage section contains at least 1 code block"
-      - "Validate Expected Outcomes follow When/Then format"
+      - "Validate Expected Outcomes contain BOTH When AND Then keywords"
       - "Return actionable errors for each validation failure"
     out_of_scope:
       - "Execution of evidence script during validation"
@@ -36,7 +36,7 @@ ticket_meta:
       - "Add validate_usage_section() to parser.rs"
       - "Check for at least 1 markdown code block (``` delimiters)"
       - "Add validate_expected_outcomes() to parser.rs"
-      - "Check outcomes contain When/Then keywords"
+      - "Check outcomes contain BOTH When AND Then keywords"
       - "Create ValidationError enum with specific variants"
       - "Return Vec<ValidationError> with actionable messages"
       - "Integrate validation into aat.rs after parsing"
@@ -49,7 +49,7 @@ ticket_meta:
     criteria:
       - "validate_evidence_script() checks existence and executable"
       - "validate_usage_section() requires at least 1 code block"
-      - "validate_expected_outcomes() checks When/Then format"
+      - "validate_expected_outcomes() requires BOTH When AND Then keywords"
       - "Actionable error messages for each validation failure"
       - "Validation integrated into AAT run flow"
       - "cargo build succeeds"
@@ -139,10 +139,10 @@ ticket_meta:
               errors.push(ValidationError::UsageMissingCodeBlock);
           }
 
-          // Validate outcomes have When/Then
+          // Validate outcomes have both When AND Then (require both keywords)
           for outcome in &parsed.expected_outcomes {
               let text_lower = outcome.text.to_lowercase();
-              if !text_lower.contains("when") && !text_lower.contains("then") {
+              if !text_lower.contains("when") || !text_lower.contains("then") {
                   errors.push(ValidationError::OutcomeMissingWhenThen {
                       outcome: outcome.text.clone(),
                   });
