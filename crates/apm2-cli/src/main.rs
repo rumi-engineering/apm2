@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -100,6 +100,11 @@ enum Commands {
     /// Credential management
     #[command(subcommand)]
     Creds(CredsCommands),
+
+    // === Factory (Agent) orchestration ===
+    /// Factory commands
+    #[command(subcommand)]
+    Factory(FactoryCommands),
 }
 
 #[derive(Subcommand, Debug)]
@@ -150,6 +155,19 @@ enum CredsCommands {
         /// Profile ID to create
         #[arg(short, long)]
         profile_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FactoryCommands {
+    /// Run an agent task from a spec
+    Run {
+        /// Path to the spec file (PRD, RFC, or Ticket)
+        spec_file: PathBuf,
+
+        /// Output format (text, json)
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 }
 
@@ -209,6 +227,15 @@ fn main() -> Result<()> {
                 provider,
                 profile_id,
             } => commands::creds::login(&provider, profile_id.as_deref()),
+        },
+        Commands::Factory(cmd) => match cmd {
+            FactoryCommands::Run { spec_file, format } => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("Failed to build tokio runtime")?;
+                rt.block_on(commands::factory::run(&spec_file, &format))
+            },
         },
     }
 }

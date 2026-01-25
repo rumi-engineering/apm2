@@ -39,6 +39,8 @@ tracing-subscriber.workspace = true
 
 # Utilities
 directories.workspace = true
+uuid.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
