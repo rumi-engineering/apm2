@@ -23,6 +23,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use xshell::{Shell, cmd};
 
+use crate::reviewer_state::{
+    HealthStatus, ReviewerStateFile, acquire_remediation_lock, kill_process,
+};
 use crate::util::{current_branch, validate_ticket_branch};
 
 /// A single check run from GitHub's API.
@@ -73,6 +76,7 @@ pub fn run(watch: bool) -> Result<()> {
         loop {
             let status = check_status(&sh, &branch_name)?;
             print_status(&status);
+            display_reviewer_health(&sh)?;
 
             // If merged, no need to keep watching
             if status.pr_state == Some(PrState::Merged) {
@@ -97,6 +101,7 @@ pub fn run(watch: bool) -> Result<()> {
     } else {
         let status = check_status(&sh, &branch_name)?;
         print_status(&status);
+        display_reviewer_health(&sh)?;
     }
 
     Ok(())
@@ -465,6 +470,220 @@ fn print_status(status: &Status) {
             },
         }
     }
+}
+
+/// Display the health status of active reviewers and auto-remediate if needed.
+///
+/// For each active reviewer in the state file, this function:
+/// 1. Checks the health status (Healthy, Stale, or Dead)
+/// 2. Displays the status with PID, last activity elapsed time
+/// 3. Auto-remediates unhealthy reviewers (Stale or Dead) by killing the
+///    process and restarting the review
+fn display_reviewer_health(sh: &Shell) -> Result<()> {
+    let state = ReviewerStateFile::load()?;
+
+    if state.reviewers.is_empty() {
+        return Ok(());
+    }
+
+    println!();
+    println!("Reviewer Health:");
+    println!("----------------");
+
+    // Process reviewers in a consistent order (security first, then quality)
+    let reviewer_order = ["security", "quality"];
+
+    for reviewer_type in &reviewer_order {
+        if let Some(entry) = state.reviewers.get(*reviewer_type) {
+            let health = entry.check_health();
+            let elapsed = entry
+                .get_log_mtime_elapsed()
+                .map_or_else(|| "unknown".to_string(), |s| format!("{s}s"));
+
+            let status_display = match health {
+                HealthStatus::Healthy => format!(
+                    "  [ok] {}: PID {} | Last activity: {} ago | Status: {}",
+                    capitalize(reviewer_type),
+                    entry.pid,
+                    elapsed,
+                    health.as_str()
+                ),
+                HealthStatus::Stale | HealthStatus::Dead => format!(
+                    "  [!] {}: PID {} | Last activity: {} ago | Status: {}",
+                    capitalize(reviewer_type),
+                    entry.pid,
+                    elapsed,
+                    health.as_str()
+                ),
+            };
+            println!("{status_display}");
+
+            // Auto-remediate unhealthy reviewers
+            if health != HealthStatus::Healthy {
+                remediate_reviewer(sh, reviewer_type, entry, health)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Capitalize the first letter of a string.
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// Remediate an unhealthy reviewer by killing it and restarting the review.
+fn remediate_reviewer(
+    sh: &Shell,
+    reviewer_type: &str,
+    entry: &crate::reviewer_state::ReviewerEntry,
+    health: HealthStatus,
+) -> Result<()> {
+    // Try to acquire lock to prevent concurrent remediation
+    let Ok(_lock) = acquire_remediation_lock() else {
+        println!("      Skipping remediation (another remediation in progress)");
+        return Ok(());
+    };
+
+    let elapsed = entry
+        .get_log_mtime_elapsed()
+        .map_or_else(|| "unknown".to_string(), |s| format!("{s}s"));
+
+    println!(
+        "  [!] {} reviewer {} ({}), restarting...",
+        capitalize(reviewer_type),
+        if health == HealthStatus::Stale {
+            "stale"
+        } else {
+            "dead"
+        },
+        elapsed
+    );
+
+    // Kill the stale/dead process
+    if health == HealthStatus::Stale {
+        let killed = kill_process(entry.pid);
+        if killed {
+            println!("      Killed process {}", entry.pid);
+        }
+    }
+
+    // Remove old log file
+    if entry.log_file.exists() {
+        let _ = std::fs::remove_file(&entry.log_file);
+    }
+
+    // Load state, remove entry, save
+    let mut state = ReviewerStateFile::load()?;
+    state.remove_reviewer(reviewer_type);
+    state.save()?;
+
+    // Re-trigger the review using the saved PR URL and HEAD SHA
+    restart_review(sh, reviewer_type, &entry.pr_url, &entry.head_sha)?;
+
+    Ok(())
+}
+
+/// Restart a review using the PR URL and HEAD SHA from the state file.
+fn restart_review(sh: &Shell, reviewer_type: &str, pr_url: &str, head_sha: &str) -> Result<()> {
+    let repo_root = cmd!(sh, "git rev-parse --show-toplevel")
+        .read()
+        .context("Failed to get repository root")?
+        .trim()
+        .to_string();
+
+    let prompt_path = match reviewer_type {
+        "security" => format!("{repo_root}/documents/reviews/SECURITY_REVIEW_PROMPT.md"),
+        "quality" => format!("{repo_root}/documents/reviews/CODE_QUALITY_PROMPT.md"),
+        _ => return Ok(()),
+    };
+
+    if !std::path::Path::new(&prompt_path).exists() {
+        println!("      Warning: Review prompt not found at {prompt_path}");
+        return Ok(());
+    }
+
+    // Read and substitute variables in the prompt
+    let prompt_content =
+        std::fs::read_to_string(&prompt_path).context("Failed to read review prompt")?;
+
+    let prompt = prompt_content
+        .replace("$PR_URL", pr_url)
+        .replace("$HEAD_SHA", head_sha);
+
+    // Create log file using tempfile
+    let log_file = tempfile::Builder::new()
+        .prefix(&format!("apm2_review_{reviewer_type}_"))
+        .suffix(".log")
+        .tempfile()
+        .context("Failed to create log file")?;
+
+    // Keep the log file (don't delete on drop)
+    let (_, log_path) = log_file.keep().context("Failed to persist log file")?;
+
+    // Create prompt temp file
+    let mut prompt_file =
+        tempfile::NamedTempFile::new().context("Failed to create prompt temp file")?;
+    std::io::Write::write_all(&mut prompt_file, prompt.as_bytes())
+        .context("Failed to write prompt")?;
+
+    let (_, prompt_path) = prompt_file
+        .keep()
+        .context("Failed to persist prompt file")?;
+
+    let prompt_path_str = prompt_path.display().to_string();
+    let log_path_str = log_path.display().to_string();
+
+    // Spawn the reviewer process
+    let shell_cmd = format!(
+        "(script -q \"{log_path_str}\" -c \"gemini --yolo < '{prompt_path_str}'\"; rm -f '{prompt_path_str}') &"
+    );
+
+    let child = std::process::Command::new("sh")
+        .args(["-c", &shell_cmd])
+        .spawn();
+
+    match child {
+        Ok(mut child) => {
+            // Get the PID of the shell process
+            let pid = child.id();
+
+            // Wait briefly to let the shell start the script command
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // Record the new entry in state file
+            let mut state = ReviewerStateFile::load()?;
+            state.set_reviewer(
+                reviewer_type,
+                crate::reviewer_state::ReviewerEntry {
+                    pid,
+                    started_at: chrono::Utc::now(),
+                    log_file: log_path,
+                    pr_url: pr_url.to_string(),
+                    head_sha: head_sha.to_string(),
+                },
+            );
+            state.save()?;
+
+            println!(
+                "      Restarted {} review (PID: {})",
+                capitalize(reviewer_type),
+                pid
+            );
+
+            // Don't wait for the child - it's running in background
+            let _ = child.wait();
+        },
+        Err(e) => {
+            println!("      Failed to restart review: {e}");
+        },
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

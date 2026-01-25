@@ -15,8 +15,11 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use tempfile::NamedTempFile;
 use xshell::{Shell, cmd};
+
+use crate::reviewer_state::{ReviewerEntry, ReviewerStateFile};
 
 /// Review type determines which prompt and status check to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +255,13 @@ fn run_ai_review(
         review_type.display_name()
     );
 
+    // Determine the reviewer type key for state tracking
+    let reviewer_type_key = match review_type {
+        ReviewType::Security => "security",
+        ReviewType::Quality => "quality",
+        ReviewType::Uat => unreachable!("UAT is handled separately"),
+    };
+
     // Run the AI tool synchronously (not in background)
     // The AI tool is responsible for:
     // 1. Posting the review comment
@@ -266,19 +276,53 @@ fn run_ai_review(
     // 1. Avoid shell escaping issues with complex markdown
     // 2. Use random filenames to prevent symlink/TOCTOU attacks
     // 3. Create with restrictive permissions (0600)
-    // 4. Auto-cleanup when NamedTempFile is dropped
+    // 4. Redirect output to log file for mtime-based health monitoring
     match review_type {
         ReviewType::Security | ReviewType::Quality => {
-            // temp_file is auto-deleted when dropped at end of closure
-            let result = NamedTempFile::new().and_then(|mut temp_file| {
-                temp_file.write_all(prompt.as_bytes())?;
-                let prompt_path = temp_file.path().display().to_string();
-                let shell_cmd =
-                    format!("script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null");
-                std::process::Command::new("sh")
-                    .args(["-c", &shell_cmd])
-                    .status()
-            });
+            // Create log file for output capture (mtime tracking)
+            let log_file = tempfile::Builder::new()
+                .prefix(&format!("apm2_review_{reviewer_type_key}_"))
+                .suffix(".log")
+                .tempfile()
+                .context("Failed to create log file")?;
+
+            // Keep the log file
+            let (_, log_path) = log_file.keep().context("Failed to persist log file")?;
+            let log_path_str = log_path.display().to_string();
+
+            // Create prompt temp file
+            let mut prompt_temp =
+                NamedTempFile::new().context("Failed to create prompt temp file")?;
+            prompt_temp.write_all(prompt.as_bytes())?;
+            let prompt_temp_path = prompt_temp.path().display().to_string();
+
+            // Record entry in state file before starting
+            let mut state = ReviewerStateFile::load().unwrap_or_default();
+
+            // We'll use 0 as PID initially since this is synchronous
+            // The actual process PID will be different but we track state anyway
+            let entry = ReviewerEntry {
+                pid: std::process::id(), // Use current process as placeholder
+                started_at: Utc::now(),
+                log_file: log_path.clone(),
+                pr_url: pr_url.to_string(),
+                head_sha: head_sha.to_string(),
+            };
+            state.set_reviewer(reviewer_type_key, entry);
+            let _ = state.save();
+
+            // Run with log capture
+            let shell_cmd =
+                format!("script -q \"{log_path_str}\" -c \"gemini --yolo < '{prompt_temp_path}'\"");
+            let result = std::process::Command::new("sh")
+                .args(["-c", &shell_cmd])
+                .status();
+
+            // Clean up: remove from state and delete log file
+            let mut state = ReviewerStateFile::load().unwrap_or_default();
+            state.remove_reviewer(reviewer_type_key);
+            let _ = state.save();
+            let _ = std::fs::remove_file(&log_path);
 
             let status_context = review_type.status_context();
             match result {
