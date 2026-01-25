@@ -30,9 +30,8 @@ use crate::util::{current_branch, validate_ticket_branch};
 /// The `gh pr checks --json` command returns these fields:
 /// - `state`: PENDING, `IN_PROGRESS`, SUCCESS, FAILURE, etc.
 /// - `bucket`: pending, pass, fail
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct CheckRun {
-    #[allow(dead_code)]
     name: String,
     #[serde(default)]
     state: Option<String>,
@@ -133,8 +132,8 @@ enum CiStatus {
     Pending,
     /// All checks passed
     Success,
-    /// One or more checks failed
-    Failure,
+    /// One or more checks failed, with the names of failed checks
+    Failure(Vec<String>),
 }
 
 /// Review status.
@@ -146,6 +145,33 @@ enum ReviewStatus {
     Approved,
     /// Changes requested
     ChangesRequested,
+}
+
+/// Get the remediation command for a specific check type.
+///
+/// Returns `Some(command)` if a known remediation command exists for the check
+/// name, or `None` if no specific fix is known.
+fn get_remediation_command(check_name: &str) -> Option<&'static str> {
+    // Normalize the check name for case-insensitive matching
+    let name_lower = check_name.to_lowercase();
+
+    // Match against known check types
+    if name_lower.contains("clippy") {
+        Some("cargo clippy --fix --allow-dirty")
+    } else if name_lower.contains("fmt") || name_lower.contains("format") {
+        Some("cargo fmt")
+    } else if name_lower.contains("test") {
+        Some("cargo test --workspace")
+    } else if name_lower.contains("review")
+        && (name_lower.contains("security") || name_lower.contains("quality"))
+    {
+        // Both security and quality review failures have the same fix
+        Some("cargo xtask push --force-review")
+    } else if name_lower.contains("semver") {
+        Some("cargo semver-checks")
+    } else {
+        None
+    }
 }
 
 /// Check the current status.
@@ -245,7 +271,8 @@ fn get_ci_status(sh: &Shell, branch_name: &str) -> Result<CiStatus> {
 /// determines the overall CI status:
 /// - If any check has bucket=pending or state is PENDING/`IN_PROGRESS`: return
 ///   Pending
-/// - If any check has bucket=fail or state is FAILURE: return Failure
+/// - If any check has bucket=fail or state is FAILURE: return Failure with
+///   names
 /// - Otherwise: return Success
 fn parse_ci_status(output: &str) -> CiStatus {
     let trimmed = output.trim();
@@ -269,22 +296,26 @@ fn parse_ci_status(output: &str) -> CiStatus {
         return CiStatus::Pending;
     }
 
-    // Check for any failures first (bucket=fail/cancel or state=FAILURE)
+    // Collect failed check names
     // Per gh pr checks --help: bucket can be pass, fail, pending, skipping, or
     // cancel
-    for check in &checks {
-        if let Some(bucket) = &check.bucket {
-            // Both "fail" and "cancel" should be treated as failures
-            if bucket == "fail" || bucket == "cancel" {
-                return CiStatus::Failure;
-            }
-        }
-        if let Some(state) = &check.state {
-            let state_upper = state.to_uppercase();
-            if state_upper == "FAILURE" {
-                return CiStatus::Failure;
-            }
-        }
+    let failed_checks: Vec<String> = checks
+        .iter()
+        .filter(|check| {
+            check.bucket.as_ref().is_some_and(|bucket| {
+                // Both "fail" and "cancel" should be treated as failures
+                bucket == "fail" || bucket == "cancel"
+            }) || check
+                .state
+                .as_ref()
+                .is_some_and(|state| state.to_uppercase() == "FAILURE")
+        })
+        .map(|check| check.name.clone())
+        .collect();
+
+    // If any failures found, return Failure with the check names
+    if !failed_checks.is_empty() {
+        return CiStatus::Failure(failed_checks);
     }
 
     // Check for any pending/in-progress checks
@@ -355,7 +386,15 @@ fn print_status(status: &Status) {
             match &status.ci {
                 Some(CiStatus::Pending) => println!("  [..] CI checks running"),
                 Some(CiStatus::Success) => println!("  [ok] CI checks passed"),
-                Some(CiStatus::Failure) => println!("  [X] CI checks failed"),
+                Some(CiStatus::Failure(failed_checks)) => {
+                    // Display each failed check with its remediation hint
+                    for check_name in failed_checks {
+                        println!("  [X] {check_name} failed");
+                        if let Some(fix_cmd) = get_remediation_command(check_name) {
+                            println!("      Fix: {fix_cmd}");
+                        }
+                    }
+                },
                 None => {},
             }
 
@@ -393,7 +432,7 @@ fn print_status(status: &Status) {
         match &status.pr_state {
             Some(PrState::Open) => {
                 // Check CI first
-                if matches!(&status.ci, Some(CiStatus::Failure)) {
+                if matches!(&status.ci, Some(CiStatus::Failure(_))) {
                     println!("  Fix CI failures, then commit and push:");
                     println!("    cargo xtask commit '<fix message>'");
                     println!("    cargo xtask push");
@@ -487,7 +526,10 @@ mod tests {
             {"name": "build", "state": "SUCCESS", "bucket": "pass"},
             {"name": "test", "state": "FAILURE", "bucket": "fail"}
         ]"#;
-        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+        assert_eq!(
+            parse_ci_status(json),
+            CiStatus::Failure(vec!["test".to_string()])
+        );
     }
 
     #[test]
@@ -495,7 +537,10 @@ mod tests {
         let json = r#"[
             {"name": "build", "state": "SUCCESS", "bucket": "fail"}
         ]"#;
-        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+        assert_eq!(
+            parse_ci_status(json),
+            CiStatus::Failure(vec!["build".to_string()])
+        );
     }
 
     #[test]
@@ -519,7 +564,10 @@ mod tests {
         let json = r#"[
             {"name": "build", "state": "FAILURE", "bucket": "fail"}
         ]"#;
-        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+        assert_eq!(
+            parse_ci_status(json),
+            CiStatus::Failure(vec!["build".to_string()])
+        );
     }
 
     #[test]
@@ -543,7 +591,10 @@ mod tests {
             {"name": "lint", "state": "IN_PROGRESS", "bucket": "pending"},
             {"name": "test", "state": "FAILURE", "bucket": "fail"}
         ]"#;
-        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+        assert_eq!(
+            parse_ci_status(json),
+            CiStatus::Failure(vec!["test".to_string()])
+        );
     }
 
     #[test]
@@ -562,7 +613,10 @@ mod tests {
         let json = r#"[
             {"name": "build", "state": "COMPLETED", "bucket": "cancel"}
         ]"#;
-        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+        assert_eq!(
+            parse_ci_status(json),
+            CiStatus::Failure(vec!["build".to_string()])
+        );
     }
 
     #[test]
@@ -606,5 +660,104 @@ mod tests {
         assert_eq!(status.pr_state, Some(PrState::Open));
         assert_eq!(status.ci, Some(CiStatus::Success));
         assert_eq!(status.review, Some(ReviewStatus::Approved));
+    }
+
+    #[test]
+    fn test_get_remediation_command_clippy() {
+        assert_eq!(
+            get_remediation_command("Clippy"),
+            Some("cargo clippy --fix --allow-dirty")
+        );
+        assert_eq!(
+            get_remediation_command("clippy-checks"),
+            Some("cargo clippy --fix --allow-dirty")
+        );
+        assert_eq!(
+            get_remediation_command("Run Clippy"),
+            Some("cargo clippy --fix --allow-dirty")
+        );
+    }
+
+    #[test]
+    fn test_get_remediation_command_fmt() {
+        assert_eq!(get_remediation_command("Fmt"), Some("cargo fmt"));
+        assert_eq!(get_remediation_command("Format Check"), Some("cargo fmt"));
+        assert_eq!(get_remediation_command("rust-fmt"), Some("cargo fmt"));
+    }
+
+    #[test]
+    fn test_get_remediation_command_test() {
+        assert_eq!(
+            get_remediation_command("Test"),
+            Some("cargo test --workspace")
+        );
+        assert_eq!(
+            get_remediation_command("Unit Tests"),
+            Some("cargo test --workspace")
+        );
+        assert_eq!(
+            get_remediation_command("integration-test"),
+            Some("cargo test --workspace")
+        );
+    }
+
+    #[test]
+    fn test_get_remediation_command_security_review() {
+        assert_eq!(
+            get_remediation_command("Security Review"),
+            Some("cargo xtask push --force-review")
+        );
+        assert_eq!(
+            get_remediation_command("security-review-check"),
+            Some("cargo xtask push --force-review")
+        );
+    }
+
+    #[test]
+    fn test_get_remediation_command_quality_review() {
+        assert_eq!(
+            get_remediation_command("Quality Review"),
+            Some("cargo xtask push --force-review")
+        );
+        assert_eq!(
+            get_remediation_command("code-quality-review"),
+            Some("cargo xtask push --force-review")
+        );
+    }
+
+    #[test]
+    fn test_get_remediation_command_semver() {
+        assert_eq!(
+            get_remediation_command("SemverCheck"),
+            Some("cargo semver-checks")
+        );
+        assert_eq!(
+            get_remediation_command("semver-checks"),
+            Some("cargo semver-checks")
+        );
+    }
+
+    #[test]
+    fn test_get_remediation_command_unknown() {
+        assert_eq!(get_remediation_command("Unknown Check"), None);
+        assert_eq!(get_remediation_command("build"), None);
+        assert_eq!(get_remediation_command("deploy"), None);
+    }
+
+    #[test]
+    fn test_parse_ci_status_multiple_failures() {
+        let json = r#"[
+            {"name": "Clippy", "state": "FAILURE", "bucket": "fail"},
+            {"name": "Test", "state": "FAILURE", "bucket": "fail"}
+        ]"#;
+        let result = parse_ci_status(json);
+        match result {
+            CiStatus::Failure(failed) => {
+                assert_eq!(failed.len(), 2);
+                assert!(failed.contains(&"Clippy".to_string()));
+                assert!(failed.contains(&"Test".to_string()));
+            },
+            _ => panic!("Expected CiStatus::Failure"),
+        }
     }
 }
