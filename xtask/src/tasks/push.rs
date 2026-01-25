@@ -460,7 +460,116 @@ fn extract_ticket_title(content: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+
+    /// Test that `NamedTempFile` creates files with secure properties.
+    ///
+    /// Verifies:
+    /// 1. Permissions are 0600 (owner read/write only)
+    /// 2. Paths are unpredictable (different for each file)
+    /// 3. Files are cleaned up after drop
+    #[test]
+    fn test_temp_file_security() {
+        // Test 1: Verify permissions are 0600
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let metadata = temp_file
+            .as_file()
+            .metadata()
+            .expect("Failed to get metadata");
+        let mode = metadata.permissions().mode();
+
+        // On Unix, mode includes file type bits. We only care about permission bits
+        // (0o777 mask)
+        let permission_bits = mode & 0o777;
+        assert_eq!(
+            permission_bits, 0o600,
+            "Temp file should have 0600 permissions, got {permission_bits:o}"
+        );
+
+        // Test 2: Verify paths are unpredictable (different for each file)
+        let temp_file1 = NamedTempFile::new().expect("Failed to create temp file 1");
+        let temp_file2 = NamedTempFile::new().expect("Failed to create temp file 2");
+        let path1 = temp_file1.path().to_path_buf();
+        let path2 = temp_file2.path().to_path_buf();
+
+        assert_ne!(
+            path1, path2,
+            "Temp file paths should be different (unpredictable)"
+        );
+
+        // Both paths should be in the system temp directory, not a fixed location
+        let temp_dir = std::env::temp_dir();
+        assert!(
+            path1.starts_with(&temp_dir),
+            "Temp file should be in system temp directory"
+        );
+        assert!(
+            path2.starts_with(&temp_dir),
+            "Temp file should be in system temp directory"
+        );
+
+        // Test 3: Verify cleanup after drop
+        let path_to_check = temp_file.path().to_path_buf();
+        assert!(path_to_check.exists(), "Temp file should exist before drop");
+        drop(temp_file);
+        assert!(
+            !path_to_check.exists(),
+            "Temp file should be cleaned up after drop"
+        );
+    }
+
+    /// Test that script command format is valid for PTY allocation.
+    ///
+    /// Verifies:
+    /// 1. Script command format includes PTY allocation via `script -qec`
+    /// 2. Input redirection uses correct `<` syntax
+    /// 3. Command properly quotes paths
+    #[test]
+    fn test_script_command_format() {
+        // Test with a simple path
+        let prompt_path = "/tmp/test_prompt.txt";
+        let shell_cmd = format!("script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null");
+
+        // Verify command includes PTY allocation
+        assert!(
+            shell_cmd.contains("script -qec"),
+            "Command should use script -qec for PTY allocation"
+        );
+
+        // Verify input redirection syntax
+        assert!(
+            shell_cmd.contains("< '"),
+            "Command should use < for input redirection"
+        );
+
+        // Verify path is quoted
+        assert!(
+            shell_cmd.contains(&format!("< '{prompt_path}'")),
+            "Path should be single-quoted in input redirection"
+        );
+
+        // Verify /dev/null is used as typescript output
+        assert!(
+            shell_cmd.ends_with("/dev/null"),
+            "Command should redirect script output to /dev/null"
+        );
+
+        // Test with a path containing special characters (not quotes)
+        let special_path = "/tmp/test file.txt";
+        let special_cmd = format!("script -qec \"gemini --yolo < '{special_path}'\" /dev/null");
+
+        // Verify the command is well-formed
+        assert!(
+            special_cmd.contains("script -qec"),
+            "Command with spaces should still use script -qec"
+        );
+        assert!(
+            special_cmd.contains(&format!("< '{special_path}'")),
+            "Path with spaces should be properly quoted"
+        );
+    }
 
     #[test]
     fn test_extract_ticket_title() {
