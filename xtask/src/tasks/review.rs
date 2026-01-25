@@ -261,13 +261,23 @@ fn run_ai_review(
             // Using script -qec gives Gemini a headed environment where all tools
             // (including run_shell_command) are available. Without this, headless mode
             // filters out shell tools causing "Tool not found in registry" errors.
-            let shell_cmd = format!(
-                "script -qec \"gemini --yolo '{}'\" /dev/null",
-                prompt.replace('\'', "'\\''").replace('"', "\\\"")
-            );
-            let result = std::process::Command::new("sh")
-                .args(["-c", &shell_cmd])
-                .status();
+            //
+            // We write the prompt to a temp file to avoid shell escaping issues with
+            // the complex markdown prompt containing backticks, nested quotes, etc.
+            let prompt_file =
+                std::env::temp_dir().join(format!("gemini_review_{}.md", std::process::id()));
+            let result = if std::fs::write(&prompt_file, &prompt).is_ok() {
+                let prompt_path = prompt_file.display().to_string();
+                let shell_cmd =
+                    format!("script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null");
+                let res = std::process::Command::new("sh")
+                    .args(["-c", &shell_cmd])
+                    .status();
+                let _ = std::fs::remove_file(&prompt_file);
+                res
+            } else {
+                Err(std::io::Error::other("Failed to write prompt file"))
+            };
 
             match result {
                 Ok(status) if status.success() => {

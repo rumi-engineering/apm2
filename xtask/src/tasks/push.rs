@@ -299,16 +299,26 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
             // Using script -qec gives Gemini a headed environment where all tools
             // (including run_shell_command) are available. Without this, headless mode
             // filters out shell tools causing "Tool not found in registry" errors.
-            let _ = std::process::Command::new("sh")
-                .args([
-                    "-c",
-                    &format!(
-                        "script -qec \"gemini --yolo '{}'\" /dev/null &",
-                        prompt.replace('\'', "'\\''").replace('"', "\\\"")
-                    ),
-                ])
-                .spawn();
-            println!("    Security review started in background");
+            //
+            // We write the prompt to a temp file to avoid shell escaping issues with
+            // the complex markdown prompt containing backticks, nested quotes, etc.
+            let prompt_file =
+                std::env::temp_dir().join(format!("gemini_prompt_{}.md", std::process::id()));
+            if std::fs::write(&prompt_file, &prompt).is_ok() {
+                let prompt_path = prompt_file.display().to_string();
+                // Use a subshell that runs gemini then cleans up the temp file
+                let _ = std::process::Command::new("sh")
+                    .args([
+                        "-c",
+                        &format!(
+                            "(script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null; rm -f '{prompt_path}') &"
+                        ),
+                    ])
+                    .spawn();
+                println!("    Security review started in background");
+            } else {
+                println!("    Warning: Failed to write prompt file for Gemini");
+            }
         }
     } else if !gemini_available {
         println!("  Note: Gemini CLI not available, skipping security review");
