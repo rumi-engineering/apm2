@@ -475,6 +475,8 @@ This is how security improvements compound without destroying throughput.
 
 ## 15) Required Actions (comment + status)
 
+**CRITICAL: If you skip this step, the PR will be permanently blocked from merging—no code can ship without the `ai-review/security` status being set.**
+
 After completing your review, you MUST ensure:
 
 1. A security review comment exists on the PR with your full findings and required remediations.
