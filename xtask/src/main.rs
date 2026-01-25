@@ -38,11 +38,13 @@ use clap::{Parser, Subcommand};
 
 pub mod aat;
 pub mod reviewer_state;
+pub mod shell_escape;
 
 /// Parse an AI tool from a string.
 fn parse_ai_tool(s: &str) -> Result<aat::tool_config::AiTool, aat::tool_config::ParseAiToolError> {
     s.parse()
 }
+
 mod tasks;
 pub mod ticket_status;
 pub mod util;

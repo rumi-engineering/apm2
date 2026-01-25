@@ -27,6 +27,7 @@ use crate::reviewer_state::{
     HealthStatus, MAX_RESTART_ATTEMPTS, ReviewerEntry, ReviewerStateFile, acquire_remediation_lock,
     kill_process,
 };
+use crate::shell_escape::build_script_command_with_cleanup;
 use crate::util::{current_branch, validate_ticket_branch};
 
 /// Watch mode timeout in seconds.
@@ -864,15 +865,12 @@ fn restart_review(
         .keep()
         .context("Failed to persist prompt file")?;
 
-    let prompt_path_str = prompt_path.display().to_string();
-    let log_path_str = log_path.display().to_string();
-
     // Spawn the reviewer process
     // Note: No trailing `&` - Command::spawn() runs asynchronously, and we need
     // the sh process to stay alive so the tracked PID remains valid.
-    let shell_cmd = format!(
-        "script -q \"{log_path_str}\" -c \"gemini --yolo < '{prompt_path_str}'\"; rm -f '{prompt_path_str}'"
-    );
+    //
+    // Use build_script_command_with_cleanup for safe path quoting
+    let shell_cmd = build_script_command_with_cleanup(&prompt_path, &log_path);
 
     let child = std::process::Command::new("sh")
         .args(["-c", &shell_cmd])
