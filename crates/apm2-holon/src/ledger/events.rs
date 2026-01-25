@@ -19,13 +19,14 @@
 //! };
 //!
 //! // Create an episode started event
-//! let started = EpisodeStarted::new(
+//! let started = EpisodeStarted::try_new(
 //!     "ep-001",
 //!     "work-123",
 //!     "lease-456",
 //!     1,
 //!     1_000_000_000,
-//! );
+//! )
+//! .expect("valid IDs");
 //!
 //! // Create a completion event
 //! let completed = EpisodeCompleted::new(
@@ -209,6 +210,12 @@ impl EpisodeStarted {
     }
 
     /// Creates a new episode started event without validation.
+    ///
+    /// # Warning
+    ///
+    /// **This constructor skips ID validation.** It should only be used when
+    /// IDs are guaranteed to be valid (e.g., internal logic or after prior
+    /// validation). For external input, always use [`try_new`](Self::try_new).
     ///
     /// # Safety Note (Logic)
     ///

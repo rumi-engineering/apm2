@@ -22,14 +22,15 @@
 //!     EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted,
 //! };
 //!
-//! // Record episode start
-//! let started = EpisodeStarted::new(
+//! // Record episode start - use try_new for validated construction
+//! let started = EpisodeStarted::try_new(
 //!     "ep-001",
 //!     "work-123",
 //!     "lease-456",
 //!     1,
 //!     1_000_000_000,
-//! );
+//! )
+//! .expect("valid IDs");
 //!
 //! // Simulate execution...
 //!
