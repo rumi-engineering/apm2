@@ -93,8 +93,8 @@ const MAX_TOKENS: u64 = 1_000_000;
 /// Expected hash size (BLAKE3 = 32 bytes).
 const HASH_SIZE: usize = 32;
 
-/// Maximum number of items in repeated fields (prevents DoS via unbounded
-/// lists).
+/// Maximum number of items in repeated fields (prevents denial-of-service via
+/// unbounded lists).
 const MAX_REPEATED_ITEMS: usize = 1000;
 
 /// Known git operations.
@@ -833,10 +833,10 @@ mod validation_tests {
 
     #[test]
     fn test_shell_exec_too_many_env_vars() {
-        let env_vars: Vec<String> = (0..MAX_REPEATED_ITEMS + 1)
+        let env_vars: Vec<String> = (0..=MAX_REPEATED_ITEMS)
             .map(|i| format!("VAR{i}=val"))
             .collect();
-        
+
         let req = ToolRequest {
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
@@ -853,5 +853,56 @@ mod validation_tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.rule == "max_items"));
+    }
+
+    #[test]
+    fn test_git_op_too_many_args() {
+        let args: Vec<String> = (0..=MAX_REPEATED_ITEMS)
+            .map(|i| format!("--arg{i}"))
+            .collect();
+
+        let req = ToolRequest {
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::GitOp(GitOperation {
+                operation: "DIFF".to_string(),
+                args,
+                cwd: String::new(),
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.rule == "max_items"));
+        assert!(errors.iter().any(|e| e.field == "git_op.args"));
+    }
+
+    #[test]
+    fn test_artifact_publish_too_many_metadata() {
+        let metadata: Vec<String> = (0..=MAX_REPEATED_ITEMS)
+            .map(|i| format!("key{i}=value"))
+            .collect();
+
+        let req = ToolRequest {
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactPublish(ArtifactPublish {
+                artifact_id: "art-001".to_string(),
+                content_hash: vec![0u8; 32],
+                category: "test".to_string(),
+                metadata,
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.rule == "max_items"));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "artifact_publish.metadata")
+        );
     }
 }
