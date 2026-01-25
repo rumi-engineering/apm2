@@ -20,6 +20,11 @@ rfc_governance_and_gates:
         - Lint command implementation approach
         - Gemini CLI switch for code quality
         - Reviewer agent health monitoring and auto-remediation
+        - Shell command safety utility design (Phase 4)
+        - Reviewer spawn logic centralization (Phase 4)
+        - Cross-platform process checking approach (Phase 4)
+        - Temp file lifecycle management (Phase 4)
+        - Documentation example linting (Phase 4)
 
     - gate: SECURITY_REVIEW
       status: PENDING
@@ -85,6 +90,26 @@ rfc_governance_and_gates:
     - item: "Reviewer health monitoring with auto-remediation works"
       status: PENDING
       ticket: "TCK-00067"
+
+    - item: "Shell command safety utility prevents injection vulnerabilities"
+      status: PENDING
+      ticket: "TCK-00068"
+
+    - item: "Reviewer spawn logic centralized in ReviewerSpawner"
+      status: PENDING
+      ticket: "TCK-00069"
+
+    - item: "Cross-platform process checks use sysinfo instead of /proc"
+      status: PENDING
+      ticket: "TCK-00070"
+
+    - item: "Temp files tracked in state for reliable cleanup"
+      status: PENDING
+      ticket: "TCK-00071"
+
+    - item: "Documentation examples pass lint checks"
+      status: PENDING
+      ticket: "TCK-00072"
 
     - item: "No new security vulnerabilities introduced"
       status: PENDING

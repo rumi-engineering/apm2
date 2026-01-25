@@ -126,8 +126,8 @@ rfc_problem_and_imports:
             - Gemini writes to stdout/stderr which is captured in the log
             - Any tool execution produces output that updates mtime
             - No need to parse Gemini's output format (which may change)
-            Fallback: If mtime unchanged for >60s but process is alive, treat as stale.
-      stale_threshold: "60 seconds since last activity (log file mtime)"
+            Fallback: If mtime unchanged for >300s but process is alive, treat as stale.
+      stale_threshold: "300 seconds (5 minutes) since last activity (log file mtime)"
       state_storage: |
         Store reviewer state in a JSON file (~/.apm2/reviewer_state.json).
         Use atomic writes (write to temp file, then rename) to prevent corruption.
@@ -167,7 +167,7 @@ rfc_problem_and_imports:
         The -c flag specifies the command to run.
         The log file's mtime updates whenever new output is written.
       auto_remediation: |
-        When an agent is unhealthy (process dead or last_activity > 60s ago):
+        When an agent is unhealthy (process dead or last_activity > 300s ago):
         1. Send SIGTERM to process, wait 5s, then SIGKILL if still alive
         2. Remove entry from state file (using atomic write)
         3. Re-trigger review with same PR URL and HEAD SHA
@@ -304,13 +304,13 @@ rfc_problem_and_imports:
           AI reviewer agents. For each active reviewer, it MUST report:
           1. Whether the process PID is alive (status)
           2. The timestamp of last activity (based on log file mtime)
-          When an agent is unhealthy (dead process or last activity >60s ago),
+          When an agent is unhealthy (dead process or last activity >300s ago),
           the check command MUST auto-remediate by killing the stale process
           and re-triggering the review.
         acceptance_criteria:
           - "Check displays reviewer PID alive/dead status for each review type"
           - "Check displays last activity timestamp for each active reviewer"
-          - "Unhealthy reviewers (>60s stale) are automatically killed and restarted"
+          - "Unhealthy reviewers (>300s stale) are automatically killed and restarted"
           - "Reviewer state persisted in ~/.apm2/reviewer_state.json"
           - "Gemini output redirected to log file for activity tracking (mtime)"
         verification:
@@ -320,3 +320,195 @@ rfc_problem_and_imports:
             - Security: PID <pid> | Last activity: <elapsed> ago | Status: HEALTHY/STALE/DEAD
             - Quality:  PID <pid> | Last activity: <elapsed> ago | Status: HEALTHY/STALE/DEAD
             Auto-remediation occurs when status is STALE or DEAD
+
+      - id: MAINT-015
+        type: SECURITY
+        title: "Shell command construction MUST use safe quoting utilities"
+        statement: |
+          All shell command construction in xtask MUST use safe quoting utilities
+          to prevent shell injection vulnerabilities from paths containing special
+          characters (spaces, quotes, backticks, etc.).
+        acceptance_criteria:
+          - "quote_path() utility exists for safe path quoting"
+          - "build_script_command() helper exists for PTY-wrapped commands"
+          - "No raw format!() shell string construction in xtask"
+          - "All shell paths use quote_path() or equivalent"
+        verification:
+          command: "grep -r 'format!' xtask/src | grep -v quote_path"
+          pass_condition: "No unquoted path interpolation in shell commands"
+
+      - id: MAINT-016
+        type: ENHANCEMENT
+        title: "Reviewer spawn logic MUST be centralized"
+        statement: |
+          All reviewer spawning logic (temp file creation, prompt interpolation,
+          script command construction, state persistence) MUST be centralized
+          in a single ReviewerSpawner component to eliminate code duplication.
+        acceptance_criteria:
+          - "ReviewerSpawner struct exists with spawn() method"
+          - "push.rs, check.rs, review.rs all use ReviewerSpawner"
+          - "No duplicate spawn logic exists across modules"
+        verification:
+          command: "cargo xtask lint --check-duplication"
+          pass_condition: "No duplicated spawn code patterns found"
+
+      - id: MAINT-017
+        type: ENHANCEMENT
+        title: "Process checks SHOULD be cross-platform"
+        statement: |
+          Process checking (PID alive, cmdline inspection) SHOULD use
+          cross-platform APIs instead of Linux-specific /proc filesystem
+          to enable macOS compatibility.
+        acceptance_criteria:
+          - "No direct /proc filesystem access"
+          - "sysinfo crate used for process introspection"
+          - "Code compiles for macOS target"
+        verification:
+          command: "cargo build --target x86_64-apple-darwin"
+          pass_condition: "Compiles successfully or documents exception"
+
+      - id: MAINT-018
+        type: SECURITY
+        title: "Temp files MUST be tracked for reliable cleanup"
+        statement: |
+          Temporary files created during reviewer execution MUST be tracked
+          in the reviewer state file for reliable cleanup. Manual rm -f in
+          shell commands MUST NOT be used for temp file cleanup.
+        acceptance_criteria:
+          - "Temp files tracked in reviewer_state.json"
+          - "No rm -f in shell command construction"
+          - "Orphaned temp files cleaned up by check command"
+        verification:
+          command: "grep -r 'rm -f' xtask/src"
+          pass_condition: "No rm -f in shell commands"
+
+      - id: MAINT-019
+        type: ENHANCEMENT
+        title: "Documentation examples MUST pass lint checks"
+        statement: |
+          Code examples in documentation (especially SAFE_RUST_PATTERNS.md)
+          MUST pass the same anti-pattern lint checks as production code
+          to prevent documentation from teaching bad patterns.
+        acceptance_criteria:
+          - "cargo xtask lint --include-docs scans markdown code blocks"
+          - "Detects unquoted shell paths in examples"
+          - "Warning displayed during commit if doc examples violate patterns"
+        verification:
+          command: "cargo xtask lint --include-docs"
+          pass_condition: "No anti-pattern warnings in documentation"
+
+      # Phase 5: AAT Completion and Check Watch Fix
+      - id: AAT-001
+        type: ENHANCEMENT
+        title: "AAT MUST support configurable AI tool backend"
+        statement: |
+          The AAT command MUST support configuring the AI tool backend via
+          environment variable (AAT_AI_TOOL) with CLI flag override (--ai-tool).
+          Supported values: gemini, claude-code. Default: gemini.
+        acceptance_criteria:
+          - "AAT_AI_TOOL environment variable selects backend"
+          - "Supported values: gemini, claude-code"
+          - "--ai-tool CLI flag overrides environment variable"
+          - "Default is gemini when neither set"
+        verification:
+          command: "AAT_AI_TOOL=claude-code cargo xtask aat --dry-run <URL>"
+          pass_condition: "Uses claude-code backend"
+
+      - id: AAT-002
+        type: ENHANCEMENT
+        title: "Hypothesis generation MUST use AI tool"
+        statement: |
+          The AAT hypothesis generation MUST invoke the configured AI tool
+          with PR description and diff to generate testable hypotheses.
+          The stub implementation MUST be replaced with real AI invocation.
+        acceptance_criteria:
+          - "AI tool invoked for hypothesis generation"
+          - "PR description and diff passed to AI"
+          - "At least 3 hypotheses generated"
+          - "At least 1 hypothesis tests error handling"
+        verification:
+          command: "cargo xtask aat <PR_URL> --dry-run"
+          pass_condition: "AI-generated hypotheses in output"
+
+      - id: AAT-003
+        type: ENHANCEMENT
+        title: "Hypotheses MUST be executed and verified"
+        statement: |
+          Each generated hypothesis MUST be executed by running its
+          verification_method command. The stdout, stderr, exit code,
+          and executed_at timestamp MUST be captured and stored.
+        acceptance_criteria:
+          - "Verification commands are executed"
+          - "stdout and stderr captured"
+          - "exit_code captured"
+          - "executed_at set AFTER command execution"
+          - "Result marked PASSED/FAILED based on exit code"
+        verification:
+          command: "cargo xtask aat <PR_URL>"
+          pass_condition: "Hypotheses show execution results with stdout/stderr"
+
+      - id: AAT-004
+        type: ENHANCEMENT
+        title: "AAT MUST test input variations to detect invariance"
+        statement: |
+          For each CLI command in hypotheses, AAT MUST generate at least 3
+          input variations, execute each, and detect invariance (identical
+          output for different inputs) as an anti-gaming violation.
+        acceptance_criteria:
+          - "At least 3 input variations per CLI command"
+          - "Each variation executed with output captured"
+          - "Invariance detected when all outputs identical"
+          - "Invariance flagged as anti-gaming violation"
+        verification:
+          command: "cargo xtask aat <PR_URL>"
+          pass_condition: "Input variations tested and invariance checked"
+
+      - id: AAT-005
+        type: BUG_FIX
+        title: "Anti-gaming MUST detect ISO timestamps"
+        statement: |
+          The anti-gaming analysis MUST detect hardcoded ISO 8601 timestamps
+          (e.g., 2026-01-25T10:00:00Z) in PR diffs as potential gaming.
+        acceptance_criteria:
+          - "TIMESTAMP_REGEX matches ISO 8601 format"
+          - "HardcodedTimestamp violation variant exists"
+          - "Timestamps in added lines detected"
+          - "Tests for timestamp detection pass"
+        verification:
+          command: "cargo test -p xtask test_timestamp"
+          pass_condition: "Timestamp detection tests pass"
+
+      - id: AAT-006
+        type: ENHANCEMENT
+        title: "Evidence script MUST be validated; PR format MUST be verified"
+        statement: |
+          AAT MUST validate that evidence scripts exist and are executable,
+          Usage sections contain code blocks, and Expected Outcomes follow
+          When/Then format. Actionable errors MUST be returned for failures.
+        acceptance_criteria:
+          - "Evidence script path validated for existence"
+          - "Evidence script validated for executable permission"
+          - "Usage section requires at least 1 code block"
+          - "Expected outcomes require BOTH When AND Then keywords"
+          - "Actionable error messages for each failure"
+        verification:
+          command: "cargo xtask aat <PR_URL> --dry-run"
+          pass_condition: "Validation errors shown with fix suggestions"
+
+      - id: CHECK-001
+        type: BUG_FIX
+        title: "Watch mode MUST exit on terminal states with 180s timeout"
+        statement: |
+          The check --watch command MUST exit immediately on terminal states
+          (Closed, CI Failure, Changes Requested) with exit code 1, and MUST
+          timeout after 180 seconds with exit code 2 and remediation suggestion.
+        acceptance_criteria:
+          - "Exits on PrState::Closed with exit code 1"
+          - "Exits on CiStatus::Failure with exit code 1"
+          - "Exits on ReviewStatus::ChangesRequested with exit code 1"
+          - "Exits after 180s timeout with exit code 2"
+          - "Timeout message suggests manually restarting slow checks"
+          - "Clear message printed for each exit condition"
+        verification:
+          command: "cargo xtask check --watch"
+          pass_condition: "Exits on terminal states instead of hanging"

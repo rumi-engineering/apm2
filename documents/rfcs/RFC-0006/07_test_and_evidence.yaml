@@ -260,7 +260,7 @@ rfc_test_and_evidence:
         description: "Verify auto-remediation of stale reviewer"
         prerequisites:
           - "TCK-00067 completed"
-          - "Stale reviewer (>60s since last activity)"
+          - "Stale reviewer (>300s since last activity)"
         steps:
           - "Wait for reviewer to become stale (or mock stale state by touching log file with old timestamp)"
           - "Run: cargo xtask check"

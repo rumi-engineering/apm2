@@ -126,8 +126,8 @@ rfc_contracts_and_versioning:
               stat(log_file).mtime - file modification time
               This is reliable because any Gemini output updates the log file.
         health_status:
-          HEALTHY: "PID alive AND log_file mtime < 60s ago"
-          STALE: "PID alive AND log_file mtime >= 60s ago"
+          HEALTHY: "PID alive AND log_file mtime < 300s ago"
+          STALE: "PID alive AND log_file mtime >= 300s ago"
           DEAD: "PID not alive (regardless of log_file mtime)"
           NOT_STARTED: "No entry in state file for this review type"
         output_format: |

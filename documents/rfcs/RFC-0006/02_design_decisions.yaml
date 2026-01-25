@@ -305,7 +305,7 @@ rfc_design_decisions:
             - "Self-healing workflow"
       chosen_rationale: |
         Auto-remediation provides the best developer experience. When an agent
-        is stale (>60s since last activity as measured by log file mtime),
+        is stale (>300s since last activity as measured by log file mtime),
         automatically killing and restarting is faster than prompting the user
         to do it manually. The user is informed of the remediation action for
         transparency.

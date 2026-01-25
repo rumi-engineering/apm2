@@ -528,7 +528,7 @@ rfc_ticket_decomposition:
             Acceptance Criteria:
             - check command displays reviewer health section
             - Health shows PID, last activity timestamp, status for each reviewer
-            - Stale reviewers (>60s) are automatically killed and restarted
+            - Stale reviewers (>300s) are automatically killed and restarted
             - Remediation logged to user
             - State persisted in ~/.apm2/reviewer_state.json
             - Atomic state file writes prevent corruption
@@ -547,17 +547,17 @@ rfc_ticket_decomposition:
     │  TCK-00061  │  │  TCK-00062  │
     │ clippy      │  │ xtask lint  │
     │ lints       │  │ command     │
-    └──────┬──────┘  └─────────────┘
-           │
-           │ depends on
-           ▼
-    Phase 3:
-    ┌─────────────┐
-    │  TCK-00065  │
-    │ check       │
-    │ remediation │
-    └─────────────┘
-
+    └──────┬──────┘  └──────┬──────┘
+           │                │
+           │ depends on     │ depends on (for TCK-00072)
+           ▼                │
+    Phase 3:                │
+    ┌─────────────┐         │
+    │  TCK-00065  │         │
+    │ check       │         │
+    │ remediation │         │
+    └─────────────┘         │
+                            │
     Phase 2 (Test Coverage) - No dependencies:
     ┌─────────────┐  ┌─────────────┐
     │  TCK-00063  │  │  TCK-00064  │
@@ -580,6 +580,385 @@ rfc_ticket_decomposition:
                      │ reviewer    │
                      │ health      │
                      └─────────────┘
+
+    Phase 4 (Follow-Up Improvements):
+    ┌─────────────┐         ┌─────────────┐
+    │  TCK-00068  │─────────│  TCK-00069  │
+    │ shell       │ dep on  │ refactor    │───────┐
+    │ safety      │         │ spawn       │       │
+    └─────────────┘         └─────────────┘       │
+                                                  │
+    TCK-00067 ────────────> ┌─────────────┐       │
+    (reviewer   dep on      │  TCK-00070  │       │
+     health)                │ cross-      │       │
+                            │ platform    │       │
+                            └─────────────┘       │
+                                                  │
+    TCK-00067 ─────────────────────────────┐      │
+    (reviewer               dep on         │      │
+     health)                               v      v
+                            ┌─────────────────────┐
+                            │      TCK-00071      │
+                            │    temp file        │
+                            │    lifecycle        │
+                            └─────────────────────┘
+
+    TCK-00062 ────────────> ┌─────────────┐
+    (lint cmd)    dep on    │  TCK-00072  │
+                            │ doc example │
+                            │ lint        │
+                            └─────────────┘
+
+    Phase 5 (AAT Completion and Check Watch Fix):
+    ┌─────────────┐
+    │  TCK-00073  │─────────┐
+    │ AI tool     │         │
+    │ config      │         │
+    └─────────────┘         │
+                            │ depends on
+                            ▼
+                     ┌─────────────┐
+                     │  TCK-00074  │─────────┐
+                     │ hypothesis  │         │
+                     │ generation  │         │
+                     └─────────────┘         │
+                                             │ depends on
+                                             ▼
+                                      ┌─────────────┐
+                                      │  TCK-00075  │─────────┐
+                                      │ hypothesis  │         │
+                                      │ execution   │         │
+                                      └─────────────┘         │
+                                                              │ depends on
+                                                              ▼
+                                                       ┌─────────────┐
+                                                       │  TCK-00076  │
+                                                       │ input       │
+                                                       │ variation   │
+                                                       └─────────────┘
+
+    Standalone (no dependencies):
+    ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+    │  TCK-00077  │  │  TCK-00078  │  │  TCK-00079  │
+    │ timestamp   │  │ validation  │  │ check watch │
+    │ detection   │  │             │  │ fix         │
+    └─────────────┘  └─────────────┘  └─────────────┘
+
+    - phase: 4
+      name: "Follow-Up Improvements"
+      description: "Address issues discovered during Phase 0-3 implementation"
+      tickets:
+        - ticket_id: "TCK-00068"
+          title: "Add Shell Command Safety Utility"
+          requirements:
+            - "MAINT-015"
+          dependencies: []
+          scope_summary: |
+            Create shell escaping utilities to prevent shell injection vulnerabilities:
+
+            Files to create:
+            - xtask/src/shell_escape.rs
+
+            Files to modify:
+            - xtask/src/main.rs (add module)
+            - xtask/src/tasks/push.rs (use quote_path)
+            - xtask/src/tasks/review.rs (use quote_path)
+            - xtask/src/tasks/check.rs (use quote_path)
+            - xtask/Cargo.toml (add shell-escape dependency)
+
+            Implementation:
+            1. Implement quote_path() function that safely quotes paths for shell
+            2. Implement build_script_command() helper for PTY-wrapped commands
+            3. Update all shell command construction to use these utilities
+            4. Add unit tests for edge cases (spaces, quotes, backticks, newlines)
+
+            Acceptance Criteria:
+            - No raw format!() shell string construction in xtask
+            - All shell paths use quote_path() or equivalent
+            - Tests cover all shell metacharacters
+
+        - ticket_id: "TCK-00069"
+          title: "Refactor Reviewer Spawn Logic into Shared Module"
+          requirements:
+            - "MAINT-016"
+          dependencies:
+            - "TCK-00068"
+          scope_summary: |
+            Consolidate duplicated reviewer spawn logic into ReviewerSpawner:
+
+            Files to modify:
+            - xtask/src/reviewer_state.rs (add ReviewerSpawner)
+            - xtask/src/tasks/push.rs (use ReviewerSpawner)
+            - xtask/src/tasks/review.rs (use ReviewerSpawner)
+            - xtask/src/tasks/check.rs (use ReviewerSpawner)
+
+            Implementation:
+            1. Create ReviewerSpawner struct with spawn() method
+            2. Consolidate: temp file creation, prompt interpolation, script command, state persistence
+            3. Update all callers to use ReviewerSpawner::spawn()
+            4. Remove duplicate implementations
+
+            Acceptance Criteria:
+            - Spawn logic exists in exactly one place
+            - No duplicate temp file, script command, or state write logic
+
+        - ticket_id: "TCK-00070"
+          title: "Add Cross-Platform Process Checks"
+          requirements:
+            - "MAINT-017"
+          dependencies:
+            - "TCK-00067"
+          scope_summary: |
+            Replace Linux-only /proc usage with cross-platform sysinfo crate:
+
+            Files to modify:
+            - Cargo.toml (workspace sysinfo dependency)
+            - xtask/Cargo.toml (sysinfo dependency)
+            - xtask/src/reviewer_state.rs (is_our_process with sysinfo)
+
+            Implementation:
+            1. Add sysinfo crate to dependencies
+            2. Replace /proc/{pid}/cmdline parsing with sysinfo::System::process()
+            3. Add #[cfg(target_os)] guards for platform-specific code
+            4. Document platform requirements
+
+            Acceptance Criteria:
+            - No direct /proc filesystem access
+            - Code compiles for macOS target
+
+        - ticket_id: "TCK-00071"
+          title: "Improve Temp File Lifecycle Management"
+          requirements:
+            - "MAINT-018"
+          dependencies:
+            - "TCK-00067"
+            - "TCK-00069"
+          scope_summary: |
+            Track temp files in state for reliable cleanup:
+
+            Files to modify:
+            - xtask/src/reviewer_state.rs (ManagedTempFile, temp_files field)
+            - xtask/src/tasks/push.rs (register temp files)
+            - xtask/src/tasks/review.rs (register temp files)
+            - xtask/src/tasks/check.rs (orphan cleanup)
+
+            Implementation:
+            1. Create ManagedTempFile wrapper that tracks files in state
+            2. Register temp files in reviewer_state.json
+            3. Add cleanup sweep for orphaned temp files (>1 hour old)
+            4. Remove all rm -f from shell command strings
+
+            Acceptance Criteria:
+            - No rm -f in shell command construction
+            - Temp files tracked in state and cleaned up reliably
+
+        - ticket_id: "TCK-00072"
+          title: "Add Documentation Example Linting"
+          requirements:
+            - "MAINT-019"
+          dependencies:
+            - "TCK-00062"
+          scope_summary: |
+            Extend cargo xtask lint to check markdown code blocks:
+
+            Files to modify:
+            - xtask/Cargo.toml (add pulldown-cmark dependency)
+            - xtask/src/tasks/lint.rs (add markdown scanning)
+            - xtask/src/tasks/commit.rs (call lint with --include-docs)
+
+            Implementation:
+            1. Add markdown parsing with pulldown-cmark
+            2. Extract Rust code blocks from *.md files
+            3. Apply anti-pattern checks to documentation examples
+            4. Add --include-docs flag to lint command
+            5. Display warning during commit if doc examples violate patterns
+
+            Acceptance Criteria:
+            - cargo xtask lint --include-docs scans markdown code blocks
+            - Detects unquoted shell paths in documentation examples
+            - Warning displayed during commit
+
+    - phase: 5
+      name: "AAT Completion and Check Watch Fix"
+      description: "Complete AAT implementation and fix check --watch terminal state handling"
+      tickets:
+        - ticket_id: "TCK-00073"
+          title: "Add Configurable AI Tool Backend for AAT"
+          requirements:
+            - "AAT-001"
+          dependencies: []
+          scope_summary: |
+            Add AAT_AI_TOOL environment variable (default: gemini):
+
+            Files to create:
+            - xtask/src/aat/tool_config.rs
+
+            Files to modify:
+            - xtask/src/aat/mod.rs (add module)
+            - xtask/src/main.rs (add CLI arg)
+
+            Implementation:
+            1. Create AatToolConfig struct with from_env() method
+            2. Support values: gemini, claude-code
+            3. Add --ai-tool CLI flag override
+            4. Default to gemini when no env var or flag set
+
+            Acceptance Criteria:
+            - AatToolConfig struct exists
+            - Environment variable support works
+            - CLI flag override works
+
+        - ticket_id: "TCK-00074"
+          title: "Implement AI-Powered Hypothesis Generation"
+          requirements:
+            - "AAT-002"
+          dependencies:
+            - "TCK-00073"
+          scope_summary: |
+            Replace stub generate_hypotheses() in aat.rs:207-251:
+
+            Existing files to verify/update:
+            - documents/reviews/AAT_HYPOTHESIS_PROMPT.md (already exists)
+
+            Files to modify:
+            - xtask/src/tasks/aat.rs (replace stub)
+
+            Implementation:
+            1. Create prompt template for hypothesis generation
+            2. Invoke configured AI tool with PR description + diff
+            3. Parse AI response into Vec<Hypothesis>
+            4. Ensure at least 3 hypotheses with at least 1 error handling case
+
+            Acceptance Criteria:
+            - AI tool invoked for hypothesis generation
+            - Response parsed into hypotheses
+            - Validation of hypothesis count and error handling coverage
+
+        - ticket_id: "TCK-00075"
+          title: "Implement Hypothesis Execution Engine"
+          requirements:
+            - "AAT-003"
+          dependencies:
+            - "TCK-00074"
+          scope_summary: |
+            Create hypothesis execution engine:
+
+            Files to create:
+            - xtask/src/aat/executor.rs
+
+            Files to modify:
+            - xtask/src/aat/mod.rs (add executor module export)
+            - xtask/src/tasks/aat.rs (integrate executor into run())
+
+            Implementation:
+            1. Create execute_hypothesis() function
+            2. Run verification commands in shell
+            3. Capture stdout, stderr, exit code
+            4. Set executed_at timestamp AFTER execution
+            5. Compare actual outcome to prediction
+            6. Mark result as PASSED/FAILED
+
+            Acceptance Criteria:
+            - Hypotheses are actually executed
+            - Output captured correctly
+            - Timestamps set after execution
+
+        - ticket_id: "TCK-00076"
+          title: "Add Input Variation Testing"
+          requirements:
+            - "AAT-004"
+          dependencies:
+            - "TCK-00075"
+          scope_summary: |
+            Add input variation testing for anti-gaming:
+
+            Files to create:
+            - xtask/src/aat/variation.rs
+
+            Files to modify:
+            - xtask/src/aat/mod.rs (add variation module export)
+            - xtask/src/aat/evidence.rs (populate InputVariation)
+            - xtask/src/tasks/aat.rs (integrate variation testing)
+
+            Implementation:
+            1. For each CLI command, generate at least 3 input variations
+            2. Execute each variation and capture output
+            3. Detect invariance (identical output for different inputs)
+            4. Populate InputVariation struct with real data
+            5. Flag invariance as anti-gaming violation
+
+            Acceptance Criteria:
+            - Input variations generated and executed
+            - Invariance detected and flagged
+
+        - ticket_id: "TCK-00077"
+          title: "Complete Anti-Gaming Pattern Detection"
+          requirements:
+            - "AAT-005"
+          dependencies: []
+          scope_summary: |
+            Add ISO timestamp detection to anti-gaming:
+
+            Files to modify:
+            - xtask/src/aat/anti_gaming.rs (add regex + detection)
+            - xtask/src/aat/types.rs (add violation variant)
+
+            Implementation:
+            1. Add TIMESTAMP_REGEX for ISO 8601 format detection
+            2. Add AntiGamingViolation::HardcodedTimestamp variant
+            3. Detect patterns like 2026-01-25T10:00:00Z in diff
+            4. Add tests for timestamp detection
+
+            Acceptance Criteria:
+            - ISO timestamps detected in diffs
+            - Tests pass
+
+        - ticket_id: "TCK-00078"
+          title: "Add Evidence Script and PR Format Validation"
+          requirements:
+            - "AAT-006"
+          dependencies: []
+          scope_summary: |
+            Add validation for evidence scripts and PR format:
+
+            Files to modify:
+            - xtask/src/aat/parser.rs (add validation)
+            - xtask/src/tasks/aat.rs (integrate validation)
+
+            Implementation:
+            1. Validate evidence script path exists and is executable
+            2. Validate Usage section contains at least 1 code block
+            3. Validate Expected Outcomes contain BOTH When AND Then keywords
+            4. Return actionable errors for each validation failure
+
+            Acceptance Criteria:
+            - Evidence script validated
+            - PR format validated (When/Then requirement enforced)
+            - Actionable error messages
+
+        - ticket_id: "TCK-00079"
+          title: "Fix check --watch Terminal State Handling"
+          requirements:
+            - "CHECK-001"
+          dependencies: []
+          scope_summary: |
+            Fix check --watch indefinite hang on terminal states:
+
+            Files to modify:
+            - xtask/src/tasks/check.rs (fix exit conditions, add timeout)
+
+            Implementation:
+            1. Add exit on PrState::Closed (exit code 1)
+            2. Add exit on CiStatus::Failure (exit code 1)
+            3. Add exit on ReviewStatus::ChangesRequested (exit code 1)
+            4. Add 180s default timeout (non-configurable)
+            5. On timeout: exit code 2, suggest "manually restart slow checks"
+            6. Print clear message indicating why watch exited
+
+            Acceptance Criteria:
+            - Exits on all terminal states
+            - 180s timeout with exit code 2
+            - Clear exit messages
 
   impact_summary:
     - ticket: "TCK-00059"
@@ -618,9 +997,69 @@ rfc_ticket_decomposition:
       issues_prevented: ["A1"]
       impact: "Automatic detection and recovery from stale/crashed reviewers"
 
+    - ticket: "TCK-00068"
+      issues_prevented: ["A2"]
+      impact: "Eliminates shell injection vulnerabilities from unquoted paths"
+
+    - ticket: "TCK-00069"
+      issues_prevented: ["A2", "A3"]
+      impact: "Reduces code duplication and inconsistent security patterns"
+
+    - ticket: "TCK-00070"
+      issues_prevented: []
+      impact: "Enables macOS development and reduces platform-specific bugs"
+
+    - ticket: "TCK-00071"
+      issues_prevented: ["A3"]
+      impact: "Prevents temp file leaks and ensures reliable cleanup"
+
+    - ticket: "TCK-00072"
+      issues_prevented: ["A2", "A3"]
+      impact: "Ensures documentation examples teach correct patterns"
+
+    - ticket: "TCK-00073"
+      issues_prevented: []
+      impact: "Enables configurable AI backend for AAT flexibility"
+
+    - ticket: "TCK-00074"
+      issues_prevented: []
+      impact: "AI-powered hypothesis generation replaces stub implementation"
+
+    - ticket: "TCK-00075"
+      issues_prevented: []
+      impact: "Real hypothesis execution with captured output"
+
+    - ticket: "TCK-00076"
+      issues_prevented: []
+      impact: "Input variation testing detects invariance anti-gaming"
+
+    - ticket: "TCK-00077"
+      issues_prevented: []
+      impact: "Detects hardcoded timestamps in PRs"
+
+    - ticket: "TCK-00078"
+      issues_prevented: []
+      impact: "Validates PR format and evidence scripts"
+
+    - ticket: "TCK-00079"
+      issues_prevented: []
+      impact: "Fixes indefinite hang on terminal states in watch mode"
+
   expected_outcomes:
     - "80% fewer review iterations on state machine changes"
     - "Zero recurrence of temp file/shell escaping issues"
     - "Pre-commit catches 95% of lint issues before push"
     - "Unified AI reviewer simplifies tooling"
     - "Stale reviewers auto-remediated within 60s of detection"
+    - "Zero shell injection vulnerabilities from path handling"
+    - "Single source of truth for reviewer spawn logic"
+    - "Cross-platform compatibility for macOS development"
+    - "Reliable temp file cleanup with no orphaned files"
+    - "Documentation examples validated against same lint rules as code"
+    - "AAT hypothesis generation uses real AI instead of stub"
+    - "AAT hypotheses are actually executed with captured output"
+    - "Input variation testing detects gaming attempts"
+    - "Hardcoded timestamps detected in PR diffs"
+    - "PR format and evidence scripts validated before AAT runs"
+    - "check --watch exits on terminal states instead of hanging indefinitely"
+    - "180s timeout prevents watch mode from running forever"

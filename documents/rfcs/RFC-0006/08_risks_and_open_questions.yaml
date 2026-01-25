@@ -211,15 +211,16 @@ rfc_risks_and_open_questions:
     - id: DN-006-004
       question: "What stale threshold for reviewer health?"
       options:
-        - "30 seconds"
-        - "60 seconds (chosen)"
+        - "60 seconds"
         - "120 seconds"
-      chosen: "60 seconds"
+        - "300 seconds (chosen)"
+      chosen: "300 seconds"
       rationale: |
-        60 seconds balances responsiveness with tolerance for slow operations.
-        Normal tool calls complete within seconds. 30s may be too aggressive for
-        file reads on large files. 120s delays detection of truly stale reviewers.
-        60s is a reasonable middle ground that can be tuned based on experience.
+        300 seconds (5 minutes) balances responsiveness with tolerance for slow AI
+        operations. AI tool startup, large PR analysis, and complex reasoning can
+        take several minutes. 60s may be too aggressive and cause false positives.
+        300s provides reasonable tolerance while still detecting truly stale reviewers.
+        The constant STALE_THRESHOLD_SECS can be tuned based on experience.
 
     - id: DN-006-005
       question: "Auto-remediate or prompt user?"
