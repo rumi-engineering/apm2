@@ -73,11 +73,25 @@
 //! }
 //! ```
 //!
+//! ## Resource Management
+//!
+//! Holons operate under resource constraints defined by leases. The
+//! [`resource`] module provides:
+//!
+//! - [`resource::Lease`]: Time-bounded, scoped authorization for work
+//! - [`resource::Budget`]: Multi-dimensional resource limits (episodes, tokens,
+//!   time)
+//! - [`resource::LeaseScope`]: Authority boundaries for operations
+//!
 //! ## Design Notes
 //!
 //! This crate embodies Axiom I (Markov Blanket) from the Principia Holonica:
 //! each holon defines a clear boundary through its trait contract, with
 //! well-defined interfaces for communication across that boundary.
+//!
+//! The resource module implements Axiom III (Bounded Authority): leases
+//! constrain what operations holons can perform and how many resources they can
+//! consume.
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -86,6 +100,7 @@
 pub mod artifact;
 pub mod context;
 pub mod error;
+pub mod resource;
 pub mod result;
 pub mod stop;
 pub mod traits;
@@ -98,6 +113,7 @@ mod tests;
 pub use artifact::Artifact;
 pub use context::EpisodeContext;
 pub use error::HolonError;
+pub use resource::{Budget, Lease, LeaseScope, ResourceError};
 pub use result::EpisodeResult;
 pub use stop::StopCondition;
 pub use traits::Holon;
@@ -107,6 +123,7 @@ pub mod prelude {
     pub use crate::artifact::Artifact;
     pub use crate::context::EpisodeContext;
     pub use crate::error::HolonError;
+    pub use crate::resource::{Budget, Lease, LeaseScope, ResourceError};
     pub use crate::result::EpisodeResult;
     pub use crate::stop::StopCondition;
     pub use crate::traits::Holon;
