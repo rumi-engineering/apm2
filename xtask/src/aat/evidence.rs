@@ -112,7 +112,8 @@ impl EvidenceBundleBuilder {
                 GamingViolation::IfTestConditional { snippet, .. } => {
                     static_analysis.if_test_patterns.push(snippet.clone());
                 },
-                GamingViolation::HardcodedUuid { snippet, .. } => {
+                GamingViolation::HardcodedUuid { snippet, .. }
+                | GamingViolation::HardcodedTimestamp { snippet, .. } => {
                     static_analysis.hardcoded_values.push(snippet.clone());
                 },
                 GamingViolation::MockPattern { snippet, .. } => {

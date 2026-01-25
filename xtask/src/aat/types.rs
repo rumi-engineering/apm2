@@ -147,6 +147,17 @@ pub enum GamingViolation {
         /// The TODO comment text.
         snippet: String,
     },
+
+    /// Detected hardcoded ISO 8601 timestamp that may indicate test-specific
+    /// behavior.
+    HardcodedTimestamp {
+        /// File path where the timestamp was found.
+        file: String,
+        /// Line number in the file.
+        line: u32,
+        /// The matched timestamp string.
+        snippet: String,
+    },
 }
 
 /// A TODO/FIXME/HACK comment extracted from the diff.
@@ -488,6 +499,11 @@ mod tests {
                 file: "src/handler.rs".to_string(),
                 line: 100,
                 snippet: "TODO: implement caching".to_string(),
+            },
+            GamingViolation::HardcodedTimestamp {
+                file: "src/config.rs".to_string(),
+                line: 15,
+                snippet: "2026-01-25T10:00:00Z".to_string(),
             },
         ];
 
