@@ -108,6 +108,9 @@ pub struct ReviewerEntry {
     pub started_at: DateTime<Utc>,
     /// Path to the log file capturing the reviewer's output.
     pub log_file: PathBuf,
+    /// Path to the prompt file used for this review.
+    #[serde(default)]
+    pub prompt_file: Option<PathBuf>,
     /// The PR URL being reviewed.
     pub pr_url: String,
     /// The HEAD SHA being reviewed.
@@ -115,6 +118,9 @@ pub struct ReviewerEntry {
     /// Number of times this reviewer has been restarted.
     #[serde(default)]
     pub restart_count: u32,
+    /// Temporary files created for this review (for cleanup tracking).
+    #[serde(default)]
+    pub temp_files: Vec<PathBuf>,
 }
 
 impl ReviewerEntry {
@@ -343,6 +349,79 @@ impl ReviewerStateFile {
     pub fn get_reviewer(&self, reviewer_type: &str) -> Option<&ReviewerEntry> {
         self.reviewers.get(reviewer_type)
     }
+
+    /// Clean up orphaned temp files from dead reviewers older than the
+    /// threshold.
+    ///
+    /// This function removes temp files for reviewers that:
+    /// 1. Have a `Dead` health status (process is no longer running)
+    /// 2. Were started more than `age_threshold_secs` ago
+    ///
+    /// After cleanup, the dead entries are also removed from the state file.
+    ///
+    /// # Arguments
+    ///
+    /// * `age_threshold_secs` - Only clean up entries older than this many
+    ///   seconds
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Vec` of paths that were successfully cleaned up.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state file cannot be saved.
+    pub fn cleanup_orphaned_temp_files(&mut self, age_threshold_secs: u64) -> Result<Vec<PathBuf>> {
+        let mut cleaned = Vec::new();
+        let now = Utc::now();
+        let threshold =
+            chrono::Duration::seconds(i64::try_from(age_threshold_secs).unwrap_or(i64::MAX));
+
+        // Collect entries to clean up (dead and old enough)
+        let entries_to_cleanup: Vec<(String, Vec<PathBuf>)> = self
+            .reviewers
+            .iter()
+            .filter_map(|(name, entry)| {
+                // Skip if reviewer is still alive
+                if entry.check_health() != HealthStatus::Dead {
+                    return None;
+                }
+
+                // Skip if not old enough
+                let age = now.signed_duration_since(entry.started_at);
+                if age < threshold {
+                    return None;
+                }
+
+                // Collect all temp files to clean up
+                let mut files = entry.temp_files.clone();
+                // Also include log_file and prompt_file
+                files.push(entry.log_file.clone());
+                if let Some(prompt) = &entry.prompt_file {
+                    files.push(prompt.clone());
+                }
+
+                Some((name.clone(), files))
+            })
+            .collect();
+
+        // Clean up files and remove entries
+        for (name, files) in &entries_to_cleanup {
+            for path in files {
+                if path.exists() && std::fs::remove_file(path).is_ok() {
+                    cleaned.push(path.clone());
+                }
+            }
+            self.reviewers.remove(name);
+        }
+
+        // Save the updated state
+        if !entries_to_cleanup.is_empty() {
+            self.save()?;
+        }
+
+        Ok(cleaned)
+    }
 }
 
 /// Result of a reviewer spawn operation.
@@ -499,7 +578,7 @@ impl<'a> ReviewerSpawner<'a> {
         let mut prompt_temp = NamedTempFile::new().ok()?;
         prompt_temp.write_all(prompt.as_bytes()).ok()?;
 
-        // Persist the prompt file (will be cleaned up by the script command)
+        // Persist the prompt file - cleanup happens via state tracking
         let (_, prompt_path) = prompt_temp.keep().ok()?;
 
         // Build the script command with cleanup
@@ -518,9 +597,11 @@ impl<'a> ReviewerSpawner<'a> {
             pid,
             started_at: Utc::now(),
             log_file: log_path,
+            prompt_file: Some(prompt_path),
             pr_url: self.pr_url.to_string(),
             head_sha: self.head_sha.to_string(),
             restart_count: self.restart_count,
+            temp_files: Vec::new(),
         };
 
         // Save to state file
@@ -567,16 +648,20 @@ impl<'a> ReviewerSpawner<'a> {
         // Create prompt temp file
         let mut prompt_temp = NamedTempFile::new().context("Failed to create prompt temp file")?;
         prompt_temp.write_all(prompt.as_bytes())?;
-        let prompt_temp_path = prompt_temp.path().to_path_buf();
+        let (_, prompt_temp_path) = prompt_temp
+            .keep()
+            .context("Failed to persist prompt file")?;
 
         // Record entry in state file before starting
         let entry = ReviewerEntry {
             pid: std::process::id(), // Use current process as placeholder
             started_at: Utc::now(),
             log_file: log_path.clone(),
+            prompt_file: Some(prompt_temp_path.clone()),
             pr_url: self.pr_url.to_string(),
             head_sha: self.head_sha.to_string(),
             restart_count: self.restart_count,
+            temp_files: Vec::new(),
         };
 
         let mut state = ReviewerStateFile::load().unwrap_or_default();
@@ -593,20 +678,64 @@ impl<'a> ReviewerSpawner<'a> {
             .status()
             .context("Failed to run reviewer process")?;
 
-        // Clean up: remove from state
+        // Clean up: remove from state and temp files
         let mut state = ReviewerStateFile::load().unwrap_or_default();
-        state.remove_reviewer(self.review_type);
+        let _ = cleanup_reviewer_temp_files(&mut state, self.review_type);
         let _ = state.save();
-
-        // Clean up log file on success (caller can choose to keep on failure)
-        if status.success() {
-            let _ = fs::remove_file(&log_path);
-        }
 
         Ok(SyncResult { status, log_path })
     }
 }
 
+/// Clean up temp files associated with a reviewer entry.
+///
+/// This removes the log file, prompt file, and any tracked temp files.
+/// It also removes the entry from the state file.
+///
+/// # Arguments
+///
+/// * `state` - The mutable state file reference
+/// * `reviewer_type` - The key for the reviewer entry (e.g., "security",
+///   "quality")
+///
+/// # Returns
+///
+/// Returns a `Vec` of paths that were successfully cleaned up.
+pub fn cleanup_reviewer_temp_files(
+    state: &mut ReviewerStateFile,
+    reviewer_type: &str,
+) -> Vec<PathBuf> {
+    let mut cleaned = Vec::new();
+
+    if let Some(entry) = state.get_reviewer(reviewer_type) {
+        // Clean up all tracked temp files
+        for path in &entry.temp_files {
+            if path.exists() && std::fs::remove_file(path).is_ok() {
+                cleaned.push(path.clone());
+            }
+        }
+
+        // Clean up log file
+        if entry.log_file.exists() && std::fs::remove_file(&entry.log_file).is_ok() {
+            cleaned.push(entry.log_file.clone());
+        }
+
+        // Clean up prompt file
+        if let Some(prompt) = &entry.prompt_file {
+            if prompt.exists() && std::fs::remove_file(prompt).is_ok() {
+                cleaned.push(prompt.clone());
+            }
+        }
+    }
+
+    // Remove the entry from state
+    state.remove_reviewer(reviewer_type);
+
+    cleaned
+}
+
+/// One hour in seconds, used as the default age threshold for orphan cleanup.
+pub const ORPHAN_CLEANUP_AGE_THRESHOLD_SECS: u64 = 3600;
 /// Kill a process with SIGTERM, wait up to 5s, then SIGKILL if needed.
 ///
 /// # Arguments
@@ -791,9 +920,11 @@ mod tests {
             pid: 12345,
             started_at: Utc::now(),
             log_file: PathBuf::from("/tmp/test.log"),
+            prompt_file: Some(PathBuf::from("/tmp/test_prompt.txt")),
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
             restart_count: 0,
+            temp_files: Vec::new(),
         };
 
         state.set_reviewer("security", entry);
@@ -810,9 +941,11 @@ mod tests {
             pid: 12345,
             started_at: Utc::now(),
             log_file: PathBuf::from("/tmp/test.log"),
+            prompt_file: Some(PathBuf::from("/tmp/test_prompt.txt")),
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
             restart_count: 0,
+            temp_files: vec![PathBuf::from("/tmp/extra.txt")],
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -821,6 +954,8 @@ mod tests {
         assert_eq!(entry.pid, deserialized.pid);
         assert_eq!(entry.pr_url, deserialized.pr_url);
         assert_eq!(entry.head_sha, deserialized.head_sha);
+        assert_eq!(entry.prompt_file, deserialized.prompt_file);
+        assert_eq!(entry.temp_files, deserialized.temp_files);
     }
 
     #[test]
@@ -833,9 +968,11 @@ mod tests {
                 pid: 12345,
                 started_at: Utc::now(),
                 log_file: PathBuf::from("/tmp/security.log"),
+                prompt_file: None,
                 pr_url: "https://github.com/owner/repo/pull/123".to_string(),
                 head_sha: "abc123".to_string(),
                 restart_count: 0,
+                temp_files: Vec::new(),
             },
         );
 
@@ -845,9 +982,11 @@ mod tests {
                 pid: 12346,
                 started_at: Utc::now(),
                 log_file: PathBuf::from("/tmp/quality.log"),
+                prompt_file: None,
                 pr_url: "https://github.com/owner/repo/pull/123".to_string(),
                 head_sha: "abc123".to_string(),
                 restart_count: 0,
+                temp_files: Vec::new(),
             },
         );
 
@@ -876,9 +1015,11 @@ mod tests {
             pid: 999_999_999, // Very unlikely to exist
             started_at: Utc::now(),
             log_file: PathBuf::from("/tmp/nonexistent.log"),
+            prompt_file: None,
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
             restart_count: 0,
+            temp_files: Vec::new(),
         };
 
         assert_eq!(entry.check_health(), HealthStatus::Dead);
@@ -890,9 +1031,11 @@ mod tests {
             pid: 12345,
             started_at: Utc::now(),
             log_file: PathBuf::from("/tmp/definitely_does_not_exist_12345.log"),
+            prompt_file: None,
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
             restart_count: 0,
+            temp_files: Vec::new(),
         };
 
         assert!(entry.get_log_mtime_elapsed().is_none());
@@ -908,9 +1051,11 @@ mod tests {
             pid: 12345,
             started_at: Utc::now(),
             log_file: path,
+            prompt_file: None,
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
             restart_count: 0,
+            temp_files: Vec::new(),
         };
 
         let elapsed = entry.get_log_mtime_elapsed();
@@ -927,9 +1072,11 @@ mod tests {
             pid: u32::MAX,
             started_at: Utc::now(),
             log_file: PathBuf::from("/tmp/test.log"),
+            prompt_file: None,
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
             restart_count: 0,
+            temp_files: Vec::new(),
         };
 
         // Should return Dead without attempting to signal PID -1
@@ -1022,9 +1169,11 @@ mod tests {
             pid: current_pid,
             started_at: Utc::now(),
             log_file: PathBuf::from("/tmp/test.log"),
+            prompt_file: None,
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
             restart_count: 0,
+            temp_files: Vec::new(),
         };
 
         // The current process is a test process, not gemini/script
@@ -1045,9 +1194,11 @@ mod tests {
             pid: current_pid,
             started_at: Utc::now(),
             log_file: PathBuf::from("/tmp/nonexistent.log"),
+            prompt_file: None,
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
             restart_count: 0,
+            temp_files: Vec::new(),
         };
 
         // Even though the process exists, it's not a reviewer process
@@ -1066,12 +1217,141 @@ mod tests {
             pid: 0,
             started_at: Utc::now(),
             log_file: PathBuf::from("/tmp/test.log"),
+            prompt_file: None,
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
             restart_count: 0,
+            temp_files: Vec::new(),
         };
 
         // PID 0 is invalid and should return Dead
         assert_eq!(entry.check_health(), HealthStatus::Dead);
+    }
+
+    /// Test cleanup of orphaned temp files.
+    #[test]
+    fn test_cleanup_orphaned_temp_files() {
+        // Create temp files that we'll track
+        let temp_log = tempfile::NamedTempFile::new().unwrap();
+        let temp_prompt = tempfile::NamedTempFile::new().unwrap();
+        let temp_extra = tempfile::NamedTempFile::new().unwrap();
+
+        // Keep the files (don't auto-delete)
+        let (_, log_path) = temp_log.keep().unwrap();
+        let (_, prompt_path) = temp_prompt.keep().unwrap();
+        let (_, extra_path) = temp_extra.keep().unwrap();
+
+        // Create a state with a dead reviewer (non-existent PID, old enough)
+        let mut state = ReviewerStateFile::default();
+        state.set_reviewer(
+            "security",
+            ReviewerEntry {
+                pid: 999_999_999,                                    // Very unlikely to exist
+                started_at: Utc::now() - chrono::Duration::hours(2), // Old enough
+                log_file: log_path.clone(),
+                prompt_file: Some(prompt_path.clone()),
+                pr_url: "https://github.com/owner/repo/pull/123".to_string(),
+                head_sha: "abc123".to_string(),
+                restart_count: 0,
+                temp_files: vec![extra_path.clone()],
+            },
+        );
+
+        // Verify files exist before cleanup
+        assert!(log_path.exists());
+        assert!(prompt_path.exists());
+        assert!(extra_path.exists());
+
+        // Run cleanup with 1 hour threshold
+        let cleaned = state.cleanup_orphaned_temp_files(3600).unwrap();
+
+        // Should have cleaned up 3 files
+        assert_eq!(cleaned.len(), 3);
+        assert!(!log_path.exists());
+        assert!(!prompt_path.exists());
+        assert!(!extra_path.exists());
+
+        // Entry should be removed from state
+        assert!(state.get_reviewer("security").is_none());
+    }
+
+    /// Test that cleanup does not remove files from healthy reviewers.
+    #[test]
+    fn test_cleanup_orphaned_temp_files_skips_alive() {
+        // Create temp files
+        let temp_log = tempfile::NamedTempFile::new().unwrap();
+        let (_, log_path) = temp_log.keep().unwrap();
+
+        // Create a state with a reviewer using current process PID
+        // Note: This won't be considered "our process" but we're testing the
+        // age threshold
+        let mut state = ReviewerStateFile::default();
+        state.set_reviewer(
+            "security",
+            ReviewerEntry {
+                pid: 999_999_999,       // Dead process
+                started_at: Utc::now(), // Not old enough (just started)
+                log_file: log_path.clone(),
+                prompt_file: None,
+                pr_url: "https://github.com/owner/repo/pull/123".to_string(),
+                head_sha: "abc123".to_string(),
+                restart_count: 0,
+                temp_files: Vec::new(),
+            },
+        );
+
+        // Run cleanup with 1 hour threshold - entry is not old enough
+        let cleaned = state.cleanup_orphaned_temp_files(3600).unwrap();
+
+        // Should not have cleaned up anything (not old enough)
+        assert!(cleaned.is_empty());
+        assert!(log_path.exists());
+
+        // Entry should still exist
+        assert!(state.get_reviewer("security").is_some());
+
+        // Clean up the file manually
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// Test `cleanup_reviewer_temp_files` helper function.
+    #[test]
+    fn test_cleanup_reviewer_temp_files() {
+        // Create temp files and persist them (keep() returns paths)
+        let temp_log = tempfile::NamedTempFile::new().unwrap();
+        let temp_prompt = tempfile::NamedTempFile::new().unwrap();
+
+        let (_, log_path) = temp_log.keep().unwrap();
+        let (_, prompt_path) = temp_prompt.keep().unwrap();
+
+        let mut state = ReviewerStateFile::default();
+        state.set_reviewer(
+            "quality",
+            ReviewerEntry {
+                pid: 12345,
+                started_at: Utc::now(),
+                log_file: log_path.clone(),
+                prompt_file: Some(prompt_path.clone()),
+                pr_url: "https://github.com/owner/repo/pull/123".to_string(),
+                head_sha: "abc123".to_string(),
+                restart_count: 0,
+                temp_files: Vec::new(),
+            },
+        );
+
+        // Verify files exist
+        assert!(log_path.exists());
+        assert!(prompt_path.exists());
+
+        // Clean up
+        let cleaned = cleanup_reviewer_temp_files(&mut state, "quality");
+
+        // Should have cleaned up 2 files
+        assert_eq!(cleaned.len(), 2);
+        assert!(!log_path.exists());
+        assert!(!prompt_path.exists());
+
+        // Entry should be removed
+        assert!(state.get_reviewer("quality").is_none());
     }
 }

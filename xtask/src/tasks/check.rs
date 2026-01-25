@@ -24,8 +24,9 @@ use serde::Deserialize;
 use xshell::{Shell, cmd};
 
 use crate::reviewer_state::{
-    HealthStatus, MAX_RESTART_ATTEMPTS, ReviewerEntry, ReviewerSpawner, ReviewerStateFile,
-    acquire_remediation_lock, kill_process,
+    HealthStatus, MAX_RESTART_ATTEMPTS, ORPHAN_CLEANUP_AGE_THRESHOLD_SECS, ReviewerEntry,
+    ReviewerSpawner, ReviewerStateFile, acquire_remediation_lock, cleanup_reviewer_temp_files,
+    kill_process,
 };
 use crate::util::{current_branch, validate_ticket_branch};
 
@@ -101,6 +102,33 @@ struct CheckRun {
     bucket: Option<String>,
 }
 
+/// Clean up orphaned temp files from dead reviewers older than the threshold.
+///
+/// This function silently cleans up temp files for reviewers that:
+/// 1. Have a `Dead` health status (process is no longer running)
+/// 2. Were started more than 1 hour ago
+///
+/// Any errors are logged but do not fail the check command.
+fn cleanup_orphaned_temp_files_if_needed() {
+    if let Ok(mut state) = ReviewerStateFile::load() {
+        match state.cleanup_orphaned_temp_files(ORPHAN_CLEANUP_AGE_THRESHOLD_SECS) {
+            Ok(cleaned) if !cleaned.is_empty() => {
+                println!(
+                    "Cleaned up {} orphaned temp file(s) from dead reviewers.",
+                    cleaned.len()
+                );
+            },
+            Ok(_) => {
+                // No files cleaned up, nothing to report
+            },
+            Err(e) => {
+                // Log but don't fail
+                eprintln!("Warning: Failed to clean up orphaned temp files: {e}");
+            },
+        }
+    }
+}
+
 /// Check ticket and PR status.
 ///
 /// This function displays the current state and suggests the next action.
@@ -137,6 +165,9 @@ pub fn run(watch: bool) -> Result<u8> {
         println!("Checking status for {}", ticket_branch.ticket_id);
     }
     println!();
+
+    // Clean up orphaned temp files from dead reviewers older than 1 hour
+    cleanup_orphaned_temp_files_if_needed();
 
     if watch {
         let start = Instant::now();
@@ -677,16 +708,21 @@ fn remediate_reviewer(
     };
 
     if is_review_completed(sh, &current_entry.head_sha, status_context) {
-        // Review completed, clean up the state entry and log file
-        if current_entry.log_file.exists() {
-            let _ = std::fs::remove_file(&current_entry.log_file);
-        }
-        state.remove_reviewer(reviewer_type);
+        // Review completed, clean up the state entry and all temp files
+        let cleaned = cleanup_reviewer_temp_files(&mut state, reviewer_type);
         state.save()?;
-        println!(
-            "      {} review completed, cleaning up state",
-            capitalize(reviewer_type)
-        );
+        if cleaned.is_empty() {
+            println!(
+                "      {} review completed, cleaning up state",
+                capitalize(reviewer_type)
+            );
+        } else {
+            println!(
+                "      {} review completed, cleaned up {} temp file(s)",
+                capitalize(reviewer_type),
+                cleaned.len()
+            );
+        }
         return Ok(());
     }
 
@@ -697,11 +733,8 @@ fn remediate_reviewer(
             capitalize(reviewer_type),
             MAX_RESTART_ATTEMPTS
         );
-        // Clean up but don't restart
-        if current_entry.log_file.exists() {
-            let _ = std::fs::remove_file(&current_entry.log_file);
-        }
-        state.remove_reviewer(reviewer_type);
+        // Clean up all temp files but don't restart
+        let _ = cleanup_reviewer_temp_files(&mut state, reviewer_type);
         state.save()?;
         return Ok(());
     }
@@ -731,18 +764,13 @@ fn remediate_reviewer(
         }
     }
 
-    // Remove old log file
-    if current_entry.log_file.exists() {
-        let _ = std::fs::remove_file(&current_entry.log_file);
-    }
-
     // Save the PR URL and HEAD SHA before removing the entry
     let pr_url = current_entry.pr_url.clone();
     let head_sha = current_entry.head_sha.clone();
     let restart_count = current_entry.restart_count + 1;
 
-    // Remove old entry
-    state.remove_reviewer(reviewer_type);
+    // Clean up old temp files and remove entry
+    let _ = cleanup_reviewer_temp_files(&mut state, reviewer_type);
     state.save()?;
 
     // Re-trigger the review using the saved PR URL and HEAD SHA

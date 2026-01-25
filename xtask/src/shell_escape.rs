@@ -130,33 +130,35 @@ pub fn build_script_command(prompt_path: &Path, log_path: Option<&Path>) -> Stri
     )
 }
 
-/// Builds a script command with prompt file cleanup after execution.
+/// Builds a script command for background execution with log capture.
 ///
-/// Similar to [`build_script_command`] but appends `; rm -f '<prompt_path>'`
-/// to clean up the prompt file after Gemini completes.
+/// This is the same as [`build_script_command`] with `Some(log_path)`, but
+/// provided as a separate function for clarity when spawning background
+/// reviewers.
+///
+/// Note: Temp file cleanup is handled via state tracking in
+/// `reviewer_state.rs`, not via shell commands. This avoids race conditions
+/// and ensures cleanup even if the process is killed.
 ///
 /// # Arguments
 ///
-/// * `prompt_path` - Path to the prompt file to redirect as input (will be
-///   deleted)
+/// * `prompt_path` - Path to the prompt file to redirect as input
 /// * `log_path` - Path to capture output for activity tracking
 ///
 /// # Returns
 ///
-/// A shell command string that runs Gemini and then removes the prompt file.
+/// A shell command string that runs Gemini with log capture.
 ///
 /// # Format
 ///
 /// ```text
-/// script -q '<log_path>' -c 'gemini --yolo < '\''<prompt_path>'\'''; rm -f '<prompt_path>'
+/// script -q '<log_path>' -c 'gemini --yolo < '\''<prompt_path>'\'''
 /// ```
 pub fn build_script_command_with_cleanup(prompt_path: &Path, log_path: &Path) -> String {
-    let quoted_prompt = quote_path(prompt_path);
-    let quoted_log = quote_path(log_path);
-    let inner_cmd = format!("gemini --yolo < {quoted_prompt}");
-    let escaped_inner = escape_for_single_quote(&inner_cmd);
-
-    format!("script -q {quoted_log} -c '{escaped_inner}'; rm -f {quoted_prompt}")
+    // Temp file cleanup is now handled via state tracking, not shell commands.
+    // This function is kept for backward compatibility but now delegates to
+    // build_script_command with log capture.
+    build_script_command(prompt_path, Some(log_path))
 }
 
 #[cfg(test)]
@@ -395,7 +397,7 @@ mod tests {
         let log = Path::new("/tmp/review.log");
         let cmd = build_script_command_with_cleanup(prompt, log);
 
-        // Verify command structure
+        // Verify command structure - same as build_script_command with log
         assert!(
             cmd.contains("script -q"),
             "Command should use script -q: {cmd}"
@@ -404,9 +406,10 @@ mod tests {
             cmd.contains("gemini --yolo"),
             "Command should invoke gemini --yolo: {cmd}"
         );
+        // Note: rm -f is no longer used - cleanup is handled via state tracking
         assert!(
-            cmd.contains("; rm -f"),
-            "Command should include cleanup rm -f: {cmd}"
+            !cmd.contains("rm -f"),
+            "Command should NOT include rm -f (cleanup via state): {cmd}"
         );
     }
 
@@ -416,12 +419,10 @@ mod tests {
         let log = Path::new("/tmp/log.txt");
         let cmd = build_script_command_with_cleanup(prompt, log);
 
-        // Path with spaces should be quoted in both the script and rm commands
-        let quote_count = cmd.matches('\'').count();
-        // We expect at least 2 quoted paths (prompt in script + prompt in rm)
+        // Path with spaces should be quoted
         assert!(
-            quote_count >= 2,
-            "Paths should be quoted in both script and rm commands: {cmd}"
+            cmd.contains('\''),
+            "Path with spaces should be quoted: {cmd}"
         );
     }
 

@@ -284,8 +284,6 @@ fn run_ai_review(
         Ok(result) => {
             println!("  Warning: Gemini exited with status: {}", result.status);
             println!("  You may need to run the review manually or check the output.");
-            // Clean up log file on failure too
-            let _ = std::fs::remove_file(&result.log_path);
         },
         Err(e) => {
             println!("  Warning: Failed to run Gemini: {e}");
