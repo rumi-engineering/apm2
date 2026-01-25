@@ -93,6 +93,10 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 zeroize = { version = "1.8", features = ["derive"] }
 
+# Sandboxing (Linux only)
+seccompiler = "0.5"
+libc = "0.2"
+
 # Internal crates
 apm2-core = { version = "0.3.0", path = "crates/apm2-core" }
 

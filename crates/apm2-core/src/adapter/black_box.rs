@@ -62,6 +62,8 @@ use super::event::{
     ProcessExited, ProcessStarted, ProgressSignal, ProgressType, StallDetected,
     ToolRequestDetected,
 };
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::seccomp::compile_seccomp_filter;
 use super::watcher::FilesystemWatcher;
 
 /// Black-box adapter for observation-based agent monitoring.
@@ -161,6 +163,45 @@ impl BlackBoxAdapter {
 
         // Set environment variables (filtered for security)
         self.apply_environment(&mut cmd);
+
+        // Apply seccomp sandbox (Linux x86_64 only)
+        //
+        // We compile the BPF filter BEFORE fork() to avoid memory allocation in the
+        // child process. The pre_exec hook only applies the pre-compiled filter,
+        // which is async-signal-safe (just a prctl() call).
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            // Compile the filter in the parent process (safe to allocate here)
+            let compiled_filter = if self.config.seccomp.is_enforced() {
+                compile_seccomp_filter(&self.config.seccomp)
+                    .map_err(|e| AdapterError::SpawnFailed(format!("seccomp compile: {e}")))?
+            } else {
+                None
+            };
+
+            if let Some(filter) = compiled_filter {
+                // SAFETY: The pre_exec hook runs in the child process after fork(),
+                // before exec(). This is a restricted environment where:
+                // - Memory allocations may not be safe (we avoid them by pre-compiling)
+                // - Mutex operations may deadlock (we don't use any)
+                // - Only async-signal-safe functions should be called
+                //
+                // The CompiledSeccompFilter::apply() method only calls prctl() via
+                // seccompiler, which is async-signal-safe. No allocations occur.
+                //
+                // The unsafe block is required by the pre_exec API and is necessary
+                // to apply kernel-level security restrictions before process execution.
+                #[allow(unsafe_code)]
+                unsafe {
+                    cmd.pre_exec(move || {
+                        filter
+                            .apply()
+                            .map(|_| ())
+                            .map_err(|e| std::io::Error::other(e.message))
+                    });
+                }
+            }
+        }
 
         // Spawn the process
         let child = cmd
