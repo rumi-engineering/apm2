@@ -49,6 +49,7 @@ pub mod shutdown;
 pub mod state;
 pub mod supervisor;
 pub mod tool;
+pub mod work;
 
 /// Prelude module for convenient imports.
 pub mod prelude {

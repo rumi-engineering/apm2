@@ -146,6 +146,11 @@ message WorkTransitioned {
   string from_state = 2;
   string to_state = 3;  // OPEN, CLAIMED, IN_PROGRESS, REVIEW, NEEDS_INPUT, NEEDS_ADJUDICATION
   string rationale_code = 4;
+  // Previous transition count for replay protection.
+  // MUST match work.transition_count before this transition.
+  // This field is strictly validated to prevent replay attacks.
+  // For the first transition (Open -> Claimed), use 0.
+  uint32 previous_transition_count = 5;
 }
 
 message WorkCompleted {

@@ -231,6 +231,12 @@ pub struct WorkTransitioned {
     pub to_state: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub rationale_code: ::prost::alloc::string::String,
+    /// Previous transition count for replay protection.
+    /// MUST match work.transition_count before this transition.
+    /// This field is strictly validated to prevent replay attacks.
+    /// For the first transition (Open -> Claimed), use 0.
+    #[prost(uint32, tag = "5")]
+    pub previous_transition_count: u32,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
