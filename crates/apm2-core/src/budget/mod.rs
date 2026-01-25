@@ -38,7 +38,7 @@
 //! // Check if a tool call can proceed
 //! if tracker.can_charge(BudgetType::ToolCalls, 1) {
 //!     // Execute the tool...
-//!     tracker.charge(BudgetType::ToolCalls, 1);
+//!     tracker.charge(BudgetType::ToolCalls, 1).unwrap();
 //! }
 //!
 //! // Check for budget exceeded
@@ -263,6 +263,8 @@ pub struct BudgetTracker {
     started_at: Instant,
     /// Start timestamp in nanoseconds (for serialization/events).
     started_at_ns: u64,
+    /// Time offset in milliseconds (for restored sessions).
+    time_offset_ms: u64,
 }
 
 impl BudgetTracker {
@@ -279,6 +281,30 @@ impl BudgetTracker {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
                 .unwrap_or(0),
+            time_offset_ms: 0,
+        }
+    }
+
+    /// Creates a new budget tracker with restored state.
+    ///
+    /// This is used when resuming a session to restore its budget consumption.
+    #[must_use]
+    pub fn restore(
+        session_id: impl Into<String>,
+        config: BudgetConfig,
+        started_at_ns: u64,
+        tokens_consumed: u64,
+        tool_calls_consumed: u64,
+        time_offset_ms: u64,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            config,
+            tokens_consumed,
+            tool_calls_consumed,
+            started_at: Instant::now(),
+            started_at_ns,
+            time_offset_ms,
         }
     }
 
@@ -298,6 +324,7 @@ impl BudgetTracker {
             tool_calls_consumed: 0,
             started_at: Instant::now(),
             started_at_ns,
+            time_offset_ms: 0,
         }
     }
 
@@ -351,7 +378,9 @@ impl BudgetTracker {
     #[must_use]
     pub fn elapsed_ms(&self) -> u64 {
         // Saturate at u64::MAX for extremely long sessions (unlikely in practice)
-        u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+        let current_run_ms =
+            u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.time_offset_ms.saturating_add(current_run_ms)
     }
 
     /// Returns `true` if the given budget type is exceeded.
@@ -417,20 +446,46 @@ impl BudgetTracker {
 
     /// Charges an amount against the budget.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the budget type is `Time` (time is tracked automatically).
-    pub fn charge(&mut self, budget_type: BudgetType, amount: u64) {
+    /// Returns `BudgetChargeError::TimeCannotBeCharged` if the budget type
+    /// is `Time` (time is tracked automatically).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::budget::{
+    ///     BudgetChargeError, BudgetConfig, BudgetTracker, BudgetType,
+    /// };
+    ///
+    /// let mut tracker = BudgetTracker::new("session-1", BudgetConfig::default());
+    ///
+    /// // Token and ToolCalls can be charged
+    /// assert!(tracker.charge(BudgetType::Token, 100).is_ok());
+    /// assert!(tracker.charge(BudgetType::ToolCalls, 1).is_ok());
+    ///
+    /// // Time cannot be charged (tracked automatically)
+    /// assert_eq!(
+    ///     tracker.charge(BudgetType::Time, 100),
+    ///     Err(BudgetChargeError::TimeCannotBeCharged)
+    /// );
+    /// ```
+    #[allow(clippy::missing_const_for_fn)] // Uses saturating_add which is not const
+    pub fn charge(
+        &mut self,
+        budget_type: BudgetType,
+        amount: u64,
+    ) -> Result<(), BudgetChargeError> {
         match budget_type {
             BudgetType::Token => {
                 self.tokens_consumed = self.tokens_consumed.saturating_add(amount);
+                Ok(())
             },
             BudgetType::ToolCalls => {
                 self.tool_calls_consumed = self.tool_calls_consumed.saturating_add(amount);
+                Ok(())
             },
-            BudgetType::Time => {
-                panic!("Time budget cannot be charged directly; it is tracked automatically");
-            },
+            BudgetType::Time => Err(BudgetChargeError::TimeCannotBeCharged),
         }
     }
 
@@ -441,22 +496,44 @@ impl BudgetTracker {
     ///
     /// Returns `BudgetCheckResult::Exceeded` if the charge would exceed the
     /// budget.
+    ///
+    /// # Note
+    ///
+    /// This method silently ignores attempts to charge `BudgetType::Time`
+    /// (since time is tracked automatically). The check result is still
+    /// returned, but no charge is made.
     pub fn try_charge(&mut self, budget_type: BudgetType, amount: u64) -> BudgetCheckResult {
         let result = self.check(budget_type, amount);
         if result.is_allowed() && !matches!(budget_type, BudgetType::Time) {
-            self.charge(budget_type, amount);
+            // SAFETY: charge() only fails for Time, which we explicitly exclude
+            let _ = self.charge(budget_type, amount);
         }
         result
     }
 
     /// Increments the tool call counter by 1.
+    ///
+    /// # Panics
+    ///
+    /// This method will never panic in practice. The internal `expect` call
+    /// guards against an impossible case (charging `ToolCalls` always
+    /// succeeds).
     pub fn record_tool_call(&mut self) {
-        self.charge(BudgetType::ToolCalls, 1);
+        // SAFETY: ToolCalls is always a valid charge type
+        self.charge(BudgetType::ToolCalls, 1)
+            .expect("ToolCalls charge should never fail");
     }
 
     /// Records token consumption from an inference call.
+    ///
+    /// # Panics
+    ///
+    /// This method will never panic in practice. The internal `expect` call
+    /// guards against an impossible case (charging `Token` always succeeds).
     pub fn record_tokens(&mut self, tokens: u64) {
-        self.charge(BudgetType::Token, tokens);
+        // SAFETY: Token is always a valid charge type
+        self.charge(BudgetType::Token, tokens)
+            .expect("Token charge should never fail");
     }
 
     /// Creates a summary of the current budget state.
@@ -534,6 +611,31 @@ impl std::fmt::Display for BudgetExceededError {
 }
 
 impl std::error::Error for BudgetExceededError {}
+
+/// Error returned when attempting to charge an invalid budget type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetChargeError {
+    /// Attempted to charge the time budget directly.
+    ///
+    /// Time budget is tracked automatically via elapsed wall-clock time
+    /// and cannot be charged manually.
+    TimeCannotBeCharged,
+}
+
+impl std::fmt::Display for BudgetChargeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimeCannotBeCharged => {
+                write!(
+                    f,
+                    "Time budget cannot be charged directly; it is tracked automatically"
+                )
+            },
+        }
+    }
+}
+
+impl std::error::Error for BudgetChargeError {}
 
 // ============================================================================
 // Event Integration
@@ -668,12 +770,12 @@ mod tests {
         let config = BudgetConfig::builder().token_budget(1000).build();
         let mut tracker = BudgetTracker::new("session-1", config);
 
-        tracker.charge(BudgetType::Token, 100);
+        tracker.charge(BudgetType::Token, 100).unwrap();
         assert_eq!(tracker.consumed(BudgetType::Token), 100);
         assert_eq!(tracker.remaining(BudgetType::Token), 900);
         assert!(!tracker.is_exceeded(BudgetType::Token));
 
-        tracker.charge(BudgetType::Token, 900);
+        tracker.charge(BudgetType::Token, 900).unwrap();
         assert_eq!(tracker.consumed(BudgetType::Token), 1000);
         assert_eq!(tracker.remaining(BudgetType::Token), 0);
         assert!(tracker.is_exceeded(BudgetType::Token));
@@ -745,7 +847,7 @@ mod tests {
 
         assert!(tracker.first_exceeded().is_none());
 
-        tracker.charge(BudgetType::Token, 100);
+        tracker.charge(BudgetType::Token, 100).unwrap();
         assert_eq!(tracker.first_exceeded(), Some(BudgetType::Token));
     }
 
@@ -758,8 +860,8 @@ mod tests {
             .build();
         let mut tracker = BudgetTracker::new("session-1", config);
 
-        tracker.charge(BudgetType::Token, 500);
-        tracker.charge(BudgetType::ToolCalls, 50);
+        tracker.charge(BudgetType::Token, 500).unwrap();
+        tracker.charge(BudgetType::ToolCalls, 50).unwrap();
 
         let summary = tracker.summary();
         assert_eq!(summary.session_id, "session-1");
@@ -793,8 +895,8 @@ mod tests {
         let config = BudgetConfig::builder().token_budget(u64::MAX).build();
         let mut tracker = BudgetTracker::new("session-1", config);
 
-        tracker.charge(BudgetType::Token, u64::MAX - 10);
-        tracker.charge(BudgetType::Token, 100);
+        tracker.charge(BudgetType::Token, u64::MAX - 10).unwrap();
+        tracker.charge(BudgetType::Token, 100).unwrap();
 
         // Should saturate at MAX, not overflow
         assert_eq!(tracker.consumed(BudgetType::Token), u64::MAX);
@@ -811,11 +913,21 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Time budget cannot be charged directly")]
-    fn test_charge_time_panics() {
+    fn test_charge_time_returns_error() {
         let config = BudgetConfig::default();
         let mut tracker = BudgetTracker::new("session-1", config);
-        tracker.charge(BudgetType::Time, 100);
+
+        // Time budget cannot be charged directly
+        let result = tracker.charge(BudgetType::Time, 100);
+        assert_eq!(result, Err(BudgetChargeError::TimeCannotBeCharged));
+
+        // Token and ToolCalls can be charged
+        assert!(tracker.charge(BudgetType::Token, 100).is_ok());
+        assert!(tracker.charge(BudgetType::ToolCalls, 1).is_ok());
+
+        // Verify consumption was recorded for valid types
+        assert_eq!(tracker.consumed(BudgetType::Token), 100);
+        assert_eq!(tracker.consumed(BudgetType::ToolCalls), 1);
     }
 
     // ========================================================================
@@ -833,7 +945,7 @@ mod tests {
         let mut tracker = BudgetTracker::new("session-123", config);
 
         // Exceed the token budget
-        tracker.charge(BudgetType::Token, 1500);
+        tracker.charge(BudgetType::Token, 1500).unwrap();
 
         let event = super::create_budget_exceeded_event(&tracker, BudgetType::Token);
 
@@ -876,7 +988,7 @@ mod tests {
 
         // Create a tracker with a very short time budget
         let config = BudgetConfig::builder()
-            .time_budget_ms(1)  // 1ms
+            .time_budget_ms(1) // 1ms
             .build();
         let tracker = BudgetTracker::new("session-789", config);
 
@@ -894,5 +1006,23 @@ mod tests {
             },
             _ => panic!("Expected BudgetExceeded event"),
         }
+    }
+
+    #[test]
+    fn test_budget_tracker_restore() {
+        let config = BudgetConfig::default();
+        let tracker = BudgetTracker::restore(
+            "session-restored",
+            config,
+            123_456_789, // started_at_ns
+            1000,        // tokens
+            50,          // tool_calls
+            300_000,     // time_offset_ms (5 minutes)
+        );
+
+        assert_eq!(tracker.consumed(BudgetType::Token), 1000);
+        assert_eq!(tracker.consumed(BudgetType::ToolCalls), 50);
+        assert!(tracker.consumed(BudgetType::Time) >= 300_000);
+        assert_eq!(tracker.started_at_ns(), 123_456_789);
     }
 }

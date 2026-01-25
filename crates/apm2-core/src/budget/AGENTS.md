@@ -74,7 +74,7 @@ pub struct BudgetTracker {
 - [INV-0005] Time cannot be charged directly (tracked automatically)
 
 **Contracts:**
-- [CTR-0005] `charge()` panics for `BudgetType::Time` (invariant enforcement)
+- [CTR-0005] `charge()` returns `Err(BudgetChargeError::TimeCannotBeCharged)` for `BudgetType::Time` (time is tracked automatically)
 - [CTR-0006] `try_charge()` returns result without side effect on exceeded
 - [CTR-0007] `is_exceeded()` returns `false` for unlimited budgets
 

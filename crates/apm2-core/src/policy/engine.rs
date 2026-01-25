@@ -1816,7 +1816,7 @@ policy:
         let mut tracker = BudgetTracker::new("session-123", config);
 
         // Exceed the token budget
-        tracker.charge(BudgetType::Token, 1500);
+        tracker.charge(BudgetType::Token, 1500).unwrap();
 
         let request = create_file_read_request("/any/file.txt");
         let result = engine.evaluate_with_budget(&request, &tracker);
@@ -1851,7 +1851,7 @@ policy:
 
         // Exceed the tool call budget
         for _ in 0..15 {
-            tracker.charge(BudgetType::ToolCalls, 1);
+            tracker.charge(BudgetType::ToolCalls, 1).unwrap();
         }
 
         let request = create_shell_exec_request("cargo test");
@@ -1918,7 +1918,7 @@ policy:
 
         let config = BudgetConfig::builder().token_budget(100).build();
         let mut tracker = BudgetTracker::new("session-123", config);
-        tracker.charge(BudgetType::Token, 200);
+        tracker.charge(BudgetType::Token, 200).unwrap();
 
         let request = create_file_read_request("/any/file.txt");
         let result = engine.evaluate_with_budget(&request, &tracker);
@@ -1952,8 +1952,10 @@ policy:
         let mut tracker = BudgetTracker::new("session-123", config);
 
         // Even with massive consumption, unlimited means not exceeded
-        tracker.charge(BudgetType::Token, u64::MAX - 10);
-        tracker.charge(BudgetType::ToolCalls, u64::MAX - 10);
+        tracker.charge(BudgetType::Token, u64::MAX - 10).unwrap();
+        tracker
+            .charge(BudgetType::ToolCalls, u64::MAX - 10)
+            .unwrap();
 
         let request = create_file_read_request("/any/file.txt");
         let result = engine.evaluate_with_budget(&request, &tracker);
