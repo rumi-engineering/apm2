@@ -198,6 +198,22 @@ impl LeaseReducerState {
 ///
 /// If the ledger may be replicated from untrusted peers, inject a `Verifier`
 /// trait to cryptographically verify signatures during replay.
+///
+/// # Trust Boundary: Replay Protection
+///
+/// This reducer relies on the ledger layer for replay protection. If terminal
+/// leases are pruned (via `prune_terminal_leases`), the reducer no longer has
+/// memory of those lease IDs. Replay protection MUST be enforced at the ledger
+/// layer through:
+///
+/// 1. **Event deduplication**: The ledger must reject duplicate events before
+///    they reach the reducer.
+/// 2. **Monotonic event ordering**: Events must be processed in order, and the
+///    ledger must not replay already-processed events.
+///
+/// If the reducer is replayed from a ledger that doesn't guarantee
+/// deduplication, pruned lease IDs could be re-issued. This is by design -
+/// the reducer is a pure state machine, not a deduplication authority.
 #[derive(Debug, Default)]
 pub struct LeaseReducer {
     state: LeaseReducerState,
