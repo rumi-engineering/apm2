@@ -28,6 +28,20 @@ pub enum EvidenceError {
         value: String,
     },
 
+    /// The gate ID is invalid.
+    #[error("invalid gate ID: {value}")]
+    InvalidGateId {
+        /// The invalid value or reason.
+        value: String,
+    },
+
+    /// The receipt ID is invalid.
+    #[error("invalid receipt ID: {value}")]
+    InvalidReceiptId {
+        /// The invalid value or reason.
+        value: String,
+    },
+
     /// Evidence with this ID already exists.
     #[error("evidence already exists: {evidence_id}")]
     DuplicateEvidence {

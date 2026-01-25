@@ -406,3 +406,416 @@ async fn test_adapter_event_session_id() {
         );
     }
 }
+
+// =============================================================================
+// Claude Code Instrumented Adapter Tests
+// =============================================================================
+
+/// Test Claude Code adapter configuration creation and builder pattern.
+#[test]
+fn test_claude_code_config_creation() {
+    let config = ClaudeCodeConfig::new("claude-session-123");
+
+    assert_eq!(config.session_id, "claude-session-123");
+    assert_eq!(config.claude_binary, "claude");
+    assert!(config.args.is_empty());
+    assert!(config.working_dir.is_none());
+    assert!(config.stall_detection_enabled);
+    assert!(config.hooks.pre_tool_use);
+    assert!(config.hooks.post_tool_use);
+    assert!(config.hooks.session_lifecycle);
+}
+
+/// Test Claude Code adapter configuration builder.
+#[test]
+fn test_claude_code_config_builder() {
+    let config = ClaudeCodeConfig::new("claude-builder-test")
+        .with_binary("/usr/local/bin/claude")
+        .with_working_dir("/home/user/project")
+        .with_args(["--model", "opus", "--verbose"])
+        .with_stall_timeout(Duration::from_secs(180))
+        .without_stall_detection();
+
+    assert_eq!(config.session_id, "claude-builder-test");
+    assert_eq!(config.claude_binary, "/usr/local/bin/claude");
+    assert_eq!(
+        config.working_dir,
+        Some(std::path::PathBuf::from("/home/user/project"))
+    );
+    assert_eq!(config.args, vec!["--model", "opus", "--verbose"]);
+    assert_eq!(config.stall_timeout, Duration::from_secs(180));
+    assert!(!config.stall_detection_enabled);
+}
+
+/// Test Claude Code adapter creation and initial state.
+#[test]
+fn test_claude_code_adapter_creation() {
+    let config = ClaudeCodeConfig::new("claude-adapter-test");
+    let adapter = ClaudeCodeAdapter::new(config);
+
+    assert_eq!(adapter.session_id(), "claude-adapter-test");
+    assert!(!adapter.is_running());
+    assert!(adapter.pid().is_none());
+    assert!(adapter.claude_session_id().is_none());
+    assert!(adapter.exit_code().is_none());
+    assert!(adapter.exit_signal().is_none());
+}
+
+/// Test that Claude Code adapter implements the Adapter trait correctly.
+#[test]
+fn test_claude_code_adapter_trait_type() {
+    let config = ClaudeCodeConfig::new("trait-test");
+    let adapter = ClaudeCodeAdapter::new(config);
+
+    // Verify adapter_type returns the correct string
+    assert_eq!(Adapter::adapter_type(&adapter), "claude-code");
+}
+
+/// Test hook event serialization and deserialization.
+#[test]
+fn test_hook_event_serialization() {
+    // Test PreToolUse event
+    let pre_tool = HookEvent::PreToolUse(ToolUseEvent {
+        tool_use_id: "tool-001".to_string(),
+        tool_name: "Read".to_string(),
+        input: serde_json::json!({"file_path": "/tmp/test.rs"}),
+        session_id: Some("session-xyz".to_string()),
+        timestamp: Some(1_706_000_000_000),
+    });
+
+    let json = serde_json::to_string(&pre_tool).unwrap();
+    assert!(json.contains("\"type\":\"pre_tool_use\""));
+    assert!(json.contains("Read"));
+
+    // Test PostToolUse event
+    let post_tool = HookEvent::PostToolUse(ToolResultEvent {
+        tool_use_id: "tool-001".to_string(),
+        output: serde_json::json!({"content": "file contents here"}),
+        success: true,
+        error: None,
+        duration_ms: Some(50),
+    });
+
+    let json = serde_json::to_string(&post_tool).unwrap();
+    assert!(json.contains("\"type\":\"post_tool_use\""));
+    assert!(json.contains("tool-001"));
+
+    // Test SessionStart event
+    let session_start = HookEvent::SessionStart(SessionStartEvent {
+        session_id: "claude-session-abc".to_string(),
+        working_dir: Some("/home/user/project".to_string()),
+        model: Some("claude-opus-4".to_string()),
+        timestamp: Some(1_706_000_000_000),
+    });
+
+    let json = serde_json::to_string(&session_start).unwrap();
+    assert!(json.contains("\"type\":\"session_start\""));
+    assert!(json.contains("claude-opus-4"));
+
+    // Test SessionEnd event
+    let session_end = HookEvent::SessionEnd(SessionEndEvent {
+        session_id: "claude-session-abc".to_string(),
+        reason: Some("completed".to_string()),
+        duration_ms: Some(120_000),
+    });
+
+    let json = serde_json::to_string(&session_end).unwrap();
+    assert!(json.contains("\"type\":\"session_end\""));
+
+    // Test Progress event
+    let progress = HookEvent::Progress(ProgressEvent {
+        progress_type: "thinking".to_string(),
+        description: Some("Processing user request".to_string()),
+        token_count: Some(500),
+    });
+
+    let json = serde_json::to_string(&progress).unwrap();
+    assert!(json.contains("\"type\":\"progress\""));
+    assert!(json.contains("thinking"));
+}
+
+/// Test hook response creation.
+#[test]
+fn test_hook_response_creation() {
+    // Default response allows continuation
+    let default_response = HookResponse::default();
+    assert!(default_response.continue_execution);
+    assert!(default_response.message.is_none());
+    assert!(default_response.modified_input.is_none());
+
+    // Custom deny response
+    let deny_response = HookResponse {
+        continue_execution: false,
+        message: Some("Tool execution denied by policy".to_string()),
+        modified_input: None,
+    };
+    assert!(!deny_response.continue_execution);
+    assert!(deny_response.message.is_some());
+
+    // Response with modified input
+    let modified_response = HookResponse {
+        continue_execution: true,
+        message: Some("Input sanitized".to_string()),
+        modified_input: Some(serde_json::json!({"sanitized": true})),
+    };
+    assert!(modified_response.continue_execution);
+    assert!(modified_response.modified_input.is_some());
+}
+
+/// Test that environment configuration follows security defaults.
+#[test]
+fn test_claude_code_environment_security() {
+    let config = ClaudeCodeConfig::new("security-test");
+
+    // Verify default-deny: inherit is false
+    assert!(
+        !config.environment.inherit,
+        "Default config should not inherit parent environment"
+    );
+
+    // Verify sensitive keys are in the exclude list
+    let exclude = &config.environment.exclude;
+    assert!(exclude.contains(&"ANTHROPIC_API_KEY".to_string()));
+    assert!(exclude.contains(&"AWS_SECRET_ACCESS_KEY".to_string()));
+    assert!(exclude.contains(&"AWS_ACCESS_KEY_ID".to_string()));
+    assert!(exclude.contains(&"GITHUB_TOKEN".to_string()));
+    assert!(exclude.contains(&"OPENAI_API_KEY".to_string()));
+    assert!(exclude.contains(&"NPM_TOKEN".to_string()));
+}
+
+/// Test hook configuration defaults.
+#[test]
+fn test_hook_config_defaults() {
+    let config = HookConfig::default();
+
+    assert!(
+        config.pre_tool_use,
+        "PreToolUse hook should be enabled by default"
+    );
+    assert!(
+        config.post_tool_use,
+        "PostToolUse hook should be enabled by default"
+    );
+    assert!(
+        config.session_lifecycle,
+        "Session lifecycle hooks should be enabled by default"
+    );
+    assert_eq!(
+        config.hook_timeout,
+        Duration::from_secs(30),
+        "Default hook timeout should be 30 seconds"
+    );
+}
+
+/// Test that the adapter correctly reports adapter type through trait.
+#[test]
+fn test_adapter_trait_implementation() {
+    let config = ClaudeCodeConfig::new("trait-impl-test");
+    let mut adapter = ClaudeCodeAdapter::new(config);
+
+    // Test session_id through trait
+    assert_eq!(Adapter::session_id(&adapter), "trait-impl-test");
+
+    // Test is_running through trait
+    assert!(!Adapter::is_running(&adapter));
+
+    // Test pid through trait
+    assert!(Adapter::pid(&adapter).is_none());
+
+    // Test adapter_type through trait
+    assert_eq!(Adapter::adapter_type(&adapter), "claude-code");
+
+    // Test take_event_receiver through trait
+    let rx = Adapter::take_event_receiver(&mut adapter);
+    assert!(rx.is_some());
+
+    // Second take should return None
+    let rx2 = Adapter::take_event_receiver(&mut adapter);
+    assert!(rx2.is_none());
+}
+
+/// Test tool use event structure.
+#[test]
+fn test_tool_use_event_structure() {
+    let event = ToolUseEvent {
+        tool_use_id: "toolu_01ABC123".to_string(),
+        tool_name: "Bash".to_string(),
+        input: serde_json::json!({
+            "command": "cargo test",
+            "timeout": 60000
+        }),
+        session_id: Some("sess_xyz".to_string()),
+        timestamp: Some(1_706_123_456_789),
+    };
+
+    assert_eq!(event.tool_use_id, "toolu_01ABC123");
+    assert_eq!(event.tool_name, "Bash");
+    assert!(event.input.is_object());
+    assert_eq!(event.session_id, Some("sess_xyz".to_string()));
+    assert_eq!(event.timestamp, Some(1_706_123_456_789));
+
+    // Verify serialization round-trip
+    let json = serde_json::to_string(&event).unwrap();
+    let parsed: ToolUseEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.tool_use_id, event.tool_use_id);
+    assert_eq!(parsed.tool_name, event.tool_name);
+}
+
+/// Test tool result event structure.
+#[test]
+fn test_tool_result_event_structure() {
+    // Success case
+    let success_event = ToolResultEvent {
+        tool_use_id: "toolu_01ABC123".to_string(),
+        output: serde_json::json!({"result": "test passed"}),
+        success: true,
+        error: None,
+        duration_ms: Some(1500),
+    };
+
+    assert!(success_event.success);
+    assert!(success_event.error.is_none());
+    assert_eq!(success_event.duration_ms, Some(1500));
+
+    // Failure case
+    let failure_event = ToolResultEvent {
+        tool_use_id: "toolu_01ABC123".to_string(),
+        output: serde_json::json!(null),
+        success: false,
+        error: Some("Command failed with exit code 1".to_string()),
+        duration_ms: Some(500),
+    };
+
+    assert!(!failure_event.success);
+    assert!(failure_event.error.is_some());
+}
+
+/// Test session lifecycle events.
+#[test]
+fn test_session_lifecycle_events() {
+    let start_event = SessionStartEvent {
+        session_id: "sess_lifecycle_test".to_string(),
+        working_dir: Some("/home/user/project".to_string()),
+        model: Some("claude-opus-4-20250514".to_string()),
+        timestamp: Some(1_706_000_000_000),
+    };
+
+    assert_eq!(start_event.session_id, "sess_lifecycle_test");
+    assert_eq!(
+        start_event.working_dir,
+        Some("/home/user/project".to_string())
+    );
+    assert!(start_event.model.as_ref().unwrap().contains("opus"));
+
+    let end_event = SessionEndEvent {
+        session_id: "sess_lifecycle_test".to_string(),
+        reason: Some("user_terminated".to_string()),
+        duration_ms: Some(300_000), // 5 minutes
+    };
+
+    assert_eq!(end_event.session_id, "sess_lifecycle_test");
+    assert_eq!(end_event.reason, Some("user_terminated".to_string()));
+    assert_eq!(end_event.duration_ms, Some(300_000));
+}
+
+/// Test progress event types.
+#[test]
+fn test_progress_event_types() {
+    let thinking_event = ProgressEvent {
+        progress_type: "thinking".to_string(),
+        description: Some("Analyzing code structure".to_string()),
+        token_count: Some(1500),
+    };
+
+    assert_eq!(thinking_event.progress_type, "thinking");
+    assert!(thinking_event.description.is_some());
+    assert_eq!(thinking_event.token_count, Some(1500));
+
+    let streaming_event = ProgressEvent {
+        progress_type: "streaming".to_string(),
+        description: Some("Generating response".to_string()),
+        token_count: Some(500),
+    };
+
+    assert_eq!(streaming_event.progress_type, "streaming");
+
+    let idle_event = ProgressEvent {
+        progress_type: "idle".to_string(),
+        description: None,
+        token_count: None,
+    };
+
+    assert_eq!(idle_event.progress_type, "idle");
+    assert!(idle_event.description.is_none());
+}
+
+/// Test that Claude Code adapter implements the Adapter trait uniformly.
+#[test]
+fn test_claude_code_adapter_trait_uniformity() {
+    let claude_config = ClaudeCodeConfig::new("uniform-claude");
+    let claude = ClaudeCodeAdapter::new(claude_config);
+
+    // Check that the adapter implements the trait correctly through method calls
+    let _ = Adapter::session_id(&claude);
+    let _ = Adapter::is_running(&claude);
+    let _ = Adapter::pid(&claude);
+    let _ = Adapter::adapter_type(&claude);
+
+    // Verify adapter type is correct
+    assert_eq!(Adapter::adapter_type(&claude), "claude-code");
+}
+
+/// Test that spawn failure is handled correctly.
+#[cfg_attr(miri, ignore)] // Miri can't spawn processes
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_claude_code_adapter_spawn_failure() {
+    let config =
+        ClaudeCodeConfig::new("spawn-fail-test").with_binary("nonexistent_claude_binary_12345");
+
+    let mut adapter = ClaudeCodeAdapter::new(config);
+
+    let result = adapter.start().await;
+    assert!(result.is_err());
+
+    match result {
+        Err(AdapterError::SpawnFailed(msg)) => {
+            assert!(!msg.is_empty(), "Error message should not be empty");
+        },
+        _ => panic!("Expected SpawnFailed error"),
+    }
+
+    // Adapter should not be running after failed start
+    assert!(!adapter.is_running());
+    assert!(adapter.pid().is_none());
+}
+
+/// Test that adapter is not running before start is called.
+#[test]
+fn test_claude_code_adapter_initial_state() {
+    let config = ClaudeCodeConfig::new("initial-state-test");
+    let adapter = ClaudeCodeAdapter::new(config);
+
+    // Adapter should not be running before start is called
+    assert!(!adapter.is_running());
+    assert!(adapter.pid().is_none());
+    assert!(adapter.claude_session_id().is_none());
+}
+
+/// Test exit classification string representation.
+///
+/// Note: The actual classification logic is tested in the `claude_code`
+/// module's unit tests. Here we test the public interface of
+/// `ExitClassification`.
+#[test]
+fn test_exit_classification_as_str() {
+    // Verify all classification variants have string representations
+    assert_eq!(ExitClassification::CleanSuccess.as_str(), "CLEAN_SUCCESS");
+    assert_eq!(ExitClassification::CleanError.as_str(), "CLEAN_ERROR");
+    assert_eq!(ExitClassification::Signal.as_str(), "SIGNAL");
+    assert_eq!(ExitClassification::Timeout.as_str(), "TIMEOUT");
+    assert_eq!(
+        ExitClassification::EntropyExceeded.as_str(),
+        "ENTROPY_EXCEEDED"
+    );
+    assert_eq!(ExitClassification::Unknown.as_str(), "UNKNOWN");
+}

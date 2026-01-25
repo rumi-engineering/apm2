@@ -5,11 +5,14 @@
 //! - Filesystem watching configuration
 //! - Stall detection thresholds
 //! - Progress signal derivation settings
+//! - Seccomp sandbox configuration (Linux only)
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use super::seccomp::SeccompProfile;
 
 /// Configuration for a black-box adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +35,13 @@ pub struct BlackBoxConfig {
     /// Environment variables to pass to the process.
     /// Only safe variables are allowed; sensitive ones are filtered.
     pub environment: EnvironmentConfig,
+
+    /// Seccomp sandbox configuration (Linux only).
+    ///
+    /// When enabled, applies syscall filtering to the spawned process
+    /// to restrict what it can do at the kernel level. This is a
+    /// defense-in-depth measure on top of the mediation layer.
+    pub seccomp: SeccompProfile,
 }
 
 impl BlackBoxConfig {
@@ -49,6 +59,8 @@ impl BlackBoxConfig {
             stall_detection: StallDetectionConfig::default(),
             progress: ProgressConfig::default(),
             environment: EnvironmentConfig::default(),
+            // Default: no seccomp filtering (opt-in for safety)
+            seccomp: SeccompProfile::none(),
         }
     }
 
@@ -81,6 +93,32 @@ impl BlackBoxConfig {
     #[must_use]
     pub const fn with_stall_timeout(mut self, timeout: Duration) -> Self {
         self.stall_detection.timeout = timeout;
+        self
+    }
+
+    /// Sets the seccomp profile for process sandboxing.
+    ///
+    /// On Linux, this applies syscall filtering via seccomp-bpf.
+    /// On other platforms, this setting is ignored (no-op).
+    #[must_use]
+    pub const fn with_seccomp(mut self, profile: SeccompProfile) -> Self {
+        self.seccomp = profile;
+        self
+    }
+
+    /// Enables seccomp sandboxing with the "restricted" profile.
+    ///
+    /// This is a convenience method that enables the recommended
+    /// seccomp profile for agent processes. It blocks:
+    /// - All network syscalls
+    /// - Privilege escalation syscalls
+    /// - Dangerous kernel operations
+    ///
+    /// Note: Seccomp-bpf cannot filter filesystem access by path.
+    /// For path-based access control, use Landlock LSM or mount namespaces.
+    #[must_use]
+    pub const fn with_seccomp_sandbox(mut self) -> Self {
+        self.seccomp = SeccompProfile::restricted();
         self
     }
 }
@@ -294,5 +332,36 @@ mod tests {
             !config.inherit,
             "Security: default config must use default-deny (inherit=false)"
         );
+    }
+
+    #[test]
+    fn test_default_seccomp_is_none() {
+        // Default: seccomp is opt-in (none by default)
+        let config = BlackBoxConfig::new("session-123", "echo");
+        assert!(!config.seccomp.is_enforced());
+    }
+
+    #[test]
+    fn test_with_seccomp() {
+        use super::super::seccomp::SeccompProfileLevel;
+
+        let profile = SeccompProfile::restricted();
+        let config = BlackBoxConfig::new("session-123", "echo").with_seccomp(profile);
+
+        assert!(config.seccomp.is_enforced());
+        assert_eq!(config.seccomp.level, SeccompProfileLevel::Restricted);
+    }
+
+    #[test]
+    fn test_with_seccomp_sandbox() {
+        use super::super::seccomp::SeccompProfileLevel;
+
+        let config = BlackBoxConfig::new("session-123", "echo")
+            .with_working_dir("/tmp/workspace")
+            .with_watch_path("/tmp/watch")
+            .with_seccomp_sandbox();
+
+        assert!(config.seccomp.is_enforced());
+        assert_eq!(config.seccomp.level, SeccompProfileLevel::Restricted);
     }
 }

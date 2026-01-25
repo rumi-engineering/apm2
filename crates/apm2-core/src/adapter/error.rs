@@ -69,6 +69,10 @@ pub enum AdapterError {
     /// Internal error.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Seccomp filter failed to apply.
+    #[error("seccomp filter failed: {0}")]
+    SeccompFailed(String),
 }
 
 impl AdapterError {
@@ -86,7 +90,10 @@ impl AdapterError {
     pub const fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Self::SpawnFailed(_) | Self::ConfigError(_) | Self::Internal(_)
+            Self::SpawnFailed(_)
+                | Self::ConfigError(_)
+                | Self::Internal(_)
+                | Self::SeccompFailed(_)
         )
     }
 }

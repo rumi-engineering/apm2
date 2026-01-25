@@ -31,6 +31,12 @@ chrono.workspace = true
 # Utilities
 uuid.workspace = true
 
+# Cryptography
+blake3.workspace = true
+
+# Canonicalization
+serde_jcs = "0.1"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 proptest.workspace = true

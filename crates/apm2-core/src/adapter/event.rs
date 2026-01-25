@@ -57,6 +57,82 @@ pub enum AdapterEventPayload {
 
     /// Stall detected (no activity for configured duration).
     StallDetected(StallDetected),
+
+    /// Diagnostic event for protocol violations and security issues.
+    Diagnostic(Diagnostic),
+}
+
+/// Diagnostic event for protocol violations and security issues.
+///
+/// These events indicate problems detected at the adapter boundary that
+/// may warrant investigation or termination of the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    /// Severity of the diagnostic.
+    pub severity: DiagnosticSeverity,
+
+    /// Category of the diagnostic.
+    pub category: DiagnosticCategory,
+
+    /// Human-readable message describing the issue.
+    pub message: String,
+
+    /// Additional context about the diagnostic.
+    pub context: BTreeMap<String, String>,
+}
+
+/// Severity level of a diagnostic event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiagnosticSeverity {
+    /// Informational diagnostic (e.g., protocol quirks).
+    Info,
+
+    /// Warning that may indicate a problem.
+    Warning,
+
+    /// Error that indicates a security or protocol violation.
+    Error,
+}
+
+impl DiagnosticSeverity {
+    /// Returns the severity as a string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Warning => "WARNING",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+/// Category of diagnostic event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiagnosticCategory {
+    /// Protocol violation (e.g., malformed JSON).
+    ProtocolViolation,
+
+    /// Security policy violation (e.g., unauthorized tool).
+    SecurityViolation,
+
+    /// Resource limit exceeded.
+    ResourceLimit,
+
+    /// Internal adapter error.
+    InternalError,
+}
+
+impl DiagnosticCategory {
+    /// Returns the category as a string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProtocolViolation => "PROTOCOL_VIOLATION",
+            Self::SecurityViolation => "SECURITY_VIOLATION",
+            Self::ResourceLimit => "RESOURCE_LIMIT",
+            Self::InternalError => "INTERNAL_ERROR",
+        }
+    }
 }
 
 /// Agent process started event.
@@ -403,5 +479,69 @@ mod tests {
         assert_eq!(stall.idle_duration, Duration::from_secs(120));
         assert_eq!(stall.threshold, Duration::from_secs(60));
         assert_eq!(stall.stall_count, 3);
+    }
+
+    #[test]
+    fn test_diagnostic_severity_as_str() {
+        assert_eq!(DiagnosticSeverity::Info.as_str(), "INFO");
+        assert_eq!(DiagnosticSeverity::Warning.as_str(), "WARNING");
+        assert_eq!(DiagnosticSeverity::Error.as_str(), "ERROR");
+    }
+
+    #[test]
+    fn test_diagnostic_category_as_str() {
+        assert_eq!(
+            DiagnosticCategory::ProtocolViolation.as_str(),
+            "PROTOCOL_VIOLATION"
+        );
+        assert_eq!(
+            DiagnosticCategory::SecurityViolation.as_str(),
+            "SECURITY_VIOLATION"
+        );
+        assert_eq!(DiagnosticCategory::ResourceLimit.as_str(), "RESOURCE_LIMIT");
+        assert_eq!(DiagnosticCategory::InternalError.as_str(), "INTERNAL_ERROR");
+    }
+
+    #[test]
+    fn test_diagnostic_serialization() {
+        let mut context = BTreeMap::new();
+        context.insert("line".to_string(), "invalid json".to_string());
+
+        let diagnostic = Diagnostic {
+            severity: DiagnosticSeverity::Error,
+            category: DiagnosticCategory::ProtocolViolation,
+            message: "JSON parse error".to_string(),
+            context,
+        };
+
+        let json = serde_json::to_string(&diagnostic).unwrap();
+        let parsed: Diagnostic = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.severity, DiagnosticSeverity::Error);
+        assert_eq!(parsed.category, DiagnosticCategory::ProtocolViolation);
+        assert_eq!(parsed.message, "JSON parse error");
+        assert_eq!(
+            parsed.context.get("line"),
+            Some(&"invalid json".to_string())
+        );
+    }
+
+    #[test]
+    fn test_diagnostic_event_payload() {
+        let event = AdapterEvent {
+            sequence: 42,
+            timestamp_nanos: 1_000_000_000,
+            session_id: "session-diag".to_string(),
+            payload: AdapterEventPayload::Diagnostic(Diagnostic {
+                severity: DiagnosticSeverity::Warning,
+                category: DiagnosticCategory::SecurityViolation,
+                message: "Unauthorized tool detected".to_string(),
+                context: BTreeMap::new(),
+            }),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: AdapterEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, parsed);
     }
 }

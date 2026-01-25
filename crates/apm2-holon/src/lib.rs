@@ -99,7 +99,9 @@
 
 pub mod artifact;
 pub mod context;
+pub mod episode;
 pub mod error;
+pub mod ledger;
 pub mod resource;
 pub mod result;
 pub mod skill;
@@ -113,7 +115,14 @@ mod tests;
 // Re-export main types at crate root for convenience
 pub use artifact::Artifact;
 pub use context::EpisodeContext;
+pub use episode::{
+    EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome, EpisodeLoopResult,
+};
 pub use error::HolonError;
+pub use ledger::{
+    ChainError, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeOutcome,
+    EpisodeStarted, EventHash, EventHashError, EventType, LedgerEvent, verify_chain,
+};
 pub use resource::{Budget, Lease, LeaseScope, ResourceError};
 pub use result::EpisodeResult;
 pub use skill::{
@@ -127,7 +136,14 @@ pub use traits::Holon;
 pub mod prelude {
     pub use crate::artifact::Artifact;
     pub use crate::context::EpisodeContext;
+    pub use crate::episode::{
+        EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome, EpisodeLoopResult,
+    };
     pub use crate::error::HolonError;
+    pub use crate::ledger::{
+        ChainError, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeOutcome,
+        EpisodeStarted, EventHash, EventType, LedgerEvent, verify_chain,
+    };
     pub use crate::resource::{Budget, Lease, LeaseScope, ResourceError};
     pub use crate::result::EpisodeResult;
     pub use crate::skill::{HolonConfig, HolonContract, SkillFrontmatter, StopConditionsConfig};

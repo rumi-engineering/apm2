@@ -104,9 +104,11 @@ dependencies = [
  "directories",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -121,6 +123,8 @@ dependencies = [
  "ed25519-dalek",
  "humantime",
  "keyring",
+ "libc",
+ "memchr",
  "nix",
  "once_cell",
  "proptest",
@@ -130,6 +134,7 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "rusqlite",
+ "seccompiler",
  "secrecy",
  "serde",
  "serde_json",
@@ -164,10 +169,12 @@ dependencies = [
 name = "apm2-holon"
 version = "0.3.0"
 dependencies = [
+ "blake3",
  "chrono",
  "proptest",
  "serde",
  "serde_bytes",
+ "serde_jcs",
  "serde_json",
  "serde_yaml",
  "thiserror",
@@ -1435,6 +1442,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
+name = "ryu-js"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1448,6 +1461,15 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "secrecy"
@@ -1503,6 +1525,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "serde_jcs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cacecf649bc1a7c5f0e299cc813977c6a78116abda2b93b1ee01735b71ead9a8"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

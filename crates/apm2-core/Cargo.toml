@@ -44,6 +44,7 @@ directories.workspace = true
 humantime.workspace = true
 regex.workspace = true
 once_cell.workspace = true
+memchr.workspace = true
 
 # Database
 rusqlite.workspace = true
@@ -57,6 +58,11 @@ blake3.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
 zeroize.workspace = true
+
+# Sandboxing (Linux only, conditional compilation)
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

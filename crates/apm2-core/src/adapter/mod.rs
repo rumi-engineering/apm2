@@ -38,11 +38,18 @@
 //!
 //! This is the most portable adapter type and works with any agent.
 //!
-//! ## Instrumented Adapter (future)
+//! ## Claude Code Instrumented Adapter
 //!
-//! Instrumented adapters receive events directly from agents that
-//! implement the APM2 event protocol. This provides richer telemetry
-//! but requires agent cooperation.
+//! The Claude Code adapter integrates with Claude Code's native hook system
+//! to receive rich telemetry. It provides:
+//!
+//! - **Native tool requests**: Exact tool invocations via `PreToolUse` hooks
+//! - **Tool responses**: Results via `PostToolUse` hooks
+//! - **Rich progress signals**: Precise event timing and context
+//! - **Session lifecycle**: Claude Code session start/stop events
+//!
+//! Use the instrumented adapter when running Claude Code for maximum
+//! observability and control.
 //!
 //! # Event Contract
 //!
@@ -90,11 +97,14 @@
 //! - Processes are spawned with minimal capabilities
 //! - All observations are treated as untrusted
 //! - Failures result in session termination
+//! - On Linux, seccomp-bpf filtering restricts syscalls (defense in depth)
 
 mod black_box;
+mod claude_code;
 mod config;
 mod error;
 mod event;
+pub mod seccomp;
 mod traits;
 mod watcher;
 
@@ -103,6 +113,10 @@ mod tests;
 
 // Re-export main types
 pub use black_box::BlackBoxAdapter;
+pub use claude_code::{
+    ClaudeCodeAdapter, ClaudeCodeConfig, HookConfig, HookEvent, HookResponse, ProgressEvent,
+    SessionEndEvent, SessionStartEvent, ToolResultEvent, ToolUseEvent,
+};
 pub use config::{
     BlackBoxConfig, EnvironmentConfig, FilesystemConfig, ProcessConfig, ProgressConfig,
     StallDetectionConfig,
@@ -112,6 +126,10 @@ pub use event::{
     AdapterEvent, AdapterEventPayload, DetectionMethod, ExitClassification, FileChangeType,
     FilesystemChange, ProcessExited, ProcessStarted, ProgressSignal, ProgressType, StallDetected,
     ToolRequestDetected,
+};
+pub use seccomp::{
+    CompiledSeccompFilter, SeccompError, SeccompProfile, SeccompProfileLevel, SeccompResult,
+    apply_seccomp_filter, compile_seccomp_filter,
 };
 pub use traits::{Adapter, AdapterExt, BoxFuture};
 pub use watcher::{FilesystemWatcher, WatcherHandle};
