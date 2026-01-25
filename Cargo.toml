@@ -60,6 +60,7 @@ shell-escape = "0.1"
 glob = "0.3"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 nix = { version = "0.30", features = ["signal", "process", "fs"] }
+wait-timeout = "0.2"
 directories = "6"
 humantime = "2.1"
 ctrlc = "3.4"

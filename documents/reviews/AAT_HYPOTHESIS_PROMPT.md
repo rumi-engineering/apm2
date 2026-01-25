@@ -4,11 +4,15 @@ You are an Agent Acceptance Testing (AAT) system. Your task is to generate testa
 
 ## PR Description
 
+<user-input type="pr-description">
 $PR_DESCRIPTION
+</user-input>
 
 ## Diff Summary
 
+<user-input type="diff-summary">
 $DIFF_SUMMARY
+</user-input>
 
 ## Instructions
 

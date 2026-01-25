@@ -28,11 +28,17 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use tempfile::NamedTempFile;
+use wait_timeout::ChildExt;
 use xshell::{Shell, cmd};
+
+/// Maximum time allowed for AI tool execution (5 minutes).
+/// This prevents hung AI tools from blocking CI runners indefinitely.
+const AI_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::aat::anti_gaming::analyze_diff;
 use crate::aat::evidence::EvidenceBundleBuilder;
@@ -215,7 +221,12 @@ const HYPOTHESIS_PROMPT_PATH: &str = "documents/reviews/AAT_HYPOTHESIS_PROMPT.md
 /// This intermediate struct captures the JSON schema returned by the AI tool,
 /// which uses slightly different field types than our internal `Hypothesis`
 /// type.
+///
+/// Note: We use `deny_unknown_fields` to ensure strict parsing of AI responses.
+/// This prevents silent failures where the AI returns unexpected fields that
+/// could indicate a misunderstood prompt or malformed output.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawHypothesis {
     id: String,
     prediction: String,
@@ -356,10 +367,12 @@ fn invoke_ai_tool(prompt_path: &Path, tool_config: &AatToolConfig) -> Result<Str
     // For hypothesis generation, we use synchronous execution (no log file)
     let shell_cmd = build_ai_script_command(prompt_path, tool_config);
 
-    // Execute the command and capture output
-    let output = std::process::Command::new("sh")
+    // Spawn the command with stdout/stderr capture
+    let mut child = std::process::Command::new("sh")
         .args(["-c", &shell_cmd])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| {
             format!(
                 "Failed to execute AI tool '{}'\n\
@@ -369,9 +382,36 @@ fn invoke_ai_tool(prompt_path: &Path, tool_config: &AatToolConfig) -> Result<Str
             )
         })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let exit_code = output.status.code().unwrap_or(-1);
+    // Wait with timeout to prevent hung AI tools from blocking CI indefinitely
+    let Some(status) = child.wait_timeout(AI_TOOL_TIMEOUT)? else {
+        // Timeout expired - kill the process and report error
+        let _ = child.kill();
+        let _ = child.wait(); // Reap the zombie process
+        bail!(
+            "AI tool '{}' timed out after {} seconds\n\
+             Hint: The AI tool may be hung or the prompt may be too complex.\n\
+             Consider breaking down the PR into smaller changes.",
+            tool_config.ai_tool,
+            AI_TOOL_TIMEOUT.as_secs()
+        );
+    };
+
+    // Read stdout and stderr from the completed process
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+
+    if let Some(mut stdout) = child.stdout.take() {
+        std::io::Read::read_to_end(&mut stdout, &mut stdout_buf)
+            .context("Failed to read AI tool stdout")?;
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        std::io::Read::read_to_end(&mut stderr, &mut stderr_buf)
+            .context("Failed to read AI tool stderr")?;
+    }
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_buf);
+        let exit_code = status.code().unwrap_or(-1);
         bail!(
             "AI tool '{}' failed with exit code {}\n\
              Stderr: {}\n\
@@ -382,7 +422,7 @@ fn invoke_ai_tool(prompt_path: &Path, tool_config: &AatToolConfig) -> Result<Str
         );
     }
 
-    let stdout = String::from_utf8(output.stdout).context(
+    let stdout = String::from_utf8(stdout_buf).context(
         "AI tool output was not valid UTF-8\n\
          Hint: The AI tool may have produced binary output unexpectedly",
     )?;
@@ -1188,5 +1228,33 @@ These hypotheses cover the main scenarios."#;
         );
         let hypotheses = result.unwrap();
         assert_eq!(hypotheses[0].verification_method, "grep '[0-9]+' file.txt");
+    }
+
+    #[test]
+    fn test_ai_tool_timeout_is_reasonable() {
+        // Document and verify the timeout constant is reasonable
+        // 5 minutes should be enough for most AI tool invocations
+        // but not so long that hung processes block CI indefinitely
+        assert_eq!(AI_TOOL_TIMEOUT.as_secs(), 300);
+        assert!(
+            AI_TOOL_TIMEOUT.as_secs() >= 60,
+            "Timeout should be at least 1 minute"
+        );
+        assert!(
+            AI_TOOL_TIMEOUT.as_secs() <= 600,
+            "Timeout should not exceed 10 minutes"
+        );
+    }
+
+    #[test]
+    fn test_raw_hypothesis_rejects_unknown_fields() {
+        // Verify that RawHypothesis with deny_unknown_fields rejects extra fields
+        let input_with_extra = r#"{"id": "H-001", "prediction": "test", "verification_method": "cmd", "tests_error_handling": true, "extra_field": "should fail"}"#;
+        let result: Result<RawHypothesis, _> = serde_json::from_str(input_with_extra);
+        assert!(result.is_err(), "Should reject unknown fields");
+        assert!(
+            result.unwrap_err().to_string().contains("unknown field"),
+            "Error should mention unknown field"
+        );
     }
 }

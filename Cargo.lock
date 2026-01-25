@@ -2358,6 +2358,7 @@ dependencies = [
  "shell-escape",
  "sysinfo",
  "tempfile",
+ "wait-timeout",
  "xshell",
 ]
 
