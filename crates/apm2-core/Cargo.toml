@@ -74,6 +74,16 @@ test-utils = []
 [lints]
 workspace = true
 
+# Semver lint exceptions for INTERNAL protobuf-generated types only.
+# Proto-generated types (in crate::events) are expected to evolve with new fields and enum variants.
+# This is standard proto evolution and these types are internal to the kernel.
+#
+# NOTE: These exceptions MUST NOT be applied to public-facing library APIs.
+# Only internal proto-generated event types should use these relaxed rules.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+enum_variant_added = "allow"
+
 [[bench]]
 name = "ipc_benchmarks"
 harness = false

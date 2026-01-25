@@ -38,6 +38,8 @@
 //!     work_id: "work-789".to_string(),
 //!     lease_id: "lease-012".to_string(),
 //!     entropy_budget: 1000,
+//!     resume_cursor: 0,
+//!     restart_attempt: 0,
 //! };
 //!
 //! let session_event = SessionEvent {

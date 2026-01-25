@@ -62,7 +62,30 @@ message SessionEvent {
     SessionProgress progress = 2;
     SessionTerminated terminated = 3;
     SessionQuarantined quarantined = 4;
+    SessionCrashDetected crash_detected = 5;
+    SessionRestartScheduled restart_scheduled = 6;
   }
+}
+
+// Emitted when a session process exits unexpectedly or crashes.
+message SessionCrashDetected {
+  string session_id = 1;
+  string crash_type = 2;  // CLEAN_EXIT, ERROR_EXIT, SIGNAL, TIMEOUT, ENTROPY_EXCEEDED
+  int32 exit_code = 3;
+  int32 signal = 4;
+  uint64 uptime_ms = 5;
+  uint64 last_cursor = 6;
+  uint32 restart_count = 7;
+}
+
+// Emitted when a restart has been scheduled for a crashed session.
+message SessionRestartScheduled {
+  string session_id = 1;
+  uint64 scheduled_at = 2;
+  uint64 restart_at = 3;
+  uint64 resume_cursor = 4;
+  uint32 attempt_number = 5;
+  string backoff_type = 6;  // FIXED, EXPONENTIAL, LINEAR
 }
 
 message SessionStarted {
@@ -72,6 +95,10 @@ message SessionStarted {
   string work_id = 4;
   string lease_id = 5;
   uint64 entropy_budget = 6;
+  // For restarted sessions: cursor to resume from
+  uint64 resume_cursor = 7;
+  // For restarted sessions: restart attempt number (0 = first start)
+  uint32 restart_attempt = 8;
 }
 
 message SessionProgress {

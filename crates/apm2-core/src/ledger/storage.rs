@@ -169,6 +169,13 @@ impl EventRecord {
             signature: None,
         }
     }
+
+    /// Sets the sequence ID for this event record (builder pattern).
+    #[must_use]
+    pub const fn with_seq_id(mut self, seq_id: u64) -> Self {
+        self.seq_id = Some(seq_id);
+        self
+    }
 }
 
 /// A reference to an artifact in content-addressable storage.
