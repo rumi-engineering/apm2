@@ -87,6 +87,13 @@ pub enum HolonError {
         field: String,
     },
 
+    /// A resource limit has been exceeded.
+    #[error("resource exhausted: {reason}")]
+    ResourceExhausted {
+        /// Why the resource was exhausted.
+        reason: String,
+    },
+
     /// An internal error occurred.
     #[error("internal error: {0}")]
     Internal(String),
@@ -170,6 +177,14 @@ impl HolonError {
         }
     }
 
+    /// Creates a new resource exhausted error.
+    #[must_use]
+    pub fn resource_exhausted(reason: impl Into<String>) -> Self {
+        Self::ResourceExhausted {
+            reason: reason.into(),
+        }
+    }
+
     /// Creates a new internal error.
     #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {
@@ -193,6 +208,7 @@ impl HolonError {
             | Self::EscalationFailed { .. }
             | Self::InvalidState { .. }
             | Self::MissingContext { .. }
+            | Self::ResourceExhausted { .. }
             | Self::Internal(_) => false,
         }
     }
@@ -205,7 +221,9 @@ impl HolonError {
     pub const fn should_escalate(&self) -> bool {
         match self {
             Self::EpisodeExecutionFailed { recoverable, .. } => !*recoverable,
-            Self::InvalidInput { .. } | Self::ArtifactEmissionFailed { .. } => false,
+            Self::InvalidInput { .. }
+            | Self::ArtifactEmissionFailed { .. }
+            | Self::ResourceExhausted { .. } => false,
             Self::InvalidLease { .. }
             | Self::LeaseExpired { .. }
             | Self::BudgetExhausted { .. }
@@ -250,7 +268,7 @@ impl HolonError {
     pub const fn error_class(&self) -> ErrorClass {
         match self {
             Self::InvalidLease { .. } | Self::LeaseExpired { .. } => ErrorClass::Lease,
-            Self::BudgetExhausted { .. } => ErrorClass::Budget,
+            Self::BudgetExhausted { .. } | Self::ResourceExhausted { .. } => ErrorClass::Budget,
             Self::InvalidInput { .. } | Self::MissingContext { .. } => ErrorClass::Validation,
             Self::EpisodeExecutionFailed { .. } => ErrorClass::Execution,
             Self::ArtifactEmissionFailed { .. }
@@ -358,6 +376,15 @@ mod unit_tests {
         assert!(!err.is_recoverable());
         assert!(err.should_escalate());
         assert_eq!(err.error_class(), ErrorClass::Infrastructure);
+    }
+
+    #[test]
+    fn test_resource_exhausted_error() {
+        let err = HolonError::resource_exhausted("max attempts exceeded");
+        assert!(err.to_string().contains("max attempts exceeded"));
+        assert!(!err.is_recoverable());
+        assert!(!err.should_escalate());
+        assert_eq!(err.error_class(), ErrorClass::Budget);
     }
 
     #[test]

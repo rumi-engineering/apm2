@@ -89,6 +89,7 @@ pub mod error;
 pub mod result;
 pub mod stop;
 pub mod traits;
+pub mod work;
 
 #[cfg(test)]
 mod tests;
@@ -109,4 +110,5 @@ pub mod prelude {
     pub use crate::result::EpisodeResult;
     pub use crate::stop::StopCondition;
     pub use crate::traits::Holon;
+    pub use crate::work::{AttemptOutcome, AttemptRecord, WorkLifecycle, WorkObject};
 }
