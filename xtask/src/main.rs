@@ -37,6 +37,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod aat;
+pub mod reviewer_state;
 mod tasks;
 pub mod ticket_status;
 pub mod util;
