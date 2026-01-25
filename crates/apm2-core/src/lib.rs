@@ -39,6 +39,7 @@ pub mod crypto;
 pub mod events;
 pub mod health;
 pub mod ipc;
+pub mod lease;
 pub mod ledger;
 pub mod log;
 pub mod process;

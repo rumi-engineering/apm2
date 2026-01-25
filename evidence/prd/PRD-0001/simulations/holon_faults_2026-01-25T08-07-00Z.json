@@ -1,0 +1,21 @@
+{
+  "evidence_id": "EVID-0006",
+  "category": "CHAOS_TEST_RESULTS",
+  "suite": "holon_faults",
+  "timestamp": "2026-01-25T08:07:00Z",
+  "results": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4
+  },
+  "tests": [
+    "session::tests::test_crash_recovery_simulation",
+    "session::tests::prop_checkpoint_matches_genesis",
+    "session::tests::prop_replay_deterministic",
+    "reducer::tests::test_determinism_after_crash_recovery_simulation"
+  ],
+  "verification": {
+    "network_access": "DISALLOWED",
+    "exit_code": 0
+  }
+}
