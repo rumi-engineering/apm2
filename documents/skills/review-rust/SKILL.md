@@ -13,6 +13,8 @@ inputs: [ChangeSet, PlanOfRecord, CI_Evidence]
 outputs: [MergeReceipt | FindingReport]
 ```
 
+> **Reference**: For comprehensive Rust principles and best practices, see [`documents/skills/rust-textbook/SKILL.md`](../rust-textbook/SKILL.md).
+
 ---
 
 ## ChangeSet Assessment Loop
