@@ -33,6 +33,7 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
 
+pub mod adapter;
 pub mod config;
 pub mod credentials;
 pub mod crypto;

@@ -1,0 +1,117 @@
+//! Agent adapter module for wrapping heterogeneous agent runtimes.
+//!
+//! This module provides adapters that normalize different agent types into a
+//! common event contract. It supports both **black-box adapters** (observation-
+//! based) and **instrumented adapters** (native event reporting).
+//!
+//! # Architecture
+//!
+//! The adapter layer sits between the supervisor and agent processes:
+//!
+//! ```text
+//! ┌─────────────┐
+//! │  Supervisor │
+//! └──────┬──────┘
+//!        │ AdapterEvent
+//!        ▼
+//! ┌─────────────┐
+//! │   Adapter   │ ◄── Common interface (Adapter trait)
+//! └──────┬──────┘
+//!        │ spawn/observe
+//!        ▼
+//! ┌─────────────┐
+//! │Agent Process│ ◄── Could be Claude, Gemini, custom agent, etc.
+//! └─────────────┘
+//! ```
+//!
+//! # Adapter Types
+//!
+//! ## Black-Box Adapter
+//!
+//! The black-box adapter derives events from side effects without any
+//! cooperation from the agent. It:
+//!
+//! - Spawns the agent process with configured environment
+//! - Monitors filesystem for changes
+//! - Infers tool requests from observations
+//! - Emits progress signals based on activity patterns
+//!
+//! This is the most portable adapter type and works with any agent.
+//!
+//! ## Instrumented Adapter (future)
+//!
+//! Instrumented adapters receive events directly from agents that
+//! implement the APM2 event protocol. This provides richer telemetry
+//! but requires agent cooperation.
+//!
+//! # Event Contract
+//!
+//! All adapters emit [`AdapterEvent`] instances that include:
+//!
+//! - **Lifecycle events**: Process started, exited
+//! - **Progress signals**: Activity, heartbeats, tool completion
+//! - **Filesystem changes**: File created, modified, deleted
+//! - **Tool detections**: Inferred tool requests (black-box) or reported
+//!   (instrumented)
+//! - **Stall detection**: Lack of activity exceeding threshold
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use apm2_core::adapter::{BlackBoxAdapter, BlackBoxConfig};
+//!
+//! // Configure the black-box adapter
+//! let config = BlackBoxConfig::new("session-123", "claude")
+//!     .with_working_dir("/workspace")
+//!     .with_watch_path("/workspace")
+//!     .with_stall_timeout(Duration::from_secs(120));
+//!
+//! // Create and start the adapter
+//! let mut adapter = BlackBoxAdapter::new(config);
+//! adapter.start().await?;
+//!
+//! // Receive events
+//! let mut rx = adapter.take_event_receiver().unwrap();
+//! while let Some(event) = rx.recv().await {
+//!     match event.payload {
+//!         AdapterEventPayload::ProcessStarted(e) => println!("Started: PID {}", e.pid),
+//!         AdapterEventPayload::Progress(e) => println!("Progress: {:?}", e.signal_type),
+//!         AdapterEventPayload::ProcessExited(e) => println!("Exited: {:?}", e.classification),
+//!         _ => {}
+//!     }
+//! }
+//! ```
+//!
+//! # Security Model
+//!
+//! Adapters follow a **default-deny, least-privilege, fail-closed** model:
+//!
+//! - Environment variables are filtered to exclude sensitive keys
+//! - Processes are spawned with minimal capabilities
+//! - All observations are treated as untrusted
+//! - Failures result in session termination
+
+mod black_box;
+mod config;
+mod error;
+mod event;
+mod traits;
+mod watcher;
+
+#[cfg(test)]
+mod tests;
+
+// Re-export main types
+pub use black_box::BlackBoxAdapter;
+pub use config::{
+    BlackBoxConfig, EnvironmentConfig, FilesystemConfig, ProcessConfig, ProgressConfig,
+    StallDetectionConfig,
+};
+pub use error::AdapterError;
+pub use event::{
+    AdapterEvent, AdapterEventPayload, DetectionMethod, ExitClassification, FileChangeType,
+    FilesystemChange, ProcessExited, ProcessStarted, ProgressSignal, ProgressType, StallDetected,
+    ToolRequestDetected,
+};
+pub use traits::{Adapter, AdapterExt, BoxFuture};
+pub use watcher::{FilesystemWatcher, WatcherHandle};
