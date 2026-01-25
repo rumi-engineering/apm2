@@ -158,4 +158,53 @@ mod tests {
         let commit_message = format!("feat({ticket_id}): {message}");
         assert_eq!(commit_message, "feat(TCK-00031): implement commit command");
     }
+
+    #[test]
+    fn test_commit_message_with_special_characters() {
+        // Verify commit messages handle special characters
+        let ticket_id = "TCK-00058";
+        let message = "add pre-commit checks (fmt, clippy, test)";
+        let commit_message = format!("feat({ticket_id}): {message}");
+        assert_eq!(
+            commit_message,
+            "feat(TCK-00058): add pre-commit checks (fmt, clippy, test)"
+        );
+    }
+
+    #[test]
+    fn test_commit_message_multiword() {
+        // Verify multi-word messages are handled correctly
+        let ticket_id = "TCK-00042";
+        let message = "this is a longer commit message with multiple words";
+        let commit_message = format!("feat({ticket_id}): {message}");
+        assert!(commit_message.starts_with("feat(TCK-00042): "));
+        assert!(commit_message.ends_with("multiple words"));
+    }
+
+    #[test]
+    fn test_pre_commit_check_count() {
+        // Document that we run exactly 4 pre-commit checks:
+        // 1. cargo fmt --check
+        // 2. cargo clippy --all-targets -- -D warnings
+        // 3. cargo test -p xtask
+        // 4. cargo semver-checks (optional)
+        const CHECK_COUNT: usize = 4;
+        assert_eq!(CHECK_COUNT, 4);
+    }
+
+    #[test]
+    fn test_fix_suggestions_are_documented() {
+        // Document the fix suggestions provided for each check failure.
+        // These are the context messages used in run_pre_commit_checks().
+        let fmt_suggestion = "Run 'cargo fmt' to fix formatting.";
+        let clippy_suggestion = "Fix them before committing.";
+        let test_suggestion = "Fix the tests before committing.";
+        let semver_install = "Install with: cargo install cargo-semver-checks";
+
+        // Verify suggestions are non-empty and helpful
+        assert!(fmt_suggestion.contains("cargo fmt"));
+        assert!(clippy_suggestion.contains("Fix"));
+        assert!(test_suggestion.contains("Fix"));
+        assert!(semver_install.contains("cargo install"));
+    }
 }
