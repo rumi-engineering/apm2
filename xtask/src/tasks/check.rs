@@ -24,10 +24,9 @@ use serde::Deserialize;
 use xshell::{Shell, cmd};
 
 use crate::reviewer_state::{
-    HealthStatus, MAX_RESTART_ATTEMPTS, ReviewerEntry, ReviewerStateFile, acquire_remediation_lock,
-    kill_process,
+    HealthStatus, MAX_RESTART_ATTEMPTS, ReviewerEntry, ReviewerSpawner, ReviewerStateFile,
+    acquire_remediation_lock, kill_process,
 };
-use crate::shell_escape::build_script_command_with_cleanup;
 use crate::util::{current_branch, validate_ticket_branch};
 
 /// Watch mode timeout in seconds.
@@ -832,81 +831,27 @@ fn restart_review(
         _ => return Ok(()),
     };
 
-    if !std::path::Path::new(&prompt_path).exists() {
+    let prompt_path_ref = std::path::Path::new(&prompt_path);
+    if !prompt_path_ref.exists() {
         println!("      Warning: Review prompt not found at {prompt_path}");
         return Ok(());
     }
 
-    // Read and substitute variables in the prompt
-    let prompt_content =
-        std::fs::read_to_string(&prompt_path).context("Failed to read review prompt")?;
+    // Use ReviewerSpawner for centralized spawn logic
+    let spawner = ReviewerSpawner::new(reviewer_type, pr_url, head_sha)
+        .with_prompt_file(prompt_path_ref)?
+        .with_restart_count(restart_count);
 
-    let prompt = prompt_content
-        .replace("$PR_URL", pr_url)
-        .replace("$HEAD_SHA", head_sha);
-
-    // Create log file using tempfile
-    let log_file = tempfile::Builder::new()
-        .prefix(&format!("apm2_review_{reviewer_type}_"))
-        .suffix(".log")
-        .tempfile()
-        .context("Failed to create log file")?;
-
-    // Keep the log file (don't delete on drop)
-    let (_, log_path) = log_file.keep().context("Failed to persist log file")?;
-
-    // Create prompt temp file
-    let mut prompt_file =
-        tempfile::NamedTempFile::new().context("Failed to create prompt temp file")?;
-    std::io::Write::write_all(&mut prompt_file, prompt.as_bytes())
-        .context("Failed to write prompt")?;
-
-    let (_, prompt_path) = prompt_file
-        .keep()
-        .context("Failed to persist prompt file")?;
-
-    // Spawn the reviewer process
-    // Note: No trailing `&` - Command::spawn() runs asynchronously, and we need
-    // the sh process to stay alive so the tracked PID remains valid.
-    //
-    // Use build_script_command_with_cleanup for safe path quoting
-    let shell_cmd = build_script_command_with_cleanup(&prompt_path, &log_path);
-
-    let child = std::process::Command::new("sh")
-        .args(["-c", &shell_cmd])
-        .spawn();
-
-    match child {
-        Ok(child) => {
-            // Get the PID of the shell process
-            let pid = child.id();
-
-            // Record the new entry in state file
-            let mut state = ReviewerStateFile::load()?;
-            state.set_reviewer(
-                reviewer_type,
-                ReviewerEntry {
-                    pid,
-                    started_at: chrono::Utc::now(),
-                    log_file: log_path,
-                    pr_url: pr_url.to_string(),
-                    head_sha: head_sha.to_string(),
-                    restart_count,
-                },
-            );
-            state.save()?;
-
+    match spawner.spawn_background() {
+        Some(result) => {
             println!(
                 "      Restarted {} review (PID: {})",
                 capitalize(reviewer_type),
-                pid
+                result.entry.pid
             );
-
-            // Don't wait for the child - it runs in background via
-            // Command::spawn()
         },
-        Err(e) => {
-            println!("      Failed to restart review: {e}");
+        None => {
+            println!("      Failed to restart review");
         },
     }
 

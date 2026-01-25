@@ -28,13 +28,24 @@
 //! This module uses `sysinfo` crate for cross-platform process introspection.
 //! Signal handling (SIGTERM, SIGKILL) is only available on Unix platforms.
 //! On non-Unix platforms, process termination returns an error.
+//!
+//! # Reviewer Spawning
+//!
+//! The [`ReviewerSpawner`] struct provides centralized spawn logic for all
+//! reviewer invocations. It handles:
+//! - Prompt variable interpolation (`$PR_URL`, `$HEAD_SHA`)
+//! - Secure temp file creation for prompts and logs
+//! - Script command construction with proper shell escaping
+//! - State persistence to the state file
+//! - Process spawning (background or synchronous)
 
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ExitStatus};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -331,6 +342,268 @@ impl ReviewerStateFile {
     /// Get a reviewer entry by type.
     pub fn get_reviewer(&self, reviewer_type: &str) -> Option<&ReviewerEntry> {
         self.reviewers.get(reviewer_type)
+    }
+}
+
+/// Result of a reviewer spawn operation.
+#[derive(Debug)]
+pub struct SpawnResult {
+    /// The reviewer entry that was created.
+    pub entry: ReviewerEntry,
+    /// The child process (if spawned in background mode).
+    /// For synchronous mode, this is `None` since we wait for completion.
+    pub child: Option<Child>,
+}
+
+/// Result of a synchronous reviewer execution.
+#[derive(Debug)]
+pub struct SyncResult {
+    /// The exit status of the reviewer process.
+    pub status: ExitStatus,
+    /// Path to the log file (cleaned up automatically if successful).
+    pub log_path: PathBuf,
+}
+
+/// Centralized reviewer spawning logic.
+///
+/// This struct encapsulates all the logic for spawning AI reviewer processes,
+/// eliminating code duplication across `push.rs`, `check.rs`, and `review.rs`.
+///
+/// # Usage
+///
+/// ```ignore
+/// use xtask::reviewer_state::ReviewerSpawner;
+///
+/// // For background spawning (push.rs, check.rs restart)
+/// let spawner = ReviewerSpawner::new("security", pr_url, head_sha)
+///     .with_prompt_content(&prompt_content);
+/// let result = spawner.spawn_background()?;
+///
+/// // For synchronous execution (review.rs)
+/// let spawner = ReviewerSpawner::new("quality", pr_url, head_sha)
+///     .with_prompt_content(&prompt_content);
+/// let result = spawner.spawn_sync()?;
+/// ```
+///
+/// # Spawn Lifecycle
+///
+/// 1. Create temp file for prompt content (secure, 0600 permissions)
+/// 2. Create temp file for log capture (for mtime-based health monitoring)
+/// 3. Construct script command using `shell_escape` utilities
+/// 4. Spawn process via `Command::new("sh")`
+/// 5. Record entry in `ReviewerStateFile`
+/// 6. Return child PID for tracking
+pub struct ReviewerSpawner<'a> {
+    /// The type of reviewer (e.g., "security", "quality").
+    review_type: &'a str,
+    /// The PR URL being reviewed.
+    pr_url: &'a str,
+    /// The HEAD SHA being reviewed.
+    head_sha: &'a str,
+    /// The prompt content (already interpolated with variables).
+    prompt_content: Option<String>,
+    /// Number of times this reviewer has been restarted (for remediation).
+    restart_count: u32,
+}
+
+impl<'a> ReviewerSpawner<'a> {
+    /// Create a new `ReviewerSpawner`.
+    ///
+    /// # Arguments
+    ///
+    /// * `review_type` - The type of reviewer (e.g., "security", "quality")
+    /// * `pr_url` - The PR URL being reviewed
+    /// * `head_sha` - The HEAD SHA being reviewed
+    #[must_use]
+    pub const fn new(review_type: &'a str, pr_url: &'a str, head_sha: &'a str) -> Self {
+        Self {
+            review_type,
+            pr_url,
+            head_sha,
+            prompt_content: None,
+            restart_count: 0,
+        }
+    }
+
+    /// Set the prompt content (already interpolated).
+    ///
+    /// The prompt should have `$PR_URL` and `$HEAD_SHA` already substituted.
+    #[must_use]
+    pub fn with_prompt_content(mut self, content: &str) -> Self {
+        self.prompt_content = Some(content.to_string());
+        self
+    }
+
+    /// Load and interpolate prompt from a file path.
+    ///
+    /// Reads the prompt file and substitutes `$PR_URL` and `$HEAD_SHA`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read.
+    pub fn with_prompt_file(mut self, path: &Path) -> anyhow::Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read prompt file: {}", path.display()))?;
+
+        let interpolated = content
+            .replace("$PR_URL", self.pr_url)
+            .replace("$HEAD_SHA", self.head_sha);
+
+        self.prompt_content = Some(interpolated);
+        Ok(self)
+    }
+
+    /// Set the restart count (for remediation restarts).
+    #[must_use]
+    pub const fn with_restart_count(mut self, count: u32) -> Self {
+        self.restart_count = count;
+        self
+    }
+
+    /// Spawn the reviewer in the background.
+    ///
+    /// This method:
+    /// 1. Creates secure temp files for prompt and log
+    /// 2. Constructs the script command with proper shell escaping
+    /// 3. Spawns the process asynchronously
+    /// 4. Records the entry in the state file
+    ///
+    /// The prompt temp file is cleaned up after execution via the command
+    /// itself. The log file remains for health monitoring and is cleaned up
+    /// by the check command when the reviewer completes.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(SpawnResult)` on success, or `None` if spawning fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` if:
+    /// - No prompt content was set
+    /// - Temp file creation fails
+    /// - Process spawning fails
+    pub fn spawn_background(self) -> Option<SpawnResult> {
+        let prompt = self.prompt_content.as_ref()?;
+
+        // Create log file for output capture (mtime tracking)
+        let log_file = tempfile::Builder::new()
+            .prefix(&format!("apm2_review_{}_", self.review_type))
+            .suffix(".log")
+            .tempfile()
+            .ok()?;
+
+        // Keep the log file (don't delete on drop) - cleanup happens on completion
+        let (_, log_path) = log_file.keep().ok()?;
+
+        // Create prompt temp file
+        let mut prompt_temp = NamedTempFile::new().ok()?;
+        prompt_temp.write_all(prompt.as_bytes()).ok()?;
+
+        // Persist the prompt file (will be cleaned up by the script command)
+        let (_, prompt_path) = prompt_temp.keep().ok()?;
+
+        // Build the script command with cleanup
+        let shell_cmd =
+            crate::shell_escape::build_script_command_with_cleanup(&prompt_path, &log_path);
+
+        // Spawn the process
+        let child = std::process::Command::new("sh")
+            .args(["-c", &shell_cmd])
+            .spawn()
+            .ok()?;
+
+        let pid = child.id();
+
+        let entry = ReviewerEntry {
+            pid,
+            started_at: Utc::now(),
+            log_file: log_path,
+            pr_url: self.pr_url.to_string(),
+            head_sha: self.head_sha.to_string(),
+            restart_count: self.restart_count,
+        };
+
+        // Save to state file
+        let mut state = ReviewerStateFile::load().unwrap_or_default();
+        state.set_reviewer(self.review_type, entry.clone());
+        let _ = state.save();
+
+        Some(SpawnResult {
+            entry,
+            child: Some(child),
+        })
+    }
+
+    /// Spawn the reviewer synchronously and wait for completion.
+    ///
+    /// This method is used by `review.rs` for manual review invocation where
+    /// we want to wait for the result.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(SyncResult)` with the exit status and log path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No prompt content was set
+    /// - Temp file creation fails
+    /// - Process spawning or waiting fails
+    pub fn spawn_sync(self) -> anyhow::Result<SyncResult> {
+        let prompt = self
+            .prompt_content
+            .as_ref()
+            .context("No prompt content set")?;
+
+        // Create log file for output capture
+        let log_file = tempfile::Builder::new()
+            .prefix(&format!("apm2_review_{}_", self.review_type))
+            .suffix(".log")
+            .tempfile()
+            .context("Failed to create log file")?;
+
+        let (_, log_path) = log_file.keep().context("Failed to persist log file")?;
+
+        // Create prompt temp file
+        let mut prompt_temp = NamedTempFile::new().context("Failed to create prompt temp file")?;
+        prompt_temp.write_all(prompt.as_bytes())?;
+        let prompt_temp_path = prompt_temp.path().to_path_buf();
+
+        // Record entry in state file before starting
+        let entry = ReviewerEntry {
+            pid: std::process::id(), // Use current process as placeholder
+            started_at: Utc::now(),
+            log_file: log_path.clone(),
+            pr_url: self.pr_url.to_string(),
+            head_sha: self.head_sha.to_string(),
+            restart_count: self.restart_count,
+        };
+
+        let mut state = ReviewerStateFile::load().unwrap_or_default();
+        state.set_reviewer(self.review_type, entry);
+        let _ = state.save();
+
+        // Build command with log capture (no cleanup - we handle it)
+        let shell_cmd =
+            crate::shell_escape::build_script_command(&prompt_temp_path, Some(&log_path));
+
+        // Run synchronously and wait
+        let status = std::process::Command::new("sh")
+            .args(["-c", &shell_cmd])
+            .status()
+            .context("Failed to run reviewer process")?;
+
+        // Clean up: remove from state
+        let mut state = ReviewerStateFile::load().unwrap_or_default();
+        state.remove_reviewer(self.review_type);
+        let _ = state.save();
+
+        // Clean up log file on success (caller can choose to keep on failure)
+        if status.success() {
+            let _ = fs::remove_file(&log_path);
+        }
+
+        Ok(SyncResult { status, log_path })
     }
 }
 

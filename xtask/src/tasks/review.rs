@@ -11,16 +11,12 @@
 //! 3. Posts a PR comment with findings
 //! 4. Updates the status check to success/failure
 
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
-use tempfile::NamedTempFile;
 use xshell::{Shell, cmd};
 
-use crate::reviewer_state::{ReviewerEntry, ReviewerStateFile};
-use crate::shell_escape::build_script_command;
+use crate::reviewer_state::ReviewerSpawner;
 
 /// Review type determines which prompt and status check to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,10 +235,19 @@ fn run_ai_review(
     }
 
     println!("\n[1/2] Reading review prompt...");
+
+    // Determine the reviewer type key for state tracking
+    let reviewer_type_key = match review_type {
+        ReviewType::Security => "security",
+        ReviewType::Quality => "quality",
+        ReviewType::Uat => unreachable!("UAT is handled separately"),
+    };
+
+    // Read the prompt and substitute additional variables (owner/repo)
     let prompt_content =
         std::fs::read_to_string(&full_prompt_path).context("Failed to read review prompt")?;
 
-    // Substitute variables in the prompt
+    // Substitute all variables including owner/repo
     let prompt = prompt_content
         .replace("$PR_URL", pr_url)
         .replace("$HEAD_SHA", head_sha)
@@ -256,103 +261,36 @@ fn run_ai_review(
         review_type.display_name()
     );
 
-    // Determine the reviewer type key for state tracking
-    let reviewer_type_key = match review_type {
-        ReviewType::Security => "security",
-        ReviewType::Quality => "quality",
-        ReviewType::Uat => unreachable!("UAT is handled separately"),
-    };
+    // Use ReviewerSpawner for centralized spawn logic (synchronous mode)
+    let spawner =
+        ReviewerSpawner::new(reviewer_type_key, pr_url, head_sha).with_prompt_content(&prompt);
 
-    // Run the AI tool synchronously (not in background)
-    // The AI tool is responsible for:
-    // 1. Posting the review comment
-    // 2. Updating the status check
-    //
-    // Both Security and Quality reviews use Gemini with pseudo-TTY for full tool
-    // access. Using script -qec gives Gemini a headed environment where all
-    // tools (including run_shell_command) are available. Without this, headless
-    // mode filters out shell tools causing "Tool not found in registry" errors.
-    //
-    // We write the prompt to a secure temp file (via tempfile crate) to:
-    // 1. Avoid shell escaping issues with complex markdown
-    // 2. Use random filenames to prevent symlink/TOCTOU attacks
-    // 3. Create with restrictive permissions (0600)
-    // 4. Redirect output to log file for mtime-based health monitoring
-    match review_type {
-        ReviewType::Security | ReviewType::Quality => {
-            // Create log file for output capture (mtime tracking)
-            let log_file = tempfile::Builder::new()
-                .prefix(&format!("apm2_review_{reviewer_type_key}_"))
-                .suffix(".log")
-                .tempfile()
-                .context("Failed to create log file")?;
-
-            // Keep the log file
-            let (_, log_path) = log_file.keep().context("Failed to persist log file")?;
-
-            // Create prompt temp file
-            let mut prompt_temp =
-                NamedTempFile::new().context("Failed to create prompt temp file")?;
-            prompt_temp.write_all(prompt.as_bytes())?;
-            let prompt_temp_path = prompt_temp.path().to_path_buf();
-
-            // Record entry in state file before starting
-            let mut state = ReviewerStateFile::load().unwrap_or_default();
-
-            // We'll use 0 as PID initially since this is synchronous
-            // The actual process PID will be different but we track state anyway
-            let entry = ReviewerEntry {
-                pid: std::process::id(), // Use current process as placeholder
-                started_at: Utc::now(),
-                log_file: log_path.clone(),
-                pr_url: pr_url.to_string(),
-                head_sha: head_sha.to_string(),
-                restart_count: 0,
-            };
-            state.set_reviewer(reviewer_type_key, entry);
-            let _ = state.save();
-
-            // Run with log capture using safe path quoting
-            let shell_cmd = build_script_command(&prompt_temp_path, Some(&log_path));
-            let result = std::process::Command::new("sh")
-                .args(["-c", &shell_cmd])
-                .status();
-
-            // Clean up: remove from state and delete log file
-            let mut state = ReviewerStateFile::load().unwrap_or_default();
-            state.remove_reviewer(reviewer_type_key);
-            let _ = state.save();
-            let _ = std::fs::remove_file(&log_path);
-
-            let status_context = review_type.status_context();
-            match result {
-                Ok(status) if status.success() => {
-                    println!(
-                        "  Gemini {} review completed.",
-                        review_type.display_name().to_lowercase()
-                    );
-                    println!(
-                        "\n  Note: Gemini should have posted a comment and updated the status."
-                    );
-                    println!("  If not, you may need to update the status manually:");
-                    println!("    gh api --method POST /repos/{owner_repo}/statuses/{head_sha} \\");
-                    println!("      -f state=success -f context={status_context} \\");
-                    println!(
-                        "      -f description=\"{} review passed\"",
-                        review_type.display_name()
-                    );
-                },
-                Ok(status) => {
-                    println!("  Warning: Gemini exited with status: {status}");
-                    println!("  You may need to run the review manually or check the output.");
-                },
-                Err(e) => {
-                    println!("  Warning: Failed to run Gemini: {e}");
-                    println!("  You may need to run the review manually or check the output.");
-                },
-            }
+    let status_context = review_type.status_context();
+    match spawner.spawn_sync() {
+        Ok(result) if result.status.success() => {
+            println!(
+                "  Gemini {} review completed.",
+                review_type.display_name().to_lowercase()
+            );
+            println!("\n  Note: Gemini should have posted a comment and updated the status.");
+            println!("  If not, you may need to update the status manually:");
+            println!("    gh api --method POST /repos/{owner_repo}/statuses/{head_sha} \\");
+            println!("      -f state=success -f context={status_context} \\");
+            println!(
+                "      -f description=\"{} review passed\"",
+                review_type.display_name()
+            );
         },
-        ReviewType::Uat => unreachable!("UAT is handled separately"),
+        Ok(result) => {
+            println!("  Warning: Gemini exited with status: {}", result.status);
+            println!("  You may need to run the review manually or check the output.");
+            // Clean up log file on failure too
+            let _ = std::fs::remove_file(&result.log_path);
+        },
+        Err(e) => {
+            println!("  Warning: Failed to run Gemini: {e}");
+            println!("  You may need to run the review manually or check the output.");
+        },
     }
 
     println!("\n{} review complete!", review_type.display_name());
@@ -439,6 +377,8 @@ fn update_status(
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::NamedTempFile;
 
     use super::*;
 
