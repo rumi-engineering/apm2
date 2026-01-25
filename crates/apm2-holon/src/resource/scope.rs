@@ -183,9 +183,22 @@ impl LeaseScope {
     /// - `..` at the end (e.g., `foo/..`)
     /// - `..` in the middle (e.g., `foo/../bar`)
     /// - Just `..`
+    ///
+    /// # Security
+    ///
+    /// This function checks for both `/` and `\` separators to handle
+    /// cross-platform path formats. While APM2 primarily targets Unix systems,
+    /// checking for both separators provides defense-in-depth against path
+    /// manipulation attacks that might use Windows-style separators.
     fn contains_path_traversal(path: &str) -> bool {
-        // Check for exact ".." or paths starting/ending/containing "/.." or "../"
-        path == ".." || path.starts_with("../") || path.ends_with("/..") || path.contains("/../")
+        // Split by both / and \ to handle cross-platform paths
+        // This provides defense-in-depth against path manipulation attacks
+        for component in path.split(['/', '\\']) {
+            if component == ".." {
+                return true;
+            }
+        }
+        false
     }
 
     /// Checks if `prefix` is a valid namespace prefix of `path`.
@@ -522,6 +535,44 @@ mod tests {
         assert!(!unlimited.allows_namespace("anything/../secret"));
         // But normal paths still work
         assert!(unlimited.allows_namespace("anything/normal/path"));
+    }
+
+    #[test]
+    fn test_path_traversal_windows_separator() {
+        // SECURITY: Path traversal with Windows-style backslash separators
+        // must also be blocked to prevent cross-platform bypass attacks.
+        let scope = LeaseScope::builder().namespace("project").build();
+
+        // Windows-style backslash traversal must be blocked
+        assert!(
+            !scope.allows_namespace("project\\..\\secret"),
+            "Windows-style backslash traversal should be blocked"
+        );
+        assert!(
+            !scope.allows_namespace("..\\secret"),
+            "Backslash parent traversal should be blocked"
+        );
+        assert!(
+            !scope.allows_namespace("project\\.."),
+            "Backslash trailing traversal should be blocked"
+        );
+
+        // Mixed separators should also be blocked
+        assert!(
+            !scope.allows_namespace("project/..\\secret"),
+            "Mixed separator traversal should be blocked"
+        );
+        assert!(
+            !scope.allows_namespace("project\\../secret"),
+            "Mixed separator traversal should be blocked"
+        );
+
+        // Even unlimited scopes must reject Windows-style traversal
+        let unlimited = LeaseScope::unlimited();
+        assert!(
+            !unlimited.allows_namespace("anything\\..\\secret"),
+            "Unlimited scope should still block Windows traversal"
+        );
     }
 
     #[test]
