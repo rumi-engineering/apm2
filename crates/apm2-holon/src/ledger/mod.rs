@@ -46,8 +46,13 @@
 //! assert_eq!(events.len(), 2);
 //! ```
 
+mod chain;
 mod events;
 
+pub use chain::{
+    ChainError, EpisodeOutcome, EventHash, EventHashError, EventType, LedgerEvent,
+    LedgerEventBuilder, LedgerValidationError, current_timestamp_ns, verify_chain,
+};
 pub use events::{
     EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted, MAX_GOAL_SPEC_LENGTH,
     MAX_ID_LENGTH, validate_goal_spec, validate_id,

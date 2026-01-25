@@ -119,7 +119,10 @@ pub use episode::{
     EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome, EpisodeLoopResult,
 };
 pub use error::HolonError;
-pub use ledger::{EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted};
+pub use ledger::{
+    ChainError, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeOutcome,
+    EpisodeStarted, EventHash, EventHashError, EventType, LedgerEvent, verify_chain,
+};
 pub use resource::{Budget, Lease, LeaseScope, ResourceError};
 pub use result::EpisodeResult;
 pub use skill::{
@@ -138,7 +141,8 @@ pub mod prelude {
     };
     pub use crate::error::HolonError;
     pub use crate::ledger::{
-        EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted,
+        ChainError, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeOutcome,
+        EpisodeStarted, EventHash, EventType, LedgerEvent, verify_chain,
     };
     pub use crate::resource::{Budget, Lease, LeaseScope, ResourceError};
     pub use crate::result::EpisodeResult;

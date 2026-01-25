@@ -66,6 +66,8 @@ pub enum SeccompProfileLevel {
     /// - `bpf` (BPF program loading)
     /// - `userfaultfd` (page fault handling)
     /// - `unshare` (namespace creation)
+    /// - `io_uring_setup`, `io_uring_enter`, `io_uring_register` (async I/O
+    ///   bypass)
     Baseline,
 
     /// Restricted filtering - for agent processes.
@@ -75,7 +77,6 @@ pub enum SeccompProfileLevel {
     /// - `mount`, `umount`, `umount2` (filesystem manipulation)
     /// - `setuid`, `setgid`, `setgroups` (privilege escalation)
     /// - `memfd_create` (anonymous memory files)
-    /// - `io_uring_setup`, `io_uring_enter`, `io_uring_register` (async I/O)
     ///
     /// Note: This does NOT block filesystem read/write syscalls. Agents can
     /// still access files through normal means. Use other mechanisms (like

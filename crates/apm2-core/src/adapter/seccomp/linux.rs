@@ -302,6 +302,10 @@ fn get_blocked_syscalls(level: SeccompProfileLevel) -> Vec<i64> {
             syscall::BPF,
             syscall::USERFAULTFD,
             syscall::UNSHARE,
+            // io_uring (bypass for many restrictions, large attack surface)
+            syscall::IO_URING_SETUP,
+            syscall::IO_URING_ENTER,
+            syscall::IO_URING_REGISTER,
         ]);
     }
 
@@ -344,10 +348,6 @@ fn get_blocked_syscalls(level: SeccompProfileLevel) -> Vec<i64> {
             syscall::SETFSGID,
             // Memory/file tricks
             syscall::MEMFD_CREATE,
-            // io_uring (bypass for many restrictions)
-            syscall::IO_URING_SETUP,
-            syscall::IO_URING_ENTER,
-            syscall::IO_URING_REGISTER,
         ]);
     }
 
@@ -382,6 +382,11 @@ mod tests {
         assert!(blocked.contains(&syscall::BPF));
         assert!(blocked.contains(&syscall::USERFAULTFD));
         assert!(blocked.contains(&syscall::UNSHARE));
+
+        // Should block io_uring (now in baseline)
+        assert!(blocked.contains(&syscall::IO_URING_SETUP));
+        assert!(blocked.contains(&syscall::IO_URING_ENTER));
+        assert!(blocked.contains(&syscall::IO_URING_REGISTER));
 
         // Should NOT block network syscalls at baseline
         assert!(!blocked.contains(&syscall::SOCKET));
