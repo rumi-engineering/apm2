@@ -133,10 +133,13 @@ impl WorkReducer {
             return Err(WorkError::WorkAlreadyExists { work_id });
         }
 
+        // Strict parsing: reject unknown work types
+        let work_type = WorkType::parse(&event.work_type)?;
+
         // Create new work item
         let work = Work::new(
             work_id.clone(),
-            WorkType::parse(&event.work_type),
+            work_type,
             event.spec_snapshot_hash,
             event.requirement_ids,
             event.parent_work_ids,
@@ -171,8 +174,9 @@ impl WorkReducer {
             });
         }
 
-        let from_state = WorkState::parse(&event.from_state);
-        let to_state = WorkState::parse(&event.to_state);
+        // Strict parsing: reject unknown states
+        let from_state = WorkState::parse(&event.from_state)?;
+        let to_state = WorkState::parse(&event.to_state)?;
 
         // Verify the from_state matches current state
         if work.state != from_state {
@@ -183,6 +187,18 @@ impl WorkReducer {
                     work.state.as_str(),
                     event.from_state
                 ),
+            });
+        }
+
+        // Replay protection: validate sequence via previous_transition_count
+        // If the event includes a sequence hint (non-zero), verify it matches
+        let expected_count = work.transition_count;
+        if event.previous_transition_count != 0 && event.previous_transition_count != expected_count
+        {
+            return Err(WorkError::SequenceMismatch {
+                work_id: work_id.clone(),
+                expected: expected_count,
+                actual: event.previous_transition_count,
             });
         }
 
@@ -354,6 +370,10 @@ pub mod helpers {
     }
 
     /// Creates a `WorkTransitioned` event payload.
+    ///
+    /// Set `previous_transition_count` to the work item's current
+    /// `transition_count` for replay protection, or 0 to skip validation
+    /// (backward compatibility).
     #[must_use]
     pub fn work_transitioned_payload(
         work_id: &str,
@@ -361,11 +381,30 @@ pub mod helpers {
         to_state: &str,
         rationale_code: &str,
     ) -> Vec<u8> {
+        work_transitioned_payload_with_sequence(work_id, from_state, to_state, rationale_code, 0)
+    }
+
+    /// Creates a `WorkTransitioned` event payload with explicit sequence
+    /// validation.
+    ///
+    /// # Arguments
+    ///
+    /// * `previous_transition_count` - The expected `transition_count` of the
+    ///   work item before this transition. Used for replay protection.
+    #[must_use]
+    pub fn work_transitioned_payload_with_sequence(
+        work_id: &str,
+        from_state: &str,
+        to_state: &str,
+        rationale_code: &str,
+        previous_transition_count: u32,
+    ) -> Vec<u8> {
         let transitioned = WorkTransitioned {
             work_id: work_id.to_string(),
             from_state: from_state.to_string(),
             to_state: to_state.to_string(),
             rationale_code: rationale_code.to_string(),
+            previous_transition_count,
         };
         let event = WorkEvent {
             event: Some(work_event::Event::Transitioned(transitioned)),

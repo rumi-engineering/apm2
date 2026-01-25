@@ -47,6 +47,33 @@ pub enum WorkError {
         work_id: String,
     },
 
+    /// Invalid work state string.
+    #[error("invalid work state: {value}")]
+    InvalidWorkState {
+        /// The invalid state string.
+        value: String,
+    },
+
+    /// Invalid work type string.
+    #[error("invalid work type: {value}")]
+    InvalidWorkType {
+        /// The invalid type string.
+        value: String,
+    },
+
+    /// Sequence mismatch during transition (replay protection).
+    #[error(
+        "sequence mismatch for work {work_id}: expected transition_count {expected}, event implies {actual}"
+    )]
+    SequenceMismatch {
+        /// The work ID.
+        work_id: String,
+        /// Expected transition count.
+        expected: u32,
+        /// Actual count implied by the event.
+        actual: u32,
+    },
+
     /// Protocol buffer decode error.
     #[error("protobuf decode error: {0}")]
     ProtobufDecode(#[from] prost::DecodeError),

@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::error::WorkError;
+
 /// The type of work being tracked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -18,14 +20,20 @@ pub enum WorkType {
 
 impl WorkType {
     /// Parses a work type from a string.
-    #[must_use]
-    pub fn parse(s: &str) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `WorkError::InvalidWorkType` if the string is not a recognized
+    /// work type.
+    pub fn parse(s: &str) -> Result<Self, WorkError> {
         match s.to_uppercase().as_str() {
-            "PRD_REFINEMENT" => Self::PrdRefinement,
-            "RFC_REFINEMENT" => Self::RfcRefinement,
-            "REVIEW" => Self::Review,
-            // TICKET and unknown values default to Ticket
-            _ => Self::Ticket,
+            "TICKET" => Ok(Self::Ticket),
+            "PRD_REFINEMENT" => Ok(Self::PrdRefinement),
+            "RFC_REFINEMENT" => Ok(Self::RfcRefinement),
+            "REVIEW" => Ok(Self::Review),
+            _ => Err(WorkError::InvalidWorkType {
+                value: s.to_string(),
+            }),
         }
     }
 
@@ -71,18 +79,24 @@ impl std::fmt::Display for WorkState {
 
 impl WorkState {
     /// Parses a work state from a string.
-    #[must_use]
-    pub fn parse(s: &str) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `WorkError::InvalidWorkState` if the string is not a recognized
+    /// state.
+    pub fn parse(s: &str) -> Result<Self, WorkError> {
         match s.to_uppercase().as_str() {
-            "CLAIMED" => Self::Claimed,
-            "IN_PROGRESS" => Self::InProgress,
-            "REVIEW" => Self::Review,
-            "NEEDS_INPUT" => Self::NeedsInput,
-            "NEEDS_ADJUDICATION" => Self::NeedsAdjudication,
-            "COMPLETED" => Self::Completed,
-            "ABORTED" => Self::Aborted,
-            // OPEN and unknown values default to Open
-            _ => Self::Open,
+            "OPEN" => Ok(Self::Open),
+            "CLAIMED" => Ok(Self::Claimed),
+            "IN_PROGRESS" => Ok(Self::InProgress),
+            "REVIEW" => Ok(Self::Review),
+            "NEEDS_INPUT" => Ok(Self::NeedsInput),
+            "NEEDS_ADJUDICATION" => Ok(Self::NeedsAdjudication),
+            "COMPLETED" => Ok(Self::Completed),
+            "ABORTED" => Ok(Self::Aborted),
+            _ => Err(WorkError::InvalidWorkState {
+                value: s.to_string(),
+            }),
         }
     }
 
@@ -270,12 +284,29 @@ mod unit_tests {
 
     #[test]
     fn test_work_type_parse() {
-        assert_eq!(WorkType::parse("TICKET"), WorkType::Ticket);
-        assert_eq!(WorkType::parse("ticket"), WorkType::Ticket);
-        assert_eq!(WorkType::parse("PRD_REFINEMENT"), WorkType::PrdRefinement);
-        assert_eq!(WorkType::parse("RFC_REFINEMENT"), WorkType::RfcRefinement);
-        assert_eq!(WorkType::parse("REVIEW"), WorkType::Review);
-        assert_eq!(WorkType::parse("unknown"), WorkType::Ticket);
+        assert_eq!(WorkType::parse("TICKET").unwrap(), WorkType::Ticket);
+        assert_eq!(WorkType::parse("ticket").unwrap(), WorkType::Ticket);
+        assert_eq!(
+            WorkType::parse("PRD_REFINEMENT").unwrap(),
+            WorkType::PrdRefinement
+        );
+        assert_eq!(
+            WorkType::parse("RFC_REFINEMENT").unwrap(),
+            WorkType::RfcRefinement
+        );
+        assert_eq!(WorkType::parse("REVIEW").unwrap(), WorkType::Review);
+    }
+
+    #[test]
+    fn test_work_type_parse_unknown_fails() {
+        let result = WorkType::parse("UNKNOWN");
+        assert!(matches!(result, Err(WorkError::InvalidWorkType { .. })));
+
+        let result = WorkType::parse("garbage");
+        assert!(matches!(result, Err(WorkError::InvalidWorkType { .. })));
+
+        let result = WorkType::parse("");
+        assert!(matches!(result, Err(WorkError::InvalidWorkType { .. })));
     }
 
     #[test]
@@ -288,19 +319,36 @@ mod unit_tests {
 
     #[test]
     fn test_work_state_parse() {
-        assert_eq!(WorkState::parse("OPEN"), WorkState::Open);
-        assert_eq!(WorkState::parse("open"), WorkState::Open);
-        assert_eq!(WorkState::parse("CLAIMED"), WorkState::Claimed);
-        assert_eq!(WorkState::parse("IN_PROGRESS"), WorkState::InProgress);
-        assert_eq!(WorkState::parse("REVIEW"), WorkState::Review);
-        assert_eq!(WorkState::parse("NEEDS_INPUT"), WorkState::NeedsInput);
+        assert_eq!(WorkState::parse("OPEN").unwrap(), WorkState::Open);
+        assert_eq!(WorkState::parse("open").unwrap(), WorkState::Open);
+        assert_eq!(WorkState::parse("CLAIMED").unwrap(), WorkState::Claimed);
         assert_eq!(
-            WorkState::parse("NEEDS_ADJUDICATION"),
+            WorkState::parse("IN_PROGRESS").unwrap(),
+            WorkState::InProgress
+        );
+        assert_eq!(WorkState::parse("REVIEW").unwrap(), WorkState::Review);
+        assert_eq!(
+            WorkState::parse("NEEDS_INPUT").unwrap(),
+            WorkState::NeedsInput
+        );
+        assert_eq!(
+            WorkState::parse("NEEDS_ADJUDICATION").unwrap(),
             WorkState::NeedsAdjudication
         );
-        assert_eq!(WorkState::parse("COMPLETED"), WorkState::Completed);
-        assert_eq!(WorkState::parse("ABORTED"), WorkState::Aborted);
-        assert_eq!(WorkState::parse("unknown"), WorkState::Open);
+        assert_eq!(WorkState::parse("COMPLETED").unwrap(), WorkState::Completed);
+        assert_eq!(WorkState::parse("ABORTED").unwrap(), WorkState::Aborted);
+    }
+
+    #[test]
+    fn test_work_state_parse_unknown_fails() {
+        let result = WorkState::parse("UNKNOWN");
+        assert!(matches!(result, Err(WorkError::InvalidWorkState { .. })));
+
+        let result = WorkState::parse("garbage");
+        assert!(matches!(result, Err(WorkError::InvalidWorkState { .. })));
+
+        let result = WorkState::parse("");
+        assert!(matches!(result, Err(WorkError::InvalidWorkState { .. })));
     }
 
     #[test]

@@ -904,3 +904,184 @@ fn test_work_aborted_from_needs_adjudication() {
     let work = reducer.state().get("work-1").unwrap();
     assert_eq!(work.state, WorkState::Aborted);
 }
+
+// =============================================================================
+// Security Tests - Strict Parsing & Replay Protection
+// =============================================================================
+
+#[test]
+fn test_invalid_work_type_rejected() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Try to open work with invalid type
+    let payload = helpers::work_opened_payload(
+        "work-1",
+        "INVALID_TYPE", // Not a valid work type
+        vec![1, 2, 3],
+        vec![],
+        vec![],
+    );
+    let event = create_event("work.opened", "session-1", payload);
+
+    let result = reducer.apply(&event, &ctx);
+    assert!(matches!(result, Err(WorkError::InvalidWorkType { .. })));
+}
+
+#[test]
+fn test_invalid_work_state_rejected() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Open valid work first
+    let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
+    reducer
+        .apply(&create_event("work.opened", "s", open_payload), &ctx)
+        .unwrap();
+
+    // Try transition with invalid from_state
+    let trans_payload = helpers::work_transitioned_payload(
+        "work-1",
+        "INVALID_STATE", // Not a valid state
+        "CLAIMED",
+        "test",
+    );
+    let result = reducer.apply(&create_event("work.transitioned", "s", trans_payload), &ctx);
+    assert!(matches!(result, Err(WorkError::InvalidWorkState { .. })));
+}
+
+#[test]
+fn test_invalid_to_state_rejected() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Open valid work first
+    let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
+    reducer
+        .apply(&create_event("work.opened", "s", open_payload), &ctx)
+        .unwrap();
+
+    // Try transition with invalid to_state
+    let trans_payload = helpers::work_transitioned_payload(
+        "work-1",
+        "OPEN",
+        "BOGUS_STATE", // Not a valid state
+        "test",
+    );
+    let result = reducer.apply(&create_event("work.transitioned", "s", trans_payload), &ctx);
+    assert!(matches!(result, Err(WorkError::InvalidWorkState { .. })));
+}
+
+#[test]
+fn test_sequence_mismatch_rejected() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Open work (transition_count = 0)
+    let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
+    reducer
+        .apply(&create_event("work.opened", "s", open_payload), &ctx)
+        .unwrap();
+
+    // Transition with correct sequence (previous_transition_count = 0)
+    let trans_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1", "OPEN", "CLAIMED", "claim", 0, // Correct: work.transition_count is 0
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", trans_payload), &ctx)
+        .unwrap();
+
+    // Work now has transition_count = 1
+    // Try to transition with wrong sequence (should fail)
+    let bad_seq_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "start",
+        5, // Wrong: work.transition_count is 1, not 5
+    );
+    let result = reducer.apply(
+        &create_event("work.transitioned", "s", bad_seq_payload),
+        &ctx,
+    );
+    assert!(matches!(result, Err(WorkError::SequenceMismatch { .. })));
+
+    // Verify work state unchanged (transition was rejected)
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Claimed);
+    assert_eq!(work.transition_count, 1);
+}
+
+#[test]
+fn test_sequence_validation_with_correct_count() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Open work
+    let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
+    reducer
+        .apply(&create_event("work.opened", "s", open_payload), &ctx)
+        .unwrap();
+
+    // First transition with sequence validation
+    let trans1 = helpers::work_transitioned_payload_with_sequence(
+        "work-1", "OPEN", "CLAIMED", "claim", 0, // Correct
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", trans1), &ctx)
+        .unwrap();
+
+    // Second transition with sequence validation
+    let trans2 = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "start",
+        1, // Correct
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", trans2), &ctx)
+        .unwrap();
+
+    // Verify all transitions succeeded
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::InProgress);
+    assert_eq!(work.transition_count, 2);
+}
+
+#[test]
+fn test_sequence_zero_skips_validation() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Open work
+    let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
+    reducer
+        .apply(&create_event("work.opened", "s", open_payload), &ctx)
+        .unwrap();
+
+    // Transition with sequence = 0 (backward compatibility - skips validation)
+    let trans1 = helpers::work_transitioned_payload_with_sequence(
+        "work-1", "OPEN", "CLAIMED", "claim", 0, // Zero means no validation
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", trans1), &ctx)
+        .unwrap();
+
+    // Another transition with sequence = 0
+    let trans2 = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "start",
+        0, // Zero means no validation
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", trans2), &ctx)
+        .unwrap();
+
+    // Transitions work without explicit sequence
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::InProgress);
+    assert_eq!(work.transition_count, 2);
+}
