@@ -52,6 +52,15 @@ static TODO_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(TODO|FIXME|HACK):\s*(.*)").expect("TODO_REGEX should compile")
 });
 
+/// Pattern for detecting ISO 8601 timestamp format.
+///
+/// Matches patterns like:
+/// - 2026-01-25T10:00:00Z
+/// - 2026-01-25T10:00:00
+static TIMESTAMP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z?").expect("TIMESTAMP_REGEX should compile")
+});
+
 // =============================================================================
 // Diff Parsing
 // =============================================================================
@@ -187,6 +196,38 @@ pub fn detect_hardcoded_uuids(diff: &str) -> Vec<GamingViolation> {
 
         for mat in UUID_REGEX.find_iter(diff_line.content) {
             violations.push(GamingViolation::HardcodedUuid {
+                file: diff_line.file.to_string(),
+                line: diff_line.line,
+                snippet: mat.as_str().to_string(),
+            });
+        }
+    }
+
+    violations
+}
+
+/// Detect hardcoded ISO 8601 timestamp patterns in added lines.
+///
+/// Hardcoded timestamps may indicate test-specific behavior or magic values
+/// that could be used to game acceptance tests.
+///
+/// # Arguments
+/// * `diff` - A unified diff string
+///
+/// # Returns
+/// A vector of `GamingViolation::HardcodedTimestamp` for each timestamp found.
+pub fn detect_hardcoded_timestamps(diff: &str) -> Vec<GamingViolation> {
+    let mut violations = Vec::new();
+    let added_lines = parse_added_lines(diff);
+
+    for diff_line in added_lines {
+        // Skip if this is in a test file - timestamps in tests are expected
+        if is_test_file(diff_line.file) {
+            continue;
+        }
+
+        for mat in TIMESTAMP_REGEX.find_iter(diff_line.content) {
+            violations.push(GamingViolation::HardcodedTimestamp {
                 file: diff_line.file.to_string(),
                 line: diff_line.line,
                 snippet: mat.as_str().to_string(),
@@ -402,6 +443,9 @@ pub fn analyze_diff(diff: &str, known_limitations: &[KnownLimitation]) -> AntiGa
     // Detect hardcoded UUIDs
     violations.extend(detect_hardcoded_uuids(diff));
 
+    // Detect hardcoded timestamps
+    violations.extend(detect_hardcoded_timestamps(diff));
+
     // Detect mock patterns
     violations.extend(detect_mock_patterns(diff));
 
@@ -588,6 +632,84 @@ diff --git a/src/lib_test.rs b/src/lib_test.rs
             violations.is_empty(),
             "UUIDs in test files should be allowed"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Hardcoded Timestamp Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_timestamp_with_z() {
+        let diff = r#"
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
+ fn main() {
++    let ts = "2026-01-25T10:00:00Z";
+ }
+"#;
+        let violations = detect_hardcoded_timestamps(diff);
+        assert_eq!(violations.len(), 1);
+        if let GamingViolation::HardcodedTimestamp { file, snippet, .. } = &violations[0] {
+            assert_eq!(file, "src/lib.rs");
+            assert_eq!(snippet, "2026-01-25T10:00:00Z");
+        } else {
+            panic!("Expected HardcodedTimestamp violation");
+        }
+    }
+
+    #[test]
+    fn test_detect_timestamp_without_z() {
+        let diff = r#"
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
+ fn main() {
++    let ts = "2026-01-25T10:00:00";
+ }
+"#;
+        let violations = detect_hardcoded_timestamps(diff);
+        assert_eq!(violations.len(), 1);
+        if let GamingViolation::HardcodedTimestamp { snippet, .. } = &violations[0] {
+            assert_eq!(snippet, "2026-01-25T10:00:00");
+        } else {
+            panic!("Expected HardcodedTimestamp violation");
+        }
+    }
+
+    #[test]
+    fn test_timestamp_in_test_file_allowed() {
+        let diff = r#"
+diff --git a/src/lib_test.rs b/src/lib_test.rs
+--- a/src/lib_test.rs
++++ b/src/lib_test.rs
+@@ -1,3 +1,4 @@
+ fn test_main() {
++    let ts = "2026-01-25T10:00:00Z";
+ }
+"#;
+        let violations = detect_hardcoded_timestamps(diff);
+        assert!(
+            violations.is_empty(),
+            "Timestamps in test files should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_no_timestamp_violation() {
+        let diff = r"
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
+ fn main() {
++    let x = 42;
+ }
+";
+        let violations = detect_hardcoded_timestamps(diff);
+        assert!(violations.is_empty(), "No timestamp should be detected");
     }
 
     // -------------------------------------------------------------------------
