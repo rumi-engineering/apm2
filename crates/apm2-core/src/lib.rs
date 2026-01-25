@@ -44,6 +44,7 @@ pub mod ipc;
 pub mod lease;
 pub mod ledger;
 pub mod log;
+pub mod policy;
 pub mod process;
 pub mod reducer;
 pub mod restart;
