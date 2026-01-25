@@ -20,6 +20,7 @@ tempfile = { workspace = true }
 glob = { workspace = true }
 nix = { workspace = true }
 directories = { workspace = true }
+pulldown-cmark = { workspace = true }
 sysinfo = { workspace = true }
 shell-escape = { workspace = true }
 
