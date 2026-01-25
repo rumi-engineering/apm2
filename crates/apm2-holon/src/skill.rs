@@ -129,14 +129,24 @@ pub struct HolonConfig {
     pub contract: HolonContract,
 
     /// Conditions under which the holon should stop.
-    #[serde(default)]
+    ///
+    /// At least one stop condition must be configured to prevent
+    /// unbounded execution.
     pub stop_conditions: StopConditionsConfig,
 
     /// Tools this holon is allowed to use.
     ///
-    /// If empty, no tool restrictions are applied.
-    #[serde(default)]
-    pub tools: Vec<String>,
+    /// # Security
+    ///
+    /// This field uses fail-close semantics:
+    /// - `None` (omitted): No tools are permitted (maximum restriction)
+    /// - `Some([])` (empty list): No tools are permitted
+    /// - `Some([...])`: Only the listed tools are permitted
+    ///
+    /// This prevents fail-open behavior where omitting the field would
+    /// accidentally grant access to all tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
 }
 
 impl HolonConfig {
@@ -149,25 +159,43 @@ impl HolonConfig {
         // Validate contract
         self.contract.validate()?;
 
-        // Validate stop conditions
+        // Validate stop conditions - at least one must be configured
+        // to prevent unbounded execution
         self.stop_conditions.validate()?;
+        if !self.stop_conditions.is_configured() {
+            return Err(SkillParseError::InvalidHolonConfig(
+                "at least one stop condition must be configured to prevent unbounded execution"
+                    .to_string(),
+            ));
+        }
 
-        // Validate tools (no duplicates)
-        let mut seen = std::collections::HashSet::new();
-        for tool in &self.tools {
-            if tool.is_empty() {
-                return Err(SkillParseError::InvalidHolonConfig(
-                    "tool name cannot be empty".to_string(),
-                ));
-            }
-            if !seen.insert(tool) {
-                return Err(SkillParseError::InvalidHolonConfig(format!(
-                    "duplicate tool: {tool}"
-                )));
+        // Validate tools (no duplicates, no empty names)
+        if let Some(ref tools) = self.tools {
+            let mut seen = std::collections::HashSet::new();
+            for tool in tools {
+                if tool.is_empty() {
+                    return Err(SkillParseError::InvalidHolonConfig(
+                        "tool name cannot be empty".to_string(),
+                    ));
+                }
+                if !seen.insert(tool) {
+                    return Err(SkillParseError::InvalidHolonConfig(format!(
+                        "duplicate tool: {tool}"
+                    )));
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Returns the list of allowed tools.
+    ///
+    /// If `None`, no tools are permitted (fail-close default).
+    /// If `Some`, only the listed tools are allowed (may be empty).
+    #[must_use]
+    pub fn allowed_tools(&self) -> Option<&[String]> {
+        self.tools.as_deref()
     }
 }
 
@@ -431,17 +459,40 @@ mod tests {
         assert_eq!(holon.stop_conditions.max_episodes, Some(10));
         assert_eq!(holon.stop_conditions.timeout_ms, Some(300_000));
         assert_eq!(holon.stop_conditions.budget.get("tokens"), Some(&100_000));
-        assert_eq!(holon.tools, vec!["read_file", "write_file"]);
+        assert_eq!(
+            holon.tools,
+            Some(vec!["read_file".to_string(), "write_file".to_string()])
+        );
+        assert_eq!(
+            holon.allowed_tools(),
+            Some(&["read_file".to_string(), "write_file".to_string()][..])
+        );
     }
 
     #[test]
-    fn test_parse_frontmatter_with_minimal_holon_config() {
+    fn test_holon_config_requires_stop_conditions() {
+        // Config with no stop conditions should fail validation
         let content = "---\nname: minimal-holon\ndescription: Minimal holon config\nholon:\n  contract:\n    input_type: String\n    output_type: String\n---\n";
+
+        let result = parse_frontmatter(content);
+        assert!(
+            result.is_err(),
+            "config without stop conditions should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_omitted_tools_means_no_access() {
+        // Omitting tools field means no tools are permitted (fail-close)
+        let content = "---\nname: restricted-skill\ndescription: Skill with no tools\nholon:\n  contract:\n    input_type: String\n    output_type: String\n  stop_conditions:\n    max_episodes: 10\n---\n";
 
         let (fm, _) = parse_frontmatter(content).unwrap();
         let holon = fm.holon.unwrap();
-        assert!(holon.stop_conditions.max_episodes.is_none());
-        assert!(holon.tools.is_empty());
+        assert!(holon.tools.is_none(), "omitted tools should be None");
+        assert!(
+            holon.allowed_tools().is_none(),
+            "no tools should be permitted"
+        );
     }
 
     #[test]
@@ -464,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_holon_config_validation_empty_input_type() {
-        let content = "---\nname: bad-skill\ndescription: Bad skill\nholon:\n  contract:\n    input_type: \"\"\n    output_type: Result\n---\n";
+        let content = "---\nname: bad-skill\ndescription: Bad skill\nholon:\n  contract:\n    input_type: \"\"\n    output_type: Result\n  stop_conditions:\n    max_episodes: 10\n---\n";
 
         let result = parse_frontmatter(content);
         assert!(result.is_err());
@@ -490,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_holon_config_validation_duplicate_tool() {
-        let content = "---\nname: bad-skill\ndescription: Bad skill\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n  tools:\n    - read_file\n    - read_file\n---\n";
+        let content = "---\nname: bad-skill\ndescription: Bad skill\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n  stop_conditions:\n    max_episodes: 10\n  tools:\n    - read_file\n    - read_file\n---\n";
 
         let result = parse_frontmatter(content);
         assert!(result.is_err());
@@ -498,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_holon_config_validation_empty_tool() {
-        let content = "---\nname: bad-skill\ndescription: Bad skill\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n  tools:\n    - read_file\n    - \"\"\n---\n";
+        let content = "---\nname: bad-skill\ndescription: Bad skill\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n  stop_conditions:\n    max_episodes: 10\n  tools:\n    - read_file\n    - \"\"\n---\n";
 
         let result = parse_frontmatter(content);
         assert!(result.is_err());
@@ -542,7 +593,7 @@ mod tests {
                     budget: HashMap::new(),
                     max_stall_episodes: None,
                 },
-                tools: vec!["read".to_string(), "write".to_string()],
+                tools: Some(vec!["read".to_string(), "write".to_string()]),
             }),
         };
 
@@ -564,7 +615,7 @@ mod tests {
 
     #[test]
     fn test_contract_with_state_type() {
-        let content = "---\nname: stateful-skill\ndescription: A stateful skill\nholon:\n  contract:\n    input_type: Request\n    output_type: Response\n    state_type: SessionState\n---\n";
+        let content = "---\nname: stateful-skill\ndescription: A stateful skill\nholon:\n  contract:\n    input_type: Request\n    output_type: Response\n    state_type: SessionState\n  stop_conditions:\n    max_episodes: 10\n---\n";
 
         let (fm, _) = parse_frontmatter(content).unwrap();
         let holon = fm.holon.unwrap();
@@ -573,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_contract_validation_empty_state_type() {
-        let content = "---\nname: bad-skill\ndescription: Bad skill\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n    state_type: \"\"\n---\n";
+        let content = "---\nname: bad-skill\ndescription: Bad skill\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n    state_type: \"\"\n  stop_conditions:\n    max_episodes: 10\n---\n";
 
         let result = parse_frontmatter(content);
         assert!(result.is_err());
@@ -605,17 +656,37 @@ mod tests {
                 budget,
                 max_stall_episodes: Some(2),
             },
-            tools: vec!["read_file".to_string(), "write_file".to_string()],
+            tools: Some(vec!["read_file".to_string(), "write_file".to_string()]),
         };
 
         assert!(config.validate().is_ok());
     }
 
     #[test]
+    fn test_holon_requires_at_least_one_stop_condition() {
+        // Config without any stop condition should fail validation
+        let config = HolonConfig {
+            contract: HolonContract {
+                input_type: "Input".to_string(),
+                output_type: "Output".to_string(),
+                state_type: None,
+            },
+            stop_conditions: StopConditionsConfig::default(),
+            tools: None,
+        };
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "should require at least one stop condition"
+        );
+    }
+
+    #[test]
     fn test_unknown_field_in_holon_config_rejected() {
         // Unknown field in HolonConfig should be rejected to prevent fail-open security
         // issues
-        let content = "---\nname: typo-skill\ndescription: Has typo\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n  unknown_field: true\n---\n";
+        let content = "---\nname: typo-skill\ndescription: Has typo\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n  stop_conditions:\n    max_episodes: 10\n  unknown_field: true\n---\n";
 
         let result = parse_frontmatter(content);
         assert!(result.is_err(), "unknown field should be rejected");
