@@ -37,6 +37,7 @@ use crate::aat::evidence::EvidenceBundleBuilder;
 use crate::aat::parser::parse_pr_description;
 use crate::aat::tool_config::{AatToolConfig, AiTool};
 use crate::aat::types::{Hypothesis, HypothesisResult, ParsedPRDescription, Verdict};
+use crate::aat::validation::validate_pr_description;
 
 // =============================================================================
 // PR URL Parsing
@@ -322,7 +323,7 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     println!("  HEAD SHA: {sha}");
 
     // Step 3: Parse PR description
-    println!("\n[3/6] Parsing PR description...");
+    println!("\n[3/7] Parsing PR description...");
     let parsed_pr = match parse_pr_description(&description) {
         Ok(parsed) => {
             println!("  Usage: found ({} chars)", parsed.usage.len());
@@ -356,8 +357,48 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
         },
     };
 
-    // Step 4: Run anti-gaming analysis
-    println!("\n[4/6] Running anti-gaming analysis...");
+    // Step 4: Validate PR description format
+    println!("\n[4/7] Validating PR description...");
+
+    // Get repository root for evidence script validation
+    let repo_root = cmd!(sh, "git rev-parse --show-toplevel")
+        .read()
+        .context("Failed to get repository root")?
+        .trim()
+        .to_string();
+    let repo_root_path = Path::new(&repo_root);
+
+    let validation_errors = validate_pr_description(&parsed_pr, repo_root_path);
+
+    if validation_errors.is_empty() {
+        println!("  Validation: PASSED");
+    } else {
+        println!("  Validation: FAILED ({} errors)", validation_errors.len());
+        for error in &validation_errors {
+            println!("  ERROR: {}", error.message().replace('\n', "\n         "));
+        }
+
+        // Build summary with all validation errors
+        let error_summary = validation_errors
+            .iter()
+            .map(|e| e.to_string().lines().next().unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let summary = format!("PR description validation failed: {error_summary}");
+
+        if !dry_run {
+            set_status_check(&sh, &pr_info, &sha, "failure", &summary, None)?;
+        }
+
+        return Ok(AatResult {
+            verdict: Verdict::Failed,
+            evidence_path: None,
+            summary,
+        });
+    }
+
+    // Step 5: Run anti-gaming analysis
+    println!("\n[5/7] Running anti-gaming analysis...");
     let anti_gaming_result = analyze_diff(&diff, &parsed_pr.known_limitations);
     println!("  Violations: {}", anti_gaming_result.violations.len());
     println!(
@@ -373,8 +414,8 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
         println!("    - {violation:?}");
     }
 
-    // Step 5: Generate hypotheses
-    println!("\n[5/6] Generating hypotheses...");
+    // Step 6: Generate hypotheses
+    println!("\n[6/7] Generating hypotheses...");
     let hypotheses = generate_hypotheses(&parsed_pr);
     println!("  Generated: {} hypotheses", hypotheses.len());
 
@@ -387,8 +428,8 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
         println!("    - {}: {} ({})", h.id, h.prediction, result_str);
     }
 
-    // Step 6: Generate evidence bundle
-    println!("\n[6/6] Generating evidence bundle...");
+    // Step 7: Generate evidence bundle
+    println!("\n[7/7] Generating evidence bundle...");
     let bundle = EvidenceBundleBuilder::new(pr_info.number, &sha)
         .set_pr_description_parse(&parsed_pr)
         .add_hypotheses(hypotheses)
@@ -406,15 +447,8 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
         println!("\n[DRY RUN] Would write evidence bundle and set status check");
         None
     } else {
-        // Get repository root
-        let repo_root = cmd!(sh, "git rev-parse --show-toplevel")
-            .read()
-            .context("Failed to get repository root")?
-            .trim()
-            .to_string();
-
         let path = bundle
-            .write_to_file(Path::new(&repo_root))
+            .write_to_file(repo_root_path)
             .context("Failed to write evidence bundle")?;
 
         println!("  Evidence written to: {}", path.display());
