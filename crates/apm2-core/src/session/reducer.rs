@@ -1477,4 +1477,374 @@ mod unit_tests {
         assert!(!summary.is_exceeded);
         assert_eq!(summary.violation_count, 1);
     }
+
+    // ========================================================================
+    // Restart Monotonicity Boundary Tests (MAINT-009)
+    // ========================================================================
+
+    /// Helper to set up a session, terminate it, and return the reducer.
+    fn setup_terminated_session(
+        session_id: &str,
+        initial_restart_attempt: u32,
+    ) -> (SessionReducer, ReducerContext) {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        let start_payload = helpers::session_started_payload_with_restart(
+            session_id,
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            0,
+            initial_restart_attempt,
+        );
+        let start_event = create_event("session.started", session_id, start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        let term_payload =
+            helpers::session_terminated_payload(session_id, "FAILURE", "crashed", 500);
+        let term_event = create_event("session.terminated", session_id, term_payload);
+        reducer.apply(&term_event, &ctx).unwrap();
+
+        (reducer, ctx)
+    }
+
+    /// Tests `restart_attempt` 0 -> 0 transition MUST FAIL.
+    #[test]
+    fn test_restart_monotonicity_0_to_0_fails() {
+        let (mut reducer, ctx) = setup_terminated_session("session-1", 0);
+
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            500,
+            0, // same as previous
+        );
+        let restart_event = create_event("session.started", "session-1", restart_payload);
+        let result = reducer.apply(&restart_event, &ctx);
+
+        assert!(
+            matches!(
+                result,
+                Err(SessionError::RestartAttemptNotMonotonic {
+                    previous_attempt: 0,
+                    new_attempt: 0,
+                    ..
+                })
+            ),
+            "restart_attempt 0 -> 0 should fail"
+        );
+    }
+
+    /// Tests `restart_attempt` 0 -> 1 transition MUST succeed.
+    #[test]
+    fn test_restart_monotonicity_0_to_1_succeeds() {
+        let (mut reducer, ctx) = setup_terminated_session("session-1", 0);
+
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            500,
+            1, // greater than previous
+        );
+        let restart_event = create_event("session.started", "session-1", restart_payload);
+        let result = reducer.apply(&restart_event, &ctx);
+
+        assert!(result.is_ok(), "restart_attempt 0 -> 1 should succeed");
+        let state = reducer.state().get("session-1").unwrap();
+        assert!(state.is_active());
+        assert_eq!(state.last_restart_attempt(), 1);
+    }
+
+    /// Tests `restart_attempt` 5 -> 5 transition MUST FAIL.
+    #[test]
+    fn test_restart_monotonicity_5_to_5_fails() {
+        let (mut reducer, ctx) = setup_terminated_session("session-1", 5);
+
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            500,
+            5, // same as previous
+        );
+        let restart_event = create_event("session.started", "session-1", restart_payload);
+        let result = reducer.apply(&restart_event, &ctx);
+
+        assert!(
+            matches!(
+                result,
+                Err(SessionError::RestartAttemptNotMonotonic {
+                    previous_attempt: 5,
+                    new_attempt: 5,
+                    ..
+                })
+            ),
+            "restart_attempt 5 -> 5 should fail"
+        );
+    }
+
+    /// Tests `restart_attempt` 5 -> 6 transition MUST succeed.
+    #[test]
+    fn test_restart_monotonicity_5_to_6_succeeds() {
+        let (mut reducer, ctx) = setup_terminated_session("session-1", 5);
+
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            500,
+            6, // greater than previous
+        );
+        let restart_event = create_event("session.started", "session-1", restart_payload);
+        let result = reducer.apply(&restart_event, &ctx);
+
+        assert!(result.is_ok(), "restart_attempt 5 -> 6 should succeed");
+        let state = reducer.state().get("session-1").unwrap();
+        assert!(state.is_active());
+        assert_eq!(state.last_restart_attempt(), 6);
+    }
+
+    /// Tests `restart_attempt` `u32::MAX` -> any transition MUST FAIL (overflow
+    /// protection).
+    #[test]
+    fn test_restart_monotonicity_max_overflow_protection() {
+        let (mut reducer, ctx) = setup_terminated_session("session-1", u32::MAX);
+
+        // Verify last_restart_attempt is u32::MAX in terminated state
+        let state = reducer.state().get("session-1").unwrap();
+        assert_eq!(state.last_restart_attempt(), u32::MAX);
+
+        // Try to restart with u32::MAX again - MUST FAIL
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            500,
+            u32::MAX,
+        );
+        let restart_event = create_event("session.started", "session-1", restart_payload);
+        let result = reducer.apply(&restart_event, &ctx);
+
+        assert!(
+            matches!(
+                result,
+                Err(SessionError::RestartAttemptNotMonotonic {
+                    previous_attempt,
+                    new_attempt,
+                    ..
+                }) if previous_attempt == u32::MAX && new_attempt == u32::MAX
+            ),
+            "restart_attempt u32::MAX -> u32::MAX should fail"
+        );
+
+        // Also test with 0 - should still fail (0 is not > u32::MAX)
+        let restart_zero = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            500,
+            0,
+        );
+        let restart_event_zero = create_event("session.started", "session-1", restart_zero);
+        let result_zero = reducer.apply(&restart_event_zero, &ctx);
+
+        assert!(
+            matches!(
+                result_zero,
+                Err(SessionError::RestartAttemptNotMonotonic { .. })
+            ),
+            "restart_attempt u32::MAX -> 0 should fail"
+        );
+    }
+
+    /// Tests that Terminated state preserves `last_restart_attempt` and error
+    /// context.
+    #[test]
+    fn test_restart_preserves_terminated_state_data() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start with restart_attempt=3 and resume_cursor=1000
+        let start_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            1000, // resume_cursor
+            3,    // restart_attempt
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Verify Running state has correct resume_cursor and restart_attempt
+        let running_state = reducer.state().get("session-1").unwrap();
+        match running_state {
+            SessionState::Running {
+                resume_cursor,
+                restart_attempt,
+                ..
+            } => {
+                assert_eq!(*resume_cursor, 1000);
+                assert_eq!(*restart_attempt, 3);
+            },
+            _ => panic!("Expected Running state"),
+        }
+
+        // Terminate with specific error context
+        let term_payload =
+            helpers::session_terminated_payload("session-1", "FAILURE", "crash_loop_detected", 750);
+        let term_event = create_event("session.terminated", "session-1", term_payload);
+        reducer.apply(&term_event, &ctx).unwrap();
+
+        // Verify Terminated state preserves all data
+        let term_state = reducer.state().get("session-1").unwrap();
+        match term_state {
+            SessionState::Terminated {
+                last_restart_attempt,
+                rationale_code,
+                final_entropy,
+                exit_classification,
+                ..
+            } => {
+                assert_eq!(*last_restart_attempt, 3);
+                assert_eq!(rationale_code, "crash_loop_detected");
+                assert_eq!(*final_entropy, 750);
+                assert_eq!(*exit_classification, ExitClassification::Failure);
+            },
+            _ => panic!("Expected Terminated state"),
+        }
+    }
+
+    /// Tests that Quarantined state preserves `last_restart_attempt` and
+    /// reason.
+    #[test]
+    fn test_restart_preserves_quarantined_state_data() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start with restart_attempt=7
+        let start_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            2000, // resume_cursor
+            7,    // restart_attempt
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Quarantine the session
+        let quar_payload = helpers::session_quarantined_payload(
+            "session-1",
+            "excessive_policy_violations",
+            5_000_000_000,
+        );
+        let quar_event = create_event("session.quarantined", "session-1", quar_payload);
+        reducer.apply(&quar_event, &ctx).unwrap();
+
+        // Verify Quarantined state preserves all data
+        let quar_state = reducer.state().get("session-1").unwrap();
+        match quar_state {
+            SessionState::Quarantined {
+                last_restart_attempt,
+                reason,
+                quarantine_until,
+                ..
+            } => {
+                assert_eq!(*last_restart_attempt, 7);
+                assert_eq!(reason, "excessive_policy_violations");
+                assert_eq!(*quarantine_until, 5_000_000_000);
+            },
+            _ => panic!("Expected Quarantined state"),
+        }
+    }
+
+    /// Tests that restart correctly uses preserved `last_restart_attempt` for
+    /// validation.
+    #[test]
+    fn test_restart_uses_preserved_last_restart_attempt() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start with restart_attempt=10
+        let start_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            3000, // resume_cursor
+            10,   // restart_attempt
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Terminate
+        let term_payload =
+            helpers::session_terminated_payload("session-1", "FAILURE", "process_killed", 500);
+        let term_event = create_event("session.terminated", "session-1", term_payload);
+        reducer.apply(&term_event, &ctx).unwrap();
+
+        // Verify we can read last_restart_attempt from terminated state
+        let term_state = reducer.state().get("session-1").unwrap();
+        let last_attempt = term_state.last_restart_attempt();
+        assert_eq!(last_attempt, 10);
+
+        // Restart with next attempt - should succeed
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            3500,             // new resume_cursor
+            last_attempt + 1, // restart_attempt = 11
+        );
+        let restart_event = create_event("session.started", "session-1", restart_payload);
+        reducer.apply(&restart_event, &ctx).unwrap();
+
+        // Verify new Running state has updated values
+        let new_state = reducer.state().get("session-1").unwrap();
+        match new_state {
+            SessionState::Running {
+                resume_cursor,
+                restart_attempt,
+                ..
+            } => {
+                assert_eq!(*resume_cursor, 3500);
+                assert_eq!(*restart_attempt, 11);
+            },
+            _ => panic!("Expected Running state after restart"),
+        }
+    }
 }
