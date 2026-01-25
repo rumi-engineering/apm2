@@ -236,7 +236,7 @@ pub struct SeccompResult {
 mod linux;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use linux::apply_seccomp_filter;
+pub use linux::{CompiledSeccompFilter, apply_seccomp_filter, compile_seccomp_filter};
 
 // Stub implementation for non-Linux or non-x86_64 platforms
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -244,6 +244,33 @@ mod stub;
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 pub use stub::apply_seccomp_filter;
+
+// Stub types for non-Linux platforms
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+/// Placeholder for compiled filter on non-Linux platforms.
+#[derive(Clone)]
+pub struct CompiledSeccompFilter;
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+impl CompiledSeccompFilter {
+    /// No-op apply on non-Linux platforms.
+    pub fn apply(&self) -> Result<SeccompResult, SeccompError> {
+        Ok(SeccompResult {
+            applied: false,
+            level: SeccompProfileLevel::None,
+            blocked_syscall_count: 0,
+            summary: "Seccomp not available on this platform".to_string(),
+        })
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+/// No-op compile on non-Linux platforms.
+pub fn compile_seccomp_filter(
+    _profile: &SeccompProfile,
+) -> Result<Option<CompiledSeccompFilter>, SeccompError> {
+    Ok(None)
+}
 
 #[cfg(test)]
 mod tests {

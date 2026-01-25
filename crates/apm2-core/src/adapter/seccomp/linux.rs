@@ -109,34 +109,72 @@ mod syscall {
     pub const EXECVEAT: i64 = libc::SYS_execveat;
 }
 
-/// Applies the seccomp filter to the current process.
+/// A pre-compiled seccomp BPF program ready for application.
 ///
-/// This function should be called in a `pre_exec` hook before executing
-/// the target program. Once applied, the filter cannot be removed or
-/// relaxed (only made more restrictive).
+/// This struct holds the compiled BPF bytecode that can be safely applied
+/// inside a `pre_exec` hook without allocating memory.
+#[derive(Clone)]
+pub struct CompiledSeccompFilter {
+    bpf_prog: seccompiler::BpfProgram,
+    level: SeccompProfileLevel,
+    blocked_syscall_count: usize,
+}
+
+impl CompiledSeccompFilter {
+    /// Applies this pre-compiled filter to the current process.
+    ///
+    /// # Safety
+    ///
+    /// This function is safe to call inside a `pre_exec` hook because it
+    /// performs no heap allocations. It only calls `prctl(PR_SET_SECCOMP)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel rejects the filter.
+    pub fn apply(&self) -> Result<SeccompResult, SeccompError> {
+        seccompiler::apply_filter(&self.bpf_prog)
+            .map_err(|e| SeccompError::new(format!("failed to apply seccomp filter: {e}")))?;
+
+        let level_name = self.level.name();
+        let blocked_count = self.blocked_syscall_count;
+        let summary =
+            format!("Seccomp filter applied: level={level_name}, blocked={blocked_count} syscalls");
+
+        Ok(SeccompResult {
+            applied: true,
+            level: self.level,
+            blocked_syscall_count: blocked_count,
+            summary,
+        })
+    }
+}
+
+/// Compiles a seccomp filter for the given profile.
+///
+/// This function allocates memory to build the BPF program and should be
+/// called in the parent process BEFORE `fork()`. The resulting
+/// `CompiledSeccompFilter` can then be safely applied inside a `pre_exec`
+/// hook without violating async-signal-safety.
+///
+/// # Example
+///
+/// ```ignore
+/// let filter = compile_seccomp_filter(&profile)?;
+/// unsafe {
+///     cmd.pre_exec(move || filter.apply().map(|_| ()).map_err(|e| ...));
+/// }
+/// ```
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - The filter cannot be compiled (should not happen with valid profiles)
-/// - The `prctl` syscall fails to apply the filter
-/// - The kernel does not support seccomp-bpf
-///
-/// # Safety
-///
-/// This function applies kernel-level restrictions that cannot be undone.
-/// After calling this function, any blocked syscall will terminate the
-/// process immediately with SIGSYS.
-pub fn apply_seccomp_filter(profile: &SeccompProfile) -> Result<SeccompResult, SeccompError> {
-    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+/// Returns an error if the filter cannot be compiled.
+pub fn compile_seccomp_filter(
+    profile: &SeccompProfile,
+) -> Result<Option<CompiledSeccompFilter>, SeccompError> {
+    use seccompiler::{SeccompAction, SeccompFilter, SeccompRule, TargetArch};
 
     if !profile.is_enforced() {
-        return Ok(SeccompResult {
-            applied: false,
-            level: profile.level,
-            blocked_syscall_count: 0,
-            summary: "No seccomp filter applied (level=none)".to_string(),
-        });
+        return Ok(None);
     }
 
     // Build the list of blocked syscalls based on profile level
@@ -177,24 +215,60 @@ pub fn apply_seccomp_filter(profile: &SeccompProfile) -> Result<SeccompResult, S
     .map_err(|e| SeccompError::new(format!("failed to create seccomp filter: {e}")))?;
 
     // Compile to BPF program
-    let bpf_prog: BpfProgram = filter.try_into().map_err(|e: seccompiler::BackendError| {
+    let bpf_prog = filter.try_into().map_err(|e: seccompiler::BackendError| {
         SeccompError::new(format!("failed to compile BPF program: {e}"))
     })?;
 
-    // Apply the filter
-    seccompiler::apply_filter(&bpf_prog)
-        .map_err(|e| SeccompError::new(format!("failed to apply seccomp filter: {e}")))?;
-
-    let level_name = profile.level.name();
-    let summary =
-        format!("Seccomp filter applied: level={level_name}, blocked={blocked_count} syscalls");
-
-    Ok(SeccompResult {
-        applied: true,
+    Ok(Some(CompiledSeccompFilter {
+        bpf_prog,
         level: profile.level,
         blocked_syscall_count: blocked_count,
-        summary,
-    })
+    }))
+}
+
+/// Applies the seccomp filter to the current process.
+///
+/// **WARNING**: This function allocates memory and is NOT async-signal-safe.
+/// For use in a `pre_exec` hook, use `compile_seccomp_filter` followed by
+/// `CompiledSeccompFilter::apply` instead.
+///
+/// This function is provided for convenience in single-threaded contexts
+/// or when applying the filter to the current process (not a child).
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The filter cannot be compiled (should not happen with valid profiles)
+/// - The `prctl` syscall fails to apply the filter
+/// - The kernel does not support seccomp-bpf
+///
+/// # Safety
+///
+/// This function applies kernel-level restrictions that cannot be undone.
+/// After calling this function, any blocked syscall will terminate the
+/// process immediately with SIGSYS.
+pub fn apply_seccomp_filter(profile: &SeccompProfile) -> Result<SeccompResult, SeccompError> {
+    if !profile.is_enforced() {
+        return Ok(SeccompResult {
+            applied: false,
+            level: profile.level,
+            blocked_syscall_count: 0,
+            summary: "No seccomp filter applied (level=none)".to_string(),
+        });
+    }
+
+    compile_seccomp_filter(profile)?.map_or_else(
+        || {
+            // This should not happen for enforced profiles, but handle it gracefully
+            Ok(SeccompResult {
+                applied: false,
+                level: profile.level,
+                blocked_syscall_count: 0,
+                summary: "No seccomp filter applied (compilation returned None)".to_string(),
+            })
+        },
+        |compiled| compiled.apply(),
+    )
 }
 
 /// Returns the list of syscalls to block for a given profile level.

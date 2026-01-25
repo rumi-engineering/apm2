@@ -128,7 +128,8 @@ pub use event::{
     ToolRequestDetected,
 };
 pub use seccomp::{
-    SeccompError, SeccompProfile, SeccompProfileLevel, SeccompResult, apply_seccomp_filter,
+    CompiledSeccompFilter, SeccompError, SeccompProfile, SeccompProfileLevel, SeccompResult,
+    apply_seccomp_filter, compile_seccomp_filter,
 };
 pub use traits::{Adapter, AdapterExt, BoxFuture};
 pub use watcher::{FilesystemWatcher, WatcherHandle};
