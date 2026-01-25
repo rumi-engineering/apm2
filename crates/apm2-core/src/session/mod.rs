@@ -82,6 +82,7 @@
 pub mod crash;
 pub mod entropy;
 pub mod error;
+pub mod quarantine;
 pub mod recovery;
 pub mod reducer;
 pub mod restart_coordinator;
@@ -99,6 +100,9 @@ pub use entropy::{
     EntropyBudgetConfig, EntropyEvent, EntropySource, EntropyTracker, EntropyTrackerSummary,
 };
 pub use error::{SessionError, StateName};
+pub use quarantine::{
+    QuarantineConfig, QuarantineEvaluation, QuarantineInfo, QuarantineManager, QuarantineReason,
+};
 pub use recovery::{
     RecoveryError, SessionRecoveryState, collect_session_cursors, count_events_since,
     find_last_progress_cursor, find_last_session_cursor, group_by_session, replay_session_state,
