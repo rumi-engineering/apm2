@@ -17,6 +17,7 @@ use tempfile::NamedTempFile;
 use xshell::{Shell, cmd};
 
 use crate::reviewer_state::{ReviewerEntry, ReviewerStateFile};
+use crate::shell_escape::build_script_command_with_cleanup;
 use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_ticket_branch};
 
 /// Push branch and create PR.
@@ -359,7 +360,6 @@ fn spawn_reviewer(
 
     // Keep the log file (don't delete on drop) - cleanup happens on completion
     let (_, log_path) = log_file.keep().ok()?;
-    let log_path_str = log_path.display().to_string();
 
     // Create prompt temp file
     let mut prompt_temp = NamedTempFile::new().ok()?;
@@ -367,7 +367,6 @@ fn spawn_reviewer(
 
     // Persist the prompt file
     let (_, prompt_path) = prompt_temp.keep().ok()?;
-    let prompt_path_str = prompt_path.display().to_string();
 
     // Spawn Gemini in background with pseudo-TTY for full tool access.
     // Using script -q <log_path> -c gives Gemini a headed environment where all
@@ -379,9 +378,9 @@ fn spawn_reviewer(
     //
     // Note: No trailing `&` - Command::spawn() runs asynchronously, and we need
     // the sh process to stay alive so the tracked PID remains valid.
-    let shell_cmd = format!(
-        "script -q \"{log_path_str}\" -c \"gemini --yolo < '{prompt_path_str}'\"; rm -f '{prompt_path_str}'"
-    );
+    //
+    // Use build_script_command_with_cleanup for safe path quoting
+    let shell_cmd = build_script_command_with_cleanup(&prompt_path, &log_path);
 
     let child = std::process::Command::new("sh")
         .args(["-c", &shell_cmd])
@@ -562,48 +561,49 @@ mod tests {
     /// 1. Script command format includes PTY allocation via `script -qec`
     /// 2. Input redirection uses correct `<` syntax
     /// 3. Command properly quotes paths
+    ///
+    /// Note: These tests use the `shell_escape` module for secure path quoting.
     #[test]
     fn test_script_command_format() {
-        // Test with a simple path
-        let prompt_path = "/tmp/test_prompt.txt";
-        let shell_cmd = format!("script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null");
+        use std::path::Path;
+
+        use crate::shell_escape::build_script_command;
+
+        // Test with a simple path (no log - uses -qec)
+        let prompt_path = Path::new("/tmp/test_prompt.txt");
+        let shell_cmd = build_script_command(prompt_path, None);
 
         // Verify command includes PTY allocation
         assert!(
             shell_cmd.contains("script -qec"),
-            "Command should use script -qec for PTY allocation"
+            "Command should use script -qec for PTY allocation: {shell_cmd}"
         );
 
         // Verify input redirection syntax
         assert!(
-            shell_cmd.contains("< '"),
-            "Command should use < for input redirection"
-        );
-
-        // Verify path is quoted
-        assert!(
-            shell_cmd.contains(&format!("< '{prompt_path}'")),
-            "Path should be single-quoted in input redirection"
+            shell_cmd.contains("< "),
+            "Command should use < for input redirection: {shell_cmd}"
         );
 
         // Verify /dev/null is used as typescript output
         assert!(
             shell_cmd.ends_with("/dev/null"),
-            "Command should redirect script output to /dev/null"
+            "Command should redirect script output to /dev/null: {shell_cmd}"
         );
 
-        // Test with a path containing special characters (not quotes)
-        let special_path = "/tmp/test file.txt";
-        let special_cmd = format!("script -qec \"gemini --yolo < '{special_path}'\" /dev/null");
+        // Test with a path containing spaces - must be properly quoted
+        let special_path = Path::new("/tmp/test file.txt");
+        let special_cmd = build_script_command(special_path, None);
 
         // Verify the command is well-formed
         assert!(
             special_cmd.contains("script -qec"),
-            "Command with spaces should still use script -qec"
+            "Command with spaces should still use script -qec: {special_cmd}"
         );
+        // Path with spaces should be quoted (single quotes)
         assert!(
-            special_cmd.contains(&format!("< '{special_path}'")),
-            "Path with spaces should be properly quoted"
+            special_cmd.contains('\''),
+            "Path with spaces should be quoted: {special_cmd}"
         );
     }
 
