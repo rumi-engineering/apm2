@@ -38,6 +38,11 @@ use clap::{Parser, Subcommand};
 
 pub mod aat;
 pub mod reviewer_state;
+
+/// Parse an AI tool from a string.
+fn parse_ai_tool(s: &str) -> Result<aat::tool_config::AiTool, aat::tool_config::ParseAiToolError> {
+    s.parse()
+}
 mod tasks;
 pub mod ticket_status;
 pub mod util;
@@ -141,6 +146,13 @@ enum Commands {
         /// Preview without setting status check or writing evidence
         #[arg(long)]
         dry_run: bool,
+
+        /// AI tool backend to use for hypothesis generation.
+        ///
+        /// Overrides the `AAT_AI_TOOL` environment variable.
+        /// Supported values: `gemini`, `claude-code`.
+        #[arg(long, value_parser = parse_ai_tool)]
+        ai_tool: Option<aat::tool_config::AiTool>,
     },
 
     /// Check for anti-patterns in the codebase.
@@ -253,7 +265,11 @@ fn main() -> Result<()> {
             } => tasks::security_review_exec_deny(ticket_id.as_deref(), &reason, dry_run),
             SecurityReviewExecCommands::Onboard => tasks::security_review_exec_onboard(),
         },
-        Commands::Aat { pr_url, dry_run } => tasks::aat(&pr_url, dry_run),
+        Commands::Aat {
+            pr_url,
+            dry_run,
+            ai_tool,
+        } => tasks::aat(&pr_url, dry_run, ai_tool),
         Commands::Lint(args) => tasks::lint::run(args),
     }
 }

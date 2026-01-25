@@ -195,6 +195,7 @@ pub fn security_review_exec_onboard() -> Result<()> {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `dry_run` - If true, don't set status check or write evidence
+/// * `ai_tool_override` - Optional AI tool override from CLI flag
 ///
 /// # Returns
 ///
@@ -207,8 +208,12 @@ pub fn security_review_exec_onboard() -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the AAT process fails. See [`aat::run`] for details.
-pub fn aat(pr_url: &str, dry_run: bool) -> Result<()> {
-    let result = aat::run(pr_url, dry_run)?;
+pub fn aat(
+    pr_url: &str,
+    dry_run: bool,
+    ai_tool_override: Option<crate::aat::tool_config::AiTool>,
+) -> Result<()> {
+    let result = aat::run(pr_url, dry_run, ai_tool_override)?;
     // Exit with appropriate code based on verdict
     match result.verdict {
         crate::aat::types::Verdict::Passed => Ok(()),
