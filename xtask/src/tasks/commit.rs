@@ -2,10 +2,14 @@
 //!
 //! This command runs checks and creates a commit:
 //! - Validates we're on a ticket branch
-//! - Runs cargo fmt --check
-//! - Runs cargo clippy with all warnings as errors
-//! - Runs cargo test for xtask crate
-//! - Runs cargo semver-checks (if installed)
+//! - Runs `cargo fmt --check`
+//! - Runs `cargo clippy` with enhanced lints:
+//!   - `-D warnings` (all warnings as errors)
+//!   - `-D clippy::doc_markdown` (missing backticks in doc comments)
+//!   - `-D clippy::match_same_arms` (redundant match arm bodies)
+//!   - `-W clippy::missing_const_for_fn` (const promotion opportunities)
+//! - Runs `cargo test` for xtask crate
+//! - Runs `cargo semver-checks` (if installed)
 //! - Stages all changes and creates a commit
 
 use anyhow::{Context, Result, bail};
@@ -17,10 +21,10 @@ use crate::util::{current_branch, validate_ticket_branch};
 ///
 /// This function:
 /// 1. Validates we're on a ticket branch
-/// 2. Runs cargo fmt --check
-/// 3. Runs cargo clippy --all-targets -- -D warnings
-/// 4. Runs cargo test -p xtask
-/// 5. Runs cargo semver-checks (if installed, warns if not)
+/// 2. Runs `cargo fmt --check`
+/// 3. Runs `cargo clippy` with enhanced lints (see module docs)
+/// 4. Runs `cargo test -p xtask`
+/// 5. Runs `cargo semver-checks` (if installed, warns if not)
 /// 6. Stages all changes and creates a commit
 ///
 /// # Arguments
@@ -99,12 +103,16 @@ fn run_pre_commit_checks(sh: &Shell) -> Result<()> {
         .context("cargo fmt --check failed. Run 'cargo fmt' to fix formatting.")?;
     println!("  Formatting check passed.");
 
-    // Run cargo clippy
+    // Run cargo clippy with enhanced lints
     println!("\n[2/4] Running cargo clippy...");
-    cmd!(sh, "cargo clippy --all-targets -- -D warnings")
-        .run()
-        .context("cargo clippy found warnings or errors. Fix them before committing.")?;
+    cmd!(
+        sh,
+        "cargo clippy --all-targets -- -D warnings -D clippy::doc_markdown -D clippy::match_same_arms -W clippy::missing_const_for_fn"
+    )
+    .run()
+    .context("cargo clippy found warnings or errors. Fix them before committing.")?;
     println!("  Clippy check passed.");
+    println!("  Tip: Use `..` in struct patterns to ignore new fields (e.g., `Foo {{ x, .. }}`).");
 
     // Run cargo test for xtask
     println!("\n[3/4] Running cargo test -p xtask...");
@@ -185,11 +193,39 @@ mod tests {
     fn test_pre_commit_check_count() {
         // Document that we run exactly 4 pre-commit checks:
         // 1. cargo fmt --check
-        // 2. cargo clippy --all-targets -- -D warnings
+        // 2. cargo clippy --all-targets -- -D warnings -D clippy::doc_markdown -D
+        //    clippy::match_same_arms -W clippy::missing_const_for_fn
         // 3. cargo test -p xtask
         // 4. cargo semver-checks (optional)
         const CHECK_COUNT: usize = 4;
         assert_eq!(CHECK_COUNT, 4);
+    }
+
+    #[test]
+    fn test_enhanced_clippy_lints_documented() {
+        // Document the enhanced clippy lints used in pre-commit checks.
+        // These lints address issues discovered during PR #58 and #59:
+        // - doc_markdown: Catches missing backticks around code in doc comments
+        // - match_same_arms: Catches redundant match arms that should be combined
+        // - missing_const_for_fn: Warns about functions that could be const
+
+        let clippy_lints = [
+            "-D clippy::doc_markdown",
+            "-D clippy::match_same_arms",
+            "-W clippy::missing_const_for_fn",
+        ];
+
+        // Verify we have exactly 3 enhanced lints (plus -D warnings)
+        assert_eq!(clippy_lints.len(), 3);
+
+        // Verify doc_markdown is denied (not warned)
+        assert!(clippy_lints[0].starts_with("-D"));
+
+        // Verify match_same_arms is denied (not warned)
+        assert!(clippy_lints[1].starts_with("-D"));
+
+        // Verify missing_const_for_fn is warned (not denied) since it can be noisy
+        assert!(clippy_lints[2].starts_with("-W"));
     }
 
     #[test]
