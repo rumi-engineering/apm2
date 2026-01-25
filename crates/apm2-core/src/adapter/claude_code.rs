@@ -26,6 +26,16 @@
 //! └───────┬────────┘
 //!         │ hooks (stdin/stdout JSON-RPC)
 //!         ▼
+//! ┌────────────────┐        ┌──────────────┐
+//! │ stdout reader  │───────▶│ event_rx     │
+//! │ (background)   │        │ (channel)    │
+//! └────────────────┘        └──────┬───────┘
+//!                                  │
+//! ┌────────────────┐        ┌──────▼───────┐
+//! │ stdin writer   │◀───────│ response_tx  │
+//! │ (background)   │        │ (channel)    │
+//! └────────────────┘        └──────────────┘
+//!
 //! ┌────────────────┐
 //! │ClaudeCodeAdapter│
 //! │   (this crate)  │
@@ -54,8 +64,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::{Mutex, mpsc};
 
 use super::BoxFuture;
 use super::config::EnvironmentConfig;
@@ -309,6 +320,53 @@ impl Default for HookResponse {
     }
 }
 
+/// Internal event from the stdout reader task.
+#[derive(Debug)]
+enum InternalEvent {
+    /// A hook event was received from Claude Code.
+    HookEvent(HookEvent),
+    /// The stdout reader encountered an error.
+    ReaderError(String),
+    /// The stdout reader reached EOF.
+    ReaderEof,
+}
+
+/// Shared state for writing to stdin.
+struct StdinWriter {
+    stdin: ChildStdin,
+}
+
+impl std::fmt::Debug for StdinWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StdinWriter")
+            .field("stdin", &"<ChildStdin>")
+            .finish()
+    }
+}
+
+impl StdinWriter {
+    /// Creates a new stdin writer.
+    const fn new(stdin: ChildStdin) -> Self {
+        Self { stdin }
+    }
+
+    /// Writes a response to the child process.
+    async fn write_response(&mut self, response: &HookResponse) -> Result<(), AdapterError> {
+        let json =
+            serde_json::to_string(response).map_err(|e| AdapterError::Internal(e.to_string()))?;
+        self.stdin
+            .write_all(json.as_bytes())
+            .await
+            .map_err(AdapterError::Io)?;
+        self.stdin
+            .write_all(b"\n")
+            .await
+            .map_err(AdapterError::Io)?;
+        self.stdin.flush().await.map_err(AdapterError::Io)?;
+        Ok(())
+    }
+}
+
 /// Claude Code instrumented adapter.
 #[derive(Debug)]
 pub struct ClaudeCodeAdapter {
@@ -321,37 +379,28 @@ pub struct ClaudeCodeAdapter {
     /// Sequence number generator for events.
     sequence: AtomicU64,
 
-    /// Event sender.
+    /// Event sender (for external consumption).
     event_tx: Option<mpsc::Sender<AdapterEvent>>,
 
     /// Event receiver (taken when `start()` is called).
     event_rx: Option<mpsc::Receiver<AdapterEvent>>,
+
+    /// Receiver for internal events from the stdout reader.
+    internal_rx: Option<mpsc::Receiver<InternalEvent>>,
+
+    /// Writer for sending responses to stdin (behind a mutex for thread
+    /// safety).
+    stdin_writer: Option<Arc<Mutex<StdinWriter>>>,
 }
 
 /// Internal state of the adapter.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 enum AdapterState {
     /// Adapter is not started.
     Idle,
 
     /// Adapter is running with a child process.
-    Running {
-        /// The child process handle.
-        child: Child,
-        /// OS process ID.
-        pid: u32,
-        /// Time when the process started.
-        started_at: Instant,
-        /// Last activity timestamp.
-        last_activity: Instant,
-        /// Stall count.
-        stall_count: u32,
-        /// Shutdown signal.
-        shutdown: Arc<AtomicBool>,
-        /// Claude Code session ID (from hook events).
-        claude_session_id: Option<String>,
-    },
+    Running(Box<RunningState>),
 
     /// Adapter has stopped.
     Stopped {
@@ -360,6 +409,25 @@ enum AdapterState {
         /// Signal if available.
         signal: Option<i32>,
     },
+}
+
+/// State when the adapter is running (boxed to reduce enum size).
+#[derive(Debug)]
+struct RunningState {
+    /// The child process handle.
+    child: Child,
+    /// OS process ID.
+    pid: u32,
+    /// Time when the process started.
+    started_at: Instant,
+    /// Last activity timestamp.
+    last_activity: Instant,
+    /// Stall count.
+    stall_count: u32,
+    /// Shutdown signal.
+    shutdown: Arc<AtomicBool>,
+    /// Claude Code session ID (from hook events).
+    claude_session_id: Option<String>,
 }
 
 impl ClaudeCodeAdapter {
@@ -374,6 +442,8 @@ impl ClaudeCodeAdapter {
             sequence: AtomicU64::new(0),
             event_tx: Some(tx),
             event_rx: Some(rx),
+            internal_rx: None,
+            stdin_writer: None,
         }
     }
 
@@ -385,7 +455,7 @@ impl ClaudeCodeAdapter {
     /// - The adapter is already running
     /// - Claude Code fails to spawn
     pub async fn start(&mut self) -> Result<(), AdapterError> {
-        if matches!(self.state, AdapterState::Running { .. }) {
+        if matches!(self.state, AdapterState::Running(_)) {
             return Err(AdapterError::AlreadyRunning);
         }
 
@@ -415,7 +485,7 @@ impl ClaudeCodeAdapter {
         self.apply_environment(&mut cmd);
 
         // Spawn the process
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| AdapterError::SpawnFailed(e.to_string()))?;
 
@@ -423,10 +493,68 @@ impl ClaudeCodeAdapter {
             .id()
             .ok_or_else(|| AdapterError::SpawnFailed("failed to get PID".to_string()))?;
 
-        let now = Instant::now();
-        let shutdown = Arc::new(AtomicBool::new(false));
+        // Take stdout and stdin for I/O tasks
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AdapterError::SpawnFailed("failed to capture stdout".to_string()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AdapterError::SpawnFailed("failed to capture stdin".to_string()))?;
 
-        self.state = AdapterState::Running {
+        // Create channels for internal communication
+        let (internal_tx, internal_rx) = mpsc::channel::<InternalEvent>(self.config.buffer_size);
+        self.internal_rx = Some(internal_rx);
+
+        // Create stdin writer (wrapped in Arc<Mutex> for sharing)
+        let stdin_writer = Arc::new(Mutex::new(StdinWriter::new(stdin)));
+        self.stdin_writer = Some(Arc::clone(&stdin_writer));
+
+        // Spawn the stdout reader task
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+
+            loop {
+                if shutdown_clone.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        // Try to parse as a hook event; skip non-JSON output
+                        if let Ok(event) = serde_json::from_str::<HookEvent>(&line) {
+                            if internal_tx
+                                .send(InternalEvent::HookEvent(event))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    },
+                    Ok(None) => {
+                        // EOF reached
+                        let _ = internal_tx.send(InternalEvent::ReaderEof).await;
+                        break;
+                    },
+                    Err(e) => {
+                        let _ = internal_tx
+                            .send(InternalEvent::ReaderError(e.to_string()))
+                            .await;
+                        break;
+                    },
+                }
+            }
+        });
+
+        let now = Instant::now();
+
+        self.state = AdapterState::Running(Box::new(RunningState {
             child,
             pid,
             started_at: now,
@@ -434,7 +562,7 @@ impl ClaudeCodeAdapter {
             stall_count: 0,
             shutdown,
             claude_session_id: None,
-        };
+        }));
 
         // Emit process started event
         self.emit_process_started(pid).await?;
@@ -467,36 +595,24 @@ impl ClaudeCodeAdapter {
 
     /// Polls for events from Claude Code.
     ///
-    /// This reads from the process stdout for hook events and checks process
-    /// status.
+    /// This reads from the internal event channel (populated by the background
+    /// stdout reader) and checks process status.
     ///
     /// # Errors
     ///
     /// Returns an error if the adapter is not running.
     pub async fn poll(&mut self) -> Result<Option<AdapterEvent>, AdapterError> {
-        let (child, pid, started_at, last_activity, stall_count, shutdown) = match &mut self.state {
-            AdapterState::Running {
-                child,
-                pid,
-                started_at,
-                last_activity,
-                stall_count,
-                shutdown,
-                ..
-            } => (
-                child,
-                *pid,
-                *started_at,
-                last_activity,
-                stall_count,
-                shutdown.clone(),
-            ),
+        let running = match &mut self.state {
+            AdapterState::Running(state) => state,
             AdapterState::Idle => return Err(AdapterError::NotRunning),
             AdapterState::Stopped { .. } => return Ok(None),
         };
 
+        let pid = running.pid;
+        let started_at = running.started_at;
+
         // Check for process exit first
-        if let Some(status) = child.try_wait().map_err(AdapterError::Io)? {
+        if let Some(status) = running.child.try_wait().map_err(AdapterError::Io)? {
             let uptime = started_at.elapsed();
             let exit_code = status.code();
             let signal = Self::extract_signal(status);
@@ -521,21 +637,57 @@ impl ClaudeCodeAdapter {
         }
 
         // Check if shutdown was requested
-        if shutdown.load(Ordering::SeqCst) {
+        if running.shutdown.load(Ordering::SeqCst) {
             return Ok(None);
         }
 
-        // Try to read hook events from stdout (non-blocking check)
-        // Note: In a full implementation, we'd use async I/O here
-        // For now, we simulate the hook event processing
+        // Try to receive events from the internal channel (non-blocking)
+        if let Some(internal_rx) = &mut self.internal_rx {
+            match internal_rx.try_recv() {
+                Ok(InternalEvent::HookEvent(hook_event)) => {
+                    // Update last activity
+                    if let AdapterState::Running(state) = &mut self.state {
+                        state.last_activity = Instant::now();
+
+                        // Update Claude session ID if this is a session start event
+                        if let HookEvent::SessionStart(ref session) = hook_event {
+                            state.claude_session_id = Some(session.session_id.clone());
+                        }
+                    }
+
+                    // Convert hook event to adapter event
+                    let adapter_event = self.convert_hook_event(hook_event);
+
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(adapter_event.clone()).await;
+                    }
+
+                    return Ok(Some(adapter_event));
+                },
+                Ok(InternalEvent::ReaderError(msg)) => {
+                    // Reader encountered an error - this is likely fatal
+                    return Err(AdapterError::Internal(format!(
+                        "stdout reader error: {msg}"
+                    )));
+                },
+                // EOF, empty channel, or disconnected: fall through to stall check
+                Ok(InternalEvent::ReaderEof)
+                | Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) =>
+                    {},
+            }
+        }
 
         // Check for stall
         if self.config.stall_detection_enabled {
-            let idle_duration = last_activity.elapsed();
+            let AdapterState::Running(running) = &mut self.state else {
+                return Ok(None);
+            };
+
+            let idle_duration = running.last_activity.elapsed();
             if idle_duration >= self.config.stall_timeout {
-                *stall_count += 1;
-                let current_stall_count = *stall_count;
-                *last_activity = Instant::now();
+                running.stall_count += 1;
+                let current_stall_count = running.stall_count;
+                running.last_activity = Instant::now();
 
                 let stall_event =
                     self.create_event(AdapterEventPayload::StallDetected(StallDetected {
@@ -555,22 +707,10 @@ impl ClaudeCodeAdapter {
         Ok(None)
     }
 
-    /// Processes a hook event received from Claude Code.
-    ///
-    /// This converts the hook event to an `AdapterEvent` and emits it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the event channel is closed.
-    pub async fn process_hook_event(&mut self, event: HookEvent) -> Result<(), AdapterError> {
-        // Update last activity timestamp
-        if let AdapterState::Running { last_activity, .. } = &mut self.state {
-            *last_activity = Instant::now();
-        }
-
-        let adapter_event = match event {
+    /// Converts a hook event to an adapter event.
+    fn convert_hook_event(&self, event: HookEvent) -> AdapterEvent {
+        match event {
             HookEvent::PreToolUse(tool_event) => {
-                // Convert tool use event to ToolRequestDetected
                 let mut context = BTreeMap::new();
                 context.insert("tool_use_id".to_string(), tool_event.tool_use_id);
                 if let Ok(input_str) = serde_json::to_string(&tool_event.input) {
@@ -581,13 +721,12 @@ impl ClaudeCodeAdapter {
                     ToolRequestDetected {
                         tool_name: tool_event.tool_name,
                         detection_method: DetectionMethod::Instrumentation,
-                        confidence_percent: 100, // Native event, full confidence
+                        confidence_percent: 100,
                         context,
                     },
                 ))
             },
             HookEvent::PostToolUse(result_event) => {
-                // Emit a progress signal for tool completion
                 let description = if result_event.success {
                     format!("Tool {} completed successfully", result_event.tool_use_id)
                 } else {
@@ -605,15 +744,6 @@ impl ClaudeCodeAdapter {
                 }))
             },
             HookEvent::SessionStart(session_event) => {
-                // Update Claude session ID in state
-                if let AdapterState::Running {
-                    claude_session_id, ..
-                } = &mut self.state
-                {
-                    *claude_session_id = Some(session_event.session_id.clone());
-                }
-
-                // Emit a milestone progress event
                 self.create_event(AdapterEventPayload::Progress(ProgressSignal {
                     signal_type: ProgressType::Milestone,
                     description: format!(
@@ -649,15 +779,7 @@ impl ClaudeCodeAdapter {
                     entropy_cost: 0,
                 }))
             },
-        };
-
-        if let Some(tx) = &self.event_tx {
-            tx.send(adapter_event)
-                .await
-                .map_err(|e| AdapterError::ChannelSend(e.to_string()))?;
         }
-
-        Ok(())
     }
 
     /// Sends a hook response to Claude Code.
@@ -667,21 +789,19 @@ impl ClaudeCodeAdapter {
     ///
     /// # Errors
     ///
-    /// Returns an error if the adapter is not running or serialization fails.
-    pub fn send_hook_response(&mut self, response: &HookResponse) -> Result<(), AdapterError> {
-        let AdapterState::Running { child: _, .. } = &mut self.state else {
+    /// Returns an error if the adapter is not running or I/O fails.
+    pub async fn send_hook_response(&self, response: &HookResponse) -> Result<(), AdapterError> {
+        let AdapterState::Running(_) = &self.state else {
             return Err(AdapterError::NotRunning);
         };
 
-        // In a full implementation, we'd write the response to stdin
-        // For now, this is a placeholder for the hook response protocol
-        let _response_json =
-            serde_json::to_string(response).map_err(|e| AdapterError::Internal(e.to_string()))?;
+        let writer = self
+            .stdin_writer
+            .as_ref()
+            .ok_or_else(|| AdapterError::Internal("stdin writer not initialized".to_string()))?;
 
-        // TODO: Implement hook response delivery via stdin
-        // child.stdin.write_all(response_json.as_bytes())...
-
-        Ok(())
+        let mut guard = writer.lock().await;
+        guard.write_response(response).await
     }
 
     /// Stops the adapter, terminating Claude Code.
@@ -690,12 +810,9 @@ impl ClaudeCodeAdapter {
     ///
     /// Returns an error if termination fails.
     pub async fn stop(&mut self) -> Result<(), AdapterError> {
-        if let AdapterState::Running {
-            child, shutdown, ..
-        } = &mut self.state
-        {
-            shutdown.store(true, Ordering::SeqCst);
-            child.kill().await.map_err(AdapterError::Io)?;
+        if let AdapterState::Running(state) = &mut self.state {
+            state.shutdown.store(true, Ordering::SeqCst);
+            state.child.kill().await.map_err(AdapterError::Io)?;
         }
 
         Ok(())
@@ -717,14 +834,14 @@ impl ClaudeCodeAdapter {
     /// Returns whether the adapter is running.
     #[must_use]
     pub const fn is_running(&self) -> bool {
-        matches!(self.state, AdapterState::Running { .. })
+        matches!(self.state, AdapterState::Running(_))
     }
 
     /// Returns the process ID if running.
     #[must_use]
-    pub const fn pid(&self) -> Option<u32> {
+    pub fn pid(&self) -> Option<u32> {
         match &self.state {
-            AdapterState::Running { pid, .. } => Some(*pid),
+            AdapterState::Running(state) => Some(state.pid),
             _ => None,
         }
     }
@@ -733,9 +850,7 @@ impl ClaudeCodeAdapter {
     #[must_use]
     pub fn claude_session_id(&self) -> Option<&str> {
         match &self.state {
-            AdapterState::Running {
-                claude_session_id, ..
-            } => claude_session_id.as_deref(),
+            AdapterState::Running(state) => state.claude_session_id.as_deref(),
             _ => None,
         }
     }
@@ -1055,29 +1170,6 @@ mod tests {
         assert_eq!(Adapter::adapter_type(&adapter), "claude-code");
     }
 
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_process_hook_event_tool_request() {
-        let config = ClaudeCodeConfig::new("test-hook-event");
-        let mut adapter = ClaudeCodeAdapter::new(config);
-
-        // Take the event receiver
-        let _rx = adapter.take_event_receiver().unwrap();
-
-        // Process a PreToolUse hook event
-        let _tool_event = HookEvent::PreToolUse(ToolUseEvent {
-            tool_use_id: "tool-abc".to_string(),
-            tool_name: "Read".to_string(),
-            input: serde_json::json!({"file_path": "/test.txt"}),
-            session_id: Some("claude-session".to_string()),
-            timestamp: Some(1_234_567_890),
-        });
-
-        // Note: This will fail because adapter is not running, but we can test
-        // the event conversion In a real scenario, we'd need to mock
-        // the running state
-    }
-
     #[test]
     fn test_progress_event_types() {
         let thinking = ProgressEvent {
@@ -1098,5 +1190,185 @@ mod tests {
 
         let json = serde_json::to_string(&idle).unwrap();
         assert!(json.contains("idle"));
+    }
+
+    #[test]
+    fn test_internal_event_variants() {
+        // Test that InternalEvent can be constructed
+        let hook_event = InternalEvent::HookEvent(HookEvent::Progress(ProgressEvent {
+            progress_type: "test".to_string(),
+            description: None,
+            token_count: None,
+        }));
+        assert!(matches!(hook_event, InternalEvent::HookEvent(_)));
+
+        let error_event = InternalEvent::ReaderError("test error".to_string());
+        assert!(matches!(error_event, InternalEvent::ReaderError(_)));
+
+        let eof_event = InternalEvent::ReaderEof;
+        assert!(matches!(eof_event, InternalEvent::ReaderEof));
+    }
+
+    #[test]
+    fn test_hook_response_serialization() {
+        let response = HookResponse {
+            continue_execution: false,
+            message: Some("denied by policy".to_string()),
+            modified_input: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"continue_execution\":false"));
+        assert!(json.contains("denied by policy"));
+
+        let parsed: HookResponse = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.continue_execution);
+        assert_eq!(parsed.message, Some("denied by policy".to_string()));
+    }
+
+    #[test]
+    fn test_convert_hook_event_pre_tool_use() {
+        let config = ClaudeCodeConfig::new("test-convert");
+        let adapter = ClaudeCodeAdapter::new(config);
+
+        let hook_event = HookEvent::PreToolUse(ToolUseEvent {
+            tool_use_id: "test-tool-123".to_string(),
+            tool_name: "Bash".to_string(),
+            input: serde_json::json!({"command": "echo hello"}),
+            session_id: None,
+            timestamp: None,
+        });
+
+        let adapter_event = adapter.convert_hook_event(hook_event);
+        assert!(matches!(
+            adapter_event.payload,
+            AdapterEventPayload::ToolRequestDetected(_)
+        ));
+
+        if let AdapterEventPayload::ToolRequestDetected(req) = adapter_event.payload {
+            assert_eq!(req.tool_name, "Bash");
+            assert_eq!(req.detection_method, DetectionMethod::Instrumentation);
+            assert_eq!(req.confidence_percent, 100);
+            assert!(req.context.contains_key("tool_use_id"));
+        }
+    }
+
+    #[test]
+    fn test_convert_hook_event_post_tool_use() {
+        let config = ClaudeCodeConfig::new("test-convert-post");
+        let adapter = ClaudeCodeAdapter::new(config);
+
+        let hook_event = HookEvent::PostToolUse(ToolResultEvent {
+            tool_use_id: "test-tool-456".to_string(),
+            output: serde_json::json!({"result": "success"}),
+            success: true,
+            error: None,
+            duration_ms: Some(100),
+        });
+
+        let adapter_event = adapter.convert_hook_event(hook_event);
+        assert!(matches!(
+            adapter_event.payload,
+            AdapterEventPayload::Progress(_)
+        ));
+
+        if let AdapterEventPayload::Progress(progress) = adapter_event.payload {
+            assert_eq!(progress.signal_type, ProgressType::ToolComplete);
+            assert!(progress.description.contains("completed successfully"));
+            assert_eq!(progress.entropy_cost, 0);
+        }
+    }
+
+    #[test]
+    fn test_convert_hook_event_post_tool_use_failed() {
+        let config = ClaudeCodeConfig::new("test-convert-failed");
+        let adapter = ClaudeCodeAdapter::new(config);
+
+        let hook_event = HookEvent::PostToolUse(ToolResultEvent {
+            tool_use_id: "test-tool-789".to_string(),
+            output: serde_json::json!(null),
+            success: false,
+            error: Some("command not found".to_string()),
+            duration_ms: Some(50),
+        });
+
+        let adapter_event = adapter.convert_hook_event(hook_event);
+
+        if let AdapterEventPayload::Progress(progress) = adapter_event.payload {
+            assert!(progress.description.contains("failed"));
+            assert!(progress.description.contains("command not found"));
+            assert_eq!(progress.entropy_cost, 1); // failure costs entropy
+        }
+    }
+
+    #[test]
+    fn test_convert_hook_event_session_start() {
+        let config = ClaudeCodeConfig::new("test-session-start");
+        let adapter = ClaudeCodeAdapter::new(config);
+
+        let hook_event = HookEvent::SessionStart(SessionStartEvent {
+            session_id: "claude-sess-001".to_string(),
+            working_dir: Some("/home/user".to_string()),
+            model: Some("opus".to_string()),
+            timestamp: Some(1_234_567_890),
+        });
+
+        let adapter_event = adapter.convert_hook_event(hook_event);
+
+        if let AdapterEventPayload::Progress(progress) = adapter_event.payload {
+            assert_eq!(progress.signal_type, ProgressType::Milestone);
+            assert!(progress.description.contains("started"));
+            assert!(progress.description.contains("claude-sess-001"));
+        }
+    }
+
+    #[test]
+    fn test_convert_hook_event_session_end() {
+        let config = ClaudeCodeConfig::new("test-session-end");
+        let adapter = ClaudeCodeAdapter::new(config);
+
+        let hook_event = HookEvent::SessionEnd(SessionEndEvent {
+            session_id: "claude-sess-001".to_string(),
+            reason: Some("user terminated".to_string()),
+            duration_ms: Some(60_000),
+        });
+
+        let adapter_event = adapter.convert_hook_event(hook_event);
+
+        if let AdapterEventPayload::Progress(progress) = adapter_event.payload {
+            assert_eq!(progress.signal_type, ProgressType::Milestone);
+            assert!(progress.description.contains("ended"));
+            assert!(progress.description.contains("user terminated"));
+        }
+    }
+
+    #[test]
+    fn test_convert_hook_event_progress() {
+        let config = ClaudeCodeConfig::new("test-progress");
+        let adapter = ClaudeCodeAdapter::new(config);
+
+        // Test "thinking" progress
+        let thinking_event = HookEvent::Progress(ProgressEvent {
+            progress_type: "thinking".to_string(),
+            description: Some("Processing request".to_string()),
+            token_count: Some(500),
+        });
+
+        let adapter_event = adapter.convert_hook_event(thinking_event);
+        if let AdapterEventPayload::Progress(progress) = adapter_event.payload {
+            assert_eq!(progress.signal_type, ProgressType::Activity);
+        }
+
+        // Test "idle" progress
+        let idle_event = HookEvent::Progress(ProgressEvent {
+            progress_type: "idle".to_string(),
+            description: None,
+            token_count: None,
+        });
+
+        let adapter_event = adapter.convert_hook_event(idle_event);
+        if let AdapterEventPayload::Progress(progress) = adapter_event.payload {
+            assert_eq!(progress.signal_type, ProgressType::Heartbeat);
+        }
     }
 }
