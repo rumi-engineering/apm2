@@ -101,7 +101,7 @@ impl BlackBoxConfig {
     /// On Linux, this applies syscall filtering via seccomp-bpf.
     /// On other platforms, this setting is ignored (no-op).
     #[must_use]
-    pub fn with_seccomp(mut self, profile: SeccompProfile) -> Self {
+    pub const fn with_seccomp(mut self, profile: SeccompProfile) -> Self {
         self.seccomp = profile;
         self
     }
@@ -114,23 +114,11 @@ impl BlackBoxConfig {
     /// - Privilege escalation syscalls
     /// - Dangerous kernel operations
     ///
-    /// The working directory (if set) and any watched paths are
-    /// automatically added as allowed write paths.
+    /// Note: Seccomp-bpf cannot filter filesystem access by path.
+    /// For path-based access control, use Landlock LSM or mount namespaces.
     #[must_use]
-    pub fn with_seccomp_sandbox(mut self) -> Self {
-        let mut profile = SeccompProfile::restricted();
-
-        // Add working directory as allowed write path
-        if let Some(ref working_dir) = self.process.working_dir {
-            profile = profile.with_allowed_write_path(working_dir);
-        }
-
-        // Add watched paths as allowed write paths
-        for path in &self.filesystem.watch_paths {
-            profile = profile.with_allowed_write_path(path);
-        }
-
-        self.seccomp = profile;
+    pub const fn with_seccomp_sandbox(mut self) -> Self {
+        self.seccomp = SeccompProfile::restricted();
         self
     }
 }
@@ -366,24 +354,14 @@ mod tests {
 
     #[test]
     fn test_with_seccomp_sandbox() {
+        use super::super::seccomp::SeccompProfileLevel;
+
         let config = BlackBoxConfig::new("session-123", "echo")
             .with_working_dir("/tmp/workspace")
             .with_watch_path("/tmp/watch")
             .with_seccomp_sandbox();
 
         assert!(config.seccomp.is_enforced());
-        // Should have added working_dir and watch_path as allowed paths
-        assert!(
-            config
-                .seccomp
-                .allowed_write_paths
-                .contains(&PathBuf::from("/tmp/workspace"))
-        );
-        assert!(
-            config
-                .seccomp
-                .allowed_write_paths
-                .contains(&PathBuf::from("/tmp/watch"))
-        );
+        assert_eq!(config.seccomp.level, SeccompProfileLevel::Restricted);
     }
 }

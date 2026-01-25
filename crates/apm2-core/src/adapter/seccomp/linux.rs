@@ -1,4 +1,4 @@
-//! Linux-specific seccomp BPF implementation.
+//! Linux-specific seccomp BPF implementation (`x86_64` only).
 //!
 //! This module provides the actual seccomp filter implementation using
 //! the Linux kernel's seccomp-bpf facility. It must be applied in a
@@ -21,66 +21,81 @@ use std::collections::BTreeMap;
 use super::{SeccompError, SeccompProfile, SeccompProfileLevel, SeccompResult};
 
 // Syscall numbers for x86_64 Linux
+// Using libc constants where available, hardcoded values for newer syscalls.
 // See: /usr/include/asm/unistd_64.h or `ausyscall --dump`
 mod syscall {
     // Process control - dangerous
-    pub const PTRACE: i64 = 101;
-    pub const PROCESS_VM_READV: i64 = 310;
-    pub const PROCESS_VM_WRITEV: i64 = 311;
+    pub const PTRACE: i64 = libc::SYS_ptrace;
+    pub const PROCESS_VM_READV: i64 = libc::SYS_process_vm_readv;
+    pub const PROCESS_VM_WRITEV: i64 = libc::SYS_process_vm_writev;
 
     // System control - dangerous
-    pub const REBOOT: i64 = 169;
-    pub const KEXEC_LOAD: i64 = 246;
-    pub const KEXEC_FILE_LOAD: i64 = 320;
+    pub const REBOOT: i64 = libc::SYS_reboot;
+    pub const KEXEC_LOAD: i64 = libc::SYS_kexec_load;
+    pub const KEXEC_FILE_LOAD: i64 = libc::SYS_kexec_file_load;
 
     // Kernel modules - dangerous
-    pub const INIT_MODULE: i64 = 175;
-    pub const DELETE_MODULE: i64 = 176;
-    pub const FINIT_MODULE: i64 = 313;
+    pub const INIT_MODULE: i64 = libc::SYS_init_module;
+    pub const DELETE_MODULE: i64 = libc::SYS_delete_module;
+    pub const FINIT_MODULE: i64 = libc::SYS_finit_module;
 
     // Filesystem escape - dangerous
-    pub const PIVOT_ROOT: i64 = 155;
-    pub const CHROOT: i64 = 161;
-    pub const MOUNT: i64 = 165;
-    pub const UMOUNT2: i64 = 166;
+    pub const PIVOT_ROOT: i64 = libc::SYS_pivot_root;
+    pub const CHROOT: i64 = libc::SYS_chroot;
+    pub const MOUNT: i64 = libc::SYS_mount;
+    pub const UMOUNT2: i64 = libc::SYS_umount2;
+
+    // BPF and advanced kernel features - dangerous
+    pub const BPF: i64 = libc::SYS_bpf;
+    pub const USERFAULTFD: i64 = libc::SYS_userfaultfd;
+    pub const UNSHARE: i64 = libc::SYS_unshare;
 
     // Privilege escalation - dangerous
-    pub const SETUID: i64 = 105;
-    pub const SETGID: i64 = 106;
-    pub const SETGROUPS: i64 = 116;
-    pub const SETREUID: i64 = 113;
-    pub const SETREGID: i64 = 114;
-    pub const SETRESUID: i64 = 117;
-    pub const SETRESGID: i64 = 119;
-    pub const SETFSUID: i64 = 122;
-    pub const SETFSGID: i64 = 123;
+    pub const SETUID: i64 = libc::SYS_setuid;
+    pub const SETGID: i64 = libc::SYS_setgid;
+    pub const SETGROUPS: i64 = libc::SYS_setgroups;
+    pub const SETREUID: i64 = libc::SYS_setreuid;
+    pub const SETREGID: i64 = libc::SYS_setregid;
+    pub const SETRESUID: i64 = libc::SYS_setresuid;
+    pub const SETRESGID: i64 = libc::SYS_setresgid;
+    pub const SETFSUID: i64 = libc::SYS_setfsuid;
+    pub const SETFSGID: i64 = libc::SYS_setfsgid;
 
     // Network syscalls - blocked at Restricted level
-    pub const SOCKET: i64 = 41;
-    pub const CONNECT: i64 = 42;
-    pub const ACCEPT: i64 = 43;
-    pub const SENDTO: i64 = 44;
-    pub const RECVFROM: i64 = 45;
-    pub const SENDMSG: i64 = 46;
-    pub const RECVMSG: i64 = 47;
-    pub const BIND: i64 = 49;
-    pub const LISTEN: i64 = 50;
-    pub const GETSOCKNAME: i64 = 51;
-    pub const GETPEERNAME: i64 = 52;
-    pub const SOCKETPAIR: i64 = 53;
-    pub const SETSOCKOPT: i64 = 54;
-    pub const GETSOCKOPT: i64 = 55;
-    pub const ACCEPT4: i64 = 288;
-    pub const RECVMMSG: i64 = 299;
-    pub const SENDMMSG: i64 = 307;
+    pub const SOCKET: i64 = libc::SYS_socket;
+    pub const CONNECT: i64 = libc::SYS_connect;
+    pub const ACCEPT: i64 = libc::SYS_accept;
+    pub const SENDTO: i64 = libc::SYS_sendto;
+    pub const RECVFROM: i64 = libc::SYS_recvfrom;
+    pub const SENDMSG: i64 = libc::SYS_sendmsg;
+    pub const RECVMSG: i64 = libc::SYS_recvmsg;
+    pub const BIND: i64 = libc::SYS_bind;
+    pub const LISTEN: i64 = libc::SYS_listen;
+    pub const GETSOCKNAME: i64 = libc::SYS_getsockname;
+    pub const GETPEERNAME: i64 = libc::SYS_getpeername;
+    pub const SOCKETPAIR: i64 = libc::SYS_socketpair;
+    pub const SETSOCKOPT: i64 = libc::SYS_setsockopt;
+    pub const GETSOCKOPT: i64 = libc::SYS_getsockopt;
+    pub const ACCEPT4: i64 = libc::SYS_accept4;
+    pub const RECVMMSG: i64 = libc::SYS_recvmmsg;
+    pub const SENDMMSG: i64 = libc::SYS_sendmmsg;
+
+    // Memory-related dangerous syscalls
+    pub const MEMFD_CREATE: i64 = libc::SYS_memfd_create;
+
+    // io_uring syscalls (newer, may not be in all libc versions)
+    // These are hardcoded for x86_64 as they may not be in older libc
+    pub const IO_URING_SETUP: i64 = 425;
+    pub const IO_URING_ENTER: i64 = 426;
+    pub const IO_URING_REGISTER: i64 = 427;
 
     // Process creation - blocked at Strict level
-    pub const FORK: i64 = 57;
-    pub const VFORK: i64 = 58;
-    pub const CLONE: i64 = 56;
-    pub const CLONE3: i64 = 435;
-    pub const EXECVE: i64 = 59;
-    pub const EXECVEAT: i64 = 322;
+    pub const FORK: i64 = libc::SYS_fork;
+    pub const VFORK: i64 = libc::SYS_vfork;
+    pub const CLONE: i64 = libc::SYS_clone;
+    pub const CLONE3: i64 = libc::SYS_clone3;
+    pub const EXECVE: i64 = libc::SYS_execve;
+    pub const EXECVEAT: i64 = libc::SYS_execveat;
 }
 
 /// Applies the seccomp filter to the current process.
@@ -136,11 +151,15 @@ pub fn apply_seccomp_filter(profile: &SeccompProfile) -> Result<SeccompResult, S
     // Build the filter
     // match_action: action taken when a rule matches (blocked syscalls)
     // mismatch_action: default action when no rule matches (allow everything else)
+    //
+    // Note: This is a BLOCKLIST approach - we block specific syscalls and allow
+    // everything else. This is less secure than a whitelist but more practical
+    // for general-purpose agent processes.
     let filter = SeccompFilter::new(
         rules,
         block_action,         // Action for rules that match (blocked syscalls)
         SeccompAction::Allow, // Default action (allow everything else)
-        TargetArch::x86_64,
+        TargetArch::x86_64,   // Hardcoded to x86_64 - this module only supports x86_64
     )
     .map_err(|e| SeccompError::new(format!("failed to create seccomp filter: {e}")))?;
 
@@ -175,19 +194,27 @@ fn get_blocked_syscalls(level: SeccompProfileLevel) -> Vec<i64> {
             | SeccompProfileLevel::Restricted
             | SeccompProfileLevel::Strict
     ) {
-        // Baseline: dangerous syscalls
+        // Baseline: dangerous syscalls that most processes should never need
         blocked.extend([
+            // Process inspection/debugging
             syscall::PTRACE,
             syscall::PROCESS_VM_READV,
             syscall::PROCESS_VM_WRITEV,
+            // System control
             syscall::REBOOT,
             syscall::KEXEC_LOAD,
             syscall::KEXEC_FILE_LOAD,
+            // Kernel modules
             syscall::INIT_MODULE,
             syscall::DELETE_MODULE,
             syscall::FINIT_MODULE,
+            // Filesystem escape
             syscall::PIVOT_ROOT,
             syscall::CHROOT,
+            // Advanced kernel features
+            syscall::BPF,
+            syscall::USERFAULTFD,
+            syscall::UNSHARE,
         ]);
     }
 
@@ -228,6 +255,12 @@ fn get_blocked_syscalls(level: SeccompProfileLevel) -> Vec<i64> {
             syscall::SETRESGID,
             syscall::SETFSUID,
             syscall::SETFSGID,
+            // Memory/file tricks
+            syscall::MEMFD_CREATE,
+            // io_uring (bypass for many restrictions)
+            syscall::IO_URING_SETUP,
+            syscall::IO_URING_ENTER,
+            syscall::IO_URING_REGISTER,
         ]);
     }
 
@@ -259,6 +292,9 @@ mod tests {
         assert!(blocked.contains(&syscall::REBOOT));
         assert!(blocked.contains(&syscall::KEXEC_LOAD));
         assert!(blocked.contains(&syscall::INIT_MODULE));
+        assert!(blocked.contains(&syscall::BPF));
+        assert!(blocked.contains(&syscall::USERFAULTFD));
+        assert!(blocked.contains(&syscall::UNSHARE));
 
         // Should NOT block network syscalls at baseline
         assert!(!blocked.contains(&syscall::SOCKET));
@@ -272,6 +308,7 @@ mod tests {
         // Should include baseline blocks
         assert!(blocked.contains(&syscall::PTRACE));
         assert!(blocked.contains(&syscall::REBOOT));
+        assert!(blocked.contains(&syscall::BPF));
 
         // Should block network syscalls
         assert!(blocked.contains(&syscall::SOCKET));
@@ -282,6 +319,14 @@ mod tests {
         // Should block privilege escalation
         assert!(blocked.contains(&syscall::SETUID));
         assert!(blocked.contains(&syscall::SETGID));
+
+        // Should block io_uring
+        assert!(blocked.contains(&syscall::IO_URING_SETUP));
+        assert!(blocked.contains(&syscall::IO_URING_ENTER));
+        assert!(blocked.contains(&syscall::IO_URING_REGISTER));
+
+        // Should block memfd_create
+        assert!(blocked.contains(&syscall::MEMFD_CREATE));
 
         // Should NOT block process creation at restricted
         assert!(!blocked.contains(&syscall::FORK));
@@ -295,11 +340,13 @@ mod tests {
         // Should include restricted blocks
         assert!(blocked.contains(&syscall::SOCKET));
         assert!(blocked.contains(&syscall::SETUID));
+        assert!(blocked.contains(&syscall::IO_URING_SETUP));
 
         // Should block process creation
         assert!(blocked.contains(&syscall::FORK));
         assert!(blocked.contains(&syscall::VFORK));
         assert!(blocked.contains(&syscall::CLONE));
+        assert!(blocked.contains(&syscall::CLONE3));
         assert!(blocked.contains(&syscall::EXECVE));
         assert!(blocked.contains(&syscall::EXECVEAT));
     }

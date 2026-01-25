@@ -2,18 +2,28 @@
 //!
 //! This module provides syscall filtering using seccomp-bpf to restrict
 //! what agent processes can do at the kernel level. It implements a
-//! **default-deny, least-privilege, fail-closed** security model.
+//! **blocklist-based, defense-in-depth, fail-closed** security model.
 //!
 //! # Security Model
 //!
-//! The seccomp profile blocks direct network and filesystem syscalls,
-//! ensuring agents can only communicate via mediated channels (stdout/stderr,
-//! watched directories). Profile violations are fatal and terminate the
-//! process immediately.
+//! The seccomp profile blocks dangerous syscalls that are unlikely to be
+//! needed by agent processes. This is a **blocklist** approach (default-allow
+//! with specific syscalls blocked) rather than a whitelist (default-deny).
+//! While a whitelist would be more secure, it's impractical for general-purpose
+//! agent processes that may need various syscalls.
+//!
+//! **Limitations:**
+//! - Seccomp-bpf cannot filter on string arguments (like file paths) because it
+//!   cannot dereference pointers. For filesystem access control, consider
+//!   Landlock LSM or mount namespaces.
+//! - This is defense-in-depth, not a complete sandbox.
+//!
+//! Profile violations are fatal and terminate the process immediately
+//! (fail-closed).
 //!
 //! # Platform Support
 //!
-//! This module is only available on Linux systems. On other platforms,
+//! This module is only available on Linux `x86_64` systems. On other platforms,
 //! a no-op implementation is provided that always reports as "not enforced."
 //!
 //! # Example
@@ -21,18 +31,19 @@
 //! ```rust,ignore
 //! use apm2_core::adapter::seccomp::{SeccompProfile, SeccompProfileLevel};
 //!
-//! // Create a restricted profile (blocks network, limits filesystem)
+//! // Create a restricted profile (blocks network, dangerous syscalls)
 //! let profile = SeccompProfile::new(SeccompProfileLevel::Restricted);
 //!
 //! // Apply the profile to child processes (must be done before exec)
 //! // This is typically done via pre_exec hooks in std::process::Command
 //! ```
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 /// Security profile level for seccomp filtering.
+///
+/// Each level is a **blocklist** that adds more syscalls to block.
+/// Higher levels are more restrictive but may break legitimate functionality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SeccompProfileLevel {
@@ -46,28 +57,36 @@ pub enum SeccompProfileLevel {
     /// operations.
     ///
     /// Blocks:
-    /// - `ptrace`, `process_vm_readv`, `process_vm_writev` (debugging)
+    /// - `ptrace`, `process_vm_readv`, `process_vm_writev`
+    ///   (debugging/inspection)
     /// - `kexec_load`, `kexec_file_load` (kernel replacement)
     /// - `reboot` (system shutdown)
     /// - `pivot_root`, `chroot` (filesystem escape)
     /// - `init_module`, `delete_module`, `finit_module` (kernel modules)
+    /// - `bpf` (BPF program loading)
+    /// - `userfaultfd` (page fault handling)
+    /// - `unshare` (namespace creation)
     Baseline,
 
     /// Restricted filtering - for agent processes.
     ///
     /// Includes Baseline blocks, plus:
     /// - All network syscalls (`socket`, `connect`, `bind`, `listen`, etc.)
-    /// - Raw filesystem creation syscalls (`open` with `O_CREAT` outside
-    ///   allowed paths)
     /// - `mount`, `umount`, `umount2` (filesystem manipulation)
     /// - `setuid`, `setgid`, `setgroups` (privilege escalation)
+    /// - `memfd_create` (anonymous memory files)
+    /// - `io_uring_setup`, `io_uring_enter`, `io_uring_register` (async I/O)
+    ///
+    /// Note: This does NOT block filesystem read/write syscalls. Agents can
+    /// still access files through normal means. Use other mechanisms (like
+    /// Landlock or mount namespaces) for filesystem access control.
     Restricted,
 
     /// Strict filtering - maximum restriction.
     ///
     /// Includes Restricted blocks, plus:
     /// - `execve`, `execveat` (new process execution)
-    /// - `fork`, `vfork`, `clone` for new processes
+    /// - `fork`, `vfork`, `clone`, `clone3` (process creation)
     ///
     /// This level is very restrictive and may break many legitimate use cases.
     Strict,
@@ -98,12 +117,6 @@ pub struct SeccompProfile {
     /// The filtering level to apply.
     pub level: SeccompProfileLevel,
 
-    /// Paths where file creation is allowed (for Restricted level).
-    ///
-    /// Only applies when `level` is `Restricted`. These paths are
-    /// checked against the first argument of filesystem syscalls.
-    pub allowed_write_paths: Vec<PathBuf>,
-
     /// Whether to log violations before terminating.
     ///
     /// When enabled, uses `SECCOMP_RET_TRAP` for blocked syscalls
@@ -118,7 +131,6 @@ impl SeccompProfile {
     pub const fn new(level: SeccompProfileLevel) -> Self {
         Self {
             level,
-            allowed_write_paths: Vec::new(),
             log_violations: true,
         }
     }
@@ -145,13 +157,6 @@ impl SeccompProfile {
     #[must_use]
     pub const fn strict() -> Self {
         Self::new(SeccompProfileLevel::Strict)
-    }
-
-    /// Adds an allowed write path (builder pattern).
-    #[must_use]
-    pub fn with_allowed_write_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.allowed_write_paths.push(path.into());
-        self
     }
 
     /// Sets whether to log violations (builder pattern).
@@ -226,18 +231,18 @@ pub struct SeccompResult {
     pub summary: String,
 }
 
-// Platform-specific implementation
-#[cfg(target_os = "linux")]
+// Platform-specific implementation (x86_64 Linux only)
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use linux::apply_seccomp_filter;
 
-// Stub implementation for non-Linux platforms
-#[cfg(not(target_os = "linux"))]
+// Stub implementation for non-Linux or non-x86_64 platforms
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 mod stub;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 pub use stub::apply_seccomp_filter;
 
 #[cfg(test)]
@@ -275,25 +280,6 @@ mod tests {
 
         let profile = SeccompProfile::strict();
         assert_eq!(profile.level, SeccompProfileLevel::Strict);
-    }
-
-    #[test]
-    fn test_profile_with_allowed_paths() {
-        let profile = SeccompProfile::restricted()
-            .with_allowed_write_path("/tmp/workspace")
-            .with_allowed_write_path("/home/user/project");
-
-        assert_eq!(profile.allowed_write_paths.len(), 2);
-        assert!(
-            profile
-                .allowed_write_paths
-                .contains(&PathBuf::from("/tmp/workspace"))
-        );
-        assert!(
-            profile
-                .allowed_write_paths
-                .contains(&PathBuf::from("/home/user/project"))
-        );
     }
 
     #[test]
