@@ -1,9 +1,9 @@
 //! Policy evaluation engine for tool request authorization.
 //!
 //! This module provides the `PolicyEngine` that evaluates tool requests against
-//! policy rules following a **default-deny** model. Rules are evaluated in order
-//! and the first matching rule determines the decision. If no rule matches, the
-//! request is denied.
+//! policy rules following a **default-deny** model. Rules are evaluated in
+//! order and the first matching rule determines the decision. If no rule
+//! matches, the request is denied.
 //!
 //! # Security Properties
 //!
@@ -52,11 +52,10 @@
 
 use std::sync::Arc;
 
-use crate::events::ToolDecided;
-use crate::tool::{ToolRequest, tool_request};
-
 use super::parser::LoadedPolicy;
 use super::schema::{Decision, Rule, RuleType};
+use crate::events::ToolDecided;
+use crate::tool::{ToolRequest, tool_request};
 
 /// Special rule ID for default-deny decisions.
 pub const DEFAULT_DENY_RULE_ID: &str = "DEFAULT_DENY";
@@ -177,11 +176,7 @@ impl PolicyEngine {
     }
 
     /// Checks if a rule applies to a specific tool request.
-    fn rule_applies_to_tool(
-        rule: &Rule,
-        tool: &tool_request::Tool,
-        tool_name: &str,
-    ) -> bool {
+    fn rule_applies_to_tool(rule: &Rule, tool: &tool_request::Tool, tool_name: &str) -> bool {
         match rule.rule_type {
             RuleType::ToolAllow | RuleType::ToolDeny => {
                 Self::matches_tool_rule(rule, tool, tool_name)
@@ -199,11 +194,7 @@ impl PolicyEngine {
     }
 
     /// Checks if a `tool_allow`/`tool_deny` rule matches the request.
-    fn matches_tool_rule(
-        rule: &Rule,
-        tool: &tool_request::Tool,
-        tool_name: &str,
-    ) -> bool {
+    fn matches_tool_rule(rule: &Rule, tool: &tool_request::Tool, tool_name: &str) -> bool {
         // Check tool name pattern
         if let Some(ref pattern) = rule.tool {
             if !matches_pattern(pattern, tool_name) {
@@ -442,8 +433,7 @@ fn matches_pattern(pattern: &str, value: &str) -> bool {
 
     if let Some(prefix) = pattern.strip_suffix(".*") {
         return value.starts_with(prefix)
-            && (value.len() == prefix.len()
-                || value.chars().nth(prefix.len()) == Some('.'));
+            && (value.len() == prefix.len() || value.chars().nth(prefix.len()) == Some('.'));
     }
 
     if let Some(prefix) = pattern.strip_suffix('*') {
@@ -615,9 +605,7 @@ fn matches_command_pattern(pattern: &str, command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{
-        FileEdit, FileRead, FileWrite, GitOperation, InferenceCall, ShellExec,
-    };
+    use crate::tool::{FileEdit, FileRead, FileWrite, GitOperation, InferenceCall, ShellExec};
 
     fn create_test_policy(yaml: &str) -> LoadedPolicy {
         LoadedPolicy::from_yaml(yaml).expect("valid test policy")
@@ -873,7 +861,10 @@ policy:
 
         // prefix/**
         assert!(matches_path_pattern("/workspace/**", "/workspace/file.txt"));
-        assert!(matches_path_pattern("/workspace/**", "/workspace/deep/nested/file.txt"));
+        assert!(matches_path_pattern(
+            "/workspace/**",
+            "/workspace/deep/nested/file.txt"
+        ));
         assert!(!matches_path_pattern("/workspace/**", "/other/file.txt"));
 
         // ./** (current directory)
@@ -884,8 +875,14 @@ policy:
     #[test]
     fn test_path_pattern_single_star() {
         // Single * should not match path separators
-        assert!(matches_path_pattern("/workspace/*.txt", "/workspace/file.txt"));
-        assert!(!matches_path_pattern("/workspace/*.txt", "/workspace/nested/file.txt"));
+        assert!(matches_path_pattern(
+            "/workspace/*.txt",
+            "/workspace/file.txt"
+        ));
+        assert!(!matches_path_pattern(
+            "/workspace/*.txt",
+            "/workspace/nested/file.txt"
+        ));
     }
 
     // ========================================================================
@@ -1201,8 +1198,9 @@ policy:
     // ========================================================================
 
     mod fuzz {
-        use super::*;
         use proptest::prelude::*;
+
+        use super::*;
 
         // Strategy for generating valid file paths
         fn path_strategy() -> impl Strategy<Value = String> {

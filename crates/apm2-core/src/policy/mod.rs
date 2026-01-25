@@ -84,9 +84,7 @@ mod validator;
 #[cfg(test)]
 mod tests;
 
-pub use engine::{
-    DEFAULT_DENY_RATIONALE, DEFAULT_DENY_RULE_ID, EvaluationResult, PolicyEngine,
-};
+pub use engine::{DEFAULT_DENY_RATIONALE, DEFAULT_DENY_RULE_ID, EvaluationResult, PolicyEngine};
 pub use error::PolicyError;
 pub use event::{create_policy_loaded_event, create_policy_loaded_event_from_parts};
 pub use parser::{
