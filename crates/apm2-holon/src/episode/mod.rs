@@ -3,8 +3,8 @@
 //! This module implements the episode controller that manages the execution
 //! loop for holons. It handles:
 //!
-//! - Constructing [`EpisodeContext`] from work state and constraints
-//! - Executing bounded episodes via [`Holon::execute_episode`]
+//! - Constructing [`crate::EpisodeContext`] from work state and constraints
+//! - Executing bounded episodes via [`crate::Holon::execute_episode`]
 //! - Evaluating stop conditions after each episode
 //! - Emitting ledger events for episode lifecycle
 //! - Enforcing budget limits within episodes
