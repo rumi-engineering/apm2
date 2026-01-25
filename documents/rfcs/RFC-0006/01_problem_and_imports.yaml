@@ -1,0 +1,322 @@
+rfc_problem_and_imports:
+  schema_version: "2026-01-25"
+  template_version: "2026-01-25"
+
+  problem_statement:
+    summary: "9 issues discovered during PR #58 and #59 merging require systematic remediation"
+    context: |
+      During the implementation and review of PR #58 (crash detection and restart logic)
+      and PR #59, multiple categories of issues were discovered that slowed down the
+      dev loop and required multiple review iterations. These issues fall into three
+      categories:
+
+      Category A - Tool Reliability Issues:
+      - A1: Gemini CLI headless mode fails (shell tools filtered in headless mode)
+      - A2: Shell escaping breaks with markdown (complex prompts as CLI args)
+      - A3: Insecure temp file creation (predictable names, world-readable)
+
+      Category B - State Machine Bugs (Found by Security Review):
+      - B1: Session ID collision on restart (reducer rejected terminal restarts)
+      - B2: Missing state tracking fields (resume_cursor, restart_attempt missing)
+      - B3: Monotonicity violation (no restart_attempt enforcement)
+
+      Category C - Compile/Lint Errors:
+      - C1: Pattern match errors (new struct fields not matched)
+      - C2: Clippy doc-markdown warnings (missing backticks in docs)
+      - C3: Match arms identical bodies (redundant arms not combined)
+
+      Root causes include: missing anti-pattern documentation, insufficient local
+      checks, no historical knowledge capture, and inconsistent AI reviewer tooling.
+
+    observed_symptoms:
+      - category: "Tool Reliability"
+        issue_ids: ["A1", "A2", "A3"]
+        description: |
+          AI tool invocation patterns were unreliable due to shell escaping issues
+          and insecure temp file handling. Gemini CLI in headless mode filtered out
+          shell tools, causing reviews to fail silently.
+        impact: "Review cycles failed or produced incomplete results"
+
+      - category: "State Machine Bugs"
+        issue_ids: ["B1", "B2", "B3"]
+        description: |
+          Restart logic implementation had subtle bugs that security review caught.
+          The reducer rejected restarts of terminal sessions, state tracking fields
+          were missing, and monotonicity of restart_attempt was not enforced.
+        impact: "Multiple review iterations required to fix state machine issues"
+
+      - category: "Compile/Lint Errors"
+        issue_ids: ["C1", "C2", "C3"]
+        description: |
+          New struct fields weren't matched in all pattern matches, causing compile
+          errors. Clippy warnings for doc-markdown (missing backticks) and redundant
+          match arms required additional fix commits.
+        impact: "CI failures caught issues that could have been caught locally"
+
+    goals:
+      - "Document learned anti-patterns in coding guidelines"
+      - "Enhance pre-commit checks with explicit clippy lints"
+      - "Add historical issue patterns to security review prompt"
+      - "Add test coverage for restart monotonicity and AI tool invocation"
+      - "Improve check workflow with specific remediation guidance"
+      - "Add automated anti-pattern detection (lint command)"
+      - "Switch code quality reviewer from Codex to Gemini CLI"
+      - "Add reviewer agent health monitoring to check command"
+
+    non_goals:
+      - "Redesign the xtask command architecture"
+      - "Change the security review workflow fundamentally"
+      - "Add new AI reviewer integrations beyond Gemini"
+
+  implementation_note: |
+    All improvements are additive enhancements to existing xtask tooling and
+    documentation. No breaking changes to existing workflows. The switch to
+    Gemini CLI for code quality review unifies AI reviewer tooling (Gemini
+    for both security and code quality reviews).
+
+  technical_context:
+    temp_file_security:
+      description: |
+        Secure temporary file creation requires using the tempfile crate's
+        NamedTempFile which creates files with 0600 permissions in a secure
+        temporary directory.
+      anti_pattern: |
+        std::env::temp_dir().join("predictable_name.txt")
+        // World-readable, predictable path, not cleaned up on panic
+      safe_pattern: |
+        let temp = NamedTempFile::new()?;
+        temp.write_all(content)?;
+        // Auto-cleaned up, 0600 permissions, unpredictable path
+
+    shell_escaping:
+      description: |
+        Complex prompts containing markdown should not be passed as CLI
+        arguments. Instead, write to a temp file and redirect input.
+      anti_pattern: |
+        Command::new("gemini").args(["--prompt", &markdown_content])
+        // Breaks with special characters, quotes, backticks
+      safe_pattern: |
+        let temp = NamedTempFile::new()?;
+        temp.write_all(prompt.as_bytes())?;
+        Command::new("sh").args(["-c", &format!(
+            "script -qec \"gemini --yolo < '{}'\" /dev/null",
+            temp.path().display()
+        )])
+
+    restart_monotonicity:
+      description: |
+        The restart_attempt counter must be strictly monotonic to prevent
+        replay attacks and ensure consistent state machine behavior.
+      invariant: "new_restart_attempt > old_restart_attempt || old is terminal"
+
+    reviewer_agent_health:
+      description: |
+        AI reviewer agents (Gemini processes) can become stale or crash during
+        long reviews. The check command needs to monitor agent health to detect
+        and auto-remediate unhealthy agents.
+      health_indicators:
+        - field: "process_alive"
+          description: "Whether the PID of the spawned Gemini process is alive"
+          detection: "Check if PID exists via kill(pid, 0) or /proc/<pid>"
+        - field: "last_activity_timestamp"
+          description: "Timestamp of the last activity from the agent"
+          detection: |
+            Use log file modification time (mtime) as the primary activity indicator.
+            This is reliable because:
+            - Gemini writes to stdout/stderr which is captured in the log
+            - Any tool execution produces output that updates mtime
+            - No need to parse Gemini's output format (which may change)
+            Fallback: If mtime unchanged for >60s but process is alive, treat as stale.
+      stale_threshold: "60 seconds since last activity (log file mtime)"
+      state_storage: |
+        Store reviewer state in a JSON file (~/.apm2/reviewer_state.json).
+        Use atomic writes (write to temp file, then rename) to prevent corruption.
+        Schema:
+        {
+          "reviewers": {
+            "security": {
+              "pid": 12345,
+              "started_at": "2026-01-25T01:30:00Z",
+              "log_file": "/tmp/apm2_review_security_abc123.log",
+              "pr_url": "https://github.com/owner/repo/pull/123",
+              "head_sha": "abc123def456"
+            },
+            "quality": {
+              "pid": 12346,
+              "started_at": "2026-01-25T01:30:00Z",
+              "log_file": "/tmp/apm2_review_quality_def456.log",
+              "pr_url": "https://github.com/owner/repo/pull/123",
+              "head_sha": "abc123def456"
+            }
+          }
+        }
+      log_capture: |
+        Capture Gemini output using script's built-in logging feature.
+        Two invocation patterns are used:
+
+        1. Without log capture (discard typescript):
+           script -qec "gemini --yolo < '{prompt_path}'" /dev/null
+           Used by: review.rs run_ai_review() for synchronous reviews
+
+        2. With log capture (for health monitoring):
+           script -q "{log_path}" -c "gemini --yolo < '{prompt_path}'"
+           Used by: push.rs trigger_ai_reviews() for background reviews
+
+        The -q flag suppresses start/done messages.
+        The -e flag returns the exit code of the child process.
+        The -c flag specifies the command to run.
+        The log file's mtime updates whenever new output is written.
+      auto_remediation: |
+        When an agent is unhealthy (process dead or last_activity > 60s ago):
+        1. Send SIGTERM to process, wait 5s, then SIGKILL if still alive
+        2. Remove entry from state file (using atomic write)
+        3. Re-trigger review with same PR URL and HEAD SHA
+        4. Log remediation action: "[!] Quality reviewer stale (90s), restarting..."
+        5. Update state file with new reviewer entry
+
+  imports:
+    prd_requirements: []
+    # NOTE: This is a maintenance RFC for dev loop improvements.
+    # Requirements are defined inline below as RFC-local requirements.
+
+  rfc_local_requirements:
+    rationale: |
+      These requirements address issues discovered during PR #58 and #59 merging.
+      They focus on improving the dev loop through better documentation, enhanced
+      local checks, additional test coverage, and unified AI reviewer tooling.
+
+    requirements:
+      - id: MAINT-006
+        type: ENHANCEMENT
+        title: "Document learned anti-patterns in coding guidelines"
+        statement: |
+          The coding guidelines MUST include a section on learned anti-patterns
+          covering: shell argument escaping for complex strings, predictable temp
+          file names, and incomplete struct field updates.
+        acceptance_criteria:
+          - "Anti-patterns section exists in SAFE_RUST_PATTERNS.md with 3 documented patterns"
+          - "SAFE-16 pattern exists for restart monotonicity"
+          - "Referenced from main coding SKILL.md"
+        verification:
+          command: "grep 'Anti-Patterns' documents/skills/coding/references/SAFE_RUST_PATTERNS.md"
+          pass_condition: "Anti-patterns section found with documented patterns"
+
+      - id: MAINT-007
+        type: ENHANCEMENT
+        title: "Enhanced clippy lints in pre-commit checks"
+        statement: |
+          The `cargo xtask commit` command MUST run enhanced clippy lints including
+          doc_markdown, match_same_arms, and missing_const_for_fn.
+        acceptance_criteria:
+          - "Pre-commit catches doc-markdown warnings"
+          - "Pre-commit catches match-same-arms warnings"
+          - "Tip displayed about using .. in match patterns"
+        verification:
+          command: "cargo xtask commit 'test'"
+          pass_condition: "Enhanced clippy lints are applied"
+
+      - id: MAINT-008
+        type: ENHANCEMENT
+        title: "Historical issue patterns in security review prompt"
+        statement: |
+          The security review prompt MUST include a section on historical issue
+          patterns to check first, derived from actual findings in prior PRs.
+        acceptance_criteria:
+          - "Prompt includes historical patterns section"
+          - "Patterns cover state machine, temp files, shell, struct fields"
+        verification:
+          command: "grep 'Historical Issue Patterns' documents/reviews/SECURITY_REVIEW_PROMPT.md"
+          pass_condition: "Historical patterns section found"
+
+      - id: MAINT-009
+        type: RELIABILITY
+        title: "Test coverage for restart monotonicity"
+        statement: |
+          The session reducer MUST have explicit boundary tests for restart_attempt
+          monotonicity including edge cases for 0->0, 0->1, 5->5, 5->6, MAX->any.
+        acceptance_criteria:
+          - "test_restart_monotonicity_boundary_cases test exists and passes"
+          - "test_restart_preserves_terminal_state_data test exists and passes"
+        verification:
+          command: "cargo test -p apm2-core test_restart_monotonicity"
+          pass_condition: "All restart monotonicity tests pass"
+
+      - id: MAINT-010
+        type: RELIABILITY
+        title: "Test coverage for AI tool invocation patterns"
+        statement: |
+          The xtask push and review commands MUST have tests for temp file security
+          properties (0600 permissions) and script command format validity.
+        acceptance_criteria:
+          - "test_temp_file_security test exists and passes"
+          - "test_script_command_format test exists and passes"
+        verification:
+          command: "cargo test -p xtask test_temp_file"
+          pass_condition: "All temp file and script command tests pass"
+
+      - id: MAINT-011
+        type: ENHANCEMENT
+        title: "Specific remediation guidance in check workflow"
+        statement: |
+          The `cargo xtask check` command MUST display failure-type-specific
+          remediation commands (e.g., cargo fmt, cargo clippy --fix).
+        acceptance_criteria:
+          - "Clippy failures show: cargo clippy --fix --allow-dirty"
+          - "Fmt failures show: cargo fmt"
+          - "Test failures show: cargo test --workspace"
+        verification:
+          command: "cargo xtask check"
+          pass_condition: "Specific fix commands shown for each failure type"
+
+      - id: MAINT-012
+        type: ENHANCEMENT
+        title: "Automated anti-pattern detection (lint command)"
+        statement: |
+          A new `cargo xtask lint` command MUST check for anti-patterns including
+          direct std::env::temp_dir usage and shell interpolation patterns.
+        acceptance_criteria:
+          - "cargo xtask lint catches temp file anti-patterns"
+          - "cargo xtask lint catches shell interpolation anti-patterns"
+          - "Warnings (not errors) issued for anti-patterns"
+        verification:
+          command: "cargo xtask lint"
+          pass_condition: "Anti-pattern detection runs without errors"
+
+      - id: MAINT-013
+        type: ENHANCEMENT
+        title: "Switch code quality reviewer to Gemini CLI"
+        statement: |
+          The code quality review MUST use Gemini CLI instead of Codex, using the
+          same secure temp file + script pattern as security review.
+        acceptance_criteria:
+          - "cargo xtask review quality uses Gemini CLI"
+          - "cargo xtask push triggers Gemini for code quality review"
+          - "Code quality review posts comment and updates status"
+        verification:
+          command: "cargo xtask review quality <PR_URL>"
+          pass_condition: "Gemini CLI invoked without errors"
+
+      - id: MAINT-014
+        type: RELIABILITY
+        title: "Reviewer agent health monitoring in check command"
+        statement: |
+          The `cargo xtask check` command MUST monitor and report the health of
+          AI reviewer agents. For each active reviewer, it MUST report:
+          1. Whether the process PID is alive (status)
+          2. The timestamp of last activity (based on log file mtime)
+          When an agent is unhealthy (dead process or last activity >60s ago),
+          the check command MUST auto-remediate by killing the stale process
+          and re-triggering the review.
+        acceptance_criteria:
+          - "Check displays reviewer PID alive/dead status for each review type"
+          - "Check displays last activity timestamp for each active reviewer"
+          - "Unhealthy reviewers (>60s stale) are automatically killed and restarted"
+          - "Reviewer state persisted in ~/.apm2/reviewer_state.json"
+          - "Gemini output redirected to log file for activity tracking (mtime)"
+        verification:
+          command: "cargo xtask check"
+          pass_condition: |
+            Output includes reviewer health section showing:
+            - Security: PID <pid> | Last activity: <elapsed> ago | Status: HEALTHY/STALE/DEAD
+            - Quality:  PID <pid> | Last activity: <elapsed> ago | Status: HEALTHY/STALE/DEAD
+            Auto-remediation occurs when status is STALE or DEAD
