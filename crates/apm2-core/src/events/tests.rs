@@ -248,6 +248,9 @@ fn test_evidence_published_roundtrip() {
         category: "TEST_RESULTS".to_string(),
         artifact_hash: vec![0xca; 32],
         verification_command_ids: vec!["cmd-001".to_string()],
+        classification: "INTERNAL".to_string(),
+        artifact_size: 1024,
+        metadata: vec!["key=value".to_string()],
     };
 
     let evidence_event = EvidenceEvent {

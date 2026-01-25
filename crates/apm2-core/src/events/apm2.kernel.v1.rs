@@ -576,6 +576,15 @@ pub struct EvidencePublished {
     pub verification_command_ids: ::prost::alloc::vec::Vec<
         ::prost::alloc::string::String,
     >,
+    /// Data classification: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
+    #[prost(string, tag = "6")]
+    pub classification: ::prost::alloc::string::String,
+    /// Artifact size in bytes (for bundle size tracking)
+    #[prost(uint64, tag = "7")]
+    pub artifact_size: u64,
+    /// Metadata key-value pairs as "key=value" strings
+    #[prost(string, repeated, tag = "8")]
+    pub metadata: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]

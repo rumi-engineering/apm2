@@ -186,6 +186,9 @@ mod tests {
             category: "TEST".to_string(),
             artifact_hash: vec![],
             verification_command_ids: vec!["CMD-Z".into(), "CMD-A".into(), "CMD-M".into()],
+            classification: "INTERNAL".to_string(),
+            artifact_size: 100,
+            metadata: vec!["key=value".to_string()],
         };
 
         published.canonicalize();

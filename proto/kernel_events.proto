@@ -333,6 +333,12 @@ message EvidencePublished {
   string category = 3;
   bytes artifact_hash = 4;
   repeated string verification_command_ids = 5;
+  // Data classification: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
+  string classification = 6;
+  // Artifact size in bytes (for bundle size tracking)
+  uint64 artifact_size = 7;
+  // Metadata key-value pairs as "key=value" strings
+  repeated string metadata = 8;
 }
 
 message GateReceiptGenerated {
