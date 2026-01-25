@@ -1,7 +1,6 @@
 ---
 name: dev-eng-ticket
 description: Orchestrate full development workflow for an RFC's engineering tickets. Processes tickets in dependency order, implements each, creates PRs, runs AI reviews, iterates until merged, then continues to next ticket.
-user-invocable: true
 ---
 
 ## Procedure
