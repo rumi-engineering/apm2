@@ -70,11 +70,24 @@ pub fn push() -> Result<()> {
 ///
 /// * `watch` - If true, continuously poll status every 10 seconds
 ///
+/// # Returns
+///
+/// Returns `Ok(())` but may call `std::process::exit()` with appropriate exit
+/// code in watch mode:
+/// - 0: Normal completion or PR merged
+/// - 1: Terminal failure state (closed, CI failed, changes requested)
+/// - 2: Watch mode timeout
+///
 /// # Errors
 ///
 /// Returns an error if the status check fails. See [`check::run`] for details.
 pub fn check(watch: bool) -> Result<()> {
-    check::run(watch)
+    let exit_code = check::run(watch)?;
+    // Exit with the appropriate code if not success
+    if exit_code != 0 {
+        std::process::exit(i32::from(exit_code));
+    }
+    Ok(())
 }
 
 /// Clean up after PR merge.

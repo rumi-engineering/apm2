@@ -17,7 +17,7 @@
 //! | Already merged     | `cargo xtask finish` to cleanup               |
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -28,6 +28,64 @@ use crate::reviewer_state::{
     kill_process,
 };
 use crate::util::{current_branch, validate_ticket_branch};
+
+/// Watch mode timeout in seconds.
+const WATCH_TIMEOUT_SECS: u64 = 180;
+
+/// Exit code for watch timeout.
+const EXIT_TIMEOUT: u8 = 2;
+
+/// Result of watch mode with exit information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchExitReason {
+    /// PR was successfully merged.
+    Merged,
+    /// PR was closed without merging.
+    Closed,
+    /// CI failed with the given check names.
+    CiFailed(Vec<String>),
+    /// Reviewer requested changes.
+    ChangesRequested,
+    /// Watch mode timed out.
+    Timeout,
+}
+
+impl WatchExitReason {
+    /// Get the exit code for this exit reason.
+    ///
+    /// Returns:
+    /// - 0: Success (merged)
+    /// - 1: Failure (closed, CI failed, changes requested)
+    /// - 2: Timeout
+    #[must_use]
+    pub const fn exit_code(&self) -> u8 {
+        match self {
+            Self::Merged => 0,
+            Self::Closed | Self::CiFailed(_) | Self::ChangesRequested => 1,
+            Self::Timeout => EXIT_TIMEOUT,
+        }
+    }
+
+    /// Get a human-readable message for this exit reason.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::Merged => "PR merged successfully!".to_string(),
+            Self::Closed => "PR was closed without merging.".to_string(),
+            Self::CiFailed(checks) => format!(
+                "CI failed: {}\nFix the failures and push again.",
+                checks.join(", ")
+            ),
+            Self::ChangesRequested => "Changes requested by reviewer.\n\
+                 Address feedback and push again."
+                .to_string(),
+            Self::Timeout => format!(
+                "Timeout after {WATCH_TIMEOUT_SECS}s waiting for checks.\n\
+                 Suggestion: Manually restart slow checks or investigate CI.",
+            ),
+        }
+    }
+}
 
 /// A single check run from GitHub's API.
 ///
@@ -51,12 +109,19 @@ struct CheckRun {
 ///
 /// * `watch` - If true, continuously poll status every 10 seconds
 ///
+/// # Returns
+///
+/// Returns `Ok(u8)` with the appropriate exit code:
+/// - 0: Normal completion or PR merged
+/// - 1: Terminal failure state (closed, CI failed, changes requested)
+/// - 2: Watch mode timeout
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - Not on a valid ticket branch
 /// - Git or gh CLI operations fail
-pub fn run(watch: bool) -> Result<()> {
+pub fn run(watch: bool) -> Result<u8> {
     let sh = Shell::new().context("Failed to create shell")?;
 
     // Get current branch and validate it's a ticket branch
@@ -74,14 +139,43 @@ pub fn run(watch: bool) -> Result<()> {
     println!();
 
     if watch {
+        let start = Instant::now();
+
         loop {
             let status = check_status(&sh, &branch_name)?;
             print_status(&status);
             display_reviewer_health(&sh)?;
 
-            // If merged, no need to keep watching
+            // Check for terminal states and exit appropriately
             if status.pr_state == Some(PrState::Merged) {
-                break;
+                let reason = WatchExitReason::Merged;
+                println!("\n{}", reason.message());
+                return Ok(reason.exit_code());
+            }
+
+            if status.pr_state == Some(PrState::Closed) {
+                let reason = WatchExitReason::Closed;
+                println!("\n{}", reason.message());
+                return Ok(reason.exit_code());
+            }
+
+            if let Some(CiStatus::Failure(ref checks)) = status.ci {
+                let reason = WatchExitReason::CiFailed(checks.clone());
+                println!("\n{}", reason.message());
+                return Ok(reason.exit_code());
+            }
+
+            if status.review == Some(ReviewStatus::ChangesRequested) {
+                let reason = WatchExitReason::ChangesRequested;
+                println!("\n{}", reason.message());
+                return Ok(reason.exit_code());
+            }
+
+            // Check for timeout
+            if start.elapsed().as_secs() >= WATCH_TIMEOUT_SECS {
+                let reason = WatchExitReason::Timeout;
+                println!("\n{}", reason.message());
+                return Ok(reason.exit_code());
             }
 
             println!("\nPolling again in 10 seconds... (Ctrl+C to stop)");
@@ -105,7 +199,7 @@ pub fn run(watch: bool) -> Result<()> {
         display_reviewer_health(&sh)?;
     }
 
-    Ok(())
+    Ok(0)
 }
 
 /// The overall status of the ticket/PR.
@@ -1113,5 +1207,85 @@ mod tests {
             },
             _ => panic!("Expected CiStatus::Failure"),
         }
+    }
+
+    // Tests for WatchExitReason
+
+    #[test]
+    fn test_watch_exit_reason_merged_exit_code() {
+        let reason = WatchExitReason::Merged;
+        assert_eq!(reason.exit_code(), 0);
+    }
+
+    #[test]
+    fn test_watch_exit_reason_closed_exit_code() {
+        let reason = WatchExitReason::Closed;
+        assert_eq!(reason.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_watch_exit_reason_ci_failed_exit_code() {
+        let reason = WatchExitReason::CiFailed(vec!["test".to_string()]);
+        assert_eq!(reason.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_watch_exit_reason_changes_requested_exit_code() {
+        let reason = WatchExitReason::ChangesRequested;
+        assert_eq!(reason.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_watch_exit_reason_timeout_exit_code() {
+        let reason = WatchExitReason::Timeout;
+        assert_eq!(reason.exit_code(), 2);
+    }
+
+    #[test]
+    fn test_watch_exit_reason_merged_message() {
+        let reason = WatchExitReason::Merged;
+        assert_eq!(reason.message(), "PR merged successfully!");
+    }
+
+    #[test]
+    fn test_watch_exit_reason_closed_message() {
+        let reason = WatchExitReason::Closed;
+        assert_eq!(reason.message(), "PR was closed without merging.");
+    }
+
+    #[test]
+    fn test_watch_exit_reason_ci_failed_message() {
+        let reason = WatchExitReason::CiFailed(vec!["test".to_string(), "lint".to_string()]);
+        let msg = reason.message();
+        assert!(msg.contains("CI failed: test, lint"));
+        assert!(msg.contains("Fix the failures and push again."));
+    }
+
+    #[test]
+    fn test_watch_exit_reason_changes_requested_message() {
+        let reason = WatchExitReason::ChangesRequested;
+        let msg = reason.message();
+        assert!(msg.contains("Changes requested by reviewer."));
+        assert!(msg.contains("Address feedback and push again."));
+    }
+
+    #[test]
+    fn test_watch_exit_reason_timeout_message() {
+        let reason = WatchExitReason::Timeout;
+        let msg = reason.message();
+        assert!(msg.contains("Timeout after 180s waiting for checks."));
+        assert!(msg.contains("Suggestion: Manually restart slow checks or investigate CI."));
+    }
+
+    #[test]
+    fn test_watch_timeout_constant() {
+        // Verify the timeout constant is 180 seconds as required
+        assert_eq!(WATCH_TIMEOUT_SECS, 180);
+    }
+
+    #[test]
+    fn test_exit_timeout_constant() {
+        // Verify the timeout exit code is 2 as required
+        assert_eq!(EXIT_TIMEOUT, 2);
     }
 }
