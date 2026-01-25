@@ -230,8 +230,7 @@ pub struct ToolRequestDetected {
     /// Detection method.
     pub detection_method: DetectionMethod,
 
-    /// Confidence score (0.0 to 1.0) - how certain the detection is.
-    /// Note: Stored as fixed-point integer (0-100) for Eq derivation.
+    /// Confidence percentage (0-100) indicating how certain the detection is.
     pub confidence_percent: u8,
 
     /// Additional context about the detection.

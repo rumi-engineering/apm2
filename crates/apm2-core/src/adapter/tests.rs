@@ -6,7 +6,7 @@ use super::*;
 
 /// Test that the black-box adapter correctly handles process lifecycle.
 #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_black_box_adapter_lifecycle() {
     let config = BlackBoxConfig::new("session-lifecycle", "echo").with_args(["test", "output"]);
 
@@ -57,7 +57,7 @@ async fn test_black_box_adapter_lifecycle() {
 
 /// Test that the adapter correctly detects filesystem changes.
 #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_black_box_adapter_filesystem_detection() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -130,7 +130,7 @@ async fn test_black_box_adapter_filesystem_detection() {
 
 /// Test that stall detection works correctly.
 #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_black_box_adapter_stall_detection() {
     let config = BlackBoxConfig::new("session-stall", "sleep")
         .with_args(["5"])
@@ -158,7 +158,7 @@ async fn test_black_box_adapter_stall_detection() {
 
 /// Test event receiver functionality.
 #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_black_box_adapter_event_receiver() {
     let config = BlackBoxConfig::new("session-receiver", "echo").with_args(["hello"]);
 
@@ -240,7 +240,7 @@ fn test_environment_filtering_config() {
 
 /// Test adapter error handling for invalid command.
 #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_black_box_adapter_spawn_error() {
     let config = BlackBoxConfig::new("session-error", "nonexistent_command_12345");
 
@@ -254,7 +254,7 @@ async fn test_black_box_adapter_spawn_error() {
 
 /// Test that adapter correctly reports exit codes.
 #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_black_box_adapter_exit_codes() {
     // Test successful exit
     {
@@ -295,7 +295,7 @@ async fn test_black_box_adapter_exit_codes() {
 
 /// Test that progress signals are emitted on activity.
 #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_black_box_adapter_progress_signals() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -333,7 +333,7 @@ async fn test_black_box_adapter_progress_signals() {
 
 /// Test adapter event sequence numbers.
 #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_adapter_event_sequence() {
     let config = BlackBoxConfig::new("session-seq", "echo").with_args(["test"]);
 
@@ -374,7 +374,7 @@ async fn test_adapter_event_sequence() {
 
 /// Test that all events have the correct session ID.
 #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_adapter_event_session_id() {
     let config = BlackBoxConfig::new("session-id-test", "echo").with_args(["hello"]);
 

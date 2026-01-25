@@ -168,23 +168,40 @@ impl FilesystemWatcher {
     /// Supports:
     /// - `*` matches any characters except path separator
     /// - `**` matches any characters including path separator
+    ///
+    /// Note: This is a simplified implementation. For production use with
+    /// complex patterns, consider the `glob` or `globset` crates.
     fn matches_glob(pattern: &str, path: &str) -> bool {
+        // Handle ** patterns (e.g., ".git/**", "node_modules/**")
         if pattern.contains("**") {
-            // For ** patterns, check if any path segment matches
             let parts: Vec<&str> = pattern.split("**").collect();
             if parts.len() == 2 {
                 let prefix = parts[0].trim_end_matches('/');
-                if path.contains(prefix) {
-                    return true;
+                if prefix.is_empty() {
+                    return true; // "**" matches everything
                 }
+                // Check for path segment boundary: must match /prefix/ or /prefix at end
+                // or be at the start of the path
+                let with_leading = format!("/{prefix}/");
+                let at_end = format!("/{prefix}");
+                let at_start = format!("{prefix}/");
+                return path.contains(&with_leading)
+                    || path.ends_with(&at_end)
+                    || path.starts_with(&at_start)
+                    || path == prefix;
             }
         }
 
+        // Handle extension patterns (e.g., "*.swp", "*~")
         if let Some(ext_pattern) = pattern.strip_prefix("*.") {
-            // Extension pattern matching
             if let Some(ext) = path.rsplit('.').next() {
                 return ext == ext_pattern;
             }
+        }
+
+        // Handle single * suffix (e.g., "*~")
+        if let Some(suffix) = pattern.strip_prefix('*') {
+            return path.ends_with(suffix);
         }
 
         false

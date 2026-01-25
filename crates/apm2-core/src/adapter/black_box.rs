@@ -22,17 +22,25 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use apm2_core::adapter::{BlackBoxAdapter, BlackBoxConfig};
+//! use apm2_core::adapter::{BlackBoxAdapter, BlackBoxConfig, AdapterEventPayload};
 //!
 //! let config = BlackBoxConfig::new("session-123", "claude")
 //!     .with_working_dir("/workspace")
 //!     .with_watch_path("/workspace");
 //!
 //! let mut adapter = BlackBoxAdapter::new(config);
+//!
+//! // Take the event receiver for async event consumption
+//! let mut rx = adapter.take_event_receiver().unwrap();
+//!
 //! adapter.start().await?;
 //!
-//! while let Some(event) = adapter.recv().await {
+//! // Poll in a loop to drive the adapter, or use run() for convenience
+//! while let Some(event) = rx.recv().await {
 //!     println!("Event: {:?}", event);
+//!     if matches!(event.payload, AdapterEventPayload::ProcessExited(_)) {
+//!         break;
+//!     }
 //! }
 //! ```
 
@@ -243,12 +251,8 @@ impl BlackBoxAdapter {
                 AdapterState::Stopped { .. } => return Ok(None),
             };
 
-        // Check if shutdown was requested
-        if shutdown.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-
-        // Check for process exit
+        // Check for process exit first (even if shutdown was requested)
+        // This ensures we properly detect process termination and emit ProcessExited
         if let Some(status) = child.try_wait().map_err(AdapterError::Io)? {
             let uptime = started_at.elapsed();
             let exit_code = status.code();
@@ -272,6 +276,12 @@ impl BlackBoxAdapter {
             }
 
             return Ok(Some(event));
+        }
+
+        // Check if shutdown was requested (after checking for process exit)
+        // This ensures we can properly detect and report process termination
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(None);
         }
 
         // Poll filesystem for changes
@@ -606,7 +616,7 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_adapter_start_and_poll() {
         let config = BlackBoxConfig::new("session-test", "echo").with_args(["hello", "world"]);
 
@@ -635,7 +645,7 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_adapter_double_start() {
         let config = BlackBoxConfig::new("session-test", "sleep").with_args(["1"]);
 
@@ -650,7 +660,7 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)] // Miri can't spawn processes
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_adapter_with_filesystem_watch() {
         let dir = tempfile::tempdir().unwrap();
 
