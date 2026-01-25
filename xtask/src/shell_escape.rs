@@ -66,6 +66,12 @@ pub fn quote_path(path: &Path) -> String {
     escape(Cow::Borrowed(&path_str)).into_owned()
 }
 
+/// Escapes a string for use inside a single-quoted shell string.
+/// Replaces ' with '\''
+fn escape_for_single_quote(s: &str) -> String {
+    s.replace('\'', "'\\''")
+}
+
 /// Builds a script command for PTY-wrapped execution.
 ///
 /// The `script` command allocates a pseudo-TTY which gives Gemini access to
@@ -87,12 +93,12 @@ pub fn quote_path(path: &Path) -> String {
 ///
 /// With log capture (for health monitoring):
 /// ```text
-/// script -q '<log_path>' -c "gemini --yolo < '<prompt_path>'"
+/// script -q '<log_path>' -c 'gemini --yolo < '\''<prompt_path>'\'''
 /// ```
 ///
 /// Without log capture (synchronous reviews):
 /// ```text
-/// script -qec "gemini --yolo < '<prompt_path>'" /dev/null
+/// script -qec 'gemini --yolo < '\''<prompt_path>'\''' /dev/null
 /// ```
 ///
 /// # Example
@@ -112,12 +118,14 @@ pub fn quote_path(path: &Path) -> String {
 /// ```
 pub fn build_script_command(prompt_path: &Path, log_path: Option<&Path>) -> String {
     let quoted_prompt = quote_path(prompt_path);
+    let inner_cmd = format!("gemini --yolo < {quoted_prompt}");
+    let escaped_inner = escape_for_single_quote(&inner_cmd);
 
     log_path.map_or_else(
-        || format!("script -qec \"gemini --yolo < {quoted_prompt}\" /dev/null"),
+        || format!("script -qec '{escaped_inner}' /dev/null"),
         |log| {
             let quoted_log = quote_path(log);
-            format!("script -q {quoted_log} -c \"gemini --yolo < {quoted_prompt}\"")
+            format!("script -q {quoted_log} -c '{escaped_inner}'")
         },
     )
 }
@@ -140,13 +148,15 @@ pub fn build_script_command(prompt_path: &Path, log_path: Option<&Path>) -> Stri
 /// # Format
 ///
 /// ```text
-/// script -q '<log_path>' -c "gemini --yolo < '<prompt_path>'"; rm -f '<prompt_path>'
+/// script -q '<log_path>' -c 'gemini --yolo < '\''<prompt_path>'\'''; rm -f '<prompt_path>'
 /// ```
 pub fn build_script_command_with_cleanup(prompt_path: &Path, log_path: &Path) -> String {
     let quoted_prompt = quote_path(prompt_path);
     let quoted_log = quote_path(log_path);
+    let inner_cmd = format!("gemini --yolo < {quoted_prompt}");
+    let escaped_inner = escape_for_single_quote(&inner_cmd);
 
-    format!("script -q {quoted_log} -c \"gemini --yolo < {quoted_prompt}\"; rm -f {quoted_prompt}")
+    format!("script -q {quoted_log} -c '{escaped_inner}'; rm -f {quoted_prompt}")
 }
 
 #[cfg(test)]
@@ -330,8 +340,8 @@ mod tests {
             "Command with log should not use -qec (uses -q ... -c): {cmd}"
         );
         assert!(
-            cmd.contains("-c \""),
-            "Command with log should use -c flag: {cmd}"
+            cmd.contains("-c '"),
+            "Command with log should use -c flag with single quotes: {cmd}"
         );
         assert!(
             cmd.contains("gemini --yolo"),
@@ -450,16 +460,16 @@ mod tests {
     fn test_command_format_matches_expected_pattern() {
         // Test that the generated commands match the documented patterns
 
-        // Without log: script -qec "gemini --yolo < '<prompt_path>'" /dev/null
+        // Without log: script -qec 'gemini --yolo < '\''<prompt_path>'\''' /dev/null
         let prompt = Path::new("/tmp/simple.txt");
         let cmd = build_script_command(prompt, None);
         assert!(cmd.starts_with("script -qec"));
         assert!(cmd.ends_with("/dev/null"));
 
-        // With log: script -q '<log_path>' -c "gemini --yolo < '<prompt_path>'"
+        // With log: script -q '<log_path>' -c 'gemini --yolo < '\''<prompt_path>'\'''
         let log = Path::new("/tmp/log.txt");
         let cmd = build_script_command(prompt, Some(log));
         assert!(cmd.starts_with("script -q"));
-        assert!(cmd.contains("-c \"gemini"));
+        assert!(cmd.contains("-c 'gemini"));
     }
 }
