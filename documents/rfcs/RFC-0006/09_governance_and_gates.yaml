@@ -32,7 +32,8 @@ rfc_governance_and_gates:
       date: ""
       notes: |
         Review security aspects of:
-        - Temp file security patterns (SAFE-16)
+        - Temp file security patterns (ANTI-2)
+        - Restart monotonicity invariants (INV-2615 / INV-2502)
         - AI tool invocation security
         - Historical issue patterns completeness
 

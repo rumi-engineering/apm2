@@ -40,14 +40,14 @@ decision_tree:
           purpose: "Agent-native architecture doctrine."
         - path: documents/skills/coding/SKILL.md
           purpose: "Project coding standards."
-        - path: documents/skills/coding/references/SAFE_RUST_PATTERNS.md
-          purpose: "APM2 safe Rust patterns and anti-patterns."
+        - path: documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md
+          purpose: "APM2 safe patterns and anti-patterns (token-efficient index)."
         - path: documents/skills/coding/references/CI_EXPECTATIONS.md
           purpose: "CI pipeline checks and fix procedures."
         - path: documents/skills/coding/references/SECURITY_CHECKLIST.md
           purpose: "Security review checklist."
-        - path: documents/skills/coding/references/UNSAFE_CODE_POLICY.md
-          purpose: "Policy for unsafe code usage."
+        - path: documents/skills/rust-textbook/09_unsafe_rust_obligations.md
+          purpose: "Unsafe proof obligations + APM2 unsafe policy."
       steps[1]:
         - id: READ_BASELINE_CONTEXT
           action: "Read every context file listed above and record invariants, required gates, and review constraints."

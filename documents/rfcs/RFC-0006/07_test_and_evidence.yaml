@@ -185,17 +185,18 @@ rfc_test_and_evidence:
         prerequisites:
           - "TCK-00059 completed"
         steps:
-          - "Open documents/skills/coding/references/SAFE_RUST_PATTERNS.md"
+          - "Open documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md"
           - "Verify Anti-Patterns section exists"
           - "Verify ANTI-1, ANTI-2, ANTI-3 documented"
-          - "Verify SAFE-16 pattern exists"
+          - "Verify INV-2615 exists (APPLY: INV-2502)"
         pass_criteria:
           file_must_contain:
             - "Anti-Patterns"
             - "ANTI-1"
             - "ANTI-2"
             - "ANTI-3"
-            - "SAFE-16"
+            - "INV-2615"
+            - "INV-2502"
 
       - id: MV-006-002
         description: "Verify historical patterns in security prompt"
@@ -298,11 +299,11 @@ rfc_test_and_evidence:
 
   evidence_requirements:
     - id: EVID-6001
-      description: "Anti-patterns documented in SAFE_RUST_PATTERNS.md"
+      description: "Anti-patterns documented in rust-textbook Chapter 26"
       artifact_type: "documentation"
       verification:
         manual: "MV-006-001 passes"
-      location: "documents/skills/coding/references/SAFE_RUST_PATTERNS.md"
+      location: "documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md"
 
     - id: EVID-6002
       description: "Historical patterns in security review prompt"

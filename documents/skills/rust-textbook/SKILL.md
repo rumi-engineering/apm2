@@ -68,3 +68,4 @@ ID scheme: `XXXX = CCSS` where `CC` is the chapter number and `SS` is a within-c
 - 23_ffi_and_abi.md
 - 24_hazard_catalog_checklists.md
 - 25_time_monotonicity_determinism.md
+- 26_apm2_safe_patterns_and_anti_patterns.md

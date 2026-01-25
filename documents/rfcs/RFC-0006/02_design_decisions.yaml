@@ -4,11 +4,11 @@ rfc_design_decisions:
 
   decisions:
     - id: DD-006-001
-      title: "Document Anti-Patterns in SAFE_RUST_PATTERNS.md"
+      title: "Document Anti-Patterns in rust-textbook Chapter 26"
       statement: |
-        Add a new "Anti-Patterns (Lessons Learned)" section to SAFE_RUST_PATTERNS.md
-        (at documents/skills/coding/references/) documenting shell escaping, temp file,
-        and struct field update anti-patterns.
+        Add a new "Anti-Patterns (Lessons Learned)" section to
+        documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md
+        documenting shell escaping, temp file, and struct field update anti-patterns.
       context: |
         Issues discovered during PR #58 and #59 merging repeatedly appeared because
         there was no documented knowledge of these anti-patterns. Capturing them
@@ -33,7 +33,7 @@ rfc_design_decisions:
           security_tradeoffs: []
           operability_tradeoffs: []
         - id: ALT-0003
-          name: "Add section to SAFE_RUST_PATTERNS.md (chosen)"
+          name: "Add section to rust-textbook Chapter 26 (chosen)"
           pros:
             - "Natural home next to safe patterns"
             - "Developers see both patterns and anti-patterns together"
@@ -43,9 +43,9 @@ rfc_design_decisions:
           security_tradeoffs: []
           operability_tradeoffs: []
       chosen_rationale: |
-        SAFE_RUST_PATTERNS.md (at documents/skills/coding/references/) is the natural
-        home for anti-patterns since they are the inverse of safe patterns. Developers
-        consulting safe patterns should also see what to avoid.
+        rust-textbook Chapter 26 is the natural home for APM2-specific safe patterns
+        and anti-patterns. Developers consulting safe patterns should also see what
+        to avoid, in the same canonical reference.
       impacted_requirement_ids:
         - MAINT-006
       evidence_ids:
