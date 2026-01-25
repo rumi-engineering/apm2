@@ -8,6 +8,7 @@ mod aat;
 mod check;
 mod commit;
 mod finish;
+pub mod lint;
 mod push;
 mod review;
 mod security_review_exec;

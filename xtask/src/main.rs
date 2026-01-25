@@ -30,6 +30,8 @@
 //!   reason
 //! - `aat <PR_URL>` - Run Agent Acceptance Testing on a PR
 //! - `aat <PR_URL> --dry-run` - Preview AAT without setting status
+//! - `lint` - Check for anti-patterns (`temp_dir`, shell interpolation)
+//! - `lint --fix` - Check for anti-patterns (fix flag placeholder)
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -139,6 +141,17 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Check for anti-patterns in the codebase.
+    ///
+    /// Scans Rust source files for anti-patterns that cannot be caught by
+    /// clippy:
+    /// - Direct `std::env::temp_dir` usage (use `tempfile` crate instead)
+    /// - Shell interpolation patterns (use file-based input instead)
+    ///
+    /// Findings are reported as warnings (not errors) to allow gradual
+    /// adoption.
+    Lint(tasks::lint::LintArgs),
 }
 
 /// Security review exec subcommands.
@@ -240,5 +253,6 @@ fn main() -> Result<()> {
             SecurityReviewExecCommands::Onboard => tasks::security_review_exec_onboard(),
         },
         Commands::Aat { pr_url, dry_run } => tasks::aat(&pr_url, dry_run),
+        Commands::Lint(args) => tasks::lint::run(args),
     }
 }
