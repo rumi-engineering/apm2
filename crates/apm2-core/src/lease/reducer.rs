@@ -184,6 +184,20 @@ impl LeaseReducerState {
 /// - All lease operations require a registrar signature (verified by caller)
 /// - Duplicate lease issuance for the same work is rejected
 /// - Only active leases can be renewed, released, or expired
+///
+/// # Trust Boundary: Signature Verification
+///
+/// This reducer checks that `registrar_signature` is non-empty but does NOT
+/// perform cryptographic verification. The trust model assumes:
+///
+/// 1. **Ledger is append-only and authenticated**: Events are verified by the
+///    Command Handler layer *before* being appended to the ledger.
+/// 2. **Replay from trusted source**: When replaying the ledger, events are
+///    sourced from a trusted ledger instance that has already validated
+///    signatures.
+///
+/// If the ledger may be replicated from untrusted peers, inject a `Verifier`
+/// trait to cryptographically verify signatures during replay.
 #[derive(Debug, Default)]
 pub struct LeaseReducer {
     state: LeaseReducerState,
@@ -430,8 +444,11 @@ impl LeaseReducer {
         }
 
         // Apply expiration
+        // Use the lease's actual expiration time for terminated_at, not the
+        // event's expired_at, to prevent DoS via state pinning where an
+        // attacker sets expired_at=u64::MAX to evade time-based pruning.
         lease.state = LeaseState::Expired;
-        lease.terminated_at = Some(event.expired_at);
+        lease.terminated_at = Some(lease.expires_at);
 
         // Remove from active leases index
         self.state.active_leases_by_work.remove(&lease.work_id);
