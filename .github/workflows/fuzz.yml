@@ -6,6 +6,8 @@ name: Fuzz
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   schedule:
     # Run weekly on Saturdays at midnight UTC
     - cron: '0 0 * * 6'
@@ -22,7 +24,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  FUZZ_TIME: ${{ github.event.inputs.fuzz_time || '300' }}
+  # Short run on PRs (10s) to validate fuzz targets compile and work; full run on main (300s)
+  FUZZ_TIME: ${{ github.event.inputs.fuzz_time || (github.event_name == 'pull_request' && '10') || '300' }}
 
 jobs:
   fuzz:
@@ -53,7 +56,7 @@ jobs:
         run: |
           cd fuzz
           if [ -f Cargo.toml ]; then
-            targets=$(cargo fuzz list 2>/dev/null || echo "")
+            targets=$(cargo fuzz list 2>/dev/null | tr '\n' ' ' || echo "")
             echo "targets=$targets" >> $GITHUB_OUTPUT
           else
             echo "targets=" >> $GITHUB_OUTPUT
