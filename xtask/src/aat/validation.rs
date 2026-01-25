@@ -165,7 +165,9 @@ pub fn validate_evidence_script(
 
     let full_path = repo_root.join(&clean_path);
 
-    if full_path.exists() {
+    // Use is_file() instead of exists() to ensure it's actually a file, not a
+    // directory
+    if full_path.is_file() {
         // Check executable permission on Unix
         #[cfg(unix)]
         {
