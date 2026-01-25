@@ -544,4 +544,24 @@ ticket_meta:
         let url = "  https://github.com/owner/repo.git  \n";
         assert_eq!(parse_owner_repo(url), "owner/repo");
     }
+
+    #[test]
+    fn test_xshell_multiword_description() {
+        // Test that xshell correctly handles multi-word strings when interpolated
+        // This verifies the fix for TCK-00056
+        let sh = Shell::new().unwrap();
+        let desc = "Waiting for security review";
+
+        // Use echo to see what args are passed
+        let output = cmd!(sh, "echo arg1 -f description={desc} arg2")
+            .read()
+            .unwrap();
+
+        // If xshell handles it correctly, description={desc} should be a single arg
+        // Output should be: "arg1 -f description=Waiting for security review arg2"
+        assert!(
+            output.contains("description=Waiting for security review"),
+            "xshell should preserve spaces in interpolated value. Got: {output}"
+        );
+    }
 }
