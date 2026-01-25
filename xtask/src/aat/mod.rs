@@ -7,4 +7,5 @@
 pub mod anti_gaming;
 pub mod evidence;
 pub mod parser;
+pub mod tool_config;
 pub mod types;

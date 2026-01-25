@@ -35,6 +35,7 @@ use xshell::{Shell, cmd};
 use crate::aat::anti_gaming::analyze_diff;
 use crate::aat::evidence::EvidenceBundleBuilder;
 use crate::aat::parser::parse_pr_description;
+use crate::aat::tool_config::{AatToolConfig, AiTool};
 use crate::aat::types::{Hypothesis, HypothesisResult, ParsedPRDescription, Verdict};
 
 // =============================================================================
@@ -272,6 +273,7 @@ pub struct AatResult {
 ///
 /// * `pr_url` - GitHub PR URL
 /// * `dry_run` - If true, don't set status check or write evidence
+/// * `ai_tool_override` - Optional AI tool override from CLI flag
 ///
 /// # Returns
 ///
@@ -284,10 +286,18 @@ pub struct AatResult {
 /// - 0: Success (PASSED verdict)
 /// - 1: Failure (FAILED verdict)
 /// - 2: Invalid arguments or `NEEDS_ADJUDICATION`
-pub fn run(pr_url: &str, dry_run: bool) -> Result<AatResult> {
+pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Result<AatResult> {
     let sh = Shell::new().context("Failed to create shell")?;
 
+    // Configure AI tool backend
+    let tool_config = AatToolConfig::from_env().with_override(ai_tool_override);
+
     println!("Running AAT for: {pr_url}");
+    println!(
+        "  AI Tool: {} ({})",
+        tool_config.ai_tool,
+        tool_config.ai_tool.command()
+    );
     if dry_run {
         println!("  (dry-run mode - no status check will be set)");
     }
