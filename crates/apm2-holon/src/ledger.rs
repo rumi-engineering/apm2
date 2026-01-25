@@ -616,7 +616,8 @@ impl LedgerEvent {
             "previous_hash": self.previous_hash.to_hex(),
         });
 
-        // Use serde_jcs to ensure RFC 8785 canonicalization (sorted keys, no whitespace)
+        // Use serde_jcs to ensure RFC 8785 canonicalization (sorted keys, no
+        // whitespace)
         serde_jcs::to_vec(&canonical).expect("serialization cannot fail")
     }
 
