@@ -94,6 +94,11 @@ impl SessionReducer {
     }
 
     /// Handles a session started event.
+    ///
+    /// Allows session restart: if a session exists but is in a terminal state
+    /// (Terminated or Quarantined), a new `SessionStarted` event can
+    /// reinitialize it. This supports crash recovery scenarios where the
+    /// same session ID is reused.
     fn handle_started(
         &mut self,
         event: crate::events::SessionStarted,
@@ -102,11 +107,15 @@ impl SessionReducer {
         let session_id = event.session_id.clone();
 
         // Check if session already exists
-        if self.state.sessions.contains_key(&session_id) {
-            return Err(SessionError::SessionAlreadyExists { session_id });
+        if let Some(existing) = self.state.sessions.get(&session_id) {
+            // Allow restart only if session is in a terminal state
+            if existing.is_active() {
+                return Err(SessionError::SessionAlreadyExists { session_id });
+            }
+            // Terminal state (Terminated/Quarantined) can be restarted
         }
 
-        // Create new running state
+        // Create new running state with restart tracking
         let state = SessionState::Running {
             started_at: timestamp,
             actor_id: event.actor_id,
@@ -120,6 +129,8 @@ impl SessionReducer {
             violation_count: 0,
             stall_count: 0,
             timeout_count: 0,
+            resume_cursor: event.resume_cursor,
+            restart_attempt: event.restart_attempt,
         };
 
         self.state.sessions.insert(session_id, state);
@@ -841,13 +852,72 @@ mod unit_tests {
         let start_event = create_event("session.started", "session-1", start_payload.clone());
         reducer.apply(&start_event, &ctx).unwrap();
 
-        // Try to start again
+        // Try to start again while still running - should error
         let start_event2 = create_event("session.started", "session-1", start_payload);
         let result = reducer.apply(&start_event2, &ctx);
         assert!(matches!(
             result,
             Err(SessionError::SessionAlreadyExists { .. })
         ));
+    }
+
+    #[test]
+    fn test_session_restart_after_termination() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Terminate session
+        let term_payload =
+            helpers::session_terminated_payload("session-1", "FAILURE", "crashed", 500);
+        let term_event = create_event("session.terminated", "session-1", term_payload);
+        reducer.apply(&term_event, &ctx).unwrap();
+
+        // Verify session is terminated
+        assert!(reducer.state().get("session-1").unwrap().is_terminal());
+
+        // Restart with same session ID - should succeed since it's terminal
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            500, // resume_cursor
+            1,   // restart_attempt
+        );
+        let mut restart_event = create_event("session.started", "session-1", restart_payload);
+        restart_event.timestamp_ns = 3_000_000_000;
+        reducer.apply(&restart_event, &ctx).unwrap();
+
+        // Verify session is running again with restart tracking
+        let state = reducer.state().get("session-1").unwrap();
+        assert!(state.is_active());
+        match state {
+            SessionState::Running {
+                started_at,
+                resume_cursor,
+                restart_attempt,
+                ..
+            } => {
+                assert_eq!(*started_at, 3_000_000_000);
+                assert_eq!(*resume_cursor, 500);
+                assert_eq!(*restart_attempt, 1);
+            },
+            _ => panic!("Expected Running state"),
+        }
     }
 
     #[test]

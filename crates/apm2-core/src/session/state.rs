@@ -86,6 +86,11 @@ pub enum SessionState {
         stall_count: u64,
         /// Count of timeouts recorded against entropy budget.
         timeout_count: u64,
+        /// Cursor position to resume from (for crash recovery).
+        /// 0 indicates a fresh start, non-zero indicates resumption.
+        resume_cursor: u64,
+        /// Number of restart attempts (0 for initial start).
+        restart_attempt: u32,
     },
     /// Session has terminated (final state).
     #[non_exhaustive]
@@ -277,6 +282,8 @@ mod unit_tests {
             violation_count: 0,
             stall_count: 0,
             timeout_count: 0,
+            resume_cursor: 0,
+            restart_attempt: 0,
         }
     }
 
@@ -373,6 +380,8 @@ mod unit_tests {
             violation_count: 0,
             stall_count: 0,
             timeout_count: 0,
+            resume_cursor: 0,
+            restart_attempt: 0,
         };
         assert!(running.is_entropy_exceeded());
         assert_eq!(running.entropy_remaining(), Some(0));
@@ -393,6 +402,8 @@ mod unit_tests {
             violation_count: 2,
             stall_count: 1,
             timeout_count: 3,
+            resume_cursor: 0,
+            restart_attempt: 0,
         };
 
         let summary = running.entropy_summary("session-1").unwrap();
