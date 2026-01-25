@@ -1,8 +1,8 @@
 //! Restart coordination for crashed sessions.
 //!
 //! This module provides the `RestartCoordinator` which wraps the low-level
-//! `RestartManager` and integrates with entropy tracking to make restart
-//! decisions.
+//! `RestartManager` and integrates with entropy tracking and quarantine
+//! management to make restart decisions.
 
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::crash::{CrashEvent, CrashType};
 use super::entropy::EntropyTrackerSummary;
+use super::quarantine::{QuarantineEvaluation, QuarantineManager};
 use crate::restart::{BackoffConfig, RestartConfig, RestartManager};
 
 /// Coordinates restart decisions for a session.
@@ -173,6 +174,70 @@ impl RestartCoordinator {
             BackoffConfig::Exponential { .. } => "EXPONENTIAL",
             BackoffConfig::Linear { .. } => "LINEAR",
         }
+    }
+
+    /// Determines whether a crashed session should be restarted, with
+    /// quarantine support.
+    ///
+    /// This is the preferred method for making restart decisions as it
+    /// integrates with the quarantine system.
+    ///
+    /// Takes into account:
+    /// - The crash type (some crashes shouldn't trigger restart)
+    /// - The entropy budget (exhausted budget means no restart)
+    /// - The restart manager's circuit breaker and limits
+    /// - Quarantine thresholds (excessive violations, crash loops, etc.)
+    ///
+    /// # Arguments
+    /// * `crash_event` - The crash event details
+    /// * `entropy_summary` - Optional entropy tracker summary
+    /// * `quarantine_manager` - The quarantine manager to evaluate thresholds
+    /// * `current_time_ns` - Current timestamp in nanoseconds (for quarantine
+    ///   duration)
+    /// * `previous_quarantines` - How many times this session has been
+    ///   quarantined
+    #[must_use]
+    pub fn should_restart_with_quarantine(
+        &self,
+        crash_event: &CrashEvent,
+        entropy_summary: Option<&EntropyTrackerSummary>,
+        quarantine_manager: &QuarantineManager,
+        current_time_ns: u64,
+        previous_quarantines: u32,
+    ) -> RestartDecision {
+        // Build quarantine evaluation from available state
+        let mut eval = QuarantineEvaluation::new(&crash_event.session_id)
+            .with_restarts(crash_event.restart_count);
+
+        if let Some(summary) = entropy_summary {
+            eval = eval
+                .with_entropy(summary.budget, summary.consumed)
+                .with_violations(summary.violation_count);
+        }
+
+        // Check for non-restartable signal
+        if let CrashType::Signal {
+            signal,
+            signal_name,
+        } = &crash_event.crash_type
+        {
+            if !super::crash::is_signal_restartable(*signal) {
+                eval = eval.with_non_restartable_signal(*signal, signal_name);
+            }
+        }
+
+        // Check if session should be quarantined
+        if let Some(reason) = quarantine_manager.should_quarantine(&eval) {
+            let duration = quarantine_manager.calculate_duration(previous_quarantines);
+            let until = QuarantineManager::quarantine_until(current_time_ns, duration);
+            return RestartDecision::Quarantine {
+                reason: reason.to_string(),
+                until,
+            };
+        }
+
+        // Fall back to regular restart decision
+        self.should_restart(crash_event, entropy_summary)
     }
 }
 
@@ -599,5 +664,223 @@ mod tests {
         // Note: restart_count may not reset immediately depending on implementation
         // but circuit breaker should be closed
         assert!(!coordinator.is_circuit_open());
+    }
+
+    // ========================================================================
+    // Quarantine Integration Tests
+    // ========================================================================
+
+    #[test]
+    fn test_should_restart_with_quarantine_healthy_session() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let quarantine_manager = QuarantineManager::with_defaults();
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 0);
+        let entropy = make_entropy_summary(false);
+
+        let decision = coordinator.should_restart_with_quarantine(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            1_000_000_000,
+            0,
+        );
+
+        // Should restart, not quarantine
+        assert!(decision.is_restart());
+    }
+
+    #[test]
+    fn test_should_restart_with_quarantine_excessive_violations() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let quarantine_manager = QuarantineManager::with_defaults();
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 0);
+
+        // Create entropy summary with violations at threshold
+        let entropy = EntropyTrackerSummary {
+            session_id: "test-session".to_string(),
+            budget: 1000,
+            consumed: 250,
+            remaining: 750,
+            is_exceeded: false,
+            error_count: 0,
+            violation_count: 5, // At threshold
+            stall_count: 0,
+            timeout_count: 0,
+        };
+
+        let decision = coordinator.should_restart_with_quarantine(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            1_000_000_000,
+            0,
+        );
+
+        // Should quarantine due to excessive violations
+        assert!(decision.is_quarantine());
+        if let RestartDecision::Quarantine { reason, until } = decision {
+            assert!(reason.contains("violation"));
+            assert!(until > 1_000_000_000);
+        }
+    }
+
+    #[test]
+    fn test_should_restart_with_quarantine_crash_loop() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let quarantine_manager = QuarantineManager::with_defaults();
+        // Crash with 5 restarts (at threshold)
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 5);
+        let entropy = make_entropy_summary(false);
+
+        let decision = coordinator.should_restart_with_quarantine(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            1_000_000_000,
+            0,
+        );
+
+        // Should quarantine due to crash loop
+        assert!(decision.is_quarantine());
+        if let RestartDecision::Quarantine { reason, .. } = decision {
+            assert!(reason.contains("crash loop"));
+        }
+    }
+
+    #[test]
+    fn test_should_restart_with_quarantine_non_restartable_signal() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let quarantine_manager = QuarantineManager::with_defaults();
+        let crash = make_crash_event(
+            CrashType::Signal {
+                signal: libc::SIGSEGV,
+                signal_name: "SIGSEGV".to_string(),
+            },
+            0,
+        );
+
+        let decision = coordinator.should_restart_with_quarantine(
+            &crash,
+            None,
+            &quarantine_manager,
+            1_000_000_000,
+            0,
+        );
+
+        // Should quarantine due to non-restartable signal
+        assert!(decision.is_quarantine());
+        if let RestartDecision::Quarantine { reason, .. } = decision {
+            assert!(reason.contains("SIGSEGV"));
+        }
+    }
+
+    #[test]
+    fn test_should_restart_with_quarantine_entropy_exceeded() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let quarantine_manager = QuarantineManager::with_defaults();
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 0);
+        let entropy = make_entropy_summary(true); // Entropy exceeded
+
+        let decision = coordinator.should_restart_with_quarantine(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            1_000_000_000,
+            0,
+        );
+
+        // Should quarantine due to entropy exceeded
+        assert!(decision.is_quarantine());
+        if let RestartDecision::Quarantine { reason, .. } = decision {
+            assert!(reason.contains("entropy"));
+        }
+    }
+
+    #[test]
+    fn test_quarantine_duration_escalates() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let quarantine_manager = QuarantineManager::with_defaults();
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 5);
+        let entropy = make_entropy_summary(false);
+        let current_time = 1_000_000_000_000_000_000u64;
+
+        // First quarantine (previous_quarantines = 0)
+        let decision1 = coordinator.should_restart_with_quarantine(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            current_time,
+            0,
+        );
+        let RestartDecision::Quarantine { until: until1, .. } = decision1 else {
+            panic!("Expected quarantine");
+        };
+
+        // Second quarantine (previous_quarantines = 1)
+        let decision2 = coordinator.should_restart_with_quarantine(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            current_time,
+            1,
+        );
+        let RestartDecision::Quarantine { until: until2, .. } = decision2 else {
+            panic!("Expected quarantine");
+        };
+
+        // Duration should double (exponential backoff with multiplier 2.0)
+        let duration1 = until1 - current_time;
+        let duration2 = until2 - current_time;
+        assert_eq!(duration2, duration1 * 2);
+    }
+
+    #[test]
+    fn test_quarantine_disabled_for_entropy() {
+        use super::super::quarantine::QuarantineConfig;
+
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let config = QuarantineConfig {
+            quarantine_on_entropy_exceeded: false,
+            ..Default::default()
+        };
+        let quarantine_manager = QuarantineManager::new(config);
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 0);
+        let entropy = make_entropy_summary(true);
+
+        let decision = coordinator.should_restart_with_quarantine(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            1_000_000_000,
+            0,
+        );
+
+        // Should NOT quarantine (disabled), but should terminate instead
+        // because regular should_restart checks entropy
+        assert!(decision.is_terminate());
+        if let RestartDecision::Terminate { reason } = decision {
+            assert_eq!(reason, TerminateReason::EntropyExhausted);
+        }
+    }
+
+    #[test]
+    fn test_quarantine_clean_exit_not_quarantined() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let quarantine_manager = QuarantineManager::with_defaults();
+        let crash = make_crash_event(CrashType::CleanExit, 0);
+
+        let decision = coordinator.should_restart_with_quarantine(
+            &crash,
+            None,
+            &quarantine_manager,
+            1_000_000_000,
+            0,
+        );
+
+        // Clean exit should terminate, not quarantine
+        assert!(decision.is_terminate());
+        if let RestartDecision::Terminate { reason } = decision {
+            assert_eq!(reason, TerminateReason::CleanExit);
+        }
     }
 }
