@@ -26,18 +26,27 @@
 //! - 1: Failure (hypothesis failed or anti-gaming violation)
 //! - 2: Invalid arguments or missing PR sections
 
+use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use tempfile::NamedTempFile;
+use wait_timeout::ChildExt;
 use xshell::{Shell, cmd};
+
+/// Maximum time allowed for AI tool execution (5 minutes).
+/// This prevents hung AI tools from blocking CI runners indefinitely.
+const AI_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::aat::anti_gaming::analyze_diff;
 use crate::aat::evidence::EvidenceBundleBuilder;
 use crate::aat::parser::parse_pr_description;
 use crate::aat::tool_config::{AatToolConfig, AiTool};
-use crate::aat::types::{Hypothesis, HypothesisResult, ParsedPRDescription, Verdict};
+use crate::aat::types::{Hypothesis, HypothesisResult, Verdict};
 use crate::aat::validation::validate_pr_description;
+use crate::shell_escape::build_script_command;
 
 // =============================================================================
 // PR URL Parsing
@@ -198,58 +207,414 @@ pub fn set_status_check(
 }
 
 // =============================================================================
-// Hypothesis Generation (Stub)
+// Hypothesis Generation
 // =============================================================================
 
-/// Generate hypotheses from parsed PR description.
+/// Minimum number of hypotheses required for a valid AAT run.
+const MIN_HYPOTHESES: usize = 3;
+
+/// Path to the hypothesis generation prompt template.
+const HYPOTHESIS_PROMPT_PATH: &str = "documents/reviews/AAT_HYPOTHESIS_PROMPT.md";
+
+/// Raw hypothesis from AI response before transformation.
 ///
-/// This is a simplified implementation that creates basic hypotheses
-/// from the expected outcomes. In a full implementation, this would
-/// invoke the AAT skill for more sophisticated hypothesis generation.
-fn generate_hypotheses(parsed_pr: &ParsedPRDescription) -> Vec<Hypothesis> {
-    let mut hypotheses = Vec::new();
+/// This intermediate struct captures the JSON schema returned by the AI tool,
+/// which uses slightly different field types than our internal `Hypothesis`
+/// type.
+///
+/// Note: We use `deny_unknown_fields` to ensure strict parsing of AI responses.
+/// This prevents silent failures where the AI returns unexpected fields that
+/// could indicate a misunderstood prompt or malformed output.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHypothesis {
+    id: String,
+    prediction: String,
+    verification_method: String,
+    tests_error_handling: bool,
+}
+
+/// Generate hypotheses by invoking the configured AI tool.
+///
+/// This function:
+/// 1. Loads the hypothesis prompt template from `AAT_HYPOTHESIS_PROMPT.md`
+/// 2. Substitutes `$PR_DESCRIPTION` and `$DIFF_SUMMARY` placeholders
+/// 3. Invokes the configured AI tool with the prompt
+/// 4. Parses the JSON response into hypotheses
+/// 5. Validates minimum hypothesis count and error handling coverage
+///
+/// # Arguments
+///
+/// * `pr_description` - The raw PR description text
+/// * `diff` - The PR diff text
+/// * `tool_config` - AI tool configuration (gemini or claude-code)
+/// * `repo_root` - Repository root path for loading prompt template
+///
+/// # Returns
+///
+/// Returns `Ok(Vec<Hypothesis>)` on success, or an error if:
+/// - The prompt template cannot be loaded
+/// - The AI tool fails to execute
+/// - The AI response cannot be parsed as JSON
+/// - Validation fails (less than 3 hypotheses or no error handling hypothesis)
+fn generate_hypotheses(
+    pr_description: &str,
+    diff: &str,
+    tool_config: &AatToolConfig,
+    repo_root: &str,
+) -> Result<Vec<Hypothesis>> {
+    // Load the prompt template
+    let prompt_template_path = format!("{repo_root}/{HYPOTHESIS_PROMPT_PATH}");
+    let prompt_template = std::fs::read_to_string(&prompt_template_path).with_context(|| {
+        format!(
+            "Failed to read hypothesis prompt template from {prompt_template_path}\n\
+             Hint: Ensure AAT_HYPOTHESIS_PROMPT.md exists in documents/reviews/"
+        )
+    })?;
+
+    // Create a summary of the diff (truncate if too large for AI context)
+    let diff_summary = create_diff_summary(diff);
+
+    // Substitute placeholders in the prompt template.
+    // Note: We replace $DIFF_SUMMARY first, then $PR_DESCRIPTION, to prevent
+    // potential injection where a malicious PR description contains
+    // "$DIFF_SUMMARY". This order ensures user content ($PR_DESCRIPTION) is
+    // substituted last, so it cannot reference other placeholders.
+    let prompt = prompt_template
+        .replace("$DIFF_SUMMARY", &diff_summary)
+        .replace("$PR_DESCRIPTION", pr_description);
+
+    // Write prompt to secure temp file
+    let mut prompt_file =
+        NamedTempFile::new().context("Failed to create temp file for hypothesis prompt")?;
+    prompt_file
+        .write_all(prompt.as_bytes())
+        .context("Failed to write hypothesis prompt to temp file")?;
+    prompt_file
+        .flush()
+        .context("Failed to flush hypothesis prompt temp file")?;
+
+    let prompt_path = prompt_file.path();
+
+    // Build and execute the AI tool command
+    let ai_output = invoke_ai_tool(prompt_path, tool_config)?;
+
+    // Parse the AI response
+    let hypotheses = parse_ai_response(&ai_output)?;
+
+    // Validate hypothesis requirements
+    validate_hypotheses(&hypotheses)?;
+
+    // Transform raw hypotheses into full Hypothesis structs
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-    // Create hypotheses from expected outcomes
-    for (i, outcome) in parsed_pr.expected_outcomes.iter().enumerate() {
-        let id = format!("H-{:03}", i + 1);
-        let tests_error_handling = outcome.text.to_lowercase().contains("error")
-            || outcome.text.to_lowercase().contains("fail")
-            || outcome.text.to_lowercase().contains("invalid");
-
-        hypotheses.push(Hypothesis {
-            id,
-            prediction: outcome.text.clone(),
-            verification_method: "Verify via expected outcome assertion".to_string(),
-            tests_error_handling,
+    let hypotheses = hypotheses
+        .into_iter()
+        .map(|raw| Hypothesis {
+            id: raw.id,
+            prediction: raw.prediction,
+            verification_method: raw.verification_method,
+            tests_error_handling: raw.tests_error_handling,
             formed_at: now.clone(),
-            executed_at: Some(now.clone()),
-            // For now, assume outcomes with checkmarks pass
-            result: Some(if outcome.checked {
-                HypothesisResult::Passed
-            } else {
-                HypothesisResult::Failed
-            }),
-            actual_outcome: Some(if outcome.checked {
-                "Outcome verified".to_string()
-            } else {
-                "Outcome not verified".to_string()
-            }),
+            executed_at: None,
+            result: None,
+            actual_outcome: None,
             stdout: None,
             stderr: None,
-            exit_code: Some(i32::from(!outcome.checked)),
-        });
+            exit_code: None,
+        })
+        .collect();
+
+    Ok(hypotheses)
+}
+
+/// Create a summary of the diff for inclusion in the prompt.
+///
+/// If the diff is larger than a reasonable context window, it is truncated
+/// with a note indicating the truncation.
+fn create_diff_summary(diff: &str) -> String {
+    // Limit diff to approximately 50KB to fit in AI context windows
+    const MAX_DIFF_BYTES: usize = 50_000;
+
+    if diff.len() <= MAX_DIFF_BYTES {
+        diff.to_string()
+    } else {
+        // Truncate at a line boundary if possible
+        let truncated = &diff[..MAX_DIFF_BYTES];
+        let last_newline = truncated.rfind('\n').unwrap_or(MAX_DIFF_BYTES);
+        format!(
+            "{}\n\n[... diff truncated, {} more bytes ...]",
+            &diff[..last_newline],
+            diff.len() - last_newline
+        )
+    }
+}
+
+/// Invoke the AI tool with the given prompt file.
+///
+/// Uses the secure `script` wrapper pattern for PTY allocation, which gives
+/// the AI tool access to all capabilities including shell tools.
+///
+/// # Arguments
+///
+/// * `prompt_path` - Path to the prompt file
+/// * `tool_config` - AI tool configuration
+///
+/// # Returns
+///
+/// Returns the AI tool's stdout output, or an error if execution fails.
+fn invoke_ai_tool(prompt_path: &Path, tool_config: &AatToolConfig) -> Result<String> {
+    // Build the command using safe shell escaping
+    // For hypothesis generation, we use synchronous execution (no log file)
+    let shell_cmd = build_ai_script_command(prompt_path, tool_config);
+
+    // Spawn the command with stdout/stderr capture
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", &shell_cmd])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "Failed to execute AI tool '{}'\n\
+                 Hint: Ensure {} is installed and available in PATH",
+                tool_config.ai_tool,
+                tool_config.ai_tool.command()
+            )
+        })?;
+
+    // Wait with timeout to prevent hung AI tools from blocking CI indefinitely
+    let Some(status) = child.wait_timeout(AI_TOOL_TIMEOUT)? else {
+        // Timeout expired - kill the process and report error
+        let _ = child.kill();
+        let _ = child.wait(); // Reap the zombie process
+        bail!(
+            "AI tool '{}' timed out after {} seconds\n\
+             Hint: The AI tool may be hung or the prompt may be too complex.\n\
+             Consider breaking down the PR into smaller changes.",
+            tool_config.ai_tool,
+            AI_TOOL_TIMEOUT.as_secs()
+        );
+    };
+
+    // Read stdout and stderr from the completed process
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+
+    if let Some(mut stdout) = child.stdout.take() {
+        std::io::Read::read_to_end(&mut stdout, &mut stdout_buf)
+            .context("Failed to read AI tool stdout")?;
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        std::io::Read::read_to_end(&mut stderr, &mut stderr_buf)
+            .context("Failed to read AI tool stderr")?;
     }
 
-    // Ensure at least one error handling hypothesis if none exist
-    if !hypotheses.iter().any(|h| h.tests_error_handling) && !hypotheses.is_empty() {
-        // Modify the last hypothesis to be error-handling related
-        if let Some(last) = hypotheses.last_mut() {
-            last.tests_error_handling = true;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_buf);
+        let exit_code = status.code().unwrap_or(-1);
+        bail!(
+            "AI tool '{}' failed with exit code {}\n\
+             Stderr: {}\n\
+             Hint: Check that the AI tool is properly configured and authenticated",
+            tool_config.ai_tool,
+            exit_code,
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8(stdout_buf).context(
+        "AI tool output was not valid UTF-8\n\
+         Hint: The AI tool may have produced binary output unexpectedly",
+    )?;
+
+    Ok(stdout)
+}
+
+/// Build the script command for AI tool invocation.
+///
+/// This handles the differences between AI tools:
+/// - Gemini: Uses `--yolo` flag for non-interactive mode
+/// - Claude: Uses standard input without special flags
+fn build_ai_script_command(prompt_path: &Path, tool_config: &AatToolConfig) -> String {
+    match tool_config.ai_tool {
+        AiTool::Gemini => {
+            // Gemini uses build_script_command from shell_escape module
+            build_script_command(prompt_path, None)
+        },
+        AiTool::ClaudeCode => {
+            // Claude Code uses similar pattern but different command
+            let quoted_prompt = crate::shell_escape::quote_path(prompt_path);
+            let inner_cmd = format!("claude --dangerously-skip-permissions < {quoted_prompt}");
+            let escaped_inner = inner_cmd.replace('\'', "'\\''");
+            format!("script -qec '{escaped_inner}' /dev/null")
+        },
+    }
+}
+
+/// Parse the AI tool's output to extract hypotheses.
+///
+/// The AI is expected to return a JSON array of hypothesis objects.
+/// This function extracts the JSON from the output (which may contain
+/// other text like markdown formatting) and parses it.
+///
+/// Parsing strategy (in order):
+/// 1. Try to parse the entire trimmed output as JSON directly
+/// 2. Try to extract JSON from a markdown code block
+/// 3. Try to find a JSON array in the text (string-aware bracket matching)
+fn parse_ai_response(output: &str) -> Result<Vec<RawHypothesis>> {
+    let trimmed = output.trim();
+
+    // Strategy 1: Try to parse the entire output as JSON directly
+    // This handles the clean case where AI returns raw JSON without any wrapper
+    if let Ok(hypotheses) = serde_json::from_str::<Vec<RawHypothesis>>(trimmed) {
+        return Ok(hypotheses);
+    }
+
+    // Strategy 2 & 3: Extract JSON from wrapped content
+    let json_str = extract_json_array(output).with_context(|| {
+        format!(
+            "Could not find JSON array in AI response\n\
+             Expected: A JSON array of hypothesis objects\n\
+             Got: {}\n\
+             Hint: The AI tool may not have followed the output format instructions",
+            truncate_for_error(output)
+        )
+    })?;
+
+    let hypotheses: Vec<RawHypothesis> = serde_json::from_str(json_str).with_context(|| {
+        format!(
+            "Failed to parse AI response as JSON\n\
+                 JSON: {}\n\
+                 Hint: Each hypothesis must have 'id', 'prediction', 'verification_method', \
+                 and 'tests_error_handling' fields",
+            truncate_for_error(json_str)
+        )
+    })?;
+
+    Ok(hypotheses)
+}
+
+/// Extract a JSON array from text that may contain other content.
+///
+/// Handles cases where the JSON is:
+/// - Wrapped in markdown code blocks (```json ... ```)
+/// - Preceded or followed by other text
+/// - The entire output
+///
+/// This function properly handles brackets inside JSON strings by tracking
+/// string context (respecting escaped quotes and escape sequences).
+fn extract_json_array(text: &str) -> Option<&str> {
+    // First, try to find JSON in a markdown code block
+    if let Some(json) = extract_from_code_block(text) {
+        return Some(json);
+    }
+
+    // Otherwise, find the first '[' and matching ']' with string awareness
+    let start = text.find('[')?;
+    let bytes = &text.as_bytes()[start..];
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut end = None;
+
+    for (i, &byte) in bytes.iter().enumerate() {
+        let c = byte as char;
+
+        if escape_next {
+            // Skip this character, it's escaped
+            escape_next = false;
+            continue;
+        }
+
+        if c == '\\' && in_string {
+            // Next character is escaped
+            escape_next = true;
+            continue;
+        }
+
+        if c == '"' {
+            // Toggle string context
+            in_string = !in_string;
+            continue;
+        }
+
+        // Only count brackets outside of strings
+        if !in_string {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(start + i + 1);
+                        break;
+                    }
+                },
+                _ => {},
+            }
         }
     }
 
-    hypotheses
+    end.map(|e| &text[start..e])
+}
+
+/// Extract JSON from a markdown code block.
+fn extract_from_code_block(text: &str) -> Option<&str> {
+    // Look for ```json or just ```
+    let patterns = ["```json\n", "```json\r\n", "```\n", "```\r\n"];
+
+    for pattern in patterns {
+        if let Some(start) = text.find(pattern) {
+            let content_start = start + pattern.len();
+            if let Some(end) = text[content_start..].find("```") {
+                let json = text[content_start..content_start + end].trim();
+                // Verify it starts with '[' (is an array)
+                if json.starts_with('[') {
+                    return Some(json);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Validate that hypotheses meet AAT requirements.
+///
+/// Requirements:
+/// - At least 3 hypotheses
+/// - At least 1 hypothesis with `tests_error_handling = true`
+fn validate_hypotheses(hypotheses: &[RawHypothesis]) -> Result<()> {
+    // Check minimum count
+    if hypotheses.len() < MIN_HYPOTHESES {
+        bail!(
+            "AI generated only {} hypotheses, but at least {} are required\n\
+             Hint: Re-run the AAT command or manually add hypotheses to meet the minimum",
+            hypotheses.len(),
+            MIN_HYPOTHESES
+        );
+    }
+
+    // Check for error handling hypothesis
+    let error_handling_count = hypotheses.iter().filter(|h| h.tests_error_handling).count();
+    if error_handling_count == 0 {
+        bail!(
+            "No hypotheses test error handling (tests_error_handling = true)\n\
+             At least 1 hypothesis must test error handling scenarios\n\
+             Hint: Re-run the AAT command or manually add an error handling hypothesis"
+        );
+    }
+
+    Ok(())
+}
+
+/// Truncate a string for inclusion in error messages.
+fn truncate_for_error(s: &str) -> String {
+    const MAX_LEN: usize = 500;
+    if s.len() <= MAX_LEN {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..MAX_LEN])
+    }
 }
 
 // =============================================================================
@@ -415,9 +780,32 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     }
 
     // Step 6: Generate hypotheses
-    println!("\n[6/7] Generating hypotheses...");
-    let hypotheses = generate_hypotheses(&parsed_pr);
-    println!("  Generated: {} hypotheses", hypotheses.len());
+    println!("\n[6/7] Generating hypotheses via AI...");
+    println!(
+        "  Using AI tool: {} ({})",
+        tool_config.ai_tool,
+        tool_config.ai_tool.command()
+    );
+    let hypotheses = match generate_hypotheses(&description, &diff, &tool_config, &repo_root) {
+        Ok(h) => {
+            println!("  Generated: {} hypotheses", h.len());
+            h
+        },
+        Err(e) => {
+            let summary = format!("Hypothesis generation failed: {e}");
+            println!("  ERROR: {e}");
+
+            if !dry_run {
+                set_status_check(&sh, &pr_info, &sha, "failure", &summary, None)?;
+            }
+
+            return Ok(AatResult {
+                verdict: Verdict::Failed,
+                evidence_path: None,
+                summary,
+            });
+        },
+    };
 
     for h in &hypotheses {
         let result_str = match h.result {
@@ -550,71 +938,323 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // generate_hypotheses tests
+    // Hypothesis generation helper tests
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_generate_hypotheses_from_outcomes() {
-        use crate::aat::types::OutcomeItem;
-
-        let parsed = ParsedPRDescription {
-            usage: "cargo test".to_string(),
-            expected_outcomes: vec![
-                OutcomeItem {
-                    text: "Build succeeds".to_string(),
-                    checked: true,
-                },
-                OutcomeItem {
-                    text: "Tests pass".to_string(),
-                    checked: true,
-                },
-                OutcomeItem {
-                    text: "Invalid input returns error".to_string(),
-                    checked: false,
-                },
-            ],
-            evidence_script: None,
-            known_limitations: vec![],
-        };
-
-        let hypotheses = generate_hypotheses(&parsed);
-
-        assert_eq!(hypotheses.len(), 3);
-        assert_eq!(hypotheses[0].id, "H-001");
-        assert_eq!(hypotheses[0].prediction, "Build succeeds");
-        assert_eq!(hypotheses[0].result, Some(HypothesisResult::Passed));
-
-        assert_eq!(hypotheses[2].id, "H-003");
-        assert!(hypotheses[2].tests_error_handling);
-        assert_eq!(hypotheses[2].result, Some(HypothesisResult::Failed));
+    fn test_extract_json_array_simple() {
+        let input = r#"[{"id": "H-001", "prediction": "test"}]"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some());
+        assert!(result.unwrap().starts_with('['));
     }
 
     #[test]
-    fn test_generate_hypotheses_ensures_error_handling() {
-        use crate::aat::types::OutcomeItem;
+    fn test_extract_json_array_with_markdown() {
+        let input = r#"Here is the JSON:
 
-        let parsed = ParsedPRDescription {
-            usage: "cargo test".to_string(),
-            expected_outcomes: vec![
-                OutcomeItem {
-                    text: "Build succeeds".to_string(),
-                    checked: true,
-                },
-                OutcomeItem {
-                    text: "Tests pass".to_string(),
-                    checked: true,
-                },
-            ],
-            evidence_script: None,
-            known_limitations: vec![],
-        };
+```json
+[
+  {"id": "H-001", "prediction": "test", "verification_method": "cmd", "tests_error_handling": false}
+]
+```
 
-        let hypotheses = generate_hypotheses(&parsed);
+Done!"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some());
+        let json = result.unwrap();
+        assert!(json.starts_with('['));
+        assert!(json.contains("H-001"));
+    }
 
-        // At least one should be marked as error handling
+    #[test]
+    fn test_extract_json_array_with_surrounding_text() {
+        let input = r#"Based on the PR, here are my hypotheses:
+[{"id": "H-001", "prediction": "test", "verification_method": "cmd", "tests_error_handling": true}]
+These hypotheses cover the main scenarios."#;
+        let result = extract_json_array(input);
+        assert!(result.is_some());
+        let json = result.unwrap();
+        assert!(json.starts_with('['));
+        assert!(json.ends_with(']'));
+    }
+
+    #[test]
+    fn test_extract_json_array_nested_brackets() {
+        let input = r#"[{"id": "H-001", "nested": {"key": ["value"]}}]"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some());
+        let json = result.unwrap();
+        // Should extract the entire outer array
+        assert_eq!(json, input);
+    }
+
+    #[test]
+    fn test_extract_json_array_no_array() {
+        let input = "No JSON here, just text.";
+        let result = extract_json_array(input);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_ai_response_valid() {
+        let input = r#"[
+            {"id": "H-001", "prediction": "test 1", "verification_method": "cargo test", "tests_error_handling": false},
+            {"id": "H-002", "prediction": "test 2", "verification_method": "cargo build", "tests_error_handling": false},
+            {"id": "H-003", "prediction": "error test", "verification_method": "cargo test fail", "tests_error_handling": true}
+        ]"#;
+        let result = parse_ai_response(input);
+        assert!(result.is_ok());
+        let hypotheses = result.unwrap();
+        assert_eq!(hypotheses.len(), 3);
+        assert_eq!(hypotheses[0].id, "H-001");
+        assert!(hypotheses[2].tests_error_handling);
+    }
+
+    #[test]
+    fn test_parse_ai_response_missing_field() {
+        // Missing tests_error_handling field
+        let input = r#"[{"id": "H-001", "prediction": "test", "verification_method": "cmd"}]"#;
+        let result = parse_ai_response(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_hypotheses_success() {
+        let hypotheses = vec![
+            RawHypothesis {
+                id: "H-001".to_string(),
+                prediction: "test 1".to_string(),
+                verification_method: "cargo test".to_string(),
+                tests_error_handling: false,
+            },
+            RawHypothesis {
+                id: "H-002".to_string(),
+                prediction: "test 2".to_string(),
+                verification_method: "cargo build".to_string(),
+                tests_error_handling: false,
+            },
+            RawHypothesis {
+                id: "H-003".to_string(),
+                prediction: "error test".to_string(),
+                verification_method: "cargo test fail".to_string(),
+                tests_error_handling: true,
+            },
+        ];
+        let result = validate_hypotheses(&hypotheses);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_hypotheses_too_few() {
+        let hypotheses = vec![
+            RawHypothesis {
+                id: "H-001".to_string(),
+                prediction: "test 1".to_string(),
+                verification_method: "cargo test".to_string(),
+                tests_error_handling: true,
+            },
+            RawHypothesis {
+                id: "H-002".to_string(),
+                prediction: "test 2".to_string(),
+                verification_method: "cargo build".to_string(),
+                tests_error_handling: false,
+            },
+        ];
+        let result = validate_hypotheses(&hypotheses);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least 3"));
+    }
+
+    #[test]
+    fn test_validate_hypotheses_no_error_handling() {
+        let hypotheses = vec![
+            RawHypothesis {
+                id: "H-001".to_string(),
+                prediction: "test 1".to_string(),
+                verification_method: "cargo test".to_string(),
+                tests_error_handling: false,
+            },
+            RawHypothesis {
+                id: "H-002".to_string(),
+                prediction: "test 2".to_string(),
+                verification_method: "cargo build".to_string(),
+                tests_error_handling: false,
+            },
+            RawHypothesis {
+                id: "H-003".to_string(),
+                prediction: "test 3".to_string(),
+                verification_method: "cargo check".to_string(),
+                tests_error_handling: false,
+            },
+        ];
+        let result = validate_hypotheses(&hypotheses);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("error handling"));
+    }
+
+    #[test]
+    fn test_create_diff_summary_small() {
+        let small_diff = "diff --git a/file.rs b/file.rs\n+line";
+        let summary = create_diff_summary(small_diff);
+        assert_eq!(summary, small_diff);
+    }
+
+    #[test]
+    fn test_create_diff_summary_large() {
+        // Create a diff larger than 50KB
+        let large_diff = "a".repeat(60_000);
+        let summary = create_diff_summary(&large_diff);
+        assert!(summary.len() < large_diff.len());
+        assert!(summary.contains("truncated"));
+    }
+
+    #[test]
+    fn test_truncate_for_error_short() {
+        let short = "short message";
+        assert_eq!(truncate_for_error(short), short);
+    }
+
+    #[test]
+    fn test_truncate_for_error_long() {
+        let long = "a".repeat(1000);
+        let truncated = truncate_for_error(&long);
+        assert!(truncated.len() < 510); // 500 + "..."
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_from_code_block_json() {
+        let input = "```json\n[{\"id\": \"H-001\"}]\n```";
+        let result = extract_from_code_block(input);
+        assert!(result.is_some());
+        assert!(result.unwrap().starts_with('['));
+    }
+
+    #[test]
+    fn test_extract_from_code_block_plain() {
+        let input = "```\n[{\"id\": \"H-001\"}]\n```";
+        let result = extract_from_code_block(input);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_extract_from_code_block_no_array() {
+        let input = "```json\n{\"not\": \"array\"}\n```";
+        let result = extract_from_code_block(input);
+        assert!(result.is_none()); // Not an array
+    }
+
+    // -------------------------------------------------------------------------
+    // Edge case tests for JSON extraction (brackets in strings)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_json_array_brackets_in_string() {
+        // This tests the case where brackets appear inside a JSON string value
+        // The old implementation would fail on this because it didn't track string
+        // context
+        let input = r#"[{"id": "H-001", "pattern": "[a-z]+", "tests_error_handling": false}]"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some(), "Should handle brackets inside strings");
+        let json = result.unwrap();
+        assert_eq!(json, input, "Should extract the entire array");
+    }
+
+    #[test]
+    fn test_extract_json_array_single_bracket_in_string() {
+        // Edge case: single '[' in a string should not break parsing
+        let input = r#"["["]"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some(), "Should handle single bracket in string");
+        assert_eq!(result.unwrap(), input);
+    }
+
+    #[test]
+    fn test_extract_json_array_escaped_quote_in_string() {
+        // Test that escaped quotes inside strings are handled properly
+        let input =
+            r#"[{"id": "H-001", "text": "He said \"hello\"", "tests_error_handling": false}]"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some(), "Should handle escaped quotes in strings");
+        assert_eq!(result.unwrap(), input);
+    }
+
+    #[test]
+    fn test_extract_json_array_backslash_before_bracket() {
+        // Test backslash handling: backslash before bracket inside string
+        let input = r#"[{"path": "C:\\Users\\[test]"}]"#;
+        let result = extract_json_array(input);
+        assert!(result.is_some(), "Should handle backslash sequences");
+        assert_eq!(result.unwrap(), input);
+    }
+
+    #[test]
+    fn test_parse_ai_response_direct_json() {
+        // Test that clean JSON without any wrapper is parsed correctly
+        let input = r#"[
+            {"id": "H-001", "prediction": "test", "verification_method": "cmd", "tests_error_handling": true},
+            {"id": "H-002", "prediction": "test2", "verification_method": "cmd2", "tests_error_handling": false},
+            {"id": "H-003", "prediction": "test3", "verification_method": "cmd3", "tests_error_handling": false}
+        ]"#;
+        let result = parse_ai_response(input);
+        assert!(result.is_ok(), "Should parse clean JSON directly");
+        assert_eq!(result.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_parse_ai_response_with_whitespace() {
+        // Test that JSON with leading/trailing whitespace is parsed correctly
+        let input = "  \n\n  [{\"id\": \"H-001\", \"prediction\": \"test\", \"verification_method\": \"cmd\", \"tests_error_handling\": true}, {\"id\": \"H-002\", \"prediction\": \"test2\", \"verification_method\": \"cmd2\", \"tests_error_handling\": false}, {\"id\": \"H-003\", \"prediction\": \"test3\", \"verification_method\": \"cmd3\", \"tests_error_handling\": false}]  \n\n  ";
+        let result = parse_ai_response(input);
         assert!(
-            hypotheses.iter().any(|h| h.tests_error_handling),
-            "Should ensure at least one error handling hypothesis"
+            result.is_ok(),
+            "Should parse JSON with surrounding whitespace"
+        );
+    }
+
+    #[test]
+    fn test_parse_ai_response_brackets_in_verification_method() {
+        // Test that brackets in verification_method (e.g., regex) don't break parsing
+        let input = r#"[
+            {"id": "H-001", "prediction": "Pattern matches", "verification_method": "grep '[0-9]+' file.txt", "tests_error_handling": false},
+            {"id": "H-002", "prediction": "Error on invalid", "verification_method": "echo '[error]'", "tests_error_handling": true},
+            {"id": "H-003", "prediction": "Build works", "verification_method": "cargo build", "tests_error_handling": false}
+        ]"#;
+        let result = parse_ai_response(input);
+        assert!(
+            result.is_ok(),
+            "Should handle brackets in verification_method"
+        );
+        let hypotheses = result.unwrap();
+        assert_eq!(hypotheses[0].verification_method, "grep '[0-9]+' file.txt");
+    }
+
+    #[test]
+    fn test_ai_tool_timeout_is_reasonable() {
+        // Document and verify the timeout constant is reasonable
+        // 5 minutes should be enough for most AI tool invocations
+        // but not so long that hung processes block CI indefinitely
+        assert_eq!(AI_TOOL_TIMEOUT.as_secs(), 300);
+        assert!(
+            AI_TOOL_TIMEOUT.as_secs() >= 60,
+            "Timeout should be at least 1 minute"
+        );
+        assert!(
+            AI_TOOL_TIMEOUT.as_secs() <= 600,
+            "Timeout should not exceed 10 minutes"
+        );
+    }
+
+    #[test]
+    fn test_raw_hypothesis_rejects_unknown_fields() {
+        // Verify that RawHypothesis with deny_unknown_fields rejects extra fields
+        let input_with_extra = r#"{"id": "H-001", "prediction": "test", "verification_method": "cmd", "tests_error_handling": true, "extra_field": "should fail"}"#;
+        let result: Result<RawHypothesis, _> = serde_json::from_str(input_with_extra);
+        assert!(result.is_err(), "Should reject unknown fields");
+        assert!(
+            result.unwrap_err().to_string().contains("unknown field"),
+            "Error should mention unknown field"
         );
     }
 }

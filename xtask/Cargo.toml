@@ -19,6 +19,7 @@ chrono = { workspace = true }
 tempfile = { workspace = true }
 glob = { workspace = true }
 nix = { workspace = true }
+wait-timeout = { workspace = true }
 directories = { workspace = true }
 pulldown-cmark = { workspace = true }
 sysinfo = { workspace = true }
