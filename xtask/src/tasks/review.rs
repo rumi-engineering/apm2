@@ -23,7 +23,7 @@ use xshell::{Shell, cmd};
 pub enum ReviewType {
     /// Security review using Gemini and `SECURITY_REVIEW_PROMPT.md`
     Security,
-    /// Code quality review using Codex and `CODE_QUALITY_PROMPT.md`
+    /// Code quality review using Gemini and `CODE_QUALITY_PROMPT.md`
     Quality,
     /// User acceptance testing (manual sign-off)
     Uat,
@@ -60,8 +60,7 @@ impl ReviewType {
     /// Get the AI tool command for this review type.
     pub const fn ai_tool(self) -> Option<&'static str> {
         match self {
-            Self::Security => Some("gemini"),
-            Self::Quality => Some("codex"),
+            Self::Security | Self::Quality => Some("gemini"),
             Self::Uat => None, // UAT is manual
         }
     }
@@ -92,7 +91,7 @@ pub fn run_security(pr_url: &str) -> Result<()> {
 /// 1. Parses the PR URL to extract owner/repo and PR number
 /// 2. Gets the HEAD SHA of the PR
 /// 3. Reads the code quality review prompt
-/// 4. Spawns Codex to run the review (if available)
+/// 4. Spawns Gemini to run the review (if available)
 /// 5. The AI reviewer will post comments and update the status
 ///
 /// # Errors
@@ -257,18 +256,19 @@ fn run_ai_review(
     // The AI tool is responsible for:
     // 1. Posting the review comment
     // 2. Updating the status check
+    //
+    // Both Security and Quality reviews use Gemini with pseudo-TTY for full tool
+    // access. Using script -qec gives Gemini a headed environment where all
+    // tools (including run_shell_command) are available. Without this, headless
+    // mode filters out shell tools causing "Tool not found in registry" errors.
+    //
+    // We write the prompt to a secure temp file (via tempfile crate) to:
+    // 1. Avoid shell escaping issues with complex markdown
+    // 2. Use random filenames to prevent symlink/TOCTOU attacks
+    // 3. Create with restrictive permissions (0600)
+    // 4. Auto-cleanup when NamedTempFile is dropped
     match review_type {
-        ReviewType::Security => {
-            // Spawn Gemini with pseudo-TTY for full tool access.
-            // Using script -qec gives Gemini a headed environment where all tools
-            // (including run_shell_command) are available. Without this, headless mode
-            // filters out shell tools causing "Tool not found in registry" errors.
-            //
-            // We write the prompt to a secure temp file (via tempfile crate) to:
-            // 1. Avoid shell escaping issues with complex markdown
-            // 2. Use random filenames to prevent symlink/TOCTOU attacks
-            // 3. Create with restrictive permissions (0600)
-            // 4. Auto-cleanup when NamedTempFile is dropped
+        ReviewType::Security | ReviewType::Quality => {
             // temp_file is auto-deleted when dropped at end of closure
             let result = NamedTempFile::new().and_then(|mut temp_file| {
                 temp_file.write_all(prompt.as_bytes())?;
@@ -280,16 +280,23 @@ fn run_ai_review(
                     .status()
             });
 
+            let status_context = review_type.status_context();
             match result {
                 Ok(status) if status.success() => {
-                    println!("  Gemini security review completed.");
+                    println!(
+                        "  Gemini {} review completed.",
+                        review_type.display_name().to_lowercase()
+                    );
                     println!(
                         "\n  Note: Gemini should have posted a comment and updated the status."
                     );
                     println!("  If not, you may need to update the status manually:");
                     println!("    gh api --method POST /repos/{owner_repo}/statuses/{head_sha} \\");
-                    println!("      -f state=success -f context=ai-review/security \\");
-                    println!("      -f description=\"Security review passed\"");
+                    println!("      -f state=success -f context={status_context} \\");
+                    println!(
+                        "      -f description=\"{} review passed\"",
+                        review_type.display_name()
+                    );
                 },
                 Ok(status) => {
                     println!("  Warning: Gemini exited with status: {status}");
@@ -297,34 +304,6 @@ fn run_ai_review(
                 },
                 Err(e) => {
                     println!("  Warning: Failed to run Gemini: {e}");
-                    println!("  You may need to run the review manually or check the output.");
-                },
-            }
-        },
-        ReviewType::Quality => {
-            // Codex uses the 'review' subcommand to review changes against base branch.
-            // The review subcommand runs non-interactively by default.
-            let result = std::process::Command::new("codex")
-                .args(["review", "--base", "main"])
-                .status();
-
-            match result {
-                Ok(status) if status.success() => {
-                    println!("  Codex code quality review completed.");
-                    println!(
-                        "\n  Note: Codex should have posted a comment and updated the status."
-                    );
-                    println!("  If not, you may need to update the status manually:");
-                    println!("    gh api --method POST /repos/{owner_repo}/statuses/{head_sha} \\");
-                    println!("      -f state=success -f context=ai-review/code-quality \\");
-                    println!("      -f description=\"Code quality review passed\"");
-                },
-                Ok(status) => {
-                    println!("  Warning: Codex exited with status: {status}");
-                    println!("  You may need to run the review manually or check the output.");
-                },
-                Err(e) => {
-                    println!("  Warning: Failed to run Codex: {e}");
                     println!("  You may need to run the review manually or check the output.");
                 },
             }
@@ -594,7 +573,7 @@ mod tests {
     #[test]
     fn test_review_type_ai_tool() {
         assert_eq!(ReviewType::Security.ai_tool(), Some("gemini"));
-        assert_eq!(ReviewType::Quality.ai_tool(), Some("codex"));
+        assert_eq!(ReviewType::Quality.ai_tool(), Some("gemini"));
         assert_eq!(ReviewType::Uat.ai_tool(), None);
     }
 }
