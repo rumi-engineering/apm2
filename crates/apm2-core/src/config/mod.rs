@@ -78,6 +78,10 @@ pub struct DaemonConfig {
     /// State file path.
     #[serde(default = "default_state_file")]
     pub state_file: PathBuf,
+
+    /// Audit configuration.
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 impl Default for DaemonConfig {
@@ -87,8 +91,38 @@ impl Default for DaemonConfig {
             socket: default_socket(),
             log_dir: default_log_dir(),
             state_file: default_state_file(),
+            audit: AuditConfig::default(),
         }
     }
+}
+
+/// Audit configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditConfig {
+    /// Maximum days to retain audit events.
+    #[serde(default = "default_audit_retention_days")]
+    pub retention_days: u32,
+
+    /// Maximum size of audit log in bytes.
+    #[serde(default = "default_audit_max_size_bytes")]
+    pub max_size_bytes: u64,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_audit_retention_days(),
+            max_size_bytes: default_audit_max_size_bytes(),
+        }
+    }
+}
+
+const fn default_audit_retention_days() -> u32 {
+    30 // 30 days
+}
+
+const fn default_audit_max_size_bytes() -> u64 {
+    1024 * 1024 * 1024 // 1 GB
 }
 
 fn default_pid_file() -> PathBuf {
@@ -219,6 +253,10 @@ mod tests {
             pid_file = "/tmp/apm2.pid"
             socket = "/tmp/apm2.sock"
 
+            [daemon.audit]
+            retention_days = 90
+            max_size_bytes = 536870912
+
             [[credentials]]
             id = "claude-work"
             provider = "claude"
@@ -240,6 +278,8 @@ mod tests {
 
         let config = EcosystemConfig::from_toml(toml).unwrap();
         assert_eq!(config.daemon.pid_file, PathBuf::from("/tmp/apm2.pid"));
+        assert_eq!(config.daemon.audit.retention_days, 90);
+        assert_eq!(config.daemon.audit.max_size_bytes, 536_870_912);
         assert_eq!(config.credentials.len(), 1);
         assert_eq!(config.processes[0].instances, 2);
     }

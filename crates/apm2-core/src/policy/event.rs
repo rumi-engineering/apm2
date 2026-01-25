@@ -5,7 +5,7 @@
 //! loaded at startup.
 
 use super::parser::LoadedPolicy;
-use crate::events::{PolicyEvent, PolicyLoaded, policy_event};
+use crate::events::{PolicyEvent, PolicyLoaded, PolicyViolation, policy_event};
 
 /// Creates a `PolicyLoaded` event from a loaded policy.
 ///
@@ -40,6 +40,27 @@ pub fn create_policy_loaded_event_from_parts(
             policy_hash,
             policy_version,
             rule_count,
+        })),
+    }
+}
+
+/// Creates a `PolicyViolation` event.
+///
+/// This should be called when a request is denied by policy or budget.
+#[must_use]
+#[allow(clippy::missing_const_for_fn)]
+pub fn create_policy_violation_event(
+    session_id: String,
+    violation_type: String,
+    rule_id: String,
+    details: String,
+) -> PolicyEvent {
+    PolicyEvent {
+        event: Some(policy_event::Event::Violation(PolicyViolation {
+            session_id,
+            violation_type,
+            rule_id,
+            details,
         })),
     }
 }
@@ -121,6 +142,26 @@ policy:
                 assert_eq!(e1.policy_hash, e2.policy_hash);
             },
             _ => panic!("Expected PolicyLoaded events"),
+        }
+    }
+
+    #[test]
+    fn test_create_policy_violation_event() {
+        let event = create_policy_violation_event(
+            "session-123".to_string(),
+            "DENY".to_string(),
+            "DEFAULT_DENY".to_string(),
+            "No matching rule".to_string(),
+        );
+
+        match event.event {
+            Some(policy_event::Event::Violation(violation)) => {
+                assert_eq!(violation.session_id, "session-123");
+                assert_eq!(violation.violation_type, "DENY");
+                assert_eq!(violation.rule_id, "DEFAULT_DENY");
+                assert_eq!(violation.details, "No matching rule");
+            },
+            _ => panic!("Expected PolicyViolation event"),
         }
     }
 }
