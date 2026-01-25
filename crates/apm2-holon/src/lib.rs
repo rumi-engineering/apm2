@@ -102,6 +102,7 @@ pub mod context;
 pub mod error;
 pub mod resource;
 pub mod result;
+pub mod skill;
 pub mod stop;
 pub mod traits;
 pub mod work;
@@ -115,6 +116,10 @@ pub use context::EpisodeContext;
 pub use error::HolonError;
 pub use resource::{Budget, Lease, LeaseScope, ResourceError};
 pub use result::EpisodeResult;
+pub use skill::{
+    HolonConfig, HolonContract, SkillFrontmatter, SkillParseError, StopConditionsConfig,
+    parse_frontmatter, parse_skill_file,
+};
 pub use stop::StopCondition;
 pub use traits::Holon;
 
@@ -125,6 +130,7 @@ pub mod prelude {
     pub use crate::error::HolonError;
     pub use crate::resource::{Budget, Lease, LeaseScope, ResourceError};
     pub use crate::result::EpisodeResult;
+    pub use crate::skill::{HolonConfig, HolonContract, SkillFrontmatter, StopConditionsConfig};
     pub use crate::stop::StopCondition;
     pub use crate::traits::Holon;
     pub use crate::work::{AttemptOutcome, AttemptRecord, WorkLifecycle, WorkObject};
