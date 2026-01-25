@@ -121,6 +121,7 @@ dependencies = [
  "ed25519-dalek",
  "humantime",
  "keyring",
+ "memchr",
  "nix",
  "once_cell",
  "proptest",

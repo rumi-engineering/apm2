@@ -67,6 +67,7 @@ ctrlc = "3.4"
 regex = "1.10"
 once_cell = "1.19"
 sysinfo = "0.31"
+memchr = "2.7"
 
 # Markdown parsing
 pulldown-cmark = "0.10"

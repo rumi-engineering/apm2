@@ -44,6 +44,7 @@ directories.workspace = true
 humantime.workspace = true
 regex.workspace = true
 once_cell.workspace = true
+memchr.workspace = true
 
 # Database
 rusqlite.workspace = true
