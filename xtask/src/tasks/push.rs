@@ -241,7 +241,7 @@ fn create_pr(sh: &Shell, branch_name: &str, ticket_id: &str) -> Result<String> {
 /// 1. Creates PENDING status checks for both reviews (blocks merge until
 ///    complete)
 /// 2. Spawns background processes to run security review (Gemini) and code
-///    quality review (Codex) using the prompts from `documents/reviews/`
+///    quality review (Gemini) using the prompts from `documents/reviews/`
 ///
 /// The AI reviewers are responsible for updating their status to
 /// success/failure.
@@ -342,24 +342,60 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
         println!("  Note: Gemini CLI not available, skipping security review");
     }
 
-    // Try to spawn Codex for code quality review
-    let codex_available = cmd!(sh, "which codex").ignore_status().read().is_ok();
-    if codex_available && Path::new(&code_quality_prompt_path).exists() {
-        println!("  Spawning Codex code quality review...");
-        // Spawn Codex review in background using the review subcommand.
-        // The review subcommand runs non-interactively by default.
-        let _ = std::process::Command::new("sh")
-            .args(["-c", "codex review --base main &"])
-            .spawn();
-        println!("    Code quality review started in background");
-    } else if !codex_available {
-        println!("  Note: Codex CLI not available, skipping code quality review");
+    // Try to spawn Gemini for code quality review
+    // Reuse the gemini_available check from security review
+    if gemini_available && Path::new(&code_quality_prompt_path).exists() {
+        println!("  Spawning Gemini code quality review...");
+        // Read and substitute variables in the prompt
+        if let Ok(prompt_content) = std::fs::read_to_string(&code_quality_prompt_path) {
+            let prompt = prompt_content
+                .replace("$PR_URL", pr_url)
+                .replace("$HEAD_SHA", &head_sha);
+            // Spawn Gemini in background with pseudo-TTY for full tool access.
+            // Using script -qec gives Gemini a headed environment where all tools
+            // (including run_shell_command) are available. Without this, headless mode
+            // filters out shell tools causing "Tool not found in registry" errors.
+            //
+            // We write the prompt to a secure temp file (via tempfile crate) to:
+            // 1. Avoid shell escaping issues with complex markdown
+            // 2. Use random filenames to prevent symlink/TOCTOU attacks
+            // 3. Create with restrictive permissions (0600)
+            let temp_file_result =
+                NamedTempFile::new().and_then(|mut f| f.write_all(prompt.as_bytes()).map(|()| f));
+            match temp_file_result {
+                Ok(temp_file) => {
+                    // Persist the file so it survives after NamedTempFile is dropped
+                    // The background shell will delete it after gemini finishes
+                    let (_, temp_path) = temp_file.keep().unwrap_or_else(|e| {
+                        eprintln!("    Warning: Failed to persist temp file: {e}");
+                        (
+                            std::fs::File::open("/dev/null").unwrap(),
+                            std::path::PathBuf::new(),
+                        )
+                    });
+                    let prompt_path = temp_path.display().to_string();
+                    if !prompt_path.is_empty() {
+                        // Use a subshell that runs gemini then cleans up the temp file
+                        let _ = std::process::Command::new("sh")
+                            .args([
+                                "-c",
+                                &format!(
+                                    "(script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null; rm -f '{prompt_path}') &"
+                                ),
+                            ])
+                            .spawn();
+                        println!("    Code quality review started in background");
+                    }
+                },
+                Err(e) => {
+                    println!("    Warning: Failed to create temp file for Gemini: {e}");
+                },
+            }
+        }
     }
 
-    if !gemini_available && !codex_available {
-        println!(
-            "  No AI review tools available. Install gemini and/or codex CLI to enable reviews."
-        );
+    if !gemini_available {
+        println!("  No AI review tools available. Install gemini CLI to enable reviews.");
     }
 
     Ok(())
