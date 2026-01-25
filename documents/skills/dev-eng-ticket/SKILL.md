@@ -94,11 +94,24 @@ The command reports current state and suggests the next action:
 | CI running | Wait (use `--watch` to poll) |
 | CI failed | See `documents/skills/coding/references/CI_EXPECTATIONS.md` |
 | Reviews pending | Wait for reviews (auto-merge enabled) |
-| Reviews failed | Address feedback, commit, re-push with `--force-review` |
+| Reviews failed | See **Handling Review Denials** below |
 | All passed | Wait for auto-merge, then cleanup worktree |
 | Already merged | Cleanup worktree and continue to next ticket |
 
-For continuous monitoring: `timeout 180s cargo xtask check --watch` (will exit on timeout)
+For continuous monitoring: `timeout 180s cargo xtask check --watch | tail -40`
+
+#### Handling Review Denials
+
+When a review is denied, you **must** read and address all feedback:
+
+1. **Fetch PR comments**: Use `gh pr view --comments` or `gh api repos/{owner}/{repo}/pulls/{pr}/comments`
+2. **Read every comment thoroughly**: Review feedback is authoritative. Do not skim or dismiss.
+3. **Address each finding**: Every issue raised must be fixed or explicitly resolved with the reviewer.
+4. **Do not simply re-request**: Never use `--force-review` to bypass feedback. The review will fail again.
+5. **Commit fixes**: After addressing all feedback, commit your changes.
+6. **Re-push**: Only then run `cargo xtask push --force-review` to request a fresh review.
+
+**Critical**: Reviewers maintain an extremely high bar. Treat denials as learning opportunities, not obstacles.
 
 #### After Merge
 
@@ -128,7 +141,7 @@ When all tickets are done (no more processable tickets in step 2), output "Done"
 | `cargo xtask push` | Push, create/update PR, run AI reviews, enable auto-merge |
 | `cargo xtask push --force-review` | Force re-run reviews even if already completed |
 | `timeout 30s cargo xtask check` | Check CI/review status and get next action |
-| `timeout 180s cargo xtask check --watch` | Continuously poll status every 10s (with timeout) |
+| `timeout 180s cargo xtask check --watch \| tail -40` | Poll status, last 40 lines only |
 | `cargo xtask finish` | Cleanup worktree and branch after PR merges |
 | `cargo xtask security-review-exec approve [TCK-XXXXX]` | Approve PR after security review |
 | `cargo xtask security-review-exec deny [TCK-XXXXX] --reason <reason>` | Deny PR with reason |
