@@ -42,6 +42,7 @@ const AI_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::aat::anti_gaming::analyze_diff;
 use crate::aat::evidence::EvidenceBundleBuilder;
+use crate::aat::executor::HypothesisExecutor;
 use crate::aat::parser::parse_pr_description;
 use crate::aat::tool_config::{AatToolConfig, AiTool};
 use crate::aat::types::{Hypothesis, HypothesisResult, Verdict};
@@ -670,14 +671,14 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     println!();
 
     // Step 1: Parse PR URL
-    println!("[1/6] Parsing PR URL...");
+    println!("[1/8] Parsing PR URL...");
     let pr_info = parse_pr_url(pr_url)?;
     println!("  Owner: {}", pr_info.owner);
     println!("  Repo: {}", pr_info.repo);
     println!("  PR #: {}", pr_info.number);
 
     // Step 2: Fetch PR data
-    println!("\n[2/6] Fetching PR data...");
+    println!("\n[2/8] Fetching PR data...");
     let description = fetch_pr_description(&sh, &pr_info)?;
     println!("  Description: {} bytes", description.len());
 
@@ -688,7 +689,7 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     println!("  HEAD SHA: {sha}");
 
     // Step 3: Parse PR description
-    println!("\n[3/7] Parsing PR description...");
+    println!("\n[3/8] Parsing PR description...");
     let parsed_pr = match parse_pr_description(&description) {
         Ok(parsed) => {
             println!("  Usage: found ({} chars)", parsed.usage.len());
@@ -723,7 +724,7 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     };
 
     // Step 4: Validate PR description format
-    println!("\n[4/7] Validating PR description...");
+    println!("\n[4/8] Validating PR description...");
 
     // Get repository root for evidence script validation
     let repo_root = cmd!(sh, "git rev-parse --show-toplevel")
@@ -763,7 +764,7 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     }
 
     // Step 5: Run anti-gaming analysis
-    println!("\n[5/7] Running anti-gaming analysis...");
+    println!("\n[5/8] Running anti-gaming analysis...");
     let anti_gaming_result = analyze_diff(&diff, &parsed_pr.known_limitations);
     println!("  Violations: {}", anti_gaming_result.violations.len());
     println!(
@@ -780,7 +781,7 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     }
 
     // Step 6: Generate hypotheses
-    println!("\n[6/7] Generating hypotheses via AI...");
+    println!("\n[6/8] Generating hypotheses via AI...");
     println!(
         "  Using AI tool: {} ({})",
         tool_config.ai_tool,
@@ -808,6 +809,46 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     };
 
     for h in &hypotheses {
+        println!("    - {}: {} (PENDING)", h.id, h.prediction);
+    }
+
+    // Step 7: Execute hypotheses
+    println!("\n[7/8] Executing hypothesis verification commands...");
+    let mut hypotheses = hypotheses; // Make mutable for execution
+    match HypothesisExecutor::execute_all(&mut hypotheses) {
+        Ok(()) => {
+            let passed = hypotheses
+                .iter()
+                .filter(|h| h.result == Some(HypothesisResult::Passed))
+                .count();
+            let failed = hypotheses
+                .iter()
+                .filter(|h| h.result == Some(HypothesisResult::Failed))
+                .count();
+            println!(
+                "  Executed: {} hypotheses ({} passed, {} failed)",
+                hypotheses.len(),
+                passed,
+                failed
+            );
+        },
+        Err(e) => {
+            let summary = format!("Hypothesis execution failed: {e}");
+            println!("  ERROR: {e}");
+
+            if !dry_run {
+                set_status_check(&sh, &pr_info, &sha, "failure", &summary, None)?;
+            }
+
+            return Ok(AatResult {
+                verdict: Verdict::Failed,
+                evidence_path: None,
+                summary,
+            });
+        },
+    }
+
+    for h in &hypotheses {
         let result_str = match h.result {
             Some(HypothesisResult::Passed) => "PASSED",
             Some(HypothesisResult::Failed) => "FAILED",
@@ -816,8 +857,8 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
         println!("    - {}: {} ({})", h.id, h.prediction, result_str);
     }
 
-    // Step 7: Generate evidence bundle
-    println!("\n[7/7] Generating evidence bundle...");
+    // Step 8: Generate evidence bundle
+    println!("\n[8/8] Generating evidence bundle...");
     let bundle = EvidenceBundleBuilder::new(pr_info.number, &sha)
         .set_pr_description_parse(&parsed_pr)
         .add_hypotheses(hypotheses)
