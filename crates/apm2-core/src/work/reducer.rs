@@ -191,10 +191,9 @@ impl WorkReducer {
         }
 
         // Replay protection: validate sequence via previous_transition_count
-        // If the event includes a sequence hint (non-zero), verify it matches
+        // All transitions MUST provide the correct sequence to prevent replay attacks
         let expected_count = work.transition_count;
-        if event.previous_transition_count != 0 && event.previous_transition_count != expected_count
-        {
+        if event.previous_transition_count != expected_count {
             return Err(WorkError::SequenceMismatch {
                 work_id: work_id.clone(),
                 expected: expected_count,

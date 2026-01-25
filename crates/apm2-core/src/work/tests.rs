@@ -90,15 +90,20 @@ fn test_work_transition_open_to_claimed() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open work
+    // Open work (transition_count = 0)
     let open_payload =
         helpers::work_opened_payload("work-1", "TICKET", vec![1, 2, 3], vec![], vec![]);
     let open_event = create_event("work.opened", "session-1", open_payload);
     reducer.apply(&open_event, &ctx).unwrap();
 
-    // Transition to claimed
-    let trans_payload =
-        helpers::work_transitioned_payload("work-1", "OPEN", "CLAIMED", "agent_claimed");
+    // Transition to claimed (previous_transition_count = 0)
+    let trans_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "OPEN",
+        "CLAIMED",
+        "agent_claimed",
+        0,
+    );
     let mut trans_event = create_event("work.transitioned", "session-1", trans_payload);
     trans_event.timestamp_ns = 2_000_000_000;
     reducer.apply(&trans_event, &ctx).unwrap();
@@ -115,19 +120,25 @@ fn test_work_transition_claimed_to_in_progress() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open work
+    // Open work (transition_count = 0)
     let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
     let open_event = create_event("work.opened", "session-1", open_payload);
     reducer.apply(&open_event, &ctx).unwrap();
 
-    // Claim
-    let claim_payload = helpers::work_transitioned_payload("work-1", "OPEN", "CLAIMED", "claimed");
+    // Claim (previous_transition_count = 0)
+    let claim_payload =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claimed", 0);
     let claim_event = create_event("work.transitioned", "session-1", claim_payload);
     reducer.apply(&claim_event, &ctx).unwrap();
 
-    // Start work
-    let start_payload =
-        helpers::work_transitioned_payload("work-1", "CLAIMED", "IN_PROGRESS", "started");
+    // Start work (previous_transition_count = 1)
+    let start_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "started",
+        1,
+    );
     let start_event = create_event("work.transitioned", "session-1", start_payload);
     reducer.apply(&start_event, &ctx).unwrap();
 
@@ -141,7 +152,7 @@ fn test_work_transition_in_progress_to_review() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open -> Claimed -> InProgress
+    // Open -> Claimed -> InProgress (transition_count = 0)
     let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
     reducer
         .apply(
@@ -150,7 +161,8 @@ fn test_work_transition_in_progress_to_review() {
         )
         .unwrap();
 
-    let claim_payload = helpers::work_transitioned_payload("work-1", "OPEN", "CLAIMED", "claimed");
+    let claim_payload =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claimed", 0);
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", claim_payload),
@@ -158,8 +170,13 @@ fn test_work_transition_in_progress_to_review() {
         )
         .unwrap();
 
-    let start_payload =
-        helpers::work_transitioned_payload("work-1", "CLAIMED", "IN_PROGRESS", "started");
+    let start_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "started",
+        1,
+    );
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", start_payload),
@@ -167,9 +184,14 @@ fn test_work_transition_in_progress_to_review() {
         )
         .unwrap();
 
-    // Submit for review
-    let review_payload =
-        helpers::work_transitioned_payload("work-1", "IN_PROGRESS", "REVIEW", "ready_for_review");
+    // Submit for review (previous_transition_count = 2)
+    let review_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "REVIEW",
+        "ready_for_review",
+        2,
+    );
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", review_payload),
@@ -187,15 +209,16 @@ fn test_work_transition_in_progress_to_needs_input() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open -> Claimed -> InProgress
+    // Open -> Claimed -> InProgress (transition_count = 2)
     setup_in_progress_work(&mut reducer, &ctx, "work-1");
 
-    // Block on input
-    let block_payload = helpers::work_transitioned_payload(
+    // Block on input (previous_transition_count = 2)
+    let block_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "IN_PROGRESS",
         "NEEDS_INPUT",
         "waiting_for_requirements",
+        2,
     );
     reducer
         .apply(
@@ -213,11 +236,17 @@ fn test_work_transition_needs_input_to_in_progress() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open -> Claimed -> InProgress -> NeedsInput
+    // Open -> Claimed -> InProgress (transition_count = 2)
     setup_in_progress_work(&mut reducer, &ctx, "work-1");
 
-    let block_payload =
-        helpers::work_transitioned_payload("work-1", "IN_PROGRESS", "NEEDS_INPUT", "blocked");
+    // Block on input (previous_transition_count = 2)
+    let block_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "NEEDS_INPUT",
+        "blocked",
+        2,
+    );
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", block_payload),
@@ -225,12 +254,13 @@ fn test_work_transition_needs_input_to_in_progress() {
         )
         .unwrap();
 
-    // Resume
-    let resume_payload = helpers::work_transitioned_payload(
+    // Resume (previous_transition_count = 3)
+    let resume_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "NEEDS_INPUT",
         "IN_PROGRESS",
         "input_received",
+        3,
     );
     reducer
         .apply(
@@ -248,11 +278,17 @@ fn test_work_transition_review_to_in_progress_revision() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open -> Claimed -> InProgress -> Review
+    // Open -> Claimed -> InProgress (transition_count = 2)
     setup_in_progress_work(&mut reducer, &ctx, "work-1");
 
-    let review_payload =
-        helpers::work_transitioned_payload("work-1", "IN_PROGRESS", "REVIEW", "submitted");
+    // Submit for review (previous_transition_count = 2)
+    let review_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "REVIEW",
+        "submitted",
+        2,
+    );
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", review_payload),
@@ -260,9 +296,14 @@ fn test_work_transition_review_to_in_progress_revision() {
         )
         .unwrap();
 
-    // Review requests changes
-    let revision_payload =
-        helpers::work_transitioned_payload("work-1", "REVIEW", "IN_PROGRESS", "changes_requested");
+    // Review requests changes (previous_transition_count = 3)
+    let revision_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "REVIEW",
+        "IN_PROGRESS",
+        "changes_requested",
+        3,
+    );
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", revision_payload),
@@ -279,7 +320,7 @@ fn test_work_transition_claimed_release_to_open() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open -> Claimed
+    // Open -> Claimed (transition_count = 0)
     let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
     reducer
         .apply(
@@ -288,7 +329,8 @@ fn test_work_transition_claimed_release_to_open() {
         )
         .unwrap();
 
-    let claim_payload = helpers::work_transitioned_payload("work-1", "OPEN", "CLAIMED", "claimed");
+    let claim_payload =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claimed", 0);
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", claim_payload),
@@ -296,9 +338,14 @@ fn test_work_transition_claimed_release_to_open() {
         )
         .unwrap();
 
-    // Release claim
-    let release_payload =
-        helpers::work_transitioned_payload("work-1", "CLAIMED", "OPEN", "claim_released");
+    // Release claim (previous_transition_count = 1)
+    let release_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "OPEN",
+        "claim_released",
+        1,
+    );
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", release_payload),
@@ -315,7 +362,7 @@ fn test_invalid_transition_errors() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open work
+    // Open work (transition_count = 0)
     let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
     reducer
         .apply(
@@ -324,8 +371,15 @@ fn test_invalid_transition_errors() {
         )
         .unwrap();
 
-    // Try to go directly from Open to InProgress (should fail)
-    let bad_trans = helpers::work_transitioned_payload("work-1", "OPEN", "IN_PROGRESS", "bad");
+    // Try to go directly from Open to InProgress (should fail - transition not
+    // allowed)
+    let bad_trans = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "OPEN",
+        "IN_PROGRESS",
+        "bad",
+        0, // Correct sequence, but invalid transition
+    );
     let result = reducer.apply(
         &create_event("work.transitioned", "session-1", bad_trans),
         &ctx,
@@ -341,7 +395,7 @@ fn test_transition_wrong_from_state_errors() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open work
+    // Open work (transition_count = 0)
     let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
     reducer
         .apply(
@@ -351,7 +405,13 @@ fn test_transition_wrong_from_state_errors() {
         .unwrap();
 
     // Try transition with wrong from_state (says CLAIMED but work is OPEN)
-    let bad_trans = helpers::work_transitioned_payload("work-1", "CLAIMED", "IN_PROGRESS", "bad");
+    let bad_trans = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "bad",
+        0,
+    );
     let result = reducer.apply(
         &create_event("work.transitioned", "session-1", bad_trans),
         &ctx,
@@ -364,7 +424,13 @@ fn test_transition_unknown_work_errors() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    let trans = helpers::work_transitioned_payload("unknown-work", "OPEN", "CLAIMED", "claim");
+    let trans = helpers::work_transitioned_payload_with_sequence(
+        "unknown-work",
+        "OPEN",
+        "CLAIMED",
+        "claim",
+        0,
+    );
     let result = reducer.apply(&create_event("work.transitioned", "session-1", trans), &ctx);
     assert!(matches!(result, Err(WorkError::WorkNotFound { .. })));
 }
@@ -378,11 +444,17 @@ fn test_work_completed_from_review() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Setup: Open -> Claimed -> InProgress -> Review
+    // Setup: Open -> Claimed -> InProgress (transition_count = 2)
     setup_in_progress_work(&mut reducer, &ctx, "work-1");
 
-    let review_payload =
-        helpers::work_transitioned_payload("work-1", "IN_PROGRESS", "REVIEW", "submitted");
+    // Submit for review (previous_transition_count = 2)
+    let review_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "REVIEW",
+        "submitted",
+        2,
+    );
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", review_payload),
@@ -437,11 +509,17 @@ fn test_work_completed_without_evidence_errors() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Setup: Open -> Claimed -> InProgress -> Review
+    // Setup: Open -> Claimed -> InProgress (transition_count = 2)
     setup_in_progress_work(&mut reducer, &ctx, "work-1");
 
-    let review_payload =
-        helpers::work_transitioned_payload("work-1", "IN_PROGRESS", "REVIEW", "submitted");
+    // Submit for review (previous_transition_count = 2)
+    let review_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "REVIEW",
+        "submitted",
+        2,
+    );
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", review_payload),
@@ -518,10 +596,17 @@ fn test_work_aborted_from_review() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
+    // Setup: Open -> Claimed -> InProgress (transition_count = 2)
     setup_in_progress_work(&mut reducer, &ctx, "work-1");
 
-    let review_payload =
-        helpers::work_transitioned_payload("work-1", "IN_PROGRESS", "REVIEW", "submitted");
+    // Submit for review (previous_transition_count = 2)
+    let review_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "REVIEW",
+        "submitted",
+        2,
+    );
     reducer
         .apply(
             &create_event("work.transitioned", "session-1", review_payload),
@@ -580,7 +665,8 @@ fn test_state_counts() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Create 5 work items in different states
+    // Create 5 work items in different states (each starts with transition_count =
+    // 0)
     for i in 1..=5 {
         let payload =
             helpers::work_opened_payload(&format!("work-{i}"), "TICKET", vec![], vec![], vec![]);
@@ -595,15 +681,28 @@ fn test_state_counts() {
     assert_eq!(reducer.state().aborted_count(), 0);
 
     // Complete work-1 (need to go through full lifecycle)
-    let claim1 = helpers::work_transitioned_payload("work-1", "OPEN", "CLAIMED", "claim");
+    let claim1 =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claim", 0);
     reducer
         .apply(&create_event("work.transitioned", "s", claim1), &ctx)
         .unwrap();
-    let start1 = helpers::work_transitioned_payload("work-1", "CLAIMED", "IN_PROGRESS", "start");
+    let start1 = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "start",
+        1,
+    );
     reducer
         .apply(&create_event("work.transitioned", "s", start1), &ctx)
         .unwrap();
-    let review1 = helpers::work_transitioned_payload("work-1", "IN_PROGRESS", "REVIEW", "review");
+    let review1 = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "REVIEW",
+        "review",
+        2,
+    );
     reducer
         .apply(&create_event("work.transitioned", "s", review1), &ctx)
         .unwrap();
@@ -630,7 +729,7 @@ fn test_in_state_query() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Create work items
+    // Create work items (each starts with transition_count = 0)
     for i in 1..=3 {
         let payload =
             helpers::work_opened_payload(&format!("work-{i}"), "TICKET", vec![], vec![], vec![]);
@@ -639,8 +738,9 @@ fn test_in_state_query() {
             .unwrap();
     }
 
-    // Claim work-1
-    let claim1 = helpers::work_transitioned_payload("work-1", "OPEN", "CLAIMED", "claim");
+    // Claim work-1 (previous_transition_count = 0)
+    let claim1 =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claim", 0);
     reducer
         .apply(&create_event("work.transitioned", "s", claim1), &ctx)
         .unwrap();
@@ -756,8 +856,9 @@ fn test_spec_snapshot_hash_preserved() {
     let work = reducer.state().get("work-1").unwrap();
     assert_eq!(work.spec_snapshot_hash, snapshot_hash);
 
-    // Verify it persists through transitions
-    let claim = helpers::work_transitioned_payload("work-1", "OPEN", "CLAIMED", "claim");
+    // Verify it persists through transitions (previous_transition_count = 0)
+    let claim =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claim", 0);
     reducer
         .apply(&create_event("work.transitioned", "s", claim), &ctx)
         .unwrap();
@@ -771,30 +872,46 @@ fn test_spec_snapshot_hash_preserved() {
 // =============================================================================
 
 /// Sets up a work item in the `InProgress` state.
+/// After this function: `transition_count` = 2
 fn setup_in_progress_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id: &str) {
     let open_payload = helpers::work_opened_payload(work_id, "TICKET", vec![], vec![], vec![]);
     reducer
         .apply(&create_event("work.opened", "s", open_payload), ctx)
         .unwrap();
 
-    let claim_payload = helpers::work_transitioned_payload(work_id, "OPEN", "CLAIMED", "claim");
+    // transition_count = 0, so use previous_transition_count = 0
+    let claim_payload =
+        helpers::work_transitioned_payload_with_sequence(work_id, "OPEN", "CLAIMED", "claim", 0);
     reducer
         .apply(&create_event("work.transitioned", "s", claim_payload), ctx)
         .unwrap();
 
-    let start_payload =
-        helpers::work_transitioned_payload(work_id, "CLAIMED", "IN_PROGRESS", "start");
+    // transition_count = 1, so use previous_transition_count = 1
+    let start_payload = helpers::work_transitioned_payload_with_sequence(
+        work_id,
+        "CLAIMED",
+        "IN_PROGRESS",
+        "start",
+        1,
+    );
     reducer
         .apply(&create_event("work.transitioned", "s", start_payload), ctx)
         .unwrap();
 }
 
 /// Sets up a work item in the Completed state.
+/// After this function: `transition_count` = 4
 fn setup_completed_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id: &str) {
     setup_in_progress_work(reducer, ctx, work_id);
 
-    let review_payload =
-        helpers::work_transitioned_payload(work_id, "IN_PROGRESS", "REVIEW", "review");
+    // transition_count = 2 after setup_in_progress_work
+    let review_payload = helpers::work_transitioned_payload_with_sequence(
+        work_id,
+        "IN_PROGRESS",
+        "REVIEW",
+        "review",
+        2,
+    );
     reducer
         .apply(&create_event("work.transitioned", "s", review_payload), ctx)
         .unwrap();
@@ -815,13 +932,16 @@ fn test_work_transition_in_progress_to_needs_adjudication() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
+    // Setup: Open -> Claimed -> InProgress (transition_count = 2)
     setup_in_progress_work(&mut reducer, &ctx, "work-1");
 
-    let adj_payload = helpers::work_transitioned_payload(
+    // Transition to NeedsAdjudication (previous_transition_count = 2)
+    let adj_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "IN_PROGRESS",
         "NEEDS_ADJUDICATION",
         "requires_human_decision",
+        2,
     );
     reducer
         .apply(
@@ -839,14 +959,16 @@ fn test_work_transition_needs_adjudication_to_in_progress() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Setup: Open -> Claimed -> InProgress -> NeedsAdjudication
+    // Setup: Open -> Claimed -> InProgress (transition_count = 2)
     setup_in_progress_work(&mut reducer, &ctx, "work-1");
 
-    let adj_payload = helpers::work_transitioned_payload(
+    // Transition to NeedsAdjudication (previous_transition_count = 2)
+    let adj_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "IN_PROGRESS",
         "NEEDS_ADJUDICATION",
         "awaiting_decision",
+        2,
     );
     reducer
         .apply(
@@ -855,12 +977,13 @@ fn test_work_transition_needs_adjudication_to_in_progress() {
         )
         .unwrap();
 
-    // Resume after adjudication
-    let resume_payload = helpers::work_transitioned_payload(
+    // Resume after adjudication (previous_transition_count = 3)
+    let resume_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "NEEDS_ADJUDICATION",
         "IN_PROGRESS",
         "decision_received",
+        3,
     );
     reducer
         .apply(
@@ -878,13 +1001,16 @@ fn test_work_aborted_from_needs_adjudication() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
+    // Setup: Open -> Claimed -> InProgress (transition_count = 2)
     setup_in_progress_work(&mut reducer, &ctx, "work-1");
 
-    let adj_payload = helpers::work_transitioned_payload(
+    // Transition to NeedsAdjudication (previous_transition_count = 2)
+    let adj_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "IN_PROGRESS",
         "NEEDS_ADJUDICATION",
         "awaiting",
+        2,
     );
     reducer
         .apply(
@@ -933,18 +1059,20 @@ fn test_invalid_work_state_rejected() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open valid work first
+    // Open valid work first (transition_count = 0)
     let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
     reducer
         .apply(&create_event("work.opened", "s", open_payload), &ctx)
         .unwrap();
 
-    // Try transition with invalid from_state
-    let trans_payload = helpers::work_transitioned_payload(
+    // Try transition with invalid from_state (sequence is correct but state is
+    // invalid)
+    let trans_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "INVALID_STATE", // Not a valid state
         "CLAIMED",
         "test",
+        0,
     );
     let result = reducer.apply(&create_event("work.transitioned", "s", trans_payload), &ctx);
     assert!(matches!(result, Err(WorkError::InvalidWorkState { .. })));
@@ -955,18 +1083,20 @@ fn test_invalid_to_state_rejected() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open valid work first
+    // Open valid work first (transition_count = 0)
     let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
     reducer
         .apply(&create_event("work.opened", "s", open_payload), &ctx)
         .unwrap();
 
-    // Try transition with invalid to_state
-    let trans_payload = helpers::work_transitioned_payload(
+    // Try transition with invalid to_state (sequence is correct but state is
+    // invalid)
+    let trans_payload = helpers::work_transitioned_payload_with_sequence(
         "work-1",
         "OPEN",
         "BOGUS_STATE", // Not a valid state
         "test",
+        0,
     );
     let result = reducer.apply(&create_event("work.transitioned", "s", trans_payload), &ctx);
     assert!(matches!(result, Err(WorkError::InvalidWorkState { .. })));
@@ -1050,38 +1180,62 @@ fn test_sequence_validation_with_correct_count() {
 }
 
 #[test]
-fn test_sequence_zero_skips_validation() {
+fn test_cyclic_replay_attack_prevented() {
+    // Test that replay protection prevents cyclic attacks:
+    // Open -> Claimed -> Open (release) -> attempt to replay first claim event
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Open work
+    // Open work (transition_count = 0)
     let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
     reducer
         .apply(&create_event("work.opened", "s", open_payload), &ctx)
         .unwrap();
 
-    // Transition with sequence = 0 (backward compatibility - skips validation)
-    let trans1 = helpers::work_transitioned_payload_with_sequence(
-        "work-1", "OPEN", "CLAIMED", "claim", 0, // Zero means no validation
-    );
+    // First claim (previous_transition_count = 0)
+    let claim1 =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claim1", 0);
     reducer
-        .apply(&create_event("work.transitioned", "s", trans1), &ctx)
+        .apply(&create_event("work.transitioned", "s", claim1), &ctx)
         .unwrap();
 
-    // Another transition with sequence = 0
-    let trans2 = helpers::work_transitioned_payload_with_sequence(
-        "work-1",
-        "CLAIMED",
-        "IN_PROGRESS",
-        "start",
-        0, // Zero means no validation
-    );
+    // Release back to Open (previous_transition_count = 1)
+    let release =
+        helpers::work_transitioned_payload_with_sequence("work-1", "CLAIMED", "OPEN", "release", 1);
     reducer
-        .apply(&create_event("work.transitioned", "s", trans2), &ctx)
+        .apply(&create_event("work.transitioned", "s", release), &ctx)
         .unwrap();
 
-    // Transitions work without explicit sequence
+    // Work is back in Open state, but transition_count is now 2
     let work = reducer.state().get("work-1").unwrap();
-    assert_eq!(work.state, WorkState::InProgress);
+    assert_eq!(work.state, WorkState::Open);
     assert_eq!(work.transition_count, 2);
+
+    // Try to replay the first claim event with previous_transition_count = 0
+    // This should fail because work.transition_count is now 2
+    let replay_claim =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claim1", 0);
+    let result = reducer.apply(&create_event("work.transitioned", "s", replay_claim), &ctx);
+    assert!(matches!(result, Err(WorkError::SequenceMismatch { .. })));
+
+    // Verify state unchanged
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Open);
+    assert_eq!(work.transition_count, 2);
+
+    // Correct claim with proper sequence should succeed
+    let correct_claim = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "OPEN",
+        "CLAIMED",
+        "claim_correct",
+        2,
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", correct_claim), &ctx)
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Claimed);
+    assert_eq!(work.transition_count, 3);
 }
