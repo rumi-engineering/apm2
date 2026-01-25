@@ -346,9 +346,10 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
     let codex_available = cmd!(sh, "which codex").ignore_status().read().is_ok();
     if codex_available && Path::new(&code_quality_prompt_path).exists() {
         println!("  Spawning Codex code quality review...");
-        // Spawn Codex review in background using the review subcommand
+        // Spawn Codex review in background using the review subcommand.
+        // The review subcommand runs non-interactively by default.
         let _ = std::process::Command::new("sh")
-            .args(["-c", "codex review --base main -c 'full_auto=true' &"])
+            .args(["-c", "codex review --base main &"])
             .spawn();
         println!("    Code quality review started in background");
     } else if !codex_available {
