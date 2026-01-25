@@ -1972,6 +1972,86 @@ mod unit_tests {
         assert!(msg.contains("256"));
         assert!(msg.contains("128"));
     }
+
+    /// Proof that validation rejects events with 10MB strings
+    /// (denial-of-service protection).
+    ///
+    /// This test demonstrates that deserializing a malicious event with an
+    /// oversized string will be caught by the `validate()` method.
+    #[test]
+    fn test_ledger_event_limits() {
+        // Create a 10MB string - this simulates a malicious payload
+        const TEN_MB: usize = 10 * 1024 * 1024;
+        let malicious_title = "x".repeat(TEN_MB);
+
+        // Construct a JSON representation of a malicious event
+        let zero_hash: [u8; 32] = [0; 32];
+        let malicious_json = serde_json::json!({
+            "id": "evt-001",
+            "timestamp_ns": 1000_u64,
+            "work_id": "work-001",
+            "holon_id": "holon-001",
+            "event_type": {
+                "type": "work_created",
+                "title": malicious_title
+            },
+            "previous_hash": zero_hash,
+            "signature": Vec::<u8>::new()
+        });
+
+        // Deserialize the malicious event - this succeeds because serde
+        // doesn't impose limits
+        let event: LedgerEvent =
+            serde_json::from_value(malicious_json).expect("deserialization succeeds");
+
+        // But validation MUST fail due to the oversized title
+        let result = event.validate();
+        assert!(
+            matches!(
+                result,
+                Err(LedgerValidationError::StringTooLong { field, actual_len, .. })
+                if field == "title" && actual_len == TEN_MB
+            ),
+            "validate() must reject events with 10MB strings"
+        );
+    }
+
+    /// Test that signature changes do not affect the hash chain.
+    ///
+    /// This is by design: signatures are not included in the hash chain
+    /// because events may be created unsigned and signed later. The chain
+    /// verifies content integrity, not authorization history.
+    #[test]
+    fn test_signature_excluded_from_hash_by_design() {
+        let event1 = LedgerEvent::builder()
+            .event_id("evt-001")
+            .timestamp_ns(1000)
+            .work_id("work-001")
+            .holon_id("holon-001")
+            .event_type(EventType::WorkCreated {
+                title: "Test".into(),
+            })
+            .build();
+
+        let event2 = LedgerEvent::builder()
+            .event_id("evt-001")
+            .timestamp_ns(1000)
+            .work_id("work-001")
+            .holon_id("holon-001")
+            .event_type(EventType::WorkCreated {
+                title: "Test".into(),
+            })
+            .signature(vec![1, 2, 3, 4, 5])
+            .build();
+
+        // Same hash regardless of signature - this is intentional
+        assert_eq!(event1.compute_hash(), event2.compute_hash());
+
+        // The signature can be verified separately via is_signed() and
+        // signature() methods. Witness integrity, if required, should be
+        // enforced at a higher layer (e.g., requiring all events to be signed
+        // before acceptance).
+    }
 }
 
 #[cfg(test)]
