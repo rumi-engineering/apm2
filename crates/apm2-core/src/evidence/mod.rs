@@ -79,6 +79,7 @@ mod category;
 mod classification;
 mod error;
 mod publisher;
+mod receipt;
 mod reducer;
 mod state;
 
@@ -90,5 +91,8 @@ pub use category::EvidenceCategory;
 pub use classification::DataClassification;
 pub use error::EvidenceError;
 pub use publisher::{EvidencePublisher, PublishResult};
+pub use receipt::{
+    GateReasonCode, GateReceipt, GateReceiptGenerator, GateRequirements, GateResult,
+};
 pub use reducer::{EvidenceReducer, EvidenceReducerState};
 pub use state::{Evidence, EvidenceBundle, EvidenceSummary};
