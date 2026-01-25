@@ -44,6 +44,8 @@ mod reducer;
 mod state;
 
 #[cfg(test)]
+mod security_repro;
+#[cfg(test)]
 mod tests;
 
 pub use error::LeaseError;

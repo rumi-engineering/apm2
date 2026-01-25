@@ -11,6 +11,9 @@ use crate::events::{LeaseEvent, lease_event};
 use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
+const MAX_ID_LEN: usize = 128;
+const MAX_SIG_LEN: usize = 512;
+
 /// State maintained by the lease reducer.
 ///
 /// Tracks all leases and provides efficient lookup by lease ID and work ID.
@@ -152,6 +155,32 @@ impl LeaseReducer {
         let lease_id = event.lease_id.clone();
         let work_id = event.work_id.clone();
 
+        // Validate limits
+        if lease_id.len() > MAX_ID_LEN {
+            return Err(LeaseError::InvalidInput {
+                field: "lease_id".to_string(),
+                reason: format!("exceeds limit of {MAX_ID_LEN} bytes"),
+            });
+        }
+        if work_id.len() > MAX_ID_LEN {
+            return Err(LeaseError::InvalidInput {
+                field: "work_id".to_string(),
+                reason: format!("exceeds limit of {MAX_ID_LEN} bytes"),
+            });
+        }
+        if event.actor_id.len() > MAX_ID_LEN {
+            return Err(LeaseError::InvalidInput {
+                field: "actor_id".to_string(),
+                reason: format!("exceeds limit of {MAX_ID_LEN} bytes"),
+            });
+        }
+        if event.registrar_signature.len() > MAX_SIG_LEN {
+            return Err(LeaseError::InvalidInput {
+                field: "registrar_signature".to_string(),
+                reason: format!("exceeds limit of {MAX_SIG_LEN} bytes"),
+            });
+        }
+
         // Check for duplicate lease ID
         if self.state.leases.contains_key(&lease_id) {
             return Err(LeaseError::LeaseAlreadyExists { lease_id });
@@ -192,6 +221,13 @@ impl LeaseReducer {
     fn handle_renewed(&mut self, event: crate::events::LeaseRenewed) -> Result<(), LeaseError> {
         let lease_id = &event.lease_id;
 
+        if lease_id.len() > MAX_ID_LEN {
+            return Err(LeaseError::InvalidInput {
+                field: "lease_id".to_string(),
+                reason: format!("exceeds limit of {MAX_ID_LEN} bytes"),
+            });
+        }
+
         let lease =
             self.state
                 .leases
@@ -223,6 +259,12 @@ impl LeaseReducer {
                 lease_id: lease_id.clone(),
             });
         }
+        if event.registrar_signature.len() > MAX_SIG_LEN {
+            return Err(LeaseError::InvalidInput {
+                field: "registrar_signature".to_string(),
+                reason: format!("exceeds limit of {MAX_SIG_LEN} bytes"),
+            });
+        }
 
         // Apply renewal
         lease.expires_at = event.new_expires_at;
@@ -240,9 +282,17 @@ impl LeaseReducer {
     fn handle_released(
         &mut self,
         event: &crate::events::LeaseReleased,
+        actor_id: &str,
         timestamp: u64,
     ) -> Result<(), LeaseError> {
         let lease_id = &event.lease_id;
+
+        if lease_id.len() > MAX_ID_LEN {
+            return Err(LeaseError::InvalidInput {
+                field: "lease_id".to_string(),
+                reason: format!("exceeds limit of {MAX_ID_LEN} bytes"),
+            });
+        }
 
         let lease =
             self.state
@@ -257,6 +307,15 @@ impl LeaseReducer {
             return Err(LeaseError::LeaseAlreadyTerminal {
                 lease_id: lease_id.clone(),
                 current_state: lease.state.as_str().to_string(),
+            });
+        }
+
+        // Authorization check: Only lease holder can release
+        // (Future: allow supervisors to release/abort)
+        if lease.actor_id != actor_id {
+            return Err(LeaseError::Unauthorized {
+                lease_id: lease_id.clone(),
+                actor_id: actor_id.to_string(),
             });
         }
 
@@ -278,6 +337,13 @@ impl LeaseReducer {
     fn handle_expired(&mut self, event: &crate::events::LeaseExpired) -> Result<(), LeaseError> {
         let lease_id = &event.lease_id;
 
+        if lease_id.len() > MAX_ID_LEN {
+            return Err(LeaseError::InvalidInput {
+                field: "lease_id".to_string(),
+                reason: format!("exceeds limit of {MAX_ID_LEN} bytes"),
+            });
+        }
+
         let lease =
             self.state
                 .leases
@@ -291,6 +357,15 @@ impl LeaseReducer {
             return Err(LeaseError::LeaseAlreadyTerminal {
                 lease_id: lease_id.clone(),
                 current_state: lease.state.as_str().to_string(),
+            });
+        }
+
+        // Validate expiration time: Cannot expire before the lease's expiration
+        if event.expired_at < lease.expires_at {
+            return Err(LeaseError::InvalidExpiration {
+                lease_id: lease_id.clone(),
+                provided: event.expired_at,
+                lease_expires_at: lease.expires_at,
             });
         }
 
@@ -337,7 +412,9 @@ impl Reducer for LeaseReducer {
         match lease_event.event {
             Some(lease_event::Event::Issued(e)) => self.handle_issued(e),
             Some(lease_event::Event::Renewed(e)) => self.handle_renewed(e),
-            Some(lease_event::Event::Released(ref e)) => self.handle_released(e, timestamp),
+            Some(lease_event::Event::Released(ref e)) => {
+                self.handle_released(e, &event.actor_id, timestamp)
+            },
             Some(lease_event::Event::Expired(ref e)) => self.handle_expired(e),
             Some(lease_event::Event::Conflict(ref e)) => {
                 self.handle_conflict(e);

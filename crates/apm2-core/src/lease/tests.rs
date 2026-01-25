@@ -7,7 +7,7 @@ use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
 fn create_event(event_type: &str, session_id: &str, payload: Vec<u8>) -> EventRecord {
-    EventRecord::with_timestamp(event_type, session_id, "test-actor", payload, 1_000_000_000)
+    EventRecord::with_timestamp(event_type, session_id, "actor-1", payload, 1_000_000_000)
 }
 
 fn create_event_at(
@@ -16,7 +16,7 @@ fn create_event_at(
     payload: Vec<u8>,
     timestamp: u64,
 ) -> EventRecord {
-    EventRecord::with_timestamp(event_type, session_id, "test-actor", payload, timestamp)
+    EventRecord::with_timestamp(event_type, session_id, "actor-1", payload, timestamp)
 }
 
 // =============================================================================

@@ -91,4 +91,35 @@ pub enum LeaseError {
         /// The duplicate lease ID.
         lease_id: String,
     },
+
+    /// Unauthorized operation.
+    #[error("unauthorized operation on lease {lease_id}: actor {actor_id} is not the lease holder")]
+    Unauthorized {
+        /// The lease ID.
+        lease_id: String,
+        /// The unauthorized actor.
+        actor_id: String,
+    },
+
+    /// Invalid expiration time.
+    #[error(
+        "invalid expiration time for lease {lease_id}: provided={provided}, lease_expires_at={lease_expires_at}"
+    )]
+    InvalidExpiration {
+        /// The lease ID.
+        lease_id: String,
+        /// The provided expiration time.
+        provided: u64,
+        /// The lease's expiration time.
+        lease_expires_at: u64,
+    },
+
+    /// Invalid input.
+    #[error("invalid input for field {field}: {reason}")]
+    InvalidInput {
+        /// The field name.
+        field: String,
+        /// The reason it is invalid.
+        reason: String,
+    },
 }
