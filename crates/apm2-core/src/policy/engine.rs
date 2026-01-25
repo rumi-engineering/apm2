@@ -70,10 +70,11 @@
 
 use std::sync::Arc;
 
+use super::event::create_policy_violation_event;
 use super::parser::LoadedPolicy;
 use super::schema::{Decision, Rule, RuleType};
 use crate::budget::BudgetTracker;
-use crate::events::ToolDecided;
+use crate::events::{PolicyEvent, ToolDecided};
 use crate::tool::{ToolRequest, tool_request};
 
 /// Special rule ID for default-deny decisions.
@@ -543,6 +544,23 @@ impl EvaluationResult {
             rationale_code: self.rationale_code.clone(),
             budget_consumed: self.budget_consumed,
         }
+    }
+
+    /// Converts this result to a `PolicyViolation` event if denied.
+    ///
+    /// Returns `None` if the decision was `Allow`.
+    #[must_use]
+    pub fn to_policy_violation_event(&self, session_id: &str) -> Option<PolicyEvent> {
+        if self.is_allowed() {
+            return None;
+        }
+
+        Some(create_policy_violation_event(
+            session_id.to_string(),
+            self.rationale_code.clone(), // Use rationale code as violation type
+            self.rule_id.clone(),
+            self.message.clone(),
+        ))
     }
 }
 
@@ -1334,6 +1352,43 @@ policy:
 
         assert_eq!(decided.decision, "DENY");
         assert_eq!(decided.rule_id, "deny-rule");
+    }
+
+    #[test]
+    fn test_evaluation_result_to_policy_violation_event() {
+        use crate::events::policy_event;
+
+        // Deny result should produce an event
+        let result = EvaluationResult::denied(
+            "deny-rule".to_string(),
+            "ACCESS_DENIED".to_string(),
+            [0u8; 32],
+            "Access denied details".to_string(),
+        );
+
+        let event = result.to_policy_violation_event("session-123");
+        assert!(event.is_some());
+
+        match event.unwrap().event {
+            Some(policy_event::Event::Violation(v)) => {
+                assert_eq!(v.session_id, "session-123");
+                assert_eq!(v.violation_type, "ACCESS_DENIED");
+                assert_eq!(v.rule_id, "deny-rule");
+                assert_eq!(v.details, "Access denied details");
+            },
+            _ => panic!("Expected Violation event"),
+        }
+
+        // Allow result should NOT produce an event
+        let result = EvaluationResult::allowed(
+            "allow-rule".to_string(),
+            "ACCESS_ALLOWED".to_string(),
+            [0u8; 32],
+            "Access allowed".to_string(),
+        );
+
+        let event = result.to_policy_violation_event("session-123");
+        assert!(event.is_none());
     }
 
     // ========================================================================
