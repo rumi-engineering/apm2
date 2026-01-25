@@ -14,7 +14,7 @@
 //! # Health Detection
 //!
 //! Health is determined by two factors:
-//! 1. Process alive check using `kill(pid, None)` (signal 0)
+//! 1. Process alive check using `sysinfo` crate (cross-platform)
 //! 2. Log file modification time (mtime) for activity detection
 //!
 //! A reviewer is considered:
@@ -22,20 +22,31 @@
 //! - `Stale`: Process alive BUT log file mtime >= 60s ago
 //! - `Dead`: Process not alive (killed, crashed, or PID reused by unrelated
 //!   process)
+//!
+//! # Platform Support
+//!
+//! This module uses `sysinfo` crate for cross-platform process introspection.
+//! Signal handling (SIGTERM, SIGKILL) is only available on Unix platforms.
+//! On non-Unix platforms, process termination returns an error.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+#[cfg(unix)]
 use nix::libc;
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
+use sysinfo::{Pid as SysPid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tempfile::NamedTempFile;
 
 /// Stale threshold in seconds.
@@ -99,37 +110,27 @@ impl ReviewerEntry {
     /// Check the health status of this reviewer.
     ///
     /// Checks:
-    /// 1. Whether the process is still alive using `kill(pid, None)`
-    /// 2. Whether the PID is still our process (not reused) by checking
-    ///    `/proc/<pid>/cmdline` 3. Whether the log file has recent activity
-    ///    (mtime < 60s ago)
+    /// 1. Whether the process is still alive using `sysinfo` crate
+    ///    (cross-platform)
+    /// 2. Whether the PID is still our process (not reused) by checking the
+    ///    command line via `sysinfo`
+    /// 3. Whether the log file has recent activity (mtime < 60s ago)
     ///
     /// Returns:
     /// - `Dead` if process is not alive or PID was reused
     /// - `Stale` if process is alive but no recent activity
     /// - `Healthy` if process is alive and has recent activity
     pub fn check_health(&self) -> HealthStatus {
-        // Validate PID is within safe range to prevent kill(-1) which would kill all
-        // processes u32::MAX wraps to -1 when cast to i32, which would be
-        // catastrophic
-        let Ok(pid_i32) = i32::try_from(self.pid) else {
-            // PID out of valid range, treat as dead
-            return HealthStatus::Dead;
-        };
-        if pid_i32 <= 0 {
+        // Validate PID is within safe range
+        // sysinfo uses usize for PIDs, but we store as u32
+        if self.pid == 0 {
             // PID must be positive
-            return HealthStatus::Dead;
-        }
-        let pid = Pid::from_raw(pid_i32);
-
-        // Check if process is alive using kill with signal 0
-        let process_alive = kill(pid, None).is_ok();
-
-        if !process_alive {
             return HealthStatus::Dead;
         }
 
         // Check for PID reuse by verifying cmdline contains expected process
+        // This also serves as the process-alive check since it returns false
+        // if the process doesn't exist
         if !self.is_our_process() {
             return HealthStatus::Dead;
         }
@@ -156,42 +157,56 @@ impl ReviewerEntry {
     /// Check if the PID is still our process (not reused by an unrelated
     /// process).
     ///
-    /// Uses `/proc/<pid>/cmdline` to verify the process is a reviewer agent.
+    /// Uses `sysinfo` crate for cross-platform process introspection.
     /// We check for:
-    /// - "gemini" binary in argv\[0\] or the command line (the AI tool)
+    /// - "gemini" binary in the process name or command line (the AI tool)
     /// - "script" binary (the PTY wrapper we use)
     ///
     /// We specifically avoid matching editor processes like "vim script.rs"
     /// by checking if the cmdline starts with a known wrapper pattern.
     fn is_our_process(&self) -> bool {
-        let cmdline_path = format!("/proc/{}/cmdline", self.pid);
-        let Ok(mut file) = File::open(&cmdline_path) else {
+        let pid = SysPid::from_u32(self.pid);
+        let mut system = System::new();
+
+        // Refresh only the specific process with command line info
+        let refresh_kind = ProcessRefreshKind::new().with_cmd(UpdateKind::Always);
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), refresh_kind);
+
+        let Some(process) = system.process(pid) else {
+            // Process doesn't exist
             return false;
         };
 
-        // Read as bytes since cmdline may not be valid UTF-8
-        let mut cmdline_bytes = Vec::new();
-        if file.read_to_end(&mut cmdline_bytes).is_err() {
-            return false;
+        // Get command line arguments
+        let cmd = process.cmd();
+        if cmd.is_empty() {
+            // No command line info available, check process name as fallback
+            let name = process.name().to_string_lossy().to_lowercase();
+            return name.contains("gemini") || name == "script";
         }
 
-        // cmdline uses null bytes as separators
-        // Convert to lossy UTF-8 for matching
-        let cmdline = String::from_utf8_lossy(&cmdline_bytes);
-        let cmdline_lower = cmdline.to_lowercase();
+        // Join command line arguments for pattern matching
+        let cmdline: String = cmd
+            .iter()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
 
-        // Split into arguments to check argv[0] more precisely
-        let args: Vec<&str> = cmdline_lower.split('\0').collect();
-        let argv0 = args.first().unwrap_or(&"");
+        // Get argv[0] for precise matching
+        let argv0 = cmd
+            .first()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
 
-        // Check for our known patterns in argv[0]:
+        // Check for our known patterns:
         // - Contains "gemini" (the AI tool binary or script)
         // - Equals "script" or ends with "/script" (the PTY wrapper)
-        // - Contains "bash" and subsequent args contain "gemini" (shell wrapper)
+        // - Contains "bash" or "sh" and subsequent args contain "gemini" (shell
+        //   wrapper)
         let is_gemini_binary = argv0.contains("gemini");
-        let is_script_binary = *argv0 == "script" || argv0.ends_with("/script");
-        let is_shell_wrapper = (argv0.contains("bash") || argv0.contains("sh"))
-            && args.iter().any(|arg| arg.contains("gemini"));
+        let is_script_binary = argv0 == "script" || argv0.ends_with("/script");
+        let is_shell_wrapper =
+            (argv0.contains("bash") || argv0.contains("sh")) && cmdline.contains("gemini");
 
         is_gemini_binary || is_script_binary || is_shell_wrapper
     }
@@ -256,9 +271,9 @@ impl ReviewerStateFile {
 
     /// Save the state file to disk using atomic write (temp file + rename).
     ///
-    /// Creates the parent directory (~/.apm2) with 0700 permissions if needed.
-    /// Uses `tempfile::NamedTempFile` for secure temporary file creation with
-    /// automatic cleanup on panic.
+    /// Creates the parent directory (~/.apm2) with 0700 permissions if needed
+    /// (Unix only). Uses `tempfile::NamedTempFile` for secure temporary file
+    /// creation with automatic cleanup on panic.
     ///
     /// # Errors
     ///
@@ -269,11 +284,12 @@ impl ReviewerStateFile {
     pub fn save(&self) -> Result<()> {
         let path = Self::path().context("Could not determine home directory")?;
 
-        // Create parent directory with 0700 permissions
+        // Create parent directory with 0700 permissions (Unix only)
         let parent = path.parent().context("State file path has no parent")?;
         if !parent.exists() {
             fs::create_dir_all(parent).context("Failed to create ~/.apm2 directory")?;
-            // Set directory permissions to 0700
+            // Set directory permissions to 0700 (Unix only)
+            #[cfg(unix)]
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
                 .context("Failed to set ~/.apm2 directory permissions")?;
         }
@@ -327,6 +343,12 @@ impl ReviewerStateFile {
 /// # Returns
 ///
 /// Returns `true` if the process was successfully killed, `false` otherwise.
+///
+/// # Platform Support
+///
+/// This function is only available on Unix platforms. On non-Unix platforms,
+/// it always returns `false`.
+#[cfg(unix)]
 #[allow(clippy::cast_possible_truncation)]
 pub fn kill_process(pid: u32) -> bool {
     // Validate PID is within safe range to prevent kill(-1) which would kill all
@@ -369,6 +391,18 @@ pub fn kill_process(pid: u32) -> bool {
     kill(nix_pid, None).is_err()
 }
 
+/// Kill a process (non-Unix stub).
+///
+/// # Platform Support
+///
+/// Process termination is not supported on non-Unix platforms.
+/// This function always returns `false`.
+#[cfg(not(unix))]
+pub fn kill_process(_pid: u32) -> bool {
+    // Process termination not supported on this platform
+    false
+}
+
 /// Acquire an exclusive file lock for remediation.
 ///
 /// Uses flock to prevent concurrent remediation attempts.
@@ -385,6 +419,13 @@ pub fn kill_process(pid: u32) -> bool {
 /// - The file descriptor is obtained from a valid `File` object
 /// - The flock flags (`LOCK_EX | LOCK_NB`) are valid constants
 /// - The result is checked before returning
+///
+/// # Platform Support
+///
+/// This function uses Unix-specific file locking (flock). On non-Unix
+/// platforms, this function still creates the lock file but does not acquire an
+/// exclusive lock (no-op for concurrency control).
+#[cfg(unix)]
 #[allow(unsafe_code)]
 pub fn acquire_remediation_lock() -> Result<File> {
     use std::os::unix::io::AsRawFd;
@@ -414,6 +455,33 @@ pub fn acquire_remediation_lock() -> Result<File> {
         anyhow::bail!("Another remediation is in progress");
     }
 
+    Ok(file)
+}
+
+/// Acquire an exclusive file lock for remediation (non-Unix stub).
+///
+/// # Platform Support
+///
+/// On non-Unix platforms, this function creates the lock file but does not
+/// acquire an exclusive lock. Concurrent remediation may occur.
+#[cfg(not(unix))]
+pub fn acquire_remediation_lock() -> Result<File> {
+    let path = ReviewerStateFile::path()
+        .context("Could not determine home directory")?
+        .with_extension("lock");
+
+    // Create parent directory if needed
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).context("Failed to create ~/.apm2 directory")?;
+            // Note: Setting 0700 permissions is Unix-specific and skipped here
+        }
+    }
+
+    let file = File::create(&path).context("Failed to create lock file")?;
+
+    // Note: File locking is not implemented for non-Unix platforms
+    // Concurrent remediation may occur
     Ok(file)
 }
 
@@ -596,6 +664,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_kill_process_max_pid_returns_false() {
         // u32::MAX would become -1 when cast to i32, which would kill all processes
         // This test verifies we handle this safely
@@ -605,9 +674,131 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_kill_process_zero_pid_returns_false() {
         // PID 0 is special (process group) and should not be signaled
         let result = kill_process(0);
         assert!(!result);
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn test_kill_process_returns_false_on_non_unix() {
+        // On non-Unix platforms, kill_process always returns false
+        assert!(!kill_process(12345));
+        assert!(!kill_process(0));
+        assert!(!kill_process(u32::MAX));
+    }
+
+    /// Test that process checking works for the current process.
+    ///
+    /// This test verifies that the cross-platform sysinfo API can correctly
+    /// detect and inspect the current process. Note that the current test
+    /// process is not a "gemini" or "script" process, so `is_our_process()`
+    /// should return false for it. This test verifies the sysinfo API works.
+    #[test]
+    fn test_process_check_current_process_exists() {
+        // Get the current process's PID
+        let current_pid = std::process::id();
+
+        // Verify we can inspect the current process using sysinfo
+        let pid = SysPid::from_u32(current_pid);
+        let mut system = System::new();
+        let refresh_kind = ProcessRefreshKind::new().with_cmd(UpdateKind::Always);
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), refresh_kind);
+
+        // The current process should exist
+        let process = system.process(pid);
+        assert!(
+            process.is_some(),
+            "Current process (PID {current_pid}) should exist"
+        );
+
+        // We should be able to get the process name
+        let process = process.unwrap();
+        let name = process.name();
+        assert!(
+            !name.is_empty(),
+            "Process name should not be empty for current process"
+        );
+    }
+
+    /// Test that a non-existent PID returns None from sysinfo.
+    #[test]
+    fn test_process_check_nonexistent_pid() {
+        // Use a very high PID that is unlikely to exist
+        let pid = SysPid::from_u32(999_999_999);
+        let mut system = System::new();
+        let refresh_kind = ProcessRefreshKind::new().with_cmd(UpdateKind::Always);
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), refresh_kind);
+
+        // Should return None for non-existent process
+        let process = system.process(pid);
+        assert!(process.is_none(), "Non-existent PID should return None");
+    }
+
+    /// Test the `is_our_process` detection for a non-reviewer process.
+    ///
+    /// The current test process is not a "gemini" or "script" process,
+    /// so `is_our_process` should return false.
+    #[test]
+    fn test_is_our_process_returns_false_for_non_reviewer() {
+        let current_pid = std::process::id();
+
+        let entry = ReviewerEntry {
+            pid: current_pid,
+            started_at: Utc::now(),
+            log_file: PathBuf::from("/tmp/test.log"),
+            pr_url: "https://github.com/owner/repo/pull/123".to_string(),
+            head_sha: "abc123".to_string(),
+            restart_count: 0,
+        };
+
+        // The current process is a test process, not gemini/script
+        // So is_our_process should return false
+        assert!(
+            !entry.is_our_process(),
+            "Test process should not be detected as a reviewer process"
+        );
+    }
+
+    /// Test that `check_health` returns Dead for a process that exists but is
+    /// not ours.
+    #[test]
+    fn test_check_health_returns_dead_for_non_reviewer_process() {
+        let current_pid = std::process::id();
+
+        let entry = ReviewerEntry {
+            pid: current_pid,
+            started_at: Utc::now(),
+            log_file: PathBuf::from("/tmp/nonexistent.log"),
+            pr_url: "https://github.com/owner/repo/pull/123".to_string(),
+            head_sha: "abc123".to_string(),
+            restart_count: 0,
+        };
+
+        // Even though the process exists, it's not a reviewer process
+        // So check_health should return Dead (PID reuse detection)
+        assert_eq!(
+            entry.check_health(),
+            HealthStatus::Dead,
+            "Process that exists but is not a reviewer should be treated as Dead"
+        );
+    }
+
+    /// Test that `check_health` returns Dead for PID 0.
+    #[test]
+    fn test_check_health_zero_pid_returns_dead() {
+        let entry = ReviewerEntry {
+            pid: 0,
+            started_at: Utc::now(),
+            log_file: PathBuf::from("/tmp/test.log"),
+            pr_url: "https://github.com/owner/repo/pull/123".to_string(),
+            head_sha: "abc123".to_string(),
+            restart_count: 0,
+        };
+
+        // PID 0 is invalid and should return Dead
+        assert_eq!(entry.check_health(), HealthStatus::Dead);
     }
 }
