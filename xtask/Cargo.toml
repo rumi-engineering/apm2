@@ -24,6 +24,7 @@ directories = { workspace = true }
 pulldown-cmark = { workspace = true }
 sysinfo = { workspace = true }
 shell-escape = { workspace = true }
+shell-words = { workspace = true }
 
 [lints]
 workspace = true

@@ -13,8 +13,9 @@ use chrono::Utc;
 use crate::aat::types::{
     AntiGamingResult, AntiGamingSection, AntiGamingVerdict, EvidenceBundle, GamingViolation,
     Hypothesis, HypothesisResult, InputVariation, ParsedPRDescription, PrDescriptionParse,
-    StaticAnalysis, TodoCheck, Verdict,
+    SingleVariation, StaticAnalysis, TodoCheck, Verdict,
 };
+use crate::aat::variation::InputVariationResult;
 
 /// Builder for constructing evidence bundles.
 ///
@@ -148,6 +149,65 @@ impl EvidenceBundleBuilder {
         self
     }
 
+    /// Set input variation testing results.
+    ///
+    /// This converts the `InputVariationResult` from the variation module
+    /// into the `InputVariation` format for the evidence bundle.
+    ///
+    /// If invariance is detected, the anti-gaming result is set to Failed.
+    #[must_use]
+    pub fn set_input_variation_results(mut self, results: &[InputVariationResult]) -> Self {
+        // Aggregate all variation results
+        let mut total_variations = 0u32;
+        let mut any_invariance = false;
+        let mut all_variations = Vec::new();
+
+        for result in results {
+            total_variations += result.variations_tested;
+            if result.invariance_detected {
+                any_invariance = true;
+            }
+
+            // Convert variation results to SingleVariation format
+            for var in &result.variations {
+                all_variations.push(SingleVariation {
+                    input: var.input.clone(),
+                    output: var.output.clone(),
+                    exit_code: var.exit_code,
+                });
+            }
+        }
+
+        self.anti_gaming.input_variation = InputVariation {
+            variations_tested: total_variations,
+            invariance_detected: any_invariance,
+            variation_results: all_variations,
+        };
+
+        // If invariance detected, mark anti-gaming as failed
+        if any_invariance {
+            self.anti_gaming.anti_gaming_result = AntiGamingVerdict::Failed;
+        }
+
+        self
+    }
+
+    /// Set input variation data directly.
+    ///
+    /// Use this when you have already constructed the `InputVariation`.
+    #[must_use]
+    pub fn set_input_variation(mut self, input_variation: InputVariation) -> Self {
+        let invariance_detected = input_variation.invariance_detected;
+        self.anti_gaming.input_variation = input_variation;
+
+        // If invariance detected, mark anti-gaming as failed
+        if invariance_detected {
+            self.anti_gaming.anti_gaming_result = AntiGamingVerdict::Failed;
+        }
+
+        self
+    }
+
     /// Compute the final verdict based on hypotheses and anti-gaming results.
     ///
     /// # Verdict logic:
@@ -224,6 +284,9 @@ impl EvidenceBundleBuilder {
             }
             if !self.anti_gaming.todo_check.undocumented_todos.is_empty() {
                 reasons.push("undocumented TODOs");
+            }
+            if self.anti_gaming.input_variation.invariance_detected {
+                reasons.push("input variation invariance detected");
             }
             (
                 Verdict::Failed,
@@ -662,6 +725,7 @@ mod tests {
                 input_variation: InputVariation {
                     variations_tested: 3,
                     invariance_detected: false,
+                    variation_results: vec![],
                 },
                 todo_check: TodoCheck {
                     todos_found: vec!["TODO: implement caching".to_string()],
@@ -748,5 +812,70 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_set_input_variation() {
+        let input_variation = InputVariation {
+            variations_tested: 3,
+            invariance_detected: false,
+            variation_results: vec![
+                SingleVariation {
+                    input: "cmd1".to_string(),
+                    output: "output1".to_string(),
+                    exit_code: Some(0),
+                },
+                SingleVariation {
+                    input: "cmd2".to_string(),
+                    output: "output2".to_string(),
+                    exit_code: Some(0),
+                },
+            ],
+        };
+
+        let builder = EvidenceBundleBuilder::new(123, "abc123")
+            .add_hypothesis(make_passed_hypothesis("H-001"))
+            .set_input_variation(input_variation);
+
+        assert_eq!(builder.anti_gaming.input_variation.variations_tested, 3);
+        assert!(!builder.anti_gaming.input_variation.invariance_detected);
+        assert_eq!(
+            builder.anti_gaming.input_variation.variation_results.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_set_input_variation_with_invariance() {
+        let input_variation = InputVariation {
+            variations_tested: 3,
+            invariance_detected: true,
+            variation_results: vec![],
+        };
+
+        let builder = EvidenceBundleBuilder::new(123, "abc123")
+            .add_hypothesis(make_passed_hypothesis("H-001"))
+            .set_input_variation(input_variation);
+
+        // Invariance should cause anti-gaming to fail
+        assert_eq!(
+            builder.anti_gaming.anti_gaming_result,
+            AntiGamingVerdict::Failed
+        );
+    }
+
+    #[test]
+    fn test_verdict_invariance_causes_failure() {
+        let bundle = EvidenceBundleBuilder::new(123, "abc123")
+            .add_hypothesis(make_passed_hypothesis("H-001"))
+            .set_input_variation(InputVariation {
+                variations_tested: 3,
+                invariance_detected: true,
+                variation_results: vec![],
+            })
+            .build_with_timestamp("2026-01-24T10:15:00Z");
+
+        assert_eq!(bundle.verdict, Verdict::Failed);
+        assert!(bundle.verdict_reason.contains("invariance"));
     }
 }

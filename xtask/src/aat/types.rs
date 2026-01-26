@@ -292,6 +292,19 @@ pub struct StaticAnalysis {
     pub mock_patterns: Vec<String>,
 }
 
+/// A single input variation test result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SingleVariation {
+    /// The input command that was executed.
+    pub input: String,
+
+    /// The captured stdout output.
+    pub output: String,
+
+    /// The exit code of the command (None if terminated by signal).
+    pub exit_code: Option<i32>,
+}
+
 /// Input variation testing results.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InputVariation {
@@ -300,6 +313,10 @@ pub struct InputVariation {
 
     /// Whether invariance was detected (same output for different inputs).
     pub invariance_detected: bool,
+
+    /// Detailed results for each variation tested.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variation_results: Vec<SingleVariation>,
 }
 
 /// TODO cross-reference check results.

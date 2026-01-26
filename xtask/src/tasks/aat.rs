@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use regex::Regex;
 use tempfile::NamedTempFile;
 use wait_timeout::ChildExt;
 use xshell::{Shell, cmd};
@@ -45,8 +46,9 @@ use crate::aat::evidence::EvidenceBundleBuilder;
 use crate::aat::executor::HypothesisExecutor;
 use crate::aat::parser::parse_pr_description;
 use crate::aat::tool_config::{AatToolConfig, AiTool};
-use crate::aat::types::{Hypothesis, HypothesisResult, Verdict};
+use crate::aat::types::{Hypothesis, HypothesisResult, ParsedPRDescription, Verdict};
 use crate::aat::validation::validate_pr_description;
+use crate::aat::variation::InputVariationGenerator;
 use crate::shell_escape::build_script_command;
 
 // =============================================================================
@@ -619,6 +621,133 @@ fn truncate_for_error(s: &str) -> String {
 }
 
 // =============================================================================
+// Input Variation Testing
+// =============================================================================
+
+/// Maximum number of commands to extract from a PR description.
+///
+/// This limit prevents denial-of-service attacks where a malicious PR
+/// description contains hundreds of commands, each requiring execution
+/// with 3 variations. 10 commands * 3 variations = 30 executions max.
+const MAX_COMMANDS_PER_PR: usize = 10;
+
+/// Extract CLI commands from the PR description usage section.
+///
+/// Parses the usage section to find shell commands in code blocks.
+/// Returns a list of commands suitable for input variation testing.
+///
+/// # Extraction Strategy
+///
+/// 1. Extract content from fenced code blocks (bash, shell, or plain)
+/// 2. Filter to lines that look like CLI commands (start with common prefixes)
+/// 3. Skip comment lines and empty lines
+/// 4. Limit to `MAX_COMMANDS_PER_PR` to prevent abuse
+///
+/// # Arguments
+///
+/// * `parsed_pr` - The parsed PR description
+///
+/// # Returns
+///
+/// A vector of command strings extracted from the usage section,
+/// limited to `MAX_COMMANDS_PER_PR` entries.
+fn extract_commands_from_usage(parsed_pr: &ParsedPRDescription) -> Vec<String> {
+    let usage = &parsed_pr.usage;
+    let mut commands = Vec::new();
+
+    // Pattern to match fenced code blocks
+    let code_block_re = Regex::new(r"(?s)```(?:bash|shell|sh)?\s*\n(.*?)```").expect("valid regex");
+
+    // Extract commands from code blocks
+    'outer: for cap in code_block_re.captures_iter(usage) {
+        if let Some(block_content) = cap.get(1) {
+            for line in block_content.as_str().lines() {
+                // SECURITY: Enforce limit to prevent DoS via bloated usage sections
+                if commands.len() >= MAX_COMMANDS_PER_PR {
+                    break 'outer;
+                }
+
+                let line = line.trim();
+
+                // Skip empty lines and comments
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                // Only include lines that look like CLI commands
+                // (start with common command prefixes)
+                if is_cli_command(line) {
+                    commands.push(line.to_string());
+                }
+            }
+        }
+    }
+
+    // If no commands found in code blocks, try to find inline commands
+    // (lines starting with $ or common command names)
+    if commands.is_empty() {
+        for line in usage.lines() {
+            // SECURITY: Enforce limit to prevent DoS via bloated usage sections
+            if commands.len() >= MAX_COMMANDS_PER_PR {
+                break;
+            }
+
+            let line = line.trim();
+
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // Check for shell prompt prefix
+            if let Some(cmd) = line.strip_prefix("$ ") {
+                if is_cli_command(cmd) {
+                    commands.push(cmd.to_string());
+                }
+            } else if is_cli_command(line) {
+                commands.push(line.to_string());
+            }
+        }
+    }
+
+    commands
+}
+
+/// Check if a line looks like a CLI command.
+///
+/// Returns true if the line starts with a common command prefix.
+///
+/// # Security
+///
+/// This allowlist is security-sensitive. The following are intentionally
+/// EXCLUDED:
+/// - `gh ` - Could expose reviewer tokens via `gh auth token`
+/// - `git ` - Could access credentials via `git config` or credential helpers
+/// - `./` - Could execute arbitrary scripts from untrusted PR branches
+///
+/// Commands on this list will be executed in an isolated environment with
+/// credential isolation (isolated HOME), but reducing the attack surface
+/// is still important.
+fn is_cli_command(line: &str) -> bool {
+    // Security: DO NOT add `gh `, `git `, or `./` to this list.
+    // See security review findings for rationale:
+    // - gh: Could expose tokens via `gh auth token`
+    // - git: Could access credentials via git-credential helpers
+    // - ./: Could execute arbitrary scripts from untrusted PR branches
+    let command_prefixes = [
+        "cargo ", "cargo-", "rustc ", "rustup ", "npm ", "npx ", "yarn ", "pnpm ", "python ",
+        "python3 ", "pip ", "pip3 ", "make ", "cmake ", "docker ", "kubectl ",
+    ];
+
+    // Strip leading $ if present
+    let cmd = line.strip_prefix("$ ").unwrap_or(line);
+
+    command_prefixes
+        .iter()
+        .any(|prefix| cmd.starts_with(prefix))
+}
+
+// =============================================================================
 // Main AAT Command
 // =============================================================================
 
@@ -763,22 +892,61 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
         });
     }
 
-    // Step 5: Run anti-gaming analysis
+    // Step 5: Run anti-gaming analysis (static analysis + input variation)
     println!("\n[5/8] Running anti-gaming analysis...");
     let anti_gaming_result = analyze_diff(&diff, &parsed_pr.known_limitations);
-    println!("  Violations: {}", anti_gaming_result.violations.len());
     println!(
-        "  Result: {}",
-        if anti_gaming_result.passed {
-            "PASSED"
-        } else {
-            "FAILED"
-        }
+        "  Static Analysis Violations: {}",
+        anti_gaming_result.violations.len()
     );
 
     for violation in &anti_gaming_result.violations {
         println!("    - {violation:?}");
     }
+
+    // Run input variation testing on commands from usage section
+    println!("  Running input variation testing...");
+    let commands = extract_commands_from_usage(&parsed_pr);
+    let input_variation_results = if commands.is_empty() {
+        println!("    No CLI commands found in Usage section, skipping variation testing");
+        Vec::new()
+    } else {
+        println!("    Found {} commands to test", commands.len());
+        let results = InputVariationGenerator::test_commands(commands.iter().map(String::as_str));
+        let invariant_count = results.iter().filter(|r| r.invariance_detected).count();
+        println!(
+            "    Tested {} commands, {} with invariance detected",
+            results.len(),
+            invariant_count
+        );
+        for result in &results {
+            let status = if result.invariance_detected {
+                "INVARIANT (violation)"
+            } else {
+                "OK"
+            };
+            println!(
+                "      - {}: {} variations, {}",
+                result.base_command, result.variations_tested, status
+            );
+        }
+        results
+    };
+
+    // Determine overall anti-gaming result
+    let input_variation_failed = input_variation_results
+        .iter()
+        .any(|r| r.invariance_detected);
+    let overall_anti_gaming_passed = anti_gaming_result.passed && !input_variation_failed;
+
+    println!(
+        "  Overall Anti-Gaming Result: {}",
+        if overall_anti_gaming_passed {
+            "PASSED"
+        } else {
+            "FAILED"
+        }
+    );
 
     // Step 6: Generate hypotheses
     println!("\n[6/8] Generating hypotheses via AI...");
@@ -863,6 +1031,7 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
         .set_pr_description_parse(&parsed_pr)
         .add_hypotheses(hypotheses)
         .set_anti_gaming_result(&anti_gaming_result)
+        .set_input_variation_results(&input_variation_results)
         .build();
 
     let verdict = bundle.verdict;
@@ -1297,5 +1466,191 @@ These hypotheses cover the main scenarios."#;
             result.unwrap_err().to_string().contains("unknown field"),
             "Error should mention unknown field"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Input variation helper tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_is_cli_command_cargo() {
+        assert!(is_cli_command("cargo test"));
+        assert!(is_cli_command("cargo build --release"));
+        assert!(is_cli_command("cargo xtask aat <PR_URL>"));
+    }
+
+    #[test]
+    fn test_is_cli_command_git_excluded() {
+        // SECURITY: git is excluded from allowlist to prevent credential access
+        // via git-credential helpers and git config
+        assert!(!is_cli_command("git status"));
+        assert!(!is_cli_command("git commit -m 'message'"));
+    }
+
+    #[test]
+    fn test_is_cli_command_shell_prompt() {
+        assert!(is_cli_command("$ cargo test"));
+        // SECURITY: git is excluded even with shell prompt prefix
+        assert!(!is_cli_command("$ git status"));
+    }
+
+    #[test]
+    fn test_is_cli_command_relative_path_excluded() {
+        // SECURITY: ./ paths are excluded to prevent RCE via local scripts
+        // from untrusted PR branches
+        assert!(!is_cli_command("./run_tests.sh"));
+        assert!(!is_cli_command("./scripts/verify.sh"));
+    }
+
+    #[test]
+    fn test_is_cli_command_gh_excluded() {
+        // SECURITY: gh is excluded to prevent token exfiltration via `gh auth token`
+        assert!(!is_cli_command("gh auth token"));
+        assert!(!is_cli_command("gh pr view 123"));
+    }
+
+    #[test]
+    fn test_is_cli_command_not_command() {
+        assert!(!is_cli_command("This is just text"));
+        assert!(!is_cli_command("Output: success"));
+        assert!(!is_cli_command("# Comment"));
+    }
+
+    #[test]
+    fn test_extract_commands_from_usage_code_block() {
+        use crate::aat::types::ParsedPRDescription;
+
+        let parsed = ParsedPRDescription {
+            usage: r"
+Run the command:
+
+```bash
+cargo xtask aat https://github.com/owner/repo/pull/123
+cargo test --lib
+```
+
+Then verify the output.
+"
+            .to_string(),
+            expected_outcomes: vec![],
+            evidence_script: None,
+            known_limitations: vec![],
+        };
+
+        let commands = extract_commands_from_usage(&parsed);
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].contains("cargo xtask aat"));
+        assert!(commands[1].contains("cargo test"));
+    }
+
+    #[test]
+    fn test_extract_commands_from_usage_skips_comments() {
+        use crate::aat::types::ParsedPRDescription;
+
+        let parsed = ParsedPRDescription {
+            usage: r"
+```bash
+# This is a comment
+cargo build
+# Another comment
+```
+"
+            .to_string(),
+            expected_outcomes: vec![],
+            evidence_script: None,
+            known_limitations: vec![],
+        };
+
+        let commands = extract_commands_from_usage(&parsed);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0], "cargo build");
+    }
+
+    #[test]
+    fn test_extract_commands_from_usage_empty() {
+        use crate::aat::types::ParsedPRDescription;
+
+        let parsed = ParsedPRDescription {
+            usage: "No code blocks here, just prose explaining the feature.".to_string(),
+            expected_outcomes: vec![],
+            evidence_script: None,
+            known_limitations: vec![],
+        };
+
+        let commands = extract_commands_from_usage(&parsed);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_extract_commands_from_usage_inline_commands() {
+        use crate::aat::types::ParsedPRDescription;
+
+        let parsed = ParsedPRDescription {
+            usage: r"
+To run, use:
+$ cargo build
+$ cargo test
+"
+            .to_string(),
+            expected_outcomes: vec![],
+            evidence_script: None,
+            known_limitations: vec![],
+        };
+
+        let commands = extract_commands_from_usage(&parsed);
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].contains("cargo build"));
+        assert!(commands[1].contains("cargo test"));
+    }
+
+    #[test]
+    fn test_extract_commands_enforces_limit() {
+        use crate::aat::types::ParsedPRDescription;
+
+        // Create a usage section with more commands than MAX_COMMANDS_PER_PR
+        // to test DoS protection
+        let many_commands: String = (0..20)
+            .map(|i| format!("cargo test --test test_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsed = ParsedPRDescription {
+            usage: format!(
+                r"
+Run the tests:
+
+```bash
+{many_commands}
+```
+"
+            ),
+            expected_outcomes: vec![],
+            evidence_script: None,
+            known_limitations: vec![],
+        };
+
+        let commands = extract_commands_from_usage(&parsed);
+
+        // Should be limited to MAX_COMMANDS_PER_PR
+        assert_eq!(
+            commands.len(),
+            MAX_COMMANDS_PER_PR,
+            "Should enforce limit of {} commands, got {}",
+            MAX_COMMANDS_PER_PR,
+            commands.len()
+        );
+    }
+
+    /// Compile-time assertion that `MAX_COMMANDS_PER_PR` is reasonable.
+    const _: () = {
+        assert!(MAX_COMMANDS_PER_PR >= 5); // Allow reasonable use cases
+        assert!(MAX_COMMANDS_PER_PR <= 20); // Prevent excessive execution
+    };
+
+    #[test]
+    fn test_max_commands_constant_value() {
+        // Document and verify the constant value at runtime:
+        // 10 commands * 3 variations * 30s timeout = 15 minutes max execution
+        assert_eq!(MAX_COMMANDS_PER_PR, 10);
     }
 }

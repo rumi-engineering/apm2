@@ -11,3 +11,4 @@ pub mod parser;
 pub mod tool_config;
 pub mod types;
 pub mod validation;
+pub mod variation;
