@@ -61,6 +61,7 @@ struct TicketInfo {
     title: String,
     rfc_id: String,
     dependencies: Vec<String>,
+    status: Option<String>,
 }
 
 /// Start work on the next unblocked ticket.
@@ -96,7 +97,7 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
     let tickets = scan_tickets(&tickets_dir)?;
 
     // Get ticket status from git state
-    let completed = match get_completed_tickets(&sh) {
+    let github_completed = match get_completed_tickets(&sh) {
         CompletedTicketsResult::Success(tickets) => tickets,
         CompletedTicketsResult::NetworkError(msg) => {
             eprintln!("Warning: {msg}");
@@ -105,6 +106,14 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
             std::collections::HashSet::new()
         },
     };
+
+    // Merge GitHub completions with local status overrides
+    let local_completed = get_locally_completed_tickets(&tickets);
+    let completed: std::collections::HashSet<String> = github_completed
+        .union(&local_completed)
+        .cloned()
+        .collect();
+
     let in_progress =
         get_in_progress_tickets(&sh, &completed).context("Failed to get in-progress tickets")?;
 
@@ -319,6 +328,20 @@ fn scan_tickets(tickets_dir: &PathBuf) -> Result<Vec<TicketInfo>> {
     Ok(tickets)
 }
 
+/// Get tickets marked as completed locally via status field.
+///
+/// This allows overriding GitHub PR detection for tickets whose PRs
+/// used incorrect branch naming (e.g., TCK-00035 merged via TCK-00034 branch).
+fn get_locally_completed_tickets(
+    tickets: &[TicketInfo],
+) -> std::collections::HashSet<String> {
+    tickets
+        .iter()
+        .filter(|t| t.status.as_deref() == Some("completed"))
+        .map(|t| t.id.clone())
+        .collect()
+}
+
 /// Parse minimal ticket info from a YAML file.
 ///
 /// Uses simple string parsing to avoid adding a YAML parser dependency.
@@ -338,6 +361,7 @@ fn parse_ticket_yaml(path: &PathBuf) -> Result<Option<TicketInfo>> {
     // Extract other fields
     let title = extract_yaml_value(&content, "title:").unwrap_or_default();
     let rfc_id = extract_yaml_value(&content, "rfc_id:").unwrap_or_default();
+    let status = extract_yaml_value(&content, "status:");
 
     // Extract dependencies
     let dependencies = extract_dependencies(&content);
@@ -347,6 +371,7 @@ fn parse_ticket_yaml(path: &PathBuf) -> Result<Option<TicketInfo>> {
         title,
         rfc_id,
         dependencies,
+        status,
     }))
 }
 
