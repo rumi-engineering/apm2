@@ -100,8 +100,10 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "apm2-core",
+ "chrono",
  "clap",
  "directories",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

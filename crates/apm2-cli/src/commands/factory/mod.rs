@@ -10,8 +10,11 @@
 //! - `impact-map` - Impact Map generation (PRD to CCP mapping)
 //! - `rfc` - RFC framing from Impact Map and CCP
 //! - `tickets` - Ticket emission from RFC decomposition
+//! - `compile` - End-to-end compile pipeline (CCP -> Impact Map -> RFC ->
+//!   Tickets)
 
 pub mod ccp;
+pub mod compile;
 pub mod impact_map;
 pub mod rfc;
 mod run;
