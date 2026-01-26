@@ -83,27 +83,27 @@ impl ShellTool {
             debug!("Network access not requested (enforcement delegated to environment)");
         }
 
-                let timeout_duration = if req.timeout_ms > 0 {
-                    Duration::from_millis(req.timeout_ms)
-                } else {
-                    Duration::from_secs(60) // Default 60s
-                };
-        
-                #[cfg(target_os = "windows")]
-                let mut cmd = Command::new("cmd");
-                #[cfg(target_os = "windows")]
-                cmd.arg("/C").arg(&req.command);
-        
-                #[cfg(not(target_os = "windows"))]
-                let mut cmd = Command::new("sh");
-                #[cfg(not(target_os = "windows"))]
-                cmd.arg("-c").arg(&req.command);
-        
-                cmd.current_dir(cwd)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                // Set environment variables
+        let timeout_duration = if req.timeout_ms > 0 {
+            Duration::from_millis(req.timeout_ms)
+        } else {
+            Duration::from_secs(60) // Default 60s
+        };
+
+        #[cfg(target_os = "windows")]
+        let mut cmd = Command::new("cmd");
+        #[cfg(target_os = "windows")]
+        cmd.arg("/C").arg(&req.command);
+
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = Command::new("sh");
+        #[cfg(not(target_os = "windows"))]
+        cmd.arg("-c").arg(&req.command);
+
+        cmd.current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Set environment variables
         // Clear existing env to ensure hermetic execution?
         // Or inherit? Usually we want a controlled environment.
         // We'll clear and set only provided + minimal PATH/TERM.
