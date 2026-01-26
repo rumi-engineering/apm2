@@ -16,6 +16,7 @@
 pub mod ccp;
 pub mod compile;
 pub mod impact_map;
+pub mod refactor;
 pub mod rfc;
 mod run;
 pub mod tickets;
