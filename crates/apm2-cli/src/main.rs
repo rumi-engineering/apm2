@@ -181,6 +181,9 @@ enum FactoryCommands {
 
     /// Ticket commands (emit tickets from RFC decomposition)
     Tickets(commands::factory::tickets::TicketsCommand),
+
+    /// Compile pipeline (end-to-end PRD to tickets)
+    Compile(commands::factory::compile::CompileArgs),
 }
 
 fn main() -> Result<()> {
@@ -255,6 +258,9 @@ fn main() -> Result<()> {
             FactoryCommands::Rfc(rfc_cmd) => commands::factory::rfc::run_rfc(&rfc_cmd),
             FactoryCommands::Tickets(tickets_cmd) => {
                 commands::factory::tickets::run_tickets(&tickets_cmd)
+            },
+            FactoryCommands::Compile(compile_args) => {
+                commands::factory::compile::run_compile(&compile_args)
             },
         },
     }
