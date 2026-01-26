@@ -63,6 +63,7 @@ mod generated {
 }
 
 pub mod fs;
+pub mod inference;
 pub mod shell;
 mod validation;
 
