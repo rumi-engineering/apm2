@@ -82,6 +82,7 @@
 pub mod crash;
 pub mod entropy;
 pub mod error;
+pub mod exit_handler;
 pub mod quarantine;
 pub mod recovery;
 pub mod reducer;
@@ -100,6 +101,9 @@ pub use entropy::{
     EntropyBudgetConfig, EntropyEvent, EntropySource, EntropyTracker, EntropyTrackerSummary,
 };
 pub use error::{SessionError, StateName};
+pub use exit_handler::{
+    ExitHandlerContext, ExitHandlerError, ExitHandlerResult, handle_exit_signal, release_lease_stub,
+};
 pub use quarantine::{
     QuarantineConfig, QuarantineEvaluation, QuarantineInfo, QuarantineManager, QuarantineReason,
 };
