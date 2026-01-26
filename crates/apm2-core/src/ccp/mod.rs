@@ -11,6 +11,9 @@
 //!   IDs.
 //! - **Crate Graph**: Builds a deterministic dependency graph of workspace
 //!   crates using cargo metadata.
+//! - **CCP Index**: Combines component atlas and crate graph into a unified,
+//!   content-addressed artifact with BLAKE3 hashing for incremental rebuild
+//!   detection.
 //!
 //! # Example
 //!
@@ -38,6 +41,7 @@
 
 pub mod component_atlas;
 pub mod crate_graph;
+pub mod index;
 
 // Re-export primary API
 pub use component_atlas::{

@@ -15,18 +15,18 @@ The Foundation licenses and operates two primary product lines:
 
 ### 2.2 Teammate: The Holonic AI Companion (B2C/Prosumer)
 - **The AI 'Teammate':** A proactive companion for task management, scheduling, and personalized support.
-- **Differentiator:** Unlike reactive assistants, Teammate operates on the holonic substrate, providing verifiable task completion and data-driven emotional calibration.
-- **Monetization:** Subscription-based access to the user's private holon cluster.
+- **Differentiator:** Unlike reactive assistants, Teammate operates on the holonic substrate. Emotional calibration is not a fragile internal state but a **Durable Persona Projection** derived from the user's private Ledger history. This ensures that even if a holon crashes and restarts (per Axiom I), the "Teammate" persona is deterministically reconstructed from evidence, maintaining continuity without violating the Markov Blanket.
+- **Monetization:** Subscription-based access to the user's private holon cluster and encrypted persona-ledger.
 
 ## 3. Revenue Streams
+- **Internal Transfer Pricing:** Nodes within the Holonic Network operate on a **Market Holarchy** model, where sub-holons 'bid' for work and 'charge' supervisors for verified TaskCompletion events.
 - **Performance Royalties:** Percentage of cost-savings achieved by partner organizations using our algorithms.
 - **Capacity Licensing:** Charging per-agent-hour for use of the Holonic Factory.
-- **Innovation Bounties:** Fixed-price delivery of specific novel methods for enterprise clients.
 
 ## 4. Organizational Structure (Phase 3)
 - **The IP Ledger:** An immutable evidence bundle for every innovation, ensuring clear chain-of-custody from prompt to patent.
-- **The Council of Adjudication:** Human/Agent quorum responsible for high-stakes strategic decisions and IP assignment.
-- **The Holonic Network:** A distributed corporation where nodes operate as semi-autonomous profit centers.
+- **The Council of Adjudication:** Human/Agent quorum responsible for high-stakes strategic decisions. A primary Phase 3 goal is the **Industrialization of Adjudication**, where human decisions are encoded into 'Oracle Primitives' to resolve the 'Oracle Bottleneck' and move toward true zero-marginal-cost scaling.
+- **The Holonic Network:** A distributed corporation where nodes operate as semi-autonomous profit centers under internal economic leases.
 
 ## 5. Strategic Moats
 - **Compounding Quality Delta:** The system gets better at building software faster than human-only teams.

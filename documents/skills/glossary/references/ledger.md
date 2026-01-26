@@ -12,6 +12,9 @@ Events can only be added to the end of the ledger. Existing events cannot be mod
 ### Hash-Chained Integrity
 Integrity is maintained through cryptographic chaining. Each `EventRecord` (except the genesis event) contains a `prev_hash` field that stores the hash of the preceding event. This creates a chain where modifying any historical event would invalidate all subsequent signatures.
 
+### Inference Trace Integrity
+To resolve the paradox of deterministic reconstruction from probabilistic models, the ledger MAY store or reference an **Inference Trace**. This captures the exact model outputs, seeds, and metadata required to verify the *reasoning* that led to a commitment.
+
 ### Storage Architecture
 *   **SQLite WAL**: The ledger uses `SQLite` in Write-Ahead Log (WAL) mode. This allows for high-concurrency performance, enabling multiple `LedgerReader` instances (agents observing state) to operate concurrently with a single writer.
 *   **EventRecord**: The atomic unit of storage. It contains the event payload, timestamp, sequence number, and actor ID, along with cryptographic hashes and signatures.

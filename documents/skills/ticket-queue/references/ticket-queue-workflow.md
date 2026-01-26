@@ -9,7 +9,7 @@ decision_tree:
         - path: README.md
           purpose: "Root-level module index, repository-wide constraints, and canonical dev workflow."
         - path: documents/skills/dev-eng-ticket/SKILL.md
-          purpose: "Implementer workflow the subagent should follow."
+          purpose: "Instructions to be passed to the implementer subagent. The orchestrator MUST NOT execute this skill itself."
         - path: xtask/src/tasks/check.rs
           purpose: "Defines `cargo xtask check` behavior, including reviewer health auto-remediation."
         - path: xtask/src/reviewer_state.rs
