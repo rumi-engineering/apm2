@@ -17,6 +17,20 @@ The PRD review system improves over time through four feedback loops. Each loop 
 
 ---
 
+## Signal-to-Noise Ratio (SNR) Check
+
+After every review, compute the Signal-to-Noise Ratio to ensure review depth calibration:
+
+```
+SNR = (BLOCKER + MAJOR findings) / (total findings)
+```
+
+- If SNR < 0.5 (more than half are MINOR/INFO), the review depth was **miscalibrated**.
+- Emit `REVIEW_CALIBRATION_WARNING` and record for depth algorithm tuning.
+- This prevents "Alert Fatigue" — the Pragmatist's concern.
+
+---
+
 ## LOOP-TICKET: Ticket Completion Feedback
 
 **Signal Source:** Completed engineering tickets derived from PRD requirements

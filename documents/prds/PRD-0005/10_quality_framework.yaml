@@ -198,3 +198,157 @@ prd_quality_framework:
         requested: false
         rationale: ""
         required_signoffs: []
+
+    - dimension_id: ACCESSIBILITY
+      applicability: DOES_NOT_APPLY
+      disposition: NOT_APPLICABLE
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: true
+        rationale: "The Idea Compiler is a CLI-based build tool with no user-facing UI. Accessibility standards for visual/auditory interfaces do not apply."
+        required_signoffs:
+          - AUTH_PRODUCT
+
+    - dimension_id: COST_EFFICIENCY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0002
+          - REQ-0007
+        evidence_ids:
+          - EVID-0009
+      delegation:
+        guardrails:
+          - "CCP caching MUST minimize redundant computation and inference calls."
+          - "Model routing profiles SHOULD prefer local/cheap inference where quality is sufficient."
+        required_evidence_categories:
+          - BENCHMARK_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: DATA_PRIVACY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0009
+          - REQ-0012
+        evidence_ids:
+          - EVID-0008
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: INTEROPERABILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0007
+        evidence_ids:
+          - EVID-0001
+          - EVID-0007
+      delegation:
+        guardrails:
+          - "Compiler outputs MUST use standard formats (YAML, JSON, NDJSON) parseable by external tools."
+          - "Model routing MUST support multiple provider backends via explicit profile configuration."
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: OPERATIONAL_READINESS
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0012
+        evidence_ids:
+          - EVID-0001
+      delegation:
+        guardrails:
+          - "Compiler MUST emit stable exit codes and structured logs for CI/CD integration."
+          - "Dry-run mode MUST be available to validate inputs without side effects."
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: RECOVERY_ROLLBACK
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0008
+        evidence_ids:
+          - EVID-0006
+      delegation:
+        guardrails:
+          - "Compiler writes MUST be atomic (temp file + rename); partial writes are prohibited."
+          - "Evidence-first output strategy allows rollback by discarding unpromoted artifacts."
+        required_evidence_categories:
+          - TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: RELIABILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0008
+        evidence_ids:
+          - EVID-0001
+          - EVID-0006
+      delegation:
+        guardrails:
+          - "Compiler MUST be crash-only and resumable from persisted artifacts."
+          - "Golden run tests MUST validate end-to-end reliability on clean checkouts."
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: RESILIENCE
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0007
+        evidence_ids:
+          - EVID-0001
+          - EVID-0007
+      delegation:
+        guardrails:
+          - "Compiler MUST fail closed on provider unavailability unless explicit fallback is configured."
+          - "Retry policy with stricter prompting MUST be applied on structured output validation failures."
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []

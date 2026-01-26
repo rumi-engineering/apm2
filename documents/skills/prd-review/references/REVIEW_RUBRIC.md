@@ -16,6 +16,7 @@ Gates are executed in order. Deterministic gates run before LLM-assisted gates t
 | GATE-PRD-SCHEMA | TRUSTED | YAML parsing and schema conformance |
 | GATE-PRD-LINT | TRUSTED | Lint rule compliance |
 | GATE-PRD-TRACEABILITY | DETERMINISTIC | Requirement-evidence chain integrity |
+| GATE-PRD-CCP-MAPPING | DETERMINISTIC | Cousin Prevention Gate (CCP mapping) |
 | GATE-PRD-QUALITY-COVERAGE | DETERMINISTIC | Quality dimension coverage |
 | GATE-PRD-EVIDENCE-STANDARDS | DETERMINISTIC | Evidence artifact completeness |
 | GATE-PRD-CONTENT | LLM-ASSISTED | Semantic quality assessment |
@@ -192,6 +193,53 @@ BROKEN_REFS=$(comm -13 <(echo "$DEFINED_EVIDS") <(echo "$REFERENCED_EVIDS"))
 FAILED if:
 - Any evidence artifact is not referenced by any requirement (orphan evidence)
 - Any requirement references an evidence_id that does not exist (broken reference)
+
+---
+
+## GATE-PRD-CCP-MAPPING
+
+**Type:** DETERMINISTIC (algorithmic, no LLM)
+
+### Purpose
+
+Prevent cousin abstractions by enforcing CCP (Codebase Component Protocol) mapping before content review.
+
+### Evidence Contract
+
+| Field | Value |
+|-------|-------|
+| Inputs | PRD requirements (`requirements/REQ-*.yaml`), `documents/architecture/component_atlas.yaml` |
+| Outputs | CCP mapping report, cousin justifications |
+| Required | All requirements mapped to CCP OR justified with evidence |
+
+### Rubric
+
+| Check | Pass Criteria |
+|-------|---------------|
+| CCP mapping | Every requirement MUST map to an existing CCP component |
+| Cousin justification | Unmapped requirements MUST have a `cousin_justification.yaml` artifact |
+| Evidence provided | `cousin_justification.yaml` MUST reference an `evidence_artifact` (EVID-XXXX) |
+| Gap demonstrated | Evidence artifact MUST demonstrate the claimed capability gap |
+
+### Cousin Justification Schema
+
+```yaml
+requirement_id: REQ-XXXX
+existing_component: "path/to/component"
+capability_gap: "Specific capability that is missing"
+evidence_artifact: "EVID-XXXX"  # Test/proof showing the gap exists
+decision: "EXTEND" | "CREATE_NEW"
+decision_rationale: "Why extension is insufficient"
+```
+
+### Failure Mode
+
+If `evidence_artifact` is missing or does not demonstrate the claimed gap, emit:
+- `category: TRACEABILITY_DEFECT`
+- `subcategory: COUSIN_ABSTRACTION`
+- `severity: BLOCKER` (not MAJOR)
+
+**Holonic Alignment:** This gate enforces Principia Holonica Axiom IV (Economics of Attention) — "Waste is the ultimate sin."
 
 ---
 
