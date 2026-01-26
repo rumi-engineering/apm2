@@ -29,8 +29,9 @@
 //! # Feature Flag
 //!
 //! Event emission can be controlled via the `CI_EVENTS_ENABLED` environment
-//! variable. When disabled (default: enabled), webhook handlers skip event
-//! emission. The flag is cached on first access to avoid hot-path lookups.
+//! variable. When disabled (default: disabled for fail-closed security),
+//! webhook handlers skip event emission. The flag is cached on first access
+//! to avoid hot-path lookups.
 //!
 //! # Bounded Memory
 //!
@@ -367,6 +368,9 @@ impl InMemoryDeliveryIdStore {
     }
 
     /// Removes expired entries from the store.
+    ///
+    /// Uses O(1) eviction by popping entries from the front of the queue
+    /// until finding a non-expired entry ([INV-CI004]).
     fn cleanup(&self) {
         let now = Instant::now();
         let ttl = self.config.ttl;
@@ -376,16 +380,24 @@ impl InMemoryDeliveryIdStore {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Remove expired entries from the map
-        state
-            .entries
-            .retain(|_, entry| now.duration_since(entry.inserted_at) < ttl);
-
-        // Rebuild insertion_order to only include non-expired entries
-        // This is O(N) but only runs periodically during cleanup
-        // We clone the keys to avoid borrowing issues with the retain closure
-        let valid_keys: std::collections::HashSet<String> = state.entries.keys().cloned().collect();
-        state.insertion_order.retain(|id| valid_keys.contains(id));
+        // O(1) amortized: pop expired entries from the front of the queue
+        // Since entries are inserted in chronological order, expired entries
+        // will be at the front. We stop as soon as we find a non-expired entry.
+        while let Some(oldest_key) = state.insertion_order.front() {
+            if let Some(entry) = state.entries.get(oldest_key) {
+                if now.duration_since(entry.inserted_at) >= ttl {
+                    // Entry expired, remove it
+                    let key = state.insertion_order.pop_front().unwrap();
+                    state.entries.remove(&key);
+                } else {
+                    // Found a non-expired entry, stop cleanup
+                    break;
+                }
+            } else {
+                // Key in queue but not in map (shouldn't happen), remove from queue
+                state.insertion_order.pop_front();
+            }
+        }
     }
 }
 
@@ -667,7 +679,11 @@ impl EventStore for InMemoryEventStore {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let mut results: Vec<CIWorkflowCompleted> = state
+        // Apply limit BEFORE collect to avoid allocating unlimited results
+        // (prevents memory DoS from unbounded queries)
+        let limit = query.limit.unwrap_or(usize::MAX);
+
+        state
             .events
             .iter()
             .filter(|event| {
@@ -699,15 +715,9 @@ impl EventStore for InMemoryEventStore {
 
                 true
             })
+            .take(limit)
             .cloned()
-            .collect();
-
-        // Apply limit
-        if let Some(limit) = query.limit {
-            results.truncate(limit);
-        }
-
-        results
+            .collect()
     }
 
     fn get(&self, event_id: Uuid) -> Option<CIWorkflowCompleted> {
@@ -750,13 +760,13 @@ static CI_EVENTS_ENABLED_CACHE: OnceLock<bool> = OnceLock::new();
 
 /// Parses the CI events enabled flag from an environment variable value.
 ///
-/// Returns `true` unless the value is explicitly "false", "0", or "no".
+/// Returns `false` (disabled) by default for fail-closed security.
+/// Only returns `true` if explicitly set to "true", "1", or "yes".
 fn parse_ci_events_enabled(value: Option<&str>) -> bool {
-    // Enabled by default (None case), disabled only if explicitly set to false/0/no
-    value.is_none_or(|val| {
+    // Disabled by default (fail-closed security), enabled only if explicitly set
+    value.is_some_and(|val| {
         let val_lower = val.to_lowercase();
-        // Not disabled: return true if not one of the disable values
-        !(val_lower == "false" || val_lower == "0" || val_lower == "no")
+        val_lower == "true" || val_lower == "1" || val_lower == "yes"
     })
 }
 
@@ -766,7 +776,8 @@ fn parse_ci_events_enabled(value: Option<&str>) -> bool {
 /// Subsequent calls return the cached value for O(1) performance on hot paths.
 ///
 /// Returns `true` if the variable is set to "true", "1", or "yes"
-/// (case-insensitive). Returns `true` by default if the variable is not set.
+/// (case-insensitive). Returns `false` by default if the variable is not set
+/// (fail-closed security).
 #[must_use]
 pub fn is_ci_events_enabled() -> bool {
     *CI_EVENTS_ENABLED_CACHE.get_or_init(|| {
@@ -1166,7 +1177,7 @@ mod tests {
             assert!(result.is_none());
         }
 
-        /// Tests that InMemoryEventStore enforces max_events limit
+        /// Tests that `InMemoryEventStore` enforces `max_events` limit
         /// ([CTR-CI005]).
         #[test]
         fn test_event_store_bounded() {
@@ -1226,9 +1237,9 @@ mod tests {
         // to avoid unsafe env var manipulation and OnceLock caching issues.
 
         #[test]
-        fn test_parse_feature_flag_default_enabled() {
-            // When env var is not set (None), should be enabled by default
-            assert!(parse_ci_events_enabled(None));
+        fn test_parse_feature_flag_default_disabled() {
+            // When env var is not set (None), should be disabled by default (fail-closed)
+            assert!(!parse_ci_events_enabled(None));
         }
 
         #[test]
@@ -1238,12 +1249,19 @@ mod tests {
             assert!(parse_ci_events_enabled(Some("yes")));
             assert!(parse_ci_events_enabled(Some("TRUE")));
             assert!(parse_ci_events_enabled(Some("Yes")));
-            // Empty string is considered enabled (not explicitly disabled)
-            assert!(parse_ci_events_enabled(Some("")));
         }
 
         #[test]
         fn test_parse_feature_flag_disabled() {
+            // Empty string is considered disabled (fail-closed)
+            assert!(!parse_ci_events_enabled(Some("")));
+            // Unrecognized values are disabled (fail-closed)
+            assert!(!parse_ci_events_enabled(Some("maybe")));
+        }
+
+        #[test]
+        fn test_parse_feature_flag_explicit_disable_values() {
+            // These are explicitly disabled, but so is any non-"true/1/yes" value
             assert!(!parse_ci_events_enabled(Some("false")));
             assert!(!parse_ci_events_enabled(Some("0")));
             assert!(!parse_ci_events_enabled(Some("no")));

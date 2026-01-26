@@ -197,6 +197,7 @@ impl Default for CIEventEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::ci::CIEventsConfig;
     use crate::webhook::WorkflowConclusion;
 
     fn sample_completed() -> WorkflowRunCompleted {
@@ -209,9 +210,22 @@ mod tests {
         }
     }
 
+    /// Creates an enabled emitter for testing.
+    ///
+    /// Note: `CIEventEmitter::new()` uses the default config which is disabled
+    /// (fail-closed security). Tests that need events enabled must use this
+    /// helper.
+    fn enabled_emitter() -> CIEventEmitter {
+        CIEventEmitter::with_config(
+            CIEventsConfig::enabled(),
+            Arc::new(InMemoryDeliveryIdStore::new()),
+            Arc::new(InMemoryEventStore::new()),
+        )
+    }
+
     #[test]
     fn test_emit_success() {
-        let emitter = CIEventEmitter::new();
+        let emitter = enabled_emitter();
         let completed = sample_completed();
 
         let result = emitter.emit(&completed, true, "delivery-123").unwrap();
@@ -234,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_emit_duplicate_rejected() {
-        let emitter = CIEventEmitter::new();
+        let emitter = enabled_emitter();
         let completed = sample_completed();
 
         // First emission succeeds
@@ -251,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_emit_different_delivery_ids() {
-        let emitter = CIEventEmitter::new();
+        let emitter = enabled_emitter();
         let completed = sample_completed();
 
         let result1 = emitter.emit(&completed, true, "delivery-1").unwrap();
@@ -264,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_emit_failure_conclusion() {
-        let emitter = CIEventEmitter::new();
+        let emitter = enabled_emitter();
         let mut completed = sample_completed();
         completed.conclusion = WorkflowConclusion::Failure;
 
@@ -281,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_emit_no_pr_number() {
-        let emitter = CIEventEmitter::new();
+        let emitter = enabled_emitter();
         let mut completed = sample_completed();
         completed.pull_request_numbers = vec![];
 
@@ -298,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_emit_unverified_signature() {
-        let emitter = CIEventEmitter::new();
+        let emitter = enabled_emitter();
         let completed = sample_completed();
 
         let result = emitter.emit(&completed, false, "delivery-123").unwrap();
@@ -321,8 +335,6 @@ mod tests {
 
     #[test]
     fn test_emit_disabled_via_config() {
-        use crate::events::ci::CIEventsConfig;
-
         let emitter = CIEventEmitter::with_config(
             CIEventsConfig::disabled(),
             Arc::new(InMemoryDeliveryIdStore::new()),

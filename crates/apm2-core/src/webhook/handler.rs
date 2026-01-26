@@ -210,12 +210,12 @@ async fn webhook_handler(
     // 6. Log successful processing
     log_completed_event(&completed, ip, delivery_id.as_deref());
 
-    // 7. Emit CI workflow event (with idempotency check)
-    let delivery_id_value = delivery_id.unwrap_or_else(|| {
-        // Generate a fallback delivery ID if GitHub doesn't provide one
-        uuid::Uuid::new_v4().to_string()
-    });
+    // 7. Require delivery ID for idempotency (reject if missing)
+    let delivery_id_value = delivery_id.ok_or(WebhookError::MissingDeliveryId)?;
 
+    // 8. Emit CI workflow event (with idempotency check)
+    // Note: signature_verified is true here because we already verified above
+    // (the validator.verify() call would have returned an error if invalid)
     match state
         .event_emitter
         .emit(&completed, true, &delivery_id_value)?
@@ -316,8 +316,19 @@ mod tests {
     }
 
     fn make_headers(signature: Option<&str>, event_type: Option<&str>) -> HeaderMap {
+        make_headers_with_delivery(signature, event_type, Some("test-delivery-123"))
+    }
+
+    fn make_headers_with_delivery(
+        signature: Option<&str>,
+        event_type: Option<&str>,
+        delivery_id: Option<&str>,
+    ) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert("x-github-delivery", "test-delivery-123".parse().unwrap());
+
+        if let Some(delivery) = delivery_id {
+            headers.insert("x-github-delivery", delivery.parse().unwrap());
+        }
 
         if let Some(sig) = signature {
             headers.insert(SIGNATURE_HEADER, sig.parse().unwrap());
@@ -350,10 +361,18 @@ mod tests {
     }
 
     fn create_test_state(enabled: bool) -> Arc<WebhookState> {
+        use crate::events::ci::{CIEventsConfig, InMemoryDeliveryIdStore, InMemoryEventStore};
+
         let config = test_config(enabled);
         let validator = SignatureValidator::new(config.secret.clone());
         let rate_limiter = RateLimiter::new(config.rate_limit.clone());
-        let event_emitter = CIEventEmitter::new();
+        // Create an enabled event emitter for tests
+        // (default is disabled for fail-closed security)
+        let event_emitter = CIEventEmitter::with_config(
+            CIEventsConfig::enabled(),
+            std::sync::Arc::new(InMemoryDeliveryIdStore::new()),
+            std::sync::Arc::new(InMemoryEventStore::new()),
+        );
 
         Arc::new(WebhookState {
             config,
@@ -451,6 +470,18 @@ mod tests {
         let result = call_handler(state, headers, payload).await;
         // Even failures are accepted - it's a valid event
         assert_eq!(result.unwrap(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_missing_delivery_id() {
+        let state = create_test_state(true);
+        let payload = make_payload("completed", "success");
+        let signature = compute_signature("test-secret-key", &payload);
+        // Create headers without delivery ID
+        let headers = make_headers_with_delivery(Some(&signature), Some("workflow_run"), None);
+
+        let result = call_handler(state, headers, payload).await;
+        assert!(matches!(result, Err(WebhookError::MissingDeliveryId)));
     }
 
     #[test]

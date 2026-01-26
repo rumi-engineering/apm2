@@ -263,11 +263,23 @@ mod error_tests {
 }
 
 mod event_emitter_tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::events::ci::{CIEventsConfig, InMemoryDeliveryIdStore, InMemoryEventStore};
+
+    /// Creates an enabled emitter for testing.
+    fn enabled_emitter() -> CIEventEmitter {
+        CIEventEmitter::with_config(
+            CIEventsConfig::enabled(),
+            Arc::new(InMemoryDeliveryIdStore::new()),
+            Arc::new(InMemoryEventStore::new()),
+        )
+    }
 
     #[test]
     fn test_event_emitter_idempotency() {
-        let emitter = CIEventEmitter::new();
+        let emitter = enabled_emitter();
         let completed = WorkflowRunCompleted {
             workflow_run_id: 12345,
             commit_sha: "abc123".to_string(),
@@ -296,7 +308,7 @@ mod event_emitter_tests {
     fn test_event_emitter_persists_events() {
         use crate::events::ci::{CIConclusion, EventQuery};
 
-        let emitter = CIEventEmitter::new();
+        let emitter = enabled_emitter();
         let completed = WorkflowRunCompleted {
             workflow_run_id: 12345,
             commit_sha: "abc123".to_string(),
