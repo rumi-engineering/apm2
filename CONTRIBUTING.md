@@ -89,6 +89,76 @@ cargo nextest run --filter-expr 'test(my_test_name)'
 
 ---
 
+### CI vs Local Build Settings
+
+CI and local development have different priorities. CI optimizes for
+**reproducibility and cache efficiency**, while local development optimizes
+for **iteration speed**. Do not blindly copy CI settings to your local
+environment.
+
+#### Why CI Uses CARGO_INCREMENTAL=0
+
+The CI workflow sets `CARGO_INCREMENTAL=0` for several reasons:
+
+1. **Reproducibility**: Incremental compilation can produce different binaries
+   depending on build history. Disabling it ensures identical builds.
+2. **Cache efficiency**: CI caches are shared across runs. Incremental artifacts
+   are tied to specific compilation units and invalidate frequently, making
+   them less effective for shared caches.
+3. **Coverage accuracy**: Code coverage tools (cargo-llvm-cov) work more
+   reliably with full rebuilds.
+
+#### Why Local Development Should Use CARGO_INCREMENTAL=1
+
+For local development, incremental compilation provides significant speedups:
+
+- **Rebuild times**: Changes to a single file only recompile affected crates.
+- **Edit-compile-test cycles**: 10-100x faster iteration on small changes.
+- **Default behavior**: Rust enables incremental compilation by default in
+  debug builds; CI explicitly disables it.
+
+#### Recommended Local Shell Profile
+
+Add the following to your shell profile (`~/.bashrc` or `~/.zshrc`):
+
+```bash
+# APM2 Rust development settings
+# IMPORTANT: These differ from CI intentionally - see CONTRIBUTING.md
+
+# Enable sccache for cross-worktree caching
+export RUSTC_WRAPPER=sccache
+
+# Enable incremental compilation (disabled in CI for reproducibility)
+export CARGO_INCREMENTAL=1
+
+# Optional: Increase parallelism for faster builds
+# Adjust based on your CPU cores and available RAM
+# export CARGO_BUILD_JOBS=8
+
+# Optional: Enable backtraces for debugging
+export RUST_BACKTRACE=1
+```
+
+After adding these settings, reload your shell:
+```bash
+source ~/.bashrc  # or source ~/.zshrc
+```
+
+#### Warning: Do Not Copy CI Settings Blindly
+
+The CI workflow (`ci.yml`) uses settings optimized for CI runners:
+
+| Setting | CI Value | Local Value | Reason |
+|---------|----------|-------------|--------|
+| `CARGO_INCREMENTAL` | 0 | 1 | CI needs reproducibility; local needs speed |
+| `RUSTFLAGS` | `-D warnings` | (unset) | CI enforces warnings-as-errors; annoying locally during iteration |
+| `RUSTC_WRAPPER` | (unset) | `sccache` | CI uses GitHub Actions cache; local benefits from sccache |
+
+Copying `CARGO_INCREMENTAL=0` to your local environment will make your builds
+significantly slower without providing any benefit.
+
+---
+
 ### Time Budgets
 
 | Test Type | Local | CI |
