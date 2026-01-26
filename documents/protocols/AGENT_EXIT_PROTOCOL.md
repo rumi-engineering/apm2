@@ -56,7 +56,7 @@ The `protocol` field **MUST** be exactly `"apm2_agent_exit"`. This allows the sy
 
 ### Version Field
 
-The `version` field **MUST** be semver-compatible with `1.x`. Currently supported versions:
+The `version` field **MUST** be valid semver 1.x.y format (e.g., `1.0.0`, `1.1.0`). The version is validated with strict regex `^1\.\d+\.\d+$`. Currently supported versions:
 
 - `1.0.0` (initial release)
 
@@ -283,6 +283,43 @@ The feature flag defaults to disabled (fail-closed security). This ensures that:
 - Untested deployments don't accidentally process exit signals
 - Security review is required before enabling
 - Gradual rollout is possible
+
+### Server-Side Phase Verification
+
+**CRITICAL**: The system **MUST** verify that the `phase_completed` field in the exit signal matches the session's currently active work phase. This prevents protocol phase confusion attacks where an agent claims to complete a phase it was not assigned.
+
+**Verification requirements:**
+
+1. Before accepting an exit signal, the system **MUST** retrieve the session's active work phase from the session store
+2. The `phase_completed` in the exit signal **MUST** match the session's active phase
+3. On mismatch, the system **MUST** reject the exit signal with a clear error
+
+**Fail-closed behavior for phase mismatches:**
+
+- Phase mismatch errors are logged with full context (session ID, claimed phase, actual phase)
+- The exit signal is rejected; no state changes occur
+- The session remains in its current state
+- An alert/metric is emitted for security monitoring
+
+### Input Size Limits (DoS Prevention)
+
+The system enforces strict size limits to prevent memory exhaustion attacks:
+
+| Limit | Size | Applied At |
+|-------|------|------------|
+| Total JSON input | 64KB | `from_json()` before parsing |
+| `protocol` field | 64 bytes | `validate()` before checking value |
+| `version` field | 64 bytes | `validate()` before checking value |
+| `pr_url` field | 2KB | `validate()` |
+| `evidence_bundle_ref` field | 2KB | `validate()` |
+| `notes` field | 10KB | `validate()` |
+
+### URL Validation
+
+The `pr_url` field is validated for security:
+
+1. **HTTPS required**: URLs must start with `https://`
+2. **Shell injection prevention**: URLs must not contain shell metacharacters (`;`, `|`, `` ` ``, `$`)
 
 ### Unknown Field Rejection
 

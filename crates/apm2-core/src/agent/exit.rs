@@ -61,6 +61,14 @@ use uuid::Uuid;
 // Validation Constants
 // ============================================================================
 
+/// Maximum length for the entire JSON input (64KB).
+/// Prevents memory exhaustion before JSON parsing begins.
+const MAX_INPUT_LENGTH: usize = 64 * 1024;
+
+/// Maximum length for protocol and version fields (64 bytes).
+/// These are fixed-format fields that should never exceed this size.
+const MAX_PROTOCOL_VERSION_LENGTH: usize = 64;
+
 /// Maximum length for URL and path fields (2KB).
 /// Prevents memory exhaustion from oversized payloads.
 const MAX_URL_PATH_LENGTH: usize = 2 * 1024;
@@ -68,6 +76,10 @@ const MAX_URL_PATH_LENGTH: usize = 2 * 1024;
 /// Maximum length for notes field (10KB).
 /// Allows for detailed notes while preventing memory exhaustion attacks.
 const MAX_NOTES_LENGTH: usize = 10 * 1024;
+
+/// Characters that could enable shell injection if URL is used in CLI commands.
+/// Includes: semicolon, pipe, backtick, dollar sign.
+const SHELL_INJECTION_CHARS: &[char] = &[';', '|', '`', '$'];
 
 /// Regex for validating semver 1.x.y version strings.
 /// Compiled once at first use to avoid repeated compilation.
@@ -256,6 +268,26 @@ pub enum ExitSignalError {
         /// Name of the field containing the invalid path.
         field: String,
     },
+
+    /// Input exceeds maximum allowed size.
+    #[error("input too large: {actual} bytes > {max} bytes maximum")]
+    InputTooLarge {
+        /// Actual input size.
+        actual: usize,
+        /// Maximum allowed size.
+        max: usize,
+    },
+
+    /// URL contains shell injection characters.
+    #[error("pr_url contains potentially dangerous character: '{char}'")]
+    UrlInjection {
+        /// The dangerous character found.
+        char: char,
+    },
+
+    /// URL does not use HTTPS scheme.
+    #[error("pr_url must start with 'https://': got '{0}'")]
+    InsecureUrl(String),
 }
 
 // ============================================================================
@@ -366,6 +398,8 @@ impl ExitSignal {
     /// - [CTR-EXIT006] String fields must not exceed length limits (memory
     ///   exhaustion prevention).
     /// - [CTR-EXIT007] Path fields must not contain traversal sequences.
+    /// - [CTR-EXIT008] Protocol and version fields must not exceed 64 bytes.
+    /// - [CTR-EXIT009] PR URLs must use HTTPS and not contain shell characters.
     ///
     /// # Errors
     ///
@@ -373,9 +407,32 @@ impl ExitSignal {
     /// Returns `ExitSignalError::UnsupportedVersion` if the version is
     /// incompatible or malformed.
     /// Returns `ExitSignalError::FieldTooLong` if a string field exceeds
-    /// limits. Returns `ExitSignalError::PathTraversal` if a path contains
+    /// limits.
+    /// Returns `ExitSignalError::PathTraversal` if a path contains
     /// `..` or starts with `/`.
+    /// Returns `ExitSignalError::InsecureUrl` if `pr_url` doesn't start with
+    /// `https://`.
+    /// Returns `ExitSignalError::UrlInjection` if `pr_url` contains shell
+    /// characters.
     pub fn validate(&self) -> Result<(), ExitSignalError> {
+        // [CTR-EXIT008] Validate protocol/version field lengths first (DoS prevention)
+        // These fixed-format fields should never exceed 64 bytes
+        if self.protocol.len() > MAX_PROTOCOL_VERSION_LENGTH {
+            return Err(ExitSignalError::FieldTooLong {
+                field: "protocol".to_string(),
+                actual: self.protocol.len(),
+                max: MAX_PROTOCOL_VERSION_LENGTH,
+            });
+        }
+
+        if self.version.len() > MAX_PROTOCOL_VERSION_LENGTH {
+            return Err(ExitSignalError::FieldTooLong {
+                field: "version".to_string(),
+                actual: self.version.len(),
+                max: MAX_PROTOCOL_VERSION_LENGTH,
+            });
+        }
+
         // [CTR-EXIT002] Validate protocol
         if self.protocol != EXIT_SIGNAL_PROTOCOL {
             return Err(ExitSignalError::UnknownProtocol(self.protocol.clone()));
@@ -396,6 +453,21 @@ impl ExitSignal {
                     actual: pr_url.len(),
                     max: MAX_URL_PATH_LENGTH,
                 });
+            }
+
+            // [CTR-EXIT009] Validate pr_url uses HTTPS scheme
+            if !pr_url.starts_with("https://") {
+                return Err(ExitSignalError::InsecureUrl(
+                    pr_url.chars().take(50).collect::<String>()
+                        + if pr_url.len() > 50 { "..." } else { "" },
+                ));
+            }
+
+            // [CTR-EXIT009] Reject shell injection characters in pr_url
+            for c in SHELL_INJECTION_CHARS {
+                if pr_url.contains(*c) {
+                    return Err(ExitSignalError::UrlInjection { char: *c });
+                }
             }
         }
 
@@ -433,13 +505,27 @@ impl ExitSignal {
     ///
     /// This is the primary entry point for processing exit signals from agents.
     ///
+    /// # Security
+    ///
+    /// Enforces a maximum input size of 64KB before parsing to prevent memory
+    /// exhaustion attacks. Input exceeding this limit is rejected immediately.
+    ///
     /// # Errors
     ///
+    /// Returns `ExitSignalError::InputTooLarge` if input exceeds 64KB.
     /// Returns `ExitSignalError::InvalidJson` if the JSON is malformed.
     /// Returns `ExitSignalError::UnknownProtocol` if the protocol is wrong.
     /// Returns `ExitSignalError::UnsupportedVersion` if the version is
     /// incompatible.
     pub fn from_json(json: &str) -> Result<Self, ExitSignalError> {
+        // [SECURITY] Reject oversized input BEFORE parsing to prevent DoS
+        if json.len() > MAX_INPUT_LENGTH {
+            return Err(ExitSignalError::InputTooLarge {
+                actual: json.len(),
+                max: MAX_INPUT_LENGTH,
+            });
+        }
+
         let signal: Self =
             serde_json::from_str(json).map_err(|e| ExitSignalError::InvalidJson(e.to_string()))?;
         signal.validate()?;
@@ -1168,6 +1254,131 @@ mod tests {
                 Err(ExitSignalError::PathTraversal { field })
                 if field == "evidence_bundle_ref"
             ));
+        }
+
+        #[test]
+        fn test_exit_signal_from_json_rejects_oversized_input() {
+            // Create input that exceeds 64KB limit
+            let huge_input = format!(
+                r#"{{"protocol":"apm2_agent_exit","version":"1.0.0","phase_completed":"IMPLEMENTATION","exit_reason":"completed","notes":"{}"}}"#,
+                "x".repeat(70 * 1024)
+            );
+            assert!(huge_input.len() > 64 * 1024);
+
+            let result = ExitSignal::from_json(&huge_input);
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::InputTooLarge { actual, max })
+                if actual == huge_input.len() && max == 64 * 1024
+            ));
+
+            // Verify that input at or just under the limit is accepted (parsing may still
+            // fail due to field limits)
+            let within_limit = format!(
+                r#"{{"protocol":"apm2_agent_exit","version":"1.0.0","phase_completed":"IMPLEMENTATION","exit_reason":"completed","notes":"{}"}}"#,
+                "x".repeat(60 * 1024)
+            );
+            assert!(within_limit.len() < 64 * 1024);
+
+            // This should NOT fail with InputTooLarge (may fail with FieldTooLong for
+            // notes)
+            let result = ExitSignal::from_json(&within_limit);
+            assert!(!matches!(
+                result,
+                Err(ExitSignalError::InputTooLarge { .. })
+            ));
+        }
+
+        #[test]
+        fn test_exit_signal_validate_rejects_oversized_protocol_version() {
+            // Test protocol field exceeds 64 byte limit
+            let mut signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed);
+            signal.protocol = "x".repeat(65);
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::FieldTooLong { field, max, .. })
+                if field == "protocol" && max == 64
+            ));
+
+            // Test version field exceeds 64 byte limit
+            let mut signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed);
+            signal.version = "1.".to_string() + &"9".repeat(100);
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::FieldTooLong { field, max, .. })
+                if field == "version" && max == 64
+            ));
+
+            // Verify values at the limit are accepted (though they may fail other
+            // validation)
+            let mut signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed);
+            signal.protocol = "x".repeat(64);
+            let result = signal.validate();
+            // Should fail with UnknownProtocol, not FieldTooLong
+            assert!(matches!(result, Err(ExitSignalError::UnknownProtocol(_))));
+        }
+
+        #[test]
+        fn test_exit_signal_validate_pr_url_injection() {
+            // Test URL with semicolon (shell command separator)
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_pr_url("https://github.com/org/repo/pull/123;rm -rf /");
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::UrlInjection { char: ';' })
+            ));
+
+            // Test URL with pipe (shell pipe)
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_pr_url("https://github.com/org/repo/pull/123|cat /etc/passwd");
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::UrlInjection { char: '|' })
+            ));
+
+            // Test URL with backtick (command substitution)
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_pr_url("https://github.com/org/repo/pull/`whoami`");
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::UrlInjection { char: '`' })
+            ));
+
+            // Test URL with dollar sign (variable expansion)
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_pr_url("https://github.com/org/repo/pull/$HOME");
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::UrlInjection { char: '$' })
+            ));
+
+            // Test URL without HTTPS scheme
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_pr_url("http://github.com/org/repo/pull/123");
+            let result = signal.validate();
+            assert!(matches!(result, Err(ExitSignalError::InsecureUrl(_))));
+
+            // Test URL with invalid scheme
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_pr_url("file:///etc/passwd");
+            let result = signal.validate();
+            assert!(matches!(result, Err(ExitSignalError::InsecureUrl(_))));
+
+            // Test valid HTTPS URL (should pass)
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_pr_url("https://github.com/org/repo/pull/123");
+            assert!(signal.validate().is_ok());
+
+            // Test URL with query params (should pass - no shell chars)
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_pr_url("https://github.com/org/repo/pull/123?tab=files#diff-abc123");
+            assert!(signal.validate().is_ok());
         }
     }
 

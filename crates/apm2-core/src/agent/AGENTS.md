@@ -49,7 +49,7 @@ The `protocol` field **MUST** be exactly `"apm2_agent_exit"`. Any other value is
 
 ### [CTR-EXIT003] Version Compatibility
 
-The `version` field **MUST** start with `"1."` for semver compatibility with the 1.x protocol series. Version 2.x and higher are reserved for breaking changes.
+The `version` field **MUST** be valid semver 1.x.y format (e.g., `1.0.0`, `1.1.0`). The version is validated with strict regex `^1\.\d+\.\d+$` to prevent malformed values. Version 2.x and higher are reserved for breaking changes.
 
 ### [CTR-EXIT004] Phase Validation
 
