@@ -1,0 +1,363 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  decomposition_strategy: |
+    Tickets are organized by rollout phase. Each phase has a lead ticket and
+    dependent implementation tickets. Tickets are ordered to minimize blocked
+    dependencies.
+
+  tickets:
+    # Phase 1: Core Infrastructure
+    - ticket_id: TCK-00090
+      title: "Implement determinism module with YAML canonicalization"
+      phase: PHASE-1
+      requirement_ids:
+        - REQ-0008
+      description: |
+        Create crates/apm2-core/src/determinism/ with:
+        - canonicalize.rs: YAML canonicalization (sorted keys, 2-space indent)
+        - atomic_write.rs: Atomic file writes (temp -> fsync -> rename)
+        - diff_classify.rs: Classify diffs as structural vs free-text
+      files_to_create:
+        - crates/apm2-core/src/determinism/mod.rs
+        - crates/apm2-core/src/determinism/canonicalize.rs
+        - crates/apm2-core/src/determinism/atomic_write.rs
+        - crates/apm2-core/src/determinism/diff_classify.rs
+      files_to_modify:
+        - crates/apm2-core/src/lib.rs
+      verification_commands:
+        - "cargo test -p apm2-core determinism"
+        - "cargo clippy -p apm2-core -- -D warnings"
+      acceptance_criteria:
+        - "canonicalize_yaml produces identical output for semantically identical input"
+        - "write_atomic never produces partial files"
+        - "diff_classify correctly categorizes structural vs free-text changes"
+      estimated_complexity: MEDIUM
+
+    - ticket_id: TCK-00091
+      title: "Implement CCP component atlas generation"
+      phase: PHASE-1
+      requirement_ids:
+        - REQ-0002
+      description: |
+        Create crates/apm2-core/src/ccp/component_atlas.rs to:
+        - Parse AGENTS.md files from crate directories
+        - Extract invariants, contracts, and extension points
+        - Generate stable component IDs
+      files_to_create:
+        - crates/apm2-core/src/ccp/mod.rs
+        - crates/apm2-core/src/ccp/component_atlas.rs
+      verification_commands:
+        - "cargo test -p apm2-core ccp::component_atlas"
+      acceptance_criteria:
+        - "Component IDs are stable across runs"
+        - "AGENTS.md invariants are correctly extracted"
+      blocked_by:
+        - TCK-00090
+      estimated_complexity: MEDIUM
+
+    - ticket_id: TCK-00092
+      title: "Implement CCP crate graph generation"
+      phase: PHASE-1
+      requirement_ids:
+        - REQ-0002
+      description: |
+        Create crates/apm2-core/src/ccp/crate_graph.rs to:
+        - Invoke cargo metadata --format-version 1
+        - Parse output into deterministic crate graph
+        - Include dependency edges
+      files_to_create:
+        - crates/apm2-core/src/ccp/crate_graph.rs
+      verification_commands:
+        - "cargo test -p apm2-core ccp::crate_graph"
+      acceptance_criteria:
+        - "Crate graph matches cargo metadata output"
+        - "Output is deterministic (no random ordering)"
+      blocked_by:
+        - TCK-00090
+      estimated_complexity: LOW
+
+    - ticket_id: TCK-00093
+      title: "Implement CCP index and CLI command"
+      phase: PHASE-1
+      requirement_ids:
+        - REQ-0001
+        - REQ-0002
+      description: |
+        Create crates/apm2-core/src/ccp/index.rs and CLI command:
+        - Generate CCP index with content hashes
+        - CLI: apm2 factory ccp build
+      files_to_create:
+        - crates/apm2-core/src/ccp/index.rs
+        - crates/apm2-cli/src/commands/factory/ccp.rs
+      files_to_modify:
+        - crates/apm2-cli/src/main.rs
+        - crates/apm2-cli/src/commands/factory.rs
+      verification_commands:
+        - "cargo run --bin apm2 -- factory ccp build --help"
+        - "cargo test -p apm2-core ccp::index"
+      acceptance_criteria:
+        - "CLI command produces CCP index"
+        - "Content hashes validate correctly"
+      blocked_by:
+        - TCK-00091
+        - TCK-00092
+      estimated_complexity: MEDIUM
+
+    # Phase 2: Impact Mapping and RFC Framing
+    - ticket_id: TCK-00094
+      title: "Implement Impact Map generation"
+      phase: PHASE-2
+      requirement_ids:
+        - REQ-0003
+      description: |
+        Create crates/apm2-core/src/impact_map/ to:
+        - Parse PRD requirements
+        - Map requirements to CCP components
+        - Identify duplication risks
+        - Classify net-new substrate
+      files_to_create:
+        - crates/apm2-core/src/impact_map/mod.rs
+        - crates/apm2-core/src/impact_map/mapper.rs
+        - crates/apm2-core/src/impact_map/adjudication.rs
+        - crates/apm2-core/src/impact_map/output.rs
+        - crates/apm2-cli/src/commands/factory/impact_map.rs
+      files_to_modify:
+        - crates/apm2-core/src/lib.rs
+        - crates/apm2-cli/src/main.rs
+      verification_commands:
+        - "cargo run --bin apm2 -- factory impact-map build --prd PRD-0005"
+        - "cargo test -p apm2-core impact_map"
+      acceptance_criteria:
+        - "All requirements mapped or classified as net-new"
+        - "Duplication risks identified"
+        - "Output is deterministic YAML"
+      blocked_by:
+        - TCK-00093
+      estimated_complexity: HIGH
+
+    - ticket_id: TCK-00095
+      title: "Implement RFC framer with CCP grounding"
+      phase: PHASE-2
+      requirement_ids:
+        - REQ-0004
+      description: |
+        Create crates/apm2-core/src/rfc_framer/ to:
+        - Generate RFC skeleton from Impact Map
+        - Include CCP grounding section
+        - Validate all path references
+      files_to_create:
+        - crates/apm2-core/src/rfc_framer/mod.rs
+        - crates/apm2-core/src/rfc_framer/framer.rs
+        - crates/apm2-core/src/rfc_framer/grounding.rs
+        - crates/apm2-cli/src/commands/factory/rfc.rs
+      files_to_modify:
+        - crates/apm2-core/src/lib.rs
+        - crates/apm2-cli/src/main.rs
+      verification_commands:
+        - "cargo run --bin apm2 -- factory rfc frame --prd PRD-0005 --rfc RFC-0010"
+        - "cargo test -p apm2-core rfc_framer"
+      acceptance_criteria:
+        - "RFC includes CCP grounding section"
+        - "Invalid path references fail compilation"
+      blocked_by:
+        - TCK-00094
+      estimated_complexity: HIGH
+
+    # Phase 3: Ticket Emission and Lint
+    - ticket_id: TCK-00096
+      title: "Implement ticket emitter"
+      phase: PHASE-3
+      requirement_ids:
+        - REQ-0006
+      description: |
+        Create crates/apm2-core/src/ticket_emitter/ to:
+        - Decompose RFC into atomic tickets
+        - Validate file paths against CCP
+        - Generate verification commands
+      files_to_create:
+        - crates/apm2-core/src/ticket_emitter/mod.rs
+        - crates/apm2-core/src/ticket_emitter/emitter.rs
+        - crates/apm2-core/src/ticket_emitter/validation.rs
+        - crates/apm2-cli/src/commands/factory/tickets.rs
+      files_to_modify:
+        - crates/apm2-core/src/lib.rs
+        - crates/apm2-cli/src/main.rs
+      verification_commands:
+        - "cargo run --bin apm2 -- factory tickets emit --rfc RFC-0009"
+        - "cargo test -p apm2-core ticket_emitter"
+      acceptance_criteria:
+        - "Each ticket has stable ID"
+        - "File paths validated"
+        - "Verification commands present"
+      blocked_by:
+        - TCK-00095
+      estimated_complexity: MEDIUM
+
+    - ticket_id: TCK-00097
+      title: "Add lint rules for clutter prevention"
+      phase: PHASE-3
+      requirement_ids:
+        - REQ-0005
+      description: |
+        Add new lint rules to LINT_SPEC.yaml:
+        - LINT-0013: no-new-module-without-justification
+        - LINT-0014: cousin-abstraction-detector
+        - LINT-0015: deletion-migration-plan-required
+        Implement in xtask/src/tasks/lint.rs
+      files_to_modify:
+        - documents/standards/lint/LINT_SPEC.yaml
+        - xtask/src/tasks/lint.rs
+      verification_commands:
+        - "cargo xtask lint"
+      acceptance_criteria:
+        - "LINT-0013 fails if new module lacks justification"
+        - "LINT-0014 warns on cousin abstractions"
+        - "LINT-0015 fails if new surface lacks deletion plan"
+      blocked_by:
+        - TCK-00096
+      estimated_complexity: MEDIUM
+
+    # Phase 4: Model Routing and Manifests
+    - ticket_id: TCK-00098
+      title: "Implement model router with routing profiles"
+      phase: PHASE-4
+      requirement_ids:
+        - REQ-0007
+      description: |
+        Create crates/apm2-core/src/model_router/ to:
+        - Parse routing profile YAML
+        - Route stages to providers
+        - Support canary comparison
+      files_to_create:
+        - crates/apm2-core/src/model_router/mod.rs
+        - crates/apm2-core/src/model_router/router.rs
+        - crates/apm2-core/src/model_router/profile.rs
+        - crates/apm2-core/src/model_router/canary.rs
+        - documents/standards/schemas/routing_profile.schema.yaml
+      files_to_modify:
+        - crates/apm2-core/src/lib.rs
+      verification_commands:
+        - "cargo test -p apm2-core model_router"
+      acceptance_criteria:
+        - "Routing profiles parsed correctly"
+        - "Canary mode compares two routes"
+        - "Unavailable provider fails closed"
+      blocked_by:
+        - TCK-00097
+      estimated_complexity: HIGH
+
+    - ticket_id: TCK-00099
+      title: "Implement run manifest with signing"
+      phase: PHASE-4
+      requirement_ids:
+        - REQ-0009
+        - REQ-0012
+      description: |
+        Create crates/apm2-core/src/run_manifest/ to:
+        - Create run manifests with input/output hashes
+        - Sign manifests with Ed25519
+        - Include stage timings and routing
+      files_to_create:
+        - crates/apm2-core/src/run_manifest/mod.rs
+        - crates/apm2-core/src/run_manifest/manifest.rs
+        - crates/apm2-core/src/run_manifest/signer.rs
+      files_to_modify:
+        - crates/apm2-core/src/lib.rs
+      verification_commands:
+        - "cargo test -p apm2-core run_manifest"
+      acceptance_criteria:
+        - "Manifests include all required fields"
+        - "Signatures verify correctly"
+      blocked_by:
+        - TCK-00098
+      estimated_complexity: MEDIUM
+
+    - ticket_id: TCK-00100
+      title: "Implement end-to-end compile command"
+      phase: PHASE-4
+      requirement_ids:
+        - REQ-0001
+      description: |
+        Implement apm2 factory compile --plan <path>:
+        - Orchestrate all stages in order
+        - Support --dry-run and --profile flags
+        - Emit NDJSON observability
+      files_to_create:
+        - crates/apm2-cli/src/commands/factory/compile.rs
+      files_to_modify:
+        - crates/apm2-cli/src/main.rs
+        - crates/apm2-cli/src/commands/factory.rs
+      verification_commands:
+        - "cargo run --bin apm2 -- factory compile --plan documents/prds/PRD-0005 --dry-run"
+      acceptance_criteria:
+        - "End-to-end compilation works"
+        - "Dry-run reports intended writes"
+        - "NDJSON events emitted"
+      blocked_by:
+        - TCK-00099
+      estimated_complexity: HIGH
+
+    # Phase 5: Skills and Refactor Radar
+    - ticket_id: TCK-00101
+      title: "Update idea-compiler and create-rfc skills"
+      phase: PHASE-5
+      requirement_ids:
+        - REQ-0010
+      description: |
+        Update skill files:
+        - documents/skills/idea-compiler/SKILL.md: Full invocation guide
+        - documents/skills/create-rfc/SKILL.md: Require CCP/Impact Map
+      files_to_modify:
+        - documents/skills/idea-compiler/SKILL.md
+        - documents/skills/create-rfc/SKILL.md
+      verification_commands:
+        - "cargo xtask lint"
+      acceptance_criteria:
+        - "Skills invoke CLI commands correctly"
+        - "create-rfc requires CCP reference"
+      blocked_by:
+        - TCK-00100
+      estimated_complexity: LOW
+
+    - ticket_id: TCK-00102
+      title: "Implement Refactor Radar stage"
+      phase: PHASE-5
+      requirement_ids:
+        - REQ-0011
+      description: |
+        Create crates/apm2-core/src/refactor_radar/ to:
+        - Aggregate CCP signals (hotspots, duplication)
+        - Emit bounded recommendations
+        - Generate maintenance tickets
+      files_to_create:
+        - crates/apm2-core/src/refactor_radar/mod.rs
+        - crates/apm2-core/src/refactor_radar/radar.rs
+        - crates/apm2-core/src/refactor_radar/signals.rs
+        - crates/apm2-cli/src/commands/factory/refactor.rs
+      files_to_modify:
+        - crates/apm2-core/src/lib.rs
+        - crates/apm2-cli/src/main.rs
+      verification_commands:
+        - "cargo run --bin apm2 -- factory refactor radar --window 7d"
+        - "cargo test -p apm2-core refactor_radar"
+      acceptance_criteria:
+        - "Radar output is bounded"
+        - "Recommendations are actionable"
+      blocked_by:
+        - TCK-00100
+      estimated_complexity: HIGH
+
+  summary:
+    total_tickets: 13
+    by_phase:
+      PHASE-1: 4
+      PHASE-2: 2
+      PHASE-3: 2
+      PHASE-4: 3
+      PHASE-5: 2
+    estimated_complexity:
+      LOW: 2
+      MEDIUM: 6
+      HIGH: 5

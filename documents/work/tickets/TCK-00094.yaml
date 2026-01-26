@@ -1,0 +1,105 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00094
+  title: "Implement Impact Map generation"
+  status: OPEN
+  priority: HIGH
+  source:
+    rfc_id: RFC-0009
+    rfc_ref: "documents/rfcs/RFC-0009/06_ticket_decomposition.yaml#tickets[4]"
+    requirement_ids:
+      - REQ-0003
+  phase: PHASE-2
+  description: |
+    Create the Impact Map generator that:
+    1. Parses PRD requirements from YAML files
+    2. Maps each requirement to CCP components
+    3. Identifies duplication risks
+    4. Classifies unmappable requirements as net-new
+    5. Outputs deterministic YAML
+
+  implementation:
+    files_to_create:
+      - path: crates/apm2-core/src/impact_map/mod.rs
+        description: "Impact map module root"
+      - path: crates/apm2-core/src/impact_map/mapper.rs
+        description: "Requirement-to-component mapping logic"
+      - path: crates/apm2-core/src/impact_map/adjudication.rs
+        description: "Net-new substrate classification"
+      - path: crates/apm2-core/src/impact_map/output.rs
+        description: "Impact map YAML output"
+      - path: crates/apm2-cli/src/commands/factory/impact_map.rs
+        description: "CLI command implementation"
+
+    files_to_modify:
+      - path: crates/apm2-core/src/lib.rs
+        change: "Add pub mod impact_map;"
+      - path: crates/apm2-cli/src/main.rs
+        change: "Add ImpactMap variant to FactoryCommands"
+
+    key_functions:
+      - name: "build_impact_map"
+        signature: "pub fn build_impact_map(prd_path: &Path, ccp: &CcpIndex) -> Result<ImpactMap, ImpactMapError>"
+        behavior: |
+          1. Parse all REQ-*.yaml files from prd_path/requirements/
+          2. For each requirement:
+             a. Search CCP components for matching extension points
+             b. Score candidates by fit (high/medium/low)
+             c. Select best extension point or classify as net-new
+             d. Check for duplication risks (multiple viable candidates)
+          3. Return structured ImpactMap
+
+    data_structures:
+      - name: ImpactMap
+        fields:
+          - schema_version: String
+          - generated_at: DateTime
+          - prd_id: String
+          - ccp_index_ref: String
+          - requirement_mappings: Vec<RequirementMapping>
+          - summary: ImpactMapSummary
+
+      - name: RequirementMapping
+        fields:
+          - requirement_id: String
+          - title: String
+          - candidate_components: Vec<CandidateComponent>
+          - selected_extension_point: Option<SelectedExtensionPoint>
+          - duplication_risk: DuplicationRisk
+          - net_new_substrate: bool
+          - net_new_justification: Option<String>
+
+    cli_command:
+      usage: "apm2 factory impact-map build --prd PRD-XXXX [--output-dir <path>]"
+
+  verification:
+    commands:
+      - command: "cargo run --bin apm2 -- factory impact-map build --prd PRD-0005"
+        description: "Build impact map for PRD-0005"
+        expected_exit_code: 0
+
+      - command: "cargo test -p apm2-core impact_map"
+        description: "Impact map unit tests pass"
+        expected_exit_code: 0
+
+    acceptance_criteria:
+      - criterion: "All 12 PRD-0005 requirements are mapped or classified"
+        verification: "Manual: verify impact_map.yaml contains all requirements"
+
+      - criterion: "Net-new modules identified correctly"
+        verification: "Compare to manually created impact map"
+
+      - criterion: "Output is deterministic YAML"
+        verification: "Re-run produces identical output"
+
+  dependencies:
+    blocked_by:
+      - TCK-00093
+    blocks:
+      - TCK-00095
+
+  estimated_complexity: HIGH
+  ccp_grounding:
+    component_id: COMP-CORE
+    extension_point: new_module
+    rationale: "Impact mapping is a novel compiler stage"

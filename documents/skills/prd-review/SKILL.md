@@ -259,6 +259,8 @@ DRAFT → REVIEW_READY → IN_REVIEW ──→ APPROVED
 |----------|---------|
 | [REVIEW_RUBRIC.md](references/REVIEW_RUBRIC.md) | Formal gate definitions with evidence contracts |
 | [FINDING_CATEGORIES.md](references/FINDING_CATEGORIES.md) | Taxonomy for deterministic finding classification |
+| [ANGLE_PROMPTS.md](references/ANGLE_PROMPTS.md) | Multi-angle analysis framework for GATE-PRD-CONTENT |
+| [FEEDBACK_LOOPS.md](references/FEEDBACK_LOOPS.md) | Recursive improvement via feedback signals |
 | [COUNTERMEASURE_PATTERNS.md](references/COUNTERMEASURE_PATTERNS.md) | Patterns for preventing recurrence |
 | [CREATE_PRD_PROMPT.md](references/CREATE_PRD_PROMPT.md) | Detailed guidance for drafting new PRDs |
 

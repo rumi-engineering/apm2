@@ -1,0 +1,36 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00098
+  title: "Implement model router with routing profiles"
+  status: OPEN
+  priority: HIGH
+  source:
+    rfc_id: RFC-0009
+    requirement_ids: [REQ-0007]
+  phase: PHASE-4
+  description: |
+    Create model router that routes compiler stages to LLM providers
+    based on versioned routing profiles. Support canary comparison.
+
+  implementation:
+    files_to_create:
+      - path: crates/apm2-core/src/model_router/mod.rs
+      - path: crates/apm2-core/src/model_router/router.rs
+      - path: crates/apm2-core/src/model_router/profile.rs
+      - path: crates/apm2-core/src/model_router/canary.rs
+      - path: documents/standards/schemas/routing_profile.schema.yaml
+    files_to_modify:
+      - path: crates/apm2-core/src/lib.rs
+
+  verification:
+    commands:
+      - command: "cargo test -p apm2-core model_router"
+    acceptance_criteria:
+      - "Routing profiles parsed correctly"
+      - "Canary mode compares two routes"
+      - "Unavailable provider fails closed"
+
+  dependencies:
+    blocked_by: [TCK-00097]
+    blocks: [TCK-00099]
+  estimated_complexity: HIGH

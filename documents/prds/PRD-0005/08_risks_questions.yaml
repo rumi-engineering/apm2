@@ -1,0 +1,71 @@
+prd_risks_questions:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  risks:
+    - id: RSK-0001
+      statement: "Compiler outputs become non-deterministic due to unconstrained LLM variability, causing noisy diffs and process thrash."
+      impact: "High: reduces trust in the pipeline, increases review burden, and encourages bypass behaviors."
+      likelihood: "Medium without hard constraints"
+      mitigations:
+        - "Define a determinism envelope: structured IR outputs, stable ordering, and fail-closed validation."
+        - "Canary mode for model swaps; require explicit acceptance for material diffs."
+        - "Use staged prompting with strict schemas and retry policy with tighter constraints."
+      evidence_ids:
+        - EVID-0006
+        - EVID-0007
+
+    - id: RSK-0002
+      statement: "Component Atlas IDs drift across refactors, breaking traceability and causing stale mappings."
+      impact: "High: undermines reuse-by-default and invalidates prior RFC mappings."
+      likelihood: "Medium"
+      mitigations:
+        - "Define stable component IDs with a persistence map and explicit rename operations."
+        - "Add atlas integrity tests and migration tooling."
+      evidence_ids:
+        - EVID-0002
+
+    - id: RSK-0003
+      statement: "RFC lint extensions are too strict early, slowing SDLC and causing frustration."
+      impact: "Medium: pipeline adoption stalls or agents work around it."
+      likelihood: "Medium"
+      mitigations:
+        - "Adopt a maturity model: warn/observe -> enforce-with-waiver -> enforce."
+        - "Keep existential invariants fail-closed; keep guidance lints warning-first."
+      evidence_ids: []
+
+    - id: RSK-0004
+      statement: "Model routing profiles leak secrets via prompts/logs or cause sensitive code to be transmitted unexpectedly."
+      impact: "High: security incident and loss of trust."
+      likelihood: "Low-to-medium depending on defaults"
+      mitigations:
+        - "Default-deny network and strict redaction; classification-aware prompt assembly."
+        - "Explicit provider selection; no implicit fallbacks."
+        - "Audit logs for external invocations, with redaction verification."
+      evidence_ids:
+        - EVID-0008
+
+    - id: RSK-0005
+      statement: "Refactor Radar becomes a source of churn rather than net simplification."
+      impact: "Medium: wasted cycles and conflicts with feature work."
+      likelihood: "Medium"
+      mitigations:
+        - "Bound radar outputs; require measurable outcome targets (surface area reduction, deletion)."
+        - "Tag conflicts and sequence automatically."
+      evidence_ids:
+        - EVID-0011
+
+  open_questions:
+    - id: Q-0001
+      question: "Which compiler outputs should be promoted into governed documents/ vs remain evidence-only, and what is the mechanical promotion workflow (diff/acceptance/gates)?"
+      decision_needed_by: "Before implementing the promote step and governed write rules"
+      resolution_plan: "Define a promotion contract (eligible artifact types, overwrite semantics, review/acceptance). Implement `apm2 factory promote` and add lint rules to prevent manual drift."
+
+    - id: Q-0002
+      question: "What is the minimal, stable set of component metadata fields that avoid overfitting early (IDs, invariants, entrypoints, owners)?"
+      decision_needed_by: "Before first AtlasBuilder implementation"
+      resolution_plan: "Start with the smallest set needed for mapping and extension-point discovery; iterate under versioned schema."
+
+    - id: Q-0003
+      question: "How should the compiler authenticate/attest runs before the full authority-core token infrastructure exists?"
+      decision_needed_by: "Before enabling signed run manifests in CI"
+      resolution_plan: "Use local ephemeral keys for dev; introduce a minimal CompilationLease signed by the daemon when available."

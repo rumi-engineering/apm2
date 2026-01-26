@@ -1,254 +1,150 @@
-# APM2 - Holonic AI Process Manager
+# APM2
 
-**Version:** 0.3.0 | **Edition:** 2024 | **MSRV:** 1.85
+Process supervision for AI agent CLIs (Claude Code, Gemini CLI, Codex CLI, and custom tools).
 
-APM2 is a process supervision framework for orchestrating heterogeneous AI agents through holonic coordination, event-sourced state management, and capability-based resource control.
+[![CI](https://github.com/Anveio/apm2/actions/workflows/ci.yml/badge.svg)](https://github.com/Anveio/apm2/actions/workflows/ci.yml)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](https://www.rust-lang.org)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-| Crate | Description | LOC (approx) |
-|-------|-------------|--------------|
-| `apm2-holon` | Holon trait, resource types, work lifecycle | ~4,500 |
-| `apm2-core` | Daemon runtime, reducers, adapters, evidence | ~35,000 |
-| `apm2-daemon` | Unix socket server, IPC handlers | ~1,000 |
-| `apm2-cli` | Command-line interface | ~1,200 |
-| `xtask` | Development automation | ~2,000 |
+APM2 runs as a local daemon that supervises agent processes with restart policies, credential hot-swapping, and an event-sourced ledger for audit and replay.
 
-## Table of Contents
+**Status:** pre-1.0 (expect breaking changes).
 
-- [Architectural Overview](#architectural-overview)
-- [Technology Stack](#technology-stack)
-- [Documentation Convention](#documentation-convention)
-- [Module Index](#module-index)
-- [Type Glossary](#type-glossary)
-- [Security](#security)
+## Features
 
----
+- Supervise processes with instances, restart/backoff, and graceful shutdown
+- Unix socket IPC between `apm2` (CLI) and `apm2-daemon` (daemon)
+- Credential profiles backed by the OS keyring (hot-swappable per process)
+- Event-sourced state (append-only SQLite ledger)
+- Spec-driven “factory” workflows (`apm2 factory ...`) for orchestrating agent work
 
-## Architectural Overview
+## Install
 
-APM2 implements a four-layer runtime: CLI communicates over Unix domain sockets with a persistent daemon, which supervises agent processes through adapter abstractions.
+APM2 is **Linux-only**. macOS and Windows are not currently supported.
 
-The **CLI** (`apm2-cli`) serializes JSON requests to the **daemon** (`apm2-daemon`), which maintains in-memory state projections derived from an append-only event ledger. **Agent processes** (Claude Code, Gemini CLI, Codex CLI, or custom agents) are observed through the adapter layer.
+## Supported platforms
 
-Three architectural patterns pervade the implementation:
+| Platform | Support | Notes |
+|----------|---------|-------|
+| Linux (x86_64) | Supported | CI-tested (Ubuntu 24.04) |
+| Linux (aarch64) | Best-effort | Not in CI; please report build issues |
+| macOS | Not supported | Linux-only project |
+| Windows | Not supported | Requires Unix domain sockets |
 
-1. **Event Sourcing**: All state changes are recorded as immutable events in a SQLite-backed ledger with WAL mode. State is reconstructed by replaying events through reducer functions.
+### Prerequisites
 
-2. **Reducer Pattern**: State transitions are computed by pure functions (`Reducer::apply`) that take an event and current state, returning the next state.
+- Rust 1.85+
+- `protoc` (Protocol Buffers compiler)
 
-3. **Content-Addressed Storage**: Evidence artifacts are stored by BLAKE3 hash in a CAS layer, providing deduplication, integrity verification, and progressive disclosure.
+Ubuntu/Debian:
 
-The crate dependency graph flows downward: `apm2-cli` and `apm2-daemon` depend on `apm2-core`, which depends on `apm2-holon`. The holon crate has no dependencies on core runtime infrastructure, establishing a clean contract boundary.
+```bash
+sudo apt-get update
+sudo apt-get install -y protobuf-compiler
+```
 
----
+Other distros: install `protoc` via your package manager.
 
-## Technology Stack
+### From source
 
-### Language & Toolchain
+```bash
+git clone https://github.com/Anveio/apm2.git
+cd apm2
 
-| Component | Version | Notes |
-|-----------|---------|-------|
-| **Rust** | 2024 edition | MSRV 1.85 |
-| **Cargo** | Workspace | Multi-crate monorepo |
-| **Clippy** | pedantic + nursery | Strict linting |
+cargo install --path crates/apm2-daemon --locked
+cargo install --path crates/apm2-cli --locked
+```
 
-### Runtime & Async
+### From git (no clone)
 
-| Crate | Purpose |
-|-------|---------|
-| [tokio](https://tokio.rs/) | Async runtime (full features) |
-| [tracing](https://tracing.rs/) | Structured logging and diagnostics |
-| [tracing-subscriber](https://docs.rs/tracing-subscriber/) | Log formatting and filtering |
+```bash
+cargo install --git https://github.com/Anveio/apm2 --tag <TAG> apm2-daemon
+cargo install --git https://github.com/Anveio/apm2 --tag <TAG> apm2-cli
+```
 
-### Serialization & Protocol
+`<TAG>` is a crate tag like `apm2-daemon-v0.3.0` / `apm2-cli-v0.3.0`.
 
-| Crate | Purpose |
-|-------|---------|
-| [serde](https://serde.rs/) | Serialization framework |
-| [serde_json](https://docs.rs/serde_json/) | JSON serialization (IPC protocol) |
-| [toml](https://docs.rs/toml/) | Configuration files |
-| [serde_yaml](https://docs.rs/serde_yaml/) | YAML parsing (skills, tickets) |
-| [prost](https://docs.rs/prost/) | Protocol Buffers (event schema) |
+## Quickstart
 
-### Persistence
+1. Create `ecosystem.toml` (or copy `ecosystem.example.toml`).
+2. Start the daemon.
+3. Start a configured process.
 
-| Crate | Purpose |
-|-------|---------|
-| [rusqlite](https://docs.rs/rusqlite/) | SQLite database (WAL mode) |
-| [blake3](https://docs.rs/blake3/) | Content-addressed storage hashing |
+Minimal `ecosystem.toml` for local development (no root required):
 
-### Cryptography & Security
+```toml
+[daemon]
+socket = "/tmp/apm2/apm2.sock"
+pid_file = "/tmp/apm2/apm2.pid"
 
-| Crate | Purpose |
-|-------|---------|
-| [blake3](https://docs.rs/blake3/) | Fast cryptographic hashing (CAS) |
-| [ed25519-dalek](https://docs.rs/ed25519-dalek/) | Ed25519 signatures (event signing) |
-| [keyring](https://docs.rs/keyring/) | OS keychain integration |
-| [secrecy](https://docs.rs/secrecy/) | Secret value handling |
-| [zeroize](https://docs.rs/zeroize/) | Secure memory zeroing |
+[[processes]]
+name = "claude"
+command = "claude"
+cwd = "/path/to/your/project"
+```
 
-### CLI & IPC
+Start the daemon in the foreground:
 
-| Crate | Purpose |
-|-------|---------|
-| [clap](https://docs.rs/clap/) | Command-line argument parsing |
-| [nix](https://docs.rs/nix/) | Unix APIs (signals, fork, sockets) |
-| [chrono](https://docs.rs/chrono/) | Date/time handling |
+```bash
+apm2 daemon --no-daemon
+```
 
-### Testing & Quality
+In another terminal:
 
-| Crate | Purpose |
-|-------|---------|
-| [proptest](https://docs.rs/proptest/) | Property-based testing |
-| [criterion](https://docs.rs/criterion/) | Benchmarking |
-| [tempfile](https://docs.rs/tempfile/) | Temporary file fixtures |
+```bash
+apm2 list
+apm2 start claude
+apm2 logs claude --follow
+```
 
-### Wire Protocols
+## Configuration
 
-**IPC Protocol** (CLI ↔ Daemon): Length-prefixed JSON over Unix domain sockets. See [`apm2_core::ipc`](crates/apm2-core/src/ipc/AGENTS.md).
+APM2 reads `ecosystem.toml` by default (override with `--config <path>`).
 
-**Event Schema**: Protocol Buffers via prost for the append-only event ledger. Canonical encoding ensures deterministic signatures. See [`proto/kernel_events.proto`](proto/kernel_events.proto).
+- `[daemon]`: PID/socket paths (defaults to `/var/run/apm2/...`), plus audit settings
+- `[[credentials]]`: credential profiles (stored in the OS keyring)
+- `[[processes]]`: supervised processes (command, args, env, instances, restart/log/shutdown policies)
 
-**Tool Protocol**: Protocol Buffers for agent-to-kernel tool requests. Default-deny, least-privilege enforcement. See [`proto/tool_protocol.proto`](proto/tool_protocol.proto).
+See `ecosystem.example.toml` for a full annotated example.
 
----
+## Concepts (holonic runtime)
 
-## Documentation Convention
+- **Holon**: an autonomous unit that is also part of a larger supervisor (“holarchy”).
+- **Lease / Budget**: time-bounded, scope-bounded authority with explicit resource limits.
+- **Reducer**: a pure event → state transition function used to rebuild projections from the ledger.
+- **Work substrate**: the coordination plane built from work objects + an append-only event ledger.
 
-Each module contains an `AGENTS.md` file providing AI-agent-optimized documentation with:
+See `documents/skills/glossary/` and `AGENTS.md` for deeper definitions and module-level docs.
 
-- **Overview**: Module purpose and architectural context
-- **Key Types**: Rust type definitions with field documentation
-- **Invariants**: Tagged as `[INV-XXXX]` - properties that must always hold
-- **Contracts**: Tagged as `[CTR-XXXX]` - pre/post conditions for operations
-- **Public API**: Primary functions and methods
-- **Examples**: Usage patterns and code samples
-- **Related Modules**: Cross-references to dependent modules
-- **References**: Links to external specifications
+## Documentation
 
-See individual `AGENTS.md` files linked in the Module Index below for detailed documentation.
+- [AGENTS.md](AGENTS.md): architecture + module index
+- [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and tooling
+- [SECURITY.md](SECURITY.md): vulnerability reporting and security docs pointers
+- [documents/](documents/): PRDs, RFCs, security docs, and specs
 
----
+## Roadmap
 
-## Module Index
+This project is pre-1.0; the roadmap is directional and may change.
 
-### apm2-holon
+- Stabilize the `ecosystem.toml` schema and IPC protocol ahead of 1.0
+- Ship systemd-oriented operational docs and examples (service unit, directories, permissions)
+- Improve crash recovery by wiring up `state_file` snapshots and restore paths
+- Expand adapter documentation and ergonomics for custom agents
+- Publish signed release artifacts for common Linux targets (x86_64, aarch64)
 
-| Module | Description | Documentation |
-|--------|-------------|---------------|
-| `apm2_holon::traits` | `Holon` trait definition | [AGENTS.md](crates/apm2-holon/AGENTS.md) |
-| `apm2_holon::context` | `EpisodeContext` for bounded execution | [AGENTS.md](crates/apm2-holon/AGENTS.md) |
-| `apm2_holon::result` | `EpisodeResult` and `EpisodeOutcome` | [AGENTS.md](crates/apm2-holon/AGENTS.md) |
-| `apm2_holon::stop` | `StopCondition` enumeration | [AGENTS.md](crates/apm2-holon/AGENTS.md) |
-| `apm2_holon::artifact` | `Artifact` type for evidence | [AGENTS.md](crates/apm2-holon/AGENTS.md) |
-| `apm2_holon::error` | `HolonError` error type | [AGENTS.md](crates/apm2-holon/AGENTS.md) |
-| `apm2_holon::work` | `WorkObject`, `WorkLifecycle`, `AttemptRecord` | [AGENTS.md](crates/apm2-holon/AGENTS.md) |
-| `apm2_holon::resource` | `Budget`, `Lease`, `LeaseScope` | [AGENTS.md](crates/apm2-holon/AGENTS.md) |
-| `apm2_holon::skill` | Skill frontmatter parsing | [AGENTS.md](crates/apm2-holon/AGENTS.md) |
+## Contributing
 
-### apm2-core
-
-| Module | Description | Documentation |
-|--------|-------------|---------------|
-| `apm2_core::adapter` | Agent adapter abstractions | [AGENTS.md](crates/apm2-core/src/adapter/AGENTS.md) |
-| `apm2_core::config` | Ecosystem configuration | [AGENTS.md](crates/apm2-core/src/config/AGENTS.md) |
-| `apm2_core::credentials` | Credential profiles and stores | [AGENTS.md](crates/apm2-core/src/credentials/AGENTS.md) |
-| `apm2_core::crypto` | Cryptographic primitives | [AGENTS.md](crates/apm2-core/src/crypto/AGENTS.md) |
-| `apm2_core::events` | Event type definitions | [AGENTS.md](crates/apm2-core/src/events/AGENTS.md) |
-| `apm2_core::evidence` | Evidence publishing and CAS | [AGENTS.md](crates/apm2-core/src/evidence/AGENTS.md) |
-| `apm2_core::health` | Health check configurations | [AGENTS.md](crates/apm2-core/src/health/AGENTS.md) |
-| `apm2_core::ipc` | IPC protocol types | [AGENTS.md](crates/apm2-core/src/ipc/AGENTS.md) |
-| `apm2_core::lease` | Lease management runtime | [AGENTS.md](crates/apm2-core/src/lease/AGENTS.md) |
-| `apm2_core::ledger` | Append-only event ledger | [AGENTS.md](crates/apm2-core/src/ledger/AGENTS.md) |
-| `apm2_core::log` | Structured logging | [AGENTS.md](crates/apm2-core/src/log/AGENTS.md) |
-| `apm2_core::process` | Process lifecycle management | [AGENTS.md](crates/apm2-core/src/process/AGENTS.md) |
-| `apm2_core::reducer` | Reducer trait and implementations | [AGENTS.md](crates/apm2-core/src/reducer/AGENTS.md) |
-| `apm2_core::restart` | Restart policies and backoff | [AGENTS.md](crates/apm2-core/src/restart/AGENTS.md) |
-| `apm2_core::session` | Session lifecycle | [AGENTS.md](crates/apm2-core/src/session/AGENTS.md) |
-| `apm2_core::shutdown` | Graceful shutdown coordination | [AGENTS.md](crates/apm2-core/src/shutdown/AGENTS.md) |
-| `apm2_core::state` | Global state aggregation | [AGENTS.md](crates/apm2-core/src/state/AGENTS.md) |
-| `apm2_core::supervisor` | Process collection supervisor | [AGENTS.md](crates/apm2-core/src/supervisor/AGENTS.md) |
-| `apm2_core::tool` | Tool request protocol | [AGENTS.md](crates/apm2-core/src/tool/AGENTS.md) |
-| `apm2_core::work` | Work queue management | [AGENTS.md](crates/apm2-core/src/work/AGENTS.md) |
-
-### apm2-daemon
-
-| Module | Description | Documentation |
-|--------|-------------|---------------|
-| `apm2_daemon::state` | Thread-safe shared daemon state | [AGENTS.md](crates/apm2-daemon/AGENTS.md) |
-| `apm2_daemon::ipc_server` | Unix socket server, framing | [AGENTS.md](crates/apm2-daemon/AGENTS.md) |
-| `apm2_daemon::handlers` | IPC request handlers | [AGENTS.md](crates/apm2-daemon/AGENTS.md) |
-
-### apm2-cli
-
-| Module | Description | Documentation |
-|--------|-------------|---------------|
-| `apm2_cli::commands::daemon` | Daemon lifecycle commands | [AGENTS.md](crates/apm2-cli/AGENTS.md) |
-| `apm2_cli::commands::process` | Process management commands | [AGENTS.md](crates/apm2-cli/AGENTS.md) |
-| `apm2_cli::commands::creds` | Credential management commands | [AGENTS.md](crates/apm2-cli/AGENTS.md) |
-
----
-
-## Type Glossary
-
-| Type | Module | Description |
-|------|--------|-------------|
-| `Artifact` | `apm2_holon::artifact` | Evidence artifact with content hash |
-| `AttemptRecord` | `apm2_holon::work` | Record of attempt execution |
-| `BackoffConfig` | `apm2_core::restart` | Backoff strategy (Fixed/Exponential/Linear) |
-| `BlackBoxAdapter` | `apm2_core::adapter` | Observation-based agent adapter |
-| `Budget` | `apm2_holon::resource` | Four-dimensional resource limits |
-| `ContentAddressedStore` | `apm2_core::evidence` | CAS trait for artifact storage |
-| `CredentialProfile` | `apm2_core::credentials` | Credential configuration |
-| `DataClassification` | `apm2_core::evidence` | Data sensitivity level |
-| `EpisodeContext` | `apm2_holon::context` | Execution context for episodes |
-| `EpisodeResult` | `apm2_holon::result` | Episode execution result |
-| `EventRecord` | `apm2_core::ledger` | Ledger event with hash chain |
-| `Holon` | `apm2_holon::traits` | Core agent trait |
-| `HolonError` | `apm2_holon::error` | Holon operation errors |
-| `Lease` | `apm2_holon::resource` | Time-bounded authorization |
-| `LeaseScope` | `apm2_holon::resource` | Authority boundaries |
-| `Ledger` | `apm2_core::ledger` | Append-only event store |
-| `ProcessSpec` | `apm2_core::process` | Process configuration |
-| `ProcessState` | `apm2_core::process` | Process lifecycle state |
-| `Reducer` | `apm2_core::reducer` | Event application trait |
-| `RestartConfig` | `apm2_core::restart` | Restart policy configuration |
-| `SessionState` | `apm2_core::session` | Session lifecycle state |
-| `StopCondition` | `apm2_holon::stop` | Episode termination predicate |
-| `Supervisor` | `apm2_core::supervisor` | Process collection manager |
-| `ToolRequest` | `apm2_core::tool` | Agent tool invocation |
-| `WorkLifecycle` | `apm2_holon::work` | Work state machine |
-| `WorkObject` | `apm2_holon::work` | Tracked work unit |
-| `DaemonStateHandle` | `apm2_daemon::state` | Thread-safe daemon state wrapper |
-| `SharedState` | `apm2_daemon::state` | Type alias for `Arc<DaemonStateHandle>` |
-| `RunnerKey` | `apm2_daemon::state` | Composite key: `(ProcessId, instance)` |
-| `Cli` | `apm2_cli` | Top-level CLI argument parser |
-| `Commands` | `apm2_cli` | Primary command enum |
-| `CredsCommands` | `apm2_cli::commands::creds` | Credential subcommands |
-
----
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and open an issue/PR.
 
 ## Security
 
-Security documentation is maintained in [`documents/security/`](documents/security/):
-
-| Document | Description |
-|----------|-------------|
-| [SECURITY.md](SECURITY.md) | Vulnerability reporting and security contacts |
-| [SECURITY_POLICY.md](documents/security/SECURITY_POLICY.md) | Security policies and compliance requirements |
-| [THREAT_MODEL.md](documents/security/THREAT_MODEL.md) | Threat analysis and attack surface documentation |
-| [SECRETS_MANAGEMENT.md](documents/security/SECRETS_MANAGEMENT.md) | Credential handling and secret storage |
-| [CI_SECURITY_GATES.md](documents/security/CI_SECURITY_GATES.md) | CI/CD security checks and gates |
-| [SIGNING_AND_VERIFICATION.md](documents/security/SIGNING_AND_VERIFICATION.md) | Release signing and artifact verification |
-| [RELEASE_PROCEDURE.md](documents/security/RELEASE_PROCEDURE.md) | Secure release process |
-| [INCIDENT_RESPONSE.md](documents/security/INCIDENT_RESPONSE.md) | Security incident handling procedures |
-
-For security vulnerability reports, see [SECURITY.md](SECURITY.md).
-
----
+Please report vulnerabilities via GitHub Security Advisories. See [SECURITY.md](SECURITY.md).
 
 ## License
 
 Licensed under either of:
+
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT License ([LICENSE-MIT](LICENSE-MIT))
 

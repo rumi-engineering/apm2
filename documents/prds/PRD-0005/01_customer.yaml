@@ -1,0 +1,132 @@
+prd_customer:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  segments:
+    - id: CUST-0001
+      name: Human operator relay surface
+      description: |
+        A human orchestrating the factory by providing high-signal conversations,
+        constraints, and priorities. The operator needs a low-friction interface
+        that transforms intent into deterministically grounded spec artifacts.
+      primary_jobs_to_be_done:
+        - Provide an intent artifact (conversation distillation) and request compilation.
+        - Review and adjudicate bounded open questions emitted by the compiler.
+        - Re-run compilation with different model routing profiles without manual YAML editing.
+      constraints:
+        - The operator MUST be able to trigger compilation via a single CLI command.
+        - Re-runs MUST be idempotent for identical inputs and repo state.
+        - The system MUST surface only a small, bounded set of questions; all else is automated.
+
+    - id: CUST-0002
+      name: Spec compiler holon (Idea Compiler)
+      description: |
+        A supervising holon that treats PRDs, RFCs, and tickets as compiled outputs.
+        It must incorporate explicit repository truth (modules, APIs, invariants)
+        and must prefer extension of existing abstractions rather than creating
+        new utilities by default.
+      primary_jobs_to_be_done:
+        - Generate a Codebase Context Pack (atlas, crate graph, hotspots, decision index).
+        - Map PRD requirements to existing components and extension points.
+        - Emit RFC drafts and ticket decompositions with low-noise, implementation-ready guidance.
+        - Record provenance and determinism receipts for each stage.
+      constraints:
+        - Outputs MUST reference concrete crates/modules/files present in the current checkout.
+        - Net-new substrate MUST require explicit adjudication records.
+        - The holon MUST be crash-only and resumable from persisted artifacts.
+
+    - id: CUST-0003
+      name: Ticket execution holons (implementers and reviewers)
+      description: |
+        Agents responsible for implementing and reviewing tickets. They need
+        navigable entrypoints (AGENTS.md invariants, stable component IDs) and
+        stable abstraction surfaces to avoid reinvention.
+      primary_jobs_to_be_done:
+        - Use ticket guidance to locate extension points and implement changes safely.
+        - Produce required evidence and pass first-pass review.
+        - Feed back recurring findings to drive continuous refactor work.
+      constraints:
+        - Tickets MUST include file-level guidance and verification commands.
+        - Tickets MUST include deletion/migration steps when new surfaces are introduced.
+        - Reviewers MUST be able to validate spec-to-code traceability mechanically.
+
+  stakeholder_entities:
+    - id: STKH-0001
+      name: APM2 Core CLI and daemon
+      entity_type: INTERNAL_COMPONENT
+      description: |
+        The CLI and daemon provide execution boundaries, auth abstractions,
+        process running, logging, and ledger-backed provenance where applicable.
+      constraints:
+        - Compiler orchestration MUST live in the core CLI to leverage shared auth.
+        - External tool invocations MUST be mediated and audited.
+
+    - id: STKH-0002
+      name: Repository working tree
+      entity_type: INTERNAL_COMPONENT
+      description: |
+        The git checkout is the compilation input for Codebase Context Pack generation.
+        Outputs are written as decomposed YAML artifacts under documents/.
+      constraints:
+        - Compilation MUST not require network access by default.
+        - Outputs MUST be written deterministically with stable ordering.
+
+    - id: STKH-0003
+      name: Inference provider fleet
+      entity_type: EXTERNAL_SYSTEM
+      description: |
+        External or local inference backends used for discrete compilation stages.
+        Providers and versions are selected by routing policy.
+      constraints:
+        - Provider selection MUST be explicit, versioned, and recorded as provenance.
+        - Prompts and outputs MUST be redaction-safe; secrets MUST NOT be emitted.
+
+    - id: STKH-0004
+      name: RFC and PRD lint/gate harness
+      entity_type: INTERNAL_COMPONENT
+      description: |
+        The standards, schemas, and lint rules that define completion predicates
+        for PRD and RFC artifacts.
+      constraints:
+        - The compiler MUST fail closed on lint violations.
+        - Lint rule evolution MUST be versioned and recorded in run manifests.
+
+  user_journeys:
+    - id: UJ-0001
+      name: Conversation -> PRD plan artifact -> RFC -> Tickets (single command)
+      steps:
+        - Operator provides a plan document (this PRD family) capturing desired outcomes.
+        - Run `apm2 factory compile --prd PRD-XXXX`.
+        - Compiler generates/refreshes Codebase Context Pack.
+        - Compiler produces Impact Map: requirement -> component mapping.
+        - Compiler emits RFC draft aligned to Impact Map.
+        - Compiler emits atomic tickets with file-level guidance and verification commands.
+      failure_modes:
+        - CCP stale or incomplete -> compiler emits a typed finding and blocks RFC emission.
+        - Requirement cannot be mapped -> compiler emits an adjudication request.
+        - Non-deterministic model output -> compiler rejects and retries with constrained prompting.
+      observability_notes:
+        - Each run emits a signed run manifest with content hashes for inputs/outputs.
+        - Each stage emits timing and structured findings to NDJSON logs.
+
+    - id: UJ-0002
+      name: Swap models and recompile with controlled diffs
+      steps:
+        - Operator selects a routing profile or overrides one stage's model/provider.
+        - Re-run compilation against the same repo state.
+        - Compiler produces a deterministic diff report and requires acceptance for material changes.
+      failure_modes:
+        - Model routing produces invalid structure -> compiler fails closed and reports the violating section.
+        - Output diff affects existing tickets -> compiler suggests a migration plan ticket set.
+      observability_notes:
+        - Diffs are summarized as structured findings with stable signatures for recurrence.
+
+    - id: UJ-0003
+      name: Continuous refactor radar
+      steps:
+        - Compiler periodically generates a Refactor Radar report from CCP hotspots and duplication signals.
+        - Report produces small maintenance tickets or a maintenance RFC proposal.
+        - Ticket executors perform refactors that reduce surface area and improve abstraction reuse.
+      failure_modes:
+        - Refactor work conflicts with feature work -> compiler tags conflicts and proposes sequencing.
+      observability_notes:
+        - Radar outputs are content-addressed and comparable across time windows.

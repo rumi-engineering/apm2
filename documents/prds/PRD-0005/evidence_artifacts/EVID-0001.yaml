@@ -1,0 +1,27 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: EVID-0001
+  category: INTEGRATION_TEST_RESULTS
+  title: End-to-end Idea Compiler golden run
+  capture:
+    paths:
+      - evidence/prd/PRD-0005/golden_runs/
+      - documents/prds/PRD-0005/
+  verification:
+    commands:
+      - id: CMD-0001
+        shell: bash
+        command: |
+          set -euo pipefail
+          ./xtask.sh factory-golden --prd PRD-0005 --clean
+        expected_exit_code: 0
+        cwd: .
+        timeout_seconds: 900
+        network_access: DISALLOWED
+  data:
+    classification: INTERNAL
+    redaction:
+      required: false
+      guidance:
+        - "Ensure run manifests and logs contain no secrets and redact provider identifiers if required by policy."

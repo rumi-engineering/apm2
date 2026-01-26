@@ -1,0 +1,129 @@
+rfc_contracts_and_versioning:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  module_contracts:
+    - module: crates/apm2-core/src/ccp
+      purpose: "Codebase Context Pack generation"
+      public_api:
+        - function: "build_ccp(repo_root: &Path, prd_id: &str) -> Result<CcpIndex>"
+          preconditions:
+            - "repo_root is a valid directory"
+            - "prd_id matches PRD-XXXX pattern"
+          postconditions:
+            - "Returns CcpIndex with valid hashes for all sub-artifacts"
+            - "All referenced files exist on disk"
+          error_conditions:
+            - "CcpBuildError::RepoNotFound if repo_root doesn't exist"
+            - "CcpBuildError::CargoMetadataFailed if cargo metadata fails"
+      invariants:
+        - "Component IDs are stable across runs for unchanged components"
+        - "Output is deterministic for fixed repo state"
+
+    - module: crates/apm2-core/src/impact_map
+      purpose: "Requirement to component mapping"
+      public_api:
+        - function: "build_impact_map(prd_path: &Path, ccp: &CcpIndex) -> Result<ImpactMap>"
+          preconditions:
+            - "prd_path contains valid PRD files"
+            - "ccp is a valid CCP index"
+          postconditions:
+            - "Every requirement is mapped or classified as net-new"
+            - "Duplication risks are identified"
+          error_conditions:
+            - "ImpactMapError::InvalidPrd if PRD parsing fails"
+            - "ImpactMapError::UnresolvableRequirement if mapping impossible"
+
+    - module: crates/apm2-core/src/rfc_framer
+      purpose: "RFC draft generation"
+      public_api:
+        - function: "frame_rfc(impact_map: &ImpactMap, ccp: &CcpIndex, rfc_id: &str) -> Result<RfcDraft>"
+          preconditions:
+            - "impact_map is valid"
+            - "rfc_id matches RFC-XXXX pattern"
+          postconditions:
+            - "RFC draft includes CCP grounding section"
+            - "All path references are validated"
+          error_conditions:
+            - "RfcFrameError::InvalidPathReference if any path doesn't exist"
+
+    - module: crates/apm2-core/src/ticket_emitter
+      purpose: "Ticket decomposition"
+      public_api:
+        - function: "emit_tickets(rfc: &RfcDraft, ccp: &CcpIndex) -> Result<Vec<Ticket>>"
+          preconditions:
+            - "rfc is a valid RFC draft"
+          postconditions:
+            - "Each ticket has stable ID"
+            - "File paths validated against CCP"
+            - "Verification commands present"
+
+    - module: crates/apm2-core/src/model_router
+      purpose: "Multi-model routing"
+      public_api:
+        - function: "route_stage(stage: StageId, profile: &RoutingProfile) -> Result<RouteSpec>"
+          preconditions:
+            - "stage is a valid stage ID"
+            - "profile is a valid routing profile"
+          postconditions:
+            - "Returns provider, model, version for stage"
+          error_conditions:
+            - "RoutingError::ProviderUnavailable if provider cannot be reached"
+            - "RoutingError::NoRouteConfigured if stage not in profile"
+
+    - module: crates/apm2-core/src/determinism
+      purpose: "Deterministic output generation"
+      public_api:
+        - function: "canonicalize_yaml(value: &serde_yaml::Value) -> String"
+          postconditions:
+            - "Output is deterministic for identical input"
+            - "Keys sorted lexicographically"
+            - "2-space indentation"
+        - function: "write_atomic(path: &Path, content: &[u8]) -> Result<()>"
+          postconditions:
+            - "File exists at path with content"
+            - "No partial writes possible"
+          error_conditions:
+            - "AtomicWriteError::FsyncFailed"
+            - "AtomicWriteError::RenameFailed"
+
+    - module: crates/apm2-core/src/run_manifest
+      purpose: "Compilation run provenance"
+      public_api:
+        - function: "create_manifest(run: &CompileRun) -> RunManifest"
+          postconditions:
+            - "Manifest includes all input/output hashes"
+            - "Manifest includes routing decisions"
+            - "Manifest includes stage timings"
+        - function: "sign_manifest(manifest: &RunManifest, key: &SigningKey) -> SignedManifest"
+          postconditions:
+            - "Signature is valid Ed25519 signature"
+            - "Signature covers canonical JSON bytes"
+
+  versioning:
+    schema_versions:
+      - artifact: PipelineSpec
+        current_version: "2026-01-26"
+        upgrade_path: "Schema changes require explicit migration"
+
+      - artifact: CcpIndex
+        current_version: "2026-01-26"
+        upgrade_path: "Backward compatible; old indices can be regenerated"
+
+      - artifact: ImpactMap
+        current_version: "2026-01-26"
+        upgrade_path: "Regenerate from CCP and PRD"
+
+      - artifact: RoutingProfile
+        current_version: "2026-01-26"
+        upgrade_path: "Additive fields only; old profiles remain valid"
+
+      - artifact: RunManifest
+        current_version: "2026-01-26"
+        upgrade_path: "Manifest includes schema_version; old manifests remain verifiable"
+
+  deprecation_policy:
+    statement: |
+      Schema versions are supported for 6 months after a new version is released.
+      Migration tooling is provided for schema upgrades.
+      Breaking changes require RFC approval.

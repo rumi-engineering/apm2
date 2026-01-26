@@ -1,0 +1,197 @@
+rfc_design_decisions:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  design_space_exploration:
+    inherited_from_prd:
+      prd_ref: "documents/prds/PRD-0005/04_solution_overview.yaml#prd_solution_overview.design_space_exploration"
+    selected_approach:
+      choice: OPT-C
+      name: "Declarative pipeline spec + pluggable stage runtime"
+      rationale: |
+        Use a declarative PipelineSpec with a pluggable stage runtime implemented in the core CLI.
+        This captures the strengths of CLI-first iteration while avoiding a monolithic, implicit workflow.
+        It also creates a clean seam for later daemon-backed execution and federation.
+
+  design_decisions:
+    - decision_id: DD-0009-001
+      title: "Compiler stages as Holon implementations"
+      context: |
+        PRD-0005 specifies that compiler stages should execute as bounded holonic episodes.
+        The apm2-holon crate already provides the Holon trait with intake/execute_episode/should_stop.
+      options:
+        - option_id: A
+          description: "Implement stages as Holon trait implementations"
+          pros:
+            - "Reuses existing bounded execution infrastructure"
+            - "Automatic budget tracking and stop condition handling"
+            - "Consistent with architectural direction"
+          cons:
+            - "Holon trait requires associated types (Input, Output, State)"
+            - "May be over-engineered for simple stages"
+        - option_id: B
+          description: "Implement stages as simple functions with manual budget checking"
+          pros:
+            - "Simpler implementation"
+            - "No trait ceremony"
+          cons:
+            - "Duplicates budget/stop logic"
+            - "Inconsistent with holonic architecture"
+      selected: A
+      rationale: |
+        Option A aligns with the holonic architecture established in RFC-0003. The trait
+        ceremony is acceptable given the benefits of consistent lifecycle management.
+        Each stage becomes a struct implementing Holon with stage-specific Input/Output types.
+      grounding:
+        component_id: COMP-HOLON
+        extension_point: EXT-HOLON-TRAIT
+        files_impacted:
+          - crates/apm2-core/src/ccp/mod.rs
+          - crates/apm2-core/src/impact_map/mod.rs
+          - crates/apm2-core/src/rfc_framer/mod.rs
+          - crates/apm2-core/src/ticket_emitter/mod.rs
+
+    - decision_id: DD-0009-002
+      title: "PipelineSpec as YAML IR"
+      context: |
+        The compiler needs a declarative specification of stages, their inputs/outputs,
+        and ordering constraints. This enables controlled evolution and partial runs.
+      options:
+        - option_id: A
+          description: "Define PipelineSpec as a YAML file in documents/standards/"
+          pros:
+            - "Governed document, version controlled"
+            - "Easy to inspect and modify"
+            - "Supports multiple pipeline variants"
+          cons:
+            - "Requires YAML parsing and validation"
+        - option_id: B
+          description: "Hardcode pipeline structure in Rust"
+          pros:
+            - "Type-safe at compile time"
+            - "No parsing overhead"
+          cons:
+            - "Less flexible"
+            - "Changes require recompilation"
+      selected: A
+      rationale: |
+        Option A supports the governance model where pipeline specs are versioned artifacts.
+        The YAML parsing overhead is negligible and already present in the codebase.
+      grounding:
+        component_id: COMP-STANDARDS
+        files_impacted:
+          - documents/standards/schemas/pipeline_spec.schema.yaml (new)
+          - documents/standards/pipeline_specs/default.yaml (new)
+
+    - decision_id: DD-0009-003
+      title: "CCP artifact structure"
+      context: |
+        The CCP must be deterministic, content-addressed, and incrementally buildable.
+        It needs to capture component IDs, invariants, crate graph, and prior decisions.
+      options:
+        - option_id: A
+          description: "Single monolithic YAML file"
+          pros:
+            - "Simple to produce and consume"
+          cons:
+            - "Large file, difficult to diff"
+            - "No incremental updates"
+        - option_id: B
+          description: "Multiple files with index"
+          pros:
+            - "Incrementally buildable"
+            - "Easy to diff individual artifacts"
+            - "Parallel generation possible"
+          cons:
+            - "More complex structure"
+      selected: B
+      rationale: |
+        Option B supports incremental builds and parallel generation. The index file
+        provides content hashes for all sub-artifacts, enabling cache invalidation.
+      grounding:
+        files_impacted:
+          - crates/apm2-core/src/ccp/index.rs
+          - crates/apm2-core/src/ccp/component_atlas.rs
+          - crates/apm2-core/src/ccp/crate_graph.rs
+          - crates/apm2-core/src/ccp/api_inventory.rs
+          - crates/apm2-core/src/ccp/decisions_index.rs
+
+    - decision_id: DD-0009-004
+      title: "YAML canonicalization strategy"
+      context: |
+        REQ-0008 requires deterministic outputs. YAML has multiple valid representations
+        for the same data structure, so canonicalization is needed.
+      options:
+        - option_id: A
+          description: "Use serde_yaml with custom serializer settings"
+          pros:
+            - "Leverages existing dependency"
+            - "Reasonable control over output"
+          cons:
+            - "serde_yaml may not guarantee stable output across versions"
+        - option_id: B
+          description: "Post-process with a dedicated canonicalizer"
+          pros:
+            - "Full control over output format"
+            - "Can enforce specific rules (key ordering, quoting)"
+          cons:
+            - "Additional complexity"
+      selected: B
+      rationale: |
+        Option B provides the strongest determinism guarantees. The canonicalizer will:
+        1. Sort keys lexicographically at all levels
+        2. Use consistent quoting rules (single quotes for strings with special chars)
+        3. Use 2-space indentation
+        4. Remove trailing whitespace
+      grounding:
+        files_impacted:
+          - crates/apm2-core/src/determinism/canonicalize.rs
+
+    - decision_id: DD-0009-005
+      title: "Model routing profile structure"
+      context: |
+        REQ-0007 requires explicit model routing with versioned profiles.
+        The profile must specify provider, model, and version per stage.
+      selected: "Use structured YAML with stage-keyed routes"
+      grounding:
+        files_impacted:
+          - documents/standards/schemas/routing_profile.schema.yaml (new)
+          - crates/apm2-core/src/model_router/profile.rs
+
+    - decision_id: DD-0009-006
+      title: "Run manifest format"
+      context: |
+        REQ-0009 requires signed run manifests with provenance.
+        The manifest must record inputs, outputs, routing, timings, and lint results.
+      selected: "JSON manifest with Ed25519 signature"
+      rationale: |
+        JSON is chosen over YAML for manifests because:
+        1. Canonical JSON (RFC 8785) has stricter determinism than YAML
+        2. Ed25519 signatures can be computed over JSON bytes
+        3. Machine-readable, easy to parse in various tools
+      grounding:
+        component_id: COMP-CORE
+        files_impacted:
+          - crates/apm2-core/src/run_manifest/manifest.rs
+          - crates/apm2-core/src/run_manifest/signer.rs
+
+  architectural_invariants:
+    - invariant_id: AI-0009-001
+      statement: "All compiler stage outputs are content-addressed with SHA256 or BLAKE3 hashes"
+      enforcement: "CCP index and run manifest include hashes; verification fails on mismatch"
+
+    - invariant_id: AI-0009-002
+      statement: "YAML outputs use canonical form: sorted keys, 2-space indent, no trailing whitespace"
+      enforcement: "determinism/canonicalize.rs post-processes all YAML before write"
+
+    - invariant_id: AI-0009-003
+      statement: "File writes are atomic: temp -> fsync -> rename"
+      enforcement: "determinism/atomic_write.rs provides write_atomic() function"
+
+    - invariant_id: AI-0009-004
+      statement: "All path references in RFCs and tickets are validated against CCP"
+      enforcement: "rfc_framer/grounding.rs and ticket_emitter/validation.rs check paths"
+
+    - invariant_id: AI-0009-005
+      statement: "Net-new modules require explicit justification in Impact Map"
+      enforcement: "LINT-0013 fails if justification is missing"

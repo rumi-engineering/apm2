@@ -1,0 +1,90 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00093
+  title: "Implement CCP index and CLI command"
+  status: OPEN
+  priority: HIGH
+  source:
+    rfc_id: RFC-0009
+    rfc_ref: "documents/rfcs/RFC-0009/06_ticket_decomposition.yaml#tickets[3]"
+    requirement_ids:
+      - REQ-0001
+      - REQ-0002
+  phase: PHASE-1
+  description: |
+    Create the CCP index generator and CLI command:
+    1. Aggregate all CCP sub-artifacts (atlas, crate graph, etc.)
+    2. Compute content hashes for each artifact
+    3. Generate CCP index JSON
+    4. Implement CLI: apm2 factory ccp build
+
+  implementation:
+    files_to_create:
+      - path: crates/apm2-core/src/ccp/index.rs
+        description: "CCP index generation"
+      - path: crates/apm2-cli/src/commands/factory/mod.rs
+        description: "Factory subcommand module"
+      - path: crates/apm2-cli/src/commands/factory/ccp.rs
+        description: "CCP CLI command implementation"
+
+    files_to_modify:
+      - path: crates/apm2-cli/src/main.rs
+        change: "Extend FactoryCommands enum with Ccp variant"
+      - path: crates/apm2-cli/src/commands/factory.rs
+        change: "Refactor to module structure, add ccp subcommand"
+
+    key_functions:
+      - name: "build_ccp"
+        signature: "pub fn build_ccp(repo_root: &Path, prd_id: &str, output_dir: &Path) -> Result<CcpIndex, CcpError>"
+        behavior: |
+          1. Build component atlas
+          2. Build crate graph
+          3. Build API inventory (optional, can be placeholder)
+          4. Build decisions index (optional, can be placeholder)
+          5. Write all artifacts to output_dir
+          6. Compute SHA256 hashes for each artifact
+          7. Write CCP index JSON
+
+    cli_command:
+      usage: "apm2 factory ccp build [--prd PRD-XXXX] [--output-dir <path>]"
+      flags:
+        - name: "--prd"
+          description: "PRD ID to associate CCP with"
+          default: "auto-detect from git"
+        - name: "--output-dir"
+          description: "Output directory for CCP artifacts"
+          default: "evidence/prd/{prd_id}/ccp/"
+
+  verification:
+    commands:
+      - command: "cargo run --bin apm2 -- factory ccp build --help"
+        description: "CLI help works"
+        expected_exit_code: 0
+
+      - command: "cargo run --bin apm2 -- factory ccp build --prd PRD-0005"
+        description: "CCP builds for PRD-0005"
+        expected_exit_code: 0
+
+      - command: "cargo test -p apm2-core ccp::index"
+        description: "CCP index unit tests pass"
+        expected_exit_code: 0
+
+    acceptance_criteria:
+      - criterion: "CLI command produces CCP index"
+        verification: "Manual: run command, verify evidence/prd/PRD-0005/ccp/ccp_index.json exists"
+
+      - criterion: "Content hashes validate correctly"
+        verification: "Unit test: test_ccp_index_hashes_valid"
+
+  dependencies:
+    blocked_by:
+      - TCK-00091
+      - TCK-00092
+    blocks:
+      - TCK-00094
+
+  estimated_complexity: MEDIUM
+  ccp_grounding:
+    component_id: COMP-CLI
+    extension_point: EXT-CLI-001
+    rationale: "Extends FactoryCommands enum with ccp subcommand"

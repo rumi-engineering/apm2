@@ -1,0 +1,37 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00102
+  title: "Implement Refactor Radar stage"
+  status: OPEN
+  priority: MEDIUM
+  source:
+    rfc_id: RFC-0009
+    requirement_ids: [REQ-0011]
+  phase: PHASE-5
+  description: |
+    Create Refactor Radar that aggregates CCP signals (hotspots,
+    duplication heuristics) into bounded maintenance recommendations.
+    Can emit maintenance tickets or RFC proposals.
+
+  implementation:
+    files_to_create:
+      - path: crates/apm2-core/src/refactor_radar/mod.rs
+      - path: crates/apm2-core/src/refactor_radar/radar.rs
+      - path: crates/apm2-core/src/refactor_radar/signals.rs
+      - path: crates/apm2-cli/src/commands/factory/refactor.rs
+    files_to_modify:
+      - path: crates/apm2-core/src/lib.rs
+      - path: crates/apm2-cli/src/main.rs
+
+  verification:
+    commands:
+      - command: "cargo run --bin apm2 -- factory refactor radar --window 7d"
+      - command: "cargo test -p apm2-core refactor_radar"
+    acceptance_criteria:
+      - "Radar output is bounded (max items)"
+      - "Recommendations are actionable"
+
+  dependencies:
+    blocked_by: [TCK-00100]
+    blocks: []
+  estimated_complexity: HIGH

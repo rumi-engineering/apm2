@@ -334,15 +334,37 @@ FAILED if any evidence artifact missing required fields (id, category, title, ca
 
 ### Purpose
 
-Assess semantic quality of requirements and evidence sufficiency.
+Assess semantic quality of requirements and evidence sufficiency through structured multi-angle analysis.
 
 ### Evidence Contract
 
 | Field | Value |
 |-------|-------|
 | Inputs | All PRD files |
-| Outputs | Content quality assessment |
-| Required | No BLOCKER-severity content issues |
+| Outputs | Content quality assessment, angle coverage matrix |
+| Required | No BLOCKER-severity content issues, all required angles executed |
+
+### Angle Dispatch Protocol
+
+Execute analysis through 8 structured angles. See [ANGLE_PROMPTS.md](ANGLE_PROMPTS.md) for detailed prompt templates.
+
+| Angle ID | Focus | Required | Finding Categories |
+|----------|-------|----------|-------------------|
+| TECHNICAL_FEASIBILITY | Can requirements be implemented? | Yes | SPEC_DEFECT |
+| CUSTOMER_VALUE | Does PRD solve real problems? | Yes | SPEC_DEFECT |
+| IMPLEMENTATION_RISK | What could go wrong? | Yes | SPEC_DEFECT |
+| REUSE_POTENTIAL | Extend existing vs create net-new? | Yes | TRACEABILITY_DEFECT |
+| VERIFIABILITY | Are requirements testable? | Yes | SPEC_DEFECT, EVIDENCE_DEFECT |
+| OPERATIONAL_READINESS | Can this be deployed safely? | No | SPEC_DEFECT, EVIDENCE_DEFECT |
+| SECURITY_POSTURE | Default-deny maintained? | No | EVIDENCE_DEFECT |
+| COHERENCE_CONSISTENCY | Internally consistent? | Yes | SPEC_DEFECT |
+
+**Angle Execution Requirements:**
+
+1. **All required angles MUST be executed** (6 required angles minimum)
+2. **Optional angles SHOULD be executed** for production PRDs
+3. **Each angle produces findings** with `angle_id` attribution
+4. **Angle coverage matrix** captured in output bundle
 
 ### Rubric
 
@@ -353,34 +375,93 @@ Assess semantic quality of requirements and evidence sufficiency.
 | Evidence sufficiency | Evidence would convince skeptical reviewer |
 | Completeness | No obvious gaps in requirement coverage |
 | Consistency | No contradictions between requirements |
+| Angle coverage | All required angles executed with findings documented |
 
 ### Assessment Questions
 
-For each requirement, evaluate:
+For each requirement, evaluate through applicable angles:
 
-1. **Clarity**: Can an implementer understand exactly what to build?
-2. **Testability**: Can a tester write a pass/fail test from the acceptance criteria?
-3. **Evidence**: Does the linked evidence actually demonstrate the requirement is met?
-4. **Scope**: Is the requirement appropriately scoped (not too broad, not too narrow)?
+1. **Clarity** (COHERENCE_CONSISTENCY): Can an implementer understand exactly what to build?
+2. **Testability** (VERIFIABILITY): Can a tester write a pass/fail test from the acceptance criteria?
+3. **Evidence** (VERIFIABILITY): Does the linked evidence actually demonstrate the requirement is met?
+4. **Scope** (COHERENCE_CONSISTENCY): Is the requirement appropriately scoped (not too broad, not too narrow)?
+5. **Feasibility** (TECHNICAL_FEASIBILITY): Can this be implemented with current technology?
+6. **Risk** (IMPLEMENTATION_RISK): What could prevent successful implementation?
+7. **Reuse** (REUSE_POTENTIAL): Does this duplicate existing abstractions?
 
 For the PRD overall, evaluate:
 
 1. **Coverage**: Are there obvious requirements missing for the stated problem?
 2. **Consistency**: Do requirements contradict each other?
 3. **Feasibility**: Are requirements technically achievable?
+4. **Customer Value**: Does the PRD solve a real, validated problem?
 
 ### Severity Assignment for Content Issues
 
-| Issue Type | Severity | Example |
-|------------|----------|---------|
-| Contradiction between requirements | BLOCKER | REQ-0001 says "MUST use HTTP" and REQ-0002 says "MUST use gRPC" |
-| Requirement impossible to implement | BLOCKER | "MUST complete in 0ms" |
-| Completely untestable requirement | BLOCKER | "System MUST be intuitive" with no criteria |
-| Ambiguous but interpretable requirement | MAJOR | "MUST respond quickly" (could add "< 100ms") |
-| Missing obvious requirement | MAJOR | No error handling requirement for a critical path |
-| Evidence doesn't fully demonstrate requirement | MAJOR | Test only covers happy path |
-| Minor clarity improvement | MINOR | Could be reworded for clarity |
-| Style or formatting suggestion | INFO | Passive voice could be active |
+| Issue Type | Severity | Example | Source Angle |
+|------------|----------|---------|--------------|
+| Contradiction between requirements | BLOCKER | REQ-0001 says "MUST use HTTP" and REQ-0002 says "MUST use gRPC" | COHERENCE_CONSISTENCY |
+| Requirement impossible to implement | BLOCKER | "MUST complete in 0ms" | TECHNICAL_FEASIBILITY |
+| Completely untestable requirement | BLOCKER | "System MUST be intuitive" with no criteria | VERIFIABILITY |
+| Goals disconnected from problem | BLOCKER | Goals don't address stated customer pain | CUSTOMER_VALUE |
+| Ambiguous but interpretable requirement | MAJOR | "MUST respond quickly" (could add "< 100ms") | COHERENCE_CONSISTENCY |
+| Missing obvious requirement | MAJOR | No error handling requirement for a critical path | IMPLEMENTATION_RISK |
+| Evidence doesn't fully demonstrate requirement | MAJOR | Test only covers happy path | VERIFIABILITY |
+| Duplicates existing abstraction | MAJOR | Reimplements existing RetryPolicy | REUSE_POTENTIAL |
+| Missing rollback strategy | MAJOR | No rollback for critical deployment | OPERATIONAL_READINESS |
+| Minor clarity improvement | MINOR | Could be reworded for clarity | COHERENCE_CONSISTENCY |
+| Ignored extension point | MINOR | Could leverage existing middleware | REUSE_POTENTIAL |
+| Style or formatting suggestion | INFO | Passive voice could be active | - |
+
+### Angle Coverage Matrix
+
+Each GATE-PRD-CONTENT execution produces an angle coverage matrix:
+
+```yaml
+angle_coverage:
+  prd_id: PRD-XXXX
+  review_timestamp: "2026-01-25T10:00:00Z"
+  angles:
+    - angle_id: TECHNICAL_FEASIBILITY
+      required: true
+      executed: true
+      finding_count: 2
+      blocker_count: 1
+      finding_ids: [FND-PRD-XXXX-001, FND-PRD-XXXX-002]
+    - angle_id: CUSTOMER_VALUE
+      required: true
+      executed: true
+      finding_count: 0
+      blocker_count: 0
+      finding_ids: []
+    # ... remaining angles
+  summary:
+    total_angles: 8
+    required_angles: 6
+    executed_angles: 8
+    required_executed: 6
+    total_findings: 12
+    blocker_findings: 2
+```
+
+### Merge Strategy for Angle Findings
+
+When multiple angles identify the same issue:
+
+1. **Deduplicate:** Same category + subcategory + location = single finding
+2. **Highest Severity Wins:** Use maximum severity from contributing angles
+3. **Combine Remediation:** Merge suggestions from all angles
+4. **Preserve Attribution:** Finding includes `angle_ids` list
+
+```yaml
+finding:
+  finding_id: FND-PRD-0005-007
+  angle_ids: [VERIFIABILITY, OPERATIONAL_READINESS]  # Both angles found this
+  category: EVIDENCE_DEFECT
+  subcategory: CRITERION_VAGUE
+  severity: MAJOR
+  # ... rest of finding
+```
 
 ### Confidence Levels
 
@@ -393,8 +474,9 @@ For the PRD overall, evaluate:
 ### Stop Condition
 
 - FAILED if any BLOCKER-severity content issue detected
+- FAILED if any required angle not executed
 - NEEDS_ADJUDICATION if confidence is LOW on any MAJOR issue
-- PASSED if no BLOCKER issues and HIGH/MEDIUM confidence on all assessments
+- PASSED if no BLOCKER issues, all required angles executed, and HIGH/MEDIUM confidence on all assessments
 
 ---
 
@@ -448,3 +530,6 @@ For the PRD overall, evaluate:
 - `standards/enums/03_evidence_categories.yaml` - 27 evidence categories
 - `standards/enums/04_quality_dimensions.yaml` - 18 quality dimensions
 - `standards/enums/18_network_access.yaml` - network_access enum
+- [ANGLE_PROMPTS.md](ANGLE_PROMPTS.md) - Multi-angle analysis prompts for GATE-PRD-CONTENT
+- [FINDING_CATEGORIES.md](FINDING_CATEGORIES.md) - Finding taxonomy with angle attributions
+- [FEEDBACK_LOOPS.md](FEEDBACK_LOOPS.md) - Recursive improvement through feedback signals
