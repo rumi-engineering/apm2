@@ -1,3 +1,90 @@
+---
+name: create-rfc
+description: Skill for creating RFC (Request for Comments) documents with iterative quality review and ticket decomposition in the APM2 project.
+user-invocable: true
+holon:
+  # ============================================================================
+  # Contract Definition
+  # ============================================================================
+  # The contract defines the input/output types for this holon.
+  #
+  # Design Decision: DEC-RFC-3001 - Holon as Async Trait with Associated Types
+  # The contract surface is specified declaratively here and enforced at runtime.
+  contract:
+    # Input type: RFC specification with requirements and plan references
+    input_type: RfcRequest
+
+    # Output type: Completed RFC with all 9 files and associated tickets
+    output_type: RfcResult
+
+    # State type: Tracks RFC creation progress across phases
+    state_type: RfcProgress
+
+  # ============================================================================
+  # Stop Conditions
+  # ============================================================================
+  # Stop conditions for RFC generation work. RFC creation is a multi-phase
+  # process involving document creation, iterative review, and ticket generation.
+  #
+  # Design Decision: DEC-RFC-3004 - Episode Stop Condition Evaluation
+  # Stop conditions are evaluated after each episode in priority order.
+  #
+  # Security Note: These limits prevent unbounded execution during RFC creation.
+  stop_conditions:
+    # Maximum episodes: RFC work involves multiple phases
+    #   - Phase 1: Initial RFC creation (9 files) ~ 5-10 episodes
+    #   - Phase 2: Iterative quality review ~ 5-10 episodes
+    #   - Phase 3: Ticket creation ~ 5-10 episodes
+    #   - Phase 4: Commit and verification ~ 2-3 episodes
+    # Total: 25 episodes provides headroom for complex RFCs
+    max_episodes: 25
+
+    # Timeout: 30 minutes for complete RFC generation
+    # RFC creation is a longer-running process that involves extensive
+    # reading, writing, and verification.
+    timeout_ms: 1800000
+
+    # Budget limits for RFC work
+    budget:
+      # Token budget: RFC work generates substantial text
+      # - 9 RFC YAML files with detailed content
+      # - Multiple ticket files
+      # - Iterative review and refinement
+      # 500K tokens allows for complex RFCs with multiple iterations
+      tokens: 500000
+
+      # Tool call budget: RFC work involves many file operations
+      # - Reading existing RFCs for reference
+      # - Creating 9+ YAML files
+      # - Creating ticket files
+      # - Git operations
+      # 500 tool calls provides sufficient capacity
+      tool_calls: 500
+
+    # Stall detection: RFC work may have periods of exploration
+    # Allow 5 episodes without progress before escalating
+    max_stall_episodes: 5
+
+  # ============================================================================
+  # Tool Permissions
+  # ============================================================================
+  # Tools required for RFC creation work.
+  #
+  # Security Model (Fail-Close):
+  # Only the tools explicitly listed are permitted.
+  #
+  # Design Decision: DEC-RFC-3003 - Lease Derivation for Sub-Holons
+  # When spawning review subagents, their tool access is the intersection
+  # of this parent's tools and the requested tools.
+  tools:
+    - Read         # Read existing RFCs, templates, and codebase files
+    - Write        # Create RFC YAML files and ticket files
+    - Edit         # Modify RFC files during iterative review
+    - Glob         # Find files by pattern
+    - Grep         # Search file contents
+    - Bash         # Git operations (add, commit, push), mkdir
+---
+
 # Create RFC Skill
 
 This skill documents the process for creating RFC (Request for Comments) documents in the apm2 project.
@@ -283,3 +370,80 @@ READY → IN_PROGRESS → COMPLETED
 4. **Link everything**: Requirements → Decisions → Tickets → Tests → Evidence
 5. **Be explicit about dependencies**: Ticket ordering matters for implementation
 6. **Iterate on quality**: Multiple subagent passes catch different issues
+
+---
+
+## Holon Configuration
+
+This skill is configured to execute as a holon with bounded resource consumption.
+
+### Stop Conditions
+
+| Condition | Value | Description |
+|-----------|-------|-------------|
+| `max_episodes` | 25 | Maximum episodes across all RFC creation phases |
+| `timeout_ms` | 1800000 | 30 minute wall-clock limit |
+| `budget.tokens` | 500000 | Token budget for extensive document generation |
+| `budget.tool_calls` | 500 | Tool call budget for file operations |
+| `max_stall_episodes` | 5 | Progress stall detection threshold |
+
+### Tool Permissions
+
+The skill has access to tools required for RFC creation:
+
+- `Read`: Read existing RFCs, templates, and codebase files
+- `Write`: Create RFC YAML files and ticket files
+- `Edit`: Modify RFC files during iterative review
+- `Glob`: Find files by pattern
+- `Grep`: Search file contents
+- `Bash`: Git operations and directory creation
+
+Tools not in this list are denied (fail-close security model).
+
+### Integration with spawn_holon
+
+This skill can be executed via the `spawn_holon` orchestration function:
+
+```rust
+use apm2_holon::spawn::{spawn_holon, SpawnConfig};
+use apm2_holon::resource::{Budget, LeaseScope};
+use apm2_holon::skill::parse_skill_file;
+
+// Parse skill frontmatter
+let (frontmatter, _body) = parse_skill_file("documents/skills/create-rfc/SKILL.md")?;
+let holon_config = frontmatter.holon.expect("create-rfc has holon config");
+
+// Build spawn configuration from skill config
+let config = SpawnConfig::builder()
+    .work_id("rfc-creation-001")
+    .work_title("Create RFC-XXXX")
+    .issuer_id("registrar")
+    .holder_id("create-rfc")
+    .scope(LeaseScope::builder()
+        .tools(holon_config.allowed_tools().unwrap_or(&[]))
+        .build())
+    .budget(Budget::new(
+        holon_config.stop_conditions.max_episodes.unwrap_or(25),
+        holon_config.stop_conditions.budget.get("tool_calls").copied().unwrap_or(500),
+        holon_config.stop_conditions.budget.get("tokens").copied().unwrap_or(500000),
+        holon_config.stop_conditions.timeout_ms.unwrap_or(1800000),
+    ))
+    .build()?;
+
+// Execute the holon
+let result = spawn_holon(&mut holon, input, config, || current_time_ns())?;
+```
+
+### Related Documentation
+
+- [RFC-0003: Holonic Framework](../../rfcs/RFC-0003/00_meta.yaml)
+- [example-holon Skill](../example-holon/SKILL.md)
+- [apm2-holon AGENTS.md](../../../crates/apm2-holon/AGENTS.md)
+
+### Invariants
+
+1. At least one stop condition is always configured (enforced at parse time)
+2. Tool access follows fail-close semantics (omitted = denied)
+3. Budget exhaustion triggers graceful termination, not error
+4. Escalation preserves work state for supervisor continuation
+5. All stop condition values must be > 0 (validated at parse time)
