@@ -36,43 +36,43 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     // === Daemon management ===
-    /// Start the daemon
+    /// Start the daemon (background by default)
     Daemon {
         /// Run in foreground (don't daemonize)
         #[arg(long)]
         no_daemon: bool,
     },
 
-    /// Kill the daemon
+    /// Stop the daemon (graceful shutdown)
     Kill,
 
     // === Process management ===
-    /// Start process(es)
+    /// Start a configured process (all instances)
     Start {
-        /// Process name (or 'all')
+        /// Process name
         name: String,
     },
 
-    /// Stop process(es)
+    /// Stop a configured process (all instances)
     Stop {
-        /// Process name (or 'all')
+        /// Process name
         name: String,
     },
 
-    /// Restart process(es)
+    /// Restart a configured process (stop then start)
     Restart {
-        /// Process name (or 'all')
+        /// Process name
         name: String,
     },
 
-    /// Graceful reload (rolling restart)
+    /// Graceful reload (rolling restart) [daemon support pending]
     Reload {
-        /// Process name (or 'all')
+        /// Process name
         name: String,
     },
 
     // === Process info ===
-    /// List all processes
+    /// List configured processes
     #[command(alias = "ls")]
     List,
 
@@ -82,7 +82,7 @@ enum Commands {
         name: String,
     },
 
-    /// Tail process logs
+    /// Tail process logs [daemon support pending]
     Logs {
         /// Process name
         name: String,
@@ -97,22 +97,22 @@ enum Commands {
     },
 
     // === Credential management ===
-    /// Credential management
+    /// Credential management [daemon support pending]
     #[command(subcommand)]
     Creds(CredsCommands),
 
     // === Factory (Agent) orchestration ===
-    /// Factory commands
+    /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
     Factory(FactoryCommands),
 }
 
 #[derive(Subcommand, Debug)]
 enum CredsCommands {
-    /// List credential profiles
+    /// List credential profiles [daemon support pending]
     List,
 
-    /// Add a new credential profile
+    /// Add a new credential profile [daemon support pending]
     Add {
         /// Profile ID
         profile_id: String,
@@ -126,19 +126,19 @@ enum CredsCommands {
         auth_method: String,
     },
 
-    /// Remove a credential profile
+    /// Remove a credential profile [daemon support pending]
     Remove {
         /// Profile ID
         profile_id: String,
     },
 
-    /// Force refresh a credential profile
+    /// Force refresh a credential profile [daemon support pending]
     Refresh {
         /// Profile ID
         profile_id: String,
     },
 
-    /// Switch credentials for a running process
+    /// Switch credentials for a running process [daemon support pending]
     Switch {
         /// Process name
         process: String,
@@ -147,12 +147,12 @@ enum CredsCommands {
         profile: String,
     },
 
-    /// Interactive login flow
+    /// Print provider login instructions (does not store credentials)
     Login {
         /// Provider (claude, gemini, openai)
         provider: String,
 
-        /// Profile ID to create
+        /// Profile ID to reference in printed instructions
         #[arg(short, long)]
         profile_id: Option<String>,
     },
@@ -160,13 +160,13 @@ enum CredsCommands {
 
 #[derive(Subcommand, Debug)]
 enum FactoryCommands {
-    /// Run an agent task from a spec
+    /// Run a Markdown spec with an agent CLI (currently Claude Code)
     Run {
         /// Path to the spec file (PRD, RFC, or Ticket)
         spec_file: PathBuf,
 
-        /// Output format (text, json)
-        #[arg(long, default_value = "text")]
+        /// Output format (`text` or `json`)
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
         format: String,
     },
 }

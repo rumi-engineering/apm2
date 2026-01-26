@@ -1,0 +1,27 @@
+prd_instance_readme:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  prd_id: "PRD-0005"
+  title: "RFC Idea Compiler Pipeline - Codebase-Aware RFCs and Multi-Model Orchestration"
+  description: |
+    This PRD defines the "Idea Compiler": a deterministic compilation pipeline
+    that converts an operator-provided plan/PRD into a codebase-aware RFC and a
+    low-noise set of engineering tickets.
+
+    The pipeline explicitly incorporates repository truth (crates/modules/APIs,
+    AGENTS.md invariants, and prior decisions) via a generated Codebase Context
+    Pack, and records model/provider provenance per stage.
+
+  decomposition:
+    - "requirements/: one file per requirement (low-context friendly)."
+    - "evidence_artifacts/: one file per evidence artifact definition (low-context friendly)."
+  key_outputs:
+    - "Codebase Context Pack (CCP): component atlas + crate graph + hotspots + decision index."
+    - "Impact Map: PRD requirement -> existing component + extension point mapping."
+    - "RFC drafts: grounded in CCP; reuse-by-default; explicit justification for net-new substrate."
+    - "Ticket set: atomic, low-noise, with deletion/migration plans when new surfaces are introduced."
+    - "Run manifests: signed, content-addressed receipts for each compile run."
+  binding:
+    standards:
+      - "standards/00_standards_meta.yaml#standards_meta"
+      - "standards/lint/LINT_SPEC.yaml#lint_spec"

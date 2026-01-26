@@ -1,0 +1,26 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: EVID-0009
+  category: BENCHMARK_RESULTS
+  title: Performance benchmarks for CCP build and end-to-end compile
+  capture:
+    paths:
+      - evidence/prd/PRD-0005/benchmarks/
+  verification:
+    commands:
+      - id: CMD-0001
+        shell: bash
+        command: |
+          set -euo pipefail
+          cargo bench --package apm2-xtask --bench factory_bench
+        expected_exit_code: 0
+        cwd: .
+        timeout_seconds: 1200
+        network_access: DISALLOWED
+  data:
+    classification: INTERNAL
+    redaction:
+      required: false
+      guidance:
+        - "Bench outputs must not embed absolute paths; normalize if necessary."

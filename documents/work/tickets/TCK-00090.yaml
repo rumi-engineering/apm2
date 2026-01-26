@@ -1,0 +1,91 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00090
+  title: "Implement determinism module with YAML canonicalization"
+  status: OPEN
+  priority: HIGH
+  source:
+    rfc_id: RFC-0009
+    rfc_ref: "documents/rfcs/RFC-0009/06_ticket_decomposition.yaml#tickets[0]"
+    requirement_ids:
+      - REQ-0008
+  phase: PHASE-1
+  description: |
+    Create the determinism module in apm2-core that provides:
+    1. YAML canonicalization (sorted keys, 2-space indent, no trailing whitespace)
+    2. Atomic file writes (temp -> fsync -> rename)
+    3. Diff classification (structural vs free-text)
+
+    This module is foundational for all compiler outputs.
+
+  implementation:
+    files_to_create:
+      - path: crates/apm2-core/src/determinism/mod.rs
+        description: "Module root exporting public API"
+      - path: crates/apm2-core/src/determinism/canonicalize.rs
+        description: "YAML canonicalization functions"
+      - path: crates/apm2-core/src/determinism/atomic_write.rs
+        description: "Atomic file write implementation"
+      - path: crates/apm2-core/src/determinism/diff_classify.rs
+        description: "Diff classification logic"
+
+    files_to_modify:
+      - path: crates/apm2-core/src/lib.rs
+        change: "Add pub mod determinism;"
+
+    key_functions:
+      - name: "canonicalize_yaml"
+        signature: "pub fn canonicalize_yaml(value: &serde_yaml::Value) -> String"
+        behavior: |
+          - Sort all object keys lexicographically at all nesting levels
+          - Use 2-space indentation
+          - Remove trailing whitespace
+          - Use consistent quoting (single quotes for strings with special chars)
+
+      - name: "write_atomic"
+        signature: "pub fn write_atomic(path: &Path, content: &[u8]) -> Result<(), AtomicWriteError>"
+        behavior: |
+          1. Write to temp file in same directory
+          2. fsync the temp file
+          3. fsync the parent directory
+          4. Atomic rename to target path
+
+      - name: "classify_diff"
+        signature: "pub fn classify_diff(old: &str, new: &str) -> DiffClassification"
+        behavior: |
+          - Parse both as YAML
+          - Compare structure (keys, arrays, types)
+          - If only free-text fields differ, return FreeText
+          - Otherwise return Structural
+
+  verification:
+    commands:
+      - command: "cargo test -p apm2-core determinism"
+        description: "Run unit tests for determinism module"
+        expected_exit_code: 0
+
+      - command: "cargo clippy -p apm2-core -- -D warnings"
+        description: "Lint check passes"
+        expected_exit_code: 0
+
+    acceptance_criteria:
+      - criterion: "canonicalize_yaml produces identical output for semantically identical input"
+        verification: "Unit test: test_yaml_canonicalization_idempotent"
+
+      - criterion: "write_atomic never produces partial files"
+        verification: "Unit test: test_atomic_write_no_partial"
+
+      - criterion: "classify_diff correctly categorizes structural vs free-text changes"
+        verification: "Unit tests: test_diff_classify_structural, test_diff_classify_freetext"
+
+  dependencies:
+    blocked_by: []
+    blocks:
+      - TCK-00091
+      - TCK-00092
+
+  estimated_complexity: MEDIUM
+  ccp_grounding:
+    component_id: COMP-CORE
+    extension_point: new_module
+    rationale: "New cross-cutting concern with no existing equivalent"

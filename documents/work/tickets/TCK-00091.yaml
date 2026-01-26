@@ -1,0 +1,86 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00091
+  title: "Implement CCP component atlas generation"
+  status: OPEN
+  priority: HIGH
+  source:
+    rfc_id: RFC-0009
+    rfc_ref: "documents/rfcs/RFC-0009/06_ticket_decomposition.yaml#tickets[1]"
+    requirement_ids:
+      - REQ-0002
+  phase: PHASE-1
+  description: |
+    Create the component atlas generator that:
+    1. Discovers AGENTS.md files in crate directories
+    2. Parses invariants, contracts, and extension points
+    3. Generates stable component IDs
+    4. Outputs deterministic YAML via the determinism module
+
+  implementation:
+    files_to_create:
+      - path: crates/apm2-core/src/ccp/mod.rs
+        description: "CCP module root"
+      - path: crates/apm2-core/src/ccp/component_atlas.rs
+        description: "Component atlas generation"
+
+    files_to_modify:
+      - path: crates/apm2-core/src/lib.rs
+        change: "Add pub mod ccp;"
+
+    key_functions:
+      - name: "build_component_atlas"
+        signature: "pub fn build_component_atlas(repo_root: &Path) -> Result<ComponentAtlas, CcpError>"
+        behavior: |
+          1. Glob for **/AGENTS.md in crates/
+          2. Parse each AGENTS.md for invariants (INV-*), contracts (CTR-*), extension points
+          3. Generate stable component ID from crate name (COMP-{UPPER_SNAKE_CASE})
+          4. Return structured ComponentAtlas
+
+    data_structures:
+      - name: ComponentAtlas
+        fields:
+          - schema_version: String
+          - generated_at: DateTime
+          - repo_root: PathBuf
+          - components: Vec<Component>
+
+      - name: Component
+        fields:
+          - id: String
+          - name: String
+          - path: PathBuf
+          - type: ComponentType
+          - description: String
+          - agents_md: Option<PathBuf>
+          - invariants: Vec<Invariant>
+          - contracts: Vec<Contract>
+          - extension_points: Vec<ExtensionPoint>
+
+  verification:
+    commands:
+      - command: "cargo test -p apm2-core ccp::component_atlas"
+        description: "Run component atlas unit tests"
+        expected_exit_code: 0
+
+    acceptance_criteria:
+      - criterion: "Component IDs are stable across runs"
+        verification: "Unit test: test_component_atlas_stable_ids"
+
+      - criterion: "AGENTS.md invariants are correctly extracted"
+        verification: "Unit test: test_agents_md_parsing"
+
+      - criterion: "Output uses canonical YAML format"
+        verification: "Integration test verifies output matches expected format"
+
+  dependencies:
+    blocked_by:
+      - TCK-00090
+    blocks:
+      - TCK-00093
+
+  estimated_complexity: MEDIUM
+  ccp_grounding:
+    component_id: COMP-CORE
+    extension_point: new_module
+    rationale: "CCP is a novel capability per PRD-0005"

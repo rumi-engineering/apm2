@@ -1,0 +1,173 @@
+rfc_test_and_evidence:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  testing_strategy:
+    unit_tests:
+      - module: crates/apm2-core/src/determinism
+        tests:
+          - name: "test_yaml_canonicalization_key_order"
+            description: "Verify keys are sorted lexicographically"
+          - name: "test_yaml_canonicalization_idempotent"
+            description: "Verify canonicalize(canonicalize(x)) == canonicalize(x)"
+          - name: "test_atomic_write_creates_file"
+            description: "Verify file is created with correct content"
+          - name: "test_atomic_write_no_partial"
+            description: "Verify interrupted writes don't leave partial files"
+          - name: "test_diff_classify_structural"
+            description: "Verify structural changes are correctly identified"
+          - name: "test_diff_classify_freetext"
+            description: "Verify free-text changes are correctly identified"
+
+      - module: crates/apm2-core/src/ccp
+        tests:
+          - name: "test_component_atlas_stable_ids"
+            description: "Verify component IDs don't change for unchanged components"
+          - name: "test_crate_graph_deterministic"
+            description: "Verify crate graph output is identical for same input"
+          - name: "test_ccp_index_hashes_valid"
+            description: "Verify all content hashes in index are correct"
+
+      - module: crates/apm2-core/src/impact_map
+        tests:
+          - name: "test_requirement_mapping"
+            description: "Verify requirements map to correct components"
+          - name: "test_net_new_classification"
+            description: "Verify unmappable requirements are classified"
+          - name: "test_duplication_risk_detection"
+            description: "Verify duplication risks are identified"
+
+      - module: crates/apm2-core/src/rfc_framer
+        tests:
+          - name: "test_path_validation_valid"
+            description: "Verify valid paths pass validation"
+          - name: "test_path_validation_invalid"
+            description: "Verify invalid paths fail compilation"
+          - name: "test_ccp_grounding_included"
+            description: "Verify RFC includes CCP grounding section"
+
+      - module: crates/apm2-core/src/model_router
+        tests:
+          - name: "test_routing_profile_parse"
+            description: "Verify routing profile YAML parses correctly"
+          - name: "test_route_selection"
+            description: "Verify correct route selected for stage"
+          - name: "test_canary_comparison"
+            description: "Verify canary mode compares outputs correctly"
+
+      - module: crates/apm2-core/src/run_manifest
+        tests:
+          - name: "test_manifest_creation"
+            description: "Verify manifest includes all required fields"
+          - name: "test_manifest_signing"
+            description: "Verify signature is valid"
+          - name: "test_manifest_verification"
+            description: "Verify tampered manifests fail verification"
+
+    integration_tests:
+      - name: "test_ccp_build_apm2_repo"
+        location: crates/apm2-core/tests/ccp_integration.rs
+        description: "Build CCP for the apm2 repository itself"
+        verification: |
+          - CCP index exists
+          - All sub-artifacts exist
+          - Hashes validate
+          - Re-run produces identical output
+
+      - name: "test_end_to_end_compile"
+        location: crates/apm2-core/tests/compile_integration.rs
+        description: "Run full compile pipeline on a test PRD"
+        verification: |
+          - All stages complete
+          - Run manifest is produced and signed
+          - Output artifacts are valid YAML
+
+    property_tests:
+      - name: "proptest_yaml_canonicalization"
+        description: "Verify canonicalization is deterministic for arbitrary YAML"
+        strategy: "Generate random serde_yaml::Value, verify canonicalize is idempotent"
+
+      - name: "proptest_atomic_write"
+        description: "Verify atomic writes never produce partial files"
+        strategy: "Simulate interrupts at various points, verify file integrity"
+
+  evidence_requirements:
+    from_prd:
+      - evidence_id: EVID-0001
+        prd_ref: "documents/prds/PRD-0005/evidence_artifacts/EVID-0001.yaml"
+        rfc_coverage: |
+          End-to-end test: test_end_to_end_compile
+          Demonstrates CLI commands produce expected outputs
+
+      - evidence_id: EVID-0002
+        prd_ref: "documents/prds/PRD-0005/evidence_artifacts/EVID-0002.yaml"
+        rfc_coverage: |
+          Integration test: test_ccp_build_apm2_repo
+          Demonstrates CCP generation with stable IDs
+
+      - evidence_id: EVID-0005
+        prd_ref: "documents/prds/PRD-0005/evidence_artifacts/EVID-0005.yaml"
+        rfc_coverage: |
+          Unit tests: test_path_validation_*
+          Demonstrates ticket file path validation
+
+      - evidence_id: EVID-0006
+        prd_ref: "documents/prds/PRD-0005/evidence_artifacts/EVID-0006.yaml"
+        rfc_coverage: |
+          Unit tests: test_diff_classify_*
+          Demonstrates determinism diff classification
+
+      - evidence_id: EVID-0007
+        prd_ref: "documents/prds/PRD-0005/evidence_artifacts/EVID-0007.yaml"
+        rfc_coverage: |
+          Unit tests: test_routing_profile_parse, test_route_selection
+          Demonstrates routing profile parsing and selection
+
+      - evidence_id: EVID-0008
+        prd_ref: "documents/prds/PRD-0005/evidence_artifacts/EVID-0008.yaml"
+        rfc_coverage: |
+          Unit tests: test_manifest_signing, test_manifest_verification
+          Demonstrates run manifest provenance
+
+  acceptance_test_plan:
+    scenarios:
+      - scenario_id: AT-001
+        title: "Fresh CCP build"
+        steps:
+          - "Run: apm2 factory ccp build"
+          - "Verify: CCP artifacts created in evidence/prd/PRD-0005/ccp/"
+          - "Verify: Content hashes in index are correct"
+        expected_outcome: "CCP built successfully with valid hashes"
+
+      - scenario_id: AT-002
+        title: "Deterministic re-run"
+        steps:
+          - "Run: apm2 factory ccp build"
+          - "Run: apm2 factory ccp build (again)"
+          - "Verify: Output is byte-identical"
+        expected_outcome: "No diff between runs"
+
+      - scenario_id: AT-003
+        title: "Impact map for PRD-0005"
+        steps:
+          - "Run: apm2 factory impact-map build --prd PRD-0005"
+          - "Verify: All 12 requirements mapped"
+          - "Verify: Net-new modules identified"
+        expected_outcome: "Impact map matches manual analysis"
+
+      - scenario_id: AT-004
+        title: "End-to-end compile with dry-run"
+        steps:
+          - "Run: apm2 factory compile --plan documents/prds/PRD-0005 --dry-run"
+          - "Verify: No files modified"
+          - "Verify: Report shows intended writes"
+        expected_outcome: "Dry-run reports correctly"
+
+      - scenario_id: AT-005
+        title: "Run manifest verification"
+        steps:
+          - "Run: apm2 factory compile --plan documents/prds/PRD-0005"
+          - "Run: apm2 factory verify --manifest <manifest_path>"
+          - "Verify: Signature validates"
+          - "Verify: Content hashes match"
+        expected_outcome: "Manifest verifies successfully"

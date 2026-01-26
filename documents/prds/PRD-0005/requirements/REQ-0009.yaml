@@ -1,0 +1,18 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0009
+  type: SECURITY
+  title: Auth and provenance integration for compiler runs
+  statement: |
+    The compiler MUST integrate with core auth abstractions to attest compilation runs.
+    Each compile run MUST obtain a CompilationLease (local dev may use ephemeral keys) and emit a signed run manifest binding inputs, outputs, and routing choices.
+  acceptance_criteria:
+    - "Run manifest includes: lease_id, issuer identity, timestamps, hashes for inputs/outputs, and stage routing provenance."
+    - "When daemon-backed auth is available, lease and manifest signatures are verified by `apm2 factory verify`."
+    - "The compiler never relies on ambient credentials for external tool invocations; any external invocation must be mediated and recorded."
+    - "Manifest verification fails if any referenced artifact hash does not match the on-disk content."
+  evidence:
+    evidence_ids:
+      - EVID-0008
+      - EVID-0001

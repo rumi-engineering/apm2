@@ -1,0 +1,81 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00092
+  title: "Implement CCP crate graph generation"
+  status: OPEN
+  priority: HIGH
+  source:
+    rfc_id: RFC-0009
+    rfc_ref: "documents/rfcs/RFC-0009/06_ticket_decomposition.yaml#tickets[2]"
+    requirement_ids:
+      - REQ-0002
+  phase: PHASE-1
+  description: |
+    Create the crate graph generator that:
+    1. Invokes cargo metadata --format-version 1 --no-deps
+    2. Parses the JSON output
+    3. Produces a deterministic crate graph JSON artifact
+
+  implementation:
+    files_to_create:
+      - path: crates/apm2-core/src/ccp/crate_graph.rs
+        description: "Crate graph generation from cargo metadata"
+
+    key_functions:
+      - name: "build_crate_graph"
+        signature: "pub fn build_crate_graph(repo_root: &Path) -> Result<CrateGraph, CcpError>"
+        behavior: |
+          1. Run: cargo metadata --format-version 1 --no-deps
+          2. Parse JSON output into CargoMetadata struct
+          3. Extract workspace members, dependencies
+          4. Sort all lists deterministically
+          5. Return CrateGraph
+
+    data_structures:
+      - name: CrateGraph
+        fields:
+          - schema_version: String
+          - generated_at: DateTime
+          - workspace_root: PathBuf
+          - crates: Vec<CrateInfo>
+          - edges: Vec<DependencyEdge>
+
+      - name: CrateInfo
+        fields:
+          - name: String
+          - version: String
+          - path: PathBuf
+          - edition: String
+          - rust_version: Option<String>
+          - crate_type: CrateType
+          - dependencies: Vec<String>
+
+      - name: DependencyEdge
+        fields:
+          - from: String
+          - to: String
+
+  verification:
+    commands:
+      - command: "cargo test -p apm2-core ccp::crate_graph"
+        description: "Run crate graph unit tests"
+        expected_exit_code: 0
+
+    acceptance_criteria:
+      - criterion: "Crate graph matches cargo metadata output"
+        verification: "Integration test compares graph to cargo metadata"
+
+      - criterion: "Output is deterministic (no random ordering)"
+        verification: "Unit test: test_crate_graph_deterministic"
+
+  dependencies:
+    blocked_by:
+      - TCK-00090
+    blocks:
+      - TCK-00093
+
+  estimated_complexity: LOW
+  ccp_grounding:
+    component_id: COMP-CORE
+    extension_point: new_module
+    rationale: "Part of CCP infrastructure"

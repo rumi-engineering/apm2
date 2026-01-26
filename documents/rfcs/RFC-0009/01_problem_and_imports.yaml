@@ -1,0 +1,70 @@
+rfc_problem_and_imports:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  problem_statement:
+    inherited_from_prd:
+      prd_ref: "documents/prds/PRD-0005/02_problem.yaml#prd_problem"
+      primary: |
+        The system lacks a deterministic, codebase-aware PRD->RFC "idea compiler" that
+        (a) ingests explicit repository truth, (b) prefers reuse-by-default, (c) emits
+        low-noise tickets, and (d) records provenance and determinism receipts.
+    rfc_refinement: |
+      This RFC specifies the implementation architecture for the Idea Compiler pipeline.
+      The compiler is structured as a sequence of holonic stages, each producing deterministic
+      artifacts that are content-addressed and cryptographically attested. The implementation
+      leverages existing apm2-core infrastructure for lease management, cryptographic signing,
+      and event ledger storage.
+
+  imports:
+    prd_requirements:
+      - requirement_id: REQ-0001
+        ref: "documents/prds/PRD-0005/requirements/REQ-0001.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0002
+        ref: "documents/prds/PRD-0005/requirements/REQ-0002.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0003
+        ref: "documents/prds/PRD-0005/requirements/REQ-0003.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0004
+        ref: "documents/prds/PRD-0005/requirements/REQ-0004.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0005
+        ref: "documents/prds/PRD-0005/requirements/REQ-0005.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0006
+        ref: "documents/prds/PRD-0005/requirements/REQ-0006.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0007
+        ref: "documents/prds/PRD-0005/requirements/REQ-0007.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0008
+        ref: "documents/prds/PRD-0005/requirements/REQ-0008.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0009
+        ref: "documents/prds/PRD-0005/requirements/REQ-0009.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0010
+        ref: "documents/prds/PRD-0005/requirements/REQ-0010.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0011
+        ref: "documents/prds/PRD-0005/requirements/REQ-0011.yaml#prd_requirement"
+        import_type: FULL
+      - requirement_id: REQ-0012
+        ref: "documents/prds/PRD-0005/requirements/REQ-0012.yaml#prd_requirement"
+        import_type: FULL
+
+    existing_infrastructure:
+      - component_id: COMP-CLI
+        ref: "evidence/prd/PRD-0005/ccp/component_atlas.yaml#component_atlas.components[0]"
+        usage: "Extend FactoryCommands enum for new compile subcommands"
+      - component_id: COMP-CORE
+        ref: "evidence/prd/PRD-0005/ccp/component_atlas.yaml#component_atlas.components[2]"
+        usage: "Add new modules for compiler stages"
+      - component_id: COMP-HOLON
+        ref: "evidence/prd/PRD-0005/ccp/component_atlas.yaml#component_atlas.components[3]"
+        usage: "Leverage Holon trait for stage execution model"
+      - component_id: COMP-XTASK
+        ref: "evidence/prd/PRD-0005/ccp/component_atlas.yaml#component_atlas.components[4]"
+        usage: "Extend lint rules"

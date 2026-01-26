@@ -1,0 +1,176 @@
+rfc_governance_and_gates:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  authority_signoffs:
+    required:
+      - authority_id: AUTH_ARCHITECTURE
+        rationale: "RFC introduces 8 new modules in apm2-core"
+        signoff_criteria:
+          - "Design decisions align with holonic architecture"
+          - "Module boundaries are clean and maintainable"
+          - "No circular dependencies introduced"
+        status: PENDING
+
+      - authority_id: AUTH_PRODUCT
+        rationale: "RFC implements PRD-0005 requirements"
+        signoff_criteria:
+          - "All 12 PRD requirements are addressed"
+          - "CLI UX is acceptable"
+          - "Rollout plan is feasible"
+        status: PENDING
+
+  gates:
+    - gate_id: GATE-RFC-REVIEW
+      description: "RFC technical review"
+      criteria:
+        - "Design decisions are justified"
+        - "Trust boundaries are documented"
+        - "Contracts are specified"
+        - "Test plan covers requirements"
+      status: PENDING
+      signoffs_required:
+        - AUTH_ARCHITECTURE
+
+    - gate_id: GATE-IMPL-PHASE1
+      description: "Phase 1 implementation complete"
+      criteria:
+        - "TCK-00090 through TCK-00093 complete"
+        - "CCP builds for apm2 repo"
+        - "Determinism tests pass"
+      status: PENDING
+      blocked_by:
+        - GATE-RFC-REVIEW
+
+    - gate_id: GATE-IMPL-PHASE2
+      description: "Phase 2 implementation complete"
+      criteria:
+        - "TCK-00094 and TCK-00095 complete"
+        - "Impact Map builds for PRD-0005"
+        - "RFC framing works"
+      status: PENDING
+      blocked_by:
+        - GATE-IMPL-PHASE1
+
+    - gate_id: GATE-IMPL-PHASE3
+      description: "Phase 3 implementation complete"
+      criteria:
+        - "TCK-00096 and TCK-00097 complete"
+        - "Ticket emission works"
+        - "Lint rules active"
+      status: PENDING
+      blocked_by:
+        - GATE-IMPL-PHASE2
+
+    - gate_id: GATE-IMPL-PHASE4
+      description: "Phase 4 implementation complete"
+      criteria:
+        - "TCK-00098 through TCK-00100 complete"
+        - "End-to-end compile works"
+        - "Run manifests signed"
+      status: PENDING
+      blocked_by:
+        - GATE-IMPL-PHASE3
+
+    - gate_id: GATE-IMPL-PHASE5
+      description: "Phase 5 implementation complete"
+      criteria:
+        - "TCK-00101 and TCK-00102 complete"
+        - "Skills updated"
+        - "Refactor Radar works"
+      status: PENDING
+      blocked_by:
+        - GATE-IMPL-PHASE4
+
+    - gate_id: GATE-ACCEPTANCE
+      description: "Feature acceptance"
+      criteria:
+        - "All acceptance tests pass (AT-001 through AT-005)"
+        - "Documentation complete"
+        - "No blocking bugs"
+      status: PENDING
+      blocked_by:
+        - GATE-IMPL-PHASE5
+      signoffs_required:
+        - AUTH_PRODUCT
+
+  change_control:
+    scope_changes:
+      policy: |
+        Any changes to PRD requirements or RFC design decisions require:
+        1. Update to relevant PRD or RFC file
+        2. Review by original authority signoffs
+        3. Impact assessment on downstream tickets
+
+    rollback_plan: |
+      If critical issues are found post-implementation:
+      1. New modules can be feature-flagged off
+      2. CLI commands can be hidden behind --unstable flag
+      3. Skills can be reverted to previous versions
+      No schema migrations are required for rollback.
+
+  traceability:
+    prd_to_rfc:
+      - prd_requirement: REQ-0001
+        rfc_coverage:
+          - DD-0009-002
+          - "05_rollout_and_ops.yaml#cli_reference"
+          - TCK-00093
+          - TCK-00100
+
+      - prd_requirement: REQ-0002
+        rfc_coverage:
+          - DD-0009-003
+          - TCK-00091
+          - TCK-00092
+          - TCK-00093
+
+      - prd_requirement: REQ-0003
+        rfc_coverage:
+          - "evidence/prd/PRD-0005/impact_map/impact_map.yaml"
+          - TCK-00094
+
+      - prd_requirement: REQ-0004
+        rfc_coverage:
+          - DD-0009-001
+          - TCK-00095
+
+      - prd_requirement: REQ-0005
+        rfc_coverage:
+          - TCK-00097
+
+      - prd_requirement: REQ-0006
+        rfc_coverage:
+          - TCK-00096
+
+      - prd_requirement: REQ-0007
+        rfc_coverage:
+          - DD-0009-005
+          - TCK-00098
+
+      - prd_requirement: REQ-0008
+        rfc_coverage:
+          - DD-0009-004
+          - AI-0009-001
+          - AI-0009-002
+          - AI-0009-003
+          - TCK-00090
+
+      - prd_requirement: REQ-0009
+        rfc_coverage:
+          - DD-0009-006
+          - TCK-00099
+
+      - prd_requirement: REQ-0010
+        rfc_coverage:
+          - TCK-00101
+
+      - prd_requirement: REQ-0011
+        rfc_coverage:
+          - TCK-00102
+
+      - prd_requirement: REQ-0012
+        rfc_coverage:
+          - "05_rollout_and_ops.yaml#monitoring"
+          - TCK-00099
+          - TCK-00100

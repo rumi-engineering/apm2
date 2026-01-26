@@ -1,0 +1,35 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00097
+  title: "Add lint rules for clutter prevention"
+  status: OPEN
+  priority: MEDIUM
+  source:
+    rfc_id: RFC-0009
+    requirement_ids: [REQ-0005]
+  phase: PHASE-3
+  description: |
+    Add new lint rules to LINT_SPEC.yaml and implement in xtask:
+    - LINT-0013: no-new-module-without-justification
+    - LINT-0014: cousin-abstraction-detector (WARNING)
+    - LINT-0015: deletion-migration-plan-required
+
+  implementation:
+    files_to_modify:
+      - path: documents/standards/lint/LINT_SPEC.yaml
+        change: "Add LINT-0013, LINT-0014, LINT-0015 rules"
+      - path: xtask/src/tasks/lint.rs
+        change: "Implement rule checks"
+
+  verification:
+    commands:
+      - command: "cargo xtask lint"
+    acceptance_criteria:
+      - "LINT-0013 fails if new module lacks justification"
+      - "LINT-0014 warns on cousin abstractions"
+      - "LINT-0015 fails if new surface lacks deletion plan"
+
+  dependencies:
+    blocked_by: [TCK-00096]
+    blocks: [TCK-00098]
+  estimated_complexity: MEDIUM

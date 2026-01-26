@@ -1,0 +1,16 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0010
+  type: UX
+  title: Skill system integration for operator and agent workflows
+  statement: |
+    The system MUST integrate the compiler pipeline into the skill library so that a human operator can relay a conversation summary and an agent can execute the full PRD->RFC->ticket workflow deterministically. This includes creating a new idea-compiler skill and updating existing skills (create-rfc, prd-review) to require CCP and Impact Map inputs for RFC creation.
+  acceptance_criteria:
+    - "A new skill `documents/skills/idea-compiler/SKILL.md` exists with invocations mapping to CLI commands and artifact inputs/outputs."
+    - "The create-rfc skill is updated to require a CCP reference and Impact Map reference before drafting RFC files."
+    - "Skill instructions include deterministic runbook steps and disallow manual, divergent workflows."
+  evidence:
+    evidence_ids:
+      - EVID-0010
+      - EVID-0001

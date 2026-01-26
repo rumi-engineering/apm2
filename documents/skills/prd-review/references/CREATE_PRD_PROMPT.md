@@ -37,6 +37,28 @@ PRD-ID format: `PRD-XXXX` (4-digit zero-padded). Template contains 19 YAML files
 | Evidence linkage | >=1 evidence_id |
 | Type | FUNCTIONAL, NON_FUNCTIONAL, CONSTRAINT, or INTEGRATION |
 
+### Falsifiability Standard (Mandatory)
+
+Every acceptance criterion MUST be **machine-verifiable**. This means:
+
+1. **Bound by a Threshold:** Replace subjective terms with numeric bounds.
+   - BAD: "System MUST be fast"
+   - GOOD: "p99 latency MUST be <200ms under 1000 RPS"
+
+2. **Verifiable by Artifact:** Each criterion MUST reference an evidence artifact type.
+   - BAD: "Users should find the system easy to use"
+   - GOOD: "New users MUST complete onboarding in <5 minutes (EVID: session_recording_analysis)"
+
+3. **Falsifiable by Command:** The ideal criterion can be tested by a single shell command.
+   - Example: `curl -w '%{time_total}' ... | jq '.latency < 0.2'`
+
+**Prohibited Terms (Auto-Fail):**
+- "seamless", "intuitive", "user-friendly", "reliable", "robust", "performant", "scalable" (without quantification)
+- "reasonable", "appropriate", "sufficient", "adequate" (without bounds)
+- "should" (use MUST, SHOULD RFC 2119 style with explicit fallback)
+
+If a criterion uses a prohibited term without quantification, it is an `EVIDENCE_DEFECT (CRITERION_VAGUE)` with `BLOCKER` severity.
+
 **Good:** `"The system MUST return error code 400 when input validation fails."`
 **Bad:** `"The system should handle errors appropriately."` (vague, untestable)
 

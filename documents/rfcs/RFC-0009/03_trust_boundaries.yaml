@@ -1,0 +1,109 @@
+rfc_trust_boundaries:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  trust_model:
+    principals:
+      - principal_id: P-OPERATOR
+        description: "Human operator initiating compilation runs"
+        trust_level: HIGH
+        capabilities:
+          - "Invoke any CLI command"
+          - "Override routing profiles"
+          - "Accept material diffs"
+
+      - principal_id: P-COMPILER
+        description: "Idea Compiler pipeline executing as a process"
+        trust_level: MEDIUM
+        capabilities:
+          - "Read repository files"
+          - "Write to designated output directories"
+          - "Invoke model providers via configured routes"
+        restrictions:
+          - "Cannot modify source code directly"
+          - "Cannot push to remote repositories"
+          - "Cannot access network except via model router"
+
+      - principal_id: P-MODEL_PROVIDER
+        description: "External LLM provider (Claude, GPT, etc.)"
+        trust_level: LOW
+        capabilities:
+          - "Receive prompts and return structured responses"
+        restrictions:
+          - "Responses are untrusted until validated"
+          - "No direct file system access"
+          - "No network access beyond API endpoint"
+
+    boundaries:
+      - boundary_id: B-001
+        name: "Compiler-to-Model boundary"
+        from_principal: P-COMPILER
+        to_principal: P-MODEL_PROVIDER
+        crossing_mechanism: "HTTP/HTTPS API call via model_router"
+        validation:
+          - "Responses parsed into structured IR"
+          - "Schema validation before use"
+          - "Retry with stricter constraints on validation failure"
+        threats:
+          - "Prompt injection via model response"
+          - "Non-deterministic outputs"
+          - "Provider unavailability"
+        mitigations:
+          - "Structured output schema enforcement"
+          - "Canary comparison for drift detection"
+          - "Fail-closed on validation errors"
+
+      - boundary_id: B-002
+        name: "Compiler-to-Filesystem boundary"
+        from_principal: P-COMPILER
+        to_principal: FILESYSTEM
+        crossing_mechanism: "Rust std::fs via atomic_write"
+        validation:
+          - "Path validation against allowed directories"
+          - "Atomic write pattern (temp -> fsync -> rename)"
+        threats:
+          - "Path traversal"
+          - "Partial writes"
+        mitigations:
+          - "Allowlist of writable directories"
+          - "Atomic writes prevent partial state"
+
+      - boundary_id: B-003
+        name: "Operator-to-Compiler boundary"
+        from_principal: P-OPERATOR
+        to_principal: P-COMPILER
+        crossing_mechanism: "CLI invocation"
+        validation:
+          - "Argument parsing via clap"
+          - "File existence checks"
+        threats:
+          - "Invalid inputs causing undefined behavior"
+        mitigations:
+          - "Strong typing in CLI"
+          - "Input validation before processing"
+
+  data_classification:
+    - classification: PUBLIC
+      description: "CCP artifacts, RFCs, tickets, run manifests"
+      handling: "May be committed to repository"
+
+    - classification: INTERNAL
+      description: "Routing profiles with provider identifiers"
+      handling: "May contain provider names but not credentials"
+
+    - classification: CONFIDENTIAL
+      description: "API keys, credentials"
+      handling: "Never included in compiler artifacts; accessed via environment or keyring"
+
+  security_constraints:
+    - constraint_id: SC-001
+      statement: "Model prompts must not contain secrets or credentials"
+      enforcement: "Prompt templates reviewed; no dynamic credential injection"
+
+    - constraint_id: SC-002
+      statement: "Run manifests must not include raw model responses"
+      enforcement: "Manifests include hashes and structured summaries only"
+
+    - constraint_id: SC-003
+      statement: "Output directories are restricted to evidence/ and documents/"
+      enforcement: "CLI validates output paths against allowlist"

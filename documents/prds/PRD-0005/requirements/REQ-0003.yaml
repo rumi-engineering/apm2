@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0003
+  type: FUNCTIONAL
+  title: Requirement-to-component impact mapping
+  statement: |
+    The compiler MUST map each PRD requirement to one or more existing codebase components and extension points identified in the CCP, producing a deterministic Impact Map artifact used by RFC framing.
+  acceptance_criteria:
+    - "For each requirement, the Impact Map lists candidate components (stable IDs), a selected extension point, and rationale bound to atlas entries."
+    - "Requirements that cannot be mapped are explicitly classified as net-new substrate and require an adjudication record before RFC emission."
+    - "Impact Map is deterministic for a fixed PRD and repo state and includes stable ordering for diff-friendly review."
+    - "Impact Map includes a 'duplication risk' field when multiple plausible extension points exist."
+  evidence:
+    evidence_ids:
+      - EVID-0003
+      - EVID-0006

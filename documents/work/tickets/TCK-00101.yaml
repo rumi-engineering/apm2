@@ -1,0 +1,33 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00101
+  title: "Update idea-compiler and create-rfc skills"
+  status: OPEN
+  priority: MEDIUM
+  source:
+    rfc_id: RFC-0009
+    requirement_ids: [REQ-0010]
+  phase: PHASE-5
+  description: |
+    Update skill files to integrate with compiler pipeline:
+    - idea-compiler: Full invocation guide for factory compile
+    - create-rfc: Require CCP and Impact Map references
+
+  implementation:
+    files_to_modify:
+      - path: documents/skills/idea-compiler/SKILL.md
+        change: "Complete skill with CLI invocations"
+      - path: documents/skills/create-rfc/SKILL.md
+        change: "Add CCP/Impact Map prerequisites"
+
+  verification:
+    commands:
+      - command: "cargo xtask lint"
+    acceptance_criteria:
+      - "Skills invoke CLI commands correctly"
+      - "create-rfc requires CCP reference"
+
+  dependencies:
+    blocked_by: [TCK-00100]
+    blocks: []
+  estimated_complexity: LOW

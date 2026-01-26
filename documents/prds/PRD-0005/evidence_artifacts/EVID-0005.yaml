@@ -1,0 +1,27 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: EVID-0005
+  category: TEST_RESULTS
+  title: Ticket emission tests (atomicity, traceability, verification commands)
+  capture:
+    paths:
+      - evidence/prd/PRD-0005/tickets/
+      - documents/work/tickets/
+  verification:
+    commands:
+      - id: CMD-0001
+        shell: bash
+        command: |
+          set -euo pipefail
+          cargo test --package apm2-xtask --lib ticket_emit::tests
+        expected_exit_code: 0
+        cwd: .
+        timeout_seconds: 600
+        network_access: DISALLOWED
+  data:
+    classification: INTERNAL
+    redaction:
+      required: false
+      guidance:
+        - "Ticket lint asserts every ticket contains verification commands and stable file paths."
