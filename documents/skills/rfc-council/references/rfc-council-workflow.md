@@ -1,11 +1,13 @@
-# RFC Council Workflow
+title: RFC Council Workflow
 
 decision_tree:
   entrypoint: VALIDATE_AND_CLASSIFY
   nodes[1]:
     - id: VALIDATE_AND_CLASSIFY
       purpose: "Validate inputs and branch to the correct mode."
-      steps[5]:
+      steps[6]:
+        - id: NOTE_VARIABLE_SUBSTITUTION
+          action: "References do not interpolate variables; replace <MODE_OPTIONAL> and <TARGET_ID> placeholders before running commands."
         - id: VALIDATE_ID
           action: |
             Validate input ID format:

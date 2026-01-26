@@ -1,4 +1,4 @@
-# RFC Ticket Review Rubric
+title: RFC Ticket Review Rubric
 
 Formal gate definitions with evidence contracts for RFC ticket review.
 

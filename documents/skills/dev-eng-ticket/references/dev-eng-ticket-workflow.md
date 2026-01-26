@@ -8,8 +8,6 @@ decision_tree:
       context_files[6]:
         - path: README.md
           purpose: "Root-level module index, documentation discovery, and repository-wide constraints."
-        - path: documents/skills/coding/SKILL.md
-          purpose: "Project coding standards."
         - path: documents/skills/rust-textbook/SKILL.md
           purpose: "Rust quality guidance; choose relevant sections later."
         - path: documents/security/AGENTS.md

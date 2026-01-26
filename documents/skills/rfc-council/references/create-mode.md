@@ -1,11 +1,13 @@
-# CREATE Mode
+title: RFC CREATE Mode
 
 decision_tree:
   entrypoint: CREATE_FLOW
   nodes[1]:
     - id: CREATE_FLOW
       purpose: "Generate RFC and tickets from PRD."
-      steps[6]:
+      steps[7]:
+        - id: NOTE_VARIABLE_SUBSTITUTION
+          action: "References do not interpolate variables; replace <PRD_ID> and <RFC_ID> placeholders before running commands."
         - id: PHASE_1_RFC_CREATION
           action: |
             Create RFC directory and 9 YAML files:

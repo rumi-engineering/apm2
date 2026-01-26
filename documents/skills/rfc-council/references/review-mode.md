@@ -1,11 +1,13 @@
-# REVIEW Mode
+title: RFC REVIEW Mode
 
 decision_tree:
   entrypoint: RUN_GATES
   nodes[1]:
     - id: RUN_GATES
       purpose: "Execute formal review gates and emit findings."
-      steps[7]:
+      steps[8]:
+        - id: NOTE_VARIABLE_SUBSTITUTION
+          action: "References do not interpolate variables; replace <RFC_ID> and <PRD_ID> placeholders before running commands."
         - id: LOAD_INPUTS
           action: |
             Load RFC and ticket files:

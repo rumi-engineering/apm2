@@ -24,7 +24,6 @@ rfc_ticket_decomposition:
 
             Files to modify:
             - documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md
-            - documents/skills/coding/SKILL.md (add reference to anti-patterns section)
 
             Add "Anti-Patterns (Lessons Learned)" section:
             - ANTI-1: Shell argument escaping for complex strings

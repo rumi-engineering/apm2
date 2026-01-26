@@ -56,6 +56,11 @@
 - ENFORCE BY: use `Vec<T>` instead of `Option<T>` for associated identifiers (e.g., `pr_numbers: Vec<u64>` instead of `pr_number: Option<u64>`).
 [PROVENANCE] APM2 Security Policy; RSK-1906 (Nondeterminism/Integrity).
 
+[CONTRACT: CTR-1908] Serialization in Crypto Contexts.
+- REJECT IF: serialization errors are swallowed when the output feeds into a hash or signature.
+- ENFORCE BY: propagate all serialization failures to prevent silent corruption of hash chains.
+[PROVENANCE] APM2 Implementation Standard; CTR-0701.
+
 ## References (Normative Anchors)
 
 - Rust Reference: Behavior considered undefined: https://doc.rust-lang.org/reference/behavior-considered-undefined.html

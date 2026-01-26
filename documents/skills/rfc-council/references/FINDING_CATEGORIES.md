@@ -1,4 +1,4 @@
-# Finding Categories
+title: RFC Ticket Finding Categories
 
 Taxonomy for RFC ticket review finding classification. Enables FindingSignature computation, recurrence tracking, and automated remediation recommendations.
 

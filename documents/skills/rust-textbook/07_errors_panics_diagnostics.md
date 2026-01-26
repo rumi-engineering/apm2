@@ -40,6 +40,19 @@
 - ENFORCE BY: enums for error kinds; include actionable context (indices, ranges, sizes); stable `Display` messages.
 [PROVENANCE] std error traits and conventions; public API stability expectations.
 
+```rust
+// Pattern: Typed Error Model
+#[derive(Debug, thiserror::Error)]
+pub enum FsEditError {
+    #[error("path rejected: {0}")]
+    PathRejected(String),
+    #[error("payload too large: {size} > {max}")]
+    TooLarge { size: u64, max: u64 },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+```
+
 [CONTRACT: CTR-0704] `#[must_use]` on Values That Carry Correctness Obligations.
 - REJECT IF: dropping a value can silently discard an error, guard, token, or pending operation required for correctness.
 - ENFORCE BY: `#[must_use]` on results/guards/tokens; clippy lint policy that denies unused results where appropriate.
@@ -50,6 +63,11 @@
 - REJECT IF: `allow(...)` is introduced without a local rationale and scope minimization.
 - ENFORCE BY: workspace lint policy; local suppressions only with precise targets.
 [PROVENANCE] Rust Reference: attributes (lint attributes).
+
+[CONTRACT: CTR-0706] Non-Critical Error Visibility (Tracing over Printing).
+- REJECT IF: library code uses `println!`, `eprintln!`, or `dbg!` for diagnostics or non-critical errors.
+- ENFORCE BY: use the `tracing` crate (or `log`) for warnings and info; allow callers to decide on collection/visibility.
+[PROVENANCE] APM2 Implementation Standard.
 
 ## References (Normative Anchors)
 

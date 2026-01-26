@@ -50,6 +50,28 @@
 [PROVENANCE] APM2 Implementation Standard.
 [VERIFICATION] Test ghost key eviction: reuse key after TTL, verify new entry survives eviction.
 
+[CONTRACT: CTR-1303] Bounded In-Memory Stores (Memory DoS Prevention).
+- REJECT IF: in-memory collections (HashMaps, Vecs) tracking external events lack a hard upper bound.
+- ENFORCE BY:
+  - use a `max_entries` limit.
+  - O(1) eviction: use `VecDeque` alongside `HashMap` to track insertion order for fast eviction.
+[PROVENANCE] APM2 Implementation Standard; CTR-MEM001.
+
+```rust
+// Pattern: Bounded Store with O(1) Eviction
+impl<K: Hash + Eq + Clone, V> BoundedStore<K, V> {
+    pub fn insert(&mut self, key: K, value: V) {
+        while self.entries.len() >= self.max_entries {
+            if let Some(old_key) = self.insertion_order.pop_front() {
+                self.entries.remove(&old_key);
+            }
+        }
+        self.entries.insert(key.clone(), value);
+        self.insertion_order.push_back(key);
+    }
+}
+```
+
 ## References (Normative Anchors)
 
 - std `Vec`: https://doc.rust-lang.org/std/vec/struct.Vec.html

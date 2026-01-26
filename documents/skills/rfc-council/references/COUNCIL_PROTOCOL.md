@@ -1,6 +1,13 @@
-# Council Protocol
+title: RFC COUNCIL Protocol
 
-Full orchestration instructions for the COUNCIL depth level. This protocol governs how 3 subagents coordinate across 3 iterative review cycles to produce a consensus assessment on RFC ticket quality.
+decision_tree:
+  entrypoint: COUNCIL_ORCHESTRATION
+  nodes[1]:
+    - id: COUNCIL_ORCHESTRATION
+      purpose: "Orchestrate 3-agent deliberation for RFC tickets."
+      steps[1]:
+        - id: NOTE_VARIABLE_SUBSTITUTION
+          action: "References do not interpolate variables; replace <RFC_ID> placeholders before running commands."
 
 ## Overview
 
@@ -72,6 +79,9 @@ state: "INIT"
 1. Create session file at `evidence/rfc/{RFC_ID}/reviews/council_session_{timestamp}.yaml`
 2. Load RFC content and tickets into context
 3. Load CCP component atlas
+4. Load REQUIRED READING into context:
+   - `documents/skills/agent-native-software/SKILL.md`
+   - `documents/security/AGENTS.md`
 
 ### Step 2: Spawn Subagents
 
