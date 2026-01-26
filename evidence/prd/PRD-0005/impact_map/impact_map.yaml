@@ -1,342 +1,150 @@
-impact_map:
-  schema_version: "2026-01-26"
-  generated_at: "2026-01-26T00:00:00Z"
-  prd_id: PRD-0005
-  ccp_index_ref: evidence/prd/PRD-0005/ccp/ccp_index.json
-
-  requirement_mappings:
-    - requirement_id: REQ-0001
-      title: "Single-command Idea Compiler entrypoint"
-      candidate_components:
-        - component_id: COMP-CLI
-          extension_point: EXT-CLI-001
-          fit_score: high
-          rationale: "FactoryCommands enum is the natural extension point for adding compile, ccp, impact-map, rfc, tickets subcommands"
-      selected_extension_point:
-        component_id: COMP-CLI
-        extension_point: EXT-CLI-001
-        implementation_approach: |
-          Extend FactoryCommands enum with new variants:
-          - Compile { plan: PathBuf, profile: Option<String>, dry_run: bool }
-          - Ccp(CcpCommands)
-          - ImpactMap(ImpactMapCommands)
-          - Rfc(RfcCommands)
-          - Tickets(TicketCommands)
-          - Skill(SkillCommands)
-          - Refactor(RefactorCommands)
-        files_to_modify:
-          - crates/apm2-cli/src/main.rs
-          - crates/apm2-cli/src/commands/factory.rs
-        files_to_create:
-          - crates/apm2-cli/src/commands/factory/compile.rs
-          - crates/apm2-cli/src/commands/factory/ccp.rs
-          - crates/apm2-cli/src/commands/factory/impact_map.rs
-          - crates/apm2-cli/src/commands/factory/rfc.rs
-          - crates/apm2-cli/src/commands/factory/tickets.rs
-      duplication_risk: none
-      net_new_substrate: false
-
-    - requirement_id: REQ-0002
-      title: "Codebase Context Pack generation"
-      candidate_components:
-        - component_id: COMP-CORE
-          extension_point: null
-          fit_score: medium
-          rationale: "apm2-core has cargo metadata parsing capability but CCP is a distinct concern"
-        - component_id: COMP-XTASK
-          extension_point: null
-          fit_score: low
-          rationale: "xtask is for dev tooling, not runtime features"
-      selected_extension_point:
-        component_id: COMP-CORE
-        extension_point: new_module
-        implementation_approach: |
-          Create new module crates/apm2-core/src/ccp/ with:
-          - component_atlas.rs: Parse AGENTS.md, extract invariants/contracts
-          - crate_graph.rs: Invoke cargo metadata, produce deterministic graph
-          - api_inventory.rs: Extract public types from lib.rs files
-          - hotspots.rs: Git churn analysis (optional, defer)
-          - decisions_index.rs: Parse existing RFC metas
-          - index.rs: Generate CCP index with hashes
-        files_to_modify:
-          - crates/apm2-core/src/lib.rs (add pub mod ccp)
-        files_to_create:
-          - crates/apm2-core/src/ccp/mod.rs
-          - crates/apm2-core/src/ccp/component_atlas.rs
-          - crates/apm2-core/src/ccp/crate_graph.rs
-          - crates/apm2-core/src/ccp/api_inventory.rs
-          - crates/apm2-core/src/ccp/decisions_index.rs
-          - crates/apm2-core/src/ccp/index.rs
-      duplication_risk: low
-      duplication_risk_rationale: "No existing CCP infrastructure; this is net-new but well-scoped"
-      net_new_substrate: true
-      net_new_justification: |
-        CCP is a core concept introduced by PRD-0005 with no existing equivalent.
-        It does not duplicate existing functionality but builds on cargo metadata
-        and YAML parsing already available in apm2-core.
-
-    - requirement_id: REQ-0003
-      title: "Requirement-to-component impact mapping"
-      candidate_components:
-        - component_id: COMP-CORE
-          extension_point: null
-          fit_score: medium
-          rationale: "Natural to colocate with CCP generation"
-      selected_extension_point:
-        component_id: COMP-CORE
-        extension_point: new_module
-        implementation_approach: |
-          Create crates/apm2-core/src/impact_map/ with:
-          - mapper.rs: Map requirements to CCP components
-          - adjudication.rs: Handle net-new substrate classification
-          - output.rs: Produce deterministic YAML output
-        files_to_create:
-          - crates/apm2-core/src/impact_map/mod.rs
-          - crates/apm2-core/src/impact_map/mapper.rs
-          - crates/apm2-core/src/impact_map/adjudication.rs
-          - crates/apm2-core/src/impact_map/output.rs
-      net_new_substrate: true
-      net_new_justification: "Impact mapping is a novel compiler stage with no existing equivalent"
-
-    - requirement_id: REQ-0004
-      title: "RFC framing grounded in CCP and Impact Map"
-      candidate_components:
-        - component_id: COMP-SKILLS
-          extension_point: null
-          fit_score: medium
-          rationale: "rfc-council skill already exists"
-        - component_id: COMP-CORE
-          extension_point: null
-          fit_score: high
-          rationale: "Compiler stage should live in core"
-      selected_extension_point:
-        component_id: COMP-CORE
-        extension_point: new_module
-        implementation_approach: |
-          Create crates/apm2-core/src/rfc_framer/ with:
-          - framer.rs: Generate RFC skeleton from Impact Map + CCP
-          - grounding.rs: Validate all path references against CCP
-          - templates.rs: RFC section templates with CCP bindings
-        files_to_modify:
-          - documents/skills/rfc-council/SKILL.md (update to require CCP/Impact Map)
-        files_to_create:
-          - crates/apm2-core/src/rfc_framer/mod.rs
-          - crates/apm2-core/src/rfc_framer/framer.rs
-          - crates/apm2-core/src/rfc_framer/grounding.rs
-      net_new_substrate: true
-      net_new_justification: "RFC framing with CCP grounding is a new capability"
-
-    - requirement_id: REQ-0005
-      title: "RFC and ticket lint extensions to prevent clutter"
-      candidate_components:
-        - component_id: COMP-XTASK
-          extension_point: EXT-XTASK-LINT
-          fit_score: high
-          rationale: "Lint rules live in xtask/src/tasks/lint.rs"
-        - component_id: COMP-STANDARDS
-          extension_point: null
-          fit_score: high
-          rationale: "LINT_SPEC.yaml defines lint rules"
-      selected_extension_point:
-        component_id: COMP-STANDARDS
-        extension_point: LINT_SPEC
-        implementation_approach: |
-          Add new lint rules to documents/standards/lint/LINT_SPEC.yaml:
-          - LINT-0013: no-new-module-without-justification
-          - LINT-0014: cousin-abstraction-detector
-          - LINT-0015: deletion-migration-plan-required
-          Implement corresponding checks in xtask/src/tasks/lint.rs
-        files_to_modify:
-          - documents/standards/lint/LINT_SPEC.yaml
-          - xtask/src/tasks/lint.rs
-      duplication_risk: none
-      net_new_substrate: false
-
-    - requirement_id: REQ-0006
-      title: "Atomic ticket decomposition with migration and verification"
-      candidate_components:
-        - component_id: COMP-CORE
-          extension_point: null
-          fit_score: high
-          rationale: "Natural location for ticket generation"
-      selected_extension_point:
-        component_id: COMP-CORE
-        extension_point: new_module
-        implementation_approach: |
-          Create crates/apm2-core/src/ticket_emitter/ with:
-          - emitter.rs: Decompose RFC into atomic tickets
-          - validation.rs: Validate file paths exist in CCP
-          - verification.rs: Generate verification commands
-        files_to_create:
-          - crates/apm2-core/src/ticket_emitter/mod.rs
-          - crates/apm2-core/src/ticket_emitter/emitter.rs
-          - crates/apm2-core/src/ticket_emitter/validation.rs
-      net_new_substrate: true
-      net_new_justification: "Automated ticket decomposition is a new compiler stage"
-
-    - requirement_id: REQ-0007
-      title: "Multi-model routing with explicit profiles and provenance"
-      candidate_components:
-        - component_id: COMP-CORE
-          extension_point: EXT-CORE-ADAPTER
-          fit_score: medium
-          rationale: "Adapter pattern could be extended but routing is distinct"
-      selected_extension_point:
-        component_id: COMP-CORE
-        extension_point: new_module
-        implementation_approach: |
-          Create crates/apm2-core/src/model_router/ with:
-          - router.rs: Route stages to providers based on profile
-          - profile.rs: Parse routing profile YAML
-          - canary.rs: Run canary comparisons between routes
-        files_to_create:
-          - crates/apm2-core/src/model_router/mod.rs
-          - crates/apm2-core/src/model_router/router.rs
-          - crates/apm2-core/src/model_router/profile.rs
-          - crates/apm2-core/src/model_router/canary.rs
-          - documents/standards/schemas/routing_profile.schema.yaml
-      net_new_substrate: true
-      net_new_justification: "Model routing infrastructure does not exist"
-
-    - requirement_id: REQ-0008
-      title: "Determinism envelope and material-diff acceptance"
-      candidate_components:
-        - component_id: COMP-CORE
-          extension_point: null
-          fit_score: high
-          rationale: "Core infrastructure concern"
-      selected_extension_point:
-        component_id: COMP-CORE
-        extension_point: new_module
-        implementation_approach: |
-          Create crates/apm2-core/src/determinism/ with:
-          - canonicalize.rs: YAML canonicalization (key ordering, indentation)
-          - atomic_write.rs: Write temp -> fsync -> rename pattern
-          - diff_classify.rs: Classify diffs as structural vs free-text
-        files_to_create:
-          - crates/apm2-core/src/determinism/mod.rs
-          - crates/apm2-core/src/determinism/canonicalize.rs
-          - crates/apm2-core/src/determinism/atomic_write.rs
-          - crates/apm2-core/src/determinism/diff_classify.rs
-      net_new_substrate: true
-      net_new_justification: "Determinism envelope is a new cross-cutting concern"
-
-    - requirement_id: REQ-0009
-      title: "Auth and provenance integration for compiler runs"
-      candidate_components:
-        - component_id: COMP-CORE
-          extension_point: null
-          fit_score: high
-          rationale: "lease and crypto modules already exist"
-        - component_id: COMP-HOLON
-          extension_point: null
-          fit_score: medium
-          rationale: "Lease types exist in apm2-holon"
-      selected_extension_point:
-        component_id: COMP-CORE
-        extension_point: existing_modules
-        implementation_approach: |
-          Reuse existing infrastructure:
-          - crates/apm2-core/src/lease/ for CompilationLease
-          - crates/apm2-core/src/crypto/ for signing run manifests
-          - crates/apm2-core/src/ledger/ for storing run history
-          Create crates/apm2-core/src/run_manifest/ for manifest structure
-        files_to_modify:
-          - crates/apm2-core/src/lease/mod.rs (add CompilationLease variant)
-        files_to_create:
-          - crates/apm2-core/src/run_manifest/mod.rs
-          - crates/apm2-core/src/run_manifest/manifest.rs
-          - crates/apm2-core/src/run_manifest/signer.rs
-      duplication_risk: low
-      duplication_risk_rationale: "Reuses existing lease/crypto/ledger; run_manifest is new but specialized"
-      net_new_substrate: false
-
-    - requirement_id: REQ-0010
-      title: "Skill system integration for operator and agent workflows"
-      candidate_components:
-        - component_id: COMP-SKILLS
-          extension_point: null
-          fit_score: high
-          rationale: "Skill library is the target"
-        - component_id: COMP-HOLON
-          extension_point: null
-          fit_score: medium
-          rationale: "Skill parsing exists in apm2-holon"
-      selected_extension_point:
-        component_id: COMP-SKILLS
-        extension_point: skill_library
-        implementation_approach: |
-          - Update documents/skills/idea-compiler/SKILL.md (already exists as stub)
-          - Update documents/skills/rfc-council/SKILL.md to require CCP/Impact Map
-        files_to_modify:
-          - documents/skills/idea-compiler/SKILL.md
-          - documents/skills/rfc-council/SKILL.md
-      duplication_risk: none
-      net_new_substrate: false
-
-    - requirement_id: REQ-0011
-      title: "Continuous Refactor Radar stage"
-      candidate_components:
-        - component_id: COMP-CORE
-          extension_point: null
-          fit_score: high
-          rationale: "Compiler stage location"
-      selected_extension_point:
-        component_id: COMP-CORE
-        extension_point: new_module
-        implementation_approach: |
-          Create crates/apm2-core/src/refactor_radar/ with:
-          - radar.rs: Aggregate CCP signals into recommendations
-          - signals.rs: Hotspot detection, duplication heuristics
-          - tickets.rs: Emit maintenance tickets
-        files_to_create:
-          - crates/apm2-core/src/refactor_radar/mod.rs
-          - crates/apm2-core/src/refactor_radar/radar.rs
-          - crates/apm2-core/src/refactor_radar/signals.rs
-      net_new_substrate: true
-      net_new_justification: "Refactor Radar is a new compiler stage"
-
-    - requirement_id: REQ-0012
-      title: "Structured observability for compilation runs"
-      candidate_components:
-        - component_id: COMP-CORE
-          extension_point: null
-          fit_score: high
-          rationale: "events and ledger modules already exist"
-      selected_extension_point:
-        component_id: COMP-CORE
-        extension_point: existing_modules
-        implementation_approach: |
-          Extend existing infrastructure:
-          - Define compilation events in proto (crates/apm2-core/proto/apm2.kernel.v1.proto)
-          - Add NDJSON event formatting
-          - Define exit code enum for failure classification
-        files_to_modify:
-          - crates/apm2-core/proto/apm2.kernel.v1.proto
-          - crates/apm2-core/src/events/mod.rs
-        files_to_create:
-          - crates/apm2-core/src/factory/observability.rs
-      duplication_risk: none
-      net_new_substrate: false
-
-  summary:
-    total_requirements: 12
-    requirements_with_existing_extension_points: 5
-    requirements_requiring_net_new: 7
-    net_new_modules:
-      - crates/apm2-core/src/ccp/
-      - crates/apm2-core/src/impact_map/
-      - crates/apm2-core/src/rfc_framer/
-      - crates/apm2-core/src/ticket_emitter/
-      - crates/apm2-core/src/model_router/
-      - crates/apm2-core/src/determinism/
-      - crates/apm2-core/src/refactor_radar/
-      - crates/apm2-core/src/run_manifest/
-    reused_infrastructure:
-      - crates/apm2-cli/src/commands/factory.rs (CLI extension point)
-      - crates/apm2-core/src/lease/ (lease infrastructure)
-      - crates/apm2-core/src/crypto/ (signing)
-      - crates/apm2-core/src/ledger/ (event storage)
-      - crates/apm2-core/src/events/ (event definitions)
-      - xtask/src/tasks/lint.rs (lint implementation)
-      - documents/standards/lint/LINT_SPEC.yaml (lint rules)
+adjudication:
+  duplication_risks:
+    - competing_components:
+      - COMP-HOLON
+      - COMP-CORE
+      competing_extension_points:
+      - EXT-HOLON-TRAIT
+      - EXT-CORE-ADAPTER
+      rationale: Multiple high-confidence extension points (2) could satisfy this requirement
+      recommendation: Review requirement scope and select the most appropriate extension point. Consider whether the requirement should be split into multiple smaller requirements.
+      requirement_id: REQ-0010
+      severity: high
+  high_confidence_count: 4
+  needs_review_count: 8
+  net_new_requirements:
+    - reason: No matching components found in CCP index
+      requirement_id: REQ-0001
+      requirement_title: Single-command Idea Compiler entrypoint
+      suggested_approach: This requirement needs a new module. Create a justification in the RFC's design decisions section.
+    - reason: No matching components found in CCP index
+      requirement_id: REQ-0002
+      requirement_title: Codebase Context Pack generation
+      suggested_approach: This requirement needs a new module. Create a justification in the RFC's design decisions section.
+    - reason: No matching components found in CCP index
+      requirement_id: REQ-0003
+      requirement_title: Requirement-to-component impact mapping
+      suggested_approach: This requirement needs a new module. Create a justification in the RFC's design decisions section.
+    - reason: No matching components found in CCP index
+      requirement_id: REQ-0004
+      requirement_title: RFC framing grounded in CCP and Impact Map
+      suggested_approach: This requirement needs a new module. Create a justification in the RFC's design decisions section.
+    - reason: No matching components found in CCP index
+      requirement_id: REQ-0006
+      requirement_title: Atomic ticket decomposition with migration and verification
+      suggested_approach: This requirement needs a new module. Create a justification in the RFC's design decisions section.
+    - reason: No matching components found in CCP index
+      requirement_id: REQ-0007
+      requirement_title: Multi-model routing with explicit profiles and provenance
+      suggested_approach: This requirement needs a new module. Create a justification in the RFC's design decisions section.
+    - reason: No matching components found in CCP index
+      requirement_id: REQ-0008
+      requirement_title: Determinism envelope and material-diff acceptance
+      suggested_approach: This requirement needs a new module. Create a justification in the RFC's design decisions section.
+    - reason: No matching components found in CCP index
+      requirement_id: REQ-0011
+      requirement_title: Continuous Refactor Radar stage
+      suggested_approach: This requirement needs a new module. Create a justification in the RFC's design decisions section.
+  total_requirements: 12
+ccp_index_hash: f6bb3e7
+content_hash: fe091e5fb956ca91561716a7d64f1de93e824d89f6e27ba88a031d428097c041
+generated_at: "2026-01-26T19:24:59.788998032Z"
+prd_id: PRD-0005
+requirement_mappings:
+  - candidates: []
+    needs_review: true
+    requirement_id: REQ-0001
+    requirement_statement: "The system MUST provide a deterministic CLI entrypoint in the core `apm2` CLI\nthat orchestrates the Idea Compiler pipeline end-to-end and can also execute\neach stage independently."
+    requirement_title: Single-command Idea Compiler entrypoint
+  - candidates: []
+    needs_review: true
+    requirement_id: REQ-0002
+    requirement_statement: "The compiler MUST generate a Codebase Context Pack (CCP) for a given repository\ncheckout, including:\n  (a) a component atlas with stable component IDs and invariants,\n  (b) a crate dependency graph..."
+    requirement_title: Codebase Context Pack generation
+  - candidates: []
+    needs_review: true
+    requirement_id: REQ-0003
+    requirement_statement: The compiler MUST map each PRD requirement to one or more existing codebase components and extension points identified in the CCP, producing a deterministic Impact Map artifact used by RFC framing.
+    requirement_title: Requirement-to-component impact mapping
+  - candidates: []
+    needs_review: true
+    requirement_id: REQ-0004
+    requirement_statement: "The compiler MUST produce RFC drafts that are grounded in the CCP and Impact Map. RFC outputs MUST:\n  (a) reference concrete crates/modules/files in the current repo state,\n  (b) document extension..."
+    requirement_title: RFC framing grounded in CCP and Impact Map
+  - candidates:
+    - component_id: COMP-XTASK
+      component_name: xtask
+      extension_point_id: EXT-XTASK-LINT
+      fit_score: high
+      rationale: "Exact match: requirement mentions module 'lint'"
+      similarity_score: 0.07142857142857142
+    needs_review: false
+    requirement_id: REQ-0005
+    requirement_statement: "The system MUST extend linting for RFCs and tickets to prevent clutter and accidental duplication.\nThe lint extensions MUST implement:\n  (a) no-new-module without explicit justification,\n  (b) a co..."
+    requirement_title: RFC and ticket lint extensions to prevent clutter
+  - candidates: []
+    needs_review: true
+    requirement_id: REQ-0006
+    requirement_statement: The compiler MUST emit atomic engineering tickets from RFCs. Tickets MUST be low-noise and implementation-ready, including file-level guidance, explicit dependencies, verification commands, and mig...
+    requirement_title: Atomic ticket decomposition with migration and verification
+  - candidates: []
+    needs_review: true
+    requirement_id: REQ-0007
+    requirement_statement: "The compiler MUST support running stages across multiple model providers and versions via a versioned routing profile.\nThe routing profile MUST pin provider, model, and version per stage by default..."
+    requirement_title: Multi-model routing with explicit profiles and provenance
+  - candidates: []
+    needs_review: true
+    requirement_id: REQ-0008
+    requirement_statement: The compiler MUST enforce a determinism envelope for all stage outputs. Outputs MUST be written with stable ordering and atomic replacement, and re-running compilation with identical inputs MUST pr...
+    requirement_title: Determinism envelope and material-diff acceptance
+  - candidates:
+    - component_id: COMP-CORE
+      component_name: apm2-core
+      extension_point_id: EXT-CORE-ADAPTER
+      fit_score: high
+      rationale: "Exact match: requirement mentions module 'lease'"
+      similarity_score: 0.025
+    needs_review: false
+    requirement_id: REQ-0009
+    requirement_statement: "The compiler MUST integrate with core auth abstractions to attest compilation runs.\nEach compile run MUST obtain a CompilationLease (local dev may use ephemeral keys) and emit a signed run manifest..."
+    requirement_title: Auth and provenance integration for compiler runs
+  - candidates:
+    - component_id: COMP-CORE
+      component_name: apm2-core
+      extension_point_id: EXT-CORE-ADAPTER
+      fit_score: high
+      rationale: "Exact match: requirement mentions module 'work'"
+      similarity_score: 0.0625
+    - component_id: COMP-HOLON
+      component_name: apm2-holon
+      extension_point_id: EXT-HOLON-TRAIT
+      fit_score: high
+      rationale: "Exact match: requirement mentions module 'skill'"
+      similarity_score: 0.05263157894736842
+    needs_review: false
+    requirement_id: REQ-0010
+    requirement_statement: The system MUST integrate the compiler pipeline into the skill library so that a human operator can relay a conversation summary and an agent can execute the full PRD->RFC->ticket workflow determin...
+    requirement_title: Skill system integration for operator and agent workflows
+  - candidates: []
+    needs_review: true
+    requirement_id: REQ-0011
+    requirement_statement: "The compiler MUST provide a Refactor Radar stage that continuously emits maintenance recommendations based on CCP signals.\nRadar outputs MUST be bounded and must prioritize measurable simplificatio..."
+    requirement_title: Continuous Refactor Radar stage
+  - candidates:
+    - component_id: COMP-XTASK
+      component_name: xtask
+      extension_point_id: EXT-XTASK-LINT
+      fit_score: high
+      rationale: "Exact match: requirement mentions module 'lint'"
+      similarity_score: 0.0625
+    needs_review: false
+    requirement_id: REQ-0012
+    requirement_statement: The compiler MUST emit structured observability for every run and stage, including NDJSON event logs, typed findings, stable exit codes, and run manifests capturing timings and lint receipts.
+    requirement_title: Structured observability for compilation runs
+schema_version: "2026-01-26"
+summary:
+  duplication_risks: 1
+  high_confidence_matches: 4
+  needs_review: 8
+  net_new_count: 8
+  total_requirements: 12

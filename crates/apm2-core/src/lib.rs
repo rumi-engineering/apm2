@@ -44,6 +44,7 @@ pub mod determinism;
 pub mod events;
 pub mod evidence;
 pub mod health;
+pub mod impact_map;
 pub mod ipc;
 pub mod lease;
 pub mod ledger;

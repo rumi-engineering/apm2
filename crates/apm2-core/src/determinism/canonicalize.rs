@@ -447,6 +447,11 @@ fn emit_mapping_inline_first(map: &serde_yaml::Mapping, indent: usize, output: &
             output.push(' ');
             emit_value(val, indent, false, output);
             output.push('\n');
+        } else if is_inline_empty(val) {
+            // Handle empty sequences [] and empty mappings {} on same line
+            output.push(' ');
+            emit_value(val, indent, false, output);
+            output.push('\n');
         } else {
             emit_value(val, indent, false, output);
         }
@@ -482,9 +487,24 @@ fn emit_mapping(
             output.push(' ');
             emit_value(val, indent + 1, false, output);
             output.push('\n');
+        } else if is_inline_empty(val) {
+            // Handle empty sequences [] and empty mappings {} on same line
+            output.push(' ');
+            emit_value(val, indent + 1, false, output);
+            output.push('\n');
         } else {
             emit_value(val, indent + 1, false, output);
         }
+    }
+}
+
+/// Returns true if the value is an empty sequence or mapping that will be
+/// emitted inline.
+fn is_inline_empty(value: &Value) -> bool {
+    match value {
+        Value::Sequence(seq) => seq.is_empty(),
+        Value::Mapping(map) => map.is_empty(),
+        _ => false,
     }
 }
 
