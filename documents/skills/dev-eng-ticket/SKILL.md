@@ -211,7 +211,69 @@ pub enum FsEditError {
 
 ---
 
-## 6. PR Checklist for Review Readiness
+## 6. Serialization in Crypto Contexts (`CTR-0701`, `RSK-2415`)
+
+**Never swallow serialization errors** when the output feeds into a hash or signature.
+
+```rust
+// WRONG: Silent failure corrupts hash chain integrity
+// let bytes = serde_jcs::to_vec(&event).unwrap_or_default();
+
+// CORRECT: Propagate serialization failures
+fn hash_event(event: &LedgerEvent) -> Result<EventHash, CryptoError> {
+    let bytes = serde_jcs::to_vec(event)
+        .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
+    Ok(compute_hash(&bytes))
+}
+```
+
+---
+
+## 7. Builder Validation Scope (`CTR-1205`)
+
+Builders must validate **ALL** input fields that affect logic, not just identifiers.
+
+```rust
+impl SpawnConfigBuilder {
+    pub fn build(self) -> Result<SpawnConfig, ConfigError> {
+        validate_id(&self.work_id, "work_id")?;
+        validate_id(&self.issuer_id, "issuer_id")?;
+        // Vital: Validate specs/configs, not just IDs!
+        validate_goal_spec(&self.goal_spec)?;
+        Ok(SpawnConfig { ... })
+    }
+}
+```
+
+---
+
+## 8. Hash Chain Integrity (`CTR-2601`)
+
+Hash chains must commit to **ALL** related state (lifecycle events, data payloads). Disjoint chains require an RFC reference.
+
+```rust
+// CORRECT: Commit to ALL related events
+let episode_hash = compute_aggregate_hash(&episode_events)?;
+let committed_hash = combine_hashes(lease_issued_hash, episode_hash);
+let work_completed = LedgerEvent::new(committed_hash, ...);
+```
+
+---
+
+## 9. Non-Critical Error Visibility (`HARD-PRINT`)
+
+Do not use `eprintln!` in library code. Use `tracing` for non-critical failures.
+
+```rust
+// Pattern: Log warnings for non-critical failures
+if let Err(e) = work.set_metadata("key", value) {
+    tracing::warn!(error = %e, "metadata set failed");
+}
+```
+
+---
+
+## 10. PR Checklist for Review Readiness
 
 1.  **Bounded Reads:** All reads checked against `max` before allocation (`RSK-2415`).
 2.  **Atomic Writes:** State updates use `NamedTempFile` + `persist` (`CTR-1502`).
@@ -219,3 +281,6 @@ pub enum FsEditError {
 4.  **Negative Tests:** Oversize input fails; traversal fails; forbidden actions denied (`RSK-0701`).
 5.  **Miri Validation:** If `unsafe` is used, `// SAFETY:` comment is present and Miri passes (`RSK-2401`).
 6.  **Textbook Alignment:** Check your changes against the [Hazard Catalog](/documents/skills/rust-textbook/24_hazard_catalog_checklists.md).
+7.  **Serialization Safety:** All `serde` operations in crypto contexts propagate errors (`RSK-2415`).
+8.  **Builder Completeness:** Builder validates ALL inputs (strings, specs, configs), not just IDs.
+9.  **Chain Integrity:** Hash chains commit to all related events.
