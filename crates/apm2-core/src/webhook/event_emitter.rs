@@ -137,8 +137,10 @@ impl CIEventEmitter {
             return Ok(EmitResult::Disabled);
         }
 
-        // 2. Check idempotency (CTR-EE001)
-        if !self.delivery_store.check_and_mark(delivery_id) {
+        // 2. Check idempotency (read-only) (CTR-EE001)
+        // We check first without marking to ensure atomicity: if persistence
+        // fails, we haven't marked the delivery ID, allowing retries.
+        if self.delivery_store.contains(delivery_id) {
             tracing::info!(
                 delivery_id = %delivery_id,
                 "duplicate delivery ID, skipping event emission"
@@ -160,9 +162,17 @@ impl CIEventEmitter {
         let event_id = event.event_id;
 
         // 4. Persist event (CTR-EE002)
+        // Persistence happens BEFORE marking the delivery ID. This ensures:
+        // - If persist fails, the delivery ID is NOT marked -> retry is allowed
+        // - If persist succeeds but mark fails, worst case is a duplicate event (which
+        //   is better than losing the event entirely)
         self.event_store
             .persist(&event)
             .map_err(|e| WebhookError::Internal(format!("failed to persist event: {e}")))?;
+
+        // 5. Mark delivery ID as seen (after successful persist)
+        // This ensures idempotency for future requests.
+        self.delivery_store.mark(delivery_id);
 
         tracing::info!(
             event_id = %event_id,
@@ -198,7 +208,7 @@ impl Default for CIEventEmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::ci::CIEventsConfig;
+    use crate::events::ci::{CIEventsConfig, EventStore};
     use crate::webhook::WorkflowConclusion;
 
     fn sample_completed() -> WorkflowRunCompleted {
@@ -385,5 +395,62 @@ mod tests {
         assert_eq!(emitter.event_store().count(), 0);
         // Delivery ID should not be marked (since we returned early)
         assert!(emitter.delivery_store().is_empty());
+    }
+
+    /// A failing event store for testing atomicity guarantees.
+    struct FailingEventStore;
+
+    impl EventStore for FailingEventStore {
+        fn persist(
+            &self,
+            _event: &CIWorkflowCompleted,
+        ) -> Result<(), crate::events::ci::EventStoreError> {
+            Err(crate::events::ci::EventStoreError::Storage(
+                "simulated failure".to_string(),
+            ))
+        }
+
+        fn query(&self, _query: &crate::events::ci::EventQuery) -> Vec<CIWorkflowCompleted> {
+            vec![]
+        }
+
+        fn get(&self, _event_id: uuid::Uuid) -> Option<CIWorkflowCompleted> {
+            None
+        }
+
+        fn count(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn test_persistence_failure_allows_retry() {
+        // This test verifies the atomicity guarantee:
+        // If persistence fails, the delivery ID should NOT be marked,
+        // allowing subsequent retries to succeed.
+        let delivery_store: Arc<dyn DeliveryIdStore> = Arc::new(InMemoryDeliveryIdStore::new());
+        let emitter = CIEventEmitter::with_config(
+            CIEventsConfig::enabled(),
+            Arc::clone(&delivery_store),
+            Arc::new(FailingEventStore),
+        );
+        let completed = sample_completed();
+
+        // First attempt fails due to persistence error
+        let result1 = emitter.emit(&completed, true, "delivery-123");
+        assert!(result1.is_err());
+
+        // Critically: the delivery ID should NOT be marked
+        // This allows retries to succeed once the store is fixed
+        assert!(!delivery_store.contains("delivery-123"));
+        assert!(delivery_store.is_empty());
+
+        // Now create an emitter with a working store
+        let working_emitter = enabled_emitter();
+
+        // Retry with the same delivery ID should succeed
+        // (In a real scenario, this would be the same emitter after recovery)
+        let result2 = working_emitter.emit(&completed, true, "delivery-123");
+        assert!(matches!(result2, Ok(EmitResult::Emitted { .. })));
     }
 }

@@ -330,11 +330,34 @@ impl Default for DeliveryIdConfig {
 /// Implementations must be thread-safe ([INV-CI001]) and unwind-safe
 /// to preserve API compatibility with types that require panic safety.
 pub trait DeliveryIdStore: Send + Sync + UnwindSafe + RefUnwindSafe {
-    /// Checks if a delivery ID has been seen.
+    /// Checks if a delivery ID has been seen (read-only).
+    ///
+    /// Returns `true` if the delivery ID exists in the store (is a duplicate),
+    /// `false` if it's new (not seen before).
+    fn contains(&self, delivery_id: &str) -> bool;
+
+    /// Marks a delivery ID as seen.
+    ///
+    /// Should be called after successfully persisting the associated event
+    /// to ensure atomicity: if persistence fails, the delivery ID is not
+    /// marked, allowing retries.
+    fn mark(&self, delivery_id: &str);
+
+    /// Checks if a delivery ID has been seen, and if not, marks it.
     ///
     /// Returns `true` if the delivery ID is new (not seen before),
     /// `false` if it's a duplicate.
-    fn check_and_mark(&self, delivery_id: &str) -> bool;
+    ///
+    /// Note: Prefer using `contains()` + `mark()` separately for better
+    /// atomicity guarantees when combined with event persistence.
+    fn check_and_mark(&self, delivery_id: &str) -> bool {
+        if self.contains(delivery_id) {
+            false
+        } else {
+            self.mark(delivery_id);
+            true
+        }
+    }
 
     /// Returns the number of tracked delivery IDs.
     fn len(&self) -> usize;
@@ -413,7 +436,11 @@ impl InMemoryDeliveryIdStore {
         // will be at the front. We stop as soon as we find a non-expired entry.
         while let Some(oldest_key) = state.insertion_order.front() {
             if let Some(entry) = state.entries.get(oldest_key) {
-                if now.duration_since(entry.inserted_at) >= ttl {
+                // Use checked_duration_since for robustness against clock issues
+                let elapsed = now
+                    .checked_duration_since(entry.inserted_at)
+                    .unwrap_or(Duration::ZERO);
+                if elapsed >= ttl {
                     // Entry expired, remove it
                     let key = state.insertion_order.pop_front().unwrap();
                     state.entries.remove(&key);
@@ -422,7 +449,7 @@ impl InMemoryDeliveryIdStore {
                     break;
                 }
             } else {
-                // Key in queue but not in map (shouldn't happen), remove from queue
+                // Key in queue but not in map (ghost key), remove from queue
                 state.insertion_order.pop_front();
             }
         }
@@ -436,32 +463,42 @@ impl Default for InMemoryDeliveryIdStore {
 }
 
 impl DeliveryIdStore for InMemoryDeliveryIdStore {
-    fn check_and_mark(&self, delivery_id: &str) -> bool {
+    fn contains(&self, delivery_id: &str) -> bool {
         let now = Instant::now();
 
         // Probabilistic cleanup
         let count = self
             .check_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count > 0 && count % self.config.cleanup_interval == 0 {
+        if self.config.cleanup_interval > 0
+            && count > 0
+            && count % self.config.cleanup_interval == 0
+        {
             self.cleanup();
         }
 
         // Check if already exists (read lock)
-        {
-            let state = self
-                .state
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-            if let Some(entry) = state.entries.get(delivery_id) {
-                // Check if still within TTL
-                if now.duration_since(entry.inserted_at) < self.config.ttl {
-                    return false; // Duplicate
-                }
-                // Expired, will be replaced below
+        if let Some(entry) = state.entries.get(delivery_id) {
+            // Check if still within TTL
+            // Use checked_duration_since for robustness against clock issues
+            let elapsed = now
+                .checked_duration_since(entry.inserted_at)
+                .unwrap_or(Duration::ZERO);
+            if elapsed < self.config.ttl {
+                return true; // Exists and not expired
             }
         }
+
+        false // Does not exist or expired
+    }
+
+    fn mark(&self, delivery_id: &str) {
+        let now = Instant::now();
 
         // Insert new entry (write lock)
         let mut state = self
@@ -469,16 +506,20 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Double-check after acquiring write lock (race condition)
+        // Check if entry exists and is expired - remove it first
         if let Some(entry) = state.entries.get(delivery_id) {
-            if now.duration_since(entry.inserted_at) < self.config.ttl {
-                return false; // Another thread inserted it
+            let elapsed = now
+                .checked_duration_since(entry.inserted_at)
+                .unwrap_or(Duration::ZERO);
+            if elapsed >= self.config.ttl {
+                // Entry expired - remove from entries map but leave ghost key in
+                // insertion_order. The cleanup() function handles ghost keys in O(1)
+                // by checking if the key exists in the map before evicting.
+                state.entries.remove(delivery_id);
+            } else {
+                // Entry exists and not expired - nothing to do
+                return;
             }
-            // Entry expired - remove from entries map but leave ghost key in
-            // insertion_order. The cleanup() function handles ghost keys in O(1)
-            // by checking if the key exists in the map before evicting.
-            // This avoids an O(N) scan of insertion_order.
-            state.entries.remove(delivery_id);
         }
 
         // Enforce max_entries limit with O(1) eviction ([INV-CI004])
@@ -497,8 +538,6 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
             DeliveryIdEntry { inserted_at: now },
         );
         state.insertion_order.push_back(delivery_id.to_string());
-
-        true // New entry
     }
 
     fn len(&self) -> usize {
@@ -1147,6 +1186,56 @@ mod tests {
 
             store.check_and_mark("delivery-1");
             assert!(!store.is_empty());
+        }
+
+        #[test]
+        fn test_contains_and_mark_separate() {
+            let store = InMemoryDeliveryIdStore::new();
+
+            // Initially empty
+            assert!(!store.contains("delivery-1"));
+
+            // Mark it
+            store.mark("delivery-1");
+            assert_eq!(store.len(), 1);
+
+            // Now contains returns true
+            assert!(store.contains("delivery-1"));
+
+            // Marking again is idempotent
+            store.mark("delivery-1");
+            assert_eq!(store.len(), 1);
+        }
+
+        #[test]
+        fn test_cleanup_interval_zero_safe() {
+            // cleanup_interval = 0 should not cause division by zero
+            let config = DeliveryIdConfig {
+                ttl: Duration::from_secs(3600),
+                max_entries: 1000,
+                cleanup_interval: 0, // Edge case
+            };
+            let store = InMemoryDeliveryIdStore::with_config(config);
+
+            // This should not panic
+            assert!(store.check_and_mark("delivery-1"));
+            assert!(store.check_and_mark("delivery-2"));
+            assert!(store.check_and_mark("delivery-3"));
+            assert_eq!(store.len(), 3);
+        }
+
+        #[test]
+        fn test_check_and_mark_uses_contains_and_mark() {
+            // Verify that the default check_and_mark uses contains + mark
+            let store = InMemoryDeliveryIdStore::new();
+
+            // This should use contains (returns false) + mark
+            assert!(store.check_and_mark("delivery-1"));
+            assert_eq!(store.len(), 1);
+
+            // This should use contains (returns true) and NOT call mark
+            assert!(!store.check_and_mark("delivery-1"));
+            assert_eq!(store.len(), 1); // Still 1, not added again
         }
     }
 
