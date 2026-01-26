@@ -105,6 +105,7 @@ pub mod ledger;
 pub mod resource;
 pub mod result;
 pub mod skill;
+pub mod spawn;
 pub mod stop;
 pub mod traits;
 pub mod work;
@@ -129,6 +130,7 @@ pub use skill::{
     HolonConfig, HolonContract, SkillFrontmatter, SkillParseError, StopConditionsConfig,
     parse_frontmatter, parse_skill_file,
 };
+pub use spawn::{SpawnConfig, SpawnOutcome, SpawnResult, spawn_holon};
 pub use stop::StopCondition;
 pub use traits::Holon;
 
@@ -147,6 +149,7 @@ pub mod prelude {
     pub use crate::resource::{Budget, Lease, LeaseScope, ResourceError};
     pub use crate::result::EpisodeResult;
     pub use crate::skill::{HolonConfig, HolonContract, SkillFrontmatter, StopConditionsConfig};
+    pub use crate::spawn::{SpawnConfig, SpawnOutcome, SpawnResult, spawn_holon};
     pub use crate::stop::StopCondition;
     pub use crate::traits::Holon;
     pub use crate::work::{AttemptOutcome, AttemptRecord, WorkLifecycle, WorkObject};

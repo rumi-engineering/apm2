@@ -1009,6 +1009,114 @@ error.is_recoverable()       // Always false (all resource errors are non-recove
 3. `Lease` contains `LeaseScope` and `Budget`
 4. Lease derivation creates parent-child relationships with budget deduction
 5. `SkillFrontmatter` optionally contains `HolonConfig` for holon-enabled skills
+6. `spawn_holon` orchestrates the full lifecycle: work creation, lease issuance, episode execution
+
+---
+
+## Module: spawn
+
+Holon spawning and orchestration functions.
+
+### `spawn_holon`
+
+Main orchestration function that ties together all components to execute a holon.
+
+```rust
+pub fn spawn_holon<H, F>(
+    holon: &mut H,
+    input: H::Input,
+    config: SpawnConfig,
+    clock: F,
+) -> Result<SpawnResult<H::Output>, HolonError>
+where
+    H: Holon,
+    F: FnMut() -> u64;
+```
+
+**Lifecycle Steps:**
+1. Creates `WorkObject` to track work
+2. Issues `Lease` authorizing execution
+3. Calls `Holon::intake` with input
+4. Runs episode loop via `EpisodeController`
+5. Emits ledger events for work and lease lifecycle
+6. Handles escalation and forwards to caller
+7. Returns `SpawnResult` with final state
+
+### `SpawnConfig`
+
+Configuration for spawning a holon.
+
+```rust
+pub struct SpawnConfig {
+    pub work_id: String,
+    pub work_title: String,
+    pub issuer_id: String,
+    pub holder_id: String,
+    pub scope: LeaseScope,
+    pub budget: Budget,
+    pub expires_at_ns: Option<u64>,
+    pub goal_spec: Option<String>,
+    pub episode_config: EpisodeControllerConfig,
+}
+```
+
+**Builder Pattern:**
+```rust
+let config = SpawnConfig::builder()
+    .work_id("work-001")
+    .work_title("Process task")
+    .issuer_id("registrar")
+    .holder_id("agent")
+    .scope(LeaseScope::unlimited())
+    .budget(Budget::new(10, 100, 10_000, 60_000))
+    .expires_at_ns(1_000_000_000)
+    .goal_spec("Complete the task")
+    .build()?;
+```
+
+### `SpawnResult<T>`
+
+Result of spawning and executing a holon.
+
+```rust
+pub struct SpawnResult<T> {
+    pub work: WorkObject,
+    pub outcome: SpawnOutcome,
+    pub events: Vec<LedgerEvent>,
+    pub episode_events: Vec<EpisodeEvent>,
+    pub output: Option<T>,
+    pub episodes_executed: u64,
+    pub tokens_consumed: u64,
+}
+```
+
+**Query Methods:**
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `is_successful()` | `bool` | True if outcome is `Completed` |
+| `is_escalated()` | `bool` | True if outcome is `Escalated` |
+| `is_error()` | `bool` | True if outcome is `Error` |
+| `escalation_reason()` | `Option<&str>` | Escalation reason if applicable |
+
+### `SpawnOutcome`
+
+```rust
+pub enum SpawnOutcome {
+    Completed,
+    BudgetExhausted { resource: String },
+    MaxEpisodesReached,
+    Blocked { reason: String },
+    Escalated { reason: String },
+    Error { error: String, recoverable: bool },
+}
+```
+
+**Invariants:**
+- `spawn_holon` always creates valid `WorkObject` and `Lease`
+- Episode loop runs until a terminal condition
+- All lifecycle transitions emit corresponding ledger events
+- Escalation reasons are preserved and propagated to caller
+- Budget exhaustion keeps work in `InProgress` for potential continuation
 
 ---
 
