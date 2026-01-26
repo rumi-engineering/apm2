@@ -172,6 +172,9 @@ enum FactoryCommands {
 
     /// CCP (Code Context Protocol) commands
     Ccp(commands::factory::ccp::CcpCommand),
+
+    /// Impact Map commands (PRD requirement to CCP component mapping)
+    ImpactMap(commands::factory::impact_map::ImpactMapCommand),
 }
 
 fn main() -> Result<()> {
@@ -240,6 +243,9 @@ fn main() -> Result<()> {
                 rt.block_on(commands::factory::run(&spec_file, &format))
             },
             FactoryCommands::Ccp(ccp_cmd) => commands::factory::ccp::run_ccp(&ccp_cmd),
+            FactoryCommands::ImpactMap(impact_map_cmd) => {
+                commands::factory::impact_map::run_impact_map(&impact_map_cmd)
+            },
         },
     }
 }
