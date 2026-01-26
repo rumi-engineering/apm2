@@ -178,6 +178,9 @@ enum FactoryCommands {
 
     /// RFC commands (RFC framing from Impact Map and CCP)
     Rfc(commands::factory::rfc::RfcCommand),
+
+    /// Ticket commands (emit tickets from RFC decomposition)
+    Tickets(commands::factory::tickets::TicketsCommand),
 }
 
 fn main() -> Result<()> {
@@ -250,6 +253,9 @@ fn main() -> Result<()> {
                 commands::factory::impact_map::run_impact_map(&impact_map_cmd)
             },
             FactoryCommands::Rfc(rfc_cmd) => commands::factory::rfc::run_rfc(&rfc_cmd),
+            FactoryCommands::Tickets(tickets_cmd) => {
+                commands::factory::tickets::run_tickets(&tickets_cmd)
+            },
         },
     }
 }

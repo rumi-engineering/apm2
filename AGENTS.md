@@ -167,6 +167,7 @@ See individual `AGENTS.md` files linked in the Module Index below for detailed d
 | `apm2_core::shutdown` | Graceful shutdown coordination | [AGENTS.md](crates/apm2-core/src/shutdown/AGENTS.md) |
 | `apm2_core::state` | Global state aggregation | [AGENTS.md](crates/apm2-core/src/state/AGENTS.md) |
 | `apm2_core::supervisor` | Process collection supervisor | [AGENTS.md](crates/apm2-core/src/supervisor/AGENTS.md) |
+| `apm2_core::ticket_emitter` | RFC to ticket decomposition | [mod.rs](crates/apm2-core/src/ticket_emitter/mod.rs) |
 | `apm2_core::tool` | Tool request protocol | [AGENTS.md](crates/apm2-core/src/tool/AGENTS.md) |
 | `apm2_core::work` | Work queue management | [AGENTS.md](crates/apm2-core/src/work/AGENTS.md) |
 

@@ -59,6 +59,7 @@ pub mod shutdown;
 pub mod state;
 pub mod supervisor;
 pub mod syscall;
+pub mod ticket_emitter;
 pub mod tool;
 pub mod webhook;
 pub mod work;
