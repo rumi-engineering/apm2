@@ -41,6 +41,10 @@ pub struct WorkflowRun {
     /// Unique identifier for the workflow run.
     pub id: u64,
 
+    /// The name of the workflow (e.g., "CI", "Build and Test").
+    #[serde(default)]
+    pub name: Option<String>,
+
     /// The commit SHA that triggered the workflow.
     pub head_sha: String,
 
@@ -108,6 +112,10 @@ pub struct WorkflowRunCompleted {
     /// Unique identifier for the workflow run.
     pub workflow_run_id: u64,
 
+    /// The name of the workflow (e.g., "CI", "Build and Test").
+    /// Falls back to "workflow" if not provided by GitHub.
+    pub workflow_name: String,
+
     /// The commit SHA that triggered the workflow.
     pub commit_sha: String,
 
@@ -160,6 +168,10 @@ impl WorkflowRunPayload {
 
         Ok(WorkflowRunCompleted {
             workflow_run_id: self.workflow_run.id,
+            workflow_name: self
+                .workflow_run
+                .name
+                .unwrap_or_else(|| "workflow".to_string()),
             commit_sha: self.workflow_run.head_sha,
             branch: self.workflow_run.head_branch,
             conclusion,
@@ -239,10 +251,33 @@ mod tests {
         let completed = payload.into_completed().unwrap();
 
         assert_eq!(completed.workflow_run_id, 12345);
+        // Defaults to "workflow" when name not provided
+        assert_eq!(completed.workflow_name, "workflow");
         assert_eq!(completed.commit_sha, "abc123def456");
         assert_eq!(completed.branch, "feature/test");
         assert_eq!(completed.conclusion, WorkflowConclusion::Success);
         assert_eq!(completed.pull_request_numbers, vec![42, 43]);
+    }
+
+    #[test]
+    fn test_into_completed_with_workflow_name() {
+        let body = r#"{
+            "action": "completed",
+            "workflow_run": {
+                "id": 12345,
+                "name": "Build and Test",
+                "head_sha": "abc123def456",
+                "head_branch": "feature/test",
+                "conclusion": "success",
+                "pull_requests": [{"number": 42}]
+            }
+        }"#
+        .as_bytes();
+
+        let payload = WorkflowRunPayload::parse(body).unwrap();
+        let completed = payload.into_completed().unwrap();
+
+        assert_eq!(completed.workflow_name, "Build and Test");
     }
 
     #[test]

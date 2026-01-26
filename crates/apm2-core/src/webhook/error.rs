@@ -18,6 +18,10 @@ pub enum WebhookError {
     #[error("missing signature header")]
     MissingSignature,
 
+    /// The X-GitHub-Delivery header is missing.
+    #[error("missing delivery ID header")]
+    MissingDeliveryId,
+
     /// The signature header has an invalid format.
     #[error("invalid signature format: {0}")]
     InvalidSignatureFormat(String),
@@ -38,6 +42,10 @@ pub enum WebhookError {
     #[error("rate limit exceeded")]
     RateLimitExceeded,
 
+    /// Duplicate delivery ID (idempotency check).
+    #[error("duplicate delivery")]
+    DuplicateDelivery,
+
     /// Internal error (should not occur in normal operation).
     #[error("internal error: {0}")]
     Internal(String),
@@ -51,6 +59,7 @@ impl WebhookError {
     /// - Invalid payload: 400 Bad Request
     /// - Unsupported event: 400 Bad Request
     /// - Rate limit: 429 Too Many Requests
+    /// - Duplicate delivery: 200 OK (idempotent success)
     /// - Internal: 500 Internal Server Error
     #[must_use]
     pub const fn status_code(&self) -> StatusCode {
@@ -59,8 +68,12 @@ impl WebhookError {
             Self::MissingSignature | Self::InvalidSignature | Self::InvalidSignatureFormat(_) => {
                 StatusCode::UNAUTHORIZED
             },
-            Self::InvalidPayload(_) | Self::UnsupportedEventType(_) => StatusCode::BAD_REQUEST,
+            Self::MissingDeliveryId | Self::InvalidPayload(_) | Self::UnsupportedEventType(_) => {
+                StatusCode::BAD_REQUEST
+            },
             Self::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
+            // Duplicate delivery returns 200 OK for idempotency
+            Self::DuplicateDelivery => StatusCode::OK,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -75,11 +88,13 @@ impl IntoResponse for WebhookError {
         let body = match &self {
             Self::Disabled => "Not Found",
             Self::MissingSignature => "Missing signature",
+            Self::MissingDeliveryId => "Missing delivery ID",
             Self::InvalidSignatureFormat(_) => "Invalid signature format",
             Self::InvalidSignature => "Invalid signature",
             Self::InvalidPayload(_) => "Invalid payload",
             Self::UnsupportedEventType(_) => "Unsupported event type",
             Self::RateLimitExceeded => "Rate limit exceeded",
+            Self::DuplicateDelivery => "OK",
             Self::Internal(_) => "Internal server error",
         };
 
@@ -97,6 +112,10 @@ mod tests {
         assert_eq!(
             WebhookError::MissingSignature.status_code(),
             StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            WebhookError::MissingDeliveryId.status_code(),
+            StatusCode::BAD_REQUEST
         );
         assert_eq!(
             WebhookError::InvalidSignature.status_code(),

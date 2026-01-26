@@ -7,6 +7,12 @@
 //!
 //! The router enforces a 100KB request body limit to prevent memory exhaustion
 //! from oversized payloads. This is configured via `DefaultBodyLimit` layer.
+//!
+//! # Event Emission
+//!
+//! After successful webhook validation, the handler emits a
+//! `CIWorkflowCompleted` ledger event using the [`CIEventEmitter`]. Event
+//! emission is controlled by the `CI_EVENTS_ENABLED` environment variable.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -19,6 +25,7 @@ use axum::routing::post;
 
 use super::config::WebhookConfig;
 use super::error::WebhookError;
+use super::event_emitter::{CIEventEmitter, EmitResult};
 use super::payload::{WorkflowRunCompleted, WorkflowRunPayload};
 use super::rate_limit::RateLimiter;
 use super::signature::SignatureValidator;
@@ -49,6 +56,9 @@ struct WebhookState {
 
     /// Rate limiter.
     rate_limiter: RateLimiter,
+
+    /// Event emitter for CI workflow events.
+    event_emitter: CIEventEmitter,
 }
 
 /// The webhook handler wraps configuration and provides an axum router.
@@ -58,8 +68,36 @@ pub struct WebhookHandler {
 
 impl WebhookHandler {
     /// Creates a new webhook handler with the given configuration.
+    ///
+    /// # Warning
+    ///
+    /// This constructor uses ephemeral in-memory stores for delivery ID
+    /// deduplication and event storage. These stores are cleared on process
+    /// restart, which means:
+    ///
+    /// - **Replay attacks**: Delivery IDs seen before restart will be accepted
+    ///   again after restart.
+    /// - **Event loss**: Persisted events are lost on restart.
+    ///
+    /// For production deployments, use [`with_event_emitter`] to inject
+    /// persistent stores backed by a database.
+    ///
+    /// [`with_event_emitter`]: Self::with_event_emitter
     #[must_use]
     pub fn new(config: WebhookConfig) -> Self {
+        tracing::warn!(
+            "WebhookHandler initialized with ephemeral in-memory stores. \
+             Delivery IDs and events will be lost on restart. \
+             For production, inject persistent stores via with_event_emitter()."
+        );
+        Self::with_event_emitter(config, CIEventEmitter::new())
+    }
+
+    /// Creates a new webhook handler with a custom event emitter.
+    ///
+    /// This is useful for testing or when custom event stores are needed.
+    #[must_use]
+    pub fn with_event_emitter(config: WebhookConfig, event_emitter: CIEventEmitter) -> Self {
         let validator = SignatureValidator::new(config.secret.clone());
         let rate_limiter = RateLimiter::new(config.rate_limit.clone());
 
@@ -68,6 +106,7 @@ impl WebhookHandler {
                 config,
                 validator,
                 rate_limiter,
+                event_emitter,
             }),
         }
     }
@@ -118,6 +157,15 @@ impl WebhookHandler {
     pub fn is_enabled(&self) -> bool {
         self.state.config.enabled
     }
+
+    /// Returns a reference to the event emitter.
+    ///
+    /// This can be used to access the event store for querying persisted
+    /// events.
+    #[must_use]
+    pub fn event_emitter(&self) -> &CIEventEmitter {
+        &self.state.event_emitter
+    }
 }
 
 /// The axum handler for GitHub webhooks.
@@ -128,7 +176,8 @@ impl WebhookHandler {
 ///    service)
 /// 3. Validates the HMAC-SHA256 signature
 /// 4. Parses and validates the payload
-/// 5. Returns appropriate status codes
+/// 5. Emits CI workflow event (with idempotency check)
+/// 6. Returns appropriate status codes
 async fn webhook_handler(
     State(state): State<Arc<WebhookState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -181,6 +230,29 @@ async fn webhook_handler(
     // 6. Log successful processing
     log_completed_event(&completed, ip, delivery_id.as_deref());
 
+    // 7. Require delivery ID for idempotency (reject if missing)
+    let delivery_id_value = delivery_id.ok_or(WebhookError::MissingDeliveryId)?;
+
+    // 8. Emit CI workflow event (with idempotency check)
+    // Note: signature_verified is true here because we already verified above
+    // (the validator.verify() call would have returned an error if invalid)
+    match state
+        .event_emitter
+        .emit(&completed, true, &delivery_id_value)?
+    {
+        EmitResult::Emitted { event_id } => {
+            tracing::debug!(event_id = %event_id, "CI event emitted");
+        },
+        EmitResult::Disabled => {
+            tracing::debug!("CI events disabled, event not emitted");
+        },
+        EmitResult::Duplicate => {
+            tracing::debug!("duplicate delivery, returning OK");
+            // Return OK for idempotent duplicate handling
+            return Ok(StatusCode::OK);
+        },
+    }
+
     // Return 202 Accepted (webhook received and will be processed)
     Ok(StatusCode::ACCEPTED)
 }
@@ -210,12 +282,21 @@ fn log_completed_event(event: &WorkflowRunCompleted, ip: IpAddr, delivery_id: Op
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::panic::{RefUnwindSafe, UnwindSafe};
 
     use axum::http::HeaderMap;
     use bytes::Bytes;
     use secrecy::SecretString;
 
     use super::*;
+
+    // Static assertions for auto-trait implementations.
+    // These are compile-time checks that ensure WebhookHandler maintains
+    // API compatibility with code that requires panic safety.
+    const _: fn() = || {
+        fn assert_unwind_safe<T: UnwindSafe + RefUnwindSafe>() {}
+        assert_unwind_safe::<WebhookHandler>();
+    };
 
     fn test_config(enabled: bool) -> WebhookConfig {
         WebhookConfig::builder()
@@ -264,8 +345,19 @@ mod tests {
     }
 
     fn make_headers(signature: Option<&str>, event_type: Option<&str>) -> HeaderMap {
+        make_headers_with_delivery(signature, event_type, Some("test-delivery-123"))
+    }
+
+    fn make_headers_with_delivery(
+        signature: Option<&str>,
+        event_type: Option<&str>,
+        delivery_id: Option<&str>,
+    ) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert("x-github-delivery", "test-delivery-123".parse().unwrap());
+
+        if let Some(delivery) = delivery_id {
+            headers.insert("x-github-delivery", delivery.parse().unwrap());
+        }
 
         if let Some(sig) = signature {
             headers.insert(SIGNATURE_HEADER, sig.parse().unwrap());
@@ -298,14 +390,24 @@ mod tests {
     }
 
     fn create_test_state(enabled: bool) -> Arc<WebhookState> {
+        use crate::events::ci::{CIEventsConfig, InMemoryDeliveryIdStore, InMemoryEventStore};
+
         let config = test_config(enabled);
         let validator = SignatureValidator::new(config.secret.clone());
         let rate_limiter = RateLimiter::new(config.rate_limit.clone());
+        // Create an enabled event emitter for tests
+        // (default is disabled for fail-closed security)
+        let event_emitter = CIEventEmitter::with_config(
+            CIEventsConfig::enabled(),
+            std::sync::Arc::new(InMemoryDeliveryIdStore::new()),
+            std::sync::Arc::new(InMemoryEventStore::new()),
+        );
 
         Arc::new(WebhookState {
             config,
             validator,
             rate_limiter,
+            event_emitter,
         })
     }
 
@@ -397,6 +499,18 @@ mod tests {
         let result = call_handler(state, headers, payload).await;
         // Even failures are accepted - it's a valid event
         assert_eq!(result.unwrap(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_missing_delivery_id() {
+        let state = create_test_state(true);
+        let payload = make_payload("completed", "success");
+        let signature = compute_signature("test-secret-key", &payload);
+        // Create headers without delivery ID
+        let headers = make_headers_with_delivery(Some(&signature), Some("workflow_run"), None);
+
+        let result = call_handler(state, headers, payload).await;
+        assert!(matches!(result, Err(WebhookError::MissingDeliveryId)));
     }
 
     #[test]
