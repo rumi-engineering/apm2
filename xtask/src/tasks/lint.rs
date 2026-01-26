@@ -5,12 +5,16 @@
 //! - Shell interpolation patterns (use file-based input instead)
 //! - Unquoted shell paths in format!() calls
 //! - Insecure temp file patterns
+//! - LINT-0013: New modules without RFC justification
+//! - LINT-0014: Cousin abstractions (similar struct/trait definitions)
+//! - LINT-0015: New pub items without deletion/migration plans
 //!
 //! When `--include-docs` is passed, also scans markdown files for code blocks
 //! and checks them for the same anti-patterns.
 //!
 //! Findings are reported as warnings (not errors) to allow gradual adoption.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -33,6 +37,24 @@ pub struct LintArgs {
     pub include_docs: bool,
 }
 
+/// Severity level for lint findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LintSeverity {
+    /// Warning - does not fail the build.
+    Warning,
+    /// Error - fails the build.
+    Error,
+}
+
+impl std::fmt::Display for LintSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Warning => write!(f, "warning"),
+            Self::Error => write!(f, "error"),
+        }
+    }
+}
+
 /// A lint finding with location and remediation information.
 #[derive(Debug, Clone)]
 pub struct LintFinding {
@@ -46,14 +68,28 @@ pub struct LintFinding {
     pub message: String,
     /// Suggested remediation.
     pub suggestion: String,
+    /// Severity level (warning or error).
+    pub severity: LintSeverity,
+    /// Lint rule ID (e.g., "LINT-0013").
+    pub lint_id: Option<String>,
 }
 
 impl std::fmt::Display for LintFinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lint_id_suffix = self
+            .lint_id
+            .as_ref()
+            .map_or(String::new(), |id| format!(" [{id}]"));
         write!(
             f,
-            "warning: {}\n  --> {}:{}\n  |\n  | {}\n  |\n  = help: {}",
-            self.message, self.file_path, self.line_number, self.pattern, self.suggestion
+            "{}{}: {}\n  --> {}:{}\n  |\n  | {}\n  |\n  = help: {}",
+            self.severity,
+            lint_id_suffix,
+            self.message,
+            self.file_path,
+            self.line_number,
+            self.pattern,
+            self.suggestion
         )
     }
 }
@@ -140,6 +176,11 @@ pub fn scan_workspace(args: LintArgs) -> Result<Vec<LintFinding>> {
     if args.include_docs {
         check_markdown_examples(&mut findings)?;
     }
+
+    // Run clutter prevention lint checks (LINT-0013, LINT-0014, LINT-0015)
+    check_no_new_module_without_justification(&mut findings)?;
+    check_cousin_abstractions(&mut findings)?;
+    check_deletion_plan_required(&mut findings)?;
 
     Ok(findings)
 }
@@ -315,6 +356,8 @@ fn check_temp_dir_usage(
             pattern: line.trim().to_string(),
             message: "Direct temp_dir() usage creates predictable paths vulnerable to symlink attacks".to_string(),
             suggestion: "Use tempfile::NamedTempFile or tempfile::TempDir instead. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-2".to_string(),
+            severity: LintSeverity::Warning,
+            lint_id: None,
         });
     }
 }
@@ -350,6 +393,8 @@ fn check_temp_dir_usage_in_doc(
                     .to_string(),
             suggestion: "Use tempfile::NamedTempFile in examples. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-2"
                 .to_string(),
+            severity: LintSeverity::Warning,
+            lint_id: None,
         });
     }
 }
@@ -395,6 +440,8 @@ fn check_unquoted_shell_paths(
                 pattern: line.trim().to_string(),
                 message: "Unquoted path in shell command format string may break with special characters".to_string(),
                 suggestion: "Use quote_path() or shell_escape() for paths in shell commands. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-1".to_string(),
+                severity: LintSeverity::Warning,
+                lint_id: None,
             });
         }
     }
@@ -458,6 +505,8 @@ fn check_shell_interpolation(
                 pattern: line.trim().to_string(),
                 message: "Complex string interpolation in shell command may break with special characters".to_string(),
                 suggestion: "Write complex strings to a temp file and use stdin redirection. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-1".to_string(),
+                severity: LintSeverity::Warning,
+                lint_id: None,
             });
         }
     }
@@ -485,6 +534,8 @@ fn check_shell_interpolation(
             suggestion:
                 "Write prompts to a temp file and redirect stdin. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-1"
                     .to_string(),
+            severity: LintSeverity::Warning,
+            lint_id: None,
         });
     }
 }
@@ -524,7 +575,488 @@ fn check_shell_interpolation_in_doc(
             suggestion:
                 "Show safe pattern using temp file and stdin redirection. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-1"
                     .to_string(),
+            severity: LintSeverity::Warning,
+            lint_id: None,
         });
+    }
+}
+
+// =============================================================================
+// LINT-0013: no-new-module-without-justification
+// =============================================================================
+
+/// A struct or trait definition extracted from a Rust source file.
+#[derive(Debug, Clone)]
+struct TypeDefinition {
+    /// Name of the type.
+    name: String,
+    /// File path where defined.
+    file_path: String,
+    /// Line number in the file.
+    line_number: usize,
+    /// Field names for structs (empty for traits).
+    field_names: Vec<String>,
+    /// Whether this is a struct or trait.
+    kind: TypeKind,
+}
+
+/// Kind of type definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeKind {
+    Struct,
+    Trait,
+}
+
+/// Check for new modules without RFC justification (LINT-0013).
+///
+/// Scans for mod.rs files that are not tracked in git HEAD and verifies
+/// they have justification in an RFC. Currently implements a simplified
+/// check that flags any new mod.rs files.
+fn check_no_new_module_without_justification(findings: &mut Vec<LintFinding>) -> Result<()> {
+    // Get list of new (untracked or staged) mod.rs files
+    let new_mod_files = get_new_mod_files()?;
+
+    // Load RFC justifications from ticket decomposition files
+    let justified_paths = load_rfc_justified_paths()?;
+
+    for mod_file in new_mod_files {
+        // Check if this module path is justified in any RFC
+        let is_justified = justified_paths
+            .iter()
+            .any(|justified| mod_file.contains(justified) || justified.contains(&mod_file));
+
+        if !is_justified {
+            findings.push(LintFinding {
+                file_path: mod_file.clone(),
+                line_number: 1,
+                pattern: "mod.rs".to_string(),
+                message: "New module lacks RFC justification".to_string(),
+                suggestion: "Add this module path to files_to_create in an RFC's 06_ticket_decomposition.yaml".to_string(),
+                severity: LintSeverity::Error,
+                lint_id: Some("LINT-0013".to_string()),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Get list of new mod.rs files (not in git HEAD).
+fn get_new_mod_files() -> Result<Vec<String>> {
+    use std::process::Command;
+
+    // Get untracked files
+    let output = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+        .context("Failed to run git ls-files")?;
+
+    let untracked = String::from_utf8_lossy(&output.stdout);
+
+    // Get staged new files
+    let output = Command::new("git")
+        .args(["diff", "--cached", "--name-only", "--diff-filter=A"])
+        .output()
+        .context("Failed to run git diff --cached")?;
+
+    let staged = String::from_utf8_lossy(&output.stdout);
+
+    // Combine and filter for mod.rs files in crates/ or xtask/
+    let mut new_mods: Vec<String> = untracked
+        .lines()
+        .chain(staged.lines())
+        .filter(|path| {
+            path.ends_with("mod.rs") && (path.starts_with("crates/") || path.starts_with("xtask/"))
+        })
+        .map(String::from)
+        .collect();
+
+    new_mods.sort();
+    new_mods.dedup();
+
+    Ok(new_mods)
+}
+
+/// Load justified file paths from RFC ticket decomposition files.
+fn load_rfc_justified_paths() -> Result<Vec<String>> {
+    let mut justified = Vec::new();
+
+    // Scan RFC ticket decomposition files
+    let pattern = "documents/rfcs/*/06_ticket_decomposition.yaml";
+    let glob_pattern = glob::glob(pattern).context("Invalid RFC glob pattern")?;
+
+    for entry in glob_pattern.flatten() {
+        if let Ok(content) = std::fs::read_to_string(&entry) {
+            // Extract files_to_create entries using simple pattern matching
+            // Look for lines like "        - crates/apm2-core/src/determinism/mod.rs"
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("- ") && trimmed.contains('/') {
+                    let path = trimmed.trim_start_matches("- ").trim();
+                    if std::path::Path::new(path)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+                    {
+                        justified.push(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(justified)
+}
+
+// =============================================================================
+// LINT-0014: cousin-abstraction-detector
+// =============================================================================
+
+/// Default similarity threshold for cousin abstraction detection.
+const COUSIN_SIMILARITY_THRESHOLD: f64 = 0.8;
+
+/// Check for cousin abstractions - similar struct/trait definitions
+/// (LINT-0014).
+///
+/// Parses all struct and trait definitions in the workspace and computes
+/// similarity scores based on name similarity (Levenshtein) and structural
+/// similarity (field overlap). Warns when similarity exceeds threshold.
+fn check_cousin_abstractions(findings: &mut Vec<LintFinding>) -> Result<()> {
+    let type_defs = collect_type_definitions()?;
+
+    // Compare all pairs
+    for i in 0..type_defs.len() {
+        for j in (i + 1)..type_defs.len() {
+            let def_a = &type_defs[i];
+            let def_b = &type_defs[j];
+
+            // Only compare same kinds (struct-struct or trait-trait)
+            if def_a.kind != def_b.kind {
+                continue;
+            }
+
+            let similarity = compute_type_similarity(def_a, def_b);
+
+            if similarity >= COUSIN_SIMILARITY_THRESHOLD {
+                findings.push(LintFinding {
+                    file_path: def_a.file_path.clone(),
+                    line_number: def_a.line_number,
+                    pattern: format!("{} vs {}", def_a.name, def_b.name),
+                    message: format!(
+                        "Potential cousin abstraction: '{}' and '{}' have {:.0}% similarity",
+                        def_a.name,
+                        def_b.name,
+                        similarity * 100.0
+                    ),
+                    suggestion: format!(
+                        "Consider unifying these types or documenting why they are distinct. See also: {}:{}",
+                        def_b.file_path, def_b.line_number
+                    ),
+                    severity: LintSeverity::Warning,
+                    lint_id: Some("LINT-0014".to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Collect all struct and trait definitions from workspace Rust files.
+fn collect_type_definitions() -> Result<Vec<TypeDefinition>> {
+    let mut definitions = Vec::new();
+
+    let patterns = ["crates/**/*.rs", "xtask/src/**/*.rs"];
+
+    for pattern in patterns {
+        let glob_pattern = glob::glob(pattern).context("Invalid glob pattern")?;
+
+        for entry in glob_pattern.flatten() {
+            if let Ok(content) = std::fs::read_to_string(&entry) {
+                let file_path = entry.display().to_string();
+                extract_type_definitions(&content, &file_path, &mut definitions);
+            }
+        }
+    }
+
+    Ok(definitions)
+}
+
+/// Extract struct and trait definitions from Rust source code.
+///
+/// Uses the `syn` crate to parse the source and extract type definitions.
+fn extract_type_definitions(content: &str, file_path: &str, definitions: &mut Vec<TypeDefinition>) {
+    // Try to parse the file with syn
+    let Ok(syntax) = syn::parse_file(content) else {
+        // If parsing fails, skip this file (might have syntax errors)
+        return;
+    };
+
+    for item in &syntax.items {
+        match item {
+            syn::Item::Struct(item_struct) => {
+                let name = item_struct.ident.to_string();
+                let line_number = item_struct.ident.span().start().line;
+
+                let field_names: Vec<String> = match &item_struct.fields {
+                    syn::Fields::Named(fields) => fields
+                        .named
+                        .iter()
+                        .filter_map(|f| f.ident.as_ref().map(std::string::ToString::to_string))
+                        .collect(),
+                    syn::Fields::Unnamed(fields) => {
+                        (0..fields.unnamed.len()).map(|i| format!("_{i}")).collect()
+                    },
+                    syn::Fields::Unit => Vec::new(),
+                };
+
+                definitions.push(TypeDefinition {
+                    name,
+                    file_path: file_path.to_string(),
+                    line_number,
+                    field_names,
+                    kind: TypeKind::Struct,
+                });
+            },
+            syn::Item::Trait(item_trait) => {
+                let name = item_trait.ident.to_string();
+                let line_number = item_trait.ident.span().start().line;
+
+                // For traits, extract method names as "fields" for comparison
+                let field_names: Vec<String> = item_trait
+                    .items
+                    .iter()
+                    .filter_map(|item| {
+                        if let syn::TraitItem::Fn(method) = item {
+                            Some(method.sig.ident.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                definitions.push(TypeDefinition {
+                    name,
+                    file_path: file_path.to_string(),
+                    line_number,
+                    field_names,
+                    kind: TypeKind::Trait,
+                });
+            },
+            _ => {},
+        }
+    }
+}
+
+/// Compute similarity between two type definitions.
+///
+/// Returns a score between 0.0 and 1.0 based on:
+/// - Name similarity (Levenshtein distance)
+/// - Field/method overlap (Jaccard similarity)
+fn compute_type_similarity(a: &TypeDefinition, b: &TypeDefinition) -> f64 {
+    // Name similarity using normalized Levenshtein
+    let name_similarity = strsim::normalized_levenshtein(&a.name, &b.name);
+
+    // Field/method overlap using Jaccard similarity
+    let field_similarity = if a.field_names.is_empty() && b.field_names.is_empty() {
+        // If both have no fields, consider them structurally similar
+        1.0
+    } else if a.field_names.is_empty() || b.field_names.is_empty() {
+        // If one has fields and other doesn't, not similar
+        0.0
+    } else {
+        let set_a: std::collections::HashSet<_> = a.field_names.iter().collect();
+        let set_b: std::collections::HashSet<_> = b.field_names.iter().collect();
+        let intersection = set_a.intersection(&set_b).count();
+        let union = set_a.union(&set_b).count();
+        if union == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let ratio = intersection as f64 / union as f64;
+            ratio
+        }
+    };
+
+    // Weight name similarity more heavily (60% name, 40% structure)
+    0.6f64.mul_add(name_similarity, 0.4 * field_similarity)
+}
+
+// =============================================================================
+// LINT-0015: deletion-migration-plan-required
+// =============================================================================
+
+/// Check for new pub items without deletion/migration plans (LINT-0015).
+///
+/// Scans for new public items (fn, struct, trait, mod) in staged/untracked
+/// files and verifies they have corresponding deletion plans in the RFC.
+fn check_deletion_plan_required(findings: &mut Vec<LintFinding>) -> Result<()> {
+    // Get list of new or modified Rust files
+    let new_files = get_new_rust_files()?;
+
+    // Load deletion plans from RFCs
+    let deletion_plans = load_rfc_deletion_plans()?;
+
+    for file_path in new_files {
+        if let Ok(content) = std::fs::read_to_string(&file_path) {
+            check_pub_items_for_deletion_plan(&content, &file_path, &deletion_plans, findings);
+        }
+    }
+
+    Ok(())
+}
+
+/// Get list of new or modified Rust files.
+fn get_new_rust_files() -> Result<Vec<String>> {
+    use std::process::Command;
+
+    // Get untracked files
+    let output = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+        .context("Failed to run git ls-files")?;
+
+    let untracked = String::from_utf8_lossy(&output.stdout);
+
+    // Get staged new/modified files
+    let output = Command::new("git")
+        .args(["diff", "--cached", "--name-only", "--diff-filter=AM"])
+        .output()
+        .context("Failed to run git diff --cached")?;
+
+    let staged = String::from_utf8_lossy(&output.stdout);
+
+    // Combine and filter for .rs files in crates/ or xtask/
+    let mut new_files: Vec<String> = untracked
+        .lines()
+        .chain(staged.lines())
+        .filter(|path| {
+            std::path::Path::new(path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+                && (path.starts_with("crates/") || path.starts_with("xtask/"))
+        })
+        .map(String::from)
+        .collect();
+
+    new_files.sort();
+    new_files.dedup();
+
+    Ok(new_files)
+}
+
+/// Load deletion plans from RFC files.
+///
+/// Returns a map of item names to their deletion plan descriptions.
+fn load_rfc_deletion_plans() -> Result<HashMap<String, String>> {
+    let mut plans = HashMap::new();
+
+    // Scan RFC rollout/ops files for deletion_plan sections
+    let pattern = "documents/rfcs/*/05_rollout_and_ops.yaml";
+    let glob_pattern = glob::glob(pattern).context("Invalid RFC glob pattern")?;
+
+    for entry in glob_pattern.flatten() {
+        if let Ok(content) = std::fs::read_to_string(&entry) {
+            // Simple YAML parsing: look for deletion_plan sections
+            // Format expected:
+            // deletion_plan:
+            //   - item: "FunctionName" plan: "Will be removed in v2.0"
+            let mut in_deletion_plan = false;
+            let mut current_item = String::new();
+
+            for line in content.lines() {
+                let trimmed = line.trim();
+
+                if trimmed == "deletion_plan:" || trimmed.starts_with("deletion_plan:") {
+                    in_deletion_plan = true;
+                    continue;
+                }
+
+                if in_deletion_plan {
+                    if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.is_empty() {
+                        // End of deletion_plan section
+                        in_deletion_plan = false;
+                        continue;
+                    }
+
+                    if trimmed.starts_with("- item:") || trimmed.starts_with("item:") {
+                        current_item = trimmed
+                            .trim_start_matches("- item:")
+                            .trim_start_matches("item:")
+                            .trim()
+                            .trim_matches('"')
+                            .to_string();
+                    } else if trimmed.starts_with("plan:") && !current_item.is_empty() {
+                        let plan = trimmed
+                            .trim_start_matches("plan:")
+                            .trim()
+                            .trim_matches('"')
+                            .to_string();
+                        plans.insert(current_item.clone(), plan);
+                        current_item.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(plans)
+}
+
+/// Check public items in a file for corresponding deletion plans.
+fn check_pub_items_for_deletion_plan(
+    content: &str,
+    file_path: &str,
+    deletion_plans: &HashMap<String, String>,
+    findings: &mut Vec<LintFinding>,
+) {
+    // Parse with syn to find pub items
+    let Ok(syntax) = syn::parse_file(content) else {
+        return;
+    };
+
+    for item in &syntax.items {
+        let (name, line_number, item_kind) = match item {
+            syn::Item::Fn(item_fn) if matches!(item_fn.vis, syn::Visibility::Public(_)) => {
+                let name = item_fn.sig.ident.to_string();
+                let line = item_fn.sig.ident.span().start().line;
+                (name, line, "function")
+            },
+            syn::Item::Struct(item_struct)
+                if matches!(item_struct.vis, syn::Visibility::Public(_)) =>
+            {
+                let name = item_struct.ident.to_string();
+                let line = item_struct.ident.span().start().line;
+                (name, line, "struct")
+            },
+            syn::Item::Trait(item_trait)
+                if matches!(item_trait.vis, syn::Visibility::Public(_)) =>
+            {
+                let name = item_trait.ident.to_string();
+                let line = item_trait.ident.span().start().line;
+                (name, line, "trait")
+            },
+            syn::Item::Mod(item_mod) if matches!(item_mod.vis, syn::Visibility::Public(_)) => {
+                let name = item_mod.ident.to_string();
+                let line = item_mod.ident.span().start().line;
+                (name, line, "module")
+            },
+            _ => continue,
+        };
+
+        // Check if this item has a deletion plan
+        if !deletion_plans.contains_key(&name) {
+            findings.push(LintFinding {
+                file_path: file_path.to_string(),
+                line_number,
+                pattern: format!("pub {item_kind} {name}"),
+                message: format!("New public {item_kind} '{name}' lacks a deletion/migration plan"),
+                suggestion:
+                    "Add a deletion_plan entry in the RFC's 05_rollout_and_ops.yaml for this item"
+                        .to_string(),
+                severity: LintSeverity::Error,
+                lint_id: Some("LINT-0015".to_string()),
+            });
+        }
     }
 }
 
@@ -568,12 +1100,31 @@ mod tests {
             pattern: "std::env::temp_dir()".to_string(),
             message: "Test message".to_string(),
             suggestion: "Test suggestion".to_string(),
+            severity: LintSeverity::Warning,
+            lint_id: None,
         };
 
         let output = finding.to_string();
         assert!(output.contains("warning: Test message"));
         assert!(output.contains("src/main.rs:42"));
         assert!(output.contains("help: Test suggestion"));
+    }
+
+    #[test]
+    fn test_lint_finding_display_with_id() {
+        let finding = LintFinding {
+            file_path: "src/main.rs".to_string(),
+            line_number: 42,
+            pattern: "pub struct Foo".to_string(),
+            message: "Test error message".to_string(),
+            suggestion: "Test suggestion".to_string(),
+            severity: LintSeverity::Error,
+            lint_id: Some("LINT-0013".to_string()),
+        };
+
+        let output = finding.to_string();
+        assert!(output.contains("error [LINT-0013]: Test error message"));
+        assert!(output.contains("src/main.rs:42"));
     }
 
     #[test]
@@ -723,6 +1274,8 @@ mod tests {
             pattern: "temp_dir()".to_string(),
             message: "Test".to_string(),
             suggestion: "Fix it".to_string(),
+            severity: LintSeverity::Warning,
+            lint_id: None,
         };
 
         let display = finding.to_string();
@@ -864,6 +1417,8 @@ code line 2
             pattern: "std::env::temp_dir()".to_string(),
             message: "Documentation example uses insecure pattern".to_string(),
             suggestion: "Use tempfile crate instead".to_string(),
+            severity: LintSeverity::Warning,
+            lint_id: None,
         };
 
         let display = finding.to_string();
@@ -871,5 +1426,189 @@ code line 2
             "documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md:50"
         ));
         assert!(display.contains("Documentation example"));
+    }
+
+    // =========================================================================
+    // Tests for LINT-0013, LINT-0014, LINT-0015 (clutter prevention)
+    // =========================================================================
+
+    #[test]
+    fn test_lint_severity_display() {
+        assert_eq!(LintSeverity::Warning.to_string(), "warning");
+        assert_eq!(LintSeverity::Error.to_string(), "error");
+    }
+
+    #[test]
+    fn test_type_kind_equality() {
+        assert_eq!(TypeKind::Struct, TypeKind::Struct);
+        assert_eq!(TypeKind::Trait, TypeKind::Trait);
+        assert_ne!(TypeKind::Struct, TypeKind::Trait);
+    }
+
+    #[test]
+    fn test_extract_type_definitions_struct() {
+        let content = r"
+pub struct Foo {
+    pub name: String,
+    pub value: i32,
+}
+";
+        let mut definitions = Vec::new();
+        extract_type_definitions(content, "test.rs", &mut definitions);
+
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "Foo");
+        assert_eq!(definitions[0].kind, TypeKind::Struct);
+        assert!(definitions[0].field_names.contains(&"name".to_string()));
+        assert!(definitions[0].field_names.contains(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_extract_type_definitions_trait() {
+        let content = r"
+pub trait Bar {
+    fn method_one(&self);
+    fn method_two(&self) -> i32;
+}
+";
+        let mut definitions = Vec::new();
+        extract_type_definitions(content, "test.rs", &mut definitions);
+
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].name, "Bar");
+        assert_eq!(definitions[0].kind, TypeKind::Trait);
+        assert!(
+            definitions[0]
+                .field_names
+                .contains(&"method_one".to_string())
+        );
+        assert!(
+            definitions[0]
+                .field_names
+                .contains(&"method_two".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compute_type_similarity_identical_names() {
+        let a = TypeDefinition {
+            name: "FooBar".to_string(),
+            file_path: "a.rs".to_string(),
+            line_number: 1,
+            field_names: vec!["x".to_string(), "y".to_string()],
+            kind: TypeKind::Struct,
+        };
+        let b = TypeDefinition {
+            name: "FooBar".to_string(),
+            file_path: "b.rs".to_string(),
+            line_number: 1,
+            field_names: vec!["x".to_string(), "y".to_string()],
+            kind: TypeKind::Struct,
+        };
+
+        let similarity = compute_type_similarity(&a, &b);
+        assert!(
+            (similarity - 1.0).abs() < 0.001,
+            "Expected 1.0, got {similarity}"
+        );
+    }
+
+    #[test]
+    fn test_compute_type_similarity_similar_names() {
+        let a = TypeDefinition {
+            name: "UserData".to_string(),
+            file_path: "a.rs".to_string(),
+            line_number: 1,
+            field_names: vec!["id".to_string(), "name".to_string()],
+            kind: TypeKind::Struct,
+        };
+        let b = TypeDefinition {
+            name: "UserInfo".to_string(),
+            file_path: "b.rs".to_string(),
+            line_number: 1,
+            field_names: vec!["id".to_string(), "name".to_string()],
+            kind: TypeKind::Struct,
+        };
+
+        let similarity = compute_type_similarity(&a, &b);
+        // Names are similar (User* prefix), fields identical
+        assert!(similarity >= 0.7, "Expected >= 0.7, got {similarity}");
+    }
+
+    #[test]
+    fn test_compute_type_similarity_different() {
+        let a = TypeDefinition {
+            name: "Apple".to_string(),
+            file_path: "a.rs".to_string(),
+            line_number: 1,
+            field_names: vec!["color".to_string()],
+            kind: TypeKind::Struct,
+        };
+        let b = TypeDefinition {
+            name: "Banana".to_string(),
+            file_path: "b.rs".to_string(),
+            line_number: 1,
+            field_names: vec!["length".to_string()],
+            kind: TypeKind::Struct,
+        };
+
+        let similarity = compute_type_similarity(&a, &b);
+        // Names and fields are completely different
+        assert!(similarity < 0.5, "Expected < 0.5, got {similarity}");
+    }
+
+    #[test]
+    fn test_cousin_similarity_threshold() {
+        // Verify the threshold constant is reasonable
+        // Using const block to silence clippy::assertions_on_constants
+        const { assert!(COUSIN_SIMILARITY_THRESHOLD > 0.5) };
+        const { assert!(COUSIN_SIMILARITY_THRESHOLD <= 1.0) };
+    }
+
+    #[test]
+    fn test_check_pub_items_for_deletion_plan() {
+        let content = r"
+pub fn public_function() {}
+fn private_function() {}
+pub struct PublicStruct { pub x: i32 }
+struct PrivateStruct { x: i32 }
+";
+        let mut findings = Vec::new();
+        let deletion_plans = HashMap::new(); // Empty - no plans
+
+        check_pub_items_for_deletion_plan(content, "test.rs", &deletion_plans, &mut findings);
+
+        // Should flag pub items but not private ones
+        assert_eq!(findings.len(), 2);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.pattern.contains("public_function"))
+        );
+        assert!(findings.iter().any(|f| f.pattern.contains("PublicStruct")));
+        assert!(!findings.iter().any(|f| f.pattern.contains("private")));
+    }
+
+    #[test]
+    fn test_check_pub_items_with_deletion_plan() {
+        let content = r"
+pub fn public_function() {}
+pub struct PublicStruct { pub x: i32 }
+";
+        let mut findings = Vec::new();
+        let mut deletion_plans = HashMap::new();
+        deletion_plans.insert(
+            "public_function".to_string(),
+            "Will be removed in v2.0".to_string(),
+        );
+        deletion_plans.insert(
+            "PublicStruct".to_string(),
+            "Deprecated, use NewStruct".to_string(),
+        );
+
+        check_pub_items_for_deletion_plan(content, "test.rs", &deletion_plans, &mut findings);
+
+        // Should not flag items that have deletion plans
+        assert_eq!(findings.len(), 0);
     }
 }
