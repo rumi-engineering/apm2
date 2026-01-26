@@ -10,7 +10,7 @@ This document links the 5-phase [North Star Vision](NORTH_STAR.md) to specific i
 |-----------|-----------|---------------------------------|
 | **Autonomous Kernel** | `PRD-0001` | Single-command end-to-end execution of a verified change. |
 | **Cousin Prevention** | `PRD-0004` | 100% of new requirements map to CCP before implementation. |
-| **Council Protocol** | `RFC-XXXX` | Multi-agent quorum reaches convergence on 3 consecutive PRDs. |
+| **Council Protocol** | `RFC-0010` | Quorum convergence protocol (signatures, dissent set, reconciliation artifacts) verified for 3 consecutive PRDs. |
 | **Recursive Skill Edit**| `rsi-modes-of-reasoning` | Agent successfully refactors its own reasoning documentation. |
 
 ---
@@ -21,8 +21,8 @@ This document links the 5-phase [North Star Vision](NORTH_STAR.md) to specific i
 
 | Milestone | PRD / RFC | Transition Gate (Exit Criteria) |
 |-----------|-----------|---------------------------------|
-| **Scholar Integration** | `RFC-XXXX` | Agent can perform prior art search against patent/academic DBs. |
-| **Novelty Discriminator**| `RFC-XXXX` | Automatic scoring of "semantic distance" from existing methods. |
+| **Scholar Integration** | `RFC-XXXX` | `PriorArtQuery` evidence primitive (query spec + source snapshot digests) integrated into automated gates. |
+| **Novelty Discriminator**| `RFC-XXXX` | Deterministic novelty scoring against content-addressed regression corpus with replayable evidence receipts. |
 | **First Patentable Method**| `RFC-XXXX` | Agent generates a method with >2x performance vs. baseline. |
 
 ---

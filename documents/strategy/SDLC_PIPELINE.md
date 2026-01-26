@@ -70,5 +70,5 @@ Final reconciliation and deployment.
 
 1.  **Repository Truth:** The Codebase Context Pack (CCP) is the source of truth for all designs. No guessing allowed.
 2.  **Waste is Sin:** "Cousin Abstractions" (duplication) are blockers. Reuse-by-default is the law.
-3.  **Falsifiability:** If a requirement cannot be tested by a single shell command, it is a defect.
+3.  **Falsifiability:** If a requirement cannot be tested by a single shell command (GateRun), it is a defect. Portfolio-level metrics (e.g., "Series A secured") that are inherently external MUST be represented as **Oracle Primitives**—explicit, budgeted escalations that produce content-addressed evidence receipts—rather than narrative assertions. Any transition gate MUST be expressible as a checkable predicate over evidence artifacts.
 4.  **Agent-Native:** Software is designed to be understood and edited by both humans and agents with equal efficiency.

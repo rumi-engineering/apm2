@@ -12,10 +12,10 @@ The canonical 5-phase vision that all council members must internalize. This doc
 - Review efficiency: Time-to-merge for agent-authored PRs
 - Autonomy level: Percentage of tasks completed without human intervention
 
-**Exit Criteria:**
-- Agent-authored code passes review with ≤50% of findings vs. human baseline
-- Agent can complete end-to-end feature implementation from PRD to merged PR
-- Agent demonstrates consistent improvement across 3 consecutive evaluation cycles
+**Exit Criteria (Gated):**
+- Agent-authored code passes review with ≤50% of findings vs. human baseline (as measured by `gate-baseline-comparison-v1`).
+- Agent can complete end-to-end feature implementation from PRD to merged PR without manual intervention.
+- Agent demonstrates monotonic improvement across 3 consecutive `evaluation-cycle-v1` runs.
 
 ## Phase 2: Novel Methods Generation
 
@@ -27,10 +27,14 @@ The canonical 5-phase vision that all council members must internalize. This doc
 - Generalizability: Applicability across problem domains
 - Documentation quality: Clarity sufficient for patent filing
 
-**Exit Criteria:**
-- System generates ≥3 patentable innovations per quarter
-- At least one innovation achieves >2x performance improvement in target domain
-- Patent applications filed with positive examiner feedback
+**Exit Criteria (Gated):**
+- System generates ≥3 innovations per quarter satisfying the `novelty-threshold-v1` predicate in `ScholarGate`.
+- At least one innovation achieves >2x performance improvement in target domain as verified by `reproducible-benchmark-receipt`.
+- Evidence of patent application submission and content-addressed examiner feedback artifacts present in `evidence/ip/`.
+
+**Aspirational Metrics:**
+- Positive examiner feedback (qualitative).
+- Broad scientific community adoption.
 
 ## Phase 3: Company Formation
 
@@ -42,10 +46,14 @@ The canonical 5-phase vision that all council members must internalize. This doc
 - Customer acquisition: Number of paying enterprise customers
 - Team composition: Key hires across engineering, legal, business development
 
-**Exit Criteria:**
-- Company legally incorporated with IP assignments complete
-- First $1M ARR achieved
-- Series A funding secured or profitability demonstrated
+**Exit Criteria (Gated):**
+- Company legally incorporated with signed IP assignment artifacts present in `evidence/governance/`.
+- Proof of IP transfer from individual contributors to the entity verified by `gate-legal-audit`.
+
+**Aspirational Milestones (Non-Gated):**
+- First $1M ARR achieved.
+- Series A funding secured or profitability demonstrated.
+- Team composition: Key hires across engineering, legal, business development.
 
 ## Phase 4: Corporate Partnerships
 
@@ -57,10 +65,10 @@ The canonical 5-phase vision that all council members must internalize. This doc
 - Technology transfer: Patents/methods licensed to partners
 - Market reach: Combined addressable market through partnerships
 
-**Exit Criteria:**
-- ≥3 Fortune 500 partnerships established
-- Joint R&D budget exceeds $10M annually
-- Technology deployed at scale across partner ecosystems
+**Exit Criteria (Gated):**
+- ≥3 Fortune 500 partnerships established with signed contract hashes in `evidence/partnerships/`.
+- Joint R&D budget allocation receipts exceed $10M total.
+- Technology deployment evidence bundles for partner ecosystems verified by `gate-external-deployment`.
 
 ## Phase 5: Planetary Impact
 
