@@ -1,0 +1,17 @@
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+ticket:
+  id: TCK-00101
+  title: "SUPERSEDED: RFC-0009 ticket (migrated to TCK-00121)"
+  status: CANCELLED
+  rfc_id: RFC-0009
+  requirement_ids: []
+  depends_on: []
+
+supersession:
+  superseded_by_rfc: RFC-0010
+  migrated_to_ticket: TCK-00121
+  rationale: |
+    RFC-0009 was decoupled from PRD-0005 and marked SUPERSEDED.
+    This ticket is retained for traceability only.

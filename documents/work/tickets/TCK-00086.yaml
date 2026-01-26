@@ -8,8 +8,10 @@ ticket_meta:
     prd_id: "PRD-0004"
     rfc_id: "RFC-0008"
     requirements:
-      - requirement_id: "HANDOFF-002"
-        requirement_ref: "documents/rfcs/RFC-0008/01_problem_and_imports.yaml#rfc_local_requirements.requirements[1]"
+      - requirement_id: "REQ-0009"
+        requirement_ref: "documents/prds/PRD-0004/requirements/REQ-0009.yaml#prd_requirement"
+      - requirement_id: "REQ-0025"
+        requirement_ref: "documents/prds/PRD-0004/requirements/REQ-0025.yaml#prd_requirement"
     evidence_artifacts:
       - "EVID-8002"
   custody:
