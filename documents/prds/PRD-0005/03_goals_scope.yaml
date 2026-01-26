@@ -40,7 +40,7 @@ prd_goals_scope:
       - "Impact Map and RFC framing rules grounded in CCP."
       - "RFC lint extensions to prevent duplication and enforce justifications."
       - "Ticket decomposition generation with deletion/migration plans."
-      - "Skill system integration (new idea-compiler skill, create-rfc updates)."
+      - "Skill system integration (new idea-compiler skill, rfc-council updates)."
       - "Refactor Radar generation from CCP signals."
     out_of_scope:
       - "Federation (kernel-to-kernel replication/routing)."

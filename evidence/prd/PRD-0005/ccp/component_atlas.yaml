@@ -159,7 +159,7 @@ component_atlas:
       type: document_collection
       description: "Agent skill definitions with frontmatter and references"
       items:
-        - documents/skills/create-rfc/SKILL.md
+        - documents/skills/rfc-council/SKILL.md
         - documents/skills/prd-review/SKILL.md
         - documents/skills/dev-eng-ticket/SKILL.md
         - documents/skills/aat/SKILL.md

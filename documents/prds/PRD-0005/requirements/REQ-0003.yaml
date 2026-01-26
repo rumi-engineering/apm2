@@ -9,7 +9,7 @@ prd_requirement:
   acceptance_criteria:
     - "For each requirement, the Impact Map lists candidate components (stable IDs), a selected extension point, and rationale bound to atlas entries."
     - "Requirements that cannot be mapped are explicitly classified as net-new substrate and require an adjudication record before RFC emission."
-    - "Impact Map is deterministic for a fixed PRD and repo state and includes stable ordering for diff-friendly review."
+    - "Impact Map is byte-identical for identical inputs (defined as: PRD file content hashes, git commit SHA of tracked files, routing profile hash). Untracked files MUST NOT affect output unless --allow-dirty is specified. Output includes stable ordering for diff-friendly review."
     - "Impact Map includes a 'duplication risk' field when multiple plausible extension points exist."
   evidence:
     evidence_ids:

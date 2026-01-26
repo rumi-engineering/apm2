@@ -4,6 +4,7 @@ prd_evidence_artifact:
   id: EVID-0001
   category: INTEGRATION_TEST_RESULTS
   title: End-to-end Idea Compiler golden run
+  evidence_status: PENDING_IMPLEMENTATION
   capture:
     paths:
       - evidence/prd/PRD-0005/golden_runs/

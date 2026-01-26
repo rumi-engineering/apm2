@@ -3,6 +3,7 @@ prd_evidence_artifact:
   template_version: "2026-01-23"
   id: EVID-0007
   category: INTEGRATION_TEST_RESULTS
+  evidence_status: PENDING_IMPLEMENTATION
   title: Model routing profile and provenance manifest tests
   capture:
     paths:

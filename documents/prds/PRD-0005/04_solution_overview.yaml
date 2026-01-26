@@ -137,7 +137,7 @@ prd_solution_overview:
           and consume CCP guidance while implementing tickets.
         responsibilities:
           - "Create/maintain a new idea-compiler skill."
-          - "Update create-rfc skill to require CCP/Impact Map inputs."
+          - "Update rfc-council skill to require CCP/Impact Map inputs."
 
       - name: "Refactor Radar"
         description: |
@@ -176,12 +176,21 @@ prd_solution_overview:
           - Ticket_Emit
       promote:
         usage:
-          - "apm2 factory promote --run <RUN_ID> --to documents/"
+          - "apm2 factory promote --run <RUN_ID> --to documents/ [--dry-run]"
+        safety_requirements:
+          - "Promote MUST verify run manifest signature and gate passage before proceeding."
+          - "Promote MUST acquire exclusive lock on target directory; concurrent operations fail-fast."
+          - "Promote MUST create atomic backup in evidence/backups/<TIMESTAMP>/ before writes."
+          - "Promote executes as atomic transaction: stage writes in temp dir, verify, rename; failure triggers rollback."
 
     io:
       repo_state:
         default: "Require clean working tree for determinism."
         override: "Allow dirty trees only with explicit `--allow-dirty` (hashes include tracked + untracked file contents)."
+        dirty_tree_constraints:
+          - "Reject untracked files >10MB, symlinks outside repo root, and files matching secret patterns (.env, *_key, credentials.json)."
+          - "Dirty-tree hashing respects .gitignore and includes submodule commit hashes (not uncommitted submodule changes)."
+          - "A manifest warning is emitted for dirty runs indicating non-reproducibility risk."
       outputs:
         run_root: "evidence/prd/<PRD-ID>/runs/<RUN_ID>/"
         caches:
@@ -218,9 +227,11 @@ prd_solution_overview:
         - "New crate/package."
         - "New module file (any new `*.rs` in the module tree)."
         - "New top-level named item: struct, enum, trait, type alias (regardless of visibility)."
+        - "New function or method with public-equivalent visibility (used by >1 call site outside its defining module)."
       other:
         - "New CLI subcommand surface."
         - "New protocol message/field (when applicable)."
+        - "New shared helper (any function called from multiple modules that didn't exist before)."
 
     deferred_to_phase_2:
       - "Dual-route canary execution."

@@ -28,6 +28,11 @@
 - APPLY: INV-0001/0002/0008, INV-0802/0804, RSK-0903.
 - REJECT IF: any checklist item in INV-0902 is unproven.
 
+[HAZARD: RSK-1304] Ghost Key Prevention in TTL Queues.
+- TRIGGER: insertion-order queues (VecDeque) used for TTL-based eviction in HashMaps.
+- APPLY: RSK-1304.
+- REJECT IF: queue stores only keys without timestamps for TTL-based stores.
+
 ## Drops and Panics
 
 [HAZARD: RSK-2405] Drop Scope and Drop Order Changes.
@@ -57,6 +62,11 @@
 - APPLY: CTR-1003 (HB graph required), RSK-1002 (reclamation).
 - REJECT IF: HB graph is absent.
 
+[HAZARD: RSK-2504] Defensive Duration and Interval Handling.
+- TRIGGER: use of `duration_since()`; modulo/division on interval variables.
+- APPLY: RSK-2504.
+- REJECT IF: `checked_duration_since()` is missing or intervals lack zero-guards.
+
 ## Async
 
 [HAZARD: RSK-2410] Invariant Broken Across `.await`.
@@ -68,6 +78,11 @@
 - TRIGGER: `select`-style constructs; branch-local work mutates shared state before winning.
 - APPLY: RSK-1102 (lateral state corruption).
 - REJECT IF: losing branch cancellation can leave shared state partially updated.
+
+[CONTRACT: CTR-1104] Cancellation-Safe State Mutation.
+- TRIGGER: idempotency markers set alongside external side effects (DB/File persist).
+- APPLY: CTR-1104.
+- REJECT IF: idempotency marker is set BEFORE the side effect completes.
 
 ## cfg, Features, Build Matrix
 

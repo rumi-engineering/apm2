@@ -51,6 +51,14 @@
 - ENFORCE BY: keep clock domains separate in types and modules; convert only at defined boundaries.
 [PROVENANCE] std types represent different semantics; only `Duration` is a clock-independent value.
 
+[HAZARD: RSK-2504] Defensive Duration and Interval Handling.
+- OS clocks can jump backwards, and intervals can be zero.
+- REJECT IF: `duration_since()` is used without the `checked_` variant.
+- REJECT IF: modulo operations on intervals lack a zero-guard.
+- ENFORCE BY: use `checked_duration_since().unwrap_or(Duration::ZERO)`; guard division/modulo by checking `interval > 0`.
+[PROVENANCE] std Instant::duration_since (can panic on some platforms/versions if time goes backwards); APM2 Implementation Standard.
+[VERIFICATION] Code audit for unchecked duration math and zero-interval modulo.
+
 [CONTRACT: CTR-2503] Deterministic Tests Require a Controllable Clock.
 - REJECT IF: tests depend on real time passing (sleep-based flakiness) when a controllable clock is feasible.
 - ENFORCE BY: fake clock injection; deterministic schedulers; time-free unit tests with explicit durations.

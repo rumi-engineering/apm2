@@ -38,13 +38,11 @@ decision_tree:
           purpose: "Axioms of holonic operation."
         - path: documents/skills/holonic-agent-network/references/agent-native-software.md
           purpose: "Agent-native architecture doctrine."
-        - path: documents/skills/coding/SKILL.md
-          purpose: "Project coding standards."
         - path: documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md
           purpose: "APM2 safe patterns and anti-patterns (token-efficient index)."
-        - path: documents/skills/coding/references/CI_EXPECTATIONS.md
+        - path: documents/reviews/CI_EXPECTATIONS.md
           purpose: "CI pipeline checks and fix procedures."
-        - path: documents/skills/coding/references/SECURITY_CHECKLIST.md
+        - path: documents/security/SECURITY_CHECKLIST.md
           purpose: "Security review checklist."
         - path: documents/skills/rust-textbook/09_unsafe_rust_obligations.md
           purpose: "Unsafe proof obligations + APM2 unsafe policy."

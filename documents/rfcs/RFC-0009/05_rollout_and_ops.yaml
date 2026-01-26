@@ -65,7 +65,7 @@ rfc_rollout_and_ops:
         description: "Update skills and implement continuous refactoring"
         deliverables:
           - "Updated idea-compiler skill"
-          - "Updated create-rfc skill"
+          - "Updated rfc-council skill"
           - "crates/apm2-core/src/refactor_radar/ module"
           - "CLI: apm2 factory refactor radar"
         verification: |

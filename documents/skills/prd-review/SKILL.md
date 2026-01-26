@@ -22,7 +22,7 @@ variables:
   MODE_OPTIONAL: "$1"
   PRD_ID: "$2"
 
-references[15]:
+references[17]:
   - path: references/prd-review-workflow.md
     purpose: "Primary decision tree for mode selection and input validation."
   - path: references/create-mode.md
@@ -53,6 +53,10 @@ references[15]:
     purpose: "Patterns for preventing defect recurrence."
   - path: references/commands.md
     purpose: "CLI command reference."
+  - path: ../agent-native-software/SKILL.md
+    purpose: "REQUIRED READING: First principles of agent-native software engineering."
+  - path: ../../security/AGENTS.md
+    purpose: "REQUIRED READING: Security policy, threat models, and incident response."
 
 decision_tree:
   entrypoint: WORKFLOW

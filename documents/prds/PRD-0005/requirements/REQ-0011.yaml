@@ -12,6 +12,7 @@ prd_requirement:
     - "Radar output volume is bounded (max items) and includes prioritization rationale; hotspot signals are aggregated rather than per-file noise."
     - "Radar can emit a bounded set of maintenance tickets or a maintenance RFC proposal, with explicit measurable outcomes."
     - "Radar computes stable recurrence signatures for comparable diffs across time windows."
+    - "Radar includes a circuit breaker: if (radar tickets completed / radar tickets generated) drops below 0.5 for 2 consecutive windows, radar output is suspended until backlog is cleared or AUTH_ARCHITECTURE explicitly overrides."
   evidence:
     evidence_ids:
       - EVID-0011

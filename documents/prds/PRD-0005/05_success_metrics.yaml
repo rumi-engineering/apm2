@@ -12,10 +12,13 @@ prd_success_metrics:
 
     - id: MET-0002
       name: Requirement mapping completeness
-      description: Percentage of PRD requirements mapped to existing components or explicitly adjudicated as net-new substrate.
-      target: "100%"
+      description: |
+        Percentage of PRD requirements mapped to existing components or explicitly adjudicated as net-new substrate.
+        Quality gates: no component mapped to >30% of requirements (prevents trivial mappings);
+        net-new substrate ratio <=20% (prevents classification inflation).
+      target: "100% completeness with quality gates"
       measurement:
-        method: "Impact Map coverage check"
+        method: "Impact Map coverage check with distribution analysis"
         signal_source: "impact_map artifacts"
 
     - id: MET-0003
@@ -30,7 +33,10 @@ prd_success_metrics:
 
     - id: MET-0004
       name: Reuse ratio
-      description: Ratio of tickets that primarily extend existing modules vs introduce net-new modules/crates.
+      description: |
+        Ratio of tickets that primarily extend existing modules vs introduce net-new modules/crates.
+        Baseline (pre-compiler) to be measured during implementation. Target of 80% represents
+        estimated 2x improvement over baseline. If baseline is already >70%, target should be revised upward.
       target: ">= 80% extend-existing"
       measurement:
         method: "diff classifier + RFC justification scan"
@@ -46,7 +52,10 @@ prd_success_metrics:
 
     - id: MET-0006
       name: Compile latency
-      description: Wall-clock time for `apm2 factory compile` on a typical developer machine.
+      description: |
+        Wall-clock time for `apm2 factory compile` on a typical developer machine.
+        Baseline: repo with <=50 crates, <=500 KLOC, machine with >=4 cores, >=8GB RAM, SSD storage.
+        For larger repos, latency scales approximately linearly with crate count.
       target: "p50 <= 2 minutes, p95 <= 5 minutes"
       measurement:
         method: "timings recorded in run manifests"

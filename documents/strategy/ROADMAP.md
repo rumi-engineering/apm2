@@ -34,6 +34,7 @@ This document links the 5-phase [North Star Vision](NORTH_STAR.md) to specific i
 | Milestone | BP / PRD | Transition Gate (Exit Criteria) |
 |-----------|-----------|---------------------------------|
 | **IP Ledger** | `BP-0001` | Immutable record of agent-authored IP with ownership proof. |
+| **Teammate Foundation** | `PRD-0006` | Prototype of the proactive scheduler + sentiment ledger. |
 | **Licensing Engine** | `BP-0002` | Automated royalty collection and contract enforcement. |
 | **First $1M ARR** | `BP-0003` | Verifiable revenue from external software licenses. |
 

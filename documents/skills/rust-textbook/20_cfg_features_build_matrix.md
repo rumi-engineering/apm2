@@ -39,6 +39,11 @@
 [PROVENANCE] SemVer hazards include cfg-dependent API drift.
 [VERIFICATION] Downstream compilation under supported feature sets.
 
+[CONTRACT: CTR-2003] Fail-Closed Feature Flags.
+- REJECT IF: feature flags controlling security-sensitive behavior default to enabled (fail-open).
+- ENFORCE BY: default to disabled; require explicit opt-in via environment or feature flag.
+[PROVENANCE] APM2 Security Policy; CTR-FLAG001.
+
 ## References (Normative Anchors)
 
 - Rust Reference: Conditional compilation: https://doc.rust-lang.org/reference/conditional-compilation.html

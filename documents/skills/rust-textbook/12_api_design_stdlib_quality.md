@@ -41,8 +41,34 @@
 
 [CONTRACT: CTR-1205] Construction Protocols Must Be Validated.
 - REJECT IF: builders/setters allow invalid intermediate or final states unless invalidity is unobservable and internally contained.
+- REJECT IF: builder validation only checks identifiers (IDs) but skips logic-affecting specs/configs.
 - ENFORCE BY: builder with `build()` validation; typestate when ordering matters; `TryFrom`/`FromStr` for parsing constructors.
 [PROVENANCE] Rust type system supports invalid-state elimination by construction; invalid states must not be representable at safe boundaries.
+
+```rust
+// Pattern: Builder Validation Scope
+impl SpawnConfigBuilder {
+    pub fn build(self) -> Result<SpawnConfig, ConfigError> {
+        validate_id(&self.work_id, "work_id")?;
+        // Vital: Validate specs/configs, not just IDs!
+        validate_goal_spec(&self.goal_spec)?;
+        Ok(SpawnConfig { ... })
+    }
+}
+```
+
+[CONTRACT: CTR-1206] Authoritative Apply Pattern.
+- REJECT IF: security-sensitive configurations can be partially or inconsistently applied.
+- ENFORCE BY: a single authoritative function that consumes a config and returns a fully prepared resource (e.g., `Command`, `Socket`).
+[PROVENANCE] APM2 Implementation Standard.
+
+```rust
+// Pattern: Authoritative Apply
+pub fn command_with_sandbox(mut cmd: Command, profile: &SandboxProfile) -> Result<Command, Error> {
+    apply_sandbox_controls(&mut cmd, profile)?;
+    Ok(cmd)
+}
+```
 
 ## References (Normative Anchors)
 

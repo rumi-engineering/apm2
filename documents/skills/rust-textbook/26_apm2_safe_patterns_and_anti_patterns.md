@@ -67,6 +67,11 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 - REJECT IF: restart attempts / sequence numbers can decrease or reset across terminal states.
 - ENFORCE BY: store last-seen attempt in terminal states; require `attempt > previous`.
 
+[CONTRACT: CTR-2616] Hash Chain Integrity.
+- REJECT IF: hash chains do not commit to ALL related state (lifecycle events, data payloads).
+- ENFORCE BY: combine all relevant event hashes into the final committed hash.
+[PROVENANCE] APM2 Implementation Standard.
+
 ## Anti-Patterns (Lessons Learned)
 
 ### ANTI-1

@@ -3,6 +3,7 @@ prd_evidence_artifact:
   template_version: "2026-01-23"
   id: EVID-0006
   category: DIFFS
+  evidence_status: PENDING_IMPLEMENTATION
   title: Determinism and diff-classification tests
   capture:
     paths:

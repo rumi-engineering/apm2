@@ -301,22 +301,22 @@ rfc_ticket_decomposition:
 
     # Phase 5: Skills and Refactor Radar
     - ticket_id: TCK-00101
-      title: "Update idea-compiler and create-rfc skills"
+      title: "Update idea-compiler and rfc-council skills"
       phase: PHASE-5
       requirement_ids:
         - REQ-0010
       description: |
         Update skill files:
         - documents/skills/idea-compiler/SKILL.md: Full invocation guide
-        - documents/skills/create-rfc/SKILL.md: Require CCP/Impact Map
+        - documents/skills/rfc-council/SKILL.md: Require CCP/Impact Map
       files_to_modify:
         - documents/skills/idea-compiler/SKILL.md
-        - documents/skills/create-rfc/SKILL.md
+        - documents/skills/rfc-council/SKILL.md
       verification_commands:
         - "cargo xtask lint"
       acceptance_criteria:
         - "Skills invoke CLI commands correctly"
-        - "create-rfc requires CCP reference"
+        - "rfc-council requires CCP reference"
       blocked_by:
         - TCK-00100
       estimated_complexity: LOW

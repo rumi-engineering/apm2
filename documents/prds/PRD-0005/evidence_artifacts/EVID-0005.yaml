@@ -3,6 +3,7 @@ prd_evidence_artifact:
   template_version: "2026-01-23"
   id: EVID-0005
   category: TEST_RESULTS
+  evidence_status: PENDING_IMPLEMENTATION
   title: Ticket emission tests (atomicity, traceability, verification commands)
   capture:
     paths:

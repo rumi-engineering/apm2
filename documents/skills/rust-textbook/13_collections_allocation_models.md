@@ -21,6 +21,13 @@
 - REJECT IF: identity assumptions are implicit (pointer address equality, index reuse without generation).
 [PROVENANCE] Stable identity is not implied by Rust collections; it is a design contract.
 
+[CONTRACT: CTR-1302] Query Result Limiting (Memory DoS Prevention).
+- Apply limits BEFORE collecting iterators to prevent memory exhaustion from query results.
+- REJECT IF: `.collect()` precedes `.take(limit)` in query paths.
+- ENFORCE BY: `.take(limit).collect()`.
+[PROVENANCE] APM2 Implementation Standard; RSK-1901 (Resource Exhaustion).
+[VERIFICATION] Query with limit=N on M>>N items, verify O(limit) memory.
+
 [HAZARD: RSK-1302] Size Math and Allocation Are Attacker-Controlled at Boundaries.
 - TRIGGER: parsing lengths from inputs; `len * size_of::<T>()` computations; `reserve`/`with_capacity` from untrusted sizes.
 - FAILURE MODE: integer overflow; oversized allocation; quadratic behavior due to repeated growth.
@@ -35,6 +42,35 @@
 - ENFORCE BY: sort keys; use ordered maps/sets for deterministic output; define ordering in the format contract.
 [PROVENANCE] std docs: hash maps do not guarantee iteration order.
 [VERIFICATION] Deterministic snapshot tests that sort before asserting.
+
+[HAZARD: RSK-1304] Ghost Key Prevention in TTL Queues.
+- When using insertion-order queues (VecDeque) with TTL-based eviction, keys can be reused after expiration.
+- REJECT IF: queue stores only keys without timestamps for TTL-based stores.
+- ENFORCE BY: store timestamps alongside keys in the queue to detect and skip stale "ghost" entries.
+[PROVENANCE] APM2 Implementation Standard.
+[VERIFICATION] Test ghost key eviction: reuse key after TTL, verify new entry survives eviction.
+
+[CONTRACT: CTR-1303] Bounded In-Memory Stores (Memory DoS Prevention).
+- REJECT IF: in-memory collections (HashMaps, Vecs) tracking external events lack a hard upper bound.
+- ENFORCE BY:
+  - use a `max_entries` limit.
+  - O(1) eviction: use `VecDeque` alongside `HashMap` to track insertion order for fast eviction.
+[PROVENANCE] APM2 Implementation Standard; CTR-MEM001.
+
+```rust
+// Pattern: Bounded Store with O(1) Eviction
+impl<K: Hash + Eq + Clone, V> BoundedStore<K, V> {
+    pub fn insert(&mut self, key: K, value: V) {
+        while self.entries.len() >= self.max_entries {
+            if let Some(old_key) = self.insertion_order.pop_front() {
+                self.entries.remove(&old_key);
+            }
+        }
+        self.entries.insert(key.clone(), value);
+        self.insertion_order.push_back(key);
+    }
+}
+```
 
 ## References (Normative Anchors)
 

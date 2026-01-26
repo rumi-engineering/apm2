@@ -104,7 +104,7 @@ impact_map:
         - component_id: COMP-SKILLS
           extension_point: null
           fit_score: medium
-          rationale: "create-rfc skill already exists"
+          rationale: "rfc-council skill already exists"
         - component_id: COMP-CORE
           extension_point: null
           fit_score: high
@@ -118,7 +118,7 @@ impact_map:
           - grounding.rs: Validate all path references against CCP
           - templates.rs: RFC section templates with CCP bindings
         files_to_modify:
-          - documents/skills/create-rfc/SKILL.md (update to require CCP/Impact Map)
+          - documents/skills/rfc-council/SKILL.md (update to require CCP/Impact Map)
         files_to_create:
           - crates/apm2-core/src/rfc_framer/mod.rs
           - crates/apm2-core/src/rfc_framer/framer.rs
@@ -267,10 +267,10 @@ impact_map:
         extension_point: skill_library
         implementation_approach: |
           - Update documents/skills/idea-compiler/SKILL.md (already exists as stub)
-          - Update documents/skills/create-rfc/SKILL.md to require CCP/Impact Map
+          - Update documents/skills/rfc-council/SKILL.md to require CCP/Impact Map
         files_to_modify:
           - documents/skills/idea-compiler/SKILL.md
-          - documents/skills/create-rfc/SKILL.md
+          - documents/skills/rfc-council/SKILL.md
       duplication_risk: none
       net_new_substrate: false
 

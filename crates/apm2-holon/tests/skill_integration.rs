@@ -735,61 +735,61 @@ fn test_episode_controller_respects_skill_config() {
 }
 
 // ============================================================================
-// TCK-00048: create-rfc Skill Holon Configuration Tests
+// TCK-00048: rfc-council Skill Holon Configuration Tests
 // ============================================================================
 
-/// Returns the path to the create-rfc SKILL.md file.
-fn create_rfc_skill_path() -> PathBuf {
+/// Returns the path to the rfc-council SKILL.md file.
+fn rfc_council_skill_path() -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     PathBuf::from(manifest_dir)
         .parent()
         .unwrap()
         .parent()
         .unwrap()
-        .join("documents/skills/create-rfc/SKILL.md")
+        .join("documents/skills/rfc-council/SKILL.md")
 }
 
-/// TCK-00048 Criterion 1: create-rfc skill has holon: configuration.
+/// TCK-00048 Criterion 1: rfc-council skill has holon: configuration.
 ///
 /// Verifies that the SKILL.md file parses successfully and contains
 /// valid holon configuration.
 #[test]
-fn test_create_rfc_skill_has_holon_config() {
-    let skill_path = create_rfc_skill_path();
+fn test_rfc_council_skill_has_holon_config() {
+    let skill_path = rfc_council_skill_path();
 
     // Verify file exists
     assert!(
         skill_path.exists(),
-        "create-rfc SKILL.md should exist at {}",
+        "rfc-council SKILL.md should exist at {}",
         skill_path.display()
     );
 
     // Parse the skill file
     let (frontmatter, body) =
-        parse_skill_file(&skill_path).expect("should parse create-rfc SKILL.md");
+        parse_skill_file(&skill_path).expect("should parse rfc-council SKILL.md");
 
     // Verify basic frontmatter
-    assert_eq!(frontmatter.name, "create-rfc");
+    assert_eq!(frontmatter.name, "rfc-council");
     assert!(frontmatter.description.contains("RFC"));
     assert!(
         frontmatter.user_invocable,
-        "create-rfc should be user-invocable"
+        "rfc-council should be user-invocable"
     );
 
     // Verify holon config is present
     assert!(
         frontmatter.holon.is_some(),
-        "create-rfc should have holon configuration"
+        "rfc-council should have holon configuration"
     );
 
     let holon_config = frontmatter.holon.unwrap();
 
     // Verify contract
-    assert_eq!(holon_config.contract.input_type, "RfcRequest");
-    assert_eq!(holon_config.contract.output_type, "RfcResult");
+    assert_eq!(holon_config.contract.input_type, "RfcCouncilRequest");
+    assert_eq!(holon_config.contract.output_type, "RfcCouncilResult");
     assert_eq!(
         holon_config.contract.state_type,
-        Some("RfcProgress".to_string())
+        Some("RfcCouncilProgress".to_string())
     );
 
     // Verify body contains holon documentation
@@ -803,8 +803,8 @@ fn test_create_rfc_skill_has_holon_config() {
 /// Verifies that the configured stop conditions are suitable for
 /// RFC generation work (multi-phase, longer-running).
 #[test]
-fn test_create_rfc_stop_conditions_appropriate() {
-    let skill_path = create_rfc_skill_path();
+fn test_rfc_council_stop_conditions_appropriate() {
+    let skill_path = rfc_council_skill_path();
     let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");
     let holon_config = frontmatter.holon.expect("should have holon config");
     let stop = &holon_config.stop_conditions;
@@ -841,8 +841,8 @@ fn test_create_rfc_stop_conditions_appropriate() {
 /// Verifies that budget limits are set and will prevent unbounded
 /// resource consumption.
 #[test]
-fn test_create_rfc_budget_limits_prevent_runaway() {
-    let skill_path = create_rfc_skill_path();
+fn test_rfc_council_budget_limits_prevent_runaway() {
+    let skill_path = rfc_council_skill_path();
     let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");
     let holon_config = frontmatter.holon.expect("should have holon config");
     let stop = &holon_config.stop_conditions;
@@ -883,13 +883,13 @@ fn test_create_rfc_budget_limits_prevent_runaway() {
     );
 }
 
-/// TCK-00048 Criterion 4: create-rfc executes correctly as holon.
+/// TCK-00048 Criterion 4: rfc-council executes correctly as holon.
 ///
 /// Verifies that a spawn configuration can be built from the skill
 /// and a holon can be executed with it.
 #[test]
-fn test_create_rfc_executes_as_holon() {
-    let skill_path = create_rfc_skill_path();
+fn test_rfc_council_executes_as_holon() {
+    let skill_path = rfc_council_skill_path();
     let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");
     let holon_config = frontmatter.holon.expect("should have holon config");
 
@@ -920,31 +920,30 @@ fn test_create_rfc_executes_as_holon() {
 /// original content and the skill can still be understood without
 /// the holon configuration.
 #[test]
-fn test_create_rfc_no_regression() {
-    let skill_path = create_rfc_skill_path();
+fn test_rfc_council_no_regression() {
+    let skill_path = rfc_council_skill_path();
     let (frontmatter, body) = parse_skill_file(&skill_path).expect("should parse");
 
     // Verify original content is preserved
-    assert!(body.contains("# Create RFC Skill"));
+    assert!(body.contains("# RFC Council Skill"));
     assert!(body.contains("## Prerequisites"));
-    assert!(body.contains("## Step-by-Step Process"));
-    assert!(body.contains("### Phase 1: Initial RFC Creation"));
-    assert!(body.contains("### Phase 2: Iterative Quality Review"));
-    assert!(body.contains("### Phase 3: Engineering Ticket Creation"));
-    assert!(body.contains("### Phase 4: Commit, Push, and Merge"));
-    assert!(body.contains("## Verification"));
-    assert!(body.contains("## Common Patterns"));
-    assert!(body.contains("## Tips"));
+    assert!(body.contains("## Modes"));
+    assert!(body.contains("## Gate Structure"));
+    assert!(body.contains("## Council Subagents"));
+    assert!(body.contains("## Review Cycles"));
+    assert!(body.contains("## Verdict Rules"));
+    assert!(body.contains("## Success Metrics"));
+    assert!(body.contains("## Holon Configuration"));
 
     // Verify skill metadata is correct
-    assert_eq!(frontmatter.name, "create-rfc");
+    assert_eq!(frontmatter.name, "rfc-council");
     assert!(frontmatter.user_invocable);
 }
 
-/// Test that create-rfc tool permissions are appropriate.
+/// Test that rfc-council tool permissions are appropriate.
 #[test]
-fn test_create_rfc_tool_permissions() {
-    let skill_path = create_rfc_skill_path();
+fn test_rfc_council_tool_permissions() {
+    let skill_path = rfc_council_skill_path();
     let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");
     let holon_config = frontmatter.holon.expect("should have holon config");
 

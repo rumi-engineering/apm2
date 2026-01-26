@@ -3,6 +3,7 @@ prd_evidence_artifact:
   template_version: "2026-01-23"
   id: EVID-0002
   category: TEST_RESULTS
+  evidence_status: PENDING_IMPLEMENTATION
   title: CCP generation and atlas stability tests
   capture:
     paths:

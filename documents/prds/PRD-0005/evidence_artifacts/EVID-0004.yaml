@@ -3,6 +3,7 @@ prd_evidence_artifact:
   template_version: "2026-01-23"
   id: EVID-0004
   category: LINT_REPORTS
+  evidence_status: PENDING_IMPLEMENTATION
   title: RFC and ticket lint extension reports
   capture:
     paths:

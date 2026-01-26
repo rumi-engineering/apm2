@@ -9,7 +9,7 @@ prd_risks_questions:
       mitigations:
         - "Define a determinism envelope: structured IR outputs, stable ordering, and fail-closed validation."
         - "Canary mode for model swaps; require explicit acceptance for material diffs."
-        - "Use staged prompting with strict schemas and retry policy with tighter constraints."
+        - "Use staged prompting with strict schemas and retry policy with tighter constraints (max 3 retries with progressively stricter constraints; after 3 failures, stage enters FAILED state with structured error requiring manual remediation or routing profile adjustment)."
       evidence_ids:
         - EVID-0006
         - EVID-0007

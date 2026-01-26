@@ -31,6 +31,13 @@
 [PROVENANCE] Async cancellation is drop of non-selected futures; shared state invariants must hold at drop points.
 [VERIFICATION] Deterministic tests that force branch win/loss permutations; property tests for idempotency of commit logic.
 
+[CONTRACT: CTR-1104] Cancellation-Safe State Mutation (Atomic Phase Pattern).
+- Idempotency stores with external side effects (e.g., persist to DB) MUST use a three-phase pattern to prevent data loss on cancellation.
+- REJECT IF: idempotency marker (mark) is set before side effect (persist) completes.
+- ENFORCE BY: check → persist → mark pattern (only mark after successful persist).
+[PROVENANCE] APM2 Implementation Standard; async cancellation is drop of the future.
+[VERIFICATION] Tests that induce failure during persistence and verify the ID remains unmarked.
+
 [CONTRACT: CTR-1102] Capture Mode Controls Ownership and `Send`.
 - `async { ... }` captures by inferred borrow/move modes.
 - `async move { ... }` moves captured values into the future.
