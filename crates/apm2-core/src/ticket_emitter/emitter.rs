@@ -250,14 +250,39 @@ pub struct TicketEmitResult {
     pub warnings: Vec<String>,
 }
 
-/// Validates an ID (RFC) for path traversal attacks.
-fn validate_id(id: &str) -> Result<(), TicketEmitError> {
+/// Validates an RFC ID for path traversal attacks.
+fn validate_rfc_id(id: &str) -> Result<(), TicketEmitError> {
     if id.contains('/') || id.contains('\\') || id.contains("..") {
         return Err(TicketEmitError::PathTraversalError {
             path: id.to_string(),
-            reason: "ID contains invalid characters".to_string(),
+            reason: "RFC ID contains invalid characters".to_string(),
         });
     }
+    Ok(())
+}
+
+/// Validates a ticket ID against the strict project standard pattern.
+///
+/// Ticket IDs must match the pattern `TCK-NNNNN` (where N is a digit).
+/// This prevents:
+/// - Path traversal attacks (e.g., `../evil`, `TCK/../../etc`)
+/// - Shell injection (e.g., `TCK;rm -rf /`, `TCK|evil`, `TCK$(cmd)`)
+///
+/// # Errors
+///
+/// Returns `TicketEmitError::PathTraversalError` if the ID is invalid.
+fn validate_ticket_id(id: &str) -> Result<(), TicketEmitError> {
+    // Strict pattern: TCK- followed by exactly 5 digits
+    let is_valid =
+        id.len() == 9 && id.starts_with("TCK-") && id[4..].chars().all(|c| c.is_ascii_digit());
+
+    if !is_valid {
+        return Err(TicketEmitError::PathTraversalError {
+            path: id.to_string(),
+            reason: "Ticket ID must match pattern TCK-NNNNN (e.g., TCK-00001)".to_string(),
+        });
+    }
+
     Ok(())
 }
 
@@ -540,6 +565,9 @@ fn parse_tickets_from_decomposition(
                 reason: "Ticket missing 'ticket_id' field".to_string(),
             })?;
 
+        // Validate ticket ID to prevent path traversal and shell injection
+        validate_ticket_id(original_id)?;
+
         // Use stable ID mapping - always use the original ID for idempotency
         let ticket_id = original_id.to_string();
 
@@ -754,7 +782,7 @@ pub fn emit_tickets(
     options: &TicketEmitOptions,
 ) -> Result<TicketEmitResult, TicketEmitError> {
     // Validate RFC ID
-    validate_id(rfc_id)?;
+    validate_rfc_id(rfc_id)?;
 
     info!(
         repo_root = %repo_root.display(),
@@ -1082,9 +1110,9 @@ mod tests {
         assert!(matches!(result, Err(TicketEmitError::RfcNotFound { .. })));
     }
 
-    /// Test ID validation rejects traversal.
+    /// Test RFC ID validation rejects traversal.
     #[test]
-    fn test_id_validation() {
+    fn test_rfc_id_validation() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
 
@@ -1093,6 +1121,94 @@ mod tests {
             result,
             Err(TicketEmitError::PathTraversalError { .. })
         ));
+    }
+
+    /// Test ticket ID validation rejects path traversal and shell injection.
+    ///
+    /// This is a security test ensuring malicious ticket IDs in YAML
+    /// cannot cause path traversal or shell injection attacks.
+    #[test]
+    fn test_invalid_ticket_id_rejection() {
+        // Test cases for various attack vectors
+        let invalid_ids = [
+            ("../test", "path traversal with .."),
+            ("TCK/../evil", "path traversal embedded"),
+            ("TCK/test", "forward slash"),
+            ("TCK\\test", "backslash"),
+            ("TCK;rm", "shell semicolon"),
+            ("TCK-001|evil", "shell pipe"),
+            ("TCK&evil", "shell ampersand"),
+            ("TCK$(cmd)", "shell command substitution"),
+            ("TCK`cmd`", "shell backtick"),
+            ("TCK$VAR", "shell variable"),
+            ("TCK-0001", "too few digits"),
+            ("TCK-000001", "too many digits"),
+            ("TCK00001", "missing hyphen"),
+            ("tck-00001", "lowercase prefix"),
+            ("XYZ-00001", "wrong prefix"),
+            ("", "empty string"),
+            ("TCK-ABCDE", "letters instead of digits"),
+        ];
+
+        for (invalid_id, description) in invalid_ids {
+            let result = validate_ticket_id(invalid_id);
+            assert!(
+                result.is_err(),
+                "Should reject '{invalid_id}' ({description})"
+            );
+            assert!(
+                matches!(result, Err(TicketEmitError::PathTraversalError { .. })),
+                "Should return PathTraversalError for '{invalid_id}' ({description})"
+            );
+        }
+
+        // Verify valid IDs are accepted
+        let valid_ids = ["TCK-00001", "TCK-00100", "TCK-99999", "TCK-12345"];
+        for valid_id in valid_ids {
+            let result = validate_ticket_id(valid_id);
+            assert!(result.is_ok(), "Should accept valid ticket ID '{valid_id}'");
+        }
+    }
+
+    /// Test that malicious ticket IDs in decomposition YAML are rejected.
+    #[test]
+    fn test_malicious_ticket_id_in_decomposition() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create RFC with malicious ticket ID
+        let rfc_dir = root.join("documents/rfcs/RFC-MALICIOUS");
+        fs::create_dir_all(&rfc_dir).unwrap();
+
+        fs::write(
+            rfc_dir.join("06_ticket_decomposition.yaml"),
+            r#"rfc_ticket_decomposition:
+  tickets:
+    - ticket_id: "../../../etc/passwd"
+      title: "Malicious ticket"
+      description: "Attempting path traversal"
+"#,
+        )
+        .unwrap();
+
+        // Create minimal directory structure
+        let tickets_dir = root.join("documents/work/tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+
+        let result = emit_tickets(
+            root,
+            "RFC-MALICIOUS",
+            &TicketEmitOptions {
+                dry_run: true,
+                skip_validation: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            matches!(result, Err(TicketEmitError::PathTraversalError { .. })),
+            "Should reject decomposition with malicious ticket ID"
+        );
     }
 
     /// Test dry run mode.
