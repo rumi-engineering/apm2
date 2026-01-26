@@ -41,6 +41,7 @@ bytes.workspace = true
 # Utilities
 uuid.workspace = true
 nix.workspace = true
+wait-timeout.workspace = true
 directories.workspace = true
 humantime.workspace = true
 regex.workspace = true
