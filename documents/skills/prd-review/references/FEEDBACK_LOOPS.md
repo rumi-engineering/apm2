@@ -10,7 +10,7 @@ The PRD review system improves over time through four feedback loops. Each loop 
 
 | Loop ID | Signal Source | Feedback Target | Automation Level |
 |---------|---------------|-----------------|------------------|
-| LOOP-TICKET | Ticket completion | PRD template enhancement | Manual |
+| LOOP-TICKET | Ticket completion | PRD template enhancement | Automated (Variance-Triggered) |
 | LOOP-AAT | AAT verification | Verifiability rubric | Semi-automated |
 | LOOP-RECURRENCE | FindingSignature counts | Countermeasure creation | Automated |
 | LOOP-IMPACT | Impact map grounding | REUSE_POTENTIAL angle | Manual |

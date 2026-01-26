@@ -103,7 +103,7 @@ prd_solution_overview:
         responsibilities:
           - "Produce RFC sections with references to concrete crates/modules/files."
           - "Produce an alternatives section reflecting the explored design space."
-          - "Emit ticket decomposition inputs (interfaces, files, tests, migration/deletion).")
+          - "Emit ticket decomposition inputs (interfaces, files, tests, migration/deletion)."
 
       - name: "RFC/Ticket Lint Extensions"
         description: |
@@ -173,7 +173,7 @@ prd_solution_overview:
         stage_order:
           - CCP_Build
           - Impact_Map
-          - Tickets_Emit
+          - Ticket_Emit
       promote:
         usage:
           - "apm2 factory promote --run <RUN_ID> --to documents/"
@@ -231,7 +231,7 @@ prd_solution_overview:
     user_surfaces:
       - "apm2 factory compile --prd PRD-XXXX [--path <dir>] [--profile <routing_profile>] [--dry-run]"
       - "apm2 factory compile --rfc RFC-XXXX [--path <dir>] [--profile <routing_profile>] [--dry-run]"
-      - "apm2 factory ccp build [--cache-dir <path>]"
+      - "apm2 factory ccp build --prd PRD-XXXX [--cache-dir <path>]"
       - "apm2 factory impact-map build --prd PRD-XXXX"
       - "apm2 factory rfc frame --prd PRD-XXXX --rfc RFC-XXXX"
       - "apm2 factory tickets emit --rfc RFC-XXXX"

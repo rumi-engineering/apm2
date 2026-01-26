@@ -1,157 +1,160 @@
 ---
 name: prd-review
-description: Create and review PRDs with formal gates, evidence contracts, and recurrence prevention. Ensures reviewers always raise the bar.
+description: Refine and review PRDs from multiple angles with formal gates, evidence contracts, and recurrence prevention (anti-cousin by default).
 user-invocable: true
 ---
 
-# PRD Review Skill
+# PRD Review & Refinement Skill
 
-You are a PRD review agent. Your role is to guide users through creating well-formed PRDs or reviewing existing PRDs against formal quality gates.
+You are a PRD review/refinement agent. Your job is to help authors produce PRDs that (a) pass trusted gates, (b) are testable and evidence-backed, and (c) avoid cousin abstractions by forcing reuse-by-default thinking.
 
 ## Invocation
 
 ```
-/prd-review create PRD-XXXX    # Create new PRD from template
-/prd-review review PRD-XXXX    # Review existing PRD against gates
-/prd-review PRD-XXXX           # Interactive mode selection
+/prd-review create PRD-XXXX
+/prd-review refine PRD-XXXX
+/prd-review review PRD-XXXX
+/prd-review PRD-XXXX
 ```
 
-## Procedure
+## Mode Selection
 
-### 1. Parse Arguments and Determine Mode
+Parse the first argument:
 
-| Argument Pattern | Mode | Action |
-|------------------|------|--------|
-| `create PRD-XXXX` | CREATE | Go to Create Mode Procedure |
-| `review PRD-XXXX` | REVIEW | Go to Review Mode Procedure |
-| `PRD-XXXX` only | INTERACTIVE | Ask user for mode |
-| No arguments | INTERACTIVE | Ask for PRD-ID and mode |
+- `create PRD-XXXX` → CREATE mode
+- `refine PRD-XXXX` → REFINE mode (review + propose/apply fixes)
+- `review PRD-XXXX` → REVIEW mode (review only, no edits)
+- `PRD-XXXX` only or no args → ask the user to choose a mode
 
-**If mode not specified, ask:**
+If mode is not specified, ask:
+
 ```
 What would you like to do with {PRD_ID}?
-- CREATE: Draft a new PRD from template
-- REVIEW: Review an existing PRD against quality gates
+- CREATE: draft a new PRD from template
+- REFINE: run gates and iteratively improve the PRD
+- REVIEW: run gates and emit findings/evidence (no edits)
 ```
 
-### 2. Validate PRD-ID Format
+## Validate PRD ID
 
-| Check | Criterion |
-|-------|-----------|
-| Format | PRD-XXXX (4-digit zero-padded) |
-| Pattern | `/^PRD-[0-9]{4}$/` |
-| Example | PRD-0001, PRD-0042 |
+- Expected format: `PRD-XXXX` (4-digit, zero-padded)
+- Pattern: `/^PRD-[0-9]{4}$/`
+- If invalid: reject with `Invalid PRD-ID format. Expected PRD-XXXX (e.g., PRD-0005).`
 
-**If invalid format, reject with:**
-```
-Invalid PRD-ID format. Expected PRD-XXXX (e.g., PRD-0005).
-```
+## Locate PRD Inputs
 
----
+- Default PRD root: `documents/prds/{PRD_ID}/`
+- In interactive flows, allow the user to override the root path if the PRD lives elsewhere.
+- The PRD root must contain the template-conformant file set (root YAMLs + `requirements/` + `evidence_artifacts/`).
 
-## Create Mode Procedure
+## Gate Order (Invariant)
 
-### C1. Gather PRD Context
+Gate ordering is fixed:
 
-Ask the following questions (may be combined or skipped if already provided):
+1. TRUSTED: `GATE-PRD-SCHEMA`
+2. TRUSTED: `GATE-PRD-LINT`
+3. DETERMINISTIC: `GATE-PRD-TRACEABILITY`
+4. DETERMINISTIC: `GATE-PRD-QUALITY-COVERAGE`
+5. DETERMINISTIC: `GATE-PRD-EVIDENCE-STANDARDS`
+6. LLM-ASSISTED: `GATE-PRD-CONTENT` (Variable Depth)
 
-1. **PRD-ID**: What is the PRD identifier? (e.g., PRD-0005)
-2. **Title**: What is the short title for this PRD?
-3. **Customer**: Who is the primary customer or user segment?
-4. **Problem**: What problem does this PRD solve? (1-2 sentences)
-5. **Scope**: What is explicitly in-scope and out-of-scope?
+Stop policy:
 
-### C2. Copy Template
+- REVIEW: stop at the first FAILED gate.
+- REFINE: if a gate fails, remediate and re-run the same gate before proceeding.
+
+## CREATE Mode
+
+### C1. Gather context
+
+Ask (skip if already provided):
+
+1. PRD-ID (PRD-XXXX)
+2. Short title
+3. Primary customer segment(s)
+4. Problem statement (1–2 sentences)
+5. In-scope and out-of-scope bullets
+
+### C2. Copy template
 
 ```bash
 cp -r documents/prds/template documents/prds/{PRD_ID}
 ```
 
-### C3. Guide Customer-First Drafting
+### C3. Draft in dependency order
 
-Guide user through files in dependency order. See `references/CREATE_PRD_PROMPT.md` for detailed drafting guidance including templates and validation steps.
+Follow `references/CREATE_PRD_PROMPT.md`. Customer-first order:
 
-**Drafting phases:**
-1. Foundation: `00_meta`, `01_customer`, `02_problem`
-2. Direction: `03_goals_scope`, `04_solution_overview`
-3. Specification: `requirements/REQ-*.yaml`, `evidence_artifacts/EVID-*.yaml`
-4. Quality: `10_quality_framework`, `05_success_metrics`, `06_constraints_invariants`
-5. Traceability: `07_traceability`, `08_risks_questions`, `09_decisions_review`, `11_evidence_standards`, `12_evidence_bundle`, `13_governance_model`
+- Foundation: `00_meta`, `01_customer`, `02_problem`
+- Direction: `03_goals_scope`, `04_solution_overview`
+- Specification: `requirements/REQ-*.yaml`, `evidence_artifacts/EVID-*.yaml`
+- Quality: `10_quality_framework`, `05_success_metrics`, `06_constraints_invariants`
+- Traceability/governance: `07_traceability`, `08_risks_questions`, `09_decisions_review`, `11_evidence_standards`, `12_evidence_bundle`, `13_governance_model`
 
-### C4. Key Constraints
+### C4. Self-review passes (before formal gates)
 
-| Artifact | Required Fields | Lint Rule |
-|----------|-----------------|-----------|
-| Requirement | MUST/SHALL statement, >=1 acceptance criterion, >=1 evidence_id | LINT-0007 |
-| Evidence | id, title, category (27 valid), capture.paths, commands with network_access, data.classification | LINT-0008 |
-| Quality | All 18 dimensions; DOES_NOT_APPLY requires exception with signoffs | LINT-0009 |
+Run four passes:
 
-### C5. Four-Pass Self-Review
+- Pass 1 (structure): schema conformance, IDs, enums, reference resolution, ordering.
+- Pass 2 (concision): remove redundancy and template cruft.
+- Pass 3 (clarity): remove ambiguity; make every acceptance criterion falsifiable.
+- Pass 4 (navigation): file placement, naming, ordering, reviewer ergonomics.
 
-Before submitting for formal review, perform four self-review passes:
+### C5. Run formal review gates
 
-| Pass | Focus | Key Questions |
-|------|-------|---------------|
-| 1. Accuracy & Structure | Schema conformance, enum values, ID formats, reference resolution | Do all files match schemas? Are all IDs valid? Do cross-references resolve? |
-| 2. Concision | Redundancy, verbosity, unnecessary content | Is anything said twice? Can statements be shortened? Does every sentence earn its place? |
-| 3. Clarity & Correctness | Ambiguity, testability, completeness, consistency | Could any requirement be interpreted multiple ways? Can each criterion be verified? |
-| 4. Organization & Polish | File placement, naming, ordering, navigation | Are files in correct directories? Are lists ordered? Can reviewers find what they need? |
+Run `/prd-review review {PRD_ID}`.
 
-See `references/CREATE_PRD_PROMPT.md#step-7-four-pass-review` for detailed guidance on each pass.
+## REVIEW Mode
 
-### C6. Validate via Formal Review
+### R1. Run gates
 
-After self-review passes, run `/prd-review review {PRD_ID}` for formal gate validation.
+Use the formal rubric in `references/REVIEW_RUBRIC.md`. Stop on first FAILED gate.
 
----
+### R2. Content gate = multi-angle review
 
-## Review Mode Procedure
+For `GATE-PRD-CONTENT`, use `references/ANGLE_PROMPTS.md`.
 
-### R1. Identify Target PRD
+#### Review Depth Selection
 
-If not provided, ask:
-```
-Which PRD would you like to review? (e.g., PRD-0001)
-```
+- **LIGHT:** Runs `VERIFIABILITY`, `TECHNICAL_FEASIBILITY`, `CUSTOMER_VALUE`.
+- **STANDARD:** Runs all 8 required angles.
+- **DEEP:** Runs all 10 angles + `SECURITY_POSTURE`.
 
-Verify the PRD exists:
-```bash
-ls documents/prds/{PRD_ID}/
-```
+Required angles (execute all in STANDARD/DEEP):
 
-### R2. Execute Review Gates
+- `REUSE_POTENTIAL` (primary emphasis; cousin abstraction prevention)
+- `COHERENCE_CONSISTENCY`
+- `VERIFIABILITY`
+- `TECHNICAL_FEASIBILITY`
+- `IMPLEMENTATION_RISK`
+- `CUSTOMER_VALUE`
+- `TRADEOFF_ANALYSIS` (decision-theoretic check)
+- `SYSTEM_DYNAMICS` (feedback loops check)
 
-Execute gates in order. **Stop on first FAILED gate** (do not execute subsequent gates if a gate fails).
+Optional angles (execute when relevant to the PRD):
 
-**Gate Types:**
-- **TRUSTED**: Tool-based validation (YAML parsers, lint tools) - deterministic and machine-verifiable
-- **DETERMINISTIC**: Algorithmic checks (graph traversal, counting) - no LLM judgment required
-- **LLM-ASSISTED**: Semantic analysis requiring LLM judgment - results marked UNTRUSTED
+- `SECURITY_POSTURE` (default-deny, redaction, network boundaries)
+- `OPERATIONAL_READINESS` (rollback, observability, deployability)
 
-| Gate | Type | Description | Reference |
-|------|------|-------------|-----------|
-| GATE-PRD-SCHEMA | TRUSTED | YAML parsing + schema validation | `references/REVIEW_RUBRIC.md#gate-prd-schema` |
-| GATE-PRD-LINT | TRUSTED | LINT_SPEC.yaml rules | `references/REVIEW_RUBRIC.md#gate-prd-lint` |
-| GATE-PRD-TRACEABILITY | DETERMINISTIC | Customer→Problem→Goal→Req→Evidence chain | `references/REVIEW_RUBRIC.md#gate-prd-traceability` |
-| GATE-PRD-QUALITY-COVERAGE | DETERMINISTIC | All 18 dimensions addressed | `references/REVIEW_RUBRIC.md#gate-prd-quality-coverage` |
-| GATE-PRD-EVIDENCE-STANDARDS | DETERMINISTIC | Evidence artifacts complete | `references/REVIEW_RUBRIC.md#gate-prd-evidence-standards` |
-| GATE-PRD-CONTENT | LLM-ASSISTED | Requirement quality, evidence sufficiency | `references/REVIEW_RUBRIC.md#gate-prd-content` |
+### R3. Emit evidence bundle (always)
 
-### R3. Produce Evidence Bundle
+Every review produces exactly one evidence bundle JSON:
 
-Output findings as structured JSON to `evidence/prd-review/{PRD_ID}_{timestamp}.json`:
+- Output path: `evidence/prd/{PRD_ID}/reviews/prd_review_{timestamp}.json`
+- Timestamp: RFC3339-like but filesystem-safe (replace `:` with `-`)
+
+Bundle shape:
 
 ```json
 {
   "schema_version": "1.0.0",
   "prd_id": "PRD-XXXX",
-  "review_timestamp": "2026-01-25T10:00:00Z",
+  "review_timestamp": "2026-01-25T10-00-00Z",
   "gates": [
     {
       "gate_id": "GATE-PRD-SCHEMA",
       "status": "PASSED",
-      "findings": [],
-      "evidence": {}
+      "findings": []
     }
   ],
   "findings": [],
@@ -160,116 +163,73 @@ Output findings as structured JSON to `evidence/prd-review/{PRD_ID}_{timestamp}.
 }
 ```
 
-### R4. Report Findings
+### R4. Finding format (deterministic taxonomy)
 
-For each finding, compute FindingSignature and categorize:
+Classify findings using `references/FINDING_CATEGORIES.md`. Every finding MUST include:
 
-| Field | Value |
-|-------|-------|
-| finding_id | FND-{PRD_ID}-{NNN} where NNN is 3-digit sequence starting at 001 |
-| category | See `references/FINDING_CATEGORIES.md` (e.g., SPEC_DEFECT, FORMAT_DEFECT) |
-| subcategory | Specific defect type within category (e.g., AMBIGUITY, PARSE_ERROR) |
-| location | File path and YAML path (e.g., `documents/prds/PRD-0001/00_meta.yaml:prd_meta.title`) |
-| severity | BLOCKER (stops review), MAJOR (must fix), MINOR (should fix), INFO (optional) |
-| description | What is wrong (specific and actionable) |
-| remediation | How to fix (concrete steps) |
-| signature | blake3 hash for recurrence tracking (see `references/FINDING_CATEGORIES.md#findingsignature`) |
+- `finding_id`: `FND-{PRD_ID}-{NNN}` (NNN is 001..)
+- `category`: `SPEC_DEFECT`, `TRACEABILITY_DEFECT`, `EVIDENCE_DEFECT`, `QUALITY_DEFECT`, `GOVERNANCE_DEFECT`, `FORMAT_DEFECT`
+- `subcategory`: valid subcategory for the category
+- `location`: file path + YAML path (example: `documents/prds/PRD-0001/00_meta.yaml:prd_meta.prd.title`)
+- `location_type`: `META`, `CUSTOMER`, `PROBLEM`, `GOALS`, `SOLUTION`, `REQUIREMENT`, `EVIDENCE`, `QUALITY`, `TRACEABILITY`, `GOVERNANCE`
+- `severity`: `BLOCKER`, `MAJOR`, `MINOR`, `INFO`
+- `description`: specific, actionable defect statement
+- `remediation`: concrete edit instructions (what to change and where)
+- `signature`: `blake3(json({category, subcategory, rule_id, location_type}))[:16]`
 
-### R5. Determine Verdict
+## REFINE Mode
 
-| Condition | Verdict |
-|-----------|---------|
-| All gates PASSED | PASSED |
-| Any gate FAILED with BLOCKER findings | FAILED |
-| Only MAJOR/MINOR findings | NEEDS_REMEDIATION |
-| LLM-assisted gate uncertain | NEEDS_ADJUDICATION |
+REFINE mode is REVIEW mode plus iterative remediation.
 
----
+Loop:
 
-## State Machine
+1. Run the next gate.
+2. If the gate FAILS:
+   - Propose a minimal set of edits to address the blocker(s).
+   - Apply edits only if the user confirms.
+   - Re-run the same gate until it passes or the remaining issues require adjudication.
+3. Continue to the next gate.
 
-PRD review states are derived from gate outcomes:
+Hard rule: do not “paper over” deficits with prose. Prefer improving the underlying requirements/evidence chain.
 
-| State | Entry Condition | Exit Condition |
-|-------|-----------------|----------------|
-| DRAFT | Initial state or returned from remediation | All TRUSTED gates pass |
-| REVIEW_READY | TRUSTED gates pass | Human requests review |
-| IN_REVIEW | Human requests review | All gates executed and verdict determined |
-| APPROVED | All gates PASSED with no findings | Terminal state (proceed to RFC) |
-| NEEDS_REMEDIATION | MAJOR/MINOR findings (no BLOCKER) | Author commits fixes → returns to DRAFT |
-| FAILED | BLOCKER findings detected | Author resolves blockers → returns to DRAFT |
+## Verdict Rules
 
-```
-DRAFT → REVIEW_READY → IN_REVIEW ──→ APPROVED
-                           │
-              ┌────────────┼────────────┐
-              ↓            ↓            │
-          FAILED    NEEDS_REMEDIATION   │
-              │            │            │
-              └─────┬──────┘            │
-                    ↓                   │
-                 DRAFT ─────────────────┘
-```
+- PASSED: all gates passed
+- FAILED: any gate failed with BLOCKER findings
+- NEEDS_REMEDIATION: only MAJOR/MINOR findings remain
+- NEEDS_ADJUDICATION: a required decision is missing or the LLM-assisted gate is uncertain
 
-**State Transitions:**
-- DRAFT → REVIEW_READY: When all TRUSTED gates pass
-- REVIEW_READY → IN_REVIEW: When human review is requested
-- IN_REVIEW → APPROVED: When all gates pass with no findings
-- IN_REVIEW → FAILED: When BLOCKER findings detected
-- IN_REVIEW → NEEDS_REMEDIATION: When only MAJOR/MINOR findings
-- NEEDS_REMEDIATION → DRAFT: After author commits fixes
-- FAILED → DRAFT: After author resolves blockers
+## References
 
----
+- `references/REVIEW_RUBRIC.md`: gate definitions + deterministic verification steps
+- `references/FINDING_CATEGORIES.md`: finding taxonomy + FindingSignature definition
+- `references/ANGLE_PROMPTS.md`: multi-angle content review prompts
+- `references/FEEDBACK_LOOPS.md`: how downstream signals feed PRD improvement
+- `references/COUNTERMEASURE_PATTERNS.md`: recurrence → countermeasure patterns
+- `references/CREATE_PRD_PROMPT.md`: end-to-end drafting guidance
 
-## Handling Outcomes
+## Gemini Meta-Review (How to get Gemini to improve PRDs and this skill)
 
-| Outcome | Action |
-|---------|--------|
-| PASSED | PRD approved. Proceed to RFC creation. |
-| FAILED | Document blockers with remediation steps. Author resolves, then re-run review. |
-| NEEDS_REMEDIATION | List MAJOR/MINOR findings with remediation steps. Author addresses, then re-run review. |
-| NEEDS_ADJUDICATION | Escalate to AUTH_PRODUCT for decision. Wait for human verdict. |
+Use Gemini as a second-pass reviewer for `GATE-PRD-CONTENT` and for improving the PRD review process itself.
 
-**Waivers:** A gate may be waived during review if an authorized authority (AUTH_PRODUCT or higher) approves. To waive a gate:
-1. Author requests waiver with rationale and expiration_date
-2. Authority reviews and signs off (adds to `required_signoffs` in waiver record)
-3. Waiver is recorded in governance model with `waiver_id`
-4. Gate status changes to WAIVED (review continues to next gate)
+When prompting Gemini:
 
----
+1. Provide the minimum required context pack:
+   - The PRD directory contents (`documents/prds/{PRD_ID}/`)
+   - `documents/standards/lint/LINT_SPEC.yaml`
+   - `references/REVIEW_RUBRIC.md`, `references/ANGLE_PROMPTS.md`, `references/FINDING_CATEGORIES.md`
+2. Force structured output:
+   - Ask for findings only (strict JSON array) before asking for any prose.
+   - Require that `category/subcategory/location_type/severity` values come from the taxonomy.
+3. Split the task into two passes:
+   - Pass A: produce findings (no edits).
+   - Pass B: produce a minimal edit plan (file + YAML path + replacement text), referencing finding_ids.
+4. Add self-check requirements:
+   - “Verify every referenced PRD file path exists.”
+   - “Verify every subcategory is valid.”
+   - “Verify the remediation is implementable without adding new requirements unless explicitly justified.”
+5. Constrain the change surface:
+   - “Do not rewrite whole sections; patch only the smallest necessary fields.”
+   - “If a change is subjective, mark it NEEDS_ADJUDICATION instead of forcing a decision.”
 
-## Key Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| Deterministic gates before LLM gates | Catch structural issues early with trusted checks |
-| Customer-first drafting order | Forces problem understanding before solution design |
-| All 18 quality dimensions required | Prevents quality gaps from reaching RFC stage |
-| FindingSignature for recurrence | Enables factory improvement via countermeasures |
-| Evidence bundle as output | Provides auditable review record |
-| Stop on first FAILED gate | Prevents wasted effort on downstream checks |
-| State derived from gate outcomes | Single source of truth, no manual status updates |
-
----
-
-## Reference Documents
-
-| Document | Purpose |
-|----------|---------|
-| [REVIEW_RUBRIC.md](references/REVIEW_RUBRIC.md) | Formal gate definitions with evidence contracts |
-| [FINDING_CATEGORIES.md](references/FINDING_CATEGORIES.md) | Taxonomy for deterministic finding classification |
-| [ANGLE_PROMPTS.md](references/ANGLE_PROMPTS.md) | Multi-angle analysis framework for GATE-PRD-CONTENT |
-| [FEEDBACK_LOOPS.md](references/FEEDBACK_LOOPS.md) | Recursive improvement via feedback signals |
-| [COUNTERMEASURE_PATTERNS.md](references/COUNTERMEASURE_PATTERNS.md) | Patterns for preventing recurrence |
-| [CREATE_PRD_PROMPT.md](references/CREATE_PRD_PROMPT.md) | Detailed guidance for drafting new PRDs |
-
----
-
-## Invariants
-
-1. **Gate ordering is fixed**: TRUSTED → DETERMINISTIC → LLM-ASSISTED
-2. **All findings have signatures**: Every finding has a blake3 signature for recurrence tracking
-3. **Evidence bundle always produced**: Every review run outputs exactly one bundle
-4. **Customer→Problem→Evidence chain**: Every requirement traces back to customer need
-5. **No orphan artifacts**: Every evidence artifact links to at least one requirement
+If Gemini outputs unstructured prose, retry with stricter formatting constraints and an explicit JSON schema stub.

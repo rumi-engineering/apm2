@@ -1,5 +1,7 @@
 # Idea Compiler Pipeline Stages
 
+**Run outputs:** Compiler stages write to a per-run root under `evidence/` first (for reproducibility and replay). Governed `documents/` updates happen only via an explicit promote step.
+
 ## Stage: CCP_Build
 
 **Goal:** Generate a Codebase Context Pack (CCP) for the current repository checkout.
@@ -44,7 +46,7 @@
 - RFC template
 
 **Outputs:**
-- `documents/rfcs/RFC-XXXX/` (template-conformant)
+- `evidence/prd/<PRD-ID>/runs/<RUN_ID>/rfcs/RFC-XXXX/` (template-conformant draft)
 
 **Completion predicate:**
 - RFC references valid paths; new abstractions justified; lint passes at configured maturity level.
@@ -58,7 +60,7 @@
 - CCP for file references and extension point validation
 
 **Outputs:**
-- `documents/work/tickets/TCK-*.yaml`
+- `evidence/prd/<PRD-ID>/runs/<RUN_ID>/tickets/TCK-*.yaml`
 
 **Completion predicate:**
 - Ticket lint passes: file paths exist; verification commands present; dependencies consistent.
@@ -72,7 +74,7 @@
 - PipelineSpec
 
 **Outputs:**
-- Updated/new skill files (e.g., `idea-compiler`)
+- Proposed skill updates under `evidence/prd/<PRD-ID>/runs/<RUN_ID>/skills/` and/or a promotion bundle.
 
 **Completion predicate:**
 - `apm2 factory skill verify` passes; no divergent instructions.

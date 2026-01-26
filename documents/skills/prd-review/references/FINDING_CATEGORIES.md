@@ -23,6 +23,10 @@ Taxonomy for deterministic finding classification. Enables FindingSignature comp
 | MISSING_FALLBACK | Critical path without degradation strategy | IMPLEMENTATION_RISK |
 | IMPLICIT_DEPENDENCY | Undeclared dependency on external system | IMPLEMENTATION_RISK |
 | MISSING_ROLLBACK | No rollback strategy for deployment | OPERATIONAL_READINESS |
+| NAIVE_OPTIMIZATION | Claims "best" without tradeoff analysis | TRADEOFF_ANALYSIS |
+| HIDDEN_COST | Tradeoff downsides are not acknowledged | TRADEOFF_ANALYSIS |
+| UNSTABLE_FEEDBACK | Design creates reinforcing feedback loops | SYSTEM_DYNAMICS |
+| SECOND_ORDER_HARM | Negative consequences on wider system | SYSTEM_DYNAMICS |
 
 ---
 
@@ -37,6 +41,7 @@ Taxonomy for deterministic finding classification. Enables FindingSignature comp
 | BROKEN_REF | Reference to non-existent artifact | - |
 | COUSIN_ABSTRACTION | Requirement duplicates existing abstraction | REUSE_POTENTIAL |
 | IGNORED_EXTENSION_POINT | Existing extension point not leveraged | REUSE_POTENTIAL |
+| UNGROUNDED_SOLUTION | Solution Overview does not map to CCP | REUSE_POTENTIAL |
 
 ---
 
@@ -141,6 +146,10 @@ Severity is determined by category and subcategory combination.
 | SPEC_DEFECT | UNMITIGATED_RISK | MAJOR | IMPLEMENTATION_RISK |
 | SPEC_DEFECT | UNTESTABLE | MAJOR | VERIFIABILITY |
 | SPEC_DEFECT | WEAK_CUSTOMER | MAJOR | CUSTOMER_VALUE |
+| SPEC_DEFECT | HIDDEN_COST | MAJOR | TRADEOFF_ANALYSIS |
+| SPEC_DEFECT | NAIVE_OPTIMIZATION | MAJOR | TRADEOFF_ANALYSIS |
+| SPEC_DEFECT | SECOND_ORDER_HARM | MAJOR | SYSTEM_DYNAMICS |
+| SPEC_DEFECT | UNSTABLE_FEEDBACK | BLOCKER | SYSTEM_DYNAMICS |
 | TRACEABILITY_DEFECT | BROKEN_REF | BLOCKER | - |
 | TRACEABILITY_DEFECT | CIRCULAR_REF | BLOCKER | - |
 | TRACEABILITY_DEFECT | COUSIN_ABSTRACTION | MAJOR | REUSE_POTENTIAL |
@@ -148,6 +157,7 @@ Severity is determined by category and subcategory combination.
 | TRACEABILITY_DEFECT | MISSING_CHAIN | BLOCKER | - |
 | TRACEABILITY_DEFECT | ORPHAN_EVID | MINOR | - |
 | TRACEABILITY_DEFECT | ORPHAN_REQ | MAJOR | - |
+| TRACEABILITY_DEFECT | UNGROUNDED_SOLUTION | MAJOR | REUSE_POTENTIAL |
 | EVIDENCE_DEFECT | COVERAGE_GAP | MAJOR | VERIFIABILITY |
 | EVIDENCE_DEFECT | CRITERION_VAGUE | MAJOR | VERIFIABILITY |
 | EVIDENCE_DEFECT | EVIDENCE_WEAK | MAJOR | VERIFIABILITY |

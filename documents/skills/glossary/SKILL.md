@@ -17,3 +17,15 @@ user-invocable: false
 | Countermeasure | references/countermeasure.md |
 | Merge Receipt | references/merge_receipt.md |
 | Lease / Budget | references/lease_and_budget.md |
+| Episode | references/episode.md |
+| Artifact | references/artifact.md |
+| Evidence | references/evidence.md |
+| Gate | references/gate.md |
+| Ledger | references/ledger.md |
+| Policy | references/policy.md |
+| Finding | references/finding.md |
+| ChangeSet | references/change_set.md |
+| Plan | references/plan.md |
+| Coordinator | references/coordinator.md |
+| Supervisor | references/supervisor.md |
+| Tool | references/tool.md |

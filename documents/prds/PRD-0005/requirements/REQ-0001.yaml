@@ -10,7 +10,7 @@ prd_requirement:
     each stage independently.
   acceptance_criteria:
     - "`apm2 factory compile --prd PRD-XXXX` runs CCP_Build -> Impact_Map -> RFC_Frame -> Ticket_Emit -> Skill_Sync (and optional Refactor_Radar) in declared order."
-    - "Each stage can be executed independently (e.g., `apm2 factory ccp build`, `apm2 factory impact-map build --prd PRD-XXXX`)."
+    - "Each stage can be executed independently (e.g., `apm2 factory ccp build --prd PRD-XXXX`, `apm2 factory impact-map build --prd PRD-XXXX`)."
     - "All commands support a machine output mode (json or ndjson) that includes stage status, produced paths, and artifact hashes."
     - "All commands support `--dry-run` that reports intended writes without modifying files."
     - "The compiler fails closed on schema or lint violations, returning stable non-zero exit codes by failure class."
