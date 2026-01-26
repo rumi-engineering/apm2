@@ -63,10 +63,13 @@ ed25519-dalek.workspace = true
 rand.workspace = true
 zeroize.workspace = true
 
+# Unix-specific (for TOCTOU mitigation via O_NOFOLLOW)
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 # Sandboxing (Linux only, conditional compilation)
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler.workspace = true
-libc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
