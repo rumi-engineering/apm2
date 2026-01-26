@@ -55,6 +55,7 @@ pub mod process;
 pub mod reducer;
 pub mod restart;
 pub mod rfc_framer;
+pub mod run_manifest;
 pub mod session;
 pub mod shutdown;
 pub mod state;

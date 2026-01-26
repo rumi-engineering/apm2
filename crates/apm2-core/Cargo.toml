@@ -60,6 +60,7 @@ prost.workspace = true
 prost-types.workspace = true
 
 # Cryptography
+base64.workspace = true
 blake3.workspace = true
 hex.workspace = true
 ed25519-dalek.workspace = true
