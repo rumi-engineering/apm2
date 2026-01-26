@@ -333,9 +333,21 @@ fn scan_tickets(tickets_dir: &PathBuf) -> Result<Vec<TicketInfo>> {
 fn get_locally_completed_tickets(tickets: &[TicketInfo]) -> std::collections::HashSet<String> {
     tickets
         .iter()
-        .filter(|t| t.status.as_deref() == Some("completed"))
+        .filter(|ticket| {
+            ticket
+                .status
+                .as_deref()
+                .is_some_and(is_local_completion_status)
+        })
         .map(|t| t.id.clone())
         .collect()
+}
+
+fn is_local_completion_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_uppercase().as_str(),
+        "COMPLETED" | "DONE" | "CANCELLED" | "CANCELED"
+    )
 }
 
 /// Parse minimal ticket info from a YAML file.
@@ -580,6 +592,38 @@ ticket_meta:
 
         let deps = extract_dependencies(content);
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_get_locally_completed_tickets_accepts_done_cancelled() {
+        let tickets = vec![
+            TicketInfo {
+                id: "TCK-00001".to_string(),
+                title: String::new(),
+                rfc_id: String::new(),
+                dependencies: Vec::new(),
+                status: Some("DONE".to_string()),
+            },
+            TicketInfo {
+                id: "TCK-00002".to_string(),
+                title: String::new(),
+                rfc_id: String::new(),
+                dependencies: Vec::new(),
+                status: Some("CANCELLED".to_string()),
+            },
+            TicketInfo {
+                id: "TCK-00003".to_string(),
+                title: String::new(),
+                rfc_id: String::new(),
+                dependencies: Vec::new(),
+                status: Some("IN_PROGRESS".to_string()),
+            },
+        ];
+
+        let completed = get_locally_completed_tickets(&tickets);
+        assert!(completed.contains("TCK-00001"));
+        assert!(completed.contains("TCK-00002"));
+        assert!(!completed.contains("TCK-00003"));
     }
 
     #[test]
