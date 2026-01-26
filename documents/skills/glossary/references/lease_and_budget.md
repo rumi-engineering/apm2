@@ -15,11 +15,15 @@
 -   **Expiration:** Leases have a hard timestamp (TTL). Operations after expiration are rejected by the Kernel.
 -   **Derivation:** A Holon can sub-lease authority to a child Holon, but the child's lease must be a strict subset of the parent's (lower budget, narrower scope).
 
-## Data Structure References
+## Implementation
 
--   **`Lease`** (`crates/apm2-holon/src/resource/lease.rs`): A time-bounded, scope-bounded authorization for a holon.
--   **`Budget`** (`crates/apm2-holon/src/resource/budget.rs`): Four-dimensional resource limits (episodes, tool_calls, tokens, duration_ms).
--   **`LeaseScope`** (`crates/apm2-holon/src/resource/scope.rs`): Authority boundaries (work_ids, tools, namespaces) for a lease.
+-   `Lease` struct (`crates/apm2-holon/src/resource/lease.rs`):
+    -   `lease_id`: Unique ID.
+    -   `holder`: Actor ID.
+    -   `budget`: Remaining resources.
+    -   `signature`: Cryptographic proof of issuance.
+-   `LeaseReducer` (`crates/apm2-core/src/lease/reducer.rs`):
+    -   Tracks active leases and prevents duplicates.
 
 **SDLC Context:**
 Every "Episode" of agent execution (e.g., handling a ticket) MUST run under a valid Lease. If the Lease expires or the Budget runs out, the Episode is terminated.

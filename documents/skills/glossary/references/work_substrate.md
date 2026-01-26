@@ -15,11 +15,15 @@
 -   **EvidenceBundle:** Content-addressed proofs (logs, artifacts) hashed with BLAKE3.
 -   **Decision:** Governed adjudication (e.g., "Accept Risk", "Approve Plan").
 
-## Data Structure References
+## Codebase Implementation
 
--   **`WorkObject`** (`crates/apm2-holon/src/work.rs`): The unit of work being tracked, containing lifecycle state and attempt history.
--   **`WorkLifecycle`** (`crates/apm2-holon/src/work.rs`): The state machine for work (e.g., `Created`, `InProgress`, `Completed`).
--   **`AttemptRecord`** (`crates/apm2-holon/src/work.rs`): A record of a single execution attempt on a work object.
+-   **`apm2-core`:**
+    -   Implements the `Ledger` (append-only log).
+    -   Defines `Event` enums (protobuf) for all state transitions.
+    -   Provides `Reducer` traits to compute current state from history.
+-   **Storage:**
+    -   **Ledger:** SQLite in WAL mode.
+    -   **Artifacts:** Content-Addressed Storage (CAS) on disk.
 
 ## SDLC Interaction
 

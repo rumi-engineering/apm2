@@ -10,24 +10,10 @@ The PRD review system improves over time through four feedback loops. Each loop 
 
 | Loop ID | Signal Source | Feedback Target | Automation Level |
 |---------|---------------|-----------------|------------------|
-| LOOP-TICKET | Ticket completion | PRD template enhancement | Automated (Variance-Triggered) |
+| LOOP-TICKET | Ticket completion | PRD template enhancement | Manual |
 | LOOP-AAT | AAT verification | Verifiability rubric | Semi-automated |
 | LOOP-RECURRENCE | FindingSignature counts | Countermeasure creation | Automated |
 | LOOP-IMPACT | Impact map grounding | REUSE_POTENTIAL angle | Manual |
-
----
-
-## Signal-to-Noise Ratio (SNR) Check
-
-After every review, compute the Signal-to-Noise Ratio to ensure review depth calibration:
-
-```
-SNR = (BLOCKER + MAJOR findings) / (total findings)
-```
-
-- If SNR < 0.5 (more than half are MINOR/INFO), the review depth was **miscalibrated**.
-- Emit `REVIEW_CALIBRATION_WARNING` and record for depth algorithm tuning.
-- This prevents "Alert Fatigue" — the Pragmatist's concern.
 
 ---
 

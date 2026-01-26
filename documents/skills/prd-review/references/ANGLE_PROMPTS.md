@@ -18,8 +18,6 @@ During GATE-PRD-CONTENT, dispatch these angles to ensure comprehensive coverage.
 | OPERATIONAL_READINESS | Can this be deployed safely? | No |
 | SECURITY_POSTURE | Default-deny maintained? | No |
 | COHERENCE_CONSISTENCY | Internally consistent? | Yes |
-| TRADEOFF_ANALYSIS | What was sacrificed for optimization? | Yes |
-| SYSTEM_DYNAMICS | Feedback loops and ecosystem impact? | Yes |
 
 **Completion Requirement:** All required angles MUST be executed. Optional angles SHOULD be executed for production PRDs.
 
@@ -51,7 +49,6 @@ During GATE-PRD-CONTENT, dispatch these angles to ensure comprehensive coverage.
 2. Does the requirement assume infrastructure capabilities that exist?
 3. Are there implicit technology dependencies that may not be available?
 4. Do requirements assume capabilities that conflict with the current stack?
-5. **Fermi Check:** Perform a back-of-the-envelope calculation. If scale increases 100x, does the math still hold?
 
 ### Example Evaluation
 
@@ -98,7 +95,6 @@ finding:
 3. Can we validate that the stated problem actually exists?
 4. Do goals directly address the problem, or do they assume a solution?
 5. Would solving these requirements actually improve customer outcomes?
-6. **Abductive Check:** Is the proposed solution the *best explanation* for how to solve the problem? Does evidence support this mechanism over a simpler correlation?
 
 ### Example Evaluation
 
@@ -191,7 +187,6 @@ findings:
 |-------------|-------------|----------|
 | COUSIN_ABSTRACTION | Requirement duplicates existing abstraction | MAJOR |
 | IGNORED_EXTENSION_POINT | Existing extension point not leveraged | MINOR |
-| UNGROUNDED_SOLUTION | Solution Overview does not map to CCP | MAJOR |
 
 ### Evaluation Questions
 
@@ -200,7 +195,6 @@ findings:
 3. Does the solution use existing extension points in the architecture?
 4. What is the net-new code ratio vs. reuse ratio?
 5. Are similar problems solved consistently with existing patterns?
-6. **CCP Mapping:** Can the Solution Overview be deterministically mapped to the `component_atlas.yaml`?
 
 ### Example Evaluation
 
@@ -421,97 +415,6 @@ finding:
 
 ---
 
-## TRADEOFF_ANALYSIS
-
-**Focus:** What was optimized, what was sacrificed, and is the choice justified?
-
-### Signals to Look For
-
-- "Naive Optimization" (claiming to be best at everything: fast, cheap, and safe).
-- Hidden costs or side effects ignored in the design.
-- Mismatch between the optimized variable and the business goal.
-- Lack of "Why not X?" reasoning.
-
-### Finding Subcategories
-
-| Subcategory | Description | Severity |
-|-------------|-------------|----------|
-| NAIVE_OPTIMIZATION | Claims "best" without tradeoff analysis | MAJOR |
-| HIDDEN_COST | Tradeoff downsides are not acknowledged | MAJOR |
-
-### Evaluation Questions
-
-1. What was optimized (Speed, Consistency, Availability, Cost)?
-2. What was sacrificed to achieve that optimization? (If nothing, look harder).
-3. Is the sacrifice acceptable given the business constraints?
-4. **Pareto Check:** Are we on the efficient frontier, or just picking a bad point?
-5. Why was the alternative rejected?
-6. **The Zero-Sum Test:** Identify the specific metric degraded to achieve a benefit.
-7. **The "Why Not" Inversion:** Require a structural reason for rejecting the obvious alternative.
-
-### Example Evaluation
-
-```yaml
-requirement: "MUST provide strong consistency across all regions with <10ms latency"
-angle: TRADEOFF_ANALYSIS
-assessment: |
-  Violates CAP theorem/PACELC. Strong consistency + Low Latency + Partition Tolerance
-  is physically impossible across global regions.
-  Design claims to optimize everything (Naive Optimization).
-finding:
-  category: SPEC_DEFECT
-  subcategory: NAIVE_OPTIMIZATION
-  severity: MAJOR
-  remediation: "Choose between Strong Consistency (high latency) or Eventual Consistency (low latency)"
-```
-
----
-
-## SYSTEM_DYNAMICS
-
-**Focus:** Feedback loops, delays, and second-order effects on the ecosystem.
-
-### Signals to Look For
-
-- Reinforcing loops without dampeners (e.g., retries causing more load).
-- Delays between action and system response (oscillation risk).
-- Resource exhaustion risks in shared systems (tragedy of the commons).
-- Unintended consequences on upstream/downstream components.
-
-### Finding Subcategories
-
-| Subcategory | Description | Severity |
-|-------------|-------------|----------|
-| UNSTABLE_FEEDBACK | Design creates reinforcing feedback loops | BLOCKER |
-| SECOND_ORDER_HARM | Negative consequences on wider system | MAJOR |
-
-### Evaluation Questions
-
-1. Does the feature create a reinforcing loop? (e.g., auto-scaling triggered by load -> more connections -> more load).
-2. Are there time delays that could cause oscillation?
-3. How does this affect the shared resource budget of the Holarchy?
-4. What happens if every agent does this simultaneously?
-5. **Loop Simulation:** Simulate state at t+1, t+10, t+100.
-6. **The "Thundering Herd" Check:** Analyze peak resource demand under simultaneous trigger conditions.
-
-### Example Evaluation
-
-```yaml
-requirement: "Agents MUST retry failed API calls immediately"
-angle: SYSTEM_DYNAMICS
-assessment: |
-  Immediate retry on failure creates a reinforcing loop during outages.
-  If the API is down due to load, retries will increase load, prolonging the outage.
-  This is a classic Thundering Herd problem.
-finding:
-  category: SPEC_DEFECT
-  subcategory: UNSTABLE_FEEDBACK
-  severity: BLOCKER
-  remediation: "Implement exponential backoff with jitter"
-```
-
----
-
 ## Angle Coverage Matrix
 
 After executing all angles, produce coverage matrix:
@@ -531,9 +434,9 @@ angle_coverage:
       finding_ids: []
     # ... remaining angles
   summary:
-    total_angles: 10
-    executed_angles: 10
-    required_executed: 8
+    total_angles: 8
+    executed_angles: 8
+    required_executed: 6
     findings_by_angle:
       TECHNICAL_FEASIBILITY: 2
       CUSTOMER_VALUE: 0

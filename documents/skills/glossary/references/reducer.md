@@ -9,8 +9,9 @@
 
 ## Core Codebase Traits
 
--   **`Reducer`** (`crates/apm2-core/src/reducer/traits.rs`): The pure function trait that transitions state by applying an `Event`.
--   **`CheckpointableReducer`**:
+-   `Reducer` trait (`crates/apm2-core/src/reducer/traits.rs`):
+    -   `fn apply(&mut self, event: &Event, ctx: &ReducerContext) -> Result<(), Error>`
+-   `CheckpointableReducer`:
     -   Allows snapshots of the state to be saved to SQLite to avoid replaying from genesis every time.
 
 ## Known Reducers
