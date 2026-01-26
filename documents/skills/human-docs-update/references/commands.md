@@ -52,3 +52,52 @@ commands[13]:
   - name: get-pr-url
     command: "gh pr view --json url -q .url"
     purpose: "Get the URL of the current PR."
+
+---
+
+## Usage Examples
+
+### Complete Workflow
+
+```bash
+# 1. Check current state
+git status --porcelain
+git branch --show-current
+
+# 2. Create feature branch if on main
+git checkout -b docs/update-readme
+
+# 3. Run pre-commit checks
+pre-commit run --all-files
+
+# 4. Stage and commit
+git add documents/README.md
+git commit -m "docs: update README with new examples"
+
+# 5. Sync with main (may rewrite history)
+git fetch origin main && git rebase origin/main
+
+# 6. Push with force-with-lease (safe after rebase)
+git push -u origin docs/update-readme --force-with-lease
+
+# 7. Create PR and request reviews
+gh pr create --title "docs: update README" --body "Add new examples"
+PR_URL=$(gh pr view --json url -q .url)
+cargo xtask review quality "$PR_URL"
+cargo xtask review security "$PR_URL"
+
+# 8. Enable auto-merge
+gh pr merge --auto --squash
+```
+
+### Why force-with-lease?
+
+After rebasing on origin/main, your local branch has different commits than the remote. A regular `git push` will fail because the histories diverge. Options:
+
+| Command | Safety | Use Case |
+|---------|--------|----------|
+| `git push --force` | ❌ Dangerous | Never use - overwrites without checking |
+| `git push --force-with-lease` | ✅ Safe | Use after rebase - fails if remote changed |
+| `git push` | ✅ Safe | Only works if no rebase occurred |
+
+`--force-with-lease` is the safe choice because it will fail if someone else pushed to your branch since you last fetched, preventing accidental overwrites.

@@ -31,10 +31,23 @@ decision_tree:
             - If input is PRD-XXXX: default to CREATE
             - If input is RFC-XXXX:
                 - Read `00_meta.yaml` to determine version.
-                - If version is `v0`: mode = EXPLORE
-                - If version is `v2`: mode = FINALIZE
-                - If version is `v4`: mode = DECOMPOSE
-                - Default: mode = REVIEW
+                - Apply version-based branching:
+                  ```
+                  version_str = meta["version"]  # e.g., "v0", "v2", "v4"
+                  if version_str == "v0":
+                      mode = EXPLORE   # Advance to v2 (Grounded)
+                  elif version_str == "v2":
+                      mode = FINALIZE  # Advance to v4 (Standard)
+                  elif version_str == "v4":
+                      # Check if tickets already exist
+                      if tickets_exist_for_rfc(RFC_ID):
+                          mode = REVIEW  # Review existing tickets
+                      else:
+                          mode = DECOMPOSE  # Generate tickets
+                  else:
+                      mode = REVIEW  # Default fallback
+                  ```
+                - Explicit `--mode` flag always overrides auto-selection.
         - id: SELECT_DEPTH
           action: |
             Compute depth based on impact:

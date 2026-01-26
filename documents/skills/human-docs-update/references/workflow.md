@@ -89,10 +89,12 @@ decision_tree:
 
         - id: PUSH_BRANCH
           action: |
-            Push branch with tracking:
+            Push branch with tracking and force-with-lease (safe after rebase):
             ```bash
-            git push -u origin <branch-name>
+            git push -u origin <branch-name> --force-with-lease
             ```
+            Note: --force-with-lease is required after rebase to update remote,
+            but it's safer than --force as it will fail if someone else pushed.
       decisions[1]:
         - id: PROCEED_TO_PR
           if: "push successful"
@@ -113,10 +115,19 @@ decision_tree:
           action: |
             Request AI reviews using xtask:
             ```bash
-            cargo xtask review quality <PR_URL>
-            cargo xtask review security <PR_URL>
+            # Get PR URL first
+            PR_URL=$(gh pr view --json url -q .url)
+
+            # Request quality review (code style, patterns, maintainability)
+            cargo xtask review quality "$PR_URL"
+
+            # Request security review (vulnerabilities, trust boundaries)
+            cargo xtask review security "$PR_URL"
             ```
-            These commands initiate the specialized AI review workflows for the given PR.
+            These commands spawn AI review agents that:
+            1. Fetch the PR diff
+            2. Analyze changes against project guidelines
+            3. Post review comments to the PR
 
         - id: ENABLE_AUTO_MERGE
           action: |
