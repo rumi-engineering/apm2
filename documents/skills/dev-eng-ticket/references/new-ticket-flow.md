@@ -5,7 +5,7 @@ decision_tree:
   nodes[1]:
     - id: NEW_TICKET_FLOW
       purpose: "Implement a ticket from scratch and open a new PR."
-      steps[10]:
+      steps[11]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <TICKET_ID> and <RFC_ID> with values extracted from start-ticket output."
         - id: READ_TICKET_CONTEXT
@@ -23,6 +23,9 @@ decision_tree:
           action: "Implement the change following Textbook quality standards."
         - id: UPDATE_DOCS_AND_AGENTS
           action: "Update documentation and AGENTS.md if public behavior or module invariants change."
+        - id: FIX_FORMATTING
+          action: command
+          run: "cargo fmt"
         - id: VERIFY_AND_COMMIT
           action: command
           run: "cargo xtask commit \"Initial implementation of <TICKET_ID>\""

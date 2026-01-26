@@ -1,6 +1,6 @@
 title: Dev Ticket Command Reference
 
-commands[12]:
+commands[13]:
   - name: start-ticket-default
     command: "cargo xtask start-ticket"
     purpose: "Setup dev environment for next unblocked ticket."
@@ -13,6 +13,9 @@ commands[12]:
   - name: start-ticket-print-path
     command: "cargo xtask start-ticket [target] --print-path"
     purpose: "Output only worktree path (use for cd)."
+  - name: format
+    command: "cargo fmt"
+    purpose: "Fix formatting issues before committing."
   - name: commit
     command: "cargo xtask commit \"<message>\""
     purpose: "Verify, sync with main, and commit."

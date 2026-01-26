@@ -80,3 +80,4 @@ Before submitting a PR, verify your changes against the following specific contr
 15. **Defensive Time:** Use `checked_duration_since()`, guard interval divisors ([RSK-2504]).
 16. **Query Limits:** Apply `.take(limit)` BEFORE `.collect()` ([CTR-1302]).
 17. **Audit Completeness:** Use `Vec<T>` not `Option<T>` when multiplicity possible ([CTR-1907]).
+18. **Formatting:** `cargo fmt` has been run to ensure consistent style and pass CI ([CTR-2618]).

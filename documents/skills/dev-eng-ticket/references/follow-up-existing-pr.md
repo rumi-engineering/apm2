@@ -5,7 +5,7 @@ decision_tree:
   nodes[1]:
     - id: FOLLOW_UP_EXISTING_PR
       purpose: "Continue work on an existing PR, addressing the latest feedback and improvements."
-      steps[10]:
+      steps[11]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <TICKET_ID>, <RFC_ID>, and <PR_URL> with values extracted from start-ticket output."
         - id: READ_TICKET_CONTEXT
@@ -27,6 +27,9 @@ decision_tree:
           action: "Address the latest feedback and improve correctness. Apply relevant Rust Textbook frameworks (Ownership, Async, Errors, etc.)."
         - id: UPDATE_DOCS_AND_AGENTS
           action: "Update documentation and AGENTS.md files to reflect changes and new invariants."
+        - id: FIX_FORMATTING
+          action: command
+          run: "cargo fmt"
         - id: VERIFY_AND_COMMIT
           action: command
           run: "cargo xtask commit \"Addressing review feedback and improving implementation\""

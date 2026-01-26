@@ -1,6 +1,6 @@
 title: Human Docs Update Command Reference
 
-commands[10]:
+commands[13]:
   - name: check-git-state
     command: "git status --porcelain"
     purpose: "Show all uncommitted changes in machine-readable format."
@@ -21,27 +21,33 @@ commands[10]:
     command: "git add <file1> <file2> ..."
     purpose: "Stage specific files for commit. Prefer explicit paths over -A."
 
-  - name: commit-with-coauthor
-    command: |
-      git commit -m "$(cat <<'EOF'
-      <type>: <description>
-
-      Co-Authored-By: Claude <noreply@anthropic.com>
-      EOF
-      )"
-    purpose: "Create commit with conventional message and co-author footer."
+  - name: commit-conventional
+    command: "git commit -m \"<type>: <description>\""
+    purpose: "Create a conventional commit."
 
   - name: sync-with-main
     command: "git fetch origin main && git rebase origin/main"
     purpose: "Fetch latest main and rebase current branch on it."
 
-  - name: push-and-pr
-    command: "cargo xtask push"
-    purpose: "Push, create/update PR, run AI reviews, enable auto-merge."
+  - name: push-branch
+    command: "git push -u origin <branch-name> --force-with-lease"
+    purpose: "Push the current branch to origin with tracking, using force-with-lease to safely handle rebased history."
 
-  - name: push-force-review
-    command: "cargo xtask push --force-review"
-    purpose: "Force re-run reviews after addressing feedback."
+  - name: create-pr
+    command: "gh pr create --title \"<title>\" --body \"<summary>\""
+    purpose: "Create a pull request using GitHub CLI."
+
+  - name: review-quality
+    command: "cargo xtask review quality <PR_URL>"
+    purpose: "Request an AI code quality review for the PR."
+
+  - name: review-security
+    command: "cargo xtask review security <PR_URL>"
+    purpose: "Request an AI security review for the PR."
+
+  - name: enable-auto-merge
+    command: "gh pr merge --auto --squash"
+    purpose: "Enable squash auto-merge for the current PR."
 
   - name: get-pr-url
     command: "gh pr view --json url -q .url"

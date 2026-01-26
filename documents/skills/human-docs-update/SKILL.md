@@ -76,12 +76,10 @@ decision_tree:
 This skill handles the complete workflow for getting documentation updates reviewed and merged:
 
 1. **Normalize Git State** - Handle any starting state (uncommitted changes, behind remote, etc.)
-2. **Run Local Checks** - Execute pre-commit hooks and formatting
-3. **Stage & Commit** - Stage changes and create conventional commit
-4. **Sync with Remote** - Fetch and rebase on origin/main
-5. **Push & Create PR** - Push branch and create pull request
-6. **Request Reviews** - Request AI code-quality and security reviews
-7. **Enable Auto-merge** - Set up squash auto-merge
+2. **Run Local Checks** - Execute pre-commit hooks and formatting.
+3. **Stage & Commit** - Stage changes and create a conventional commit.
+4. **Sync & Push** - Sync with origin/main, push the branch, and create a pull request.
+5. **Review & Merge** - Request AI reviews and enable auto-merge.
 
 ## Prerequisites
 
@@ -106,12 +104,11 @@ This skill handles the complete workflow for getting documentation updates revie
 - `Read` - Read files to understand changes
 - `Glob` - Find modified files
 - `Grep` - Search contents
-- `Bash` - Git operations, pre-commit, xtask
+- `Bash` - Git operations, pre-commit, gh cli
 
 ## Success Criteria
 
 - PR created with descriptive title and body
-- All local checks pass (formatting, linting)
-- Branch synced with origin/main
-- AI reviews requested (if collaborators available)
-- Auto-merge enabled
+- All local checks pass (via `pre-commit`)
+- Branch synced with origin/main (via `git rebase`)
+- AI reviews requested and auto-merge enabled (via `cargo xtask review` and `gh pr`)

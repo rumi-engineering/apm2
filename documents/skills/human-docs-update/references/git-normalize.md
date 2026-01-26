@@ -152,38 +152,39 @@ decision_tree:
             reason: "Merge conflicts require manual resolution"
 
     - id: NORMALIZE_BRANCH
-      purpose: "Ensure branch is ready for new work."
-      steps[4]:
-        - id: STASH_IF_NEEDED
-          action: |
-            If there are changes AND we need to switch branches:
-            ```bash
-            git stash push -m "human-docs-update: auto-stash"
-            ```
-            Track that we stashed so we can pop later.
+      purpose: "Ensure we are on a feature branch with a clean baseline."
+      steps[6]:
+        - id: IDENTIFY_CURRENT_BRANCH
+          action: "git branch --show-current"
+          capture_as: current_branch
 
-        - id: FETCH_LATEST
-          action: |
-            Fetch latest from origin:
-            ```bash
-            git fetch origin
-            ```
+        - id: FETCH_ORIGIN
+          action: "git fetch origin main"
 
-        - id: CHECK_MAIN_DIVERGENCE
+        - id: HANDLE_MAIN_BRANCH
+          if: "current_branch is 'main' or 'master'"
           action: |
-            If on feature branch, check divergence from main:
-            ```bash
-            git rev-list --count HEAD..origin/main
-            ```
-            If significantly behind (>50 commits), warn user.
+            We must not work on main.
+            1. Derive branch name (e.g., `docs/update-<date>`) or use BRANCH_NAME_OPTIONAL.
+            2. Stash changes: `git stash push -m "human-docs-update: auto-stash"`
+            3. Create and switch: `git checkout -b <branch-name> origin/main`
+            4. Pop stash: `git stash pop`
+            If pop fails, HALT for manual conflict resolution.
 
-        - id: POP_STASH_IF_NEEDED
+        - id: HANDLE_FEATURE_BRANCH
+          if: "current_branch is NOT 'main' or 'master'"
           action: |
-            If we stashed earlier:
-            ```bash
-            git stash pop
-            ```
-            If pop fails (conflicts), HALT for manual resolution.
+            Ensure feature branch is based on latest main.
+            1. `git rebase origin/main`
+            If rebase fails, HALT for manual resolution or `git rebase --abort`.
+
+        - id: VERIFY_CLEAN_STATE
+          action: |
+            Ensure no unresolved merge artifacts:
+            `git status --porcelain | grep -q "^UU" && exit 1 || exit 0`
+
+        - id: READY_FOR_COMMIT
+          action: "The git state is now normalized and anchored to origin/main."
       decisions[1]:
         - id: NORMALIZED
           if: "branch normalized successfully"

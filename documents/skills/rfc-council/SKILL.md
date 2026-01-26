@@ -119,6 +119,26 @@ anti-cousin enforcement.
 3. **PHASE_CLOSURE (v2->v4)**: Forced convergence. Deferring or answering all open questions.
 4. **PHASE_DECOMPOSITION (v4)**: Creating atomic, agent-executable engineering docs.
 
+## Gate Structure
+
+| Gate | Type | Purpose |
+|------|------|---------|
+| GATE-TCK-SCHEMA | TRUSTED | YAML parsing |
+| GATE-TCK-DEPENDENCY-ACYCLICITY | DETERMINISTIC | No cycles |
+| GATE-TCK-SCOPE-COVERAGE | DETERMINISTIC | Requirements covered |
+| GATE-TCK-CCP-MAPPING | DETERMINISTIC | Files exist in CCP |
+| GATE-TCK-ATOMICITY | LLM-ASSISTED | Single-PR completable |
+| GATE-TCK-IMPLEMENTABILITY | LLM-ASSISTED | Agent can implement |
+| GATE-TCK-ANTI-COUSIN | LLM-ASSISTED | No cousin abstractions |
+
+## Council Subagents
+
+| Agent | Role | Focus |
+|-------|------|-------|
+| SA-1 | Structural Rigorist | Dependencies, type safety |
+| SA-2 | Implementation Feasibility | Execution planning |
+| SA-3 | Anti-Cousin Guardian | CCP alignment, reuse |
+
 ## Review Cycles
 
 1. **CYCLE_1 (STRUCTURAL)**: Schema, dependencies, coverage, CCP mapping
