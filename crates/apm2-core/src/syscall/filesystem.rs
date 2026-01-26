@@ -53,6 +53,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use tempfile::NamedTempFile;
 use tracing::{debug, info, instrument, warn};
 
 use super::error::SyscallError;
@@ -60,11 +61,17 @@ use super::error::SyscallError;
 /// Maximum symlink resolution depth to prevent infinite loops.
 const MAX_SYMLINK_DEPTH: usize = 40;
 
+/// Default maximum content size for reads (100MB).
+const DEFAULT_MAX_READ_SIZE: usize = 100 * 1024 * 1024;
+
 /// Default maximum content size for writes (100MB).
 const DEFAULT_MAX_WRITE_SIZE: usize = 100 * 1024 * 1024;
 
 /// Default maximum content size for edits (10MB).
 const DEFAULT_MAX_EDIT_SIZE: usize = 10 * 1024 * 1024;
+
+/// Buffer size for streaming hash operations.
+const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Converts a Duration to milliseconds as u64, saturating at `u64::MAX`.
 ///
@@ -83,6 +90,9 @@ pub struct FilesystemConfig {
     /// Root directory for all file operations.
     /// All paths must resolve to within this directory.
     workspace_root: PathBuf,
+
+    /// Maximum content size for read operations.
+    max_read_size: usize,
 
     /// Maximum content size for write operations.
     max_write_size: usize,
@@ -118,6 +128,7 @@ impl FilesystemConfig {
             max_write_size: DEFAULT_MAX_WRITE_SIZE,
             max_edit_size: DEFAULT_MAX_EDIT_SIZE,
             follow_symlinks: true,
+            max_read_size: DEFAULT_MAX_READ_SIZE,
         }
     }
 
@@ -157,6 +168,7 @@ pub struct FilesystemConfigBuilder {
     workspace_root: PathBuf,
     max_write_size: usize,
     max_edit_size: usize,
+    max_read_size: usize,
     follow_symlinks: bool,
 }
 
@@ -168,6 +180,7 @@ impl FilesystemConfigBuilder {
             workspace_root: workspace_root.as_ref().to_path_buf(),
             max_write_size: DEFAULT_MAX_WRITE_SIZE,
             max_edit_size: DEFAULT_MAX_EDIT_SIZE,
+            max_read_size: DEFAULT_MAX_READ_SIZE,
             follow_symlinks: true,
         }
     }
@@ -211,6 +224,7 @@ impl FilesystemConfigBuilder {
             workspace_root,
             max_write_size: self.max_write_size,
             max_edit_size: self.max_edit_size,
+            max_read_size: self.max_read_size,
             follow_symlinks: self.follow_symlinks,
         })
     }
@@ -456,6 +470,13 @@ impl FilesystemHandler {
             (file_size - offset) as usize
         };
 
+        if read_size > self.config.max_read_size {
+            return Err(SyscallError::ContentTooLarge {
+                size: read_size,
+                limit: self.config.max_read_size,
+            });
+        }
+
         let mut content = vec![0u8; read_size];
         let bytes_read = file.read(&mut content).map_err(|e| SyscallError::Io {
             path: canonical.clone(),
@@ -524,6 +545,7 @@ impl FilesystemHandler {
         // Get hash of existing content if file exists
         let hash_before = if canonical.exists() {
             if create_only {
+                // We check here for a quick fail, but the real atomic check is in OpenOptions
                 return Err(SyscallError::FileAlreadyExists { path: canonical });
             }
             Some(hash_file(&canonical)?)
@@ -541,16 +563,31 @@ impl FilesystemHandler {
         };
 
         // Open file with appropriate options
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(!append)
-            .append(append)
-            .open(&canonical)
-            .map_err(|e| SyscallError::Io {
-                path: canonical.clone(),
-                source: e,
-            })?;
+        let mut options = OpenOptions::new();
+        options.write(true);
+
+        if create_only {
+            // Atomic check-and-create
+            options.create_new(true);
+        } else {
+            options.create(true);
+            options.truncate(!append);
+        }
+        
+        options.append(append);
+
+        let mut file = options.open(&canonical).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                SyscallError::FileAlreadyExists {
+                    path: canonical.clone(),
+                }
+            } else {
+                SyscallError::Io {
+                    path: canonical.clone(),
+                    source: e,
+                }
+            }
+        })?;
 
         // Write content
         file.write_all(content).map_err(|e| SyscallError::Io {
@@ -636,6 +673,12 @@ impl FilesystemHandler {
 
         // Validate and resolve path
         let canonical = self.validate_path(path, true)?;
+        
+        // Use the parent directory for the temp file to ensure it's on the same filesystem
+        let parent_dir = canonical.parent().ok_or_else(|| SyscallError::PathValidation {
+             path: canonical.clone(),
+             reason: "file has no parent directory".to_string() 
+        })?;
 
         // Read existing content
         let existing = fs::read_to_string(&canonical).map_err(|e| SyscallError::Io {
@@ -663,15 +706,21 @@ impl FilesystemHandler {
         let new_file_content = existing.replacen(old_content, new_content, 1);
 
         // Write atomically by writing to temp file and renaming
-        let temp_path = canonical.with_extension("tmp");
-        fs::write(&temp_path, &new_file_content).map_err(|e| SyscallError::Io {
-            path: temp_path.clone(),
+        // Security: Use NamedTempFile::new_in to avoid predictable names and ensure atomic creation
+        let mut temp_file = NamedTempFile::new_in(parent_dir).map_err(|e| SyscallError::Io {
+            path: parent_dir.to_path_buf(),
             source: e,
         })?;
-
-        fs::rename(&temp_path, &canonical).map_err(|e| SyscallError::Io {
-            path: canonical.clone(),
+        
+        temp_file.write_all(new_file_content.as_bytes()).map_err(|e| SyscallError::Io {
+            path: temp_file.path().to_path_buf(),
             source: e,
+        })?;
+        
+        // Persist the temp file to the target path
+        temp_file.persist(&canonical).map_err(|e| SyscallError::Io {
+            path: canonical.clone(),
+            source: e.error,
         })?;
 
         // Get hash after edit
@@ -764,13 +813,33 @@ fn resolve_path_with_symlinks(path: &Path, max_depth: usize) -> Result<PathBuf, 
     }
 }
 
-/// Computes the BLAKE3 hash of a file.
+/// Computes the BLAKE3 hash of a file using streaming.
+///
+/// Uses a heap-allocated buffer to avoid large stack allocations.
 fn hash_file(path: &Path) -> Result<[u8; 32], SyscallError> {
-    let content = fs::read(path).map_err(|e| SyscallError::Io {
+    let mut file = File::open(path).map_err(|e| SyscallError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
-    Ok(*blake3::hash(&content).as_bytes())
+
+    let mut hasher = blake3::Hasher::new();
+    // Allocate buffer on heap to avoid large stack allocation (clippy::large_stack_arrays)
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+
+    loop {
+        let bytes_read = file.read(&mut buffer).map_err(|e| SyscallError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]
@@ -1131,8 +1200,64 @@ mod tests {
         // After hash should be different
         assert_ne!(record.hash_after, initial_hash);
 
-        // After hash should match new content
-        let final_hash = handler.read_file(&file_path, 0, 0).unwrap().content_hash;
-        assert_eq!(record.hash_after, final_hash);
-    }
-}
+                // After hash should match new content
+
+                let final_hash = handler.read_file(&file_path, 0, 0).unwrap().content_hash;
+
+                assert_eq!(record.hash_after, final_hash);
+
+            }
+
+        
+
+            #[test]
+
+            fn test_hash_large_file_streaming() {
+
+                let (temp_dir, _handler) = setup_workspace();
+
+                
+
+                // Create a file larger than HASH_BUFFER_SIZE (64KB)
+
+                // 1MB = 1024 * 1024 bytes
+
+                let size = 1024 * 1024;
+
+                let mut content = Vec::with_capacity(size);
+
+                for i in 0..size {
+
+                    content.push((i % 256) as u8);
+
+                }
+
+                
+
+                let file_path = temp_dir.path().join("large_hash.txt");
+
+                fs::write(&file_path, &content).unwrap();
+
+                
+
+                // Calculate expected hash
+
+                let expected = blake3::hash(&content);
+
+                
+
+                // Calculate actual hash using our streaming function
+
+                // We need to access the private hash_file function, so this test stays in this module
+
+                let actual = hash_file(&file_path).unwrap();
+
+                
+
+                assert_eq!(actual, *expected.as_bytes());
+
+            }
+
+        }
+
+        
