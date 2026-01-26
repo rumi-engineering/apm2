@@ -6,66 +6,84 @@
 
 A meta-discipline applying specific checks *before* committing to conclusions: base-rate anchoring, alternative-hypothesis generation, premortem analysis, and active disconfirmation search. Not a new inference pattern—a constraint layer that intercepts and stress-tests outputs from other reasoning modes.
 
-The core move: "Before I act on this conclusion, what predictable errors might I be making?" Debiasing treats your own cognition as a known-flawed instrument and applies systematic corrections.
+The key insight: Cognitive biases are *predictable* errors, not random noise. Because they're predictable, they're correctable—if you know where to look. Debiasing operationalizes decades of cognitive science into actionable pre-commitment checks.
 
-Unlike reasoning modes that produce conclusions, debiasing *audits* conclusions. It's the quality-control gate between thinking and deciding.
+Debiasing applies to outputs from *any* other reasoning mode: before accepting an abductive hypothesis, a Bayesian update, a decision-theoretic recommendation, or a causal inference—run the debiasing checklist.
 
 ## What it outputs
 
 | Artifact | Description | Produced by step |
 |----------|-------------|------------------|
 | **Base-rate anchor** | Reference-class frequency before inside-view adjustment | Step 1 |
-| **Alternative-hypothesis list** | ≥3 competing explanations with relative plausibility | Step 2 |
-| **Premortem report** | "Assume we failed—why?" with top 3 causes | Step 3 |
+| **Alternative-hypothesis list** | >=3 competing explanations with relative plausibility | Step 2 |
+| **Premortem report** | "Assume we failed—why?" with top 3 causes ranked by likelihood | Step 3 |
 | **Disconfirmation tests** | Specific observations that would falsify the favored view | Step 4 |
-| **Cognitive-load flag** | Whether judgment was made under impaired conditions | Step 5 |
-| **Bias audit log** | List of checked biases with pass/fail + rationale | Step 6 |
-| **Residual uncertainty log** | What remains uncertain and why | Step 7 |
+| **Cognitive-load flag** | Assessment of reasoning conditions (rushed/tired/invested = provisional) | Step 5 |
+| **Bias audit log** | Explicit check for anchoring/availability/confirmation with pass/fail + rationale | Step 6 |
+| **Residual uncertainty statement** | What remains uncertain and why, even after debiasing | Step 7 |
 
 ## Procedure (decision steps)
 
-1. **Anchor on base rate** — Before analyzing specifics, ask: "What's the reference-class frequency for outcomes like this?" Write it down.
-   - *Technique:* Identify the broadest reasonable reference class (e.g., "software projects" before "our team's projects"), then narrow with justification.
-   - *Test:* Would a stranger with only statistical knowledge predict close to your base rate?
-   - *Output:* "Base rate for [reference class]: X%"
+1. **Anchor on base rate** — Before analyzing specifics, ask: "What's the reference-class frequency for outcomes like this?" Write it down *before* considering inside-view details.
+   - *Technique:* Find 3+ similar past cases; what % succeeded/failed?
+   - *Test:* Would you bet at this base rate? If not, adjust.
+   - *Output:* "Base rate for [reference class] is X% (source: Y)."
 
-2. **Generate alternatives** — List ≥3 hypotheses that could explain the same evidence. Assign rough plausibility to each.
-   - *Technique:* Include at least one "mundane" alternative (coincidence, measurement error) and one "uncomfortable" alternative (systemic cause you'd rather not consider).
-   - *Test:* Is there an alternative you'd prefer not to be true? You should have listed it.
-   - *Output:* Numbered list with plausibility estimates.
+2. **Generate alternatives** — List >=3 hypotheses that could explain the same evidence. Assign rough plausibility to each. Include at least one that contradicts your favored view.
+   - *Technique:* "What would a smart skeptic believe? What if the opposite were true?"
+   - *Test:* Are alternatives genuine competitors or strawmen?
+   - *Output:* Numbered list with plausibility estimates (e.g., H1: 50%, H2: 30%, H3: 20%).
 
-3. **Run premortem** — Assume the decision failed. Brainstorm top 3 reasons it could fail. Identify which are addressable now.
-   - *Technique:* Frame as "It's 6 months later and this was a disaster. What happened?"
-   - *Test:* Are any failure modes within your control but not yet addressed?
-   - *Output:* "Premortem causes: (1) ..., (2) ..., (3) ..."
+3. **Run premortem** — Assume the decision failed spectacularly. Brainstorm top 3 reasons it could fail. Rank by likelihood. Identify which are addressable now.
+   - *Technique:* "It's one year later and this was a disaster. Write the postmortem headline."
+   - *Test:* Did you include internal/controllable failure causes, not just external/uncontrollable ones?
+   - *Output:* Top 3 failure causes with "addressable now?" flag.
 
 4. **Seek disconfirmation** — For your favored conclusion, specify 2-3 observations that would change your mind. Actively look for them.
-   - *Technique:* Ask "What would my harshest critic point to as evidence against this?"
-   - *Test:* Did you actually look, or just list disconfirmation in theory?
-   - *Output:* "Would revise if: (a) ..., (b) ..."
+   - *Technique:* "What would I need to see to abandon this position?"
+   - *Test:* Have you actually searched for disconfirming evidence, or just specified it hypothetically?
+   - *Output:* Disconfirmation tests + search results.
 
-5. **Check cognitive load** — If rushed, tired, or emotionally invested, flag the judgment as provisional and schedule re-evaluation.
-   - *Signals:* Time pressure, sleep deprivation, personal stake, recent emotional event, pressure from authority.
-   - *Output:* "Cognitive-load flag: [clear | impaired: reason]"
+5. **Check cognitive load** — If rushed, tired, or emotionally invested, flag the judgment as provisional and schedule re-evaluation under better conditions.
+   - *Signals:* Deadline pressure, <6 hours sleep, strong emotional reaction to outcome, personal stake in being right.
+   - *Test:* "Would I make this same judgment after a good night's sleep with no deadline?"
+   - *Output:* Cognitive-load flag (green/yellow/red) + scheduled re-evaluation if yellow/red.
 
-6. **Audit for anchoring/availability/confirmation** — Explicitly ask: "Am I weighting first info too heavily (anchoring)? Recent/vivid info (availability)? Info that confirms my prior (confirmation)?"
-   - *Anchoring test:* What was the first number/estimate you heard? Is your final estimate suspiciously close?
-   - *Availability test:* Can you recall a vivid counterexample to your conclusion? If not, why not?
-   - *Confirmation test:* What evidence would the opposition cite? Did you engage with it?
-   - *Output:* "Bias check: anchoring [pass/fail], availability [pass/fail], confirmation [pass/fail]"
+6. **Audit for specific biases** — Check the Big Three explicitly:
+   - **Anchoring:** "Am I weighting the first number/estimate I heard too heavily?"
+   - **Availability:** "Am I overweighting recent, vivid, or emotionally charged information?"
+   - **Confirmation:** "Am I seeking/interpreting evidence to confirm my existing belief?"
+   - *Test:* For each, articulate what you'd expect to see if you *were* biased—then check.
+   - *Output:* 3-item audit with pass/fail + rationale.
 
-7. **Document residual uncertainty** — Record what you're still uncertain about and why.
-   - *Output:* "Remaining uncertainty: ..."
+7. **Document residual uncertainty** — Record what you're still uncertain about and why. Distinguish "uncertainty I can reduce with more info" from "irreducible uncertainty."
+   - *Test:* Would gathering more information change the decision? If yes, is it worth the cost?
+   - *Output:* Uncertainty statement with "reducible vs. irreducible" classification.
 
 ## Quick checklist (pre-decision gate)
 
-- [ ] Base rate written before inside-view analysis
-- [ ] ≥3 alternative hypotheses listed (including one you'd prefer not be true)
-- [ ] Premortem completed (top 3 failure causes, at least one addressable)
-- [ ] ≥2 disconfirming observations specified AND actively sought
-- [ ] Cognitive-load flag set if impaired conditions
-- [ ] Anchoring / availability / confirmation bias explicitly checked
-- [ ] Residual uncertainty documented
+- [ ] Base rate written *before* inside-view analysis (source cited)
+- [ ] >=3 alternative hypotheses listed with plausibility estimates
+- [ ] Premortem completed (top 3 failure causes, >=1 internal/controllable)
+- [ ] >=2 disconfirming observations specified AND actively searched for
+- [ ] Anchoring / availability / confirmation bias explicitly checked (3-item audit)
+- [ ] Cognitive-load flag set (green/yellow/red)
+- [ ] Residual uncertainty documented (reducible vs. irreducible)
+
+## Bias Reference Card
+
+| Bias | Definition | Detection question | Fix |
+|------|------------|-------------------|-----|
+| **Anchoring** | Over-relying on first information received | "Did my estimate move enough from the first number I heard?" | Estimate independently before seeing anchors; use multiple reference points |
+| **Availability** | Overweighting easily recalled (recent/vivid) examples | "Am I thinking of this because it's likely or because it's memorable?" | Seek base rates; ask "what am I *not* thinking of?" |
+| **Confirmation** | Seeking/interpreting evidence to support existing beliefs | "Would I accept this evidence if it supported the opposite conclusion?" | Actively seek disconfirmation; steelman the opposing view |
+| **Overconfidence** | Excessive certainty in own judgments | "What's my track record on similar judgments?" | Calibration training; widen confidence intervals |
+| **Hindsight** | "I knew it all along" after learning outcome | "Would I have predicted this *before* knowing the outcome?" | Pre-register predictions; reconstruct pre-outcome state |
+| **Sunk cost** | Continuing because of past investment, not future value | "Would I start this if I hadn't already invested?" | Evaluate from fresh start; ignore sunk costs |
+| **Planning fallacy** | Underestimating time/cost/risk for future tasks | "How long did similar past projects actually take?" | Use reference-class forecasting; add buffer |
+| **Groupthink** | Conforming to group consensus without critical evaluation | "Have I heard genuine disagreement, or just alignment?" | Anonymous voting; assign devil's advocate |
+| **Authority bias** | Over-deferring to senior/expert opinion | "Would I accept this reasoning from a junior person?" | Evaluate argument independent of source |
+| **Status quo bias** | Preferring current state over alternatives | "Would I choose this option if starting fresh?" | Frame as active choice, not default |
 
 ## Micro-example
 
@@ -73,107 +91,106 @@ Unlike reasoning modes that produce conclusions, debiasing *audits* conclusions.
 
 | Step | Action | Output |
 |------|--------|--------|
-| 1. Base rate | "What % of caching projects actually solve the performance problem?" → Historical data: ~40% hit root cause. | Base rate: 40% |
-| 2. Alternatives | (a) Caching helps, (b) N+1 query is real bottleneck, (c) GC pauses dominate, (d) Problem is network latency not compute | 4 hypotheses |
-| 3. Premortem | "Cache deployed, latency unchanged—why?" → Didn't profile first; cache hit rate low; wrong layer cached. | 3 failure modes |
-| 4. Disconfirmation | Profile shows cache-hit rate <50%, or latency unchanged after deployment → abandon caching hypothesis. | 2 disconfirming observations |
-| 5. Cognitive load | Team is under deadline pressure → flag as provisional. | Flag: impaired (deadline) |
-| 6. Bias audit | Anchoring: first idea was caching (from similar past fix) → check. Confirmation: only looked at cache-supporting logs → fail. | Anchoring: watch, Confirmation: fail |
-| 7. Decision | Profile first to test alternatives, then re-evaluate. Revisit after deadline pressure clears. | Action + conditions |
+| 1. Base rate | "What % of caching projects actually solve the performance problem?" Historical data: ~40% hit root cause | Base rate: 40% (source: internal project retrospectives) |
+| 2. Alternatives | (a) Caching helps: 40%, (b) N+1 query is real bottleneck: 35%, (c) GC pauses dominate: 20%, (d) Network latency: 5% | 4 hypotheses with plausibility |
+| 3. Premortem | "Cache deployed, latency unchanged—why?" Didn't profile first (internal); cache hit rate low (internal); wrong layer cached (internal) | 3 causes, all addressable now |
+| 4. Disconfirmation | Profile shows cache-hit rate <50% or latency unchanged after deployment = abandon caching hypothesis. **Searched:** ran profiler | Profiler showed N+1 queries, not cache misses |
+| 5. Cognitive load | Team is not under deadline pressure; no emotional investment | Green flag |
+| 6. Bias audit | Anchoring: first suggestion was caching = possible anchor; Availability: recent success with caching = possible; Confirmation: team likes caching = yes | 2/3 flags raised |
+| 7. Decision | Profile showed N+1 queries dominate. Caching deprioritized; fix queries first | Alternative hypothesis (b) now favored |
 
 ## How it differs
 
 | Mode | Debiasing differs because... |
 |------|------------------------------|
-| [Meta-reasoning](75-meta-reasoning.md) | Meta-reasoning selects *which* mode to use; debiasing audits *any* mode's output for predictable errors. Meta-reasoning is upstream (mode selection); debiasing is downstream (output validation). |
-| [Calibration](76-calibration-epistemic-humility.md) | Calibration measures accuracy over many judgments retrospectively; debiasing applies corrective checks to a single judgment prospectively. Calibration tracks whether you're well-calibrated over time; debiasing intervenes on this specific decision. |
-| [Red-teaming](79-adversarial-red-team.md) | Red-teaming assumes an external adversary attacking your system; debiasing assumes your own cognition is the adversary. Red-teaming asks "how would an attacker exploit this?"; debiasing asks "how is my thinking exploiting itself?" |
-| [Heuristic reasoning](53-heuristic.md) | Heuristics are the System 1 shortcuts debiasing corrects—fast, automatic, often useful but systematically wrong in predictable ways. Debiasing is the System 2 audit layer. |
-| [Abductive reasoning](13-abductive.md) | Abduction generates hypotheses; debiasing forces you to generate *multiple* hypotheses and seek disconfirmation for your favorite. Abduction can fall into story bias; debiasing counters it. |
-| [Reflective equilibrium](77-reflective-equilibrium.md) | Reflective equilibrium seeks coherence among beliefs and principles; debiasing seeks accuracy by correcting known cognitive errors. Both are meta-level, but different goals: coherence vs. accuracy. |
+| [Meta-reasoning](75-meta-reasoning.md) | Meta-reasoning selects *which* mode to use; debiasing audits *any* mode's output for predictable errors. Meta-reasoning: "What tool should I use?" Debiasing: "Is this tool's output trustworthy?" |
+| [Calibration](76-calibration-epistemic-humility.md) | Calibration measures accuracy over many judgments (long-run tracking); debiasing applies corrective checks to a single judgment (point intervention). You need both: calibration tells you *how* biased you typically are; debiasing catches biases *now*. |
+| [Red-teaming](79-adversarial-red-team.md) | Red-teaming assumes an external adversary attacking your system; debiasing assumes your own cognition is the adversary. Red-teaming: "How would an attacker break this?" Debiasing: "How is my own mind breaking this?" |
+| [Heuristic reasoning](53-heuristic.md) | Heuristics are the fast-and-frugal shortcuts (System 1); debiasing is the slow audit that catches their errors (System 2). Heuristics are the defendant; debiasing is the prosecutor. |
+| [Abductive reasoning](13-abductive.md) | Abduction generates hypotheses; debiasing prevents "story bias" from selecting the most narratively appealing rather than best-supported hypothesis. Apply debiasing *after* abduction, before committing. |
+| [Bayesian reasoning](11-bayesian-probabilistic.md) | Bayesian reasoning is the normative standard for belief updating; debiasing catches departures from that standard (base-rate neglect, conservatism, representativeness). Debiasing ensures your actual updates approximate Bayesian updates. |
+| [Reference-class forecasting](18-reference-class-outside-view.md) | Reference-class forecasting is *one technique* used in debiasing (step 1: anchor on base rate). Debiasing is the broader discipline; reference-class is a specific tool within it. |
 
 **Common confusions:**
 
-1. *Debiasing vs. calibration:* Calibration tracks long-run accuracy ("Am I right 80% of the time when I say 80%?"); debiasing intervenes on a single decision ("Am I making a predictable error right now?"). You can be well-calibrated on average but still need debiasing on any specific high-stakes call.
+1. *Debiasing vs. calibration:* Calibration tracks long-run accuracy; debiasing intervenes on a single decision. You can be well-calibrated on average but still need debiasing on any specific high-stakes call. Think of calibration as your batting average and debiasing as your at-bat checklist.
 
-2. *Debiasing vs. red-teaming:* Red-teaming asks "how would an attacker break this?" Debiasing asks "how is my own reasoning broken?" Both are adversarial but the threat model differs. Use red-teaming for security/robustness; use debiasing for all decisions.
+2. *Debiasing vs. red-teaming:* Red-teaming asks "how would an attacker break this?" Debiasing asks "how is my own reasoning broken?" Both are adversarial audits, but the threat model differs: external adversary vs. internal cognitive failure.
 
-3. *Debiasing vs. skepticism:* Skepticism suspends judgment indefinitely; debiasing applies specific corrections and then commits. The goal isn't doubt for doubt's sake—it's structured doubt that terminates in better decisions.
+3. *Debiasing vs. critical thinking:* "Critical thinking" is a vague umbrella term. Debiasing is specific: it targets *predictable* cognitive errors with *named* corrective procedures. Saying "think critically" is not debiasing; running the 7-step checklist is.
 
 ## Best for
 
 - **High-stakes one-shot decisions** — where you can't rely on averaging over many trials
-- **Forecasting and estimation** — where base-rate neglect and overconfidence dominate errors
+- **Forecasting & estimation** — where base-rate neglect and overconfidence dominate errors
 - **Incident postmortems** — where hindsight bias distorts root-cause analysis
 - **Investment / resource allocation** — where confirmation bias anchors on early signals
 - **Leadership reviews** — where authority gradients suppress disconfirmation
-- **Hiring and promotion** — where first impressions and halo effects dominate
-- **Strategic planning** — where motivated reasoning distorts threat assessment
-- **Medical diagnosis** — where availability bias overweights recent cases
+- **Hiring decisions** — where first impressions anchor subsequent evaluation
+- **Strategic planning** — where optimism bias and planning fallacy inflate projections
+- **Code review** — where availability bias favors recently seen patterns
 
 ## Common failure mode
 
-**Ritualized checklists that don't change conclusions.** Going through the motions—writing "base rate: N/A" or "alternatives: none convincing"—without genuine consideration.
+**Ritualized checklists that don't change conclusions.** Going through the motions—writing "base rate: N/A" or "alternatives: none convincing"—without genuine consideration. The checklist becomes a box-ticking exercise that provides false assurance.
 
 ### Detection signals
 
 - Checklist items are copy-pasted from previous decisions
 - Alternative hypotheses are strawmen dismissed in one sentence
-- Premortem lists only external/uncontrollable causes
+- Premortem lists only external/uncontrollable causes ("market conditions," "bad luck")
 - No decision was ever reversed or modified by the checklist
-- Disconfirmation step says "looked and found nothing" without specifying what was looked for
-- Same person always fills out the checklist (no independent perspectives)
-- Checklist completed after decision already made (post-hoc rationalization)
+- Time spent on debiasing < 5 minutes for high-stakes decisions
+- Disconfirmation tests are hypothetical only (never actually searched for)
+- The same person always plays devil's advocate (role becomes theatrical)
+- Base rates are "estimated" without consulting actual data
 
 ### Mitigations
 
-1. **Require at least one judgment change per quarter** — Track whether debiasing ever shifted a decision. If never, the process is theatrical.
-   - *Test:* In the last 3 months, what decision did debiasing change?
+1. **Require at least one judgment change per quarter** — Track whether debiasing ever shifted a decision. If never, the process is theatrical. Set a quota: if 0 reversals in Q, the process needs repair.
+   - *Test:* When did debiasing last change a decision?
 
-2. **Rotate devil's advocate** — Assign someone to argue for the second-best alternative; rotate the role so it's not always the same skeptic.
-   - *Test:* Who argued against the winning hypothesis this time?
+2. **Rotate devil's advocate** — Assign someone to argue for the second-best alternative; rotate the role so it's not always the same skeptic. The advocate must present the strongest case they can, not a strawman.
+   - *Test:* Could the advocate's case convince an outsider?
 
-3. **Blind elicitation** — Collect individual base-rate estimates before group discussion to prevent anchoring on the first speaker.
-   - *Test:* Did everyone write their estimate before discussion?
+3. **Blind elicitation** — Collect individual base-rate estimates before group discussion to prevent anchoring on the first speaker or the senior person. Reveal estimates simultaneously.
+   - *Test:* Did everyone commit to their estimate before seeing others'?
 
-4. **Time-box but enforce** — Debiasing should take 10-15 min, not 2 hours—but those 10 min must happen before commitment, not after.
-   - *Test:* Was the checklist completed before or after the decision?
+4. **Time-box but enforce** — Debiasing should take 10-15 min, not 2 hours—but those 10 min must happen *before* commitment, not after. Schedule debiasing as a required meeting segment, not an optional add-on.
+   - *Test:* Is debiasing on the calendar before the decision meeting?
 
-5. **Require specificity** — Reject vague entries. "Alternatives: none convincing" is not acceptable; must list 3 specific alternatives with specific reasons for lower plausibility.
-   - *Test:* Could someone reconstruct your reasoning from the checklist?
+5. **Require evidence of disconfirmation search** — Specifying disconfirming observations isn't enough; you must actually look for them. Document what you searched and what you found.
+   - *Test:* Can you show the search results?
 
-6. **Track disconfirmation hit rate** — If you never find disconfirming evidence, either you're very good or you're not really looking. Check by random audit.
-   - *Test:* In the last 10 decisions, how many times did disconfirmation search find something?
-
-7. **Separate checklist-filler from decision-maker** — Have one person complete debiasing, another make the decision. The decision-maker must respond to each flag.
-   - *Test:* Did the decision-maker explicitly address each debiasing finding?
+6. **Audit the audits** — Periodically review past debiasing artifacts: Were base rates accurate? Did premortems predict actual failures? Did disconfirmation tests catch errors? Learn from the gaps.
+   - *Test:* What's your debiasing hit rate?
 
 ## Anti-patterns to avoid
 
 | Anti-pattern | What it looks like | Fix |
 |--------------|-------------------|-----|
-| **Checkbox theater** | Checklist completed in 2 minutes with no substance | Set minimum time (10 min) and require specific entries |
-| **Strawman alternatives** | "Alternative: maybe it's aliens" (easily dismissed) | Require at least one alternative you'd prefer not be true |
-| **Hindsight premortem** | Premortem written after outcome known | Time-stamp and lock before decision |
-| **Motivated disconfirmation** | "Looked for disconfirmation, found none" with no specifics | Specify exactly what you looked for and where |
-| **Authority override** | Senior person dismisses checklist findings without engagement | Require written response to each flag |
-| **One-time event** | Debiasing applied once, never tracked | Aggregate and review quarterly |
-| **Post-hoc rationalization** | Checklist filled out after decision to justify it | Hard rule: checklist before decision, or decision reverts |
+| **Box-ticking** | Checklist completed in <2 min for complex decision | Minimum time threshold; require written rationale |
+| **Strawman alternatives** | "Alternatives: (b) do nothing, (c) do something stupid" | Alternatives must be positions a smart person could hold |
+| **External-only premortem** | Failure causes are all outside your control | Require >=1 internal/controllable cause per premortem |
+| **Hypothetical disconfirmation** | "I would change my mind if X" but never search for X | Require evidence of actual search |
+| **Seniority anchoring** | Senior person speaks first, others anchor on their view | Blind elicitation; junior speaks first |
+| **Debiasing theater** | Process exists for appearance, not effect | Track decision reversals; require periodic audits |
+| **Confirmation by exhaustion** | "We looked everywhere and found nothing against it" | Specify what disconfirmation *would* look like before searching |
+| **One-and-done** | Debiasing applied once at decision point, never revisited | Schedule re-evaluation for long-running decisions |
 
-## Bias quick-reference
+## When debiasing backfires
 
-| Bias | What it is | Debiasing countermeasure |
-|------|-----------|-------------------------|
-| **Anchoring** | Over-relying on first information received | Elicit estimates before sharing; adjust deliberately from base rate |
-| **Availability** | Overweighting vivid/recent examples | Ask "What's the base rate?" before recalling examples |
-| **Confirmation** | Seeking evidence that supports existing beliefs | Force disconfirmation search; assign devil's advocate |
-| **Hindsight** | "I knew it all along" after learning outcome | Pre-commit to predictions; lock before outcome |
-| **Overconfidence** | Certainty exceeds accuracy | Track calibration; widen confidence intervals |
-| **Planning fallacy** | Underestimating time/cost/risk | Use reference-class forecasting; add buffer |
-| **Sunk cost** | Continuing due to past investment | Ask "If starting fresh, would I choose this?" |
-| **Fundamental attribution** | Blaming individuals over systems | Ask "What system produced this outcome?" |
-| **Halo effect** | One positive trait colors all judgments | Evaluate dimensions independently |
-| **Groupthink** | Conformity suppresses dissent | Anonymous input; rotate devil's advocate |
+Debiasing is not free. Costs to watch for:
+
+1. **Analysis paralysis** — Endless alternative-generation prevents timely decisions. *Fix:* Time-box strictly; satisfice on meta-questions.
+
+2. **False humility** — Excessive uncertainty when action is needed. *Fix:* Debiasing produces better judgments, not perfect ones; decide anyway.
+
+3. **Process overhead** — Debiasing overhead exceeds decision stakes. *Fix:* Scale effort to stakes; skip formal debiasing for low-stakes calls.
+
+4. **Skepticism spiral** — Doubting everything, including valid evidence. *Fix:* Debiasing targets *predictable* errors, not all beliefs.
+
+**Rule of thumb:** Apply full debiasing protocol to top 20% of decisions by stakes/irreversibility. For routine decisions, use abbreviated checklist: base rate + one alternative + one disconfirmation test.
 
 ## Related modes
 
@@ -182,6 +199,7 @@ Unlike reasoning modes that produce conclusions, debiasing *audits* conclusions.
 - [Adversarial / red-team reasoning](79-adversarial-red-team.md) — structured external criticism (vs. debiasing's internal audit)
 - [Meta-reasoning](75-meta-reasoning.md) — choosing reasoning modes (debiasing audits their outputs)
 - [Reference-class forecasting](18-reference-class-outside-view.md) — base-rate anchoring technique used in step 1
-- [Abductive reasoning](13-abductive.md) — hypothesis generation that debiasing forces to be plural
-- [Reflective equilibrium](77-reflective-equilibrium.md) — seeking coherence (vs. debiasing's accuracy focus)
-- [Decision-theoretic reasoning](45-decision-theoretic.md) — optimal choice under uncertainty (debiasing audits its inputs)
+- [Abductive reasoning](13-abductive.md) — hypothesis generation that debiasing stress-tests for story bias
+- [Bayesian probabilistic reasoning](11-bayesian-probabilistic.md) — normative standard that debiasing helps approximate
+- [Decision-theoretic reasoning](45-decision-theoretic.md) — decisions that benefit from pre-commitment debiasing
+- [Satisficing](51-satisficing.md) — "good enough" reasoning that applies to debiasing effort itself

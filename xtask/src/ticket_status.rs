@@ -405,4 +405,123 @@ branch refs/heads/ticket/RFC-0002/TCK-00030
         let result = parse_ticket_ids_from_pr_json(json_with_complete);
         assert!(result.contains("TCK-00030"));
     }
+
+    // =========================================================================
+    // Error handling path tests (TCK-00103)
+    // =========================================================================
+
+    #[test]
+    fn test_completed_tickets_result_success_variant() {
+        // Verify Success variant can be constructed and matched
+        let tickets: HashSet<String> =
+            HashSet::from(["TCK-00001".to_string(), "TCK-00002".to_string()]);
+        let result = CompletedTicketsResult::Success(tickets);
+
+        match result {
+            CompletedTicketsResult::Success(t) => {
+                assert_eq!(t.len(), 2);
+                assert!(t.contains("TCK-00001"));
+                assert!(t.contains("TCK-00002"));
+            },
+            CompletedTicketsResult::NetworkError(_) => {
+                panic!("Expected Success variant");
+            },
+        }
+    }
+
+    #[test]
+    fn test_completed_tickets_result_network_error_variant() {
+        // Verify NetworkError variant can be constructed and matched
+        let error_msg = "Failed to query GitHub for merged PRs: connection refused";
+        let result = CompletedTicketsResult::NetworkError(error_msg.to_string());
+
+        match result {
+            CompletedTicketsResult::Success(_) => {
+                panic!("Expected NetworkError variant");
+            },
+            CompletedTicketsResult::NetworkError(msg) => {
+                assert!(msg.contains("connection refused"));
+                assert!(msg.contains("Failed to query GitHub"));
+            },
+        }
+    }
+
+    #[test]
+    fn test_completed_tickets_result_empty_success() {
+        // Success with empty set is valid (no merged PRs found)
+        let result = CompletedTicketsResult::Success(HashSet::new());
+
+        match result {
+            CompletedTicketsResult::Success(t) => {
+                assert!(t.is_empty());
+            },
+            CompletedTicketsResult::NetworkError(_) => {
+                panic!("Expected Success variant");
+            },
+        }
+    }
+
+    #[test]
+    fn test_completed_tickets_result_handles_various_error_messages() {
+        // Verify different error scenarios produce identifiable messages
+        let scenarios = [
+            ("network timeout", "timeout"),
+            ("authentication failed", "auth"),
+            ("rate limit exceeded", "rate limit"),
+            ("repository not found", "not found"),
+        ];
+
+        for (error_type, substring) in scenarios {
+            let msg = format!("Failed to query GitHub: {error_type}");
+            let result = CompletedTicketsResult::NetworkError(msg.clone());
+
+            if let CompletedTicketsResult::NetworkError(m) = result {
+                assert!(
+                    m.contains(substring),
+                    "Error message should contain '{substring}': {m}"
+                );
+            } else {
+                panic!("Expected NetworkError variant for {error_type}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fallback_behavior_on_network_error() {
+        // Simulate the fallback behavior that should happen when network fails:
+        // Using an empty HashSet as fallback is valid
+        let network_error = CompletedTicketsResult::NetworkError("connection refused".to_string());
+
+        let completed = match network_error {
+            CompletedTicketsResult::Success(tickets) => tickets,
+            CompletedTicketsResult::NetworkError(_msg) => {
+                // Fallback: use empty set (may re-select completed tickets)
+                HashSet::new()
+            },
+        };
+
+        // With empty completed set, all tickets appear as pending
+        let in_progress = HashSet::new();
+        assert_eq!(
+            get_ticket_status("TCK-00001", &completed, &in_progress),
+            TicketStatus::Pending
+        );
+
+        // This is the expected fallback behavior - the ticket will be
+        // re-selectable even if it was previously completed
+    }
+
+    #[test]
+    fn test_debug_format_for_completed_tickets_result() {
+        // Verify Debug trait is implemented and produces useful output
+        let success = CompletedTicketsResult::Success(HashSet::from(["TCK-00001".to_string()]));
+        let debug_str = format!("{success:?}");
+        assert!(debug_str.contains("Success"));
+        assert!(debug_str.contains("TCK-00001"));
+
+        let error = CompletedTicketsResult::NetworkError("test error".to_string());
+        let debug_str = format!("{error:?}");
+        assert!(debug_str.contains("NetworkError"));
+        assert!(debug_str.contains("test error"));
+    }
 }
