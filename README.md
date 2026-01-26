@@ -174,8 +174,6 @@ Sends an IPC shutdown request to the daemon.
 
 All process commands operate on process **names** from `[[processes]]` in `ecosystem.toml`.
 
-Note: the CLI help currently mentions a special name `all`, but the daemon treats it as a literal process name (support for `all` is planned).
-
 #### `apm2 list` (alias: `apm2 ls`)
 
 Lists all configured processes and a high-level summary:
