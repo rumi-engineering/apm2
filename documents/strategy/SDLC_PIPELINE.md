@@ -17,7 +17,7 @@ This document defines the normative SDLC pipeline for the APM2 project, spanning
 
 ---
 
-## 1. Idea Compilation ([`idea-compiler`](../skills/idea-compiler/SKILL.md))
+## 1. Idea Compilation (`idea-compiler`)
 
 The entry point for any change. This phase grounds a high-level intent into the existing codebase context to prevent "Cousin Abstractions" (duplicate work).
 
@@ -25,7 +25,7 @@ The entry point for any change. This phase grounds a high-level intent into the 
 *   **Key Output:** A structured PRD or RFC that references existing components and extension points.
 *   **Command:** `/idea-compiler --prd PRD-XXXX`
 
-## 2. PRD Governance ([`prd-review`](../skills/prd-review/SKILL.md))
+## 2. PRD Governance (`prd-review`)
 
 Ensures that requirements are falsifiable, testable, and aligned with the North Star vision.
 
@@ -33,7 +33,7 @@ Ensures that requirements are falsifiable, testable, and aligned with the North 
 *   **Depth:** Scales from `LIGHT` to `COUNCIL` (3-agent deliberation) based on the change's blast radius.
 *   **Command:** `/prd-review [refine|review] PRD-XXXX`
 
-## 3. RFC & Ticket Orchestration ([`rfc-council`](../skills/rfc-council/SKILL.md))
+## 3. RFC & Ticket Orchestration (`rfc-council`)
 
 The technical blueprinting phase. Decomposes the PRD into "Agent-Native" engineering tickets.
 
@@ -41,7 +41,7 @@ The technical blueprinting phase. Decomposes the PRD into "Agent-Native" enginee
 *   **Anti-Cousin Gate:** Every file path in a ticket MUST be mapped to the CCP atlas or explicitly justified as a net-new substrate.
 *   **Command:** `/rfc-council [create|refine|review] RFC-XXXX`
 
-## 4. Implementation ([`dev-eng-ticket`](../skills/dev-eng-ticket/SKILL.md))
+## 4. Implementation (`dev-eng-ticket`)
 
 The autonomous engineering phase where the heavy lifting happens.
 
@@ -49,7 +49,7 @@ The autonomous engineering phase where the heavy lifting happens.
 *   **Output:** Functional code, unit tests, and an **Evidence Script** documenting successful implementation.
 *   **Command:** `/dev-eng-ticket TCK-XXXXX`
 
-## 5. Verification ([`aat`](../skills/aat/SKILL.md))
+## 5. Verification (`aat`)
 
 Agent Acceptance Testing (AAT) uses hypothesis-driven testing to verify the PR before it can be merged.
 
