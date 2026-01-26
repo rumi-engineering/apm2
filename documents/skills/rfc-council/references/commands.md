@@ -1,12 +1,18 @@
 # RFC Council Commands
 
-commands[5]:
+commands[7]:
   - name: create
     command: "/rfc-council create PRD-XXXX"
     purpose: "Generate RFC v0 (Discovery) from PRD."
   - name: evolve
     command: "/rfc-council RFC-XXXX"
     purpose: "Auto-advance RFC through lifecycle: v0 -> v2 (EXPLORE), v2 -> v4 (FINALIZE), v4 -> Tickets (DECOMPOSE)."
+  - name: explore
+    command: "/rfc-council explore RFC-XXXX"
+    purpose: "Explicitly run EXPLORE mode to advance v0 -> v2 with codebase investigation."
+  - name: finalize
+    command: "/rfc-council finalize RFC-XXXX"
+    purpose: "Explicitly run FINALIZE mode to advance v2 -> v4 with forced convergence."
   - name: review
     command: "/rfc-council review RFC-XXXX"
     purpose: "Consolidated review and refinement. Checks for existing evidence, runs gates, remediates MAJOR findings, and emits a new evidence bundle."
@@ -23,18 +29,39 @@ commands[5]:
 
 ### Lifecycle Progression
 
+The RFC evolves through versioned phases. Each invocation advances to the next phase:
+
 ```bash
-# 1. Initialize RFC v0 from PRD
+# 1. Initialize RFC v0 from PRD (GENESIS phase)
 /rfc-council create PRD-0005
+# Output: documents/rfcs/RFC-0010/ created with version: v0
 
-# 2. Advance v0 -> v2 (Exploration Phase)
-/rfc-council RFC-0010 
-
-# 3. Advance v2 -> v4 (Finalization Phase)
+# 2. Advance v0 -> v2 (EXPLORATION phase)
 /rfc-council RFC-0010
+# Performs codebase investigation, grounds design decisions
+# Output: RFC-0010/00_meta.yaml updated to version: v2
 
-# 4. Generate Tickets from v4 (Decomposition Phase)
+# 3. Advance v2 -> v4 (CLOSURE phase)
 /rfc-council RFC-0010
+# Forces convergence on all open questions
+# Output: RFC-0010/00_meta.yaml updated to version: v4
+
+# 4. Generate Tickets from v4 (DECOMPOSITION phase)
+/rfc-council RFC-0010
+# Creates atomic engineering tickets
+# Output: documents/work/tickets/TCK-*.yaml files
+```
+
+### Explicit Mode Selection
+
+Override automatic mode selection when needed:
+
+```bash
+# Force EXPLORE mode on any RFC (useful for re-investigation)
+/rfc-council explore RFC-0010
+
+# Force FINALIZE mode (skip exploration if already grounded)
+/rfc-council finalize RFC-0010
 ```
 
 ### Consolidated Review & Refinement

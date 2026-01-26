@@ -15,12 +15,13 @@ decision_tree:
 
         - id: EXPLORATORY_COUNCIL
           action: |
-            Invoke COUNCIL_PROTOCOL with specialized SA roles for v0->v2:
+            Invoke COUNCIL_PROTOCOL with lifecycle-adaptive SA roles for v0->v2:
             - SA-1 (Rigorist): Validate design hypotheses against existing system traits and patterns.
             - SA-2 (Feasibility): Perform mock implementation runs to verify technical grounding.
             - SA-3 (Anti-Cousin): Identify exact extension points in the codebase to prevent parallel abstractions.
 
-            Constraint: Each SA selects 3 RANDOM reasoning modes + 5 specialized modes.
+            Constraint: Each SA selects **5 strictly random reasoning modes** from modes-of-reasoning
+            (see COUNCIL_PROTOCOL.md Step 3: Stochastic Mode Selection for algorithm).
 
         - id: CODEBASE_INVESTIGATION
           action: |

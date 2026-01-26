@@ -104,20 +104,47 @@ anti-cousin enforcement.
 
 ## Modes
 
-| Mode | Input | Output | Purpose |
-|------|-------|--------|---------|
-| CREATE | PRD-XXXX | RFC v0 | Generate discovery-focused RFC v0 from PRD |
-| EXPLORE | RFC v0 | RFC v2 | Codebase investigation to resolve open questions |
-| FINALIZE | RFC v2 | RFC v4 | Final architectural convergence and sign-off |
-| DECOMPOSE| RFC v4 | Tickets | Generate implementation-ready engineering tickets |
-| REVIEW | RFC-XXXX | Findings | Formal gate review with iterative refinement |
+| Mode | Input | Output | Version Transition | Purpose |
+|------|-------|--------|-------------------|---------|
+| CREATE | PRD-XXXX | RFC v0 | - -> v0 | Generate discovery-focused RFC v0 from PRD |
+| EXPLORE | RFC v0 | RFC v2 | v0 -> v2 | Codebase investigation to resolve open questions |
+| FINALIZE | RFC v2 | RFC v4 | v2 -> v4 | Final architectural convergence and sign-off |
+| DECOMPOSE| RFC v4 | Tickets | v4 -> Tickets | Generate implementation-ready engineering tickets |
+| REVIEW | RFC-XXXX | Findings | (any) | Formal gate review with iterative refinement |
+
+### Automatic Mode Selection
+
+When invoked with just an RFC ID (e.g., `/rfc-council RFC-0010`), the skill auto-selects the appropriate mode based on the RFC version in `00_meta.yaml`:
+
+```
+RFC v0  -> EXPLORE mode  (advance to v2)
+RFC v2  -> FINALIZE mode (advance to v4)
+RFC v4  -> DECOMPOSE mode (generate tickets)
+```
+
+This enables a simple progression: invoke `/rfc-council RFC-XXXX` repeatedly to advance the RFC through its lifecycle.
 
 ## Council Evolution Phases
 
-1. **PHASE_GENESIS (v0)**: Mapping PRD to system architecture. Identifying "Known Unknowns".
-2. **PHASE_EXPLORATION (v0->v2)**: Active codebase deep-dive. Anchoring design in existing patterns.
-3. **PHASE_CLOSURE (v2->v4)**: Forced convergence. Deferring or answering all open questions.
-4. **PHASE_DECOMPOSITION (v4)**: Creating atomic, agent-executable engineering docs.
+The RFC lifecycle progresses through versioned phases, each with distinct goals and council focus:
+
+| Phase | Version | Council Focus | Key Artifacts |
+|-------|---------|---------------|---------------|
+| **GENESIS** | v0 | Map PRD to architecture; identify "Known Unknowns" | `08_risks_and_open_questions.yaml` populated |
+| **EXPLORATION** | v0 -> v2 | Codebase deep-dive; anchor design in existing patterns | `02_design_decisions.yaml` grounded in evidence |
+| **CLOSURE** | v2 -> v4 | Forced convergence; defer or answer all open questions | All placeholders resolved; gates pass |
+| **DECOMPOSITION** | v4 | Create atomic, agent-executable engineering tickets | `documents/work/tickets/TCK-*.yaml` created |
+
+### Phase Progression Rules
+
+1. **v0 (Discovery)**: RFC created from PRD. Open questions documented but not necessarily resolved.
+2. **v2 (Grounded)**: Codebase investigation complete. Design decisions backed by evidence.
+3. **v4 (Standard)**: All open questions resolved or explicitly deferred. Ready for ticket decomposition.
+
+Each phase transition requires passing relevant gates:
+- **v0 -> v2**: GATE-TCK-CCP-MAPPING (verify codebase alignment)
+- **v2 -> v4**: All 9 gates must pass (APPROVED or APPROVED_WITH_REMEDIATION)
+- **v4 -> Tickets**: GATE-TCK-ATOMICITY and GATE-TCK-IMPLEMENTABILITY for each ticket
 
 ## Gate Structure
 

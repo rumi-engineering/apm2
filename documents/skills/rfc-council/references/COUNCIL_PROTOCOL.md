@@ -12,11 +12,21 @@ decision_tree:
 ## Overview
 
 The COUNCIL protocol is a multi-agent deliberation process designed to prevent "cognitive entropy collapse" (premature convergence on suboptimal designs). It achieves this by:
-1. Spawns 3 subagents with specialized but lifecycle-adaptive roles.
-2. **Maximum Entropy Reasoning:** Each subagent selects **5 strictly random reasoning modes** from `modes-of-reasoning/SKILL.md`. By removing fixed "specialized" modes, the council is forced to synthesize new perspectives for every session, preventing model-mode entrenchment.
-3. Subagents apply Agent-Native Software principles (Stochastic Cognition, Tool-Loops) to their analysis.
-4. Subagents execute 3 review cycles with inter-cycle onboarding notes.
-5. Findings converge through quorum voting (2/3 agreement).
+
+1. **Lifecycle-Adaptive Subagents**: Spawns 3 subagents with specialized roles that shift focus based on RFC version (v0/v2/v4).
+2. **Maximum Entropy Reasoning**: Each subagent selects **5 strictly random reasoning modes** from `modes-of-reasoning/SKILL.md`. By removing fixed "specialized" modes, the council is forced to synthesize new perspectives for every session, preventing model-mode entrenchment.
+3. **Agent-Native Principles**: Subagents apply Stochastic Cognition and Tool-Loop patterns to their analysis, treating all assessments as probabilistic.
+4. **Structured Deliberation**: 3 review cycles with inter-cycle onboarding notes enable progressive refinement.
+5. **Quorum Consensus**: Findings converge through 2/3 voting (2 of 3 agents must agree).
+
+### Why Maximum Entropy?
+
+Traditional council designs assign fixed reasoning specializations to each agent (e.g., "SA-1 always uses deductive reasoning"). This creates predictable blind spots and model-mode entrenchment. Maximum entropy selection forces:
+
+- **Perspective diversity**: Same agent applies different lenses each session
+- **Cross-pollination**: Structural rigorists must sometimes think heuristically
+- **Emergent insights**: Random mode combinations reveal unexpected connections
+- **Anti-confirmation bias**: Harder to find only what you're looking for
 
 ---
 
@@ -46,25 +56,84 @@ Spawn 3 subagents. Their specific focus shifts based on the RFC version:
 
 Each subagent selects **5 strictly random modes** from `documents/skills/modes-of-reasoning/SKILL.md`.
 
-**Constraint:** Subagents must explain how their 5 random modes interact to challenge their primary lifecycle focus. For example, SA-1 (Structural Rigorist) might be forced to use Mode 24 (Heuristic) or Mode 62 (Historical), "disturbing" their usual deductive patterns.
+**Selection Algorithm:**
+```python
+import random
+
+def select_random_modes(agent_id: str, session_seed: int) -> list[int]:
+    """
+    Select 5 strictly random reasoning modes for a subagent.
+
+    Uses session seed + agent_id for reproducibility (same session = same modes).
+    Ensures distribution across multiple categories.
+    """
+    random.seed(f"{session_seed}-{agent_id}")
+
+    # All 80 modes from modes-of-reasoning
+    all_modes = list(range(1, 81))
+
+    # Select 5 without replacement
+    selected = random.sample(all_modes, 5)
+
+    return sorted(selected)
+```
+
+**Constraint:** Subagents must explain how their 5 random modes interact to challenge their primary lifecycle focus. For example, SA-1 (Structural Rigorist) might be forced to use Mode 53 (Heuristic) or Mode 62 (Narrative), "disturbing" their usual deductive patterns.
+
+**Category Distribution Check:** After selection, verify at least 2 different categories are represented:
+- Formal (1-8)
+- Ampliative (9-19)
+- Uncertainty (20-24)
+- Vagueness (25-29)
+- Inconsistency & Defaults (30-36)
+- Causal & Explanatory (37-43)
+- Practical (44-54)
+- Strategic & Social (55-58)
+- Dialectical & Rhetorical (59-63)
+- Modal & Temporal (64-67)
+- Domain-Specific (68-74)
+- Meta-Level (75-80)
 
 Despite the randomness of the reasoning *lens*, subagents must still produce their assigned artifacts by applying their random modes to the task:
 
 #### SA-1: Efficacy & Structure Rigorist
 - Artifact: **Explanatory Scoring Table** (Evaluating chosen design vs. alternatives through the 5 random lenses).
+- Example: If assigned modes [6, 23, 47, 62, 79], SA-1 evaluates using Constraint Satisfiability, Maximum Entropy, Planning/Policy, Narrative, and Adversarial reasoning.
 
 #### SA-2: Implementation Feasibility
 - Artifact: **Mock Implementation Run Report** (Simulating agent logic using the 5 random lenses to identify friction points).
+- Example: If assigned modes [11, 39, 51, 70, 76], SA-2 simulates using Bayesian, Counterfactual, Satisficing, Engineering Design, and Calibration reasoning.
 
 #### SA-3: Security & Anti-Cousin Guardian
 - Artifact: **Claim-Argument-Evidence (CAE) Tree** (Building security assurance by justifying claims using the 5 random lenses).
+- Example: If assigned modes [8, 35, 49, 65, 72], SA-3 builds assurance using Counterexample-Guided, Argumentation, Robust/Worst-Case, Deontic, and Moral/Ethical reasoning.
 
 ### Step 4: Validate Mode Selection
 
-Before proceeding to CYCLE_1:
-- [ ] Each subagent has exactly 5 strictly random modes.
-- [ ] Total mode overlap across all subagents is minimized.
-- [ ] Each subagent has modes from >= 2 categories in the reasoning taxonomy.
+Before proceeding to CYCLE_1, verify the selection satisfies entropy constraints:
+
+**Validation Checklist:**
+- [ ] Each subagent has exactly 5 modes (no more, no less)
+- [ ] All 15 modes (5 × 3 agents) are selected using the stochastic algorithm
+- [ ] Each subagent has modes from >= 2 different categories
+- [ ] Total mode overlap across all subagents is <= 3 (some overlap is acceptable)
+- [ ] No subagent has all modes from a single category (prevents specialization collapse)
+
+**Validation Output (logged to council session):**
+```yaml
+mode_selection_validation:
+  session_id: COUNCIL-RFC-XXXX-TIMESTAMP
+  subagent_modes:
+    SA-1: [6, 23, 47, 62, 79]
+    SA-2: [11, 39, 51, 70, 76]
+    SA-3: [8, 35, 49, 65, 72]
+  category_coverage:
+    SA-1: [Formal, Uncertainty, Practical, Dialectical, Meta-Level]  # 5 categories
+    SA-2: [Ampliative, Causal, Practical, Domain-Specific, Meta-Level]  # 5 categories
+    SA-3: [Formal, Inconsistency, Practical, Modal, Domain-Specific]  # 5 categories
+  total_overlap: 0
+  validation_passed: true
+```
 
 ---
 
