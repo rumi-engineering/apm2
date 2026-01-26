@@ -77,4 +77,73 @@ pub enum WorkError {
     /// Protocol buffer decode error.
     #[error("protobuf decode error: {0}")]
     ProtobufDecode(#[from] prost::DecodeError),
+
+    /// PR association only allowed from `InProgress` state.
+    ///
+    /// # Security
+    ///
+    /// Restricting PR association to `InProgress` prevents an agent from
+    /// bypassing CI gating by associating a work item with a PR that has
+    /// already passed CI while the work is in `CiPending` or `Blocked` state.
+    #[error(
+        "PR association only allowed from InProgress state, work {work_id} is in {current_state}"
+    )]
+    PrAssociationNotAllowed {
+        /// The work ID.
+        work_id: String,
+        /// The current state of the work item.
+        current_state: WorkState,
+    },
+
+    /// PR number already associated with another active work item.
+    ///
+    /// # Security
+    ///
+    /// Enforces uniqueness of PR numbers across active work items to prevent
+    /// CI result confusion (contract CTR-CIQ002).
+    #[error("PR number {pr_number} is already associated with active work item {existing_work_id}")]
+    PrNumberAlreadyAssociated {
+        /// The PR number that is already in use.
+        pr_number: u64,
+        /// The work ID that already has this PR number.
+        existing_work_id: String,
+    },
+
+    /// CI-gated transition requires authorized rationale code.
+    ///
+    /// # Security
+    ///
+    /// Transitions from CI-gated states (`CiPending`) can only be performed
+    /// by the CI event processor using specific rationale codes (`ci_passed`
+    /// or `ci_failed`). This prevents agents from bypassing CI gating by
+    /// directly emitting `WorkTransitioned` events.
+    #[error(
+        "CI-gated transition from {from_state} requires authorized rationale code, got '{rationale_code}'"
+    )]
+    CiGatedTransitionUnauthorized {
+        /// The current (CI-gated) state.
+        from_state: WorkState,
+        /// The attempted target state.
+        to_state: WorkState,
+        /// The rationale code provided.
+        rationale_code: String,
+    },
+
+    /// CI-gated transition requires authorized actor.
+    ///
+    /// # Security
+    ///
+    /// Transitions from CI-gated states (`CiPending`) can only be performed
+    /// by the designated CI system actor. This prevents arbitrary agents from
+    /// bypassing CI gating by emitting `WorkTransitioned` events with the
+    /// correct rationale code but an unauthorized actor identity.
+    #[error(
+        "CI-gated transition from {from_state} requires authorized CI actor, got actor '{actor_id}'"
+    )]
+    CiGatedTransitionUnauthorizedActor {
+        /// The current (CI-gated) state.
+        from_state: WorkState,
+        /// The actor ID that attempted the transition.
+        actor_id: String,
+    },
 }

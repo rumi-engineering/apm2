@@ -1,13 +1,22 @@
 //! Tests for the work module.
 
 use super::error::WorkError;
-use super::reducer::{WorkReducer, helpers};
+use super::reducer::{CI_SYSTEM_ACTOR_ID, WorkReducer, helpers};
 use super::state::WorkState;
 use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
 fn create_event(event_type: &str, session_id: &str, payload: Vec<u8>) -> EventRecord {
     EventRecord::with_timestamp(event_type, session_id, "test-actor", payload, 1_000_000_000)
+}
+
+fn create_event_with_actor(
+    event_type: &str,
+    session_id: &str,
+    actor_id: &str,
+    payload: Vec<u8>,
+) -> EventRecord {
+    EventRecord::with_timestamp(event_type, session_id, actor_id, payload, 1_000_000_000)
 }
 
 // =============================================================================
@@ -1238,4 +1247,1028 @@ fn test_cyclic_replay_attack_prevented() {
     let work = reducer.state().get("work-1").unwrap();
     assert_eq!(work.state, WorkState::Claimed);
     assert_eq!(work.transition_count, 3);
+}
+
+// =============================================================================
+// CI-Gated Phase Transition Tests
+// =============================================================================
+
+#[test]
+fn test_work_transition_in_progress_to_ci_pending() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress (transition_count = 2)
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+
+    // Transition to CiPending (PR created, waiting for CI)
+    let ci_pending_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "CI_PENDING",
+        "pr_created",
+        2,
+    );
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", ci_pending_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::CiPending);
+    assert_eq!(work.transition_count, 3);
+    assert_eq!(work.last_rationale_code, "pr_created");
+}
+
+#[test]
+fn test_work_transition_ci_pending_to_ready_for_review() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // CI passed, transition to ReadyForReview (must use CI system actor)
+    let ready_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "ci_passed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::ReadyForReview);
+    assert_eq!(work.transition_count, 4);
+    assert_eq!(work.last_rationale_code, "ci_passed");
+}
+
+#[test]
+fn test_work_transition_ci_pending_to_blocked() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // CI failed, transition to Blocked (must use CI system actor)
+    let blocked_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "BLOCKED",
+        "ci_failed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                blocked_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Blocked);
+    assert_eq!(work.transition_count, 4);
+    assert_eq!(work.last_rationale_code, "ci_failed");
+}
+
+#[test]
+fn test_work_transition_blocked_to_ci_pending_retry() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending -> Blocked
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // CI failed, transition to Blocked (must use CI system actor)
+    let blocked_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "BLOCKED",
+        "ci_failed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                blocked_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    // Fix pushed, retry CI (transition back to CiPending)
+    // Note: Blocked -> CiPending is NOT a CI-gated transition, any actor can retry
+    let retry_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "BLOCKED",
+        "CI_PENDING",
+        "ci_retry",
+        4,
+    );
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", retry_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::CiPending);
+    assert_eq!(work.transition_count, 5);
+    assert_eq!(work.last_rationale_code, "ci_retry");
+}
+
+#[test]
+fn test_work_transition_ready_for_review_to_review() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending -> ReadyForReview
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // CI passed, transition to ReadyForReview (must use CI system actor)
+    let ready_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "ci_passed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    // Review agent claims work (not a CI-gated transition, any actor can claim)
+    let review_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "READY_FOR_REVIEW",
+        "REVIEW",
+        "review_claimed",
+        4,
+    );
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", review_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Review);
+    assert_eq!(work.transition_count, 5);
+}
+
+#[test]
+fn test_ci_pending_not_claimable() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert!(!work.state.is_claimable());
+}
+
+#[test]
+fn test_blocked_not_claimable() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending -> Blocked
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    let blocked_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "BLOCKED",
+        "ci_failed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                blocked_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert!(!work.state.is_claimable());
+}
+
+#[test]
+fn test_ready_for_review_is_claimable() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending -> ReadyForReview
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    let ready_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "ci_passed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert!(work.state.is_claimable());
+}
+
+#[test]
+fn test_claimable_work_query() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Create work items in different states
+    for i in 1..=5 {
+        let payload =
+            helpers::work_opened_payload(&format!("work-{i}"), "TICKET", vec![], vec![], vec![]);
+        reducer
+            .apply(&create_event("work.opened", "session-1", payload), &ctx)
+            .unwrap();
+    }
+
+    // Claim work-1 (no longer claimable)
+    let claim1 =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claim", 0);
+    reducer
+        .apply(&create_event("work.transitioned", "s", claim1), &ctx)
+        .unwrap();
+
+    // Get all claimable work
+    let claimable = reducer.state().claimable_work();
+    assert_eq!(claimable.len(), 4); // work-2 through work-5
+
+    // All should be in Open state
+    for work in claimable {
+        assert_eq!(work.state, WorkState::Open);
+    }
+}
+
+#[test]
+fn test_work_pr_associated() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+
+    // Verify no PR number or commit_sha initially
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.pr_number, None);
+    assert_eq!(work.commit_sha, None);
+
+    // Associate PR number
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 42, "abc123def456");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    // Verify PR number and commit_sha are set
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.pr_number, Some(42));
+    assert_eq!(work.commit_sha, Some("abc123def456".to_string()));
+}
+
+#[test]
+fn test_work_lookup_by_pr_number() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup multiple work items in InProgress state (required for PR association)
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+    setup_in_progress_work(&mut reducer, &ctx, "work-2");
+    setup_in_progress_work(&mut reducer, &ctx, "work-3");
+
+    // Associate PR numbers with work-1 and work-2
+    let pr_payload1 = helpers::work_pr_associated_payload("work-1", 100, "sha1");
+    let pr_payload2 = helpers::work_pr_associated_payload("work-2", 200, "sha2");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload1),
+            &ctx,
+        )
+        .unwrap();
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload2),
+            &ctx,
+        )
+        .unwrap();
+
+    // Lookup by PR number
+    let work100 = reducer.state().by_pr_number(100);
+    assert!(work100.is_some());
+    assert_eq!(work100.unwrap().work_id, "work-1");
+
+    let work200 = reducer.state().by_pr_number(200);
+    assert!(work200.is_some());
+    assert_eq!(work200.unwrap().work_id, "work-2");
+
+    // No PR for work-3
+    let work300 = reducer.state().by_pr_number(300);
+    assert!(work300.is_none());
+}
+
+#[test]
+fn test_ci_gated_work_query() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Create and transition work items to different CI states
+    for i in 1..=3 {
+        let payload =
+            helpers::work_opened_payload(&format!("work-{i}"), "TICKET", vec![], vec![], vec![]);
+        reducer
+            .apply(&create_event("work.opened", "session-1", payload), &ctx)
+            .unwrap();
+    }
+
+    // work-1: Open -> Claimed -> InProgress -> CiPending
+    let claim1 =
+        helpers::work_transitioned_payload_with_sequence("work-1", "OPEN", "CLAIMED", "claim", 0);
+    reducer
+        .apply(&create_event("work.transitioned", "s", claim1), &ctx)
+        .unwrap();
+    let start1 = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "start",
+        1,
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", start1), &ctx)
+        .unwrap();
+    let ci1 = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "CI_PENDING",
+        "pr_created",
+        2,
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", ci1), &ctx)
+        .unwrap();
+
+    // work-2: Open -> Claimed -> InProgress -> CiPending -> Blocked
+    let claim2 =
+        helpers::work_transitioned_payload_with_sequence("work-2", "OPEN", "CLAIMED", "claim", 0);
+    reducer
+        .apply(&create_event("work.transitioned", "s", claim2), &ctx)
+        .unwrap();
+    let start2 = helpers::work_transitioned_payload_with_sequence(
+        "work-2",
+        "CLAIMED",
+        "IN_PROGRESS",
+        "start",
+        1,
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", start2), &ctx)
+        .unwrap();
+    let ci2 = helpers::work_transitioned_payload_with_sequence(
+        "work-2",
+        "IN_PROGRESS",
+        "CI_PENDING",
+        "pr_created",
+        2,
+    );
+    reducer
+        .apply(&create_event("work.transitioned", "s", ci2), &ctx)
+        .unwrap();
+    let blocked2 = helpers::work_transitioned_payload_with_sequence(
+        "work-2",
+        "CI_PENDING",
+        "BLOCKED",
+        "ci_failed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor("work.transitioned", "s", CI_SYSTEM_ACTOR_ID, blocked2),
+            &ctx,
+        )
+        .unwrap();
+
+    // work-3 stays in Open state
+
+    // Query CI-gated work
+    let ci_gated = reducer.state().ci_gated_work();
+    assert_eq!(ci_gated.len(), 2); // work-1 (CiPending) and work-2 (Blocked)
+}
+
+#[test]
+fn test_work_aborted_from_ci_pending() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Abort from CiPending
+    let abort_payload = helpers::work_aborted_payload("work-1", "MANUAL", "cancelled_by_user");
+    reducer
+        .apply(
+            &create_event("work.aborted", "session-1", abort_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Aborted);
+    assert!(work.is_terminal());
+}
+
+#[test]
+fn test_work_aborted_from_blocked() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending -> Blocked
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    let blocked_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "BLOCKED",
+        "ci_failed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                blocked_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    // Abort from Blocked
+    let abort_payload = helpers::work_aborted_payload("work-1", "TIMEOUT", "abandoned");
+    reducer
+        .apply(
+            &create_event("work.aborted", "session-1", abort_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Aborted);
+}
+
+#[test]
+fn test_work_aborted_from_ready_for_review() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending -> ReadyForReview
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    let ready_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "ci_passed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                ready_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    // Abort from ReadyForReview
+    let abort_payload = helpers::work_aborted_payload("work-1", "MANUAL", "cancelled");
+    reducer
+        .apply(
+            &create_event("work.aborted", "session-1", abort_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Aborted);
+}
+
+/// Sets up a work item in the `CiPending` state.
+/// After this function: `transition_count` = 3
+fn setup_ci_pending_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_id: &str) {
+    setup_in_progress_work(reducer, ctx, work_id);
+
+    // transition_count = 2 after setup_in_progress_work
+    let ci_pending_payload = helpers::work_transitioned_payload_with_sequence(
+        work_id,
+        "IN_PROGRESS",
+        "CI_PENDING",
+        "pr_created",
+        2,
+    );
+    reducer
+        .apply(
+            &create_event("work.transitioned", "s", ci_pending_payload),
+            ctx,
+        )
+        .unwrap();
+}
+
+// =============================================================================
+// WorkPrAssociated Security Tests
+// =============================================================================
+
+#[test]
+fn test_pr_association_only_allowed_from_in_progress() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Create work in Open state
+    let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
+    reducer
+        .apply(
+            &create_event("work.opened", "session-1", open_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    // Try to associate PR from Open state (should fail)
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 42, "sha123");
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload),
+        &ctx,
+    );
+    assert!(matches!(
+        result,
+        Err(WorkError::PrAssociationNotAllowed { .. })
+    ));
+
+    // Verify work is still in Open state with no PR
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Open);
+    assert_eq!(work.pr_number, None);
+}
+
+#[test]
+fn test_pr_association_fails_from_ci_pending() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Verify work is in CiPending state
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::CiPending);
+
+    // Try to associate PR from CiPending state (should fail)
+    // This prevents bypassing CI gating by associating with a PR that already
+    // passed
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 99, "sha_bypass_attempt");
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload),
+        &ctx,
+    );
+    assert!(matches!(
+        result,
+        Err(WorkError::PrAssociationNotAllowed { .. })
+    ));
+}
+
+#[test]
+fn test_pr_association_fails_from_blocked() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending -> Blocked
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+    let blocked_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "BLOCKED",
+        "ci_failed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event_with_actor(
+                "work.transitioned",
+                "session-1",
+                CI_SYSTEM_ACTOR_ID,
+                blocked_payload,
+            ),
+            &ctx,
+        )
+        .unwrap();
+
+    // Verify work is in Blocked state
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Blocked);
+
+    // Try to associate PR from Blocked state (should fail)
+    // This prevents bypassing CI gating by associating with a different PR
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 99, "sha_bypass_attempt");
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload),
+        &ctx,
+    );
+    assert!(matches!(
+        result,
+        Err(WorkError::PrAssociationNotAllowed { .. })
+    ));
+}
+
+#[test]
+fn test_pr_number_uniqueness_enforced() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup two work items in InProgress state
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+    setup_in_progress_work(&mut reducer, &ctx, "work-2");
+
+    // Associate PR 100 with work-1
+    let pr_payload1 = helpers::work_pr_associated_payload("work-1", 100, "sha1");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload1),
+            &ctx,
+        )
+        .unwrap();
+
+    // Try to associate the same PR 100 with work-2 (should fail - CTR-CIQ002)
+    let pr_payload2 = helpers::work_pr_associated_payload("work-2", 100, "sha2");
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload2),
+        &ctx,
+    );
+    assert!(matches!(
+        result,
+        Err(WorkError::PrNumberAlreadyAssociated { .. })
+    ));
+
+    // Verify work-2 still has no PR
+    let work2 = reducer.state().get("work-2").unwrap();
+    assert_eq!(work2.pr_number, None);
+}
+
+#[test]
+fn test_pr_number_can_be_reused_after_terminal_state() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup work-1 in InProgress state
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+
+    // Associate PR 100 with work-1
+    let pr_payload1 = helpers::work_pr_associated_payload("work-1", 100, "sha1");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload1),
+            &ctx,
+        )
+        .unwrap();
+
+    // Abort work-1 (terminal state)
+    let abort_payload = helpers::work_aborted_payload("work-1", "MANUAL", "cancelled");
+    reducer
+        .apply(
+            &create_event("work.aborted", "session-1", abort_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    // Now work-1 is in terminal state, PR 100 should be available
+
+    // Setup work-2 in InProgress state
+    setup_in_progress_work(&mut reducer, &ctx, "work-2");
+
+    // Associate PR 100 with work-2 (should succeed - work-1 is terminal)
+    let pr_payload2 = helpers::work_pr_associated_payload("work-2", 100, "sha2");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload2),
+            &ctx,
+        )
+        .unwrap();
+
+    let work2 = reducer.state().get("work-2").unwrap();
+    assert_eq!(work2.pr_number, Some(100));
+}
+
+#[test]
+fn test_commit_sha_stored_on_pr_association() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+
+    // Associate PR with specific commit SHA
+    let commit_sha = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 42, commit_sha);
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    // Verify commit_sha is stored
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.pr_number, Some(42));
+    assert_eq!(work.commit_sha, Some(commit_sha.to_string()));
+}
+
+#[test]
+fn test_pr_association_fails_for_unknown_work() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Try to associate PR with non-existent work
+    let pr_payload = helpers::work_pr_associated_payload("unknown-work", 42, "sha123");
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload),
+        &ctx,
+    );
+    assert!(matches!(result, Err(WorkError::WorkNotFound { .. })));
+}
+
+#[test]
+fn test_pr_association_idempotent_same_pr() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+
+    // Associate PR 42 with work-1
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 42, "sha1");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload.clone()),
+            &ctx,
+        )
+        .unwrap();
+
+    // Associate the same PR again (should succeed - idempotent)
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload),
+        &ctx,
+    );
+    assert!(result.is_ok());
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.pr_number, Some(42));
+}
+
+// =============================================================================
+// CI-Gated Transition Authorization Tests
+// =============================================================================
+
+#[test]
+fn test_ci_gated_transition_requires_authorized_rationale_ci_passed() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Verify work is in CiPending state
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::CiPending);
+
+    // CI-gated transition with authorized rationale and actor (should succeed)
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "ci_passed",
+        3, // transition_count after CiPending
+    );
+    let result = reducer.apply(
+        &create_event_with_actor(
+            "work.transitioned",
+            "session-1",
+            CI_SYSTEM_ACTOR_ID,
+            payload,
+        ),
+        &ctx,
+    );
+    assert!(result.is_ok());
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::ReadyForReview);
+}
+
+#[test]
+fn test_ci_gated_transition_requires_authorized_rationale_ci_failed() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // CI-gated transition with authorized rationale and actor (should succeed)
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "BLOCKED",
+        "ci_failed",
+        3,
+    );
+    let result = reducer.apply(
+        &create_event_with_actor(
+            "work.transitioned",
+            "session-1",
+            CI_SYSTEM_ACTOR_ID,
+            payload,
+        ),
+        &ctx,
+    );
+    assert!(result.is_ok());
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Blocked);
+}
+
+#[test]
+fn test_ci_gated_transition_rejects_unauthorized_rationale() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Try to transition with unauthorized rationale (should fail)
+    // This prevents agents from bypassing CI gating by directly emitting
+    // transitions
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "manual_bypass_attempt", // Unauthorized rationale!
+        3,
+    );
+    let result = reducer.apply(
+        &create_event("work.transitioned", "session-1", payload),
+        &ctx,
+    );
+
+    // Should fail with CiGatedTransitionUnauthorized
+    assert!(matches!(
+        result,
+        Err(WorkError::CiGatedTransitionUnauthorized { .. })
+    ));
+
+    // Work should still be in CiPending state
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::CiPending);
+}
+
+#[test]
+fn test_ci_gated_transition_rejects_empty_rationale() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Try to transition with empty rationale (should fail)
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "", // Empty rationale!
+        3,
+    );
+    let result = reducer.apply(
+        &create_event("work.transitioned", "session-1", payload),
+        &ctx,
+    );
+
+    // Should fail with CiGatedTransitionUnauthorized
+    assert!(matches!(
+        result,
+        Err(WorkError::CiGatedTransitionUnauthorized { .. })
+    ));
+}
+
+#[test]
+fn test_ci_gated_transition_rejects_unauthorized_actor() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Try to transition with correct rationale but WRONG actor (should fail)
+    // This prevents agents from bypassing CI gating even with correct rationale
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "READY_FOR_REVIEW",
+        "ci_passed", // Correct rationale
+        3,
+    );
+    let result = reducer.apply(
+        // Use "malicious-agent" instead of CI_SYSTEM_ACTOR_ID
+        &create_event_with_actor("work.transitioned", "session-1", "malicious-agent", payload),
+        &ctx,
+    );
+
+    // Should fail with CiGatedTransitionUnauthorizedActor
+    assert!(matches!(
+        result,
+        Err(WorkError::CiGatedTransitionUnauthorizedActor { .. })
+    ));
+
+    // Work should still be in CiPending state
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::CiPending);
+}
+
+#[test]
+fn test_non_ci_gated_transition_allows_any_rationale() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+
+    // Non-CI-gated transition (InProgress -> Review) with arbitrary rationale
+    // (should succeed)
+    let payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "IN_PROGRESS",
+        "REVIEW",
+        "any_rationale_is_fine",
+        2,
+    );
+    let result = reducer.apply(
+        &create_event("work.transitioned", "session-1", payload),
+        &ctx,
+    );
+    assert!(result.is_ok());
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Review);
 }

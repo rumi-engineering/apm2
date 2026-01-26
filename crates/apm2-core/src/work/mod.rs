@@ -16,12 +16,30 @@
 //! WorkCompleted/WorkAborted --> Work (COMPLETED/ABORTED)
 //! ```
 //!
+//! # CI-Gated Workflow
+//!
+//! The CI-gated workflow adds additional states for PR-based work:
+//!
+//! ```text
+//! InProgress --PR created--> CiPending
+//!                            |
+//!            CI Success------+------CI Failure
+//!            v                      v
+//!       ReadyForReview          Blocked
+//!            |                      |
+//!            v                      v
+//!         Review           CiPending (retry)
+//! ```
+//!
+//! See [`ci_queue`] for CI event processing logic.
+//!
 //! # Key Concepts
 //!
 //! - **Work**: A tracked unit of work with state transitions
 //! - **`WorkState`**: The current lifecycle state of work (OPEN, CLAIMED, etc.)
 //! - **Spec Snapshot**: Hash of the specification at work creation time
 //! - **Requirement Binding**: Links work to PRD requirements
+//! - **CI Gating**: Work items can be gated on CI completion before review
 //!
 //! # Example
 //!
@@ -33,6 +51,7 @@
 //! // Apply work events from the ledger...
 //! ```
 
+pub mod ci_queue;
 mod error;
 mod reducer;
 mod state;
@@ -40,6 +59,10 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub use ci_queue::{
+    CiQueueProcessResult, CiTransitionBuilder, can_transition_from_ci, process_ci_event,
+    target_phase_for_conclusion,
+};
 pub use error::WorkError;
 pub use reducer::{WorkReducer, WorkReducerState, helpers};
 pub use state::{Work, WorkState, WorkType};

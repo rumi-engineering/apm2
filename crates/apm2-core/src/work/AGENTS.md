@@ -32,15 +32,19 @@ WorkCompleted/WorkAborted --> Work (COMPLETED/ABORTED)
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum WorkState {
-    Open,              // Work is open and available for claiming
-    Claimed,           // Work has been claimed by an agent
-    InProgress,        // Work is actively being processed
-    Review,            // Work is under review
-    NeedsInput,        // Work is blocked waiting for input
-    NeedsAdjudication, // Work requires human decision
-    Completed,         // Terminal: successfully completed
-    Aborted,           // Terminal: aborted
+    Open              = 0,  // Work is open and available for claiming
+    Claimed           = 1,  // Work has been claimed by an agent
+    InProgress        = 2,  // Work is actively being processed
+    Review            = 3,  // Work is under review
+    NeedsInput        = 4,  // Work is blocked waiting for input
+    NeedsAdjudication = 5,  // Work requires human decision
+    Completed         = 6,  // Terminal: successfully completed
+    Aborted           = 7,  // Terminal: aborted
+    CiPending         = 8,  // CI-gated: waiting for CI completion (not claimable)
+    ReadyForReview    = 9,  // CI-gated: CI passed, ready for review (claimable)
+    Blocked           = 10, // CI-gated: CI failed or blocked (not claimable)
 }
 ```
 
@@ -48,10 +52,12 @@ pub enum WorkState {
 - [INV-0101] Terminal states (`Completed`, `Aborted`) allow no further transitions
 - [INV-0102] `is_terminal()` returns true only for `Completed` and `Aborted`
 - [INV-0103] `is_active()` is the logical negation of `is_terminal()`
+- [INV-0110] Discriminant values are stable for semver compatibility
 
 **Contracts:**
 - [CTR-0101] `can_transition_to()` returns `true` only for valid state machine edges
 - [CTR-0102] `parse()` rejects unknown state strings with `WorkError::InvalidWorkState`
+- [CTR-0108] `is_claimable()` returns `true` only for `Open` and `ReadyForReview`
 
 ### `WorkType`
 
@@ -90,6 +96,8 @@ pub struct Work {
     pub evidence_ids: Vec<String>,
     pub gate_receipt_id: Option<String>,
     pub abort_reason: Option<String>,
+    pub pr_number: Option<u64>,      // CI gating: PR number for CI event matching
+    pub commit_sha: Option<String>,  // CI gating: commit SHA for CI verification
 }
 ```
 
@@ -98,6 +106,8 @@ pub struct Work {
 - [INV-0105] `transition_count` monotonically increases on each transition
 - [INV-0106] `evidence_bundle_hash` and `evidence_ids` are populated only on completion
 - [INV-0107] `abort_reason` is populated only on abort
+- [INV-0111] `pr_number` is set only via `WorkPrAssociated` event from `InProgress` state
+- [INV-0112] `commit_sha` is set together with `pr_number` for CI verification
 
 **Contracts:**
 - [CTR-0105] `Work::new()` initializes state to `Open` with `transition_count = 0`
@@ -139,10 +149,16 @@ pub enum WorkError {
     InvalidWorkType { value: String },
     SequenceMismatch { work_id: String, expected: u32, actual: u32 },
     ProtobufDecode(#[from] prost::DecodeError),
+    PrAssociationNotAllowed { work_id: String, current_state: WorkState },
+    PrNumberAlreadyAssociated { pr_number: u64, existing_work_id: String },
+    CiGatedTransitionUnauthorized { from_state: WorkState, to_state: WorkState, rationale_code: String },
+    CiGatedTransitionUnauthorizedActor { from_state: WorkState, actor_id: String },
 }
 ```
 
 ## State Machine Transitions
+
+### Standard Transitions
 
 | From | To | Condition |
 |------|----|-----------|
@@ -151,7 +167,8 @@ pub enum WorkError {
 | `Claimed` | `InProgress` | Work started |
 | `Claimed` | `Open` | Claim released |
 | `Claimed` | `Aborted` | Explicit cancellation |
-| `InProgress` | `Review` | Submitted for review |
+| `InProgress` | `Review` | Submitted for review (non-CI path) |
+| `InProgress` | `CiPending` | PR created, waiting for CI |
 | `InProgress` | `NeedsInput` | Blocked on input |
 | `InProgress` | `NeedsAdjudication` | Requires human decision |
 | `InProgress` | `Aborted` | Explicit cancellation |
@@ -162,6 +179,19 @@ pub enum WorkError {
 | `NeedsInput` | `Aborted` | Explicit cancellation |
 | `NeedsAdjudication` | `InProgress` | Decision received |
 | `NeedsAdjudication` | `Aborted` | Explicit cancellation |
+
+### CI-Gated Transitions
+
+| From | To | Condition |
+|------|----|-----------|
+| `CiPending` | `ReadyForReview` | CI passed (`CIWorkflowCompleted` with success) |
+| `CiPending` | `Blocked` | CI failed (`CIWorkflowCompleted` with failure) |
+| `CiPending` | `Aborted` | Explicit cancellation |
+| `ReadyForReview` | `Review` | Review agent claims work |
+| `ReadyForReview` | `Aborted` | Explicit cancellation |
+| `Blocked` | `CiPending` | CI retried (after fix pushed) |
+| `Blocked` | `InProgress` | Work returned to implementation |
+| `Blocked` | `Aborted` | Explicit cancellation |
 
 ## Public API
 
@@ -176,6 +206,7 @@ Applies a work event to update the projection state. Processes:
 - `work.transitioned`: Validates and applies state transition
 - `work.completed`: Transitions to `Completed` (requires evidence)
 - `work.aborted`: Transitions to `Aborted`
+- `work.pr_associated`: Associates a PR number and commit SHA with a work item (CI gating)
 
 ### `WorkReducerState::get(&self, work_id: &str) -> Option<&Work>`
 
@@ -223,6 +254,12 @@ pub fn work_aborted_payload(
     work_id: &str,
     abort_reason: &str,
     rationale_code: &str,
+) -> Vec<u8>
+
+pub fn work_pr_associated_payload(
+    work_id: &str,
+    pr_number: u64,
+    commit_sha: &str,
 ) -> Vec<u8>
 ```
 
@@ -318,6 +355,65 @@ Work cannot transition to `Completed` without evidence:
 // WorkError::CompletionWithoutEvidence
 let no_evidence = helpers::work_completed_payload("WORK-001", vec![], vec![], "");
 ```
+
+### PR Association Constraints (CI Gating)
+
+PR association is restricted to prevent CI gating bypass:
+
+1. **State Restriction**: PR association is only allowed from `InProgress` state. This prevents agents from bypassing CI gating by associating a work item with a PR that has already passed CI while in `CiPending` or `Blocked` state.
+
+```rust
+// WorkError::PrAssociationNotAllowed - work must be in InProgress
+let bad_pr = helpers::work_pr_associated_payload("WORK-001", 42, "sha123");
+// Fails if work is in CiPending, Blocked, or any other non-InProgress state
+```
+
+2. **Uniqueness Constraint (CTR-CIQ002)**: A PR number cannot be associated with multiple active work items. This prevents CI result confusion where CI events could incorrectly transition unrelated work.
+
+```rust
+// WorkError::PrNumberAlreadyAssociated - PR 42 already used by WORK-001
+let duplicate_pr = helpers::work_pr_associated_payload("WORK-002", 42, "sha456");
+```
+
+3. **Commit SHA Storage**: The commit SHA is stored alongside the PR number to enable verification that CI results match the specific commit pushed by the agent (preventing stale CI results from triggering transitions).
+
+4. **CI-Gated Transition Authorization**: Transitions from CI-gated states (`CiPending`) require BOTH:
+   - **Authorized rationale codes** (`ci_passed` or `ci_failed`) that only the CI processor emits
+   - **Authorized actor ID** (`system:ci-processor`) that identifies the CI event processor
+
+This two-layer check prevents agents from bypassing CI gating by directly emitting `WorkTransitioned` events with the correct rationale code but an unauthorized actor identity.
+
+```rust
+// WorkError::CiGatedTransitionUnauthorized - unauthorized rationale
+let bypass_attempt = helpers::work_transitioned_payload_with_sequence(
+    "WORK-001", "CI_PENDING", "READY_FOR_REVIEW", "manual_bypass", 3
+);
+// Fails because "manual_bypass" is not an authorized CI rationale code
+
+// WorkError::CiGatedTransitionUnauthorizedActor - unauthorized actor
+// Even with correct rationale, wrong actor is rejected
+let actor_bypass = helpers::work_transitioned_payload_with_sequence(
+    "WORK-001", "CI_PENDING", "READY_FOR_REVIEW", "ci_passed", 3
+);
+// Fails if signed by actor other than "system:ci-processor"
+```
+
+5. **Commit SHA Verification in CI Queue**: The CI event processor verifies that the CI event's `commit_sha` matches the work item's stored `commit_sha`. This prevents stale CI results (from old commits) from incorrectly transitioning work items that have been updated with new commits.
+
+### WorkReadyForNextPhase Event
+
+The `WorkReadyForNextPhase` event is an **audit event** emitted by the CI event processor (outside the reducer) when CI results trigger a phase transition. It is NOT processed by the `WorkReducer`.
+
+The actual state transition is done via `WorkTransitioned` events:
+- CI success: `CiPending` -> `ReadyForReview` via `WorkTransitioned`
+- CI failure: `CiPending` -> `Blocked` via `WorkTransitioned`
+
+The `WorkReadyForNextPhase` event provides audit trail for:
+- Which CI event triggered the transition
+- The previous and next phases
+- Timestamp of the transition decision
+
+This separation allows the reducer to remain focused on state management while the audit event captures the full context of CI-triggered transitions.
 
 ## Related Modules
 

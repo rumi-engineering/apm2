@@ -130,6 +130,7 @@ message WorkEvent {
     WorkTransitioned transitioned = 2;
     WorkCompleted completed = 3;
     WorkAborted aborted = 4;
+    WorkPrAssociated pr_associated = 5;
   }
 }
 
@@ -144,7 +145,9 @@ message WorkOpened {
 message WorkTransitioned {
   string work_id = 1;
   string from_state = 2;
-  string to_state = 3;  // OPEN, CLAIMED, IN_PROGRESS, REVIEW, NEEDS_INPUT, NEEDS_ADJUDICATION
+  // Valid states: OPEN, CLAIMED, IN_PROGRESS, CI_PENDING, READY_FOR_REVIEW,
+  // BLOCKED, REVIEW, NEEDS_INPUT, NEEDS_ADJUDICATION
+  string to_state = 3;
   string rationale_code = 4;
   // Previous transition count for replay protection.
   // MUST match work.transition_count before this transition.
@@ -164,6 +167,14 @@ message WorkAborted {
   string work_id = 1;
   string abort_reason = 2;  // POLICY_DENY, TIMEOUT, ENTROPY_EXCEEDED, MANUAL
   string rationale_code = 3;
+}
+
+// Emitted when a PR is created and associated with a work item.
+// This enables CI event matching for phase transitions.
+message WorkPrAssociated {
+  string work_id = 1;
+  uint64 pr_number = 2;
+  string commit_sha = 3;  // The commit SHA that triggered the CI workflow
 }
 
 // ============================================================

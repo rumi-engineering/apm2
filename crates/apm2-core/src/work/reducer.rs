@@ -11,6 +11,19 @@ use crate::events::{WorkEvent, work_event};
 use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
+/// The designated actor ID for the CI system processor.
+///
+/// Only events signed by this actor can transition work items from CI-gated
+/// states (`CiPending`). This prevents arbitrary agents from bypassing CI
+/// gating by emitting `WorkTransitioned` events.
+///
+/// # Security
+///
+/// This constant defines the system-level identity that the CI event processor
+/// must use when signing transition events. The value uses a `system:` prefix
+/// to distinguish it from regular agent identities.
+pub const CI_SYSTEM_ACTOR_ID: &str = "system:ci-processor";
+
 /// State maintained by the work reducer.
 ///
 /// Maps work IDs to their current state.
@@ -92,6 +105,51 @@ impl WorkReducerState {
             .filter(|w| w.requirement_ids.contains(&requirement_id.to_string()))
             .collect()
     }
+
+    /// Returns the work item associated with a PR number, if any.
+    ///
+    /// # CI Gating
+    ///
+    /// This method is used to match `CIWorkflowCompleted` events to work items
+    /// for phase transitions.
+    #[must_use]
+    pub fn by_pr_number(&self, pr_number: u64) -> Option<&Work> {
+        self.work_items
+            .values()
+            .find(|w| w.pr_number == Some(pr_number))
+    }
+
+    /// Returns all work items in CI-gated states (`CiPending` or `Blocked`).
+    ///
+    /// # CI Gating
+    ///
+    /// These work items are waiting for CI events to trigger phase transitions.
+    #[must_use]
+    pub fn ci_gated_work(&self) -> Vec<&Work> {
+        self.work_items
+            .values()
+            .filter(|w| {
+                matches!(
+                    w.state,
+                    crate::work::WorkState::CiPending | crate::work::WorkState::Blocked
+                )
+            })
+            .collect()
+    }
+
+    /// Returns all work items that are claimable (`Open` or `ReadyForReview`).
+    ///
+    /// # CI Gating
+    ///
+    /// Only these work items can be claimed by agents. Work items in
+    /// `CiPending` or `Blocked` states cannot be claimed.
+    #[must_use]
+    pub fn claimable_work(&self) -> Vec<&Work> {
+        self.work_items
+            .values()
+            .filter(|w| w.state.is_claimable())
+            .collect()
+    }
 }
 
 /// Reducer for work lifecycle events.
@@ -151,10 +209,17 @@ impl WorkReducer {
     }
 
     /// Handles a work transitioned event.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The transition event payload
+    /// * `timestamp` - Event timestamp
+    /// * `actor_id` - The actor ID from the event record (signer identity)
     fn handle_transitioned(
         &mut self,
         event: crate::events::WorkTransitioned,
         timestamp: u64,
+        actor_id: &str,
     ) -> Result<(), WorkError> {
         let work_id = &event.work_id;
 
@@ -207,6 +272,31 @@ impl WorkReducer {
                 from_state,
                 to_state,
             });
+        }
+
+        // Security check: CI-gated transitions require both:
+        // 1. Authorized rationale codes (ci_passed/ci_failed)
+        // 2. Authorized actor ID (system:ci-processor)
+        // This prevents agents from bypassing CI gating by directly emitting
+        // WorkTransitioned events.
+        if from_state == WorkState::CiPending {
+            // Check rationale code
+            let rationale = &event.rationale_code;
+            if rationale != "ci_passed" && rationale != "ci_failed" {
+                return Err(WorkError::CiGatedTransitionUnauthorized {
+                    from_state,
+                    to_state,
+                    rationale_code: rationale.clone(),
+                });
+            }
+
+            // Check actor ID - only the CI system processor can sign these events
+            if actor_id != CI_SYSTEM_ACTOR_ID {
+                return Err(WorkError::CiGatedTransitionUnauthorizedActor {
+                    from_state,
+                    actor_id: actor_id.to_string(),
+                });
+            }
         }
 
         // Apply the transition
@@ -297,6 +387,70 @@ impl WorkReducer {
 
         Ok(())
     }
+
+    /// Handles a work PR associated event.
+    ///
+    /// # CI Gating
+    ///
+    /// Associates a PR number with a work item, enabling CI event matching
+    /// for phase transitions.
+    ///
+    /// # Security Constraints
+    ///
+    /// - **State Restriction**: PR association is only allowed when the work
+    ///   item is in `InProgress` state. This prevents agents from bypassing CI
+    ///   gating by associating a work item with a PR that has already passed CI
+    ///   while in `CiPending` or `Blocked` state.
+    ///
+    /// - **Uniqueness Constraint (CTR-CIQ002)**: A PR number cannot be
+    ///   associated with a work item if it is already associated with another
+    ///   active (non-terminal) work item. This prevents CI result confusion.
+    fn handle_pr_associated(
+        &mut self,
+        event: &crate::events::WorkPrAssociated,
+    ) -> Result<(), WorkError> {
+        let work_id = &event.work_id;
+        let pr_number = event.pr_number;
+        let commit_sha = &event.commit_sha;
+
+        // Security check: Verify PR number is not already associated with another
+        // active work item (CTR-CIQ002 uniqueness constraint)
+        if let Some(existing_work) = self
+            .state
+            .work_items
+            .values()
+            .find(|w| w.pr_number == Some(pr_number) && w.is_active() && w.work_id != *work_id)
+        {
+            return Err(WorkError::PrNumberAlreadyAssociated {
+                pr_number,
+                existing_work_id: existing_work.work_id.clone(),
+            });
+        }
+
+        let work =
+            self.state
+                .work_items
+                .get_mut(work_id)
+                .ok_or_else(|| WorkError::WorkNotFound {
+                    work_id: work_id.clone(),
+                })?;
+
+        // Security check: PR association only allowed from InProgress state.
+        // This prevents bypassing CI gating by associating with a PR that has
+        // already passed CI while in CiPending or Blocked state.
+        if work.state != WorkState::InProgress {
+            return Err(WorkError::PrAssociationNotAllowed {
+                work_id: work_id.clone(),
+                current_state: work.state,
+            });
+        }
+
+        // Set the PR number and commit SHA for CI event matching
+        work.pr_number = Some(pr_number);
+        work.commit_sha = Some(commit_sha.clone());
+
+        Ok(())
+    }
 }
 
 impl Reducer for WorkReducer {
@@ -315,12 +469,16 @@ impl Reducer for WorkReducer {
 
         let work_event = WorkEvent::decode(&event.payload[..])?;
         let timestamp = event.timestamp_ns;
+        let actor_id = &event.actor_id;
 
         match work_event.event {
             Some(work_event::Event::Opened(e)) => self.handle_opened(e, timestamp),
-            Some(work_event::Event::Transitioned(e)) => self.handle_transitioned(e, timestamp),
+            Some(work_event::Event::Transitioned(e)) => {
+                self.handle_transitioned(e, timestamp, actor_id)
+            },
             Some(work_event::Event::Completed(e)) => self.handle_completed(e, timestamp),
             Some(work_event::Event::Aborted(e)) => self.handle_aborted(e, timestamp),
+            Some(work_event::Event::PrAssociated(ref e)) => self.handle_pr_associated(e),
             None => Ok(()),
         }
     }
@@ -343,7 +501,8 @@ pub mod helpers {
     use prost::Message;
 
     use crate::events::{
-        WorkAborted, WorkCompleted, WorkEvent, WorkOpened, WorkTransitioned, work_event,
+        WorkAborted, WorkCompleted, WorkEvent, WorkOpened, WorkPrAssociated, WorkTransitioned,
+        work_event,
     };
 
     /// Creates a `WorkOpened` event payload.
@@ -450,6 +609,26 @@ pub mod helpers {
         };
         let event = WorkEvent {
             event: Some(work_event::Event::Aborted(aborted)),
+        };
+        event.encode_to_vec()
+    }
+
+    /// Creates a `WorkPrAssociated` event payload.
+    ///
+    /// # CI Gating
+    ///
+    /// This event associates a PR number with a work item, enabling CI event
+    /// matching for phase transitions. Should be emitted when an agent creates
+    /// a PR for a work item.
+    #[must_use]
+    pub fn work_pr_associated_payload(work_id: &str, pr_number: u64, commit_sha: &str) -> Vec<u8> {
+        let pr_associated = WorkPrAssociated {
+            work_id: work_id.to_string(),
+            pr_number,
+            commit_sha: commit_sha.to_string(),
+        };
+        let event = WorkEvent {
+            event: Some(work_event::Event::PrAssociated(pr_associated)),
         };
         event.encode_to_vec()
     }
