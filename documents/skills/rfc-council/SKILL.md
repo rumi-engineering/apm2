@@ -106,8 +106,18 @@ anti-cousin enforcement.
 
 | Mode | Input | Output | Purpose |
 |------|-------|--------|---------|
-| CREATE | PRD-XXXX | RFC + Tickets | Generate RFC and tickets from PRD |
-| REVIEW | RFC-XXXX | Findings Bundle + Remediation | Formal gate review with iterative refinement |
+| CREATE | PRD-XXXX | RFC v0 | Generate discovery-focused RFC v0 from PRD |
+| EXPLORE | RFC v0 | RFC v2 | Codebase investigation to resolve open questions |
+| FINALIZE | RFC v2 | RFC v4 | Final architectural convergence and sign-off |
+| DECOMPOSE| RFC v4 | Tickets | Generate implementation-ready engineering tickets |
+| REVIEW | RFC-XXXX | Findings | Formal gate review with iterative refinement |
+
+## Council Evolution Phases
+
+1. **PHASE_GENESIS (v0)**: Mapping PRD to system architecture. Identifying "Known Unknowns".
+2. **PHASE_EXPLORATION (v0->v2)**: Active codebase deep-dive. Anchoring design in existing patterns.
+3. **PHASE_CLOSURE (v2->v4)**: Forced convergence. Deferring or answering all open questions.
+4. **PHASE_DECOMPOSITION (v4)**: Creating atomic, agent-executable engineering docs.
 
 ## Gate Structure
 

@@ -1,0 +1,58 @@
+schema_version: "2026-01-25"
+template_version: "2026-01-25"
+
+ticket:
+  id: TCK-00123
+  title: "Implement RFC Council Evolution and Human Docs Skill"
+  status: IN_PROGRESS
+  rfc_id: MAINTENANCE
+  requirement_ids:
+    - MAINT-XTASK-EVOLVE
+  depends_on: []
+
+implementation:
+  summary: |
+    Refactor the RFC Council skill to support versioned discovery-to-decomposition lifecycle (v0-v4) and enhance the COUNCIL protocol with maximum entropy reasoning. Refine the Human Docs Update skill for better git normalization and AI review automation.
+
+  files_to_modify:
+    - path: "documents/skills/rfc-council/SKILL.md"
+      changes: "Update modes and evolution phases"
+    - path: "documents/skills/rfc-council/references/COUNCIL_PROTOCOL.md"
+      changes: "Implement 5 random reasoning modes and lifecycle focus"
+    - path: "documents/skills/rfc-council/references/rfc-council-workflow.md"
+      changes: "Add version-based branching"
+    - path: "documents/skills/rfc-council/references/commands.md"
+      changes: "Update commands for lifecycle progression"
+    - path: "documents/skills/human-docs-update/SKILL.md"
+      changes: "Refine overview and success criteria"
+    - path: "documents/skills/human-docs-update/references/workflow.md"
+      changes: "Add cargo xtask review commands"
+    - path: "documents/skills/human-docs-update/references/commands.md"
+      changes: "Add review commands and force-with-lease"
+
+  files_to_create:
+    - path: "documents/skills/rfc-council/references/exploratory-mode.md"
+      purpose: "Logic for v0 -> v2 transitions"
+    - path: "documents/skills/rfc-council/references/closure-mode.md"
+      purpose: "Logic for v2 -> v4 transitions"
+
+  implementation_steps:
+    - step: 1
+      action: "Refactor RFC Council lifecycle logic"
+    - step: 2
+      action: "Implement Stochastic Mode Selection in Council Protocol"
+    - step: 3
+      action: "Clean up Human Docs Update workflow"
+    - step: 4
+      action: "Verify with local tests"
+
+acceptance_criteria:
+  - criterion: "RFCs can auto-advance from v0 to v4"
+  - criterion: "Council subagents use 5 random reasoning modes"
+  - criterion: "Human Docs Update skill handles git normalization"
+  - criterion: "Regression tests for rfc-council pass"
+
+test_requirements:
+  - test_id: skill-integration-rfc-council
+    description: "Verify rfc-council skill content preserved"
+    verification_command: "cargo test -p apm2-holon --test skill_integration test_rfc_council_no_regression"

@@ -69,6 +69,32 @@ Defects in ticket atomicity and PR mergability.
 
 ---
 
+## SECURITY_DEFECT
+
+Defects in security posture and trust boundary preservation.
+
+| Subcategory | Description | Gate Source |
+|-------------|-------------|-------------|
+| BOUNDARY_VIOLATION | Ticket crosses trust boundary without validation | GATE-TCK-SECURITY-AND-INTEGRITY |
+| INVARIANT_FAILURE | Ticket violates a system security invariant | GATE-TCK-SECURITY-AND-INTEGRITY |
+| UNMITIGATED_THREAT | Identified threat (TH-XXX) lacks implementation | GATE-TCK-SECURITY-AND-INTEGRITY |
+| SECRET_EXPOSURE | Potential for credential leakage or exposure | GATE-TCK-SECURITY-AND-INTEGRITY |
+
+---
+
+## FIDELITY_DEFECT
+
+Defects in how implementation matches requirement intent.
+
+| Subcategory | Description | Gate Source |
+|-------------|-------------|-------------|
+| REQUIREMENT_GAP | Implementation fails to fulfill core requirement | GATE-TCK-REQUIREMENT-FIDELITY |
+| INTENT_MISMATCH | Implementation substance contradicts PRD intent | GATE-TCK-REQUIREMENT-FIDELITY |
+| ANOMALY_IGNORED | Implementation fails to address listed anomaly | GATE-TCK-REQUIREMENT-FIDELITY |
+| INSUFFICIENT_SUBSTANCE | Steps are logically insufficient for success | GATE-TCK-REQUIREMENT-FIDELITY |
+
+---
+
 ## FindingSignature
 
 Deterministic signature for recurrence tracking. Computed as `blake3(json({category, subcategory, gate_id, location_type}))[:16]`.
@@ -109,6 +135,14 @@ Severity is determined by category and subcategory combination.
 | ATOMICITY_DEFECT | SCOPE_TOO_LARGE | MAJOR |
 | ATOMICITY_DEFECT | MULTI_COMPONENT | MAJOR |
 | ATOMICITY_DEFECT | MERGE_UNSAFE | BLOCKER |
+| SECURITY_DEFECT | BOUNDARY_VIOLATION | BLOCKER |
+| SECURITY_DEFECT | INVARIANT_FAILURE | MAJOR |
+| SECURITY_DEFECT | UNMITIGATED_THREAT | MAJOR |
+| SECURITY_DEFECT | SECRET_EXPOSURE | BLOCKER |
+| FIDELITY_DEFECT | REQUIREMENT_GAP | BLOCKER |
+| FIDELITY_DEFECT | INTENT_MISMATCH | MAJOR |
+| FIDELITY_DEFECT | ANOMALY_IGNORED | MAJOR |
+| FIDELITY_DEFECT | INSUFFICIENT_SUBSTANCE | MAJOR |
 
 ---
 

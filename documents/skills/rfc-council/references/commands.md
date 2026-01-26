@@ -1,9 +1,12 @@
 # RFC Council Commands
 
-commands[4]:
+commands[5]:
   - name: create
     command: "/rfc-council create PRD-XXXX"
-    purpose: "Generate RFC and tickets from PRD."
+    purpose: "Generate RFC v0 (Discovery) from PRD."
+  - name: evolve
+    command: "/rfc-council RFC-XXXX"
+    purpose: "Auto-advance RFC through lifecycle: v0 -> v2 (EXPLORE), v2 -> v4 (FINALIZE), v4 -> Tickets (DECOMPOSE)."
   - name: review
     command: "/rfc-council review RFC-XXXX"
     purpose: "Consolidated review and refinement. Checks for existing evidence, runs gates, remediates MAJOR findings, and emits a new evidence bundle."
@@ -12,24 +15,26 @@ commands[4]:
     purpose: "Run full council review with 3 subagents (includes refinement)."
   - name: implicit-review
     command: "/rfc-council RFC-XXXX"
-    purpose: "Runs the consolidated review mode for the given RFC."
+    purpose: "Runs the appropriate evolution or review mode based on target state."
 
 ---
 
 ## Usage Examples
 
-### Create RFC from PRD
+### Lifecycle Progression
 
 ```bash
-# Generate RFC-0010 from PRD-0005
+# 1. Initialize RFC v0 from PRD
 /rfc-council create PRD-0005
 
-# This will:
-# 1. Read PRD-0005 files
-# 2. Generate 9 RFC YAML files in documents/rfcs/RFC-0010/
-# 3. Create ticket files in documents/work/tickets/
-# 4. Run self-review
-# 5. Commit and push
+# 2. Advance v0 -> v2 (Exploration Phase)
+/rfc-council RFC-0010 
+
+# 3. Advance v2 -> v4 (Finalization Phase)
+/rfc-council RFC-0010
+
+# 4. Generate Tickets from v4 (Decomposition Phase)
+/rfc-council RFC-0010
 ```
 
 ### Consolidated Review & Refinement
@@ -37,20 +42,6 @@ commands[4]:
 ```bash
 # Review and iteratively improve RFC-0009 tickets
 /rfc-council review RFC-0009
-
-# This will:
-# 1. Check for pre-existing evidence bundles at evidence/rfc/RFC-0009/reviews/
-# 2. Run all 7 gates
-# 3. Apply remediations for BLOCKER/MAJOR findings
-# 4. Re-run gates to verify fixes
-# 5. Emit a NEW evidence bundle at evidence/rfc/RFC-0009/reviews/rfc_review_{timestamp}.yaml
-```
-
-### Council Review
-
-```bash
-# Full council review with 3 subagents and refinement
-/rfc-council review RFC-0009 --council
 ```
 
 ---
