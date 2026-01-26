@@ -39,6 +39,7 @@ pub mod budget;
 pub mod config;
 pub mod credentials;
 pub mod crypto;
+pub mod determinism;
 pub mod events;
 pub mod evidence;
 pub mod health;
