@@ -14,7 +14,6 @@
 //!
 //! Findings are reported as warnings (not errors) to allow gradual adoption.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -680,9 +679,15 @@ fn check_no_new_module_without_justification(findings: &mut Vec<LintFinding>) ->
 
     for mod_file in new_mod_files {
         // Check if this module path is justified in any RFC
-        let is_justified = justified_paths
-            .iter()
-            .any(|justified| mod_file.contains(justified) || justified.contains(&mod_file));
+        // Use strict path matching: the justified path must end with the mod_file path
+        // or be an exact match. This prevents overly broad justifications like "mod.rs"
+        // from bypassing clutter checks for all modules.
+        let mod_path = Path::new(&mod_file);
+        let is_justified = justified_paths.iter().any(|justified| {
+            let justified_path = Path::new(justified);
+            // Exact match or justified path ends with the mod_file components
+            justified_path == mod_path || justified_path.ends_with(mod_path)
+        });
 
         if !is_justified {
             findings.push(LintFinding {
@@ -1041,12 +1046,30 @@ fn get_new_rust_files() -> Result<Vec<String>> {
     Ok(new_files)
 }
 
+/// A deletion plan entry with optional scope information.
+#[derive(Debug, Clone)]
+struct DeletionPlanEntry {
+    /// The item name (e.g., "init", `MyStruct`).
+    item_name: String,
+    /// Optional file path scope (e.g., "crates/foo/src/lib.rs").
+    /// If None, the plan applies globally (with ambiguity warning).
+    file_scope: Option<String>,
+    /// The deletion/migration plan description.
+    /// Stored for logging/debugging but not used in matching logic.
+    #[allow(dead_code)]
+    plan: String,
+}
+
 /// Load deletion plans from RFC files.
 ///
 /// Uses `serde_yaml` to parse the YAML structure and extract `deletion_plan`
-/// entries. Returns a map of item names to their deletion plan descriptions.
-fn load_rfc_deletion_plans() -> Result<HashMap<String, String>> {
-    let mut plans = HashMap::new();
+/// entries. Returns a list of deletion plan entries with optional scope.
+///
+/// Deletion plan items can be specified as:
+/// - Simple name: `init` (global, may trigger ambiguity warning)
+/// - Scoped name: `crates/foo/src/lib.rs::init` (file-scoped, preferred)
+fn load_rfc_deletion_plans() -> Result<Vec<DeletionPlanEntry>> {
+    let mut plans = Vec::new();
 
     // Scan RFC rollout/ops files for deletion_plan sections
     let pattern = "documents/rfcs/*/05_rollout_and_ops.yaml";
@@ -1059,7 +1082,22 @@ fn load_rfc_deletion_plans() -> Result<HashMap<String, String>> {
                 Ok(rollout_file) => {
                     if let Some(rollout) = rollout_file.rfc_rollout_and_ops {
                         for plan_item in &rollout.deletion_plan {
-                            plans.insert(plan_item.item.clone(), plan_item.plan.clone());
+                            // Check if the item is scoped (contains "::")
+                            let entry =
+                                if let Some((scope, name)) = plan_item.item.rsplit_once("::") {
+                                    DeletionPlanEntry {
+                                        item_name: name.to_string(),
+                                        file_scope: Some(scope.to_string()),
+                                        plan: plan_item.plan.clone(),
+                                    }
+                                } else {
+                                    DeletionPlanEntry {
+                                        item_name: plan_item.item.clone(),
+                                        file_scope: None,
+                                        plan: plan_item.plan.clone(),
+                                    }
+                                };
+                            plans.push(entry);
                         }
                     }
                 },
@@ -1076,11 +1114,36 @@ fn load_rfc_deletion_plans() -> Result<HashMap<String, String>> {
     Ok(plans)
 }
 
+/// Check if a deletion plan matches an item, considering scope.
+///
+/// Returns `Some(is_scoped)` if the plan matches, where `is_scoped` indicates
+/// whether the match was file-scoped (true) or global/unscoped (false).
+fn deletion_plan_matches(
+    plan: &DeletionPlanEntry,
+    item_name: &str,
+    file_path: &str,
+) -> Option<bool> {
+    if plan.item_name != item_name {
+        return None;
+    }
+
+    plan.file_scope.as_ref().map_or(Some(false), |scope| {
+        // Scoped match: file path must end with the scope
+        let file_path_obj = Path::new(file_path);
+        let scope_path = Path::new(scope);
+        if file_path_obj == scope_path || file_path_obj.ends_with(scope_path) {
+            Some(true) // Scoped match
+        } else {
+            None // Scope doesn't match
+        }
+    })
+}
+
 /// Check public items in a file for corresponding deletion plans.
 fn check_pub_items_for_deletion_plan(
     content: &str,
     file_path: &str,
-    deletion_plans: &HashMap<String, String>,
+    deletion_plans: &[DeletionPlanEntry],
     findings: &mut Vec<LintFinding>,
 ) {
     // Parse with syn to find pub items
@@ -1118,7 +1181,42 @@ fn check_pub_items_for_deletion_plan(
         };
 
         // Check if this item has a deletion plan
-        if !deletion_plans.contains_key(&name) {
+        // Prefer scoped matches over unscoped ones
+        let mut has_scoped_match = false;
+        let mut has_unscoped_match = false;
+
+        for plan in deletion_plans {
+            if let Some(is_scoped) = deletion_plan_matches(plan, &name, file_path) {
+                if is_scoped {
+                    has_scoped_match = true;
+                    break; // Scoped match is definitive
+                }
+                has_unscoped_match = true;
+            }
+        }
+
+        if has_scoped_match {
+            // Item has a properly scoped deletion plan - no finding
+            continue;
+        }
+
+        if has_unscoped_match {
+            // Item matched by unscoped plan - warn about ambiguity
+            findings.push(LintFinding {
+                file_path: file_path.to_string(),
+                line_number,
+                pattern: format!("pub {item_kind} {name}"),
+                message: format!(
+                    "Public {item_kind} '{name}' has unscoped deletion plan (ambiguous match)"
+                ),
+                suggestion: format!(
+                    "Use scoped deletion plan: '{file_path}::{name}' in 05_rollout_and_ops.yaml"
+                ),
+                severity: LintSeverity::Warning,
+                lint_id: Some("LINT-0015".to_string()),
+            });
+        } else {
+            // No deletion plan at all
             findings.push(LintFinding {
                 file_path: file_path.to_string(),
                 line_number,
@@ -1648,7 +1746,7 @@ pub struct PublicStruct { pub x: i32 }
 struct PrivateStruct { x: i32 }
 ";
         let mut findings = Vec::new();
-        let deletion_plans = HashMap::new(); // Empty - no plans
+        let deletion_plans: Vec<DeletionPlanEntry> = Vec::new(); // Empty - no plans
 
         check_pub_items_for_deletion_plan(content, "test.rs", &deletion_plans, &mut findings);
 
@@ -1664,25 +1762,136 @@ struct PrivateStruct { x: i32 }
     }
 
     #[test]
-    fn test_check_pub_items_with_deletion_plan() {
+    fn test_check_pub_items_with_scoped_deletion_plan() {
         let content = r"
 pub fn public_function() {}
 pub struct PublicStruct { pub x: i32 }
 ";
         let mut findings = Vec::new();
-        let mut deletion_plans = HashMap::new();
-        deletion_plans.insert(
-            "public_function".to_string(),
-            "Will be removed in v2.0".to_string(),
-        );
-        deletion_plans.insert(
-            "PublicStruct".to_string(),
-            "Deprecated, use NewStruct".to_string(),
-        );
+        let deletion_plans = vec![
+            DeletionPlanEntry {
+                item_name: "public_function".to_string(),
+                file_scope: Some("test.rs".to_string()),
+                plan: "Will be removed in v2.0".to_string(),
+            },
+            DeletionPlanEntry {
+                item_name: "PublicStruct".to_string(),
+                file_scope: Some("test.rs".to_string()),
+                plan: "Deprecated, use NewStruct".to_string(),
+            },
+        ];
 
         check_pub_items_for_deletion_plan(content, "test.rs", &deletion_plans, &mut findings);
 
-        // Should not flag items that have deletion plans
+        // Should not flag items that have scoped deletion plans
         assert_eq!(findings.len(), 0);
+    }
+
+    #[test]
+    fn test_check_pub_items_with_unscoped_deletion_plan_warns() {
+        let content = r"
+pub fn init() {}
+";
+        let mut findings = Vec::new();
+        let deletion_plans = vec![DeletionPlanEntry {
+            item_name: "init".to_string(),
+            file_scope: None, // Unscoped - global match
+            plan: "Will be removed".to_string(),
+        }];
+
+        check_pub_items_for_deletion_plan(
+            content,
+            "crates/foo/src/lib.rs",
+            &deletion_plans,
+            &mut findings,
+        );
+
+        // Should warn about ambiguous unscoped match
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, LintSeverity::Warning);
+        assert!(findings[0].message.contains("unscoped"));
+    }
+
+    #[test]
+    fn test_check_pub_items_scoped_plan_wrong_file() {
+        let content = r"
+pub fn init() {}
+";
+        let mut findings = Vec::new();
+        let deletion_plans = vec![DeletionPlanEntry {
+            item_name: "init".to_string(),
+            file_scope: Some("crates/bar/src/lib.rs".to_string()), // Wrong file
+            plan: "Will be removed".to_string(),
+        }];
+
+        check_pub_items_for_deletion_plan(
+            content,
+            "crates/foo/src/lib.rs",
+            &deletion_plans,
+            &mut findings,
+        );
+
+        // Should flag as missing (scoped plan doesn't match this file)
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, LintSeverity::Error);
+        assert!(findings[0].message.contains("lacks a deletion"));
+    }
+
+    #[test]
+    fn test_deletion_plan_matches_scoped() {
+        let plan = DeletionPlanEntry {
+            item_name: "init".to_string(),
+            file_scope: Some("crates/foo/src/lib.rs".to_string()),
+            plan: "test".to_string(),
+        };
+
+        // Exact match
+        assert_eq!(
+            deletion_plan_matches(&plan, "init", "crates/foo/src/lib.rs"),
+            Some(true)
+        );
+
+        // Ends with match
+        assert_eq!(
+            deletion_plan_matches(&plan, "init", "/home/user/project/crates/foo/src/lib.rs"),
+            Some(true)
+        );
+
+        // Wrong name
+        assert_eq!(
+            deletion_plan_matches(&plan, "other", "crates/foo/src/lib.rs"),
+            None
+        );
+
+        // Wrong file
+        assert_eq!(
+            deletion_plan_matches(&plan, "init", "crates/bar/src/lib.rs"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_deletion_plan_matches_unscoped() {
+        let plan = DeletionPlanEntry {
+            item_name: "init".to_string(),
+            file_scope: None,
+            plan: "test".to_string(),
+        };
+
+        // Matches any file with the same name
+        assert_eq!(
+            deletion_plan_matches(&plan, "init", "crates/foo/src/lib.rs"),
+            Some(false) // false indicates unscoped match
+        );
+        assert_eq!(
+            deletion_plan_matches(&plan, "init", "crates/bar/src/lib.rs"),
+            Some(false)
+        );
+
+        // Wrong name still doesn't match
+        assert_eq!(
+            deletion_plan_matches(&plan, "other", "crates/foo/src/lib.rs"),
+            None
+        );
     }
 }
