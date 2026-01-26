@@ -49,6 +49,7 @@ pub mod ipc;
 pub mod lease;
 pub mod ledger;
 pub mod log;
+pub mod model_router;
 pub mod policy;
 pub mod process;
 pub mod reducer;
