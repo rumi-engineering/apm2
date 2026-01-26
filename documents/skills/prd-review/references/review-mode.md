@@ -1,15 +1,21 @@
 # REVIEW Mode
 
 decision_tree:
-  entrypoint: RUN_GATES
+  entrypoint: REVIEW_AND_REFINE
   nodes[1]:
-    - id: RUN_GATES
-      purpose: "Execute formal review gates and emit findings."
-      steps[6]:
-        - id: EXECUTE_DETERMINISTIC_GATES
-          action: invoke_reference
-          reference: references/REVIEW_RUBRIC.md
-          purpose: "Run SCHEMA, LINT, TRACEABILITY, CCP-MAPPING, QUALITY, and EVIDENCE gates."
+    - id: REVIEW_AND_REFINE
+      purpose: "Execute formal review gates with iterative refinement and emit findings."
+      steps[7]:
+        - id: ITERATIVE_GATE_EXECUTION
+          action: |
+            For each gate in the invariant order (1-7):
+            1. Execute gate (SCHEMA -> LINT -> TRACEABILITY -> CCP-MAPPING -> QUALITY -> EVIDENCE -> CONTENT).
+            2. If gate FAILS with BLOCKER/MAJOR findings:
+               a. PROPOSE_EDITS: Generate remediations (BOUND_ADDED, EVIDENCE_LINKED, etc.).
+               b. APPLY_EDITS: Modify PRD if substance test passes.
+               c. DELTA_QUALITY_CHECK: Verify fix is not PROSE_ONLY.
+               d. RE-RUN: Repeat gate check once to verify fix.
+            3. Record final findings for the gate.
         - id: COMPUTE_DEPTH
           action: "Compute impact vector based on requirements, dependencies, abstractions, data classification, and blast radius."
           logic: |
@@ -38,13 +44,15 @@ decision_tree:
           reference: references/COUNCIL_PROTOCOL.md
           condition: "depth is COUNCIL"
         - id: EMIT_BUNDLE
-          action: "Produce prd_review_{timestamp}.json evidence bundle."
+          action: |
+            Produce NEW prd_review_{timestamp}.json evidence bundle.
+            Note: Always emit a new bundle even if all gates pass initially.
       decisions[2]:
-        - id: GATE_FAILED
-          if: "any gate status is FAILED"
+        - id: CRITICAL_FAILURE
+          if: "any gate status is FAILED after refinement"
           then:
             stop: true
-        - id: ALL_GATES_COMPLETED
-          if: "all gates executed"
+        - id: COMPLETED
+          if: "all gates executed and refined"
           then:
             stop: true

@@ -20,7 +20,10 @@ use xshell::{Shell, cmd};
 ///
 /// Where XXXX is 4 digits and XXXXX is 5 digits.
 static TICKET_BRANCH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^ticket/(?:(RFC-\d{4})/)?(TCK-\d{5})$")
+    // Two separate patterns:
+    // 1. ticket/ branches require strict TCK-XXXXX format (with optional RFC-XXXX/)
+    // 2. feat/ branches allow any word/hyphen characters
+    Regex::new(r"^(?:ticket/(?:(RFC-\d{4})/)?(TCK-\d{5})|feat/([\w\-]+))$")
         .expect("Invalid regex pattern for ticket branch")
 });
 
@@ -80,8 +83,11 @@ pub fn validate_ticket_branch(branch_name: &str) -> Result<TicketBranch> {
 
     Ok(TicketBranch {
         rfc_id: captures.get(1).map(|m| m.as_str().to_string()),
+        // Group 2 captures TCK-XXXXX for ticket/ branches
+        // Group 3 captures the name for feat/ branches
         ticket_id: captures
             .get(2)
+            .or_else(|| captures.get(3))
             .expect("Ticket ID capture group missing")
             .as_str()
             .to_string(),

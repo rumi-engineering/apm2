@@ -5,26 +5,31 @@ decision_tree:
   nodes[1]:
     - id: VALIDATE_AND_CLASSIFY
       purpose: "Validate inputs and branch to the correct mode."
-      steps[6]:
+      steps[7]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <MODE_OPTIONAL> and <TARGET_ID> placeholders before running commands."
         - id: VALIDATE_ID
           action: |
             Validate input ID format:
             - CREATE mode: PRD_ID must match /^PRD-[0-9]{4}$/
-            - REVIEW/REFINE mode: RFC_ID must match /^RFC-[0-9]{4}$/
+            - REVIEW mode: RFC_ID must match /^RFC-[0-9]{4}$/
             If invalid, reject with error.
         - id: LOCATE_INPUTS
           action: |
             Set paths based on mode:
             - CREATE: PRD root = documents/prds/{PRD_ID}/
-            - REVIEW/REFINE: RFC root = documents/rfcs/{RFC_ID}/
+            - REVIEW: RFC root = documents/rfcs/{RFC_ID}/
                              Tickets = documents/work/tickets/TCK-*.yaml (filtered by rfc_id)
+        - id: CHECK_EXISTING_EVIDENCE
+          action: |
+            For RFC-XXXX targets:
+            - Search `evidence/rfc/{RFC_ID}/reviews/rfc_review_*.yaml`
+            - If found, load the latest bundle to identify previously failed gates and unresolved findings.
         - id: SELECT_MODE
           action: |
             If mode not provided:
             - If input is PRD-XXXX: default to CREATE
-            - If input is RFC-XXXX: ask user to choose REVIEW or REFINE
+            - If input is RFC-XXXX: default to REVIEW
         - id: SELECT_DEPTH
           action: |
             Compute depth based on impact:
@@ -45,7 +50,7 @@ decision_tree:
             5. GATE-TCK-ATOMICITY
             6. GATE-TCK-IMPLEMENTABILITY
             7. GATE-TCK-ANTI-COUSIN
-      decisions[3]:
+      decisions[2]:
         - id: MODE_CREATE
           if: "mode is CREATE"
           then:
@@ -54,7 +59,3 @@ decision_tree:
           if: "mode is REVIEW"
           then:
             next_reference: references/review-mode.md
-        - id: MODE_REFINE
-          if: "mode is REFINE"
-          then:
-            next_reference: references/refine-mode.md

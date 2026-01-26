@@ -1,7 +1,7 @@
 ---
 name: rfc-council
 description: Unified skill for RFC creation and ticket quality review with multi-agent council deliberation and anti-cousin enforcement.
-argument-hint: "[create | review | refine] [PRD-XXXX | RFC-XXXX]"
+argument-hint: "[create | review] [PRD-XXXX | RFC-XXXX]"
 user-invocable: true
 holon:
   # ============================================================================
@@ -18,8 +18,7 @@ holon:
   stop_conditions:
     # Maximum episodes: RFC work involves multiple phases
     #   - CREATE mode: RFC generation + ticket decomposition ~ 15-20 episodes
-    #   - REVIEW mode: 3 review cycles with 7 gates ~ 10-15 episodes
-    #   - REFINE mode: Review + remediation ~ 15-20 episodes
+    #   - REVIEW mode: Consolidated review + remediation ~ 20-25 episodes
     max_episodes: 25
 
     # Timeout: 30 minutes for complete RFC operations
@@ -64,15 +63,13 @@ variables:
   MODE_OPTIONAL: "$1"
   TARGET_ID: "$2"
 
-references[10]:
+references[9]:
   - path: references/rfc-council-workflow.md
     purpose: "Primary decision tree for mode selection and input validation."
   - path: references/create-mode.md
     purpose: "Logic for generating RFC and tickets from PRD."
   - path: references/review-mode.md
-    purpose: "Logic for formal ticket review and depth computation."
-  - path: references/refine-mode.md
-    purpose: "Logic for iterative review and remediation."
+    purpose: "Logic for formal ticket review and depth computation (includes refinement)."
   - path: references/REVIEW_RUBRIC.md
     purpose: "Formal gate definitions and evidence contracts."
   - path: references/FINDING_CATEGORIES.md
@@ -101,8 +98,8 @@ anti-cousin enforcement.
 ## Prerequisites
 
 1. **CCP Required**: Codebase Context Pack must exist at `evidence/prd/{PRD_ID}/ccp/` (CREATE)
-   or be referenced by RFC (REVIEW/REFINE)
-2. **Input**: PRD-XXXX (CREATE) or RFC-XXXX (REVIEW/REFINE) must exist
+   or be referenced by RFC (REVIEW)
+2. **Input**: PRD-XXXX (CREATE) or RFC-XXXX (REVIEW) must exist
 3. **Required Reading**: Load `agent-native-software` skill and `AGENTS.md` security policy
 
 ## Modes
@@ -110,8 +107,7 @@ anti-cousin enforcement.
 | Mode | Input | Output | Purpose |
 |------|-------|--------|---------|
 | CREATE | PRD-XXXX | RFC + Tickets | Generate RFC and tickets from PRD |
-| REVIEW | RFC-XXXX | Findings Bundle | Formal gate review |
-| REFINE | RFC-XXXX | Remediated RFC | Iterative review and fix |
+| REVIEW | RFC-XXXX | Findings Bundle + Remediation | Formal gate review with iterative refinement |
 
 ## Gate Structure
 

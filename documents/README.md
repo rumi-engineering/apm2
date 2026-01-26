@@ -10,7 +10,8 @@ This directory contains all project documentation, standards, and specifications
 | `prds/` | Product Requirements Documents | `prds/template/` for new PRDs |
 | `rfcs/` | Request for Comments | `rfcs/template/` for new RFCs |
 | `protocol_profiles/` | Agent protocol configurations | |
-| `skills/` | Agent skill definitions | |
+| `strategy/` | Strategy & SDLC Pipeline | [SDLC_PIPELINE.md](./strategy/SDLC_PIPELINE.md) |
+| `skills/` | Agent skill definitions | [README.md](./skills/README.md) |
 | `work/` | Tickets and work tracking | `work/tickets/` |
 | `coding/` | Coding guidelines | |
 | `security/` | Security documentation | |

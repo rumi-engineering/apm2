@@ -1,11 +1,11 @@
 title: RFC REVIEW Mode
 
 decision_tree:
-  entrypoint: RUN_GATES
+  entrypoint: REVIEW_AND_REFINE
   nodes[1]:
-    - id: RUN_GATES
-      purpose: "Execute formal review gates and emit findings."
-      steps[8]:
+    - id: REVIEW_AND_REFINE
+      purpose: "Execute formal review gates with iterative refinement and emit findings."
+      steps[9]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <RFC_ID> and <PRD_ID> placeholders before running commands."
         - id: LOAD_INPUTS
@@ -14,29 +14,23 @@ decision_tree:
             - RFC files: documents/rfcs/{RFC_ID}/*.yaml
             - Ticket files: documents/work/tickets/TCK-*.yaml (filter by rfc_id)
             - CCP: evidence/prd/{PRD_ID}/ccp/component_atlas.yaml
+            - Previous Evidence: Load latest bundle if found in workflow.
 
             Extract:
             - requirement_ids from RFC
             - ticket_ids from ticket files
             - file_paths from tickets
 
-        - id: EXECUTE_TRUSTED_GATES
-          action: invoke_reference
-          reference: references/REVIEW_RUBRIC.md
-          purpose: "Run GATE-TCK-SCHEMA."
-          gates: [GATE-TCK-SCHEMA]
-
-        - id: EXECUTE_DETERMINISTIC_GATES
-          action: invoke_reference
-          reference: references/REVIEW_RUBRIC.md
-          purpose: "Run DEPENDENCY-ACYCLICITY, SCOPE-COVERAGE, CCP-MAPPING."
-          gates: [GATE-TCK-DEPENDENCY-ACYCLICITY, GATE-TCK-SCOPE-COVERAGE, GATE-TCK-CCP-MAPPING]
-
-        - id: EXECUTE_LLM_GATES
-          action: invoke_reference
-          reference: references/REVIEW_RUBRIC.md
-          purpose: "Run ATOMICITY, IMPLEMENTABILITY, ANTI-COUSIN."
-          gates: [GATE-TCK-ATOMICITY, GATE-TCK-IMPLEMENTABILITY, GATE-TCK-ANTI-COUSIN]
+        - id: ITERATIVE_GATE_EXECUTION
+          action: |
+            For each gate in the invariant order (1-7):
+            1. Execute gate (TRUSTED -> DETERMINISTIC -> LLM-ASSISTED).
+            2. If gate FAILS with BLOCKER/MAJOR findings:
+               a. PROPOSE_EDITS: Generate remediations (TICKET_REWRITTEN, DEPENDENCY_FIXED, etc.).
+               b. APPLY_EDITS: Modify tickets if substance test passes.
+               c. DELTA_QUALITY_CHECK: Verify fix is not PROSE_ONLY.
+               d. RE-RUN: Repeat gate check once to verify fix.
+            3. Record final findings for the gate.
 
         - id: COMPUTE_DEPTH
           action: |
@@ -55,17 +49,18 @@ decision_tree:
 
         - id: EMIT_BUNDLE
           action: |
-            Produce evidence bundle:
+            Produce NEW evidence bundle:
             - Path: evidence/rfc/{RFC_ID}/reviews/rfc_review_{timestamp}.yaml
             - Contents: gates, findings, verdict, council_metadata (if COUNCIL)
+            - Note: Always emit a new bundle even if all gates pass initially.
       decisions[2]:
-        - id: GATE_FAILED
-          if: "any gate status is FAILED"
+        - id: CRITICAL_FAILURE
+          if: "any gate status is FAILED after refinement"
           then:
             stop: true
             verdict: REJECTED
-        - id: ALL_GATES_COMPLETED
-          if: "all gates executed"
+        - id: COMPLETED
+          if: "all gates executed and refined"
           then:
             stop: true
             verdict: compute_verdict()

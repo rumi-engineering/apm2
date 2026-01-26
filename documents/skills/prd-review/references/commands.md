@@ -1,15 +1,12 @@
 # PRD Review Commands
 
-commands[4]:
+commands[3]:
   - name: create
     command: "/prd-review create PRD-XXXX"
     purpose: "Draft a new PRD from template."
-  - name: refine
-    command: "/prd-review refine PRD-XXXX"
-    purpose: "Run gates and iteratively improve the PRD."
   - name: review
     command: "/prd-review review PRD-XXXX"
-    purpose: "Run gates and emit findings/evidence (no edits)."
+    purpose: "Consolidated review and refinement. Checks for existing evidence, runs gates, remediates findings, and emits a new evidence bundle."
   - name: implicit-review
     command: "/prd-review PRD-XXXX"
-    purpose: "Select mode interactively for the given PRD."
+    purpose: "Runs the consolidated review mode for the given PRD."

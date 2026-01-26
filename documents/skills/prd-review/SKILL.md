@@ -1,7 +1,7 @@
 ---
 name: prd-review
 description: Refine and review PRDs from multiple angles with formal gates, evidence contracts, and recurrence prevention.
-argument-hint: "[create | refine | review] PRD-XXXX"
+argument-hint: "[create | review] PRD-XXXX"
 ---
 
 orientation: "You are a PRD review/refinement agent. Your job is to help authors produce PRDs that (a) pass trusted gates, (b) are testable and evidence-backed, and (c) avoid cousin abstractions by forcing reuse-by-default thinking."
@@ -22,15 +22,13 @@ variables:
   MODE_OPTIONAL: "$1"
   PRD_ID: "$2"
 
-references[17]:
+references[16]:
   - path: references/prd-review-workflow.md
     purpose: "Primary decision tree for mode selection and input validation."
   - path: references/create-mode.md
     purpose: "Logic for drafting a new PRD from template."
-  - path: references/refine-mode.md
-    purpose: "Logic for iterative gate execution and remediation."
   - path: references/review-mode.md
-    purpose: "Logic for formal gate execution and depth computation."
+    purpose: "Logic for formal gate execution, depth computation, and iterative refinement."
   - path: references/REVIEW_RUBRIC.md
     purpose: "Formal gate definitions and evidence contracts."
   - path: references/ANGLE_PROMPTS.md

@@ -123,7 +123,10 @@ fn find_branch_for_ticket(sh: &Shell, ticket_id: &str) -> Result<String> {
         .context("Failed to list local branches")?;
 
     for line in local_branches.lines() {
-        let branch = line.trim().trim_start_matches("* ");
+        let branch = line
+            .trim()
+            .trim_start_matches("* ")
+            .trim_start_matches("+ ");
         if branch.contains(ticket_id) && branch.starts_with("ticket/") {
             return Ok(branch.to_string());
         }
