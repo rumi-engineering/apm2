@@ -76,10 +76,12 @@ decision_tree:
 This skill handles the complete workflow for getting documentation updates reviewed and merged:
 
 1. **Normalize Git State** - Handle any starting state (uncommitted changes, behind remote, etc.)
-2. **Run Local Checks** - Execute pre-commit hooks and formatting.
-3. **Stage & Commit** - Stage changes and create a conventional commit.
-4. **Sync & Push** - Sync with origin/main, push the branch, and create a pull request.
-5. **Review & Merge** - Request AI reviews and enable auto-merge.
+2. **Run Local Checks** - Execute pre-commit hooks and formatting
+3. **Stage & Commit** - Stage changes and create a conventional commit
+4. **Sync & Push** - Sync with origin/main, push the branch (with `--force-with-lease` for rebased history)
+5. **Create PR** - Create pull request using `gh pr create`
+6. **Request AI Reviews** - Run `cargo xtask review quality` and `cargo xtask review security`
+7. **Enable Auto-Merge** - Enable squash auto-merge for automatic completion
 
 ## Prerequisites
 
@@ -111,4 +113,19 @@ This skill handles the complete workflow for getting documentation updates revie
 - PR created with descriptive title and body
 - All local checks pass (via `pre-commit`)
 - Branch synced with origin/main (via `git rebase`)
-- AI reviews requested and auto-merge enabled (via `cargo xtask review` and `gh pr`)
+- Branch pushed with `--force-with-lease` (safe force push after rebase)
+- AI reviews requested:
+  - `cargo xtask review quality <PR_URL>` - Code quality review
+  - `cargo xtask review security <PR_URL>` - Security review
+- Auto-merge enabled (via `gh pr merge --auto --squash`)
+
+## Review Commands
+
+The skill uses the following xtask commands to request AI reviews:
+
+| Command | Purpose |
+|---------|---------|
+| `cargo xtask review quality <PR_URL>` | Request AI code quality review |
+| `cargo xtask review security <PR_URL>` | Request AI security review |
+
+These commands spawn AI review agents that analyze the PR and post review comments.

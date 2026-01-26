@@ -1,11 +1,20 @@
 title: RFC CREATE Mode
 
+# Execution Context
+#
+# This file serves two modes with conditional execution:
+# - CREATE mode: Executes PHASE_1 -> PHASE_2 -> PHASE_4 -> PHASE_5 (skips PHASE_3)
+# - DECOMPOSE mode: Jumps directly to PHASE_3 only (ticket generation)
+#
+# The `condition` field on each step indicates which mode(s) execute it.
+# Steps without a condition are executed by all modes.
+
 decision_tree:
   entrypoint: CREATE_FLOW
   nodes[1]:
     - id: CREATE_FLOW
-      purpose: "Generate RFC and tickets from PRD."
-      steps[5]:
+      purpose: "Generate RFC and tickets from PRD. Also handles DECOMPOSE mode for ticket generation."
+      steps[6]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <PRD_ID> and <RFC_ID> placeholders before running commands."
         - id: PHASE_1_GENESIS_CREATION
@@ -33,20 +42,48 @@ decision_tree:
 
         - id: PHASE_2_DISCOVERY_COUNCIL
           action: |
-            Invoke COUNCIL_PROTOCOL with specialized SA roles for v0:
+            Invoke COUNCIL_PROTOCOL with lifecycle-adaptive SA roles for v0:
             - SA-1: Focus on mapping PRD requirements to potential architecture.
             - SA-2: Identify implementability risks and missing codebase knowledge.
             - SA-3: Identify trust boundary gaps and security unknowns.
 
-            Constraint: Each SA selects 3 RANDOM reasoning modes + 5 specialized modes.
+            Constraint: Each SA selects **5 strictly random reasoning modes** from modes-of-reasoning
+            (see COUNCIL_PROTOCOL.md Step 3: Stochastic Mode Selection for algorithm).
+
+        - id: PHASE_3_TICKET_CREATION
+          condition: "mode is DECOMPOSE"
+          action: |
+            Generate engineering tickets from approved RFC v4:
+            (DECOMPOSE mode jumps directly to this step via rfc-council-workflow.md)
+
+            Prerequisites:
+            - RFC is at version v4 (Standard phase)
+            - 06_ticket_decomposition.yaml has planned ticket structure
+
+            Steps:
+            1. Read `06_ticket_decomposition.yaml` for planned ticket structure.
+            2. For each planned ticket:
+               a. Create `documents/work/tickets/TCK-XXXXX.yaml`
+               b. Populate from RFC design decisions and requirements
+               c. Ensure GATE-TCK-ATOMICITY criteria (single PR completable)
+               d. Ensure GATE-TCK-IMPLEMENTABILITY criteria (agent can implement)
+            3. Set `depends_on` relationships between tickets.
+            4. Stage and commit:
+               ```bash
+               git add documents/work/tickets/TCK-*.yaml
+               git commit -m "docs(RFC-XXXX): Generate engineering tickets from v4"
+               ```
+            5. Return to caller (do not proceed to PHASE_4/PHASE_5).
 
         - id: PHASE_4_SELF_REVIEW
+          condition: "mode is CREATE"
           action: |
             Execute REVIEW mode on v0:
             - Focus on GATE-TCK-SCOPE-COVERAGE and GATE-TCK-SCHEMA.
             - Accept failing gates for ATOMICITY/IMPLEMENTABILITY if documented as open questions in 08_risks_and_open_questions.yaml.
 
         - id: PHASE_5_COMMIT
+          condition: "mode is CREATE"
           action: |
             Stage and commit:
             ```bash
