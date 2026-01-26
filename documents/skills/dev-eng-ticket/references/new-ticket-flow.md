@@ -18,7 +18,7 @@ decision_tree:
             - path: "documents/rfcs/<RFC_ID>/06_ticket_decomposition.yaml"
               purpose: "Ticket scope and dependencies (if RFC exists)."
         - id: READ_LOCAL_INVARIANTS
-          action: "Read AGENTS.md, mod.rs, and relevant tests for each touched module to understand local invariants."
+          action: "Read the root README.md to identify the AGENTS.md files for each touched module. Read those AGENTS.md files, mod.rs, and relevant tests to understand local invariants."
         - id: SELECT_RELEVANT_RUST_FRAMEWORKS
           action: "Based on the planned changes, select the Rust domains that matter (ownership, lifetimes, async, unsafe, API design, errors, performance, security) and read the relevant rust-textbook sections."
         - id: PLAN_TESTS

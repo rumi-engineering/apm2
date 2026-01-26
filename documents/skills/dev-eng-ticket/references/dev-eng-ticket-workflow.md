@@ -5,11 +5,9 @@ decision_tree:
   nodes[1]:
     - id: INIT_AND_CLASSIFY
       purpose: "Initialize worktree and choose the correct workflow path."
-      context_files[7]:
-        - path: AGENTS.md
-          purpose: "Repository-wide agent instructions."
-        - path: CONTRIBUTING.md
-          purpose: "Developer workflow and required commands."
+      context_files[6]:
+        - path: README.md
+          purpose: "Root-level module index, documentation discovery, and repository-wide constraints."
         - path: documents/skills/coding/SKILL.md
           purpose: "Project coding standards."
         - path: documents/skills/rust-textbook/SKILL.md

@@ -24,6 +24,9 @@ decision_tree:
           action: command
           run: "bash -lc 'set -euo pipefail; root=$(git rev-parse --show-toplevel); parent=$(dirname \"$root\"); wt=\"$parent/apm2-<TICKET_ID>\"; if [ -d \"$wt\" ]; then echo \"$wt\"; else git worktree add \"$wt\" \"<BRANCH_NAME>\"; echo \"$wt\"; fi'"
           capture_as: worktree_path
+        - id: UPDATE_PR_IF_BEHIND
+          action: command
+          run: "bash -lc 'set -euo pipefail; status=$(gh pr view \"<BRANCH_NAME>\" --json mergeStateStatus --jq .mergeStateStatus || echo \"UNKNOWN\"); if [ \"$status\" == \"BEHIND\" ]; then echo \"PR is behind main; updating...\"; gh pr update-branch \"<BRANCH_NAME>\"; else echo \"PR status is $status; no update needed.\"; fi'"
         - id: DISPATCH_IMPLEMENTER
           action: "Dispatch an implementer subagent in <WORKTREE_PATH> to get the PR into a mergeable state (CI + reviews). The queue orchestrator MUST NOT modify code."
         - id: MONITOR_TO_MERGE

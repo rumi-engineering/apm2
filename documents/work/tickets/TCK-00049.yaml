@@ -46,7 +46,7 @@ ticket_meta:
       - "Schema updated with scope, plan, definition_of_done.criteria, and notes fields"
       - "YAML template created with complete ticket structure"
       - "All 25 tickets migrated with full content embedded in YAML"
-      - "No ticket MD files remain (only README.md and STATUS_TRACKING.md)"
+      - "No ticket MD files remain (only README.md)"
       - "cargo build succeeds"
       - "cargo test passes"
       - "start-ticket command works without errors"
