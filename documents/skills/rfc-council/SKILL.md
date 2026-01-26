@@ -97,10 +97,81 @@ anti-cousin enforcement.
 
 ## Prerequisites
 
-1. **CCP Required**: Codebase Context Pack must exist at `evidence/prd/{PRD_ID}/ccp/` (CREATE)
-   or be referenced by RFC (REVIEW)
-2. **Input**: PRD-XXXX (CREATE) or RFC-XXXX (REVIEW) must exist
-3. **Required Reading**: Load `agent-native-software` skill and `AGENTS.md` security policy
+Before RFC review or creation can proceed, the following artifacts MUST exist.
+**Fail fast if any prerequisite is missing.**
+
+### Required Artifacts
+
+1. **CCP Index** (MANDATORY for CREATE/REVIEW):
+   - Path: `evidence/prd/{PRD_ID}/ccp/ccp_index.json`
+   - Generate with: `apm2 factory ccp build --prd <PRD_ID>`
+   - Validates: Codebase structure, file inventory, module dependencies
+
+2. **Impact Map** (MANDATORY for CREATE):
+   - Path: `evidence/prd/{PRD_ID}/impact_map/impact_map.yaml`
+   - Generate with: `apm2 factory impact-map build --prd <PRD_ID>`
+   - Validates: PRD requirements mapped to CCP components
+
+3. **Input Document**:
+   - CREATE mode: PRD must exist at `documents/prds/PRD-XXXX/`
+   - REVIEW mode: RFC must exist at `documents/rfcs/RFC-XXXX/`
+
+4. **Required Reading**:
+   - Load `agent-native-software` skill
+   - Load `AGENTS.md` security policy
+
+### Prerequisite Validation Decision Tree
+
+```
+START
+  |
+  v
+[Check PRD exists?]
+  |-- NO --> STOP: "PRD-XXXX not found at documents/prds/PRD-XXXX/"
+  |-- YES
+      |
+      v
+[Check CCP index exists?]
+  |-- NO --> STOP: "CCP missing. Run: apm2 factory ccp build --prd <PRD_ID>"
+  |-- YES
+      |
+      v
+[Mode = CREATE?]
+  |-- YES --> [Check Impact Map exists?]
+  |             |-- NO --> STOP: "Impact Map missing. Run: apm2 factory impact-map build --prd <PRD_ID>"
+  |             |-- YES --> PROCEED to CREATE workflow
+  |-- NO (REVIEW)
+      |
+      v
+[Check RFC exists?]
+  |-- NO --> STOP: "RFC-XXXX not found at documents/rfcs/RFC-XXXX/"
+  |-- YES --> PROCEED to REVIEW workflow
+```
+
+### Quick Prerequisite Generation
+
+If artifacts are missing, generate them using the compile pipeline:
+
+```bash
+# Generate CCP only
+apm2 factory ccp build --prd PRD-0005
+
+# Generate Impact Map (requires CCP)
+apm2 factory impact-map build --prd PRD-0005
+
+# Or generate all prerequisites at once (dry-run to validate)
+apm2 factory compile --prd PRD-0005 --dry-run
+```
+
+### Validation Commands
+
+```bash
+# Check CCP exists
+test -f evidence/prd/PRD-0005/ccp/ccp_index.json && echo "CCP OK" || echo "CCP MISSING"
+
+# Check Impact Map exists
+test -f evidence/prd/PRD-0005/impact_map/impact_map.yaml && echo "Impact Map OK" || echo "Impact Map MISSING"
+```
 
 ## Modes
 
