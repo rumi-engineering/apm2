@@ -1,0 +1,185 @@
+schema_id: apm2.defects.record.schema.v1
+description: >
+  DefectRecord is an evidence-backed counterexample linked to intent/contracts and
+  pipeline artifacts. Primary uses: dedupe, clustering, automated remediation, governance.
+required:
+  - schema_version
+  - id
+  - created_at
+  - defect_domain
+  - stage_detected
+  - surface
+  - severity
+  - title
+  - statement
+  - actor
+  - environment
+  - links
+  - evidence
+  - fingerprint
+properties:
+  schema_version:
+    type: string
+    const: apm2.defects.record.v1
+
+  id:
+    type: string
+    pattern: "^DFT-[0-9]{6}$"
+
+  created_at:
+    type: string
+    format: date-time
+
+  defect_domain:
+    $ref: "apm2.defects.taxonomy.v1#/enums/defect_domain"
+
+  stage_detected:
+    $ref: "apm2.defects.taxonomy.v1#/enums/stage_detected"
+
+  surface:
+    $ref: "apm2.defects.taxonomy.v1#/enums/surface"
+
+  severity:
+    $ref: "apm2.defects.taxonomy.v1#/enums/severity"
+
+  reproducibility:
+    $ref: "apm2.defects.taxonomy.v1#/enums/reproducibility"
+    default: UNKNOWN
+
+  disposition:
+    $ref: "apm2.defects.taxonomy.v1#/enums/disposition"
+    default: OPEN
+
+  inefficiency:
+    description: "Optional inefficiency annotations; defects MAY be classified as pure inefficiency."
+    properties:
+      inefficiency_class:
+        $ref: "apm2.defects.taxonomy.v1#/enums/inefficiency_class"
+      delta_cost:
+        type: object
+        properties:
+          tokens:
+            type: integer
+            minimum: 0
+          tool_calls:
+            type: integer
+            minimum: 0
+          wall_ms:
+            type: integer
+            minimum: 0
+          cpu_ms:
+            type: integer
+            minimum: 0
+          bytes_io:
+            type: integer
+            minimum: 0
+          risk_score:
+            type: number
+            minimum: 0.0
+
+  title:
+    type: string
+    max_length: 140
+
+  statement:
+    description: >
+      Counterexample form: expected predicate/contract vs observed behavior; include
+      minimal context needed for interpretation; avoid narrative.
+    type: string
+    max_length: 2000
+
+  actor:
+    required: [holon_id, role]
+    properties:
+      holon_id: { type: string }
+      role: { type: string }
+      lease_ref: { type: string }
+      budget_ref: { type: string }
+      capability_set_ref: { type: string }
+
+  environment:
+    required: [system_version, git_rev, platform]
+    properties:
+      system_version: { type: string }
+      git_rev: { type: string }
+      platform: { type: string }
+      config_refs:
+        type: array
+        items: { type: string }
+
+  links:
+    required: [intent_refs]
+    properties:
+      intent_refs:
+        type: array
+        items: { type: string }
+      contract_refs:
+        type: array
+        items: { type: string }
+      rfc_refs:
+        type: array
+        items: { type: string }
+      ticket_refs:
+        type: array
+        items: { type: string }
+      pr_refs:
+        type: array
+        items: { type: string }
+      release_refs:
+        type: array
+        items: { type: string }
+      gate_run_refs:
+        type: array
+        items: { type: string }
+      oracle_refs:
+        type: array
+        items: { type: string }
+
+  evidence:
+    required: [evidence_refs]
+    properties:
+      evidence_refs:
+        type: array
+        items: { type: string }
+      repro:
+        type: array
+        items:
+          required: [cmd]
+          properties:
+            cmd: { type: string }
+            cwd: { type: string }
+            env: { type: object }
+            expected: { type: string }
+            observed: { type: string }
+
+  analysis:
+    description: "Optional; added by classifier agents post-intake."
+    properties:
+      hypotheses:
+        type: array
+        items:
+          required: [type, confidence]
+          properties:
+            type: { type: string }
+            confidence:
+              $ref: "apm2.defects.taxonomy.v1#/enums/confidence"
+            supporting_evidence_refs:
+              type: array
+              items: { type: string }
+      recommended_actions:
+        type: array
+        items:
+          required: [action_type]
+          properties:
+            action_type:
+              $ref: "apm2.defects.taxonomy.v1#/enums/action_type"
+            target_ref: { type: string }
+            notes:
+              type: string
+              max_length: 600
+
+  fingerprint:
+    description: >
+      Deterministic hash over normalized fields for dedupe/clustering.
+      Minimum inputs: defect_domain + surface + normalized title + key links + repro[0].cmd.
+    type: string

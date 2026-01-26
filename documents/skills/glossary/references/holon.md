@@ -5,10 +5,11 @@
 **Key Properties:**
 
 -   **Janus Dualism:** Looks "up" to supervisors (submitting to constraints/budgets) and "down" to subordinates (imposing order/goals).
+    -   *Control Principle:* A supervisor controls the **Interface Variety** of its subordinates, not their internal complexity.
 -   **Markov Blanket:** A statistical boundary separating internal state from external states. Interaction occurs *only* through:
     -   **Active States:** Outputs (Artifacts, Tool Requests).
     -   **Sensory States:** Inputs (Events, Work Objects).
-    -   *Internal State is ephemeral and opaque.*
+    -   **Filter of Commitment:** Internal state is secluded (private) until it is explicitly "committed" to the Ledger as a Checkpoint. This enables crash-only recovery without violating the principle of seclusion.
 -   **Autonomy:** Operates within a bounded context (`EpisodeContext`) and resource limits (`Budget`).
 
 ## Data Structure References

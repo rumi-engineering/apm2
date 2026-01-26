@@ -1,0 +1,104 @@
+schema_id: apm2.defects.taxonomy.v1
+description: >
+  Stable enumerations for defect classification in holonic agent-native networks.
+  Values are identifiers; do not rename. Deprecate by adding new values and marking
+  old values as deprecated in a separate governance record.
+enums:
+  defect_domain:
+    - CONTEXT
+    - ENGINEERING
+    - SPECIFICATION_GAP
+    - VERIFICATION
+    - SECURITY_CAPABILITY
+    - PRODUCT_VALUE
+    - OPERATIONS
+    - ECONOMICS
+
+  stage_detected:
+    - INTENT            # PRD/portfolio
+    - REFINEMENT        # RFC/design compilation
+    - PLANNING          # ticket compilation / scope packing
+    - IMPLEMENTATION
+    - REVIEW
+    - CI
+    - UAT
+    - RELEASE
+    - RUNTIME
+    - INCIDENT
+    - GOVERNANCE
+
+  surface:
+    - CLI
+    - DAEMON_API
+    - LEDGER
+    - EVIDENCE
+    - PRIMITIVE
+    - TEMPLATE
+    - DOCS
+    - POLICY
+    - CAPABILITY
+    - SKILL
+    - INFRA
+    - OBSERVABILITY
+    - RELEASE_CHANNEL
+    - ECONOMICS
+    - ORACLE
+
+  severity:
+    - S0_STOP_THE_LINE
+    - S1_CRITICAL
+    - S2_MAJOR
+    - S3_MINOR
+    - S4_INFO
+
+  reproducibility:
+    - DETERMINISTIC
+    - PROBABILISTIC
+    - FLAKY
+    - UNKNOWN
+
+  disposition:
+    - OPEN
+    - ACKNOWLEDGED
+    - FIX_IN_PROGRESS
+    - FIXED
+    - WONT_FIX
+    - DUPLICATE
+    - NEEDS_INFO
+
+  confidence:
+    - LOW
+    - MEDIUM
+    - HIGH
+
+  inefficiency_class:
+    - EXTRA_TOOL_CALLS              # any non-zero tool calls needed for missing context
+    - CONTEXT_OVERBUDGET            # context exceeds declared budget
+    - REDUNDANT_COMPUTE             # repeated work that should have been memoized/cached
+    - REDUNDANT_COMMUNICATION       # repeated messages/handshakes due to missing receipts/contracts
+    - UNNECESSARY_REVIEW_CYCLES     # cycles caused by missing proofs/invariants/primitives
+    - UNNECESSARY_ROLLOUT_RISK      # rollout without sufficient guardrails
+    - AMBIGUOUS_OUTPUT              # CLI/messages cause interpretive load or misaction
+    - WEAK_VERIFIER_SIGNAL          # high cost, low discrimination verifiers
+    - CAPABILITY_OVERGRANT          # broader capabilities than task requires
+    - CAPABILITY_UNDERGRANT         # prevents completion despite valid intent
+    - UNBOUNDED_SEARCH              # exploration without leases/stop rules
+    - SCHEMA_DRIFT                  # incompatible or ambiguous schema evolution
+
+  action_type:
+    - UPDATE_DOCS
+    - UPDATE_TEMPLATES
+    - UPDATE_CLI_CONTRACT
+    - UPDATE_POLICY
+    - UPDATE_CAPABILITIES
+    - ADD_GATE
+    - FIX_GATE
+    - ADD_TEST
+    - FIX_IMPLEMENTATION
+    - CREATE_OR_EXTEND_PRIMITIVE
+    - REFACTOR_SCOPE
+    - REVISE_REFINEMENT
+    - REVISE_INTENT
+    - IMPROVE_OBSERVABILITY
+    - IMPROVE_RELEASE_PROCESS
+    - OPTIMIZE_ECONOMICS

@@ -3,6 +3,10 @@ protocol:
   id: CODE-QUALITY-REVIEW
   version: 1.0.0
   type: executable_specification
+  constraints[3]:
+    - "No local execution: For efficiency and focus, reviewers DO NOT run build, test, or lint commands locally."
+    - "Static analysis only: Focus on code quality, design, invariants, and adherence to holonic principles."
+    - "CI Reliance: Assume minor formatting and auto-lintable errors are handled by CI. CI will block on test failures."
   inputs[2]:
     - PR_URL
     - HEAD_SHA
@@ -152,8 +156,9 @@ decision_tree:
 
     - id: PHASE_4_ANALYZE_CHANGED_FILES
       purpose: "Understand what code was modified and in what context."
-      assumptions[1]:
+      assumptions[2]:
         - "Assume minor formatting issues and auto-lintable errors are handled by CI; focus on code quality, correctness, and design."
+        - "Adhere to 'No local execution' constraint: Focus on static analysis; do not execute tests or build commands."
       steps[2]:
         - id: REVIEW_EACH_CHANGED_FILE
           action: for_each_file

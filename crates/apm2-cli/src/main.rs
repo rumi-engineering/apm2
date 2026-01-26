@@ -169,6 +169,9 @@ enum FactoryCommands {
         #[arg(long, default_value = "text", value_parser = ["text", "json"])]
         format: String,
     },
+
+    /// CCP (Code Context Protocol) commands
+    Ccp(commands::factory::ccp::CcpCommand),
 }
 
 fn main() -> Result<()> {
@@ -236,6 +239,7 @@ fn main() -> Result<()> {
                     .context("Failed to build tokio runtime")?;
                 rt.block_on(commands::factory::run(&spec_file, &format))
             },
+            FactoryCommands::Ccp(ccp_cmd) => commands::factory::ccp::run_ccp(&ccp_cmd),
         },
     }
 }
