@@ -10,6 +10,47 @@ See @documents/security/RELEASE_PROCEDURE.md
 
 ---
 
+## Build Optimization
+
+The project uses worktree-based development, which can lead to redundant
+compilation across worktrees. These optimizations help reduce build times.
+
+### Shared Compilation Cache (sccache)
+
+[sccache](https://github.com/mozilla/sccache) caches compiled artifacts
+and shares them across different Cargo target directories. This is
+particularly useful for worktree-based development where each worktree
+has its own `target/` directory.
+
+**Installation:**
+```bash
+cargo install sccache
+```
+
+**Configuration:** Add to your shell profile (`~/.bashrc` or `~/.zshrc`):
+```bash
+export RUSTC_WRAPPER=sccache
+```
+
+**Verification:**
+```bash
+sccache --show-stats
+```
+
+**Benefits:**
+- Compilation artifacts shared across all worktrees
+- No file locking conflicts (unlike shared CARGO_TARGET_DIR)
+- Automatic cache management
+- Cache stored at `~/.cache/sccache`
+
+**Troubleshooting:**
+If you experience cache-related issues, clear the cache:
+```bash
+rm -rf ~/.cache/sccache
+```
+
+---
+
 ### Time Budgets
 
 | Test Type | Local | CI |
