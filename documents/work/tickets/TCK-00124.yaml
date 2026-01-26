@@ -1,0 +1,48 @@
+ticket_meta:
+  schema_version: "2026-01-26"
+  template_version: "2026-01-26"
+  ticket:
+    id: "TCK-00124"
+    title: "Implement agent-friendly UX verification for AAT"
+  binds:
+    prd_id: "PRD-0003"
+    rfc_id: "RFC-0004"
+    requirements:
+      - requirement_id: "REQ-0007"
+        requirement_ref: "documents/prds/PRD-0003/requirements/REQ-0007.yaml#prd_requirement"
+    evidence_artifacts:
+      - "EVID-0001"
+      - "EVID-0002"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_TOOLING"
+  dependencies:
+    tickets:
+      - "TCK-00054"
+  scope:
+    in_scope:
+      - "Update AAT agent to verify CLI commands produce structured output"
+      - "Verify error messages contain 'remediation guidance'"
+      - "Check --help output consistency across new commands"
+      - "Verify exit codes follow standard (0/non-zero)"
+      - "Produce AAT feedback as structured JSON for ingestion by other agents"
+    out_of_scope:
+      - "Fixing the actual UX of other tools (this ticket is for verification)"
+  plan:
+    steps:
+      - "Add 'UXVerifier' module to xtask/src/aat/"
+      - "Implement pattern matching for 'Actionable Error' markers"
+      - "Implement structured output validation (JSON/YAML attempt)"
+      - "Integrate UXVerifier into AAT main loop"
+      - "Add UX findings to EvidenceBundle"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0001"
+    criteria:
+      - "AAT agent correctly identifies tools without structured output"
+      - "AAT agent flags error messages that lack actionable advice"
+      - "AAT output JSON contains 'ux_audit' section"
+  notes:
+    security: "No special security considerations"

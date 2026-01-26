@@ -8,16 +8,8 @@ ticket_meta:
     prd_id: "PRD-0004"
     rfc_id: "RFC-0008"
     requirements:
-      - requirement_id: "HANDOFF-001"
-        requirement_ref: "documents/rfcs/RFC-0008/01_problem_and_imports.yaml#rfc_local_requirements.requirements[0]"
-      - requirement_id: "HANDOFF-002"
-        requirement_ref: "documents/rfcs/RFC-0008/01_problem_and_imports.yaml#rfc_local_requirements.requirements[1]"
-      - requirement_id: "HANDOFF-003"
-        requirement_ref: "documents/rfcs/RFC-0008/01_problem_and_imports.yaml#rfc_local_requirements.requirements[2]"
-      - requirement_id: "HANDOFF-004"
-        requirement_ref: "documents/rfcs/RFC-0008/01_problem_and_imports.yaml#rfc_local_requirements.requirements[3]"
-      - requirement_id: "HANDOFF-005"
-        requirement_ref: "documents/rfcs/RFC-0008/01_problem_and_imports.yaml#rfc_local_requirements.requirements[4]"
+      - requirement_id: "REQ-0018"
+        requirement_ref: "documents/prds/PRD-0004/requirements/REQ-0018.yaml#prd_requirement"
     evidence_artifacts:
       - "EVID-8005"
   custody:
