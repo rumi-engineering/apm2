@@ -341,6 +341,41 @@ rfc_ticket_decomposition:
         - "Unit tests for required reading file existence"
         evidence_ids: []
 
+    # =================================================================
+    # PHASE 5: Bug Fixes
+    # =================================================================
+    - ticket_id: TCK-00103
+      title: "Fix silent failure in ticket status detection"
+      ticket_files:
+        meta_ref: "documents/work/tickets/TCK-00103.yaml#ticket_meta"
+      scope:
+        in_scope:
+        - "Add CompletedTicketsResult enum to distinguish success from network failure"
+        - "Update get_completed_tickets() to return structured result instead of silent fallback"
+        - "Update start_ticket.rs caller to handle new result type with warning"
+        - "Add unit tests for error handling paths"
+        out_of_scope:
+        - "Caching mechanism for offline operation"
+        - "Retry logic with backoff"
+        - "--offline flag (future enhancement)"
+      binds:
+        requirement_ids: []
+        evidence_ids: []
+      custody_agent_roles:
+      - AGENT_IMPLEMENTER
+      responsibility_domains:
+      - DOMAIN_TOOLING
+      dependencies:
+      - TCK-00035
+      definition_of_done:
+        criteria:
+        - "Network failure produces visible warning instead of silent empty set"
+        - "get_completed_tickets() returns CompletedTicketsResult enum"
+        - "start-ticket command warns when GitHub API unavailable"
+        - "Unit tests verify error handling paths"
+        - "cargo test -p xtask ticket_status passes"
+        evidence_ids: []
+
     verification:
       acceptance_criteria:
       - "cargo build -p xtask compiles without warnings"

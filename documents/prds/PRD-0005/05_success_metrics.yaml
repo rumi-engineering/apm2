@@ -1,0 +1,61 @@
+prd_success_metrics:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  metrics:
+    - id: MET-0001
+      name: End-to-end compile success rate
+      description: Percentage of compile runs that complete without lint violations for a fixed repo state.
+      target: ">= 90%"
+      measurement:
+        method: "CI harness runs on PRDs tagged IDEA_COMPILER"
+        signal_source: "run manifests + exit codes"
+
+    - id: MET-0002
+      name: Requirement mapping completeness
+      description: Percentage of PRD requirements mapped to existing components or explicitly adjudicated as net-new substrate.
+      target: "100%"
+      measurement:
+        method: "Impact Map coverage check"
+        signal_source: "impact_map artifacts"
+
+    - id: MET-0003
+      name: Ticket noise index
+      description: |
+        Proxy measure for ticket usefulness and non-duplication:
+        (tickets without file paths or verification commands) / total tickets.
+      target: "<= 10%"
+      measurement:
+        method: "ticket lint"
+        signal_source: "documents/work/tickets"
+
+    - id: MET-0004
+      name: Reuse ratio
+      description: Ratio of tickets that primarily extend existing modules vs introduce net-new modules/crates.
+      target: ">= 80% extend-existing"
+      measurement:
+        method: "diff classifier + RFC justification scan"
+        signal_source: "RFC + ticket outputs"
+
+    - id: MET-0005
+      name: Determinism and diff stability
+      description: Re-running compilation with identical inputs and profile yields byte-identical artifacts, or a bounded diff requiring acceptance.
+      target: ">= 95% byte-identical"
+      measurement:
+        method: "golden run harness"
+        signal_source: "artifact hashes"
+
+    - id: MET-0006
+      name: Compile latency
+      description: Wall-clock time for `apm2 factory compile` on a typical developer machine.
+      target: "p50 <= 2 minutes, p95 <= 5 minutes"
+      measurement:
+        method: "timings recorded in run manifests"
+        signal_source: "run manifests"
+
+    - id: MET-0007
+      name: Continuous refactor throughput
+      description: Number of refactor radar tickets completed per time window and their measured effect on duplication/hotspot signals.
+      target: "weekly radar + measurable improvement trend"
+      measurement:
+        method: "radar signature tracking"
+        signal_source: "radar artifacts + recurrence projection"

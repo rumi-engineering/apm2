@@ -1,0 +1,34 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00100
+  title: "Implement end-to-end compile command"
+  status: OPEN
+  priority: HIGH
+  source:
+    rfc_id: RFC-0009
+    requirement_ids: [REQ-0001]
+  phase: PHASE-4
+  description: |
+    Implement apm2 factory compile --plan <path> that orchestrates
+    all stages: CCP -> Impact Map -> RFC -> Tickets.
+    Support --dry-run and --profile flags. Emit NDJSON observability.
+
+  implementation:
+    files_to_create:
+      - path: crates/apm2-cli/src/commands/factory/compile.rs
+    files_to_modify:
+      - path: crates/apm2-cli/src/main.rs
+      - path: crates/apm2-cli/src/commands/factory.rs
+
+  verification:
+    commands:
+      - command: "cargo run --bin apm2 -- factory compile --plan documents/prds/PRD-0005 --dry-run"
+    acceptance_criteria:
+      - "End-to-end compilation works"
+      - "Dry-run reports intended writes without modification"
+      - "NDJSON events emitted"
+
+  dependencies:
+    blocked_by: [TCK-00099]
+    blocks: [TCK-00101, TCK-00102]
+  estimated_complexity: HIGH

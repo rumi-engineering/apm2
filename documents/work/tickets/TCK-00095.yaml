@@ -1,0 +1,36 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00095
+  title: "Implement RFC framer with CCP grounding"
+  status: OPEN
+  priority: HIGH
+  source:
+    rfc_id: RFC-0009
+    requirement_ids: [REQ-0004]
+  phase: PHASE-2
+  description: |
+    Create RFC framer that generates RFC skeletons grounded in CCP and Impact Map.
+    Validates all path references against CCP.
+
+  implementation:
+    files_to_create:
+      - path: crates/apm2-core/src/rfc_framer/mod.rs
+      - path: crates/apm2-core/src/rfc_framer/framer.rs
+      - path: crates/apm2-core/src/rfc_framer/grounding.rs
+      - path: crates/apm2-cli/src/commands/factory/rfc.rs
+    files_to_modify:
+      - path: crates/apm2-core/src/lib.rs
+      - path: crates/apm2-cli/src/main.rs
+
+  verification:
+    commands:
+      - command: "cargo run --bin apm2 -- factory rfc frame --prd PRD-0005 --rfc RFC-0010"
+      - command: "cargo test -p apm2-core rfc_framer"
+    acceptance_criteria:
+      - "RFC includes CCP grounding section"
+      - "Invalid path references fail compilation"
+
+  dependencies:
+    blocked_by: [TCK-00094]
+    blocks: [TCK-00096]
+  estimated_complexity: HIGH

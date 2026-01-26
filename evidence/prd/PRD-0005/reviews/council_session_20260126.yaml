@@ -1,0 +1,192 @@
+council_session:
+  schema_version: "1.0.0"
+  session_id: "COUNCIL-PRD-0005-20260126-143000"
+  prd_id: PRD-0005
+  prd_title: "RFC Idea Compiler Pipeline - Codebase-Aware RFCs and Multi-Model Orchestration"
+  review_timestamp: "2026-01-26T14:30:00Z"
+  review_depth: COUNCIL
+  terminal_state: CONVERGED
+  cycles_completed: 3
+
+  subagents:
+    - agent_id: SA-1
+      emergent_role: "Formal Rigorist"
+      selected_modes: [7, 6, 1, 8, 75]
+      mode_names:
+        - "Type-theoretic reasoning"
+        - "Constraint/satisfiability reasoning"
+        - "Deductive reasoning"
+        - "Counterexample-guided reasoning"
+        - "Meta-reasoning"
+      finding_count: 16
+      severity_distribution:
+        BLOCKER: 0
+        MAJOR: 9
+        MINOR: 6
+        INFO: 1
+
+    - agent_id: SA-2
+      emergent_role: "Systems Analyst"
+      selected_modes: [43, 55, 47, 49, 79]
+      mode_names:
+        - "Systems thinking"
+        - "Game-theoretic/strategic reasoning"
+        - "Planning/policy reasoning"
+        - "Robust/worst-case reasoning"
+        - "Adversarial/red-team reasoning"
+      finding_count: 15
+      severity_distribution:
+        BLOCKER: 0
+        MAJOR: 11
+        MINOR: 4
+        INFO: 0
+
+    - agent_id: SA-3
+      emergent_role: "Risk Navigator"
+      selected_modes: [11, 45, 52, 76, 80]
+      mode_names:
+        - "Bayesian probabilistic reasoning"
+        - "Decision-theoretic reasoning"
+        - "Value-of-information reasoning"
+        - "Calibration and epistemic humility"
+        - "Debiasing/epistemic hygiene reasoning"
+      finding_count: 16
+      severity_distribution:
+        BLOCKER: 0
+        MAJOR: 12
+        MINOR: 4
+        INFO: 0
+
+  findings_summary:
+    total_findings: 47
+    after_dedup: 47
+    severity_totals:
+      BLOCKER: 0
+      MAJOR: 32
+      MINOR: 14
+      INFO: 1
+
+  key_findings:
+    unanimous_themes:
+      - id: THEME-001
+        description: "MVP Stage Order Inconsistency - RFC_Frame missing from MVP but tickets require RFC source"
+        findings: ["FND-SA1-CYC1-007", "FND-SA2-CYC1-006"]
+
+      - id: THEME-002
+        description: "Success Metrics Need Baselines - Targets stated without calibration data"
+        findings: ["FND-SA1-CYC1-015", "FND-SA3-CYC1-002", "FND-SA3-CYC1-003", "FND-SA3-CYC1-010", "FND-SA3-CYC1-011"]
+
+      - id: THEME-003
+        description: "Missing Failure Mode Handling - Edge cases and recovery paths underspecified"
+        findings: ["FND-SA1-CYC1-010", "FND-SA1-CYC1-011", "FND-SA2-CYC1-009", "FND-SA2-CYC1-010", "FND-SA3-CYC1-006"]
+
+    majority_themes:
+      - id: THEME-004
+        description: "Type/Schema Underspecification - PipelineSpec IR needs explicit type definitions"
+        findings: ["FND-SA1-CYC1-001", "FND-SA1-CYC1-002", "FND-SA1-CYC1-003"]
+
+      - id: THEME-005
+        description: "Constraint Gaps for Invariants - INV-* lack corresponding fail-closed gates"
+        findings: ["FND-SA1-CYC1-005"]
+
+      - id: THEME-006
+        description: "Gaming Vectors - Metrics and gates can be circumvented"
+        findings: ["FND-SA2-CYC1-004", "FND-SA2-CYC1-012"]
+
+      - id: THEME-007
+        description: "Cognitive Biases - Confirmation bias, planning fallacy present"
+        findings: ["FND-SA3-CYC1-013", "FND-SA3-CYC1-014", "FND-SA3-CYC1-015"]
+
+  remediations_proposed:
+    - remediation_id: REM-001
+      target: "04_solution_overview.yaml#mvp_contract.cli.stages.stage_order"
+      summary: "Add RFC_Frame to MVP stage_order"
+      quorum_vote: UNANIMOUS
+
+    - remediation_id: REM-002
+      target: "04_solution_overview.yaml#mvp_contract.crash_recovery"
+      summary: "Add crash-recovery checkpoint specification"
+      quorum_vote: UNANIMOUS
+
+    - remediation_id: REM-003
+      target: "04_solution_overview.yaml#mvp_contract.routing.model_determinism_constraints"
+      summary: "Add model determinism constraints (temperature=0, seed)"
+      quorum_vote: UNANIMOUS
+
+    - remediation_id: REM-004
+      target: "06_constraints_invariants.yaml#enforcement_gates"
+      summary: "Add enforcement gates for INV-0001 through INV-0005"
+      quorum_vote: UNANIMOUS
+
+    - remediation_id: REM-005
+      target: "05_success_metrics.yaml#metrics"
+      summary: "Add baselines and calibration plans for MET-0001, MET-0004, MET-0005"
+      quorum_vote: UNANIMOUS
+      note: "Deferred - metrics unavailable until system operational"
+
+    - remediation_id: REM-006
+      target: "04_solution_overview.yaml#mvp_contract.fail_closed_gates"
+      summary: "Add GATE-FACTORY-EXTENSION-INTEGRITY (anti-laundering)"
+      quorum_vote: UNANIMOUS
+
+    - remediation_id: REM-007
+      target: "08_risks_questions.yaml#risks"
+      summary: "Add RSK-0006 (prompt injection) and RSK-0007 (extension laundering)"
+      quorum_vote: UNANIMOUS
+
+    - remediation_id: REM-008
+      target: "04_solution_overview.yaml#key_components"
+      summary: "Add Secret Redaction Filter component"
+      quorum_vote: UNANIMOUS
+
+  north_star_assessment:
+    phase_scores:
+      phase_1_rsi:
+        score: 0.85
+        variance: 0.0
+        consensus: true
+      phase_2_novel:
+        score: 0.33
+        variance: 0.003
+        consensus: true
+      phase_3_company:
+        score: 0.17
+        variance: 0.001
+        consensus: true
+      phase_4_partnerships:
+        score: 0.08
+        variance: 0.003
+        consensus: true
+      phase_5_planetary:
+        score: 0.02
+        variance: 0.001
+        consensus: true
+    primary_phase_alignment: 1
+    violations: []
+    strategic_recommendations:
+      - "PRD-0005 is strongly Phase 1 aligned. No modifications needed for North Star compliance."
+      - "Consider documenting CCP/Impact Map as potential novel methods (Phase 2 future work)."
+      - "Maintain focus on RSI; do not prematurely optimize for company/partnership phases."
+
+  verdict:
+    status: NEEDS_REMEDIATION
+    confidence: HIGH
+    quorum_achieved: true
+    reason: |
+      PRD-0005 passed all structural gates. GATE-PRD-CONTENT identified 47 findings
+      (0 BLOCKER, 32 MAJOR). Council achieved unanimous quorum on 8 remediation proposals.
+      PRD will achieve PASSED status once remediations are applied.
+
+      Note: Metrics baselines (REM-005) deferred until system operational.
+
+  next_steps:
+    - "Apply structural remediations (REM-001 through REM-004, REM-006 through REM-008)"
+    - "Re-run GATE-PRD-SCHEMA and GATE-PRD-LINT after edits"
+    - "Proceed to AUTH_PRODUCT and AUTH_SECURITY signoff"
+    - "Defer REM-005 (metric baselines) until post-MVP operational data available"
+
+  deferred_items:
+    - item: "Success metric baselines and calibration plans"
+      reason: "Metrics unavailable until Idea Compiler is operational"
+      remediation_id: REM-005
+      resume_trigger: "After 30 compile runs establish baseline data"

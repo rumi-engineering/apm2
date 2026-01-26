@@ -1,0 +1,354 @@
+prd_quality_framework:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  profile_id: PRD_QUALITY_FRAMEWORK_V2
+  dimensions:
+    - dimension_id: AGENT_FRIENDLY_UX
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0010
+          - REQ-0012
+        evidence_ids:
+          - EVID-0001
+          - EVID-0010
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: DEFAULT_DENY_SECURITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0007
+          - REQ-0009
+          - REQ-0012
+        evidence_ids:
+          - EVID-0008
+        
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: DETERMINISM
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0008
+        evidence_ids:
+          - EVID-0006
+          - EVID-0001
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: OBSERVABILITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0012
+        evidence_ids:
+          - EVID-0001
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: TESTABILITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0002
+          - REQ-0003
+          - REQ-0004
+          - REQ-0005
+          - REQ-0006
+        evidence_ids:
+          - EVID-0002
+          - EVID-0003
+          - EVID-0004
+          - EVID-0005
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: PERFORMANCE
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0002
+        evidence_ids:
+          - EVID-0009
+      delegation:
+        guardrails:
+          - "CCP generation MUST support incremental operation via caching and stable cache keys."
+          - "End-to-end compile SHOULD complete within defined latency targets on typical developer hardware."
+        required_evidence_categories:
+          - BENCHMARK_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: DOCUMENTATION
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0010
+        evidence_ids:
+          - EVID-0010
+      delegation:
+        guardrails:
+          - "Skill instructions MUST be versioned and reference actual CLI commands and artifact paths."
+          - "CCP component atlas entries MUST point to code locations and invariants (AGENTS.md)."
+        required_evidence_categories:
+          - BUILD_ARTIFACTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: BACKWARD_COMPATIBILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0007
+          - REQ-0008
+        evidence_ids:
+          - EVID-0007
+      delegation:
+        guardrails:
+          - "Routing profile schema changes MUST be versioned; older profiles must either remain supported or fail with a migration message."
+          - "Run manifest schema changes MUST be versioned and documented."
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: ERROR_HANDLING
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0012
+        evidence_ids:
+          - EVID-0001
+      delegation:
+        guardrails:
+          - "Compiler errors MUST be classified and emitted with stable exit codes."
+          - "All error outputs MUST be redaction-safe and include actionable next steps."
+        required_evidence_categories:
+          - TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: SCALABILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0002
+          - REQ-0011
+        evidence_ids:
+          - EVID-0009
+          - EVID-0011
+      delegation:
+        guardrails:
+          - "Pipeline stages SHOULD be parallelizable where dependency ordering permits."
+          - "Refactor Radar MUST bound output volume to prevent churn."
+        required_evidence_categories:
+          - METRICS_DASHBOARDS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: ACCESSIBILITY
+      applicability: DOES_NOT_APPLY
+      disposition: NOT_APPLICABLE
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: true
+        rationale: "The Idea Compiler is a CLI-based build tool with no user-facing UI. Accessibility standards for visual/auditory interfaces do not apply."
+        required_signoffs:
+          - AUTH_PRODUCT
+
+    - dimension_id: COST_EFFICIENCY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0002
+          - REQ-0007
+        evidence_ids:
+          - EVID-0009
+      delegation:
+        guardrails:
+          - "CCP caching MUST minimize redundant computation and inference calls."
+          - "Model routing profiles SHOULD prefer local/cheap inference where quality is sufficient."
+        required_evidence_categories:
+          - BENCHMARK_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: DATA_PRIVACY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0009
+          - REQ-0012
+        evidence_ids:
+          - EVID-0008
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: INTEROPERABILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0007
+        evidence_ids:
+          - EVID-0001
+          - EVID-0007
+      delegation:
+        guardrails:
+          - "Compiler outputs MUST use standard formats (YAML, JSON, NDJSON) parseable by external tools."
+          - "Model routing MUST support multiple provider backends via explicit profile configuration."
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: OPERATIONAL_READINESS
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0012
+        evidence_ids:
+          - EVID-0001
+      delegation:
+        guardrails:
+          - "Compiler MUST emit stable exit codes and structured logs for CI/CD integration."
+          - "Dry-run mode MUST be available to validate inputs without side effects."
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: RECOVERY_ROLLBACK
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0008
+        evidence_ids:
+          - EVID-0006
+      delegation:
+        guardrails:
+          - "Compiler writes MUST be atomic (temp file + rename); partial writes are prohibited."
+          - "Evidence-first output strategy allows rollback by discarding unpromoted artifacts."
+        required_evidence_categories:
+          - TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: RELIABILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0008
+        evidence_ids:
+          - EVID-0001
+          - EVID-0006
+      delegation:
+        guardrails:
+          - "Compiler MUST be crash-only and resumable from persisted artifacts."
+          - "Golden run tests MUST validate end-to-end reliability on clean checkouts."
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+
+    - dimension_id: RESILIENCE
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0007
+        evidence_ids:
+          - EVID-0001
+          - EVID-0007
+      delegation:
+        guardrails:
+          - "Compiler MUST fail closed on provider unavailability unless explicit fallback is configured."
+          - "Retry policy with stricter prompting MUST be applied on structured output validation failures."
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []

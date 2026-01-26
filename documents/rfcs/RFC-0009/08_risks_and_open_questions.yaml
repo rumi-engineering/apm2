@@ -1,0 +1,146 @@
+rfc_risks_and_open_questions:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  risks:
+    - risk_id: RISK-0009-001
+      title: "Model output non-determinism"
+      description: |
+        LLM outputs are inherently non-deterministic. Even with temperature=0,
+        provider infrastructure may introduce variance.
+      likelihood: HIGH
+      impact: MEDIUM
+      mitigation:
+        - "Parse model outputs into structured IR before use"
+        - "Canonicalize all outputs before writing"
+        - "Classify diffs and require acceptance for structural changes"
+        - "Support canary mode to detect drift"
+      residual_risk: |
+        Free-text fields may still vary; this is acceptable per REQ-0008
+        which allows bounded diff for non-structural changes.
+
+    - risk_id: RISK-0009-002
+      title: "CCP staleness"
+      description: |
+        CCP may become stale if generated before code changes.
+        Impact Maps and RFCs grounded in stale CCP may reference
+        non-existent or outdated components.
+      likelihood: MEDIUM
+      impact: HIGH
+      mitigation:
+        - "Include git commit hash in CCP index"
+        - "Validate path references at RFC frame time"
+        - "Re-generate CCP as first step of compile pipeline"
+      residual_risk: |
+        If code changes between CCP build and RFC frame within
+        the same compile run, references may be invalid. This is
+        addressed by fail-closed path validation.
+
+    - risk_id: RISK-0009-003
+      title: "Routing profile misconfiguration"
+      description: |
+        Incorrect routing profiles could send prompts to wrong providers
+        or use inappropriate model versions.
+      likelihood: LOW
+      impact: HIGH
+      mitigation:
+        - "Routing profiles are schema-validated"
+        - "Profiles are governed documents with version control"
+        - "Run manifests record all routing decisions for audit"
+      residual_risk: |
+        Human error in profile authoring remains possible.
+        Canary mode provides detection mechanism.
+
+    - risk_id: RISK-0009-004
+      title: "Adoption friction"
+      description: |
+        The compiler adds new steps to the PRD->RFC workflow.
+        Teams may bypass the compiler if it feels heavy.
+      likelihood: MEDIUM
+      impact: MEDIUM
+      mitigation:
+        - "Single-command invocation minimizes friction"
+        - "Incremental adoption: stages can run independently"
+        - "Clear error messages guide users"
+        - "Skills provide guided workflows"
+      residual_risk: |
+        Some friction is inherent. The value proposition
+        (better RFCs, less rework) must justify the overhead.
+
+    - risk_id: RISK-0009-005
+      title: "Cousin abstraction false positives"
+      description: |
+        The cousin abstraction detector (LINT-0014) uses heuristics
+        that may produce false positives, flagging legitimate new
+        abstractions as duplication risks.
+      likelihood: MEDIUM
+      impact: LOW
+      mitigation:
+        - "LINT-0014 is a WARNING, not an ERROR"
+        - "Explicit acknowledgment resolves the warning"
+        - "Heuristics can be tuned over time"
+      residual_risk: |
+        Some false positives are acceptable if true positives
+        (actual duplications) are caught.
+
+  open_questions:
+    - question_id: OQ-0009-001
+      question: "What is the default routing profile?"
+      context: |
+        REQ-0007 requires routing profiles but doesn't specify defaults.
+        What model/provider should be used when no profile is specified?
+      proposed_resolution: |
+        Create a "default" profile that uses Claude Sonnet for most stages.
+        The profile is a governed document and can be updated.
+      status: OPEN
+      owner: AUTH_PRODUCT
+
+    - question_id: OQ-0009-002
+      question: "How should hotspot detection work?"
+      context: |
+        REQ-0002 mentions churn/hotspot summaries but doesn't specify
+        the algorithm or data source (git history, build logs, etc.).
+      proposed_resolution: |
+        Defer hotspot detection to Phase 2. Initial CCP includes
+        placeholder for hotspots.yaml but generation is optional.
+      status: RESOLVED
+      resolution: "Defer to Phase 2; not required for MVP"
+
+    - question_id: OQ-0009-003
+      question: "Should the compiler run as a daemon service?"
+      context: |
+        PRD-0005 Option B (daemon-resident compiler) was not selected,
+        but daemon integration may be desired for caching and leases.
+      proposed_resolution: |
+        Initial implementation is CLI-only (Option C). Daemon integration
+        can be added later without breaking the CLI interface.
+      status: RESOLVED
+      resolution: "CLI-only for now; daemon is future work"
+
+    - question_id: OQ-0009-004
+      question: "How are model API credentials managed?"
+      context: |
+        Model routing requires API credentials for providers.
+        Should these be in routing profiles, environment, or keyring?
+      proposed_resolution: |
+        Credentials are NOT in routing profiles (security risk).
+        Use environment variables or keyring via existing apm2-core
+        credentials module.
+      status: RESOLVED
+      resolution: "Environment variables or keyring; never in profiles"
+
+  assumptions:
+    - assumption_id: ASSUM-001
+      statement: "Cargo metadata output is deterministic"
+      validation: "cargo metadata --format-version 1 produces stable JSON"
+      risk_if_invalid: "CCP crate graph would be non-deterministic"
+
+    - assumption_id: ASSUM-002
+      statement: "AGENTS.md format is consistent across crates"
+      validation: "Manual review of existing AGENTS.md files"
+      risk_if_invalid: "Component atlas parsing may fail"
+
+    - assumption_id: ASSUM-003
+      statement: "Ed25519 signatures are sufficient for provenance"
+      validation: "Standard cryptographic practice"
+      risk_if_invalid: "Run manifest attestation would be insecure"

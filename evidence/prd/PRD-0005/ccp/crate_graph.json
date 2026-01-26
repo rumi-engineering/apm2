@@ -1,0 +1,60 @@
+{
+  "schema_version": "2026-01-26",
+  "generated_at": "2026-01-26T00:00:00Z",
+  "workspace_root": "/home/ubuntu/Projects/apm2",
+  "crates": [
+    {
+      "name": "apm2-core",
+      "version": "0.3.0",
+      "path": "crates/apm2-core",
+      "edition": "2024",
+      "rust_version": "1.85",
+      "type": "lib",
+      "dependencies": [
+        "tokio", "serde", "serde_json", "serde_yaml", "prost", "rusqlite",
+        "ed25519-dalek", "blake3", "thiserror", "tracing", "uuid", "chrono",
+        "axum", "tower", "http", "regex", "tempfile"
+      ]
+    },
+    {
+      "name": "apm2-daemon",
+      "version": "0.3.0",
+      "path": "crates/apm2-daemon",
+      "edition": "2024",
+      "rust_version": "1.85",
+      "type": "bin",
+      "dependencies": ["apm2-core", "tokio", "clap", "serde", "serde_json", "tracing", "tracing-subscriber", "nix", "ctrlc"]
+    },
+    {
+      "name": "apm2-cli",
+      "version": "0.3.0",
+      "path": "crates/apm2-cli",
+      "edition": "2024",
+      "rust_version": "1.85",
+      "type": "bin",
+      "dependencies": ["apm2-core", "tokio", "clap", "serde", "serde_json", "tracing", "tracing-subscriber", "uuid", "tempfile"]
+    },
+    {
+      "name": "apm2-holon",
+      "version": "0.3.0",
+      "path": "crates/apm2-holon",
+      "edition": "2024",
+      "rust_version": "1.85",
+      "type": "lib",
+      "dependencies": ["serde", "serde_json", "serde_yaml", "thiserror", "tokio", "uuid", "chrono", "blake3"]
+    },
+    {
+      "name": "xtask",
+      "version": "0.1.0",
+      "path": "xtask",
+      "edition": "2024",
+      "rust_version": "1.85",
+      "type": "bin",
+      "dependencies": ["anyhow", "clap", "serde", "serde_json", "serde_yaml", "xshell", "glob", "regex", "tempfile"]
+    }
+  ],
+  "edges": [
+    {"from": "apm2-daemon", "to": "apm2-core"},
+    {"from": "apm2-cli", "to": "apm2-core"}
+  ]
+}

@@ -1,0 +1,35 @@
+ticket:
+  schema_version: "2026-01-23"
+  id: TCK-00099
+  title: "Implement run manifest with signing"
+  status: OPEN
+  priority: HIGH
+  source:
+    rfc_id: RFC-0009
+    requirement_ids: [REQ-0009, REQ-0012]
+  phase: PHASE-4
+  description: |
+    Create run manifest module that records compilation provenance
+    with Ed25519 signatures. Include input/output hashes, routing
+    decisions, and stage timings.
+
+  implementation:
+    files_to_create:
+      - path: crates/apm2-core/src/run_manifest/mod.rs
+      - path: crates/apm2-core/src/run_manifest/manifest.rs
+      - path: crates/apm2-core/src/run_manifest/signer.rs
+    files_to_modify:
+      - path: crates/apm2-core/src/lib.rs
+
+  verification:
+    commands:
+      - command: "cargo test -p apm2-core run_manifest"
+    acceptance_criteria:
+      - "Manifests include all required fields"
+      - "Signatures verify correctly"
+      - "Tampered manifests fail verification"
+
+  dependencies:
+    blocked_by: [TCK-00098]
+    blocks: [TCK-00100]
+  estimated_complexity: MEDIUM

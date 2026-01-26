@@ -1,0 +1,163 @@
+rfc_rollout_and_ops:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+
+  rollout_plan:
+    phases:
+      - phase_id: PHASE-1
+        name: "Core Infrastructure"
+        description: "Implement determinism envelope and CCP generation"
+        deliverables:
+          - "crates/apm2-core/src/determinism/ module"
+          - "crates/apm2-core/src/ccp/ module"
+          - "CLI: apm2 factory ccp build"
+        verification: |
+          - CCP builds deterministically for apm2 repo
+          - Re-runs produce identical output
+          - Content hashes validate correctly
+        dependencies: []
+
+      - phase_id: PHASE-2
+        name: "Impact Mapping and RFC Framing"
+        description: "Implement requirement mapping and RFC generation"
+        deliverables:
+          - "crates/apm2-core/src/impact_map/ module"
+          - "crates/apm2-core/src/rfc_framer/ module"
+          - "CLI: apm2 factory impact-map build"
+          - "CLI: apm2 factory rfc frame"
+        verification: |
+          - Impact Map correctly maps PRD-0005 requirements
+          - RFC draft references valid paths
+          - Path validation catches invalid references
+        dependencies:
+          - PHASE-1
+
+      - phase_id: PHASE-3
+        name: "Ticket Emission and Lint Extensions"
+        description: "Implement ticket decomposition and clutter prevention"
+        deliverables:
+          - "crates/apm2-core/src/ticket_emitter/ module"
+          - "LINT-0013, LINT-0014, LINT-0015 in LINT_SPEC.yaml"
+          - "CLI: apm2 factory tickets emit"
+        verification: |
+          - Tickets include file paths and verification commands
+          - Lint rules catch missing justifications
+        dependencies:
+          - PHASE-2
+
+      - phase_id: PHASE-4
+        name: "Model Routing and Run Manifests"
+        description: "Implement multi-model routing and provenance"
+        deliverables:
+          - "crates/apm2-core/src/model_router/ module"
+          - "crates/apm2-core/src/run_manifest/ module"
+          - "Routing profile schema"
+          - "CLI: apm2 factory compile (end-to-end)"
+        verification: |
+          - Routing profiles parsed correctly
+          - Run manifests signed and verifiable
+          - Canary mode produces comparison reports
+        dependencies:
+          - PHASE-3
+
+      - phase_id: PHASE-5
+        name: "Skill Integration and Refactor Radar"
+        description: "Update skills and implement continuous refactoring"
+        deliverables:
+          - "Updated idea-compiler skill"
+          - "Updated create-rfc skill"
+          - "crates/apm2-core/src/refactor_radar/ module"
+          - "CLI: apm2 factory refactor radar"
+        verification: |
+          - Skills correctly invoke CLI commands
+          - Refactor Radar produces bounded recommendations
+        dependencies:
+          - PHASE-4
+
+  operational_considerations:
+    resource_requirements:
+      - resource: "Disk space for CCP artifacts"
+        estimate: "~10MB per PRD"
+        mitigation: "Incremental builds; cache invalidation"
+
+      - resource: "Model API calls per compile"
+        estimate: "3-5 calls per stage with LLM involvement"
+        mitigation: "Caching; deterministic prompts"
+
+    monitoring:
+      - metric: "compile_duration_seconds"
+        type: histogram
+        labels: [prd_id, stage]
+        purpose: "Track compilation performance"
+
+      - metric: "compile_errors_total"
+        type: counter
+        labels: [prd_id, error_class]
+        purpose: "Track failure modes"
+
+      - metric: "determinism_diff_accepted_total"
+        type: counter
+        labels: [prd_id]
+        purpose: "Track how often material diffs require acceptance"
+
+    failure_modes:
+      - mode: "Model provider unavailable"
+        detection: "HTTP timeout or error response"
+        response: "Fail closed; emit typed finding"
+        recovery: "Retry with backoff; manual intervention"
+
+      - mode: "Invalid CCP due to repo state"
+        detection: "Validation failure during CCP build"
+        response: "Fail closed; report missing files"
+        recovery: "Fix repo state; re-run"
+
+      - mode: "Non-deterministic model output"
+        detection: "Canary comparison shows material diff"
+        response: "Emit diff report; require acceptance"
+        recovery: "Operator reviews and accepts or adjusts prompt"
+
+  cli_reference:
+    commands:
+      - command: "apm2 factory compile --plan <path> [--profile <profile>] [--dry-run]"
+        description: "Run full compilation pipeline"
+        flags:
+          - name: "--plan"
+            description: "Path to PRD or plan document"
+          - name: "--profile"
+            description: "Routing profile name (default: 'default')"
+          - name: "--dry-run"
+            description: "Report intended writes without modifying files"
+        exit_codes:
+          - code: 0
+            meaning: "Success"
+          - code: 1
+            meaning: "General error"
+          - code: 10
+            meaning: "Schema validation failure"
+          - code: 11
+            meaning: "Lint failure"
+          - code: 12
+            meaning: "Route unavailable"
+          - code: 13
+            meaning: "Parse failure"
+
+      - command: "apm2 factory ccp build [--cache-dir <path>]"
+        description: "Build Codebase Context Pack for current repo"
+
+      - command: "apm2 factory impact-map build --prd PRD-XXXX"
+        description: "Build Impact Map for a PRD"
+
+      - command: "apm2 factory rfc frame --prd PRD-XXXX --rfc RFC-XXXX"
+        description: "Frame an RFC from Impact Map and CCP"
+
+      - command: "apm2 factory tickets emit --rfc RFC-XXXX"
+        description: "Emit tickets from RFC"
+
+      - command: "apm2 factory skill sync"
+        description: "Update skills to use compiler pipeline"
+
+      - command: "apm2 factory refactor radar --window 7d"
+        description: "Generate refactor recommendations"
+
+      - command: "apm2 factory verify --manifest <path>"
+        description: "Verify a run manifest signature and hashes"

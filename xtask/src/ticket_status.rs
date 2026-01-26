@@ -29,27 +29,40 @@ pub enum TicketStatus {
     Completed,
 }
 
+/// Result of querying completed tickets from GitHub.
+#[derive(Debug)]
+pub enum CompletedTicketsResult {
+    /// Successfully queried GitHub.
+    Success(HashSet<String>),
+    /// GitHub query failed - use fallback behavior.
+    NetworkError(String),
+}
+
 /// Get all completed ticket IDs by checking merged PRs.
 ///
 /// Queries GitHub for merged PRs with ticket branch patterns like
 /// `ticket/RFC-*/TCK-XXXXX` and extracts the ticket IDs.
 ///
-/// # Errors
+/// # Returns
 ///
-/// Returns an error if the `gh` CLI command fails. If GitHub is unavailable,
-/// returns an empty set (allowing offline operation with reduced
-/// functionality).
-pub fn get_completed_tickets(sh: &Shell) -> Result<HashSet<String>> {
+/// - `CompletedTicketsResult::Success` with the set of completed ticket IDs
+/// - `CompletedTicketsResult::NetworkError` if GitHub CLI fails (network, auth,
+///   rate limit)
+pub fn get_completed_tickets(sh: &Shell) -> CompletedTicketsResult {
     // Query GitHub for merged PRs with ticket branch pattern
     // Use --limit 500 to get a reasonable history
-    let output = cmd!(
+    let result = cmd!(
         sh,
         "gh pr list --state merged --limit 500 --json headRefName"
     )
-    .read()
-    .unwrap_or_default();
+    .read();
 
-    Ok(parse_ticket_ids_from_pr_json(&output))
+    match result {
+        Ok(output) => CompletedTicketsResult::Success(parse_ticket_ids_from_pr_json(&output)),
+        Err(e) => CompletedTicketsResult::NetworkError(format!(
+            "Failed to query GitHub for merged PRs: {e}"
+        )),
+    }
 }
 
 /// Get ticket IDs with active branches (not merged).
@@ -353,5 +366,43 @@ branch refs/heads/ticket/RFC-0002/TCK-00030
             get_ticket_status("TCK-00003", &completed, &in_progress),
             TicketStatus::Pending
         );
+    }
+
+    #[test]
+    fn test_parse_ticket_ids_from_pr_json_empty() {
+        // Empty JSON array (no merged PRs)
+        let json = "[]";
+        let result = parse_ticket_ids_from_pr_json(json);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ticket_ids_from_pr_json_empty_string() {
+        // Empty string (simulates network failure fallback)
+        let json = "";
+        let result = parse_ticket_ids_from_pr_json(json);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ticket_ids_from_pr_json_malformed() {
+        // Malformed JSON should not panic, just return empty set
+        let json = "not valid json {{{";
+        let result = parse_ticket_ids_from_pr_json(json);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ticket_ids_from_pr_json_partial() {
+        // Truncated JSON without closing quote returns empty (safe behavior)
+        let json = r#"[{"headRefName":"ticket/RFC-0002/TCK-00030"#;
+        let result = parse_ticket_ids_from_pr_json(json);
+        assert!(result.is_empty());
+
+        // But complete entries before truncation are extracted
+        let json_with_complete =
+            r#"[{"headRefName":"ticket/RFC-0002/TCK-00030"},{"headRefName":"ticket/RFC-"#;
+        let result = parse_ticket_ids_from_pr_json(json_with_complete);
+        assert!(result.contains("TCK-00030"));
     }
 }

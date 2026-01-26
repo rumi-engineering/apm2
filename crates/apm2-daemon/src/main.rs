@@ -44,7 +44,7 @@ struct Args {
     #[arg(long)]
     socket: Option<PathBuf>,
 
-    /// Path to state file
+    /// Path to state file (reserved; not wired up yet)
     #[arg(long)]
     state_file: Option<PathBuf>,
 

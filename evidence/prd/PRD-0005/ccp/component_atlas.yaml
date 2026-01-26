@@ -1,0 +1,175 @@
+component_atlas:
+  schema_version: "2026-01-26"
+  generated_at: "2026-01-26T00:00:00Z"
+  repo_root: "/home/ubuntu/Projects/apm2"
+
+  components:
+    - id: COMP-CLI
+      name: apm2-cli
+      path: crates/apm2-cli
+      type: binary_crate
+      description: "CLI client for managing AI CLI processes via IPC communication with the daemon"
+      agents_md: crates/apm2-cli/AGENTS.md
+      invariants:
+        - id: INV-CLI-001
+          statement: "config defaults to ecosystem.toml in current directory"
+        - id: INV-CLI-002
+          statement: "socket path resolution: CLI arg > config file > /var/run/apm2/apm2.sock"
+        - id: INV-CLI-003
+          statement: "Uses length-prefixed JSON framing per apm2_core::ipc protocol"
+        - id: INV-CLI-004
+          statement: "Connection is closed after each request-response cycle (stateless)"
+      contracts:
+        - id: CTR-CLI-001
+          statement: "Daemon spawns apm2-daemon binary, does not implement daemon logic directly"
+        - id: CTR-CLI-002
+          statement: "Kill sends IpcRequest::Shutdown to daemon"
+        - id: CTR-CLI-003
+          statement: "Process commands require daemon to be running"
+      extension_points:
+        - id: EXT-CLI-001
+          name: FactoryCommands
+          path: crates/apm2-cli/src/main.rs
+          line_range: [161, 172]
+          description: "Clap subcommand enum for factory commands"
+
+    - id: COMP-DAEMON
+      name: apm2-daemon
+      path: crates/apm2-daemon
+      type: binary_crate
+      description: "Unix socket daemon for managing AI CLI processes through IPC handlers and shared state"
+      agents_md: crates/apm2-daemon/AGENTS.md
+      invariants:
+        - id: INV-D001
+          statement: "shutdown flag is monotonic: once set to true, it never reverts to false"
+        - id: INV-D002
+          statement: "started_at is immutable after construction"
+        - id: INV-D003
+          statement: "All access to inner state requires acquiring the RwLock"
+        - id: INV-D007
+          statement: "Maximum message size is 16 MiB (MAX_MESSAGE_SIZE)"
+        - id: INV-D008
+          statement: "Connection closes on any framing or parse error"
+      contracts:
+        - id: CTR-D001
+          statement: "is_shutdown_requested() is lock-free (uses AtomicBool)"
+        - id: CTR-D009
+          statement: "All handlers return exactly one IpcResponse"
+      extension_points:
+        - id: EXT-D001
+          name: IpcHandlers
+          path: crates/apm2-daemon/src/handlers.rs
+          description: "Handler dispatch for IpcRequest variants"
+
+    - id: COMP-CORE
+      name: apm2-core
+      path: crates/apm2-core
+      type: library_crate
+      description: "Core library providing adapters, process management, IPC, tool protocol, policy engine, ledger, webhooks"
+      modules:
+        - name: adapter
+          path: crates/apm2-core/src/adapter
+          description: "Agent adapters (ClaudeCode, BlackBox) for process observation"
+          extension_points:
+            - id: EXT-CORE-ADAPTER
+              name: Adapter trait
+              path: crates/apm2-core/src/adapter/traits.rs
+              description: "Trait for implementing new agent adapters"
+        - name: process
+          path: crates/apm2-core/src/process
+          description: "ProcessRunner and ProcessSpec for lifecycle management"
+        - name: ledger
+          path: crates/apm2-core/src/ledger
+          description: "SQLite-backed append-only event ledger"
+        - name: crypto
+          path: crates/apm2-core/src/crypto
+          description: "Ed25519 signing, BLAKE3 hashing, key management"
+        - name: policy
+          path: crates/apm2-core/src/policy
+          description: "YAML policy parsing and enforcement"
+        - name: events
+          path: crates/apm2-core/src/events
+          description: "Protobuf event definitions and canonical serialization"
+        - name: evidence
+          path: crates/apm2-core/src/evidence
+          description: "Evidence publishing and content-addressed storage"
+        - name: lease
+          path: crates/apm2-core/src/lease
+          description: "Lease state machine and reducer"
+        - name: work
+          path: crates/apm2-core/src/work
+          description: "Work object state machine and reducer"
+        - name: webhook
+          path: crates/apm2-core/src/webhook
+          description: "GitHub webhook handling"
+        - name: config
+          path: crates/apm2-core/src/config
+          description: "TOML configuration parsing"
+
+    - id: COMP-HOLON
+      name: apm2-holon
+      path: crates/apm2-holon
+      type: library_crate
+      description: "Core trait contract and resource types for holonic AI coordination"
+      agents_md: crates/apm2-holon/AGENTS.md
+      invariants:
+        - id: INV-HOLON-001
+          statement: "All associated types must implement Send + Sync"
+        - id: INV-HOLON-002
+          statement: "intake() must validate the lease before preparing internal state"
+        - id: INV-HOLON-003
+          statement: "execute_episode() must respect budget constraints in context"
+      modules:
+        - name: traits
+          path: crates/apm2-holon/src/traits.rs
+          description: "Holon trait definition"
+          extension_points:
+            - id: EXT-HOLON-TRAIT
+              name: Holon trait
+              path: crates/apm2-holon/src/traits.rs
+              description: "Core trait for implementing holonic agents"
+        - name: resource
+          path: crates/apm2-holon/src/resource
+          description: "Budget, Lease, LeaseScope types"
+        - name: skill
+          path: crates/apm2-holon/src/skill.rs
+          description: "Skill frontmatter parsing"
+        - name: spawn
+          path: crates/apm2-holon/src/spawn.rs
+          description: "Holon spawning and orchestration"
+
+    - id: COMP-XTASK
+      name: xtask
+      path: xtask
+      type: binary_crate
+      description: "Development automation tasks including lint"
+      modules:
+        - name: lint
+          path: xtask/src/tasks/lint.rs
+          description: "YAML lint implementation"
+          extension_points:
+            - id: EXT-XTASK-LINT
+              name: Lint rules
+              path: xtask/src/tasks/lint.rs
+              description: "Extension point for adding new lint rules"
+
+    - id: COMP-SKILLS
+      name: skill-library
+      path: documents/skills
+      type: document_collection
+      description: "Agent skill definitions with frontmatter and references"
+      items:
+        - documents/skills/create-rfc/SKILL.md
+        - documents/skills/prd-review/SKILL.md
+        - documents/skills/dev-eng-ticket/SKILL.md
+        - documents/skills/aat/SKILL.md
+        - documents/skills/idea-compiler/SKILL.md
+
+    - id: COMP-STANDARDS
+      name: standards
+      path: documents/standards
+      type: document_collection
+      description: "Lint spec, schemas, and governance standards"
+      items:
+        - documents/standards/lint/LINT_SPEC.yaml
+        - documents/standards/schemas/
