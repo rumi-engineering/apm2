@@ -273,7 +273,96 @@ if let Err(e) = work.set_metadata("key", value) {
 
 ---
 
-## 10. PR Checklist for Review Readiness
+## 10. Bounded In-Memory Stores (`CTR-MEM001`)
+
+In-memory stores (HashMaps, Vecs tracking network requests or events) MUST have hard upper bounds to prevent DoS via memory exhaustion.
+
+### 10.1 Bounded HashMap with O(1) Eviction
+
+Use `VecDeque` alongside `HashMap` for insertion-order tracking to enable O(1) eviction without holding locks during O(N) scans.
+
+```rust
+pub struct BoundedStore<K: Hash + Eq + Clone, V> {
+    entries: HashMap<K, V>,
+    insertion_order: VecDeque<K>,  // O(1) eviction via pop_front()
+    max_entries: usize,
+}
+
+impl<K: Hash + Eq + Clone, V> BoundedStore<K, V> {
+    pub fn insert(&mut self, key: K, value: V) {
+        // Evict oldest if at capacity
+        while self.entries.len() >= self.max_entries {
+            if let Some(old_key) = self.insertion_order.pop_front() {
+                self.entries.remove(&old_key);
+            }
+        }
+        self.entries.insert(key.clone(), value);
+        self.insertion_order.push_back(key);
+    }
+}
+```
+
+*   **Reject if:** HashMap/Vec grows without `max_entries` limit.
+*   **Reject if:** Eviction uses `iter().min_by_key()` (O(N) under lock).
+*   **Test:** `test_bounded_store_respects_limit` - insert N+1 items, assert len() <= N.
+
+---
+
+## 11. Serde Security for Ledger/Audit Types (`CTR-SERDE001`)
+
+Types persisted to ledgers or used in audit trails MUST use strict parsing to prevent ambiguity and hidden data injection.
+
+```rust
+// CORRECT: Strict parsing for ledger events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]  // Rejects payloads with extra fields
+pub struct LedgerEvent {
+    pub event_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub payload: EventPayload,
+}
+
+// WRONG: Permissive parsing allows hidden data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEvent { /* ... */ }  // Missing deny_unknown_fields
+```
+
+*   **Reject if:** Ledger/audit types lack `#[serde(deny_unknown_fields)]`.
+*   **Test:** `test_rejects_unknown_fields` - deserialize JSON with extra field, assert error.
+
+---
+
+## 12. Fail-Closed Feature Flags (`CTR-FLAG001`)
+
+Feature flags controlling security-sensitive behavior MUST default to **disabled** (fail-closed). Ephemeral stores MUST warn at startup.
+
+```rust
+// CORRECT: Default to disabled, explicit opt-in
+pub fn is_feature_enabled() -> bool {
+    std::env::var("FEATURE_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)  // Fail-closed default
+}
+
+// CORRECT: Warn about ephemeral stores at startup
+impl Handler {
+    pub fn new() -> Self {
+        tracing::warn!(
+            "Using ephemeral in-memory stores. \
+             Data will be lost on restart. \
+             For production, inject persistent stores."
+        );
+        // ...
+    }
+}
+```
+
+*   **Reject if:** Security feature flags default to `true` (fail-open).
+*   **Reject if:** In-memory stores for production data lack startup warning.
+
+---
+
+## 13. PR Checklist for Review Readiness
 
 1.  **Bounded Reads:** All reads checked against `max` before allocation (`RSK-2415`).
 2.  **Atomic Writes:** State updates use `NamedTempFile` + `persist` (`CTR-1502`).
@@ -284,3 +373,6 @@ if let Err(e) = work.set_metadata("key", value) {
 7.  **Serialization Safety:** All `serde` operations in crypto contexts propagate errors (`RSK-2415`).
 8.  **Builder Completeness:** Builder validates ALL inputs (strings, specs, configs), not just IDs.
 9.  **Chain Integrity:** Hash chains commit to all related events.
+10. **Bounded Stores:** In-memory stores have `max_entries` limit with O(1) eviction (`CTR-MEM001`).
+11. **Ledger Serde:** Audit/ledger types use `#[serde(deny_unknown_fields)]` (`CTR-SERDE001`).
+12. **Fail-Closed Flags:** Security feature flags default to disabled (`CTR-FLAG001`).
