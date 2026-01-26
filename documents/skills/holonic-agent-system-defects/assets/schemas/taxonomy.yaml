@@ -7,6 +7,7 @@ enums:
   defect_domain:
     - CONTEXT
     - ENGINEERING
+    - SPECIFICATION_GAP
     - VERIFICATION
     - SECURITY_CAPABILITY
     - PRODUCT_VALUE
@@ -41,6 +42,7 @@ enums:
     - OBSERVABILITY
     - RELEASE_CHANNEL
     - ECONOMICS
+    - ORACLE
 
   severity:
     - S0_STOP_THE_LINE

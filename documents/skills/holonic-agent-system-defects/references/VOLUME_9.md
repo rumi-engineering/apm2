@@ -34,7 +34,7 @@ See `schemas/taxonomy.yaml` and `schemas/defect_record_schema.yaml`. Schemas are
 
 ## 9.4 Inefficiency Catalog (Defects as Waste)
 Inefficiency defects include:
-- any additional context discovery tool call beyond the ContextPack,
+- any additional context discovery tool call beyond the ContextPack for a **scoped implementation task** (**Research tasks** and **Verification tools** used for active inference are exempt),
 - repeated CI failures due to flake or missing determinism,
 - redundant compilation of identical artifacts without caching,
 - ambiguous CLI output requiring interpretation,

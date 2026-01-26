@@ -131,6 +131,9 @@ properties:
       gate_run_refs:
         type: array
         items: { type: string }
+      oracle_refs:
+        type: array
+        items: { type: string }
 
   evidence:
     required: [evidence_refs]

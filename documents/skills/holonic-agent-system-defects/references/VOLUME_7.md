@@ -25,4 +25,4 @@ Low-value verifiers are replaced by cheaper, sharper checks or by primitives tha
 Roadmaps are derived from clustered defects: the largest recurrence clusters define where primitives and verifiers should be invested. This replaces anecdotal prioritization with counterexample economics. The roadmap itself is governed: it must cite defect cluster fingerprints and evidence counts.
 
 ## 7.5 Zero-Tool Ideal Convergence
-The system converges toward ZTI by migrating context discovery from execution to compilation. Every “tool call for context” is a measured inefficiency defect, enabling the compiler to learn which contexts to preload in future packs.
+The system converges toward ZTI by migrating context discovery from execution to compilation for **scoped implementation tasks**. Every “tool call for context” in these tasks is a measured inefficiency defect (**Research tasks** are exempt), enabling the compiler to learn which contexts to preload in future packs.

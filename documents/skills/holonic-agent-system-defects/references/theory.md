@@ -21,7 +21,15 @@ Holons are bounded, ephemeral, crash-only actors whose internal state is non-dur
 - **Primitive**: invariant-preserving operator with a small stable API and packaged evidence.
 
 ## 4. Universal Defect Principle
-Every verifier failure is a defect. A CI failure is always a defect. A flaky test is a verification defect. An incident lacking sufficient telemetry is a verification defect. A release requiring manual rollback is an operations defect. A system that requires context discovery during execution is a context defect. The defect system is universal: it spans code, infrastructure, processes, and runtime.
+Every verifier failure is a defect. A CI failure is always a defect. A flaky test is a verification defect. An incident lacking sufficient telemetry is a verification defect. A release requiring manual rollback is an operations defect. 
+
+The **Zero-Tool Ideal (ZTI)** mandates that implementation should be actuation, not exploration. This applies to **scoped implementation tasks**. 
+
+**Research Exemption:** ZTI does NOT apply to holons whose primary mission is **Research, Discovery, or Mapping**. In research contexts, tool-based exploration is the core work product.
+
+Any tool call executed primarily to discover missing context in a scoped task is a **context defect**. However, tool calls used for **verification** (tests, linters, compilers) are exempt from ZTI inefficiency counts as they represent active inference.
+
+In high-entropy states where environmental complexity exceeds a holon's requisite variety, the holon MAY request a **Human-as-Oracle** intervention. This is classified as a **Specification Gap** (Engineering domain) that updates the refinement compiler, rather than a defect of the agent itself.
 
 ## 5. Containment: Capability Integrity, SoD, Context Firewalls
 ### 5.1 Capability Model

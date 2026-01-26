@@ -14,7 +14,9 @@ user-invocable: false
 | Budget | references/lease_and_budget.md |
 | CCP | references/ccp.md |
 | ChangeSet | references/change_set.md |
+| Checkpointing | references/checkpointing.md |
 | CLI | references/cli.md |
+| ContextPack | references/context_pack.md |
 | Coordinator | references/coordinator.md |
 | Countermeasure | references/countermeasure.md |
 | Credentials | references/credentials.md |
@@ -28,12 +30,16 @@ user-invocable: false
 | Lease | references/lease_and_budget.md |
 | Ledger | references/ledger.md |
 | Merge Receipt | references/merge_receipt.md |
+| OCAP | references/ocap.md |
+| Oracle | references/oracle.md |
 | Plan | references/plan.md |
 | Policy | references/policy.md |
 | Process | references/process.md |
 | Reducer | references/reducer.md |
 | Restart / Backoff | references/restart.md |
 | Session | references/session.md |
+| Snapshot | references/snapshot.md |
+| Specification Gap | references/specification_gap.md |
 | Stop Condition | references/stop_condition.md |
 | Supervisor | references/supervisor.md |
 | Tool | references/tool.md |

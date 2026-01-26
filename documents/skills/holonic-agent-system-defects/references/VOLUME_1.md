@@ -23,6 +23,8 @@ A defect system MUST be event-sourced: defects, findings, gate runs, releases, a
 - replay of the exact verifier that produced a counterexample,
 - safe merging of distributed defect streams.
 
+To optimize performance, the system SHOULD support **Sub-Episode Checkpointing** (recording intermediate tool outputs) for fine-grained recovery and **Canonical State Snapshots** to prune historical replay requirements.
+
 ## 1.3 EvidenceBundles and Replay Semantics
 EvidenceBundles are content-addressed collections of artifacts sufficient to validate a claim. Evidence includes: command transcripts, environment snapshots, configuration hashes, logs, traces, and output hashes. Replay semantics MUST specify determinism class:
 - deterministic replay (same inputs ⇒ same outcome),
