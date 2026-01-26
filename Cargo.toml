@@ -90,9 +90,19 @@ prost-build = "0.13"
 
 # Cryptography
 blake3 = "1.5"
+hex = "0.4"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
 rand = "0.8"
 zeroize = { version = "1.8", features = ["derive"] }
+
+# HTTP Server (webhook handler)
+axum = "0.7"
+http = "1.0"
+http-body-util = "0.1"
+tower = { version = "0.4", features = ["util"] }
 
 # Sandboxing (Linux only)
 seccompiler = "0.5"

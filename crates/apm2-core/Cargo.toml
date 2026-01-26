@@ -59,9 +59,19 @@ prost-types.workspace = true
 
 # Cryptography
 blake3.workspace = true
+hex.workspace = true
 ed25519-dalek.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 rand.workspace = true
 zeroize.workspace = true
+
+# HTTP Server (webhook handler)
+axum.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+tower.workspace = true
 
 # Unix-specific (for TOCTOU mitigation via O_NOFOLLOW)
 [target.'cfg(unix)'.dependencies]

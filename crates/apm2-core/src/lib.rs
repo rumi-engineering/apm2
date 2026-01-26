@@ -55,6 +55,7 @@ pub mod state;
 pub mod supervisor;
 pub mod syscall;
 pub mod tool;
+pub mod webhook;
 pub mod work;
 
 /// Prelude module for convenient imports.
