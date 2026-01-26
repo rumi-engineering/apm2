@@ -46,7 +46,8 @@ pub enum CompletedTicketsResult {
 /// # Returns
 ///
 /// - `CompletedTicketsResult::Success` with the set of completed ticket IDs
-/// - `CompletedTicketsResult::NetworkError` if GitHub CLI fails (network, auth, rate limit)
+/// - `CompletedTicketsResult::NetworkError` if GitHub CLI fails (network, auth,
+///   rate limit)
 pub fn get_completed_tickets(sh: &Shell) -> CompletedTicketsResult {
     // Query GitHub for merged PRs with ticket branch pattern
     // Use --limit 500 to get a reasonable history
@@ -399,7 +400,8 @@ branch refs/heads/ticket/RFC-0002/TCK-00030
         assert!(result.is_empty());
 
         // But complete entries before truncation are extracted
-        let json_with_complete = r#"[{"headRefName":"ticket/RFC-0002/TCK-00030"},{"headRefName":"ticket/RFC-"#;
+        let json_with_complete =
+            r#"[{"headRefName":"ticket/RFC-0002/TCK-00030"},{"headRefName":"ticket/RFC-"#;
         let result = parse_ticket_ids_from_pr_json(json_with_complete);
         assert!(result.contains("TCK-00030"));
     }

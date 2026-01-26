@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
-use crate::ticket_status::{CompletedTicketsResult, get_completed_tickets, get_in_progress_tickets};
+use crate::ticket_status::{
+    CompletedTicketsResult, get_completed_tickets, get_in_progress_tickets,
+};
 use crate::util::main_worktree;
 
 /// Type of target specified for start-ticket command.
@@ -101,7 +103,7 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
             eprintln!("         Using empty completed set - may re-select completed tickets.");
             eprintln!();
             std::collections::HashSet::new()
-        }
+        },
     };
     let in_progress =
         get_in_progress_tickets(&sh, &completed).context("Failed to get in-progress tickets")?;
