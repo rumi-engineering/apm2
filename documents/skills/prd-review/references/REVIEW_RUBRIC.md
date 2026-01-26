@@ -358,10 +358,12 @@ Execute analysis through 8 structured angles. See [ANGLE_PROMPTS.md](ANGLE_PROMP
 | OPERATIONAL_READINESS | Can this be deployed safely? | No | SPEC_DEFECT, EVIDENCE_DEFECT |
 | SECURITY_POSTURE | Default-deny maintained? | No | EVIDENCE_DEFECT |
 | COHERENCE_CONSISTENCY | Internally consistent? | Yes | SPEC_DEFECT |
+| TRADEOFF_ANALYSIS | Optimizations justified? | Yes | SPEC_DEFECT |
+| SYSTEM_DYNAMICS | Feedback loops stable? | Yes | SPEC_DEFECT |
 
 **Angle Execution Requirements:**
 
-1. **All required angles MUST be executed** (6 required angles minimum)
+1. **All required angles MUST be executed** (8 required angles minimum)
 2. **Optional angles SHOULD be executed** for production PRDs
 3. **Each angle produces findings** with `angle_id` attribution
 4. **Angle coverage matrix** captured in output bundle
@@ -388,6 +390,8 @@ For each requirement, evaluate through applicable angles:
 5. **Feasibility** (TECHNICAL_FEASIBILITY): Can this be implemented with current technology?
 6. **Risk** (IMPLEMENTATION_RISK): What could prevent successful implementation?
 7. **Reuse** (REUSE_POTENTIAL): Does this duplicate existing abstractions?
+8. **Tradeoff** (TRADEOFF_ANALYSIS): Is the optimization justified by a sacrifice?
+9. **Dynamics** (SYSTEM_DYNAMICS): Does this create unstable feedback loops?
 
 For the PRD overall, evaluate:
 
@@ -411,6 +415,8 @@ For the PRD overall, evaluate:
 | Missing rollback strategy | MAJOR | No rollback for critical deployment | OPERATIONAL_READINESS |
 | Minor clarity improvement | MINOR | Could be reworded for clarity | COHERENCE_CONSISTENCY |
 | Ignored extension point | MINOR | Could leverage existing middleware | REUSE_POTENTIAL |
+| Naive Optimization | MAJOR | Claims "best" without tradeoff analysis | TRADEOFF_ANALYSIS |
+| Unstable Feedback Loop | BLOCKER | Design creates reinforcing loop (e.g., infinite retries) | SYSTEM_DYNAMICS |
 | Style or formatting suggestion | INFO | Passive voice could be active | - |
 
 ### Angle Coverage Matrix
@@ -436,10 +442,10 @@ angle_coverage:
       finding_ids: []
     # ... remaining angles
   summary:
-    total_angles: 8
-    required_angles: 6
-    executed_angles: 8
-    required_executed: 6
+    total_angles: 10
+    required_angles: 8
+    executed_angles: 10
+    required_executed: 8
     total_findings: 12
     blocker_findings: 2
 ```

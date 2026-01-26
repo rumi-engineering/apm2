@@ -1,8 +1,8 @@
 ---
 name: idea-compiler
-description: Compile an operator plan/PRD into a codebase-aware RFC and low-noise engineering tickets using the Idea Compiler pipeline (CCP -> Impact Map -> RFC -> Tickets), with explicit model routing and signed run manifests.
+description: Compile a PRD or RFC into CCP-grounded outputs (anti-cousin by default) using the Idea Compiler pipeline, with explicit model routing and reproducible run manifests.
 user-invocable: true
-argument-hint: "[--plan <path> | --prd PRD-XXXX] [--profile <routing_profile>] [--dry-run]"
+argument-hint: "[--prd PRD-XXXX | --rfc RFC-XXXX] [--path <dir>] [--profile <routing_profile>] [--dry-run]"
 ---
 
 # Idea Compiler Skill
@@ -12,15 +12,15 @@ This skill drives the PRD->RFC "Idea Compiler" compilation pipeline. The pipelin
 ## When to use
 
 Use this skill when:
-- You have an operator conversation distillation or a PRD that needs to become an RFC and tickets.
+- You have a PRD (or existing RFC) that needs to become low-noise, codebase-aware tickets.
 - You want RFCs/tickets grounded in the existing codebase (no invented extension points).
 - You want deterministic re-runs, provenance, and controlled model routing.
 
 ## Invocation
 
 ```bash
-/idea-compiler --plan <path> [--profile <profile>] [--dry-run]
-/idea-compiler --prd PRD-XXXX [--profile <profile>] [--dry-run]
+/idea-compiler --prd PRD-XXXX [--path <dir>] [--profile <profile>] [--dry-run]
+/idea-compiler --rfc RFC-XXXX [--path <dir>] [--profile <profile>] [--dry-run]
 ```
 
 ## Core doctrine
@@ -34,26 +34,34 @@ Use this skill when:
 
 ### 1) Validate inputs
 
-- If using `--plan`, ensure the plan document is present and readable.
-- If using `--prd`, ensure `documents/prds/PRD-XXXX/` exists.
+- If using `--prd`, ensure `documents/prds/PRD-XXXX/` exists (or `--path` points at the PRD root).
+- If using `--rfc`, ensure `documents/rfcs/RFC-XXXX/` exists (or `--path` points at the RFC root).
+- Default posture: write outputs to `evidence/` first; only update governed `documents/` via an explicit promote step.
 
 ### 2) Run compilation
 
 Preferred (end-to-end):
 
 ```bash
-apm2 factory compile --plan <path> --profile <profile>
+apm2 factory compile --prd PRD-XXXX --profile <profile>
+# or
+apm2 factory compile --rfc RFC-XXXX --profile <profile>
 ```
 
 Or stage-by-stage:
 
 ```bash
-apm2 factory ccp build
+apm2 factory ccp build --prd PRD-XXXX
 apm2 factory impact-map build --prd PRD-XXXX
 apm2 factory rfc frame --prd PRD-XXXX --rfc RFC-XXXX
 apm2 factory tickets emit --rfc RFC-XXXX
 apm2 factory skill sync
+apm2 factory promote --run <RUN_ID> --to documents/
 ```
+
+Notes:
+- MVP emphasis is anti-cousin: CCP + Impact Map + tickets. RFC framing and Skill Sync can be deferred when not needed.
+- Prefer a local routing profile by default (no network) and only opt into external providers via explicit profiles.
 
 ### 3) Handle findings
 

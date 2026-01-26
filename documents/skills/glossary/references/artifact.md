@@ -25,10 +25,8 @@ Artifacts are strongly typed to allow for automated processing. Common kinds inc
 *   `decision`: A record of the agent's reasoning process (Chain of Thought).
 
 ## Data Structure References
-*   **`Artifact`** (`crates/apm2-holon/src/artifact.rs`): The struct containing metadata (`id`, `kind`, `work_id`, `content_hash`) and content.
-*   **`EvidenceBundle`** (`crates/apm2-core/src/evidence/state.rs`): A container for multiple artifacts.
-*   **`DataClassification`** (`crates/apm2-core/src/evidence/classification.rs`): Enum defining sensitivity levels (`Public`, `Internal`, `Confidential`, `Restricted`).
-*   **`ContentAddressedStore`** (`crates/apm2-core/src/evidence/mod.rs`): The trait defining the interface for storing and retrieving artifacts by hash.
+*   **`Artifact`**: The struct containing metadata (`id`, `kind`, `work_id`, `content_hash`) and content.
+*   **`EvidenceBundle`**: A container for multiple artifacts.
 
 ## See Also
 *   **Gate**: The protocol that verifies artifacts.

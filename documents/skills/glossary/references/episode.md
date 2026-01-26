@@ -29,9 +29,9 @@ The execution loop terminates when one of the following priority-ordered conditi
 To prevent runaway agents, the system enforces a `max_episodes` limit (default: 100) per execution loop. Each episode also consumes from a `Budget` allocated by a `Lease`. If the budget runs out, the episode is forcibly terminated, ensuring predictable cost and performance.
 
 ## Data Structure References
-*   **`EpisodeContext`** (`crates/apm2-holon/src/context.rs`): Contains the input state for the episode, including budgets and work IDs.
-*   **`EpisodeResult`** (`crates/apm2-holon/src/result.rs`): Captures the output of the episode, including the outcome (`Completed`, `Failed`, etc.) and resource consumption.
-*   **`EpisodeController`** (`crates/apm2-holon/src/episode/controller.rs`): The engine that drives the execution loop.
+*   **`EpisodeContext`**: Contains the input state for the episode.
+*   **`EpisodeResult`**: Captures the output of the episode, including actions taken and the next state.
+*   **`EpisodeController`**: The engine that drives the loop.
 
 ## See Also
 *   **Holon**: The entity that executes the episode.

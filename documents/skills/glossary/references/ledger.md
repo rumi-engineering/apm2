@@ -22,6 +22,7 @@ To keep the ledger lightweight, large data blobs (Artifacts) are stored in Conte
 ## Data Structure References
 *   **`Ledger`** (`crates/apm2-core/src/ledger/storage.rs`): The main storage engine managing the `SQLite` connection and WAL mode.
 *   **`EventRecord`** (`crates/apm2-core/src/ledger/storage.rs`): The schema for a single event, containing payload, `seq_id`, `event_hash`, `prev_hash`, and `signature`.
+*   **`ArtifactRef`** (`crates/apm2-core/src/ledger/storage.rs`): A reference to a binary object in CAS, including its content hash and storage path.
 *   **`LedgerReader`** (`crates/apm2-core/src/ledger/storage.rs`): A read-only view of the ledger for concurrent access.
 
 ## See Also

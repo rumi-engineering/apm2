@@ -24,7 +24,7 @@
 
 ## SDLC Interaction
 
--   **Generation:** Produced by the CLI command `apm2 factory ccp build`. This scans the current `git` working tree and emits artifacts to `evidence/prd/<PRD-ID>/ccp/`.
+-   **Generation:** Produced by the CLI command `apm2 factory ccp build --prd PRD-XXXX`. This scans the current `git` working tree and emits artifacts to `evidence/prd/<PRD-ID>/ccp/`.
 -   **Consumption (Planning):** The `Idea Compiler` (specifically `Impact_Map` and `RFC_Frame` stages) loads the CCP to ground high-level intents in concrete file paths.
 -   **Consumption (Coding):** Coding agents (like `dev-eng-ticket`) read the CCP to understand available tools and libraries before writing code.
 -   **Invariant:** "No Plan without Truth." A CCP must be generated before an RFC can be drafted.
