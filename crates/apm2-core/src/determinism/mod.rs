@@ -45,9 +45,9 @@
 //!
 //! # Module Structure
 //!
-//! - [`canonicalize`]: YAML canonicalization functions
-//! - [`atomic_write`]: Crash-safe file writing
-//! - [`diff_classify`]: Diff classification logic
+//! - `canonicalize`: YAML canonicalization functions
+//! - `atomic_write`: Crash-safe file writing
+//! - `diff_classify`: Diff classification logic
 
 mod atomic_write;
 mod canonicalize;
