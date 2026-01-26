@@ -24,7 +24,8 @@
 //!   variables (`PATH`, `HOME`, `CARGO_HOME`, `RUSTUP_HOME`) are passed through
 //! - [SEC-0002] Cargo metadata is parsed with strict typed schemas to prevent
 //!   fail-open on malformed input
-//! - [SEC-0003] Subprocess has 30-second timeout to prevent denial-of-service via hanging process
+//! - [SEC-0003] Subprocess has 30-second timeout to prevent denial-of-service
+//!   via hanging process
 //! - [SEC-0004] JSON is parsed directly from `BufReader` for memory efficiency
 
 use std::collections::{HashMap, HashSet};
@@ -33,12 +34,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use wait_timeout::ChildExt;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
+use wait_timeout::ChildExt;
 
 // =============================================================================
 // Cargo Metadata Schema Types (SEC-0002: Strict typed parsing)
@@ -334,12 +334,13 @@ fn invoke_cargo_metadata(repo_root: &Path) -> Result<CargoMetadata, CrateGraphEr
     // Take stdout handle for parsing
     let stdout = child.stdout.take();
 
-    // SEC-0003: Wait with timeout to prevent denial-of-service via hanging subprocess
-    let Some(status) = child
-        .wait_timeout(CARGO_METADATA_TIMEOUT)
-        .map_err(|e| CrateGraphError::CargoInvocationError {
+    // SEC-0003: Wait with timeout to prevent denial-of-service via hanging
+    // subprocess
+    let Some(status) = child.wait_timeout(CARGO_METADATA_TIMEOUT).map_err(|e| {
+        CrateGraphError::CargoInvocationError {
             reason: format!("failed to wait for cargo: {e}"),
-        })?
+        }
+    })?
     else {
         // Timeout - kill the process
         let _ = child.kill();
