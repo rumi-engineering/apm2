@@ -106,28 +106,18 @@ anti-cousin enforcement.
 
 | Mode | Input | Output | Purpose |
 |------|-------|--------|---------|
-| CREATE | PRD-XXXX | RFC + Tickets | Generate RFC and tickets from PRD |
-| REVIEW | RFC-XXXX | Findings Bundle + Remediation | Formal gate review with iterative refinement |
+| CREATE | PRD-XXXX | RFC v0 | Generate discovery-focused RFC v0 from PRD |
+| EXPLORE | RFC v0 | RFC v2 | Codebase investigation to resolve open questions |
+| FINALIZE | RFC v2 | RFC v4 | Final architectural convergence and sign-off |
+| DECOMPOSE| RFC v4 | Tickets | Generate implementation-ready engineering tickets |
+| REVIEW | RFC-XXXX | Findings | Formal gate review with iterative refinement |
 
-## Gate Structure
+## Council Evolution Phases
 
-| Gate | Type | Purpose |
-|------|------|---------|
-| GATE-TCK-SCHEMA | TRUSTED | YAML parsing |
-| GATE-TCK-DEPENDENCY-ACYCLICITY | DETERMINISTIC | No cycles |
-| GATE-TCK-SCOPE-COVERAGE | DETERMINISTIC | Requirements covered |
-| GATE-TCK-CCP-MAPPING | DETERMINISTIC | Files exist in CCP |
-| GATE-TCK-ATOMICITY | LLM-ASSISTED | Single-PR completable |
-| GATE-TCK-IMPLEMENTABILITY | LLM-ASSISTED | Agent can implement |
-| GATE-TCK-ANTI-COUSIN | LLM-ASSISTED | No cousin abstractions |
-
-## Council Subagents
-
-| Agent | Role | Focus |
-|-------|------|-------|
-| SA-1 | Structural Rigorist | Dependencies, type safety |
-| SA-2 | Implementation Feasibility | Execution planning |
-| SA-3 | Anti-Cousin Guardian | CCP alignment, reuse |
+1. **PHASE_GENESIS (v0)**: Mapping PRD to system architecture. Identifying "Known Unknowns".
+2. **PHASE_EXPLORATION (v0->v2)**: Active codebase deep-dive. Anchoring design in existing patterns.
+3. **PHASE_CLOSURE (v2->v4)**: Forced convergence. Deferring or answering all open questions.
+4. **PHASE_DECOMPOSITION (v4)**: Creating atomic, agent-executable engineering docs.
 
 ## Review Cycles
 

@@ -94,7 +94,9 @@ Gates execute in fixed order. Deterministic gates run before LLM-assisted gates 
 4. **GATE-TCK-CCP-MAPPING** (DETERMINISTIC): File paths exist in CCP
 5. **GATE-TCK-ATOMICITY** (LLM-ASSISTED): Each ticket completable in single PR
 6. **GATE-TCK-IMPLEMENTABILITY** (LLM-ASSISTED): Agent can implement without clarification
-7. **GATE-TCK-ANTI-COUSIN** (LLM-ASSISTED): No cousin abstractions introduced
+7. **GATE-TCK-SECURITY-AND-INTEGRITY** (LLM-ASSISTED): Tickets preserve trust boundaries and mitigate threats
+8. **GATE-TCK-REQUIREMENT-FIDELITY** (LLM-ASSISTED): Implementation content accurately fulfills PRD intent
+9. **GATE-TCK-ANTI-COUSIN** (LLM-ASSISTED): No cousin abstractions introduced
 
 ## Evidence Bundle Schema
 

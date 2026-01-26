@@ -15,10 +15,9 @@ protocol:
   type: executable_specification
   inputs[1]:
     - TICKET_ID_OPTIONAL
-  outputs[3]:
+  outputs[2]:
     - WorktreePath
     - PR_URL
-    - MergeStatus
 
 variables:
   TICKET_ID_OPTIONAL: "$1"
