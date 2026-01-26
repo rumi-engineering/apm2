@@ -175,6 +175,9 @@ enum FactoryCommands {
 
     /// Impact Map commands (PRD requirement to CCP component mapping)
     ImpactMap(commands::factory::impact_map::ImpactMapCommand),
+
+    /// RFC commands (RFC framing from Impact Map and CCP)
+    Rfc(commands::factory::rfc::RfcCommand),
 }
 
 fn main() -> Result<()> {
@@ -246,6 +249,7 @@ fn main() -> Result<()> {
             FactoryCommands::ImpactMap(impact_map_cmd) => {
                 commands::factory::impact_map::run_impact_map(&impact_map_cmd)
             },
+            FactoryCommands::Rfc(rfc_cmd) => commands::factory::rfc::run_rfc(&rfc_cmd),
         },
     }
 }

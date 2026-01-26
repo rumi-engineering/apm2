@@ -53,6 +53,7 @@ pub mod policy;
 pub mod process;
 pub mod reducer;
 pub mod restart;
+pub mod rfc_framer;
 pub mod session;
 pub mod shutdown;
 pub mod state;
