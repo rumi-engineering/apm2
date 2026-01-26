@@ -29,9 +29,10 @@
 //! - [SEC-0004] JSON is parsed directly from `BufReader` for memory efficiency
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -156,6 +157,10 @@ pub enum CrateGraphError {
         /// The timeout in seconds.
         timeout_secs: u64,
     },
+
+    /// Reader thread panicked during output collection.
+    #[error("reader thread panicked while collecting subprocess output")]
+    ReaderThreadPanic,
 }
 
 /// Type of crate target.
@@ -280,6 +285,17 @@ const ALLOWED_ENV_VARS: &[&str] = &[
     "TERM",
 ];
 
+/// Maximum stderr size (1 MB) - limits error message collection.
+const MAX_STDERR_SIZE: u64 = 1024 * 1024;
+
+/// Reads from a pipe into a Vec<u8> with a size limit.
+/// Returns the bytes read (up to limit) and whether the limit was exceeded.
+fn read_pipe_bounded<R: Read>(reader: R, limit: u64) -> std::io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    reader.take(limit).read_to_end(&mut buffer)?;
+    Ok(buffer)
+}
+
 /// Invokes `cargo metadata` and returns the parsed metadata.
 ///
 /// # Security
@@ -287,6 +303,13 @@ const ALLOWED_ENV_VARS: &[&str] = &[
 /// The cargo subprocess runs with a sanitized environment (SEC-0001). Only
 /// essential variables are passed through to prevent leaking secrets like
 /// API keys or tokens to the subprocess.
+///
+/// # Deadlock Prevention
+///
+/// Stdout and stderr are read concurrently in separate threads BEFORE waiting
+/// for the subprocess to complete. This prevents deadlock when the subprocess
+/// writes more than the OS pipe buffer size (~64KB), which would cause the
+/// subprocess to block on write while the parent waits for it to exit.
 ///
 /// # Errors
 ///
@@ -311,6 +334,7 @@ fn invoke_cargo_metadata(repo_root: &Path) -> Result<CargoMetadata, CrateGraphEr
     cmd.arg("metadata")
         .arg("--format-version")
         .arg("1")
+        .arg("--locked") // Prevent network access and Cargo.lock updates
         .arg("--manifest-path")
         .arg(&manifest_path)
         .arg("--no-deps")
@@ -331,17 +355,57 @@ fn invoke_cargo_metadata(repo_root: &Path) -> Result<CargoMetadata, CrateGraphEr
             reason: e.to_string(),
         })?;
 
-    // Take stdout handle for parsing
-    let stdout = child.stdout.take();
+    // Take stdout and stderr handles BEFORE waiting to prevent deadlock.
+    // If the subprocess writes more than the pipe buffer (~64KB), it will
+    // block on write. We must read concurrently with waiting.
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    // Spawn reader threads to consume stdout and stderr concurrently.
+    // This prevents deadlock when subprocess output exceeds pipe buffer.
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+
+    // Spawn stdout reader thread
+    let stdout_thread = if let Some(stdout) = stdout_handle {
+        Some(std::thread::spawn(move || {
+            let result = read_pipe_bounded(stdout, MAX_CARGO_METADATA_SIZE);
+            let _ = stdout_tx.send(result);
+        }))
+    } else {
+        let _ = stdout_tx.send(Ok(Vec::new()));
+        None
+    };
+
+    // Spawn stderr reader thread
+    let stderr_thread = if let Some(stderr) = stderr_handle {
+        Some(std::thread::spawn(move || {
+            let result = read_pipe_bounded(stderr, MAX_STDERR_SIZE);
+            let _ = stderr_tx.send(result);
+        }))
+    } else {
+        let _ = stderr_tx.send(Ok(Vec::new()));
+        None
+    };
 
     // SEC-0003: Wait with timeout to prevent denial-of-service via hanging
-    // subprocess
-    let Some(status) = child.wait_timeout(CARGO_METADATA_TIMEOUT).map_err(|e| {
+    // subprocess. Reader threads will continue draining pipes in parallel.
+    let status_result = child.wait_timeout(CARGO_METADATA_TIMEOUT).map_err(|e| {
         CrateGraphError::CargoInvocationError {
             reason: format!("failed to wait for cargo: {e}"),
         }
-    })?
-    else {
+    });
+
+    // Join reader threads (they will complete once subprocess closes pipes)
+    if let Some(thread) = stdout_thread {
+        let _ = thread.join();
+    }
+    if let Some(thread) = stderr_thread {
+        let _ = thread.join();
+    }
+
+    // Check wait result after joining threads
+    let Some(status) = status_result? else {
         // Timeout - kill the process
         let _ = child.kill();
         let _ = child.wait(); // Reap the zombie
@@ -350,37 +414,32 @@ fn invoke_cargo_metadata(repo_root: &Path) -> Result<CargoMetadata, CrateGraphEr
         });
     };
 
-    // Read stderr for error messages (only needed if command failed)
+    // Collect stdout result from channel
+    let stdout_bytes = stdout_rx
+        .recv()
+        .map_err(|_| CrateGraphError::ReaderThreadPanic)?
+        .map_err(|e| CrateGraphError::CargoInvocationError {
+            reason: format!("failed to read stdout: {e}"),
+        })?;
+
+    // Collect stderr result from channel
+    let stderr_bytes = stderr_rx
+        .recv()
+        .map_err(|_| CrateGraphError::ReaderThreadPanic)?
+        .map_err(|e| CrateGraphError::CargoInvocationError {
+            reason: format!("failed to read stderr: {e}"),
+        })?;
+
+    // Check for cargo errors
     if !status.success() {
-        let mut stderr_content = String::new();
-        if let Some(stderr) = child.stderr.take() {
-            // Limit stderr read to prevent DoS
-            stderr
-                .take(1024 * 1024) // 1 MB limit for stderr
-                .read_to_string(&mut stderr_content)
-                .map_err(|e| CrateGraphError::CargoInvocationError {
-                    reason: format!("failed to read stderr: {e}"),
-                })?;
-        }
+        let stderr_content = String::from_utf8_lossy(&stderr_bytes).into_owned();
         return Err(CrateGraphError::CargoError {
             stderr: stderr_content,
         });
     }
 
-    // SEC-0004: Parse JSON directly from BufReader for memory efficiency
-    // Instead of reading entire output into a string, parse streaming from reader
-    let Some(stdout) = stdout else {
-        return Err(CrateGraphError::CargoInvocationError {
-            reason: "stdout was not captured".to_string(),
-        });
-    };
-
-    // Wrap in BufReader with size limit for efficiency and DoS prevention
-    let limited_reader = stdout.take(MAX_CARGO_METADATA_SIZE);
-    let buf_reader = BufReader::new(limited_reader);
-
-    // SEC-0002: Parse with strict typed schema directly from reader
-    serde_json::from_reader::<_, CargoMetadata>(buf_reader).map_err(|e| {
+    // SEC-0002: Parse with strict typed schema
+    serde_json::from_slice::<CargoMetadata>(&stdout_bytes).map_err(|e| {
         CrateGraphError::MetadataParseError {
             reason: format!("failed to parse cargo metadata schema: {e}"),
         }
