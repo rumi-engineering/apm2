@@ -53,6 +53,7 @@ pub mod model_router;
 pub mod policy;
 pub mod process;
 pub mod reducer;
+pub mod refactor_radar;
 pub mod restart;
 pub mod rfc_framer;
 pub mod run_manifest;

@@ -184,6 +184,9 @@ enum FactoryCommands {
 
     /// Compile pipeline (end-to-end PRD to tickets)
     Compile(commands::factory::compile::CompileArgs),
+
+    /// Refactor radar (maintenance recommendations)
+    Refactor(commands::factory::refactor::RefactorCommand),
 }
 
 fn main() -> Result<()> {
@@ -261,6 +264,9 @@ fn main() -> Result<()> {
             },
             FactoryCommands::Compile(compile_args) => {
                 commands::factory::compile::run_compile(&compile_args)
+            },
+            FactoryCommands::Refactor(refactor_cmd) => {
+                commands::factory::refactor::run_refactor(&refactor_cmd)
             },
         },
     }
