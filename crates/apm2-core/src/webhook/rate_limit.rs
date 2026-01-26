@@ -7,6 +7,8 @@
 //!
 //! - `max_requests`: Maximum number of requests allowed in the window
 //! - `window_secs`: Size of the sliding window in seconds
+//! - `max_tracked_ips`: Hard cap on unique IPs tracked (denial-of-service
+//!   protection)
 //!
 //! # Thread Safety
 //!
@@ -16,14 +18,23 @@
 //! # Memory Management
 //!
 //! To prevent unbounded memory growth from attackers spoofing IP addresses,
-//! the rate limiter calls `cleanup()` probabilistically on every Nth request
-//! (default: every 100 requests). This removes entries for IPs that have no
-//! recent requests within the time window.
+//! the rate limiter employs two defenses:
 //!
-//! # Invariant
+//! 1. **Probabilistic cleanup**: Calls `cleanup()` every Nth request (default:
+//!    100) to remove entries for IPs with no recent requests.
+//!
+//! 2. **Hard cap on tracked IPs**: The `max_tracked_ips` setting (default:
+//!    10,000) provides a strict upper bound on memory usage. When the limit is
+//!    reached and a new IP arrives, cleanup is attempted first. If still at
+//!    limit, the request is rejected with `RateLimitExceeded`.
+//!
+//! # Invariants
 //!
 //! - [INV-WH002] Rate limiter state is thread-safe.
 //! - [INV-WH003] Cleanup is called periodically to bound memory usage.
+//! - [INV-WH004] The number of tracked IPs never exceeds `max_tracked_ips`,
+//!   providing a hard upper bound on memory consumption regardless of attack
+//!   rate. This prevents OOM crashes from IP spoofing attacks.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -48,6 +59,18 @@ pub struct RateLimitConfig {
     /// A higher value means less frequent cleanup but more potential memory
     /// usage. Default: 100 requests.
     pub cleanup_interval: u64,
+
+    /// Maximum number of unique IP addresses to track (INV-WH004).
+    ///
+    /// This provides a hard upper bound on memory usage to prevent OOM crashes
+    /// from IP spoofing attacks. When the limit is reached and a new IP
+    /// arrives:
+    /// 1. Cleanup is attempted to reclaim expired entries
+    /// 2. If still at limit, the request is rejected
+    ///
+    /// Default: 10,000 IPs. With typical entry overhead (~100 bytes per IP
+    /// including timestamps), this bounds memory to roughly 1MB.
+    pub max_tracked_ips: usize,
 }
 
 impl Default for RateLimitConfig {
@@ -58,6 +81,8 @@ impl Default for RateLimitConfig {
             window_secs: 60,
             // Run cleanup every 100 requests to bound memory growth
             cleanup_interval: 100,
+            // Hard cap at 10,000 IPs to prevent OOM from IP spoofing (INV-WH004)
+            max_tracked_ips: 10_000,
         }
     }
 }
@@ -97,6 +122,10 @@ impl RateLimiter {
     /// configured by `cleanup_interval`) to prevent unbounded memory growth
     /// from IP address spoofing attacks (INV-WH003).
     ///
+    /// Additionally, if the number of tracked IPs reaches `max_tracked_ips`
+    /// and a new (untracked) IP attempts a request, cleanup is forced and
+    /// if still at limit, the request is rejected (INV-WH004).
+    ///
     /// # Arguments
     ///
     /// * `ip` - The source IP address of the request
@@ -104,7 +133,8 @@ impl RateLimiter {
     /// # Errors
     ///
     /// Returns `WebhookError::RateLimitExceeded` if the request would exceed
-    /// the rate limit.
+    /// the rate limit, or if the IP limit is reached and the IP is not already
+    /// tracked.
     pub fn check(&self, ip: IpAddr) -> Result<(), WebhookError> {
         let now = Instant::now();
         let window_duration = std::time::Duration::from_secs(self.config.window_secs);
@@ -129,6 +159,10 @@ impl RateLimiter {
                 .state
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            // Check if this IP is already tracked
+            let ip_is_tracked = state.contains_key(&ip);
+
             if let Some(timestamps) = state.get(&ip) {
                 let recent_count = timestamps.iter().filter(|&&t| t > cutoff).count();
                 if recent_count >= self.config.max_requests as usize {
@@ -141,6 +175,36 @@ impl RateLimiter {
                     return Err(WebhookError::RateLimitExceeded);
                 }
             }
+
+            // INV-WH004: Check if we're at the IP limit and this is a new IP
+            if !ip_is_tracked && state.len() >= self.config.max_tracked_ips {
+                // Drop read lock before cleanup
+                drop(state);
+
+                // Force cleanup to try to make room
+                tracing::debug!(
+                    tracked_ips = self.config.max_tracked_ips,
+                    "max tracked IPs reached, forcing cleanup"
+                );
+                self.cleanup();
+
+                // Re-check after cleanup
+                let state = self
+                    .state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+                // Still at limit and IP still not tracked? Reject.
+                if !state.contains_key(&ip) && state.len() >= self.config.max_tracked_ips {
+                    tracing::warn!(
+                        ip = %ip,
+                        tracked_ips = state.len(),
+                        max_tracked_ips = self.config.max_tracked_ips,
+                        "rejecting new IP: max tracked IPs limit reached (INV-WH004)"
+                    );
+                    return Err(WebhookError::RateLimitExceeded);
+                }
+            }
         }
 
         // If we get here, we need to record the request
@@ -148,6 +212,19 @@ impl RateLimiter {
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // INV-WH004: Final check under write lock for new IPs at limit
+        // This handles race conditions where another thread added IPs between
+        // our read check and acquiring the write lock.
+        if !state.contains_key(&ip) && state.len() >= self.config.max_tracked_ips {
+            tracing::warn!(
+                ip = %ip,
+                tracked_ips = state.len(),
+                max_tracked_ips = self.config.max_tracked_ips,
+                "rejecting new IP: max tracked IPs limit reached (INV-WH004)"
+            );
+            return Err(WebhookError::RateLimitExceeded);
+        }
 
         let timestamps = state.entry(ip).or_default();
 
@@ -342,6 +419,7 @@ mod tests {
         assert_eq!(config.max_requests, 60);
         assert_eq!(config.window_secs, 60);
         assert_eq!(config.cleanup_interval, 100);
+        assert_eq!(config.max_tracked_ips, 10_000);
     }
 
     #[test]
@@ -394,6 +472,8 @@ mod tests {
             window_secs: 1,
             // Cleanup every 10 requests for faster testing
             cleanup_interval: 10,
+            // High limit so we're testing probabilistic cleanup, not max_tracked_ips
+            max_tracked_ips: 1000,
         };
         let limiter = RateLimiter::new(config);
 
@@ -433,6 +513,7 @@ mod tests {
             max_requests: 100,
             window_secs: 60,
             cleanup_interval: 5,
+            ..Default::default()
         };
         let limiter = RateLimiter::new(config);
         let ip = test_ip();
@@ -445,5 +526,113 @@ mod tests {
         // Verify counter has incremented (cleanup should have run at request 5)
         let count = limiter.request_count.load(Ordering::Relaxed);
         assert_eq!(count, 6);
+    }
+
+    /// Test that the `max_tracked_ips` limit is enforced (INV-WH004).
+    ///
+    /// This test verifies that:
+    /// 1. The rate limiter accepts requests up to the `max_tracked_ips` limit
+    /// 2. New (untracked) IPs are rejected when the limit is reached
+    /// 3. Already-tracked IPs continue to work even at the limit
+    /// 4. The map never exceeds `max_tracked_ips` entries
+    ///
+    /// This protects against denial-of-service attacks via IP spoofing where
+    /// an attacker could exhaust server memory by sending requests from
+    /// millions of unique spoofed source IPs.
+    #[test]
+    fn test_max_tracked_ips_limit() {
+        let config = RateLimitConfig {
+            max_requests: 100,
+            window_secs: 60,
+            cleanup_interval: 1000, // High value to prevent probabilistic cleanup
+            max_tracked_ips: 5,     // Small limit for testing
+        };
+        let limiter = RateLimiter::new(config);
+
+        // Fill up to the limit with 5 unique IPs
+        for i in 0..5 {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, i));
+            let result = limiter.check(ip);
+            assert!(
+                result.is_ok(),
+                "IP {i} should be allowed (within limit), got {result:?}"
+            );
+        }
+
+        // Verify we're at the limit
+        assert_eq!(
+            limiter.tracked_ips(),
+            5,
+            "Should have exactly 5 tracked IPs"
+        );
+
+        // Try to add 5 more unique IPs - they should all be rejected
+        let mut rejected_count = 0;
+        for i in 5..10 {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, i));
+            if limiter.check(ip).is_err() {
+                rejected_count += 1;
+            }
+        }
+
+        // All 5 new IPs should be rejected
+        assert_eq!(
+            rejected_count, 5,
+            "All new IPs beyond limit should be rejected"
+        );
+
+        // Verify the map never exceeded the limit (INV-WH004)
+        assert!(
+            limiter.tracked_ips() <= 5,
+            "Map size {} should never exceed max_tracked_ips (5)",
+            limiter.tracked_ips()
+        );
+
+        // Already-tracked IPs should still work
+        let existing_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0));
+        assert!(
+            limiter.check(existing_ip).is_ok(),
+            "Already-tracked IP should still be allowed"
+        );
+    }
+
+    /// Test that cleanup can make room for new IPs when at the limit.
+    ///
+    /// This verifies that when `max_tracked_ips` is reached with expired
+    /// entries, forcing cleanup allows new IPs to be accepted.
+    #[test]
+    fn test_max_tracked_ips_cleanup_reclaims_space() {
+        let config = RateLimitConfig {
+            max_requests: 100,
+            window_secs: 1, // Short window for testing
+            cleanup_interval: 1000,
+            max_tracked_ips: 5,
+        };
+        let limiter = RateLimiter::new(config);
+
+        // Fill up with 5 IPs
+        for i in 0..5 {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, i));
+            limiter.check(ip).unwrap();
+        }
+
+        assert_eq!(limiter.tracked_ips(), 5);
+
+        // Wait for entries to expire
+        thread::sleep(Duration::from_millis(1100));
+
+        // New IP should succeed because cleanup is forced and reclaims space
+        let new_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100));
+        let result = limiter.check(new_ip);
+        assert!(
+            result.is_ok(),
+            "New IP should be allowed after cleanup reclaims expired entries"
+        );
+
+        // Verify we cleaned up and have the new IP
+        assert!(
+            limiter.tracked_ips() <= 5,
+            "Should still respect max_tracked_ips limit"
+        );
     }
 }
