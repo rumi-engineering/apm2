@@ -11,59 +11,18 @@ decision_tree:
 
 ## Overview
 
-The COUNCIL protocol is a multi-agent deliberation process that:
-1. Spawns 3 subagents with specialized roles
-2. Each subagent selects 5 reasoning modes from the 80 available
-3. Subagents execute 3 review cycles with inter-cycle onboarding notes
-4. Findings converge through quorum voting (2/3 agreement)
-5. Final assessment includes implementability scoring
+The COUNCIL protocol is a multi-agent deliberation process designed to prevent "cognitive entropy collapse" (premature convergence on suboptimal designs). It achieves this by:
+1. Spawns 3 subagents with specialized but lifecycle-adaptive roles.
+2. **Maximum Entropy Reasoning:** Each subagent selects **5 strictly random reasoning modes** from `modes-of-reasoning/SKILL.md`. By removing fixed "specialized" modes, the council is forced to synthesize new perspectives for every session, preventing model-mode entrenchment.
+3. Subagents apply Agent-Native Software principles (Stochastic Cognition, Tool-Loops) to their analysis.
+4. Subagents execute 3 review cycles with inter-cycle onboarding notes.
+5. Findings converge through quorum voting (2/3 agreement).
 
 ---
 
 ## State Machine
 
-```
-+---------+
-|  INIT   | -- Initialize session, spawn subagents, select modes
-+----+----+
-     |
-     v
-+---------+
-| CYCLE_1 | -- STRUCTURAL: Schema, dependencies, coverage, CCP
-|(STRUCT) |
-+----+----+
-     | Generate onboarding notes
-     v
-+---------+
-| CYCLE_2 | -- FEASIBILITY: Atomicity, implementability, anti-cousin
-| (FEAS)  |
-+----+----+
-     | Generate onboarding notes
-     v
-+---------+
-| CYCLE_3 | -- CONVERGE: Vote on contested findings, reach quorum
-|(CONVERGE)|
-+----+----+
-     |
-     v
-   +-+-+
-   |   |
-   v   v
-+------+ +----------+ +---------+
-|CONVERGED| |DEADLOCKED| | ABORTED |
-+------+ +----------+ +---------+
-```
-
-### State Transitions
-
-| From | To | Trigger |
-|------|----|---------|
-| INIT | CYCLE_1 | All 3 subagents have selected 5 modes |
-| CYCLE_1 | CYCLE_2 | All subagents completed structural review |
-| CYCLE_2 | CYCLE_3 | All subagents completed feasibility review |
-| CYCLE_3 | CONVERGED | All blockers resolved AND quorum achieved |
-| CYCLE_3 | DEADLOCKED | Quorum failed on >=1 contested finding |
-| ANY | ABORTED | Timeout (1 hour) OR budget exhausted |
+[... existing state machine ...]
 
 ---
 
@@ -71,60 +30,41 @@ The COUNCIL protocol is a multi-agent deliberation process that:
 
 ### Step 1: Session Initialization
 
-```yaml
-session_id: "COUNCIL-{RFC_ID}-{timestamp}"
-state: "INIT"
-```
+[... existing initialization steps ...]
 
-1. Create session file at `evidence/rfc/{RFC_ID}/reviews/council_session_{timestamp}.yaml`
-2. Load RFC content and tickets into context
-3. Load CCP component atlas
-4. Load REQUIRED READING into context:
-   - `documents/skills/agent-native-software/SKILL.md`
-   - `documents/security/AGENTS.md`
+### Step 2: Spawn Subagents (Lifecycle-Aware)
 
-### Step 2: Spawn Subagents
+Spawn 3 subagents. Their specific focus shifts based on the RFC version:
 
-Spawn 3 subagents with specialized roles:
+| Agent | v0 (Discovery) Focus | v2 (Exploration) Focus | v4 (Closure) Focus |
+|-------|----------------------|------------------------|--------------------|
+| SA-1  | Structural mapping, PRD fidelity | Codebase pattern alignment | Final architectural convergence |
+| SA-2  | Risk identification, knowledge gaps | Mock implementation runs | Execution efficiency & atomicity |
+| SA-3  | Trust boundary discovery | Extension point security | Final security assurance (CAE Tree) |
 
-| Agent | Role | Focus | Key Modes |
-|-------|------|-------|-----------|
-| SA-1 | Structural Rigorist | Graph properties, dependencies | 1 (Deductive), 6 (Constraint), 7 (Type-theoretic), 43 (Systems), 75 (Meta) |
-| SA-2 | Implementation Feasibility | Agent theory-of-mind, execution | 47 (Planning), 48 (Optimization), 51 (Satisficing), 56 (Theory-of-mind), 70 (Engineering) |
-| SA-3 | Anti-Cousin Guardian | CCP alignment, reuse validation | 14 (Analogical), 15 (Case-based), 32 (Defeasible), 33 (Belief revision), 79 (Adversarial) |
+### Step 3: Stochastic Mode Selection
 
-### Step 3: Mode Selection
+Each subagent selects **5 strictly random modes** from `documents/skills/modes-of-reasoning/SKILL.md`.
 
-Each subagent selects 5 modes based on their specialization:
+**Constraint:** Subagents must explain how their 5 random modes interact to challenge their primary lifecycle focus. For example, SA-1 (Structural Rigorist) might be forced to use Mode 24 (Heuristic) or Mode 62 (Historical), "disturbing" their usual deductive patterns.
 
-#### SA-1: Structural Rigorist
-- Mode 1 (Deductive): Formal validation of dependency graph
-- Mode 6 (Constraint): Schema and structural constraints
-- Mode 7 (Type-theoretic): Type safety in interfaces
-- Mode 43 (Systems): Cross-component interactions
-- Mode 75 (Meta): Reasoning about review process
+Despite the randomness of the reasoning *lens*, subagents must still produce their assigned artifacts by applying their random modes to the task:
+
+#### SA-1: Efficacy & Structure Rigorist
+- Artifact: **Explanatory Scoring Table** (Evaluating chosen design vs. alternatives through the 5 random lenses).
 
 #### SA-2: Implementation Feasibility
-- Mode 47 (Planning): Implementation step completeness
-- Mode 48 (Optimization): Resource efficiency
-- Mode 51 (Satisficing): Acceptable vs optimal solutions
-- Mode 56 (Theory-of-mind): Agent implementability
-- Mode 70 (Engineering): Practical implementation concerns
+- Artifact: **Mock Implementation Run Report** (Simulating agent logic using the 5 random lenses to identify friction points).
 
-#### SA-3: Anti-Cousin Guardian
-- Mode 14 (Analogical): Pattern matching to existing code
-- Mode 15 (Case-based): Historical precedent
-- Mode 32 (Defeasible): Reuse assumptions
-- Mode 33 (Belief revision): Updating CCP knowledge
-- Mode 79 (Adversarial): Red-teaming reuse claims
+#### SA-3: Security & Anti-Cousin Guardian
+- Artifact: **Claim-Argument-Evidence (CAE) Tree** (Building security assurance by justifying claims using the 5 random lenses).
 
 ### Step 4: Validate Mode Selection
 
 Before proceeding to CYCLE_1:
-- [ ] Each subagent has exactly 5 modes
-- [ ] At least one subagent has a mode in range 75-80 (SA-1 has 75)
-- [ ] Total mode overlap <= 5 across all subagents
-- [ ] Each subagent has modes from >= 3 categories
+- [ ] Each subagent has exactly 5 strictly random modes.
+- [ ] Total mode overlap across all subagents is minimized.
+- [ ] Each subagent has modes from >= 2 categories in the reasoning taxonomy.
 
 ---
 
@@ -144,20 +84,22 @@ Before proceeding to CYCLE_1:
 For each subagent:
 1. Load RFC and ticket files
 2. For each assigned gate:
-   a. Apply mode-specific reasoning
-   b. Generate findings using that mode's lens
-   c. Tag each finding with `source_mode` and `source_agent`
-3. Record all findings in session state
+   a. Apply the 5 random modes of reasoning to the structural analysis.
+   b. Generate findings using those lenses.
+   c. Tag each finding with `source_mode` and `source_agent`.
+3. Record all findings in session state.
 
 ### Cycle 1 Output Requirements
 
 Each subagent produces:
-- 0-N findings (no minimum, no maximum)
+- 0-N findings.
 - Each finding MUST include:
-  - `source_agent`: SA-1, SA-2, or SA-3
-  - `source_cycle`: 1
-  - `source_mode`: which of the 5 modes generated it
-  - `agreement_status`: PENDING
+  - `source_agent`: SA-1, SA-2, or SA-3.
+  - `source_cycle`: 1.
+  - `source_mode`: which of the 5 random modes generated it.
+  - `agreement_status`: PENDING.
+
+[... rest of protocol ...]
 
 ### Aggregation
 

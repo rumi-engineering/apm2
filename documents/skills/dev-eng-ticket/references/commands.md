@@ -1,6 +1,6 @@
 title: Dev Ticket Command Reference
 
-commands[12]:
+commands[13]:
   - name: start-ticket-default
     command: "cargo xtask start-ticket"
     purpose: "Setup dev environment for next unblocked ticket."
@@ -13,6 +13,9 @@ commands[12]:
   - name: start-ticket-print-path
     command: "cargo xtask start-ticket [target] --print-path"
     purpose: "Output only worktree path (use for cd)."
+  - name: format
+    command: "cargo fmt"
+    purpose: "Fix formatting issues before committing."
   - name: commit
     command: "cargo xtask commit \"<message>\""
     purpose: "Verify, sync with main, and commit."
@@ -22,12 +25,9 @@ commands[12]:
   - name: push-force-review
     command: "cargo xtask push --force-review"
     purpose: "Force re-run reviews after addressing feedback."
-  - name: check
-    command: "timeout 30s cargo xtask check"
-    purpose: "Check CI/review status and get next action."
-  - name: check-watch
-    command: "timeout 30s cargo xtask check --watch | tail -40"
-    purpose: "Poll status continuously; show last 40 lines."
+  - name: fetch-latest-feedback
+    command: "gh pr view <PR_URL> --json reviews,reviewThreads --jq '{latest_review: (.reviews[-1].body // \"N/A\"), unresolved_threads: [.reviewThreads[]? | select(.isResolved == false) | {path: .path, body: .comments[-1].body}]}'"
+    purpose: "Get the most recent review body and all unresolved comment threads."
   - name: finish
     command: "cargo xtask finish"
     purpose: "Cleanup worktree and branch after PR merges."

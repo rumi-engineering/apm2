@@ -19,6 +19,8 @@ Gates are executed in order. Deterministic gates run before LLM-assisted gates t
 | GATE-TCK-CCP-MAPPING | DETERMINISTIC | File paths exist in CCP (anti-cousin) |
 | GATE-TCK-ATOMICITY | LLM-ASSISTED | Each ticket completable in single PR |
 | GATE-TCK-IMPLEMENTABILITY | LLM-ASSISTED | Agent can implement without clarification |
+| GATE-TCK-SECURITY-AND-INTEGRITY | LLM-ASSISTED | Tickets preserve trust boundaries and mitigate threats |
+| GATE-TCK-REQUIREMENT-FIDELITY | LLM-ASSISTED | Implementation content accurately fulfills PRD intent |
 | GATE-TCK-ANTI-COUSIN | LLM-ASSISTED | No cousin abstractions introduced |
 
 ---
@@ -344,6 +346,90 @@ For each ticket, ask from agent perspective:
 ### Stop Condition
 
 FAILED if any ticket has BLOCKER implementability issues.
+
+---
+
+## GATE-TCK-SECURITY-AND-INTEGRITY
+
+**Type:** LLM-ASSISTED (semantic analysis, UNTRUSTED)
+
+### Purpose
+
+Verify that the ticket-level implementation details respect the trust boundaries, invariants, and threat mitigations defined in the RFC.
+
+### Evidence Contract
+
+| Field | Value |
+|-------|-------|
+| Inputs | Ticket implementation steps, `03_trust_boundaries.yaml`, SA-3 CAE Tree |
+| Outputs | Security integrity assessment per ticket |
+| Required | No violation of defined trust boundaries or invariants |
+
+### Rubric
+
+| Check | Pass Criteria |
+|-------|---------------|
+| Trust Boundary | Ticket steps do not cross boundaries without validation |
+| Invariant Preservation | Implementation maintains all listed boundary invariants |
+| Threat Mitigation | Ticket includes steps for relevant TH-XXX mitigations |
+| Secret Handling | No hardcoded secrets or insecure credential patterns |
+
+### Assessment Questions (from SA-3)
+
+1. Does this ticket introduce a new interface that crosses a trust boundary (e.g., untrusted model output)?
+2. If so, are there explicit validation steps in the implementation?
+3. Does the ticket maintain the "Atomic writes" invariant (e.g., using `NamedTempFile`)?
+4. Are there any exploitation vectors (TH-XXX) that this ticket fails to address?
+
+### Severity Assignment
+
+| Issue | Severity |
+|-------|----------|
+| Trust boundary violation | BLOCKER |
+| Failed invariant (e.g., non-atomic write) | MAJOR |
+| Missing mitigation for identified threat | MAJOR |
+| Insecure error handling (leaking info) | MINOR |
+
+---
+
+## GATE-TCK-REQUIREMENT-FIDELITY
+
+**Type:** LLM-ASSISTED (semantic analysis, UNTRUSTED)
+
+### Purpose
+
+Verify that the *substance* of the tickets (implementation steps and code examples) actually solves the problem described in the PRD, rather than just "referencing" the requirement ID.
+
+### Evidence Contract
+
+| Field | Value |
+|-------|-------|
+| Inputs | Ticket content, `01_problem_and_imports.yaml`, SA-1 Abductive Scoring Table |
+| Outputs | Fidelity score per requirement mapping |
+| Required | Implementation steps are logically sufficient to fulfill the requirement |
+
+### Rubric
+
+| Check | Pass Criteria |
+|-------|---------------|
+| Logical Sufficiency | Steps fully implement the "Problem Statement" intent |
+| Requirement Alignment | Code examples match the imported requirement definitions |
+| No Scope Gap | No "middle-of-the-road" implementations that miss the core need |
+
+### Assessment Questions (from SA-1)
+
+1. Looking at the PRD requirement, would these implementation steps actually fulfill it?
+2. Is the "Best Explanation" from the Abductive Scoring Table reflected in the ticket's design choices?
+3. Does the ticket address the "Surprising observations" or "Anomalies" listed in the problem statement?
+
+### Severity Assignment
+
+| Issue | Severity |
+|-------|----------|
+| Implementation fails to solve core PRD problem | BLOCKER |
+| Significant gap between requirement and steps | MAJOR |
+| Code example contradicts requirement intent | MAJOR |
+| Implementation is correct but inefficient | MINOR |
 
 ---
 
