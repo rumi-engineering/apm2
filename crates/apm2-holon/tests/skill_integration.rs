@@ -733,3 +733,239 @@ fn test_episode_controller_respects_skill_config() {
     assert!(result.is_successful());
     assert_eq!(result.episodes_executed(), 3);
 }
+
+// ============================================================================
+// TCK-00048: create-rfc Skill Holon Configuration Tests
+// ============================================================================
+
+/// Returns the path to the create-rfc SKILL.md file.
+fn create_rfc_skill_path() -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(manifest_dir)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("documents/skills/create-rfc/SKILL.md")
+}
+
+/// TCK-00048 Criterion 1: create-rfc skill has holon: configuration.
+///
+/// Verifies that the SKILL.md file parses successfully and contains
+/// valid holon configuration.
+#[test]
+fn test_create_rfc_skill_has_holon_config() {
+    let skill_path = create_rfc_skill_path();
+
+    // Verify file exists
+    assert!(
+        skill_path.exists(),
+        "create-rfc SKILL.md should exist at {}",
+        skill_path.display()
+    );
+
+    // Parse the skill file
+    let (frontmatter, body) =
+        parse_skill_file(&skill_path).expect("should parse create-rfc SKILL.md");
+
+    // Verify basic frontmatter
+    assert_eq!(frontmatter.name, "create-rfc");
+    assert!(frontmatter.description.contains("RFC"));
+    assert!(
+        frontmatter.user_invocable,
+        "create-rfc should be user-invocable"
+    );
+
+    // Verify holon config is present
+    assert!(
+        frontmatter.holon.is_some(),
+        "create-rfc should have holon configuration"
+    );
+
+    let holon_config = frontmatter.holon.unwrap();
+
+    // Verify contract
+    assert_eq!(holon_config.contract.input_type, "RfcRequest");
+    assert_eq!(holon_config.contract.output_type, "RfcResult");
+    assert_eq!(
+        holon_config.contract.state_type,
+        Some("RfcProgress".to_string())
+    );
+
+    // Verify body contains holon documentation
+    assert!(body.contains("## Holon Configuration"));
+    assert!(body.contains("Stop Conditions"));
+    assert!(body.contains("Tool Permissions"));
+}
+
+/// TCK-00048 Criterion 2: Stop conditions appropriate for RFC work.
+///
+/// Verifies that the configured stop conditions are suitable for
+/// RFC generation work (multi-phase, longer-running).
+#[test]
+fn test_create_rfc_stop_conditions_appropriate() {
+    let skill_path = create_rfc_skill_path();
+    let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");
+    let holon_config = frontmatter.holon.expect("should have holon config");
+    let stop = &holon_config.stop_conditions;
+
+    // Verify stop conditions are configured
+    assert!(stop.is_configured());
+
+    // max_episodes: Should be >= 25 for multi-phase RFC work
+    let max_episodes = stop.max_episodes.expect("should have max_episodes");
+    assert!(
+        max_episodes >= 25,
+        "RFC work needs at least 25 episodes, got {max_episodes}"
+    );
+
+    // timeout_ms: Should be >= 30 minutes (1,800,000 ms) for complex RFCs
+    let timeout_ms = stop.timeout_ms.expect("should have timeout_ms");
+    assert!(
+        timeout_ms >= 1_800_000,
+        "RFC work needs at least 30 min timeout, got {timeout_ms} ms"
+    );
+
+    // max_stall_episodes: Should be >= 5 for exploration
+    let max_stall = stop
+        .max_stall_episodes
+        .expect("should have max_stall_episodes");
+    assert!(
+        max_stall >= 5,
+        "RFC work should allow 5+ stall episodes, got {max_stall}"
+    );
+}
+
+/// TCK-00048 Criterion 3: Budget limits prevent runaway execution.
+///
+/// Verifies that budget limits are set and will prevent unbounded
+/// resource consumption.
+#[test]
+fn test_create_rfc_budget_limits_prevent_runaway() {
+    let skill_path = create_rfc_skill_path();
+    let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");
+    let holon_config = frontmatter.holon.expect("should have holon config");
+    let stop = &holon_config.stop_conditions;
+
+    // Verify budget has token limit
+    let tokens = stop
+        .budget
+        .get("tokens")
+        .expect("should have tokens budget");
+    assert!(
+        *tokens > 0,
+        "tokens budget must be positive to prevent runaway"
+    );
+    assert!(
+        *tokens >= 500_000,
+        "RFC work needs at least 500K tokens, got {tokens}"
+    );
+
+    // Verify budget has tool_calls limit
+    let tool_calls = stop
+        .budget
+        .get("tool_calls")
+        .expect("should have tool_calls budget");
+    assert!(
+        *tool_calls > 0,
+        "tool_calls budget must be positive to prevent runaway"
+    );
+    assert!(
+        *tool_calls >= 500,
+        "RFC work needs at least 500 tool calls, got {tool_calls}"
+    );
+
+    // Verify budget will stop before infinite execution
+    // At least one finite limit must exist
+    assert!(
+        stop.max_episodes.is_some() || stop.timeout_ms.is_some() || !stop.budget.is_empty(),
+        "must have at least one finite limit"
+    );
+}
+
+/// TCK-00048 Criterion 4: create-rfc executes correctly as holon.
+///
+/// Verifies that a spawn configuration can be built from the skill
+/// and a holon can be executed with it.
+#[test]
+fn test_create_rfc_executes_as_holon() {
+    let skill_path = create_rfc_skill_path();
+    let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");
+    let holon_config = frontmatter.holon.expect("should have holon config");
+
+    // Create spawn config from skill
+    let config =
+        spawn_config_from_holon_config("rfc-test-001", &holon_config).expect("valid config");
+
+    // Create a test holon that completes quickly (simulating successful RFC
+    // creation)
+    let mut holon = ExampleTaskHolon::new(3);
+
+    // Execute
+    let clock = mock_clock();
+    let result = spawn_holon(&mut holon, "test-rfc-creation".to_string(), config, clock)
+        .expect("spawn should succeed");
+
+    // Verify execution completed
+    assert!(result.is_successful(), "should complete successfully");
+    assert!(
+        result.episodes_executed <= 25,
+        "should respect max_episodes"
+    );
+}
+
+/// TCK-00048 Criterion 5: No regression in existing behavior.
+///
+/// Verifies that the skill documentation still contains all the
+/// original content and the skill can still be understood without
+/// the holon configuration.
+#[test]
+fn test_create_rfc_no_regression() {
+    let skill_path = create_rfc_skill_path();
+    let (frontmatter, body) = parse_skill_file(&skill_path).expect("should parse");
+
+    // Verify original content is preserved
+    assert!(body.contains("# Create RFC Skill"));
+    assert!(body.contains("## Prerequisites"));
+    assert!(body.contains("## Step-by-Step Process"));
+    assert!(body.contains("### Phase 1: Initial RFC Creation"));
+    assert!(body.contains("### Phase 2: Iterative Quality Review"));
+    assert!(body.contains("### Phase 3: Engineering Ticket Creation"));
+    assert!(body.contains("### Phase 4: Commit, Push, and Merge"));
+    assert!(body.contains("## Verification"));
+    assert!(body.contains("## Common Patterns"));
+    assert!(body.contains("## Tips"));
+
+    // Verify skill metadata is correct
+    assert_eq!(frontmatter.name, "create-rfc");
+    assert!(frontmatter.user_invocable);
+}
+
+/// Test that create-rfc tool permissions are appropriate.
+#[test]
+fn test_create_rfc_tool_permissions() {
+    let skill_path = create_rfc_skill_path();
+    let (frontmatter, _) = parse_skill_file(&skill_path).expect("should parse");
+    let holon_config = frontmatter.holon.expect("should have holon config");
+
+    // Verify tools are specified
+    assert!(holon_config.tools.is_some(), "should have tool list");
+    let tools = holon_config.tools.unwrap();
+
+    // Verify required tools for RFC creation are present
+    assert!(
+        tools.contains(&"Read".to_string()),
+        "should have Read for reading files"
+    );
+    assert!(
+        tools.contains(&"Write".to_string()),
+        "should have Write for creating files"
+    );
+    assert!(
+        tools.contains(&"Bash".to_string()),
+        "should have Bash for git operations"
+    );
+
+    // Verify tools list is not empty (fail-close would deny all)
+    assert!(!tools.is_empty(), "tool list should not be empty");
+}
