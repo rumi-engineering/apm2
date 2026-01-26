@@ -38,6 +38,10 @@ pub enum WebhookError {
     #[error("rate limit exceeded")]
     RateLimitExceeded,
 
+    /// Duplicate delivery ID (idempotency check).
+    #[error("duplicate delivery")]
+    DuplicateDelivery,
+
     /// Internal error (should not occur in normal operation).
     #[error("internal error: {0}")]
     Internal(String),
@@ -51,6 +55,7 @@ impl WebhookError {
     /// - Invalid payload: 400 Bad Request
     /// - Unsupported event: 400 Bad Request
     /// - Rate limit: 429 Too Many Requests
+    /// - Duplicate delivery: 200 OK (idempotent success)
     /// - Internal: 500 Internal Server Error
     #[must_use]
     pub const fn status_code(&self) -> StatusCode {
@@ -61,6 +66,8 @@ impl WebhookError {
             },
             Self::InvalidPayload(_) | Self::UnsupportedEventType(_) => StatusCode::BAD_REQUEST,
             Self::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
+            // Duplicate delivery returns 200 OK for idempotency
+            Self::DuplicateDelivery => StatusCode::OK,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -80,6 +87,7 @@ impl IntoResponse for WebhookError {
             Self::InvalidPayload(_) => "Invalid payload",
             Self::UnsupportedEventType(_) => "Unsupported event type",
             Self::RateLimitExceeded => "Rate limit exceeded",
+            Self::DuplicateDelivery => "OK",
             Self::Internal(_) => "Internal server error",
         };
 

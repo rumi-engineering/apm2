@@ -13,6 +13,12 @@
 //! All events are wrapped in a [`KernelEvent`] envelope that includes
 //! sequence numbers, timestamps, signatures, and hash chain links.
 //!
+//! # CI Workflow Events
+//!
+//! The [`ci`] submodule provides ledger event types for CI workflow completions,
+//! separate from the Protocol Buffer-based kernel events. These are JSON-serializable
+//! events for audit logging and downstream processing.
+//!
 //! # Canonical Encoding
 //!
 //! Events use Protocol Buffers for encoding with the following constraints
@@ -74,6 +80,7 @@ mod generated {
 }
 
 mod canonical;
+pub mod ci;
 
 pub use canonical::Canonicalize;
 pub use generated::*;

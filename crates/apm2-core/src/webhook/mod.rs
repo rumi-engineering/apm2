@@ -53,6 +53,7 @@
 
 mod config;
 mod error;
+pub mod event_emitter;
 mod handler;
 mod payload;
 mod rate_limit;
@@ -63,6 +64,7 @@ mod tests;
 
 pub use config::{WebhookConfig, WebhookConfigBuilder, WebhookConfigError};
 pub use error::WebhookError;
+pub use event_emitter::{CIEventEmitter, EmitResult};
 pub use handler::WebhookHandler;
 pub use payload::{WorkflowConclusion, WorkflowRunCompleted, WorkflowRunPayload};
 pub use rate_limit::{RateLimitConfig, RateLimiter};

@@ -262,6 +262,72 @@ mod error_tests {
     }
 }
 
+mod event_emitter_tests {
+    use super::*;
+
+    #[test]
+    fn test_event_emitter_idempotency() {
+        let emitter = CIEventEmitter::new();
+        let completed = WorkflowRunCompleted {
+            workflow_run_id: 12345,
+            commit_sha: "abc123".to_string(),
+            branch: "main".to_string(),
+            conclusion: WorkflowConclusion::Success,
+            pull_request_numbers: vec![42],
+        };
+
+        // First emission succeeds
+        let result1 = emitter.emit(&completed, true, "delivery-123").unwrap();
+        assert!(matches!(result1, EmitResult::Emitted { .. }));
+
+        // Same delivery ID is rejected as duplicate
+        let result2 = emitter.emit(&completed, true, "delivery-123").unwrap();
+        assert_eq!(result2, EmitResult::Duplicate);
+
+        // Different delivery ID succeeds
+        let result3 = emitter.emit(&completed, true, "delivery-456").unwrap();
+        assert!(matches!(result3, EmitResult::Emitted { .. }));
+
+        // Verify only 2 events stored
+        assert_eq!(emitter.event_store().count(), 2);
+    }
+
+    #[test]
+    fn test_event_emitter_persists_events() {
+        use crate::events::ci::{CIConclusion, EventQuery};
+
+        let emitter = CIEventEmitter::new();
+        let completed = WorkflowRunCompleted {
+            workflow_run_id: 12345,
+            commit_sha: "abc123".to_string(),
+            branch: "main".to_string(),
+            conclusion: WorkflowConclusion::Failure,
+            pull_request_numbers: vec![42, 43],
+        };
+
+        let result = emitter.emit(&completed, true, "delivery-123").unwrap();
+        let EmitResult::Emitted { event_id } = result else {
+            panic!("Expected Emitted")
+        };
+
+        // Query by PR number
+        let query = EventQuery::new().with_pr_number(42);
+        let events = emitter.event_store().query(&query);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, event_id);
+        assert_eq!(events[0].payload.conclusion, CIConclusion::Failure);
+    }
+
+    #[test]
+    fn test_duplicate_delivery_returns_ok() {
+        // Per HTTP semantics, duplicate webhook delivery should return 200 OK
+        // (idempotent operation)
+        use axum::http::StatusCode;
+
+        assert_eq!(WebhookError::DuplicateDelivery.status_code(), StatusCode::OK);
+    }
+}
+
 /// Property-based tests for robustness.
 #[cfg(test)]
 mod proptest_tests {

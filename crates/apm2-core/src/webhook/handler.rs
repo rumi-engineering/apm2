@@ -7,6 +7,12 @@
 //!
 //! The router enforces a 100KB request body limit to prevent memory exhaustion
 //! from oversized payloads. This is configured via `DefaultBodyLimit` layer.
+//!
+//! # Event Emission
+//!
+//! After successful webhook validation, the handler emits a `CIWorkflowCompleted`
+//! ledger event using the [`CIEventEmitter`]. Event emission is controlled by
+//! the `CI_EVENTS_ENABLED` environment variable.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -19,6 +25,7 @@ use axum::routing::post;
 
 use super::config::WebhookConfig;
 use super::error::WebhookError;
+use super::event_emitter::{CIEventEmitter, EmitResult};
 use super::payload::{WorkflowRunCompleted, WorkflowRunPayload};
 use super::rate_limit::RateLimiter;
 use super::signature::SignatureValidator;
@@ -49,6 +56,9 @@ struct WebhookState {
 
     /// Rate limiter.
     rate_limiter: RateLimiter,
+
+    /// Event emitter for CI workflow events.
+    event_emitter: CIEventEmitter,
 }
 
 /// The webhook handler wraps configuration and provides an axum router.
@@ -60,6 +70,14 @@ impl WebhookHandler {
     /// Creates a new webhook handler with the given configuration.
     #[must_use]
     pub fn new(config: WebhookConfig) -> Self {
+        Self::with_event_emitter(config, CIEventEmitter::new())
+    }
+
+    /// Creates a new webhook handler with a custom event emitter.
+    ///
+    /// This is useful for testing or when custom event stores are needed.
+    #[must_use]
+    pub fn with_event_emitter(config: WebhookConfig, event_emitter: CIEventEmitter) -> Self {
         let validator = SignatureValidator::new(config.secret.clone());
         let rate_limiter = RateLimiter::new(config.rate_limit.clone());
 
@@ -68,6 +86,7 @@ impl WebhookHandler {
                 config,
                 validator,
                 rate_limiter,
+                event_emitter,
             }),
         }
     }
@@ -118,6 +137,14 @@ impl WebhookHandler {
     pub fn is_enabled(&self) -> bool {
         self.state.config.enabled
     }
+
+    /// Returns a reference to the event emitter.
+    ///
+    /// This can be used to access the event store for querying persisted events.
+    #[must_use]
+    pub fn event_emitter(&self) -> &CIEventEmitter {
+        &self.state.event_emitter
+    }
 }
 
 /// The axum handler for GitHub webhooks.
@@ -128,7 +155,8 @@ impl WebhookHandler {
 ///    service)
 /// 3. Validates the HMAC-SHA256 signature
 /// 4. Parses and validates the payload
-/// 5. Returns appropriate status codes
+/// 5. Emits CI workflow event (with idempotency check)
+/// 6. Returns appropriate status codes
 async fn webhook_handler(
     State(state): State<Arc<WebhookState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -180,6 +208,29 @@ async fn webhook_handler(
 
     // 6. Log successful processing
     log_completed_event(&completed, ip, delivery_id.as_deref());
+
+    // 7. Emit CI workflow event (with idempotency check)
+    let delivery_id_value = delivery_id.unwrap_or_else(|| {
+        // Generate a fallback delivery ID if GitHub doesn't provide one
+        uuid::Uuid::new_v4().to_string()
+    });
+
+    match state
+        .event_emitter
+        .emit(&completed, true, &delivery_id_value)?
+    {
+        EmitResult::Emitted { event_id } => {
+            tracing::debug!(event_id = %event_id, "CI event emitted");
+        }
+        EmitResult::Disabled => {
+            tracing::debug!("CI events disabled, event not emitted");
+        }
+        EmitResult::Duplicate => {
+            tracing::debug!("duplicate delivery, returning OK");
+            // Return OK for idempotent duplicate handling
+            return Ok(StatusCode::OK);
+        }
+    }
 
     // Return 202 Accepted (webhook received and will be processed)
     Ok(StatusCode::ACCEPTED)
@@ -301,11 +352,13 @@ mod tests {
         let config = test_config(enabled);
         let validator = SignatureValidator::new(config.secret.clone());
         let rate_limiter = RateLimiter::new(config.rate_limit.clone());
+        let event_emitter = CIEventEmitter::new();
 
         Arc::new(WebhookState {
             config,
             validator,
             rate_limiter,
+            event_emitter,
         })
     }
 
