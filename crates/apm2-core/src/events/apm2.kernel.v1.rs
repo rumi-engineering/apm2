@@ -186,7 +186,7 @@ pub struct SessionQuarantined {
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WorkEvent {
-    #[prost(oneof = "work_event::Event", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "work_event::Event", tags = "1, 2, 3, 4, 5")]
     pub event: ::core::option::Option<work_event::Event>,
 }
 /// Nested message and enum types in `WorkEvent`.
@@ -202,6 +202,8 @@ pub mod work_event {
         Completed(super::WorkCompleted),
         #[prost(message, tag = "4")]
         Aborted(super::WorkAborted),
+        #[prost(message, tag = "5")]
+        PrAssociated(super::WorkPrAssociated),
     }
 }
 #[derive(Eq, Hash)]
@@ -226,7 +228,8 @@ pub struct WorkTransitioned {
     pub work_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub from_state: ::prost::alloc::string::String,
-    /// OPEN, CLAIMED, IN_PROGRESS, REVIEW, NEEDS_INPUT, NEEDS_ADJUDICATION
+    /// Valid states: OPEN, CLAIMED, IN_PROGRESS, CI_PENDING, READY_FOR_REVIEW,
+    /// BLOCKED, REVIEW, NEEDS_INPUT, NEEDS_ADJUDICATION
     #[prost(string, tag = "3")]
     pub to_state: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
@@ -260,6 +263,19 @@ pub struct WorkAborted {
     pub abort_reason: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub rationale_code: ::prost::alloc::string::String,
+}
+/// Emitted when a PR is created and associated with a work item.
+/// This enables CI event matching for phase transitions.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WorkPrAssociated {
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub pr_number: u64,
+    /// The commit SHA that triggered the CI workflow
+    #[prost(string, tag = "3")]
+    pub commit_sha: ::prost::alloc::string::String,
 }
 /// ============================================================
 /// TOOL EVENTS

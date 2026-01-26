@@ -92,6 +92,51 @@ impl WorkReducerState {
             .filter(|w| w.requirement_ids.contains(&requirement_id.to_string()))
             .collect()
     }
+
+    /// Returns the work item associated with a PR number, if any.
+    ///
+    /// # CI Gating
+    ///
+    /// This method is used to match `CIWorkflowCompleted` events to work items
+    /// for phase transitions.
+    #[must_use]
+    pub fn by_pr_number(&self, pr_number: u64) -> Option<&Work> {
+        self.work_items
+            .values()
+            .find(|w| w.pr_number == Some(pr_number))
+    }
+
+    /// Returns all work items in CI-gated states (`CiPending` or `Blocked`).
+    ///
+    /// # CI Gating
+    ///
+    /// These work items are waiting for CI events to trigger phase transitions.
+    #[must_use]
+    pub fn ci_gated_work(&self) -> Vec<&Work> {
+        self.work_items
+            .values()
+            .filter(|w| {
+                matches!(
+                    w.state,
+                    crate::work::WorkState::CiPending | crate::work::WorkState::Blocked
+                )
+            })
+            .collect()
+    }
+
+    /// Returns all work items that are claimable (`Open` or `ReadyForReview`).
+    ///
+    /// # CI Gating
+    ///
+    /// Only these work items can be claimed by agents. Work items in `CiPending`
+    /// or `Blocked` states cannot be claimed.
+    #[must_use]
+    pub fn claimable_work(&self) -> Vec<&Work> {
+        self.work_items
+            .values()
+            .filter(|w| w.state.is_claimable())
+            .collect()
+    }
 }
 
 /// Reducer for work lifecycle events.
@@ -297,6 +342,40 @@ impl WorkReducer {
 
         Ok(())
     }
+
+    /// Handles a work PR associated event.
+    ///
+    /// # CI Gating
+    ///
+    /// Associates a PR number with a work item, enabling CI event matching
+    /// for phase transitions.
+    fn handle_pr_associated(
+        &mut self,
+        event: &crate::events::WorkPrAssociated,
+    ) -> Result<(), WorkError> {
+        let work_id = &event.work_id;
+
+        let work =
+            self.state
+                .work_items
+                .get_mut(work_id)
+                .ok_or_else(|| WorkError::WorkNotFound {
+                    work_id: work_id.clone(),
+                })?;
+
+        // Cannot associate PR with terminal work
+        if work.is_terminal() {
+            return Err(WorkError::InvalidTransition {
+                from_state: work.state.as_str().to_string(),
+                event_type: "work.pr_associated".to_string(),
+            });
+        }
+
+        // Set the PR number
+        work.pr_number = Some(event.pr_number);
+
+        Ok(())
+    }
 }
 
 impl Reducer for WorkReducer {
@@ -321,6 +400,7 @@ impl Reducer for WorkReducer {
             Some(work_event::Event::Transitioned(e)) => self.handle_transitioned(e, timestamp),
             Some(work_event::Event::Completed(e)) => self.handle_completed(e, timestamp),
             Some(work_event::Event::Aborted(e)) => self.handle_aborted(e, timestamp),
+            Some(work_event::Event::PrAssociated(ref e)) => self.handle_pr_associated(e),
             None => Ok(()),
         }
     }
@@ -343,7 +423,8 @@ pub mod helpers {
     use prost::Message;
 
     use crate::events::{
-        WorkAborted, WorkCompleted, WorkEvent, WorkOpened, WorkTransitioned, work_event,
+        WorkAborted, WorkCompleted, WorkEvent, WorkOpened, WorkPrAssociated, WorkTransitioned,
+        work_event,
     };
 
     /// Creates a `WorkOpened` event payload.
@@ -450,6 +531,26 @@ pub mod helpers {
         };
         let event = WorkEvent {
             event: Some(work_event::Event::Aborted(aborted)),
+        };
+        event.encode_to_vec()
+    }
+
+    /// Creates a `WorkPrAssociated` event payload.
+    ///
+    /// # CI Gating
+    ///
+    /// This event associates a PR number with a work item, enabling CI event
+    /// matching for phase transitions. Should be emitted when an agent creates
+    /// a PR for a work item.
+    #[must_use]
+    pub fn work_pr_associated_payload(work_id: &str, pr_number: u64, commit_sha: &str) -> Vec<u8> {
+        let pr_associated = WorkPrAssociated {
+            work_id: work_id.to_string(),
+            pr_number,
+            commit_sha: commit_sha.to_string(),
+        };
+        let event = WorkEvent {
+            event: Some(work_event::Event::PrAssociated(pr_associated)),
         };
         event.encode_to_vec()
     }

@@ -299,6 +299,110 @@ pub struct CheckResult {
 }
 
 // ============================================================================
+// CI-Gated Phase Transition Events
+// ============================================================================
+
+/// Event emitted when a work item transitions to a new phase after CI
+/// completion.
+///
+/// This event is the output of the CI-gated queue processing. When a
+/// `CIWorkflowCompleted` event is received and matched to a work item, the
+/// work item's phase transitions and this event is emitted to record the
+/// transition.
+///
+/// # CI Gating
+///
+/// The CI-gated workflow transitions are:
+/// - CI Success: `CiPending` -> `ReadyForReview`
+/// - CI Failure: `CiPending` -> `Blocked`
+///
+/// # Example
+///
+/// ```rust
+/// use apm2_core::events::ci::WorkReadyForNextPhase;
+/// use uuid::Uuid;
+///
+/// let event = WorkReadyForNextPhase::new(
+///     "work-123".to_string(),
+///     "CI_PENDING".to_string(),
+///     "READY_FOR_REVIEW".to_string(),
+///     Uuid::new_v4(), // ID of the CIWorkflowCompleted event
+/// );
+///
+/// assert_eq!(event.event_type, "WorkReadyForNextPhase");
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkReadyForNextPhase {
+    /// Unique identifier for this event (UUID v4).
+    pub event_id: Uuid,
+
+    /// The type of event (always `WorkReadyForNextPhase`).
+    pub event_type: String,
+
+    /// When the event was created (UTC).
+    pub timestamp: DateTime<Utc>,
+
+    /// The work item ID that transitioned.
+    pub work_id: String,
+
+    /// The phase the work item transitioned from.
+    pub previous_phase: String,
+
+    /// The phase the work item transitioned to.
+    pub next_phase: String,
+
+    /// The event ID of the `CIWorkflowCompleted` event that triggered this
+    /// transition.
+    pub triggered_by: Uuid,
+}
+
+impl WorkReadyForNextPhase {
+    /// The constant event type string.
+    pub const EVENT_TYPE: &'static str = "WorkReadyForNextPhase";
+
+    /// Creates a new `WorkReadyForNextPhase` event.
+    #[must_use]
+    pub fn new(
+        work_id: String,
+        previous_phase: String,
+        next_phase: String,
+        triggered_by: Uuid,
+    ) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            event_type: Self::EVENT_TYPE.to_string(),
+            timestamp: Utc::now(),
+            work_id,
+            previous_phase,
+            next_phase,
+            triggered_by,
+        }
+    }
+
+    /// Creates a new event with a specific timestamp (for testing).
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_timestamp(
+        work_id: String,
+        previous_phase: String,
+        next_phase: String,
+        triggered_by: Uuid,
+        timestamp: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            event_type: Self::EVENT_TYPE.to_string(),
+            timestamp,
+            work_id,
+            previous_phase,
+            next_phase,
+            triggered_by,
+        }
+    }
+}
+
+// ============================================================================
 // Idempotency Tracking
 // ============================================================================
 
@@ -849,17 +953,26 @@ impl EventStore for InMemoryEventStore {
 }
 
 // ============================================================================
-// Feature Flag
+// Feature Flags
 // ============================================================================
 
 /// Environment variable name for the CI events feature flag.
 pub const CI_EVENTS_ENABLED_ENV: &str = "CI_EVENTS_ENABLED";
+
+/// Environment variable name for the CI-gated queue feature flag.
+pub const CI_GATED_QUEUE_ENABLED_ENV: &str = "CI_GATED_QUEUE_ENABLED";
 
 /// Cached value of the CI events enabled flag.
 ///
 /// Using `OnceLock` to read the environment variable only once,
 /// avoiding hot-path `env::var` calls which are relatively expensive.
 static CI_EVENTS_ENABLED_CACHE: OnceLock<bool> = OnceLock::new();
+
+/// Cached value of the CI-gated queue enabled flag.
+///
+/// Using `OnceLock` to read the environment variable only once,
+/// avoiding hot-path `env::var` calls which are relatively expensive.
+static CI_GATED_QUEUE_ENABLED_CACHE: OnceLock<bool> = OnceLock::new();
 
 /// Parses the CI events enabled flag from an environment variable value.
 ///
@@ -885,6 +998,28 @@ fn parse_ci_events_enabled(value: Option<&str>) -> bool {
 pub fn is_ci_events_enabled() -> bool {
     *CI_EVENTS_ENABLED_CACHE.get_or_init(|| {
         let value = std::env::var(CI_EVENTS_ENABLED_ENV).ok();
+        parse_ci_events_enabled(value.as_deref())
+    })
+}
+
+/// Checks if the CI-gated queue processing is enabled.
+///
+/// Reads and caches the `CI_GATED_QUEUE_ENABLED` environment variable on first
+/// call. Subsequent calls return the cached value for O(1) performance on hot
+/// paths.
+///
+/// Returns `true` if the variable is set to "true", "1", or "yes"
+/// (case-insensitive). Returns `false` by default if the variable is not set
+/// (fail-closed security).
+///
+/// # CI Gating
+///
+/// When enabled, CI workflow completion events trigger automatic phase
+/// transitions for work items (e.g., `CiPending` -> `ReadyForReview`).
+#[must_use]
+pub fn is_ci_gated_queue_enabled() -> bool {
+    *CI_GATED_QUEUE_ENABLED_CACHE.get_or_init(|| {
+        let value = std::env::var(CI_GATED_QUEUE_ENABLED_ENV).ok();
         parse_ci_events_enabled(value.as_deref())
     })
 }
@@ -915,6 +1050,38 @@ impl CIEventsConfig {
     }
 
     /// Creates a new config with events disabled.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+}
+
+/// Configuration for CI-gated queue feature behavior.
+///
+/// This struct allows injecting configuration for testing without
+/// modifying global environment variables (which is unsafe in Rust 2024).
+#[derive(Debug, Clone)]
+pub struct CIGatedQueueConfig {
+    /// Whether CI-gated queue processing is enabled.
+    pub enabled: bool,
+}
+
+impl Default for CIGatedQueueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: is_ci_gated_queue_enabled(),
+        }
+    }
+}
+
+impl CIGatedQueueConfig {
+    /// Creates a new config with queue processing enabled.
+    #[must_use]
+    pub const fn enabled() -> Self {
+        Self { enabled: true }
+    }
+
+    /// Creates a new config with queue processing disabled.
     #[must_use]
     pub const fn disabled() -> Self {
         Self { enabled: false }
@@ -1582,6 +1749,100 @@ mod tests {
 
             let disabled = CIEventsConfig::disabled();
             assert!(!disabled.enabled);
+        }
+
+        #[test]
+        fn test_ci_gated_queue_config() {
+            let enabled = CIGatedQueueConfig::enabled();
+            assert!(enabled.enabled);
+
+            let disabled = CIGatedQueueConfig::disabled();
+            assert!(!disabled.enabled);
+        }
+    }
+
+    mod work_ready_for_next_phase_tests {
+        use super::*;
+
+        #[test]
+        fn test_event_creation() {
+            let triggered_by = Uuid::new_v4();
+            let event = WorkReadyForNextPhase::new(
+                "work-123".to_string(),
+                "CI_PENDING".to_string(),
+                "READY_FOR_REVIEW".to_string(),
+                triggered_by,
+            );
+
+            assert_eq!(event.event_type, WorkReadyForNextPhase::EVENT_TYPE);
+            assert_eq!(event.work_id, "work-123");
+            assert_eq!(event.previous_phase, "CI_PENDING");
+            assert_eq!(event.next_phase, "READY_FOR_REVIEW");
+            assert_eq!(event.triggered_by, triggered_by);
+        }
+
+        #[test]
+        fn test_event_serialization() {
+            let triggered_by = Uuid::new_v4();
+            let event = WorkReadyForNextPhase::new(
+                "work-123".to_string(),
+                "CI_PENDING".to_string(),
+                "READY_FOR_REVIEW".to_string(),
+                triggered_by,
+            );
+
+            let json = serde_json::to_string(&event).unwrap();
+            let deserialized: WorkReadyForNextPhase = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(event.event_id, deserialized.event_id);
+            assert_eq!(event.work_id, deserialized.work_id);
+            assert_eq!(event.previous_phase, deserialized.previous_phase);
+            assert_eq!(event.next_phase, deserialized.next_phase);
+            assert_eq!(event.triggered_by, deserialized.triggered_by);
+        }
+
+        #[test]
+        fn test_event_json_schema() {
+            let triggered_by = Uuid::new_v4();
+            let event = WorkReadyForNextPhase::new(
+                "work-123".to_string(),
+                "CI_PENDING".to_string(),
+                "BLOCKED".to_string(),
+                triggered_by,
+            );
+
+            let json = serde_json::to_value(&event).unwrap();
+
+            // Verify required fields exist
+            assert!(json.get("event_id").is_some());
+            assert_eq!(json["event_type"], "WorkReadyForNextPhase");
+            assert!(json.get("timestamp").is_some());
+            assert_eq!(json["work_id"], "work-123");
+            assert_eq!(json["previous_phase"], "CI_PENDING");
+            assert_eq!(json["next_phase"], "BLOCKED");
+            assert!(json.get("triggered_by").is_some());
+        }
+
+        #[test]
+        fn test_deny_unknown_fields() {
+            let json = r#"{
+                "event_id": "00000000-0000-0000-0000-000000000000",
+                "event_type": "WorkReadyForNextPhase",
+                "timestamp": "2024-01-01T00:00:00Z",
+                "work_id": "work-123",
+                "previous_phase": "CI_PENDING",
+                "next_phase": "READY_FOR_REVIEW",
+                "triggered_by": "00000000-0000-0000-0000-000000000001",
+                "unknown_field": "malicious_data"
+            }"#;
+
+            let result: Result<WorkReadyForNextPhase, _> = serde_json::from_str(json);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("unknown field"),
+                "Error should mention unknown field: {err}"
+            );
         }
     }
 }

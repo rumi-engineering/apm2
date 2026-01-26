@@ -59,6 +59,30 @@ pub enum WorkState {
     Claimed,
     /// Work is actively being processed.
     InProgress,
+    /// Work is waiting for CI completion (not claimable).
+    ///
+    /// # CI Gating
+    ///
+    /// Work enters this state when a PR has been created and CI is running.
+    /// Agents cannot claim work in this state. The work will transition to
+    /// `ReadyForReview` (CI success) or `Blocked` (CI failure) based on
+    /// `CIWorkflowCompleted` events.
+    CiPending,
+    /// Work is ready for review after CI passed (claimable).
+    ///
+    /// # CI Gating
+    ///
+    /// Work enters this state after `CIWorkflowCompleted` with `Success`
+    /// conclusion. Review agents can claim work in this state.
+    ReadyForReview,
+    /// Work is blocked due to CI failure or other issues (not claimable).
+    ///
+    /// # CI Gating
+    ///
+    /// Work enters this state after `CIWorkflowCompleted` with `Failure`
+    /// conclusion. The work can transition back to `CiPending` when CI is
+    /// retried (e.g., after a fix is pushed).
+    Blocked,
     /// Work is under review.
     Review,
     /// Work is blocked waiting for input.
@@ -89,6 +113,9 @@ impl WorkState {
             "OPEN" => Ok(Self::Open),
             "CLAIMED" => Ok(Self::Claimed),
             "IN_PROGRESS" => Ok(Self::InProgress),
+            "CI_PENDING" => Ok(Self::CiPending),
+            "READY_FOR_REVIEW" => Ok(Self::ReadyForReview),
+            "BLOCKED" => Ok(Self::Blocked),
             "REVIEW" => Ok(Self::Review),
             "NEEDS_INPUT" => Ok(Self::NeedsInput),
             "NEEDS_ADJUDICATION" => Ok(Self::NeedsAdjudication),
@@ -107,6 +134,9 @@ impl WorkState {
             Self::Open => "OPEN",
             Self::Claimed => "CLAIMED",
             Self::InProgress => "IN_PROGRESS",
+            Self::CiPending => "CI_PENDING",
+            Self::ReadyForReview => "READY_FOR_REVIEW",
+            Self::Blocked => "BLOCKED",
             Self::Review => "REVIEW",
             Self::NeedsInput => "NEEDS_INPUT",
             Self::NeedsAdjudication => "NEEDS_ADJUDICATION",
@@ -128,6 +158,15 @@ impl WorkState {
     }
 
     /// Checks if a transition from this state to the target state is valid.
+    ///
+    /// # CI-Gated Transitions
+    ///
+    /// The CI-gated workflow adds these transitions:
+    /// - `InProgress` -> `CiPending`: PR created, waiting for CI
+    /// - `CiPending` -> `ReadyForReview`: CI passed
+    /// - `CiPending` -> `Blocked`: CI failed
+    /// - `Blocked` -> `CiPending`: CI retried (after fix pushed)
+    /// - `ReadyForReview` -> `Review`: Review agent claimed work
     #[must_use]
     pub const fn can_transition_to(&self, target: &Self) -> bool {
         match (self, target) {
@@ -136,8 +175,19 @@ impl WorkState {
             | (Self::Claimed, Self::InProgress | Self::Open | Self::Aborted)
             | (
                 Self::InProgress,
-                Self::Review | Self::NeedsInput | Self::NeedsAdjudication | Self::Aborted,
+                Self::Review
+                    | Self::CiPending
+                    | Self::NeedsInput
+                    | Self::NeedsAdjudication
+                    | Self::Aborted,
             )
+            // CI-gated transitions (from CiPending)
+            | (Self::CiPending, Self::ReadyForReview | Self::Blocked | Self::Aborted)
+            // CI passed, ready for review agent to claim
+            | (Self::ReadyForReview, Self::Review | Self::Aborted)
+            // CI failed, can retry (back to CiPending) or abort
+            | (Self::Blocked, Self::CiPending | Self::InProgress | Self::Aborted)
+            // Review transitions
             | (Self::Review, Self::Completed | Self::InProgress | Self::Aborted)
             | (Self::NeedsInput | Self::NeedsAdjudication, Self::InProgress | Self::Aborted) => {
                 true
@@ -146,6 +196,27 @@ impl WorkState {
             // All other transitions are invalid (including from terminal states)
             _ => false,
         }
+    }
+
+    /// Returns true if work in this state can be claimed by an agent.
+    ///
+    /// # Claimable States
+    ///
+    /// - `Open`: Work is newly created and can be claimed for implementation.
+    /// - `ReadyForReview`: CI passed and work is ready for review agent.
+    ///
+    /// # Non-Claimable States
+    ///
+    /// - `Claimed`: Already claimed by another agent.
+    /// - `InProgress`: Work is being actively processed.
+    /// - `CiPending`: Waiting for CI completion - cannot be claimed.
+    /// - `Blocked`: CI failed - cannot be claimed until fixed.
+    /// - `Review`: Under review by an agent.
+    /// - `NeedsInput`/`NeedsAdjudication`: Blocked on external input.
+    /// - `Completed`/`Aborted`: Terminal states.
+    #[must_use]
+    pub const fn is_claimable(&self) -> bool {
+        matches!(self, Self::Open | Self::ReadyForReview)
     }
 }
 
@@ -194,6 +265,18 @@ pub struct Work {
 
     /// Abort reason (populated on abort).
     pub abort_reason: Option<String>,
+
+    /// PR number associated with this work (for CI event matching).
+    ///
+    /// # CI Gating
+    ///
+    /// When an agent creates a PR for this work, the PR number is recorded here.
+    /// This enables matching `CIWorkflowCompleted` events to work items so that
+    /// CI completion can trigger phase transitions (e.g., `CiPending` ->
+    /// `ReadyForReview`).
+    ///
+    /// A value of `None` indicates no PR has been created yet.
+    pub pr_number: Option<u64>,
 }
 
 impl Work {
@@ -223,7 +306,19 @@ impl Work {
             evidence_ids: Vec::new(),
             gate_receipt_id: None,
             abort_reason: None,
+            pr_number: None,
         }
+    }
+
+    /// Sets the PR number for this work item.
+    ///
+    /// # CI Gating
+    ///
+    /// This method should be called when a PR is created for this work item.
+    /// The PR number is used to match `CIWorkflowCompleted` events to work
+    /// items for phase transitions.
+    pub const fn set_pr_number(&mut self, pr_number: u64) {
+        self.pr_number = Some(pr_number);
     }
 
     /// Returns true if this work is in a terminal state.
@@ -326,6 +421,16 @@ mod unit_tests {
             WorkState::parse("IN_PROGRESS").unwrap(),
             WorkState::InProgress
         );
+        assert_eq!(WorkState::parse("CI_PENDING").unwrap(), WorkState::CiPending);
+        assert_eq!(
+            WorkState::parse("ci_pending").unwrap(),
+            WorkState::CiPending
+        );
+        assert_eq!(
+            WorkState::parse("READY_FOR_REVIEW").unwrap(),
+            WorkState::ReadyForReview
+        );
+        assert_eq!(WorkState::parse("BLOCKED").unwrap(), WorkState::Blocked);
         assert_eq!(WorkState::parse("REVIEW").unwrap(), WorkState::Review);
         assert_eq!(
             WorkState::parse("NEEDS_INPUT").unwrap(),
@@ -356,6 +461,9 @@ mod unit_tests {
         assert_eq!(WorkState::Open.as_str(), "OPEN");
         assert_eq!(WorkState::Claimed.as_str(), "CLAIMED");
         assert_eq!(WorkState::InProgress.as_str(), "IN_PROGRESS");
+        assert_eq!(WorkState::CiPending.as_str(), "CI_PENDING");
+        assert_eq!(WorkState::ReadyForReview.as_str(), "READY_FOR_REVIEW");
+        assert_eq!(WorkState::Blocked.as_str(), "BLOCKED");
         assert_eq!(WorkState::Review.as_str(), "REVIEW");
         assert_eq!(WorkState::NeedsInput.as_str(), "NEEDS_INPUT");
         assert_eq!(WorkState::NeedsAdjudication.as_str(), "NEEDS_ADJUDICATION");
@@ -368,6 +476,9 @@ mod unit_tests {
         assert!(!WorkState::Open.is_terminal());
         assert!(!WorkState::Claimed.is_terminal());
         assert!(!WorkState::InProgress.is_terminal());
+        assert!(!WorkState::CiPending.is_terminal());
+        assert!(!WorkState::ReadyForReview.is_terminal());
+        assert!(!WorkState::Blocked.is_terminal());
         assert!(!WorkState::Review.is_terminal());
         assert!(!WorkState::NeedsInput.is_terminal());
         assert!(!WorkState::NeedsAdjudication.is_terminal());
@@ -380,11 +491,32 @@ mod unit_tests {
         assert!(WorkState::Open.is_active());
         assert!(WorkState::Claimed.is_active());
         assert!(WorkState::InProgress.is_active());
+        assert!(WorkState::CiPending.is_active());
+        assert!(WorkState::ReadyForReview.is_active());
+        assert!(WorkState::Blocked.is_active());
         assert!(WorkState::Review.is_active());
         assert!(WorkState::NeedsInput.is_active());
         assert!(WorkState::NeedsAdjudication.is_active());
         assert!(!WorkState::Completed.is_active());
         assert!(!WorkState::Aborted.is_active());
+    }
+
+    #[test]
+    fn test_work_state_claimable() {
+        // Claimable states
+        assert!(WorkState::Open.is_claimable());
+        assert!(WorkState::ReadyForReview.is_claimable());
+
+        // Non-claimable states
+        assert!(!WorkState::Claimed.is_claimable());
+        assert!(!WorkState::InProgress.is_claimable());
+        assert!(!WorkState::CiPending.is_claimable());
+        assert!(!WorkState::Blocked.is_claimable());
+        assert!(!WorkState::Review.is_claimable());
+        assert!(!WorkState::NeedsInput.is_claimable());
+        assert!(!WorkState::NeedsAdjudication.is_claimable());
+        assert!(!WorkState::Completed.is_claimable());
+        assert!(!WorkState::Aborted.is_claimable());
     }
 
     #[test]
@@ -406,11 +538,52 @@ mod unit_tests {
     #[test]
     fn test_work_state_transitions_from_in_progress() {
         assert!(WorkState::InProgress.can_transition_to(&WorkState::Review));
+        assert!(WorkState::InProgress.can_transition_to(&WorkState::CiPending));
         assert!(WorkState::InProgress.can_transition_to(&WorkState::NeedsInput));
         assert!(WorkState::InProgress.can_transition_to(&WorkState::NeedsAdjudication));
         assert!(WorkState::InProgress.can_transition_to(&WorkState::Aborted));
         assert!(!WorkState::InProgress.can_transition_to(&WorkState::Completed));
         assert!(!WorkState::InProgress.can_transition_to(&WorkState::Open));
+    }
+
+    #[test]
+    fn test_work_state_transitions_from_ci_pending() {
+        // CI success -> ReadyForReview
+        assert!(WorkState::CiPending.can_transition_to(&WorkState::ReadyForReview));
+        // CI failure -> Blocked
+        assert!(WorkState::CiPending.can_transition_to(&WorkState::Blocked));
+        // Can abort from CI pending
+        assert!(WorkState::CiPending.can_transition_to(&WorkState::Aborted));
+        // Cannot skip to completion
+        assert!(!WorkState::CiPending.can_transition_to(&WorkState::Completed));
+        // Cannot go back to InProgress directly
+        assert!(!WorkState::CiPending.can_transition_to(&WorkState::InProgress));
+    }
+
+    #[test]
+    fn test_work_state_transitions_from_ready_for_review() {
+        // Review agent claims work
+        assert!(WorkState::ReadyForReview.can_transition_to(&WorkState::Review));
+        // Can abort
+        assert!(WorkState::ReadyForReview.can_transition_to(&WorkState::Aborted));
+        // Cannot skip to completion
+        assert!(!WorkState::ReadyForReview.can_transition_to(&WorkState::Completed));
+        // Cannot go back to CiPending
+        assert!(!WorkState::ReadyForReview.can_transition_to(&WorkState::CiPending));
+    }
+
+    #[test]
+    fn test_work_state_transitions_from_blocked() {
+        // Retry CI after fix
+        assert!(WorkState::Blocked.can_transition_to(&WorkState::CiPending));
+        // Can go back to InProgress for more work
+        assert!(WorkState::Blocked.can_transition_to(&WorkState::InProgress));
+        // Can abort
+        assert!(WorkState::Blocked.can_transition_to(&WorkState::Aborted));
+        // Cannot skip to completion
+        assert!(!WorkState::Blocked.can_transition_to(&WorkState::Completed));
+        // Cannot skip to ReadyForReview
+        assert!(!WorkState::Blocked.can_transition_to(&WorkState::ReadyForReview));
     }
 
     #[test]
