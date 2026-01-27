@@ -36,11 +36,11 @@ decision_tree:
           purpose: "Required security gates and local verification commands."
         - path: documents/security/THREAT_MODEL.md
           purpose: "Threat model for security risk evaluation."
-        - path: documents/skills/holonic-agent-network/SKILL.md
+        - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/SKILL.md
           purpose: "Core holonic philosophy and constraints."
-        - path: documents/skills/holonic-agent-network/references/principia-holonic.md
+        - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/principia-holonic.md
           purpose: "Axioms of holonic operation."
-        - path: documents/skills/holonic-agent-network/references/agent-native-software.md
+        - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/agent-native-software.md
           purpose: "Agent-native architecture doctrine."
         - path: documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md
           purpose: "APM2 safe patterns and anti-patterns (token-efficient index)."

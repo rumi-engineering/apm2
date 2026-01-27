@@ -14,7 +14,7 @@ decision_tree:
           purpose: "Security documentation index and quick reference."
         - path: documents/security/SECURITY_POLICY.md
           purpose: "Security invariants and modes."
-        - path: documents/skills/holonic-agent-network/SKILL.md
+        - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/SKILL.md
           purpose: "Core philosophy and constraints."
       steps[5]:
         - id: READ_BASELINE_CONTEXT

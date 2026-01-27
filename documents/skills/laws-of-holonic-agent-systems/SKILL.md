@@ -71,3 +71,20 @@ This index provides a machine-parseable and human-navigable map of the inescapab
 | **LAW-13** | Semantic Contracting | [law_13.md](references/law_13.md) |
 | **LAW-14** | Proportionality and Risk-Weighted Evidence | [law_14.md](references/law_14.md) |
 | **LAW-15** | Measurement Integrity | [law_15.md](references/law_15.md) |
+
+## Grand Unified Theory
+
+The grand unified theory of agent-native holonic software compiles these laws into a normative, operationalizable framework.
+
+*   **[Grand Unified Theory of Agent-Native Holonic Software (APM2)](references/unified-theory.md)**
+
+## Integrated Skills
+
+The following skills are integrated components of the Laws of Holonic Agent Systems:
+
+| Skill | Summary |
+|-------|---------|
+| [Agent-Native Software](references/agent-native-software/SKILL.md) | Industry textbook on writing software for robots/agents. |
+| [Holonic Agent Network](references/holonic-agent-network/SKILL.md) | Principles of compositional agency and the Principia Holonica. |
+| [Holonic Agent System Defects](references/holonic-agent-system-defects/SKILL.md) | Theory and taxonomy of defects in agent-native systems. |
+
