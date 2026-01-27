@@ -15,7 +15,7 @@ The `glossary` skill (`documents/skills/glossary/SKILL.md`) serves as the "Repos
 2.  **Update the Index** in `documents/skills/glossary/SKILL.md` to include these new terms in the table.
 
 ## Definition Requirements
-Do not use generic dictionary definitions. Use the specific "Agent-Native" definitions from `apm2` doctrine (`principia-holonic.md`, `agent-native-software.md`, `PRD-0004`).
+Do not use generic dictionary definitions. Use the specific "Agent-Native" definitions from `apm2` doctrine (`unified-theory.md` (dcp://apm2.local/governance/holonic_unified_theory@v1), `agent-native-software.md`, `PRD-0004`).
 
 *   **Episode**: Define as a "Bounded Context Window" with `EpisodeContext`, `EpisodeResult`, and `StopCondition`. Mention `max_episodes` and budget.
 *   **Artifact**: Define as "Content-Addressed Evidence". Mention `CAS`, `BLAKE3`, and `EvidenceBundle`.

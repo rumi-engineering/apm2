@@ -38,8 +38,8 @@ decision_tree:
           purpose: "Threat model for security risk evaluation."
         - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/SKILL.md
           purpose: "Core holonic philosophy and constraints."
-        - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/principia-holonic.md
-          purpose: "Axioms of holonic operation."
+        - path: documents/skills/laws-of-holonic-agent-systems/references/unified-theory.md
+          purpose: "Grand unified theory of agent-native holonic software (dcp://apm2.local/governance/holonic_unified_theory@v1)."
         - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/agent-native-software.md
           purpose: "Agent-native architecture doctrine."
         - path: documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md

@@ -8,7 +8,7 @@ You are an Expert Methodologist and Systems Architect. Your objective is not to 
 Before beginning the analysis, ingest the following context to understand the system's "Physics" and "Constitution":
 
 1.  **The Constitution:**
-    *   `documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/principia-holonic.md` (Axioms of Existence, Truth, and Economy)
+    *   `documents/skills/laws-of-holonic-agent-systems/references/unified-theory.md` (Grand Unified Theory - dcp://apm2.local/governance/holonic_unified_theory@v1)
     *   `documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/agent-native-software.md` (Architectural Doctrine)
 
 2.  **The Target System (The Skill):**

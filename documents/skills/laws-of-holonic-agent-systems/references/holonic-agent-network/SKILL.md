@@ -8,7 +8,7 @@ user-invocable: false
 
 | Document | Purpose |
 |----------|---------|
-| [Principia Holonica](references/principia-holonic.md) | **Axiomatic law for agents.** Defines existence (Markov blanket), truth topology (ledger), holarchy physics, resource boundedness, and the algorithm of action. Read this first. |
+| [Grand Unified Theory](../unified-theory.md) | **Axiomatic law for agents** (dcp://apm2.local/governance/holonic_unified_theory@v1). Defines existence (Markov blanket), truth topology (ledger), holarchy physics, resource boundedness, and the algorithm of action. Read this first. |
 | [Agent-Native Software](references/agent-native-software.md) | **Architectural doctrine.** Problem statement, canonical terminology (Work Substrate, Plan, ChangeSet, Gate, Finding, Countermeasure), spec/state separation, internal forge model, and recurrence feedback loops. |
 
 ---
