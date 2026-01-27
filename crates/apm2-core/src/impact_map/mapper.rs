@@ -603,13 +603,15 @@ pub fn parse_requirements(
         let path = entry.path();
 
         // Only process REQ-*.yaml files to skip index/readme files.
-        // Consolidation prevents redundant extension splitting.
-        let is_valid_req = path
+        let is_req_file = path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("REQ-") && (n.ends_with(".yaml") || n.ends_with(".yml")));
+            .is_some_and(|n| n.starts_with("REQ-"));
+        let is_yaml = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
 
-        if is_valid_req {
+        if is_req_file && is_yaml {
             yaml_files.push(path);
         }
     }
