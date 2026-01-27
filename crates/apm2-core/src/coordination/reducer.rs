@@ -93,7 +93,19 @@ impl CoordinationReducer {
     /// Handles a `coordination.started` event.
     ///
     /// Creates a new coordination session in the `Initializing` state.
+    /// This is idempotent - if a coordination with this ID already exists,
+    /// the event is ignored to prevent resetting budget usage or work progress.
     fn handle_started(&mut self, event: CoordinationStarted) {
+        // Idempotency: Skip if coordination already exists
+        // This prevents a replayed Started event from resetting accumulated state
+        if self
+            .state
+            .coordinations
+            .contains_key(&event.coordination_id)
+        {
+            return;
+        }
+
         // Create the coordination session
         let Ok(session) = CoordinationSession::new(
             event.coordination_id.clone(),
@@ -107,7 +119,7 @@ impl CoordinationReducer {
             return;
         };
 
-        // Insert into state (idempotent - existing coordination is overwritten)
+        // Insert into state
         self.state
             .coordinations
             .insert(event.coordination_id, session);
@@ -664,6 +676,64 @@ mod unit_tests {
 
         // States should be equal (idempotent)
         assert_eq!(state1, state2);
+    }
+
+    #[test]
+    fn tck_00149_started_does_not_reset_accumulated_state() {
+        let mut reducer = CoordinationReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start coordination
+        let start_payload = started_payload("coord-1", vec!["work-1".to_string()]);
+        reducer
+            .apply(&create_event(EVENT_TYPE_STARTED, &start_payload), &ctx)
+            .unwrap();
+
+        // Process a session to accumulate some state
+        let bound_payload = bound_payload("coord-1", "session-1", "work-1", 1);
+        reducer
+            .apply(
+                &create_event(EVENT_TYPE_SESSION_BOUND, &bound_payload),
+                &ctx,
+            )
+            .unwrap();
+
+        let unbound_payload = unbound_payload(
+            "coord-1",
+            "session-1",
+            "work-1",
+            SessionOutcome::Success,
+            5000,
+        );
+        reducer
+            .apply(
+                &create_event(EVENT_TYPE_SESSION_UNBOUND, &unbound_payload),
+                &ctx,
+            )
+            .unwrap();
+
+        // Record accumulated state
+        let coord_before = reducer.state().get("coord-1").unwrap();
+        let budget_before = coord_before.budget_usage.consumed_episodes;
+        let work_index_before = coord_before.work_index;
+        assert_eq!(budget_before, 1, "Should have consumed 1 episode");
+        assert_eq!(work_index_before, 1, "Should have advanced work_index");
+
+        // Try to replay the Started event
+        reducer
+            .apply(&create_event(EVENT_TYPE_STARTED, &start_payload), &ctx)
+            .unwrap();
+
+        // Verify state was NOT reset
+        let coord_after = reducer.state().get("coord-1").unwrap();
+        assert_eq!(
+            coord_after.budget_usage.consumed_episodes, budget_before,
+            "Duplicate Started should not reset budget_usage"
+        );
+        assert_eq!(
+            coord_after.work_index, work_index_before,
+            "Duplicate Started should not reset work_index"
+        );
     }
 
     #[test]
