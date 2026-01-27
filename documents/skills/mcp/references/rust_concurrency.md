@@ -15,12 +15,22 @@
   - semaphore-limited (`max_inflight_handlers`)
   - per-method concurrency caps for high-cost methods (`tools/call`, `resources/read`)
 
-### Transport Deadlock Mitigation
-- **The Stalled Peer Problem**: In `stdio` or single-socket transports, if the local process blocks while writing to a full OS buffer (because the peer is slow to read), it may stop reading from the peer. If the peer is also blocked writing, a deadlock occurs.
-- **Mitigation**:
-  - `reader_task` and `writer_task` **MUST** be strictly independent.
-  - The `writer_task` should use a bounded MPSC channel. If the channel is full, the producer (handler) should await, but the `reader_task` must remain unblocked to continue processing inbound cancellations or pings.
-  - Use `tokio::select!` in handlers to ensure that a stalled write doesn't prevent responding to a `notifications/cancelled`.
+### Transport Deadlock Mitigation (The Stalled Peer Problem)
+In `stdio` or single-socket transports, a deadlock occurs if the Server's `stdout` pipe is full (Server blocked on `write`) while the Client's `stdout` pipe is also full (Client blocked on `write` to Server's `stdin`). 
+
+**Implementation Mandates:**
+1.  **Strict Task Separation**: The `reader_task` and `writer_task` MUST NOT share a mutex or be awaited sequentially in the same loop. 
+2.  **Unblockable Reader**: The `reader_task` MUST continue to drain the transport even if the `writer_task` is blocked.
+3.  **Cancellation Bypass**: When the `writer_task`'s MPSC queue is full, the `reader_task` MUST still be able to process `notifications/cancelled`. This is achieved by:
+    *   Using a high-priority `cancellation` channel that bypasses the standard outbound queue.
+    *   OR, more simply, the `reader_task` triggers a `CancellationToken` shared with the handler. The handler, upon seeing the cancellation, drops its pending write and exits, thus unblocking the `writer_task`'s queue.
+4.  **Yielding on Stalls**: Use `tokio::select!` in handlers to wait for *either* the outbound queue to have space *or* a cancellation signal:
+    ```rust
+    tokio::select! {
+        res = outbound_tx.reserve() => { /* proceed with send */ }
+        _ = cancel_token.cancelled() => { return Err(Error::cancelled()); }
+    }
+    ```
 
 ## Cancellation / timeouts
 - Per-request timeout:

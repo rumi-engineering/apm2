@@ -49,6 +49,14 @@ pub trait RequestHandler: Send + Sync {
 - **Lazy / Double-Pass Parsing**:
   1.  **Pass 1 (Router)**: Deserialize the outer envelope (`id`, `method`) while keeping `params` as a `RawValue`. This allows rapid dispatch or rejection (e.g., Method Not Found) without paying for full param deserialization.
   2.  **Pass 2 (Handler)**: The specific handler deserializes the `RawValue` into its expected typed structure.
+
+### Zero-Copy Deserialization Patterns
+For maximum throughput, handlers should avoid intermediate allocations for strings or byte buffers.
+- **Borrowed RawValue**: While `Box<RawValue>` is safer for async handlers (no lifetime issues), `mcp-core` should support `JsonRpcRequest<&'a RawValue>` for sync-capable or scoped-executor handlers.
+- **Bytes-to-Str**: Use `serde(borrow)` to map JSON strings directly to `&str` or `Cow<str>` pointing into the transport buffer.
+- **The Lifecycle Problem**: Since the transport buffer is typically reused (via `BytesMut`), a handler that borrows from it MUST complete before the buffer is cleared for the next message. 
+  - *Mitigation*: For long-running tool calls, the handler should clone only the specific fields it needs (e.g., tool arguments) into an owned struct, then release the buffer reference.
+
 - Parse input into an owned message enum:
   - `JsonRpcRequest { id, method, params: Option<Box<RawValue>> }`
   - `JsonRpcNotification { method, params: Option<Box<RawValue>> }`

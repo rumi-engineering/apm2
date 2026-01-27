@@ -34,11 +34,13 @@ See `references/spec_mcp_contract.md`.
 - `IdGen` (monotone, collision-free per session).
 - `Cancellation` + `Progress` (cross-cutting).
 - `Tasks` (optional feature): task-augmented execution + polling.
+- **Schema Sanitizer**: Provider-aware visitor for Gemini/Codex compatibility.
 
 See:
 - `references/rust_api_surface.md`
 - `references/rust_concurrency.md`
 - `references/rust_framing_codec.md`
+- `references/rust_schema_sanitization.md`
 
 ### Performance invariants
 - Zero-copy buffering where possible (`bytes::Bytes/BytesMut`).
@@ -57,7 +59,7 @@ See `references/provider_compatibility.md`.
 
 ## Files
 - `references/references_index.md`: machine-readable index + provenance.
-- `references/spec_*`: protocol, methods, transports, auth, security, schema pointers.
+- `references/spec_tasks_state_machine.md`: lifecycle and notifications for long-running tasks.
 - `references/rust_*`: crate layout, APIs, parsing, testing.
 - `references/provider_*`: integration notes for major clients.
 - `references/test_*`: conformance + fuzz + golden vectors.

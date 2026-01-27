@@ -28,7 +28,8 @@
       "references/rust_framing_codec.md",
       "references/rust_concurrency.md",
       "references/rust_error_model.md",
-      "references/rust_testing.md"
+      "references/rust_testing.md",
+      "references/rust_schema_sanitization.md"
     ],
     "sources": "references/sources.md",
     "spec": [
@@ -43,7 +44,8 @@
       "references/spec_utilities.md",
       "references/spec_auth_oauth2.md",
       "references/spec_security_best_practices.md",
-      "references/spec_schema_reference.md"
+      "references/spec_schema_reference.md",
+      "references/spec_tasks_state_machine.md"
     ],
     "testing": [
       "references/test_conformance_suite.md",

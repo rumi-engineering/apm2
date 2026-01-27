@@ -25,14 +25,17 @@ multiple_connections:
 sse_resumability:
   event_id:
     - "server MAY include SSE event 'id'"
-    - "id MUST be globally unique across all streams within a session (or per client if no session IDs)"
+    - "id MUST be globally unique across all streams within a session"
+    - "Sequence Requirement: IDs SHOULD be monotonically increasing (e.g., integers or KSUIDs) to facilitate range-based replay."
   reconnect:
     client_header: "Last-Event-ID"
     rules:
       - "client SHOULD reconnect via GET with Last-Event-ID to resume"
-      - "REPLAY BUFFER: server SHOULD maintain a per-session ring buffer (e.g., last 50 events) to replay missed messages when a client reconnects with a valid Last-Event-ID."
-      - "server MAY replay only messages for the originating stream; MUST NOT replay messages from other streams"
-      - "server SHOULD prime clients with an event id + empty data to enable reconnect cursors"
+      - "REPLAY BUFFER: server SHOULD maintain a per-session ring buffer (e.g., last 50 events)."
+      - "Buffer Miss: If Last-Event-ID is provided but NOT in the buffer (expired), the server MUST NOT replay; it should start the stream from the current real-time cursor and MAY emit a warning notification."
+      - "Session Scope: A change in Mcp-Session-Id invalidates the Last-Event-ID; the client MUST reset its event cursor."
+      - "server MUST NOT replay messages from other sessions or other clients."
+      - "server SHOULD prime clients with an initial event 'id' + empty data upon GET connection to establish a baseline for subsequent reconnects."
 
 cors_requirements:
   usage: "Required for web-based MCP clients (e.g., browser-based IDEs)"
