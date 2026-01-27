@@ -39,7 +39,7 @@ decision_tree:
 
 The following documents define the core principles and security posture of APM2:
 
-*   **[Agent-Native Software: Industry Textbook](/documents/skills/agent-native-software/SKILL.md)**: First principles of stochastic cognition, context limits, and tool-loops.
+*   **[Agent-Native Software: Industry Textbook](/documents/skills/laws-of-holonic-agent-systems/references/agent-native-software/SKILL.md)**: First principles of stochastic cognition, context limits, and tool-loops.
 *   **[Security Documentation](/documents/security/AGENTS.md)**: Security philosophy, policy, and required reading for all agents.
 
 ## Required Reading (APM2 Rust Textbook)

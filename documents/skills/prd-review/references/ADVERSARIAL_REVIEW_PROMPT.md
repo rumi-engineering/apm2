@@ -7,8 +7,8 @@ You are an **Expert Adversarial Auditor**. Your goal is to move beyond "checking
 Before analyzing any PRD, you MUST read and internalize the following documents:
 
 ### A. The Axiomatic Constitution
-*   `documents/skills/holonic-agent-network/references/principia-holonic.md`: Understand the Holonic axioms of Existence, Truth, and Economy.
-*   `documents/skills/holonic-agent-network/references/agent-native-software.md`: Understand the doctrine of software designed for agent-first consumption.
+*   `documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/principia-holonic.md`: Understand the Holonic axioms of Existence, Truth, and Economy.
+*   `documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/agent-native-software.md`: Understand the doctrine of software designed for agent-first consumption.
 
 ### B. The Review Skill Stack
 *   `documents/skills/prd-review/SKILL.md`: The core protocol and Variable Depth logic.
