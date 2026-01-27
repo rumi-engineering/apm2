@@ -346,10 +346,19 @@ rfc_design_decisions:
         - Enforces resource budgets via cgroups (CPU, memory, I/O)
         - Collects telemetry and manages evidence economics
 
-        **Layering Model:**
+        **Layering Model (Normative):**
+        1. **EpisodeRuntime (apm2-daemon)** is the **Authoritative Plant Controller**. It 
+           owns the process lifetime, enforces resource budgets via cgroups, and 
+           is the single source of truth for kernel events and receipts.
+        2. **EpisodeController (apm2-holon)** is an **Orchestration Algorithm**. It
+           consumes services provided by the daemon and provides an in-process
+           execution loop for Holon traits. It is **NOT authoritative**; its 
+           outputs (like RunReceipt) are advisory and must be bound into 
+           authoritative daemon receipts to be meaningful.
+
         ```
-        EpisodeRuntime (daemon process control)
-            └── EpisodeController (in-process loop)
+        EpisodeRuntime (Authoritative Plant Controller)
+            └── EpisodeController (Orchestration Algorithm)
                     └── HarnessAdapter implements Holon trait
         ```
 
@@ -617,9 +626,16 @@ rfc_design_decisions:
         **v0 Finding Resolved:** SA2-F-008, SA3-F-003
 
         To ensure stable digests for signing, all Protobuf messages bound into
-        receipts MUST use deterministic serialization:
+        receipts MUST use deterministic serialization.
 
-        **Rules:**
+        **The Unsigned Canonical Bytes Rule:**
+        Authoritative signing is performed over the "Unsigned Canonical Bytes" of 
+        a message. This is defined as the Protobuf-encoded bytes of the message 
+        where the `signature` and any `issuer_signature` fields are set to their 
+        default (empty) values. This ensures the signature does not attempt to 
+        sign itself, creating a stable fixpoint for verification.
+
+        **Deterministic Rules:**
         1. **Field Order**: Fields MUST be serialized in tag number order (standard).
         2. **Maps**: Maps are forbidden in signed messages (use repeated entries).
         3. **Repeated Fields**: Order must be stable (sorted by content hash if

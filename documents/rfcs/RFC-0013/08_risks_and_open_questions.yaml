@@ -314,12 +314,10 @@ rfc_risks_and_open_questions:
         derived from events, and versioned. The architectural principle (AD-EVID-003)
         establishes that the ledger IS the substrate and reducers derive metrics.
 
-        Requires event vocabulary for:
-        - Telemetry frames emitted from ring buffers on trigger
-        - Evidence pinning (DefectRecord → evidence.pinned)
-        - TTL expiration events
-        - Compaction completion
-      status: RESOLVED_V4
+        Ring buffers, TTL, and pinning must use a stable event vocabulary to 
+        prevent disjoint subsystems or parallel observability systems that 
+        bypass the ledger.
+      status: RESOLVED
       proposed_answer: |
         **v2 Architectural Principle (established):**
         - Ring buffers are daemon-local transient capture
@@ -327,38 +325,35 @@ rfc_risks_and_open_questions:
         - Reducers compute all metrics (no parallel pipelines)
         - Ledger is the substrate for evidence economics
 
-        **Finalized Event Vocabulary:**
-        - `telemetry.frame`: High-rate metrics from cgroup probes
-        - `evidence.pinned`: Artifact pinned by DefectRecord/incident
-        - `evidence.ttl_expired`: Artifact eligible for compaction
-        - `compaction.completed`: Summary receipt referencing dropped artifacts
+        **Normative Minimal v1 Vocabulary:**
+        1. `telemetry.frame`: (Normative aggregate) CPU, Memory, IO stats.
+        2. `evidence.pinned`: Cryptographically binds artifact hash to investigation.
+        3. `evidence.ttl_expired`: Signals artifact eligibility for compaction.
+        4. `compaction.completed`: Replaces raw artifacts with summary receipt.
+        5. `episode.quarantined`: Authoritative state change pinning all episode evidence.
 
-        **Reducer Extensions:**
-        - EvidenceReducer: pin_state tracking, TTL event handling
-        - MetricsReducer: Scorecard computation from event stream
-        - CompactionReducer: Process compaction.completed events
+        **Reducer Semantics:**
+        All metrics derived from these events are versioned and deterministic.
       resolution: |
-        **v2 Grounding (2026-01-27):**
+        **v2 Resolution (2026-01-27):**
 
-        Architectural principle established in AD-EVID-003:
-        - Ledger IS the substrate; metrics are reducers over the ledger
-        - No parallel pipelines (Prometheus scrape) that bypass receipts
-        - Ring buffers emit events on trigger; reducers compute projections
+        The event vocabulary is frozen for v1 to prevent fragmentation. All 
+        components MUST use these events for evidence and metrics.
 
-        **Finalized Event Vocabulary:**
-        1. `telemetry.frame`: Sourced from ring buffer on trigger (seq, ts, cpu, mem, io)
-        2. `evidence.pinned`: Binds a DefectRecord or Incident to a specific artifact hash
-        3. `evidence.ttl_expired`: Emitted by EvidenceReducer when artifact crosses TTL threshold
-        4. `compaction.completed`: Captures the new compaction receipt hash and tombstoned digests
+        **Minimal v1 Events:**
+        - `telemetry.frame`: High-rate metrics frames bound to receipts.
+        - `evidence.pinned`: Binds artifact `bb3-256` hash to incident/defect.
+        - `evidence.ttl_expired`: Deterministic signal for cleanup reducers.
+        - `compaction.completed`: Finalizes the deletion of expired raw evidence.
+        - `episode.quarantined`: (Authoritative) Prevents any cleanup of evidence.
 
-        **Implementation Plan:**
-        - Add `pin_state` to `crates/apm2-core/src/evidence/state.rs`
-        - Implement `EvidenceReducer` extensions for pin/TTL events
-        - Wire `DefectRecord::emit()` to produce `evidence.pinned` events
+        **Implementation:**
+        - Events defined in `proto/apm2d_runtime_v1.proto`.
+        - `EvidenceReducer` implements pin/TTL state machine.
+        - `DefectRecord` wiring emits `evidence.pinned` events.
       evidence_refs:
         - "AD-EVID-003 (architectural principle)"
-        - "crates/apm2-core/src/reducer/traits.rs"
-        - "crates/apm2-core/src/evidence/reducer.rs"
+        - "proto/apm2d_runtime_v1.proto (Normative)"
         - "crates/apm2-core/src/cac/defect.rs"
       owner: AUTH_ARCHITECTURE
 

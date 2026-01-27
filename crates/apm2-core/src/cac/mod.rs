@@ -174,6 +174,7 @@ pub mod capability_gate;
 pub mod compiler;
 pub mod conformance;
 pub mod dcp_index;
+pub mod defect;
 pub mod export;
 pub mod manifest;
 pub mod pack_spec;
@@ -203,6 +204,10 @@ pub use dcp_index::{
     DcpEntry, DcpIndex, DcpIndexError, DcpIndexReducer, DcpIndexReducerError, DcpIndexState,
     EVENT_TYPE_ARTIFACT_DEPRECATED, EVENT_TYPE_ARTIFACT_REGISTERED, MAX_CONTENT_HASH_LENGTH,
     MAX_STABLE_ID_LENGTH, RESERVED_PREFIXES, parse_stable_id,
+};
+pub use defect::{
+    DefectContext, DefectError, DefectRecord, DefectRecordBuilder, DefectSeverity, DefectSignal,
+    SignalType,
 };
 // Export pipeline exports
 pub use export::{

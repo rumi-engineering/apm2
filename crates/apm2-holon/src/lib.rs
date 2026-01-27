@@ -99,7 +99,7 @@
 
 pub mod artifact;
 pub mod context;
-pub mod defect;
+pub use apm2_core::cac::defect;
 pub mod episode;
 pub mod error;
 pub mod ledger;

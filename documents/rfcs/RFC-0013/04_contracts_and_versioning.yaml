@@ -225,7 +225,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         Handshake messages for client-daemon connection.
-        Defined in `proto/daemon_protocol.proto`.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
       interface: |
         message Hello {
           uint32 protocol_version = 1;
@@ -246,7 +246,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         Episode lifecycle control messages.
-        Defined in `proto/daemon_protocol.proto`.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
       interface: |
         message CreateEpisode {
           bytes envelope_hash = 1;
@@ -292,7 +292,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         I/O streaming messages.
-        Defined in `proto/daemon_protocol.proto`.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
       interface: |
         message SendInput {
           string episode_id = 1;
@@ -317,7 +317,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         Tool request/response messages.
-        Defined in `proto/daemon_protocol.proto`.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
       interface: |
         message ToolRequest {
           string episode_id = 1;
@@ -355,7 +355,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         Telemetry streaming messages.
-        Defined in `proto/daemon_protocol.proto`.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
       interface: |
         message TelemetryFrame {
           string episode_id = 1;
@@ -381,7 +381,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         Receipt and evidence publication messages.
-        Defined in `proto/daemon_protocol.proto`.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
       interface: |
         message PublishEvidence {
           bytes artifact_hash = 1;

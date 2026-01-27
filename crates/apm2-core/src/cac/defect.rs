@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_holon::defect::{
+//! use apm2_core::cac::defect::{
 //!     DefectRecord, DefectSeverity, DefectSignal, SignalType,
 //! };
 //!
@@ -384,7 +384,7 @@ impl DefectContext {
 /// # Example
 ///
 /// ```rust
-/// use apm2_holon::defect::{
+/// use apm2_core::cac::defect::{
 ///     DefectRecord, DefectSeverity, DefectSignal, SignalType,
 /// };
 ///

@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package apm2.daemon.v1;
 
-import "google/protobuf/timestamp.proto";
-
 // CTR-PROTO-001: Handshake
 message Hello {
   uint32 protocol_version = 1;
@@ -65,6 +63,13 @@ message ResizePty {
   string episode_id = 1;
   uint32 cols = 2;
   uint32 rows = 3;
+}
+
+// Minimal v1 vocabulary for evidence economics
+message EpisodeQuarantined {
+  string episode_id = 1;
+  string reason = 2;
+  repeated bytes evidence_pinned = 3;
 }
 
 enum StopReason {
@@ -198,6 +203,23 @@ message Receipt {
   bytes envelope_hash = 6;
   optional string issuer_id = 7;
   optional bytes issuer_signature = 8;
+}
+
+// Minimal v1 vocabulary events for evidence economics
+message EvidencePinned {
+  bytes artifact_hash = 1;
+  string reason = 2;
+  optional string defect_id = 3;
+}
+
+message EvidenceTtlExpired {
+  bytes artifact_hash = 1;
+  uint64 timestamp = 2;
+}
+
+message CompactionCompleted {
+  bytes summary_receipt_hash = 1;
+  repeated bytes tombstoned_hashes = 2;
 }
 
 enum ReceiptKind {
