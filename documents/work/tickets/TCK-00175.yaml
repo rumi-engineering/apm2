@@ -1,0 +1,106 @@
+acceptance_criteria:
+  - criterion: E2E test suite covering episode lifecycle
+    verification: Tests pass with create/start/stop cycle
+  - criterion: Budget exhaustion scenarios
+    verification: Episode terminates on budget limit
+  - criterion: Termination enforcement
+    verification: Stop order terminates running episode
+implementation:
+  code_examples:
+    - description: E2E lifecycle test
+      code: |
+        #[tokio::test]
+        async fn test_episode_lifecycle() {
+            let daemon = TestDaemon::start().await;
+            let client = daemon.client();
+
+            // Create episode
+            let envelope = test_envelope();
+            let episode_id = client.create(envelope).await.unwrap();
+
+            // Start episode
+            let handle = client.start(&episode_id).await.unwrap();
+            assert_eq!(client.status(&episode_id).await.unwrap(), EpisodeState::Running);
+
+            // Stop episode
+            client.stop(&episode_id, StopReason::Normal).await.unwrap();
+            assert_eq!(client.status(&episode_id).await.unwrap(), EpisodeState::Terminated);
+        }
+  files_to_create:
+    - path: crates/apm2-daemon/tests/e2e_lifecycle.rs
+      purpose: E2E episode lifecycle tests
+    - path: crates/apm2-daemon/tests/common/mod.rs
+      purpose: Test utilities and helpers
+    - path: crates/apm2-daemon/tests/common/daemon.rs
+      purpose: TestDaemon helper for E2E tests
+  files_to_modify:
+    - changes: Add test dependency on tempfile, tokio-test
+      path: crates/apm2-daemon/Cargo.toml
+  implementation_steps:
+    - step: 1
+      action: Create TestDaemon helper
+      details: |
+        TestDaemon struct:
+        - start(): spawn daemon in temp directory
+        - client(): get test client
+        - stop(): terminate daemon
+        - cleanup(): remove temp files
+    - step: 2
+      action: Implement lifecycle tests
+      details: |
+        Test scenarios:
+        - Happy path: create -> start -> stop
+        - Concurrent episodes
+        - Episode status queries
+        - Invalid transitions (start twice, stop twice)
+    - step: 3
+      action: Implement budget exhaustion tests
+      details: |
+        Test scenarios:
+        - Token budget exhaustion
+        - Wall time exhaustion
+        - CPU time exhaustion
+        - Verify BUDGET_EXHAUSTED event
+    - step: 4
+      action: Implement termination tests
+      details: |
+        Test scenarios:
+        - Normal stop
+        - Signal delivery (SIGTERM, SIGKILL)
+        - Quarantine on crash
+        - Evidence pinning on failure
+    - step: 5
+      action: Verify event emission
+      details: |
+        Assert events emitted:
+        - episode.created
+        - episode.started
+        - episode.stopped / episode.quarantined
+        - budget.exhausted (when applicable)
+  summary: |
+    Implement E2E test suite covering episode lifecycle and budget enforcement.
+    Tests create/start/stop cycles, budget exhaustion, and termination enforcement.
+    Uses TestDaemon helper for isolated test environment.
+notes: |
+  Phase: PHASE-4 (Integration and CLI)
+  Generated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.
+  Maps to TCK-PEND-018a.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Lifecycle E2E
+    test_id: E2E-00175-01
+    verification_command: cargo test -p apm2-daemon --test e2e_lifecycle
+  - description: Budget exhaustion E2E
+    test_id: E2E-00175-02
+    verification_command: cargo test -p apm2-daemon --test e2e_budget
+ticket:
+  depends_on:
+    - TCK-00174
+  id: TCK-00175
+  requirement_ids:
+    - REQ-EPISODE-001
+    - REQ-DAEMON-001
+  rfc_id: RFC-0013
+  status: READY
+  title: Implement E2E lifecycle and budget tests

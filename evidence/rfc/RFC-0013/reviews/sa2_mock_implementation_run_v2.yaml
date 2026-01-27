@@ -1,0 +1,812 @@
+schema_version: "1.0.0"
+rfc_id: RFC-0013
+review_timestamp: "2026-01-27T21:00:00Z"
+review_type: MOCK_IMPLEMENTATION_RUN
+rfc_version: v2
+reviewer_agent: SA-2
+reviewer_role: Implementation Feasibility
+
+# =============================================================================
+# SA-2 MOCK IMPLEMENTATION RUN REPORT
+# RFC-0013 v2: APM2 Kernel Daemon and Holonic Runtime Protocol
+# =============================================================================
+
+assigned_modes:
+  - mode_id: 11
+    name: Bayesian
+    application: "Estimating implementation effort and probability of blockers"
+  - mode_id: 42
+    name: Inference to Best Explanation (IBE)
+    application: "Diagnosing missing dependencies and interface mismatches"
+  - mode_id: 47
+    name: Planning/Policy
+    application: "Evaluating ticket decomposition and dependency ordering"
+  - mode_id: 51
+    name: Satisficing
+    application: "Identifying minimum viable implementations for gates"
+  - mode_id: 70
+    name: Engineering Design
+    application: "Assessing architectural soundness and integration patterns"
+
+# =============================================================================
+# GATE EXECUTION
+# =============================================================================
+
+gates:
+  - gate_id: GATE-TCK-ATOMICITY
+    status: CONDITIONAL_PASS
+    evidence: |
+      Analyzed 18 preliminary tickets across 4 phases.
+
+      ATOMIC (16/18):
+      - TCK-PEND-001 through TCK-PEND-008: Clear scope, single deliverable
+      - TCK-PEND-010 through TCK-PEND-017: Well-bounded
+
+      COMPOSITE (2/18):
+      - TCK-PEND-009: Combines tool execution + receipt generation (split recommended)
+      - TCK-PEND-018: E2E tests too broad (decompose by scenario)
+    remediation_required:
+      - "Split TCK-PEND-009 into execution and receipt tickets"
+      - "Decompose TCK-PEND-018 into lifecycle/budget/tool/telemetry test tickets"
+    source_mode: "Mode 47 (Planning/Policy)"
+
+  - gate_id: GATE-TCK-IMPLEMENTABILITY
+    status: CONDITIONAL_PASS
+    evidence: |
+      Mock implementation run identified 7 implementation concerns.
+      Phase 1A is partially blocked by missing proto file.
+      Phase 2C requires cgroup infrastructure not in workspace.
+    remediation_required:
+      - "Create proto/daemon_protocol.proto stub"
+      - "Add zbus crate or document direct cgroup fallback"
+      - "Enable nix 'pty' feature"
+    source_mode: "Mode 70 (Engineering Design)"
+
+# =============================================================================
+# MOCK IMPLEMENTATION RUN: TCK-PEND-003 (EpisodeEnvelope)
+# =============================================================================
+
+mock_implementation_runs:
+  - ticket_id: TCK-PEND-003
+    title: "Implement EpisodeEnvelope type with canonicalization"
+    phase: PHASE-1B
+    simulation_summary: |
+      Simulated agent attempting to implement EpisodeEnvelope per CTR-DAEMON-002.
+      Identified dependencies, gaps, and friction points.
+
+    dependency_analysis:
+      requires:
+        - dependency: "TCK-PEND-002 (protobuf messages)"
+          status: NOT_IMPLEMENTED
+          blocker: true
+          notes: "EpisodeEnvelope proto definition needed for wire format"
+
+        - dependency: "proto/daemon_protocol.proto"
+          status: MISSING
+          blocker: true
+          notes: "File does not exist; TCK-PEND-002 cannot complete"
+
+        - dependency: "apm2-core canonicalization infrastructure"
+          status: AVAILABLE
+          blocker: false
+          notes: "canonicalize.rs exists with YAML canonicalizer; need protobuf equivalent"
+
+        - dependency: "blake3 hashing"
+          status: AVAILABLE
+          blocker: false
+          notes: "blake3 v1.5 in workspace dependencies"
+
+        - dependency: "serde derive"
+          status: AVAILABLE
+          blocker: false
+          notes: "serde with derive feature enabled"
+
+    implementation_steps:
+      - step: 1
+        description: "Create crates/apm2-daemon/src/episode/envelope.rs"
+        friction: LOW
+        notes: "Directory structure clear; follows existing patterns"
+
+      - step: 2
+        description: "Define EpisodeEnvelope struct per CTR-DAEMON-002"
+        friction: MEDIUM
+        notes: |
+          Contract provides clear interface:
+          - episode_id, actor_id, work_id, lease_id, budget
+          - stop_conditions, pinned_snapshot, capability_manifest_hash
+          - risk_tier, determinism_class, context_refs
+
+          FRICTION: Some inner types (EpisodeBudget, PinnedSnapshot, etc.) not defined
+          in existing codebase. Agent must create them or RFC must specify location.
+
+      - step: 3
+        description: "Implement canonical_bytes() method"
+        friction: HIGH
+        notes: |
+          RFC specifies deterministic serialization with golden vectors.
+          FRICTION POINTS:
+          1. No protobuf canonicalizer exists (only YAML canonicalizer in canonicalize.rs)
+          2. Protobuf has non-deterministic map encoding (RFC acknowledges: maps forbidden)
+          3. Golden vectors for envelope not specified; test vectors needed
+          4. Canonicalizer ID and version tracking not implemented
+
+      - step: 4
+        description: "Implement digest() method using BLAKE3"
+        friction: LOW
+        notes: "blake3::hash(canonical_bytes()) - straightforward"
+
+      - step: 5
+        description: "Add tests with golden vectors"
+        friction: HIGH
+        notes: |
+          FRICTION: No golden vectors provided in RFC.
+          Agent must either:
+          1. Generate vectors and get them approved (coordination overhead)
+          2. Wait for RFC v4 to include vectors (blocked)
+          3. Skip golden vector tests (gate compliance risk)
+
+    identified_blockers:
+      - blocker_id: MOCK-003-B1
+        severity: BLOCKER
+        description: "proto/daemon_protocol.proto does not exist"
+        impact: "Cannot define wire format for EpisodeEnvelope"
+        remediation: "Create placeholder proto file with EpisodeEnvelope message"
+
+      - blocker_id: MOCK-003-B2
+        severity: MAJOR
+        description: "Protobuf canonicalizer not implemented"
+        impact: "canonical_bytes() cannot be implemented deterministically"
+        remediation: |
+          Add protobuf canonicalizer to apm2-core/src/determinism/
+          Must handle: field ordering, empty fields, nested messages
+
+      - blocker_id: MOCK-003-B3
+        severity: MAJOR
+        description: "Golden vectors not specified in RFC"
+        impact: "Tests cannot verify canonical encoding correctness"
+        remediation: "RFC v4 should include golden vectors for EpisodeEnvelope"
+
+    estimated_effort:
+      lines_of_code: 400-600
+      tests_required: 15-20
+      hours_estimate: 8-12
+      confidence: 0.65
+      notes: |
+        Confidence reduced due to:
+        - Missing proto file (adds 2-4h to create)
+        - No protobuf canonicalizer (adds 4-8h to implement)
+        - Golden vector generation (adds 2-4h)
+
+  # -------------------------------------------------------------------------
+  # MOCK RUN: TCK-PEND-001 (UDS Protocol Server)
+  # -------------------------------------------------------------------------
+  - ticket_id: TCK-PEND-001
+    title: "Implement UDS protocol server with length-prefixed framing"
+    phase: PHASE-1A
+    simulation_summary: |
+      Simulated agent implementing UDS server. Existing ipc_server.rs provides
+      foundation but needs protocol layer additions.
+
+    dependency_analysis:
+      requires:
+        - dependency: "tokio with full features"
+          status: AVAILABLE
+          blocker: false
+          notes: "tokio 1.0 with full features in workspace"
+
+        - dependency: "apm2-core IPC framing"
+          status: AVAILABLE
+          blocker: false
+          notes: "frame_message() and parse_frame_length() exist in apm2-core/src/ipc/"
+
+        - dependency: "XDG directories"
+          status: AVAILABLE
+          blocker: false
+          notes: "directories crate v6 available"
+
+    implementation_steps:
+      - step: 1
+        description: "Extend ipc_server.rs with protocol layer"
+        friction: LOW
+        notes: |
+          Existing server at crates/apm2-daemon/src/ipc_server.rs handles:
+          - Socket binding at XDG_RUNTIME_DIR path
+          - Length-prefixed framing (MAX_MESSAGE_SIZE = 16MB)
+          - Connection handling with tokio spawn
+          Extension straightforward.
+
+      - step: 2
+        description: "Add version negotiation in handshake"
+        friction: MEDIUM
+        notes: |
+          CTR-PROTO-001 defines Hello/HelloAck messages.
+          FRICTION: Messages not in proto file yet (proto/daemon_protocol.proto missing)
+
+    identified_blockers:
+      - blocker_id: MOCK-001-B1
+        severity: MAJOR
+        description: "proto/daemon_protocol.proto missing"
+        impact: "Handshake messages (Hello, HelloAck) cannot be compiled"
+        remediation: "Create proto file with handshake messages"
+
+    estimated_effort:
+      lines_of_code: 200-300
+      tests_required: 8-12
+      hours_estimate: 4-6
+      confidence: 0.80
+      notes: "High confidence due to existing ipc_server.rs foundation"
+
+  # -------------------------------------------------------------------------
+  # MOCK RUN: TCK-PEND-005 (PTY Spawning)
+  # -------------------------------------------------------------------------
+  - ticket_id: TCK-PEND-005
+    title: "Implement PTY spawning and output capture"
+    phase: PHASE-1C
+    simulation_summary: |
+      Simulated agent implementing PTY allocation using nix crate.
+      Identified feature flag issue.
+
+    dependency_analysis:
+      requires:
+        - dependency: "nix crate with pty feature"
+          status: MISSING_FEATURE
+          blocker: true
+          notes: |
+            Cargo.toml has: nix = { version = "0.30", features = ["signal", "process", "fs"] }
+            Missing: "pty" feature required for openpty(), forkpty()
+
+        - dependency: "tokio-pty-process or similar"
+          status: NOT_IN_WORKSPACE
+          blocker: false
+          notes: "Alternative: use nix pty + tokio::io::unix"
+
+    implementation_steps:
+      - step: 1
+        description: "Enable nix pty feature"
+        friction: LOW
+        notes: "Add 'pty' to nix features in Cargo.toml"
+
+      - step: 2
+        description: "Implement PTY allocation"
+        friction: MEDIUM
+        notes: |
+          nix::pty::openpty() returns master/slave pair
+          Need to configure: TIOCSCTTY, TIOCSWTINSZ
+          Ring buffer for output capture per AD-EVID-001
+
+    identified_blockers:
+      - blocker_id: MOCK-005-B1
+        severity: MINOR
+        description: "nix crate missing 'pty' feature"
+        impact: "PTY functions (openpty, forkpty) unavailable"
+        remediation: |
+          Update Cargo.toml:
+          nix = { version = "0.30", features = ["signal", "process", "fs", "pty"] }
+
+    estimated_effort:
+      lines_of_code: 300-400
+      tests_required: 10-15
+      hours_estimate: 6-8
+      confidence: 0.75
+
+  # -------------------------------------------------------------------------
+  # MOCK RUN: TCK-PEND-011 (Cgroups v2 Reader)
+  # -------------------------------------------------------------------------
+  - ticket_id: TCK-PEND-011
+    title: "Implement cgroups v2 reader for resource metrics"
+    phase: PHASE-2C
+    simulation_summary: |
+      Simulated agent implementing cgroup integration.
+      Identified significant infrastructure gap.
+
+    dependency_analysis:
+      requires:
+        - dependency: "systemd DBus API (zbus crate)"
+          status: NOT_IN_WORKSPACE
+          blocker: true
+          notes: |
+            AD-CGROUP-001 specifies "Primary: systemd transient API (DBus)"
+            zbus crate not in Cargo.toml
+
+        - dependency: "cgroup v2 filesystem access"
+          status: AVAILABLE
+          blocker: false
+          notes: "Fallback: direct reads from /sys/fs/cgroup/"
+
+        - dependency: "nix crate"
+          status: AVAILABLE
+          blocker: false
+          notes: "For process/cgroup management"
+
+    implementation_steps:
+      - step: 1
+        description: "Decide: zbus or direct cgroup writes"
+        friction: HIGH
+        notes: |
+          RFC specifies systemd transient API as primary.
+          FRICTION: zbus not in dependencies.
+          Options:
+          1. Add zbus (~1.5MB compile-time cost, async complexity)
+          2. Use direct cgroup v2 writes as primary (simpler, less ecosystem alignment)
+          3. Hybrid: direct writes with optional systemd socket activation
+
+      - step: 2
+        description: "Implement CgroupReader"
+        friction: MEDIUM
+        notes: |
+          Read from /sys/fs/cgroup/<episode-scope>/:
+          - cpu.stat (usage_usec, user_usec, system_usec)
+          - memory.current, memory.peak
+          - memory.stat (page faults)
+          - io.stat (read/write bytes)
+
+    identified_blockers:
+      - blocker_id: MOCK-011-B1
+        severity: MAJOR
+        description: "zbus crate not in workspace dependencies"
+        impact: "Cannot use systemd transient API for cgroup creation"
+        remediation: |
+          Either:
+          1. Add zbus to workspace.dependencies
+          2. Update AD-CGROUP-001 to specify direct cgroup writes as primary
+
+    estimated_effort:
+      lines_of_code: 500-700
+      tests_required: 15-20
+      hours_estimate: 12-16
+      confidence: 0.55
+      notes: "Low confidence due to systemd integration complexity"
+
+# =============================================================================
+# DEPENDENCY VERIFICATION
+# =============================================================================
+
+dependency_verification:
+  cargo_toml_analysis:
+    workspace_root: "/home/ubuntu/Projects/apm2-PRD-0004-work-substrate/Cargo.toml"
+
+    required_present:
+      - crate: prost
+        version: "0.13"
+        status: PRESENT
+        notes: "Protocol buffers runtime"
+
+      - crate: prost-types
+        version: "0.13"
+        status: PRESENT
+        notes: "Well-known protobuf types"
+
+      - crate: prost-build
+        version: "0.13"
+        status: PRESENT
+        notes: "Proto compilation (build-dependency)"
+
+      - crate: tokio
+        version: "1.0"
+        features: ["full"]
+        status: PRESENT
+        notes: "Async runtime with all features"
+
+      - crate: blake3
+        version: "1.5"
+        status: PRESENT
+        notes: "Content addressing"
+
+      - crate: ed25519-dalek
+        version: "2.1"
+        status: PRESENT
+        notes: "Receipt signing"
+
+      - crate: nix
+        version: "0.30"
+        features: ["signal", "process", "fs"]
+        status: PARTIAL
+        notes: "Missing 'pty' feature for PTY operations"
+
+      - crate: rusqlite
+        version: "0.31"
+        status: PRESENT
+        notes: "Ledger storage"
+
+    required_missing:
+      - crate: zbus
+        purpose: "systemd DBus API for transient cgroup scopes"
+        severity: MAJOR
+        notes: |
+          AD-CGROUP-001 specifies systemd transient API as primary strategy.
+          Without zbus, must fall back to direct cgroup v2 writes.
+        remediation: |
+          Either add: zbus = "4.0"
+          Or update RFC to specify direct cgroup writes as primary
+
+  proto_files:
+    - file: proto/kernel_events.proto
+      status: EXISTS
+      version: "0.2.0"
+      notes: "KernelEvent envelope with all event types"
+
+    - file: proto/tool_protocol.proto
+      status: EXISTS
+      version: "0.1.0"
+      notes: "ToolRequest/ToolResponse messages"
+
+    - file: proto/daemon_protocol.proto
+      status: MISSING
+      notes: |
+        RFC contracts CTR-PROTO-001 through CTR-PROTO-006 reference this file.
+        Required messages: Hello, HelloAck, CreateEpisode, EpisodeCreated, etc.
+        BLOCKER for Phase 1A.
+
+  build_system:
+    build_rs: "crates/apm2-core/build.rs"
+    proto_compilation: FUNCTIONAL
+    notes: |
+      build.rs compiles kernel_events.proto and tool_protocol.proto.
+      Will need update to include daemon_protocol.proto when created.
+
+# =============================================================================
+# INTERFACE COMPATIBILITY ANALYSIS
+# =============================================================================
+
+interface_compatibility:
+  holon_trait_analysis:
+    location: "crates/apm2-holon/src/traits.rs"
+    analysis: |
+      RFC AD-ADAPT-001 specifies HarnessAdapter implements Holon trait.
+
+      Current Holon trait:
+      ```rust
+      pub trait Holon: Send + Sync {
+          type Input: Send + Sync;
+          type Output: Send + Sync;
+          type State: Send + Sync;
+
+          fn intake(&mut self, input: Self::Input, lease_id: &str) -> Result<(), HolonError>;
+          fn execute_episode(&mut self, ctx: &EpisodeContext) -> Result<EpisodeResult<Self::Output>, HolonError>;
+          fn emit_artifact(&self, artifact: Artifact) -> Result<(), HolonError>;
+          fn escalate(&mut self, reason: &str) -> Result<(), HolonError>;
+          fn should_stop(&self, ctx: &EpisodeContext) -> StopCondition;
+          fn state(&self) -> &Self::State;
+      }
+      ```
+
+      RFC HarnessAdapter in CTR-DAEMON-003:
+      ```rust
+      #[async_trait]
+      pub trait HarnessAdapter: Send + Sync {
+          fn adapter_type(&self) -> AdapterType;
+          async fn spawn(...) -> Result<HarnessHandle, Error>;
+          async fn send_input(...) -> Result<(), Error>;
+          fn output_stream(...) -> impl Stream<Item = HarnessEvent>;
+          async fn terminate(...) -> Result<ExitStatus, Error>;
+      }
+      ```
+
+      MISMATCH: The traits have different signatures. HarnessAdapter is async-focused
+      with spawn/terminate lifecycle, while Holon is sync with execute_episode loop.
+
+      AD-ADAPT-001 says "HarnessAdapter becomes the concrete Holon implementation"
+      but the trait signatures don't align. This requires either:
+      1. HarnessAdapter wraps internal Holon impl (composition)
+      2. New trait that bridges both patterns (complexity)
+      3. Redefine HarnessAdapter to match Holon (breaking RFC contract)
+
+    finding_id: SA2-F-007
+    severity: MAJOR
+    remediation: |
+      Clarify in RFC:
+      - HarnessAdapter wraps an internal Holon implementation
+      - HarnessAdapter.spawn() creates internal Holon
+      - HarnessAdapter delegates to Holon.execute_episode() in PTY I/O loop
+      - This is composition, not direct implementation
+
+  adapter_trait_analysis:
+    location: "crates/apm2-core/src/adapter/traits.rs"
+    analysis: |
+      Existing Adapter trait in apm2-core:
+      ```rust
+      pub trait Adapter: Send {
+          fn start(&mut self) -> BoxFuture<'_, Result<(), AdapterError>>;
+          fn poll(&mut self) -> BoxFuture<'_, Result<Option<AdapterEvent>, AdapterError>>;
+          fn stop(&mut self) -> BoxFuture<'_, Result<(), AdapterError>>;
+          fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<AdapterEvent>>;
+          fn session_id(&self) -> &str;
+          fn is_running(&self) -> bool;
+          fn pid(&self) -> Option<u32>;
+          fn adapter_type(&self) -> &'static str;
+      }
+      ```
+
+      RFC HarnessAdapter has similar methods (spawn vs start, terminate vs stop).
+      Relationship unclear: Is HarnessAdapter an extension of existing Adapter?
+
+      SA1-F-009 notes this as INFO-level potential overlap.
+
+    finding_id: SA1-F-009
+    severity: INFO
+    remediation: |
+      Clarify: HarnessAdapter in apm2-daemon wraps existing Adapter implementations
+      from apm2-core. No trait refactoring needed; composition pattern.
+
+  episode_controller_analysis:
+    location: "crates/apm2-holon/src/episode/controller.rs"
+    analysis: |
+      EpisodeController (1,714 lines) is production-ready with:
+      - run_episode_loop() for bounded holon execution
+      - Budget tracking via Lease
+      - Context pack miss tracking
+      - RunReceipt generation
+      - DefectRecord emission
+
+      AD-LAYER-001 correctly resolves the cousin violation:
+      - EpisodeRuntime (daemon) wraps EpisodeController (holon)
+      - HarnessAdapter implements Holon trait
+      - No code duplication; clean layering
+
+      VERIFIED: SA3-F-011 cousin violation properly resolved.
+
+    finding_id: SA3-F-011
+    severity: INFO
+    status: RESOLVED
+    resolution: "AD-LAYER-001 establishes correct layering model"
+
+# =============================================================================
+# FINDINGS SUMMARY
+# =============================================================================
+
+findings:
+  # Previous v2 findings - verification status
+  - finding_id: SA2-F-001
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: MISSING_DEPENDENCY
+    severity: MAJOR
+    status: CONFIRMED
+    location:
+      file: Cargo.toml
+      yaml_path: workspace.dependencies
+    description: |
+      AD-CGROUP-001 specifies systemd transient API (DBus: org.freedesktop.systemd1)
+      as primary cgroup creation strategy. zbus crate not in workspace dependencies.
+    remediation: |
+      Either:
+      1. Add zbus = "4.0" to workspace.dependencies
+      2. Update RFC AD-CGROUP-001 to specify direct cgroup v2 writes as primary
+         with systemd socket activation as enhancement
+    source_mode: "Mode 42 (IBE)"
+
+  - finding_id: SA2-F-002
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: MISSING_FEATURE
+    severity: MINOR
+    status: CONFIRMED
+    location:
+      file: Cargo.toml
+      yaml_path: workspace.dependencies.nix.features
+    description: |
+      nix crate missing 'pty' feature. Current features: ["signal", "process", "fs"]
+      PTY operations (openpty, forkpty) require 'pty' feature.
+    remediation: |
+      Update workspace.dependencies:
+      nix = { version = "0.30", features = ["signal", "process", "fs", "pty"] }
+    source_mode: "Mode 70 (Engineering Design)"
+
+  - finding_id: SA2-F-003
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: MISSING_ARTIFACT
+    severity: MAJOR
+    status: CONFIRMED
+    location:
+      file: proto/
+      yaml_path: daemon_protocol.proto
+    description: |
+      proto/daemon_protocol.proto does not exist but is referenced by:
+      - TCK-PEND-002 deliverables
+      - CTR-PROTO-001 through CTR-PROTO-006 contracts
+      - Phase 1A gate (GATE-PROTO-FRAMING)
+
+      Existing proto files: kernel_events.proto, tool_protocol.proto
+      build.rs compiles these but not daemon_protocol.proto
+    remediation: |
+      Create proto/daemon_protocol.proto with message stubs:
+      - Hello, HelloAck (handshake)
+      - CreateEpisode, EpisodeCreated, StartEpisode, etc.
+      Update build.rs to compile this file
+    source_mode: "Mode 70 (Engineering Design)"
+
+  - finding_id: SA2-F-004
+    gate_id: GATE-TCK-ATOMICITY
+    category: ATOMICITY_DEFECT
+    subcategory: COMPOSITE_TICKET
+    severity: MINOR
+    status: CONFIRMED
+    location:
+      file: documents/rfcs/RFC-0013/06_ticket_decomposition.yaml
+      yaml_path: preliminary_tickets[8]
+    description: |
+      TCK-PEND-009 combines two distinct concerns:
+      1. Tool execution with budget charging
+      2. Receipt generation per AD-RECEIPT-001
+      These should be separate tickets for atomic PRs.
+    remediation: |
+      Split into:
+      - TCK-PEND-009a: Implement tool execution with budget charging
+      - TCK-PEND-009b: Implement tool receipt generation
+    source_mode: "Mode 47 (Planning/Policy)"
+
+  - finding_id: SA2-F-005
+    gate_id: GATE-TCK-ATOMICITY
+    category: ATOMICITY_DEFECT
+    subcategory: COMPOSITE_TICKET
+    severity: MINOR
+    status: CONFIRMED
+    location:
+      file: documents/rfcs/RFC-0013/06_ticket_decomposition.yaml
+      yaml_path: preliminary_tickets[17]
+    description: |
+      TCK-PEND-018 "Implement end-to-end integration tests" is too broad.
+      Summary includes: episode lifecycle, receipt verification, budget exhaustion.
+    remediation: |
+      Decompose into:
+      - TCK-PEND-018a: E2E lifecycle tests (create/start/stop/status)
+      - TCK-PEND-018b: E2E receipt verification tests
+      - TCK-PEND-018c: E2E budget exhaustion tests
+      - TCK-PEND-018d: E2E tool mediation tests
+    source_mode: "Mode 47 (Planning/Policy)"
+
+  - finding_id: SA2-F-006
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: STRUCTURE_DEFECT
+    subcategory: UNREALISTIC_GATE
+    severity: MAJOR
+    status: CONFIRMED
+    location:
+      file: documents/rfcs/RFC-0013/05_rollout_and_ops.yaml
+      yaml_path: rollout_strategy.phases[5].gate
+    description: |
+      GATE-TEL-ACCURACY: "Telemetry within 5% of actual consumption"
+
+      This is unrealistic without cgroup v2 access. Telemetry accuracy depends on:
+      1. cgroup v2 enabled on host (not guaranteed)
+      2. Process placed in correct cgroup scope
+      3. Kernel accounting precision
+
+      5% accuracy requires privileged cgroup operations. Degraded mode
+      (fallback to /proc) may have 15-20% variance.
+    remediation: |
+      Add GATE-CGROUP-AVAILABLE prerequisite:
+      - If cgroup v2 available: GATE-TEL-ACCURACY at 5%
+      - If fallback mode: GATE-TEL-ACCURACY at 15%
+
+      Or split gate:
+      - GATE-TEL-CGROUP: 5% with cgroup
+      - GATE-TEL-FALLBACK: 15% without cgroup
+    source_mode: "Mode 51 (Satisficing)"
+
+  - finding_id: SA2-F-007
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: INTERFACE_MISMATCH
+    severity: MAJOR
+    status: CONFIRMED
+    location:
+      file: documents/rfcs/RFC-0013/04_contracts_and_versioning.yaml
+      yaml_path: interface_contracts[2]
+    description: |
+      RFC HarnessAdapter trait (CTR-DAEMON-003) differs from:
+      1. Existing Adapter trait (apm2-core/src/adapter/traits.rs)
+      2. Holon trait (apm2-holon/src/traits.rs)
+
+      AD-ADAPT-001 says "HarnessAdapter implements Holon" but signatures don't match:
+      - Holon: execute_episode(&mut self, ctx) -> EpisodeResult
+      - HarnessAdapter: spawn/send_input/output_stream/terminate
+
+      This is composition, not direct implementation.
+    remediation: |
+      Update AD-ADAPT-001 to clarify:
+      - HarnessAdapter is a WRAPPER that internally uses Holon
+      - spawn() creates internal Holon instance
+      - PTY I/O loop calls Holon.execute_episode()
+      - This is composition pattern, not trait implementation
+    source_mode: "Mode 42 (IBE)"
+
+  # New findings from mock implementation run
+  - finding_id: SA2-F-008
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: MISSING_CANONICALIZER
+    severity: MAJOR
+    status: NEW
+    location:
+      file: crates/apm2-core/src/determinism/
+      yaml_path: (missing canonicalize_proto.rs)
+    description: |
+      RFC AD-DAEMON-003 specifies protobuf canonicalization with golden vectors.
+      Only YAML canonicalizer exists (canonicalize.rs). No protobuf canonicalizer.
+
+      Required for:
+      - EpisodeEnvelope.canonical_bytes()
+      - Receipt signing
+      - Digest binding
+    remediation: |
+      Create crates/apm2-core/src/determinism/canonicalize_proto.rs implementing:
+      - canonicalize_proto(message: &impl prost::Message) -> Vec<u8>
+      - Field ordering by tag number
+      - Empty field handling
+      - Nested message recursion
+
+      Add golden vectors for EpisodeEnvelope in test fixtures.
+    source_mode: "Mode 70 (Engineering Design)"
+
+  - finding_id: SA2-F-009
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: MISSING_TEST_VECTORS
+    severity: MINOR
+    status: NEW
+    location:
+      file: documents/rfcs/RFC-0013/04_contracts_and_versioning.yaml
+      yaml_path: interface_contracts
+    description: |
+      RFC specifies "Golden vectors maintained in kernel-testkit" but:
+      1. kernel-testkit crate does not exist
+      2. No golden vectors provided for EpisodeEnvelope
+      3. No golden vectors provided for Receipt types
+
+      Without vectors, agents cannot verify canonical encoding correctness.
+    remediation: |
+      Either:
+      1. Create kernel-testkit crate with golden vector test fixtures
+      2. Add golden vectors to RFC 04_contracts_and_versioning.yaml
+      3. Document vector generation process in ticket acceptance criteria
+    source_mode: "Mode 11 (Bayesian)"
+
+# =============================================================================
+# VERDICT
+# =============================================================================
+
+verdict: NEEDS_REMEDIATION
+verdict_reason: |
+  RFC-0013 v2 Mock Implementation Run identified 9 findings (3 MAJOR, 6 MINOR).
+
+  **BLOCKER-class issues (implementation cannot proceed):**
+  1. SA2-F-003: proto/daemon_protocol.proto missing - blocks Phase 1A
+
+  **MAJOR issues (require RFC update or Cargo.toml change):**
+  2. SA2-F-001: zbus crate missing for systemd DBus
+  3. SA2-F-006: GATE-TEL-ACCURACY unrealistic without cgroup
+  4. SA2-F-007: HarnessAdapter/Holon interface mismatch needs clarification
+  5. SA2-F-008: Protobuf canonicalizer not implemented
+
+  **MINOR issues (addressed during implementation):**
+  6. SA2-F-002: nix crate 'pty' feature missing
+  7. SA2-F-004: TCK-PEND-009 should split
+  8. SA2-F-005: TCK-PEND-018 too broad
+  9. SA2-F-009: Golden vectors not specified
+
+  **Resolved from v1:**
+  - SA3-F-011: Cousin violation resolved via AD-LAYER-001 layering model
+
+  **Mock Implementation Confidence:**
+  - TCK-PEND-001 (UDS Server): 80% confidence, 4-6h
+  - TCK-PEND-003 (EpisodeEnvelope): 65% confidence, 8-12h
+  - TCK-PEND-005 (PTY): 75% confidence, 6-8h
+  - TCK-PEND-011 (Cgroups): 55% confidence, 12-16h
+
+  RFC is ready for v4 finalization after addressing MAJOR remediations.
+
+remediation_priority:
+  immediate:
+    - "SA2-F-003: Create proto/daemon_protocol.proto stub"
+  before_v4:
+    - "SA2-F-001: Add zbus or update AD-CGROUP-001"
+    - "SA2-F-006: Update GATE-TEL-ACCURACY for degraded mode"
+    - "SA2-F-007: Clarify HarnessAdapter composition pattern"
+    - "SA2-F-008: Document protobuf canonicalizer requirement"
+  during_decompose:
+    - "SA2-F-002: Enable nix 'pty' feature"
+    - "SA2-F-004: Split TCK-PEND-009"
+    - "SA2-F-005: Decompose TCK-PEND-018"
+    - "SA2-F-009: Add golden vector requirements to ticket ACs"

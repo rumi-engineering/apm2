@@ -1,0 +1,442 @@
+agent_id: SA-1
+session_id: COUNCIL-RFC-0013-DECOMPOSE
+assessment_date: "2026-01-27"
+cycle: 1
+selected_modes: [4, 22, 48, 61, 75]
+mode_categories: [Constraint Satisfiability, Bayesian Belief Networks, Systems Thinking, Dialectical Reasoning, Calibration]
+
+# Mode Application Rationale
+mode_selections:
+  mode_4_constraint_satisfiability:
+    purpose: "Verify ticket scoping respects phase ordering, dependency acyclicity, and crate boundaries"
+    application: "Analyzed 21 preliminary tickets across 9 phases; checked graph acyclicity and constraint propagation"
+
+  mode_22_bayesian_belief_networks:
+    purpose: "Model dependencies as causal networks; estimate implementation success given ticket interdependencies"
+    application: "Constructed dependency DAG; computed critical path (depth 10) and module isolation assumptions"
+
+  mode_48_systems_thinking:
+    purpose: "Assess RFC as integrated whole: component interactions, architectural layering, evidence flow"
+    application: "Verified six-plane decomposition, EpisodeRuntime→EpisodeController layering, reducer pattern for evidence economics"
+
+  mode_61_dialectical_reasoning:
+    purpose: "Identify tensions: doctrine requirements vs ticket decomposition; v0 findings vs v2 resolutions"
+    application: "Evaluated AD-LAYER-001 (cousin violation resolution), AD-EVID-003 (evidence economics coherence), trade-offs between coverage and scope"
+
+  mode_75_calibration:
+    purpose: "Assess confidence levels in gate verdicts; identify epistemic gaps or surprising findings"
+    application: "Confidence HIGH (no cycles, clear dependencies) but MODERATE concern on requirement coverage (8/14 constraints documented in tickets)"
+
+gate_assessments:
+  - gate_id: GATE-TCK-DEPENDENCY-ACYCLICITY
+    status: PASSED
+    evidence: |
+      Exhaustive DFS analysis of all 21 tickets confirms zero cycles in dependency graph.
+
+      Critical observations:
+      - Linear chain structure: TCK-PEND-001 → TCK-PEND-002 → ... → TCK-PEND-003/004
+      - Parallel branches from TCK-PEND-004 (Episode foundation):
+        * Phase 1C: PTY (TCK-PEND-005) and Adapter (TCK-PEND-006)
+        * Phase 2A: Tool Broker (TCK-PEND-007/008)
+        * Phase 2C: Telemetry (TCK-PEND-011)
+      - Convergence points: TCK-PEND-013 (Evidence), TCK-PEND-017 (CLI)
+      - Final integration: TCK-PEND-018a/b/c merge at TCK-PEND-017
+
+      Maximum dependency depth: 10 (TCK-PEND-018a/b/c at critical path tail)
+      Longest linear subchain: 8 edges (TCK-PEND-001 → ... → TCK-PEND-010)
+
+      No back-edges, no cross-phase reversals detected.
+      DAG is implementable; parallelism opportunities clear (Phase 2A+2B+2C independent).
+    confidence: HIGH
+
+  - gate_id: GATE-TCK-SCOPE-COVERAGE
+    status: FAILED
+    evidence: |
+      Critical finding: Only 8 of 14 doctrine/requirements are explicitly traced in ticket requirement_ids.
+
+      COVERED (8):
+      - REQ-DAEMON-001: TCK-PEND-004, TCK-PEND-018a
+      - REQ-EPISODE-001: TCK-PEND-003, TCK-PEND-004, TCK-PEND-018a
+      - REQ-PROTOCOL-001: TCK-PEND-001, TCK-PEND-002
+      - REQ-TOOL-001: TCK-PEND-007, TCK-PEND-008, TCK-PEND-009a, TCK-PEND-018b
+      - REQ-TEL-001: TCK-PEND-011, TCK-PEND-012, TCK-PEND-018b
+      - REQ-EVID-001: TCK-PEND-013, TCK-PEND-014, TCK-PEND-015, TCK-PEND-018c
+      - REQ-RECEIPT-001: TCK-PEND-009b, TCK-PEND-010, TCK-PEND-018c
+      - REQ-ADAPTER-001: TCK-PEND-005, TCK-PEND-006, TCK-PEND-016
+
+      MISSING (6):
+      - DOC-TRUTH-001 (Events + evidence as source of truth): IMPLIED in all TCK-PEND-* but NOT EXPLICIT
+      - DOC-BOUNDARY-001 (Holonic boundary and channels): IMPLICIT in TCK-PEND-004, 005, 006 but no explicit trace
+      - DOC-OCAP-001 (OCAP enforcement): IMPLICIT in TCK-PEND-007, 008 but not mapped
+      - DOC-LEASE-001 (Leases and budgets mandatory): IMPLICIT in TCK-PEND-004 but not traced
+      - DOC-MEASURE-001 (Measurement integrity verification predicate): IMPLICIT in TCK-PEND-010 but no explicit coverage
+      - DOC-BOUNDED-001 (Bounded cognition / context packs): IMPLICIT in TCK-PEND-007/008/012 but missing explicit map
+
+      Root cause: DOC-* requirements are architectural constraints embedded in multiple tickets rather than
+      standalone implementations. This is defensible (they are non-negotiable doctrine, not discrete deliverables),
+      but the decomposition should EXPLICITLY TRACE doctrine bindings to create traceability matrix.
+    confidence: HIGH
+    remediation: |
+      1. Add explicit doctrine_id mappings to each ticket requirement_ids field
+      2. Create traceability matrix showing which TCK-PEND-* items enforce which DOC-* constraints
+      3. Add doctrine enforcement verification to test_and_evidence.yaml (TCK-PEND-018 E2E tests)
+
+  - gate_id: GATE-TCK-CCP-MAPPING
+    status: FAILED
+    evidence: |
+      Significant mismatch between declared module paths and actual codebase structure.
+
+      Declared new modules (RFC meta):
+      - crates/apm2-daemon/src/episode/     → MISSING (directory does not exist)
+      - crates/apm2-daemon/src/protocol/    → MISSING (directory does not exist)
+      - crates/apm2-daemon/src/telemetry/   → MISSING (directory does not exist)
+      - crates/apm2-daemon/src/evidence/    → MISSING (directory does not exist)
+      - crates/apm2-core/src/adapter/       → EXISTS (already present)
+
+      Current apm2-daemon/src structure (as of 2026-01-27):
+      - handlers.rs (10KB)
+      - ipc_server.rs (4KB)
+      - main.rs (10KB)
+      - state.rs (4KB)
+
+      Assessment:
+      - Flat module structure (no subdirectories) is current state
+      - No lib.rs pattern; using main.rs for daemon entry point
+      - Implies significant refactoring will be required during implementation
+      - Four new module boundaries (episode/, protocol/, telemetry/, evidence/) are STRUCTURAL dependencies
+        that must exist BEFORE tickets depending on them can complete
+
+      Risk: If module scaffolding is not created early (TCK-PEND-001/002), downstream tickets will face
+      integration friction.
+    confidence: HIGH
+    remediation: |
+      1. Add explicit "module_scaffolding" ticket (TCK-PEND-000) as prerequisite to TCK-PEND-001
+         This ticket creates:
+         - crates/apm2-daemon/src/lib.rs with module declarations
+         - crates/apm2-daemon/src/episode/mod.rs (empty)
+         - crates/apm2-daemon/src/protocol/mod.rs (empty)
+         - crates/apm2-daemon/src/telemetry/mod.rs (empty)
+         - crates/apm2-daemon/src/evidence/mod.rs (empty)
+         - Updates Cargo.toml to reflect new dependencies (tokio, prost, nix, blake3, ed25519-dalek)
+      2. Modify TCK-PEND-001 to depend on TCK-PEND-000
+      3. Add module structure verification to each phase's test suite
+
+additional_gates:
+  - gate_id: GATE-TCK-ARCHITECTURAL-COHERENCE
+    status: PASSED
+    notes: |
+      Six-plane architecture (Control/I/O/Tool/Telemetry/Evidence/Ledger) is consistently represented across ticket descriptions.
+
+      Key architectural validations:
+      1. Layering model (EpisodeRuntime → EpisodeController → HarnessAdapter) is sound
+         - Resolves v0 cousin violation (AD-LAYER-001)
+         - Clear responsibility boundaries maintained
+      2. Evidence economics via reducer pattern (AD-EVID-003) is architecturally coherent
+         - Ring buffers as transient (daemon-local)
+         - On trigger → ledger events → reducer projections
+         - Prevents parallel metrics pipelines (Goodhart protection)
+      3. OCAP enforcement dual-layer (AD-CAC-001) correctly mapped
+         - Daemon pre-execution validation (ToolBroker)
+         - Post-execution audit via EpisodeController.record_pack_miss()
+      4. Cryptographic integrity (AD-KEY-001, AD-VERIFY-001) has clear ownership
+         - Key lifecycle in OS keychain
+         - Canonical bytes determinism enforced via golden vectors
+    confidence: HIGH
+
+  - gate_id: GATE-TCK-IMPLEMENTABILITY
+    status: PASSED_WITH_CAVEATS
+    caveats: |
+      1. CRITICAL PATH RISK: Maximum depth 10 tickets means 8+ weeks serial dependency
+         - Parallel phases (2A/2B/2C) can reduce wall-clock time if parallelized
+         - Recommend critical path analysis during detailed ticket creation (TCK-XXXXX generation)
+
+      2. MODULE SCAFFOLDING: Lack of Rust lib.rs pattern suggests implementation approach needs clarification
+         - Either convert daemon to library + binary pattern, OR
+         - Use flat module structure with careful export boundaries
+         - Recommend adding architectural guidance to implementation section
+
+      3. PROTOBUF GENERATION: TCK-PEND-002 mentions "golden vectors" but no build integration specified
+         - Need prost build.rs configuration
+         - Golden vector testing framework not detailed
+         - Recommend adding to kernel-testkit ticket description
+
+      4. CGROUP INTEGRATION: AD-CGROUP-001 mentions systemd transient API (zbus crate)
+         - zbus not listed in key_dependencies in RFC meta
+         - Fallback strategy (direct cgroup v2) requires nix pty feature (claimed to exist)
+         - Verify Cargo.toml features before implementation
+    confidence: MODERATE
+
+  - gate_id: GATE-TCK-EVIDENCE-QUALITY
+    status: PASSED
+    notes: |
+      Test and evidence plan (07_ticket_decomposition.yaml) provides clear E2E test strategy:
+
+      TCK-PEND-018a: E2E lifecycle tests
+        - Episode create/start/stop/status lifecycle
+        - Budget exhaustion and termination enforcement
+        - Traceability to REQ-EPISODE-001, REQ-DAEMON-001
+
+      TCK-PEND-018b: E2E tool/telemetry tests
+        - Tool mediation, deduplication, receipt binding
+        - Telemetry frame verification vs. resource consumption
+        - Traceability to REQ-TOOL-001, REQ-TEL-001
+
+      TCK-PEND-018c: E2E evidence and receipt tests
+        - Evidence integrity verification
+        - Receipt authenticity (signature validation)
+        - Compaction and TTL enforcement
+        - Traceability to REQ-EVID-001, REQ-RECEIPT-001
+
+      Assessment: Evidence is stratified correctly (unit → integration → E2E).
+                  Each phase has corresponding test coverage plan.
+    confidence: HIGH
+
+findings:
+  - finding_id: SA1-D-001
+    gate_id: GATE-TCK-SCOPE-COVERAGE
+    category: REQUIREMENT MAPPING
+    severity: MAJOR
+    location: "documents/rfcs/RFC-0013/06_ticket_decomposition.yaml"
+    description: |
+      Six doctrine requirements (DOC-TRUTH-001, DOC-BOUNDARY-001, DOC-OCAP-001, DOC-LEASE-001,
+      DOC-MEASURE-001, DOC-BOUNDED-001) are not explicitly listed in any ticket's requirement_ids.
+
+      These are non-negotiable architectural constraints that must be verified at implementation time.
+      The absence of explicit mappings creates traceability gaps that could lead to:
+      - Incomplete doctrine verification during gate reviews
+      - Missed enforcement opportunities in code review
+      - Defects in holonic boundary enforcement (DOC-BOUNDARY-001)
+
+      Example: DOC-MEASURE-001 (verification predicate) is critical to REQ-RECEIPT-001 but
+      the tracing is implicit via AD-VERIFY-001, not explicit in TCK-PEND-010 requirement_ids.
+    remediation: |
+      1. Update 06_ticket_decomposition.yaml to include doctrine_ids field in each ticket:
+         ```yaml
+         - ticket_id: TCK-PEND-010
+           title: "Implement receipt signing and verification"
+           requirement_ids: [REQ-RECEIPT-001]
+           doctrine_ids: [DOC-MEASURE-001, DOC-TRUTH-001]
+           depends_on: [TCK-PEND-009b]
+           summary: ...
+         ```
+      2. Create explicit "Doctrine Enforcement Checklist" in 07_test_and_evidence.yaml
+      3. Add doctrine verification gate to TCK-PEND-018 E2E test acceptance criteria
+    source_mode: "Mode 4 (Constraint Satisfiability) - requires explicit constraint enumeration"
+
+  - finding_id: SA1-D-002
+    gate_id: GATE-TCK-CCP-MAPPING
+    category: MODULE STRUCTURE MISMATCH
+    severity: BLOCKER
+    location: "crates/apm2-daemon/src/ and documents/rfcs/RFC-0013/00_meta.yaml"
+    description: |
+      RFC declares four new module subdirectories that do not exist in current codebase.
+      Current daemon structure is flat (main.rs, state.rs, handlers.rs, ipc_server.rs).
+
+      Declared modules:
+      - crates/apm2-daemon/src/episode/
+      - crates/apm2-daemon/src/protocol/
+      - crates/apm2-daemon/src/telemetry/
+      - crates/apm2-daemon/src/evidence/
+
+      This creates a structural dependency:
+      - TCK-PEND-003 (EpisodeEnvelope) assumes episode/ module exists
+      - TCK-PEND-001 (UDS protocol) assumes protocol/ module exists
+      - TCK-PEND-011 (CgroupReader) assumes telemetry/ module exists
+      - TCK-PEND-013 (Flight recorder) assumes evidence/ module exists
+
+      If module scaffolding is not in place BEFORE these tickets, implementation will hit
+      import errors and refactoring churn. This is a CRITICAL PATH blocker.
+    remediation: |
+      1. Create new ticket TCK-PEND-000 "Scaffold apm2-daemon module structure"
+         - Create lib.rs with module declarations
+         - Create episode/mod.rs, protocol/mod.rs, telemetry/mod.rs, evidence/mod.rs (empty)
+         - Refactor main.rs to use modules
+         - Add Cargo.toml dependencies (tokio, prost, nix, blake3, ed25519-dalek, zbus)
+         - Run cargo check to verify compilation
+      2. Insert TCK-PEND-000 as dependency for TCK-PEND-001, 003, 011, 013
+      3. Document module ownership in 00_meta.yaml crate_boundaries section
+    source_mode: "Mode 48 (Systems Thinking) - module organization is structural integrity concern"
+
+  - finding_id: SA1-D-003
+    gate_id: GATE-TCK-CCP-MAPPING
+    category: DEPENDENCY METADATA
+    severity: MAJOR
+    location: "documents/rfcs/RFC-0013/00_meta.yaml"
+    description: |
+      RFC meta declares key_dependencies but Cargo.toml integration is not verified.
+
+      Declared dependencies:
+      - tokio 1.x (async runtime)
+      - prost 0.12 (protobuf)
+      - nix 0.30 (Unix APIs)
+      - blake3 1.x (hashing)
+      - ed25519-dalek 2.x (signing)
+
+      Missing from declared list but required by design:
+      - zbus 4.4 (systemd transient API for cgroups) - mentioned in AD-CGROUP-001
+
+      Risk: If zbus is not added to Cargo.toml before TCK-PEND-011, cgroup v2 integration will fail.
+      Fallback path (direct nix writes) is less robust.
+    remediation: |
+      1. Add zbus 4.4 to key_dependencies in 00_meta.yaml
+      2. Verify all declared dependencies are present in crates/apm2-daemon/Cargo.toml
+      3. Add version constraint verification to TCK-PEND-000 (scaffold ticket)
+      4. Document fallback strategies (systemd transient → direct cgroup v2) in AD-CGROUP-001
+    source_mode: "Mode 22 (Bayesian Belief Networks) - dependency versions affect implementation probability"
+
+  - finding_id: SA1-D-004
+    gate_id: GATE-TCK-SCOPE-COVERAGE
+    category: PHASE ORDERING RISK
+    severity: MAJOR
+    location: "documents/rfcs/RFC-0013/06_ticket_decomposition.yaml"
+    description: |
+      Ticket critical path is 10 edges long (TCK-PEND-001 → ... → TCK-PEND-018a).
+      This translates to minimum 8-10 weeks of serial work if each ticket takes 1 week.
+
+      Phase dependencies create a critical path:
+      Phase 1A: Protocol foundation (TCK-PEND-001, 002) - must be first
+      Phase 1B: Episode envelope (TCK-PEND-003, 004) - depends on Phase 1A
+      Phase 1C: PTY/Adapter (TCK-PEND-005, 006) - depends on Phase 1B
+      Phase 2A: Tool Broker (TCK-PEND-007, 008) - depends on Phase 1B
+      Phase 3A: Evidence (TCK-PEND-013, 014, 015) - depends on Phase 1C + Phase 2C
+      Phase 4: CLI/E2E (TCK-PEND-017, 018a/b/c) - depends on Phase 3A + Phase 3B
+
+      Opportunity: Phases 2A, 2B, 2C are largely independent. Can be parallelized to reduce wall-clock time
+      by ~3 weeks if assigned to separate teams.
+
+      Risk: If team bandwidth is single-threaded, delays in early phases cascade to all downstream phases.
+      No slack in dependencies; any delay exceeds project timeline.
+    remediation: |
+      1. Add "parallelization strategy" section to 05_rollout_and_ops.yaml
+      2. Identify team assignments to reduce critical path:
+         - Team A: TCK-PEND-001, 002, 003, 004 (Phase 1, critical path)
+         - Team B: TCK-PEND-005, 006, 013, 014, 015 (PTY/Evidence, Phase 1C + 3A)
+         - Team C: TCK-PEND-007, 008, 009a, 009b, 010 (Tool, Phase 2A/B)
+         - Team D: TCK-PEND-011, 012 (Telemetry, Phase 2C)
+      3. Add milestone gates at phase boundaries to validate readiness before proceeding
+      4. Track actual cycle time per ticket to refine future estimates
+    source_mode: "Mode 48 (Systems Thinking) - critical path is system-level constraint"
+
+  - finding_id: SA1-D-005
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: GOLDEN VECTOR TESTING
+    severity: MINOR
+    location: "documents/rfcs/RFC-0013/06_ticket_decomposition.yaml TCK-PEND-002"
+    description: |
+      TCK-PEND-002 "Implement protobuf message definitions" mentions "Include golden vectors"
+      but no supporting infrastructure is described.
+
+      Golden vectors are critical for:
+      - Ensuring deterministic protobuf serialization (AD-VERIFY-001 requirement)
+      - Cross-platform compatibility (Rust↔Go↔Python)
+      - Regression detection in canonicalization changes
+
+      Current reference: kernel-testkit crate mentioned in 00_meta.yaml as "new: true"
+      but kernel-testkit is not in the ticket list (no TCK-PEND-* for test infrastructure).
+
+      Risk: Golden vector infrastructure may not exist; TCK-PEND-002 may be blocked on kernel-testkit
+      availability.
+    remediation: |
+      1. Add explicit ticket for kernel-testkit infrastructure (or merge into TCK-PEND-002)
+      2. Document golden vector specification:
+         - Format: YAML or JSON with canonical bytes + signed hash
+         - Test harness: cargo test --test canonical_bytes
+         - Coverage: all message types used in signed receipts
+      3. Reference golden vector standard in AD-VERIFY-001
+      4. Add to TCK-PEND-002 acceptance criteria
+    source_mode: "Mode 75 (Calibration) - test infrastructure availability is epistemically uncertain"
+
+  - finding_id: SA1-D-006
+    gate_id: GATE-TCK-ARCHITECTURAL-COHERENCE
+    category: REDUCER PATTERN CLARITY
+    severity: MINOR
+    location: "documents/rfcs/RFC-0013/02_design_decisions.yaml AD-EVID-003"
+    description: |
+      AD-EVID-003 "Evidence economics as ledger events + reducers" is architecturally sound but
+      evidence economics implementation is split across multiple tickets:
+
+      - TCK-PEND-013: Ring buffer (transient)
+      - TCK-PEND-014: TTL + pinning
+      - TCK-PEND-015: Compaction
+
+      The decomposition does not explicitly define:
+      1. Event vocabulary (e.g., evidence.pinned, evidence.ttl_expired, compaction.completed)
+         - Decision states "v4 Finalization Required" - this is v4, so should be finalized
+      2. Reducer implementations for evidence events
+         - EvidenceReducer needs to handle pin_state/TTL event handling (TODO noted)
+         - MetricsReducer state schema not defined
+      3. Integration point between daemon ring buffers and ledger events
+         - TCK-PEND-013 describes ring buffer but not ledger event emission
+         - TCK-PEND-014 describes TTL but not TTL event generation
+
+      Risk: Implementers of TCK-PEND-013/014/015 may create disjoint subsystems if event vocabulary
+      is not frozen in advance.
+    remediation: |
+      1. Create "Evidence event vocabulary" in 04_contracts_and_versioning.yaml
+         Document event types: evidence.pinned, evidence.ttl_expired, compaction.completed, etc.
+      2. Add reducer pseudo-code to EvidenceReducer section showing event → state transition
+      3. Update TCK-PEND-013/014/015 summaries to reference event vocabulary
+      4. Add "Verify event vocabulary consistency" test to TCK-PEND-018c
+    source_mode: "Mode 61 (Dialectical Reasoning) - tensions between abstraction levels (ring buffers vs. ledger events)"
+
+summary_statistics:
+  total_preliminary_tickets: 21
+  phases: 9
+  dependency_graph_acyclicity: PASS
+  requirement_coverage: PARTIAL (8/14 explicit, 6/14 implicit)
+  module_structure_alignment: FAIL (4/5 modules missing)
+  architectural_coherence: PASS
+  critical_path_depth: 10 tickets
+  parallelizable_phases: 3 (2A, 2B, 2C)
+  blockers_identified: 1 (module scaffolding)
+  major_findings: 3 (scope mapping, CCP mapping, critical path)
+  minor_findings: 2 (golden vectors, evidence economics)
+
+verdict: NEEDS_REMEDIATION
+
+remediation_priority:
+  - priority: CRITICAL
+    finding_ids: [SA1-D-002]
+    reason: "Module scaffolding is blocking many downstream tickets; must be resolved before TCK-PEND-001 kicks off"
+    estimated_effort: "1 ticket (TCK-PEND-000), ~3-5 days"
+
+  - priority: HIGH
+    finding_ids: [SA1-D-001, SA1-D-004]
+    reason: "Scope coverage and critical path planning affect overall project risk"
+    estimated_effort: "Documentation update + team assignment planning, ~2-3 days"
+
+  - priority: MEDIUM
+    finding_ids: [SA1-D-003, SA1-D-005, SA1-D-006]
+    reason: "Dependency metadata, test infrastructure, and event vocabulary refinement"
+    estimated_effort: "Design clarification + Cargo.toml updates, ~5-7 days across team"
+
+recommendation: |
+  RFC-0013 is READY FOR DETAILED TICKET GENERATION (TCK-XXXXX) with the following conditions:
+
+  1. BLOCKER RESOLUTION: Create TCK-PEND-000 "Scaffold apm2-daemon module structure" and insert
+     as dependency for TCK-PEND-001, TCK-PEND-003, TCK-PEND-011, TCK-PEND-013.
+     This unlocks all Phase 1 work.
+
+  2. SCOPE CLARIFICATION: Update 06_ticket_decomposition.yaml to add explicit doctrine_ids mappings
+     for all six DOC-* requirements. Create traceability matrix in 07_test_and_evidence.yaml.
+
+  3. PARALLEL TEAM PLANNING: Assign Team C and Team D to TCK-PEND-007/008/009/010/011/012 work
+     in parallel with Team A/B on TCK-PEND-001-006. This reduces critical path from 10 weeks to ~6-7 weeks.
+
+  4. DEPENDENCY VERIFICATION: Audit crates/apm2-daemon/Cargo.toml to confirm all declared dependencies
+     are present. Add zbus 4.4 if missing (required for systemd transient API fallback).
+
+  5. EVIDENCE VOCABULARY FREEZE: Finalize event types (evidence.pinned, evidence.ttl_expired, etc.) in
+     v4 before implementation. Update reducer pseudo-code in 04_contracts_and_versioning.yaml.
+
+  Estimated additional planning effort: 1-2 weeks
+  Post-remediation verdict: PASS (pending above items)
+
+  Confidence in this assessment: HIGH (Mode 4 constraint analysis, Mode 48 systems analysis both converge)
+
+---
+Assessment completed by: SA-1 (Structural Rigorist)
+Reasoning modes applied: [4, 22, 48, 61, 75]
+Gate pass rate: 2/3 explicit gates (PASS: ACYCLICITY, ARCHITECTURE; FAIL: COVERAGE, CCP-MAPPING)
+Supplementary gates: 2/2 (PASS: EVIDENCE, IMPLEMENTABILITY-CAVEATS)
+Confidence in verdict: HIGH (epistemic uncertainty is well-scoped to known unknowns)

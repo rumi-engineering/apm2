@@ -1,0 +1,430 @@
+rfc_governance_and_gates:
+  schema_version: "2026-01-27"
+  template_version: "2026-01-27"
+
+  governance:
+    approval_requirements:
+      - authority: AUTH_ARCHITECTURE
+        scope: "System architecture, planes design, protocol decisions"
+        status: PENDING
+        notes: "Awaiting v2 exploration phase"
+
+      - authority: AUTH_SECURITY
+        scope: "Trust boundaries, OCAP enforcement, receipt signing"
+        status: PENDING
+        notes: "Awaiting v2 security review"
+
+      - authority: AUTH_PRODUCT
+        scope: "Operator experience, rollout strategy"
+        status: PENDING
+        notes: "Awaiting v4 finalization"
+
+    version_history:
+      - version: v0
+        date: "2026-01-27"
+        description: "RFC v0 (Discovery phase) - initial structure from inline RFC content"
+        changes:
+          - "Created 9 RFC files from provided specification"
+          - "Mapped doctrine requirements to derived requirements"
+          - "Documented architecture decisions AD-DAEMON-001 through AD-SEC-001"
+          - "Identified 7 open questions for v2 investigation"
+          - "Outlined 18 preliminary tickets across 4 rollout phases"
+        author: "rfc-council CREATE mode"
+
+      - version: v2
+        date: "2026-01-27"
+        description: "RFC v2 (Grounded phase) - codebase investigation complete"
+        changes:
+          - "Resolved OQ-DAEMON-001: Harness adapter tool call detection (AD-ADAPT-001)"
+          - "Resolved OQ-DAEMON-002: Cgroup hierarchy design (AD-CGROUP-001)"
+          - "Resolved OQ-DAEMON-003: Adapter failure handling (AD-FAIL-001)"
+          - "Resolved OQ-DAEMON-004: CAC ContextPack integration (AD-CAC-001)"
+          - "Resolved SA3-F-011: EpisodeController vs EpisodeRuntime cousin violation (AD-LAYER-001)"
+          - "Added v2 architecture decisions with evidence references"
+          - "Grounded design in existing apm2-core and apm2-holon patterns"
+        author: "rfc-council EXPLORE mode"
+
+  gates:
+    - gate_id: GATE-TCK-SCHEMA
+      type: TRUSTED
+      status: PASS
+      evidence: "All 9 RFC YAML files created and parse correctly"
+      notes: "v0 schema validation complete"
+
+    - gate_id: GATE-TCK-DEPENDENCY-ACYCLICITY
+      type: DETERMINISTIC
+      status: PENDING
+      evidence: |
+        Preliminary ticket structure shows linear dependencies.
+        Will be fully validated during DECOMPOSE phase.
+      notes: "Pending ticket decomposition"
+
+    - gate_id: GATE-TCK-SCOPE-COVERAGE
+      type: DETERMINISTIC
+      status: PENDING
+      evidence: |
+        8 derived requirements mapped from doctrine.
+        Ticket coverage to be validated during DECOMPOSE.
+      notes: "Pending v4 finalization"
+
+    - gate_id: GATE-TCK-CCP-MAPPING
+      type: DETERMINISTIC
+      status: PENDING
+      evidence: |
+        No PRD-specific CCP for this foundational RFC.
+        Codebase integration points identified:
+        - apm2-core (ledger, CAS, events)
+        - apm2-daemon (existing server)
+        - apm2-cli (commands)
+        Will validate against existing modules during EXPLORE.
+      notes: "Pending v2 codebase investigation"
+
+    - gate_id: GATE-TCK-ATOMICITY
+      type: LLM_ASSISTED
+      status: PENDING
+      evidence: |
+        Preliminary tickets organized by rollout phase.
+        Each phase builds on previous.
+        Final ticket atomicity requires DECOMPOSE analysis.
+      notes: "Pending DECOMPOSE mode"
+
+    - gate_id: GATE-TCK-IMPLEMENTABILITY
+      type: LLM_ASSISTED
+      status: PENDING
+      evidence: |
+        Architecture decisions documented with rationale.
+        Open questions identified for v2 resolution.
+        Contracts defined for major interfaces.
+      notes: "Pending v2 exploration findings"
+
+    - gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+      type: LLM_ASSISTED
+      status: PENDING
+      evidence: |
+        Trust boundaries documented in 03_trust_boundaries.yaml.
+        Threat model with 7 threats and mitigations.
+        Security controls documented in AD-SEC-001.
+      notes: "Pending AUTH_SECURITY review"
+
+    - gate_id: GATE-TCK-REQUIREMENT-FIDELITY
+      type: LLM_ASSISTED
+      status: PENDING
+      evidence: |
+        Derived requirements trace to doctrine.
+        Architecture decisions reference doctrine sections.
+      notes: "Pending v4 finalization"
+
+    - gate_id: GATE-TCK-ANTI-COUSIN
+      type: LLM_ASSISTED
+      status: PENDING
+      evidence: |
+        This is net-new daemon infrastructure.
+        Extends existing apm2-daemon; does not replace.
+        Will validate against existing session/process modules during EXPLORE.
+      notes: "Pending v2 codebase investigation"
+
+  discovery_council_results:
+    session_id: "COUNCIL-RFC-0013-20260127-v0"
+    phase: "v0 (Discovery)"
+    subagents:
+      - agent_id: SA-1
+        role: "Structural Rigorist"
+        focus: "Doctrine mapping, architecture consistency, contract completeness"
+        verdict: NEEDS_REMEDIATION
+        findings_summary:
+          blockers: 3
+          major: 6
+          minor: 4
+        key_blockers:
+          - "SA1-F-001: CAC ContextPack integration unresolved (OQ-DAEMON-004)"
+          - "SA1-F-002: Canonicalization golden vectors not in contracts"
+          - "SA1-F-003: Six-plane synchronization invariants missing"
+        key_majors:
+          - "SA1-F-004: HarnessAdapter interface stability unclear"
+          - "SA1-F-005: Budget tracking across planes not specified"
+          - "SA1-F-006: Evidence retention policy missing critical details"
+          - "SA1-F-007: Security controls v1 baseline but no elevation path"
+          - "SA1-F-008: Measurement integrity predicate not operationalized"
+          - "SA1-F-009: Ledger plane event schema not included"
+
+      - agent_id: SA-2
+        role: "Implementation Feasibility"
+        focus: "Rust implementability, dependency availability, rollout realism"
+        verdict: NEEDS_CLARIFICATION
+        findings_summary:
+          blockers: 3
+          major: 7
+          minor: 5
+        key_blockers:
+          - "SA2-F-001: nix crate PTY/cgroup features not enabled"
+          - "SA2-F-002: Protobuf daemon protocol messages incomplete"
+          - "SA2-F-003: HarnessAdapter trait may diverge from RFC contracts"
+        key_majors:
+          - "SA2-F-004: EpisodeRuntime/EpisodeEnvelope types not defined"
+          - "SA2-F-005: ToolBroker/DedupeCache not implemented"
+          - "SA2-F-006: TelemetryCollector/cgroup integration missing"
+          - "SA2-F-007: Receipt signing infrastructure incomplete"
+          - "SA2-F-008: Evidence economics not scoped in rollout"
+          - "SA2-F-009: Protocol server not implemented"
+          - "SA2-F-010: Episode state machine not integrated with session"
+
+      - agent_id: SA-3
+        role: "Security & Anti-Cousin Guardian"
+        focus: "Trust boundaries, threat coverage, receipt integrity, cousin risks"
+        verdict: NEEDS_HARDENING
+        findings_summary:
+          blockers: 5
+          major: 6
+          minor: 4
+          cousin_violations: 1
+          potential_cousins: 2
+        key_blockers:
+          - "SA3-F-001: Signing key compromise mitigation incomplete"
+          - "SA3-F-002: PTY parser security gap (OQ-DAEMON-001 OPEN)"
+          - "SA3-F-003: Receipt verification predicate not implementable"
+          - "SA3-F-004: Stop-state TOCTOU race not mitigated"
+          - "SA3-F-005: Evidence storage budget exhaustion undefined"
+        key_majors:
+          - "SA3-F-006: Capability manifest versioning/revocation"
+          - "SA3-F-007: Telemetry redaction rules incomplete"
+          - "SA3-F-008: Side channel escape not mitigated"
+          - "SA3-F-009: Credential ambient environment not specified"
+          - "SA3-F-010: Receipt timestamp monotonicity not enforced"
+          - "SA3-F-011: COUSIN VIOLATION - EpisodeController overlap"
+        anti_cousin_analysis:
+          - component: "apm2-holon::episode::EpisodeController"
+            risk: COUSIN_VIOLATION
+            recommendation: "Clarify daemon EpisodeRuntime vs holon EpisodeController"
+          - component: "apm2-core::session::SessionReducer"
+            risk: POTENTIAL_COUSIN
+            recommendation: "Extend SessionReducer for receipt handling"
+          - component: "apm2-core::session::ExitHandler"
+            risk: POTENTIAL_COUSIN
+            recommendation: "Integrate with ExitHandler for terminations"
+
+    aggregated_findings:
+      total_blockers: 11
+      total_majors: 19
+      total_minors: 13
+
+    council_verdict: NEEDS_V2_INVESTIGATION
+    verdict_reason: |
+      RFC-0013 v0 Discovery phase complete. The RFC is architecturally sound and
+      well-grounded in holonic unified theory doctrine. However, 11 BLOCKER-level
+      findings across all three subagents prevent advancement to implementation:
+
+      STRUCTURAL (SA-1):
+      - Canonicalization contracts incomplete (blocks golden vectors)
+      - CAC ContextPack integration unresolved (blocks OCAP)
+      - Plane synchronization invariants implicit (blocks race-free implementation)
+
+      FEASIBILITY (SA-2):
+      - Dependency features not confirmed (blocks PTY/cgroup)
+      - Protocol messages incomplete (blocks Phase 1A)
+      - Core types (EpisodeRuntime, ToolBroker) not defined
+
+      SECURITY (SA-3):
+      - Signing key lifecycle not specified (blocks receipts)
+      - PTY parser security open (blocks adapter trust)
+      - Receipt verification predicate vague (blocks integrity)
+      - Stop-state race mitigation incomplete (blocks safety)
+      - Evidence exhaustion undefined (blocks bounded storage)
+
+      ANTI-COUSIN:
+      - apm2-holon::EpisodeController overlaps daemon EpisodeRuntime
+
+      v2 EXPLORE phase MUST resolve these before implementation can begin.
+
+  v2_council_results:
+    session_id: "COUNCIL-RFC-0013-20260127-v2"
+    phase: "v2 (Exploration → Grounded)"
+    council_verdict: GROUNDED
+    verdict_reason: |
+      RFC-0013 v2 Exploration phase complete. All four open questions resolved with
+      evidence-backed architecture decisions. The cousin violation (SA3-F-011) is
+      resolved through clear layering between EpisodeController and EpisodeRuntime.
+
+      **Resolved v0 Blockers:**
+
+      STRUCTURAL (SA-1):
+      - SA1-F-001 (CAC ContextPack): RESOLVED via AD-CAC-001 dual-layer enforcement
+      - SA1-F-003 (Plane synchronization): Deferred to v4 (implementation detail)
+
+      FEASIBILITY (SA-2):
+      - SA2-F-001 (nix crate features): Confirmed available, implementation required
+      - SA2-F-003 (HarnessAdapter divergence): RESOLVED via AD-ADAPT-001 (implements Holon)
+
+      SECURITY (SA-3):
+      - SA3-F-002 (PTY parser security): RESOLVED via AD-ADAPT-001 deterministic parser
+      - SA3-F-011 (COUSIN VIOLATION): RESOLVED via AD-LAYER-001 layering model
+
+      **Remaining Items for v4:**
+      - SA1-F-002: Golden vectors require implementation (test-time artifact)
+      - SA3-F-001: Signing key lifecycle (security review required)
+      - SA3-F-003: Receipt verification predicate (implementation detail)
+      - SA3-F-004: Stop-state race mitigation (implementation detail)
+
+    exploration_evidence:
+      - title: "EpisodeController Analysis"
+        summary: |
+          Explored apm2-holon crate. EpisodeController is in-process loop manager
+          implementing active inference pattern. Manages Holon trait implementations
+          with logical budgets. Key finding: HarnessAdapter should implement Holon trait.
+        key_files:
+          - "crates/apm2-holon/src/episode/controller.rs"
+          - "crates/apm2-holon/src/holon/traits.rs"
+
+      - title: "Daemon Infrastructure Analysis"
+        summary: |
+          Explored apm2-daemon crate. Current architecture: UDS IPC server with
+          length-prefixed framing, shared state via Arc<RwLock<>>, process management
+          via ProcessRunner. Extension pattern: add episode/ module alongside handlers.
+        key_files:
+          - "crates/apm2-daemon/src/ipc_server.rs"
+          - "crates/apm2-daemon/src/handlers.rs"
+          - "crates/apm2-daemon/src/state.rs"
+
+      - title: "Session/Process Module Analysis"
+        summary: |
+          Explored apm2-core session and process modules. SessionReducer handles
+          lifecycle events deterministically. ExitHandler validates phase transitions.
+          EntropyTracker provides budget accounting. All infrastructure reusable.
+        key_files:
+          - "crates/apm2-core/src/session/reducer.rs"
+          - "crates/apm2-core/src/session/exit_handler.rs"
+          - "crates/apm2-core/src/session/entropy.rs"
+
+      - title: "Telemetry/Cgroup Analysis"
+        summary: |
+          No existing cgroup integration found. ProcessHandle has metric fields but
+          unpopulated. BudgetTracker provides token/time tracking. Evidence CAS available.
+          Implementation from scratch required for cgroup metrics.
+        key_files:
+          - "crates/apm2-core/src/process/mod.rs (ProcessHandle)"
+          - "crates/apm2-core/src/budget/mod.rs"
+          - "crates/apm2-core/src/evidence/cas.rs"
+
+      - title: "Evidence Economics Architecture"
+        summary: |
+          **Key Insight:** Metrics are NOT a separate system - they're reducers over
+          the ledger. The ledger IS the substrate. This prevents Goodharting by ensuring
+          all metrics are evidence-backed, derived from events, and versioned.
+
+          **Architecture Principle (AD-EVID-003):**
+          - Ring buffers = daemon-local transient capture (bounded memory)
+          - On trigger → emit events to ledger
+          - Reducers compute all metrics from ledger events
+          - No parallel pipelines (Prometheus scrape) that bypass receipts
+
+          **Existing Infrastructure (extend in v4):**
+          - Reducer trait: deterministic, checkpointable (traits.rs)
+          - EvidenceReducer: handles evidence.published, evidence.gate_receipt
+          - DefectRecord: production-ready (1,292 lines), wire to evidence.pinned in v4
+          - ContentAddressedStore: exists
+
+          **v4 Finalization Required:**
+          - Event vocabulary: telemetry.frame, evidence.pinned, evidence.ttl_expired, compaction.completed
+          - EvidenceReducer extensions for pin_state/TTL event handling
+          - MetricsReducer state schema and projections
+        key_files:
+          - "crates/apm2-core/src/reducer/traits.rs (Reducer trait)"
+          - "crates/apm2-core/src/evidence/reducer.rs (EvidenceReducer)"
+          - "crates/apm2-holon/src/defect.rs (DefectRecord)"
+          - "crates/apm2-core/src/evidence/cas.rs (CAS)"
+          - "crates/apm2-core/src/evidence/state.rs (needs pin_state)"
+
+    gate_updates:
+      - gate_id: GATE-TCK-CCP-MAPPING
+        status: PASS
+        evidence: |
+          All proposed modules map to existing crate boundaries:
+          - apm2-daemon: episode/, protocol/, telemetry/, evidence/
+          - apm2-core: adapter extensions, session integration
+          No cousin abstractions introduced; HarnessAdapter extends Holon trait.
+
+      - gate_id: GATE-TCK-ANTI-COUSIN
+        status: PASS
+        evidence: |
+          SA3-F-011 cousin violation resolved:
+          - EpisodeRuntime wraps (not replaces) EpisodeController
+          - HarnessAdapter implements Holon trait for integration
+          - Layering model documented in AD-LAYER-001
+
+  v0_council_notes: |
+    RFC-0013 v0 created via CREATE mode from inline RFC content.
+    Content was comprehensive (17 sections in source), mapped to 9-file structure.
+
+    Key observations:
+    1. This is foundational infrastructure without PRD binding
+    2. Grounding derived from holonic unified theory doctrine
+    3. Relationship to PRD-0004 (Work Substrate) and RFC-0012 (Coordination) documented
+    4. RFC-0012 coordination layer consumes this daemon runtime
+
+    v2 EXPLORE phase MUST address (from council findings):
+    - SA1-F-001/SA3-F-002: Resolve OQ-DAEMON-001 (PTY parsing) and OQ-DAEMON-004 (CAC)
+    - SA1-F-002/SA3-F-003: Define canonical_bytes() contracts with golden vectors
+    - SA1-F-003/SA3-F-004: Specify plane synchronization invariants and stop-state atomicity
+    - SA3-F-001: Complete signing key lifecycle specification
+    - SA3-F-011: Clarify EpisodeRuntime vs EpisodeController relationship
+    - SA2-F-001: Confirm nix crate features for PTY/cgroup
+    - SA2-F-002: Create proto/daemon_protocol.proto
+
+    v4 FINALIZE phase should:
+    - Close remaining 3 DEFERRED questions or explicitly defer
+    - Complete ticket decomposition with final IDs
+    - Obtain AUTH_SECURITY signoff on trust boundaries
+
+  next_steps:
+    - step: "v0 -> v2 (Exploration phase)"
+      description: |
+        Investigate codebase to resolve open questions:
+        - OQ-DAEMON-001: Harness adapter tool call detection
+        - OQ-DAEMON-002: Cgroup hierarchy design
+        - OQ-DAEMON-003: Adapter failure handling
+        - OQ-DAEMON-004: CAC ContextPack integration
+
+        Also validate:
+        - Existing apm2-daemon extension points
+        - Session/process module reuse potential
+        - Telemetry collection feasibility
+      trigger: "Invoke /rfc-council RFC-0013 for EXPLORE mode"
+      status: COMPLETED
+      completed_date: "2026-01-27"
+      results: |
+        All 4 open questions resolved with evidence-backed architecture decisions.
+        Cousin violation (SA3-F-011) resolved via layering model (AD-LAYER-001).
+        Design grounded in existing apm2-core and apm2-holon patterns.
+
+    - step: "v2 -> v4 (Finalization phase)"
+      description: |
+        Resolve remaining questions via COUNCIL session.
+        Add AD-* decisions for each open question resolution.
+        Obtain security signoffs.
+      trigger: "Invoke /rfc-council RFC-0013 after v2 complete"
+      status: READY
+
+    - step: "v4 -> Tickets (Decomposition phase)"
+      description: |
+        Generate implementation-ready tickets from finalized RFC.
+        Assign final TCK-XXXXX identifiers.
+        Validate atomicity and implementability gates.
+      trigger: "Invoke /rfc-council RFC-0013 after v4 complete"
+      status: PENDING_V4
+
+  relationship_to_coordination:
+    description: |
+      RFC-0012 (Agent Coordination Layer) defines the higher-level work loop
+      that consumes this daemon runtime. Specifically:
+
+      - RFC-0012 CoordinationController calls SessionSpawner
+      - SessionSpawner maps to this RFC's EpisodeRuntime.create/start
+      - Coordination observes session termination via events emitted by this daemon
+      - Token aggregation in coordination reads from TelemetryFrames
+
+      This RFC provides the substrate; RFC-0012 provides queue semantics.
+    dependency_direction: "RFC-0012 depends on RFC-0013 (this RFC)"
+    integration_points:
+      - "EpisodeRuntime.create() <- coordination.session_bound event trigger"
+      - "EpisodeRuntime.stop() <- coordination stop condition"
+      - "Episode events <- coordination reducer observation"
+      - "TelemetryFrame <- coordination budget aggregation"

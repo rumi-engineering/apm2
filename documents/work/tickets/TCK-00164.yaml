@@ -1,0 +1,105 @@
+acceptance_criteria:
+  - criterion: ToolBroker struct per CTR-DAEMON-004
+    verification: All methods implemented and tested
+  - criterion: DedupeCache for idempotent tool replay
+    verification: Repeated requests return cached results
+  - criterion: Policy evaluation for allow/deny decisions
+    verification: Policy rules correctly evaluated
+implementation:
+  code_examples:
+    - description: ToolBroker structure
+      code: |
+        pub struct ToolBroker {
+            policy: Arc<PolicyEngine>,
+            capabilities: CapabilityStore,
+            dedupe_cache: DedupeCache,
+            cas: Arc<ContentAddressedStore>,
+        }
+
+        impl ToolBroker {
+            pub async fn initialize(&self, manifest_hash: Hash) -> Result<()>;
+            pub async fn request(&self, episode_id: EpisodeId, req: ToolRequest) -> Result<ToolDecision>;
+            pub async fn execute(&self, episode_id: EpisodeId, decision: ToolDecision) -> Result<ToolResult>;
+            pub fn lookup_dedupe(&self, key: &DedupeKey) -> Option<ToolResult>;
+        }
+  files_to_create:
+    - path: crates/apm2-daemon/src/episode/broker.rs
+      purpose: ToolBroker implementation
+    - path: crates/apm2-daemon/src/episode/dedupe.rs
+      purpose: DedupeCache for idempotent replay
+    - path: crates/apm2-daemon/src/episode/decision.rs
+      purpose: ToolRequest, ToolDecision, ToolResult types
+  files_to_modify:
+    - changes: Export broker, dedupe, decision modules
+      path: crates/apm2-daemon/src/episode/mod.rs
+  implementation_steps:
+    - step: 1
+      action: Define ToolRequest type
+      details: |
+        Create request type per CTR-DAEMON-004:
+        - request_id: unique
+        - tool: ToolName
+        - dedupe_key: DedupeKey
+        - args_hash: Hash
+        - inline_args: Option<ToolArgs> (for small payloads)
+    - step: 2
+      action: Define ToolDecision type
+      details: |
+        Create decision type:
+        - request_id: matching request
+        - decision: Allow | Deny | DedupeCacheHit
+        - rule_id: which policy rule matched
+        - policy_hash: policy version
+        - budget_delta: resources to charge
+    - step: 3
+      action: Implement DedupeCache
+      details: |
+        Create cache for idempotent replay:
+        - insert(key: DedupeKey, result: ToolResult)
+        - get(key: &DedupeKey) -> Option<&ToolResult>
+        - evict_by_episode(episode_id)
+        - LRU eviction when over capacity
+    - step: 4
+      action: Implement ToolBroker
+      details: |
+        Create broker with methods:
+        - initialize(): load capability manifest from CAS
+        - request(): validate capability, check dedupe, evaluate policy
+        - execute(): charge budget, execute tool, store result
+        - lookup_dedupe(): query cache
+    - step: 5
+      action: Integrate with PolicyEngine
+      details: |
+        Use apm2-core PolicyEngine for rule evaluation:
+        - Load policy from CAS
+        - Evaluate rules against request
+        - Return Allow/Deny with rule_id
+  summary: |
+    Implement ToolBroker with dedupe cache per CTR-DAEMON-004.
+    Validates and executes tool calls with OCAP enforcement.
+    DedupeCache enables idempotent tool replay for reliability.
+notes: |
+  Phase: PHASE-2A (Tool Broker Foundation)
+  Generated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.
+  Maps to TCK-PEND-008.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Broker request flow
+    test_id: UT-00164-01
+    verification_command: cargo test -p apm2-daemon broker_request
+  - description: Dedupe cache hit
+    test_id: UT-00164-02
+    verification_command: cargo test -p apm2-daemon dedupe_cache
+  - description: Policy evaluation
+    test_id: IT-00164-01
+    verification_command: cargo test -p apm2-daemon --test integration broker_policy
+ticket:
+  depends_on:
+    - TCK-00163
+  id: TCK-00164
+  requirement_ids:
+    - REQ-TOOL-001
+  rfc_id: RFC-0013
+  status: READY
+  title: Implement ToolBroker with dedupe cache

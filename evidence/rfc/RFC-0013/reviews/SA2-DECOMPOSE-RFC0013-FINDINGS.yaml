@@ -1,0 +1,817 @@
+agent_id: SA-2
+session_id: COUNCIL-RFC-0013-DECOMPOSE
+cycle: 1
+assessment_date: "2026-01-27"
+selected_modes: [9, 38, 53, 68, 76]
+mode_categories: [Ampliative, Causal, Heuristic, Scientific, Meta-Level]
+
+preamble: |
+  SA-2 (Implementation Feasibility) conducted detailed analysis of RFC-0013 preliminary
+  ticket decomposition with focus on Rust implementability, dependency availability,
+  and rollout realism. Assessment applied 5 stochastically-selected reasoning modes:
+
+  - Mode 9 (Abductive Reasoning): Inferred implementation patterns from existing codebase
+  - Mode 38 (Counterfactual Reasoning): Evaluated what could break if assumptions fail
+  - Mode 53 (Heuristic Reasoning): Applied past project experience heuristics
+  - Mode 68 (Scientific Method): Validated assumptions against evidence (v2 codebase exploration)
+  - Mode 76 (Epistemic Auditing): Validated claim boundaries and uncertainty levels
+
+  Assessment scope: 21 preliminary tickets organized in 4 phases. Special focus on
+  previous SA2 findings (SA2-F-004, SA2-F-005) and their split resolutions.
+
+gate_assessments:
+  - gate_id: GATE-TCK-ATOMICITY
+    status: PASSED
+    tickets_assessed: 21
+    atomic_count: 21
+    non_atomic_tickets: []
+    evidence: |
+      All 21 tickets represent coherent, single-threaded units of work:
+
+      **Phase 1A (Protocol Foundation):**
+      - TCK-PEND-001 (UDS server): Focused on socket setup + framing
+      - TCK-PEND-002 (Protobuf defs): Pure code generation + golden vectors
+
+      **Phase 1B (Episode Envelope):**
+      - TCK-PEND-003 (EpisodeEnvelope): Single struct with canonical_bytes()
+      - TCK-PEND-004 (EpisodeRuntime): State machine implementation
+
+      **Phase 1C (PTY Runner):**
+      - TCK-PEND-005 (PTY spawning): PTY allocation + output capture
+      - TCK-PEND-006 (HarnessAdapter): Trait definition + registry
+
+      **Phase 2A (Tool Broker):**
+      - TCK-PEND-007 (Capability manifest): Manifest type + validation
+      - TCK-PEND-008 (ToolBroker): Core broker implementation
+
+      **Phase 2B (Tool Execution):**
+      - TCK-PEND-009a (Tool execution): Executor + budget charging
+      - TCK-PEND-009b (Tool receipts): Receipt generation
+      - TCK-PEND-010 (Receipt signing): Ed25519 + verification
+
+      **Phase 2C (Telemetry):**
+      - TCK-PEND-011 (Cgroup reader): CgroupReader implementation
+      - TCK-PEND-012 (TelemetryCollector): Frame streaming
+
+      **Phase 3A (Evidence Economics):**
+      - TCK-PEND-013 (Flight recorder): Ring buffers for PTY/tool/telemetry
+      - TCK-PEND-014 (Evidence TTL/pinning): TTL + pin API
+      - TCK-PEND-015 (Evidence compaction): Compaction job + tombstones
+
+      **Phase 3B (Vendor Adapter):**
+      - TCK-PEND-016 (Claude Code adapter): Vendor-specific parser
+
+      **Phase 4 (Integration):**
+      - TCK-PEND-017 (CLI commands): apm2 episode {create,start,stop,status}
+      - TCK-PEND-018a (E2E lifecycle): Episode lifecycle + budget tests
+      - TCK-PEND-018b (E2E tools): Tool mediation + telemetry tests
+      - TCK-PEND-018c (E2E evidence): Evidence + receipt verification tests
+
+      **Verdict:** All 21 tickets are atomic. Each can be completed in 1-2 days by
+      a competent agent. The split of TCK-PEND-009 (execution vs receipts) and
+      TCK-PEND-018 (3-way E2E split) are appropriate and follow single-responsibility
+      principle.
+    split_analysis: |
+      **Previous Splits (v2 review):**
+      - SA2-F-004: TCK-PEND-009 (execution) → TCK-PEND-009a + TCK-PEND-009b ✓ CORRECT
+        - 009a: tool execution, budget charging, CAS storage, OCAP enforcement
+        - 009b: receipt generation, envelope binding, result hash binding
+        - Rationale: Budget charging is orthogonal to receipt generation
+        - Implementability: Each is ~150-200 lines of Rust
+
+      - SA2-F-005: TCK-PEND-018 (E2E tests) → TCK-PEND-018a + 018b + 018c ✓ CORRECT
+        - 018a: Lifecycle (create/start/stop) + budget exhaustion scenarios
+        - 018b: Tool mediation (allow/deny), deduplication, receipt binding
+        - 018c: Evidence integrity, receipt authenticity, compaction, TTL
+        - Rationale: Test suites are non-overlapping requirement domains
+        - Implementability: Each test suite is independent and ~300-400 lines
+
+  - gate_id: GATE-TCK-IMPLEMENTABILITY
+    status: PASSED
+    clear_count: 21
+    unclear_tickets: []
+    evidence: |
+      All 21 tickets have sufficient detail for agent implementation without ambiguity.
+
+      **Clarity Assessment Criteria:**
+      1. Are implementation steps clear? (Interface design + file paths + code patterns)
+      2. Are dependencies explicit? (depends_on field + CTR references)
+      3. Are code examples or patterns referenced? (Contracts in 04_contracts_and_versioning.yaml)
+      4. Are test/evidence artifacts specified?
+      5. Can agent ask no clarifying questions?
+
+      **Result:** 21/21 pass all criteria.
+
+      Example implementations:
+
+      1. **TCK-PEND-001 (UDS Protocol Server)**
+         - Path: crates/apm2-daemon/src/protocol/server.rs
+         - Dependencies: tokio, nix (for UDS), bytes
+         - Interface: AD-DAEMON-002 specifies socket path, framing, max frame
+         - Test: kernel-testkit golden vectors for framing round-trip
+         - Clarity: Agent can implement without questions
+
+      2. **TCK-PEND-003 (EpisodeEnvelope)**
+         - Path: crates/apm2-core/src/episode/envelope.rs
+         - Contract: CTR-DAEMON-002 specifies exact fields and types
+         - Pattern: #[derive(Clone, Serialize, Deserialize)] with canonical_bytes()
+         - Test: Golden vectors per AD-VERIFY-001
+         - Clarity: Struct definition is deterministic; agent can code exactly
+
+      3. **TCK-PEND-004 (EpisodeRuntime)**
+         - Path: crates/apm2-daemon/src/episode/runtime.rs
+         - Contract: CTR-DAEMON-001 specifies interface and async/await pattern
+         - State machine: AD-EPISODE-002 defines 3 states (CREATED, RUNNING, TERMINATED/QUARANTINED)
+         - Integration: Wraps EpisodeController from apm2-holon per AD-LAYER-001
+         - Clarity: Agent understands state flow and interface exactly
+
+      4. **TCK-PEND-007 (Capability Manifest)**
+         - Path: crates/apm2-core/src/tool/manifest.rs
+         - Contract: AD-TOOL-002 specifies sealed references + scope structure
+         - Pattern: capability_id, tool_class enum, scope paths, risk tier
+         - Integration: Validated in ToolBroker per CTR-DAEMON-004
+         - Clarity: Type structure clear; no ambiguity
+
+      5. **TCK-PEND-009a (Tool Execution)**
+         - Path: crates/apm2-daemon/src/tool/executor.rs
+         - Interface: CTR-DAEMON-004 specifies execute() method
+         - Budget charging: Tracked via BudgetTracker from apm2-core
+         - OCAP: Validated against CapabilityStore
+         - CAS storage: ContentAddressedStore pattern from apm2-core
+         - Clarity: Agent integrates existing types; minimal new abstraction
+
+      6. **TCK-PEND-011 (Cgroup Reader)**
+         - Path: crates/apm2-daemon/src/telemetry/cgroup.rs
+         - Dependencies: nix crate (fs module) for /sys/fs/cgroup reads
+         - Pattern: AD-CGROUP-001 specifies systemd transient API (zbus) + fallback
+         - Metrics: AD-TEL-001 specifies exact TelemetryFrame fields
+         - Clarity: Cgroup hierarchy documented; file paths explicit
+
+      7. **TCK-PEND-016 (Claude Code Adapter)**
+         - Path: crates/apm2-core/src/adapter/claude_code.rs (extend)
+         - Pattern: Implement HarnessAdapter trait (CTR-DAEMON-003)
+         - Parser: Deterministic state machine per AD-ADAPT-001
+         - Test fixtures: Required from real Claude Code sessions
+         - Clarity: Adapter interface clear; vendor-specific details localized
+
+      **Verdict:** All 21 tickets are implementable. Agents have:
+      - Exact file paths
+      - Contract specifications (CTR-DAEMON-001 through CTR-PROTO-006)
+      - Architecture decisions with rationale (AD-DAEMON-001 through AD-VERIFY-001)
+      - Dependency information (tokio, prost, nix, blake3, ed25519-dalek, zbus)
+      - Integration points documented
+      - Test/golden vector requirements specified
+
+findings:
+  - finding_id: SA2-D-001
+    gate_id: GATE-TCK-ATOMICITY
+    category: INFO
+    severity: INFO
+    location: "TCK-PEND-001 through TCK-PEND-006"
+    title: "Phase 1 Sequencing is Tight but Achievable"
+    description: |
+      Phase 1 has a critical path: TCK-PEND-001 → TCK-PEND-002 → TCK-PEND-003 →
+      TCK-PEND-004 → (TCK-PEND-005 + TCK-PEND-006).
+
+      This is appropriate as protocol server (001) must precede message definitions (002),
+      which must precede envelope type (003), which must precede runtime (004).
+
+      However, the time estimate for Phase 1 depends on parallelization:
+      - Sequential: ~6-8 days
+      - Parallel (005/006 concurrent with 003/004): ~4-5 days
+    remediation: "No remediation required. Sequencing is correct. Schedule phases in parallel where possible."
+    source_mode: "Mode 53 (Heuristic Reasoning) - past project experience with protocol server rollouts"
+
+  - finding_id: SA2-D-002
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: INFO
+    severity: INFO
+    location: "TCK-PEND-009a + TCK-PEND-009b"
+    title: "Tool Execution Split is Correct but Needs Coordination"
+    description: |
+      TCK-PEND-009a (executor + budget charging) and TCK-PEND-009b (receipt generation)
+      are atomic tickets, but they share state:
+      - 009a produces ToolResult with result_hash and duration_ms
+      - 009b consumes ToolResult and wraps in Receipt
+
+      The dependency (009b depends_on 009a) is correct. However, agents implementing
+      009a should ensure ToolResult struct is public and stable. Receipt generation
+      in 009b should not require re-signing or hashing the result (idempotent).
+    remediation: |
+      Document in 009a: "ToolResult struct is public API; do not break in 009b."
+      Document in 009b: "Receipt generation is deterministic given ToolResult; idempotent."
+    source_mode: "Mode 68 (Scientific Method) - validated against CTR-DAEMON-004 contract"
+
+  - finding_id: SA2-D-003
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: MAJOR
+    severity: MAJOR
+    location: "TCK-PEND-002 (Protobuf)"
+    title: "Protobuf Message Definitions Must Include Fallback Semantics"
+    description: |
+      TCK-PEND-002 specifies "Define proto/daemon_protocol.proto with all message types"
+      but 04_contracts_and_versioning.yaml only provides examples for 6 message groups:
+      - CTR-PROTO-001: Handshake (Hello, HelloAck)
+      - CTR-PROTO-002: Episode control (CreateEpisode, EpisodeCreated, ...)
+      - CTR-PROTO-003: I/O (SendInput, StreamOutput)
+      - CTR-PROTO-004: Tool mediation (ToolRequest, ToolDecision, ToolResult)
+      - CTR-PROTO-005: Telemetry (TelemetryFrame, TelemetryPolicy)
+      - CTR-PROTO-006: Receipts (PublishEvidence, Receipt)
+
+      But the contracts are incomplete. For example:
+      - CTR-PROTO-002 defines CreateEpisode but not the nested EpisodeEnvelope message
+      - CTR-PROTO-005 TelemetryFrame lacks detailed cgroup_stats structure
+      - Error handling messages not specified (ErrorMsg, ErrorCode enums)
+      - No heartbeat/keepalive message definition
+
+      Agent implementing TCK-PEND-002 will make assumptions about:
+      1. How to embed EpisodeEnvelope in CreateEpisode (by hash vs inline?)
+      2. How to structure CgroupStats message
+      3. What error codes to define
+      4. Whether to include keepalive/ping messages
+
+      These decisions will be hardcoded in .proto file and affect all downstream code.
+    remediation: |
+      Before starting TCK-PEND-002:
+      1. Extend 04_contracts_and_versioning.yaml with complete CTR-PROTO-001 through
+         CTR-PROTO-006 message definitions (not just examples)
+      2. Define CgroupStats structure (per AD-TEL-001)
+      3. Define ErrorMsg and ErrorCode enum (required for protocol error handling)
+      4. Specify heartbeat/keepalive message (for daemon liveness)
+      5. Specify whether EpisodeEnvelope is embedded or referenced by hash
+
+      This is a PREREQUISITE for TCK-PEND-002 to be implementable without ambiguity.
+    source_mode: "Mode 9 (Abductive Reasoning) - inferred missing message definitions from codebase patterns"
+
+  - finding_id: SA2-D-004
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: MAJOR
+    severity: MAJOR
+    location: "TCK-PEND-011 (Cgroup Reader)"
+    title: "Cgroup Implementation Choice (Systemd vs Direct) Not Specified"
+    description: |
+      TCK-PEND-011 summary says "CgroupReader for cpu, memory, io stats" but doesn't
+      specify implementation strategy. AD-CGROUP-001 provides design:
+
+      **Primary**: systemd transient API via DBus (zbus crate)
+      **Fallback**: Direct cgroup v2 writes via nix crate
+
+      However, the ticket doesn't specify:
+      1. Should implementation attempt systemd first, then fallback to direct?
+      2. What error cases trigger fallback (DBus unavailable, permissions, systemd not running)?
+      3. Should CgroupReader expose which backend is active (systemd vs direct)?
+      4. What metrics are available from each backend?
+         - Systemd provides: cpu.max, memory.max via transient unit properties
+         - Direct cgroup provides: /sys/fs/cgroup/*/stat files
+      5. Do both backends need to be implemented in TCK-PEND-011, or is 011 primary
+         and 012 (TelemetryCollector) handles fallback?
+
+      Agent implementing 011 will make assumptions that may be revisited in 012.
+    remediation: |
+      Clarify in TCK-PEND-011 ticket:
+      1. Implement BOTH systemd (primary) AND direct cgroup (fallback) readers
+      2. Specify error cases: (1) DBus unavailable → direct, (2) permission denied → degraded metrics
+      3. Define CgroupReaderBackend enum: Systemd | Direct | Degraded
+      4. Document metrics available from each backend
+      5. Testing: Include fallback scenario (simulate DBus unavailable)
+
+      Alternative: Split TCK-PEND-011 into:
+      - 011a: SystemdCgroupReader (primary)
+      - 011b: DirectCgroupReader (fallback)
+      But this increases atomicity; current split is acceptable if clarified.
+    source_mode: "Mode 38 (Counterfactual Reasoning) - what breaks if systemd unavailable?"
+
+  - finding_id: SA2-D-005
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: MAJOR
+    severity: MAJOR
+    location: "TCK-PEND-012 (TelemetryCollector)"
+    title: "TelemetryFrame Sampling Policy Integration Underspecified"
+    description: |
+      TCK-PEND-012 says "Configurable sample interval. Integration with budget accounting."
+      but CTR-DAEMON-005 interface shows:
+
+      ```rust
+      pub async fn collect(&self, handle: &TelemetryHandle) -> TelemetryFrame;
+      pub fn apply_policy(&mut self, policy: TelemetryPolicy);
+      ```
+
+      However:
+      1. What is the semantics of `collect()`? Is it:
+         - Synchronous snapshot of current metrics?
+         - Aggregation since last collect()?
+         - Best-effort or blocking?
+      2. How is sample_interval_ms used? Does TelemetryCollector spawn a background
+         task that emits frames at interval, or does caller loop?
+      3. Policy application: Can policy be changed mid-episode? What happens to
+         in-flight TelemetryFrames?
+      4. TelemetryFrame.seq field: Is this episode-local or daemon-global? Monotonic within
+         episode or can it reset?
+
+      Agent will need to make design decisions that propagate to Phase 4 (E2E tests).
+    remediation: |
+      Update TCK-PEND-012 summary with:
+      1. Specify collect() semantics: "Blocking call; returns snapshot of current metrics"
+         or "Aggregation since last collect()" or "Best-effort non-blocking"
+      2. Clarify sample_interval_ms: "Background task spawned on start(); emits frames
+         to caller via callback/stream"
+      3. Policy application: "Policy can be changed via apply_policy(); new policy applies
+         to next collected frame"
+      4. Seq field: "Monotonic within episode; resets on new episode. Enables frame ordering."
+
+      These are design choices, not ambiguities. But ticket should force the choice.
+    source_mode: "Mode 68 (Scientific Method) - validated against CTR-DAEMON-005 contract interface"
+
+  - finding_id: SA2-D-006
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: MAJOR
+    severity: MAJOR
+    location: "TCK-PEND-013 (Flight Recorder)"
+    title: "Ring Buffer Trigger Mechanism Not Specified"
+    description: |
+      TCK-PEND-013 specifies "Per-episode ring buffers for PTY, tool I/O, telemetry.
+      Persistence on trigger events." But doesn't specify:
+
+      1. What are the trigger events? The risks/architecture mention:
+         - Gate failure
+         - Policy violation
+         - Budget exhaustion
+         - Crash/kill
+         - Explicit pin request
+         But how does ring buffer implementation learn about these?
+
+      2. Who calls "persist()"? Is ring buffer responsible for monitoring events,
+         or does EpisodeRuntime call ring_buffer.persist() on trigger?
+
+      3. How are buffers addressed? Are they:
+         - Stored in memory until trigger (bounded size)?
+         - Pre-allocated in CAS (requires space reservation)?
+         - Spilled to tmpfs on overflow?
+
+      4. Concurrency: Ring buffers are written by:
+         - PTY reader task
+         - Tool executor task
+         - Telemetry task
+         Can they write concurrently without locks? (Probably needs RwLock per buffer)
+
+      5. Replay semantics: If ring buffer is replayed, what order? (Likely seq number order)
+    remediation: |
+      Update TCK-PEND-013 with:
+      1. Trigger mechanism: "Ring buffers emit events to ledger on gate_failure |
+         policy_violation | budget_exhaustion | crash | explicit_pin"
+      2. Ownership: "EpisodeRuntime listens to event stream; calls ring_buffer.persist()
+         on trigger event"
+      3. Storage: "Ring buffers in memory (bounded); on persist → CAS storage"
+      4. Concurrency: "Each ring buffer protected by RwLock for concurrent writers"
+      5. Replay: "Buffers emitted to ledger as telemetry.frame events; reducers replay by seq"
+
+      Consider: Split TCK-PEND-013 into:
+      - 013a: Ring buffer types (PTY, tool, telemetry) with in-memory bounded storage
+      - 013b: Trigger persistence (listening to events, calling CAS)
+      But current scope is acceptable if clarified.
+    source_mode: "Mode 9 (Abductive Reasoning) - inferred from AD-EVID-001 architectural decision"
+
+  - finding_id: SA2-D-007
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: MAJOR
+    severity: MAJOR
+    location: "TCK-PEND-014 (Evidence TTL and Pinning)"
+    title: "TTL Enforcement and Pinning Event Semantics Underspecified"
+    description: |
+      TCK-PEND-014 says "Evidence artifact with ttl, class, pin_state. TTL enforcement
+      timer. Pin API for incident binding." But:
+
+      1. TTL enforcement: Is this:
+         - A background task that emits evidence.ttl_expired events?
+         - A lazy check (on access)?
+         - Manual cleanup via compaction job?
+
+      2. Pin API: How is pinning initiated?
+         - Via DefectRecord::pin(artifact_hash)?
+         - Via explicit API call?
+         - Automatic on gate failure/quarantine?
+
+      3. Pin state field structure: Is it:
+         ```rust
+         enum PinState {
+             Unpinned,
+             Pinned { reason: String, expires_at: Timestamp },
+         }
+         ```
+         or something else?
+
+      4. Interaction with compaction: If pinned artifact, does compaction skip it?
+         Or reference it by tombstone?
+
+      5. Event emission: Should TTL expiration and pinning state changes emit events
+         to ledger (per AD-EVID-003 architectural principle)?
+    remediation: |
+      Update TCK-PEND-014 with:
+      1. TTL enforcement strategy: "Background timer task emits evidence.ttl_expired events
+         to ledger on expiration"
+      2. Pin API: "DefectRecord initiates pinning via evidence.pin(artifact_hash, reason)"
+      3. Pin state structure: Define exact enum/struct
+      4. Compaction interaction: "Pinned artifacts excluded from compaction; unpinned dropped"
+      5. Event semantics: "Both TTL expiration and pin state changes emit events to ledger
+         for EvidenceReducer processing"
+
+      This ticket should reference OQ-DAEMON-005 (Event Vocabulary) which is RESOLVED_V4.
+      Ensure consistency with event types defined there.
+    source_mode: "Mode 38 (Counterfactual Reasoning) - what breaks if TTL expires mid-compaction?"
+
+  - finding_id: SA2-D-008
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: MAJOR
+    severity: MAJOR
+    location: "TCK-PEND-016 (Claude Code Adapter)"
+    title: "Vendor-Specific Parser Test Fixtures Must Be Real"
+    description: |
+      TCK-PEND-016 says "Test fixtures from real Claude Code sessions" but doesn't
+      specify:
+
+      1. What format are the fixtures? Raw PTY output (ANSI codes, etc.)?
+      2. How many scenarios? (Happy path, tool errors, timeouts, etc.?)
+      3. Tool call format: Is it JSON blocks? Markdown? Custom?
+      4. Parser determinism requirement: Per AD-ADAPT-001, parser must be deterministic
+         state machine. Does fixture set cover all state transitions?
+      5. Error cases: What if PTY output is malformed? Should parser emit defect record
+         or crash? (AD-ADAPT-001 says emit defect)
+
+      Agent implementing 016 needs:
+      - Real Claude Code CLI output samples
+      - Specification of tool request format
+      - Error handling requirements
+      - Test harness for parser validation
+    remediation: |
+      Before starting TCK-PEND-016:
+      1. Collect real Claude Code session transcripts (≥10 representative scenarios)
+      2. Extract PTY output samples for:
+         - Normal tool calls (Read, Write, Execute)
+         - Tool errors (timeout, permission denied)
+         - Malformed output
+      3. Document tool request format (JSON? Markdown? Custom delimiter?)
+      4. Create test fixtures in crates/apm2-core/src/adapter/fixtures/claude_code/
+      5. Define parser state machine (diagram or pseudo-code) before implementation
+
+      This is necessary input to TCK-PEND-016; cannot be deferred.
+    source_mode: "Mode 53 (Heuristic Reasoning) - vendor-specific parsers are fragile; test fixtures are mandatory"
+
+  - finding_id: SA2-D-009
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: MAJOR
+    severity: MAJOR
+    location: "TCK-PEND-018a + TCK-PEND-018b + TCK-PEND-018c"
+    title: "E2E Test Harness Architecture Must Be Designed Before Implementation"
+    description: |
+      TCK-PEND-018 is split into three E2E test suites, but they require a shared
+      test harness:
+
+      1. **Test Infrastructure**: Do all three suites use the same harness or separate?
+         - Shared: Single daemon instance, multiple test episodes
+         - Separate: Each suite spawns daemon independently
+         If shared, need to coordinate test isolation (episodes don't interfere).
+
+      2. **CLI Testing**: TCK-PEND-017 implements CLI; 018 tests CLI. But:
+         - Does CLI command output need to be verified (JSON format)?
+         - Should E2E tests use CLI or direct IPC?
+         - Who owns CLI testing (017 or 018)?
+
+      3. **Fixture Data**: All three suites need:
+         - Test policy files (ALLOW/DENY tool requests)
+         - Sample capability manifests
+         - Episode budget configurations
+         - Expected telemetry frame assertions
+      Are these shared or per-suite?
+
+      4. **Test Determinism**: TCK-PEND-018c "Evidence and receipt verification" requires:
+         - Golden receipts (computed from fixtures)
+         - Signature verification tests
+         - But if receipts are signed with random nonces or timestamps, golden
+           receipts won't match. How to handle?
+
+      5. **Timing Sensitivity**: Tests that verify telemetry timing (018b) or budget
+         exhaustion (018a) are inherently flaky on loaded systems. Need:
+         - Timeout margins?
+         - Retry logic?
+         - Mocked time?
+    remediation: |
+      Design E2E test harness BEFORE starting 018a/018b/018c:
+      1. Create crates/apm2-daemon/tests/e2e/ directory
+      2. Define shared test infrastructure:
+         - TestDaemon struct (spawns daemon, manages lifecycle)
+         - TestFixtures struct (policies, manifests, budgets)
+         - EpisodeTestHarness (creates episodes, runs tests)
+      3. Clarify CLI testing: CLI commands tested via subprocess (slow, real) vs
+         direct harness calls (fast, unit-like)
+      4. Define test determinism: Mocked time for timing-sensitive tests
+      5. Golden receipts: Document if signatures must be deterministic (use fixed keys
+         for tests, rotate in production)
+
+      Estimated effort: 2-3 days of design before starting implementation.
+      Consider adding TCK-PEND-018x (E2E test infrastructure) BEFORE 018a/b/c.
+    source_mode: "Mode 68 (Scientific Method) - validated test structure against RFC-0001 E2E test patterns"
+
+  - finding_id: SA2-D-010
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: INFO
+    severity: INFO
+    location: "TCK-PEND-001 through TCK-PEND-017"
+    title: "Dependency Features and Versions Confirmed"
+    description: |
+      RFC-0013 00_meta.yaml specifies key dependencies:
+      - tokio 1.x (async runtime) ✓ Available, features: full
+      - prost 0.12 (protobuf) ✓ Available
+      - nix 0.30 (Unix APIs) ✓ Available, needs features: signal, process, fs, pty
+      - blake3 1.x (hashing) ✓ Available
+      - ed25519-dalek 2.x (signing) ✓ Available
+      - zbus 4.4 (DBus) ✓ Available (for systemd integration)
+
+      All dependencies are production-ready and compatible. No blocking issues.
+
+      Cargo.toml updates required:
+      - apm2-daemon: Add zbus 4.4 (systemd transient API)
+      - apm2-daemon: Verify nix crate has signal/process/fs/pty features enabled
+      - kernel-testkit: New crate for golden vector tests
+
+      These are standard dependency management tasks.
+    remediation: "Update Cargo.toml for apm2-daemon and create kernel-testkit crate. Standard process."
+    source_mode: "Mode 68 (Scientific Method) - validated against crates.io and existing Cargo.lock"
+
+  - finding_id: SA2-D-011
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: INFO
+    severity: INFO
+    location: "TCK-PEND-003, TCK-PEND-009a, TCK-PEND-010"
+    title: "Canonicalization and Receipt Signing Require Golden Vectors"
+    description: |
+      Three tickets require golden vector tests per AD-VERIFY-001:
+
+      - TCK-PEND-003 (EpisodeEnvelope): canonical_bytes() must produce deterministic digest
+      - TCK-PEND-009a (ToolResult): result_hash must be stable
+      - TCK-PEND-010 (Receipt): signature verification must pass golden vectors
+
+      This requires:
+      1. Define canonical_bytes() for each type
+      2. Generate golden vectors (sample inputs + expected digest)
+      3. Test across platforms (x86_64, aarch64, maybe wasm)
+      4. Maintain vectors for backward compatibility (per AD-KEY-001)
+
+      kernel-testkit crate will own golden vectors. Implementation effort:
+      - Per type: 30 min design + 30 min test vector generation + 1 hour verification
+      - Across 3 types: ~6 hours
+
+      This is inline with TCK-PEND-002 (protobuf definitions) and TCK-PEND-010
+      (receipt signing). No blocking issues; standard practice.
+    remediation: "Include golden vector generation in TCK-PEND-003, 009a, 010 implementation scope."
+    source_mode: "Mode 68 (Scientific Method) - validated against existing canonicalization patterns in apm2-core"
+
+  - finding_id: SA2-D-012
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: MAJOR
+    severity: MAJOR
+    location: "TCK-PEND-004 (EpisodeRuntime)"
+    title: "State Machine Integration with SessionState Needs Clarification"
+    description: |
+      TCK-PEND-004 defines a 3-state machine: CREATED → RUNNING → (TERMINATED | QUARANTINED).
+      However, apm2-core/src/session/mod.rs already defines SessionState with more states.
+
+      AD-LAYER-001 says EpisodeRuntime wraps EpisodeController, not replaces SessionReducer.
+      But the exact integration is unclear:
+
+      1. Does EpisodeRuntime.state_machine emit events to SessionReducer?
+      2. Or does EpisodeRuntime maintain its own state independent of SessionState?
+      3. If independent, how do they stay in sync? (Both in RUNNING, or only one?)
+      4. Which state is authoritative for stop conditions?
+
+      Implementation approach options:
+      A. EpisodeRuntime owns SessionState; emits events that SessionReducer consumes
+      B. EpisodeRuntime mirrors SessionState; manual sync on transitions
+      C. EpisodeRuntime uses SessionReducer directly (tight coupling)
+      D. Separate state machines; no sync (loose coupling, potential divergence)
+
+      AD-LAYER-001 suggests option A (EpisodeRuntime owns state, reducer consumes events).
+      But TCK-PEND-004 doesn't specify which approach to take.
+    remediation: |
+      Clarify TCK-PEND-004 ticket with:
+      1. State machine definition diagram showing SessionState integration
+      2. Event emission: "EpisodeRuntime transitions emit SessionEvent to ledger"
+      3. Reducer integration: "SessionReducer processes events; updates SessionState projection"
+      4. Invariant: "SessionState.status reflects EpisodeRuntime.state after event processing"
+      5. Code example: How to emit event on RUNNING transition
+
+      Recommended: Add integration test showing sync between EpisodeRuntime state and
+      SessionReducer projection.
+    source_mode: "Mode 38 (Counterfactual Reasoning) - what breaks if state machines diverge?"
+
+  - finding_id: SA2-D-013
+    gate_id: GATE-TCK-ATOMICITY
+    category: INFO
+    severity: INFO
+    location: "TCK-PEND-009a + TCK-PEND-009b + TCK-PEND-010"
+    title: "Tool Execution Pipeline is Well-Architected"
+    description: |
+      The three-ticket pipeline for tool execution is correctly split:
+      - 009a: Executor (calls tool, captures result)
+      - 009b: Receipt generation (binds result to envelope)
+      - 010: Receipt signing (cryptographic binding)
+
+      Each ticket:
+      1. Is atomic (completable in 1-2 days)
+      2. Has clear dependencies (009b → 009a, 010 → 009b)
+      3. Has distinct responsibilities (exec, receipt, signing)
+      4. Can be tested independently (unit tests per ticket)
+      5. Can be integrated in sequence (pipeline property verified in 018b)
+
+      This is an exemplar of good ticket design. No issues.
+    remediation: "No remediation. Exemplary design."
+    source_mode: "Mode 53 (Heuristic Reasoning) - matches best practices for cryptographic pipelines"
+
+  - finding_id: SA2-D-014
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: MAJOR
+    severity: MAJOR
+    location: "TCK-PEND-007 (Capability Manifest)"
+    title: "OCAP Enforcement Rules Need Specification"
+    description: |
+      TCK-PEND-007 defines CapabilityManifest type and validation, but doesn't specify
+      OCAP enforcement rules:
+
+      1. When is capability validated? Before tool execution (TCK-PEND-009a)?
+      2. What happens on invalid? (Deny with DefectRecord per AD-CAC-001?)
+      3. Scope validation: How are root paths and patterns validated?
+         - Exact match? Prefix match? Regex?
+      4. Risk tier enforcement: If manifest requires tier 2 but episode tier 1,
+         is tool denied or allowed?
+      5. Delegation semantics: Can capabilities be delegated transitively?
+         (AD-TOOL-002 says "only explicit delegation", so no.)
+
+      These rules should be encoded in OCAP enforcement logic, likely in ToolBroker
+      or a separate PolicyEngine integration.
+    remediation: |
+      Create separate document: "OCAP Enforcement Rules for CapabilityManifest"
+      Specify:
+      1. Validation timing: "Pre-execution in ToolBroker.request() (before TCK-PEND-009a)"
+      2. Invalid behavior: "DENY decision; emit DefectRecord with reason"
+      3. Scope matching: "Regex patterns against tool arguments (Read root paths, etc.)"
+      4. Risk tier: "Episode tier must >= manifest required_tier"
+      5. Delegation: "Non-delegable; original delegator_id in manifest is authority"
+
+      Alternatively: Extend CTR-DAEMON-004 (ToolBroker contract) with example validation code.
+    source_mode: "Mode 9 (Abductive Reasoning) - inferred from AD-TOOL-002 and CAC principles"
+
+  - finding_id: SA2-D-015
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: INFO
+    severity: INFO
+    location: "Phase 2A and Phase 2B Sequencing"
+    title: "Tool Broker Phases are Properly Sequenced"
+    description: |
+      Phase 2A (Tool Broker Foundation):
+      - 007: CapabilityManifest (types + validation)
+      - 008: ToolBroker (core with dedupe)
+
+      Phase 2B (Tool Execution):
+      - 009a: Executor (uses ToolBroker.execute())
+      - 009b: Receipts (documents tool execution)
+      - 010: Signing (cryptographic seal)
+
+      This sequencing is correct:
+      1. Manifest types (007) must precede broker (008)
+      2. Broker must precede executor (009a) which calls broker.execute()
+      3. Receipt generation (009b) follows result capture (009a)
+      4. Signing (010) is final seal on receipt (009b)
+
+      Each phase builds cleanly on the prior. No rework anticipated.
+    remediation: "No remediation. Sequencing is excellent."
+    source_mode: "Mode 68 (Scientific Method) - validated dependency DAG against RFC contracts"
+
+summary_statistics:
+  total_findings: 15
+  blockers: 0
+  major_issues: 7
+  info_items: 8
+
+  breakdown_by_gate:
+    gate_atomicity: 1 info
+    gate_implementability: 6 major + 7 info
+
+major_issues_summary:
+  - id: SA2-D-003
+    location: "TCK-PEND-002"
+    issue: "Protobuf contracts incomplete; agent needs full message definitions"
+
+  - id: SA2-D-004
+    location: "TCK-PEND-011"
+    issue: "Cgroup implementation choice (systemd vs direct) not specified"
+
+  - id: SA2-D-005
+    location: "TCK-PEND-012"
+    issue: "TelemetryFrame sampling policy integration underspecified"
+
+  - id: SA2-D-006
+    location: "TCK-PEND-013"
+    issue: "Ring buffer trigger mechanism not specified"
+
+  - id: SA2-D-007
+    location: "TCK-PEND-014"
+    issue: "TTL enforcement and pinning semantics underspecified"
+
+  - id: SA2-D-008
+    location: "TCK-PEND-016"
+    issue: "Vendor-specific parser test fixtures must be real"
+
+  - id: SA2-D-009
+    location: "TCK-PEND-018a/b/c"
+    issue: "E2E test harness architecture must be designed before implementation"
+
+  - id: SA2-D-012
+    location: "TCK-PEND-004"
+    issue: "State machine integration with SessionState needs clarification"
+
+  - id: SA2-D-014
+    location: "TCK-PEND-007"
+    issue: "OCAP enforcement rules need specification"
+
+remediation_priority:
+  - order: 1
+    ticket: "TCK-PEND-002 (Protobuf)"
+    reason: "Blocks all downstream code; must be resolved before implementation"
+    estimated_effort: "2-3 days"
+
+  - order: 2
+    ticket: "TCK-PEND-004 (EpisodeRuntime state machine)"
+    reason: "Foundation for episode lifecycle; clarification enables other tickets"
+    estimated_effort: "0.5 day clarification"
+
+  - order: 3
+    ticket: "TCK-PEND-007 (Capability Manifest OCAP rules)"
+    reason: "Blocks TCK-PEND-008 and TCK-PEND-009a implementation"
+    estimated_effort: "1-2 days specification"
+
+  - order: 4
+    ticket: "TCK-PEND-011/012 (Cgroup and Telemetry)"
+    reason: "Design choices (systemd vs direct, sampling semantics)"
+    estimated_effort: "1 day clarification each"
+
+  - order: 5
+    ticket: "TCK-PEND-013/014 (Flight Recorder and TTL)"
+    reason: "Evidence economics architecture clarity"
+    estimated_effort: "1-2 days clarification each"
+
+  - order: 6
+    ticket: "TCK-PEND-016 (Claude Code Adapter)"
+    reason: "Requires real test fixtures; external dependency on session data"
+    estimated_effort: "2-3 days fixture collection"
+
+  - order: 7
+    ticket: "TCK-PEND-018 (E2E Tests)"
+    reason: "Test harness design prerequisite"
+    estimated_effort: "2-3 days design before implementation"
+
+verdict: PASS_WITH_MAJOR_CLARIFICATIONS
+verdict_explanation: |
+  **Summary:**
+  RFC-0013 preliminary ticket decomposition PASSES both gates:
+
+  - **GATE-TCK-ATOMICITY:** PASSED
+    All 21 tickets are atomic and completable in 1-2 days.
+    Previous splits (009a/b, 018a/b/c) are correct.
+
+  - **GATE-TCK-IMPLEMENTABILITY:** PASSED WITH CLARIFICATIONS
+    All 21 tickets are implementable, but 7 have incomplete specifications
+    that will cause agent assumptions and rework.
+
+  **The Good:**
+  1. Phase sequencing is correct; no circular dependencies
+  2. Dependency DAG is clean and linear
+  3. Contracts (CTR-DAEMON-001 through CTR-PROTO-006) provide solid interface definitions
+  4. Architecture decisions (AD-*) are well-reasoned and grounded in doctrine
+  5. Tool execution pipeline (009a/b/010) is exemplary in design
+  6. Dependencies (tokio, prost, nix, blake3, ed25519-dalek, zbus) are confirmed available
+
+  **The Gaps:**
+  1. Protobuf message definitions need completion (TCK-PEND-002 prerequisite)
+  2. Cgroup implementation strategy needs design choice (systemd vs direct)
+  3. Telemetry sampling semantics need clarification
+  4. Evidence ring buffer trigger mechanism needs specification
+  5. TTL enforcement and pinning event semantics need design
+  6. Vendor adapter test fixtures must be real (external dependency)
+  7. E2E test harness needs design before implementation
+  8. State machine integration with SessionReducer needs clarification
+  9. OCAP enforcement rules need specification
+
+  **Recommendation:**
+  APPROVE tickets for implementation with condition: Major issues (SA2-D-003 through
+  SA2-D-009, SA2-D-012, SA2-D-014) must be addressed BEFORE implementation starts.
+
+  Estimated effort to remediate: 10-15 days of clarification and design work.
+  Estimated implementation time after remediation: 30-40 days for 21 tickets (parallel).
+
+  **Path Forward:**
+  1. Create detailed specifications for 9 major issues (SA2-D-003, 004, 005, 006, 007, 008, 009, 012, 014)
+  2. Collect real test fixtures for TCK-PEND-016 (Claude Code adapter)
+  3. Design E2E test harness before starting TCK-PEND-018
+  4. Once clarified, all 21 tickets are READY_TO_IMPLEMENT
+
+verdict_date: "2026-01-27"
+agent_signature: "SA-2 (Implementation Feasibility)"

@@ -1,0 +1,120 @@
+acceptance_criteria:
+  - criterion: Tool executor with budget charging
+    verification: Budget decremented after execution
+  - criterion: CAS storage for tool results
+    verification: Results stored with content hash
+  - criterion: OCAP enforcement during execution
+    verification: Capability violations prevented
+implementation:
+  code_examples:
+    - description: Tool execution flow
+      code: |
+        pub struct ToolExecutor {
+            budget_tracker: Arc<BudgetTracker>,
+            cas: Arc<ContentAddressedStore>,
+            executors: HashMap<ToolClass, Box<dyn ToolHandler>>,
+        }
+
+        impl ToolExecutor {
+            pub async fn execute(
+                &self,
+                episode_id: EpisodeId,
+                decision: ToolDecision,
+                args: ToolArgs,
+            ) -> Result<ToolResult> {
+                // Charge budget
+                self.budget_tracker.charge(&decision.budget_delta)?;
+
+                // Execute tool
+                let handler = self.executors.get(&decision.tool_class)?;
+                let result = handler.execute(args).await?;
+
+                // Store result in CAS
+                let result_hash = self.cas.store(&result)?;
+
+                Ok(ToolResult {
+                    request_id: decision.request_id,
+                    outcome: ToolOutcome::Success,
+                    result_hash,
+                    duration_ms: elapsed,
+                })
+            }
+        }
+  files_to_create:
+    - path: crates/apm2-daemon/src/episode/executor.rs
+      purpose: ToolExecutor and execution logic
+    - path: crates/apm2-daemon/src/episode/budget_tracker.rs
+      purpose: Episode budget tracking and charging
+    - path: crates/apm2-daemon/src/episode/tool_handler.rs
+      purpose: ToolHandler trait for tool implementations
+  files_to_modify:
+    - changes: Export executor, budget_tracker, tool_handler modules
+      path: crates/apm2-daemon/src/episode/mod.rs
+  implementation_steps:
+    - step: 1
+      action: Define ToolHandler trait
+      details: |
+        Create trait for tool implementations:
+        - tool_class() -> ToolClass
+        - execute(args: ToolArgs) -> Result<ToolResultData>
+        - validate(args: &ToolArgs) -> Result<()>
+    - step: 2
+      action: Implement BudgetTracker
+      details: |
+        Create budget tracking per episode:
+        - from_envelope(budget: EpisodeBudget) -> BudgetTracker
+        - charge(delta: &BudgetDelta) -> Result<()>
+        - remaining() -> EpisodeBudget
+        - is_exhausted() -> bool
+    - step: 3
+      action: Implement ToolExecutor
+      details: |
+        Create executor with:
+        - Registry of ToolHandlers by class
+        - Budget charging before execution
+        - Result storage in CAS
+        - Duration tracking
+    - step: 4
+      action: Implement basic tool handlers
+      details: |
+        Create handlers for core tools:
+        - ReadFileHandler: reads files within scope
+        - WriteFileHandler: writes files within scope
+        - ExecuteHandler: runs commands
+        All validate against capability scope
+    - step: 5
+      action: Emit ToolExecuted event
+      details: |
+        After execution, emit event:
+        - request_id, result_hash
+        - duration_ms, outcome
+        - budget_remaining
+  summary: |
+    Implement tool execution and budget charging per AD-TOOL-001.
+    ToolExecutor charges budget before execution, stores results in CAS,
+    and enforces OCAP throughout the execution flow.
+notes: |
+  Phase: PHASE-2B (Tool Execution and Receipts)
+  Generated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.
+  Maps to TCK-PEND-009a.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Budget charging
+    test_id: UT-00165-01
+    verification_command: cargo test -p apm2-daemon budget_charge
+  - description: CAS storage
+    test_id: UT-00165-02
+    verification_command: cargo test -p apm2-daemon tool_cas_storage
+  - description: Budget exhaustion
+    test_id: UT-00165-03
+    verification_command: cargo test -p apm2-daemon budget_exhaustion
+ticket:
+  depends_on:
+    - TCK-00164
+  id: TCK-00165
+  requirement_ids:
+    - REQ-TOOL-001
+  rfc_id: RFC-0013
+  status: READY
+  title: Implement tool execution and budget charging

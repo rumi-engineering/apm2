@@ -1,0 +1,112 @@
+acceptance_criteria:
+  - criterion: CapabilityManifest type with sealed references
+    verification: Unit test verifies manifest structure
+  - criterion: Capability validation against tool requests
+    verification: Unauthorized requests denied
+  - criterion: Policy integration for OCAP enforcement
+    verification: Policy rules evaluated for each request
+implementation:
+  code_examples:
+    - description: CapabilityManifest structure
+      code: |
+        pub struct CapabilityManifest {
+            pub manifest_id: ManifestId,
+            pub capabilities: Vec<Capability>,
+            pub delegator_id: ActorId,
+            pub created_at: Timestamp,
+            pub expires_at: Option<Timestamp>,
+        }
+
+        pub struct Capability {
+            pub capability_id: CapabilityId,
+            pub tool_class: ToolClass,
+            pub scope: CapabilityScope,
+            pub risk_tier_required: RiskTier,
+        }
+
+        pub struct CapabilityScope {
+            pub root_paths: Vec<PathBuf>,
+            pub allowed_patterns: Vec<GlobPattern>,
+            pub size_limits: SizeLimits,
+            pub network_policy: Option<NetworkPolicy>,
+        }
+  files_to_create:
+    - path: crates/apm2-daemon/src/episode/capability.rs
+      purpose: CapabilityManifest and Capability types
+    - path: crates/apm2-daemon/src/episode/scope.rs
+      purpose: CapabilityScope and validation logic
+    - path: crates/apm2-daemon/src/episode/tool_class.rs
+      purpose: ToolClass enum and matching
+  files_to_modify:
+    - changes: Export capability, scope, tool_class modules
+      path: crates/apm2-daemon/src/episode/mod.rs
+  implementation_steps:
+    - step: 1
+      action: Define CapabilityManifest
+      details: |
+        Create manifest type per AD-TOOL-002:
+        - manifest_id: unique identifier
+        - capabilities: Vec<Capability>
+        - delegator_id: who granted
+        - timestamps for audit
+    - step: 2
+      action: Define Capability struct
+      details: |
+        Create sealed capability reference:
+        - capability_id: unique
+        - tool_class: Read | Write | Execute | Network | ...
+        - scope: path patterns, size limits
+        - risk_tier_required: minimum tier
+    - step: 3
+      action: Implement CapabilityScope
+      details: |
+        Create scope validation:
+        - root_paths: allowed base directories
+        - allowed_patterns: glob patterns for paths
+        - size_limits: max bytes per operation
+        - network_policy: allowed hosts/ports
+    - step: 4
+      action: Implement validation logic
+      details: |
+        CapabilityManifest.validate(tool_request):
+        - Find matching capability by tool_class
+        - Verify path within allowed patterns
+        - Check size limits
+        - Verify risk tier
+        - Return Allow | Deny(reason)
+    - step: 5
+      action: Integrate with PolicyEngine
+      details: |
+        CapabilityValidator struct:
+        - load_manifest(hash: Hash) -> CapabilityManifest
+        - validate_request(manifest, request) -> Decision
+        - Uses apm2-core PolicyEngine for rule evaluation
+  summary: |
+    Implement capability manifest and validation per AD-TOOL-002.
+    Defines sealed capability references with scoped parameters.
+    Capabilities are delegated not discovered (OCAP enforcement).
+notes: |
+  Phase: PHASE-2A (Tool Broker Foundation)
+  Generated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.
+  Maps to TCK-PEND-007.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Capability validation
+    test_id: UT-00163-01
+    verification_command: cargo test -p apm2-daemon capability_validation
+  - description: Scope pattern matching
+    test_id: UT-00163-02
+    verification_command: cargo test -p apm2-daemon scope_patterns
+  - description: Unauthorized denial
+    test_id: UT-00163-03
+    verification_command: cargo test -p apm2-daemon capability_deny
+ticket:
+  depends_on:
+    - TCK-00160
+  id: TCK-00163
+  requirement_ids:
+    - REQ-TOOL-001
+  rfc_id: RFC-0013
+  status: READY
+  title: Implement capability manifest and validation
