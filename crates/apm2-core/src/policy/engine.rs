@@ -873,9 +873,7 @@ fn matches_command_pattern(pattern: &str, command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{
-        ArtifactFetch, FileEdit, FileRead, FileWrite, GitOperation, InferenceCall, ShellExec,
-    };
+    use crate::tool::{FileEdit, FileRead, FileWrite, GitOperation, InferenceCall, ShellExec};
 
     fn create_test_policy(yaml: &str) -> LoadedPolicy {
         LoadedPolicy::from_yaml(yaml).expect("valid test policy")
@@ -2459,7 +2457,7 @@ policy:
 #[cfg(test)]
 mod consumption_tests {
     use super::*;
-    use crate::tool::{ArtifactFetch, FileRead, ToolRequest, tool_request};
+    use crate::tool::{ArtifactFetch, ToolRequest, tool_request};
 
     fn create_test_policy(yaml: &str) -> LoadedPolicy {
         LoadedPolicy::from_yaml(yaml).expect("valid test policy")
