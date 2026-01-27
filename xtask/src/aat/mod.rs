@@ -5,6 +5,7 @@
 //! hypothesis-driven testing before they can merge.
 
 pub mod anti_gaming;
+pub mod cac_harness;
 pub mod evidence;
 pub mod executor;
 pub mod parser;
