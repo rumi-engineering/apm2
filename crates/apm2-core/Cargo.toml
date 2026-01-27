@@ -86,6 +86,9 @@ http.workspace = true
 http-body-util.workspace = true
 tower.workspace = true
 
+# CLI (optional, for clap introspection)
+clap = { workspace = true, optional = true }
+
 # Unix-specific (for TOCTOU mitigation via O_NOFOLLOW)
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -109,6 +112,8 @@ default = []
 test-utils = []
 # Enable canonicalization test vectors for cross-platform verification
 test_vectors = []
+# Enable clap introspection for CLI command enumeration
+clap-introspection = ["dep:clap"]
 
 [lints]
 workspace = true

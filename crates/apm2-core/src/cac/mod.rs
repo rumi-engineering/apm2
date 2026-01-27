@@ -174,6 +174,7 @@ pub mod compiler;
 pub mod conformance;
 pub mod dcp_index;
 pub mod export;
+pub mod manifest;
 pub mod pack_spec;
 pub mod patch_engine;
 pub mod target_profile;
@@ -202,6 +203,16 @@ pub use export::{
     ContentResolver, DEFAULT_EXPORTER_VERSION, ExportConfig, ExportError, ExportManifest,
     ExportOutput, ExportPipeline, ExportPipelineBuilder, MAX_RENDERED_CONTENT_BYTES,
     MemoryContentResolver, Provenance,
+};
+// Manifest exports
+pub use manifest::{
+    CAPABILITY_MANIFEST_VERSION, Capability, CapabilityBuilder, CapabilityManifest,
+    CapabilityManifestBuilder, Command, CommandBuilder, MAX_CAPABILITIES,
+    MAX_CAPABILITY_DESCRIPTION_LENGTH, MAX_CAPABILITY_ID_LENGTH, MAX_COMMAND_DESCRIPTION_LENGTH,
+    MAX_COMMAND_NAME_LENGTH, MAX_COMMANDS, MAX_PROFILE_LENGTH, MAX_SCHEMA_REF_LENGTH,
+    MAX_SELFTEST_ID_LENGTH, MAX_SELFTEST_REFS, MAX_TARGET_LENGTH,
+    MAX_VERSION_LENGTH as MANIFEST_MAX_VERSION_LENGTH, ManifestConfig, ManifestConfigBuilder,
+    ManifestError, SelftestRef, VerificationMethod,
 };
 pub use pack_spec::{
     BudgetConstraint, BudgetConstraintBuilder, CONTEXT_PACK_SPEC_SCHEMA, CONTEXT_PACK_SPEC_VERSION,
