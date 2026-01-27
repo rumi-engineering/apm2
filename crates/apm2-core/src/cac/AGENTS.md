@@ -156,6 +156,88 @@ Budget constraints for ContextPack consumption.
 - [INV-0040] If `max_artifacts` is set, its unit must be `artifacts`
 - [INV-0041] If `max_time_ms` is set, its unit must be `ms`
 
+### `ContextPackCompiler`
+
+```rust
+pub struct ContextPackCompiler<'a> {
+    index: &'a DcpIndex,
+}
+```
+
+Compiler for ContextPack specifications that resolves transitive dependencies,
+detects cycles, enforces budget constraints, and generates deterministic manifests.
+
+**Invariants:**
+- [INV-0042] Cycle detection uses Tarjan's SCC algorithm for O(V+E) complexity
+- [INV-0043] Manifest entries are sorted by stable_id for determinism
+- [INV-0044] Deep-pinning resolves all stable_ids to content_hashes before output
+
+**Contracts:**
+- [CTR-0034] `compile()` returns `CycleDetected` error with full cycle path
+- [CTR-0035] `compile()` returns `BudgetExceeded` if any budget dimension is violated
+- [CTR-0036] Same input spec always produces identical manifest bytes (determinism)
+- [CTR-0037] `CompilationReceipt` includes manifest hash for integrity verification
+
+### `CompiledContextPack`
+
+```rust
+pub struct CompiledContextPack {
+    pub manifest: CompiledManifest,
+    pub content_hashes: BTreeMap<String, String>,
+    pub budget_used: BudgetUsed,
+}
+```
+
+The result of compiling a ContextPackSpec, containing the deterministic manifest
+and all resolved content hashes.
+
+**Invariants:**
+- [INV-0045] `content_hashes` is keyed by stable_id, values are 64-char hex hashes
+- [INV-0046] All entries in `manifest.entries` have corresponding `content_hashes` entries
+
+### `CompilationReceipt`
+
+```rust
+pub struct CompilationReceipt {
+    pub spec_id: String,
+    pub compile_time_ms: u64,
+    pub artifact_count: usize,
+    pub root_count: usize,
+    pub warnings: Vec<CompilationWarning>,
+    pub manifest_hash: String,
+}
+```
+
+Receipt capturing compilation metadata for audit and verification.
+
+**Invariants:**
+- [INV-0047] `manifest_hash` is BLAKE3 hash of canonical manifest JSON (64 hex chars)
+- [INV-0048] Warnings are generated for unused dependency reviews or hash mismatches
+
+### `CompilationError`
+
+```rust
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompilationError {
+    CycleDetected { path: Vec<String> },
+    ArtifactNotFound { stable_id: String },
+    ArtifactDeprecated { stable_id: String },
+    BudgetExceeded { dimension: String, limit: u64, actual: u64 },
+    TooManyArtifacts { count: usize, max: usize },
+    ResolutionDepthExceeded { depth: usize, max: usize },
+    InvalidPackSpec(PackSpecError),
+    ManifestGenerationFailed { message: String },
+}
+```
+
+Comprehensive error types for compilation failures.
+
+**Design Rationale:**
+- `CycleDetected` includes full path for debugging cyclic dependencies
+- `BudgetExceeded` reports dimension, limit, and actual for clear error messages
+- `#[non_exhaustive]` allows adding error variants without breaking semver
+
 ### `ValidationError`
 
 ```rust
@@ -188,6 +270,8 @@ Comprehensive error types with JSON path locations.
 | `MAX_STABLE_ID_LENGTH` | 1024 | Maximum stable ID length |
 | `MAX_CONTENT_HASH_LENGTH` | 64 | Hex-encoded BLAKE3 hash length |
 | `MAX_DEPENDENCIES` | 128 | Maximum dependencies per artifact |
+| `MAX_ARTIFACTS_IN_PACK` | 10,000 | Maximum artifacts in a compiled pack |
+| `MAX_RESOLUTION_DEPTH` | 256 | Maximum dependency resolution depth |
 
 ## Public API
 
@@ -205,6 +289,8 @@ Comprehensive error types with JSON path locations.
 | `TypedQuantity::bytes(v)` | Create byte quantity |
 | `TypedQuantity::checked_add(q)` | Checked addition with unit validation |
 | `BudgetConstraint::builder()` | Create a builder for budget constraints |
+| `ContextPackCompiler::new(index)` | Create compiler with DCP index |
+| `ContextPackCompiler::compile(spec)` | Compile pack spec to CompiledContextPack |
 
 ## Examples
 
