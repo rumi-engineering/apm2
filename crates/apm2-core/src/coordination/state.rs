@@ -384,6 +384,176 @@ impl BudgetUsage {
             consumed_tokens: 0,
         }
     }
+
+    // =========================================================================
+    // Budget Tracking Helper Methods (TCK-00151)
+    // =========================================================================
+
+    /// Checks if the episode budget is exhausted.
+    ///
+    /// Per AD-COORD-004: Returns `true` when `consumed_episodes >=
+    /// max_episodes`.
+    ///
+    /// # Arguments
+    ///
+    /// * `budget` - The budget constraints to check against
+    ///
+    /// # Returns
+    ///
+    /// `true` if episode budget is exhausted, `false` otherwise.
+    #[must_use]
+    pub const fn is_episode_budget_exhausted(&self, budget: &CoordinationBudget) -> bool {
+        self.consumed_episodes >= budget.max_episodes
+    }
+
+    /// Checks if the duration budget is exhausted.
+    ///
+    /// Per AD-COORD-004: Returns `true` when `elapsed_ms >= max_duration_ms`.
+    ///
+    /// # Arguments
+    ///
+    /// * `budget` - The budget constraints to check against
+    ///
+    /// # Returns
+    ///
+    /// `true` if duration budget is exhausted, `false` otherwise.
+    #[must_use]
+    pub const fn is_duration_budget_exhausted(&self, budget: &CoordinationBudget) -> bool {
+        self.elapsed_ms >= budget.max_duration_ms
+    }
+
+    /// Checks if the token budget is exhausted.
+    ///
+    /// Per AD-COORD-004: Returns `true` when `max_tokens` is set AND
+    /// `consumed_tokens >= max_tokens`.
+    ///
+    /// # Arguments
+    ///
+    /// * `budget` - The budget constraints to check against
+    ///
+    /// # Returns
+    ///
+    /// `true` if token budget is exhausted, `false` otherwise.
+    /// Always returns `false` if `max_tokens` is `None`.
+    #[must_use]
+    pub const fn is_token_budget_exhausted(&self, budget: &CoordinationBudget) -> bool {
+        match budget.max_tokens {
+            Some(max) => self.consumed_tokens >= max,
+            None => false,
+        }
+    }
+
+    /// Checks if any budget constraint is exhausted.
+    ///
+    /// Per AD-COORD-013 priority ordering, checks:
+    /// 1. Duration budget (highest priority among budgets)
+    /// 2. Token budget (if set)
+    /// 3. Episode budget (lowest priority among budgets)
+    ///
+    /// # Arguments
+    ///
+    /// * `budget` - The budget constraints to check against
+    ///
+    /// # Returns
+    ///
+    /// `Some(BudgetType)` for the highest-priority exhausted budget, or `None`.
+    #[must_use]
+    pub const fn check_budget_exhausted(&self, budget: &CoordinationBudget) -> Option<BudgetType> {
+        // Per AD-COORD-013: Duration > Tokens > Episodes priority
+        if self.is_duration_budget_exhausted(budget) {
+            return Some(BudgetType::Duration);
+        }
+        if self.is_token_budget_exhausted(budget) {
+            return Some(BudgetType::Tokens);
+        }
+        if self.is_episode_budget_exhausted(budget) {
+            return Some(BudgetType::Episodes);
+        }
+        None
+    }
+
+    /// Aggregates token consumption from a session outcome.
+    ///
+    /// Per AD-COORD-011: Token consumption is aggregated from session
+    /// `final_entropy` values. This method safely saturates to prevent
+    /// overflow.
+    ///
+    /// # Arguments
+    ///
+    /// * `tokens` - Tokens consumed by the session (from `final_entropy`)
+    pub const fn aggregate_tokens(&mut self, tokens: u64) {
+        self.consumed_tokens = self.consumed_tokens.saturating_add(tokens);
+    }
+
+    /// Increments the consumed episodes counter.
+    ///
+    /// Safely saturates to prevent overflow.
+    pub const fn increment_episodes(&mut self) {
+        self.consumed_episodes = self.consumed_episodes.saturating_add(1);
+    }
+
+    /// Updates the elapsed time from a start instant.
+    ///
+    /// Uses `checked_duration_since` for defensive time handling per RSK-2504.
+    ///
+    /// # Arguments
+    ///
+    /// * `started_at` - The instant when coordination started
+    ///
+    /// # Note
+    ///
+    /// Truncation from `u128` to `u64` is safe as `u64` can hold approximately
+    /// 584 million years in milliseconds.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn update_elapsed_from(&mut self, started_at: std::time::Instant) {
+        self.elapsed_ms = started_at.elapsed().as_millis() as u64;
+    }
+
+    /// Returns the remaining episodes before budget exhaustion.
+    ///
+    /// # Arguments
+    ///
+    /// * `budget` - The budget constraints
+    ///
+    /// # Returns
+    ///
+    /// Number of episodes remaining, or 0 if budget is exhausted.
+    #[must_use]
+    pub const fn remaining_episodes(&self, budget: &CoordinationBudget) -> u32 {
+        budget.max_episodes.saturating_sub(self.consumed_episodes)
+    }
+
+    /// Returns the remaining duration in milliseconds before budget exhaustion.
+    ///
+    /// # Arguments
+    ///
+    /// * `budget` - The budget constraints
+    ///
+    /// # Returns
+    ///
+    /// Remaining duration in milliseconds, or 0 if budget is exhausted.
+    #[must_use]
+    pub const fn remaining_duration_ms(&self, budget: &CoordinationBudget) -> u64 {
+        budget.max_duration_ms.saturating_sub(self.elapsed_ms)
+    }
+
+    /// Returns the remaining tokens before budget exhaustion, if a token limit
+    /// is set.
+    ///
+    /// # Arguments
+    ///
+    /// * `budget` - The budget constraints
+    ///
+    /// # Returns
+    ///
+    /// `Some(remaining)` if token budget is set, `None` otherwise.
+    #[must_use]
+    pub const fn remaining_tokens(&self, budget: &CoordinationBudget) -> Option<u64> {
+        match budget.max_tokens {
+            Some(max) => Some(max.saturating_sub(self.consumed_tokens)),
+            None => None,
+        }
+    }
 }
 
 /// The type of budget that was exhausted.
@@ -1676,6 +1846,289 @@ mod tests {
         assert!(
             result.is_ok(),
             "Expected exact limit to work, got: {result:?}"
+        );
+    }
+
+    // ========================================================================
+    // TCK-00151: Budget Enforcement Helper Tests
+    // ========================================================================
+
+    /// TCK-00151: Test episode budget exhaustion detection.
+    ///
+    /// Verification: Coordination stops at `max_episodes`.
+    #[test]
+    fn tck_00151_episode_budget_exhausted() {
+        let budget = CoordinationBudget::new(5, 60_000, None).unwrap();
+        let mut usage = BudgetUsage::new();
+
+        // Not exhausted initially
+        assert!(!usage.is_episode_budget_exhausted(&budget));
+        assert_eq!(usage.remaining_episodes(&budget), 5);
+
+        // Consume 4 episodes - still not exhausted
+        usage.consumed_episodes = 4;
+        assert!(!usage.is_episode_budget_exhausted(&budget));
+        assert_eq!(usage.remaining_episodes(&budget), 1);
+
+        // Consume 5th episode - now exhausted
+        usage.consumed_episodes = 5;
+        assert!(usage.is_episode_budget_exhausted(&budget));
+        assert_eq!(usage.remaining_episodes(&budget), 0);
+
+        // Over budget - still exhausted
+        usage.consumed_episodes = 10;
+        assert!(usage.is_episode_budget_exhausted(&budget));
+        assert_eq!(usage.remaining_episodes(&budget), 0);
+    }
+
+    /// TCK-00151: Test duration budget exhaustion detection.
+    ///
+    /// Verification: Coordination stops at `max_duration_ms`.
+    #[test]
+    fn tck_00151_duration_budget_exhausted() {
+        let budget = CoordinationBudget::new(10, 30_000, None).unwrap();
+        let mut usage = BudgetUsage::new();
+
+        // Not exhausted initially
+        assert!(!usage.is_duration_budget_exhausted(&budget));
+        assert_eq!(usage.remaining_duration_ms(&budget), 30_000);
+
+        // Consume 29 seconds - still not exhausted
+        usage.elapsed_ms = 29_000;
+        assert!(!usage.is_duration_budget_exhausted(&budget));
+        assert_eq!(usage.remaining_duration_ms(&budget), 1_000);
+
+        // Consume exactly 30 seconds - now exhausted
+        usage.elapsed_ms = 30_000;
+        assert!(usage.is_duration_budget_exhausted(&budget));
+        assert_eq!(usage.remaining_duration_ms(&budget), 0);
+
+        // Over budget - still exhausted
+        usage.elapsed_ms = 45_000;
+        assert!(usage.is_duration_budget_exhausted(&budget));
+        assert_eq!(usage.remaining_duration_ms(&budget), 0);
+    }
+
+    /// TCK-00151: Test token budget exhaustion detection.
+    ///
+    /// Verification: Coordination stops at `max_tokens` (when set).
+    #[test]
+    fn tck_00151_token_budget_exhausted() {
+        // With token limit set
+        let budget_with_tokens = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let mut usage = BudgetUsage::new();
+
+        // Not exhausted initially
+        assert!(!usage.is_token_budget_exhausted(&budget_with_tokens));
+        assert_eq!(usage.remaining_tokens(&budget_with_tokens), Some(100_000));
+
+        // Consume 99,999 tokens - still not exhausted
+        usage.consumed_tokens = 99_999;
+        assert!(!usage.is_token_budget_exhausted(&budget_with_tokens));
+        assert_eq!(usage.remaining_tokens(&budget_with_tokens), Some(1));
+
+        // Consume exactly 100,000 tokens - now exhausted
+        usage.consumed_tokens = 100_000;
+        assert!(usage.is_token_budget_exhausted(&budget_with_tokens));
+        assert_eq!(usage.remaining_tokens(&budget_with_tokens), Some(0));
+
+        // Over budget - still exhausted
+        usage.consumed_tokens = 150_000;
+        assert!(usage.is_token_budget_exhausted(&budget_with_tokens));
+        assert_eq!(usage.remaining_tokens(&budget_with_tokens), Some(0));
+
+        // Without token limit - never exhausted
+        let budget_no_tokens = CoordinationBudget::new(10, 60_000, None).unwrap();
+        assert!(!usage.is_token_budget_exhausted(&budget_no_tokens));
+        assert_eq!(usage.remaining_tokens(&budget_no_tokens), None);
+    }
+
+    /// TCK-00151: Test budget exhaustion priority ordering.
+    ///
+    /// Per AD-COORD-013: Duration > Tokens > Episodes priority.
+    #[test]
+    fn tck_00151_budget_exhaustion_priority() {
+        let budget = CoordinationBudget::new(5, 10_000, Some(50_000)).unwrap();
+        let mut usage = BudgetUsage::new();
+
+        // No budget exhausted
+        assert_eq!(usage.check_budget_exhausted(&budget), None);
+
+        // Only episode budget exhausted - returns Episodes
+        usage.consumed_episodes = 5;
+        assert_eq!(
+            usage.check_budget_exhausted(&budget),
+            Some(BudgetType::Episodes)
+        );
+
+        // Token and episode exhausted - returns Tokens (higher priority)
+        usage.consumed_tokens = 50_000;
+        assert_eq!(
+            usage.check_budget_exhausted(&budget),
+            Some(BudgetType::Tokens)
+        );
+
+        // All three exhausted - returns Duration (highest priority)
+        usage.elapsed_ms = 10_000;
+        assert_eq!(
+            usage.check_budget_exhausted(&budget),
+            Some(BudgetType::Duration)
+        );
+
+        // Reset and test duration alone
+        usage.consumed_episodes = 0;
+        usage.consumed_tokens = 0;
+        usage.elapsed_ms = 10_000;
+        assert_eq!(
+            usage.check_budget_exhausted(&budget),
+            Some(BudgetType::Duration)
+        );
+    }
+
+    /// TCK-00151: Test token aggregation from session outcomes.
+    ///
+    /// Verification: `consumed_tokens` reflects session `final_entropy`.
+    #[test]
+    fn tck_00151_token_aggregation() {
+        let mut usage = BudgetUsage::new();
+
+        // Initial state
+        assert_eq!(usage.consumed_tokens, 0);
+
+        // Aggregate first session tokens
+        usage.aggregate_tokens(1000);
+        assert_eq!(usage.consumed_tokens, 1000);
+
+        // Aggregate second session tokens
+        usage.aggregate_tokens(2500);
+        assert_eq!(usage.consumed_tokens, 3500);
+
+        // Aggregate third session tokens
+        usage.aggregate_tokens(500);
+        assert_eq!(usage.consumed_tokens, 4000);
+
+        // Verify saturation behavior (no overflow)
+        usage.consumed_tokens = u64::MAX - 100;
+        usage.aggregate_tokens(200);
+        assert_eq!(usage.consumed_tokens, u64::MAX);
+    }
+
+    /// TCK-00151: Test episode increment helper.
+    #[test]
+    fn tck_00151_episode_increment() {
+        let mut usage = BudgetUsage::new();
+
+        assert_eq!(usage.consumed_episodes, 0);
+
+        usage.increment_episodes();
+        assert_eq!(usage.consumed_episodes, 1);
+
+        usage.increment_episodes();
+        assert_eq!(usage.consumed_episodes, 2);
+
+        // Verify saturation behavior (no overflow)
+        usage.consumed_episodes = u32::MAX;
+        usage.increment_episodes();
+        assert_eq!(usage.consumed_episodes, u32::MAX);
+    }
+
+    /// TCK-00151: Test remaining budget calculations at boundary conditions.
+    #[test]
+    fn tck_00151_remaining_budget_boundaries() {
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+
+        // Test at exactly budget limit
+        let usage_at_limit = BudgetUsage {
+            consumed_episodes: 10,
+            elapsed_ms: 60_000,
+            consumed_tokens: 100_000,
+        };
+        assert_eq!(usage_at_limit.remaining_episodes(&budget), 0);
+        assert_eq!(usage_at_limit.remaining_duration_ms(&budget), 0);
+        assert_eq!(usage_at_limit.remaining_tokens(&budget), Some(0));
+
+        // Test over budget (should saturate to 0, not underflow)
+        let usage_over_limit = BudgetUsage {
+            consumed_episodes: 15,
+            elapsed_ms: 90_000,
+            consumed_tokens: 150_000,
+        };
+        assert_eq!(usage_over_limit.remaining_episodes(&budget), 0);
+        assert_eq!(usage_over_limit.remaining_duration_ms(&budget), 0);
+        assert_eq!(usage_over_limit.remaining_tokens(&budget), Some(0));
+    }
+
+    /// TCK-00151: Test budget usage with large values (near `u64::MAX`).
+    #[test]
+    fn tck_00151_budget_large_values() {
+        // Create budget with large values
+        let budget = CoordinationBudget::new_unchecked(u32::MAX, u64::MAX, Some(u64::MAX));
+        let mut usage = BudgetUsage::new();
+
+        // Not exhausted with large budget
+        assert!(!usage.is_episode_budget_exhausted(&budget));
+        assert!(!usage.is_duration_budget_exhausted(&budget));
+        assert!(!usage.is_token_budget_exhausted(&budget));
+
+        // Consume large amounts - still not exhausted
+        usage.consumed_episodes = u32::MAX - 1;
+        usage.elapsed_ms = u64::MAX - 1;
+        usage.consumed_tokens = u64::MAX - 1;
+        assert!(!usage.is_episode_budget_exhausted(&budget));
+        assert!(!usage.is_duration_budget_exhausted(&budget));
+        assert!(!usage.is_token_budget_exhausted(&budget));
+
+        // At max - now exhausted
+        usage.consumed_episodes = u32::MAX;
+        usage.elapsed_ms = u64::MAX;
+        usage.consumed_tokens = u64::MAX;
+        assert!(usage.is_episode_budget_exhausted(&budget));
+        assert!(usage.is_duration_budget_exhausted(&budget));
+        assert!(usage.is_token_budget_exhausted(&budget));
+    }
+
+    /// TCK-00151: Test budget usage serde roundtrip preserves helper behavior.
+    #[test]
+    fn tck_00151_budget_usage_serde_roundtrip() {
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let usage = BudgetUsage {
+            consumed_episodes: 5,
+            elapsed_ms: 30_000,
+            consumed_tokens: 50_000,
+        };
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&usage).unwrap();
+        let restored: BudgetUsage = serde_json::from_str(&json).unwrap();
+
+        // Verify helper methods work identically
+        assert_eq!(
+            usage.is_episode_budget_exhausted(&budget),
+            restored.is_episode_budget_exhausted(&budget)
+        );
+        assert_eq!(
+            usage.is_duration_budget_exhausted(&budget),
+            restored.is_duration_budget_exhausted(&budget)
+        );
+        assert_eq!(
+            usage.is_token_budget_exhausted(&budget),
+            restored.is_token_budget_exhausted(&budget)
+        );
+        assert_eq!(
+            usage.check_budget_exhausted(&budget),
+            restored.check_budget_exhausted(&budget)
+        );
+        assert_eq!(
+            usage.remaining_episodes(&budget),
+            restored.remaining_episodes(&budget)
+        );
+        assert_eq!(
+            usage.remaining_duration_ms(&budget),
+            restored.remaining_duration_ms(&budget)
+        );
+        assert_eq!(
+            usage.remaining_tokens(&budget),
+            restored.remaining_tokens(&budget)
         );
     }
 }

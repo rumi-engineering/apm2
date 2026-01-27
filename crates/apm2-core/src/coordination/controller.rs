@@ -1893,4 +1893,422 @@ mod tests {
         let events = controller.emitted_events();
         assert_eq!(events.len(), 10); // started + 4*(bound+unbound) + completed
     }
+
+    // =========================================================================
+    // TCK-00151: Budget Enforcement Tests
+    // =========================================================================
+
+    /// TCK-00151: Episode budget enforced - coordination stops at
+    /// `max_episodes`.
+    ///
+    /// Acceptance Criteria 1: Episode budget enforced.
+    #[test]
+    fn tck_00151_episode_budget_enforced() {
+        // Create config with max 3 episodes
+        let budget = CoordinationBudget::new(3, 60_000, None).unwrap();
+        let config = CoordinationConfig::new(
+            vec!["work-1".to_string()], // Only one work item but 5 retries available
+            budget,
+            10, // max_attempts_per_work = 10 (more than episodes)
+        )
+        .unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Consume 3 episodes with failures (still retrying same work)
+        for i in 0u64..3 {
+            let spawn = controller
+                .prepare_session_spawn("work-1", 100 + i, 2_000_000_000 + i * 1_000_000_000)
+                .unwrap();
+            controller
+                .record_session_termination(
+                    &spawn.session_id,
+                    "work-1",
+                    SessionOutcome::Failure,
+                    100,
+                    3_000_000_000 + i * 1_000_000_000,
+                )
+                .unwrap();
+        }
+
+        // Verify episode budget is exhausted
+        assert_eq!(controller.budget_usage.consumed_episodes, 3);
+
+        // Check stop condition - should return BudgetExhausted(Episodes)
+        let stop = controller.check_stop_condition();
+        assert!(matches!(
+            stop,
+            Some(StopCondition::BudgetExhausted(
+                super::super::state::BudgetType::Episodes
+            ))
+        ));
+    }
+
+    /// TCK-00151: Duration budget enforced - coordination stops at
+    /// `max_duration_ms`.
+    ///
+    /// Acceptance Criteria 2: Duration budget enforced.
+    #[test]
+    fn tck_00151_duration_budget_enforced() {
+        // Create config with max 1ms duration (will be exceeded immediately)
+        let budget = CoordinationBudget::new(100, 1, None).unwrap();
+        let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 3).unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Wait for real time to elapse (the controller tracks wall clock time)
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Update budget usage elapsed time (simulate what happens in the run loop)
+        if let Some(started_at) = controller.started_at {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                controller.budget_usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+            }
+        }
+
+        // Check stop condition - should return BudgetExhausted(Duration)
+        let stop = controller.check_stop_condition();
+        assert!(matches!(
+            stop,
+            Some(StopCondition::BudgetExhausted(
+                super::super::state::BudgetType::Duration
+            ))
+        ));
+    }
+
+    /// TCK-00151: Token budget enforced - coordination stops at `max_tokens`.
+    ///
+    /// Acceptance Criteria 3: Token budget enforced (when set).
+    #[test]
+    fn tck_00151_token_budget_enforced() {
+        // Create config with max 1000 tokens
+        let budget = CoordinationBudget::new(100, 60_000, Some(1000)).unwrap();
+        let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 10).unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Consume 1000 tokens across multiple sessions
+        let spawn1 = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn1.session_id,
+                "work-1",
+                SessionOutcome::Failure,
+                400,
+                3_000_000_000,
+            )
+            .unwrap();
+
+        let spawn2 = controller
+            .prepare_session_spawn("work-1", 101, 4_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn2.session_id,
+                "work-1",
+                SessionOutcome::Failure,
+                600, // Total: 400 + 600 = 1000
+                5_000_000_000,
+            )
+            .unwrap();
+
+        // Verify token budget is exhausted
+        assert_eq!(controller.budget_usage.consumed_tokens, 1000);
+
+        // Check stop condition - should return BudgetExhausted(Tokens)
+        let stop = controller.check_stop_condition();
+        assert!(matches!(
+            stop,
+            Some(StopCondition::BudgetExhausted(
+                super::super::state::BudgetType::Tokens
+            ))
+        ));
+    }
+
+    /// TCK-00151: Token budget not enforced when not set.
+    #[test]
+    fn tck_00151_token_budget_not_set() {
+        // Create config WITHOUT token budget
+        let budget = CoordinationBudget::new(100, 60_000, None).unwrap();
+        let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 10).unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Consume many tokens
+        let spawn1 = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn1.session_id,
+                "work-1",
+                SessionOutcome::Failure,
+                1_000_000, // Large token consumption
+                3_000_000_000,
+            )
+            .unwrap();
+
+        // Verify tokens accumulated but no stop condition for tokens
+        assert_eq!(controller.budget_usage.consumed_tokens, 1_000_000);
+
+        // Should NOT stop - no token budget set
+        let stop = controller.check_stop_condition();
+        assert!(stop.is_none());
+    }
+
+    /// TCK-00151: Token aggregation from session outcomes.
+    ///
+    /// Acceptance Criteria 4: Token aggregation from session `final_entropy`.
+    #[test]
+    fn tck_00151_token_aggregation_from_sessions() {
+        let config = test_config(vec![
+            "work-1".to_string(),
+            "work-2".to_string(),
+            "work-3".to_string(),
+        ]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Session 1: 1000 tokens
+        let spawn1 = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn1.session_id,
+                "work-1",
+                SessionOutcome::Success,
+                1000,
+                3_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.budget_usage.consumed_tokens, 1000);
+
+        // Session 2: 2500 tokens
+        let spawn2 = controller
+            .prepare_session_spawn("work-2", 200, 4_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn2.session_id,
+                "work-2",
+                SessionOutcome::Success,
+                2500,
+                5_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.budget_usage.consumed_tokens, 3500);
+
+        // Session 3: 500 tokens (even failures consume tokens)
+        let spawn3 = controller
+            .prepare_session_spawn("work-3", 300, 6_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn3.session_id,
+                "work-3",
+                SessionOutcome::Failure,
+                500,
+                7_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.budget_usage.consumed_tokens, 4000);
+
+        // Complete and verify final budget usage
+        controller
+            .complete(StopCondition::WorkCompleted, 8_000_000_000)
+            .unwrap();
+        assert_eq!(controller.budget_usage.consumed_tokens, 4000);
+    }
+
+    /// TCK-00151: Budget priority ordering (Duration > Tokens > Episodes).
+    ///
+    /// Per AD-COORD-013: When multiple budgets are exhausted, the highest
+    /// priority one should be reported.
+    #[test]
+    fn tck_00151_budget_priority_ordering() {
+        // Create config with all budget types set to low values
+        let budget = CoordinationBudget::new(1, 1, Some(1)).unwrap();
+        let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 3).unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Consume 1 episode and 1 token
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn.session_id,
+                "work-1",
+                SessionOutcome::Success,
+                1,
+                3_000_000_000,
+            )
+            .unwrap();
+
+        // Wait for duration to be exhausted
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        if let Some(started_at) = controller.started_at {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                controller.budget_usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+            }
+        }
+
+        // All three budgets are now exhausted, check priority
+        // Duration should take priority
+        let stop = controller.check_stop_condition();
+        assert!(matches!(
+            stop,
+            Some(StopCondition::BudgetExhausted(
+                super::super::state::BudgetType::Duration
+            ))
+        ));
+    }
+
+    /// TCK-00151: Verify budget usage is included in completed event.
+    #[test]
+    fn tck_00151_budget_usage_in_completed_event() {
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 3).unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Process one session
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn.session_id,
+                "work-1",
+                SessionOutcome::Success,
+                5000,
+                3_000_000_000,
+            )
+            .unwrap();
+
+        // Complete and check budget usage in event
+        let completed = controller
+            .complete(StopCondition::WorkCompleted, 4_000_000_000)
+            .unwrap();
+
+        assert_eq!(completed.budget_usage.consumed_episodes, 1);
+        assert_eq!(completed.budget_usage.consumed_tokens, 5000);
+        // elapsed_ms is set from real time tracking
+        // Just verify the field is accessible and has a value
+        let _ = completed.budget_usage.elapsed_ms;
+    }
+
+    /// TCK-00151: Verify budget usage is included in aborted event.
+    #[test]
+    fn tck_00151_budget_usage_in_aborted_event() {
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 3).unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Process one session
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn.session_id,
+                "work-1",
+                SessionOutcome::Failure,
+                3000,
+                3_000_000_000,
+            )
+            .unwrap();
+
+        // Abort and check budget usage in event
+        let aborted = controller
+            .abort(AbortReason::NoEligibleWork, 4_000_000_000)
+            .unwrap();
+
+        assert_eq!(aborted.budget_usage.consumed_episodes, 1);
+        assert_eq!(aborted.budget_usage.consumed_tokens, 3000);
+    }
+
+    /// TCK-00151: Episode increment is monotonic.
+    #[test]
+    fn tck_00151_episode_increment_monotonic() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        let mut prev_episodes = 0;
+
+        for i in 0u64..3 {
+            let spawn = controller
+                .prepare_session_spawn("work-1", 100 + i, 2_000_000_000 + i * 1_000_000_000)
+                .unwrap();
+            controller
+                .record_session_termination(
+                    &spawn.session_id,
+                    "work-1",
+                    SessionOutcome::Failure,
+                    100,
+                    3_000_000_000 + i * 1_000_000_000,
+                )
+                .unwrap();
+
+            // Episodes should be strictly increasing
+            assert!(
+                controller.budget_usage.consumed_episodes > prev_episodes,
+                "Episodes should increase: {} <= {}",
+                controller.budget_usage.consumed_episodes,
+                prev_episodes
+            );
+            prev_episodes = controller.budget_usage.consumed_episodes;
+        }
+
+        assert_eq!(prev_episodes, 3);
+    }
+
+    /// TCK-00151: Token consumption is monotonic.
+    #[test]
+    fn tck_00151_token_consumption_monotonic() {
+        let config = test_config(vec![
+            "work-1".to_string(),
+            "work-2".to_string(),
+            "work-3".to_string(),
+        ]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        let work_ids = ["work-1", "work-2", "work-3"];
+        let mut prev_tokens = 0;
+
+        for (i, work_id) in work_ids.iter().enumerate() {
+            let spawn = controller
+                .prepare_session_spawn(work_id, (i as u64) * 100, 2_000_000_000)
+                .unwrap();
+            controller
+                .record_session_termination(
+                    &spawn.session_id,
+                    work_id,
+                    SessionOutcome::Success,
+                    (i as u64 + 1) * 100, // 100, 200, 300 tokens
+                    3_000_000_000,
+                )
+                .unwrap();
+
+            // Tokens should be non-decreasing (monotonic)
+            assert!(
+                controller.budget_usage.consumed_tokens >= prev_tokens,
+                "Tokens should be monotonic: {} < {}",
+                controller.budget_usage.consumed_tokens,
+                prev_tokens
+            );
+            prev_tokens = controller.budget_usage.consumed_tokens;
+        }
+
+        assert_eq!(prev_tokens, 600); // 100 + 200 + 300
+    }
 }
