@@ -137,7 +137,9 @@ pub enum ExportError {
     },
 
     /// Invalid path component in `stable_id` (path traversal attempt).
-    #[error("invalid path component in stable_id '{stable_id}': component '{component}' contains invalid characters or is a traversal attempt")]
+    #[error(
+        "invalid path component in stable_id '{stable_id}': component '{component}' contains invalid characters or is a traversal attempt"
+    )]
     InvalidPathComponent {
         /// The `stable_id` containing the invalid component.
         stable_id: String,
@@ -660,10 +662,11 @@ impl ExportPipeline {
     /// Returns an error if manifest serialization fails.
     fn create_provenance(&self, pack: &CompiledContextPack) -> Result<Provenance, ExportError> {
         // Use the manifest hash as source pack hash
-        let manifest_json =
-            serde_json::to_string(&pack.manifest).map_err(|e| ExportError::ProvenanceSerializationFailed {
+        let manifest_json = serde_json::to_string(&pack.manifest).map_err(|e| {
+            ExportError::ProvenanceSerializationFailed {
                 message: format!("failed to serialize manifest for hashing: {e}"),
-            })?;
+            }
+        })?;
         let hash = blake3::hash(manifest_json.as_bytes());
         let hash_hex = hex::encode(hash.as_bytes());
 
@@ -1396,7 +1399,10 @@ mod tests {
         // Verify file extension is .json
         assert_eq!(manifest.outputs.len(), 1);
         let output_path = temp_dir.path().join("org/doc/readme.json");
-        assert!(output_path.exists(), "Output file should exist with .json extension");
+        assert!(
+            output_path.exists(),
+            "Output file should exist with .json extension"
+        );
 
         // Verify _provenance is injected
         let content = std::fs::read_to_string(&output_path).unwrap();
@@ -1407,10 +1413,16 @@ mod tests {
         assert_eq!(json["number"], 42);
 
         // Check _provenance injected
-        assert!(json["_provenance"].is_object(), "_provenance should be injected");
+        assert!(
+            json["_provenance"].is_object(),
+            "_provenance should be injected"
+        );
         assert!(json["_provenance"]["source_pack_hash"].is_string());
         assert_eq!(json["_provenance"]["export_profile"], "json-profile");
-        assert_eq!(json["_provenance"]["export_timestamp"], "2026-01-27T12:00:00Z");
+        assert_eq!(
+            json["_provenance"]["export_timestamp"],
+            "2026-01-27T12:00:00Z"
+        );
     }
 
     #[test]
@@ -1447,7 +1459,10 @@ mod tests {
         // Original content should be preserved
         assert_eq!(json["data"], "test");
         // No _provenance should be injected
-        assert!(json.get("_provenance").is_none(), "_provenance should not be injected with None embed mode");
+        assert!(
+            json.get("_provenance").is_none(),
+            "_provenance should not be injected with None embed mode"
+        );
     }
 
     #[test]
@@ -1513,18 +1528,27 @@ mod tests {
 
         let pack = test_pack();
         let mut resolver = MemoryContentResolver::new();
-        resolver.insert("org:doc:readme", b"This is plain text content.\nWith multiple lines.");
+        resolver.insert(
+            "org:doc:readme",
+            b"This is plain text content.\nWith multiple lines.",
+        );
 
         let manifest = pipeline.export(&pack, &resolver).unwrap();
 
         // Verify file extension is .txt
         assert_eq!(manifest.outputs.len(), 1);
         let output_path = temp_dir.path().join("org/doc/readme.txt");
-        assert!(output_path.exists(), "Output file should exist with .txt extension");
+        assert!(
+            output_path.exists(),
+            "Output file should exist with .txt extension"
+        );
 
         // Verify content has YAML frontmatter provenance
         let content = std::fs::read_to_string(&output_path).unwrap();
-        assert!(content.starts_with("---\n"), "Should start with YAML frontmatter");
+        assert!(
+            content.starts_with("---\n"),
+            "Should start with YAML frontmatter"
+        );
         assert!(content.contains("provenance:"));
         assert!(content.contains("export_profile: \"text-profile\""));
         assert!(content.contains("This is plain text content."));
@@ -1560,7 +1584,10 @@ mod tests {
         pipeline.export(&pack, &resolver).unwrap();
 
         let content = std::fs::read_to_string(temp_dir.path().join("org/doc/readme.txt")).unwrap();
-        assert!(content.starts_with("Plain text first."), "Content should come first");
+        assert!(
+            content.starts_with("Plain text first."),
+            "Content should come first"
+        );
         assert!(content.contains("<!-- Provenance -->"));
         assert!(content.contains("provenance:"));
     }
