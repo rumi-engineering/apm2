@@ -79,6 +79,8 @@
 //! - AD-COORD-005: Circuit breaker threshold of 3 consecutive failures
 //! - AD-COORD-009: Coordination event serialization via JSON
 
+pub mod controller;
+pub mod error;
 pub mod events;
 pub mod reducer;
 pub mod state;
@@ -86,15 +88,22 @@ pub mod state;
 #[cfg(test)]
 mod tests;
 
-// Re-export main types from state module
+// Re-export controller types
+pub use controller::{
+    CIRCUIT_BREAKER_THRESHOLD, CoordinationConfig, CoordinationController,
+    DEFAULT_MAX_ATTEMPTS_PER_WORK, FreshnessCheck, SpawnResult, TerminationResult, WorkItemState,
+};
+// Re-export error types
+pub use error::{ControllerError, ControllerResult};
 // Re-export event types
-// Re-export reducer
 pub use events::{
     BLAKE3_HASH_SIZE, CoordinationAborted, CoordinationCompleted, CoordinationEvent,
     CoordinationSessionBound, CoordinationSessionUnbound, CoordinationStarted, EVENT_TYPE_ABORTED,
     EVENT_TYPE_COMPLETED, EVENT_TYPE_SESSION_BOUND, EVENT_TYPE_SESSION_UNBOUND, EVENT_TYPE_STARTED,
 };
+// Re-export reducer types
 pub use reducer::{CoordinationReducer, CoordinationReducerError};
+// Re-export state types
 pub use state::{
     AbortReason, BindingInfo, BudgetType, BudgetUsage, CoordinationBudget, CoordinationError,
     CoordinationSession, CoordinationState, CoordinationStatus, MAX_HASHMAP_SIZE,
