@@ -396,42 +396,49 @@ fn test_large_content() {
 #[test]
 fn test_all_tool_variants_encode() {
     let file_read = ToolRequest {
+        consumption_mode: false,
         tool: Some(tool_request::Tool::FileRead(FileRead::default())),
         ..Default::default()
     };
     let _ = file_read.encode_to_vec();
 
     let file_write = ToolRequest {
+        consumption_mode: false,
         tool: Some(tool_request::Tool::FileWrite(FileWrite::default())),
         ..Default::default()
     };
     let _ = file_write.encode_to_vec();
 
     let file_edit = ToolRequest {
+        consumption_mode: false,
         tool: Some(tool_request::Tool::FileEdit(FileEdit::default())),
         ..Default::default()
     };
     let _ = file_edit.encode_to_vec();
 
     let shell_exec = ToolRequest {
+        consumption_mode: false,
         tool: Some(tool_request::Tool::ShellExec(ShellExec::default())),
         ..Default::default()
     };
     let _ = shell_exec.encode_to_vec();
 
     let git_op = ToolRequest {
+        consumption_mode: false,
         tool: Some(tool_request::Tool::GitOp(GitOperation::default())),
         ..Default::default()
     };
     let _ = git_op.encode_to_vec();
 
     let inference = ToolRequest {
+        consumption_mode: false,
         tool: Some(tool_request::Tool::Inference(InferenceCall::default())),
         ..Default::default()
     };
     let _ = inference.encode_to_vec();
 
     let artifact = ToolRequest {
+        consumption_mode: false,
         tool: Some(tool_request::Tool::ArtifactPublish(
             ArtifactPublish::default(),
         )),

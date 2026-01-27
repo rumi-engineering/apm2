@@ -53,7 +53,7 @@
 //! let loaded = LoadedPolicy::from_yaml(yaml).unwrap();
 //! let engine = PolicyEngine::new(&loaded);
 //!
-//! let request = ToolRequest {
+//! let request = ToolRequest { consumption_mode: false,
 //!     request_id: "req-001".to_string(),
 //!     session_token: "session-abc".to_string(),
 //!     dedupe_key: String::new(),

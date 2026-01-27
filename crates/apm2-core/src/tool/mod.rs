@@ -32,10 +32,10 @@
 //!
 //! // Create a file read request
 //! let request = ToolRequest {
-//!     consumption_mode: false,
 //!     request_id: "req-001".to_string(),
 //!     session_token: "session-abc".to_string(),
 //!     dedupe_key: String::new(),
+//!     consumption_mode: false,
 //!     tool: Some(tool_request::Tool::FileRead(FileRead {
 //!         path: "/path/to/file.txt".to_string(),
 //!         offset: 0,

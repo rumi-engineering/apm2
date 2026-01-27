@@ -52,6 +52,7 @@ The admission gate that orchestrates validation, canonicalization, and storage o
 - [CTR-0026] `admit()` validates DCP ID length and character safety before any expensive operations
 - [CTR-0027] `with_schema_id()` enables schema reference tracking in admission receipts
 
+
 ### `DcpIndex`
 
 ```rust
