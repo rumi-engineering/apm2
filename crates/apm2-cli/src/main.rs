@@ -110,6 +110,10 @@ enum Commands {
     /// Pack commands (compile and manage `ContextPacks`)
     Pack(commands::pack::PackCommand),
 
+    // === Export (CAC export pipeline) ===
+    /// Export a compiled context pack to target profile layout
+    Export(commands::export::ExportArgs),
+
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
@@ -273,6 +277,14 @@ fn main() -> Result<()> {
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
             let exit_code = commands::pack::run_pack(&pack_cmd);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Export(export_args) => {
+            // Export commands use specific exit codes per TCK-00143:
+            // 0=success, 1=error, 2=conformance_failure
+            // We use std::process::exit to bypass anyhow Result handling
+            // and ensure precise exit codes are returned.
+            let exit_code = commands::export::run_export(&export_args);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {
