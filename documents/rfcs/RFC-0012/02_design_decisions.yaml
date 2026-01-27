@@ -142,13 +142,22 @@ rfc_design_decisions:
         4. IF AND ONLY IF the event is successfully committed to the ledger (authoritative record),
            the controller proceeds to spawn the session via the `SessionSpawner`.
 
+        TOTAL BINDING LIFECYCLE (PHASE 1):
+        - If `SessionSpawner::spawn` returns an error, the controller MUST immediately
+          emit `coordination.session_unbound(reason=SPAWN_FAILED)` and mark the work
+          outcome as failed/skipped.
+        - If `session.started` is not observed within a configurable timeout, the
+          controller MUST treat the attempt as a spawn failure and emit `session_unbound`.
+
         This ensures that no session is spawned unless the binding is
-        authoritatively recorded and validated against the pinned state.
-        Spawning BEFORE commit is a correctness defect.
+        authoritatively recorded, and that failed spawns do not leave "dangling"
+        bindings in the projection.
       rationale: |
         "Check-then-spawn" is vulnerable to TOCTOU races. Placing the
         binding commit *before* side effects (spawning) and making it
         conditional on state freshness ensures deterministic coordination.
+        Total lifecycle tracking prevents unreconciled state from polluting
+        the recurrence loop.
       constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0005"
 
     - decision_id: AD-COORD-007
