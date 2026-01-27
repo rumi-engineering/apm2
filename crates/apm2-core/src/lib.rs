@@ -36,6 +36,7 @@
 pub mod adapter;
 pub mod agent;
 pub mod budget;
+pub mod cac;
 pub mod ccp;
 pub mod config;
 pub mod credentials;
