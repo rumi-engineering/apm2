@@ -94,11 +94,37 @@
 //!
 //! assert_eq!(result.patched_document["version"], 2);
 //! ```
+//!
+//! # DCP Index Example
+//!
+//! ```
+//! use apm2_core::cac::dcp_index::{DcpEntry, DcpIndex};
+//!
+//! let mut index = DcpIndex::new();
+//!
+//! // Register an artifact with a valid 64-character hex hash
+//! let entry = DcpEntry::new(
+//!     "org:ticket:TCK-00134",
+//!     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+//!     "cac:schema:ticket-v1",
+//! );
+//! index.register(entry).unwrap();
+//!
+//! // Resolve returns the content hash
+//! let hash = index.resolve("org:ticket:TCK-00134");
+//! assert!(hash.is_some());
+//! ```
 
 pub mod admission;
+pub mod dcp_index;
 pub mod patch_engine;
 mod validator;
 
+pub use dcp_index::{
+    DcpEntry, DcpIndex, DcpIndexError, DcpIndexReducer, DcpIndexReducerError, DcpIndexState,
+    EVENT_TYPE_ARTIFACT_DEPRECATED, EVENT_TYPE_ARTIFACT_REGISTERED, MAX_CONTENT_HASH_LENGTH,
+    MAX_STABLE_ID_LENGTH, RESERVED_PREFIXES, parse_stable_id,
+};
 pub use patch_engine::{PatchEngine, PatchEngineError, PatchResult, PatchType, ReplayViolation};
 pub use validator::{
     CacValidator, MAX_ARRAY_MEMBERS, MAX_DEPTH, MAX_OBJECT_PROPERTIES, ValidationError,
