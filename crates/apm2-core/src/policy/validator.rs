@@ -65,8 +65,8 @@ fn validate_rule(rule: &Rule) -> Result<(), PolicyError> {
         RuleType::Filesystem => {
             validate_filesystem_rule(rule)?;
         },
-        // Secrets and Inference rules have no additional requirements
-        RuleType::Secrets | RuleType::Inference => {},
+        // Secrets, Inference, and ConsumptionMode rules have no additional requirements
+        RuleType::Secrets | RuleType::Inference | RuleType::ConsumptionMode => {},
     }
 
     // Validate path patterns if present
@@ -299,6 +299,7 @@ mod tests {
             limit: None,
             hosts: vec![],
             ports: vec![],
+            stable_ids: vec![],
             condition: None,
             rationale_code: None,
             reason: None,
@@ -317,6 +318,7 @@ mod tests {
             limit,
             hosts: vec![],
             ports: vec![],
+            stable_ids: vec![],
             condition: None,
             rationale_code: None,
             reason: None,
@@ -460,6 +462,7 @@ mod tests {
             limit: None,
             hosts: vec![],
             ports: vec![],
+            stable_ids: vec![],
             condition: None,
             rationale_code: None,
             reason: None,
@@ -483,6 +486,7 @@ mod tests {
             limit: None,
             hosts: vec!["api.example.com".to_string()],
             ports: vec![],
+            stable_ids: vec![],
             condition: None,
             rationale_code: None,
             reason: None,
@@ -506,6 +510,7 @@ mod tests {
             limit: None,
             hosts: vec![],
             ports: vec![],
+            stable_ids: vec![],
             condition: None,
             rationale_code: None,
             reason: None,

@@ -154,7 +154,9 @@ impl PolicyEngine {
 
         // Evaluate rules in order
         for rule in &self.policy.policy.rules {
-            if let Some(result) = self.evaluate_rule(rule, tool, &tool_name) {
+            if let Some(result) =
+                self.evaluate_rule(rule, tool, &tool_name, request.consumption_mode)
+            {
                 return result;
             }
         }
@@ -225,9 +227,10 @@ impl PolicyEngine {
         rule: &Rule,
         tool: &tool_request::Tool,
         tool_name: &str,
+        consumption_mode: bool,
     ) -> Option<EvaluationResult> {
         // Check if the rule type applies to this tool
-        if !Self::rule_applies_to_tool(rule, tool, tool_name) {
+        if !Self::rule_applies_to_tool(rule, tool, tool_name, consumption_mode) {
             return None;
         }
 
@@ -253,10 +256,26 @@ impl PolicyEngine {
     }
 
     /// Checks if a rule applies to a specific tool request.
-    fn rule_applies_to_tool(rule: &Rule, tool: &tool_request::Tool, tool_name: &str) -> bool {
+    fn rule_applies_to_tool(
+        rule: &Rule,
+        tool: &tool_request::Tool,
+        tool_name: &str,
+        consumption_mode: bool,
+    ) -> bool {
         match rule.rule_type {
             RuleType::ToolAllow | RuleType::ToolDeny => {
+                // If consumption_mode is true, standard tool rules DO NOT apply to
+                // ArtifactFetch
+                if consumption_mode && matches!(tool, tool_request::Tool::ArtifactFetch(_)) {
+                    return false;
+                }
                 Self::matches_tool_rule(rule, tool, tool_name)
+            },
+            RuleType::ConsumptionMode => {
+                if !consumption_mode {
+                    return false;
+                }
+                Self::matches_consumption_mode_rule(rule, tool)
             },
             RuleType::Filesystem => Self::matches_filesystem_rule(rule, tool),
             RuleType::Network => Self::matches_network_rule(rule, tool),
@@ -434,6 +453,25 @@ impl PolicyEngine {
     const fn matches_inference_rule(_rule: &Rule, tool: &tool_request::Tool) -> bool {
         // Inference rules apply to InferenceCall
         matches!(tool, tool_request::Tool::Inference(_))
+    }
+
+    /// Checks if a consumption mode rule matches the request.
+    fn matches_consumption_mode_rule(rule: &Rule, tool: &tool_request::Tool) -> bool {
+        let tool_request::Tool::ArtifactFetch(req) = tool else {
+            return false;
+        };
+
+        // Content-hash-only fetch is never allowed by a consumption_mode rule
+        if req.stable_id.is_empty() {
+            return false;
+        }
+
+        if rule.stable_ids.is_empty() {
+            // No specific IDs listed - matches all stable_id fetches
+            return true;
+        }
+
+        rule.stable_ids.contains(&req.stable_id)
     }
 
     /// Applies the default decision when no rule matches.
@@ -2411,5 +2449,155 @@ policy:
                 }
             }
         }
+    }
+}
+
+// ========================================================================
+
+#[cfg(test)]
+mod consumption_tests {
+    use super::*;
+    use crate::tool::{ArtifactFetch, ToolRequest, tool_request};
+
+    fn create_test_policy(yaml: &str) -> LoadedPolicy {
+        LoadedPolicy::from_yaml(yaml).expect("valid test policy")
+    }
+
+    #[test]
+    fn test_consumption_mode_denies_content_hash_only() {
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-fetch"
+      type: consumption_mode
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        let request = ToolRequest {
+            consumption_mode: true,
+            request_id: "req".to_string(),
+            session_token: "sess".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: String::new(),
+                content_hash: vec![0xaa; 32], // 32 bytes = valid BLAKE3 hash
+                expected_hash: Vec::new(),
+                max_bytes: 0,
+                format: String::new(),
+            })),
+        };
+
+        // Should be denied because stable_id is empty
+        assert!(engine.evaluate(&request).is_denied());
+    }
+
+    #[test]
+    fn test_consumption_mode_allows_stable_id() {
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-fetch"
+      type: consumption_mode
+      stable_ids: ["org:ticket:TCK-001"]
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        let request = ToolRequest {
+            consumption_mode: true,
+            request_id: "req".to_string(),
+            session_token: "sess".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: "org:ticket:TCK-001".to_string(),
+                content_hash: Vec::new(),
+                expected_hash: Vec::new(),
+                max_bytes: 0,
+                format: String::new(),
+            })),
+        };
+
+        assert!(engine.evaluate(&request).is_allowed());
+    }
+
+    #[test]
+    fn test_consumption_mode_denies_unlisted_stable_id() {
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "allow-fetch"
+      type: consumption_mode
+      stable_ids: ["org:ticket:TCK-001"]
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        let request = ToolRequest {
+            consumption_mode: true,
+            request_id: "req".to_string(),
+            session_token: "sess".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: "org:ticket:TCK-002".to_string(),
+                content_hash: Vec::new(),
+                expected_hash: Vec::new(),
+                max_bytes: 0,
+                format: String::new(),
+            })),
+        };
+
+        assert!(engine.evaluate(&request).is_denied());
+    }
+
+    #[test]
+    fn test_normal_mode_ignores_consumption_rules() {
+        let yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test"
+  rules:
+    - id: "consumption-rule"
+      type: consumption_mode
+      decision: deny # Should be ignored in normal mode
+    - id: "allow-tool"
+      type: tool_allow
+      tool: "artifact.fetch"
+      decision: allow
+  default_decision: deny
+"#;
+        let policy = create_test_policy(yaml);
+        let engine = PolicyEngine::new(&policy);
+
+        let request = ToolRequest {
+            consumption_mode: false,
+            request_id: "req".to_string(),
+            session_token: "sess".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: String::new(),
+                content_hash: vec![0xaa; 32], // 32 bytes = valid BLAKE3 hash
+                expected_hash: Vec::new(),
+                max_bytes: 0,
+                format: String::new(),
+            })),
+        };
+
+        // Should be allowed by tool_allow rule, consumption rule ignored
+        let result = engine.evaluate(&request);
+        assert!(result.is_allowed());
+        assert_eq!(result.rule_id, "allow-tool");
     }
 }

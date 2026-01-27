@@ -222,6 +222,33 @@ message ArtifactPublish {
   repeated string metadata = 4;
 }
 
+// Request to fetch an artifact by stable ID or content hash.
+//
+// In consumption mode, policy enforces that only allowlisted stable_ids
+// can be fetched to ensure hermeticity.
+message ArtifactFetch {
+  // Stable identifier for resolution (e.g., "org:ticket:TCK-001").
+  // If set, the kernel resolves this to a content hash.
+  string stable_id = 1;
+
+  // Direct content hash reference (BLAKE3, 32 bytes).
+  // Policy may restrict usage in consumption mode to prevent side-channel bypass.
+  // Note: Changed from string (hex) to bytes for consistency with ArtifactPublish.
+  bytes content_hash = 2;
+
+  // Expected content hash for validation when using stable_id (BLAKE3, 32 bytes).
+  // If resolution yields a different hash, the fetch fails.
+  // Note: Changed from string (hex) to bytes for consistency with content_hash.
+  bytes expected_hash = 3;
+
+  // Maximum bytes to return (inline or total).
+  uint64 max_bytes = 4;
+
+  // Requested format (e.g., "json", "yaml", "raw").
+  // The kernel may perform transcoding if supported.
+  string format = 5;
+}
+
 // ============================================================
 // TOOL RESPONSE
 // ============================================================
@@ -297,29 +324,4 @@ message ValidationError {
 
   // Human-readable description of the error.
   string message = 3;
-}
-
-// Request to fetch an artifact by stable ID or content hash.
-//
-// In consumption mode, policy enforces that only allowlisted stable_ids
-// can be fetched to ensure hermeticity.
-message ArtifactFetch {
-  // Stable identifier for resolution (e.g., "org:ticket:TCK-001").
-  // If set, the kernel resolves this to a content hash.
-  string stable_id = 1;
-
-  // Direct content hash reference (BLAKE3 hex).
-  // Policy may restrict usage in consumption mode to prevent side-channel bypass.
-  string content_hash = 2;
-
-  // Expected content hash for validation when using stable_id.
-  // If resolution yields a different hash, the fetch fails.
-  string expected_hash = 3;
-
-  // Maximum bytes to return (inline or total).
-  uint64 max_bytes = 4;
-
-  // Requested format (e.g., "json", "yaml", "raw").
-  // The kernel may perform transcoding if supported.
-  string format = 5;
 }

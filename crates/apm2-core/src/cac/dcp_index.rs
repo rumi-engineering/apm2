@@ -619,7 +619,15 @@ fn validate_stable_id(stable_id: &str) -> Result<(), DcpIndexError> {
 }
 
 /// Checks if `stable_id` uses a reserved prefix.
-fn check_reserved_prefix(stable_id: &str) -> Result<(), DcpIndexError> {
+///
+/// This function is public so it can be called from `AdmissionGate` to enforce
+/// reserved prefix restrictions at the admission boundary.
+///
+/// # Errors
+///
+/// Returns [`DcpIndexError::ReservedPrefix`] if the `stable_id` starts with
+/// a reserved prefix (`cac:`, `bootstrap:`, `internal:`).
+pub fn check_reserved_prefix(stable_id: &str) -> Result<(), DcpIndexError> {
     for prefix in RESERVED_PREFIXES {
         if stable_id.starts_with(prefix) {
             return Err(DcpIndexError::ReservedPrefix {

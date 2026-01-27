@@ -472,6 +472,63 @@ fn validate_artifact_publish(req: &ArtifactPublish, errors: &mut Vec<ValidationE
     }
 }
 
+/// Validate an artifact fetch request.
+fn validate_artifact_fetch(req: &ArtifactFetch, errors: &mut Vec<ValidationError>) {
+    // stable_id is optional, but if present must be ≤1024 chars (DCP limit)
+    if req.stable_id.len() > 1024 {
+        errors.push(ValidationError {
+            field: "artifact_fetch.stable_id".to_string(),
+            rule: "max_length".to_string(),
+            message: "stable_id must be at most 1024 characters".to_string(),
+        });
+    }
+
+    // content_hash is optional, but if present must be 32 bytes (BLAKE3)
+    if !req.content_hash.is_empty() && req.content_hash.len() != 32 {
+        errors.push(ValidationError {
+            field: "artifact_fetch.content_hash".to_string(),
+            rule: "hash_length".to_string(),
+            message: "content_hash must be exactly 32 bytes (BLAKE3)".to_string(),
+        });
+    }
+
+    // expected_hash optional, same rules as content_hash
+    if !req.expected_hash.is_empty() && req.expected_hash.len() != 32 {
+        errors.push(ValidationError {
+            field: "artifact_fetch.expected_hash".to_string(),
+            rule: "hash_length".to_string(),
+            message: "expected_hash must be exactly 32 bytes (BLAKE3)".to_string(),
+        });
+    }
+
+    // At least one of stable_id or content_hash must be provided
+    if req.stable_id.is_empty() && req.content_hash.is_empty() {
+        errors.push(ValidationError {
+            field: "artifact_fetch".to_string(),
+            rule: "required".to_string(),
+            message: "either stable_id or content_hash must be provided".to_string(),
+        });
+    }
+
+    // max_bytes limit (100MB safety cap matching write size)
+    if req.max_bytes > (MAX_WRITE_SIZE as u64) {
+        errors.push(ValidationError {
+            field: "artifact_fetch.max_bytes".to_string(),
+            rule: "max_value".to_string(),
+            message: format!("max_bytes must be at most {MAX_WRITE_SIZE}"),
+        });
+    }
+
+    // format optional, max length check
+    if req.format.len() > 32 {
+        errors.push(ValidationError {
+            field: "artifact_fetch.format".to_string(),
+            rule: "max_length".to_string(),
+            message: "format must be at most 32 characters".to_string(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod validation_tests {
     use super::*;
@@ -932,81 +989,6 @@ mod validation_tests {
     }
 }
 
-/// Validate an artifact fetch request.
-fn validate_artifact_fetch(req: &ArtifactFetch, errors: &mut Vec<ValidationError>) {
-    // stable_id is optional, but if present must be ≤1024 chars (DCP limit)
-    if req.stable_id.len() > 1024 {
-        errors.push(ValidationError {
-            field: "artifact_fetch.stable_id".to_string(),
-            rule: "max_length".to_string(),
-            message: "stable_id must be at most 1024 characters".to_string(),
-        });
-    }
-
-    // content_hash is optional, but if present must be 64 chars (hex BLAKE3)
-    if !req.content_hash.is_empty() {
-        if req.content_hash.len() != 64 {
-            errors.push(ValidationError {
-                field: "artifact_fetch.content_hash".to_string(),
-                rule: "hash_length".to_string(),
-                message: "content_hash must be exactly 64 characters (hex)".to_string(),
-            });
-        }
-        if !req.content_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            errors.push(ValidationError {
-                field: "artifact_fetch.content_hash".to_string(),
-                rule: "format".to_string(),
-                message: "content_hash must be hex characters".to_string(),
-            });
-        }
-    }
-
-    // expected_hash optional, same rules as content_hash
-    if !req.expected_hash.is_empty() {
-        if req.expected_hash.len() != 64 {
-            errors.push(ValidationError {
-                field: "artifact_fetch.expected_hash".to_string(),
-                rule: "hash_length".to_string(),
-                message: "expected_hash must be exactly 64 characters (hex)".to_string(),
-            });
-        }
-        if !req.expected_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            errors.push(ValidationError {
-                field: "artifact_fetch.expected_hash".to_string(),
-                rule: "format".to_string(),
-                message: "expected_hash must be hex characters".to_string(),
-            });
-        }
-    }
-
-    // At least one of stable_id or content_hash must be provided
-    if req.stable_id.is_empty() && req.content_hash.is_empty() {
-        errors.push(ValidationError {
-            field: "artifact_fetch".to_string(),
-            rule: "required".to_string(),
-            message: "either stable_id or content_hash must be provided".to_string(),
-        });
-    }
-
-    // max_bytes limit (100MB safety cap matching write size)
-    if req.max_bytes > (MAX_WRITE_SIZE as u64) {
-        errors.push(ValidationError {
-            field: "artifact_fetch.max_bytes".to_string(),
-            rule: "max_value".to_string(),
-            message: format!("max_bytes must be at most {MAX_WRITE_SIZE}"),
-        });
-    }
-
-    // format optional, max length check
-    if req.format.len() > 32 {
-        errors.push(ValidationError {
-            field: "artifact_fetch.format".to_string(),
-            rule: "max_length".to_string(),
-            message: "format must be at most 32 characters".to_string(),
-        });
-    }
-}
-
 #[cfg(test)]
 mod artifact_fetch_tests {
     use super::*;
@@ -1020,8 +1002,8 @@ mod artifact_fetch_tests {
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: "org:ticket:TCK-001".to_string(),
-                content_hash: String::new(),
-                expected_hash: String::new(),
+                content_hash: Vec::new(),
+                expected_hash: Vec::new(),
                 max_bytes: 1024,
                 format: "json".to_string(),
             })),
@@ -1038,8 +1020,8 @@ mod artifact_fetch_tests {
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: String::new(),
-                content_hash: "a".repeat(64),
-                expected_hash: String::new(),
+                content_hash: vec![0xaa; 32], // 32 bytes = valid BLAKE3 hash
+                expected_hash: Vec::new(),
                 max_bytes: 1024,
                 format: String::new(),
             })),
@@ -1056,8 +1038,8 @@ mod artifact_fetch_tests {
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: String::new(),
-                content_hash: String::new(),
-                expected_hash: String::new(),
+                content_hash: Vec::new(),
+                expected_hash: Vec::new(),
                 max_bytes: 1024,
                 format: String::new(),
             })),
@@ -1077,8 +1059,8 @@ mod artifact_fetch_tests {
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: String::new(),
-                content_hash: "invalid-hash".to_string(),
-                expected_hash: String::new(),
+                content_hash: vec![0xaa; 16], // 16 bytes = invalid (should be 32)
+                expected_hash: Vec::new(),
                 max_bytes: 1024,
                 format: String::new(),
             })),
@@ -1102,8 +1084,8 @@ mod artifact_fetch_tests {
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: "org:test".to_string(),
-                content_hash: String::new(),
-                expected_hash: String::new(),
+                content_hash: Vec::new(),
+                expected_hash: Vec::new(),
                 max_bytes: (MAX_WRITE_SIZE + 1) as u64,
                 format: String::new(),
             })),

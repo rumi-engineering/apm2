@@ -60,6 +60,9 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::dcp_index::RESERVED_PREFIXES;
+use super::dcp_index::check_reserved_prefix;
 use super::patch_engine::{PatchEngine, PatchEngineError, PatchType};
 use super::validator::{
     CacValidator, MAX_ARRAY_MEMBERS, MAX_DEPTH, MAX_OBJECT_PROPERTIES, ValidationError,
@@ -107,6 +110,15 @@ pub enum AdmissionError {
     InvalidDcpId {
         /// The reason the DCP ID is invalid.
         reason: String,
+    },
+
+    /// The DCP ID uses a reserved prefix without authorization.
+    #[error("reserved prefix: dcp_id '{dcp_id}' uses reserved prefix '{prefix}'")]
+    ReservedPrefix {
+        /// The DCP ID that used a reserved prefix.
+        dcp_id: String,
+        /// The reserved prefix that was used.
+        prefix: String,
     },
 
     /// Input complexity exceeds allowed limits.
@@ -234,6 +246,14 @@ pub struct AdmissionRequest {
     /// BLAKE3 hash of the schema (hex-encoded).
     pub schema_hash: String,
 
+    /// The DCP stable ID of the schema used for validation.
+    ///
+    /// This is the reference to a registered schema artifact (e.g.,
+    /// `org:schema:ticket-v1`). If provided, it will be included in the
+    /// `DcpEntry.schema_id` for the admitted artifact. If not provided
+    /// (empty string), no schema reference is recorded.
+    pub schema_id: String,
+
     /// The admission operation type.
     pub operation: AdmissionOperation,
 }
@@ -251,6 +271,11 @@ impl AdmissionRequest {
     /// # Returns
     ///
     /// An `AdmissionRequest` configured for artifact creation.
+    ///
+    /// # Note
+    ///
+    /// This constructor does not set `schema_id`. Use `with_schema_id()` to set
+    /// it if you need to track the schema reference in the DCP index.
     #[must_use]
     pub fn new_artifact(
         dcp_id: impl Into<String>,
@@ -265,8 +290,20 @@ impl AdmissionRequest {
             content,
             schema: schema.clone(),
             schema_hash,
+            schema_id: String::new(),
             operation: AdmissionOperation::Create,
         }
+    }
+
+    /// Sets the schema ID for this request.
+    ///
+    /// The `schema_id` is the DCP stable ID of the schema artifact (e.g.,
+    /// `org:schema:ticket-v1`). This is used to populate
+    /// `DcpEntry.schema_id` when the artifact is registered in the index.
+    #[must_use]
+    pub fn with_schema_id(mut self, schema_id: impl Into<String>) -> Self {
+        self.schema_id = schema_id.into();
+        self
     }
 
     /// Creates a JSON Patch admission request (update operation).
@@ -283,6 +320,11 @@ impl AdmissionRequest {
     /// # Returns
     ///
     /// An `AdmissionRequest` configured for JSON Patch update.
+    ///
+    /// # Note
+    ///
+    /// This constructor does not set `schema_id`. Use `with_schema_id()` to set
+    /// it if you need to track the schema reference in the DCP index.
     #[must_use]
     pub fn new_json_patch(
         dcp_id: impl Into<String>,
@@ -299,6 +341,7 @@ impl AdmissionRequest {
             content: Value::Null, // Will be populated after patching
             schema: schema.clone(),
             schema_hash,
+            schema_id: String::new(),
             operation: AdmissionOperation::JsonPatch {
                 patch,
                 expected_base_hash: expected_base_hash.into(),
@@ -321,6 +364,11 @@ impl AdmissionRequest {
     /// # Returns
     ///
     /// An `AdmissionRequest` configured for Merge Patch update.
+    ///
+    /// # Note
+    ///
+    /// This constructor does not set `schema_id`. Use `with_schema_id()` to set
+    /// it if you need to track the schema reference in the DCP index.
     #[must_use]
     pub fn new_merge_patch(
         dcp_id: impl Into<String>,
@@ -337,6 +385,7 @@ impl AdmissionRequest {
             content: Value::Null, // Will be populated after patching
             schema: schema.clone(),
             schema_hash,
+            schema_id: String::new(),
             operation: AdmissionOperation::MergePatch {
                 patch,
                 expected_base_hash: expected_base_hash.into(),
@@ -353,6 +402,7 @@ impl AdmissionRequest {
 /// - `base_hash`: BLAKE3 hash of the base document (if applicable)
 /// - `new_hash`: BLAKE3 hash of the admitted artifact
 /// - `schema_hash`: BLAKE3 hash of the validation schema
+/// - `schema_id`: DCP stable ID of the schema (if provided)
 ///
 /// The receipt also includes canonicalizer metadata per DD-0002.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +436,13 @@ pub struct AdmissionReceipt {
     /// BLAKE3 hash of the validation schema (hex-encoded).
     pub schema_hash: String,
 
+    /// DCP stable ID of the schema used for validation.
+    ///
+    /// This is the reference used in `DcpEntry.schema_id` for DCP index
+    /// registration. Empty string if no schema ID was provided.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schema_id: String,
+
     /// Size of the admitted artifact in bytes.
     pub artifact_size: usize,
 
@@ -412,6 +469,7 @@ impl AdmissionReceipt {
         artifact_kind: ArtifactKind,
         new_hash: String,
         schema_hash: String,
+        schema_id: String,
         artifact_size: usize,
         is_new_content: bool,
         patch_hash: Option<String>,
@@ -427,6 +485,7 @@ impl AdmissionReceipt {
             base_hash,
             new_hash,
             schema_hash,
+            schema_id,
             artifact_size,
             canonicalizer_id: CANONICALIZER_ID.to_string(),
             canonicalizer_version: CANONICALIZER_VERSION.to_string(),
@@ -711,6 +770,7 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
                     request.dcp_id,
                     request.artifact_kind,
                     request.schema_hash,
+                    request.schema_id,
                     base_document.clone(),
                     patch.clone(),
                     expected_base_hash.clone(),
@@ -730,6 +790,7 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
                     request.dcp_id,
                     request.artifact_kind,
                     request.schema_hash,
+                    request.schema_id,
                     base_document.clone(),
                     patch.clone(),
                     expected_base_hash.clone(),
@@ -774,6 +835,7 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
             request.artifact_kind,
             new_hash,
             request.schema_hash,
+            request.schema_id,
             store_result.size,
             store_result.is_new,
             None, // No patch hash for create
@@ -795,6 +857,7 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
         dcp_id: String,
         artifact_kind: ArtifactKind,
         schema_hash: String,
+        schema_id: String,
         base_document: Value,
         patch: Value,
         expected_base_hash: String,
@@ -830,6 +893,7 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
             artifact_kind,
             patch_result.new_hash,
             schema_hash,
+            schema_id,
             store_result.size,
             store_result.is_new,
             Some(patch_result.patch_hash),
@@ -851,6 +915,7 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
         dcp_id: String,
         artifact_kind: ArtifactKind,
         schema_hash: String,
+        schema_id: String,
         base_document: Value,
         patch: Value,
         expected_base_hash: String,
@@ -886,6 +951,7 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
             artifact_kind,
             patch_result.new_hash,
             schema_hash,
+            schema_id,
             store_result.size,
             store_result.is_new,
             Some(patch_result.patch_hash),
@@ -935,7 +1001,8 @@ fn compute_schema_hash(schema: &Value) -> String {
     )
 }
 
-/// Validates a DCP ID for length and character safety.
+/// Validates a DCP ID for length, character safety, and reserved prefix
+/// enforcement.
 ///
 /// # Security
 ///
@@ -943,6 +1010,9 @@ fn compute_schema_hash(schema: &Value) -> String {
 /// - Enforces maximum length of [`MAX_DCP_ID_LENGTH`] (1024 characters)
 /// - Rejects control characters (including newlines) to prevent metadata
 ///   injection
+/// - **Enforces reserved prefix restrictions** (`cac:`, `bootstrap:`,
+///   `internal:`) since `DcpIndexReducer` disables this check during event
+///   replay
 fn validate_dcp_id(dcp_id: &str) -> Result<(), AdmissionError> {
     // Check empty
     if dcp_id.is_empty() {
@@ -969,6 +1039,24 @@ fn validate_dcp_id(dcp_id: &str) -> Result<(), AdmissionError> {
             reason: format!("dcp_id contains control character at position {pos} (not allowed)"),
         });
     }
+
+    // SECURITY: Enforce reserved prefix restrictions.
+    // This is critical because DcpIndexReducer disables this check during event
+    // replay (to support replaying historical events), so AdmissionGate is the
+    // sole control point for preventing creation of artifacts in reserved
+    // namespaces.
+    check_reserved_prefix(dcp_id).map_err(|e| match e {
+        super::dcp_index::DcpIndexError::ReservedPrefix { stable_id, prefix } => {
+            AdmissionError::ReservedPrefix {
+                dcp_id: stable_id,
+                prefix,
+            }
+        },
+        // Other errors shouldn't occur from check_reserved_prefix, but handle defensively
+        _ => AdmissionError::InvalidDcpId {
+            reason: e.to_string(),
+        },
+    })?;
 
     Ok(())
 }
@@ -1796,6 +1884,264 @@ mod tests {
         assert!(
             result.is_ok(),
             "DCP ID at MAX_DCP_ID_LENGTH should be accepted"
+        );
+    }
+
+    // =========================================================================
+    // Security Verification Tests (TCK-00134)
+    // =========================================================================
+
+    #[test]
+    fn test_security_reserved_prefix_cac_rejected() {
+        // SECURITY TEST: Verify artifacts with reserved prefix 'cac:' are rejected
+        // This is critical because DcpIndexReducer disables prefix checks during replay
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "malicious"});
+
+        let request = AdmissionRequest::new_artifact(
+            "cac:malicious:test",
+            ArtifactKind::Generic,
+            artifact,
+            &schema,
+        );
+
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::ReservedPrefix { ref dcp_id, ref prefix })
+                if dcp_id == "cac:malicious:test" && prefix == "cac:"),
+            "Expected ReservedPrefix error for 'cac:' prefix, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_security_reserved_prefix_bootstrap_rejected() {
+        // SECURITY TEST: Verify artifacts with reserved prefix 'bootstrap:' are
+        // rejected
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "malicious"});
+
+        let request = AdmissionRequest::new_artifact(
+            "bootstrap:config:malicious",
+            ArtifactKind::Generic,
+            artifact,
+            &schema,
+        );
+
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::ReservedPrefix { ref prefix, .. })
+                if prefix == "bootstrap:"),
+            "Expected ReservedPrefix error for 'bootstrap:' prefix, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_security_reserved_prefix_internal_rejected() {
+        // SECURITY TEST: Verify artifacts with reserved prefix 'internal:' are rejected
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "malicious"});
+
+        let request = AdmissionRequest::new_artifact(
+            "internal:system:exploit",
+            ArtifactKind::Generic,
+            artifact,
+            &schema,
+        );
+
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::ReservedPrefix { ref prefix, .. })
+                if prefix == "internal:"),
+            "Expected ReservedPrefix error for 'internal:' prefix, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_security_all_reserved_prefixes_enforced() {
+        // SECURITY TEST: Verify all RESERVED_PREFIXES are enforced
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "test"});
+
+        for prefix in RESERVED_PREFIXES {
+            let dcp_id = format!("{prefix}evil:artifact");
+            let request = AdmissionRequest::new_artifact(
+                &dcp_id,
+                ArtifactKind::Generic,
+                artifact.clone(),
+                &schema,
+            );
+
+            let result = gate.admit(request);
+            assert!(
+                matches!(result, Err(AdmissionError::ReservedPrefix { .. })),
+                "Expected ReservedPrefix error for prefix '{prefix}', got: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_security_non_reserved_prefix_accepted() {
+        // SECURITY TEST: Verify non-reserved prefixes are still accepted
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "test"});
+
+        // These should all succeed (not reserved prefixes)
+        let valid_prefixes = [
+            "org:ticket:TCK-00134",
+            "company:project:artifact",
+            "myorg:schema:test-v1",
+            "acme:rfc:RFC-0001",
+        ];
+
+        for dcp_id in valid_prefixes {
+            let request = AdmissionRequest::new_artifact(
+                dcp_id,
+                ArtifactKind::Ticket,
+                artifact.clone(),
+                &schema,
+            );
+
+            let result = gate.admit(request);
+            assert!(
+                result.is_ok(),
+                "Non-reserved prefix '{dcp_id}' should be accepted, got: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_schema_id_in_receipt() {
+        // SECURITY TEST: Verify schema_id is properly tracked in receipts
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "TCK-00134"});
+
+        let schema_id = "org:schema:ticket-v1";
+        let request = AdmissionRequest::new_artifact(
+            "org:ticket:TCK-00134",
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        )
+        .with_schema_id(schema_id);
+
+        let result = gate.admit(request).unwrap();
+
+        assert_eq!(
+            result.receipt.schema_id, schema_id,
+            "Receipt should contain the schema_id"
+        );
+    }
+
+    #[test]
+    fn test_schema_id_empty_by_default() {
+        // Verify schema_id is empty when not explicitly set
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "TCK-00134"});
+
+        let request = AdmissionRequest::new_artifact(
+            "org:ticket:TCK-00134",
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        );
+        // Note: NOT calling .with_schema_id()
+
+        let result = gate.admit(request).unwrap();
+
+        assert!(
+            result.receipt.schema_id.is_empty(),
+            "Receipt schema_id should be empty by default"
+        );
+    }
+
+    #[test]
+    fn test_schema_id_in_patch_receipt() {
+        // Verify schema_id is tracked in patch operation receipts
+        let gate = make_gate();
+        let schema = sample_schema();
+        let base = json!({"id": "TCK-00134", "version": 1});
+        let patch = json!([{"op": "replace", "path": "/version", "value": 2}]);
+
+        let base_str = serde_json::to_string(&base).unwrap();
+        let canonical_base = canonicalize_json(&base_str).unwrap();
+        let base_hash = hash_bytes(canonical_base.as_bytes());
+
+        let schema_id = "org:schema:ticket-v1";
+        let request = AdmissionRequest::new_json_patch(
+            "org:ticket:TCK-00134",
+            ArtifactKind::Ticket,
+            base,
+            patch,
+            &base_hash,
+            &schema,
+        )
+        .with_schema_id(schema_id);
+
+        let result = gate.admit(request).unwrap();
+
+        assert_eq!(
+            result.receipt.schema_id, schema_id,
+            "Patch receipt should contain the schema_id"
+        );
+    }
+
+    #[test]
+    fn test_schema_id_serialization() {
+        // Verify schema_id is properly serialized/deserialized in receipts
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "TCK-00134"});
+
+        let schema_id = "org:schema:ticket-v1";
+        let request = AdmissionRequest::new_artifact(
+            "org:ticket:TCK-00134",
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        )
+        .with_schema_id(schema_id);
+
+        let result = gate.admit(request).unwrap();
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&result.receipt).unwrap();
+        let deserialized: AdmissionReceipt = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            deserialized.schema_id, schema_id,
+            "schema_id should survive serialization roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_schema_id_skipped_when_empty_in_serialization() {
+        // Verify empty schema_id is not included in JSON output
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "TCK-00134"});
+
+        let request = AdmissionRequest::new_artifact(
+            "org:ticket:TCK-00134",
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        );
+        // NOT setting schema_id
+
+        let result = gate.admit(request).unwrap();
+        let json = serde_json::to_string(&result.receipt).unwrap();
+
+        // Empty schema_id should not appear in JSON due to skip_serializing_if
+        assert!(
+            !json.contains("schema_id"),
+            "Empty schema_id should be skipped in serialization"
         );
     }
 }

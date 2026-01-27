@@ -34,6 +34,25 @@ A compiled JSON Schema validator with CAC-specific configuration.
 - [CTR-0021] `validate()` returns first error encountered (fail-fast)
 - [CTR-0022] All errors include JSON path to the violation
 
+### `AdmissionGate`
+
+```rust
+pub struct AdmissionGate<C: ContentAddressedStore> { /* fields private */ }
+```
+
+The admission gate that orchestrates validation, canonicalization, and storage of CAC artifacts.
+
+**Invariants:**
+- [INV-0029] Reserved prefixes (`cac:`, `bootstrap:`, `internal:`) are enforced at admission time
+- [INV-0030] `schema_id` is tracked in receipts when provided
+- [INV-0031] DCP IDs must not contain control characters (metadata injection prevention)
+
+**Contracts:**
+- [CTR-0025] `admit()` enforces reserved prefix restrictions (critical: DcpIndexReducer disables this during replay)
+- [CTR-0026] `admit()` validates DCP ID length and character safety before any expensive operations
+- [CTR-0027] `with_schema_id()` enables schema reference tracking in admission receipts
+
+
 ### `DcpIndex`
 
 ```rust

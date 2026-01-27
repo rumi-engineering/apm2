@@ -102,11 +102,19 @@
 //!
 //! let mut index = DcpIndex::new();
 //!
-//! // Register an artifact with a valid 64-character hex hash
+//! // First register the schema (self-referential for bootstrap)
+//! let schema = DcpEntry::new(
+//!     "org:schema:ticket-v1",
+//!     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+//!     "org:schema:ticket-v1", // Self-referential is allowed
+//! );
+//! index.register(schema).unwrap();
+//!
+//! // Now register an artifact with a valid 64-character hex hash
 //! let entry = DcpEntry::new(
 //!     "org:ticket:TCK-00134",
 //!     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-//!     "cac:schema:ticket-v1",
+//!     "org:schema:ticket-v1",
 //! );
 //! index.register(entry).unwrap();
 //!
