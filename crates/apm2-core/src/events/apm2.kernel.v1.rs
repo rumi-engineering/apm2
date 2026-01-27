@@ -29,7 +29,10 @@ pub struct KernelEvent {
     #[prost(uint32, tag = "7")]
     pub schema_version: u32,
     /// Event payload (oneof)
-    #[prost(oneof = "kernel_event::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17")]
+    #[prost(
+        oneof = "kernel_event::Payload",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18"
+    )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
 /// Nested message and enum types in `KernelEvent`.
@@ -54,6 +57,8 @@ pub mod kernel_event {
         Evidence(super::EvidenceEvent),
         #[prost(message, tag = "17")]
         Key(super::KeyEvent),
+        #[prost(message, tag = "18")]
+        Capability(super::CapabilityEvent),
     }
 }
 /// ============================================================
@@ -618,6 +623,45 @@ pub struct GateReceiptGenerated {
     pub evidence_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bytes = "vec", tag = "6")]
     pub receipt_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// ============================================================
+/// CAPABILITY EVENTS
+/// ============================================================
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CapabilityEvent {
+    #[prost(oneof = "capability_event::Event", tags = "1")]
+    pub event: ::core::option::Option<capability_event::Event>,
+}
+/// Nested message and enum types in `CapabilityEvent`.
+pub mod capability_event {
+    #[derive(Eq, Hash)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        Required(super::CapabilityRequired),
+    }
+}
+/// Emitted during planning phase when a capability is required for a plan step.
+/// This event enables capability negotiation and tracking.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CapabilityRequired {
+    /// The capability ID that is required (e.g., "cac:patch:apply")
+    #[prost(string, tag = "1")]
+    pub capability_id: ::prost::alloc::string::String,
+    /// The work ID this requirement is associated with
+    #[prost(string, tag = "2")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Whether this capability is required (true) or optional (false)
+    #[prost(bool, tag = "3")]
+    pub required: bool,
+    /// The status of the capability: AVAILABLE, UNAVAILABLE, DEGRADED
+    #[prost(string, tag = "4")]
+    pub status: ::prost::alloc::string::String,
+    /// Human-readable reason for the status
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
 }
 /// ============================================================
 /// KEY EVENTS

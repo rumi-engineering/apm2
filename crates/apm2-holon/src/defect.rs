@@ -197,6 +197,10 @@ pub enum SignalType {
     /// Agent Acceptance Test failed.
     #[serde(rename = "AAT_FAIL")]
     AatFail,
+
+    /// A required capability is unavailable.
+    #[serde(rename = "CAPABILITY_UNAVAILABLE")]
+    CapabilityUnavailable,
 }
 
 impl SignalType {
@@ -210,6 +214,7 @@ impl SignalType {
             Self::CanonicalizerDrift => "CANONICALIZER_DRIFT",
             Self::ExportDrift => "EXPORT_DRIFT",
             Self::AatFail => "AAT_FAIL",
+            Self::CapabilityUnavailable => "CAPABILITY_UNAVAILABLE",
         }
     }
 }
@@ -477,6 +482,45 @@ impl DefectRecord {
             )
             .add_remediation("Add missing artifact to context pack manifest")
             .add_remediation("Verify artifact stable ID is correct")
+            .build()
+    }
+
+    /// Creates a defect record for a required capability that is unavailable.
+    ///
+    /// This is a convenience constructor for emitting a defect when a required
+    /// capability is not present in the AAT receipt during planning phase.
+    ///
+    /// # Arguments
+    ///
+    /// * `defect_id` - Unique identifier for this defect
+    /// * `work_id` - The work ID this defect is associated with
+    /// * `capability_id` - The capability ID that is required but unavailable
+    /// * `timestamp_ns` - When the defect was detected (Unix nanoseconds)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DefectError` if any input exceeds validation limits.
+    pub fn capability_unavailable(
+        defect_id: impl Into<String>,
+        work_id: impl Into<String>,
+        capability_id: impl Into<String>,
+        timestamp_ns: u64,
+    ) -> Result<Self, DefectError> {
+        let capability_id_str = capability_id.into();
+        Self::builder(defect_id, "CAPABILITY_UNAVAILABLE")
+            .severity(DefectSeverity::S1) // High severity - required capability missing
+            .work_id(work_id)
+            .detected_at(timestamp_ns)
+            .signal(DefectSignal::new(
+                SignalType::CapabilityUnavailable,
+                format!("required capability '{capability_id_str}' not in AAT receipt"),
+            ))
+            .context(
+                DefectContext::new().with_requested_stable_id(capability_id_str),
+            )
+            .add_remediation("Ensure selftest suite covers the required capability")
+            .add_remediation("Verify the capability ID is correct")
+            .add_remediation("Run selftest to generate new AAT receipt")
             .build()
     }
 
@@ -854,6 +898,46 @@ mod tests {
             Some("org:doc:missing")
         );
         assert!(!defect.suggested_remediations().is_empty());
+    }
+
+    #[test]
+    fn test_defect_record_capability_unavailable() {
+        let defect = DefectRecord::capability_unavailable(
+            "DEF-002",
+            "work-123",
+            "cac:patch:apply",
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(defect.defect_id(), "DEF-002");
+        assert_eq!(defect.defect_class(), "CAPABILITY_UNAVAILABLE");
+        assert_eq!(defect.severity(), DefectSeverity::S1); // High severity
+        assert_eq!(defect.work_id(), "work-123");
+        assert_eq!(
+            defect.signal().signal_type(),
+            SignalType::CapabilityUnavailable
+        );
+        assert!(defect.signal().details().contains("cac:patch:apply"));
+        assert_eq!(
+            defect.context().requested_stable_id(),
+            Some("cac:patch:apply")
+        );
+        assert!(!defect.suggested_remediations().is_empty());
+    }
+
+    #[test]
+    fn test_signal_type_capability_unavailable() {
+        assert_eq!(
+            SignalType::CapabilityUnavailable.as_str(),
+            "CAPABILITY_UNAVAILABLE"
+        );
+
+        let json = serde_json::to_string(&SignalType::CapabilityUnavailable).unwrap();
+        assert_eq!(json, "\"CAPABILITY_UNAVAILABLE\"");
+
+        let deserialized: SignalType = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, SignalType::CapabilityUnavailable);
     }
 
     #[test]

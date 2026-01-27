@@ -50,6 +50,7 @@ message KernelEvent {
     AdjudicationEvent adjudication = 15;
     EvidenceEvent evidence = 16;
     KeyEvent key = 17;
+    CapabilityEvent capability = 18;
   }
 }
 
@@ -359,6 +360,30 @@ message GateReceiptGenerated {
   string result = 4;  // PASS, FAIL
   repeated string evidence_ids = 5;
   bytes receipt_signature = 6;
+}
+
+// ============================================================
+// CAPABILITY EVENTS
+// ============================================================
+message CapabilityEvent {
+  oneof event {
+    CapabilityRequired required = 1;
+  }
+}
+
+// Emitted during planning phase when a capability is required for a plan step.
+// This event enables capability negotiation and tracking.
+message CapabilityRequired {
+  // The capability ID that is required (e.g., "cac:patch:apply")
+  string capability_id = 1;
+  // The work ID this requirement is associated with
+  string work_id = 2;
+  // Whether this capability is required (true) or optional (false)
+  bool required = 3;
+  // The status of the capability: AVAILABLE, UNAVAILABLE, DEGRADED
+  string status = 4;
+  // Human-readable reason for the status
+  string reason = 5;
 }
 
 // ============================================================

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// - Identification (work ID, lease ID, episode number)
 /// - Budget constraints (remaining tokens, time, etc.)
 /// - Progress state (goal, current progress)
+/// - Capability negotiation (available capabilities for planning)
 ///
 /// The holon uses this context to make decisions about what to do
 /// in this episode and whether to continue or stop.
@@ -61,6 +62,16 @@ pub struct EpisodeContext {
 
     /// Timestamp when this episode started (nanoseconds since epoch).
     started_at_ns: u64,
+
+    /// Available capability IDs for planning phase negotiation.
+    ///
+    /// This field contains the capability IDs that are available for this
+    /// episode, as verified by an AAT receipt. Planning steps that require
+    /// capabilities not in this list should be filtered out or degraded.
+    ///
+    /// Empty vector means no capability filtering (all capabilities allowed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    capability_ids: Vec<String>,
 }
 
 impl EpisodeContext {
@@ -130,6 +141,47 @@ impl EpisodeContext {
         self.started_at_ns
     }
 
+    /// Returns the available capability IDs for planning phase negotiation.
+    ///
+    /// This returns the capability IDs that are available for this episode,
+    /// as verified by an AAT receipt. Planning steps that require capabilities
+    /// not in this list should be filtered out or degraded.
+    ///
+    /// Returns an empty slice if no capability filtering is configured.
+    #[must_use]
+    pub fn capability_ids(&self) -> &[String] {
+        &self.capability_ids
+    }
+
+    /// Returns `true` if the given capability is available.
+    ///
+    /// If no capabilities are configured (empty list), all capabilities
+    /// are considered available (no filtering).
+    #[must_use]
+    pub fn has_capability(&self, capability_id: &str) -> bool {
+        self.capability_ids.is_empty() || self.capability_ids.iter().any(|c| c == capability_id)
+    }
+
+    /// Filters a list of capability IDs to only those available in this
+    /// context.
+    ///
+    /// This is useful for planning phase integration where available
+    /// capabilities determine which plan steps can execute.
+    ///
+    /// If no capabilities are configured (empty list), returns all input
+    /// capabilities (no filtering).
+    #[must_use]
+    pub fn filter_capabilities(&self, capability_ids: &[String]) -> Vec<String> {
+        if self.capability_ids.is_empty() {
+            return capability_ids.to_vec();
+        }
+        capability_ids
+            .iter()
+            .filter(|id| self.capability_ids.contains(id))
+            .cloned()
+            .collect()
+    }
+
     /// Returns `true` if this is the first episode.
     #[must_use]
     pub const fn is_first_episode(&self) -> bool {
@@ -179,6 +231,7 @@ impl EpisodeContext {
             progress_state: self.progress_state.clone(),
             parent_holon_id: self.parent_holon_id.clone(),
             started_at_ns: current_timestamp_ns(),
+            capability_ids: self.capability_ids.clone(),
         }
     }
 
@@ -205,6 +258,7 @@ pub struct EpisodeContextBuilder {
     progress_state: Option<String>,
     parent_holon_id: Option<String>,
     started_at_ns: Option<u64>,
+    capability_ids: Vec<String>,
 }
 
 impl EpisodeContextBuilder {
@@ -278,6 +332,23 @@ impl EpisodeContextBuilder {
         self
     }
 
+    /// Sets the available capability IDs for planning phase negotiation.
+    ///
+    /// These capability IDs determine which plan steps can execute. Steps
+    /// requiring capabilities not in this list should be filtered out.
+    #[must_use]
+    pub fn capability_ids(mut self, capability_ids: Vec<String>) -> Self {
+        self.capability_ids = capability_ids;
+        self
+    }
+
+    /// Adds a single capability ID to the available capabilities.
+    #[must_use]
+    pub fn add_capability_id(mut self, capability_id: impl Into<String>) -> Self {
+        self.capability_ids.push(capability_id.into());
+        self
+    }
+
     /// Builds the `EpisodeContext`.
     ///
     /// # Panics
@@ -296,6 +367,7 @@ impl EpisodeContextBuilder {
             progress_state: self.progress_state,
             parent_holon_id: self.parent_holon_id,
             started_at_ns: self.started_at_ns.unwrap_or_else(current_timestamp_ns),
+            capability_ids: self.capability_ids,
         }
     }
 }
@@ -443,5 +515,146 @@ mod unit_tests {
         assert!(!ctx.tokens_exhausted());
         assert!(!ctx.time_exhausted());
         assert!(!ctx.any_budget_exhausted());
+    }
+
+    // =========================================================================
+    // Capability ID Tests (TCK-00146)
+    // =========================================================================
+
+    #[test]
+    fn test_capability_ids_empty_by_default() {
+        let ctx = EpisodeContext::builder()
+            .work_id("work-123")
+            .lease_id("lease-456")
+            .build();
+
+        assert!(ctx.capability_ids().is_empty());
+    }
+
+    #[test]
+    fn test_capability_ids_builder() {
+        let ctx = EpisodeContext::builder()
+            .work_id("work-123")
+            .lease_id("lease-456")
+            .capability_ids(vec![
+                "cac:patch:apply".to_string(),
+                "cac:admission:validate".to_string(),
+            ])
+            .build();
+
+        assert_eq!(ctx.capability_ids().len(), 2);
+        assert!(
+            ctx.capability_ids()
+                .contains(&"cac:patch:apply".to_string())
+        );
+        assert!(
+            ctx.capability_ids()
+                .contains(&"cac:admission:validate".to_string())
+        );
+    }
+
+    #[test]
+    fn test_add_capability_id() {
+        let ctx = EpisodeContext::builder()
+            .work_id("work-123")
+            .lease_id("lease-456")
+            .add_capability_id("cac:patch:apply")
+            .add_capability_id("cac:admission:validate")
+            .build();
+
+        assert_eq!(ctx.capability_ids().len(), 2);
+    }
+
+    #[test]
+    fn test_has_capability_with_capabilities_set() {
+        let ctx = EpisodeContext::builder()
+            .work_id("work-123")
+            .lease_id("lease-456")
+            .capability_ids(vec![
+                "cac:patch:apply".to_string(),
+                "cac:admission:validate".to_string(),
+            ])
+            .build();
+
+        assert!(ctx.has_capability("cac:patch:apply"));
+        assert!(ctx.has_capability("cac:admission:validate"));
+        assert!(!ctx.has_capability("cac:export:render"));
+    }
+
+    #[test]
+    fn test_has_capability_with_empty_list_allows_all() {
+        let ctx = EpisodeContext::builder()
+            .work_id("work-123")
+            .lease_id("lease-456")
+            .build();
+
+        // Empty capability list means no filtering - all capabilities allowed
+        assert!(ctx.has_capability("cac:patch:apply"));
+        assert!(ctx.has_capability("cac:any:capability"));
+    }
+
+    #[test]
+    fn test_filter_capabilities() {
+        let ctx = EpisodeContext::builder()
+            .work_id("work-123")
+            .lease_id("lease-456")
+            .capability_ids(vec![
+                "cac:patch:apply".to_string(),
+                "cac:admission:validate".to_string(),
+            ])
+            .build();
+
+        let requested = vec![
+            "cac:patch:apply".to_string(),
+            "cac:export:render".to_string(), // Not available
+            "cac:admission:validate".to_string(),
+        ];
+
+        let filtered = ctx.filter_capabilities(&requested);
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.contains(&"cac:patch:apply".to_string()));
+        assert!(filtered.contains(&"cac:admission:validate".to_string()));
+        assert!(!filtered.contains(&"cac:export:render".to_string()));
+    }
+
+    #[test]
+    fn test_filter_capabilities_empty_list_returns_all() {
+        let ctx = EpisodeContext::builder()
+            .work_id("work-123")
+            .lease_id("lease-456")
+            .build();
+
+        let requested = vec![
+            "cac:patch:apply".to_string(),
+            "cac:export:render".to_string(),
+        ];
+
+        let filtered = ctx.filter_capabilities(&requested);
+
+        // Empty capability list means no filtering
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered, requested);
+    }
+
+    #[test]
+    fn test_next_episode_preserves_capability_ids() {
+        let ctx = EpisodeContext::builder()
+            .work_id("work-123")
+            .lease_id("lease-456")
+            .remaining_tokens(1000)
+            .remaining_time_ms(60_000)
+            .capability_ids(vec![
+                "cac:patch:apply".to_string(),
+                "cac:admission:validate".to_string(),
+            ])
+            .build();
+
+        let next = ctx.next_episode(100, 5_000);
+
+        // Capability IDs should be preserved across episodes
+        assert_eq!(next.capability_ids().len(), 2);
+        assert!(next.has_capability("cac:patch:apply"));
+        assert!(next.has_capability("cac:admission:validate"));
     }
 }
