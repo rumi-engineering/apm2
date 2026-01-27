@@ -1,0 +1,110 @@
+acceptance_criteria:
+  - criterion: E2E tests for tool mediation
+    verification: Tool requests flow through broker
+  - criterion: Deduplication verification
+    verification: Repeated requests return cached results
+  - criterion: Receipt binding verification
+    verification: Receipts contain correct hashes
+implementation:
+  code_examples:
+    - description: E2E tool mediation test
+      code: |
+        #[tokio::test]
+        async fn test_tool_mediation() {
+            let daemon = TestDaemon::start().await;
+            let episode_id = daemon.create_and_start().await;
+
+            // Send tool request
+            let request = ToolRequest {
+                tool: "read".into(),
+                dedupe_key: dedupe_key!("test-read"),
+                args_hash: hash_of(b"test.txt"),
+            };
+            let decision = daemon.tool_request(&episode_id, request.clone()).await.unwrap();
+            assert_eq!(decision.decision, Decision::Allow);
+
+            // Execute tool
+            let result = daemon.tool_execute(&episode_id, decision).await.unwrap();
+            assert!(result.receipt.verify(&daemon.public_key()).is_ok());
+
+            // Dedupe hit
+            let decision2 = daemon.tool_request(&episode_id, request).await.unwrap();
+            assert_eq!(decision2.decision, Decision::DedupeCacheHit { .. });
+        }
+  files_to_create:
+    - path: crates/apm2-daemon/tests/e2e_tool.rs
+      purpose: E2E tool mediation tests
+    - path: crates/apm2-daemon/tests/e2e_telemetry.rs
+      purpose: E2E telemetry frame tests
+    - path: crates/apm2-daemon/tests/common/mock_harness.rs
+      purpose: Mock harness for controlled testing
+  files_to_modify:
+    - changes: Add mock harness to test registry
+      path: crates/apm2-daemon/tests/common/mod.rs
+  implementation_steps:
+    - step: 1
+      action: Create MockHarness
+      details: |
+        MockHarness for controlled testing:
+        - Configurable output patterns
+        - Programmable tool calls
+        - Controlled exit codes
+        - Deterministic behavior
+    - step: 2
+      action: Implement tool mediation tests
+      details: |
+        Test scenarios:
+        - Allow decision flow
+        - Deny decision (unauthorized)
+        - Dedupe cache hit
+        - Budget charging
+    - step: 3
+      action: Implement deduplication tests
+      details: |
+        Test scenarios:
+        - Same dedupe key returns cached
+        - Different dedupe key re-executes
+        - Cache eviction on episode end
+    - step: 4
+      action: Implement telemetry tests
+      details: |
+        Test scenarios:
+        - Frames emitted at configured rate
+        - Metrics match resource consumption (within 5%)
+        - Ring buffer bounds respected
+        - Promotion triggers work
+    - step: 5
+      action: Verify receipt binding
+      details: |
+        Assert receipt contents:
+        - envelope_hash matches episode
+        - result_hash matches stored result
+        - signature verifies
+        - evidence_refs exist in CAS
+  summary: |
+    Implement E2E tests for tool mediation, deduplication, and telemetry.
+    Verifies tool request flow, receipt binding, and telemetry frame accuracy.
+    Uses MockHarness for controlled test scenarios.
+notes: |
+  Phase: PHASE-4 (Integration and CLI)
+  Generated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.
+  Maps to TCK-PEND-018b.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Tool mediation E2E
+    test_id: E2E-00176-01
+    verification_command: cargo test -p apm2-daemon --test e2e_tool
+  - description: Telemetry E2E
+    test_id: E2E-00176-02
+    verification_command: cargo test -p apm2-daemon --test e2e_telemetry
+ticket:
+  depends_on:
+    - TCK-00174
+  id: TCK-00176
+  requirement_ids:
+    - REQ-TOOL-001
+    - REQ-TEL-001
+  rfc_id: RFC-0013
+  status: READY
+  title: Implement E2E tool and telemetry tests

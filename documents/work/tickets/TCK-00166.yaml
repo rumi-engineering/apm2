@@ -1,0 +1,107 @@
+acceptance_criteria:
+  - criterion: Receipt generation per AD-RECEIPT-001
+    verification: Receipt contains all required fields
+  - criterion: Binding to envelope and tool result hash
+    verification: Receipt binds envelope_hash and result_hash
+  - criterion: Unsigned bytes hash for signing
+    verification: canonical_bytes() produces stable hash
+implementation:
+  code_examples:
+    - description: ToolReceipt structure
+      code: |
+        pub struct ToolReceipt {
+            pub kind: ReceiptKind,
+            pub envelope_hash: Hash,
+            pub policy_hash: Hash,
+            pub canonicalizer_id: CanonicalizerId,
+            pub canonicalizer_version: u32,
+            pub evidence_refs: Vec<Hash>,
+            pub unsigned_bytes_hash: Hash,
+            pub signature: Option<Signature>,
+            pub signer_identity: Option<SignerIdentity>,
+        }
+
+        impl ToolReceipt {
+            pub fn canonical_bytes(&self) -> Vec<u8>;
+            pub fn unsigned_bytes(&self) -> Vec<u8>;
+            pub fn verify(&self, public_key: &PublicKey) -> Result<bool>;
+        }
+  files_to_create:
+    - path: crates/apm2-daemon/src/evidence/receipt.rs
+      purpose: Receipt types and generation
+    - path: crates/apm2-daemon/src/evidence/binding.rs
+      purpose: Evidence binding logic
+    - path: crates/apm2-daemon/src/evidence/receipt_builder.rs
+      purpose: Builder pattern for receipt construction
+  files_to_modify:
+    - changes: Export receipt, binding, receipt_builder modules
+      path: crates/apm2-daemon/src/evidence/mod.rs
+  implementation_steps:
+    - step: 1
+      action: Define receipt types
+      details: |
+        Create receipt types per AD-RECEIPT-001:
+        - ReceiptKind: ToolExecution, EpisodeStart, EpisodeStop, etc.
+        - Common fields: envelope_hash, policy_hash, canonicalizer
+        - Type-specific fields: result_hash, decision, duration
+    - step: 2
+      action: Implement canonical_bytes
+      details: |
+        Deterministic serialization per AD-VERIFY-001:
+        - Fields in tag order
+        - No maps
+        - Explicit defaults
+        - Signature field excluded
+    - step: 3
+      action: Implement ReceiptBuilder
+      details: |
+        Builder pattern for receipt construction:
+        - for_tool_execution(request_id, result)
+        - with_envelope(envelope_hash)
+        - with_policy(policy_hash)
+        - with_evidence(evidence_refs)
+        - build() -> Receipt (unsigned)
+    - step: 4
+      action: Implement evidence binding
+      details: |
+        Bind receipt to evidence:
+        - Collect CAS hashes for tool args, result
+        - Include envelope hash
+        - Include policy hash
+        - Compute unsigned_bytes_hash
+    - step: 5
+      action: Create golden vectors
+      details: |
+        Golden vectors for receipt canonicalization:
+        - Various receipt kinds
+        - Different evidence ref counts
+        - Verify stable hashing
+  summary: |
+    Implement tool receipt generation per AD-RECEIPT-001.
+    Receipts bind envelope hash, policy hash, and evidence refs.
+    Includes canonical_bytes() for deterministic signing.
+notes: |
+  Phase: PHASE-2B (Tool Execution and Receipts)
+  Generated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.
+  Maps to TCK-PEND-009b.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Receipt binding
+    test_id: UT-00166-01
+    verification_command: cargo test -p apm2-daemon receipt_binding
+  - description: Golden vectors
+    test_id: UT-00166-02
+    verification_command: cargo test -p apm2-daemon receipt_golden_vectors
+  - description: Builder pattern
+    test_id: UT-00166-03
+    verification_command: cargo test -p apm2-daemon receipt_builder
+ticket:
+  depends_on:
+    - TCK-00165
+  id: TCK-00166
+  requirement_ids:
+    - REQ-RECEIPT-001
+  rfc_id: RFC-0013
+  status: READY
+  title: Implement tool receipt generation

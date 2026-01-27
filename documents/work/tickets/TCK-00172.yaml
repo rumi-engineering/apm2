@@ -1,0 +1,106 @@
+acceptance_criteria:
+  - criterion: Compaction job producing summary receipts
+    verification: Compaction produces valid receipt
+  - criterion: Tombstoned pointers for dropped artifacts
+    verification: Tombstone references original hash
+  - criterion: Compaction receipts for audit trail
+    verification: Receipt links to compacted artifacts
+implementation:
+  code_examples:
+    - description: Compaction types
+      code: |
+        pub struct CompactionJob {
+            pub episode_id: EpisodeId,
+            pub artifacts: Vec<ArtifactId>,
+            pub strategy: CompactionStrategy,
+        }
+
+        pub struct CompactionResult {
+            pub summary_hash: Hash,
+            pub tombstones: Vec<Tombstone>,
+            pub receipt: CompactionReceipt,
+        }
+
+        pub struct Tombstone {
+            pub original_hash: Hash,
+            pub summary_hash: Hash,
+            pub dropped_at: Timestamp,
+        }
+  files_to_create:
+    - path: crates/apm2-daemon/src/evidence/compaction.rs
+      purpose: CompactionJob and compaction logic
+    - path: crates/apm2-daemon/src/evidence/tombstone.rs
+      purpose: Tombstone and dropped artifact tracking
+    - path: crates/apm2-daemon/src/evidence/summary.rs
+      purpose: Summary receipt generation
+  files_to_modify:
+    - changes: Export compaction, tombstone, summary modules
+      path: crates/apm2-daemon/src/evidence/mod.rs
+  implementation_steps:
+    - step: 1
+      action: Define CompactionStrategy
+      details: |
+        Compaction strategies:
+        - CountSummary: retain counts, drop details
+        - DigestOnly: retain only content hashes
+        - TimeWindow: compact artifacts older than threshold
+    - step: 2
+      action: Implement CompactionJob
+      details: |
+        Create job runner:
+        - Identify compactable artifacts (expired, unpinned)
+        - Apply strategy to produce summary
+        - Store summary in CAS
+        - Create tombstones
+    - step: 3
+      action: Implement Tombstone
+      details: |
+        Create tombstone structure:
+        - original_hash: what was compacted
+        - summary_hash: where summary lives
+        - dropped_at: when compacted
+        Emit evidence.compacted events
+    - step: 4
+      action: Implement CompactionReceipt
+      details: |
+        Receipt for audit trail:
+        - Lists all compacted artifact hashes
+        - References summary artifact
+        - Signed like other receipts
+        - Enables verification of compaction
+    - step: 5
+      action: Schedule compaction
+      details: |
+        Periodic compaction:
+        - Run every hour (configurable)
+        - Process episodes older than retention window
+        - Emit compaction.completed events
+  summary: |
+    Implement evidence compaction per AD-EVID-002.
+    Compaction produces summary receipts referencing dropped artifacts
+    by digest (tombstoned pointers). Enables bounded storage growth.
+notes: |
+  Phase: PHASE-3A (Evidence Economics)
+  Generated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.
+  Maps to TCK-PEND-015.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Compaction produces summary
+    test_id: UT-00172-01
+    verification_command: cargo test -p apm2-daemon compaction_summary
+  - description: Tombstone creation
+    test_id: UT-00172-02
+    verification_command: cargo test -p apm2-daemon tombstone
+  - description: Compaction receipt
+    test_id: UT-00172-03
+    verification_command: cargo test -p apm2-daemon compaction_receipt
+ticket:
+  depends_on:
+    - TCK-00171
+  id: TCK-00172
+  requirement_ids:
+    - REQ-EVID-001
+  rfc_id: RFC-0013
+  status: READY
+  title: Implement evidence compaction

@@ -1,0 +1,98 @@
+acceptance_criteria:
+  - criterion: Protobuf messages compile with prost
+    verification: cargo build -p apm2-daemon succeeds
+  - criterion: All message types from CTR-PROTO-001 through CTR-PROTO-006 defined
+    verification: Unit test verifies message serialization
+  - criterion: Golden vectors match expected digests
+    verification: cargo test -p apm2-daemon proto_golden_vectors
+implementation:
+  code_examples:
+    - description: Proto file structure
+      code: |
+        syntax = "proto3";
+        package apm2.daemon.v1;
+
+        // CTR-PROTO-001: Handshake
+        message Hello {
+          uint32 protocol_version = 1;
+          ClientInfo client_info = 2;
+          repeated string requested_caps = 3;
+        }
+
+        message HelloAck {
+          ServerInfo server_info = 1;
+          repeated string granted_caps = 2;
+          bytes policy_hash = 3;
+        }
+  files_to_create:
+    - path: proto/daemon_protocol.proto
+      purpose: Protocol buffer message definitions
+    - path: crates/apm2-daemon/src/protocol/messages.rs
+      purpose: Generated Rust types and helpers
+    - path: crates/apm2-daemon/src/protocol/golden_vectors.rs
+      purpose: Golden test vectors for determinism
+    - path: crates/apm2-daemon/build.rs
+      purpose: prost build script for proto compilation
+  files_to_modify:
+    - changes: Add prost-build to build-dependencies
+      path: crates/apm2-daemon/Cargo.toml
+    - changes: Export messages module
+      path: crates/apm2-daemon/src/protocol/mod.rs
+  implementation_steps:
+    - step: 1
+      action: Create proto file with all message types
+      details: |
+        Define messages per CTR-PROTO-001 through CTR-PROTO-006:
+        - Handshake: Hello, HelloAck, ClientInfo, ServerInfo
+        - Episode Control: CreateEpisode, EpisodeCreated, StartEpisode, etc.
+        - I/O: SendInput, StreamOutput, StreamKind
+        - Tool: ToolRequest, ToolDecision, ToolResult, DecisionType
+        - Telemetry: TelemetryFrame, TelemetryPolicy
+        - Receipts: Receipt, ReceiptKind, PublishEvidence
+    - step: 2
+      action: Configure prost build
+      details: |
+        Create build.rs using prost_build::Config to compile proto files.
+        Output to OUT_DIR. Include in messages.rs via include! macro.
+    - step: 3
+      action: Add helper methods
+      details: |
+        Add convenience methods on generated types:
+        - canonical_bytes() for signed messages
+        - From/Into conversions for enums
+        - Default implementations where appropriate
+    - step: 4
+      action: Create golden vectors
+      details: |
+        Create at least 10 golden vectors per CTR-PROTO contract:
+        - JSON input -> canonical bytes -> BLAKE3 hash
+        - Verify determinism across serialization/deserialization cycles
+  summary: |
+    Implement protobuf message definitions per AD-DAEMON-003.
+    Defines all protocol messages (Handshake, Episode, I/O, Tool, Telemetry, Receipt)
+    with prost code generation and golden vectors for determinism verification.
+notes: |
+  Phase: PHASE-1A (Protocol Foundation)
+  Generated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.
+  Maps to TCK-PEND-002.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Proto compilation succeeds
+    test_id: UT-00158-01
+    verification_command: cargo build -p apm2-daemon
+  - description: Golden vectors pass
+    test_id: UT-00158-02
+    verification_command: cargo test -p apm2-daemon golden_vectors
+  - description: Round-trip serialization
+    test_id: UT-00158-03
+    verification_command: cargo test -p apm2-daemon proto_roundtrip
+ticket:
+  depends_on:
+    - TCK-00157
+  id: TCK-00158
+  requirement_ids:
+    - REQ-PROTOCOL-001
+  rfc_id: RFC-0013
+  status: READY
+  title: Implement protobuf message definitions

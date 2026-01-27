@@ -1,0 +1,110 @@
+acceptance_criteria:
+  - criterion: Verification of evidence integrity
+    verification: Stored evidence matches content hash
+  - criterion: Receipt authenticity verification
+    verification: Signed receipts verify against public key
+  - criterion: Compaction and TTL enforcement scenarios
+    verification: Expired artifacts evicted, compaction produces valid receipts
+implementation:
+  code_examples:
+    - description: E2E evidence verification test
+      code: |
+        #[tokio::test]
+        async fn test_evidence_integrity() {
+            let daemon = TestDaemon::start().await;
+            let episode_id = daemon.create_and_start().await;
+
+            // Execute tool to generate evidence
+            daemon.run_tool(&episode_id, "write", &["test.txt", "content"]).await;
+
+            // Stop episode to finalize evidence
+            daemon.stop(&episode_id, StopReason::Normal).await;
+
+            // Verify evidence integrity
+            let receipt = daemon.get_episode_receipt(&episode_id).await.unwrap();
+            for evidence_ref in &receipt.evidence_refs {
+                let content = daemon.cas_get(evidence_ref).await.unwrap();
+                assert_eq!(blake3::hash(&content).as_bytes(), evidence_ref);
+            }
+
+            // Verify receipt signature
+            assert!(receipt.verify(&daemon.public_key()).is_ok());
+        }
+  files_to_create:
+    - path: crates/apm2-daemon/tests/e2e_evidence.rs
+      purpose: E2E evidence integrity tests
+    - path: crates/apm2-daemon/tests/e2e_receipt.rs
+      purpose: E2E receipt verification tests
+    - path: crates/apm2-daemon/tests/e2e_compaction.rs
+      purpose: E2E compaction and TTL tests
+  files_to_modify: []
+  implementation_steps:
+    - step: 1
+      action: Implement evidence integrity tests
+      details: |
+        Test scenarios:
+        - Content hash matches stored content
+        - CAS retrieval returns correct data
+        - Missing evidence detected
+        - Corrupted evidence detected
+    - step: 2
+      action: Implement receipt verification tests
+      details: |
+        Test scenarios:
+        - Valid receipt verifies
+        - Tampered receipt fails
+        - Wrong key fails
+        - All evidence refs exist
+    - step: 3
+      action: Implement TTL enforcement tests
+      details: |
+        Test scenarios:
+        - Expired artifacts evicted
+        - Pinned artifacts survive TTL
+        - Unpin allows eviction
+        - Evidence class TTLs correct
+    - step: 4
+      action: Implement compaction tests
+      details: |
+        Test scenarios:
+        - Compaction produces summary
+        - Tombstones reference originals
+        - Compaction receipt valid
+        - Audit trail preserved
+    - step: 5
+      action: Implement verification predicate tests
+      details: |
+        Full doctrine predicate:
+        - VerifyReceipt(receipt)
+        - EvidenceSatisfies(contract, evidence)
+        - DigestBindingsHold(output, evidence)
+  summary: |
+    Implement E2E tests for evidence integrity and receipt verification.
+    Verifies evidence hash binding, receipt signature verification,
+    and compaction/TTL enforcement scenarios.
+notes: |
+  Phase: PHASE-4 (Integration and CLI)
+  Generated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.
+  Maps to TCK-PEND-018c.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Evidence integrity E2E
+    test_id: E2E-00177-01
+    verification_command: cargo test -p apm2-daemon --test e2e_evidence
+  - description: Receipt verification E2E
+    test_id: E2E-00177-02
+    verification_command: cargo test -p apm2-daemon --test e2e_receipt
+  - description: Compaction E2E
+    test_id: E2E-00177-03
+    verification_command: cargo test -p apm2-daemon --test e2e_compaction
+ticket:
+  depends_on:
+    - TCK-00174
+  id: TCK-00177
+  requirement_ids:
+    - REQ-EVID-001
+    - REQ-RECEIPT-001
+  rfc_id: RFC-0013
+  status: READY
+  title: Implement E2E evidence and receipt verification tests

@@ -1,0 +1,96 @@
+rfc_meta:
+  schema_version: "2026-01-27"
+  template_version: "2026-01-27"
+  version: v4
+  rfc:
+    id: RFC-0013
+    title: "APM2 Kernel Daemon and Holonic Runtime Protocol v1"
+    status: DRAFT
+    created_date: "2026-01-27"
+    last_updated_date: "2026-01-27"
+  v2_transition_date: "2026-01-27"
+  binds_to_prd:
+    prd_id: "NONE"
+    rationale: |
+      Foundational infrastructure RFC implementing mission-critical substrate layer.
+      This RFC specifies the kernel daemon (apm2d) and runtime protocol required
+      for running any agent harness as bounded holonic episodes. It provides the
+      low-level runtime enveloping consumed by:
+      - PRD-0004 (Work Substrate) for work lifecycle
+      - PRD-0008 (Agent Coordination) via RFC-0012 for session spawning
+      The unified theory doctrine (truth topology, OCAP, leases/budgets, measurement
+      integrity) serves as the grounding specification.
+  protocol_profile:
+    id: NONE
+    applies: false
+    inherited_from_prd: false
+    profile_ref: ""
+  ccp_grounding:
+    ccp_index_ref: "n/a"
+    ccp_index_hash: "n/a"
+    impact_map_ref: "n/a"
+    rationale: |
+      This is a foundational infrastructure RFC without PRD. Grounding is derived
+      from unified theory doctrine and existing kernel primitives (PRD-0001).
+      Codebase impact is assessed directly against existing modules:
+      - apm2-core (ledger, CAS, reducers, events)
+      - apm2-daemon (current basic server)
+      - apm2-cli (client commands)
+  custody:
+    producing_agent_roles:
+      - AGENT_AUTHOR
+      - AGENT_ARCHITECT
+    responsible_domains:
+      - DOMAIN_KERNEL
+      - DOMAIN_DAEMON
+      - DOMAIN_AGENT_RUNTIME
+      - DOMAIN_SECURITY
+    authority_signoffs_required:
+      - AUTH_ARCHITECTURE
+      - AUTH_SECURITY
+      - AUTH_PRODUCT
+  refs:
+    standards:
+      requirement_schema: "standards/schemas/02_requirement.schema.yaml#requirement_schema"
+      evidence_artifact_schema: "standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema"
+      quality_coverage_schema: "standards/schemas/03_quality_coverage.schema.yaml#quality_coverage_schema"
+      gate_review_schema: "standards/schemas/06_gate_review.schema.yaml#gate_review_schema"
+      waiver_schema: "standards/schemas/05_waiver.schema.yaml#waiver_schema"
+      ticket_meta_schema: "standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema"
+      lint_spec: "standards/lint/LINT_SPEC.yaml#lint_spec"
+    doctrine:
+      unified_theory: "documents/skills/laws-of-holonic-agent-systems/references/unified-theory.md"
+  implementation:
+    language: Rust
+    edition: "2024"
+    primary_crate: apm2-daemon
+    new_modules:
+      - crates/apm2-daemon/src/episode/
+      - crates/apm2-daemon/src/protocol/
+      - crates/apm2-daemon/src/telemetry/
+      - crates/apm2-daemon/src/evidence/
+      - crates/apm2-core/src/adapter/
+    key_dependencies:
+      - name: tokio
+        version: "1.x"
+        purpose: "Async runtime for daemon and episode spawning"
+      - name: prost
+        version: "0.12"
+        purpose: "Protocol Buffers for wire encoding"
+      - name: nix
+        version: "0.30"
+        purpose: "Unix APIs for PTY, cgroups, signals"
+      - name: blake3
+        version: "1.x"
+        purpose: "Content hashing for evidence and receipts"
+      - name: ed25519-dalek
+        version: "2.x"
+        purpose: "Receipt signing"
+  north_star_alignment:
+    phase: 1
+    exit_criterion: "Kernel daemon can spawn bounded agent episodes with receipted tool execution and telemetry"
+    alignment_score: "0.95+"
+    rationale: |
+      The kernel daemon is the minimal substrate required for Phase 1 autonomous
+      operation. It enables bounded episode execution with OCAP tool mediation,
+      evidence capture, and reliable vendor harness integration.

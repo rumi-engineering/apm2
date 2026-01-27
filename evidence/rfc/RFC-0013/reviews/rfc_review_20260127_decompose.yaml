@@ -1,0 +1,191 @@
+schema_version: "1.0.0"
+rfc_id: RFC-0013
+review_timestamp: "2026-01-27T22:00:00Z"
+review_depth: COUNCIL
+rfc_version: v4
+review_mode: DECOMPOSE
+
+gates:
+  - gate_id: GATE-TCK-SCHEMA
+    type: TRUSTED
+    status: PASSED
+    findings: []
+    evidence:
+      notes: "All 22 ticket YAML files parse correctly, schema validated"
+      tickets_generated: 22
+
+  - gate_id: GATE-TCK-DEPENDENCY-ACYCLICITY
+    type: DETERMINISTIC
+    status: PASSED
+    findings: []
+    evidence:
+      notes: "Linear phase dependencies, no cycles detected"
+      dependency_graph: "TCK-00156 -> TCK-00157 -> ... -> TCK-00177"
+      critical_path_depth: 10
+
+  - gate_id: GATE-TCK-SCOPE-COVERAGE
+    type: DETERMINISTIC
+    status: PASSED
+    findings: []
+    evidence:
+      notes: "All 8 derived requirements mapped to tickets"
+      requirements_covered:
+        - REQ-DAEMON-001
+        - REQ-EPISODE-001
+        - REQ-PROTOCOL-001
+        - REQ-TOOL-001
+        - REQ-TEL-001
+        - REQ-EVID-001
+        - REQ-RECEIPT-001
+        - REQ-ADAPTER-001
+
+  - gate_id: GATE-TCK-CCP-MAPPING
+    type: DETERMINISTIC
+    status: PASSED
+    findings:
+      - FND-D-001
+    evidence:
+      notes: "TCK-00156 added to scaffold missing module directories"
+      scaffolding_ticket: TCK-00156
+
+  - gate_id: GATE-TCK-ATOMICITY
+    type: LLM_ASSISTED
+    status: PASSED
+    findings: []
+    evidence:
+      notes: "All 22 tickets atomic, completable in 1-2 days"
+      tickets_assessed: 22
+      atomic_count: 22
+
+  - gate_id: GATE-TCK-IMPLEMENTABILITY
+    type: LLM_ASSISTED
+    status: PASSED
+    findings: []
+    evidence:
+      notes: "All tickets have implementation steps, file paths, code examples"
+      clear_count: 22
+
+  - gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    type: LLM_ASSISTED
+    status: PASSED
+    findings: []
+    evidence:
+      notes: "Trust boundaries documented in RFC 03_trust_boundaries.yaml"
+      trust_boundaries: 6
+      threats_mitigated: 7
+
+  - gate_id: GATE-TCK-REQUIREMENT-FIDELITY
+    type: LLM_ASSISTED
+    status: PASSED
+    findings: []
+    evidence:
+      notes: "Tickets trace to RFC requirements and doctrine"
+
+  - gate_id: GATE-TCK-ANTI-COUSIN
+    type: LLM_ASSISTED
+    status: PASSED
+    findings: []
+    evidence:
+      notes: "AD-LAYER-001 resolved SA3-F-011 cousin violation"
+      cousin_violations: 0
+      resolved_violations:
+        - SA3-F-011
+
+findings:
+  - finding_id: FND-D-001
+    gate_id: GATE-TCK-CCP-MAPPING
+    category: STRUCTURE_DEFECT
+    subcategory: MISSING_SCAFFOLD
+    severity: INFO
+    location:
+      file: documents/rfcs/RFC-0013/06_ticket_decomposition.yaml
+      yaml_path: ticket_mapping[0]
+    description: "Module directories missing in apm2-daemon; scaffolding ticket TCK-00156 created"
+    remediation: "TCK-00156 scaffolds episode/, protocol/, telemetry/, evidence/ modules"
+    source_agent: SA-1
+    source_cycle: 1
+    source_mode: 48
+    agreement_status: UNANIMOUS
+
+verdict: APPROVED
+verdict_reason: |
+  RFC-0013 DECOMPOSE mode completed successfully. All 9 gates PASSED.
+  Generated 22 implementation-ready tickets (TCK-00156 through TCK-00177).
+
+  Key outcomes:
+  1. Scaffolding ticket (TCK-00156) added to create module structure
+  2. All 8 derived requirements covered by tickets
+  3. Critical path depth: 10 tickets
+  4. 3 parallelizable tracks identified for execution efficiency
+  5. AD-LAYER-001 cousin resolution preserved in ticket design
+
+council_metadata:
+  session_id: COUNCIL-RFC-0013-DECOMPOSE
+  subagents:
+    - agent_id: SA-1
+      emergent_role: Structural Rigorist
+      selected_modes: [4, 22, 48, 61, 75]
+      mode_categories: [Formal, Uncertainty, Systems, Dialectical, Meta-Level]
+      verdict: PASS
+      findings_count: 1
+
+    - agent_id: SA-2
+      emergent_role: Implementation Feasibility
+      selected_modes: [9, 38, 53, 68, 76]
+      mode_categories: [Ampliative, Causal, Heuristic, Scientific, Meta-Level]
+      verdict: PASS
+      findings_count: 0
+
+    - agent_id: SA-3
+      emergent_role: Security & Anti-Cousin Guardian
+      selected_modes: [7, 31, 49, 66, 79]
+      mode_categories: [Formal, Inconsistency, Practical, Modal, Meta-Level]
+      verdict: PASS
+      findings_count: 0
+
+  cycles_completed: 1
+  total_findings_generated: 1
+  findings_after_dedup: 1
+  findings_by_severity:
+    BLOCKER: 0
+    MAJOR: 0
+    MINOR: 0
+    INFO: 1
+  quorum_achieved: true
+
+output_artifacts:
+  tickets_generated:
+    - TCK-00156
+    - TCK-00157
+    - TCK-00158
+    - TCK-00159
+    - TCK-00160
+    - TCK-00161
+    - TCK-00162
+    - TCK-00163
+    - TCK-00164
+    - TCK-00165
+    - TCK-00166
+    - TCK-00167
+    - TCK-00168
+    - TCK-00169
+    - TCK-00170
+    - TCK-00171
+    - TCK-00172
+    - TCK-00173
+    - TCK-00174
+    - TCK-00175
+    - TCK-00176
+    - TCK-00177
+
+  files_modified:
+    - documents/rfcs/RFC-0013/06_ticket_decomposition.yaml
+
+next_steps:
+  - action: "Begin implementation with TCK-00156 (scaffolding)"
+    priority: HIGH
+    notes: "Critical path blocker - must complete first"
+
+  - action: "Execute parallel tracks after TCK-00160"
+    priority: MEDIUM
+    notes: "Track A (Tool), Track B (Telemetry), Track C (Evidence)"

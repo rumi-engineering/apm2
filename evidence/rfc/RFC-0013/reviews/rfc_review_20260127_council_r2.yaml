@@ -1,0 +1,594 @@
+schema_version: "1.0.0"
+rfc_id: RFC-0013
+review_timestamp: "2026-01-27T21:36:20Z"
+review_depth: COUNCIL
+rfc_version: v2
+prior_review_ref: "evidence/rfc/RFC-0013/reviews/rfc_review_20260127_review_v2.yaml"
+
+gates:
+  - gate_id: GATE-TCK-SCHEMA
+    type: TRUSTED
+    status: PASSED
+    findings: []
+    evidence:
+      notes: "All 10 RFC YAML files parse correctly; required fields present"
+      files_checked: 10
+
+  - gate_id: GATE-TCK-DEPENDENCY-ACYCLICITY
+    type: DETERMINISTIC
+    status: PASSED
+    findings: []
+    evidence:
+      notes: "Preliminary tickets show linear dependencies TCK-PEND-001 -> 002 -> 003 etc; no cycles"
+
+  - gate_id: GATE-TCK-SCOPE-COVERAGE
+    type: DETERMINISTIC
+    status: PASSED
+    findings:
+      - SA1-F-012
+      - SA1-F-013
+    evidence:
+      notes: "8 derived requirements mapped to 18 preliminary tickets; v2 decisions need traces_to fields"
+      coverage_matrix:
+        REQ-DAEMON-001: [TCK-PEND-001, TCK-PEND-002, TCK-PEND-004]
+        REQ-EPISODE-001: [TCK-PEND-003, TCK-PEND-004]
+        REQ-PROTOCOL-001: [TCK-PEND-001, TCK-PEND-002]
+        REQ-TOOL-001: [TCK-PEND-007, TCK-PEND-008, TCK-PEND-009]
+        REQ-TEL-001: [TCK-PEND-011, TCK-PEND-012]
+        REQ-EVID-001: [TCK-PEND-013, TCK-PEND-014, TCK-PEND-015]
+        REQ-RECEIPT-001: [TCK-PEND-009, TCK-PEND-010]
+        REQ-ADAPTER-001: [TCK-PEND-005, TCK-PEND-006, TCK-PEND-016]
+
+  - gate_id: GATE-TCK-CCP-MAPPING
+    type: DETERMINISTIC
+    status: PASSED
+    findings:
+      - SA1-F-001
+      - SA1-F-010
+      - SA1-F-011
+      - SA1-F-014
+    evidence:
+      notes: "92% evidence_ref verification success (12/13 paths verified)"
+      verified_paths:
+        - path: crates/apm2-holon/src/episode/controller.rs
+          exists: true
+        - path: crates/apm2-holon/src/holon/traits.rs
+          exists: false
+          correct_path: crates/apm2-holon/src/traits.rs
+        - path: crates/apm2-core/src/adapter/black_box.rs
+          exists: true
+        - path: crates/apm2-core/src/adapter/claude_code.rs
+          exists: true
+        - path: proto/daemon_protocol.proto
+          exists: false
+          note: "PHASE-1A deliverable not created"
+
+  - gate_id: GATE-TCK-ATOMICITY
+    type: LLM_ASSISTED
+    status: PASSED
+    findings:
+      - SA2-F-004
+      - SA2-F-005
+    evidence:
+      notes: "16/18 preliminary tickets are atomic; 2 should be split"
+      non_atomic_tickets:
+        - ticket: TCK-PEND-009
+          reason: "Combines tool execution and receipt generation"
+        - ticket: TCK-PEND-018
+          reason: "E2E tests too broad; should decompose by scenario"
+
+  - gate_id: GATE-TCK-IMPLEMENTABILITY
+    type: LLM_ASSISTED
+    status: PASSED
+    findings:
+      - SA1-F-004
+      - SA2-F-001
+      - SA2-F-002
+      - SA2-F-003
+      - SA2-F-006
+      - SA2-F-007
+      - SA2-F-008
+    evidence:
+      notes: "Dependencies mostly available; cgroup/protobuf infrastructure gaps identified"
+      mock_implementation_results:
+        TCK-PEND-001: {confidence: "80%", blocker: "proto file missing"}
+        TCK-PEND-003: {confidence: "65%", blocker: "protobuf canonicalizer undefined"}
+        TCK-PEND-005: {confidence: "75%", blocker: "nix pty feature not enabled"}
+        TCK-PEND-011: {confidence: "55%", blocker: "zbus crate missing"}
+
+  - gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    type: LLM_ASSISTED
+    status: PASSED
+    findings:
+      - SA3-F-001
+      - SA3-F-003
+      - SA3-F-006
+      - SA3-F-012
+      - SA3-F-013
+      - SA3-F-014
+      - SA3-F-015
+    evidence:
+      notes: "Trust boundaries well-defined; 3 MAJOR security gaps from v0 unresolved"
+      cae_tree_status:
+        ocap_enforcement: PARTIALLY_SATISFIED
+        receipt_integrity: GAPS_IDENTIFIED
+        evidence_economics: SATISFIED
+        process_isolation: SATISFIED
+
+  - gate_id: GATE-TCK-REQUIREMENT-FIDELITY
+    type: LLM_ASSISTED
+    status: PASSED
+    findings:
+      - SA1-F-006
+      - SA1-F-012
+    evidence:
+      notes: "Base architecture decisions have doctrine_ref; v2 decisions lack traces_to"
+
+  - gate_id: GATE-TCK-ANTI-COUSIN
+    type: LLM_ASSISTED
+    status: PASSED
+    findings:
+      - SA3-F-011
+    evidence:
+      notes: "SA3-F-011 RESOLVED via AD-LAYER-001 layering model; no new cousin violations"
+      anti_cousin_analysis:
+        EpisodeController_vs_EpisodeRuntime: RESOLVED_VIA_LAYERING
+        HarnessAdapter_vs_BlackBoxAdapter: COMPOSITION_NOT_OVERLAP
+        new_parallel_hierarchies: NONE_DETECTED
+
+findings:
+  # SA-1 Findings (Structural Rigorist)
+  - finding_id: SA1-F-001
+    gate_id: GATE-TCK-CCP-MAPPING
+    category: FIDELITY_DEFECT
+    subcategory: EVIDENCE_PATH_MISMATCH
+    severity: MINOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: v2_architecture_decisions[0].evidence_refs[1]
+    description: "AD-LAYER-001 cites incorrect path for Holon trait (should be src/traits.rs, not src/holon/traits.rs)"
+    remediation: "Update evidence_ref path to crates/apm2-holon/src/traits.rs"
+    source_agent: SA-1
+    source_mode: 37
+    prior_status: PERSISTS
+
+  - finding_id: SA1-F-004
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: STRUCTURE_DEFECT
+    subcategory: CROSS_CRATE_DEPENDENCY
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: v2_architecture_decisions[4].description
+    description: "DefectRecord in apm2-holon but daemon needs to use it; crate dependency direction unclear"
+    remediation: "Move DefectRecord to apm2-core or document daemon->holon dependency as acceptable with rationale"
+    source_agent: SA-1
+    source_mode: 43
+    prior_status: PERSISTS
+
+  - finding_id: SA1-F-006
+    gate_id: GATE-TCK-REQUIREMENT-FIDELITY
+    category: COVERAGE_DEFECT
+    subcategory: MISSING_DOCTRINE_TRACE
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: v2_architecture_decisions
+    description: "v2 architecture decisions lack traces_to fields linking to derived requirements"
+    remediation: "Add traces_to fields to all v2 decisions"
+    source_agent: SA-1
+    source_mode: 77
+    prior_status: PERSISTS
+
+  - finding_id: SA1-F-010
+    gate_id: GATE-TCK-CCP-MAPPING
+    category: FIDELITY_DEFECT
+    subcategory: EVIDENCE_REF_ASPIRATIONAL
+    severity: MINOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: v2_architecture_decisions[4].evidence_refs[4]
+    description: "AD-EVID-003 references pin_state field that does not exist in codebase"
+    remediation: "Change wording to explicit TODO or remove aspirational claim"
+    source_agent: SA-1
+    source_mode: 6
+    prior_status: NEW
+
+  - finding_id: SA1-F-011
+    gate_id: GATE-TCK-CCP-MAPPING
+    category: STRUCTURE_DEFECT
+    subcategory: MISSING_ARTIFACT
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/04_contracts_and_versioning.yaml
+      yaml_path: interface_contracts[5]
+    description: "proto/daemon_protocol.proto does not exist; PHASE-1A deliverable incomplete"
+    remediation: "Create placeholder proto file with message stubs"
+    source_agent: SA-1
+    source_mode: 37
+    prior_status: SAME_AS_SA2-F-003
+
+  - finding_id: SA1-F-012
+    gate_id: GATE-TCK-REQUIREMENT-FIDELITY
+    category: COVERAGE_DEFECT
+    subcategory: REQUIREMENT_NOT_TRACED
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: v2_architecture_decisions
+    description: "v2 architecture decisions do not include traces_to fields linking to derived requirements"
+    remediation: "Add traces_to: [REQ-EPISODE-001, REQ-ADAPTER-001] to AD-LAYER-001, etc."
+    source_agent: SA-1
+    source_mode: 77
+    prior_status: DEDUP_WITH_SA1-F-006
+
+  - finding_id: SA1-F-013
+    gate_id: GATE-TCK-SCOPE-COVERAGE
+    category: STRUCTURE_DEFECT
+    subcategory: CROSS_CRATE_COUPLING
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: v2_architecture_decisions[4].evidence_refs
+    description: "AD-EVID-003 evidence economics requires DefectRecord from apm2-holon; inverted dependency"
+    remediation: "Document daemon->holon dependency or move DefectRecord to apm2-core"
+    source_agent: SA-1
+    source_mode: 43
+    prior_status: DEDUP_WITH_SA1-F-004
+
+  - finding_id: SA1-F-014
+    gate_id: GATE-TCK-CCP-MAPPING
+    category: FIDELITY_DEFECT
+    subcategory: VERSION_DRIFT
+    severity: MINOR
+    location:
+      file: documents/rfcs/RFC-0013/00_meta.yaml
+      yaml_path: implementation.key_dependencies[2]
+    description: "RFC specifies nix crate version 0.29 but workspace Cargo.toml has 0.30"
+    remediation: "Update RFC to match workspace version 0.30"
+    source_agent: SA-1
+    source_mode: 13
+    prior_status: SAME_AS_SA1-F-002
+
+  # SA-2 Findings (Implementation Feasibility)
+  - finding_id: SA2-F-001
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: MISSING_DEPENDENCY
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: v2_architecture_decisions[1].description
+    description: "Cgroup hierarchy (AD-CGROUP-001) requires systemd DBus; no zbus crate in Cargo.toml"
+    remediation: "Add zbus dependency or document direct cgroup v2 writes as primary strategy"
+    source_agent: SA-2
+    source_mode: 70
+    prior_status: PERSISTS
+
+  - finding_id: SA2-F-002
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: MISSING_FEATURE
+    severity: MINOR
+    location:
+      file: Cargo.toml
+      yaml_path: workspace.dependencies.nix.features
+    description: "nix crate missing 'pty' feature required for PTY spawning"
+    remediation: "Update nix dependency: nix = { version = '0.30', features = ['signal', 'process', 'fs', 'pty'] }"
+    source_agent: SA-2
+    source_mode: 70
+    prior_status: PERSISTS
+
+  - finding_id: SA2-F-003
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: MISSING_ARTIFACT
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/04_contracts_and_versioning.yaml
+      yaml_path: interface_contracts[5]
+    description: "proto/daemon_protocol.proto does not exist; PHASE-1A deliverable incomplete"
+    remediation: "Create proto/daemon_protocol.proto with message stubs from CTR-PROTO-001 through CTR-PROTO-006"
+    source_agent: SA-2
+    source_mode: 47
+    prior_status: PERSISTS
+
+  - finding_id: SA2-F-004
+    gate_id: GATE-TCK-ATOMICITY
+    category: ATOMICITY_DEFECT
+    subcategory: COMPOSITE_TICKET
+    severity: MINOR
+    location:
+      file: documents/rfcs/RFC-0013/06_ticket_decomposition.yaml
+      yaml_path: preliminary_tickets[8]
+    description: "TCK-PEND-009 combines tool execution and receipt generation; should split"
+    remediation: "Split into TCK-PEND-009a (execution) and TCK-PEND-009b (receipt)"
+    source_agent: SA-2
+    source_mode: 51
+    prior_status: PERSISTS
+
+  - finding_id: SA2-F-005
+    gate_id: GATE-TCK-ATOMICITY
+    category: ATOMICITY_DEFECT
+    subcategory: COMPOSITE_TICKET
+    severity: MINOR
+    location:
+      file: documents/rfcs/RFC-0013/06_ticket_decomposition.yaml
+      yaml_path: preliminary_tickets[17]
+    description: "TCK-PEND-018 (E2E tests) too broad; should decompose by scenario"
+    remediation: "Split into lifecycle, budget, tool, telemetry test tickets"
+    source_agent: SA-2
+    source_mode: 51
+    prior_status: PERSISTS
+
+  - finding_id: SA2-F-006
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: STRUCTURE_DEFECT
+    subcategory: UNREALISTIC_GATE
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/05_rollout_and_ops.yaml
+      yaml_path: rollout_strategy.phases[5]
+    description: "GATE-TEL-ACCURACY (5%) unrealistic without cgroup access"
+    remediation: "Add GATE-CGROUP-AVAILABLE prerequisite or relax to 15% for degraded mode"
+    source_agent: SA-2
+    source_mode: 42
+    prior_status: PERSISTS
+
+  - finding_id: SA2-F-007
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: INTERFACE_MISMATCH
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/04_contracts_and_versioning.yaml
+      yaml_path: interface_contracts[2]
+    description: "RFC HarnessAdapter trait differs from existing Adapter trait; refactoring needed"
+    remediation: "Document HarnessAdapter as wrapper around existing Adapter, clarifying composition pattern"
+    source_agent: SA-2
+    source_mode: 42
+    prior_status: PERSISTS
+
+  - finding_id: SA2-F-008
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: MISSING_SPECIFICATION
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: architecture_decisions.AD-DAEMON-003
+    description: "Protobuf canonicalizer not implemented; canonical_bytes() has no specification"
+    remediation: "Add AD-VERIFY-001 with protobuf deterministic serialization spec and golden vectors"
+    source_agent: SA-2
+    source_mode: 47
+    prior_status: NEW
+
+  # SA-3 Findings (Security & Anti-Cousin Guardian)
+  - finding_id: SA3-F-001
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: KEY_LIFECYCLE
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/08_risks_and_open_questions.yaml
+      yaml_path: risks.RISK-SECURITY-001
+    description: "Signing key lifecycle incomplete: no rotation procedure, HSM guidance, or compromise recovery"
+    remediation: "Add AD-KEY-001 with key versioning, rotation (90-day scheduled), and recovery procedures"
+    source_agent: SA-3
+    source_mode: 49
+    prior_status: PERSISTS
+
+  - finding_id: SA3-F-003
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: VERIFICATION_PREDICATE
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: architecture_decisions.AD-RECEIPT-001.verification_predicate
+    description: "Receipt verification predicate defined but not implementable without canonical_bytes() spec"
+    remediation: "Add AD-VERIFY-001 with protobuf deterministic serialization and golden vectors"
+    source_agent: SA-3
+    source_mode: 79
+    prior_status: PERSISTS
+
+  - finding_id: SA3-F-006
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: CAPABILITY_BINDING
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0013/04_contracts_and_versioning.yaml
+      yaml_path: interface_contracts.CTR-DAEMON-002
+    description: "capability_manifest_hash has no explicit verification binding; TOCTOU attack vector"
+    remediation: "Add ToolBroker.initialize() with hash verification at load time"
+    source_agent: SA-3
+    source_mode: 49
+    prior_status: PERSISTS
+
+  - finding_id: SA3-F-011
+    gate_id: GATE-TCK-ANTI-COUSIN
+    category: COUSIN_DEFECT
+    subcategory: EPISODE_CONTROLLER_OVERLAP
+    severity: INFO
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: v2_architecture_decisions.AD-LAYER-001
+    description: "v0 cousin violation RESOLVED via AD-LAYER-001 layering model"
+    remediation: "N/A - finding resolved"
+    source_agent: SA-3
+    source_mode: 35
+    prior_status: RESOLVED
+
+  - finding_id: SA3-F-012
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: PARSER_INJECTION
+    severity: MINOR
+    location:
+      file: documents/rfcs/RFC-0013/03_trust_boundaries.yaml
+      yaml_path: trust_model.boundaries.TB-ADAPTER-001
+    description: "HarnessAdapter parses untrusted PTY output; output sanitization not specified"
+    remediation: "Add invariants for output sanitization and tool request rate limiting"
+    source_agent: SA-3
+    source_mode: 79
+    prior_status: NEW
+
+  - finding_id: SA3-F-013
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: RACE_CONDITION
+    severity: MINOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: v2_architecture_decisions.AD-CGROUP-001
+    description: "cgroup fallback mode has race between creation and process assignment"
+    remediation: "Document frozen cgroup creation + unfreeze pattern for fallback mode"
+    source_agent: SA-3
+    source_mode: 49
+    prior_status: NEW
+
+  - finding_id: SA3-F-014
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: TIMING_SIDE_CHANNEL
+    severity: INFO
+    location:
+      file: documents/rfcs/RFC-0013/03_trust_boundaries.yaml
+      yaml_path: threat_model.TH-EXFIL-001
+    description: "Telemetry timing side channel acknowledged limitation (10 bps max exfiltration)"
+    remediation: "Add to TH-EXFIL-001 residual risk acknowledgment"
+    source_agent: SA-3
+    source_mode: 79
+    prior_status: NEW
+
+  - finding_id: SA3-F-015
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: NON_REPUDIATION
+    severity: MINOR
+    location:
+      file: documents/rfcs/RFC-0013/02_design_decisions.yaml
+      yaml_path: architecture_decisions.AD-RECEIPT-001
+    description: "stop_order.receipt lacks actor_id and issuer_signature for non-repudiation"
+    remediation: "Add issuer_id and issuer_signature to StopOrder message"
+    source_agent: SA-3
+    source_mode: 65
+    prior_status: NEW
+
+verdict: APPROVED_WITH_REMEDIATION
+verdict_reason: |
+  RFC-0013 v2 (Grounded) demonstrates sound architectural design with no BLOCKER findings.
+  All 9 gates PASSED structurally. The v0 cousin violation (SA3-F-011) is properly resolved
+  via AD-LAYER-001 layering model.
+
+  **Finding Statistics:**
+  - BLOCKER: 0
+  - MAJOR: 11 (9 persisting from prior review, 2 new)
+  - MINOR: 8 (5 persisting, 3 new)
+  - INFO: 2 (1 resolved, 1 new acknowledgment)
+
+  **MAJOR Findings Requiring Remediation Before v4:**
+
+  1. **Structure/Traceability (SA1)**:
+     - SA1-F-004/SA1-F-013: DefectRecord cross-crate dependency direction unclear
+     - SA1-F-006/SA1-F-012: v2 architecture decisions lack traces_to fields
+     - SA1-F-011: proto/daemon_protocol.proto does not exist
+
+  2. **Implementation Feasibility (SA2)**:
+     - SA2-F-001: zbus crate missing for systemd DBus cgroup API
+     - SA2-F-003: Proto file not created
+     - SA2-F-006: GATE-TEL-ACCURACY unrealistic without cgroup
+     - SA2-F-007: HarnessAdapter/Adapter trait interface mismatch
+     - SA2-F-008: Protobuf canonicalizer not specified
+
+  3. **Security (SA3)**:
+     - SA3-F-001: Signing key lifecycle incomplete
+     - SA3-F-003: Receipt verification predicate not implementable
+     - SA3-F-006: Capability manifest hash verification not specified
+
+  **Remediation Actions Required:**
+  1. Add traces_to fields to all v2_architecture_decisions
+  2. Create proto/daemon_protocol.proto with message stubs
+  3. Add AD-KEY-001 with key lifecycle specification
+  4. Add AD-VERIFY-001 with canonical_bytes() specification
+  5. Resolve DefectRecord crate boundary (move to apm2-core or document dependency)
+  6. Add ToolBroker.initialize() with explicit hash verification
+  7. Document cgroup fallback strategy or add zbus dependency
+
+  RFC is ready for v4 (Finalization) phase after addressing these remediations.
+
+council_metadata:
+  session_id: COUNCIL-RFC-0013-20260127-R2
+  prior_session_ref: COUNCIL-RFC-0013-20260127-REVIEW-V2
+  subagents:
+    - agent_id: SA-1
+      emergent_role: Structural Rigorist
+      selected_modes: [6, 13, 37, 43, 77]
+      verdict: NEEDS_REMEDIATION
+      findings_count: 9
+      findings_by_severity:
+        BLOCKER: 0
+        MAJOR: 5
+        MINOR: 4
+        INFO: 0
+    - agent_id: SA-2
+      emergent_role: Implementation Feasibility
+      selected_modes: [11, 42, 47, 51, 70]
+      verdict: NEEDS_REMEDIATION
+      findings_count: 8
+      findings_by_severity:
+        BLOCKER: 0
+        MAJOR: 5
+        MINOR: 3
+        INFO: 0
+    - agent_id: SA-3
+      emergent_role: Security & Anti-Cousin Guardian
+      selected_modes: [8, 35, 49, 65, 79]
+      verdict: NEEDS_REMEDIATION
+      findings_count: 7
+      findings_by_severity:
+        BLOCKER: 0
+        MAJOR: 3
+        MINOR: 4
+        INFO: 2
+  cycles_completed: 1
+  total_findings_generated: 24
+  findings_after_dedup: 21
+  findings_by_severity:
+    BLOCKER: 0
+    MAJOR: 11
+    MINOR: 8
+    INFO: 2
+  quorum_achieved: true
+  all_agents_agree_on_verdict: true
+  elapsed_time_seconds: ~600
+
+next_steps:
+  - action: "Address 11 MAJOR findings"
+    owner: AUTH_ARCHITECTURE
+    priority: HIGH
+    deadline: "Before v4 finalization"
+    items:
+      - "Add traces_to fields to v2_architecture_decisions"
+      - "Create proto/daemon_protocol.proto"
+      - "Add AD-KEY-001 (key lifecycle)"
+      - "Add AD-VERIFY-001 (canonical_bytes)"
+      - "Resolve DefectRecord crate boundary"
+      - "Clarify cgroup strategy (zbus vs direct writes)"
+      - "Add ToolBroker.initialize() hash verification"
+      - "Document HarnessAdapter/Adapter composition"
+  - action: "Address 8 MINOR findings"
+    owner: AUTH_ARCHITECTURE
+    priority: MEDIUM
+    items:
+      - "Fix evidence_ref paths (Holon trait)"
+      - "Update nix version to 0.30"
+      - "Add nix 'pty' feature"
+      - "Add adapter output sanitization"
+      - "Document cgroup fallback race mitigation"
+      - "Add stop_order non-repudiation fields"
+  - action: "Advance RFC to v4 (Finalization)"
+    trigger: "Invoke /rfc-council RFC-0013 after remediations"
+  - action: "Generate implementation tickets"
+    trigger: "After v4 complete, invoke /rfc-council RFC-0013 for DECOMPOSE mode"

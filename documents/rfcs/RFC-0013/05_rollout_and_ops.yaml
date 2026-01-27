@@ -1,0 +1,267 @@
+rfc_rollout_and_ops:
+  schema_version: "2026-01-27"
+  template_version: "2026-01-27"
+
+  rollout_strategy:
+    overview: |
+      The kernel daemon is foundational infrastructure. Rollout prioritizes
+      correctness and reliability over speed. Phased approach with gates
+      ensuring each layer is stable before building on it.
+
+    phases:
+      - phase_id: PHASE-1A
+        name: "Protocol Foundation"
+        description: |
+          Implement UDS protocol server with framing and handshake.
+          No episode runtime yet; focus on transport layer correctness.
+        deliverables:
+          - "crates/apm2-daemon/src/protocol/server.rs"
+          - "crates/apm2-daemon/src/protocol/framing.rs"
+          - "crates/apm2-daemon/src/protocol/handshake.rs"
+          - "proto/daemon_protocol.proto"
+          - "Golden vectors for framing"
+        gate: "GATE-PROTO-FRAMING: Protocol handles 1M messages without corruption"
+
+      - phase_id: PHASE-1B
+        name: "Episode Envelope and Lifecycle"
+        description: |
+          Implement EpisodeEnvelope, EpisodeRuntime, and state machine.
+          Episodes can be created and terminated; no harness spawn yet.
+        deliverables:
+          - "crates/apm2-daemon/src/episode/envelope.rs"
+          - "crates/apm2-daemon/src/episode/runtime.rs"
+          - "crates/apm2-daemon/src/episode/state.rs"
+          - "crates/apm2-core/src/events/episode.rs"
+        gate: "GATE-EPISODE-SM: State machine transitions produce correct events"
+
+      - phase_id: PHASE-1C
+        name: "PTY Runner and Basic Adapter"
+        description: |
+          Implement PTY spawning and output capture.
+          Basic adapter that emits raw output events (no parsing).
+        deliverables:
+          - "crates/apm2-daemon/src/episode/pty.rs"
+          - "crates/apm2-daemon/src/adapter/raw.rs"
+          - "crates/apm2-daemon/src/adapter/registry.rs"
+        gate: "GATE-PTY-CAPTURE: PTY output captured without loss at 1MB/s"
+
+      - phase_id: PHASE-2A
+        name: "Tool Broker Foundation"
+        description: |
+          Implement ToolBroker with capability validation and dedupe.
+          No actual tool execution yet; focus on mediation layer.
+        deliverables:
+          - "crates/apm2-daemon/src/tool/broker.rs"
+          - "crates/apm2-daemon/src/tool/capability.rs"
+          - "crates/apm2-daemon/src/tool/dedupe.rs"
+        gate: "GATE-TOOL-MEDIATION: Capability validation blocks unauthorized requests"
+
+      - phase_id: PHASE-2B
+        name: "Tool Execution and Receipts"
+        description: |
+          Implement tool execution with receipt generation.
+          Tool results stored in CAS; receipts bound to envelope.
+        deliverables:
+          - "crates/apm2-daemon/src/tool/executor.rs"
+          - "crates/apm2-daemon/src/tool/receipt.rs"
+          - "Golden vectors for tool receipts"
+        gate: "GATE-TOOL-RECEIPT: All tool executions produce valid receipts"
+
+      - phase_id: PHASE-2C
+        name: "Telemetry Collection"
+        description: |
+          Implement TelemetryCollector with cgroup integration.
+          Telemetry frames streamed with budget integration.
+        deliverables:
+          - "crates/apm2-daemon/src/telemetry/collector.rs"
+          - "crates/apm2-daemon/src/telemetry/cgroup.rs"
+          - "crates/apm2-daemon/src/telemetry/frame.rs"
+        gate: "GATE-TEL-ACCURACY: Telemetry within 5% of actual (15% in degraded mode)"
+
+      - phase_id: PHASE-3A
+        name: "Evidence Economics"
+        description: |
+          Implement flight recorder, TTL/pinning, and compaction.
+          Evidence storage bounded; triggers promote to full fidelity.
+        deliverables:
+          - "crates/apm2-daemon/src/evidence/recorder.rs"
+          - "crates/apm2-daemon/src/evidence/retention.rs"
+          - "crates/apm2-daemon/src/evidence/compaction.rs"
+        gate: "GATE-EVID-BOUNDED: Evidence storage bounded at 100MB/episode"
+
+      - phase_id: PHASE-3B
+        name: "Vendor Adapter (Claude Code)"
+        description: |
+          Implement HarnessAdapter for Claude Code CLI.
+          Parse PTY output for tool calls; emit structured events.
+        deliverables:
+          - "crates/apm2-daemon/src/adapter/claude.rs"
+          - "Test fixtures for Claude Code output parsing"
+        gate: "GATE-ADAPTER-CLAUDE: 95% tool call detection accuracy"
+
+      - phase_id: PHASE-4
+        name: "Integration and CLI"
+        description: |
+          Full integration with CLI commands.
+          End-to-end episode execution with evidence and receipts.
+        deliverables:
+          - "crates/apm2-cli/src/commands/episode.rs"
+          - "Integration test suite"
+          - "AGENTS.md documentation"
+        gate: "GATE-E2E: Episode completes with valid receipts and evidence"
+
+  operational_considerations:
+    monitoring:
+      - metric: "daemon_episodes_total"
+        type: counter
+        description: "Total episodes created"
+        labels: ["state", "adapter_type"]
+
+      - metric: "daemon_tool_requests_total"
+        type: counter
+        description: "Total tool requests processed"
+        labels: ["tool", "decision"]
+
+      - metric: "daemon_episode_duration_ms"
+        type: histogram
+        description: "Episode execution duration"
+        labels: ["adapter_type", "termination_class"]
+
+      - metric: "daemon_evidence_bytes_total"
+        type: counter
+        description: "Total evidence bytes stored"
+        labels: ["episode_id", "kind"]
+
+      - metric: "daemon_budget_exhaustion_total"
+        type: counter
+        description: "Budget exhaustion terminations"
+        labels: ["budget_type"]
+
+      - metric: "daemon_protocol_errors_total"
+        type: counter
+        description: "Protocol-level errors"
+        labels: ["error_type"]
+
+    alerting:
+      - alert: "DaemonUnavailable"
+        condition: "up{job='apm2d'} == 0"
+        severity: critical
+        description: "Kernel daemon is not running"
+
+      - alert: "HighEpisodeFailureRate"
+        condition: "rate(daemon_episodes_total{state='quarantined'}[5m]) / rate(daemon_episodes_total[5m]) > 0.1"
+        severity: warning
+        description: "More than 10% of episodes quarantined"
+
+      - alert: "EvidenceStorageHigh"
+        condition: "daemon_evidence_bytes_total > 10737418240"
+        severity: warning
+        description: "Evidence storage exceeds 10GB"
+
+      - alert: "ToolBrokerLatency"
+        condition: "histogram_quantile(0.99, daemon_tool_request_duration_ms) > 1000"
+        severity: warning
+        description: "P99 tool request latency exceeds 1s"
+
+    troubleshooting:
+      - symptom: "Episode stuck in RUNNING state"
+        diagnosis: |
+          Check if harness process is still alive: ps -p <pid>
+          Check telemetry frames for activity
+          Check for pending tool requests
+        resolution: |
+          If harness dead, send StopEpisode with HARNESS_CRASH reason
+          If tool stuck, check tool executor logs
+          Use SignalEpisode to send SIGTERM, then SIGKILL
+
+      - symptom: "Tool requests consistently denied"
+        diagnosis: |
+          Check capability manifest for episode
+          Check policy rules at time of decision
+          Check dedupe cache for stale entries
+        resolution: |
+          Verify capability manifest includes required tools
+          Review policy rules for overly restrictive patterns
+          Clear dedupe cache if stale
+
+      - symptom: "Evidence storage growing unbounded"
+        diagnosis: |
+          Check TTL enforcement timer
+          Check for pinned evidence without closure
+          Check compaction job status
+        resolution: |
+          Trigger manual compaction
+          Review and close orphaned incident pins
+          Adjust TTL for non-critical evidence classes
+
+      - symptom: "Telemetry frames missing"
+        diagnosis: |
+          Check cgroup mount status
+          Check process in expected cgroup
+          Check collector sample interval
+        resolution: |
+          Verify cgroup v2 enabled: mount | grep cgroup2
+          Verify process placement: cat /proc/<pid>/cgroup
+          Increase sample interval if under load
+
+  backwards_compatibility:
+    impact: |
+      Kernel daemon is net-new infrastructure. No backwards compatibility
+      concerns for daemon itself. Impact on existing components:
+
+      - apm2-daemon: Extended with episode runtime; existing IPC unchanged
+      - apm2-core: New event types; existing events unchanged
+      - apm2-cli: New commands; existing commands unchanged
+
+    migration_path: |
+      No migration required for v1. Daemon is additive.
+
+      Future versions may require:
+      - Evidence compaction for existing CAS content
+      - Receipt format upgrades (version negotiation)
+      - Adapter interface changes (adapter version field)
+
+  systemd_integration:
+    unit_file: |
+      [Unit]
+      Description=APM2 Kernel Daemon
+      After=network.target
+
+      [Service]
+      Type=notify
+      ExecStart=/usr/local/bin/apm2d
+      ExecReload=/bin/kill -HUP $MAINPID
+      Restart=on-failure
+      RestartSec=5
+      User=apm2
+      Group=apm2
+
+      # Security hardening
+      NoNewPrivileges=yes
+      ProtectSystem=strict
+      ProtectHome=read-only
+      PrivateTmp=yes
+      PrivateDevices=yes
+
+      # Allow cgroup access for telemetry
+      SupplementaryGroups=systemd-journal
+
+      # Runtime directory
+      RuntimeDirectory=apm2
+      RuntimeDirectoryMode=0755
+
+      [Install]
+      WantedBy=multi-user.target
+
+    socket_activation: |
+      [Unit]
+      Description=APM2 Kernel Daemon Socket
+
+      [Socket]
+      ListenStream=%t/apm2/apm2d.sock
+      SocketMode=0660
+      SocketUser=apm2
+      SocketGroup=apm2
+
+      [Install]
+      WantedBy=sockets.target

@@ -1,0 +1,430 @@
+rfc_contracts_and_versioning:
+  schema_version: "2026-01-27"
+  template_version: "2026-01-27"
+
+  interface_contracts:
+    - contract_id: CTR-DAEMON-001
+      name: "EpisodeRuntime"
+      type: rust_trait
+      description: |
+        Core interface for episode lifecycle management.
+        Spawns and observes episodes; enforces budgets and stop conditions.
+      interface: |
+        pub struct EpisodeRuntime {
+            ledger: Arc<Ledger>,
+            cas: Arc<ContentAddressedStore>,
+            policy: Arc<PolicyEngine>,
+            adapters: AdapterRegistry,
+        }
+
+        impl EpisodeRuntime {
+            pub async fn create(&self, envelope: EpisodeEnvelope) -> Result<EpisodeId, Error>;
+            pub async fn start(&self, episode_id: EpisodeId) -> Result<SessionHandle, Error>;
+            pub async fn stop(&self, episode_id: EpisodeId, reason: StopReason) -> Result<(), Error>;
+            pub async fn signal(&self, episode_id: EpisodeId, signal: UnixSignal) -> Result<(), Error>;
+            pub async fn observe(&self, episode_id: EpisodeId) -> Result<EpisodeState, Error>;
+        }
+      stability: evolving
+
+    - contract_id: CTR-DAEMON-002
+      name: "EpisodeEnvelope"
+      type: rust_struct
+      description: |
+        Immutable envelope object defining episode parameters.
+        Referenced by digest in all receipts.
+      interface: |
+        #[derive(Clone, Serialize, Deserialize)]
+        pub struct EpisodeEnvelope {
+            pub episode_id: EpisodeId,
+            pub actor_id: ActorId,
+            pub work_id: Option<WorkId>,
+            pub lease_id: LeaseId,
+            pub budget: EpisodeBudget,
+            pub stop_conditions: StopConditions,
+            pub pinned_snapshot: PinnedSnapshot,
+            pub capability_manifest_hash: Hash,
+            pub risk_tier: RiskTier,
+            pub determinism_class: DeterminismClass,
+            pub context_refs: Option<ContextRefs>,
+        }
+
+        #[derive(Clone, Serialize, Deserialize)]
+        pub struct EpisodeBudget {
+            pub tokens: u64,
+            pub tool_calls: u32,
+            pub wall_ms: u64,
+            pub cpu_ms: u64,
+            pub bytes_io: u64,
+            pub evidence_bytes: u64,
+        }
+
+        #[derive(Clone, Serialize, Deserialize)]
+        pub struct PinnedSnapshot {
+            pub repo_hash: Option<Hash>,
+            pub lockfile_hash: Option<Hash>,
+            pub policy_hash: Hash,
+            pub toolchain_hash: Option<Hash>,
+            pub model_profile_hash: Option<Hash>,
+        }
+
+        pub enum DeterminismClass {
+            Deterministic,
+            ProbabilisticBounded,
+            NonReplayable,
+        }
+      stability: stable
+
+    - contract_id: CTR-DAEMON-003
+      name: "HarnessAdapter"
+      type: rust_trait
+      description: |
+        Normalizes harness behavior into structured events.
+        Adapters parse PTY output and emit ToolRequest, Progress, Terminated events.
+      interface: |
+        #[async_trait]
+        pub trait HarnessAdapter: Send + Sync {
+            fn adapter_type(&self) -> AdapterType;
+
+            async fn spawn(
+                &self,
+                config: HarnessConfig,
+                pty: PtyHandle,
+            ) -> Result<HarnessHandle, Error>;
+
+            async fn send_input(&self, handle: &HarnessHandle, input: &[u8]) -> Result<(), Error>;
+
+            fn output_stream(&self, handle: &HarnessHandle) -> impl Stream<Item = HarnessEvent>;
+
+            async fn terminate(&self, handle: &HarnessHandle) -> Result<ExitStatus, Error>;
+        }
+
+        pub enum HarnessEvent {
+            Output { chunk: Bytes, kind: StreamKind, seq: u64, ts: Timestamp },
+            ToolRequest { request_id: RequestId, tool: ToolName, args: ToolArgs },
+            Progress { message: String, percent: Option<u8> },
+            Error { code: ErrorCode, message: String },
+            Terminated { exit_code: i32, classification: ExitClassification },
+        }
+      stability: evolving
+
+    - contract_id: CTR-DAEMON-004
+      name: "ToolBroker"
+      type: rust_struct
+      description: |
+        Validates and executes tool calls.
+        Produces tool receipts and stores evidence.
+      interface: |
+        pub struct ToolBroker {
+            policy: Arc<PolicyEngine>,
+            capabilities: CapabilityStore,
+            dedupe_cache: DedupeCache,
+            cas: Arc<ContentAddressedStore>,
+        }
+
+        impl ToolBroker {
+            pub async fn initialize(
+                &self,
+                capability_manifest_hash: Hash,
+            ) -> Result<(), Error>;
+
+            pub async fn request(
+                &self,
+                episode_id: EpisodeId,
+                request: ToolRequest,
+            ) -> Result<ToolDecision, Error>;
+
+            pub async fn execute(
+                &self,
+                episode_id: EpisodeId,
+                decision: ToolDecision,
+            ) -> Result<ToolResult, Error>;
+
+            pub fn lookup_dedupe(&self, key: &DedupeKey) -> Option<ToolResult>;
+        }
+
+        pub struct ToolRequest {
+            pub request_id: RequestId,
+            pub tool: ToolName,
+            pub dedupe_key: DedupeKey,
+            pub args_hash: Hash,
+            pub inline_args: Option<ToolArgs>,
+        }
+
+        pub struct ToolDecision {
+            pub request_id: RequestId,
+            pub decision: Decision,
+            pub rule_id: Option<RuleId>,
+            pub policy_hash: Hash,
+            pub budget_delta: BudgetDelta,
+        }
+
+        pub enum Decision {
+            Allow,
+            Deny { reason: DenyReason },
+            DedupeCacheHit { cached_result_hash: Hash },
+        }
+
+        pub struct ToolResult {
+            pub request_id: RequestId,
+            pub outcome: ToolOutcome,
+            pub result_hash: Hash,
+            pub inline_result: Option<ToolResultData>,
+            pub duration_ms: u64,
+        }
+      stability: evolving
+
+    - contract_id: CTR-DAEMON-005
+      name: "TelemetryCollector"
+      type: rust_struct
+      description: |
+        Emits TelemetryFrames; integrates with budget accounting.
+        Collects metrics from cgroups and /proc.
+      interface: |
+        pub struct TelemetryCollector {
+            cgroup_reader: CgroupReader,
+            sample_interval_ms: u64,
+        }
+
+        impl TelemetryCollector {
+            pub fn start(&self, episode_id: EpisodeId, pid: Pid) -> TelemetryHandle;
+
+            pub async fn collect(&self, handle: &TelemetryHandle) -> TelemetryFrame;
+
+            pub fn apply_policy(&mut self, policy: TelemetryPolicy);
+        }
+
+        pub struct TelemetryFrame {
+            pub episode_id: EpisodeId,
+            pub seq: u64,
+            pub ts_mono: u64,
+            pub cpu_ns: u64,
+            pub cpu_user_ns: u64,
+            pub cpu_system_ns: u64,
+            pub mem_rss_bytes: u64,
+            pub mem_peak_bytes: u64,
+            pub page_faults_major: u64,
+            pub page_faults_minor: u64,
+            pub io_read_bytes: u64,
+            pub io_write_bytes: u64,
+            pub io_read_ops: u64,
+            pub io_write_ops: u64,
+            pub net_rx_bytes: Option<u64>,
+            pub net_tx_bytes: Option<u64>,
+            pub o11y_flags: O11yFlags,
+        }
+
+        pub struct TelemetryPolicy {
+            pub sample_period_ms: u64,
+            pub promote_triggers: Vec<PromoteTrigger>,
+            pub ring_buffer_limits: RingBufferLimits,
+        }
+      stability: evolving
+
+    - contract_id: CTR-PROTO-001
+      name: "Protocol Messages (Handshake)"
+      type: protobuf
+      description: |
+        Handshake messages for client-daemon connection.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
+      interface: |
+        message Hello {
+          uint32 protocol_version = 1;
+          ClientInfo client_info = 2;
+          repeated string requested_caps = 3;
+        }
+
+        message HelloAck {
+          ServerInfo server_info = 1;
+          repeated string granted_caps = 2;
+          bytes policy_hash = 3;
+          map<string, uint32> canonicalizer_versions = 4;
+        }
+      stability: stable
+
+    - contract_id: CTR-PROTO-002
+      name: "Protocol Messages (Episode Control)"
+      type: protobuf
+      description: |
+        Episode lifecycle control messages.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
+      interface: |
+        message CreateEpisode {
+          bytes envelope_hash = 1;
+        }
+
+        message EpisodeCreated {
+          string episode_id = 1;
+          string session_id = 2;
+        }
+
+        message StartEpisode {
+          string episode_id = 1;
+        }
+
+        message EpisodeStarted {
+          uint32 session_pid = 1;
+          string io_stream_id = 2;
+        }
+
+        message StopEpisode {
+          string episode_id = 1;
+          StopReason reason = 2;
+        }
+
+        message EpisodeStopped {
+          TerminationClass termination_class = 1;
+        }
+
+        message SignalEpisode {
+          string episode_id = 1;
+          int32 signal = 2;
+        }
+
+        message ResizePty {
+          string episode_id = 1;
+          uint32 cols = 2;
+          uint32 rows = 3;
+        }
+      stability: stable
+
+    - contract_id: CTR-PROTO-003
+      name: "Protocol Messages (I/O)"
+      type: protobuf
+      description: |
+        I/O streaming messages.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
+      interface: |
+        message SendInput {
+          string episode_id = 1;
+          bytes data = 2;
+        }
+
+        message StreamOutput {
+          bytes chunk = 1;
+          StreamKind kind = 2;
+          uint64 seq = 3;
+          uint64 ts = 4;
+        }
+
+        enum StreamKind {
+          STDOUT = 0;
+          STDERR = 1;
+        }
+      stability: stable
+
+    - contract_id: CTR-PROTO-004
+      name: "Protocol Messages (Tool Mediation)"
+      type: protobuf
+      description: |
+        Tool request/response messages.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
+      interface: |
+        message ToolRequest {
+          string episode_id = 1;
+          string request_id = 2;
+          string tool = 3;
+          bytes dedupe_key = 4;
+          bytes args_hash = 5;
+          optional bytes inline_args = 6;
+        }
+
+        message ToolDecision {
+          string request_id = 1;
+          DecisionType decision = 2;
+          optional string rule_id = 3;
+          bytes policy_hash = 4;
+          BudgetDelta budget_delta = 5;
+        }
+
+        enum DecisionType {
+          ALLOW = 0;
+          DENY = 1;
+          DEDUPE_HIT = 2;
+        }
+
+        message ToolResult {
+          string request_id = 1;
+          ToolOutcome outcome = 2;
+          bytes result_hash = 3;
+          optional bytes inline_result = 4;
+        }
+      stability: stable
+
+    - contract_id: CTR-PROTO-005
+      name: "Protocol Messages (Telemetry)"
+      type: protobuf
+      description: |
+        Telemetry streaming messages.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
+      interface: |
+        message TelemetryFrame {
+          string episode_id = 1;
+          uint64 seq = 2;
+          uint64 ts_mono = 3;
+          uint64 cpu_ns = 4;
+          uint64 mem_rss_bytes = 5;
+          uint64 io_read_bytes = 6;
+          uint64 io_write_bytes = 7;
+          optional CgroupStats cgroup_stats = 8;
+          uint32 o11y_flags = 9;
+        }
+
+        message TelemetryPolicy {
+          uint64 sample_period_ms = 1;
+          repeated PromoteTrigger promote_triggers = 2;
+          RingBufferLimits ring_buffer_limits = 3;
+        }
+      stability: evolving
+
+    - contract_id: CTR-PROTO-006
+      name: "Protocol Messages (Receipts and Evidence)"
+      type: protobuf
+      description: |
+        Receipt and evidence publication messages.
+        Defined in `proto/apm2d_runtime_v1.proto` (Normative).
+      interface: |
+        message PublishEvidence {
+          bytes artifact_hash = 1;
+          EvidenceKind kind = 2;
+          RetentionHint retention_hint = 3;
+        }
+
+        message Receipt {
+          ReceiptKind kind = 1;
+          bytes unsigned_bytes_hash = 2;
+          bytes signature = 3;
+          repeated bytes evidence_refs = 4;
+          bytes policy_hash = 5;
+          bytes envelope_hash = 6;
+          optional string issuer_id = 7;
+          optional bytes issuer_signature = 8;
+        }
+
+        enum ReceiptKind {
+          TOOL_EXECUTION = 0;
+          EPISODE_START = 1;
+          EPISODE_STOP = 2;
+          GATE = 3;
+          TELEMETRY = 4;
+          COMPACTION = 5;
+          STOP_ORDER = 6;
+        }
+      stability: stable
+
+  versioning_policy:
+    strategy: "semantic_versioning"
+    protocol_versioning: |
+      Protocol version negotiated in handshake.
+      Major version increment = breaking wire change.
+      Minor version increment = backwards-compatible additions.
+
+      Golden vectors maintained for each major version.
+      Old clients supported for N-1 major versions.
+    event_versioning: |
+      Events include schema_version field.
+      Event payload changes must be backwards-compatible (new fields with defaults).
+      Breaking changes require new event type, not modification.
+    canonicalization: |
+      Canonicalizer identified by (name, version) tuple.
+      Golden vectors validate canonicalizer stability.
+      Breaking canonicalization changes = new canonicalizer version.

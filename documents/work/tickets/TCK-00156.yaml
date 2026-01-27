@@ -1,0 +1,90 @@
+acceptance_criteria:
+  - criterion: Module directories created with mod.rs files
+    verification: ls crates/apm2-daemon/src/{episode,protocol,telemetry,evidence}/mod.rs
+  - criterion: Cargo.toml includes all declared dependencies
+    verification: cargo check -p apm2-daemon succeeds
+  - criterion: lib.rs exports new modules
+    verification: grep 'mod episode' crates/apm2-daemon/src/lib.rs
+implementation:
+  code_examples:
+    - description: Module structure in lib.rs
+      code: |
+        pub mod episode;
+        pub mod protocol;
+        pub mod telemetry;
+        pub mod evidence;
+  files_to_create:
+    - path: crates/apm2-daemon/src/lib.rs
+      purpose: Library root exporting daemon modules
+    - path: crates/apm2-daemon/src/episode/mod.rs
+      purpose: Episode runtime module
+    - path: crates/apm2-daemon/src/protocol/mod.rs
+      purpose: UDS protocol and framing module
+    - path: crates/apm2-daemon/src/telemetry/mod.rs
+      purpose: Telemetry collection module
+    - path: crates/apm2-daemon/src/evidence/mod.rs
+      purpose: Evidence economics module
+  files_to_modify:
+    - changes: Add tokio, prost, nix, blake3, ed25519-dalek, zbus dependencies
+      path: crates/apm2-daemon/Cargo.toml
+  implementation_steps:
+    - step: 1
+      action: Create lib.rs with module declarations
+      details: |
+        Create crates/apm2-daemon/src/lib.rs declaring episode, protocol,
+        telemetry, evidence modules. Re-export main.rs entry point.
+    - step: 2
+      action: Create episode module structure
+      details: |
+        Create crates/apm2-daemon/src/episode/mod.rs with placeholder exports
+        for EpisodeRuntime, EpisodeEnvelope, and state machine types.
+    - step: 3
+      action: Create protocol module structure
+      details: |
+        Create crates/apm2-daemon/src/protocol/mod.rs with placeholder exports
+        for framing, UDS server, and message types.
+    - step: 4
+      action: Create telemetry module structure
+      details: |
+        Create crates/apm2-daemon/src/telemetry/mod.rs with placeholder exports
+        for TelemetryCollector, CgroupReader, and TelemetryFrame.
+    - step: 5
+      action: Create evidence module structure
+      details: |
+        Create crates/apm2-daemon/src/evidence/mod.rs with placeholder exports
+        for FlightRecorder, RingBuffer, and retention types.
+    - step: 6
+      action: Update Cargo.toml with dependencies
+      details: |
+        Add to [dependencies]:
+        - tokio = { version = "1", features = ["full"] }
+        - prost = "0.12"
+        - nix = { version = "0.30", features = ["signal", "process", "fs", "pty"] }
+        - blake3 = "1"
+        - ed25519-dalek = "2"
+        - zbus = "4.4"
+  summary: |
+    Scaffold the apm2-daemon module structure required by RFC-0013.
+    Creates four new module directories (episode, protocol, telemetry, evidence)
+    and updates Cargo.toml with all declared dependencies.
+notes: |
+  Phase: PHASE-0 (Prerequisites)
+  Generated from RFC RFC-0013 DECOMPOSE session on 2026-01-27.
+  This ticket MUST complete before TCK-00157, TCK-00159, TCK-00167, TCK-00169.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Cargo check passes
+    test_id: UT-00156-01
+    verification_command: cargo check -p apm2-daemon
+  - description: Module structure exists
+    test_id: UT-00156-02
+    verification_command: test -d crates/apm2-daemon/src/episode && test -d crates/apm2-daemon/src/protocol
+ticket:
+  depends_on: []
+  id: TCK-00156
+  requirement_ids:
+    - REQ-DAEMON-001
+  rfc_id: RFC-0013
+  status: READY
+  title: Scaffold apm2-daemon module structure
