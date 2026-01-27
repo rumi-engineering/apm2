@@ -78,6 +78,29 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features
 
+  # Cross-platform canonicalization test vectors (TCK-00130)
+  # Verifies CAC-JSON canonicalization produces identical results on linux and macos
+  test-vectors:
+    name: Test Vectors (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # nightly
+        with:
+          toolchain: nightly
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+      - name: Run canonicalization test vectors
+        run: cargo test --package apm2-core --features test_vectors canonicalization
+
   # MSRV check
   msrv:
     name: MSRV (1.85)
@@ -192,7 +215,7 @@ jobs:
   # Final check that all CI jobs passed
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, doc, test, msrv, security, deny, coverage, secrets, build, semver]
+    needs: [fmt, clippy, doc, test, test-vectors, msrv, security, deny, coverage, secrets, build, semver]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -202,6 +225,7 @@ jobs:
           if [[ "${{ needs.clippy.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.doc.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.test.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.test-vectors.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.msrv.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.security.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.deny.result }}" != "success" ]]; then exit 1; fi

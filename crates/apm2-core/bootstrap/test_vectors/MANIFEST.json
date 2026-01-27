@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Bootstrap bundle manifest for CAC-JSON test vectors",
+  "artifacts": [
+    {
+      "name": "canonicalize.json",
+      "path": "test_vectors/canonicalize.json",
+      "description": "CAC-JSON canonicalization test vectors",
+      "version": "1.0.0",
+      "canonicalizer_id": "cac-json-v1",
+      "vector_count": {
+        "positive": 30,
+        "negative": 12,
+        "depth_limit": 3,
+        "idempotence": 1,
+        "determinism": 2
+      }
+    }
+  ],
+  "notes": "Content hash is verified at compile time via include_str! and test execution"
+}

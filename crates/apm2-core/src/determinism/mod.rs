@@ -60,6 +60,8 @@ mod atomic_write;
 mod canonicalize;
 mod canonicalize_json;
 mod diff_classify;
+#[cfg(feature = "test_vectors")]
+pub mod test_vectors;
 
 // Re-export primary API
 pub use atomic_write::{AtomicWriteError, write_atomic};
