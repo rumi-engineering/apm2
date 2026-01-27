@@ -2311,4 +2311,636 @@ mod tests {
 
         assert_eq!(prev_tokens, 600); // 100 + 200 + 300
     }
+
+    // =========================================================================
+    // TCK-00152: Stop Conditions and Circuit Breaker Logic Tests
+    // =========================================================================
+
+    /// TCK-00152: Circuit breaker triggers on 3 consecutive work item failures.
+    ///
+    /// Acceptance Criteria 1: Circuit breaker triggers on 3 consecutive
+    /// failures. Per AD-COORD-005 and AD-COORD-010: Circuit breaker tracks
+    /// consecutive failures across WORK ITEMS (not sessions). A work item
+    /// counts as a failure when it exhausts its retries.
+    #[test]
+    fn tck_00152_circuit_breaker_triggers_on_3_consecutive_failures() {
+        // Use max_attempts = 1 so each failure exhausts retries immediately,
+        // causing the work item to be marked as permanently failed.
+        let budget = CoordinationBudget::new(100, 60_000, None).unwrap();
+        let config = CoordinationConfig::new(
+            vec![
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+            ],
+            budget,
+            1, // max_attempts = 1
+        )
+        .unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Work A fails (exhausts 1 retry) -> consecutive_failures = 1
+        let spawn_a = controller
+            .prepare_session_spawn("A", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_a.session_id,
+                "A",
+                SessionOutcome::Failure,
+                100,
+                3_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 1);
+        assert!(controller.check_stop_condition().is_none()); // Not yet triggered
+
+        // Work B fails -> consecutive_failures = 2
+        let spawn_b = controller
+            .prepare_session_spawn("B", 200, 4_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_b.session_id,
+                "B",
+                SessionOutcome::Failure,
+                100,
+                5_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 2);
+        assert!(controller.check_stop_condition().is_none()); // Not yet triggered
+
+        // Work C fails -> consecutive_failures = 3 (circuit breaker threshold)
+        let spawn_c = controller
+            .prepare_session_spawn("C", 300, 6_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_c.session_id,
+                "C",
+                SessionOutcome::Failure,
+                100,
+                7_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 3);
+
+        // Circuit breaker should now be triggered
+        let stop = controller.check_stop_condition();
+        assert!(matches!(
+            stop,
+            Some(StopCondition::CircuitBreakerTriggered {
+                consecutive_failures: 3
+            })
+        ));
+    }
+
+    /// TCK-00152: Circuit breaker resets on success.
+    ///
+    /// Acceptance Criteria 2: Test success after 2 failures resets counter.
+    /// Per AD-COORD-005: Counter resets to 0 on any successful session
+    /// completion.
+    #[test]
+    fn tck_00152_circuit_breaker_resets_on_success() {
+        // Use max_attempts = 1 so each failure exhausts retries immediately
+        let budget = CoordinationBudget::new(100, 60_000, None).unwrap();
+        let config = CoordinationConfig::new(
+            vec![
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+            ],
+            budget,
+            1, // max_attempts = 1
+        )
+        .unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Work A fails -> consecutive_failures = 1
+        let spawn_a = controller
+            .prepare_session_spawn("A", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_a.session_id,
+                "A",
+                SessionOutcome::Failure,
+                100,
+                3_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 1);
+
+        // Work B fails -> consecutive_failures = 2
+        let spawn_b = controller
+            .prepare_session_spawn("B", 200, 4_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_b.session_id,
+                "B",
+                SessionOutcome::Failure,
+                100,
+                5_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 2);
+
+        // Work C SUCCEEDS -> consecutive_failures resets to 0
+        let spawn_c = controller
+            .prepare_session_spawn("C", 300, 6_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_c.session_id,
+                "C",
+                SessionOutcome::Success,
+                100,
+                7_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            controller.consecutive_failures(),
+            0,
+            "Circuit breaker counter should reset to 0 on success"
+        );
+
+        // Even with previous failures, we can now process more work
+        // (circuit breaker NOT triggered because counter was reset)
+        assert!(controller.check_stop_condition().is_none());
+    }
+
+    /// TCK-00152: Retry vs circuit breaker distinction.
+    ///
+    /// Acceptance Criteria 3: Retry exhaustion for one work doesn't trigger
+    /// circuit breaker alone. Per AD-COORD-010: Circuit breaker tracks
+    /// consecutive failures across DIFFERENT work items, not within retries of
+    /// the same work item.
+    #[test]
+    fn tck_00152_retry_exhaustion_does_not_trigger_circuit_breaker_alone() {
+        // Use max_attempts = 3 (3 retries per work item)
+        let budget = CoordinationBudget::new(100, 60_000, None).unwrap();
+        let config = CoordinationConfig::new(
+            vec!["A".to_string(), "B".to_string()],
+            budget,
+            3, // max_attempts = 3
+        )
+        .unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Work A: Fail 3 times (exhaust all retries)
+        // Each session failure within retries should NOT increment consecutive_failures
+        for i in 0u64..2 {
+            let spawn = controller
+                .prepare_session_spawn("A", 100 + i, 2_000_000_000 + i * 1_000_000_000)
+                .unwrap();
+            controller
+                .record_session_termination(
+                    &spawn.session_id,
+                    "A",
+                    SessionOutcome::Failure,
+                    100,
+                    3_000_000_000 + i * 1_000_000_000,
+                )
+                .unwrap();
+            // While retrying, consecutive_failures should NOT increment
+            assert_eq!(
+                controller.consecutive_failures(),
+                0,
+                "Session failures within retries should NOT increment circuit breaker counter"
+            );
+        }
+
+        // Third (final) attempt for work A
+        let spawn_a3 = controller
+            .prepare_session_spawn("A", 102, 5_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_a3.session_id,
+                "A",
+                SessionOutcome::Failure,
+                100,
+                6_000_000_000,
+            )
+            .unwrap();
+        // NOW the work item permanently failed, so consecutive_failures = 1
+        assert_eq!(controller.consecutive_failures(), 1);
+
+        // Circuit breaker NOT triggered (only 1 work item failed)
+        assert!(
+            controller.check_stop_condition().is_none(),
+            "Circuit breaker should NOT trigger after just one work item exhausts retries"
+        );
+
+        // Work B should still be processable
+        assert_eq!(controller.current_work_id(), Some("B"));
+    }
+
+    /// TCK-00152: Stop condition priority ordering.
+    ///
+    /// Acceptance Criteria 4: When multiple conditions met, highest priority
+    /// reported. Per AD-COORD-013: `CircuitBreaker` >
+    /// `BudgetExhausted(Duration)` > `BudgetExhausted(Tokens)` >
+    /// `BudgetExhausted(Episodes)` > `WorkCompleted`.
+    #[test]
+    fn tck_00152_stop_condition_priority_ordering() {
+        // Create a scenario where both circuit breaker and episode budget are
+        // exhausted
+        let budget = CoordinationBudget::new(3, 60_000, None).unwrap();
+        let config = CoordinationConfig::new(
+            vec![
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+            ],
+            budget,
+            1, // max_attempts = 1 (immediate failure on first attempt)
+        )
+        .unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Fail 3 work items (triggers both circuit breaker AND exhausts episode budget)
+        for (i, work_id) in ["A", "B", "C"].iter().enumerate() {
+            let spawn = controller
+                .prepare_session_spawn(work_id, (i as u64) * 100, 2_000_000_000)
+                .unwrap();
+            controller
+                .record_session_termination(
+                    &spawn.session_id,
+                    work_id,
+                    SessionOutcome::Failure,
+                    100,
+                    3_000_000_000,
+                )
+                .unwrap();
+        }
+
+        // Both conditions are now true:
+        // - consecutive_failures = 3 (CircuitBreakerTriggered)
+        // - consumed_episodes = 3 (BudgetExhausted(Episodes))
+        assert_eq!(controller.consecutive_failures(), 3);
+        assert_eq!(controller.budget_usage().consumed_episodes, 3);
+
+        // CircuitBreakerTriggered should take priority over BudgetExhausted
+        let stop = controller.check_stop_condition();
+        assert!(
+            matches!(
+                stop,
+                Some(StopCondition::CircuitBreakerTriggered {
+                    consecutive_failures: 3
+                })
+            ),
+            "CircuitBreakerTriggered should have higher priority than BudgetExhausted"
+        );
+    }
+
+    /// TCK-00152: Integration test for circuit breaker with mock failures.
+    ///
+    /// IT-COORD-STOP-001: Circuit breaker trigger test.
+    #[test]
+    fn tck_00152_integration_circuit_breaker_trigger() {
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let config = CoordinationConfig::new(
+            vec![
+                "W1".to_string(),
+                "W2".to_string(),
+                "W3".to_string(),
+                "W4".to_string(),
+            ],
+            budget,
+            1,
+        )
+        .unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Simulate 3 consecutive work item failures
+        let work_ids = ["W1", "W2", "W3"];
+        for (i, work_id) in work_ids.iter().enumerate() {
+            let spawn = controller
+                .prepare_session_spawn(work_id, i as u64, 2_000_000_000)
+                .unwrap();
+            controller
+                .record_session_termination(
+                    &spawn.session_id,
+                    work_id,
+                    SessionOutcome::Failure,
+                    100,
+                    3_000_000_000,
+                )
+                .unwrap();
+        }
+
+        // Complete with circuit breaker stop condition
+        let stop = controller.check_stop_condition().unwrap();
+        assert!(matches!(
+            stop,
+            StopCondition::CircuitBreakerTriggered { .. }
+        ));
+
+        let completed = controller.complete(stop, 10_000_000_000).unwrap();
+        assert!(matches!(
+            completed.stop_condition,
+            StopCondition::CircuitBreakerTriggered {
+                consecutive_failures: 3
+            }
+        ));
+    }
+
+    /// TCK-00152: Integration test for circuit breaker reset.
+    ///
+    /// IT-COORD-STOP-002: Circuit breaker reset on success.
+    #[test]
+    fn tck_00152_integration_circuit_breaker_reset() {
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let config = CoordinationConfig::new(
+            vec![
+                "W1".to_string(),
+                "W2".to_string(),
+                "W3".to_string(),
+                "W4".to_string(),
+                "W5".to_string(),
+            ],
+            budget,
+            1,
+        )
+        .unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Fail W1
+        let spawn_w1 = controller
+            .prepare_session_spawn("W1", 0, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_w1.session_id,
+                "W1",
+                SessionOutcome::Failure,
+                100,
+                3_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 1);
+
+        // Fail W2
+        let spawn_w2 = controller
+            .prepare_session_spawn("W2", 1, 4_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_w2.session_id,
+                "W2",
+                SessionOutcome::Failure,
+                100,
+                5_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 2);
+
+        // W3 SUCCEEDS - resets counter
+        let spawn_w3 = controller
+            .prepare_session_spawn("W3", 2, 6_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_w3.session_id,
+                "W3",
+                SessionOutcome::Success,
+                100,
+                7_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 0);
+
+        // Fail W4 and W5 - only 2 failures, circuit breaker NOT triggered
+        let spawn_w4 = controller
+            .prepare_session_spawn("W4", 3, 8_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_w4.session_id,
+                "W4",
+                SessionOutcome::Failure,
+                100,
+                9_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 1);
+
+        let spawn_w5 = controller
+            .prepare_session_spawn("W5", 4, 10_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_w5.session_id,
+                "W5",
+                SessionOutcome::Failure,
+                100,
+                11_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 2);
+
+        // All work processed, should be WorkCompleted (not circuit breaker)
+        let stop = controller.check_stop_condition();
+        assert!(
+            matches!(stop, Some(StopCondition::WorkCompleted)),
+            "Should be WorkCompleted, not CircuitBreakerTriggered"
+        );
+    }
+
+    /// TCK-00152: Integration test for retry exhaustion behavior.
+    ///
+    /// IT-COORD-STOP-003: Retry exhaustion behavior.
+    #[test]
+    fn tck_00152_integration_retry_exhaustion() {
+        let budget = CoordinationBudget::new(20, 60_000, None).unwrap();
+        let config =
+            CoordinationConfig::new(vec!["W1".to_string(), "W2".to_string()], budget, 3).unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // W1: Fail, fail, then succeed (uses 3 sessions)
+        let spawn_w1_1 = controller
+            .prepare_session_spawn("W1", 0, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_w1_1.session_id,
+                "W1",
+                SessionOutcome::Failure,
+                100,
+                3_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            controller.consecutive_failures(),
+            0,
+            "Retry in progress, no circuit breaker increment"
+        );
+        assert_eq!(controller.work_index(), 0, "Still on W1 for retry");
+
+        let spawn_w1_2 = controller
+            .prepare_session_spawn("W1", 1, 4_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_w1_2.session_id,
+                "W1",
+                SessionOutcome::Failure,
+                100,
+                5_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 0);
+        assert_eq!(controller.work_index(), 0, "Still on W1 for retry");
+
+        let spawn_w1_3 = controller
+            .prepare_session_spawn("W1", 2, 6_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_w1_3.session_id,
+                "W1",
+                SessionOutcome::Success,
+                100,
+                7_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures(), 0);
+        assert_eq!(controller.work_index(), 1, "Moved to W2 after W1 success");
+
+        // W2: Succeed immediately
+        let spawn_w2 = controller
+            .prepare_session_spawn("W2", 3, 8_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_w2.session_id,
+                "W2",
+                SessionOutcome::Success,
+                100,
+                9_000_000_000,
+            )
+            .unwrap();
+
+        let stop = controller.check_stop_condition();
+        assert!(matches!(stop, Some(StopCondition::WorkCompleted)));
+
+        // Verify tracking
+        let tracking_w1 = &controller.work_tracking[0];
+        assert_eq!(tracking_w1.attempt_count, 3);
+        assert_eq!(tracking_w1.final_outcome, Some(WorkItemOutcome::Succeeded));
+        assert_eq!(tracking_w1.session_ids.len(), 3);
+
+        let tracking_w2 = &controller.work_tracking[1];
+        assert_eq!(tracking_w2.attempt_count, 1);
+        assert_eq!(tracking_w2.final_outcome, Some(WorkItemOutcome::Succeeded));
+    }
+
+    /// TCK-00152: Property test for binding completeness.
+    ///
+    /// PT-COORD-STOP-001: Binding completeness (no orphan bindings).
+    /// Every `session_bound` event must have a corresponding `session_unbound`
+    /// event.
+    #[test]
+    fn tck_00152_property_binding_completeness() {
+        let budget = CoordinationBudget::new(20, 60_000, None).unwrap();
+        let config = CoordinationConfig::new(
+            vec![
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+            ],
+            budget,
+            2,
+        )
+        .unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Run a complex sequence of successes, failures, and retries
+        let outcomes = [
+            ("A", SessionOutcome::Success), // A succeeds first try
+            ("B", SessionOutcome::Failure), // B fails first try
+            ("B", SessionOutcome::Success), // B succeeds on retry
+            ("C", SessionOutcome::Failure), // C fails first try
+            ("C", SessionOutcome::Failure), // C fails second try (exhausted)
+            ("D", SessionOutcome::Success), // D succeeds first try
+        ];
+
+        for (i, (work_id, outcome)) in outcomes.iter().enumerate() {
+            let spawn = controller
+                .prepare_session_spawn(work_id, i as u64, 2_000_000_000 + i as u64 * 1_000_000_000)
+                .unwrap();
+            controller
+                .record_session_termination(
+                    &spawn.session_id,
+                    work_id,
+                    *outcome,
+                    100,
+                    3_000_000_000 + i as u64 * 1_000_000_000,
+                )
+                .unwrap();
+        }
+
+        // Count bound and unbound events
+        let events = controller.emitted_events();
+        let bound_count = events
+            .iter()
+            .filter(|e| matches!(e, CoordinationEvent::SessionBound(_)))
+            .count();
+        let unbound_count = events
+            .iter()
+            .filter(|e| matches!(e, CoordinationEvent::SessionUnbound(_)))
+            .count();
+
+        // Every bound must have an unbound (binding completeness invariant)
+        assert_eq!(
+            bound_count, unbound_count,
+            "Binding completeness violated: {bound_count} bound events but {unbound_count} unbound events"
+        );
+
+        // Verify the session IDs match between bound and unbound events
+        let bound_session_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| {
+                if let CoordinationEvent::SessionBound(b) = e {
+                    Some(b.session_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let unbound_session_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| {
+                if let CoordinationEvent::SessionUnbound(u) = e {
+                    Some(u.session_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Every bound session ID should have a corresponding unbound
+        for session_id in &bound_session_ids {
+            assert!(
+                unbound_session_ids.contains(session_id),
+                "Session {session_id} was bound but never unbound (orphan binding)"
+            );
+        }
+    }
 }
