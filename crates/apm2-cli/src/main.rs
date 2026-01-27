@@ -102,6 +102,10 @@ enum Commands {
     #[command(subcommand)]
     Creds(CredsCommands),
 
+    // === CAC (Context-as-Code) operations ===
+    /// Context-as-Code (CAC) commands
+    Cac(commands::cac::CacCommand),
+
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
@@ -250,6 +254,14 @@ fn main() -> Result<()> {
                 provider,
                 profile_id,
             } => commands::creds::login(&provider, profile_id.as_deref()),
+        },
+        Commands::Cac(cac_cmd) => {
+            // CAC commands use specific exit codes per TCK-00133:
+            // 0=success, 1=validation_error, 2=replay_violation
+            // We use std::process::exit to bypass anyhow Result handling
+            // and ensure precise exit codes are returned.
+            let exit_code = commands::cac::run_cac(&cac_cmd);
+            std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {
             FactoryCommands::Run { spec_file, format } => {
