@@ -153,6 +153,24 @@ pub enum ExportError {
         /// Error message.
         message: String,
     },
+
+    /// Path collision detected (case-insensitive filesystem).
+    #[error("path collision: '{path1}' and '{path2}' collide on case-insensitive filesystems")]
+    PathCollision {
+        /// First path (normalized).
+        path1: String,
+        /// Second path (colliding `stable_id`).
+        path2: String,
+    },
+
+    /// Binary content cannot be exported as text format.
+    #[error("binary content in '{stable_id}' cannot be exported as {format} (not valid UTF-8)")]
+    BinaryContentAsText {
+        /// The `stable_id` containing binary content.
+        stable_id: String,
+        /// The target text format.
+        format: String,
+    },
 }
 
 // ============================================================================
@@ -443,7 +461,8 @@ impl ExportPipeline {
         self.generate_manifest(pack, outputs)
     }
 
-    /// Validates budget constraints against the pack.
+    /// Validates budget constraints against the pack (artifact count only).
+    /// Byte budget is validated cumulatively during content resolution.
     fn validate_budget(&self, pack: &CompiledContextPack) -> Result<(), ExportError> {
         let budget = &self.config.profile.budget_policy;
 
@@ -468,8 +487,17 @@ impl ExportPipeline {
         pack: &CompiledContextPack,
         resolver: &R,
     ) -> Result<Vec<RenderedOutput>, ExportError> {
+        use std::collections::HashSet;
+
         let mut outputs = Vec::new();
         let provenance = self.create_provenance(pack)?;
+        let budget = &self.config.profile.budget_policy;
+
+        // Track cumulative bytes for budget enforcement
+        let mut cumulative_bytes: u64 = 0;
+
+        // Track used paths (normalized to lowercase) for case-insensitive collision detection
+        let mut used_paths: HashSet<String> = HashSet::new();
 
         for entry in &pack.manifest.entries {
             // Resolve content
@@ -480,7 +508,7 @@ impl ExportPipeline {
                     message: e,
                 })?;
 
-            // Check content size
+            // Check content size against per-artifact limit
             if content.len() > MAX_RENDERED_CONTENT_BYTES {
                 return Err(ExportError::ContentTooLarge {
                     actual: content.len(),
@@ -488,8 +516,34 @@ impl ExportPipeline {
                 });
             }
 
+            // Track cumulative bytes and enforce max_bytes budget
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                cumulative_bytes = cumulative_bytes.saturating_add(content.len() as u64);
+            }
+            if let Some(ref max_bytes) = budget.max_bytes {
+                if cumulative_bytes > max_bytes.value() {
+                    return Err(ExportError::BudgetViolation {
+                        dimension: "bytes".to_string(),
+                        limit: max_bytes.value(),
+                        actual: cumulative_bytes,
+                    });
+                }
+            }
+
             // Render based on output format
             let rendered = self.render_artifact(&entry.stable_id, &content, &provenance)?;
+
+            // Check for case-insensitive path collision
+            let normalized_path = rendered.path.to_string_lossy().to_lowercase();
+            if !used_paths.insert(normalized_path.clone()) {
+                // Find the original path that collides
+                return Err(ExportError::PathCollision {
+                    path1: normalized_path,
+                    path2: entry.stable_id.clone(),
+                });
+            }
+
             outputs.push(rendered);
         }
 
@@ -508,26 +562,45 @@ impl ExportPipeline {
         let format = self.config.profile.delivery_constraints.output_format;
         let embed_mode = self.config.profile.delivery_constraints.provenance_embed;
 
-        // Convert content to string (assuming UTF-8 for text formats)
-        let content_str = String::from_utf8_lossy(content);
-
         // Generate output content based on format
         let (output_content, extension) = match format {
             OutputFormat::Markdown => {
-                let rendered = Self::embed_provenance(&content_str, provenance, embed_mode);
+                // Validate UTF-8 for text formats to prevent silent corruption
+                let content_str = std::str::from_utf8(content).map_err(|_| {
+                    ExportError::BinaryContentAsText {
+                        stable_id: stable_id.to_string(),
+                        format: "markdown".to_string(),
+                    }
+                })?;
+                let rendered = Self::embed_provenance(content_str, provenance, embed_mode);
                 (rendered.into_bytes(), "md")
             },
             OutputFormat::PlainText => {
-                let rendered = Self::embed_provenance(&content_str, provenance, embed_mode);
+                // Validate UTF-8 for text formats to prevent silent corruption
+                let content_str = std::str::from_utf8(content).map_err(|_| {
+                    ExportError::BinaryContentAsText {
+                        stable_id: stable_id.to_string(),
+                        format: "plain_text".to_string(),
+                    }
+                })?;
+                let rendered = Self::embed_provenance(content_str, provenance, embed_mode);
                 (rendered.into_bytes(), "txt")
             },
             OutputFormat::Json => {
+                // Validate UTF-8 for JSON format
+                let content_str = std::str::from_utf8(content).map_err(|_| {
+                    ExportError::BinaryContentAsText {
+                        stable_id: stable_id.to_string(),
+                        format: "json".to_string(),
+                    }
+                })?;
                 // For JSON, provenance is embedded as metadata object
-                let rendered = Self::embed_provenance_json(&content_str, provenance, embed_mode)?;
+                let rendered = Self::embed_provenance_json(content_str, provenance, embed_mode)?;
                 (rendered.into_bytes(), "json")
             },
             OutputFormat::Xml => {
                 // XML support is out of scope for this ticket
+                // XML can handle binary via CDATA or encoding, so pass through
                 (content.to_vec(), "xml")
             },
         };
@@ -1623,5 +1696,319 @@ mod tests {
         let content = std::fs::read_to_string(temp_dir.path().join("org/doc/readme.txt")).unwrap();
         assert_eq!(content, "Just plain text.");
         assert!(!content.contains("provenance:"));
+    }
+
+    // =========================================================================
+    // Budget Enforcement Tests (max_bytes)
+    // =========================================================================
+
+    #[test]
+    fn test_budget_violation_max_bytes_exceeded() {
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("bytes-limited")
+            .version("2026-01-27")
+            .budget_policy(
+                BudgetPolicy::builder()
+                    .max_bytes(TypedQuantity::bytes(10)) // Only 10 bytes allowed
+                    .build(),
+            )
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::Markdown)
+                    .provenance_embed(ProvenanceEmbed::None)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        // Content exceeds 10 byte budget
+        resolver.insert("org:doc:readme", b"This content is way more than 10 bytes!");
+
+        let result = pipeline.export(&pack, &resolver);
+        assert!(matches!(
+            result,
+            Err(ExportError::BudgetViolation { dimension, limit: 10, .. })
+            if dimension == "bytes"
+        ));
+    }
+
+    #[test]
+    fn test_budget_max_bytes_cumulative_enforcement() {
+        // Create a pack with multiple entries to test cumulative enforcement
+        let entry1 = ManifestEntry {
+            stable_id: "org:doc:file1".to_string(),
+            content_hash: "a".repeat(64),
+            schema_id: "org:schema:doc".to_string(),
+            dependencies: vec![],
+        };
+        let entry2 = ManifestEntry {
+            stable_id: "org:doc:file2".to_string(),
+            content_hash: "b".repeat(64),
+            schema_id: "org:schema:doc".to_string(),
+            dependencies: vec![],
+        };
+
+        let mut content_hashes = BTreeMap::new();
+        content_hashes.insert("org:doc:file1".to_string(), "a".repeat(64));
+        content_hashes.insert("org:doc:file2".to_string(), "b".repeat(64));
+
+        let pack = CompiledContextPack {
+            manifest: CompiledManifest {
+                schema: CompiledManifest::SCHEMA.to_string(),
+                schema_version: CompiledManifest::SCHEMA_VERSION.to_string(),
+                spec_id: "test-pack".to_string(),
+                target_profile: "test-profile".to_string(),
+                entries: vec![entry1, entry2],
+                canonicalizer_id: CompiledManifest::CANONICALIZER_ID.to_string(),
+                canonicalizer_version: CompiledManifest::CANONICALIZER_VERSION.to_string(),
+            },
+            content_hashes,
+            budget_used: BudgetUsed {
+                artifact_count: TypedQuantity::artifacts(2),
+                total_bytes: None,
+            },
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("bytes-cumulative")
+            .version("2026-01-27")
+            .budget_policy(
+                BudgetPolicy::builder()
+                    .max_bytes(TypedQuantity::bytes(15)) // Each file is 10 bytes, combined exceeds 15
+                    .build(),
+            )
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::Markdown)
+                    .provenance_embed(ProvenanceEmbed::None)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let mut resolver = MemoryContentResolver::new();
+        resolver.insert("org:doc:file1", b"0123456789"); // 10 bytes
+        resolver.insert("org:doc:file2", b"0123456789"); // 10 bytes - cumulative 20 exceeds 15
+
+        let result = pipeline.export(&pack, &resolver);
+        assert!(matches!(
+            result,
+            Err(ExportError::BudgetViolation { dimension, limit: 15, actual: 20 })
+            if dimension == "bytes"
+        ));
+    }
+
+    // =========================================================================
+    // Case-Insensitive Path Collision Tests
+    // =========================================================================
+
+    #[test]
+    fn test_path_collision_case_insensitive() {
+        // Create a pack with entries that would collide on case-insensitive filesystems
+        let entry1 = ManifestEntry {
+            stable_id: "org:Doc:readme".to_string(),
+            content_hash: "a".repeat(64),
+            schema_id: "org:schema:doc".to_string(),
+            dependencies: vec![],
+        };
+        let entry2 = ManifestEntry {
+            stable_id: "org:doc:readme".to_string(), // Same as entry1 on case-insensitive FS
+            content_hash: "b".repeat(64),
+            schema_id: "org:schema:doc".to_string(),
+            dependencies: vec![],
+        };
+
+        let mut content_hashes = BTreeMap::new();
+        content_hashes.insert("org:Doc:readme".to_string(), "a".repeat(64));
+        content_hashes.insert("org:doc:readme".to_string(), "b".repeat(64));
+
+        let pack = CompiledContextPack {
+            manifest: CompiledManifest {
+                schema: CompiledManifest::SCHEMA.to_string(),
+                schema_version: CompiledManifest::SCHEMA_VERSION.to_string(),
+                spec_id: "test-pack".to_string(),
+                target_profile: "test-profile".to_string(),
+                entries: vec![entry1, entry2],
+                canonicalizer_id: CompiledManifest::CANONICALIZER_ID.to_string(),
+                canonicalizer_version: CompiledManifest::CANONICALIZER_VERSION.to_string(),
+            },
+            content_hashes,
+            budget_used: BudgetUsed {
+                artifact_count: TypedQuantity::artifacts(2),
+                total_bytes: None,
+            },
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let pipeline = ExportPipeline::builder()
+            .profile(test_profile())
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let mut resolver = MemoryContentResolver::new();
+        resolver.insert("org:Doc:readme", b"Content 1");
+        resolver.insert("org:doc:readme", b"Content 2");
+
+        let result = pipeline.export(&pack, &resolver);
+        assert!(matches!(
+            result,
+            Err(ExportError::PathCollision { path1, path2 })
+            if path1.contains("org/doc/readme") && path2 == "org:doc:readme"
+        ));
+    }
+
+    // =========================================================================
+    // Binary vs Text Corruption Tests
+    // =========================================================================
+
+    #[test]
+    fn test_binary_content_as_markdown_returns_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let pipeline = ExportPipeline::builder()
+            .profile(test_profile()) // Markdown format
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        // Invalid UTF-8 sequence (binary data)
+        resolver.insert("org:doc:readme", vec![0x80, 0x81, 0x82, 0xFF, 0xFE]);
+
+        let result = pipeline.export(&pack, &resolver);
+        assert!(matches!(
+            result,
+            Err(ExportError::BinaryContentAsText { stable_id, format })
+            if stable_id == "org:doc:readme" && format == "markdown"
+        ));
+    }
+
+    #[test]
+    fn test_binary_content_as_plaintext_returns_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("plaintext-profile")
+            .version("2026-01-27")
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::PlainText)
+                    .provenance_embed(ProvenanceEmbed::None)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        // Invalid UTF-8 sequence (binary data)
+        resolver.insert("org:doc:readme", vec![0x80, 0x81, 0x82, 0xFF, 0xFE]);
+
+        let result = pipeline.export(&pack, &resolver);
+        assert!(matches!(
+            result,
+            Err(ExportError::BinaryContentAsText { stable_id, format })
+            if stable_id == "org:doc:readme" && format == "plain_text"
+        ));
+    }
+
+    #[test]
+    fn test_binary_content_as_json_returns_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("json-binary")
+            .version("2026-01-27")
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::Json)
+                    .provenance_embed(ProvenanceEmbed::None)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        // Invalid UTF-8 sequence (binary data)
+        resolver.insert("org:doc:readme", vec![0x80, 0x81, 0x82, 0xFF, 0xFE]);
+
+        let result = pipeline.export(&pack, &resolver);
+        assert!(matches!(
+            result,
+            Err(ExportError::BinaryContentAsText { stable_id, format })
+            if stable_id == "org:doc:readme" && format == "json"
+        ));
+    }
+
+    #[test]
+    fn test_binary_content_as_xml_allowed() {
+        // XML format should allow binary content (pass-through)
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("xml-binary")
+            .version("2026-01-27")
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::Xml)
+                    .provenance_embed(ProvenanceEmbed::None)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        let binary_content: Vec<u8> = vec![0x80, 0x81, 0x82, 0xFF, 0xFE];
+        resolver.insert("org:doc:readme", binary_content.clone());
+
+        // Should succeed for XML
+        let result = pipeline.export(&pack, &resolver);
+        assert!(result.is_ok());
+
+        // Verify binary content is preserved
+        let output_path = temp_dir.path().join("org/doc/readme.xml");
+        let written_content = std::fs::read(&output_path).unwrap();
+        assert_eq!(written_content, binary_content);
     }
 }
