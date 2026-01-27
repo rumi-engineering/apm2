@@ -470,7 +470,7 @@ impl AATReceipt {
     /// The canonical format is:
     /// `receipt_id|binary_hash|passed|failed|skipped|capabilities_sorted|timestamp`
     #[must_use]
-    fn canonical_bytes(&self) -> Vec<u8> {
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
         let mut sorted_caps = self.capabilities_tested.clone();
         sorted_caps.sort();
 

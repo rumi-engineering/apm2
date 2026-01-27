@@ -170,6 +170,7 @@
 //! ```
 
 pub mod admission;
+pub mod capability_gate;
 pub mod compiler;
 pub mod conformance;
 pub mod dcp_index;
@@ -181,6 +182,11 @@ pub mod target_profile;
 mod validator;
 
 // Compiler exports
+// Capability gate exports
+pub use capability_gate::{
+    CapabilityError, CapabilityGate, CapabilityRequirement, CapabilityStatus,
+    MAX_CAPABILITY_ID_LENGTH as GATE_MAX_CAPABILITY_ID_LENGTH, MAX_REQUIREMENTS_PER_CHECK,
+};
 pub use compiler::{
     BudgetUsed, CompilationError, CompilationReceipt, CompilationResult, CompilationWarning,
     CompiledContextPack, CompiledManifest, ContextPackCompiler, MAX_ARTIFACTS_IN_PACK,

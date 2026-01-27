@@ -57,6 +57,6 @@ pub use hash::{
 };
 pub use keys::{KeyManager, KeyManagerError, StoredKeypair};
 pub use sign::{
-    SIGNATURE_SIZE, Signature, Signer, SignerError, VerifyingKey, parse_signature,
+    PUBLIC_KEY_SIZE, SIGNATURE_SIZE, Signature, Signer, SignerError, VerifyingKey, parse_signature,
     parse_verifying_key, verify_signature,
 };
