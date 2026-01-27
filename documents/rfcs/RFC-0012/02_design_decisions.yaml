@@ -130,14 +130,16 @@ rfc_design_decisions:
       tradeoff_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#TRADEOFF-COORD-0001"
 
     - decision_id: AD-COORD-006
-      title: "Work freshness check using ledger sequence"
+      title: "Atomic work binding using transition counts"
       description: |
-        Before spawning a session, controller checks work state at a known
-        ledger event sequence number. Spawn proceeds only if work is still
-        in eligible state at that sequence.
+        Before spawning a session, the controller checks work state and includes
+        the `expected_transition_count` in the `coordination.session_bound` event.
+        The `WorkReducer` or an admission gate MUST reject the binding if the
+        work's actual transition count has diverged.
       rationale: |
-        Event ordering provides consistent view across reducers.
-        Prevents race conditions where work state changes during spawn.
+        Event ordering alone is insufficient for atomicity in a distributed
+        environment. Explicit transition pinning prevents TOCTOU races where
+        work is modified between the coordination decision and session start.
       constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0005"
 
     - decision_id: AD-COORD-007
@@ -183,22 +185,18 @@ rfc_design_decisions:
       constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0002"
 
     - decision_id: AD-COORD-009
-      title: "Coordination event serialization via JSON"
+      title: "Deterministic event serialization via JCS"
       description: |
-        Coordination events use JSON serialization (serde_json) for the payload field
-        in EventRecord. This follows the existing pattern used by SessionStarted,
-        WorkTransitioned, and other event payloads.
+        Coordination events MUST use deterministic JSON serialization (JCS -
+        RFC 8785) for the payload field. This ensures that signatures and
+        hashes are stable across different library versions and architectures.
 
-        No .proto file is required because:
-        - APM2 events use EventRecord with JSON payload (not protobuf messages)
-        - Existing reducers deserialize via serde_json (see session/reducer.rs:113-114)
-        - JSON provides schema flexibility for MVP
-
-        The CoordinationEvent payloads (Started, SessionBound, SessionUnbound,
-        Completed, Aborted) implement Serialize + Deserialize via serde.
+        No .proto file is required for MVP, but the use of `serde_json` MUST
+        be wrapped in a canonicalization layer (e.g., `serde_jcs`).
       rationale: |
-        Follows established event serialization pattern. JSON is adequate for MVP.
-        If protobuf is needed later, migration is possible via event versioning.
+        Non-deterministic serialization breaks ledger integrity (LAW-15).
+        Field reordering in standard JSON libraries causes hash divergence
+        during replay or signature verification.
       evidence_ref: "crates/apm2-core/src/session/reducer.rs:113-114"
 
     - decision_id: AD-COORD-010
@@ -260,7 +258,7 @@ rfc_design_decisions:
            a. Set final stop_condition
            b. Set completed_at timestamp
            c. Compute all derived fields (total_sessions, success/fail counts)
-        3. Serialize receipt to JSON bytes
+        3. Serialize receipt to JSON bytes (MUST use JCS for determinism)
         4. Compute receipt_hash = BLAKE3(receipt_bytes)
         5. Store receipt in CAS: cas.put(receipt_bytes) -> cas_hash
         6. Emit coordination.completed event with receipt_hash
@@ -291,6 +289,17 @@ rfc_design_decisions:
         Deterministic ordering enables reproducible receipts. Safety conditions
         (circuit breaker) take precedence because they indicate systemic issues.
         Success (WORK_COMPLETED) is lowest because it implies no failures.
+
+    - decision_id: AD-COORD-014
+      title: "SessionSpawner trait for execution decoupling"
+      description: |
+        Define a `SessionSpawner` trait to decouple the `CoordinationController`
+        from specific session spawning implementations (local thread, daemon IPC).
+      rationale: |
+        Prevents coordination logic from depending on brittle CLI/Daemon
+        infrastructure. Enables local testing and future multi-provider support.
+        Follows the "episode correctness first" principle.
+
 
   v2_exploration_findings: |
     RFC v2 (Grounded phase). Design decisions validated through codebase investigation.

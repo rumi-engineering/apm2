@@ -1,10 +1,12 @@
 acceptance_criteria:
   - criterion: All integration tests pass
     verification: cargo test coordination_integration
-  - criterion: Happy path produces valid receipt
+  - criterion: Happy path produces valid receipt with deterministic JCS hash
     verification: Receipt validation in test
-  - criterion: Edge cases handled correctly
-    verification: Tests for each failure mode
+  - criterion: Atomic binding prevents stale state races (TOCTOU)
+    verification: Test with simulated work state drift during spawn
+  - criterion: Coordination uses SessionSpawner trait for decoupling
+    verification: Documentation and trait usage review
   - criterion: AGENTS.md follows module pattern
     verification: Documentation review
 implementation:
@@ -13,10 +15,17 @@ implementation:
     - path: crates/apm2-core/tests/coordination_integration.rs
       purpose: Integration test suite
   files_to_modify:
-    - changes: Add AGENTS.md documentation
+    - changes: Add SessionSpawner trait and AGENTS.md documentation
       path: crates/apm2-core/src/coordination/mod.rs
-  implementation_steps: []
-  summary: ""
+  implementation_steps:
+    - "Define SessionSpawner trait in coordination/mod.rs"
+    - "Update CoordinationEvent to include expected_transition_count"
+    - "Implement MockSessionSpawner for integration tests"
+    - "Implement coordination execution loop using spawner"
+    - "Use JCS (serde_jcs) for deterministic event and receipt serialization"
+    - "Write integration tests for happy path and TOCTOU races"
+  summary: "Implement coordination end-to-end integration tests with decoupling and atomicity."
+
 notes: "Phase: PHASE-1\nGenerated from RFC RFC-0012 ticket decomposition on 2026-01-27."
 schema_version: "2026-01-26"
 template_version: "2026-01-26"

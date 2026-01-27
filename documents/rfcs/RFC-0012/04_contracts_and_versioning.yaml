@@ -95,6 +95,8 @@ rfc_contracts_and_versioning:
                 work_id: WorkId,
                 session_id: SessionId,
                 attempt_number: u32,
+                /// Atomic check: binding only succeeds if work is still at this count.
+                expected_transition_count: u32,
             },
             SessionUnbound {
                 coordination_id: CoordinationId,
@@ -147,13 +149,15 @@ rfc_contracts_and_versioning:
             work_reducer: Arc<RwLock<WorkReducer>>,
             session_reducer: Arc<RwLock<SessionReducer>>,
             cas: Arc<ContentAddressedStore>,
+            /// Session spawner decoupling (AD-COORD-014).
+            spawner: Arc<dyn SessionSpawner>,
         }
 
         impl CoordinationController {
             pub async fn start(&self, config: CoordinationConfig) -> Result<CoordinationId, Error>;
             pub async fn run_loop(&self, coordination_id: CoordinationId) -> Result<CoordinationReceipt, Error>;
             fn check_stop_condition(&self, state: &CoordinationState) -> Option<StopCondition>;
-            fn check_work_freshness(&self, work_id: WorkId, seq: u64) -> Result<(), Error>;
+            fn check_work_freshness(&self, work_id: WorkId, expected_seq: u32) -> Result<(), Error>;
         }
 
         pub struct CoordinationConfig {
@@ -163,6 +167,20 @@ rfc_contracts_and_versioning:
             pub max_work_queue_size: Option<u32>,  // Default: 1000 (AD-COORD-008)
         }
       stability: stable
+
+    - contract_id: CTR-COORD-005
+      name: "SessionSpawner"
+      type: rust_trait
+      description: |
+        Trait for decoupled session execution.
+      interface: |
+        #[async_trait]
+        pub trait SessionSpawner: Send + Sync {
+            /// Spawns a new session with the given ID and spec.
+            async fn spawn(&self, session_id: SessionId, spec: SessionSpec) -> Result<(), Error>;
+        }
+      stability: stable
+
 
     - contract_id: CTR-COORD-005
       name: "CoordinationReceipt"
