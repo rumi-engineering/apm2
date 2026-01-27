@@ -931,8 +931,6 @@ mod validation_tests {
         );
     }
 }
-<<<<<<< Updated upstream
-=======
 
 /// Validate an artifact fetch request.
 fn validate_artifact_fetch(req: &ArtifactFetch, errors: &mut Vec<ValidationError>) {
@@ -1116,4 +1114,3 @@ mod artifact_fetch_tests {
         assert!(errors.iter().any(|e| e.field == "artifact_fetch.max_bytes"));
     }
 }
->>>>>>> Stashed changes
