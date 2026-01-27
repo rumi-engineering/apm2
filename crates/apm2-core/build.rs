@@ -146,10 +146,10 @@ fn generate_bootstrap_manifest() -> Result<(), Box<dyn std::error::Error>> {
     for (stable_id, (content, hash)) in &schemas {
         // Security: Use debug formatting ({:?}) to properly escape string content
         // This prevents code injection if content contains sequences like `"#`
+        let content_escaped = format!("{content:?}");
         writeln!(
             output,
-            "    (\n        \"{stable_id}\",\n        {:?},\n        {hash:?},\n    ),",
-            content
+            "    (\n        \"{stable_id}\",\n        {content_escaped},\n        {hash:?},\n    ),",
         )?;
     }
 
