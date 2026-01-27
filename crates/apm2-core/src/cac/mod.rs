@@ -172,6 +172,7 @@
 pub mod admission;
 pub mod compiler;
 pub mod dcp_index;
+pub mod export;
 pub mod pack_spec;
 pub mod patch_engine;
 pub mod target_profile;
@@ -205,4 +206,11 @@ pub use target_profile::{
 pub use validator::{
     CacValidator, MAX_ARRAY_MEMBERS, MAX_DEPTH, MAX_OBJECT_PROPERTIES, ValidationError,
     validate_cac_artifact,
+};
+
+// Export pipeline exports
+pub use export::{
+    ContentResolver, DEFAULT_EXPORTER_VERSION, ExportConfig, ExportError, ExportManifest,
+    ExportOutput, ExportPipeline, ExportPipelineBuilder, MAX_RENDERED_CONTENT_BYTES,
+    MemoryContentResolver, Provenance,
 };
