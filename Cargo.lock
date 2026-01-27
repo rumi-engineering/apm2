@@ -131,6 +131,7 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "clap",
  "criterion",
  "directories",
  "ed25519-dalek",

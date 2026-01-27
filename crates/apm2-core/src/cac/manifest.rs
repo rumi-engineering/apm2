@@ -155,6 +155,39 @@ pub enum ManifestError {
         /// ID of the duplicate item.
         id: String,
     },
+
+    /// A field contains control characters (including null bytes).
+    ///
+    /// Control characters in hash input fields can enable collision attacks
+    /// where different logical inputs produce the same hash.
+    #[error("{field} contains control characters (including null bytes) which are not allowed")]
+    ControlCharactersNotAllowed {
+        /// The name of the field containing control characters.
+        field: String,
+    },
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Returns `true` if the string contains any control characters (ASCII 0-31 or
+/// 127).
+///
+/// Control characters in hash input fields can enable collision attacks where
+/// the delimiter (null byte) is embedded in field values, causing different
+/// logical inputs to produce identical hash outputs.
+///
+/// # Example Attack Vector (prevented by this check)
+///
+/// Without this validation:
+/// - `version="1.0\0"` + `target="x86"` would hash as `1.0\0\0x86`
+/// - `version="1.0"` + `target="\0x86"` would also hash as `1.0\0\0x86`
+///
+/// Both produce the same hash, allowing manifest replay attacks.
+#[must_use]
+fn contains_control_characters(s: &str) -> bool {
+    s.bytes().any(|b| b < 32 || b == 127)
 }
 
 // ============================================================================
@@ -295,7 +328,19 @@ impl Command {
             }
         }
 
-        // Validate subcommands recursively
+        // Check for duplicate subcommand names at this level
+        let mut seen_subcommands = std::collections::HashSet::new();
+        for subcmd in &self.subcommands {
+            if !seen_subcommands.insert(&subcmd.name) {
+                return Err(ManifestError::Duplicate {
+                    item_type: "subcommand".to_string(),
+                    id: subcmd.name.clone(),
+                });
+            }
+        }
+
+        // Validate subcommands recursively (this will also check their nested
+        // duplicates)
         for subcmd in &self.subcommands {
             subcmd.validate()?;
         }
@@ -377,6 +422,102 @@ impl CommandBuilder {
 
         command.validate()?;
         Ok(command)
+    }
+}
+
+// ============================================================================
+// Clap Introspection
+// ============================================================================
+
+/// Extracts CLI commands from a clap `Command` structure.
+///
+/// This function recursively traverses the clap command tree and converts
+/// it to the manifest's `Command` representation for capability enumeration.
+///
+/// # Feature Flag
+///
+/// This functionality requires the `clap-introspection` feature:
+///
+/// ```toml
+/// [dependencies]
+/// apm2-core = { version = "0.3", features = ["clap-introspection"] }
+/// ```
+///
+/// # Example
+///
+/// ```ignore
+/// use apm2_core::cac::manifest::{Command, extract_commands_from_clap};
+/// use clap::Command as ClapCommand;
+///
+/// let app = ClapCommand::new("myapp")
+///     .about("My application")
+///     .subcommand(ClapCommand::new("start").about("Start the app"))
+///     .subcommand(ClapCommand::new("stop").about("Stop the app"));
+///
+/// let commands = extract_commands_from_clap(&app);
+/// ```
+#[cfg(feature = "clap-introspection")]
+#[must_use]
+pub fn extract_commands_from_clap(clap_cmd: &clap::Command) -> Vec<Command> {
+    clap_cmd
+        .get_subcommands()
+        .map(convert_clap_command)
+        .collect()
+}
+
+/// Recursively converts a clap `Command` to a manifest `Command`.
+#[cfg(feature = "clap-introspection")]
+fn convert_clap_command(clap_cmd: &clap::Command) -> Command {
+    let subcommands: Vec<Command> = clap_cmd
+        .get_subcommands()
+        .map(convert_clap_command)
+        .collect();
+
+    Command {
+        name: clap_cmd.get_name().to_string(),
+        description: clap_cmd.get_about().map(ToString::to_string),
+        input_schema_ref: None,  // Schema refs must be set manually
+        output_schema_ref: None, // Schema refs must be set manually
+        subcommands,
+    }
+}
+
+/// Populates manifest commands from a clap `Command` structure.
+///
+/// This is a convenience method that combines manifest generation with
+/// clap command extraction.
+///
+/// # Feature Flag
+///
+/// Requires the `clap-introspection` feature.
+///
+/// # Example
+///
+/// ```ignore
+/// use apm2_core::cac::manifest::{CapabilityManifest, ManifestConfig};
+/// use clap::Command as ClapCommand;
+///
+/// let config = ManifestConfig::builder()
+///     .version("0.3.0")
+///     .target("x86_64-unknown-linux-gnu")
+///     .profile("release")
+///     .build()
+///     .unwrap();
+///
+/// let app = ClapCommand::new("apm2")
+///     .subcommand(ClapCommand::new("start"))
+///     .subcommand(ClapCommand::new("stop"));
+///
+/// let manifest = CapabilityManifest::generate_with_clap(&config, &app);
+/// ```
+#[cfg(feature = "clap-introspection")]
+impl CapabilityManifest {
+    /// Generates a manifest with commands extracted from clap introspection.
+    #[must_use]
+    pub fn generate_with_clap(config: &ManifestConfig, clap_cmd: &clap::Command) -> Self {
+        let mut manifest = Self::generate(config);
+        manifest.commands = extract_commands_from_clap(clap_cmd);
+        manifest
     }
 }
 
@@ -678,7 +819,37 @@ impl ManifestConfig {
     /// # Errors
     ///
     /// Returns [`ManifestError`] if validation fails.
+    ///
+    /// # Security
+    ///
+    /// This method rejects control characters (including null bytes) in all
+    /// fields to prevent binary hash collision attacks. The
+    /// `compute_binary_hash` function uses null bytes as field delimiters,
+    /// so allowing null bytes in field values would enable attackers to
+    /// craft different inputs that produce identical hashes.
     pub fn validate(&self) -> Result<(), ManifestError> {
+        // SECURITY: Reject control characters to prevent hash collision attacks.
+        // The binary hash uses null bytes as delimiters, so embedded nulls could
+        // cause `version="1.0\0" + target="x86"` to collide with
+        // `version="1.0" + target="\0x86"`.
+        if contains_control_characters(&self.version) {
+            return Err(ManifestError::ControlCharactersNotAllowed {
+                field: "version".to_string(),
+            });
+        }
+
+        if contains_control_characters(&self.target) {
+            return Err(ManifestError::ControlCharactersNotAllowed {
+                field: "target".to_string(),
+            });
+        }
+
+        if contains_control_characters(&self.profile) {
+            return Err(ManifestError::ControlCharactersNotAllowed {
+                field: "profile".to_string(),
+            });
+        }
+
         if self.version.len() > MAX_VERSION_LENGTH {
             return Err(ManifestError::FieldTooLong {
                 field: "version".to_string(),
@@ -989,14 +1160,46 @@ impl CapabilityManifest {
 
     /// Serializes the manifest to canonical JSON with sorted keys.
     ///
+    /// This method ensures deterministic output by sorting:
+    /// - Commands (and their subcommands, recursively) by name
+    /// - Capabilities by ID
+    /// - Selftest refs (already sorted via `BTreeMap`)
+    ///
     /// # Errors
     ///
     /// Returns serialization error if the manifest cannot be serialized.
     pub fn to_canonical_json(&self) -> Result<String, serde_json::Error> {
-        // BTreeMap already ensures sorted keys for selftest_refs.
-        // For complete determinism, we'd need to sort commands and capabilities too,
-        // but their order is typically meaningful (insertion order).
-        serde_json::to_string_pretty(self)
+        // Create a sorted copy for deterministic serialization
+        let sorted = self.to_sorted();
+        serde_json::to_string_pretty(&sorted)
+    }
+
+    /// Returns a copy of the manifest with all collections sorted for
+    /// determinism.
+    ///
+    /// This ensures stable output regardless of insertion order:
+    /// - Commands sorted by name (recursively for subcommands)
+    /// - Capabilities sorted by ID
+    /// - Selftest refs already sorted (`BTreeMap`)
+    #[must_use]
+    pub fn to_sorted(&self) -> Self {
+        let mut sorted = self.clone();
+
+        // Sort commands by name, recursively
+        sort_commands(&mut sorted.commands);
+
+        // Sort capabilities by ID
+        sorted.capabilities.sort_by(|a, b| a.id.cmp(&b.id));
+
+        sorted
+    }
+}
+
+/// Recursively sorts commands and their subcommands by name.
+fn sort_commands(commands: &mut [Command]) {
+    commands.sort_by(|a, b| a.name.cmp(&b.name));
+    for cmd in commands.iter_mut() {
+        sort_commands(&mut cmd.subcommands);
     }
 }
 
@@ -1138,6 +1341,50 @@ mod tests {
         assert!(matches!(result, Err(ManifestError::FieldTooLong { .. })));
     }
 
+    #[test]
+    fn test_command_validation_duplicate_subcommands() {
+        // Duplicate subcommands at the same level should be rejected
+        let result = Command::builder()
+            .name("parent")
+            .subcommand(Command::new("child"))
+            .subcommand(Command::new("child")) // Duplicate!
+            .build();
+        assert!(matches!(
+            result,
+            Err(ManifestError::Duplicate { item_type, id }) if item_type == "subcommand" && id == "child"
+        ));
+    }
+
+    #[test]
+    fn test_command_validation_duplicate_nested_subcommands() {
+        // Duplicate subcommands in nested commands should also be rejected
+        let nested = Command::builder()
+            .name("nested")
+            .subcommand(Command::new("dup"))
+            .subcommand(Command::new("dup")) // Duplicate!
+            .build();
+
+        assert!(matches!(nested, Err(ManifestError::Duplicate { .. })));
+    }
+
+    #[test]
+    fn test_command_same_name_different_levels_ok() {
+        // The same name at different nesting levels is OK
+        // e.g., "apm2 start" and "apm2 cac start" can coexist
+        let result = Command::builder()
+            .name("root")
+            .subcommand(Command::new("start"))
+            .subcommand(
+                Command::builder()
+                    .name("cac")
+                    .subcommand(Command::new("start")) // Same name, different parent - OK
+                    .build()
+                    .unwrap(),
+            )
+            .build();
+        assert!(result.is_ok());
+    }
+
     // =========================================================================
     // Capability Tests
     // =========================================================================
@@ -1213,6 +1460,119 @@ mod tests {
         assert!(!config.version.is_empty());
         assert!(!config.target.is_empty());
         assert!(!config.profile.is_empty());
+    }
+
+    // =========================================================================
+    // Security: Control Character Rejection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_manifest_config_rejects_null_in_version() {
+        // SECURITY: This test verifies we prevent hash collision attacks.
+        // Without this check, "1.0\0" + "x86" would hash the same as "1.0" + "\0x86"
+        let result = ManifestConfig::builder()
+            .version("1.0\0sneaky")
+            .target("x86_64-unknown-linux-gnu")
+            .profile("release")
+            .build();
+        assert!(matches!(
+            result,
+            Err(ManifestError::ControlCharactersNotAllowed { field }) if field == "version"
+        ));
+    }
+
+    #[test]
+    fn test_manifest_config_rejects_null_in_target() {
+        let result = ManifestConfig::builder()
+            .version("0.3.0")
+            .target("x86_64\0attack")
+            .profile("release")
+            .build();
+        assert!(matches!(
+            result,
+            Err(ManifestError::ControlCharactersNotAllowed { field }) if field == "target"
+        ));
+    }
+
+    #[test]
+    fn test_manifest_config_rejects_null_in_profile() {
+        let result = ManifestConfig::builder()
+            .version("0.3.0")
+            .target("x86_64-unknown-linux-gnu")
+            .profile("release\0")
+            .build();
+        assert!(matches!(
+            result,
+            Err(ManifestError::ControlCharactersNotAllowed { field }) if field == "profile"
+        ));
+    }
+
+    #[test]
+    fn test_manifest_config_rejects_other_control_characters() {
+        // Tab character (ASCII 9)
+        let result = ManifestConfig::builder()
+            .version("0.3.0\t")
+            .target("x86_64-unknown-linux-gnu")
+            .profile("release")
+            .build();
+        assert!(matches!(
+            result,
+            Err(ManifestError::ControlCharactersNotAllowed { .. })
+        ));
+
+        // Newline character (ASCII 10)
+        let result = ManifestConfig::builder()
+            .version("0.3.0")
+            .target("x86_64\n")
+            .profile("release")
+            .build();
+        assert!(matches!(
+            result,
+            Err(ManifestError::ControlCharactersNotAllowed { .. })
+        ));
+
+        // Carriage return (ASCII 13)
+        let result = ManifestConfig::builder()
+            .version("0.3.0")
+            .target("x86_64-unknown-linux-gnu")
+            .profile("release\r")
+            .build();
+        assert!(matches!(
+            result,
+            Err(ManifestError::ControlCharactersNotAllowed { .. })
+        ));
+
+        // DEL character (ASCII 127)
+        let result = ManifestConfig::builder()
+            .version("0.3.0\x7F")
+            .target("x86_64-unknown-linux-gnu")
+            .profile("release")
+            .build();
+        assert!(matches!(
+            result,
+            Err(ManifestError::ControlCharactersNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_contains_control_characters_helper() {
+        // Valid strings
+        assert!(!contains_control_characters("hello"));
+        assert!(!contains_control_characters("0.3.0"));
+        assert!(!contains_control_characters("x86_64-unknown-linux-gnu"));
+        assert!(!contains_control_characters("release"));
+        assert!(!contains_control_characters("test with spaces"));
+        assert!(!contains_control_characters("symbols!@#$%^&*()"));
+
+        // Invalid strings with control characters
+        assert!(contains_control_characters("with\0null"));
+        assert!(contains_control_characters("\0leading"));
+        assert!(contains_control_characters("trailing\0"));
+        assert!(contains_control_characters("with\ttab"));
+        assert!(contains_control_characters("with\nnewline"));
+        assert!(contains_control_characters("with\rcarriage"));
+        assert!(contains_control_characters("with\x7Fdel"));
+        assert!(contains_control_characters("\x01bell"));
     }
 
     // =========================================================================
@@ -1400,6 +1760,72 @@ mod tests {
             alpha_pos < zebra_pos,
             "selftest_refs should be sorted alphabetically"
         );
+    }
+
+    #[test]
+    fn test_manifest_sorts_commands_and_capabilities() {
+        let config = ManifestConfig::builder()
+            .version("0.3.0")
+            .target("x86_64-unknown-linux-gnu")
+            .profile("release")
+            .build()
+            .unwrap();
+
+        // Add commands and capabilities in non-alphabetical order
+        let manifest = CapabilityManifest::builder()
+            .config(config)
+            // Commands in reverse order
+            .command(Command::new("zebra"))
+            .command(
+                Command::builder()
+                    .name("alpha")
+                    .subcommand(Command::new("zed"))
+                    .subcommand(Command::new("ace"))
+                    .build()
+                    .unwrap(),
+            )
+            // Capabilities in reverse order
+            .capability(
+                Capability::builder()
+                    .id("zzz-cap")
+                    .verification_method(VerificationMethod::Declared)
+                    .build()
+                    .unwrap(),
+            )
+            .capability(
+                Capability::builder()
+                    .id("aaa-cap")
+                    .verification_method(VerificationMethod::Declared)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        // Get sorted version
+        let sorted = manifest.to_sorted();
+
+        // Commands should be sorted
+        assert_eq!(sorted.commands[0].name, "alpha");
+        assert_eq!(sorted.commands[1].name, "zebra");
+
+        // Subcommands should also be sorted
+        assert_eq!(sorted.commands[0].subcommands[0].name, "ace");
+        assert_eq!(sorted.commands[0].subcommands[1].name, "zed");
+
+        // Capabilities should be sorted
+        assert_eq!(sorted.capabilities[0].id, "aaa-cap");
+        assert_eq!(sorted.capabilities[1].id, "zzz-cap");
+
+        // to_canonical_json should use sorted order
+        let json = manifest.to_canonical_json().unwrap();
+        let alpha_pos = json.find("\"alpha\"").unwrap();
+        let zebra_pos = json.find("\"zebra\"").unwrap();
+        assert!(alpha_pos < zebra_pos, "commands should be sorted in JSON");
+
+        let aaa_pos = json.find("aaa-cap").unwrap();
+        let zzz_pos = json.find("zzz-cap").unwrap();
+        assert!(aaa_pos < zzz_pos, "capabilities should be sorted in JSON");
     }
 
     #[test]
