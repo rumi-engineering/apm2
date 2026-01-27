@@ -1,0 +1,161 @@
+{
+  "$id": "bootstrap:context_pack_spec.v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Bootstrap ContextPack Spec v1",
+  "description": "Specification for a ContextPack that defines the artifacts and budget constraints for hermetic consumption.",
+  "$defs": {
+    "quantity_unit": {
+      "description": "Unit for typed quantities. Prevents unit mismatch errors per DD-0007.",
+      "type": "string",
+      "enum": ["tokens", "bytes", "artifacts", "ms", "count"]
+    },
+    "typed_quantity": {
+      "description": "A quantity with explicit unit for type-safe arithmetic. Integer-only per CAC-JSON constraints.",
+      "type": "object",
+      "properties": {
+        "value": {
+          "description": "The quantity value. Must be a non-negative integer.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "unit": {
+          "$ref": "#/$defs/quantity_unit"
+        }
+      },
+      "required": ["value", "unit"],
+      "unevaluatedProperties": false
+    },
+    "budget_constraint": {
+      "description": "Budget constraints for ContextPack consumption.",
+      "type": "object",
+      "properties": {
+        "max_tokens": {
+          "description": "Maximum tokens allowed. Value must use 'tokens' unit.",
+          "$ref": "#/$defs/typed_quantity"
+        },
+        "max_bytes": {
+          "description": "Maximum bytes allowed. Value must use 'bytes' unit.",
+          "$ref": "#/$defs/typed_quantity"
+        },
+        "max_artifacts": {
+          "description": "Maximum artifact count. Value must use 'artifacts' unit.",
+          "$ref": "#/$defs/typed_quantity"
+        },
+        "max_time_ms": {
+          "description": "Maximum time in milliseconds. Value must use 'ms' unit.",
+          "$ref": "#/$defs/typed_quantity"
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "dependency_review": {
+      "description": "Review hash for reproducibility tracking.",
+      "type": "object",
+      "properties": {
+        "stable_id": {
+          "description": "The stable ID of the reviewed dependency.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "content_hash": {
+          "description": "BLAKE3-256 hash at review time.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "reviewed_at": {
+          "description": "ISO 8601 timestamp when dependency was reviewed.",
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["stable_id", "content_hash"],
+      "unevaluatedProperties": false
+    },
+    "pack_metadata": {
+      "description": "Metadata for the ContextPack specification.",
+      "type": "object",
+      "properties": {
+        "author": {
+          "description": "Author or owner of this pack spec.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "created_at": {
+          "description": "ISO 8601 timestamp when spec was created.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "description": {
+          "description": "Human-readable description of the pack's purpose.",
+          "type": "string",
+          "maxLength": 4096
+        },
+        "labels": {
+          "description": "Labels for categorization and filtering.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "maxItems": 64
+        }
+      },
+      "unevaluatedProperties": false
+    }
+  },
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "bootstrap:context_pack_spec.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "v1"
+    },
+    "spec_id": {
+      "description": "Unique identifier for this ContextPack specification.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9_.:-]+$"
+    },
+    "roots": {
+      "description": "Ordered list of root stable IDs that define the pack's entry points. Order matters for dependency resolution.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1024
+      },
+      "minItems": 1,
+      "maxItems": 1024
+    },
+    "budget": {
+      "description": "Budget constraints for pack consumption.",
+      "$ref": "#/$defs/budget_constraint"
+    },
+    "target_profile": {
+      "description": "Reference to the target profile (stable_id) for compilation.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "dependency_reviews": {
+      "description": "Review hashes for reproducibility verification.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/dependency_review"
+      },
+      "maxItems": 10000
+    },
+    "metadata": {
+      "description": "Optional pack metadata.",
+      "$ref": "#/$defs/pack_metadata"
+    }
+  },
+  "required": ["schema", "schema_version", "spec_id", "roots", "budget", "target_profile"],
+  "unevaluatedProperties": false
+}

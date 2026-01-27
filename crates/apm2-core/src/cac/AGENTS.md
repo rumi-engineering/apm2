@@ -89,6 +89,73 @@ A registered artifact entry.
 - [INV-0027] `content_hash` must be a valid 64-char hex BLAKE3 hash
 - [INV-0028] `dependencies` list cannot exceed `MAX_DEPENDENCIES` (128)
 
+### `ContextPackSpec`
+
+```rust
+pub struct ContextPackSpec {
+    pub schema: String,
+    pub schema_version: String,
+    pub spec_id: String,
+    pub roots: Vec<String>,
+    pub budget: BudgetConstraint,
+    pub target_profile: String,
+    pub dependency_reviews: Vec<DependencyReview>,
+    pub metadata: Option<PackMetadata>,
+}
+```
+
+Specification for a ContextPack defining artifacts and budget constraints for hermetic consumption.
+
+**Invariants:**
+- [INV-0032] `spec_id` must match pattern `[A-Za-z0-9_.:-]+`
+- [INV-0033] `roots` list must have at least 1 and at most 1024 entries
+- [INV-0034] All budget constraint quantities must use correct units (tokens for max_tokens, etc.)
+- [INV-0035] All types use `#[serde(deny_unknown_fields)]` for strict validation
+
+**Contracts:**
+- [CTR-0028] `TypedQuantity` arithmetic operations return errors on overflow (no panics)
+- [CTR-0029] Unit mismatch in arithmetic operations is rejected at runtime
+- [CTR-0030] Builder validates all constraints before returning `ContextPackSpec`
+
+### `TypedQuantity`
+
+```rust
+pub struct TypedQuantity {
+    value: u64,
+    unit: QuantityUnit,
+}
+```
+
+A quantity with explicit unit for type-safe arithmetic (per DD-0007 "Mars Climate Orbiter" prevention).
+
+**Invariants:**
+- [INV-0036] Value must be non-negative (u64)
+- [INV-0037] Unit must be one of: `tokens`, `bytes`, `artifacts`, `ms`, `count`
+
+**Contracts:**
+- [CTR-0031] `checked_add/sub/mul/div` return `PackSpecError` on overflow/underflow
+- [CTR-0032] Operations between quantities with different units return `UnitMismatch` error
+- [CTR-0033] `saturating_add/sub` clamp to bounds instead of overflowing
+
+### `BudgetConstraint`
+
+```rust
+pub struct BudgetConstraint {
+    pub max_tokens: Option<TypedQuantity>,
+    pub max_bytes: Option<TypedQuantity>,
+    pub max_artifacts: Option<TypedQuantity>,
+    pub max_time_ms: Option<TypedQuantity>,
+}
+```
+
+Budget constraints for ContextPack consumption.
+
+**Invariants:**
+- [INV-0038] If `max_tokens` is set, its unit must be `tokens`
+- [INV-0039] If `max_bytes` is set, its unit must be `bytes`
+- [INV-0040] If `max_artifacts` is set, its unit must be `artifacts`
+- [INV-0041] If `max_time_ms` is set, its unit must be `ms`
+
 ### `ValidationError`
 
 ```rust
@@ -133,6 +200,11 @@ Comprehensive error types with JSON path locations.
 | `DcpIndex::resolve(id)` | Resolve stable ID to content hash |
 | `DcpIndex::deprecate(id)` | Mark artifact as deprecated |
 | `DcpIndex::apply_event(evt)` | Update index from ledger event |
+| `ContextPackSpec::builder()` | Create a builder for pack specs |
+| `TypedQuantity::tokens(v)` | Create token quantity |
+| `TypedQuantity::bytes(v)` | Create byte quantity |
+| `TypedQuantity::checked_add(q)` | Checked addition with unit validation |
+| `BudgetConstraint::builder()` | Create a builder for budget constraints |
 
 ## Examples
 

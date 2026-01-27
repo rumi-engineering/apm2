@@ -125,6 +125,7 @@
 
 pub mod admission;
 pub mod dcp_index;
+pub mod pack_spec;
 pub mod patch_engine;
 mod validator;
 
@@ -132,6 +133,11 @@ pub use dcp_index::{
     DcpEntry, DcpIndex, DcpIndexError, DcpIndexReducer, DcpIndexReducerError, DcpIndexState,
     EVENT_TYPE_ARTIFACT_DEPRECATED, EVENT_TYPE_ARTIFACT_REGISTERED, MAX_CONTENT_HASH_LENGTH,
     MAX_STABLE_ID_LENGTH, RESERVED_PREFIXES, parse_stable_id,
+};
+pub use pack_spec::{
+    BudgetConstraint, BudgetConstraintBuilder, CONTEXT_PACK_SPEC_SCHEMA, CONTEXT_PACK_SPEC_VERSION,
+    ContextPackSpec, ContextPackSpecBuilder, DependencyReview, PackMetadata, PackMetadataBuilder,
+    PackSpecError, QuantityUnit, TypedQuantity,
 };
 pub use patch_engine::{PatchEngine, PatchEngineError, PatchResult, PatchType, ReplayViolation};
 pub use validator::{
