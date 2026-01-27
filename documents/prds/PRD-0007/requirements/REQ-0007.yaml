@@ -9,23 +9,10 @@ prd_requirement:
     mode trending toward zero, PR cycle time and defect recurrence improving after adoption,
     and AAT receipts gating critical operations with high pass rates.
   acceptance_criteria:
-    - id: AC-0007-01
-      description: Unplanned tool calls are tracked and trend toward zero.
-      verification_method: Metrics dashboard shows monotonic decrease in unplanned reads.
-    - id: AC-0007-02
-      description: PR cycle time improves after adoption.
-      verification_method: WorkEvent timeline analysis shows reduced median cycle time.
-    - id: AC-0007-03
-      description: AAT receipts gate critical operations.
-      verification_method: Cutover and agent planning require passing AATReceipt.
-  source_goal_id: CAC-G-0007
+    - "Unplanned tool calls are tracked and trend toward zero. Verified by: Metrics dashboard shows monotonic decrease in unplanned reads."
+    - "PR cycle time improves after adoption. Verified by: WorkEvent timeline analysis shows reduced median cycle time."
+    - "AAT receipts gate critical operations. Verified by: Cutover and agent planning require passing AATReceipt."
   evidence:
     evidence_ids:
       - EVID-0013
       - EVID-0014
-    inherited_from_prd: false
-    notes:
-      - Maps to engineering goal CAC-G-0007 from source PRD.
-      - Metrics are leading indicators tracked via ledger event aggregation.
-      - EVID-0013 provides PR cycle time baseline and comparison methodology.
-      - EVID-0014 provides defect recurrence tracking with signature clustering.

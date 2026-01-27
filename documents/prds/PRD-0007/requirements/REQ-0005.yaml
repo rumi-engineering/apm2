@@ -10,23 +10,11 @@ prd_requirement:
     deterministically from CAC sources and MUST NOT be treated as normative. Export manifests
     MUST provide provenance and be verified by conformance tests.
   acceptance_criteria:
-    - id: AC-0005-01
-      description: Target profiles define rendering, retrieval, and delivery constraints.
-      verification_method: TargetProfile schema includes budget, rendering, and retrieval policies.
-    - id: AC-0005-02
-      description: Target payloads are compiled deterministically from CAC sources.
-      verification_method: Exports from identical inputs produce byte-identical trees.
-    - id: AC-0005-03
-      description: Export manifests provide provenance.
-      verification_method: ExportManifest includes source stable_ids and content hashes.
-    - id: AC-0005-04
-      description: Conformance tests verify exports.
-      verification_method: Conformance test report passes for all target profiles.
-  source_goal_id: CAC-G-0005
+    - "Target profiles define rendering, retrieval, and delivery constraints. Verified by: TargetProfile schema includes budget, rendering, and retrieval policies."
+    - "Target payloads are compiled deterministically from CAC sources. Verified by: Exports from identical inputs produce byte-identical trees."
+    - "Export manifests provide provenance. Verified by: ExportManifest includes source stable_ids and content hashes."
+    - "Conformance tests verify exports. Verified by: Conformance test report passes for all target profiles."
   evidence:
     evidence_ids:
       - EVID-0006
       - EVID-0009
-    inherited_from_prd: false
-    notes:
-      - Maps to engineering goal CAC-G-0005 from source PRD.

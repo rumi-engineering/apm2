@@ -10,22 +10,10 @@ prd_requirement:
     provenance (stable_ids, hashes) where possible. Conformance tests MUST be required
     and their results published as evidence.
   acceptance_criteria:
-    - id: AC-0013-01
-      description: Export is deterministic from inputs.
-      verification_method: Same source artifacts produce byte-identical export tree.
-    - id: AC-0013-02
-      description: Rendering follows target profile constraints.
-      verification_method: Export respects rendering policy from TargetProfile.
-    - id: AC-0013-03
-      description: Generated files embed provenance.
-      verification_method: Markdown files include provenance in YAML frontmatter.
-    - id: AC-0013-04
-      description: Conformance tests pass and publish evidence.
-      verification_method: ExportReceipt includes conformance test report reference.
-  source_pipeline_stage: CAC-STAGE-06
+    - "Export is deterministic from inputs. Verified by: Same source artifacts produce byte-identical export tree."
+    - "Rendering follows target profile constraints. Verified by: Export respects rendering policy from TargetProfile."
+    - "Generated files embed provenance. Verified by: Markdown files include provenance in YAML frontmatter."
+    - "Conformance tests pass and publish evidence. Verified by: ExportReceipt includes conformance test report reference."
   evidence:
     evidence_ids:
       - EVID-0006
-    inherited_from_prd: false
-    notes:
-      - Derived from pipeline stage CAC-STAGE-06 in source PRD.

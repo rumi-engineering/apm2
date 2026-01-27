@@ -10,32 +10,14 @@ prd_requirement:
     emit defects by policy. Run receipts MUST capture context_pack_miss and context_pack_sufficiency;
     misses MUST gate consumption unless explicitly escalated.
   acceptance_criteria:
-    - id: AC-0003-01
-      description: Consumption holons use only stable-ID fetches from ContextPack manifest.
-      verification_method: Attempted discretionary read emits PolicyViolation and DefectRecord.
-    - id: AC-0003-02
-      description: ContextPack manifests include transitive dependency closure (deep pinning).
-      verification_method: Pack compilation resolves all dependencies and pins content hashes.
-    - id: AC-0003-03
-      description: Run receipts capture context_pack_miss and sufficiency.
-      verification_method: RunReceipt schema includes miss count and sufficiency flag.
-    - id: AC-0003-04
-      description: Pack misses fail runs by default unless escalated via EscalationPolicy.
-      verification_method: context_pack_miss triggers DefectRecord and run failure; escalation requires authorized role, explicit criteria, bounded TTL, and audit event.
-    - id: AC-0003-05
-      description: Escalation mechanism is fully specified with governance controls.
-      verification_method: |
-        EscalationPolicy artifact defines: authority_role (who can authorize), escalation_criteria
-        (what conditions allow), escalation_ttl (max duration), audit_event_type (how recorded),
-        escalation_count_metric (feedback signal for pack improvement).
-  source_goal_id: CAC-G-0003
+    - "Consumption holons use only stable-ID fetches from ContextPack manifest. Verified by: Attempted discretionary read emits PolicyViolation and DefectRecord."
+    - "ContextPack manifests include transitive dependency closure (deep pinning). Verified by: Pack compilation resolves all dependencies and pins content hashes."
+    - "Run receipts capture context_pack_miss and sufficiency. Verified by: RunReceipt schema includes miss count and sufficiency flag."
+    - "Pack misses fail runs by default unless escalated via EscalationPolicy. Verified by: context_pack_miss triggers DefectRecord and run failure; escalation requires authorized role, explicit criteria, bounded TTL, and audit event."
+    - "Escalation mechanism is fully specified with governance controls. Verified by: EscalationPolicy artifact defines: authority_role (who can authorize), escalation_criteria (what conditions allow), escalation_ttl (max duration), audit_event_type (how recorded), escalation_count_metric (feedback signal for pack improvement)."
   evidence:
     evidence_ids:
       - EVID-0005
       - EVID-0010
       - EVID-0011
       - EVID-0015
-    inherited_from_prd: false
-    notes:
-      - Maps to engineering goal CAC-G-0003 from source PRD.
-      - EVID-0015 verifies escalation policy governance controls.

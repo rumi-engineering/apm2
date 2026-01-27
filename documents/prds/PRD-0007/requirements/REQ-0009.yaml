@@ -9,22 +9,10 @@ prd_requirement:
     artifacts. Canonicalization test vectors MUST be governed artifacts pinned in the
     bootstrap bundle.
   acceptance_criteria:
-    - id: AC-0009-01
-      description: Canonicalizer id/version recorded in artifact envelopes.
-      verification_method: Envelope schema requires canonicalizer_id and canonicalizer_version fields.
-    - id: AC-0009-02
-      description: Canonicalizer id/version recorded in receipts.
-      verification_method: AdmissionReceipt includes canonicalizer metadata.
-    - id: AC-0009-03
-      description: Test vectors are governed artifacts in bootstrap bundle.
-      verification_method: Bootstrap bundle includes canonicalizer.vectors artifact kind.
-    - id: AC-0009-04
-      description: Test vectors are pinned by hash.
-      verification_method: Bootstrap manifest includes test vector content hash.
-  source_goal_id: CAC-G-0009
+    - "Canonicalizer id/version recorded in artifact envelopes. Verified by: Envelope schema requires canonicalizer_id and canonicalizer_version fields."
+    - "Canonicalizer id/version recorded in receipts. Verified by: AdmissionReceipt includes canonicalizer metadata."
+    - "Test vectors are governed artifacts in bootstrap bundle. Verified by: Bootstrap bundle includes canonicalizer.vectors artifact kind."
+    - "Test vectors are pinned by hash. Verified by: Bootstrap manifest includes test vector content hash."
   evidence:
     evidence_ids:
       - EVID-0001
-    inherited_from_prd: false
-    notes:
-      - Maps to engineering goal CAC-G-0009 from source PRD.

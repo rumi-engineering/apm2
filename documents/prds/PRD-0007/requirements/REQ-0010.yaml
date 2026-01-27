@@ -9,22 +9,10 @@ prd_requirement:
     Admission MUST reject patches or artifacts that attempt to modify or shadow bootstrap
     stable IDs. The validator MUST refuse to operate if bootstrap verification fails.
   acceptance_criteria:
-    - id: AC-0010-01
-      description: Bootstrap schema bundle is embedded in binary with pinned hashes.
-      verification_method: Binary includes bootstrap manifest with content hashes.
-    - id: AC-0010-02
-      description: Bootstrap hashes are verified at startup.
-      verification_method: Startup fails if bootstrap verification fails.
-    - id: AC-0010-03
-      description: Admission rejects patches targeting bootstrap stable IDs.
-      verification_method: Patch targeting bootstrap ID returns rejection error.
-    - id: AC-0010-04
-      description: Validator refuses to operate without verified bootstrap.
-      verification_method: Validation fails if bootstrap is unverified.
-  source_security_control: SEC-CTRL-0008
+    - "Bootstrap schema bundle is embedded in binary with pinned hashes. Verified by: Binary includes bootstrap manifest with content hashes."
+    - "Bootstrap hashes are verified at startup. Verified by: Startup fails if bootstrap verification fails."
+    - "Admission rejects patches targeting bootstrap stable IDs. Verified by: Patch targeting bootstrap ID returns rejection error."
+    - "Validator refuses to operate without verified bootstrap. Verified by: Validation fails if bootstrap is unverified."
   evidence:
     evidence_ids:
       - EVID-0008
-    inherited_from_prd: false
-    notes:
-      - Derived from security control SEC-CTRL-0008 in source PRD.

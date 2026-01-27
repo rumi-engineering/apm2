@@ -9,19 +9,9 @@ prd_requirement:
     whole-document rewrites. Admission MUST enforce replay protection via expected base hash.
     Every accepted patch MUST produce an admission receipt (evidence) and emit ledger provenance.
   acceptance_criteria:
-    - id: AC-0002-01
-      description: PatchRecords use JSON Patch or Merge Patch format.
-      verification_method: Schema validation ensures patch_kind is json_patch_rfc6902 or json_merge_patch_rfc7396.
-    - id: AC-0002-02
-      description: Admission enforces replay protection via expected_base_hash.
-      verification_method: Patch with wrong expected_base_hash is rejected with replay violation event.
-    - id: AC-0002-03
-      description: Accepted patches produce AdmissionReceipt with provenance.
-      verification_method: AdmissionReceipt references patch_hash, base_hash, new_hash, schema_hash.
-  source_goal_id: CAC-G-0002
+    - "PatchRecords use JSON Patch or Merge Patch format. Verified by: Schema validation ensures patch_kind is json_patch_rfc6902 or json_merge_patch_rfc7396."
+    - "Admission enforces replay protection via expected_base_hash. Verified by: Patch with wrong expected_base_hash is rejected with replay violation event."
+    - "Accepted patches produce AdmissionReceipt with provenance. Verified by: AdmissionReceipt references patch_hash, base_hash, new_hash, schema_hash."
   evidence:
     evidence_ids:
       - EVID-0003
-    inherited_from_prd: false
-    notes:
-      - Maps to engineering goal CAC-G-0002 from source PRD.

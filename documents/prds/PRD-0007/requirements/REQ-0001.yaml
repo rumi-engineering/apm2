@@ -10,23 +10,11 @@ prd_requirement:
     to stable bytes prior to admission, and addressable by stable IDs and immutable
     content hashes (CAS).
   acceptance_criteria:
-    - id: AC-0001-01
-      description: All normative control artifacts are stored as CAC-JSON.
-      verification_method: Schema admission rejects non-CAC-JSON normative artifacts.
-    - id: AC-0001-02
-      description: Artifacts validate against versioned schemas with fail-closed behavior.
-      verification_method: Unknown fields are rejected; validation failures block admission.
-    - id: AC-0001-03
-      description: Canonicalization produces stable bytes deterministically.
-      verification_method: canonicalize(canonical_bytes) == canonical_bytes for all valid inputs.
-    - id: AC-0001-04
-      description: Artifacts are addressable by stable IDs and content hashes.
-      verification_method: DCP resolution returns pinned content_hash for stable_id.
-  source_goal_id: CAC-G-0001
+    - "All normative control artifacts are stored as CAC-JSON. Verified by: Schema admission rejects non-CAC-JSON normative artifacts."
+    - "Artifacts validate against versioned schemas with fail-closed behavior. Verified by: Unknown fields are rejected; validation failures block admission."
+    - "Canonicalization produces stable bytes deterministically. Verified by: canonicalize(canonical_bytes) == canonical_bytes for all valid inputs."
+    - "Artifacts are addressable by stable IDs and content hashes. Verified by: DCP resolution returns pinned content_hash for stable_id."
   evidence:
     evidence_ids:
       - EVID-0001
       - EVID-0002
-    inherited_from_prd: false
-    notes:
-      - Maps to engineering goal CAC-G-0001 from source PRD.

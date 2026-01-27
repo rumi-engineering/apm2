@@ -27,6 +27,7 @@ The core engineering workflow is governed by a sequence of skills. For a detaile
 ### Reasoning & Infrastructure
 *   [modes-of-reasoning](./modes-of-reasoning/SKILL.md) - The 80 reasoning modes used by Council agents.
 *   [agent-native-software](./agent-native-software/SKILL.md) - The foundational doctrine of agent-native design.
+*   [laws-of-holonic-agent-systems](./laws-of-holonic-agent-systems/SKILL.md) - The inescapable "physics" of the holonic SDLC.
 *   [rust-textbook](./rust-textbook/) - Normative Rust contracts and safety invariants.
 
 ## Usage

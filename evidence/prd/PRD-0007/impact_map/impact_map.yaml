@@ -1,0 +1,95 @@
+adjudication:
+  duplication_risks: []
+  high_confidence_count: 0
+  needs_review_count: 0
+  net_new_requirements: []
+  total_requirements: 0
+ccp_index_hash: b5aacf287c837280b3d34a2dcce00df5f75334725fc05d3bb64253fc8aee15bd
+content_hash: "0a67c48cf29148146c6f87bbc669c733dfdd38e538cc5ad05b463925dba5cd86"
+generated_at: "2026-01-27T00:31:03.135951947Z"
+prd_id: PRD-0007
+requirement_mappings: []
+schema_version: "2026-01-26"
+summary:
+  duplication_risks: 0
+  high_confidence_matches: 0
+  needs_review: 0
+  net_new_count: 0
+  total_requirements: 15
+  unresolved_count: 15
+unresolved_mappings:
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0001
+    requirement_statement: "All normative control artifacts MUST be stored as CAC-JSON, validated against\nversioned schemas with fail-closed behavior (unknown fields rejected), canonicalized\nto stable bytes prior to admission..."
+    requirement_title: Canonical context substrate (CAC-JSON)
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0002
+    requirement_statement: "Machines MUST produce changes as patch streams (JSON Patch / Merge Patch) rather than\nwhole-document rewrites. Admission MUST enforce replay protection via expected base hash.\nEvery accepted patch ..."
+    requirement_title: Patch-first machine authoring
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0003
+    requirement_statement: "Consumption holons MUST complete tasks using only preauthorized stable-ID fetches plus\nactuation tools. Discretionary context discovery during consumption MUST be denied and\nemit defects by policy...."
+    requirement_title: Hermetic consumption with deterministic reads
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0004
+    requirement_statement: "Production holons MUST operate under explicit leases/budgets and publish replayable\nevidence (snapshots, extraction logs, diffs). Tool calls MUST be classified as\nplanned/unplanned and feed defect ..."
+    requirement_title: Bounded context production with replayable evidence
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0005
+    requirement_statement: "Target profiles MUST define rendering, retrieval, and delivery constraints independent\nof model intelligence. Target payloads (vendor layouts, model IRs) MUST be compiled\ndeterministically from CAC..."
+    requirement_title: Target interoperability without drift
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0006
+    requirement_statement: "CAC actions (admission, compilation, export, selftest) MUST be reflected in kernel\nmessages (ledger events) with hash references. Holons MUST be able to negotiate\ncapabilities and retrieve required..."
+    requirement_title: Messaging-native control plane compatibility
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0007
+    requirement_statement: "The system MUST provide measurable improvements: unplanned tool calls in consumption\nmode trending toward zero, PR cycle time and defect recurrence improving after adoption,\nand AAT receipts gating..."
+    requirement_title: Measurable throughput and quality gains
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0008
+    requirement_statement: "Budgets, timeouts, costs, and probabilities MUST be expressed as typed quantities\nwith explicit units. ContextPack compilation and validation MUST reject packs\nexceeding token/artifact/byte budgets."
+    requirement_title: Typed quantities and context budgets
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0009
+    requirement_statement: "Canonicalizer id/version MUST be recorded in envelopes and receipts for all normative\nartifacts. Canonicalization test vectors MUST be governed artifacts pinned in the\nbootstrap bundle."
+    requirement_title: Canonicalizer governance
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0010
+    requirement_statement: "The bootstrap schema bundle MUST be embedded and pinned by hash in the apm2 binary.\nAdmission MUST reject patches or artifacts that attempt to modify or shadow bootstrap\nstable IDs. The validator M..."
+    requirement_title: Bootstrap trust root immutability
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0011
+    requirement_statement: "The system MUST provide an ArtifactFetch tool for deterministic retrieval of context\nartifacts by stable ID or content hash. Policy MUST enforce that only stable-ID\nallowlisted reads are permitted ..."
+    requirement_title: ArtifactFetch tool protocol
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0012
+    requirement_statement: "The system MUST compile ContextPackSpec into ContextPackManifest with derived artifacts.\nCompilation MUST deep-pin transitive dependencies to produce self-contained packs.\nCompilation MUST be deter..."
+    requirement_title: ContextPack compilation
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0013
+    requirement_statement: "Target delivery rendering MUST be deterministic and constrained by target profile.\nExports MUST be byte-identical for identical inputs. Generated files MUST embed\nprovenance (stable_ids, hashes) wh..."
+    requirement_title: Target delivery determinism
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0014
+    requirement_statement: "The system MUST generate CapabilityManifest from the apm2 binary (not handwritten).\nSelftests MUST be hermetic and bounded (time/tool/token budgets). AATReceipt MUST\nbe required for critical cutove..."
+    requirement_title: AAT/selftest gating
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-0015
+    requirement_statement: "Consumption runs MUST emit RunReceipt capturing context_pack_miss, context_pack_sufficiency,\nand budget usage. Pack misses MUST trigger DefectRecord emission and run failure by\ndefault unless expli..."
+    requirement_title: RunReceipt emission
+    suggested_action: Requires human review or LLM-assisted matching to determine target component

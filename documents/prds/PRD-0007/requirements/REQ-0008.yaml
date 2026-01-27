@@ -9,22 +9,10 @@ prd_requirement:
     with explicit units. ContextPack compilation and validation MUST reject packs
     exceeding token/artifact/byte budgets.
   acceptance_criteria:
-    - id: AC-0008-01
-      description: Budgets use typed quantities with explicit units.
-      verification_method: Budget fields validate against quantity schema with unit field.
-    - id: AC-0008-02
-      description: Typed quantities reject unknown units.
-      verification_method: Schema validation rejects quantities with invalid unit values.
-    - id: AC-0008-03
-      description: Pack compilation enforces budget ceilings.
-      verification_method: Pack exceeding budget triggers compilation failure.
-    - id: AC-0008-04
-      description: Scaled integer quantities round-trip deterministically.
-      verification_method: Quantity serialization and deserialization preserves exact values.
-  source_goal_id: CAC-G-0008
+    - "Budgets use typed quantities with explicit units. Verified by: Budget fields validate against quantity schema with unit field."
+    - "Typed quantities reject unknown units. Verified by: Schema validation rejects quantities with invalid unit values."
+    - "Pack compilation enforces budget ceilings. Verified by: Pack exceeding budget triggers compilation failure."
+    - "Scaled integer quantities round-trip deterministically. Verified by: Quantity serialization and deserialization preserves exact values."
   evidence:
     evidence_ids:
       - EVID-0012
-    inherited_from_prd: false
-    notes:
-      - Maps to engineering goal CAC-G-0008 from source PRD.

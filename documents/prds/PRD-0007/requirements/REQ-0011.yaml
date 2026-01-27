@@ -10,31 +10,12 @@ prd_requirement:
     allowlisted reads are permitted in consumption mode. Hash mismatches MUST return
     errors and emit policy violations.
   acceptance_criteria:
-    - id: AC-0011-01
-      description: ArtifactFetch accepts stable_id or content_hash parameters.
-      verification_method: Tool request schema includes both optional parameters.
-    - id: AC-0011-02
-      description: ArtifactFetch returns result_hash and/or inline_result.
-      verification_method: Tool response includes hash and optional inline content.
-    - id: AC-0011-03
-      description: Policy enforces allowlisted reads in consumption mode.
-      verification_method: Fetch of non-allowlisted stable_id returns PolicyViolation.
-    - id: AC-0011-04
-      description: Hash mismatches emit errors and violations.
-      verification_method: expected_hash mismatch returns ToolError and DefectRecord.
-    - id: AC-0011-05
-      description: |
-        In consumption mode, ArtifactFetch MUST reject requests where content_hash
-        is provided WITHOUT corresponding stable_id. Content-hash-only fetches
-        are denied to enforce stable_id allowlist policy.
-      verification_method: |
-        ArtifactFetch(content_hash=H, stable_id=None) in consumption mode returns
-        PolicyViolation with error CONTENT_HASH_ONLY_FETCH_DENIED.
-  source_protocol_extension: CAC-MSG-REQ-0001
+    - "ArtifactFetch accepts stable_id or content_hash parameters. Verified by: Tool request schema includes both optional parameters."
+    - "ArtifactFetch returns result_hash and/or inline_result. Verified by: Tool response includes hash and optional inline content."
+    - "Policy enforces allowlisted reads in consumption mode. Verified by: Fetch of non-allowlisted stable_id returns PolicyViolation."
+    - "Hash mismatches emit errors and violations. Verified by: expected_hash mismatch returns ToolError and DefectRecord."
+    - "In consumption mode, ArtifactFetch MUST reject requests where content_hash is provided WITHOUT corresponding stable_id. Content-hash-only fetches are denied to enforce stable_id allowlist policy. Verified by: ArtifactFetch(content_hash=H, stable_id=None) in consumption mode returns PolicyViolation with error CONTENT_HASH_ONLY_FETCH_DENIED."
   evidence:
     evidence_ids:
       - EVID-0004
       - EVID-0005
-    inherited_from_prd: false
-    notes:
-      - Derived from required protocol extension CAC-MSG-REQ-0001 in source PRD.
