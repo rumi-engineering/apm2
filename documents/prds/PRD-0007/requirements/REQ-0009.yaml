@@ -1,0 +1,30 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0009"
+  type: "FUNCTIONAL"
+  title: "Canonicalizer governance"
+  statement: |
+    Canonicalizer id/version MUST be recorded in envelopes and receipts for all normative
+    artifacts. Canonicalization test vectors MUST be governed artifacts pinned in the
+    bootstrap bundle.
+  acceptance_criteria:
+    - id: AC-0009-01
+      description: Canonicalizer id/version recorded in artifact envelopes.
+      verification_method: Envelope schema requires canonicalizer_id and canonicalizer_version fields.
+    - id: AC-0009-02
+      description: Canonicalizer id/version recorded in receipts.
+      verification_method: AdmissionReceipt includes canonicalizer metadata.
+    - id: AC-0009-03
+      description: Test vectors are governed artifacts in bootstrap bundle.
+      verification_method: Bootstrap bundle includes canonicalizer.vectors artifact kind.
+    - id: AC-0009-04
+      description: Test vectors are pinned by hash.
+      verification_method: Bootstrap manifest includes test vector content hash.
+  source_goal_id: CAC-G-0009
+  evidence:
+    evidence_ids:
+      - EVID-0001
+    inherited_from_prd: false
+    notes:
+      - Maps to engineering goal CAC-G-0009 from source PRD.

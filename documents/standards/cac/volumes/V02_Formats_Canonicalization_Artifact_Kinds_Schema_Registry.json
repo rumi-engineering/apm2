@@ -1,0 +1,318 @@
+{
+  "schema": "apm2.prd.volume.v1",
+  "schema_version": "1.0.0",
+  "sections": [
+    {
+      "content": {
+        "artifact_hashing_policy": {
+          "algorithm": "BLAKE3-256",
+          "hash_id_format": "b3-256:<hex>",
+          "note": "Align with existing APM2 Evidence/CAS hashing to keep the stack coherent.",
+          "collision_resistance": "128-bit (birthday bound)",
+          "security_level_requirement": "≥256-bit per SEC-PROP-0005",
+          "upgrade_timeline": "BLAKE3-256 adequate for initial deployment. Upgrade to BLAKE3-512 or quantum-resistant hash required before 2035 or when NIST deprecates BLAKE3-256 collision resistance, whichever comes first.",
+          "monitoring": "Tracked via SEC-PROP-0005 upgrade_policy"
+        },
+        "typed_quantities": {
+          "note": "All budgets, timeouts, costs, and probabilities must use typed quantities with explicit units to avoid ad hoc string formats.",
+          "schema_ref": "cac.common.v1#/$defs/quantity",
+          "unit_rules": [
+            "Units must be explicit (e.g., ms, bytes, tokens, count, percent, usd).",
+            "Values are integers; scaling is expressed via the scale field.",
+            "Probabilities are represented as scaled integers (e.g., percent or ppm)."
+          ]
+        },
+        "canonicalizer_metadata": {
+          "required_fields": [
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "vectors_ref"
+          ],
+          "rule": "Every normative artifact envelope and receipt must record the canonicalizer id/version and reference the governed test-vector artifact."
+        },
+        "derived_formats": [
+          {
+            "id": "FMT-TOON",
+            "name": "TOON",
+            "policy": "Derived-only; never normative",
+            "required_invariants": [
+              "Must be derivable deterministically from canonical IR.",
+              "Must have a defined reverse mapping back to canonical IR OR be explicitly declared one-way."
+            ],
+            "role": "Optional derived prompt-pack encoding for LLM consumption",
+            "selection_heuristics": [
+              "Prefer TOON for large, repetitive tabular arrays or repeated keys where token savings are material.",
+              "Prefer compact JSON for deep, irregular, or highly nested structures."
+            ]
+          },
+          {
+            "id": "FMT-MARKDOWN",
+            "name": "Markdown (Vendor ABI)",
+            "notes": [
+              "Generated Markdown should embed provenance metadata in frontmatter where the vendor allows.",
+              "Direct edits to generated trees are rejected by CI unless routed through an import pipeline."
+            ],
+            "policy": "Derived-only; never normative",
+            "role": "Vendor-required human-readable interface"
+          }
+        ],
+        "normative_formats": [
+          {
+            "canonicalization": {
+              "id": "CANON-JCS",
+              "name": "JSON Canonicalization Scheme (JCS-like)",
+              "note": "Adopt RFC 8785 JCS where feasible; if deviating, publish explicit test vectors as governed artifacts and treat the canonicalizer as a versioned component.",
+              "requirements": [
+                "Deterministic object member ordering.",
+                "Deterministic number rendering (for allowed integers: minimal decimal form).",
+                "Deterministic string escaping.",
+                "No insignificant whitespace (canonical bytes)."
+              ]
+            },
+            "constraints": {
+              "arrays": {
+                "max_length": 100000
+              },
+              "duplicate_keys": "FORBIDDEN",
+              "encoding": "UTF-8",
+              "json_standard": "RFC 8259-compatible",
+              "max_depth": 128,
+              "numbers": {
+                "notes": [
+                  "Avoid float parsing ambiguity across implementations.",
+                  "If non-integer values are required, represent them as strings with an explicit unit/type."
+                ],
+                "policy": "integers_only",
+                "range": "signed_64_bit"
+              },
+              "objects": {
+                "max_members": 100000,
+                "member_name_constraints": {
+                  "notes": [
+                    "Keep member names stable and tool-friendly; avoid whitespace."
+                  ],
+                  "pattern": "^[A-Za-z0-9_./:-]{1,256}$"
+                }
+              },
+              "strings": {
+                "max_bytes": 1048576,
+                "normalization": "NFC recommended"
+              }
+            },
+            "id": "FMT-CAC-JSON",
+            "name": "CAC-JSON",
+            "role": "Sole normative representation for control artifacts"
+          },
+          {
+            "constraints": {
+              "encoding": "UTF-8",
+              "max_line_bytes": 10485760,
+              "newline_rule": "Each record terminates with \\n; no embedded newlines unless escaped within JSON strings.",
+              "record_rule": "Each line is a complete JSON value."
+            },
+            "id": "FMT-JSONL",
+            "name": "JSON Lines (JSONL)",
+            "role": "Append-only record streams (patch streams, receipts, defect streams)"
+          }
+        ],
+        "patch_authoring_policy": {
+          "allowed_patch_kinds": [
+            "json_patch_rfc6902",
+            "json_merge_patch_rfc7396"
+          ],
+          "default_patch_kind": "json_patch_rfc6902",
+          "replay_protection": {
+            "mechanism": "PatchRecord must include expected_base_hash; admission rejects mismatches.",
+            "required": true
+          },
+          "whole_document_rewrite_policy": {
+            "allowed": "discouraged",
+            "reason": "Large rewrites increase review cost and reduce cache/utilization benefits.",
+            "rule": "If a patch replaces >X% of nodes, system emits a warning or requires explicit justification code."
+          }
+        }
+      },
+      "section_id": "FORMAT_POLICY",
+      "title": "Format Policy"
+    },
+    {
+      "content": {
+        "kinds": [
+          {
+            "consume_allowed": true,
+            "kind_id": "schema.definition",
+            "normative": true,
+            "purpose": "Defines schemas used to validate other artifacts.",
+            "schema_id": "cac.schema_definition.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "policy.profile",
+            "normative": true,
+            "purpose": "Defines policy rules for tools, reads, budgets, and consumption hermeticity.",
+            "schema_id": "cac.policy_profile.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "budget.profile",
+            "normative": true,
+            "purpose": "Defines budgets/limits used in leases and tool calls.",
+            "schema_id": "cac.budget_profile.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "holon.contract",
+            "normative": true,
+            "purpose": "Defines holon roles, modes, inputs/outputs, and allowed operations.",
+            "schema_id": "cac.holon_contract.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "skill.spec",
+            "normative": true,
+            "purpose": "Defines agent skill/instruction bundles as machine-native context.",
+            "schema_id": "cac.skill_spec.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "target.profile",
+            "normative": true,
+            "purpose": "Defines rendering, retrieval, and delivery constraints independent of model intelligence; drives compilation.",
+            "schema_id": "cac.target_profile.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "canonicalizer.vectors",
+            "normative": true,
+            "purpose": "Governed canonicalization test vectors pinned in the bootstrap trust root.",
+            "schema_id": "cac.canonicalizer_vectors.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "vendor.profile",
+            "normative": false,
+            "purpose": "Derived vendor delivery profile compiled from TargetProfile (compatibility surface, not normative).",
+            "schema_id": "cac.vendor_profile.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "capabilities.manifest",
+            "normative": true,
+            "purpose": "Declares what the CLI/kernel actually supports (truth surface for agents).",
+            "schema_id": "cac.capabilities_manifest.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "context_pack.spec",
+            "normative": true,
+            "purpose": "Defines which stable IDs constitute a ContextPack and the pack's consumption contract.",
+            "schema_id": "cac.context_pack_spec.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "context_pack.manifest",
+            "normative": false,
+            "purpose": "Compiled output listing resolved stable IDs, hashes, and derived pack artifacts.",
+            "schema_id": "cac.context_pack_manifest.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "export.manifest",
+            "normative": false,
+            "purpose": "Derived output describing a vendor export tree and its provenance.",
+            "schema_id": "cac.export_manifest.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "changeset.report",
+            "normative": false,
+            "purpose": "Standardized semantic delta report for patch admissions and compaction.",
+            "schema_id": "cac.changeset_report.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "receipt.admission",
+            "normative": false,
+            "purpose": "Evidence receipt proving an artifact was admitted (validated, canonicalized, stored, indexed).",
+            "schema_id": "cac.admission_receipt.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "receipt.aat",
+            "normative": false,
+            "purpose": "Evidence receipt proving acceptance/selftests passed with bounded resources.",
+            "schema_id": "cac.aat_receipt.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "receipt.run",
+            "normative": false,
+            "purpose": "Evidence receipt for consumption runs (pack sufficiency, misses, and budget usage).",
+            "schema_id": "cac.run_receipt.v1"
+          },
+          {
+            "consume_allowed": true,
+            "kind_id": "defect.record",
+            "normative": false,
+            "purpose": "Evidence-backed defect records feeding improvement loops.",
+            "schema_id": "cac.defect_record.v1"
+          }
+        ],
+        "notes": [
+          "Normative=true kinds must be CAC-JSON, schema-validated, canonicalized, stored in CAS, and indexed in DCP before use.",
+          "Derived kinds may be stored in CAS and referenced in ledger but are not authoritative sources."
+        ],
+        "registry_version": "1.0.0"
+      },
+      "section_id": "ARTIFACT_KINDS",
+      "title": "Artifact Kind Registry"
+    },
+    {
+      "content": {
+        "compatibility_policy": {
+          "default": "strict",
+          "rules": [
+            {
+              "id": "SC-COMP-0001",
+              "statement": "Normative artifacts must set unevaluatedProperties=false (or equivalent) to reject unknown fields."
+            },
+            {
+              "id": "SC-COMP-0002",
+              "statement": "Additive changes are allowed within a schema major version only if consumers ignore them by explicit rule; default is reject."
+            },
+            {
+              "id": "SC-COMP-0003",
+              "statement": "Deprecations must be explicit: schemas may mark fields deprecated but must continue to validate until major bump."
+            }
+          ]
+        },
+        "design": {
+          "schema_id_rules": [
+            "Schema IDs are stable and versioned (e.g., cac.context_pack_spec.v1).",
+            "Breaking changes require new major schema ID version (v2)."
+          ],
+          "schema_store": "Schemas are CAC-JSON artifacts stored in CAS and referenced by stable ID + hash.",
+          "validation_engine_requirements": [
+            "Support JSON Schema draft 2020-12 (minimum).",
+            "Fail closed on unknown keywords (unless explicitly allowed by validator profile).",
+            "Enforce size/depth/resource limits during validation to prevent DoS."
+          ]
+        },
+        "schema_discovery": {
+          "bootstrap": "Kernel/CLI ships with a minimal bootstrap schema bundle pinned by hash in the binary (schema_definition + PatchRecord + AdmissionReceipt + shared refs + canonicalizer vectors). This Phase-0 trust root is immutable via the standard patch pipeline.",
+          "immutability_policy": "Admission rejects patches or artifacts that attempt to modify or shadow bootstrap stable IDs.",
+          "upgrade_path": "Bootstrap changes occur only via a new binary release (or a separately authorized bootstrap-upgrade flow), never via PatchRecord admission.",
+          "mechanism": "Schema refs are stable IDs resolvable in DCP; schemas are themselves control artifacts."
+        }
+      },
+      "section_id": "SCHEMA_REGISTRY",
+      "title": "Schema Registry"
+    }
+  ],
+  "volume": {
+    "generated_at": "2026-01-26",
+    "source_prd_id": "APM2-PRD-CAC-0001",
+    "title": "Formats, Canonicalization, Artifact Kinds, Schema Registry",
+    "volume_id": "V02"
+  }
+}

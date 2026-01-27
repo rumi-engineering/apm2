@@ -1,0 +1,793 @@
+agent_id: SA-3
+emergent_role: Systems Analyst
+selected_modes: [37, 39, 55, 65, 80]
+cycle: 1
+findings:
+  # MODE 37: Causal inference - Trace cause-effect chains and identify causal gaps
+
+  - finding_id: SA3-M37-F001
+    source_mode: 37
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: COMPLETENESS
+    title: "Incomplete causal chain from defect aggregation to pack improvement"
+    description: |
+      The feedback loop (04_solution_overview.yaml lines 311-346) describes defect aggregation
+      triggers (TRIGGER-SIGNATURE-THRESHOLD, TRIGGER-ESCALATION-FREQUENCY) but does not specify
+      WHO executes the pack spec review, WHAT process they follow, or HOW pack spec updates
+      are generated. The causal chain terminates at "PACK_SPEC_REVIEW_NEEDED event" without
+      specifying the downstream process. This creates a gap where defects aggregate but may
+      not translate to improvements.
+
+      Causal gap identified:
+      DefectRecord → Aggregation → Trigger Event → [MISSING: Review Process] → Pack Update
+
+      Without explicit process ownership and decision criteria, the feedback loop may become
+      a data sink rather than an improvement driver.
+    location: "04_solution_overview.yaml:311-346 (feedback_loop section)"
+    remediation: |
+      Add to feedback_loop section:
+      - Explicit process owner (e.g., DOMAIN_COMPILER team or AGENT_AUTHOR role)
+      - Review decision criteria (what constitutes a valid pack update vs. noise)
+      - Automated pack spec generation guidelines (if machine-authored)
+      - Human review gates (if semi-automated)
+      - Success criteria for pack updates (how to verify improvement)
+
+      Consider adding a new artifact kind: defect_aggregation.report that triggers
+      automated pack spec patch generation with human-in-the-loop approval.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M37-F002
+    source_mode: 37
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: TESTABILITY
+    title: "Weak causal link between AAT receipts and capability manifest accuracy"
+    description: |
+      SEC-CTRL-0012 (06_constraints_invariants.yaml lines 418-423) requires AATReceipts to be
+      cryptographically bound to binary hash, but does not specify HOW selftests verify that
+      the capability manifest accurately reflects reality. The causal chain assumes:
+
+      Binary → Selftest → AATReceipt → Capability Manifest Accuracy
+
+      However, if selftests are incomplete or test the wrong invariants, the AATReceipt may
+      pass while the capability manifest remains inaccurate. The causal mechanism for ensuring
+      test coverage completeness is missing.
+    location: "06_constraints_invariants.yaml:418-423 (SEC-CTRL-0012)"
+    remediation: |
+      Add requirement for capability manifest coverage analysis:
+      - Each declared capability MUST have at least one acceptance test
+      - AATReceipts MUST include coverage map: capability_id → test_id[]
+      - Admission of capability manifest updates MUST verify coverage map completeness
+      - Add guardrail: "Capability declarations without test coverage are rejected"
+
+      This closes the causal loop by ensuring the verification mechanism (AAT) actually
+      tests what it claims to test.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M37-F003
+    source_mode: 37
+    gate: GATE-PRD-CONTENT
+    severity: OBSERVATION
+    category: CONSISTENCY
+    title: "Graduated enforcement acceleration clause may create unintended causal pressure"
+    description: |
+      TRADEOFF-0001 includes an acceleration clause (08_risks_questions.yaml lines 198-200):
+      "If MET-0002 (pack completeness) >85% at week 5, advance to HARD_FAIL at week 6."
+
+      This creates a causal pressure where teams may game MET-0002 (by avoiding difficult
+      work items or escalating more frequently) to delay HARD_FAIL enforcement. The causal
+      chain is:
+
+      High pack completeness metric → Early HARD_FAIL → Increased friction
+
+      Therefore: Teams have incentive to keep pack completeness below 85% until week 7.
+
+      This inverts the intended causality and may lead to strategic underperformance.
+    location: "08_risks_questions.yaml:198-200 (acceleration_clause)"
+    remediation: |
+      Revise acceleration clause to use leading indicators resistant to gaming:
+      - Use "defect pattern diversity" (more stable) instead of raw completeness rate
+      - Add requirement: "Sample must include ≥3 different work types with difficulty ≥MEDIUM"
+      - Include confidence interval: "Upper bound of 80% CI must exceed 85%"
+
+      Alternative: Use acceleration only if BOTH completeness ≥85% AND miss rate <0.3 per run.
+      This makes gaming harder by requiring dual metric satisfaction.
+    agreement_status: PENDING
+
+  # MODE 39: Counterfactual reasoning - "What if X were different?" analysis
+
+  - finding_id: SA3-M39-F001
+    source_mode: 39
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: COMPLETENESS
+    title: "Missing counterfactual: What if bootstrap verification fails on cold start?"
+    description: |
+      CNS-0006 (06_constraints_invariants.yaml lines 48-252) provides extensive recovery
+      procedures for bootstrap failures, but does not address the counterfactual:
+
+      "What if the recovery procedures themselves fail or are unavailable?"
+
+      Specific scenario: All three primary authorities are unavailable, TIER_2 degraded
+      operations have been active for 24 hours, and TIER_3 board escalation is triggered.
+      But what if the board CANNOT reach consensus within the 24-hour SLA (lines 208-209)?
+
+      The PRD provides tiered recovery but no ultimate fallback when all tiers fail. This
+      creates an unbounded deadlock scenario where the system is permanently frozen.
+    location: "06_constraints_invariants.yaml:48-252 (CNS-0006 recovery_procedure)"
+    remediation: |
+      Add TIER_4 (Dead Man's Switch) protocol:
+      - If TIER_3 exceeds 48 hours without resolution, system enters READ_ONLY_ARCHIVE mode
+      - All state is exported to content-addressed cold storage
+      - External audit receives cryptographic proof-of-state snapshot
+      - Human operator can initiate offline manual recovery with >72-hour latency expectation
+
+      Add explicit SLA ceiling: "If bootstrap recovery exceeds 72 hours, system is considered
+      permanently compromised and requires cold-start rebuild from last known-good checkpoint."
+
+      This provides a principled exit path when cascading authority failures occur.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M39-F002
+    source_mode: 39
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: SECURITY
+    title: "Counterfactual gap: What if dependency provenance review is compromised at review time?"
+    description: |
+      CNS-0010 (06_constraints_invariants.yaml lines 278-286) requires pack specs to include
+      author_identity and admission_receipt_hash for each dependency, and warns if author_identity
+      is not on approved producer list. However, this does not address the counterfactual:
+
+      "What if the approved producer list itself is compromised or injected at review time?"
+
+      The security model assumes the approved producer list is trustworthy, but if an adversary
+      can inject malicious entries into the approved list before pack spec review, the provenance
+      check becomes meaningless. The PRD does not specify:
+      - Who controls the approved producer list
+      - How the list is versioned and admitted
+      - Whether the list itself requires provenance review
+
+      This creates a circular dependency: pack specs depend on approved producer list, but
+      how is the approved producer list itself governed?
+    location: "06_constraints_invariants.yaml:278-286 (CNS-0010)"
+    remediation: |
+      Add requirement for approved producer list governance:
+      - Approved producer list MUST itself be a governed CAC artifact (artifact kind: registry.approved_producers)
+      - List updates MUST be admitted via PatchRecord with AUTH_SECURITY signoff
+      - Pack spec reviews MUST pin the approved_producer_list_hash at review time
+      - Compilation MUST verify pack spec was reviewed against the same approved producer list version
+
+      This closes the bootstrapping loop by making the approved producer list subject to
+      the same governance as other normative artifacts.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M39-F003
+    source_mode: 39
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: COMPLETENESS
+    title: "Counterfactual: What if canonicalizer test vectors themselves drift?"
+    description: |
+      CNS-0001 through CNS-0005 and INV-0001 (06_constraints_invariants.yaml) rely heavily
+      on canonicalizer test vectors being stable and deterministic. However, the counterfactual
+      is not addressed:
+
+      "What if the test vectors themselves become corrupted or drift across bootstrap versions?"
+
+      The PRD states test vectors are "governed artifacts pinned in the bootstrap trust root"
+      (line 56-57 of 04_solution_overview.yaml), but does not specify:
+      - How test vectors are initially seeded
+      - Whether test vector updates require special ceremony
+      - What happens if two bootstrap versions disagree on test vector outputs
+
+      If test vectors drift, the entire canonicalization foundation breaks.
+    location: "06_constraints_invariants.yaml:1-47 (CNS-0001 through CNS-0005)"
+    remediation: |
+      Add test vector immutability guarantee:
+      - Test vectors MUST be generated via deterministic procedure from a public seed
+      - Procedure must be documented as part of bootstrap schema bundle
+      - Any test vector updates MUST be treated as major version bump requiring coordination ceremony
+      - Include cryptographic commitment: test vector set hash is embedded in binary and verified at startup
+
+      Add Q-0008 to open_questions: "How are canonicalization test vectors initially generated
+      and what coordination is required for updates across bootstrap versions?"
+    agreement_status: PENDING
+
+  # MODE 55: Game-theoretic/strategic reasoning - Analyze incentive structures
+
+  - finding_id: SA3-M55-F001
+    source_mode: 55
+    gate: GATE-PRD-CONTENT
+    severity: BLOCKER
+    category: SECURITY
+    title: "Misaligned incentives in escalation policy create escalation creep"
+    description: |
+      The escalation.policy artifact kind (04_solution_overview.yaml lines 257-265) allows
+      consumption holons to escalate pack misses with authorization, but the governance structure
+      creates a principal-agent problem:
+
+      - Agents (consumption holons) have incentive to escalate frequently to avoid task failure
+      - Authorities (authorization roles) face social pressure to approve escalations to unblock work
+      - Pack compiler team receives escalation_count_metric feedback, but has no direct authority
+        to deny escalations or enforce pack improvement
+
+      Game-theoretic analysis:
+      Nash equilibrium: Agents always escalate, authorities always approve, pack specs never improve.
+
+      The current design lacks negative feedback for excessive escalation. Escalation is a
+      dominant strategy because it has no cost to the agent requesting it.
+    location: "04_solution_overview.yaml:257-265 (escalation.policy)"
+    remediation: |
+      Introduce escalation cost structure to align incentives:
+
+      1. Escalation budget: Each work item has max 2 escalations. Third escalation requires
+         higher authority (AUTH_PRODUCT) and creates MAJOR defect.
+
+      2. Escalation consequence binding: If an escalation is approved, the authority_role
+         who approved it MUST be tagged in the subsequent pack spec improvement task. This
+         creates accountability.
+
+      3. Escalation recurrence penalty: If the same stable_id is escalated ≥2 times within
+         14 days (per TRIGGER-ESCALATION-FREQUENCY), subsequent escalations for that stable_id
+         require dual-signoff (authority + DOMAIN_COMPILER).
+
+      4. Pack improvement SLA binding: Escalation approval MUST include expected fix timeline.
+         If timeline is missed, escalation authority is notified and must re-approve or deny
+         future escalations for that stable_id.
+
+      These mechanisms create negative feedback loops that make escalation creep economically
+      unviable while still allowing legitimate escalations.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M55-F002
+    source_mode: 55
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: NORTH_STAR
+    title: "Graduated enforcement rollout incentivizes strategic delay"
+    description: |
+      The graduated enforcement rollout (TRADEOFF-0001, 08_risks_questions.yaml lines 188-196)
+      creates a game-theoretic timing problem:
+
+      - Weeks 1-3: WARN mode (no enforcement)
+      - Weeks 4-6: SOFT_FAIL mode (high-severity only)
+      - Weeks 7-8: HARD_FAIL mode (all violations block)
+
+      Strategic agents can optimize by:
+      - Deferring difficult work until WARN mode to avoid pack improvement pressure
+      - Completing high-priority work in SOFT_FAIL mode before HARD_FAIL arrives
+      - Stockpiling escalations in week 6 to consume during week 7-8
+
+      This creates a "cramming" pattern where pack improvement work is delayed until week 6,
+      resulting in a spike of incomplete pack specs right before HARD_FAIL. The PRD does not
+      address this strategic behavior.
+    location: "08_risks_questions.yaml:188-196 (rollout_phases)"
+    remediation: |
+      Modify rollout to remove advance warning and introduce stochastic enforcement:
+
+      Option 1: Probabilistic enforcement
+      - Week 1-2: 10% of violations fail (random sample)
+      - Week 3-4: 30% of violations fail
+      - Week 5-6: 60% of violations fail
+      - Week 7+: 100% of violations fail
+
+      Random sampling removes predictability and forces continuous pack improvement.
+
+      Option 2: Work-type stratification
+      - HIGH_PRIORITY work types enter HARD_FAIL immediately
+      - MEDIUM_PRIORITY work types follow graduated schedule
+      - LOW_PRIORITY work types have extended WARN period
+
+      This prevents "cherry-picking" of easy work during lenient periods.
+
+      Option 3 (Recommended): No-advance-notice enforcement
+      - Do not publicly announce enforcement schedule
+      - Enforcement level is determined per-work-item based on pack completeness for that work type
+      - Once a work type achieves 90% completeness, it enters HARD_FAIL for all future work
+
+      This creates continuous pressure for improvement without strategic gaming opportunities.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M55-F003
+    source_mode: 55
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: TESTABILITY
+    title: "Free-rider problem in capability manifest maintenance"
+    description: |
+      The CapabilityManifest (04_solution_overview.yaml lines 138-141) is generated by selftest
+      harness and reflects what the CLI/kernel actually supports. However, the PRD does not
+      specify WHO is responsible for maintaining comprehensive selftest coverage.
+
+      Game-theoretic issue: Capability manifest completeness is a public good. Individual
+      contributors have weak incentive to add tests for capabilities they don't personally use,
+      but strong incentive to free-ride on others' test contributions.
+
+      Result: Capability manifest may have incomplete coverage, with edge-case capabilities
+      untested. Agents discover missing capabilities at runtime rather than planning time,
+      defeating the purpose of the capability manifest.
+    location: "04_solution_overview.yaml:138-141 (ENT-CAP)"
+    remediation: |
+      Introduce capability coverage accountability mechanism:
+
+      1. Each CLI command MUST declare its capability surface via structured comment
+      2. AAT harness generates coverage report: declared_capabilities vs tested_capabilities
+      3. AATReceipt includes capability_coverage_ratio (tested/declared)
+      4. GATE-CAC-CUTOVER requires capability_coverage_ratio ≥95%
+      5. CLI command PRs are blocked unless capability tests are included
+
+      Additionally, introduce negative signal: If agents experience runtime capability failure
+      for a capability NOT in the manifest, emit DefectRecord targeting the AAT test suite
+      author (identified via git blame of test/cac/aat/).
+
+      This converts the public good problem into a private accountability problem.
+    agreement_status: PENDING
+
+  # MODE 65: Deontic reasoning - Evaluate obligations, permissions, and prohibitions
+
+  - finding_id: SA3-M65-F001
+    source_mode: 65
+    gate: GATE-PRD-SECURITY
+    severity: BLOCKER
+    category: SECURITY
+    title: "Deontic gap: Who is OBLIGATED to act when emergency override is used?"
+    description: |
+      CNS-0006 emergency override protocol (06_constraints_invariants.yaml lines 87-137)
+      specifies triple-signoff requirements and audit requirements, but does NOT specify
+      deontic obligations after override is executed:
+
+      - Who is OBLIGATED to investigate why override was necessary?
+      - Who is OBLIGATED to implement corrective measures?
+      - Who is OBLIGATED to report to board/governance?
+
+      Without explicit obligation assignment, the emergency override becomes a procedural
+      checkbox without accountability. The audit trail exists but no one is obligated to act on it.
+
+      This is a critical deontic gap: PERMISSION to override exists, but OBLIGATION to
+      follow up does not.
+    location: "06_constraints_invariants.yaml:87-137 (emergency_override)"
+    remediation: |
+      Add post-override obligation protocol:
+
+      1. OBLIGATION: AUTH_SECURITY MUST initiate incident investigation within 4 hours of override
+      2. OBLIGATION: Investigation MUST produce incident report within 72 hours
+      3. OBLIGATION: DOMAIN_GOVERNANCE MUST review incident report and determine if:
+         - Policy update required
+         - Process change required
+         - Additional safeguards required
+      4. OBLIGATION: If override was used ≥2 times within 90 days, board briefing is REQUIRED
+      5. PROHIBITION: Emergency override CANNOT be used for the same root cause twice without
+         board approval
+
+      Add to audit_requirements: "Incomplete incident investigation triggers MAJOR defect
+      assigned to AUTH_SECURITY."
+    agreement_status: PENDING
+
+  - finding_id: SA3-M65-F002
+    source_mode: 65
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: COMPLETENESS
+    title: "Unclear deontic boundary: Can consumption holons REFUSE context packs?"
+    description: |
+      G-0003 (03_goals_scope.yaml lines 18-23) specifies hermetic consumption with graduated
+      enforcement, but does not address the deontic question:
+
+      "Can a consumption holon refuse to execute if it determines the context pack is
+      insufficient, even if policy permits?"
+
+      Scenario: Agent determines that stable_id "skill:example:v1" is present in the pack,
+      but the content is semantically incorrect or outdated. Does the agent have:
+      - PERMISSION to refuse execution?
+      - OBLIGATION to execute anyway?
+      - OBLIGATION to emit defect but continue?
+
+      This deontic ambiguity creates a conflict between "hermetic consumption" (agent must
+      execute with provided pack) and "semantic correctness" (agent should refuse if inputs
+      are wrong).
+    location: "03_goals_scope.yaml:18-23 (G-0003)"
+    remediation: |
+      Add deontic protocol for pack quality objections:
+
+      1. PERMISSION: Consumption holons MAY emit PACK_QUALITY_OBJECTION defect if context
+         appears semantically incorrect
+      2. OBLIGATION: If PACK_QUALITY_OBJECTION is emitted, agent MUST provide:
+         - specific stable_id of suspect artifact
+         - expected semantic properties vs. observed properties
+         - confidence score (HIGH/MEDIUM/LOW)
+      3. PROHIBITION: Agent CANNOT refuse execution based solely on quality objection unless
+         confidence=HIGH AND artifact is marked as safety-critical
+      4. OBLIGATION: DOMAIN_COMPILER MUST review PACK_QUALITY_OBJECTION within 24 hours
+
+      This clarifies that agents have permission to object, but generally not obligation to
+      refuse, creating a balance between hermetic execution and quality feedback.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M65-F003
+    source_mode: 65
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: CONSISTENCY
+    title: "Deontic inconsistency: Waiver expiration obligations unclear"
+    description: |
+      The waiver_policy (13_governance_model.yaml lines 56-65) requires expiration_date but
+      does not specify deontic obligations when waivers expire:
+
+      - Who is OBLIGATED to revoke expired waivers?
+      - Who is OBLIGATED to notify stakeholders?
+      - Is there a PROHIBITION on using expired waivers automatically, or is grace period PERMITTED?
+
+      Without explicit obligations, expired waivers may continue to be used implicitly, defeating
+      the purpose of time-bounded waivers.
+    location: "13_governance_model.yaml:56-65 (waiver_policy)"
+    remediation: |
+      Add waiver expiration deontic protocol:
+
+      1. OBLIGATION: Kernel MUST reject any gate decision referencing an expired waiver
+      2. OBLIGATION: 7 days before waiver expiration, kernel MUST emit WAIVER_EXPIRATION_NOTICE
+         to waiver requester and authority who granted it
+      3. PERMISSION: Authority MAY extend waiver with new expiration_date via PatchRecord
+      4. PROHIBITION: Waiver extensions CANNOT exceed 2x original duration without AUTH_GOVERNANCE
+         escalation
+      5. OBLIGATION: If work is blocked by expired waiver, requester MUST either:
+         - Fix underlying issue (preferred)
+         - Request new waiver (must provide updated rationale)
+
+      This creates clear obligations and prevents zombie waivers.
+    agreement_status: PENDING
+
+  # MODE 80: Debiasing/epistemic hygiene - Identify cognitive biases in PRD
+
+  - finding_id: SA3-M80-F001
+    source_mode: 80
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: COMPLETENESS
+    title: "Optimism bias in graduated enforcement timeline (planning fallacy)"
+    description: |
+      TRADEOFF-0001 rollout schedule (08_risks_questions.yaml lines 188-196) exhibits
+      optimism bias (planning fallacy):
+
+      - Week 1-3: WARN mode
+      - Week 4-6: SOFT_FAIL mode
+      - Week 7-8: HARD_FAIL mode
+
+      Total timeline: 8 weeks to full enforcement.
+
+      This timeline assumes:
+      - Pack specs can be improved quickly (no evidence provided)
+      - Defect aggregation and feedback loop work smoothly from day 1 (optimistic)
+      - No major unanticipated issues during rollout (unlikely for complex system)
+
+      Historical evidence from similar migrations (EVID-0013, EVID-0014 methodologies) is
+      referenced but not applied to the rollout schedule itself. This is classic planning
+      fallacy: underestimating task duration by ignoring base rates.
+
+      Base rate neglect: PRD does not reference similar rollout timelines from past APM2
+      system changes or industry precedent for schema enforcement migrations.
+    location: "08_risks_questions.yaml:188-196 (rollout_phases)"
+    remediation: |
+      Apply epistemic hygiene to rollout timeline:
+
+      1. Reference class forecasting: Analyze past APM2 rollouts (if available) or industry
+         precedent for schema enforcement migrations. Use 70th percentile completion time
+         as baseline, not median.
+
+      2. Add buffer: Extend timeline to 12 weeks (50% buffer) or make timeline adaptive:
+         "Week 7-8" becomes "Week X where X = first week after MET-0002 ≥90% for 2 consecutive weeks"
+
+      3. Pre-mortem analysis: Add section "What could go wrong?" with specific scenarios:
+         - Pack compiler has bugs delaying improvements
+         - Defect aggregation produces too many false positives
+         - Authority signoff becomes bottleneck
+         Each scenario includes contingency plan.
+
+      4. Confidence interval: Express timeline with uncertainty: "HARD_FAIL enforcement by
+         week 8 (50% confidence), week 10 (80% confidence), week 12 (95% confidence)"
+
+      This debiases the timeline by forcing explicit consideration of uncertainty.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M80-F002
+    source_mode: 80
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: NORTH_STAR
+    title: "Availability bias: Overemphasis on recent pain points in problem statement"
+    description: |
+      The problem statement (02_problem.yaml) heavily emphasizes observed_failure_modes
+      (FM-0001 through FM-0005) which appear to be recent experiences (contract drift, CLI
+      ambiguity, unplanned tool calls, non-replayable research, vendor ABI dominance).
+
+      This suggests availability bias: recent, salient failures are overweighted relative to
+      less-memorable but potentially more important systemic issues.
+
+      Evidence of bias:
+      - All five failure modes are "current" issues (no historical analysis)
+      - Alternative interventions are dismissed quickly (lines 42-139) without empirical testing
+      - "CAC superiority" claims are asserted without comparative evidence
+
+      Epistemic hygiene concern: Are these the RIGHT problems to solve, or just the most
+      recent/memorable ones? Is CAC the best solution, or is it solving symptoms rather than
+      root causes?
+    location: "02_problem.yaml:33-139 (observed_failure_modes)"
+    remediation: |
+      Apply debiasing techniques to problem validation:
+
+      1. Historical failure analysis: Review defect database or incident logs for past 12 months.
+         Are FM-0001 through FM-0005 the most frequent/severe issues, or just the most recent?
+
+      2. Comparative experimentation: Before full CAC rollout, pilot alternative interventions
+         (e.g., ALT-FM001-01 "stricter Markdown linting") for 30 days and measure effectiveness.
+         This provides empirical baseline for CAC superiority claims.
+
+      3. Falsification attempt: Explicitly search for counterexamples: "What problems would
+         CAC NOT solve that are currently pain points?" Add to non_goals if found.
+
+      4. Diverse stakeholder input: Survey consumers of APM2 system (agents, humans, downstream
+         systems) to identify pain points independently. Compare with FM-0001 through FM-0005
+         to check for availability bias blind spots.
+
+      5. Add EVID-0016: "Historical failure mode frequency analysis showing FM-0001 through
+         FM-0005 represent ≥80% of recent incidents by severity-weighted count."
+
+      This provides empirical grounding for problem prioritization.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M80-F003
+    source_mode: 80
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: CONSISTENCY
+    title: "Confirmation bias in alternative intervention assessment"
+    description: |
+      Each observed_failure_mode (02_problem.yaml lines 33-139) includes alternative_interventions
+      with assessments that consistently conclude CAC is superior. This pattern suggests
+      confirmation bias: alternatives are framed to make CAC appear superior rather than
+      genuinely evaluated.
+
+      Examples:
+      - ALT-FM001-01: "Addresses symptom but not cause" (line 44)
+      - ALT-FM002-02: "Tests verify behavior exists but do not expose capabilities to agents" (line 69)
+      - ALT-FM003-01: "Detective only; does not prevent" (line 87)
+
+      All alternatives are dismissed with similar reasoning: "CAC is preventative/canonical,
+      alternatives are detective/symptomatic." This suggests the evaluation was not independent
+      but rather designed to justify a pre-determined conclusion.
+
+      Epistemic hygiene issue: Are these assessments accurate, or are they rationalization
+      of a decision already made?
+    location: "02_problem.yaml:33-139 (alternative_interventions within each FM)"
+    remediation: |
+      Apply double-blind alternative evaluation:
+
+      1. Independent assessment: Have someone NOT involved in CAC design evaluate alternatives
+         using the same criteria. Compare results.
+
+      2. Steelman alternatives: For each alternative intervention, describe the STRONGEST
+         version of that approach (not weakest). Example: "Comprehensive CLI documentation"
+         becomes "Machine-readable API contracts with integration tests and continuous validation."
+
+      3. Hybrid approaches: Consider whether CAC + alternatives is better than CAC alone.
+         Example: CAC for canonical storage + strict Markdown linting for vendor exports
+         may be superior to CAC alone.
+
+      4. Quantified comparison: Use explicit scoring matrix:
+         - Cost (implementation effort)
+         - Effectiveness (problem reduction)
+         - Risk (failure modes)
+         - Reversibility (ease of rollback)
+         Assign numerical scores (1-5) for each alternative and CAC.
+
+      5. Add EVID-0017: "Independent evaluation of alternatives by stakeholder not involved
+         in CAC design, confirming CAC superiority claims."
+
+      This debiases the alternative evaluation by forcing rigorous comparison.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M80-F004
+    source_mode: 80
+    gate: GATE-PRD-CONTENT
+    severity: OBSERVATION
+    category: NORTH_STAR
+    title: "Anchoring bias in success metrics baselines"
+    description: |
+      Success metrics (05_success_metrics.yaml) use baseline expectations that appear to be
+      anchored on unstated assumptions:
+
+      - MET-0001: "expected >50 per 1000 work items" (line 8)
+      - MET-0002: "expected <50% initially" (line 16)
+      - MET-0005: "Expected >30% rejection rate in first 30 days" (line 40)
+
+      These baselines are stated without empirical justification, suggesting anchoring bias:
+      the author picked numbers that felt reasonable without measuring current state.
+
+      Epistemic concern: If actual baseline is significantly different (e.g., current unplanned
+      reads are 200 per 1000, not 50), the target improvement may be too optimistic or too
+      conservative.
+    location: "05_success_metrics.yaml:1-93 (metrics section)"
+    remediation: |
+      Remove anchoring by measuring current state:
+
+      1. BEFORE CAC rollout, measure current baseline for MET-0001 through MET-0007 using
+         existing instrumentation (if available) or add temporary instrumentation.
+
+      2. Update baseline fields with actual measured values and confidence intervals, not
+         expectations.
+
+      3. If measurement is not feasible pre-rollout, change baseline to: "Baseline will be
+         established from first 30 days post-deployment. Target will be adjusted based on
+         measured baseline using formula: target = baseline * 0.8 (i.e., 20% improvement)."
+
+      4. Add requirement: MET-0001 through MET-0007 baselines MUST be measured and recorded
+         as evidence artifacts within 30 days of rollout.
+
+      This removes anchoring by forcing empirical baseline establishment.
+    agreement_status: PENDING
+
+  - finding_id: SA3-M80-F005
+    source_mode: 80
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: TESTABILITY
+    title: "Survivorship bias in AAT receipt gating"
+    description: |
+      GATE-CAC-CUTOVER (13_governance_model.yaml lines 48-55) requires AATReceipt to be
+      "recent and passing" but does not specify:
+      - What happens to failed AAT receipts?
+      - Are they stored and analyzed?
+      - Is there a feedback mechanism?
+
+      This creates potential survivorship bias: only passing receipts are visible, so patterns
+      in failing tests may be invisible. Decision-makers see only success, not near-misses
+      or recurring failures.
+
+      Epistemic risk: If AAT test suite has blind spots (e.g., capability X always fails but
+      is rarely needed), those blind spots remain invisible because failed receipts are not
+      systematically analyzed.
+    location: "13_governance_model.yaml:48-55 (GATE-CAC-CUTOVER)"
+    remediation: |
+      Add failed AAT receipt analysis requirement:
+
+      1. ALL AAT runs (passing and failing) MUST emit receipts stored in CAS
+      2. Failed AAT receipts MUST be tagged with failure_reason_category
+      3. AAT failure dashboard tracks:
+         - Failure frequency by capability
+         - Time-to-fix for failed capabilities
+         - Recurring failure patterns
+      4. GATE-CAC-CUTOVER additionally requires:
+         - No BLOCKER-severity AAT failures in past 7 days
+         - AAT failure rate <5% over past 30 days
+         - All recurring failures (≥3 times) have assigned owners
+
+      This eliminates survivorship bias by making failures first-class data.
+    agreement_status: PENDING
+
+north_star_assessment:
+  phase_scores:
+    P1_recursive_improvement: 0.85
+    P2_innovation: 0.35
+    P3_enterprise: 0.20
+    P4_partnership: 0.15
+    P5_life_sciences: 0.10
+  primary_phase_alignment: P1_recursive_improvement
+  phase_alignment_rationale: |
+    PRD-0007 (Context-as-Code) is strongly aligned with Phase 1: Recursive Self-Improvement.
+
+    DIRECT CONTRIBUTIONS (P1 = 0.85):
+    - Addresses core P1 objective: "Achieve recursive improvement until the system generates
+      better software than unaugmented humans"
+    - Success metrics directly target P1 key metrics:
+      * MET-0006: PR cycle time (maps to "Review efficiency")
+      * MET-0007: Defect recurrence rate (maps to "Bug introduction rate")
+      * Hermetic consumption enables higher autonomy (maps to "Autonomy level")
+    - Feedback loop (defect aggregation → pack improvement) is recursive improvement incarnate
+    - Measurable throughput gains (G-0007) create data for monotonic improvement tracking
+
+    ENABLING CONTRIBUTIONS:
+    - P2 (Innovation): 0.35 - CAC provides foundation for novel method generation by making
+      context machine-native, but does not directly generate novel methods. Score reflects
+      enabling contribution only.
+    - P3 (Enterprise): 0.20 - Target delivery pipeline and vendor interoperability support
+      future enterprise partnerships, but no direct revenue or customer work in this PRD.
+    - P4 (Partnership): 0.15 - Minimal direct contribution. Provenance and audit trails
+      support future corporate partnerships requiring compliance/security, but this is
+      preparatory, not active.
+    - P5 (Life Sciences): 0.10 - No direct contribution. Improved agent quality could
+      eventually accelerate life sciences work, but this is too far downstream to score higher.
+
+    PHASE ALIGNMENT BREAKDOWN:
+    - Primary: P1 (recursive improvement via feedback loops and measurable quality gains)
+    - Secondary: P2 (enabling future innovation through better context substrate)
+    - No phase blockers identified.
+
+  strategic_recommendations:
+    - |
+      PHASE ACCELERATION (P1): To maximize P1 impact, prioritize MET-0007 (defect recurrence)
+      over MET-0006 (cycle time). Defect recurrence directly measures recursive improvement
+      (system learns from mistakes), while cycle time is a lagging indicator. Consider adding
+      metric: "Time-to-pack-fix after defect pattern detection" as a leading indicator of
+      recursive improvement loop health.
+
+    - |
+      CROSS-PHASE SYNERGY (P1 + P2): Add explicit mechanism for capturing agent-discovered
+      context patterns as innovation seeds. When defect aggregation reveals novel context
+      organization strategies, emit those as candidate innovations for P2 evaluation. This
+      converts operational improvement (P1) into methodological innovation (P2).
+
+    - |
+      CROSS-PHASE SYNERGY (P1 + P3): Target delivery pipeline (vendor layouts) should be
+      positioned as enterprise-ready export capability from day 1. Add explicit requirement
+      for enterprise compliance features (GDPR, SOC2, HIPAA context classification). This
+      prepares P3 groundwork while executing P1 work.
+
+    - |
+      RISK MITIGATION (P2/P3): Avoid over-constraining context representation to current
+      APM2-specific needs. Ensure CAC-JSON schema is extensible enough to support future
+      non-APM2 use cases (potential P3 product offerings). Add constraint: "Schema evolution
+      MUST support cross-organization namespaces for future partnership/licensing scenarios."
+
+    - |
+      RISK MITIGATION (P1): Graduated enforcement schedule (TRADEOFF-0001) should be
+      data-driven rather than time-driven. Replace fixed timeline with adaptive triggers
+      based on MET-0002 and MET-0003 thresholds. This ensures P1 recursive improvement is
+      actually working before enforcing hermeticity, reducing risk of premature optimization.
+
+  violations: []
+  violations_rationale: |
+    No North Star violations detected:
+    - NOT PHASE_REGRESSION: PRD does not undo progress in any completed phase.
+    - NOT PHASE_SKIP: PRD is appropriately focused on P1 with P2 groundwork; no attempt to
+      skip ahead to P3/P4/P5 without prerequisites.
+    - NOT MISSION_DRIFT: All goals are clearly aligned with recursive improvement (P1 core mission).
+    - NOT VALUE_EXTRACTION: No evidence of short-term optimization at long-term mission expense.
+      The graduated enforcement approach explicitly balances short-term velocity with long-term
+      quality, showing mission alignment.
+
+    HOWEVER: Several findings (SA3-M55-F001, SA3-M55-F002) identify incentive misalignments
+    that, if not remediated, could lead to VALUE_EXTRACTION patterns (gaming metrics instead
+    of improving system). These are flagged as BLOCKER/MAJOR severity to prevent future
+    North Star violations.
+
+confidence_metadata:
+  review_depth: COMPREHENSIVE
+  files_reviewed:
+    - "00_meta.yaml"
+    - "02_problem.yaml"
+    - "03_goals_scope.yaml"
+    - "04_solution_overview.yaml"
+    - "05_success_metrics.yaml"
+    - "06_constraints_invariants.yaml"
+    - "08_risks_questions.yaml"
+    - "13_governance_model.yaml"
+    - "requirements/REQ-0001.yaml"
+    - "evidence_artifacts/EVID-0010.yaml"
+  mode_application_confidence:
+    mode_37_causal_inference: HIGH
+    mode_39_counterfactual: HIGH
+    mode_55_game_theoretic: HIGH
+    mode_65_deontic: HIGH
+    mode_80_debiasing: MEDIUM
+  mode_application_notes:
+    mode_80_note: |
+      Debiasing analysis (Mode 80) is inherently subjective. Confidence is MEDIUM because
+      bias detection requires inferring author intent from document structure. Findings
+      SA3-M80-F001 through SA3-M80-F005 are well-supported by textual evidence but could
+      be alternatively explained by author's writing style rather than cognitive bias.
+      However, the remediations (empirical grounding, independent evaluation) are valuable
+      regardless of whether bias is present.
+  overall_confidence: HIGH
+  limitations:
+    - |
+      This review cycle (cycle 1) did not examine all 15 requirements or all 15 evidence
+      artifacts in detail. Findings focus on core PRD structure and may miss requirement-specific
+      issues.
+    - |
+      Mode 55 (game-theoretic) analysis assumes rational agents optimizing individual utility.
+      If agents are cooperative or bound by strong social norms, incentive misalignments may
+      be less severe than modeled.
+    - |
+      North Star assessment assumes current state is P1 (recursive improvement). If organization
+      is actually in transition between phases, scores may need adjustment.

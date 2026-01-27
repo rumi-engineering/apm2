@@ -1,0 +1,31 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0004"
+  type: "FUNCTIONAL"
+  title: "Bounded context production with replayable evidence"
+  statement: |
+    Production holons MUST operate under explicit leases/budgets and publish replayable
+    evidence (snapshots, extraction logs, diffs). Tool calls MUST be classified as
+    planned/unplanned and feed defect signals into pack compiler improvement. Admissions
+    MUST include a ChangeSet report to summarize semantic deltas.
+  acceptance_criteria:
+    - id: AC-0004-01
+      description: Production holons operate under explicit lease/budget refs.
+      verification_method: PatchRecord inputs include budget/lease refs; budget exceeded emits event.
+    - id: AC-0004-02
+      description: Tool calls are classified as planned/unplanned.
+      verification_method: ToolEvent includes planned/unplanned classification.
+    - id: AC-0004-03
+      description: Admissions include ChangeSetReport.
+      verification_method: Admission requires ChangeSetReport for patch streams.
+    - id: AC-0004-04
+      description: Evidence snapshots are published to CAS.
+      verification_method: EvidencePublished events reference CAS hashes for production evidence.
+  source_goal_id: CAC-G-0004
+  evidence:
+    evidence_ids:
+      - EVID-0003
+    inherited_from_prd: false
+    notes:
+      - Maps to engineering goal CAC-G-0004 from source PRD.

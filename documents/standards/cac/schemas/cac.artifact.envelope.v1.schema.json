@@ -1,0 +1,123 @@
+{
+  "$id": "cac.artifact.envelope.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "kind": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "meta": {
+      "additionalProperties": false,
+      "properties": {
+        "classification": {
+          "$ref": "cac.common.v1.schema.json#/$defs/classification"
+        },
+        "canonicalizer": {
+          "additionalProperties": false,
+          "properties": {
+            "canonicalizer_id": {
+              "type": "string"
+            },
+            "canonicalizer_version": {
+              "type": "string"
+            },
+            "vectors_ref": {
+              "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+            }
+          },
+          "required": [
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "vectors_ref"
+          ],
+          "type": "object"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "dependencies": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "pinned_hash": {
+                "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+              },
+              "stable_id": {
+                "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+              }
+            },
+            "required": [
+              "stable_id"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "provenance": {
+          "additionalProperties": false,
+          "properties": {
+            "actor_id": {
+              "type": "string"
+            },
+            "notes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "source_receipts": {
+              "items": {
+                "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+              },
+              "type": "array"
+            },
+            "work_id": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "stable_id": {
+          "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stable_id",
+        "classification",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "schema": {
+      "pattern": "^cac\\.[A-Za-z0-9_.-]+\\.v[0-9]+$",
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "kind",
+    "meta",
+    "payload"
+  ],
+  "title": "CAC Artifact Envelope v1",
+  "type": "object"
+}

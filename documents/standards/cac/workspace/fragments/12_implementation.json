@@ -1,0 +1,203 @@
+{
+  "implementation": {
+    "components": [
+      {
+        "component_id": "CAC-CANON",
+        "interfaces": [
+          "canonicalize(bytes)->canonical_bytes",
+          "hash(canonical_bytes)->b3-256"
+        ],
+        "name": "CAC Canonicalizer",
+        "responsibilities": [
+          "Parse CAC-JSON without floats and with strict limits.",
+          "Emit canonical bytes deterministically.",
+          "Expose test-vector based verification."
+        ],
+        "type": "rust_library"
+      },
+      {
+        "component_id": "CAC-VALID",
+        "name": "CAC Validator",
+        "responsibilities": [
+          "Validate artifacts against JSON Schemas (draft 2020-12 minimum).",
+          "Enforce validator profile: unknown fields rejected, size/depth bounds.",
+          "Validate PatchRecord streams.",
+          "Enforce typed-quantity constraints and ContextPack budget ceilings."
+        ],
+        "type": "rust_library"
+      },
+      {
+        "component_id": "CAC-BOOTSTRAP",
+        "name": "Bootstrap Schema Bundle",
+        "responsibilities": [
+          "Embed a minimal schema bundle pinned by hash in the apm2 binary (Phase-0 trust root).",
+          "Expose a read-only bootstrap manifest to the validator and admission pipeline.",
+          "Reject any patch or artifact that attempts to modify or shadow bootstrap stable IDs."
+        ],
+        "type": "binary_embedded_data"
+      },
+      {
+        "component_id": "CAC-PATCH",
+        "name": "Patch Engine",
+        "responsibilities": [
+          "Apply JSON Patch / Merge Patch to canonical JSON trees.",
+          "Enforce replay protection via expected_base_hash.",
+          "Emit ChangeSetReport (semantic delta) for review and compaction."
+        ],
+        "type": "rust_library"
+      },
+      {
+        "component_id": "CAC-DCP",
+        "name": "DCP Index / Resolver",
+        "responsibilities": [
+          "Resolve stable_id -> pinned content_hash + schema refs.",
+          "Provide deterministic reads for consumption mode via ArtifactFetch.",
+          "Reconstruct index from ledger events.",
+          "Provide dependency graph closure for pack compilation."
+        ],
+        "type": "projection_service_or_library"
+      },
+      {
+        "commands": [
+          "apm2 cac lint",
+          "apm2 cac fmt",
+          "apm2 cac apply-patch",
+          "apm2 pack compile",
+          "apm2 export --profile <target>",
+          "apm2 capabilities --json",
+          "apm2 selftest"
+        ],
+        "component_id": "CAC-CLI",
+        "name": "APM2 CLI CAC Commands",
+        "note": "These commands must have machine-readable contracts and be listed in capabilities manifest.",
+        "type": "cli_surface"
+      },
+      {
+        "component_id": "CAC-COMPILER",
+        "name": "Context Compiler",
+        "responsibilities": [
+          "Compile ContextPackSpec into ContextPackManifest + derived artifacts.",
+          "Deep-pin transitive dependencies to produce self-contained packs.",
+          "Compile target payloads per TargetProfile (vendor layouts, model IRs).",
+          "Emit receipts and evidence."
+        ],
+        "type": "service_or_library"
+      },
+      {
+        "component_id": "CAC-AAT",
+        "name": "Selftest/AAT Harness",
+        "responsibilities": [
+          "Run hermetic acceptance tests for CLI contracts, tool protocol, and export determinism.",
+          "Emit structured AATReceipt stored in CAS and referenced in ledger."
+        ],
+        "type": "test_harness"
+      }
+    ],
+    "mvp_scope": {
+      "explicit_exclusions": [
+        "Two-way import of vendor Markdown into CAC (optional future).",
+        "Full defect triage UI; defects can be emitted as structured records/events."
+      ],
+      "goal": "A working end-to-end CAC pipeline integrated with the existing APM2 ledger/CAS/tool protocol, sufficient to gate the innermost loop and enable safe CLI cutover.",
+      "must_ship": [
+        "CAC-JSON canonicalizer + validator (strict).",
+        "Schema registry bootstrap bundle pinned in the binary, immutable via patch admission, plus resolution via DCP.",
+        "Patch admission pipeline (apply-patch) with replay protection and admission receipts.",
+        "DCP stable-ID resolution index (projection).",
+        "ArtifactFetch tool protocol extension (or equivalent deterministic read surface).",
+        "ContextPack spec + compiler producing deep-pinned manifests and derived pack artifacts.",
+        "TargetProfile schema + compiler integration (rendering, retrieval, budgets).",
+        "CapabilityManifest generator + selftest receipt pipeline (AAT).",
+        "Target delivery pipeline (at least one profile: Claude Code skills) with export manifest + conformance tests.",
+        "ChangeSetReport emission for patch admissions.",
+        "RunReceipt emission for consumption runs (pack sufficiency + misses)."
+      ]
+    },
+    "phases": [
+      {
+        "deliverables": [
+          "Bootstrap schema bundle embedded in apm2 binary with pinned hashes.",
+          "Bootstrap manifest and immutability rules (no PatchRecord updates; no shadowing).",
+          "Validator/admission pipeline uses bootstrap bundle before DCP availability."
+        ],
+        "exit_criteria": [
+          "Bootstrap hashes verified at startup.",
+          "Admission rejects patches targeting bootstrap stable IDs.",
+          "PatchRecord and AdmissionReceipt validation succeeds using only bootstrap schemas."
+        ],
+        "name": "Bootstrap Trust Root",
+        "phase_id": "CAC-IMP-00"
+      },
+      {
+        "deliverables": [
+          "CAC-JSON profile + canonicalizer (with vectors)",
+          "Schema bootstrap registry + validator",
+          "PatchRecord schema + JSONL tooling",
+          "Typed quantity standard in common schema"
+        ],
+        "exit_criteria": [
+          "Canonicalization idempotence tests pass",
+          "Schema validation is fail-closed",
+          "Patch replay protection enforced"
+        ],
+        "name": "Foundations",
+        "phase_id": "CAC-IMP-01"
+      },
+      {
+        "deliverables": [
+          "apm2 cac apply-patch end-to-end: validate -> apply -> canonicalize -> store -> evidence -> ledger",
+          "AdmissionReceipt schema and emission",
+          "DCP resolver MVP",
+          "ChangeSetReport emission and storage"
+        ],
+        "exit_criteria": [
+          "Artifacts become resolvable by stable ID with pinned hash",
+          "EvidencePublished events emitted with required metadata"
+        ],
+        "name": "Admission + Provenance",
+        "phase_id": "CAC-IMP-02"
+      },
+      {
+        "deliverables": [
+          "Tool protocol extension: ArtifactFetch (and optional DcpResolve)",
+          "Policy rules to enforce consumption hermeticity",
+          "RunReceipt emission with context_pack_miss + sufficiency"
+        ],
+        "exit_criteria": [
+          "Consumption holon can fetch required context only by stable ID",
+          "Unauthorized reads are denied and defect-emitting"
+        ],
+        "name": "Deterministic Fetch Surface",
+        "phase_id": "CAC-IMP-03"
+      },
+      {
+        "deliverables": [
+          "ContextPackSpec schema",
+          "pack compile producing manifests + derived prompt packs",
+          "PackCompilationReceipt emission",
+          "TargetProfile integration + deep-pinning closure"
+        ],
+        "exit_criteria": [
+          "Consumption tasks run without discretionary context discovery",
+          "Pack outputs are deterministic and provenanced",
+          "Packs are self-contained under transitive closure"
+        ],
+        "name": "ContextPack Compiler",
+        "phase_id": "CAC-IMP-04"
+      },
+      {
+        "deliverables": [
+          "TargetProfile schema + claude_code/v1 target profile",
+          "apm2 export produces delivery payloads + ExportManifest + conformance tests",
+          "apm2 capabilities --json + apm2 selftest + AATReceipt gating"
+        ],
+        "exit_criteria": [
+          "Target delivery is deterministic and CI-enforced",
+          "Capabilities manifest matches reality (selftested)"
+        ],
+        "name": "Target Delivery + Capabilities Truthing",
+        "phase_id": "CAC-IMP-05"
+      }
+    ]
+  }
+}

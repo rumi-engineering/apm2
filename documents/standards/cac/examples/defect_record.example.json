@@ -1,0 +1,44 @@
+{
+  "kind": "defect.record",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-01-26T00:20:00Z",
+    "dependencies": [],
+    "labels": [
+      "defect",
+      "pack-compiler"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-REVIEW",
+      "work_id": "work_example_006"
+    },
+    "stable_id": "dcp://apm2.local/defects/unplanned_context_read@2026-01-26T00:20:00Z"
+  },
+  "payload": {
+    "context": {
+      "actor_id": "HOLON-REVIEW",
+      "pack_manifest_hash": "b3-256:800240bb61ef230e8b8b6e76cdcacee68bd4a8ab4c01b317df0ea6f79bd15aef",
+      "requested_stable_id": "dcp://apm2.local/policies/tool_default_deny@v1",
+      "session_id": "sess_abc"
+    },
+    "defect_class": "UNPLANNED_CONTEXT_READ",
+    "defect_id": "defect_0001",
+    "detected_at": "2026-01-26T00:20:00Z",
+    "evidence": [
+      "b3-256:25706d7908ed1d2967de8deefd8994d3383dd162223e461b6a11359bed3a7307"
+    ],
+    "severity": "S1",
+    "signal": {
+      "details": "Consumption holon attempted to fetch stable_id dcp://apm2.local/policies/tool_default_deny@v1 not present in pack allowlist.",
+      "type": "UNPLANNED_CONTEXT_READ"
+    },
+    "suggested_remediations": [
+      "Add missing stable_id to ContextPackSpec includes list.",
+      "Recompile pack and rerun the task.",
+      "If policy is required universally, add it to base packs used by review holons."
+    ],
+    "work_id": "work_example_006"
+  },
+  "schema": "cac.defect_record.v1",
+  "schema_version": "1.0.0"
+}

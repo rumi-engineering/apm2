@@ -1,0 +1,38 @@
+{
+  "kind": "export.manifest",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-01-26T00:31:00Z",
+    "dependencies": [],
+    "labels": [
+      "export",
+      "vendor"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-CONTEXT-COMPILER",
+      "work_id": "work_example_007"
+    },
+    "stable_id": "dcp://apm2.local/exports/claude_code_skills@2026-01-26T00:31:00Z"
+  },
+  "payload": {
+    "conformance_report_hash": "b3-256:3d8ab444d37a2c7cb61e2562436d3043963b8bb5bcf159ed8310eca82a8ccf49",
+    "export_root": ".claude/skills",
+    "files": [
+      {
+        "bytes": 1234,
+        "content_hash": "b3-256:8c4836c1809eba0d977767492ec6dcf1de2cb677bebc61e23b97f385ccf9107a",
+        "path": ".claude/skills/code_review/SKILL.md"
+      }
+    ],
+    "source_inputs": [
+      {
+        "content_hash": "b3-256:b762130e1e23af0c57f00456aff3f2f702b8b15983bb32ce96c42663a54b08cf",
+        "stable_id": "dcp://apm2.local/skills/code_review@v1"
+      }
+    ],
+    "vendor_id": "claude_code",
+    "target_profile_id": "dcp://apm2.local/targets/claude_code@v1"
+  },
+  "schema": "cac.export_manifest.v1",
+  "schema_version": "1.0.0"
+}

@@ -1,0 +1,109 @@
+{
+  "$id": "cac.skill_spec.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "skill.spec"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "constraints": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "exports": {
+              "additionalProperties": true,
+              "description": "Vendor export hints (optional).",
+              "type": "object"
+            },
+            "instructions": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "text"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "intent": {
+              "type": "string"
+            },
+            "skill_name": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "tooling_contract": {
+              "additionalProperties": false,
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "PRODUCE",
+                    "CONSUME"
+                  ],
+                  "type": "string"
+                },
+                "permitted_tools": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "tool_budget": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "artifacts": {
+                      "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                    },
+                    "bytes": {
+                      "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                    },
+                    "time_ms": {
+                      "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                    },
+                    "tokens": {
+                      "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                    },
+                    "tool_calls": {
+                      "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "skill_name",
+            "intent",
+            "instructions"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.skill_spec.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC SkillSpec v1"
+}

@@ -1,0 +1,32 @@
+{
+  "kind": "schema.definition",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-01-26T00:00:00Z",
+    "dependencies": [],
+    "labels": [
+      "schema"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-KERNEL-GOVERNANCE",
+      "work_id": "work_example_000"
+    },
+    "stable_id": "dcp://apm2.local/schemas/cac.skill_spec.v1@v1"
+  },
+  "payload": {
+    "compatibility_policy": "strict",
+    "draft": "2020-12",
+    "json_schema": {
+      "$ref": "schemas/cac.skill_spec.v1.schema.json"
+    },
+    "schema_id": "cac.skill_spec.v1",
+    "schema_major": 1,
+    "validator_profile": {
+      "max_bytes": 1048576,
+      "max_depth": 128,
+      "unknown_fields": "reject"
+    }
+  },
+  "schema": "cac.schema_definition.v1",
+  "schema_version": "1.0.0"
+}

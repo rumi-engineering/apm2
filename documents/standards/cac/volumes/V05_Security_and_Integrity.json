@@ -1,0 +1,319 @@
+{
+  "schema": "apm2.prd.volume.v1",
+  "schema_version": "1.0.0",
+  "sections": [
+    {
+      "content": {
+        "controls": [
+          {
+            "details": "Restrict CAC-JSON to integer-only numbers within 64-bit range; enforce max depth and size.",
+            "id": "SEC-CTRL-0001",
+            "name": "Canonical JSON profile (no floats, bounded depth)",
+            "type": "preventative"
+          },
+          {
+            "details": "Canonicalizer is a versioned component; include golden vectors and cross-platform tests; canonical bytes used for hashing.",
+            "id": "SEC-CTRL-0002",
+            "name": "Deterministic canonicalizer with test vectors",
+            "type": "preventative"
+          },
+          {
+            "details": "Canonicalizer id/version and test-vector reference are recorded in envelopes/receipts; vectors are governed artifacts pinned in the bootstrap bundle.",
+            "id": "SEC-CTRL-0009",
+            "name": "Canonicalizer governance metadata",
+            "type": "preventative"
+          },
+          {
+            "details": "Validator profile rejects unknown fields; schemas use unevaluatedProperties=false.",
+            "id": "SEC-CTRL-0003",
+            "name": "Schema strictness (unknown field rejection)",
+            "type": "preventative"
+          },
+          {
+            "details": "Ledger events are signed and hash-chained; artifacts are content-addressed and integrity-verified.",
+            "id": "SEC-CTRL-0004",
+            "name": "Signed ledger + CAS hashes",
+            "type": "detective+preventative"
+          },
+          {
+            "details": "Consumption holons run with restricted filesystem and network; only deterministic ArtifactFetch permitted for context.",
+            "id": "SEC-CTRL-0005",
+            "name": "Hermetic runtime sandboxing",
+            "type": "preventative"
+          },
+          {
+            "details": "Generated Markdown includes provenance frontmatter; export manifest records hashes; conformance tests gate use.",
+            "id": "SEC-CTRL-0006",
+            "name": "Provenance embedding in vendor exports",
+            "type": "detective"
+          },
+          {
+            "details": "Hard bounds: max bytes, max depth, max array length, max schema complexity.",
+            "id": "SEC-CTRL-0007",
+            "name": "DoS limits in parsers and validators",
+            "type": "preventative"
+          },
+          {
+            "details": "Bootstrap schema bundle is embedded and pinned by hash; admission rejects modifications or shadowing; validator refuses to operate if bootstrap verification fails.",
+            "id": "SEC-CTRL-0008",
+            "name": "Bootstrap trust root immutability",
+            "type": "preventative"
+          },
+          {
+            "details": "Emergency override ceremonies use atomic initiation with distributed lock to prevent concurrent ceremonies. Only one ceremony can be active globally at any time.",
+            "id": "SEC-CTRL-0010",
+            "name": "Atomic ceremony initiation (race condition prevention)",
+            "type": "preventative",
+            "ceremony_lock_implementation": {
+              "lock_id": "emergency_override_ceremony_lock",
+              "lock_scope": "GLOBAL (entire system, all authorities)",
+              "lock_acquisition": "First signatory must acquire lock before generating ceremony_start_timestamp. Lock acquisition includes: (1) Verify no active ceremony (lock available), (2) Atomically set lock with ceremony_nonce and ceremony_start_timestamp, (3) Lock expires automatically after 15 minutes",
+              "lock_verification": "System MUST reject signoffs if ceremony_start_timestamp corresponds to non-active ceremony (lock released or expired).",
+              "requirements": [
+                "Ceremony initiation MUST acquire distributed lock preventing concurrent ceremonies",
+                "Only ONE ceremony can be active globally at any time",
+                "Ceremony lock released after ceremony completes or expires (15 min timeout)"
+              ],
+              "error_handling": [
+                "Failed to acquire lock returns CEREMONY_IN_PROGRESS error",
+                "Caller must wait for active ceremony to complete before initiating new ceremony"
+              ],
+              "ceremony_binding": [
+                "Ceremony begins when first signatory acquires lock and generates ceremony_start_timestamp and ceremony_nonce",
+                "All subsequent signatories MUST reference the same ceremony_start_timestamp and ceremony_nonce",
+                "Ceremony expires if third signatory does not complete within 15 minutes of ceremony_start_timestamp",
+                "Lock prevents any other ceremony initiation during active ceremony window"
+              ]
+            }
+          },
+          {
+            "details": "Fallback audit mechanism when external sink is unreachable. Emergency override MAY proceed with local audit buffering. Audit events buffered with HMAC-SHA256 integrity protection. Buffer size limited to 1000 events (prevent DoS). Post-recovery: buffered events MUST be force-pushed to external sink. Failed delivery triggers INCIDENT with board escalation. Degraded mode limited to 72 hours maximum. Entry into degraded mode logged with ceremony_nonce. Exit from degraded mode requires verification of buffer delivery.",
+            "id": "SEC-CTRL-0011",
+            "name": "Degraded audit mode for emergency override",
+            "type": "detective+compensating",
+            "activation_condition": "External audit sink unreachable for >30 minutes",
+            "resolves_finding": "SA2-M49-F001",
+            "requirements": [
+              "Post-recovery: buffered events MUST be force-pushed to external sink",
+              "Failed delivery triggers INCIDENT with board escalation",
+              "Degraded mode limited to 72 hours maximum"
+            ],
+            "audit_requirements": [
+              "Entry into degraded mode logged with ceremony_nonce",
+              "Exit from degraded mode requires verification of buffer delivery"
+            ]
+          },
+          {
+            "details": "Minimal audit capability for bootstrap-safe-mode to resolve circular dependency. Bootstrap-safe-mode MUST support emergency override audit emission. Degraded audit-only operations (no admission/compilation). Direct write to external audit sink bypassing kernel event bus. Emergency override in bootstrap-safe-mode emits audit directly via standalone audit client, not through full kernel event system.",
+            "id": "SEC-CTRL-0012",
+            "name": "Bootstrap-safe-mode audit",
+            "type": "detective+compensating",
+            "purpose": "Resolve circular dependency in bootstrap verification recovery",
+            "resolves_finding": "SA1-M1-F001",
+            "capabilities": [
+              "Bootstrap-safe-mode MUST support emergency override audit emission",
+              "Degraded audit-only operations (no admission/compilation)",
+              "Direct write to external audit sink bypassing kernel event bus"
+            ],
+            "implementation_note": "Emergency override in bootstrap-safe-mode emits audit directly via standalone audit client, not through full kernel event system."
+          },
+          {
+            "details": "Ultimate fallback when all recovery paths exhausted. Activation: TIER_3 board escalation exceeds 48 hours without resolution OR all recovery paths exhausted. System enters READ_ONLY_ARCHIVE mode. All state exported to content-addressed cold storage. External audit receives cryptographic proof-of-state snapshot. No state mutations permitted. No new event emissions. Recovery: Human operator initiates offline manual recovery. Expected latency: >72 hours. Requires cold-start rebuild from last known-good checkpoint. SLA ceiling: If bootstrap recovery exceeds 72 hours, system considered permanently compromised. TIER_4 activation is CRITICAL severity incident. Board must authorize cold-start rebuild. Post-mortem required before system restoration.",
+            "id": "SEC-CTRL-0013",
+            "name": "TIER_4 Dead Man's Switch - Ultimate Fallback",
+            "type": "corrective+detective",
+            "purpose": "Prevent permanent deadlock when all automated recovery tiers fail",
+            "resolves_finding": "SA3-M39-F001",
+            "activation_conditions": [
+              "TIER_3 board escalation exceeds 48 hours without resolution",
+              "All recovery paths exhausted"
+            ],
+            "capabilities": [
+              "System enters READ_ONLY_ARCHIVE mode",
+              "All state exported to content-addressed cold storage",
+              "External audit receives cryptographic proof-of-state snapshot"
+            ],
+            "restrictions": [
+              "No state mutations permitted",
+              "No new event emissions"
+            ],
+            "recovery_path": {
+              "process": "Human operator initiates offline manual recovery",
+              "expected_latency": ">72 hours",
+              "requirements": "Requires cold-start rebuild from last known-good checkpoint",
+              "sla_ceiling": "If bootstrap recovery exceeds 72 hours, system considered permanently compromised"
+            },
+            "audit_requirements": [
+              "TIER_4 activation is CRITICAL severity incident",
+              "Board must authorize cold-start rebuild",
+              "Post-mortem required before system restoration"
+            ]
+          }
+        ],
+        "cryptography_plan": {
+          "current": {
+            "artifact_hashing": "BLAKE3-256",
+            "ledger_signatures": "Ed25519 (per kernel_events.proto comment)"
+          },
+          "future": {
+            "note": "This PRD requires agility and versioning; it does not mandate immediate PQ deployment.",
+            "pq_readiness": [
+              "Introduce algorithm agility fields in receipts/manifests (signature_algorithm_id).",
+              "Support hybrid signatures for critical artifacts/events when PQ algorithms are adopted."
+            ]
+          }
+        },
+        "security_properties": [
+          {
+            "id": "SEC-PROP-0001",
+            "name": "Fail-closed admission",
+            "statement": "Artifacts cannot enter DCP or influence execution unless validated and canonicalized."
+          },
+          {
+            "id": "SEC-PROP-0002",
+            "name": "Replay protection",
+            "statement": "All patch admissions require expected_base_hash matching current state."
+          },
+          {
+            "id": "SEC-PROP-0003",
+            "name": "Least privilege consumption",
+            "statement": "Consumption holons have deterministic reads only; no open-ended browsing."
+          },
+          {
+            "id": "SEC-PROP-0004",
+            "name": "End-to-end provenance",
+            "statement": "All state transitions are recorded as signed events referencing immutable hashes."
+          },
+          {
+            "id": "SEC-PROP-0005",
+            "name": "Algorithm agility",
+            "statement": "Cryptographic mechanisms and canonicalization engines are versioned and upgradable. Hash algorithms MUST provide ≥256-bit collision resistance or use hybrid classical+quantum-resistant scheme.",
+            "evidence_ids": [
+              "EVID-0001"
+            ],
+            "upgrade_policy": {
+              "description": "Hash algorithm upgrade when collision resistance degrades",
+              "trigger": "Bootstrap schema bundle upgrade MUST mandate hash algorithm upgrade when collision resistance degrades below 256-bit security level.",
+              "monitoring": [
+                "Track NIST cryptographic security deprecation timelines",
+                "Emit warning when hash algorithm within 5 years of deprecation",
+                "Emit CRITICAL alert when hash algorithm deprecated"
+              ],
+              "upgrade_procedure": [
+                "New bootstrap schema bundle with upgraded hash algorithm",
+                "Binary release required (not runtime patch per CNS-0006)",
+                "Ledger migration to re-hash all artifacts with new algorithm"
+              ],
+              "rationale": "BLAKE3-256 currently provides 128-bit collision resistance (birthday bound). While adequate for short-term (5-10 years), long-term operation requires explicit commitment to upgrade before collision attacks become feasible."
+            }
+          }
+        ],
+        "threat_model": {
+          "assets_to_protect": [
+            "Integrity of control artifacts (policies, packs, capabilities).",
+            "Integrity of ledger event chain and signatures.",
+            "Confidentiality of sensitive context and secrets.",
+            "Availability of admission/validation pipeline (DoS resistance)."
+          ],
+          "assumption": "Adversary includes state actors with advanced capabilities, including discovery and exploitation of novel zero-days and future quantum threats.",
+          "attack_surfaces": [
+            "Parser and canonicalizer bugs (ambiguity, crashes, differential parsing).",
+            "Schema bypass via unknown fields or permissive validators.",
+            "Replay attacks against patch admission or work transitions.",
+            "Supply-chain injection via vendor ABI outputs or imports.",
+            "Privilege escalation through tool calls and filesystem reads.",
+            "Resource exhaustion via deeply nested JSON, huge arrays, or pathological schemas."
+          ]
+        },
+        "emergency_override": {
+          "description": "Last-resort override for deadlock scenarios with cryptographic binding and accountability",
+          "activation": "apm2 --emergency-override --signoff-1 <hash> --signoff-2 <hash> --signoff-3 <hash>",
+          "requirements": [
+            "Triple-signoff from AUTH_SECURITY, AUTH_OPS, and AUTH_ENGINEERING",
+            "Signoff hashes generated via offline signing ceremony",
+            "Audit event emitted with full context",
+            "Time-bounded (expires after 1 hour)",
+            "24-hour cooldown period between emergency overrides"
+          ],
+          "ceremony_procedure": {
+            "ceremony_window": "15 minutes",
+            "description": "All three signatories must complete signoffs within a shared ceremony window",
+            "shared_nonce": "All signatories MUST sign the same nonce to bind the ceremony",
+            "ceremony_timeout": "If all 3 signatories do not complete within 15-minute window, ceremony is invalid and must restart",
+            "ceremony_binding": [
+              "Ceremony begins when first signatory generates ceremony_start_timestamp and ceremony_nonce",
+              "All subsequent signatories MUST reference the same ceremony_start_timestamp and ceremony_nonce",
+              "Ceremony expires if third signatory does not complete within 15 minutes of ceremony_start_timestamp"
+            ]
+          },
+          "post_override_obligations": {
+            "description": "Mandatory actions after emergency override execution",
+            "purpose": "Ensure emergency override is not just permission but triggers accountability",
+            "immediate_obligations": [
+              {
+                "obligation_id": "OBL-OVERRIDE-001",
+                "responsible_role": "AUTH_SECURITY",
+                "action": "Initiate incident investigation",
+                "deadline": "Within 4 hours of override execution",
+                "deliverable": "Incident investigation ticket created with override context"
+              },
+              {
+                "obligation_id": "OBL-OVERRIDE-002",
+                "responsible_role": "All three signatory authorities",
+                "action": "Initial incident report",
+                "deadline": "Within 24 hours of override execution",
+                "deliverable": "Incident report including:\n- Root cause of bootstrap failure requiring override\n- Why normal recovery paths were insufficient\n- Immediate remediation actions taken\n- Risk assessment of override usage"
+              }
+            ],
+            "investigation_obligations": [
+              {
+                "obligation_id": "OBL-OVERRIDE-003",
+                "responsible_role": "AUTH_SECURITY",
+                "action": "Complete incident investigation",
+                "deadline": "Within 72 hours of override execution",
+                "deliverable": "Detailed incident report including:\n- Timeline of events leading to override\n- Analysis of why override was necessary\n- Identification of process/system gaps that necessitated override\n- Recommended corrective measures"
+              }
+            ],
+            "governance_obligations": [
+              {
+                "obligation_id": "OBL-OVERRIDE-004",
+                "responsible_role": "DOMAIN_GOVERNANCE",
+                "action": "Review incident report and determine corrective actions",
+                "deadline": "Within 7 days of override execution",
+                "deliverable": "Governance decision including:\n- Policy updates required (if any)\n- Process changes required (if any)\n- Additional safeguards required (if any)\n- Assignment of corrective action ownership"
+              }
+            ],
+            "recurrence_obligations": [
+              {
+                "obligation_id": "OBL-OVERRIDE-005",
+                "responsible_role": "DOMAIN_GOVERNANCE + Board",
+                "action": "Board briefing on override recurrence",
+                "trigger": "Emergency override used ≥2 times within 90 days",
+                "deadline": "Within 14 days of second override",
+                "deliverable": "Board briefing including:\n- Pattern analysis of override usage\n- Systemic issues requiring board-level intervention\n- Risk assessment of override as primary recovery mechanism"
+              }
+            ],
+            "prohibition": [
+              {
+                "prohibition_id": "PROH-OVERRIDE-001",
+                "statement": "Emergency override CANNOT be used for the same root cause twice without board approval. Second override for same root cause requires board sign-off demonstrating corrective actions from first override were insufficient or incident circumstances changed."
+              }
+            ],
+            "enforcement": {
+              "incomplete_investigation_consequence": "If OBL-OVERRIDE-001 through OBL-OVERRIDE-004 are not completed within deadlines, system emits MAJOR defect assigned to responsible_role.",
+              "recurrence_without_remediation_consequence": "If override is used twice for same root cause without board approval, system emits CRITICAL defect and triggers automatic board escalation."
+            }
+          }
+        }
+      },
+      "section_id": "SECURITY",
+      "title": "Security"
+    }
+  ],
+  "volume": {
+    "generated_at": "2026-01-26",
+    "source_prd_id": "APM2-PRD-CAC-0001",
+    "title": "Security and Integrity",
+    "volume_id": "V05"
+  }
+}

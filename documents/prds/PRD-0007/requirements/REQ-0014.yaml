@@ -1,0 +1,30 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0014"
+  type: "FUNCTIONAL"
+  title: "AAT/selftest gating"
+  statement: |
+    The system MUST generate CapabilityManifest from the apm2 binary (not handwritten).
+    Selftests MUST be hermetic and bounded (time/tool/token budgets). AATReceipt MUST
+    be required for critical cutovers and agent planning gates.
+  acceptance_criteria:
+    - id: AC-0014-01
+      description: CapabilityManifest is generated from binary.
+      verification_method: apm2 capabilities --json produces manifest matching actual behavior.
+    - id: AC-0014-02
+      description: Selftests are hermetic and bounded.
+      verification_method: AAT suites complete within max_duration_ms budget.
+    - id: AC-0014-03
+      description: AATReceipt gates critical cutovers.
+      verification_method: Cutover fails without recent passing AATReceipt.
+    - id: AC-0014-04
+      description: AATReceipt gates agent planning.
+      verification_method: Agent verifies receipt hash in CapabilityManifest before planning.
+  source_pipeline_stage: CAC-STAGE-07
+  evidence:
+    evidence_ids:
+      - EVID-0007
+    inherited_from_prd: false
+    notes:
+      - Derived from pipeline stage CAC-STAGE-07 in source PRD.

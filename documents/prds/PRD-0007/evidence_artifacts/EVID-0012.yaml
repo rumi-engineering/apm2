@@ -1,0 +1,33 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0012"
+  category: "TEST_RESULTS"
+  title: "Typed quantity validation tests"
+  description: |
+    Tests verifying typed quantity handling: unknown units are rejected,
+    scaled integer quantities round-trip deterministically.
+  source_acceptance_test: CAC-AT-0012
+  capture:
+    paths:
+      - "test/cac/quantities/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --package apm2-cac -- quantities::validation"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 60
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Quantity schema with unit enum available"
+  assertions:
+    - "Typed quantities reject unknown units"
+    - "Scaled integer quantities round-trip deterministically"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

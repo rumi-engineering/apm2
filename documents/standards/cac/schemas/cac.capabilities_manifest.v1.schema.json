@@ -1,0 +1,105 @@
+{
+  "$id": "cac.capabilities_manifest.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "capabilities.manifest"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "apm2_version": {
+              "type": "string"
+            },
+            "build_id": {
+              "type": "string"
+            },
+            "command_inventory": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "args": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "argv0": {
+                    "type": "string"
+                  },
+                  "command": {
+                    "type": "string"
+                  },
+                  "exit_codes": {
+                    "items": {
+                      "type": "integer"
+                    },
+                    "type": "array"
+                  },
+                  "inputs": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "outputs": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "command",
+                  "argv0",
+                  "outputs"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "schemas_supported": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "selftest_receipt_hash": {
+              "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+            },
+            "selftest_receipt_stable_id": {
+              "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+            },
+            "tool_protocol_version": {
+              "type": "string"
+            },
+            "target_profiles_supported": {
+              "items": {
+                "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "apm2_version",
+            "tool_protocol_version",
+            "command_inventory",
+            "schemas_supported",
+            "target_profiles_supported"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.capabilities_manifest.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC CapabilityManifest v1"
+}

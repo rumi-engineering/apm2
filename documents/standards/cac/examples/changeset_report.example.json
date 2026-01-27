@@ -1,0 +1,40 @@
+{
+  "kind": "changeset.report",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-01-26T00:00:02Z",
+    "dependencies": [],
+    "labels": [
+      "changeset",
+      "delta"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-KERNEL-GATE",
+      "work_id": "work_example_changeset"
+    },
+    "stable_id": "dcp://apm2.local/changesets/skills_code_review@2026-01-26T00:00:02Z"
+  },
+  "payload": {
+    "change_id": "changeset_0001",
+    "base_hash": "b3-256:a65b3b76c8238ad81db3926da6ce92590c0669fea1c4fa8bedc7b21d3534646f",
+    "new_hash": "b3-256:8f9969d8f0fa47a9f099447166718be0ade9d9e592457179b9e4e4589d05e906",
+    "patch_record_hash": "b3-256:2c6987f4276b4874f2dd7a24ecbc117720d76b27967614497886e5422ea9de70",
+    "summary": {
+      "added": [
+        "/payload/instructions/2"
+      ],
+      "removed": [],
+      "modified": [
+        "/payload/constraints/0"
+      ]
+    },
+    "compatibility_notes": [
+      "No breaking changes to skill intent; adds a new instruction." 
+    ],
+    "affected_packs": [
+      "dcp://apm2.local/packs/inner_loop_review@v1"
+    ]
+  },
+  "schema": "cac.changeset_report.v1",
+  "schema_version": "1.0.0"
+}

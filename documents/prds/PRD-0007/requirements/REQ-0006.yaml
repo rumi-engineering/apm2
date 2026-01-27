@@ -1,0 +1,27 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0006"
+  type: "FUNCTIONAL"
+  title: "Messaging-native control plane compatibility"
+  statement: |
+    CAC actions (admission, compilation, export, selftest) MUST be reflected in kernel
+    messages (ledger events) with hash references. Holons MUST be able to negotiate
+    capabilities and retrieve required context via stable IDs referenced in messages.
+  acceptance_criteria:
+    - id: AC-0006-01
+      description: CAC actions emit kernel messages with hash references.
+      verification_method: EvidencePublished events include dcp_id, artifact_kind, schema_id metadata.
+    - id: AC-0006-02
+      description: Holons can negotiate capabilities via stable IDs.
+      verification_method: Agent obtains CapabilityManifest by stable_id and verifies AATReceipt.
+    - id: AC-0006-03
+      description: Context retrieval uses stable IDs from messages.
+      verification_method: ArtifactFetch accepts stable_id from message metadata.
+  source_goal_id: CAC-G-0006
+  evidence:
+    evidence_ids:
+      - EVID-0007
+    inherited_from_prd: false
+    notes:
+      - Maps to engineering goal CAC-G-0006 from source PRD.

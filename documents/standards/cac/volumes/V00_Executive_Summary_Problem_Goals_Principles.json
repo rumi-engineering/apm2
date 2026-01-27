@@ -1,0 +1,337 @@
+{
+  "schema": "apm2.prd.volume.v1",
+  "schema_version": "1.0.0",
+  "sections": [
+    {
+      "content": {
+        "classification": {
+          "default_data_classification": "INTERNAL",
+          "notes": [
+            "Normative control artifacts can affect safety and correctness; treat as high-impact.",
+            "All artifacts require provenance and admission gating."
+          ],
+          "security_critical": true
+        },
+        "doc": {
+          "audience": [
+            "kernel",
+            "compiler",
+            "policy",
+            "tooling",
+            "agent-runtime",
+            "security"
+          ],
+          "created_at": "2026-01-26",
+          "id": "APM2-PRD-CAC-0001",
+          "last_updated_at": "2026-01-26",
+          "owners": [
+            {
+              "holon_id": "HOLON-KERNEL-GOVERNANCE",
+              "role": "schema+policy authority"
+            },
+            {
+              "holon_id": "HOLON-CONTEXT-COMPILER",
+              "role": "context compilation + export"
+            },
+            {
+              "holon_id": "HOLON-AAT",
+              "role": "acceptance testing + receipts"
+            }
+          ],
+          "priority": "P0",
+          "scope_tags": [
+            "context-as-code",
+            "canonical-json",
+            "patch-first",
+            "dcp",
+            "vendor-abi",
+            "messaging-native"
+          ],
+          "status": "draft",
+          "title": "Context-as-Code (CAC) v1: Canonical Context Pipeline for the APM2 Holonic Kernel"
+        },
+        "schema": "apm2.prd.cac.v1",
+        "schema_version": "1.0.0"
+      },
+      "section_id": "DOC",
+      "title": "Document Metadata"
+    },
+    {
+      "content": {
+        "context": [
+          "APM2 already has a signed, hash-chained ledger and a content-addressed store (CAS).",
+          "Today, the system still relies on implicit or prose-driven contracts (README/Markdown/scripts) and unverified assumptions about CLI functionality.",
+          "This creates unplanned context discovery, brittle agent behavior, and a slow innermost loop (code+review)."
+        ],
+        "one_line": "Make context the authoritative program: a content-addressed context graph compiled through target profiles into deterministic packs and delivery payloads, with full provenance recorded as kernel messages.",
+        "thesis": {
+          "implications": [
+            "If context is complete and correct, code can be generated deterministically (or within controlled nondeterminism).",
+            "Therefore, the highest-leverage engineering work is to make context machine-native, canonical, and enforceable.",
+            "All boundary crossings (agent\u2194kernel, kernel\u2194runtime targets) must be mediated by schemas and evidence.",
+            "Model capability is treated as a compile-time TargetProfile contract, not a runtime assumption."
+          ],
+          "statement": "In an agent-native factory, code is a compiled artifact; context is the source program."
+        }
+      },
+      "section_id": "SUMMARY",
+      "title": "Summary"
+    },
+    {
+      "content": {
+        "observed_failure_modes": [
+          {
+            "id": "CAC-FM-0001",
+            "impact": [
+              "agents mis-plan",
+              "reviewers miss implicit assumptions",
+              "system behavior diverges from declared behavior"
+            ],
+            "mechanism": "Normative requirements appear in Markdown/scripts without schema validation or canonicalization.",
+            "name": "Contract drift encoded in prose"
+          },
+          {
+            "id": "CAC-FM-0002",
+            "impact": [
+              "agents freeze mid-flight",
+              "manual debugging",
+              "slow iteration",
+              "loss of trust in automation"
+            ],
+            "mechanism": "CLI claims features via docs or flags but behavior is untested or partial.",
+            "name": "Capability ambiguity in the CLI"
+          },
+          {
+            "id": "CAC-FM-0003",
+            "impact": [
+              "non-determinism",
+              "leaky policies",
+              "hidden dependencies",
+              "repeat incidents"
+            ],
+            "mechanism": "Consumption holons perform discretionary reads/browsing because required context was not compiled into a pack.",
+            "name": "Unplanned tool calls during consumption"
+          },
+          {
+            "id": "CAC-FM-0004",
+            "impact": [
+              "irreproducible outputs",
+              "cannot audit",
+              "cannot improve pack compiler"
+            ],
+            "mechanism": "Context production uses tools without explicit leases/budgets and without publishing evidence snapshots.",
+            "name": "Non-replayable research behavior"
+          },
+          {
+            "id": "CAC-FM-0005",
+            "impact": [
+              "drift",
+              "unclear provenance",
+              "unsafe edits to generated artifacts"
+            ],
+            "mechanism": "External systems require Markdown + directory layouts; without a compiler, teams treat these outputs as source of truth.",
+            "name": "Vendor ABI requirements dominate internal design"
+          }
+        ],
+        "primary_bottleneck": {
+          "definition": "The cycle time and defect rate of the tight loop: change intent \u2192 code generation \u2192 review \u2192 merge \u2192 verification.",
+          "name": "Innermost loop throughput",
+          "why_context_blocks_it": [
+            "Agents spend time searching or asking for context that should have been pre-packaged.",
+            "Reviewers catch important bugs, but root cause is often missing or inconsistent context rather than coding mistakes.",
+            "CLI/xtask mismatch causes brittle workflows and manual intervention."
+          ]
+        },
+        "root_causes": [
+          "No normative representation for context (schema-validated, canonical, versioned).",
+          "No patch-first authoring pipeline with replay protection and evidence receipts.",
+          "No stable-ID deterministic read plane for consumption holons.",
+          "No capability truthing/selftest receipts gating agent plans.",
+          "No principled compiler boundary between internal context IR and vendor-required ABIs."
+        ],
+        "statement": "The system lacks a single, canonical, machine-validated source of truth for the context that governs planning, execution, review, and operation. This forces discretionary context discovery, increases drift, and blocks safe cutover to the APM2 CLI as the holonic control surface."
+      },
+      "section_id": "PROBLEM",
+      "title": "Problem"
+    },
+    {
+      "content": {
+        "engineering_goals": [
+          {
+            "id": "CAC-G-0001",
+            "name": "Canonical context substrate (CAC-JSON)",
+            "success_criteria": [
+              "All normative control artifacts are stored as CAC-JSON and canonicalized to stable bytes prior to admission.",
+              "Artifacts validate against versioned schemas with fail-closed behavior (unknown fields rejected).",
+              "Artifacts are addressable by stable IDs and immutable content hashes (CAS)."
+            ]
+          },
+          {
+            "id": "CAC-G-0002",
+            "name": "Patch-first machine authoring",
+            "success_criteria": [
+              "Machines produce patch streams (JSON Patch / Merge Patch) rather than whole-document rewrites.",
+              "Admission enforces replay protection via expected base hash.",
+              "Every accepted patch produces an admission receipt (evidence) and emits ledger provenance."
+            ]
+          },
+          {
+            "id": "CAC-G-0003",
+            "name": "Hermetic consumption with deterministic reads",
+            "success_criteria": [
+              "Consumption holons can complete tasks using only preauthorized stable-ID fetches plus actuation tools.",
+              "Discretionary context discovery during consumption is denied and/or defect-emitting by policy.",
+              "ContextPack manifests include transitive dependency closure (deep pinning).",
+              "Run receipts capture context_pack_miss and context_pack_sufficiency; misses gate consumption unless explicitly escalated."
+            ]
+          },
+          {
+            "id": "CAC-G-0004",
+            "name": "Bounded context production with replayable evidence",
+            "success_criteria": [
+              "Production holons operate under explicit leases/budgets and publish replayable evidence (snapshots, extraction logs, diffs).",
+              "Tool calls are classified as planned/unplanned and feed defect signals into pack compiler improvement.",
+              "Admissions include a ChangeSet report to summarize semantic deltas and enable compaction."
+            ]
+          },
+          {
+            "id": "CAC-G-0005",
+            "name": "Target interoperability without drift",
+            "success_criteria": [
+              "Target profiles define rendering, retrieval, and delivery constraints independent of model intelligence.",
+              "Target payloads (vendor layouts, model IRs) are compiled deterministically from CAC sources and never treated as normative.",
+              "Export manifests provide provenance and are verified by conformance tests."
+            ]
+          },
+          {
+            "id": "CAC-G-0006",
+            "name": "Messaging-native control plane compatibility",
+            "success_criteria": [
+              "CAC actions (admission, compilation, export, selftest) are reflected in kernel messages (ledger events) with hash references.",
+              "Holons can negotiate capabilities and retrieve required context via stable IDs referenced in messages."
+            ]
+          },
+          {
+            "id": "CAC-G-0007",
+            "name": "Measurable throughput and quality gains",
+            "success_criteria": [
+              "Unplanned tool calls in consumption mode trend toward zero.",
+              "PR cycle time and defect recurrence improve after adoption.",
+              "AAT receipts gate critical operations with high pass rates."
+            ]
+          },
+          {
+            "id": "CAC-G-0008",
+            "name": "Typed quantities and context budgets",
+            "success_criteria": [
+              "Budgets, timeouts, costs, and probabilities are expressed as typed quantities with explicit units.",
+              "ContextPack compilation and validation reject packs exceeding token/artifact/byte budgets."
+            ]
+          },
+          {
+            "id": "CAC-G-0009",
+            "name": "Canonicalizer governance",
+            "success_criteria": [
+              "Canonicalizer id/version are recorded in envelopes and receipts for all normative artifacts.",
+              "Canonicalization test vectors are governed artifacts pinned in the bootstrap bundle."
+            ]
+          }
+        ],
+        "non_goals": [
+          {
+            "id": "CAC-NG-0001",
+            "statement": "Humans authoring normative context artifacts."
+          },
+          {
+            "id": "CAC-NG-0002",
+            "statement": "Using token-optimized formats (e.g., TOON) as normative storage."
+          },
+          {
+            "id": "CAC-NG-0003",
+            "statement": "Replacing all existing kernel Protobuf schemas in this phase."
+          },
+          {
+            "id": "CAC-NG-0004",
+            "statement": "Building a universal cross-vendor standard; we compile to target profiles and delivery payloads instead."
+          }
+        ]
+      },
+      "section_id": "GOALS",
+      "title": "Goals and Non-Goals"
+    },
+    {
+      "content": [
+        {
+          "corollaries": [
+            "A missing context input is a compiler failure, not an execution-time discovery obligation.",
+            "Optimizing the innermost loop is primarily optimizing context completeness and correctness."
+          ],
+          "id": "CAC-P-PRIN-0001",
+          "name": "Context is the program",
+          "statement": "Normative context artifacts are the source program; code and other outputs are compiled artifacts."
+        },
+        {
+          "id": "CAC-P-PRIN-0002",
+          "name": "Machine-native, canonical, validated",
+          "statement": "Every normative artifact is machine-readable, schema-validated, and canonicalized to stable bytes before it can influence behavior."
+        },
+        {
+          "id": "CAC-P-PRIN-0003",
+          "name": "Patch-first authoring",
+          "statement": "Machines author changes as small, typed, replay-protected patches; whole-document rewrites are an anti-pattern."
+        },
+        {
+          "id": "CAC-P-PRIN-0004",
+          "name": "Hermetic consumption, bounded production",
+          "statement": "ZTI applies to context consumption: no discretionary context discovery; production may use tools under explicit leases/budgets with replayable evidence."
+        },
+        {
+          "id": "CAC-P-PRIN-0005",
+          "name": "Evidence is mandatory",
+          "statement": "Every admission, compilation, export, and gate decision produces evidence stored in CAS and referenced by signed ledger events."
+        },
+        {
+          "corollaries": [
+            "No direct edits to generated ABI trees in mainline.",
+            "Delivery conformance is tested and versioned via target profiles."
+          ],
+          "id": "CAC-P-PRIN-0006",
+          "name": "Target profiles are the ABI contract",
+          "statement": "Rendering, retrieval, and delivery are governed by target profiles; vendor or model-specific payloads are deterministic projections, never normative sources."
+        },
+        {
+          "id": "CAC-P-PRIN-0007",
+          "name": "Fail-closed, least privilege, algorithm agility",
+          "statement": "Parsing, validation, and policy checks fail closed; privileges are explicit; cryptography and serialization choices remain agile under an adversarial threat model."
+        },
+        {
+          "id": "CAC-P-PRIN-0008",
+          "name": "Message-level provenance and replay",
+          "statement": "All state transitions are represented as signed kernel messages referencing immutable hashes; projections are derived, reconstructable, and auditable."
+        },
+        {
+          "corollaries": [
+            "All transitive dependencies are resolved and pinned before consumption.",
+            "ContextPack manifests are closure views over the context graph."
+          ],
+          "id": "CAC-P-PRIN-0009",
+          "name": "Context graph closure",
+          "statement": "Dependencies are explicit and closed; hermetic consumption operates on deep-pinned graph closures, not open-ended discovery."
+        },
+        {
+          "id": "CAC-P-PRIN-0010",
+          "name": "Typed, bounded quantities",
+          "statement": "Budgets, timeouts, costs, and probabilities use typed quantities with explicit units and enforced bounds to ensure deterministic cross-language behavior."
+        }
+      ],
+      "section_id": "PRINCIPLES",
+      "title": "Principles"
+    }
+  ],
+  "volume": {
+    "generated_at": "2026-01-26",
+    "source_prd_id": "APM2-PRD-CAC-0001",
+    "title": "Executive Summary, Problem, Goals, Principles",
+    "volume_id": "V00"
+  }
+}

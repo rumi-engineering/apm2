@@ -13,6 +13,8 @@ Second-order reasoning that selects, monitors, and adjusts first-order reasoning
 
 Meta-reasoning is the "operating system" for all other reasoning modes. Every problem requires at least an implicit meta-reasoning step ("how should I think about this?")—making it explicit improves consistency and reduces mode mismatch.
 
+**Core principle:** The fastest path to a good answer is often choosing the right reasoning mode upfront. A mismatched mode wastes effort (optimizing when you should satisfice) or produces wrong-shaped outputs (generating hypotheses when you need proofs). Meta-reasoning is cheap (~2 minutes); mode-mismatch recovery is expensive.
+
 ## What it outputs
 
 | Artifact | Description | Produced by step |
@@ -23,6 +25,29 @@ Meta-reasoning is the "operating system" for all other reasoning modes. Every pr
 | **Stopping rule** | Specific condition that triggers "enough analysis" (e.g., confidence >=80%, 3 alternatives evaluated) | Step 3 |
 | **Progress checkpoints** | Scheduled moments to assess "is this approach working?" | Step 4 |
 | **Mode-switch trigger** | What signals would cause abandoning current approach for another | Step 5 |
+| **Retrospective note** | 1-sentence record of whether mode selection worked for future reference | Step 6 |
+
+### Artifact templates
+
+**Problem characterization (Step 1):**
+```
+Problem: [1-sentence description]
+Type: [belief | action | both]
+Environment: [cooperative | adversarial | mixed]
+Need: [certainty/assurance | exploration/learning | explanation/diagnosis | choice/tradeoffs]
+Time pressure: [high (<1h) | medium (hours-days) | low (weeks+)]
+Stakes: [low (easily reversible) | medium | high (costly to reverse)]
+```
+
+**Mode selection card (Step 2-5):**
+```
+Primary mode: [mode name] because [1-sentence fit rationale]
+Backup mode: [mode name] if [trigger condition]
+Time budget: [X minutes/hours], meta-reasoning used [Y minutes]
+Stopping rule: [specific condition]
+Checkpoints: [schedule, e.g., "15m, 30m, 45m"]
+Switch trigger: [specific signal → specific action]
+```
 
 ## Procedure (decision steps)
 
@@ -73,6 +98,38 @@ Meta-reasoning is the "operating system" for all other reasoning modes. Every pr
 | Ambiguity about problem framing | Sensemaking, dialectical | Jumping to analysis before framing |
 | Multiple stakeholders with conflicts | Argumentation, negotiation, rhetoric | Single-agent decision theory |
 | Safety-critical system | Assurance-case, robust, red-team | Heuristics, informal reasoning |
+| Don't know what I don't know | Reference-class + VoI reasoning | Overconfident single-mode commitment |
+
+## Stuck Diagnostic (when no mode obviously fits)
+
+If you've spent >3 minutes on mode selection without converging, work through this decision tree:
+
+```
+Can you state the problem in one sentence?
+  │
+  ├─ NO → Use SENSEMAKING first. You're not ready for mode selection.
+  │        Ask: "What's actually going on here?" until you can state it.
+  │
+  └─ YES → Is the problem about WHAT'S TRUE or WHAT TO DO?
+            │
+            ├─ WHAT'S TRUE (belief) →
+            │    │
+            │    ├─ Do you have data/evidence? → Statistical / Bayesian
+            │    ├─ Do you need to explain something? → Abductive / Causal
+            │    └─ Do you need certainty/proof? → Deductive / Assurance-case
+            │
+            └─ WHAT TO DO (action) →
+                 │
+                 ├─ Are others responding strategically? → Game theory / Negotiation
+                 ├─ Are tradeoffs explicit? → Decision theory / MCDA
+                 ├─ Is time pressure high? → Satisficing / Heuristics
+                 └─ Is failure catastrophic? → Robust / Worst-case / Red-team
+```
+
+**If still stuck after the tree:**
+1. Ask: "What would a competent practitioner in this domain do by default?" Use that.
+2. If no domain default: Start with **reference-class forecasting** (ground in base rates) + **satisficing** (make a "good enough" call). This combination works for most problems and rarely catastrophically fails.
+3. Document your uncertainty: "I'm not confident in mode selection; using [X] as default with [Y] as backup if [trigger]."
 
 ## Quick checklist
 
@@ -83,6 +140,53 @@ Meta-reasoning is the "operating system" for all other reasoning modes. Every pr
 - [ ] Mode-switch trigger defined
 - [ ] Checkpoint schedule established
 - [ ] Retrospective note planned
+
+## Protocol Selection Flowchart
+
+```
+Is this a familiar problem type you've solved before?
+  │
+  ├─ YES → Use domain default (see Domain Defaults below)
+  │         • Skip explicit mode selection
+  │         • 30-second "does this still fit?" check
+  │         • No formal artifacts needed
+  │
+  └─ NO → Are the stakes high (costly if wrong, hard to reverse)?
+           │
+           ├─ NO → Abbreviated protocol (2 min)
+           │        • 1-sentence problem characterization
+           │        • 1 primary mode + 1 backup
+           │        • Implicit stopping rule
+           │        • No written artifacts
+           │
+           └─ YES → Full protocol (5-10 min)
+                    • Written problem characterization (use template)
+                    • 2-3 candidate modes with fit rationale
+                    • Explicit time budget and stopping rule
+                    • Mode-switch trigger documented
+                    • Checkpoint schedule for long analyses
+```
+
+**Rule of thumb:** Meta-reasoning should consume <5% of your total analysis budget. If you have 1 hour for a decision, meta-reasoning gets 3 minutes.
+
+## Domain Defaults Reference Card
+
+For familiar problem types, skip mode selection and use these defaults:
+
+| Domain | Default mode ladder | Switch to... if... |
+|--------|--------------------|--------------------|
+| **Debugging / incident response** | Diagnostic → Mechanistic → Abductive | Causal if root-cause not in code |
+| **Estimation / forecasting** | Reference-class → Fermi → Bayesian | Robust/worst-case if downside matters more |
+| **Code review / verification** | Deductive → Constraint → Counterexample | Heuristic if time-boxed |
+| **Architecture decisions** | Decision-theoretic → Satisficing → MCDA | Game-theoretic if multiple stakeholders |
+| **Hiring / evaluation** | Reference-class → Calibration → Debiasing | Satisficing under time pressure |
+| **Incident postmortem** | Counterfactual → Causal → Mechanistic | Debiasing to check hindsight bias |
+| **Strategic planning** | Scenario/simulation → Robust → Game-theoretic | Sensemaking if environment ambiguous |
+| **Safety analysis** | Assurance-case → Red-team → Robust | Mechanistic for specific failure modes |
+| **Research / exploration** | Abductive → Statistical → Bayesian | Sensemaking if problem unclear |
+| **Negotiation / conflict** | Game-theoretic → Negotiation → Argumentation | Theory-of-mind if motives unclear |
+
+**Using the ladder:** Start with the first mode. If it's not producing useful output after 1-2 checkpoints, move to the next. The ladder is a sensible default, not a mandate.
 
 ## Micro-example
 
@@ -111,12 +215,22 @@ Meta-reasoning is the "operating system" for all other reasoning modes. Every pr
 **Common confusions:**
 
 1. *Meta-reasoning vs. overthinking:* Meta-reasoning is brief and bounded—a 2-minute mode selection, not a 2-hour philosophy seminar. If meta-reasoning takes longer than 10% of your analysis budget, you're doing it wrong.
+   - **Boundary test:** Did mode selection take <5% of total analysis time? If yes, meta-reasoning. If no, overthinking.
 
 2. *Meta-reasoning vs. debiasing:* Meta-reasoning asks "which tool?" Debiasing asks "is this tool's output trustworthy?" Use meta-reasoning first to choose the mode, then apply debiasing to check its output.
+   - **Boundary test:** Meta-reasoning: "Should I use abduction or causal inference here?" Debiasing: "Did I anchor my hypothesis on the first idea I heard?"
 
 3. *Meta-reasoning vs. planning:* Planning reasoning constructs a sequence of actions toward a goal. Meta-reasoning constructs a sequence of reasoning *steps*—it's planning for thinking, not planning for doing.
+   - **Boundary test:** Planning: "What actions achieve my goal?" Meta-reasoning: "What reasoning modes should I apply to decide what actions to take?"
 
 4. *Meta-reasoning vs. sensemaking:* Sensemaking figures out what the situation is. Meta-reasoning figures out how to think about it. If you don't know what's going on, start with sensemaking. If you know what's going on but don't know how to analyze it, use meta-reasoning.
+   - **Boundary test:** Sensemaking: "What's happening here?" Meta-reasoning: "Now that I know what's happening, how should I analyze it?"
+
+5. *Meta-reasoning vs. calibration:* Calibration tracks your accuracy over many past judgments. Meta-reasoning selects a reasoning mode for the current problem. Calibration is retrospective ("how good am I at this?"); meta-reasoning is prospective ("what should I do now?").
+   - **Boundary test:** Calibration: "My 80%-confidence predictions were right 65% of the time." Meta-reasoning: "For this problem, should I use statistical reasoning or heuristics?"
+
+6. *Meta-reasoning vs. reflective equilibrium:* Reflective equilibrium adjusts beliefs and principles for coherence across your entire belief system. Meta-reasoning selects a reasoning mode for a specific problem without requiring full belief-system coherence.
+   - **Boundary test:** Reflective equilibrium: "Do my intuitions about this case fit my general principles?" Meta-reasoning: "Which reasoning mode fits this problem type?"
 
 ## Best for
 
@@ -169,6 +283,39 @@ Meta-reasoning is the "operating system" for all other reasoning modes. Every pr
 | **Regress spiral** | "How should I decide how to reason?" | Stop at one level of meta; use default ladder |
 | **Mode rigidity** | Never switching even when mode clearly failing | Pre-define mode-switch triggers |
 | **Implicit meta-reasoning** | Using default mode without considering fit | Spend 2 min on explicit characterization |
+| **Mode tourism** | Trying every mode to "be thorough" | Commit to 1 primary + 1 backup; more modes = more confusion |
+| **Premature switching** | Abandoning mode before giving it a fair trial | Require 2+ checkpoints before switching |
+
+## When meta-reasoning backfires
+
+Meta-reasoning has costs. Watch for these failure patterns:
+
+1. **False precision** — Treating mode selection as an optimization problem when any reasonable mode would work. *Fix:* Most problems have multiple adequate approaches; "good enough" mode selection is usually sufficient.
+
+2. **Mode-switching churn** — Switching modes at every checkpoint, never committing long enough to get results. *Fix:* Require 2 checkpoints showing "no progress" before switching; switching has costs.
+
+3. **Sophistication bias** — Choosing complex modes (Bayesian, game-theoretic) when simple modes (heuristics, reference-class) would suffice. *Fix:* Start with simplest mode that could work; upgrade only if it fails.
+
+4. **Meta-level escape** — Using meta-reasoning to avoid the hard work of object-level reasoning. "I can't solve this problem, but I can discuss which mode to use." *Fix:* Time-box meta-reasoning; force object-level commitment.
+
+5. **Paralysis by framework** — Researching "the best meta-reasoning framework" instead of applying a reasonable one. *Fix:* Use this document as-is; any framework is better than no decision.
+
+**Rule of thumb:** If explicit meta-reasoning doesn't visibly improve your mode choices, skip it. For routine problems in familiar domains, implicit meta-reasoning (domain defaults) is faster and usually correct.
+
+## Mode-switch decision matrix
+
+When to switch vs. persist with your current mode:
+
+| Signal | Persist | Switch | Escalate |
+|--------|---------|--------|----------|
+| Mode producing partial output | ✓ Continue | | |
+| Mode producing no output after 2 checkpoints | | ✓ Backup mode | |
+| Problem characterization was wrong | | | ✓ Restart from Step 1 |
+| New information changes problem type | | | ✓ Re-characterize |
+| Time budget exhausted, stopping rule not met | | ✓ Satisfice with best-so-far | |
+| Mode produces output but it's wrong-shaped | | ✓ Different mode | |
+| You're confused about what mode is doing | | ✓ Simpler mode | |
+| Stakeholders disagree on mode choice | | | ✓ Sensemaking first |
 
 ## Related modes
 

@@ -10,6 +10,8 @@ The key insight: Cognitive biases are *predictable* errors, not random noise. Be
 
 Debiasing applies to outputs from *any* other reasoning mode: before accepting an abductive hypothesis, a Bayesian update, a decision-theoretic recommendation, or a causal inference—run the debiasing checklist.
 
+**Core principle:** Your conclusion is only as trustworthy as your adversarial audit of it. The checklist is not bureaucracy—it's the minimum viable process for catching the errors you're blind to by default.
+
 ## What it outputs
 
 | Artifact | Description | Produced by step |
@@ -84,6 +86,10 @@ Debiasing applies to outputs from *any* other reasoning mode: before accepting a
 | **Groupthink** | Conforming to group consensus without critical evaluation | "Have I heard genuine disagreement, or just alignment?" | Anonymous voting; assign devil's advocate |
 | **Authority bias** | Over-deferring to senior/expert opinion | "Would I accept this reasoning from a junior person?" | Evaluate argument independent of source |
 | **Status quo bias** | Preferring current state over alternatives | "Would I choose this option if starting fresh?" | Frame as active choice, not default |
+| **Narrative fallacy** | Imposing coherent story on random/complex events | "Is this compelling because it's true, or because it's a good story?" | Demand mechanism + data; distrust "just so" explanations |
+| **Conjunction fallacy** | Judging A∧B more likely than A alone (Linda problem) | "Am I adding detail that lowers probability but increases vividness?" | Check: P(A∧B) ≤ P(A); strip away vivid details and re-estimate |
+| **Affect heuristic** | Letting emotional reaction drive probability/utility estimates | "Am I scared of this *because* it's likely, or does it just feel scary?" | Separate probability estimate from consequence evaluation |
+| **Scope insensitivity** | Caring similarly about 10 vs. 10,000 affected | "Would I pay 10× more to help 10× more people?" | Use explicit quantification; convert to per-unit impact |
 
 ## Micro-example
 
@@ -113,22 +119,39 @@ Debiasing applies to outputs from *any* other reasoning mode: before accepting a
 
 **Common confusions:**
 
-1. *Debiasing vs. calibration:* Calibration tracks long-run accuracy; debiasing intervenes on a single decision. You can be well-calibrated on average but still need debiasing on any specific high-stakes call. Think of calibration as your batting average and debiasing as your at-bat checklist.
+1. *Debiasing vs. calibration:* Calibration tracks long-run accuracy; debiasing intervenes on a single decision. You can be well-calibrated on average but still need debiasing on any specific high-stakes call.
+   - **Boundary test:** Calibration answers "Over my last 50 predictions at 80% confidence, how many were correct?" Debiasing answers "For *this* decision, did I anchor on the first estimate I heard?"
 
 2. *Debiasing vs. red-teaming:* Red-teaming asks "how would an attacker break this?" Debiasing asks "how is my own reasoning broken?" Both are adversarial audits, but the threat model differs: external adversary vs. internal cognitive failure.
+   - **Boundary test:** Red-teaming requires simulating an adversary's goals and capabilities. Debiasing requires auditing your own cognition against a known list of biases.
 
 3. *Debiasing vs. critical thinking:* "Critical thinking" is a vague umbrella term. Debiasing is specific: it targets *predictable* cognitive errors with *named* corrective procedures. Saying "think critically" is not debiasing; running the 7-step checklist is.
+   - **Boundary test:** Can you name the specific bias you're checking for? If yes, debiasing. If no, vague "critical thinking."
+
+4. *Debiasing vs. decision-theoretic reasoning:* Decision theory tells you how to choose given probabilities and utilities; debiasing audits whether your probability/utility estimates are trustworthy inputs. Decision theory is the formula; debiasing is the data-quality check.
+   - **Boundary test:** Decision theory asks "Given P(X)=0.7 and U(X)=100, what should I choose?" Debiasing asks "Is 0.7 anchored on a bad first estimate?"
+
+5. *Debiasing vs. scientific reasoning:* Science uses structured methods (experiments, peer review) that include debiasing elements, but debiasing is applicable to any judgment—including non-empirical ones (hiring, strategy, ethics). Science is a domain; debiasing is a meta-process.
+   - **Boundary test:** Scientific reasoning requires hypothesis testing with data. Debiasing applies even when no experiment is possible (one-shot hiring decision).
+
+6. *Debiasing vs. assurance-case reasoning:* Assurance cases construct traceable evidence chains for claims; debiasing audits the *judgment quality* behind those claims. Assurance cases don't automatically check whether the evidence weighting is biased.
+   - **Boundary test:** Assurance-case asks "Is this claim supported by traceable evidence?" Debiasing asks "Did I weight that evidence fairly, or did availability bias inflate recent incidents?"
+
+7. *Debiasing vs. reflective equilibrium:* Reflective equilibrium adjusts beliefs and principles for coherence across your belief system. Debiasing checks individual judgments for cognitive errors without requiring full belief-system coherence.
+   - **Boundary test:** Reflective equilibrium asks "Do my intuitions and principles fit together?" Debiasing asks "Did I anchor this specific estimate on irrelevant information?"
 
 ## Best for
 
-- **High-stakes one-shot decisions** — where you can't rely on averaging over many trials
-- **Forecasting & estimation** — where base-rate neglect and overconfidence dominate errors
-- **Incident postmortems** — where hindsight bias distorts root-cause analysis
-- **Investment / resource allocation** — where confirmation bias anchors on early signals
-- **Leadership reviews** — where authority gradients suppress disconfirmation
-- **Hiring decisions** — where first impressions anchor subsequent evaluation
-- **Strategic planning** — where optimism bias and planning fallacy inflate projections
-- **Code review** — where availability bias favors recently seen patterns
+- **High-stakes one-shot decisions** — where you can't rely on averaging over many trials (e.g., acquisition, major pivot, key hire)
+- **Forecasting & estimation** — where base-rate neglect and overconfidence dominate errors (project timelines, market sizing)
+- **Incident postmortems** — where hindsight bias distorts root-cause analysis ("we should have known")
+- **Investment / resource allocation** — where confirmation bias anchors on early signals (sunk cost, pet projects)
+- **Leadership reviews** — where authority gradients suppress disconfirmation (CEO's strategy goes unchallenged)
+- **Hiring decisions** — where first impressions anchor subsequent evaluation (halo effect from interview)
+- **Strategic planning** — where optimism bias and planning fallacy inflate projections (5-year plans)
+- **Code review** — where availability bias favors recently seen patterns (over-applying last bug's fix)
+- **Hypothesis selection** — after abduction generates candidates, before committing to investigation (story bias)
+- **Policy debate** — where motivated reasoning and groupthink distort cost-benefit analysis
 
 ## Common failure mode
 
@@ -192,6 +215,45 @@ Debiasing is not free. Costs to watch for:
 
 **Rule of thumb:** Apply full debiasing protocol to top 20% of decisions by stakes/irreversibility. For routine decisions, use abbreviated checklist: base rate + one alternative + one disconfirmation test.
 
+## Protocol selection flowchart
+
+```
+Is this decision reversible within 1 week at low cost?
+  │
+  ├─ YES → Abbreviated protocol (3 min)
+  │         • Base rate from 1 reference class
+  │         • 1 alternative hypothesis
+  │         • 1 disconfirmation test
+  │         • Skip premortem, skip bias audit
+  │
+  └─ NO → Is the decision ≥10% of budget, headcount, or strategic priority?
+           │
+           ├─ YES → Full protocol (15 min) + External review
+           │         • All 7 steps
+           │         • Rotate devil's advocate
+           │         • Require written artifacts
+           │         • Schedule 30-day re-evaluation
+           │
+           └─ NO → Standard protocol (10 min)
+                   • All 7 steps
+                   • Can self-administer
+                   • Written checklist, not full artifacts
+```
+
+## Organizational prerequisites
+
+Debiasing fails in cultures that punish dissent or reward false certainty. Before expecting checklists to work, verify:
+
+| Prerequisite | Test | Failure signal |
+|--------------|------|----------------|
+| **Psychological safety** | Can a junior person publicly disagree with a senior's estimate? | Last 3 disagreements were penalized or ignored |
+| **Outcome vs. process evaluation** | Are people evaluated on reasoning quality, not just results? | Good luck rewarded; bad decisions with good outcomes praised |
+| **Falsifiability norm** | Do proposals include "I would change my mind if X"? | No proposal in last quarter included falsification criteria |
+| **Uncertainty tolerance** | Can people say "I don't know" without losing credibility? | Hedged statements are criticized as "lacking conviction" |
+| **Update culture** | Is changing your mind based on evidence celebrated or punished? | Changing positions is labeled "flip-flopping" |
+
+If ≥2 prerequisites fail, fix the culture before expecting checklists to work. Debiasing is a process; it requires an environment that rewards accurate beliefs over confident-sounding beliefs.
+
 ## Related modes
 
 - [Heuristic reasoning](53-heuristic.md) — the System 1 shortcuts debiasing corrects
@@ -203,3 +265,5 @@ Debiasing is not free. Costs to watch for:
 - [Bayesian probabilistic reasoning](11-bayesian-probabilistic.md) — normative standard that debiasing helps approximate
 - [Decision-theoretic reasoning](45-decision-theoretic.md) — decisions that benefit from pre-commitment debiasing
 - [Satisficing](51-satisficing.md) — "good enough" reasoning that applies to debiasing effort itself
+- [Assurance-case reasoning](36-assurance-case.md) — evidence chains that benefit from bias audit on evidence weighting
+- [Reflective equilibrium](77-reflective-equilibrium.md) — belief-system coherence (vs. debiasing's point-judgment audit)

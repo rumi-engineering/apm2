@@ -1,0 +1,30 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0015"
+  type: "FUNCTIONAL"
+  title: "RunReceipt emission"
+  statement: |
+    Consumption runs MUST emit RunReceipt capturing context_pack_miss, context_pack_sufficiency,
+    and budget usage. Pack misses MUST trigger DefectRecord emission and run failure by
+    default unless explicitly in escalation-allowed mode.
+  acceptance_criteria:
+    - id: AC-0015-01
+      description: RunReceipt captures context_pack_miss count.
+      verification_method: RunReceipt schema includes miss_count field.
+    - id: AC-0015-02
+      description: RunReceipt captures context_pack_sufficiency flag.
+      verification_method: RunReceipt schema includes sufficiency boolean.
+    - id: AC-0015-03
+      description: RunReceipt captures budget usage.
+      verification_method: RunReceipt includes budget delta quantities.
+    - id: AC-0015-04
+      description: Pack miss triggers DefectRecord and run failure.
+      verification_method: context_pack_miss > 0 emits UNPLANNED_CONTEXT_READ defect and fails run.
+  source_pipeline_stage: CAC-STAGE-08
+  evidence:
+    evidence_ids:
+      - EVID-0011
+    inherited_from_prd: false
+    notes:
+      - Derived from pipeline stage CAC-STAGE-08 in source PRD.

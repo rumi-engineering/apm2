@@ -1,0 +1,38 @@
+{
+  "core_choices": {
+    "canonicalization": "protobuf deterministic encoding rules",
+    "dcp_index": "Projection over typed events",
+    "ledger_representation": "new ControlArtifactEvent and DcpMappingEvent",
+    "normative_format": "canonical proto bytes (with JSON view)",
+    "required_proto_changes": [
+      "kernel_events: add ControlArtifactEvent family",
+      "tool_protocol: add ArtifactFetch"
+    ],
+    "schema_system": "proto3"
+  },
+  "id": "CAC-DESIGN-B",
+  "schema": "apm2.design.option.v1",
+  "schema_version": "1.0.0",
+  "strengths": [
+    "Highest rigor in message-level compatibility and queryability.",
+    "Clear separation between metadata and content; fewer stringly-typed conventions.",
+    "Potentially faster validation for typed messages."
+  ],
+  "suitability": {
+    "long_term": "excellent if investment is affordable",
+    "mvp": "medium"
+  },
+  "summary": {
+    "one_line": "Define ControlArtifact and DCP mapping messages in proto; store canonical proto bytes in CAS; optionally provide JSON views for LLM authoring.",
+    "why": [
+      "Strong typing and better queryability.",
+      "Aligns control plane with kernel message discipline (no maps, ordered repeats)."
+    ]
+  },
+  "title": "Option B: Protobuf-First Control Plane (Typed Events + Typed Artifacts)",
+  "weaknesses": [
+    "Bigger up-front implementation and migration cost.",
+    "LLM authoring in JSON must map precisely to proto fields; mismatches can be subtle.",
+    "Proto evolution requires tighter coordination across components."
+  ]
+}

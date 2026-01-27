@@ -1,0 +1,109 @@
+{
+  "$id": "cac.defect_record.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "defect.record"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "context": {
+              "additionalProperties": false,
+              "properties": {
+                "actor_id": {
+                  "type": "string"
+                },
+                "pack_manifest_hash": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+                },
+                "requested_stable_id": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+                },
+                "session_id": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "defect_class": {
+              "type": "string"
+            },
+            "defect_id": {
+              "type": "string"
+            },
+            "detected_at": {
+              "$ref": "cac.common.v1.schema.json#/$defs/timestamp"
+            },
+            "evidence": {
+              "items": {
+                "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+              },
+              "type": "array"
+            },
+            "severity": {
+              "enum": [
+                "S0",
+                "S1",
+                "S2",
+                "S3"
+              ],
+              "type": "string"
+            },
+            "signal": {
+              "additionalProperties": false,
+              "properties": {
+                "details": {
+                  "type": "string"
+                },
+                "type": {
+                  "enum": [
+                    "UNPLANNED_TOOL_CALL",
+                    "UNPLANNED_CONTEXT_READ",
+                    "SCHEMA_REJECT",
+                    "CANONICALIZER_DRIFT",
+                    "EXPORT_DRIFT",
+                    "AAT_FAIL"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "details"
+              ],
+              "type": "object"
+            },
+            "suggested_remediations": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "work_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "defect_id",
+            "defect_class",
+            "severity",
+            "work_id",
+            "detected_at",
+            "signal"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.defect_record.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC DefectRecord v1"
+}

@@ -1,0 +1,69 @@
+{
+  "kind": "receipt.aat",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-01-26T00:10:00Z",
+    "dependencies": [],
+    "labels": [
+      "aat",
+      "gate"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-AAT",
+      "work_id": "work_example_005"
+    },
+    "stable_id": "dcp://apm2.local/receipts/aat/apm2_cli@2026-01-26"
+  },
+  "payload": {
+    "environment": {
+      "apm2_version": "0.2.0-dev",
+      "arch": "x86_64",
+      "git_commit": "deadbeef",
+      "os": "linux"
+    },
+    "finished_at": "2026-01-26T00:10:00Z",
+    "overall_result": "PASS",
+    "run_id": "aat_run_001",
+    "started_at": "2026-01-26T00:09:00Z",
+    "suite_results": [
+      {
+        "artifacts": [
+          "b3-256:a635d7d377d9b1a4a8e8054577bb4359832a31be46a736f0335cd28f6d77b5a3"
+        ],
+        "duration_ms": 12000,
+        "failed_tests": [],
+        "result": "PASS",
+        "suite_id": "AAT-CAC-CORE"
+      },
+      {
+        "artifacts": [
+          "b3-256:6d40cff35c3ddcb467547b83d7f87f46f57c310851a7e3c68c91dd9da7dc6352"
+        ],
+        "duration_ms": 8000,
+        "failed_tests": [],
+        "result": "PASS",
+        "suite_id": "AAT-CAC-FETCH"
+      },
+      {
+        "artifacts": [
+          "b3-256:d73cbad2fd9fa83cecff8cccd0c6e2564f5981a07d1211a3d947b398c6d5396d"
+        ],
+        "duration_ms": 15000,
+        "failed_tests": [],
+        "result": "PASS",
+        "suite_id": "AAT-CAC-EXPORT"
+      },
+      {
+        "artifacts": [
+          "b3-256:de23bded7b0ca01bdc5e088611b19a3b166fc945d1673c3b14be1cfd04d16a06"
+        ],
+        "duration_ms": 5000,
+        "failed_tests": [],
+        "result": "PASS",
+        "suite_id": "AAT-CAC-CAP"
+      }
+    ]
+  },
+  "schema": "cac.aat_receipt.v1",
+  "schema_version": "1.0.0"
+}

@@ -1,0 +1,86 @@
+{
+  "$id": "cac.holon_contract.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "holon.contract"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_tool_classes": {
+              "description": "High-level allowed tool categories (e.g., artifact.fetch, git.diff).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "budgets": {
+              "additionalProperties": false,
+              "properties": {
+                "artifacts": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "bytes": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "time_ms": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "tokens": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "tool_calls": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                }
+              },
+              "type": "object"
+            },
+            "inputs": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "mode": {
+              "enum": [
+                "PRODUCE",
+                "CONSUME"
+              ],
+              "type": "string"
+            },
+            "outputs": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "policy_profile_id": {
+              "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+            },
+            "role_id": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "role_id",
+            "mode",
+            "inputs",
+            "outputs"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.holon_contract.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC HolonContract v1"
+}

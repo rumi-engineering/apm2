@@ -1,0 +1,189 @@
+{
+  "schema_version": "1.0.0",
+  "prd_id": "PRD-0007",
+  "review_timestamp": "2026-01-27T00:01:00Z",
+  "review_depth": "COUNCIL",
+  "review_type": "FULL_COUNCIL",
+  "prior_review_ref": "prd_review_council_2026-01-26T230207Z.json",
+
+  "impact_vector": {
+    "requirement_count": {"value": 15, "rating": "HIGH"},
+    "external_dependencies": {"value": 3, "rating": "HIGH"},
+    "net_new_abstractions": {"value": 8, "rating": "HIGH"},
+    "data_classification": {"value": "INTERNAL", "rating": "MEDIUM"},
+    "blast_radius": {"value": "system_wide", "rating": "HIGH"}
+  },
+
+  "gates": [
+    {"gate_id": "GATE-PRD-SCHEMA", "type": "TRUSTED", "status": "PASSED", "findings": []},
+    {"gate_id": "GATE-PRD-LINT", "type": "TRUSTED", "status": "PASSED", "findings": []},
+    {"gate_id": "GATE-PRD-TRACEABILITY", "type": "DETERMINISTIC", "status": "PASSED", "findings": []},
+    {"gate_id": "GATE-PRD-CCP-MAPPING", "type": "DETERMINISTIC", "status": "PASSED", "findings": []},
+    {"gate_id": "GATE-PRD-QUALITY-COVERAGE", "type": "DETERMINISTIC", "status": "PASSED", "findings": []},
+    {"gate_id": "GATE-PRD-EVIDENCE-STANDARDS", "type": "DETERMINISTIC", "status": "PASSED", "findings": []},
+    {"gate_id": "GATE-PRD-CONTENT", "type": "LLM-ASSISTED", "status": "PASSED", "findings": [], "council_review": true}
+  ],
+
+  "council_metadata": {
+    "session_id": "COUNCIL-PRD-0007-20260126-235900",
+    "subagents": [
+      {
+        "agent_id": "SA-1",
+        "emergent_role": "Formal Rigorist",
+        "selected_modes": [1, 7, 8, 43, 79]
+      },
+      {
+        "agent_id": "SA-2",
+        "emergent_role": "Pragmatic Optimizer",
+        "selected_modes": [45, 46, 49, 51, 76]
+      },
+      {
+        "agent_id": "SA-3",
+        "emergent_role": "Systems Analyst",
+        "selected_modes": [37, 39, 55, 65, 80]
+      }
+    ],
+    "cycles_completed": 3,
+    "total_findings_generated": 47,
+    "findings_after_dedup": 31,
+    "high_severity_findings": 6,
+    "contested_items_resolved": 4,
+    "contested_items_escalated": 1,
+    "quorum_achieved": true
+  },
+
+  "remediations_applied": [
+    {
+      "remediation_id": "REM-001",
+      "finding_id": "M8-F001",
+      "title": "Dependency provenance review for trust boundary protection",
+      "description": "Added dependency_provenance field to context_pack.spec with author_identity and admission_receipt_hash. Added CNS-0010 constraint.",
+      "files_modified": ["04_solution_overview.yaml", "06_constraints_invariants.yaml"],
+      "status": "APPLIED"
+    },
+    {
+      "remediation_id": "REM-002",
+      "finding_id": "M8-F002",
+      "title": "Content-hash-only fetch restriction",
+      "description": "Added AC-0011-05 to REQ-0011 restricting content-hash-only fetches in consumption mode. Added SEC-CTRL-0013.",
+      "files_modified": ["requirements/REQ-0011.yaml", "06_constraints_invariants.yaml"],
+      "status": "APPLIED"
+    },
+    {
+      "remediation_id": "REM-003",
+      "finding_id": "M7-F001",
+      "title": "Typed quantity schema definition",
+      "description": "Added typed_quantity.definition artifact kind with cac.typed_quantity.v1 schema. Added CNS-0008 constraint.",
+      "files_modified": ["04_solution_overview.yaml", "06_constraints_invariants.yaml"],
+      "status": "APPLIED"
+    },
+    {
+      "remediation_id": "REM-004",
+      "finding_id": "M79-F001",
+      "title": "NFC normalization requirement strengthened",
+      "description": "Strengthened CNS-0005 from recommended to required NFC normalization. Non-NFC strings now rejected.",
+      "files_modified": ["06_constraints_invariants.yaml"],
+      "status": "APPLIED"
+    },
+    {
+      "remediation_id": "REM-005",
+      "finding_id": "M79-F002",
+      "title": "Emergency override signoff protocol",
+      "description": "Added cryptographically bound signoff protocol with input fields, signature format, and verification requirements.",
+      "files_modified": ["06_constraints_invariants.yaml"],
+      "status": "APPLIED"
+    },
+    {
+      "remediation_id": "REM-006",
+      "finding_id": "F-49-001",
+      "title": "Cold-start recovery protocol",
+      "description": "Added state_repair_protocol with offline tooling (apm2-ledger-inspect, apm2-bootstrap-repair). Added INV-0006 for forward compatibility.",
+      "files_modified": ["06_constraints_invariants.yaml"],
+      "status": "APPLIED"
+    },
+    {
+      "remediation_id": "REM-007",
+      "finding_ids": ["M43-F001", "DEBIAS-005"],
+      "title": "Graduated enforcement timeline extended to 8 weeks",
+      "description": "Extended rollout from 5 weeks to 8 weeks with data-driven acceleration clause. Updated SLA to 24h during rollout.",
+      "files_modified": ["08_risks_questions.yaml", "03_goals_scope.yaml", "04_solution_overview.yaml"],
+      "status": "APPLIED"
+    }
+  ],
+
+  "contested_items_resolved": [
+    {
+      "item_id": "CONTESTED-001",
+      "title": "Bootstrap safe-mode approval",
+      "resolution": "QUORUM_SUPPORT",
+      "votes": {"SA-1": "SUPPORT", "SA-2": "SUPPORT", "SA-3": "SUPPORT"},
+      "outcome": "Bootstrap-safe-mode approved with read-only constraint and audit logging"
+    },
+    {
+      "item_id": "CONTESTED-002",
+      "title": "Typed quantity schema approach",
+      "resolution": "QUORUM_SUPPORT",
+      "votes": {"SA-1": "SUPPORT", "SA-2": "SUPPORT", "SA-3": "SUPPORT"},
+      "outcome": "Normative schema reference ($ref to cac.typed_quantity.v1) adopted"
+    },
+    {
+      "item_id": "CONTESTED-003",
+      "title": "Feedback loop SLA",
+      "resolution": "QUORUM_SUPPORT",
+      "votes": {"SA-1": "SUPPORT", "SA-2": "SUPPORT", "SA-3": "SUPPORT"},
+      "outcome": "Hybrid SLA: 24h during rollout, 48h post-rollout"
+    },
+    {
+      "item_id": "CONTESTED-004",
+      "title": "Graduated enforcement timeline",
+      "resolution": "QUORUM_SUPPORT",
+      "votes": {"SA-1": "SUPPORT", "SA-2": "SUPPORT", "SA-3": "SUPPORT"},
+      "outcome": "8-week default with acceleration clause (advance if MET-0002 >85% at week 5)"
+    }
+  ],
+
+  "contested_items_escalated": [
+    {
+      "item_id": "CONTESTED-005",
+      "title": "DefectRecord incentive structure",
+      "escalation_target": "AUTH_PRODUCT",
+      "votes": {"SA-1": "OPPOSE", "SA-2": "ABSTAIN", "SA-3": "SUPPORT"},
+      "recommendation": "Pilot positive incentive in single team for 4 weeks before broader rollout"
+    }
+  ],
+
+  "north_star_assessment": {
+    "phase_scores": {
+      "P1_recursive_improvement": 0.90,
+      "P2_innovation": 0.74,
+      "P3_enterprise": 0.70,
+      "P4_partnership": 0.55,
+      "P5_life_sciences": 0.30
+    },
+    "primary_phase_alignment": "P1_recursive_improvement",
+    "alignment_consensus": true,
+    "score_delta_from_prior": {
+      "P1_recursive_improvement": "+0.02",
+      "P2_innovation": "+0.02",
+      "P3_enterprise": "+0.03",
+      "P4_partnership": "0.00",
+      "P5_life_sciences": "-0.02"
+    },
+    "strategic_recommendations": [
+      "Remediations strengthen P1 by improving feedback loop reliability (24h SLA during rollout)",
+      "Remediations strengthen P3 by adding enterprise-grade security controls (signoff protocol, cold-start recovery)"
+    ],
+    "violations": []
+  },
+
+  "verdict": "PASSED",
+  "verdict_reason": "All 6 HIGH severity findings remediated. 4/5 contested items reached quorum. 1 item escalated to AUTH_PRODUCT (non-blocking). PRD ready for RFC transition.",
+  "confidence": "HIGH",
+
+  "reviewer": {
+    "agent_type": "council",
+    "model": "claude-opus-4-5",
+    "subagent_model": "claude-sonnet",
+    "review_mode": "FULL_COUNCIL"
+  }
+}

@@ -1,0 +1,94 @@
+prd_readme:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  prd_id: "PRD-0007"
+  title: "Context-as-Code (CAC) v1: Canonical Context Pipeline for the APM2 Holonic Kernel"
+  description: |
+    This PRD defines the Context-as-Code (CAC) system, which makes context the authoritative
+    program in the APM2 holonic kernel. The system provides a canonical context substrate
+    (CAC-JSON), patch-first machine authoring with replay protection, hermetic consumption
+    with deterministic reads, and target interoperability through compiled payloads.
+
+    Key thesis: In an agent-native factory, code is a compiled artifact; context is the
+    source program. If context is complete and correct, code can be generated deterministically.
+
+  source_document:
+    original_format: "JSON"
+    original_path: "cac_context_as_code_prd/MASTER.json"
+    original_id: "APM2-PRD-CAC-0001"
+  files:
+    metadata:
+      - "00_meta.yaml"
+    content:
+      - "01_customer.yaml"
+      - "02_problem.yaml"
+      - "03_goals_scope.yaml"
+      - "04_solution_overview.yaml"
+      - "05_success_metrics.yaml"
+      - "06_constraints_invariants.yaml"
+      - "07_traceability.yaml"
+      - "08_risks_questions.yaml"
+      - "09_decisions_review.yaml"
+      - "10_quality_framework.yaml"
+      - "11_evidence_standards.yaml"
+      - "12_evidence_bundle.yaml"
+      - "13_governance_model.yaml"
+    requirements:
+      count: 15
+      path: "requirements/"
+      files:
+        - "REQ-0001.yaml"
+        - "REQ-0002.yaml"
+        - "REQ-0003.yaml"
+        - "REQ-0004.yaml"
+        - "REQ-0005.yaml"
+        - "REQ-0006.yaml"
+        - "REQ-0007.yaml"
+        - "REQ-0008.yaml"
+        - "REQ-0009.yaml"
+        - "REQ-0010.yaml"
+        - "REQ-0011.yaml"
+        - "REQ-0012.yaml"
+        - "REQ-0013.yaml"
+        - "REQ-0014.yaml"
+        - "REQ-0015.yaml"
+    evidence_artifacts:
+      count: 12
+      path: "evidence_artifacts/"
+      files:
+        - "EVID-0001.yaml"
+        - "EVID-0002.yaml"
+        - "EVID-0003.yaml"
+        - "EVID-0004.yaml"
+        - "EVID-0005.yaml"
+        - "EVID-0006.yaml"
+        - "EVID-0007.yaml"
+        - "EVID-0008.yaml"
+        - "EVID-0009.yaml"
+        - "EVID-0010.yaml"
+        - "EVID-0011.yaml"
+        - "EVID-0012.yaml"
+  key_concepts:
+    - name: "CAC-JSON"
+      description: "Sole normative representation for control artifacts. Schema-validated, canonicalized, content-addressed."
+    - name: "ContextPack"
+      description: "Bounded set of stable-ID addressed artifacts for hermetic consumption."
+    - name: "TargetProfile"
+      description: "Machine-readable profile defining budgets, rendering, and delivery constraints."
+    - name: "DCP"
+      description: "Deterministic Content Plane - index/projection over immutable artifacts for stable-ID resolution."
+    - name: "Hermetic Consumption"
+      description: "Consumption mode where holons use only preauthorized stable-ID fetches; no discretionary discovery."
+  implementation_phases:
+    - phase_id: "CAC-IMP-00"
+      name: "Bootstrap Trust Root"
+    - phase_id: "CAC-IMP-01"
+      name: "Foundations"
+    - phase_id: "CAC-IMP-02"
+      name: "Admission + Provenance"
+    - phase_id: "CAC-IMP-03"
+      name: "Deterministic Fetch Surface"
+    - phase_id: "CAC-IMP-04"
+      name: "ContextPack Compiler"
+    - phase_id: "CAC-IMP-05"
+      name: "Target Delivery + Capabilities Truthing"

@@ -1,0 +1,471 @@
+agent_id: SA-1
+emergent_role: Formal Rigorist
+selected_modes: [1, 7, 8, 43, 79]
+cycle: 1
+findings:
+  - finding_id: SA1-M1-F001
+    source_mode: 1
+    gate: GATE-PRD-CONTENT
+    severity: BLOCKER
+    category: CONSISTENCY
+    title: "Circular dependency in bootstrap verification recovery protocol"
+    description: |
+      CNS-0006 defines a bootstrap trust root recovery protocol including bootstrap-safe-mode
+      and emergency override, but contains a logical inconsistency. The emergency override
+      protocol (lines 86-136) requires "Audit event emitted with full context" and "External
+      audit sink with maximum 5-second delivery latency." However, if bootstrap verification
+      fails at startup, the kernel cannot operate (per GRD-0001 "Fail startup if bootstrap
+      verification fails"). A non-operational kernel cannot emit audit events or deliver to
+      external sinks, creating a deadlock: override requires audit emission, but audit emission
+      requires operational kernel, which requires successful bootstrap verification.
+
+      This violates the law of non-contradiction: the system cannot simultaneously be
+      non-operational (bootstrap failure) AND operational (emitting audit events).
+    location: "06_constraints_invariants.yaml:CNS-0006, lines 86-137"
+    remediation: |
+      Specify that bootstrap-safe-mode (lines 61-70) MUST be capable of emitting minimal audit
+      events to external sink even when full kernel is non-operational. Add explicit requirement:
+      "Bootstrap-safe-mode MUST support emergency override audit event emission to external
+      audit sink with degraded capabilities (audit-only operations, no admission/compilation)."
+      Alternatively, require offline audit via apm2-ledger-inspect before emergency override.
+    agreement_status: PENDING
+
+  - finding_id: SA1-M7-F001
+    source_mode: 7
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: CONSISTENCY
+    title: "Type-level inconsistency in EscalationPolicy schema definition"
+    description: |
+      The artifact_kinds registry (04_solution_overview.yaml:257-265) defines escalation.policy
+      with schema_id cac.escalation_policy.v1, listing required fields including
+      escalation_criteria (string). However, AC-0003-04 in REQ-0003 states escalation requires
+      "explicit criteria" without constraining the type. The typed_quantity.definition schema
+      (lines 194-205) demonstrates that CAC enforces typed schemas with explicit enums.
+
+      Escalation criteria should be an enumeration or structured type (not freeform string) to
+      enable machine validation of whether escalation is authorized. A string-typed criteria
+      field allows arbitrary values like "because I said so" which cannot be validated against
+      policy rules. This violates the type-theoretic principle that security-critical decisions
+      must be checkable at compile/validation time, not runtime interpretation.
+    location: "04_solution_overview.yaml:257-265, requirements/REQ-0003.yaml:AC-0003-05"
+    remediation: |
+      Refine escalation.policy schema to include escalation_criteria as a structured type or
+      enum, not string. Example: escalation_criteria should be enum [PACK_INCOMPLETE,
+      EMERGENCY_HOTFIX, AUTHORIZED_BYPASS] with machine-checkable conditions per enum value.
+      Update AC-0003-05 verification method to require "escalation_criteria MUST validate
+      against enumerated policy reasons with explicit conditions."
+    agreement_status: PENDING
+
+  - finding_id: SA1-M8-F001
+    source_mode: 8
+    gate: GATE-PRD-CONTENT
+    severity: BLOCKER
+    category: SECURITY
+    title: "Counterexample: Hash collision enables bypass of dependency review via birthday attack"
+    description: |
+      CNS-0010 and SEC-CTRL-0010 require pack specs to pin dependency_review_hash at review
+      time and fail compilation if resolved hash differs. This is intended to prevent
+      timing-based injection where adversary modifies stable_id content between review and
+      compilation. However, BLAKE3-256 (specified in 04_solution_overview.yaml:96-100) provides
+      128-bit collision resistance. With O(2^128) work, an attacker can generate two distinct
+      artifacts A and B with the same BLAKE3-256 hash.
+
+      Counterexample attack: (1) Attacker submits benign artifact A for review with hash H. (2)
+      Reviewer captures dependency_review_hash=H at review time. (3) Before compilation,
+      attacker submits malicious artifact B (pre-computed collision) with same hash H. (4)
+      Compilation succeeds because resolved hash H matches reviewed hash H, but malicious
+      content B is used instead of reviewed content A. The dependency trust boundary is
+      bypassed without triggering DependencyHashDrift events.
+
+      While 2^128 work is currently infeasible, the PRD claims "algorithm agility" (SEC-PROP-0005)
+      suggesting long-term operation. Under Moore's Law or quantum speedup, collision attacks
+      become feasible within 10-20 year timeframe for high-value targets.
+    location: "06_constraints_invariants.yaml:CNS-0010, SEC-CTRL-0010; 04_solution_overview.yaml:96-100"
+    remediation: |
+      Add explicit collision-resistance assertion to SEC-PROP-0005: "Hash algorithm MUST provide
+      ≥256-bit collision resistance or use hybrid classical+quantum-resistant scheme." Update
+      bootstrap schema bundle upgrade policy to mandate hash algorithm upgrade when collision
+      resistance degrades below 256-bit security level. Add monitoring for cryptographic
+      security deprecation timelines.
+    agreement_status: PENDING
+
+  - finding_id: SA1-M8-F002
+    source_mode: 8
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: CONSISTENCY
+    title: "Counterexample: NFC normalization enforcement creates undetectable drift"
+    description: |
+      CNS-0005 (06_constraints_invariants.yaml:34-47) mandates NFC normalization and rejects
+      NFD/NFKC/NFKD. Enforcement states "Canonicalizer validates NFC normalization during
+      canonicalization." However, counterexample: stable_id "namespace:skill:résumé" contains
+      U+00E9 (é, NFC). An attacker submits patch with stable_id containing U+0065+U+0301 (e +
+      combining acute, NFD), which appears visually identical. If canonicalizer validates during
+      canonicalization (line 44) but stable_id comparison happens BEFORE canonicalization (e.g.,
+      during patch application to locate base artifact), the system performs byte-wise
+      comparison on non-normalized strings.
+
+      Result: Patch targeting "résumé" (NFD) fails to match existing artifact "résumé" (NFC),
+      creating phantom duplicate or patch-not-found error. User normalizes to NFC and re-submits,
+      but ledger now contains both normalized and non-normalized stable_id references, creating
+      query ambiguity. This violates INV-0001 (canonicalization determinism) because the
+      ordering of normalization vs. stable_id resolution is undefined.
+    location: "06_constraints_invariants.yaml:CNS-0005, lines 34-47"
+    remediation: |
+      Strengthen CNS-0005 to mandate: "All stable_id comparisons MUST normalize to NFC BEFORE
+      byte-wise comparison. Normalization MUST occur at parse time, before any stable_id is used
+      for lookup, patch application, or DCP resolution." Add test vector to EVID-0001:
+      "stable_id comparison with NFC/NFD equivalents MUST match after normalization."
+    agreement_status: PENDING
+
+  - finding_id: SA1-M43-F001
+    source_mode: 43
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: CONSISTENCY
+    title: "Positive feedback loop: Escalation frequency metric can suppress defect visibility"
+    description: |
+      The feedback loop (04_solution_overview.yaml:311-346) includes escalation_count_metric
+      as a "feedback signal for pack specification improvement." This creates a systems-level
+      hazard: if escalations are perceived negatively (e.g., "too many escalations indicate poor
+      pack quality"), teams are incentivized to avoid escalation even when legitimate.
+
+      Feedback amplification: (1) Pack incomplete → consumption fails → escalation needed. (2)
+      Escalation counted as negative signal → pack team pressured to reduce escalations. (3)
+      Pack team adds overly broad stable_ids to pack to reduce escalations → pack bloat and
+      increased attack surface. (4) Larger packs increase compilation time and cache pressure →
+      consumption performance degrades. (5) Teams bypass pack system entirely using shadow
+      context sources → hermeticity violated, defects invisible.
+
+      The trigger TRIGGER-ESCALATION-FREQUENCY (line 322) assumes escalations indicate pack
+      deficiency, but escalations also indicate legitimate novel use cases. Without
+      distinguishing signal (pack deficiency) from noise (novel use case), the feedback loop
+      optimizes for the wrong metric and suppresses visibility into real defects.
+    location: "04_solution_overview.yaml:311-346, artifact_kinds escalation.policy (line 264)"
+    remediation: |
+      Decompose escalation_count_metric into two metrics: escalation_deficiency_count (repeated
+      escalations for same stable_id, indicating pack deficiency) and escalation_novel_count
+      (first-time escalations, indicating new use cases). Update TRIGGER-ESCALATION-FREQUENCY
+      to trigger only on escalation_deficiency_count ≥2 within 14 days. Add success metric:
+      "Escalation approval rate ≥95% for novel use cases, indicating pack evolution keeps pace
+      with legitimate needs."
+    agreement_status: PENDING
+
+  - finding_id: SA1-M43-F002
+    source_mode: 43
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: NORTH_STAR
+    title: "Feedback latency SLA creates adversarial delay incentive"
+    description: |
+      TRADEOFF-0001 (08_risks_questions.yaml:164) specifies "feedback_latency_sla: Pack spec
+      updates within 48h of recurring defect pattern." This creates a perverse incentive: if an
+      adversary can delay defect pattern recognition beyond 48h (e.g., by spacing attacks >7
+      days apart to avoid TRIGGER-SIGNATURE-THRESHOLD clustering window), the SLA is never
+      triggered and pack vulnerabilities persist indefinitely.
+
+      Emergent behavior: DefectRecord aggregation uses "Rolling 7-day window" (line 327). An
+      attacker executing the same exploit every 8 days evades clustering, never triggering
+      pack review. The 48h SLA assumes defects cluster naturally, but adversarial timing
+      introduces anti-correlation. This is a systems-level failure mode where the SLA optimizes
+      for natural failure patterns but is blind to adversarial patterns.
+    location: "08_risks_questions.yaml:164 (feedback_latency_sla), 04_solution_overview.yaml:327"
+    remediation: |
+      Add complementary trigger: TRIGGER-SPARSE-DEFECTS with condition "Same defect signature
+      occurs ≥3 times within 30 days (regardless of spacing)" to catch adversarially-timed
+      attacks. Update aggregation_window to include both 7-day rolling window (for natural
+      patterns) and 30-day sparse detection (for adversarial patterns). Specify: "SLA applies to
+      whichever trigger fires first."
+    agreement_status: PENDING
+
+  - finding_id: SA1-M79-F001
+    source_mode: 79
+    gate: GATE-PRD-CONTENT
+    severity: BLOCKER
+    category: SECURITY
+    title: "Red-team: Ceremony window race enables authority impersonation"
+    description: |
+      CNS-0006 emergency override ceremony (06_constraints_invariants.yaml:95-129) requires
+      "All three signatories MUST complete within 15-minute ceremony window" and "All THREE
+      authorities MUST sign the SAME input tuple." However, the protocol does not specify atomic
+      binding of ceremony_start_timestamp and ceremony_nonce generation.
+
+      Attack: (1) Attacker compromises AUTH_SECURITY key. (2) Attacker initiates ceremony with
+      ceremony_start_timestamp=T1, ceremony_nonce=N1. (3) Legitimate AUTH_OPS and AUTH_ENGINEERING
+      begin signing with T1/N1. (4) Attacker initiates SECOND ceremony with
+      ceremony_start_timestamp=T2, ceremony_nonce=N2 (where T2=T1+1ms). (5) Attacker completes
+      all three signoffs using T2/N2 within 15 minutes. (6) System accepts attacker's ceremony
+      (valid triple-signoff) while legitimate signatories are still completing T1/N1 ceremony.
+
+      Vulnerability: The protocol specifies "first signatory generates ceremony_start_timestamp
+      and ceremony_nonce" (line 101) but does not prevent the SAME signatory from initiating
+      multiple overlapping ceremonies. Result: Compromised single authority can fabricate
+      triple-signoff by racing multiple ceremony windows.
+    location: "06_constraints_invariants.yaml:CNS-0006, lines 95-129"
+    remediation: |
+      Add atomic ceremony initiation protocol: "Ceremony initiation MUST acquire distributed
+      lock preventing concurrent ceremonies. Only ONE ceremony can be active globally at any
+      time. Ceremony lock released after ceremony completes or expires (15 min timeout). Failed
+      to acquire lock returns CEREMONY_IN_PROGRESS error." Add verification: "System MUST reject
+      signoffs if ceremony_start_timestamp corresponds to non-active ceremony."
+    agreement_status: PENDING
+
+  - finding_id: SA1-M79-F002
+    source_mode: 79
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: SECURITY
+    title: "Red-team: Content-hash fetch restriction bypassed via dependency traversal"
+    description: |
+      SEC-CTRL-0013 (06_constraints_invariants.yaml:424-430) restricts content-hash-only fetches
+      in consumption mode, requiring stable_id for policy enforcement. Rationale: "prevents
+      bypass of stable_id allowlist via content hash discovery through side channels."
+
+      Bypass attack: (1) Attacker controls a benign artifact A with stable_id "benign:artifact:1"
+      that is allowlisted in victim's ContextPack. (2) Attacker embeds malicious content hash H_M
+      in artifact A as a "dependency" field (valid per schema). (3) Victim's consumption holon
+      fetches A via stable_id (allowed). (4) Victim's holon parses A and discovers dependency
+      hash H_M. (5) Holon issues DcpResolve for H_M to find corresponding stable_id. (6) If
+      DcpResolve returns stable_id for H_M, holon can fetch via stable_id (bypassing hash-only
+      restriction). (7) If DcpResolve does NOT return stable_id, attacker has discovered that
+      H_M is not indexed, leaking information about CAS contents via timing side channel.
+
+      Root cause: SEC-CTRL-0013 prevents hash-only ArtifactFetch but does not restrict
+      DcpResolve by content_hash. DcpResolve can be abused as a hash→stable_id oracle, enabling
+      indirect fetch bypass or side-channel reconnaissance.
+    location: "06_constraints_invariants.yaml:SEC-CTRL-0013; 04_solution_overview.yaml:359-362 (DcpResolve)"
+    remediation: |
+      Extend SEC-CTRL-0013 to include DcpResolve: "Content-hash-only DcpResolve queries are
+      denied in consumption mode. All DcpResolve queries MUST specify stable_id; reverse lookups
+      (content_hash → stable_id) are restricted to production mode." Add policy: "Dependencies
+      referenced in artifacts MUST use stable_id, not content_hash." Validate at admission that
+      dependency fields use stable_id references.
+    agreement_status: PENDING
+
+  - finding_id: SA1-M1-F002
+    source_mode: 1
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: TESTABILITY
+    title: "Undecidable verification: Transitive closure completeness is not mechanically verifiable"
+    description: |
+      AC-0003-02 (requirements/REQ-0003.yaml:17-18) requires "ContextPack manifests include
+      transitive dependency closure (deep pinning)" with verification method "Pack compilation
+      resolves all dependencies and pins content hashes." EVID-0010 asserts "Transitive
+      dependencies are included in ContextPack manifests."
+
+      However, the assertion "all dependencies are included" is undecidable without a formal
+      dependency schema. Deductive reasoning: To verify ALL dependencies are included, we must:
+      (1) Enumerate all artifacts in pack. (2) For each artifact, parse dependency references.
+      (3) Recursively resolve dependencies. (4) Verify no missing references. But step (2)
+      requires knowing which fields in arbitrary CAC-JSON documents represent dependencies.
+      Without a universal dependency schema or type marker, the compiler cannot distinguish
+      dependency references from arbitrary stable_id mentions.
+
+      Counterexample: Artifact A references stable_id "foo:bar:1" in field "related_content"
+      (not "dependencies"). Is this a dependency requiring inclusion in pack? The PRD provides
+      no decidable rule. EVID-0010 verification "Consumption does not require additional
+      discretionary reads" is a runtime property, not a compile-time proof.
+    location: "requirements/REQ-0003.yaml:AC-0003-02, evidence_artifacts/EVID-0010.yaml:28-29"
+    remediation: |
+      Define a normative dependency declaration schema: All artifact schemas MUST include a
+      "dependencies" field (array of stable_ids) if the artifact references other artifacts.
+      Compiler traverses ONLY declared dependencies field for closure computation. Update
+      AC-0003-02: "Pack compilation resolves all dependencies declared in 'dependencies' field
+      and pins hashes. Undeclared stable_id references are warnings, not errors." This makes
+      closure computation decidable and mechanically verifiable.
+    agreement_status: PENDING
+
+  - finding_id: SA1-M7-F002
+    source_mode: 7
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: CONSISTENCY
+    title: "Type variance violation: CapabilityManifest lacks version compatibility predicate"
+    description: |
+      The CapabilityManifest (04_solution_overview.yaml:140-141, 189-193) is described as
+      "machine-readable declaration of what the CLI/kernel actually supports" and is "verified
+      by selftests (AAT)." However, capabilities evolve over time. REQ-0014 and EVID-0007
+      verify that capabilities match reality at test time, but provide no type-safe mechanism
+      for agents to query "Does binary version X support capability Y?"
+
+      Type-theoretic issue: Without a version compatibility predicate, agents must either (1)
+      assume all binaries support all capabilities (unsafe, leads to runtime errors), or (2)
+      defensively check capabilities at runtime before every operation (inefficient, violates
+      fail-fast principle). Neither approach provides compile-time or planning-time safety.
+
+      The CapabilityManifest type should be contravariant in version: newer binaries can support
+      supersets of older capabilities, but capability removal is a breaking change. The PRD
+      does not specify version compatibility rules or provide a decidable predicate for agents.
+    location: "04_solution_overview.yaml:140-141, 189-193; requirements/REQ-0014.yaml"
+    remediation: |
+      Add to CapabilityManifest schema: (1) binary_version field (semver). (2) capability_compatibility
+      matrix listing deprecated/removed capabilities by version. (3) Explicit versioning policy:
+      "Capability removal is MAJOR version bump; capability addition is MINOR version bump."
+      Update REQ-0014 AC: "AATReceipt includes binary_version; agents query capabilities using
+      (binary_version, capability_name) tuple with compatibility check."
+    agreement_status: PENDING
+
+  - finding_id: SA1-M8-F003
+    source_mode: 8
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: COMPLETENESS
+    title: "Counterexample: Compaction preserves provenance but breaks patch replay"
+    description: |
+      CNS-0006 and RSK-0006 (08_risks_questions.yaml:59-67) describe compaction as a mitigation
+      for "patch soup without compaction leads to unbounded history growth." Mitigation requires
+      "ChangeSet summaries to accompany compaction snapshots" and "Maintain provenance links
+      from snapshots back to patch chains."
+
+      Counterexample: Assume artifact at stable_id S has 1000 patches P1..P1000. Compaction
+      creates snapshot C1000 with provenance links to P1..P1000. Later, auditor wants to replay
+      history to verify artifact evolution. Auditor fetches C1000 and sees provenance links, but
+      the original patch chain P1..P1000 may have been garbage-collected (not specified in PRD).
+
+      If patches are retained: compaction provides no benefit (history still unbounded). If
+      patches are deleted: replay is impossible (provenance links point to deleted data). The
+      PRD does not specify patch retention policy post-compaction. This breaks the claimed
+      property "All state transitions are recorded as signed events" (INV-0005) because
+      transitions are summarized/deleted, not recorded indefinitely.
+    location: "08_risks_questions.yaml:RSK-0006, 06_constraints_invariants.yaml:INV-0005"
+    remediation: |
+      Specify compaction patch retention policy: "Patches MUST be retained for minimum 90 days
+      post-compaction OR until archival snapshot is created. Archival snapshots include full
+      patch chain in immutable storage. ChangeSet summaries are cryptographically bound to patch
+      chain hash to enable later verification." Update INV-0005: "State transitions are recorded
+      in ledger; patch detail retained per retention policy; summaries provide audit trail."
+    agreement_status: PENDING
+
+  - finding_id: SA1-M43-F003
+    source_mode: 43
+    gate: GATE-PRD-CONTENT
+    severity: OBSERVATION
+    category: NORTH_STAR
+    title: "Phase coupling: CAC v1 scope is tightly coupled to P1 but excludes P2-P5 pathways"
+    description: |
+      CAC is positioned as foundational infrastructure for "recursive improvement" (P1), but
+      the goals and scope exhibit tight coupling to kernel-internal tooling with limited
+      extensibility to later phases. Analysis from systems thinking perspective:
+
+      P1 (Recursive Improvement): CAC strongly enables this via hermeticity, provenance, and
+      patch-first authoring. Score: 0.95.
+
+      P2 (Innovation): CAC supports innovation through deterministic experimentation and
+      capability manifests, but artifact_kinds registry (04_solution_overview.yaml:152-265) is
+      closed-world (all kinds defined in PRD). There is no protocol for third-party artifact
+      kind registration or schema extension by external innovators. This limits innovation to
+      kernel-internal teams. Score: 0.65.
+
+      P3 (Enterprise): Target profiles enable enterprise integration, but only via "compilation
+      to vendor layouts." There is no mechanism for enterprises to define custom artifact kinds,
+      custom policies, or custom target profiles without modifying kernel. This creates vendor
+      lock-in and inhibits enterprise-specific adaptation. Score: 0.60.
+
+      P4 (Partnership): No partnership-oriented interfaces. CAC is kernel-centric with no
+      federation protocol, no cross-organization artifact sharing protocol, no namespace
+      delegation for partner organizations. Score: 0.45.
+
+      P5 (Life Sciences): No life sciences-specific considerations. CAC provides general-purpose
+      infrastructure but does not address domain-specific requirements (e.g., regulatory
+      compliance artifacts, clinical trial provenance, patient data governance). Score: 0.40.
+
+      Risk: CAC v1 is optimized for P1 at the expense of later phases, creating technical debt
+      when extending to P2-P5. This is acceptable for v1 if documented as explicit limitation.
+    location: "03_goals_scope.yaml (all goals), 04_solution_overview.yaml:152-265 (artifact_kinds)"
+    remediation: |
+      Add to scope.out_of_scope: "Third-party artifact kind registration and namespace delegation
+      (deferred to CAC v2 for P2/P3/P4 support)." Add to 08_risks_questions.yaml open_questions:
+      "Q-0008: How will CAC support third-party artifact kind extension and federated namespace
+      governance for P2/P3/P4 phases? Decision needed by CAC v2 planning." This makes the P1
+      focus explicit and sets expectation for future expansion.
+    agreement_status: PENDING
+
+  - finding_id: SA1-M79-F003
+    source_mode: 79
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: SECURITY
+    title: "Red-team: AATReceipt forgery via binary substitution post-selftest"
+    description: |
+      SEC-CTRL-0012 (06_constraints_invariants.yaml:418-424) requires AATReceipts to be
+      "cryptographically bound to binary hash" with required fields including binary_hash,
+      capability_manifest_hash, test_suite_version, execution_timestamp. Receipts for mismatched
+      binaries are rejected.
+
+      Attack scenario: (1) Attacker builds modified binary B' with malicious capability (e.g.,
+      "apm2 cac apply-patch" bypasses schema validation). (2) Attacker creates benign binary B
+      (identical to B' except malicious code removed). (3) Attacker runs selftest on benign
+      binary B, generating valid AATReceipt R with binary_hash=H(B). (4) Attacker deploys
+      malicious binary B' but presents AATReceipt R claiming binary_hash=H(B). (5) If deployment
+      verification checks ONLY that receipt exists and is signed (without re-computing H(B')
+      and comparing to H(B) in receipt), the malicious binary is accepted.
+
+      The PRD states "Receipts for mismatched binaries are rejected" but does not specify WHO
+      performs rejection or WHEN. If rejection happens only at kernel startup, but kernel reads
+      receipt from CAS, attacker can substitute binary after receipt generation but before
+      deployment.
+    location: "06_constraints_invariants.yaml:SEC-CTRL-0012, lines 418-424"
+    remediation: |
+      Specify receipt verification protocol: "At kernel startup, kernel MUST compute binary_hash
+      of its own executable and compare to binary_hash in AATReceipt. Hash mismatch MUST fail
+      startup with clear error message including both hashes." Add to GRD-0001: "Binary hash
+      verification MUST pass at startup (in addition to bootstrap verification)." Add evidence
+      artifact: "EVID-0016: Binary substitution attack test verifying startup failure when
+      AATReceipt binary_hash != actual binary hash."
+    agreement_status: PENDING
+
+  - finding_id: SA1-M1-F003
+    source_mode: 1
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: COMPLETENESS
+    title: "Logical gap: Canonicalizer versioning does not imply backward compatibility"
+    description: |
+      INV-0001 (06_constraints_invariants.yaml:288-295) asserts "Canonicalization is deterministic
+      and idempotent" with enforcement "canonicalizer versioned." SEC-CTRL-0009 records
+      "canonicalizer id/version in envelopes and receipts." However, the PRD does not specify
+      whether different canonicalizer versions produce the same output for the same input.
+
+      Deductive reasoning: If canonicalizer v1 and v2 are both "deterministic and idempotent"
+      but produce DIFFERENT canonical outputs for the same input, then content hashes differ
+      between versions. This breaks stable_id→content_hash pinning because the same logical
+      artifact has different hashes depending on canonicalizer version.
+
+      Example: Input JSON {"b":2,"a":1}. Canonicalizer v1 sorts keys → {"a":1,"b":2} → hash H1.
+      Canonicalizer v2 uses different sorting (e.g., case-insensitive) → {"a":1,"b":2} → hash
+      H2 ≠ H1. Both are deterministic and idempotent within their version, but not across
+      versions. This violates the implicit assumption that artifacts admitted under v1 remain
+      valid under v2.
+    location: "06_constraints_invariants.yaml:INV-0001, SEC-CTRL-0009"
+    remediation: |
+      Add explicit canonicalizer compatibility requirement: "Canonicalizer upgrades MUST be
+      backward compatible: canonicalize_v2(input) == canonicalize_v1(input) for all inputs
+      valid under v1 schema. Non-compatible canonicalizer changes require new major schema
+      version and re-admission of all affected artifacts." Add to Q-0001 resolution_plan:
+      "Define canonicalizer compatibility test suite verifying v(N+1) produces identical output
+      to v(N) for golden vectors."
+    agreement_status: PENDING
+
+north_star_assessment:
+  phase_scores:
+    P1_recursive_improvement: 0.95
+    P2_innovation: 0.65
+    P3_enterprise: 0.60
+    P4_partnership: 0.45
+    P5_life_sciences: 0.40
+  primary_phase_alignment: P1_recursive_improvement
+  strategic_recommendations:
+    - "PRD-0007 CAC v1 is strongly aligned with P1 (Recursive Improvement) by providing canonical context substrate, deterministic execution, and closed-loop feedback from defects to pack improvements. This is appropriate for a foundational infrastructure PRD."
+    - "Phase P2 (Innovation) alignment is moderate. The artifact_kinds registry is closed-world, limiting third-party innovation. Consider adding to CAC v2 scope: extensible artifact kind registration protocol and namespace delegation to enable external innovators."
+    - "Phase P3 (Enterprise) alignment is moderate. Target profiles enable vendor integration but lack customization pathways for enterprise-specific policies, artifact kinds, or governance models. Recommend explicit documentation that enterprise extensibility is deferred to CAC v2."
+    - "Phase P4 (Partnership) alignment is weak. No federation protocol or cross-organization artifact sharing mechanism. This is acceptable for v1 (kernel-internal focus) but should be flagged as explicit limitation requiring future work."
+    - "Phase P5 (Life Sciences) alignment is weak. CAC provides general infrastructure but no domain-specific considerations for regulatory compliance, clinical trial provenance, or patient data governance. Recommend future work: domain-specific artifact kinds and policies for life sciences (potentially CAC v3 or separate domain PRD)."
+    - "SECURITY CRITICAL: Address BLOCKER findings SA1-M1-F001 (bootstrap recovery deadlock), SA1-M8-F001 (hash collision bypass), and SA1-M79-F001 (ceremony race condition) before approval. These represent fundamental logical inconsistencies or security vulnerabilities that compromise core invariants."
+    - "RECOMMENDED: Address MAJOR findings (type inconsistencies, feedback loop hazards, red-team bypasses) to strengthen v1 rigor. These do not block approval but reduce risk of post-deployment defects."
+  violations:
+    - type: PHASE_REGRESSION
+      description: "No phase regression detected. CAC v1 builds on existing APM2 kernel primitives (ledger, CAS, holonic execution) without removing or degrading existing capabilities."
+    - type: MISSION_DRIFT
+      description: "Minor mission drift risk in SA1-M43-F003: CAC v1 is tightly coupled to P1 with limited extensibility to P2-P5. This is acceptable for v1 if explicitly documented as foundational work with planned future expansion. Recommend adding to 02_problem.yaml why_now: 'CAC v1 focuses on P1 (recursive improvement) as prerequisite for P2-P5; extensibility to later phases deferred to v2.'"
