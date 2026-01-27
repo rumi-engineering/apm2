@@ -159,7 +159,8 @@ rfc_contracts_and_versioning:
         pub struct CoordinationConfig {
             pub work_ids: Vec<WorkId>,
             pub budget: CoordinationBudget,
-            pub max_attempts_per_work: u32,
+            pub max_attempts_per_work: u32,        // Default: 3
+            pub max_work_queue_size: Option<u32>,  // Default: 1000 (AD-COORD-008)
         }
       stability: stable
 
@@ -205,6 +206,7 @@ rfc_contracts_and_versioning:
             --max-duration-ms <MS>    Maximum wall-clock time (required)
             --max-tokens <N>          Maximum tokens (optional)
             --max-attempts <N>        Max attempts per work item (default: 3)
+            --max-work-queue <N>      Max work items in queue (default: 1000)
             --json                    Output as JSON (default)
             --quiet                   Suppress progress events
 

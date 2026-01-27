@@ -1,21 +1,22 @@
 rfc_meta:
   schema_version: "2026-01-26"
   template_version: "2026-01-26"
-  version: v2
+  version: v4
   rfc:
     id: RFC-0012
     title: "Agent Coordination Layer for Autonomous Work Loop Execution"
-    status: DRAFT
+    status: APPROVED
     created_date: "2026-01-27"
     last_updated_date: "2026-01-27"
     grounded_date: "2026-01-27"
+    finalized_date: "2026-01-27"
   binds_to_prd:
     prd_id: PRD-0008
     prd_base_path: "documents/prds/PRD-0008"
     requirement_registry_ref: "documents/prds/PRD-0008/requirements/"
     evidence_bundle_ref: "documents/prds/PRD-0008/12_evidence_bundle.yaml"
     prd_meta_ref: "documents/prds/PRD-0008/00_meta.yaml"
-    rationale: "RFC v2 Grounded phase - codebase investigation complete; design decisions backed by evidence"
+    rationale: "RFC v4 Standard phase - all architectural decisions finalized; ready for ticket decomposition"
   protocol_profile:
     id: NONE
     applies: false

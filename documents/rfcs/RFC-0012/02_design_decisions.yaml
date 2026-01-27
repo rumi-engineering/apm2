@@ -140,6 +140,158 @@ rfc_design_decisions:
         Prevents race conditions where work state changes during spawn.
       constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0005"
 
+    - decision_id: AD-COORD-007
+      title: "Session ID generation for coordination-initiated spawns"
+      description: |
+        CoordinationController generates session_id (UUID v4) BEFORE emitting
+        coordination.session_bound. The same session_id is passed to the session
+        spawner (via EventRecord.session_id field). This ensures the binding event
+        correctly references the session that will be started.
+
+        Event ordering:
+        1. Controller generates session_id = UUID::new_v4()
+        2. Controller emits coordination.session_bound with session_id
+        3. Controller orchestrates session spawn with that session_id
+        4. SessionReducer processes session.started with same session_id
+        5. On termination, controller emits coordination.session_unbound
+
+        This pattern is consistent with existing EventRecord semantics where
+        session_id is assigned by the event emitter.
+      rationale: |
+        Binding events MUST precede session.started (AD-COORD-003). This requires
+        knowing session_id before spawn. UUID generation is cheap and ensures
+        uniqueness. The spawner accepts session_id as input (existing pattern).
+      constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#INV-COORD-0002"
+
+    - decision_id: AD-COORD-008
+      title: "Work queue size limit"
+      description: |
+        CoordinationConfig includes max_work_queue_size parameter (default: 1000).
+        CLI and controller reject coordination requests where work_ids.len() exceeds
+        this limit. The limit is intentionally high to support large batch operations
+        while preventing unbounded memory consumption.
+
+        Rationale for 1000 default:
+        - Typical coordination: 1-50 work items
+        - Large batch: 50-500 work items
+        - 1000 provides headroom without excessive memory risk
+        - Operators can increase via --max-work-queue-size if needed
+      rationale: |
+        Budget parameters (max_episodes, max_duration_ms) enforce runtime limits
+        but not startup memory. Work queue is loaded entirely at coordination start.
+        Bounding queue size prevents memory exhaustion from malformed requests.
+      constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0002"
+
+    - decision_id: AD-COORD-009
+      title: "Coordination event serialization via JSON"
+      description: |
+        Coordination events use JSON serialization (serde_json) for the payload field
+        in EventRecord. This follows the existing pattern used by SessionStarted,
+        WorkTransitioned, and other event payloads.
+
+        No .proto file is required because:
+        - APM2 events use EventRecord with JSON payload (not protobuf messages)
+        - Existing reducers deserialize via serde_json (see session/reducer.rs:113-114)
+        - JSON provides schema flexibility for MVP
+
+        The CoordinationEvent payloads (Started, SessionBound, SessionUnbound,
+        Completed, Aborted) implement Serialize + Deserialize via serde.
+      rationale: |
+        Follows established event serialization pattern. JSON is adequate for MVP.
+        If protobuf is needed later, migration is possible via event versioning.
+      evidence_ref: "crates/apm2-core/src/session/reducer.rs:113-114"
+
+    - decision_id: AD-COORD-010
+      title: "Work item retry semantics"
+      description: |
+        When a session fails for a work item:
+        1. Increment attempt counter for that work item
+        2. If attempt_count < max_attempts_per_work:
+           - Re-check work freshness
+           - Immediately retry (same loop iteration)
+        3. If attempt_count >= max_attempts_per_work:
+           - Mark work item as SKIPPED in coordination state
+           - Advance work_index to next item
+           - Do NOT increment consecutive_failures (circuit breaker is for
+             consecutive failures across DIFFERENT work items)
+
+        Interaction with circuit breaker:
+        - Circuit breaker tracks consecutive failures across work items
+        - If work-A fails 3 times (exhausts retries), work_index advances
+        - If work-B then fails, consecutive_failures = 1 (not 4)
+        - Circuit breaker triggers on 3 consecutive work items failing
+
+        This distinction ensures:
+        - Retries allow transient recovery for individual work items
+        - Circuit breaker catches systemic issues (all work failing)
+      rationale: |
+        Retry is per-work-item concern; circuit breaker is coordination-level concern.
+        Separating these allows fine-grained failure handling without false positives.
+      tradeoff_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#TRADEOFF-COORD-0001"
+
+    - decision_id: AD-COORD-011
+      title: "Token budget aggregation from session outcomes"
+      description: |
+        CoordinationController tracks total token consumption by observing
+        SessionTerminated events. The SessionTerminated payload includes
+        final_entropy (total tokens consumed by that session).
+
+        Aggregation algorithm:
+        1. When session.terminated event is observed for bound session
+        2. Read final_entropy from SessionReducerState.get(session_id).entropy_consumed
+        3. Add to BudgetUsage.consumed_tokens
+        4. Check against max_tokens ceiling if configured
+
+        Note: If max_tokens is None (not configured), consumed_tokens is tracked
+        but not enforced. This allows post-hoc analysis without runtime limits.
+      rationale: |
+        Coordination is read-only observer (AD-COORD-002). Token values come from
+        SessionReducer, which is the single writer for session state. Aggregation
+        happens after session termination when values are finalized.
+      evidence_ref: "crates/apm2-core/src/session/reducer.rs:186-229"
+
+    - decision_id: AD-COORD-012
+      title: "Receipt finalization and hash ordering"
+      description: |
+        CoordinationReceipt is built incrementally but finalized atomically:
+
+        1. During coordination: track work outcomes, budget usage
+        2. On stop condition detection:
+           a. Set final stop_condition
+           b. Set completed_at timestamp
+           c. Compute all derived fields (total_sessions, success/fail counts)
+        3. Serialize receipt to JSON bytes
+        4. Compute receipt_hash = BLAKE3(receipt_bytes)
+        5. Store receipt in CAS: cas.put(receipt_bytes) -> cas_hash
+        6. Emit coordination.completed event with receipt_hash
+
+        The hash in the completion event MUST match the CAS content hash.
+        Receipt is immutable after step 4; the completion event references
+        a finalized, hash-locked receipt.
+      rationale: |
+        Ensures tamper-evidence (TB-COORD-003). Hash computed AFTER all fields
+        populated, BEFORE event emission. CAS storage and event emission are
+        atomic-ish (best effort; CAS failure aborts completion).
+      invariant_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#INV-COORD-0003"
+
+    - decision_id: AD-COORD-013
+      title: "Stop condition priority ordering"
+      description: |
+        When multiple stop conditions are satisfied, the following priority applies:
+        1. CIRCUIT_BREAKER_TRIGGERED (highest - safety critical)
+        2. BUDGET_EXHAUSTED(Duration) (runtime limit)
+        3. BUDGET_EXHAUSTED(Tokens) (resource limit)
+        4. BUDGET_EXHAUSTED(Episodes) (session count limit)
+        5. MAX_ATTEMPTS_EXCEEDED(work_id) (work-level failure)
+        6. WORK_COMPLETED (lowest - success)
+
+        The receipt records the highest-priority condition that was detected.
+        This ordering ensures safety conditions take precedence over success.
+      rationale: |
+        Deterministic ordering enables reproducible receipts. Safety conditions
+        (circuit breaker) take precedence because they indicate systemic issues.
+        Success (WORK_COMPLETED) is lowest because it implies no failures.
+
   v2_exploration_findings: |
     RFC v2 (Grounded phase). Design decisions validated through codebase investigation.
 
@@ -182,3 +334,39 @@ rfc_design_decisions:
       * MUST use Reducer trait (not custom base class)
       * MUST use ledger.append() exclusively for event emission
       * MUST_NOT modify Work/Session/Lease state directly
+
+  v4_closure_findings: |
+    RFC v4 (Standard phase). Final architectural convergence via COUNCIL FINALIZE session.
+
+    ## COUNCIL Session: COUNCIL-RFC-0012-FINALIZE-20260127
+
+    ### Mode Validation
+    - SA-1: [3, 24, 48, 59, 72] (Constructive, Qualitative probability, Optimization, Dialectical, Moral/ethical)
+    - SA-2: [11, 33, 45, 56, 70] (Bayesian, Belief revision, Decision-theoretic, Theory-of-mind, Engineering design)
+    - SA-3: [8, 22, 36, 49, 65] (Counterexample-guided, Evidential, Assurance-case, Robust, Deontic)
+    - Total overlap: 0 (validation passed)
+    - Category coverage: All subagents have modes from >= 5 different categories
+
+    ### Findings Resolved
+
+    **BLOCKER (resolved):**
+    - SA2-F-CLOSURE-001 (Session spawning API) -> AD-COORD-007 specifies UUID generation
+
+    **MAJOR (resolved):**
+    - SA1-F-CLOSURE-001 + SA3-F-CLOSURE-004 (Unbounded work queue) -> AD-COORD-008 (max_work_queue_size)
+    - SA1-F-CLOSURE-002 + SA2-F-CLOSURE-003 (Proto schema) -> AD-COORD-009 (JSON serialization)
+    - SA2-F-CLOSURE-002 (Token aggregation) -> AD-COORD-011 (aggregation from session outcomes)
+
+    **MINOR (resolved):**
+    - SA1-F-CLOSURE-003 (Receipt schema) -> AD-COORD-012 (receipt finalization ordering)
+    - SA1-F-CLOSURE-004 + SA2-F-CLOSURE-004 (Retry semantics) -> AD-COORD-010 (retry vs circuit breaker)
+    - SA1-F-CLOSURE-005 (StopCondition priority) -> AD-COORD-013 (priority ordering)
+    - SA3-F-CLOSURE-001 (Orphan binding) -> Documented as edge case; timeout cleanup is Phase 2
+    - SA3-F-CLOSURE-002 (Receipt finalization) -> AD-COORD-012
+
+    ### Council Verdict
+    - SA-1: CONVERGED (after AD-COORD-007 through AD-COORD-013 additions)
+    - SA-2: IMPLEMENTABLE (all friction points resolved)
+    - SA-3: SECURE (no new security gaps introduced)
+
+    **Aggregate Verdict: APPROVED for v4 (Standard)**
