@@ -122,13 +122,66 @@
 //! let hash = index.resolve("org:ticket:TCK-00134");
 //! assert!(hash.is_some());
 //! ```
+//!
+//! # `ContextPack` Compiler Example
+//!
+//! ```
+//! use apm2_core::cac::{
+//!     BudgetConstraint, ContextPackCompiler, ContextPackSpec, DcpEntry,
+//!     DcpIndex, TypedQuantity,
+//! };
+//!
+//! // Setup DCP index with artifacts
+//! let mut index = DcpIndex::new();
+//! let schema = DcpEntry::new(
+//!     "org:schema:doc",
+//!     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+//!     "org:schema:doc",
+//! );
+//! index.register(schema).unwrap();
+//!
+//! let doc = DcpEntry::new(
+//!     "org:doc:readme",
+//!     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+//!     "org:schema:doc",
+//! );
+//! index.register(doc).unwrap();
+//!
+//! // Create compiler with index
+//! let compiler = ContextPackCompiler::new(&index);
+//!
+//! // Create a pack spec
+//! let spec = ContextPackSpec::builder()
+//!     .spec_id("my-pack")
+//!     .root("org:doc:readme")
+//!     .budget(
+//!         BudgetConstraint::builder()
+//!             .max_artifacts(TypedQuantity::artifacts(10))
+//!             .build(),
+//!     )
+//!     .target_profile("org:profile:default")
+//!     .build()
+//!     .unwrap();
+//!
+//! // Compile the pack
+//! let result = compiler.compile(&spec).unwrap();
+//! assert!(!result.pack.content_hashes.is_empty());
+//! assert_eq!(result.receipt.artifact_count, 1);
+//! ```
 
 pub mod admission;
+pub mod compiler;
 pub mod dcp_index;
 pub mod pack_spec;
 pub mod patch_engine;
 mod validator;
 
+// Compiler exports
+pub use compiler::{
+    BudgetUsed, CompilationError, CompilationReceipt, CompilationResult, CompilationWarning,
+    CompiledContextPack, CompiledManifest, ContextPackCompiler, MAX_ARTIFACTS_IN_PACK,
+    MAX_RESOLUTION_DEPTH, ManifestEntry,
+};
 pub use dcp_index::{
     DcpEntry, DcpIndex, DcpIndexError, DcpIndexReducer, DcpIndexReducerError, DcpIndexState,
     EVENT_TYPE_ARTIFACT_DEPRECATED, EVENT_TYPE_ARTIFACT_REGISTERED, MAX_CONTENT_HASH_LENGTH,
