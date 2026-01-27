@@ -114,6 +114,10 @@ enum Commands {
     /// Export a compiled context pack to target profile layout
     Export(commands::export::ExportArgs),
 
+    // === Coordination (Work queue processing) ===
+    /// Coordinate work queue processing with budget enforcement
+    Coordinate(commands::coordinate::CoordinateArgs),
+
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
@@ -285,6 +289,14 @@ fn main() -> Result<()> {
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
             let exit_code = commands::export::run_export(&export_args);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Coordinate(coordinate_args) => {
+            // Coordinate commands use specific exit codes per TCK-00153:
+            // 0=success (WORK_COMPLETED), 1=aborted, 2=invalid_args
+            // We use std::process::exit to bypass anyhow Result handling
+            // and ensure precise exit codes are returned.
+            let exit_code = commands::coordinate::run_coordinate(&coordinate_args);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {
