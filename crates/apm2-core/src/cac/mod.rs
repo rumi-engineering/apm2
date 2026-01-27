@@ -5,23 +5,28 @@
 //! - **JSON Schema validation**: Strict validation with
 //!   `unevaluatedProperties=false`
 //! - **Size limit enforcement**: Pre-validation to prevent denial-of-service
-//! - **Admission pipeline integration**: Validation after canonicalization
+//! - **Admission pipeline**: Orchestrates validation, canonicalization, and
+//!   storage
 //! - **Patch engine**: JSON Patch (RFC 6902) and Merge Patch (RFC 7396) with
 //!   replay protection
+//! - **Admission receipts**: Cryptographic receipts with hash chains
 //!
 //! # Architecture
 //!
-//! CAC artifacts flow through a validation pipeline:
+//! CAC artifacts flow through the admission pipeline:
 //! 1. Canonicalization (via `determinism::canonicalize_json`)
-//! 2. Schema validation (this module)
+//! 2. Schema validation
 //! 3. CAS storage
+//! 4. Receipt generation with hash chain
+//! 5. Ledger event emission
 //!
 //! For patch operations:
 //! 1. Validate `expected_base_hash` matches current document
 //! 2. Apply patch (JSON Patch or Merge Patch)
 //! 3. Canonicalize output (CAC-JSON format)
-//! 4. Compute new content hash
-//! 5. Return `PatchResult` with hash chain
+//! 4. Validate against schema
+//! 5. Store in CAS
+//! 6. Return `AdmissionReceipt` with hash chain
 //!
 //! # Example
 //!
@@ -43,6 +48,37 @@
 //! validator.validate(&artifact).unwrap();
 //! ```
 //!
+//! # Admission Pipeline Example
+//!
+//! ```
+//! use apm2_core::cac::admission::{AdmissionGate, AdmissionRequest, ArtifactKind};
+//! use apm2_core::evidence::MemoryCas;
+//! use serde_json::json;
+//!
+//! let cas = MemoryCas::new();
+//! let gate = AdmissionGate::new(cas);
+//!
+//! let schema = json!({
+//!     "$schema": "https://json-schema.org/draft/2020-12/schema",
+//!     "type": "object",
+//!     "properties": {
+//!         "id": { "type": "string" }
+//!     },
+//!     "unevaluatedProperties": false
+//! });
+//!
+//! let artifact = json!({"id": "TCK-00132"});
+//! let request = AdmissionRequest::new_artifact(
+//!     "dcp://org/project/ticket/TCK-00132",
+//!     ArtifactKind::Ticket,
+//!     artifact,
+//!     &schema,
+//! );
+//!
+//! let result = gate.admit(request).unwrap();
+//! assert!(!result.receipt.new_hash.is_empty());
+//! ```
+//!
 //! # Patch Engine Example
 //!
 //! ```
@@ -59,6 +95,7 @@
 //! assert_eq!(result.patched_document["version"], 2);
 //! ```
 
+pub mod admission;
 pub mod patch_engine;
 mod validator;
 
