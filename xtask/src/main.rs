@@ -32,6 +32,10 @@
 //! - `aat <PR_URL> --dry-run` - Preview AAT without setting status
 //! - `lint` - Check for anti-patterns (`temp_dir`, shell interpolation)
 //! - `lint --fix` - Check for anti-patterns (fix flag placeholder)
+//! - `capabilities` - Generate capability manifest for the binary
+//! - `capabilities --json` - Output manifest in JSON format
+//! - `selftest` - Run CAC capability selftests
+//! - `selftest --filter <pattern>` - Run only matching tests
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -167,6 +171,24 @@ enum Commands {
     /// Findings are reported as warnings (not errors) to allow gradual
     /// adoption.
     Lint(tasks::lint::LintArgs),
+
+    /// Generate capability manifest for this binary.
+    ///
+    /// Introspects the CLI commands and generates a manifest describing
+    /// all available capabilities and their requirements.
+    ///
+    /// The manifest can be used for capability-based access control (CAC)
+    /// to verify that the binary supports required operations.
+    Capabilities(tasks::capabilities::CapabilitiesArgs),
+
+    /// Run CAC capability selftests.
+    ///
+    /// Executes the selftest suite to verify that advertised capabilities
+    /// actually work. Produces an AAT receipt that can be used to prove
+    /// capability compliance.
+    ///
+    /// Exit code is 0 if all tests pass, 1 if any test fails.
+    Selftest(tasks::selftest::SelftestArgs),
 }
 
 /// Security review exec subcommands.
@@ -273,5 +295,7 @@ fn main() -> Result<()> {
             ai_tool,
         } => tasks::aat(&pr_url, dry_run, ai_tool),
         Commands::Lint(args) => tasks::lint::run(args),
+        Commands::Capabilities(args) => tasks::capabilities::run(args),
+        Commands::Selftest(args) => tasks::selftest::run(&args),
     }
 }
