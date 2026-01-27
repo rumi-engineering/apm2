@@ -1,0 +1,54 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-COORD-0006"
+  category: "SERIAL_EXECUTION_RESULTS"
+  title: "Serial execution loop and binding lifecycle tests"
+  description: |
+    Validates serial execution constraint (one active session at a time) and
+    complete work-session binding lifecycle (every bound session is unbound).
+  capture:
+    paths:
+      - "evidence/coordination/execution/"
+  verification:
+    commands:
+      - id: "CMD-COORD-0006-01"
+        shell: "bash"
+        command: "cargo test --package apm2-core --lib coordination::controller::tests::serial_execution"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test single active session constraint"
+          - "Test sequential processing"
+          - "Test work queue order preservation"
+      - id: "CMD-COORD-0006-02"
+        shell: "bash"
+        command: "cargo test --package apm2-core --lib coordination::binding::tests::lifecycle"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test bound before spawn"
+          - "Test unbound on termination"
+          - "Test no orphan bindings"
+      - id: "CMD-COORD-0006-03"
+        shell: "bash"
+        command: "cargo test --package apm2-core --lib coordination::state::tests::binding_count"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test binding count verification"
+          - "Test binding state queryable"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

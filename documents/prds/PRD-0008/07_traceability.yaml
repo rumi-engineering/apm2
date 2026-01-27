@@ -1,0 +1,106 @@
+prd_traceability:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  requirement_registry:
+    mode: "FILE_PER_REQUIREMENT"
+    local_root: "requirements/"
+    local_requirements:
+      - requirement_id: "REQ-COORD-0001"
+        requirement_ref: "requirements/REQ-COORD-0001.yaml#prd_requirement"
+      - requirement_id: "REQ-COORD-0002"
+        requirement_ref: "requirements/REQ-COORD-0002.yaml#prd_requirement"
+      - requirement_id: "REQ-COORD-0003"
+        requirement_ref: "requirements/REQ-COORD-0003.yaml#prd_requirement"
+      - requirement_id: "REQ-COORD-0004"
+        requirement_ref: "requirements/REQ-COORD-0004.yaml#prd_requirement"
+      - requirement_id: "REQ-COORD-0005"
+        requirement_ref: "requirements/REQ-COORD-0005.yaml#prd_requirement"
+      - requirement_id: "REQ-COORD-0006"
+        requirement_ref: "requirements/REQ-COORD-0006.yaml#prd_requirement"
+      - requirement_id: "REQ-COORD-0007"
+        requirement_ref: "requirements/REQ-COORD-0007.yaml#prd_requirement"
+    imports: []
+  mapping:
+    requirement_to_sections:
+      - requirement_id: "REQ-COORD-0001"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.COORD-REDUCER"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.invariants.INV-COORD-0001"
+      - requirement_id: "REQ-COORD-0002"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.COORD-EVENTS"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.invariants.INV-COORD-0002"
+      - requirement_id: "REQ-COORD-0003"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.system_model.entities.ENT-BUDGET"
+          - "05_success_metrics.yaml#prd_success_metrics.guardrails.GRD-COORD-001"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints.CNS-COORD-0002"
+      - requirement_id: "REQ-COORD-0004"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.COORD-CONTROLLER"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints.CNS-COORD-0003"
+      - requirement_id: "REQ-COORD-0005"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.system_model.entities.ENT-STOP-CONDITION"
+          - "05_success_metrics.yaml#prd_success_metrics.guardrails.GRD-COORD-002"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.invariants.INV-COORD-0005"
+      - requirement_id: "REQ-COORD-0006"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.COORD-CLI"
+          - "04_solution_overview.yaml#prd_solution_overview.interfaces.user_surfaces"
+      - requirement_id: "REQ-COORD-0007"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.COORD-RECEIPT"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.invariants.INV-COORD-0004"
+  source_mapping:
+    goal_to_requirement:
+      - source_goal_id: "COORD-G-0001"
+        requirement_ids:
+          - "REQ-COORD-0001"
+      - source_goal_id: "COORD-G-0002"
+        requirement_ids:
+          - "REQ-COORD-0002"
+      - source_goal_id: "COORD-G-0003"
+        requirement_ids:
+          - "REQ-COORD-0003"
+      - source_goal_id: "COORD-G-0004"
+        requirement_ids:
+          - "REQ-COORD-0004"
+      - source_goal_id: "COORD-G-0005"
+        requirement_ids:
+          - "REQ-COORD-0005"
+      - source_goal_id: "COORD-G-0006"
+        requirement_ids:
+          - "REQ-COORD-0006"
+      - source_goal_id: "COORD-G-0007"
+        requirement_ids:
+          - "REQ-COORD-0007"
+    acceptance_test_to_evidence:
+      - source_test_id: "COORD-AT-0001"
+        evidence_ids:
+          - "EVID-COORD-0005"
+      - source_test_id: "COORD-AT-0002"
+        evidence_ids:
+          - "EVID-COORD-0006"
+      - source_test_id: "COORD-AT-0003"
+        evidence_ids:
+          - "EVID-COORD-0003"
+      - source_test_id: "COORD-AT-0004"
+        evidence_ids:
+          - "EVID-COORD-0002"
+      - source_test_id: "COORD-AT-0005"
+        evidence_ids:
+          - "EVID-COORD-0001"
+  external_references:
+    - id: EXT-REF-NORTH-STAR
+      type: strategic_document
+      reference: "NORTH_STAR Phase 1 exit criterion"
+      description: "Agent can complete end-to-end feature implementation from PRD to merged PR without manual intervention"
+    - id: EXT-REF-PRD-0007
+      type: prd
+      reference: "PRD-0007 (Context-as-Code)"
+      description: "CAC provides context pipeline; coordination provides execution orchestration"
+    - id: EXT-REF-REDUCER-PATTERN
+      type: architectural_pattern
+      reference: "apm2-core/src/reducer/mod.rs"
+      description: "Established reducer pattern for event-sourced projections"

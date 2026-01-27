@@ -1,0 +1,271 @@
+rfc_risks_and_open_questions:
+  schema_version: "2026-01-26"
+  template_version: "2026-01-26"
+
+  risks:
+    - risk_id: RISK-COORD-001
+      title: "Session spawn latency causes coordination timeout"
+      description: |
+        Session spawn involves process creation, environment setup, and
+        initial handshake. This latency counts against max_duration_ms.
+        If spawn latency is high, coordinations may timeout before
+        useful work is done.
+      likelihood: MEDIUM
+      impact: MEDIUM
+      mitigation:
+        - "Track spawn latency separately in receipt for analysis"
+        - "Provide budget sizing guidance based on observed latencies"
+        - "Consider excluding spawn time from duration budget in future version"
+      residual_risk: MEDIUM
+      owner: AUTH_ARCHITECTURE
+      prd_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#RSK-COORD-0001"
+
+    - risk_id: RISK-COORD-002
+      title: "Race condition between freshness check and session spawn"
+      description: |
+        Work state may change between the freshness check and actual
+        session spawn, leading to duplicate execution or wasted resources.
+      likelihood: LOW
+      impact: LOW
+      mitigation:
+        - "Use ledger sequence number for consistent state view"
+        - "Session validates work state at start, fails fast if stale"
+        - "Coordination handles session failure gracefully"
+      residual_risk: LOW
+      owner: AUTH_ARCHITECTURE
+      prd_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#RSK-COORD-0002"
+
+    - risk_id: RISK-COORD-003
+      title: "Circuit breaker triggers on transient failures"
+      description: |
+        Transient issues (network glitch, temporary API unavailability)
+        may cause consecutive failures that trigger the circuit breaker,
+        aborting a coordination that could have recovered.
+      likelihood: MEDIUM
+      impact: MEDIUM
+      mitigation:
+        - "Threshold of 3 balances safety vs availability (per tradeoff analysis)"
+        - "Document that circuit breaker is safety feature, not nuisance"
+        - "Consider exponential backoff between retries in future version"
+      residual_risk: MEDIUM
+      owner: AUTH_ARCHITECTURE
+      prd_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#RSK-COORD-0003"
+
+    - risk_id: RISK-COORD-004
+      title: "Serial execution limits throughput"
+      description: |
+        MVP processes one work item at a time. For large work queues,
+        this may result in long coordination durations that hit
+        time-based budget limits.
+      likelihood: HIGH
+      impact: LOW
+      mitigation:
+        - "Serial execution is MVP scope; parallel is Phase 2"
+        - "Operators can run multiple coordinations for independent work"
+        - "Document throughput expectations"
+      residual_risk: LOW
+      owner: AUTH_PRODUCT
+      prd_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#RSK-COORD-0004"
+
+    - risk_id: RISK-COORD-005
+      title: "Budget estimation is difficult without historical data"
+      description: |
+        Operators may over-provision (waste) or under-provision
+        (premature termination) budgets without good defaults or
+        historical guidance.
+      likelihood: HIGH
+      impact: MEDIUM
+      mitigation:
+        - "Collect budget usage data from early coordinations"
+        - "Provide budget recommendation in documentation"
+        - "Receipt includes budget_usage for post-hoc analysis"
+      residual_risk: MEDIUM
+      owner: AUTH_PRODUCT
+      prd_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#RSK-COORD-0005"
+
+  open_questions:
+    - question_id: OQ-COORD-001
+      question: "How should controller integrate with existing SessionReducer spawn flow?"
+      context: |
+        SessionReducer has an existing session spawn mechanism. Coordination
+        needs to spawn sessions and observe their outcomes. Need to understand
+        the exact integration points.
+      v2_status: RESOLVED
+      v2_answer: |
+        Integration points identified via codebase investigation (SA-1 findings):
+
+        1. SESSION SPAWN FLOW:
+           - SessionStarted event contains: actor_id, work_id, lease_id, adapter_type,
+             entropy_budget, restart_attempt
+           - CoordinationController emits coordination.session_bound BEFORE session.started
+           - Session spawning uses existing spawn_holon mechanism (apm2-holon/src/spawn.rs)
+
+        2. OBSERVATION PATTERN:
+           - SessionReducerState.get(session_id) -> Option<&SessionState>
+           - SessionState::is_terminal() to detect completion
+           - SessionState::Terminated.exit_classification for outcome
+
+        3. EVENT SEQUENCE (BINDING BRACKET):
+           coordination.session_bound -> session.started -> ... -> session.terminated -> coordination.session_unbound
+
+        4. INTEGRATION API:
+           - Read: SessionReducer.state().get(session_id)
+           - Emit: ledger.append(coordination.session_bound/unbound events)
+           - NO direct session state modification (read-only observer)
+      evidence_refs:
+        - "crates/apm2-core/src/session/reducer.rs:107-152"
+        - "crates/apm2-core/src/session/reducer.rs:186-229"
+        - "crates/apm2-holon/src/spawn.rs"
+      owner: AUTH_ARCHITECTURE
+
+    - question_id: OQ-COORD-002
+      question: "What is the checkpoint format for CoordinationReducer?"
+      context: |
+        Checkpointing enables efficient state recovery without full replay.
+        Need to define checkpoint structure compatible with existing
+        checkpoint infrastructure.
+      v2_status: RESOLVED
+      v2_answer: |
+        Checkpoint format defined following established patterns (SA-1 findings):
+
+        1. CHECKPOINT INFRASTRUCTURE (crates/apm2-core/src/reducer/checkpoint.rs):
+           - SQLite schema: (id, reducer_name, seq_id, state_data, created_at_ns)
+           - CheckpointableReducer trait: serialize_state() / deserialize_state()
+           - JSON serialization via serde_json
+
+        2. CoordinationReducerState STRUCTURE:
+           ```rust
+           pub struct CoordinationReducerState {
+               pub coordinations: HashMap<String, CoordinationState>,
+               // Bindings keyed by work_id for fast lookup
+               pub bindings: HashMap<String, BindingInfo>,
+           }
+
+           pub struct CoordinationState {
+               pub coordination_id: String,
+               pub work_queue: Vec<String>,
+               pub work_index: usize,
+               pub budget: CoordinationBudget,
+               pub budget_usage: BudgetUsage,
+               pub consecutive_failures: u32,
+               pub status: CoordinationStatus,
+               pub started_at: u64,
+           }
+           ```
+
+        3. SERIALIZATION REQUIREMENTS:
+           - All types derive Serialize + Deserialize (serde)
+           - Deterministic HashMap iteration via sorted keys in JSON output
+           - State must be Send + Sync for async runtime
+
+        4. CHECKPOINT SEMANTICS:
+           - Save: CoordinationReducerState serialized to JSON blob at seq_id
+           - Restore: JSON blob deserialized, reducer resumes from seq_id
+           - Determinism: replay from checkpoint == replay from genesis for same events
+      evidence_refs:
+        - "crates/apm2-core/src/reducer/checkpoint.rs:65-99"
+        - "crates/apm2-core/src/reducer/traits.rs:94-125"
+        - "crates/apm2-core/src/session/reducer.rs:14-71"
+      owner: AUTH_ARCHITECTURE
+
+    - question_id: OQ-COORD-003
+      question: "How does coordination interact with work item state transitions?"
+      context: |
+        Work items have state (open, in_progress, completed). Coordination
+        needs to understand when work is eligible for processing and when
+        to mark it complete. Does coordination emit work state events or
+        just observe them?
+      v2_status: RESOLVED
+      v2_answer: |
+        Work interaction model defined (SA-2 and SA-3 findings):
+
+        1. WORK STATES (crates/apm2-core/src/work/state.rs):
+           Full enum: Open, Claimed, InProgress, Review, NeedsInput,
+           NeedsAdjudication, Completed, Aborted, CiPending, ReadyForReview, Blocked
+
+        2. ELIGIBILITY CRITERIA:
+           - WorkState::is_claimable() returns true ONLY for: Open, ReadyForReview
+           - Non-claimable: Claimed, InProgress, CiPending, Blocked, Review,
+             NeedsInput, NeedsAdjudication, Completed, Aborted
+
+        3. SINGLE-WRITER INVARIANT (CRITICAL):
+           - CoordinationController is READ-ONLY observer for work state
+           - Coordination does NOT emit work.* events
+           - Work state transitions owned by WorkReducer
+           - This prevents cousin abstraction with WorkReducer
+
+        4. OBSERVATION PATTERN:
+           - Query: WorkReducerState::get(work_id) -> Option<&Work>
+           - Check: work.state.is_claimable() for eligibility
+           - Track: work.transition_count for freshness validation
+
+        5. FRESHNESS CHECK (AD-COORD-006):
+           - Controller records ledger seq_id at freshness check
+           - Spawn event references this seq_id
+           - If work.transition_count changed between check and spawn,
+             skip work item (state changed externally)
+
+        6. COORDINATION RESPONSIBILITY:
+           - Track: work-session binding (coordination.session_bound/unbound)
+           - Track: coordination-level budget consumption
+           - Track: circuit breaker state (consecutive failures)
+           - DO NOT: Directly modify work or session state
+      evidence_refs:
+        - "crates/apm2-core/src/work/state.rs:62-103"
+        - "crates/apm2-core/src/work/state.rs:225-227"
+        - "crates/apm2-core/src/work/reducer.rs:218-309"
+      owner: AUTH_ARCHITECTURE
+
+    - question_id: OQ-COORD-004
+      question: "Should circuit breaker threshold be configurable?"
+      context: |
+        PRD-0008 specifies fixed threshold of 3. Some work types may
+        benefit from higher or lower thresholds.
+      v0_status: DEFERRED
+      proposed_answer: |
+        Start with fixed threshold for simplicity. Make configurable
+        if operators demonstrate need based on work type.
+      owner: AUTH_PRODUCT
+      prd_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#Q-COORD-0003"
+
+    - question_id: OQ-COORD-005
+      question: "How should coordination handle work items that become invalid mid-execution?"
+      context: |
+        Work item may be deleted or blocked while coordination is running.
+        What should coordination do?
+      v0_status: DEFERRED
+      proposed_answer: |
+        Work freshness check catches most cases. For mid-coordination
+        invalidation, session will fail and coordination proceeds.
+        Document as expected behavior.
+      owner: AUTH_ARCHITECTURE
+      prd_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#Q-COORD-0002"
+
+  deferred_items:
+    - item_id: DEFER-COORD-001
+      title: "Parallel agent execution"
+      reason: |
+        Parallel execution adds complexity around resource contention,
+        failure isolation, and budget allocation. Deferred to Phase 2.
+      prd_ref: "documents/prds/PRD-0008/03_goals_scope.yaml#out_of_scope"
+
+    - item_id: DEFER-COORD-002
+      title: "Coordination pause/resume functionality"
+      reason: |
+        Pause/resume adds state complexity and partial receipt handling.
+        Not needed for MVP autonomous operation.
+      prd_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#Q-COORD-0001"
+
+    - item_id: DEFER-COORD-003
+      title: "Dynamic priority reordering during execution"
+      reason: |
+        MVP processes queue in initial order. Dynamic reordering adds
+        complexity without clear benefit for Phase 1 goals.
+      prd_ref: "documents/prds/PRD-0008/03_goals_scope.yaml#out_of_scope"
+
+    - item_id: DEFER-COORD-004
+      title: "Human notification hooks"
+      reason: |
+        MVP emits events and receipts; external systems can subscribe.
+        Built-in notification deferred.
+      prd_ref: "documents/prds/PRD-0008/02_problem.yaml#non_goals"

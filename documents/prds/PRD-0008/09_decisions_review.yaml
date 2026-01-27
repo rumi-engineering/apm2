@@ -1,0 +1,100 @@
+prd_decisions_review:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  decisions:
+    - id: DEC-COORD-0001
+      statement: |
+        Serial execution loop chosen for MVP; parallel execution deferred to Phase 2.
+      rationale: |
+        Serial execution is simpler to implement, test, and debug. Resource contention,
+        failure isolation, and budget allocation across parallel sessions add significant
+        complexity. Serial execution establishes the coordination patterns that can be
+        extended to parallel execution.
+      alternatives_considered:
+        - id: ALT-PARALLEL
+          description: Parallel session execution with configurable concurrency.
+          status: DEFERRED
+          reason: Complexity; requires coordination-level resource management, failure isolation, and budget allocation per session.
+        - id: ALT-HYBRID
+          description: Serial by default with optional parallelism flag.
+          status: DEFERRED
+          reason: Adds conditional complexity; better to prove serial first.
+      evidence_ids: []
+    - id: DEC-COORD-0002
+      statement: |
+        Circuit breaker threshold fixed at 3 consecutive failures for MVP.
+      rationale: |
+        Fixed threshold reduces configuration complexity while providing meaningful
+        protection. 3 failures allows for transient issues while catching systematic
+        problems. Configurable threshold can be added if operators demonstrate need.
+      alternatives_considered:
+        - id: ALT-CONFIGURABLE-THRESHOLD
+          description: User-configurable circuit breaker threshold.
+          status: DEFERRED
+          reason: Adds configuration surface; start simple, add if needed.
+        - id: ALT-EXPONENTIAL-BACKOFF
+          description: Backoff delays between retries instead of hard cutoff.
+          status: DEFERRED
+          reason: Adds time-based complexity; consider for Phase 2.
+      evidence_ids: []
+    - id: DEC-COORD-0003
+      statement: |
+        CoordinationReducer follows existing reducer pattern (SessionReducer, WorkReducer).
+      rationale: |
+        Established patterns reduce implementation risk and cognitive load. Reducer
+        infrastructure (checkpointing, replay, testing) is proven. Consistency across
+        reducers simplifies system understanding.
+      alternatives_considered:
+        - id: ALT-STATE-MACHINE
+          description: State machine library instead of event-sourced reducer.
+          status: REJECTED
+          reason: Would diverge from existing patterns; loses ledger integration benefits.
+      evidence_ids: []
+    - id: DEC-COORD-0004
+      statement: |
+        Coordination events are independent of Work/Session/Lease events.
+      rationale: |
+        Separation of concerns: each reducer owns its projection. Coordination reacts
+        to other events but does not modify other reducer state. This enables independent
+        evolution and testing.
+      alternatives_considered:
+        - id: ALT-UNIFIED-EVENTS
+          description: Single event type for work+session+coordination transitions.
+          status: REJECTED
+          reason: Tight coupling; violates reducer separation; complicates evolution.
+      evidence_ids: []
+    - id: DEC-COORD-0005
+      statement: |
+        Budget parameters (max_episodes, max_duration_ms) are mandatory, not optional.
+      rationale: |
+        Safety invariant: no coordination runs indefinitely. Optional budgets create
+        risk of unbounded execution. Operators must consciously choose limits.
+      alternatives_considered:
+        - id: ALT-DEFAULT-BUDGET
+          description: System-wide default budgets with optional override.
+          status: CONSIDERED
+          reason: Could be added later; MVP requires explicit specification for safety awareness.
+      evidence_ids: []
+  gate_reviews:
+    - gate_id: GATE-PRD-SECURITY
+      status: PENDING
+      evidence_ids: []
+      coordination_specific_concerns:
+        - "Budget enforcement prevents resource exhaustion (GRD-COORD-001)."
+        - "Circuit breaker prevents crash loops (GRD-COORD-002)."
+        - "Audit trail via ledger events (SEC-COORD-0003)."
+    - gate_id: GATE-PRD-PRODUCT
+      status: PENDING
+      evidence_ids: []
+      coordination_specific_concerns:
+        - "Enables Phase 1 exit criterion for autonomous operation."
+        - "CLI interface provides machine-readable coordination control."
+        - "Evidence receipts prove coordination outcomes."
+  waivers: []
+  future_upgrade_path:
+    - Parallel execution with configurable concurrency (Phase 2).
+    - Configurable circuit breaker threshold.
+    - Exponential backoff between retries.
+    - Work priority reordering during coordination.
+    - Pause/resume functionality.
+    - Human notification hooks integration.

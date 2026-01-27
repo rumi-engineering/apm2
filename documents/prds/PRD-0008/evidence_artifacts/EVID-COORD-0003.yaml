@@ -1,0 +1,54 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-COORD-0003"
+  category: "BUDGET_ENFORCEMENT_RESULTS"
+  title: "Budget ceiling enforcement tests"
+  description: |
+    Validates that budget parameters are mandatory and enforced. Verifies
+    coordination termination on budget exhaustion and proper stop condition
+    recording.
+  capture:
+    paths:
+      - "evidence/coordination/budget/"
+  verification:
+    commands:
+      - id: "CMD-COORD-0003-01"
+        shell: "bash"
+        command: "cargo test --package apm2-core --lib coordination::budget::tests::mandatory_params"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test rejects missing max_episodes"
+          - "Test rejects missing max_duration_ms"
+      - id: "CMD-COORD-0003-02"
+        shell: "bash"
+        command: "cargo test --package apm2-core --lib coordination::budget::tests::ceiling_enforcement"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test terminates on max_episodes"
+          - "Test terminates on max_duration_ms"
+          - "Test verifies stop_condition=BUDGET_EXHAUSTED"
+      - id: "CMD-COORD-0003-03"
+        shell: "bash"
+        command: "cargo test --package apm2-core --lib coordination::budget::tests::monotonic_consumption"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test verifies budget only increases"
+          - "Test verifies no ceiling breach"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

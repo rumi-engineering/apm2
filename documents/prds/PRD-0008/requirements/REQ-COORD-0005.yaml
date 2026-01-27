@@ -1,0 +1,25 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-COORD-0005"
+  type: "NON_FUNCTIONAL"
+  title: "Stop conditions and circuit breaker"
+  statement: |
+    Coordination MUST enforce stop conditions to terminate execution. Stop conditions
+    include: WORK_COMPLETED (queue exhausted), BUDGET_EXHAUSTED (ceiling reached),
+    MAX_ATTEMPTS_EXCEEDED (work item retry limit), and CIRCUIT_BREAKER_TRIGGERED
+    (3 consecutive failures). Circuit breaker MUST reset on any successful session
+    completion. Coordination MUST terminate with exactly one stop condition.
+  acceptance_criteria:
+    - "WORK_COMPLETED on queue exhaustion. Verified by: Receipt shows stop_condition=WORK_COMPLETED when all items processed."
+    - "BUDGET_EXHAUSTED on ceiling breach. Verified by: Receipt shows stop_condition=BUDGET_EXHAUSTED when limit reached."
+    - "CIRCUIT_BREAKER_TRIGGERED after 3 consecutive failures. Verified by: Receipt shows stop_condition=CIRCUIT_BREAKER_TRIGGERED after third consecutive failure."
+    - "Circuit breaker resets on success. Verified by: Success after failures resets consecutive count; subsequent failures start from 0."
+    - "Single stop condition per coordination. Verified by: Receipt contains exactly one stop_condition value."
+  evidence:
+    evidence_ids:
+      - EVID-COORD-0002
+    inherited_from_prd: false
+    notes:
+      - "GRD-COORD-002 specifies circuit breaker threshold of 3."
+      - "INV-COORD-0005 specifies reset behavior."

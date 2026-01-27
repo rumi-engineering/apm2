@@ -1,0 +1,290 @@
+prd_quality_framework:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  profile_id: PRD_QUALITY_FRAMEWORK_V2
+  dimensions:
+    - dimension_id: AGENT_FRIENDLY_UX
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-COORD-0006
+        evidence_ids:
+          - EVID-COORD-0007
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: ACCESSIBILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - CLI outputs MUST be parseable as structured JSON for machine consumption.
+          - Error messages MUST include actionable next steps and coordination_id for correlation.
+        required_evidence_categories:
+          - TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: BACKWARD_COMPATIBILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - Coordination events MUST follow ledger event versioning conventions.
+          - CLI command interface changes require major version bump.
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: COST_EFFICIENCY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-COORD-0003
+        evidence_ids:
+          - EVID-COORD-0003
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: DATA_PRIVACY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - Coordination events MUST NOT contain work content; only identifiers.
+          - Evidence receipts MUST declare data classification.
+        required_evidence_categories:
+          - POLICY_CHECK_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: DEFAULT_DENY_SECURITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-COORD-0003
+          - REQ-COORD-0005
+        evidence_ids:
+          - EVID-COORD-0002
+          - EVID-COORD-0003
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: DETERMINISM
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-COORD-0001
+        evidence_ids:
+          - EVID-COORD-0005
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: DOCUMENTATION
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - All coordination events MUST have schema documentation.
+          - CLI command MUST be documented with usage examples.
+        required_evidence_categories:
+          - BUILD_ARTIFACTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: ERROR_HANDLING
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - All coordination failures MUST produce structured error with coordination_id.
+          - Circuit breaker triggers MUST include failure history in receipt.
+        required_evidence_categories:
+          - TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: INTEROPERABILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - Coordination events MUST integrate with existing ledger infrastructure.
+          - Receipt format MUST be compatible with CAS storage.
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: OBSERVABILITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-COORD-0007
+        evidence_ids:
+          - EVID-COORD-0001
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: OPERATIONAL_READINESS
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - Budget exhaustion MUST terminate coordination cleanly with receipt.
+          - Circuit breaker MUST emit clear diagnostic information.
+        required_evidence_categories:
+          - CONFIG_SNAPSHOTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: PERFORMANCE
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - Reducer event processing MUST complete within bounded latency.
+          - Controller loop MUST not introduce significant spawn overhead.
+        required_evidence_categories:
+          - BENCHMARK_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: RECOVERY_ROLLBACK
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - Reducer state MUST be reconstructable from ledger replay.
+          - Coordination abort MUST not leave orphan bindings.
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: RELIABILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - Session failures MUST be handled gracefully (proceed or abort per stop condition).
+          - Coordination MUST not crash on malformed work items.
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: RESILIENCE
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - Circuit breaker provides resilience against systematic failures.
+          - Partial progress preserved in receipt on abnormal termination.
+        required_evidence_categories:
+          - INTEGRATION_TEST_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: SCALABILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      coverage:
+        requirement_ids: []
+        evidence_ids: []
+      delegation:
+        guardrails:
+          - Coordination state size bounded by work queue size.
+          - Checkpointing enables large-scale replay without full history.
+        required_evidence_categories:
+          - BENCHMARK_RESULTS
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []
+    - dimension_id: TESTABILITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-COORD-0001
+        evidence_ids:
+          - EVID-COORD-0005
+          - EVID-COORD-0006
+      delegation:
+        guardrails: []
+        required_evidence_categories: []
+      exception:
+        requested: false
+        rationale: ""
+        required_signoffs: []

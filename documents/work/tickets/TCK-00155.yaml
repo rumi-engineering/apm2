@@ -1,0 +1,36 @@
+acceptance_criteria:
+  - criterion: All integration tests pass
+    verification: cargo test coordination_integration
+  - criterion: Happy path produces valid receipt
+    verification: Receipt validation in test
+  - criterion: Edge cases handled correctly
+    verification: Tests for each failure mode
+  - criterion: AGENTS.md follows module pattern
+    verification: Documentation review
+implementation:
+  code_examples: []
+  files_to_create:
+    - path: crates/apm2-core/tests/coordination_integration.rs
+      purpose: Integration test suite
+  files_to_modify:
+    - changes: Add AGENTS.md documentation
+      path: crates/apm2-core/src/coordination/mod.rs
+  implementation_steps: []
+  summary: ""
+notes: "Phase: PHASE-1\nGenerated from RFC RFC-0012 ticket decomposition on 2026-01-27."
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+test_requirements:
+  - description: Unit tests pass
+    test_id: UT-00155-01
+    verification_command: cargo test -p apm2-core tck_00155
+  - description: Integration test
+    test_id: IT-00155-01
+    verification_command: cargo run --bin apm2 -- factory tickets emit --rfc RFC-0012
+ticket:
+  depends_on: []
+  id: TCK-00155
+  requirement_ids: []
+  rfc_id: RFC-0012
+  status: READY
+  title: Implement coordination end-to-end integration tests

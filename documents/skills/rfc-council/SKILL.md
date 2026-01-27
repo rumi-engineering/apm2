@@ -98,7 +98,7 @@ anti-cousin enforcement.
 ## Prerequisites
 
 Before RFC review or creation can proceed, the following artifacts MUST exist.
-**Fail fast if any prerequisite is missing.**
+**Auto-generate missing CCP/Impact Map; fail only if PRD/RFC input is missing.**
 
 ### Required Artifacts
 
@@ -132,13 +132,15 @@ START
       |
       v
 [Check CCP index exists?]
-  |-- NO --> STOP: "CCP missing. Run: apm2 factory ccp build --prd <PRD_ID>"
+  |-- NO --> RUN: apm2 factory ccp build --prd <PRD_ID>
+  |          (auto-generates CCP, then continues)
   |-- YES
       |
       v
 [Mode = CREATE?]
   |-- YES --> [Check Impact Map exists?]
-  |             |-- NO --> STOP: "Impact Map missing. Run: apm2 factory impact-map build --prd <PRD_ID>"
+  |             |-- NO --> RUN: apm2 factory impact-map build --prd <PRD_ID>
+  |             |          (auto-generates impact map, then continues)
   |             |-- YES --> PROCEED to CREATE workflow
   |-- NO (REVIEW)
       |
@@ -180,7 +182,7 @@ test -f evidence/prd/PRD-0005/impact_map/impact_map.yaml && echo "Impact Map OK"
 | CREATE | PRD-XXXX | RFC v0 | - -> v0 | Generate discovery-focused RFC v0 from PRD |
 | EXPLORE | RFC v0 | RFC v2 | v0 -> v2 | Codebase investigation to resolve open questions |
 | FINALIZE | RFC v2 | RFC v4 | v2 -> v4 | Final architectural convergence and sign-off |
-| DECOMPOSE| RFC v4 | Tickets | v4 -> Tickets | Generate implementation-ready engineering tickets |
+| DECOMPOSE| RFC v4 | Tickets | v4 -> Tickets | Populate decomposition YAML, delegate emission to `apm2 factory tickets emit` |
 | REVIEW | RFC-XXXX | Findings | (any) | Formal gate review with iterative refinement |
 
 ### Automatic Mode Selection

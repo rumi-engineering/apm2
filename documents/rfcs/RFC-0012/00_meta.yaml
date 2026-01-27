@@ -1,0 +1,70 @@
+rfc_meta:
+  schema_version: "2026-01-26"
+  template_version: "2026-01-26"
+  version: v4
+  rfc:
+    id: RFC-0012
+    title: "Agent Coordination Layer for Autonomous Work Loop Execution"
+    status: APPROVED
+    created_date: "2026-01-27"
+    last_updated_date: "2026-01-27"
+    grounded_date: "2026-01-27"
+    finalized_date: "2026-01-27"
+  binds_to_prd:
+    prd_id: PRD-0008
+    prd_base_path: "documents/prds/PRD-0008"
+    requirement_registry_ref: "documents/prds/PRD-0008/requirements/"
+    evidence_bundle_ref: "documents/prds/PRD-0008/12_evidence_bundle.yaml"
+    prd_meta_ref: "documents/prds/PRD-0008/00_meta.yaml"
+    rationale: "RFC v4 Standard phase - all architectural decisions finalized; ready for ticket decomposition"
+  protocol_profile:
+    id: NONE
+    applies: false
+    inherited_from_prd: true
+    profile_ref: ""
+  ccp_grounding:
+    ccp_index_ref: "evidence/prd/PRD-0008/ccp/ccp_index.json"
+    ccp_index_hash: "07d2573"
+    impact_map_ref: "evidence/prd/PRD-0008/impact_map/impact_map.yaml"
+    rationale: "RFC grounded in CCP artifacts generated for PRD-0008; all 7 requirements are net-new (coordination module does not exist)"
+  custody:
+    producing_agent_roles:
+      - AGENT_AUTHOR
+      - AGENT_ARCHITECT
+    responsible_domains:
+      - DOMAIN_KERNEL
+      - DOMAIN_AGENT_RUNTIME
+    authority_signoffs_required:
+      - AUTH_ARCHITECTURE
+      - AUTH_PRODUCT
+      - AUTH_SECURITY
+  refs:
+    standards:
+      requirement_schema: "standards/schemas/02_requirement.schema.yaml#requirement_schema"
+      evidence_artifact_schema: "standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema"
+      quality_coverage_schema: "standards/schemas/03_quality_coverage.schema.yaml#quality_coverage_schema"
+      gate_review_schema: "standards/schemas/06_gate_review.schema.yaml#gate_review_schema"
+      waiver_schema: "standards/schemas/05_waiver.schema.yaml#waiver_schema"
+      ticket_meta_schema: "standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema"
+      lint_spec: "standards/lint/LINT_SPEC.yaml#lint_spec"
+  implementation:
+    language: Rust
+    edition: "2021"
+    primary_crate: apm2-core
+    new_modules:
+      - crates/apm2-core/src/coordination/
+    key_dependencies:
+      - name: tokio
+        version: "1.x"
+        purpose: "Async runtime for coordination controller"
+      - name: serde
+        version: "1.x"
+        purpose: "Serialization for coordination events and receipts"
+      - name: blake3
+        version: "1.x"
+        purpose: "Content hashing for receipt storage in CAS"
+  north_star_alignment:
+    phase: 1
+    exit_criterion: "Agent can complete end-to-end feature implementation from PRD to merged PR without manual intervention"
+    alignment_score: "0.92-0.95"
+    rationale: "CoordinationReducer directly enables autonomous agent spawning and tracking, the core Phase 1 requirement"
