@@ -52,6 +52,8 @@
 //! assert!(result.receipt.new_hash.len() == 64); // BLAKE3 hex
 //! ```
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -59,7 +61,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::patch_engine::{PatchEngine, PatchEngineError, PatchType};
-use super::validator::{CacValidator, ValidationError};
+use super::validator::{
+    CacValidator, MAX_ARRAY_MEMBERS, MAX_DEPTH, MAX_OBJECT_PROPERTIES, ValidationError,
+};
 use crate::determinism::{CacJsonError, canonicalize_json};
 use crate::evidence::{CasError, ContentAddressedStore};
 
@@ -68,6 +72,12 @@ pub const CANONICALIZER_ID: &str = "cac-json-v1";
 
 /// Canonicalizer version following semver.
 pub const CANONICALIZER_VERSION: &str = "1.0.0";
+
+/// Maximum allowed length for DCP IDs.
+///
+/// This prevents unbounded receipt/ledger bloat from malicious or erroneous
+/// artifact IDs. 1024 characters is sufficient for all valid DCP URI formats.
+pub const MAX_DCP_ID_LENGTH: usize = 1024;
 
 /// Errors that can occur during admission.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -93,10 +103,17 @@ pub enum AdmissionError {
     },
 
     /// The DCP ID is invalid.
-    #[error("invalid dcp_id: {value}")]
+    #[error("invalid dcp_id: {reason}")]
     InvalidDcpId {
-        /// The invalid DCP ID value.
-        value: String,
+        /// The reason the DCP ID is invalid.
+        reason: String,
+    },
+
+    /// Input complexity exceeds allowed limits.
+    #[error("input complexity exceeded: {message}")]
+    InputComplexityExceeded {
+        /// Description of the complexity violation.
+        message: String,
     },
 
     /// The schema hash is missing for patch operations.
@@ -494,6 +511,11 @@ pub struct ChangeSetReport {
 
 impl ChangeSetReport {
     /// Creates a `ChangeSetReport` for a JSON Patch operation.
+    ///
+    /// # Performance
+    ///
+    /// Uses `BTreeSet` for O(log N) path deduplication instead of O(N^2)
+    /// linear search, ensuring linear time complexity for large patches.
     #[must_use]
     pub fn from_json_patch(
         dcp_id: &str,
@@ -508,7 +530,9 @@ impl ChangeSetReport {
         let mut moves = 0;
         let mut copies = 0;
         let mut tests = 0;
-        let mut modified_paths = Vec::new();
+        // SECURITY: Use BTreeSet for O(log N) deduplication instead of O(N^2)
+        // Vec::contains
+        let mut paths_set: BTreeSet<String> = BTreeSet::new();
 
         if let Some(ops) = patch.as_array() {
             for op in ops {
@@ -523,9 +547,7 @@ impl ChangeSetReport {
                         _ => {},
                     }
                     if let Some(path) = op.get("path").and_then(Value::as_str) {
-                        if !modified_paths.contains(&path.to_string()) {
-                            modified_paths.push(path.to_string());
-                        }
+                        paths_set.insert(path.to_string());
                     }
                 }
             }
@@ -543,7 +565,7 @@ impl ChangeSetReport {
             moves,
             copies,
             tests,
-            modified_paths,
+            modified_paths: paths_set.into_iter().collect(),
             timestamp: Utc::now(),
         }
     }
@@ -652,14 +674,23 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
     ///   canonicalization fails
     /// - [`AdmissionError::PatchFailed`] if patch application fails
     /// - [`AdmissionError::StorageFailed`] if CAS storage fails
-    /// - [`AdmissionError::InvalidDcpId`] if the DCP ID is empty
+    /// - [`AdmissionError::InvalidDcpId`] if the DCP ID is empty, too long, or
+    ///   contains invalid characters
+    /// - [`AdmissionError::InputComplexityExceeded`] if input exceeds
+    ///   depth/size limits
     pub fn admit(&self, request: AdmissionRequest) -> Result<AdmissionResult, AdmissionError> {
-        // Validate DCP ID
-        if request.dcp_id.is_empty() {
-            return Err(AdmissionError::InvalidDcpId {
-                value: String::new(),
-            });
-        }
+        // SECURITY: Validate DCP ID first (length and character safety)
+        validate_dcp_id(&request.dcp_id)?;
+
+        // SECURITY: Validate input complexity BEFORE any serialization/hashing
+        // This prevents DoS via unbounded input that would cause expensive
+        // operations before being rejected.
+        validate_input_complexity(&request.content, "content")?;
+        validate_input_complexity(&request.schema, "schema")?;
+
+        // SECURITY: Validate schema complexity before building validator
+        // (prevents DoS via maliciously complex schemas)
+        // The validator compiles the schema, which can be expensive for complex schemas
 
         // Build the validator
         let validator = CacValidator::new(&request.schema)?;
@@ -668,31 +699,43 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
         match request.operation {
             AdmissionOperation::Create => self.admit_create(request, &validator),
             AdmissionOperation::JsonPatch {
-                patch,
-                expected_base_hash,
-                base_document,
-            } => self.admit_json_patch(
-                request.dcp_id,
-                request.artifact_kind,
-                request.schema_hash,
-                base_document,
-                patch,
-                expected_base_hash,
-                &validator,
-            ),
+                ref patch,
+                ref expected_base_hash,
+                ref base_document,
+            } => {
+                // SECURITY: Validate patch and base document complexity
+                validate_input_complexity(patch, "patch")?;
+                validate_input_complexity(base_document, "base_document")?;
+
+                self.admit_json_patch(
+                    request.dcp_id,
+                    request.artifact_kind,
+                    request.schema_hash,
+                    base_document.clone(),
+                    patch.clone(),
+                    expected_base_hash.clone(),
+                    &validator,
+                )
+            },
             AdmissionOperation::MergePatch {
-                patch,
-                expected_base_hash,
-                base_document,
-            } => self.admit_merge_patch(
-                request.dcp_id,
-                request.artifact_kind,
-                request.schema_hash,
-                base_document,
-                patch,
-                expected_base_hash,
-                &validator,
-            ),
+                ref patch,
+                ref expected_base_hash,
+                ref base_document,
+            } => {
+                // SECURITY: Validate patch and base document complexity
+                validate_input_complexity(patch, "patch")?;
+                validate_input_complexity(base_document, "base_document")?;
+
+                self.admit_merge_patch(
+                    request.dcp_id,
+                    request.artifact_kind,
+                    request.schema_hash,
+                    base_document.clone(),
+                    patch.clone(),
+                    expected_base_hash.clone(),
+                    &validator,
+                )
+            },
         }
     }
 
@@ -762,6 +805,10 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
             self.patch_engine
                 .apply_json_patch(&base_document, &patch, &expected_base_hash)?;
 
+        // SECURITY: Validate patched document complexity BEFORE expensive validation
+        // This prevents DoS via patches that produce oversized/deeply-nested results
+        validate_input_complexity(&patch_result.patched_document, "patched_result")?;
+
         // Validate patched document against schema
         validator.validate(&patch_result.patched_document)?;
 
@@ -813,6 +860,10 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
         let patch_result =
             self.patch_engine
                 .apply_merge_patch(&base_document, &patch, &expected_base_hash)?;
+
+        // SECURITY: Validate patched document complexity BEFORE expensive validation
+        // This prevents DoS via patches that produce oversized/deeply-nested results
+        validate_input_complexity(&patch_result.patched_document, "patched_result")?;
 
         // Validate patched document against schema
         validator.validate(&patch_result.patched_document)?;
@@ -882,6 +933,115 @@ fn compute_schema_hash(schema: &Value) -> String {
         |_| hash_bytes(json_str.as_bytes()),
         |canonical| hash_bytes(canonical.as_bytes()),
     )
+}
+
+/// Validates a DCP ID for length and character safety.
+///
+/// # Security
+///
+/// - Rejects empty DCP IDs
+/// - Enforces maximum length of [`MAX_DCP_ID_LENGTH`] (1024 characters)
+/// - Rejects control characters (including newlines) to prevent metadata
+///   injection
+fn validate_dcp_id(dcp_id: &str) -> Result<(), AdmissionError> {
+    // Check empty
+    if dcp_id.is_empty() {
+        return Err(AdmissionError::InvalidDcpId {
+            reason: "dcp_id cannot be empty".to_string(),
+        });
+    }
+
+    // Check length
+    if dcp_id.len() > MAX_DCP_ID_LENGTH {
+        return Err(AdmissionError::InvalidDcpId {
+            reason: format!(
+                "dcp_id exceeds maximum length of {} characters (got {})",
+                MAX_DCP_ID_LENGTH,
+                dcp_id.len()
+            ),
+        });
+    }
+
+    // SECURITY: Check for control characters (including newlines, tabs, etc.)
+    // This prevents metadata injection attacks in to_metadata() output
+    if let Some(pos) = dcp_id.chars().position(char::is_control) {
+        return Err(AdmissionError::InvalidDcpId {
+            reason: format!("dcp_id contains control character at position {pos} (not allowed)"),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validates input complexity (depth and size) to prevent `DoS` attacks.
+///
+/// # Security
+///
+/// This function MUST be called on all input `Value`s BEFORE any expensive
+/// operations (serialization, hashing, schema compilation, etc.) to prevent
+/// denial-of-service attacks via:
+/// - Deeply nested structures causing stack overflow or exponential processing
+/// - Large shallow objects (e.g., 1M keys) causing memory exhaustion
+/// - Large arrays causing memory exhaustion
+///
+/// Uses the same limits as the validator module for consistency.
+fn validate_input_complexity(value: &Value, context: &str) -> Result<(), AdmissionError> {
+    validate_complexity_recursive(value, 0, context)
+}
+
+/// Recursive helper for complexity validation.
+fn validate_complexity_recursive(
+    value: &Value,
+    depth: usize,
+    context: &str,
+) -> Result<(), AdmissionError> {
+    // Check depth limit
+    if depth > MAX_DEPTH {
+        return Err(AdmissionError::InputComplexityExceeded {
+            message: format!("{context} exceeds maximum depth of {MAX_DEPTH} at level {depth}"),
+        });
+    }
+
+    match value {
+        Value::Array(arr) => {
+            // Check array size
+            if arr.len() > MAX_ARRAY_MEMBERS {
+                return Err(AdmissionError::InputComplexityExceeded {
+                    message: format!(
+                        "{} array has {} members, exceeds limit of {}",
+                        context,
+                        arr.len(),
+                        MAX_ARRAY_MEMBERS
+                    ),
+                });
+            }
+            // Recursively check elements
+            for item in arr {
+                validate_complexity_recursive(item, depth + 1, context)?;
+            }
+        },
+        Value::Object(obj) => {
+            // Check object size
+            if obj.len() > MAX_OBJECT_PROPERTIES {
+                return Err(AdmissionError::InputComplexityExceeded {
+                    message: format!(
+                        "{} object has {} properties, exceeds limit of {}",
+                        context,
+                        obj.len(),
+                        MAX_OBJECT_PROPERTIES
+                    ),
+                });
+            }
+            // Recursively check values
+            for val in obj.values() {
+                validate_complexity_recursive(val, depth + 1, context)?;
+            }
+        },
+        // Primitives have no complexity concerns
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {},
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1358,5 +1518,284 @@ mod tests {
 
         assert!(gate.exists(&hash1).unwrap());
         assert!(gate.exists(&hash2).unwrap());
+    }
+
+    // =========================================================================
+    // Security Negative Tests (TCK-00132)
+    // =========================================================================
+
+    #[test]
+    fn test_security_large_patch_linear_time() {
+        // SECURITY TEST: Verify O(N) performance with 10k+ operations
+        // This test ensures the BTreeSet deduplication fix is working
+        let num_ops = 10_000;
+
+        // Build a patch with many distinct paths
+        let mut ops = Vec::with_capacity(num_ops);
+        for i in 0..num_ops {
+            ops.push(json!({
+                "op": "add",
+                "path": format!("/field_{}", i),
+                "value": i
+            }));
+        }
+        let patch = Value::Array(ops);
+
+        // Time the report generation
+        let start = std::time::Instant::now();
+        let report = ChangeSetReport::from_json_patch(
+            "dcp://test",
+            "base_hash",
+            "new_hash",
+            "patch_hash",
+            &patch,
+        );
+        let elapsed = start.elapsed();
+
+        // Verify all paths were collected
+        assert_eq!(report.adds, num_ops);
+        assert_eq!(report.modified_paths.len(), num_ops);
+
+        // With O(N^2) this would take ~10+ seconds for 10k ops
+        // With O(N log N) this should complete in <1 second
+        assert!(
+            elapsed.as_secs() < 1,
+            "ChangeSetReport took {elapsed:?}, expected <1s for {num_ops} ops (O(N^2) detected?)"
+        );
+    }
+
+    #[test]
+    fn test_security_deeply_nested_content_rejected() {
+        // SECURITY TEST: Verify deeply nested input is rejected early
+        let gate = make_gate();
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema"
+        });
+
+        // Build deeply nested structure (> MAX_DEPTH levels)
+        let mut nested = json!({"value": 1});
+        for _ in 0..(MAX_DEPTH + 5) {
+            nested = json!({"nested": nested});
+        }
+
+        let request =
+            AdmissionRequest::new_artifact("dcp://test", ArtifactKind::Generic, nested, &schema);
+
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::InputComplexityExceeded { .. })),
+            "Expected InputComplexityExceeded for deeply nested content, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_security_large_shallow_object_rejected() {
+        // SECURITY TEST: Verify large but shallow object (e.g., 1M keys) is rejected
+        let gate = make_gate();
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema"
+        });
+
+        // Build object with more than MAX_OBJECT_PROPERTIES keys
+        let mut large_obj = serde_json::Map::new();
+        for i in 0..=MAX_OBJECT_PROPERTIES {
+            large_obj.insert(format!("key_{i}"), json!(i));
+        }
+        let content = Value::Object(large_obj);
+
+        let request =
+            AdmissionRequest::new_artifact("dcp://test", ArtifactKind::Generic, content, &schema);
+
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::InputComplexityExceeded { .. })),
+            "Expected InputComplexityExceeded for oversized object, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_security_malicious_schema_complexity_rejected() {
+        // SECURITY TEST: Verify maliciously complex schema is rejected
+        let gate = make_gate();
+
+        // Build deeply nested schema structure
+        let mut nested_schema = json!({"type": "string"});
+        for _ in 0..(MAX_DEPTH + 5) {
+            nested_schema = json!({
+                "type": "object",
+                "properties": {
+                    "nested": nested_schema
+                }
+            });
+        }
+
+        let content = json!({"id": "test"});
+        let request = AdmissionRequest::new_artifact(
+            "dcp://test",
+            ArtifactKind::Generic,
+            content,
+            &nested_schema,
+        );
+
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::InputComplexityExceeded { .. })),
+            "Expected InputComplexityExceeded for complex schema, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_security_dcp_id_with_newlines_rejected() {
+        // SECURITY TEST: Verify dcp_id with newlines is rejected (metadata injection)
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "test"});
+
+        // DCP ID with embedded newline
+        let malicious_dcp_id = "dcp://test\nevil_key=evil_value";
+        let request = AdmissionRequest::new_artifact(
+            malicious_dcp_id,
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        );
+
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::InvalidDcpId { .. })),
+            "Expected InvalidDcpId for newline in dcp_id, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_security_dcp_id_with_control_chars_rejected() {
+        // SECURITY TEST: Verify dcp_id with control characters is rejected
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "test"});
+
+        // DCP ID with tab character
+        let malicious_dcp_id = "dcp://test\tinjected";
+        let request = AdmissionRequest::new_artifact(
+            malicious_dcp_id,
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        );
+
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::InvalidDcpId { .. })),
+            "Expected InvalidDcpId for control char in dcp_id, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_security_multi_megabyte_dcp_id_rejected() {
+        // SECURITY TEST: Verify multi-megabyte dcp_id is rejected
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "test"});
+
+        // Create a DCP ID that exceeds MAX_DCP_ID_LENGTH
+        let huge_dcp_id = "x".repeat(MAX_DCP_ID_LENGTH + 1);
+        let request =
+            AdmissionRequest::new_artifact(&huge_dcp_id, ArtifactKind::Ticket, artifact, &schema);
+
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::InvalidDcpId { .. })),
+            "Expected InvalidDcpId for oversized dcp_id, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_security_patch_producing_oversized_result_rejected() {
+        // SECURITY TEST: Verify patch that produces oversized result is rejected
+        let gate = make_gate();
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema"
+        });
+        let base = json!({"id": "test"});
+
+        // Compute base hash
+        let base_str = serde_json::to_string(&base).unwrap();
+        let canonical_base = canonicalize_json(&base_str).unwrap();
+        let base_hash = hash_bytes(canonical_base.as_bytes());
+
+        // Create a patch that adds many properties
+        let mut ops = Vec::new();
+        for i in 0..=MAX_OBJECT_PROPERTIES {
+            ops.push(json!({
+                "op": "add",
+                "path": format!("/prop_{i}"),
+                "value": i
+            }));
+        }
+        let patch = Value::Array(ops);
+
+        let request = AdmissionRequest::new_json_patch(
+            "dcp://test",
+            ArtifactKind::Generic,
+            base,
+            patch,
+            &base_hash,
+            &schema,
+        );
+
+        let result = gate.admit(request);
+        // The result should fail due to input complexity on patched result
+        assert!(
+            matches!(result, Err(AdmissionError::InputComplexityExceeded { .. })),
+            "Expected InputComplexityExceeded for oversized patch result, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_security_constants_defined() {
+        // Verify security constants are properly defined
+        assert_eq!(MAX_DCP_ID_LENGTH, 1024);
+        // Use const assertions to verify limits are positive
+        const { assert!(MAX_DEPTH > 0) };
+        const { assert!(MAX_OBJECT_PROPERTIES > 0) };
+        const { assert!(MAX_ARRAY_MEMBERS > 0) };
+    }
+
+    #[test]
+    fn test_security_valid_dcp_id_accepted() {
+        // Verify valid DCP IDs are still accepted
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "test"});
+
+        // Normal DCP ID
+        let valid_dcp_id = "dcp://org/project/artifact/id-12345";
+        let request =
+            AdmissionRequest::new_artifact(valid_dcp_id, ArtifactKind::Ticket, artifact, &schema);
+
+        let result = gate.admit(request);
+        assert!(result.is_ok(), "Valid dcp_id should be accepted");
+    }
+
+    #[test]
+    fn test_security_dcp_id_at_max_length_accepted() {
+        // Verify DCP ID at exactly MAX_DCP_ID_LENGTH is accepted
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "test"});
+
+        let max_length_dcp_id = "x".repeat(MAX_DCP_ID_LENGTH);
+        let request = AdmissionRequest::new_artifact(
+            &max_length_dcp_id,
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        );
+
+        let result = gate.admit(request);
+        assert!(
+            result.is_ok(),
+            "DCP ID at MAX_DCP_ID_LENGTH should be accepted"
+        );
     }
 }
