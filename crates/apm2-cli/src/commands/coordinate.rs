@@ -392,6 +392,15 @@ fn parse_work_ids(args: &CoordinateArgs) -> Result<Vec<String>, CoordinateCliErr
 }
 
 /// Parses work IDs from a file or stdin.
+///
+/// Supports two formats:
+/// - JSON array: If content starts with `[`, parse as JSON (fail on error).
+/// - Line-separated: If content does not start with `[`, parse as one ID per
+///   line.
+///
+/// Per security review: We detect probable JSON intent to avoid silent
+/// fallback on malformed JSON, which could lead to executing sessions with
+/// unintended identifiers.
 fn parse_work_query(path: &str) -> Result<Vec<String>, CoordinateCliError> {
     let content = if path == "-" {
         // Read from stdin
@@ -401,12 +410,22 @@ fn parse_work_query(path: &str) -> Result<Vec<String>, CoordinateCliError> {
         read_bounded_file(std::path::Path::new(path))?
     };
 
-    // Try to parse as JSON array first
-    if let Ok(ids) = serde_json::from_str::<Vec<String>>(&content) {
-        return Ok(ids);
+    let trimmed = content.trim_start();
+
+    // Detect probable JSON intent by checking first non-whitespace character.
+    // If it looks like JSON, require successful JSON parsing (fail-closed).
+    if trimmed.starts_with('[') {
+        match serde_json::from_str::<Vec<String>>(&content) {
+            Ok(ids) => return Ok(ids),
+            Err(e) => {
+                return Err(CoordinateCliError::InvalidArgs(format!(
+                    "work-query file appears to be JSON but failed to parse: {e}"
+                )));
+            },
+        }
     }
 
-    // Fall back to line-separated format
+    // Line-separated format: one work ID per line, comments start with #
     let work_ids: Vec<String> = content
         .lines()
         .map(|line| line.trim().to_string())
@@ -749,6 +768,71 @@ mod tests {
         assert_eq!(work_ids.len(), 2);
         assert_eq!(work_ids[0], "work-1");
         assert_eq!(work_ids[1], "work-2");
+    }
+
+    /// TCK-00153: Test malformed JSON in work-query is rejected (security
+    /// fix).
+    ///
+    /// Per security review: If input looks like JSON (starts with `[`) but
+    /// fails to parse, we must return an error instead of falling back to
+    /// line parsing. This prevents silent acceptance of malformed input.
+    #[test]
+    fn test_parse_work_query_malformed_json() {
+        use std::io::Write;
+
+        // Create a temp file with malformed JSON
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        write!(temp_file, r#"["id1","#).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = parse_work_query(temp_file.path().to_str().unwrap());
+        assert!(result.is_err());
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("appears to be JSON but failed to parse"),
+                "Expected JSON parse error, got: {msg}"
+            );
+        } else {
+            panic!("Expected InvalidArgs error");
+        }
+    }
+
+    /// TCK-00153: Test valid JSON array in work-query is parsed.
+    #[test]
+    fn test_parse_work_query_valid_json() {
+        use std::io::Write;
+
+        // Create a temp file with valid JSON
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        write!(temp_file, r#"["work-1", "work-2", "work-3"]"#).unwrap();
+        temp_file.flush().unwrap();
+
+        let result = parse_work_query(temp_file.path().to_str().unwrap());
+        assert!(result.is_ok());
+        let ids = result.unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], "work-1");
+        assert_eq!(ids[1], "work-2");
+        assert_eq!(ids[2], "work-3");
+    }
+
+    /// TCK-00153: Test line-separated work-query is parsed.
+    #[test]
+    fn test_parse_work_query_line_separated() {
+        use std::io::Write;
+
+        // Create a temp file with line-separated IDs
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        write!(temp_file, "work-1\n# comment\nwork-2\n  work-3  \n").unwrap();
+        temp_file.flush().unwrap();
+
+        let result = parse_work_query(temp_file.path().to_str().unwrap());
+        assert!(result.is_ok());
+        let ids = result.unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], "work-1");
+        assert_eq!(ids[1], "work-2");
+        assert_eq!(ids[2], "work-3");
     }
 
     // =========================================================================
