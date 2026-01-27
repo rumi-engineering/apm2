@@ -309,6 +309,13 @@ pub struct CoordinationController {
     /// Per-work tracking state.
     work_tracking: Vec<WorkItemState>,
 
+    /// Active session ID (enforces serial execution).
+    ///
+    /// Set in `prepare_session_spawn`, cleared in `record_session_termination`.
+    /// Having a value here means a session is currently active and no new
+    /// session can be spawned (serial execution invariant).
+    active_session_id: Option<String>,
+
     /// Budget usage tracking.
     budget_usage: BudgetUsage,
 
@@ -353,6 +360,7 @@ impl CoordinationController {
             config,
             work_index: 0,
             work_tracking,
+            active_session_id: None,
             budget_usage: BudgetUsage::new(),
             consecutive_failures: 0,
             total_sessions: 0,
@@ -519,15 +527,19 @@ impl CoordinationController {
     /// Per AD-COORD-003: `session_bound` is emitted BEFORE `session.started`.
     ///
     /// This method:
-    /// 1. Generates a new session ID (UUID v4)
-    /// 2. Creates and stores the binding event
-    /// 3. Updates attempt tracking
+    /// 1. Checks that no session is currently active (serial execution)
+    /// 2. Checks that no stop condition is met
+    /// 3. Validates the `work_id` matches the current work index
+    /// 4. Generates a new session ID (UUID v4)
+    /// 5. Creates and stores the binding event
+    /// 6. Updates attempt tracking
     ///
     /// The caller is responsible for actually spawning the session after
     /// calling this method, ensuring the bracket ordering is correct.
     ///
     /// # Arguments
     ///
+    /// * `work_id` - The work item ID (must match current work index)
     /// * `freshness_seq_id` - The sequence ID at which freshness was verified
     /// * `timestamp_ns` - Current timestamp in nanoseconds
     ///
@@ -537,8 +549,11 @@ impl CoordinationController {
     ///
     /// # Errors
     ///
-    /// Returns an error if the coordination is not running or work is
-    /// exhausted.
+    /// Returns an error if:
+    /// - Coordination is not running
+    /// - A session is already active (serial execution violation)
+    /// - A stop condition is met
+    /// - The `work_id` doesn't match the current work index
     pub fn prepare_session_spawn(
         &mut self,
         work_id: &str,
@@ -552,6 +567,20 @@ impl CoordinationController {
             });
         }
 
+        // Enforce serial execution: fail if a session is already active
+        if let Some(ref active_id) = self.active_session_id {
+            return Err(ControllerError::SessionAlreadyBound {
+                session_id: active_id.clone(),
+            });
+        }
+
+        // Check stop conditions before spawning (fail-closed)
+        if let Some(stop_condition) = self.check_stop_condition() {
+            return Err(ControllerError::Internal {
+                message: format!("stop condition met before spawn: {stop_condition:?}"),
+            });
+        }
+
         let coordination_id =
             self.coordination_id
                 .clone()
@@ -559,14 +588,22 @@ impl CoordinationController {
                     message: "coordination not started".to_string(),
                 })?;
 
-        // Find and update work tracking
-        let tracking = self
-            .work_tracking
-            .iter_mut()
-            .find(|t| t.work_id == work_id)
-            .ok_or_else(|| ControllerError::WorkNotFound {
+        // Verify work_id matches current work index (prevents duplicate ID bugs)
+        let expected_work_id =
+            self.config
+                .work_ids
+                .get(self.work_index)
+                .ok_or_else(|| ControllerError::Internal {
+                    message: "work index out of bounds".to_string(),
+                })?;
+        if work_id != expected_work_id {
+            return Err(ControllerError::WorkNotFound {
                 work_id: work_id.to_string(),
-            })?;
+            });
+        }
+
+        // Access tracking by index (handles duplicate work IDs correctly)
+        let tracking = &mut self.work_tracking[self.work_index];
 
         // Generate session ID BEFORE binding event (AD-COORD-007)
         let session_id = generate_uuid();
@@ -592,6 +629,9 @@ impl CoordinationController {
 
         // Increment total sessions
         self.total_sessions += 1;
+
+        // Set active session (serial execution enforcement)
+        self.active_session_id = Some(session_id.clone());
 
         Ok(SpawnResult {
             session_id,
@@ -620,7 +660,8 @@ impl CoordinationController {
     ///
     /// # Errors
     ///
-    /// Returns an error if the coordination is not running.
+    /// Returns an error if the coordination is not running or `session_id`
+    /// doesn't match the active session.
     pub fn record_session_termination(
         &mut self,
         session_id: &str,
@@ -635,6 +676,24 @@ impl CoordinationController {
                 .ok_or_else(|| ControllerError::Internal {
                     message: "coordination not started".to_string(),
                 })?;
+
+        // Verify session_id matches active session (serial execution enforcement)
+        match &self.active_session_id {
+            Some(active_id) if active_id != session_id => {
+                return Err(ControllerError::Internal {
+                    message: format!("session_id mismatch: expected {active_id}, got {session_id}"),
+                });
+            },
+            None => {
+                return Err(ControllerError::Internal {
+                    message: "no active session to terminate".to_string(),
+                });
+            },
+            _ => {},
+        }
+
+        // Clear active session (serial execution: allow next spawn)
+        self.active_session_id = None;
 
         // Update budget usage
         self.budget_usage.consumed_episodes = self.budget_usage.consumed_episodes.saturating_add(1);
@@ -652,6 +711,10 @@ impl CoordinationController {
             }
         }
 
+        // Access tracking by index (handles duplicate work IDs correctly)
+        // Note: work_index hasn't been incremented yet, so it points to current work
+        let tracking = &mut self.work_tracking[self.work_index];
+
         // Handle outcome
         match outcome {
             SessionOutcome::Success => {
@@ -659,10 +722,7 @@ impl CoordinationController {
                 self.successful_sessions += 1;
 
                 // Mark work item as succeeded
-                if let Some(tracking) = self.work_tracking.iter_mut().find(|t| t.work_id == work_id)
-                {
-                    tracking.final_outcome = Some(WorkItemOutcome::Succeeded);
-                }
+                tracking.final_outcome = Some(WorkItemOutcome::Succeeded);
 
                 // Advance to next work item
                 self.work_index += 1;
@@ -672,15 +732,12 @@ impl CoordinationController {
                 self.failed_sessions += 1;
 
                 // Check if retries are exhausted
-                if let Some(tracking) = self.work_tracking.iter_mut().find(|t| t.work_id == work_id)
-                {
-                    if tracking.attempt_count >= self.config.max_attempts_per_work {
-                        // Mark as failed and advance
-                        tracking.final_outcome = Some(WorkItemOutcome::Failed);
-                        self.work_index += 1;
-                    }
-                    // Otherwise, stay on same work item for retry
+                if tracking.attempt_count >= self.config.max_attempts_per_work {
+                    // Mark as failed and advance
+                    tracking.final_outcome = Some(WorkItemOutcome::Failed);
+                    self.work_index += 1;
                 }
+                // Otherwise, stay on same work item for retry
             },
         }
 
@@ -1091,6 +1148,116 @@ mod tests {
     // =========================================================================
     // Serial Execution Tests (AD-COORD-002)
     // =========================================================================
+
+    #[test]
+    fn tck_00150_serial_execution_consecutive_spawn_fails() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // First spawn succeeds
+        let spawn1 = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+
+        // Second spawn before termination should fail
+        let result = controller.prepare_session_spawn("work-1", 101, 3_000_000_000);
+        assert!(matches!(
+            result,
+            Err(ControllerError::SessionAlreadyBound { .. })
+        ));
+
+        // Terminate first session
+        controller
+            .record_session_termination(
+                &spawn1.session_id,
+                "work-1",
+                SessionOutcome::Failure,
+                100,
+                4_000_000_000,
+            )
+            .unwrap();
+
+        // Now retry should succeed (max_attempts allows 3)
+        let spawn2 = controller
+            .prepare_session_spawn("work-1", 102, 5_000_000_000)
+            .unwrap();
+
+        // Different session ID
+        assert_ne!(spawn1.session_id, spawn2.session_id);
+    }
+
+    #[test]
+    fn tck_00150_serial_execution_duplicate_work_ids() {
+        // Test with duplicate work IDs in queue
+        let config = CoordinationConfig::new(
+            vec!["A".to_string(), "B".to_string(), "A".to_string()],
+            test_budget(),
+            3,
+        )
+        .unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Process first "A" (index 0)
+        let spawn_a1 = controller
+            .prepare_session_spawn("A", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_a1.session_id,
+                "A",
+                SessionOutcome::Success,
+                100,
+                3_000_000_000,
+            )
+            .unwrap();
+
+        // First "A" should be marked as Succeeded
+        assert_eq!(
+            controller.work_tracking[0].final_outcome,
+            Some(WorkItemOutcome::Succeeded)
+        );
+        assert_eq!(controller.work_tracking[0].attempt_count, 1);
+
+        // Process "B" (index 1)
+        let spawn_b = controller
+            .prepare_session_spawn("B", 200, 4_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_b.session_id,
+                "B",
+                SessionOutcome::Success,
+                200,
+                5_000_000_000,
+            )
+            .unwrap();
+
+        // Process second "A" (index 2)
+        let spawn_a2 = controller
+            .prepare_session_spawn("A", 300, 6_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_a2.session_id,
+                "A",
+                SessionOutcome::Success,
+                300,
+                7_000_000_000,
+            )
+            .unwrap();
+
+        // Second "A" should be tracked independently
+        assert_eq!(
+            controller.work_tracking[2].final_outcome,
+            Some(WorkItemOutcome::Succeeded)
+        );
+        assert_eq!(controller.work_tracking[2].attempt_count, 1);
+
+        // First "A" unchanged
+        assert_eq!(controller.work_tracking[0].attempt_count, 1);
+    }
 
     #[test]
     fn tck_00150_serial_execution_one_session_at_time() {
