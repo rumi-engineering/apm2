@@ -65,7 +65,7 @@ use thiserror::Error;
 ///
 /// This limit is specified by RFC-0011 (Context-as-Code v1) to accommodate
 /// large CAC artifacts such as batch ticket lists or comprehensive audit logs.
-/// DoS attacks are mitigated by performing this size check **before** schema
+/// `DoS` attacks are mitigated by performing this size check **before** schema
 /// validation, ensuring expensive schema operations never run on oversized
 /// inputs.
 pub const MAX_ARRAY_MEMBERS: usize = 100_000;
@@ -79,7 +79,7 @@ pub const MAX_ARRAY_MEMBERS: usize = 100_000;
 ///
 /// This limit is specified by RFC-0011 (Context-as-Code v1) to accommodate
 /// large CAC artifacts such as property-heavy configuration objects.
-/// DoS attacks are mitigated by performing this size check **before** schema
+/// `DoS` attacks are mitigated by performing this size check **before** schema
 /// validation, ensuring expensive schema operations never run on oversized
 /// inputs.
 pub const MAX_OBJECT_PROPERTIES: usize = 100_000;
