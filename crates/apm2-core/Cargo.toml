@@ -56,6 +56,9 @@ unicode-normalization.workspace = true
 # SECURITY: Disable default features to prevent SSRF via resolve-http (reqwest)
 jsonschema = { workspace = true, default-features = false }
 
+# JSON Patch (RFC 6902) and Merge Patch (RFC 7396)
+json-patch.workspace = true
+
 # Filesystem
 tempfile.workspace = true
 
