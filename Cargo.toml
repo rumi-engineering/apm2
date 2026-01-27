@@ -109,6 +109,9 @@ tower = { version = "0.4", features = ["util"] }
 seccompiler = "0.5"
 libc = "0.2"
 
+# Unicode normalization
+unicode-normalization = "0.1"
+
 # Internal crates
 apm2-core = { version = "0.3.0", path = "crates/apm2-core" }
 
