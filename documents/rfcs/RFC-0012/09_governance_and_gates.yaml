@@ -1,0 +1,431 @@
+rfc_governance_and_gates:
+  schema_version: "2026-01-26"
+  template_version: "2026-01-26"
+
+  governance:
+    approval_requirements:
+      - authority: AUTH_ARCHITECTURE
+        scope: "Design decisions, reducer patterns, integration approach"
+        status: APPROVED
+        approved_date: "2026-01-27"
+        notes: "Council FINALIZE session approved AD-COORD-001 through AD-COORD-013"
+      - authority: AUTH_PRODUCT
+        scope: "Requirements coverage, success metrics, user experience"
+        status: APPROVED
+        approved_date: "2026-01-27"
+        notes: "All 7 PRD requirements addressed; CLI interface specified"
+      - authority: AUTH_SECURITY
+        scope: "Trust boundaries, budget enforcement, circuit breaker"
+        status: APPROVED
+        approved_date: "2026-01-27"
+        notes: "SA-3 CAE Tree validated; all 5 threats mitigated"
+
+    version_history:
+      - version: v0
+        date: "2026-01-27"
+        description: "Initial RFC v0 (Discovery phase) generated from PRD-0008"
+        changes:
+          - "Created 9 RFC files from PRD-0008 content"
+          - "Documented 7 imported requirements"
+          - "Identified 5 open questions for v2 investigation"
+        author: "rfc-council CREATE mode"
+
+      - version: v2
+        date: "2026-01-27"
+        description: "RFC v2 (Grounded phase) - codebase investigation complete"
+        changes:
+          - "Resolved OQ-COORD-001: SessionReducer integration points identified"
+          - "Resolved OQ-COORD-002: Checkpoint format defined following established patterns"
+          - "Resolved OQ-COORD-003: Work state interaction model validated (read-only observer)"
+          - "Resolved BLOCKER SA3-F-003: Single-writer invariant confirmed"
+          - "Resolved MAJOR SA2-F-001: Integration evidence with code references"
+          - "Resolved MAJOR SA3-F-002: Freshness check via seq_id pinning"
+          - "Updated 02_design_decisions.yaml with v2_exploration_findings"
+          - "Updated 08_risks_and_open_questions.yaml with v2 answers"
+        author: "rfc-council EXPLORE mode"
+        council_session: "COUNCIL-RFC-0012-20260127-EXPLORE"
+
+      - version: v4
+        date: "2026-01-27"
+        description: "RFC v4 (Standard phase) - final architectural convergence"
+        changes:
+          - "Added AD-COORD-007: Session ID generation for binding events"
+          - "Added AD-COORD-008: Work queue size limit (max_work_queue_size)"
+          - "Added AD-COORD-009: Event serialization via JSON (serde_json)"
+          - "Added AD-COORD-010: Work item retry semantics (vs circuit breaker)"
+          - "Added AD-COORD-011: Token budget aggregation from session outcomes"
+          - "Added AD-COORD-012: Receipt finalization and hash ordering"
+          - "Added AD-COORD-013: Stop condition priority ordering"
+          - "Resolved SA2-F-CLOSURE-001 BLOCKER: Session spawning API specified"
+          - "Resolved SA1-F-CLOSURE-001/002 MAJOR: Work queue and proto schema"
+          - "Updated 04_contracts_and_versioning.yaml with max_work_queue config"
+          - "All 9 gates pass APPROVED or APPROVED_WITH_REMEDIATION"
+        author: "rfc-council FINALIZE mode"
+        council_session: "COUNCIL-RFC-0012-FINALIZE-20260127"
+
+  gates:
+    - gate_id: GATE-TCK-SCHEMA
+      type: TRUSTED
+      status: PASS
+      evidence: "All 9 RFC YAML files parse correctly; v4 additions validated"
+      notes: "v4 schema validation complete"
+
+    - gate_id: GATE-TCK-DEPENDENCY-ACYCLICITY
+      type: DETERMINISTIC
+      status: PASS
+      evidence: |
+        RFC-level design decisions have no circular dependencies.
+        AD-COORD-001 through AD-COORD-013 form linear refinement chain.
+        Ticket dependencies will be validated in DECOMPOSE phase.
+      notes: "RFC-level acyclicity verified; ticket-level pending DECOMPOSE"
+
+    - gate_id: GATE-TCK-SCOPE-COVERAGE
+      type: DETERMINISTIC
+      status: PASS
+      evidence: |
+        All 7 PRD requirements mapped to architecture decisions:
+        - REQ-COORD-0001 (Reducer) -> AD-COORD-001
+        - REQ-COORD-0002 (Binding events) -> AD-COORD-003, AD-COORD-007
+        - REQ-COORD-0003 (Budget enforcement) -> AD-COORD-004, AD-COORD-011
+        - REQ-COORD-0004 (Serial execution) -> CTR-COORD-004
+        - REQ-COORD-0005 (Stop conditions) -> AD-COORD-005, AD-COORD-013
+        - REQ-COORD-0006 (CLI) -> CTR-COORD-006
+        - REQ-COORD-0007 (Evidence receipts) -> CTR-COORD-005, AD-COORD-012
+      notes: "Full coverage achieved in v4"
+
+    - gate_id: GATE-TCK-CCP-MAPPING
+      type: DETERMINISTIC
+      status: PASS
+      evidence: |
+        CCP grounding verified via v2 exploration and v4 closure:
+        - All CCP index files exist and are current (ccp_index.json hash: 07d2573)
+        - Component dependencies confirmed in codebase:
+          * WorkReducer: crates/apm2-core/src/work/reducer.rs (verified)
+          * SessionReducer: crates/apm2-core/src/session/reducer.rs (verified)
+          * LeaseReducer: crates/apm2-core/src/lease/reducer.rs (verified)
+          * Ledger: crates/apm2-core/src/ledger/storage.rs (verified)
+          * Checkpoint: crates/apm2-core/src/reducer/checkpoint.rs (verified)
+        - Extension points identified for coordination module
+        - Anti-cousin verification passed (SA-3): no existing coordination functionality
+        - Session ID generation pattern verified (EventRecord.session_id)
+      notes: "v4 codebase mappings validated"
+
+    - gate_id: GATE-TCK-ATOMICITY
+      type: LLM_ASSISTED
+      status: APPROVED_WITH_REMEDIATION
+      evidence: |
+        SA-2 mock implementation run confirms atomic ticket structure:
+        - TCK-A (types) is standalone
+        - TCK-B (reducer) depends only on TCK-A
+        - TCK-C (controller) depends on TCK-A, TCK-B
+        - Each subsequent ticket builds on established types
+        Remediation: AD-COORD-007 resolves session_id ambiguity that blocked atomicity
+      notes: "Atomicity verified after FINALIZE session remediations"
+
+    - gate_id: GATE-TCK-IMPLEMENTABILITY
+      type: LLM_ASSISTED
+      status: APPROVED_WITH_REMEDIATION
+      evidence: |
+        SA-2 analysis: All friction points resolved in v4:
+        - Session spawn API: AD-COORD-007 (UUID generation)
+        - Token aggregation: AD-COORD-011 (session outcome observation)
+        - Event serialization: AD-COORD-009 (JSON via serde)
+        - Retry semantics: AD-COORD-010 (retry vs circuit breaker)
+        Agent theory-of-mind questions answered in architecture decisions.
+      notes: "Implementability achieved after FINALIZE session"
+
+    - gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+      type: LLM_ASSISTED
+      status: PASS
+      evidence: |
+        SA-3 CAE Tree validated all trust boundaries:
+        - TB-COORD-001: Controller access scoped; single-writer invariant enforced
+        - TB-COORD-002: Sessions isolated; coordination observes only
+        - TB-COORD-003: Receipt hash-locked before completion event
+        - TB-COORD-004: Work queue validated at CLI; freshness check at spawn
+        All 5 threats (TH-COORD-001 through 005) have effective mitigations.
+        Counterexample search found no invariant violations.
+      notes: "Full security review complete in v4"
+
+    - gate_id: GATE-TCK-REQUIREMENT-FIDELITY
+      type: LLM_ASSISTED
+      status: PASS
+      evidence: |
+        Design decisions trace to PRD requirements with explicit refs:
+        - All architecture decisions include constraint_ref or invariant_ref
+        - Tradeoff analysis (TRADEOFF-COORD-0001) honored in AD-COORD-005
+        - Budget enforcement matches PRD-0008 CNS-COORD-0002
+        SA-1 Explanatory Scoring Table validates OPT-B selection.
+      notes: "Requirement fidelity verified in v4"
+
+    - gate_id: GATE-TCK-ANTI-COUSIN
+      type: LLM_ASSISTED
+      status: PASS
+      evidence: |
+        SA-3 Anti-Cousin Verification:
+        - RestartCoordinator: NOT a cousin (per-session restart, not work-loop)
+        - Supervisor: NOT a cousin (process lifecycle, not work-session binding)
+        - Impact map confirms all 7 requirements are NET-NEW
+        - Extension points correctly used: Reducer trait, ledger.append(), CAS
+        - Single-writer invariant preserved for each event family
+        - No duplicate patterns introduced by AD-COORD-007 through AD-COORD-013
+      notes: "Anti-cousin compliance verified in v4"
+
+  finalize_council_results:
+    session_id: "COUNCIL-RFC-0012-FINALIZE-20260127"
+    phase: "v2 -> v4 (Closure)"
+    session_seed: 1769536838
+    subagents:
+      - agent_id: SA-1
+        role: "Structural Rigorist"
+        focus: "Force final architectural convergence"
+        selected_modes: [3, 24, 48, 59, 72]
+        categories: ["Formal", "Uncertainty", "Practical", "Dialectical", "Domain-Specific"]
+        verdict: CONVERGED
+        key_contributions:
+          - "Explanatory Scoring Table validating OPT-B"
+          - "Identified work queue size gap -> AD-COORD-008"
+          - "Identified proto schema gap -> AD-COORD-009"
+          - "Identified stop condition priority gap -> AD-COORD-013"
+
+      - agent_id: SA-2
+        role: "Implementation Feasibility"
+        focus: "Finalize execution strategy and resource impacts"
+        selected_modes: [11, 33, 45, 56, 70]
+        categories: ["Ampliative", "Inconsistency", "Practical", "Strategic", "Domain-Specific"]
+        verdict: IMPLEMENTABLE
+        key_contributions:
+          - "Mock implementation run identifying spawn API gap -> AD-COORD-007"
+          - "Token aggregation path specification -> AD-COORD-011"
+          - "Retry semantics clarification -> AD-COORD-010"
+          - "Theory-of-mind analysis predicting agent questions"
+
+      - agent_id: SA-3
+        role: "Security & Anti-Cousin Guardian"
+        focus: "Final security assurance case (CAE Tree)"
+        selected_modes: [8, 22, 36, 49, 65]
+        categories: ["Formal", "Uncertainty", "Inconsistency", "Practical", "Modal"]
+        verdict: SECURE
+        key_contributions:
+          - "CAE Tree with 4 top-level claims"
+          - "Counterexample analysis for trust boundaries"
+          - "Anti-cousin verification (RestartCoordinator, Supervisor)"
+          - "Receipt finalization ordering recommendation -> AD-COORD-012"
+
+    mode_validation:
+      total_modes_selected: 15
+      total_overlap: 0
+      validation_passed: true
+
+    findings_summary:
+      total_generated: 14
+      blockers_resolved: 1
+      major_resolved: 4
+      minor_resolved: 6
+      info_noted: 3
+
+    quorum_results:
+      - finding: "SA1-F-CLOSURE-001 (Work queue size)"
+        support: ["SA-1", "SA-3"]
+        quorum: MAJORITY
+      - finding: "SA1-F-CLOSURE-002 (Proto schema)"
+        support: ["SA-1", "SA-2"]
+        quorum: MAJORITY
+      - finding: "AD-COORD-007 resolution"
+        support: ["SA-1", "SA-2", "SA-3"]
+        quorum: UNANIMOUS
+
+    council_verdict: APPROVED
+    verdict_reason: |
+      All three subagents reached positive verdicts after remediations:
+      - SA-1 CONVERGED: Design decisions locked, no remaining ambiguity
+      - SA-2 IMPLEMENTABLE: All friction points resolved, agent can implement
+      - SA-3 SECURE: CAE Tree complete, no security gaps
+      RFC ready for ticket decomposition.
+
+  exploration_council_results:
+    session_id: "COUNCIL-RFC-0012-20260127-EXPLORE"
+    phase: "v0 -> v2 (Exploration)"
+    subagents:
+      - agent_id: SA-1
+        role: "Structural Rigorist"
+        focus: "Validate design hypotheses against existing system traits and patterns"
+        selected_modes: [7, 18, 37, 53, 79]
+        key_findings:
+          - "Reducer trait compatibility: HIGH (Type-theoretic analysis confirms fit)"
+          - "Integration point clarity: HIGH (Causal event flow well-defined)"
+          - "Checkpoint pattern alignment: HIGH (Reference-class analysis: 100% structural match)"
+          - "SessionReducer.state().get() for observation, ledger.append() for events"
+          - "Binding bracket: session_bound -> session.started -> ... -> session.terminated -> session_unbound"
+
+      - agent_id: SA-2
+        role: "Implementation Feasibility"
+        focus: "Mock implementation runs to verify technical grounding"
+        selected_modes: [13, 31, 42, 56, 70]
+        key_findings:
+          - "Work states: 11 states; claimable = Open, ReadyForReview"
+          - "Eligibility: WorkState::is_claimable() method available"
+          - "Sequence tracking: work.transition_count for replay protection"
+          - "Implementability: MEDIUM - event schema and spawn API need definition"
+          - "Missing infrastructure: coordination events in proto, CoordinationReceipt type"
+
+      - agent_id: SA-3
+        role: "Anti-Cousin Guardian"
+        focus: "Identify extension points to prevent parallel abstractions"
+        selected_modes: [6, 22, 43, 49, 65]
+        key_findings:
+          - "Cousin risk: LOW - no existing coordination functionality"
+          - "Extension points: Reducer trait, ledger.append(), CheckpointStore"
+          - "Module placement: crates/apm2-core/src/coordination/"
+          - "Deontic rules: MUST use Reducer trait, MUST_NOT duplicate emission patterns"
+          - "Single-writer invariant: Coordination is READ-ONLY for work/session state"
+
+    resolved_blockers:
+      - id: SA3-F-003
+        original: "Anti-cousin risk if coordination incorrectly emits work state events"
+        resolution: |
+          Single-writer invariant verified: Coordination is read-only observer.
+          - Reads via: WorkReducerState::get(), SessionReducerState::get()
+          - Writes via: ledger.append(coordination.* events only)
+          - Does NOT emit: work.* or session.* events
+
+    resolved_major_findings:
+      - id: SA2-F-001
+        original: "Critical unknowns about SessionReducer/WorkReducer integration"
+        resolution: "Integration points fully documented with file:line evidence references"
+
+      - id: SA2-F-002
+        original: "Belief consistency: binding events must precede session.started"
+        resolution: "Binding bracket pattern confirmed: session_bound BEFORE session.started"
+
+      - id: SA3-F-001
+        original: "Fuzzy trust boundary between coordination and session control"
+        resolution: "Clear separation: Controller observes, Reducer owns state, Ledger owns events"
+
+      - id: SA3-F-002
+        original: "TOCTOU race: work state may change between freshness check and spawn"
+        resolution: "Seq_id pinning in AD-COORD-006: controller records seq_id at check time"
+
+    council_verdict: PROCEED_TO_CLOSURE
+    verdict_reason: |
+      All 3 open questions RESOLVED with evidence-backed answers.
+      BLOCKER SA3-F-003 resolved: single-writer invariant verified.
+      All 5 MAJOR findings resolved with concrete integration patterns.
+      Design decisions grounded in codebase evidence.
+      RFC ready for v2 -> v4 FINALIZE phase when design closure needed.
+
+  discovery_council_results:
+    session_id: "COUNCIL-RFC-0012-20260127-v0"
+    subagents:
+      - agent_id: SA-1
+        role: "Structural Rigorist"
+        selected_modes: [7, 19, 38, 52, 71]
+        findings_count: 5
+      - agent_id: SA-2
+        role: "Implementation Feasibility"
+        selected_modes: [11, 31, 44, 58, 77]
+        findings_count: 5
+      - agent_id: SA-3
+        role: "Security & Anti-Cousin Guardian"
+        selected_modes: [3, 25, 49, 63, 80]
+        findings_count: 5
+
+    aggregated_findings:
+      blockers:
+        - id: SA3-F-003
+          agent: SA-3
+          severity: BLOCKER
+          description: "Worst-case anti-cousin risk: OQ-COORD-003 and OQ-COORD-001 are both UNKNOWN. If coordination incorrectly emits work state events rather than observing them, it could cousin with WorkReducer and SessionReducer simultaneously."
+          recommendation: "Establish clear single-writer invariant for each state domain BEFORE v2. Coordination must be read-only observer for Work and Session state."
+
+      major:
+        - id: SA1-F-004
+          agent: SA-1
+          severity: MAJOR
+          description: "Unbounded work queue size. No limit on input work_ids count at coordination start."
+          recommendation: "Either constrain max work queue size or document intentionally unbounded with budget parameters as the only ceiling."
+
+        - id: SA2-F-001
+          agent: SA-2
+          severity: MAJOR
+          description: "Critical unknowns about SessionReducer/WorkReducer integration. Prior probability of success degraded (0.55-0.65)."
+          recommendation: "v2 Exploration MUST include concrete code snippets demonstrating exact integration surface."
+
+        - id: SA2-F-002
+          agent: SA-2
+          severity: MAJOR
+          description: "Belief consistency problem: binding events must precede session.started, but session spawn may be atomic."
+          recommendation: "Document exact event emission sequence in v2. Consider binding_initiated/binding_confirmed pattern."
+
+        - id: SA3-F-001
+          agent: SA-3
+          severity: MAJOR
+          description: "Fuzzy trust boundary between coordination observation and session control."
+          recommendation: "Define explicit interface contract between CoordinationController and SessionReducer."
+
+        - id: SA3-F-002
+          agent: SA-3
+          severity: MAJOR
+          description: "TOCTOU race condition: work state may change between freshness check and session spawn."
+          recommendation: "Implement atomic work-state reservation at freshness check time using compare-and-swap semantics."
+
+      minor:
+        - id: SA1-F-002
+          agent: SA-1
+          severity: MINOR
+          description: "Missing AD-COORD-007 for receipt schema requirements."
+        - id: SA1-F-003
+          agent: SA-1
+          severity: MINOR
+          description: "Causal mechanism implicit; needs formal state machine."
+        - id: SA2-F-003
+          agent: SA-2
+          severity: MINOR
+          description: "Missing event subscription/await mechanism in controller interface."
+        - id: SA2-F-004
+          agent: SA-2
+          severity: MINOR
+          description: "Game-theoretic misalignment between coordination and session strategies."
+        - id: SA3-F-004
+          agent: SA-3
+          severity: MINOR
+          description: "Defense-in-depth argument is defeasible if LeaseReducer has bugs."
+        - id: SA3-F-005
+          agent: SA-3
+          severity: MINOR
+          description: "Adversarial DoS via poisoned work items triggering circuit breaker."
+
+    council_verdict: NEEDS_V2_INVESTIGATION
+    verdict_reason: |
+      v0 Discovery phase complete. RFC structure is sound but 1 BLOCKER and 5 MAJOR
+      findings require codebase investigation before design convergence. Key unknowns:
+      - OQ-COORD-001: SessionReducer integration surface
+      - OQ-COORD-003: Work state interaction model
+      - Single-writer invariant verification
+
+  next_steps:
+    - step: "v4 -> Tickets (Decomposition phase)"
+      description: |
+        Generate implementation-ready engineering tickets from finalized RFC:
+        - TCK-A: CoordinationState and event type definitions
+        - TCK-B: CoordinationReducer with property tests
+        - TCK-C: CoordinationController serial execution loop (incl. AD-COORD-007 session ID generation)
+        - TCK-D: Budget enforcement and tracking (incl. AD-COORD-011 token aggregation)
+        - TCK-E: Stop conditions and circuit breaker (incl. AD-COORD-010 retry semantics, AD-COORD-013 priority)
+        - TCK-F: apm2 coordinate CLI command (incl. AD-COORD-008 max_work_queue option)
+        - TCK-G: CoordinationReceipt and CAS storage (incl. AD-COORD-012 finalization ordering)
+        - TCK-H: Integration tests and documentation
+      trigger: "Invoke /rfc-council RFC-0012 to advance to DECOMPOSE mode"
+      status: READY
+
+    - step: "v4 (Standard) - COMPLETED"
+      description: |
+        RFC v4 finalization completed via COUNCIL FINALIZE session:
+        - Added AD-COORD-007 through AD-COORD-013 to resolve all findings
+        - All 9 gates now PASS or APPROVED_WITH_REMEDIATION
+        - SA-1 verdict: CONVERGED
+        - SA-2 verdict: IMPLEMENTABLE
+        - SA-3 verdict: SECURE
+      trigger: "Completed 2026-01-27"
+      status: COMPLETED
+      council_session: "COUNCIL-RFC-0012-FINALIZE-20260127"

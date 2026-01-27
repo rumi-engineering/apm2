@@ -58,22 +58,62 @@ decision_tree:
 
             Prerequisites:
             - RFC is at version v4 (Standard phase)
-            - 06_ticket_decomposition.yaml has planned ticket structure
+            - 06_ticket_decomposition.yaml has planned_ticket_structure
 
-            Steps:
-            1. Read `06_ticket_decomposition.yaml` for planned ticket structure.
-            2. For each planned ticket:
-               a. Create `documents/work/tickets/TCK-XXXXX.yaml`
-               b. Populate from RFC design decisions and requirements
-               c. Ensure GATE-TCK-ATOMICITY criteria (single PR completable)
-               d. Ensure GATE-TCK-IMPLEMENTABILITY criteria (agent can implement)
-            3. Set `depends_on` relationships between tickets.
-            4. Stage and commit:
-               ```bash
-               git add documents/work/tickets/TCK-*.yaml
-               git commit -m "docs(RFC-XXXX): Generate engineering tickets from v4"
-               ```
-            5. Return to caller (do not proceed to PHASE_4/PHASE_5).
+            ## Step 1: Populate Ticket Decomposition
+
+            Transform `planned_ticket_structure` into full `tickets` array in 06_ticket_decomposition.yaml:
+
+            For each ticket group in planned_ticket_structure:
+            1. Generate stable ticket ID (TCK-XXXXX where XXXXX is sequential)
+            2. Extract implementation details from RFC design decisions (02_design_decisions.yaml)
+            3. Map requirements from the group to the ticket
+            4. Define file paths (files_to_create, files_to_modify) from CCP analysis
+            5. Write acceptance criteria from test strategy (07_test_and_evidence.yaml)
+            6. Set depends_on based on logical ordering (types before reducer before controller)
+
+            Update 06_ticket_decomposition.yaml:
+            ```yaml
+            status: POPULATED
+            tickets:
+              - ticket_id: TCK-XXXXX
+                title: "..."
+                requirement_ids: [REQ-...]
+                depends_on: []
+                files_to_create: [...]
+                files_to_modify: [...]
+                implementation_steps: [...]
+                acceptance_criteria: [...]
+                test_requirements: [...]
+            ```
+
+            ## Step 2: Validate Gates
+
+            Before emission, verify:
+            - GATE-TCK-ATOMICITY: Each ticket is single-PR completable
+            - GATE-TCK-IMPLEMENTABILITY: Agent can implement without ambiguity
+            - GATE-TCK-ANTI-COUSIN: No duplicate patterns introduced
+
+            ## Step 3: Emit Tickets via CLI
+
+            Delegate file generation to the CLI:
+            ```bash
+            apm2 factory tickets emit --rfc RFC-XXXX --prd PRD-XXXX
+            ```
+
+            This reads the populated 06_ticket_decomposition.yaml and generates
+            individual ticket files to documents/work/tickets/TCK-*.yaml.
+
+            ## Step 4: Commit
+
+            Stage and commit all changes:
+            ```bash
+            git add documents/rfcs/RFC-XXXX/06_ticket_decomposition.yaml
+            git add documents/work/tickets/TCK-*.yaml
+            git commit -m "docs(RFC-XXXX): Generate engineering tickets from v4"
+            ```
+
+            Return to caller (do not proceed to PHASE_4/PHASE_5).
 
         - id: PHASE_4_SELF_REVIEW
           condition: "mode is CREATE"

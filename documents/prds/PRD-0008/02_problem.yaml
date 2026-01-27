@@ -1,0 +1,113 @@
+prd_problem:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  context:
+    background: |
+      APM2 has a robust work management system (WorkReducer) and session management (SessionReducer),
+      but lacks the coordination layer that binds work items to agent sessions and manages the
+      autonomous execution loop. Today, operators must manually spawn agents for each work item,
+      monitor completion, and decide when to retry or escalate. This manual intervention is
+      the primary blocker for achieving Phase 1 autonomous operation.
+    current_state: |
+      The system can track work state (open, in_progress, completed) and session state (active,
+      terminated), but cannot autonomously:
+      - Spawn agent sessions for pending work items
+      - Bind work state to session lifecycle
+      - Enforce coordination-level budgets across multiple sessions
+      - Detect and respond to repeated failures (circuit breaker)
+      - Emit evidence proving coordination outcomes
+
+      Operators manually run `apm2 session start` for each work item, manually check completion,
+      and manually decide retry strategies. This creates a human bottleneck that prevents
+      end-to-end autonomous feature implementation.
+    why_now: |
+      Phase 1 exit criterion requires "Agent can complete end-to-end feature implementation from
+      PRD to merged PR without manual intervention." The coordination layer is the missing piece
+      that enables autonomous work loop execution. With WorkReducer, SessionReducer, and LeaseReducer
+      already in place, the coordination layer can be built on proven patterns and integrated
+      with existing infrastructure.
+  problem_statement:
+    primary: |
+      Enable autonomous agent coordination: the APM2 CLI must be able to spawn agent sessions
+      on a loop for a queue of work items, track their outcomes, enforce budgets and stop
+      conditions, and emit evidence receipts - all without manual intervention for nominal
+      execution paths.
+    supporting_details:
+      - "No work-to-session binding exists (work items and sessions are independent state machines)."
+      - "No coordination-level budget enforcement spans multiple sessions."
+      - "No circuit breaker prevents crash-loop resource exhaustion."
+      - "No work freshness validation before session spawn prevents stale state races."
+      - "No evidence receipt proves coordination outcomes for audit and improvement."
+  observed_failure_modes:
+    - id: FM-COORD-0001
+      name: Manual agent spawning bottleneck
+      mechanism: Operators must manually spawn each agent session and monitor completion.
+      impact:
+        - End-to-end feature implementation requires constant human attention.
+        - Throughput limited by operator availability, not system capacity.
+        - Night/weekend work blocked without on-call intervention.
+      alternative_interventions:
+        - id: ALT-FM001-01
+          intervention: "Cron-based session spawning with static work list"
+          assessment: "Inflexible; cannot respond to dynamic work queues; no budget enforcement."
+        - id: ALT-FM001-02
+          intervention: "External orchestrator (Airflow, Temporal) managing APM2 sessions"
+          assessment: "Adds operational complexity; splits state across systems; loses ledger provenance."
+      coordination_superiority: |
+        Native coordination layer integrates with existing reducers, maintains single source of
+        truth in the ledger, and provides budget/stop-condition enforcement without external
+        dependencies.
+    - id: FM-COORD-0002
+      name: Unbounded resource consumption on failure loops
+      mechanism: Failing work items are retried indefinitely without coordination-level limits.
+      impact:
+        - API rate limits exhausted by crash loops.
+        - Token budgets consumed by repeated failures.
+        - System resources tied up in unproductive execution.
+      alternative_interventions:
+        - id: ALT-FM002-01
+          intervention: "Session-level retry limits"
+          assessment: "Doesn't prevent coordination-level exhaustion across many work items."
+        - id: ALT-FM002-02
+          intervention: "Manual monitoring and intervention"
+          assessment: "Requires human attention; defeats autonomous operation goal."
+      coordination_superiority: |
+        Coordination-level budget ceilings (max_episodes, max_duration_ms, max_tokens) and
+        circuit breaker (consecutive failure threshold) provide systematic protection against
+        resource exhaustion.
+    - id: FM-COORD-0003
+      name: Stale work state races
+      mechanism: Work state may change between coordination decision and session spawn.
+      impact:
+        - Session spawned for already-completed work item.
+        - Duplicate execution and wasted resources.
+        - Inconsistent state between work and session projections.
+      alternative_interventions:
+        - id: ALT-FM003-01
+          intervention: "Optimistic locking on work state"
+          assessment: "Requires work state modification; adds complexity."
+      coordination_superiority: |
+        Work freshness check (GRD-COORD-003) validates work state immediately before session
+        spawn, using ledger event ordering to ensure consistency.
+  non_goals:
+    - id: NG-COORD-0001
+      statement: Parallel agent execution in MVP.
+      clarification: |
+        MVP focuses on serial execution loop. Parallel execution adds complexity around
+        resource contention, failure isolation, and budget allocation that should be
+        addressed in a follow-on phase.
+    - id: NG-COORD-0002
+      statement: API rate limiting integration.
+      clarification: |
+        Rate limiting is a session-level concern handled by existing infrastructure.
+        Coordination budgets are orthogonal to API rate limits.
+    - id: NG-COORD-0003
+      statement: Human notification hooks.
+      clarification: |
+        MVP emits events and receipts; external systems can subscribe for notifications.
+        Built-in notification (email, Slack) is deferred.
+    - id: NG-COORD-0004
+      statement: Cross-coordination dependencies (work DAG scheduling).
+      clarification: |
+        MVP treats work items as independent. DAG-based scheduling with inter-work
+        dependencies is a Phase 2+ feature.

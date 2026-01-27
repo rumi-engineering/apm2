@@ -1,0 +1,663 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-01-27"
+  template_version: "2026-01-27"
+
+  status: POPULATED
+  v4_note: |
+    Ticket decomposition populated from RFC v4 (Standard phase).
+    All 7 PRD requirements are covered by 8 engineering tickets.
+    Tickets follow dependency ordering for atomic incremental implementation.
+
+  tickets:
+    - ticket_id: TCK-00148
+      title: "Implement CoordinationState and event type definitions"
+      requirement_ids:
+        - REQ-COORD-0001
+      depends_on: []
+      summary: |
+        Define foundational types for the coordination module: CoordinationState,
+        CoordinationSession, CoordinationBudget, BudgetUsage, CoordinationStatus,
+        BindingInfo, and all CoordinationEvent variants (Started, SessionBound,
+        SessionUnbound, Completed, Aborted). Types follow patterns from session/state.rs.
+      files_to_create:
+        - path: "crates/apm2-core/src/coordination/mod.rs"
+          purpose: "Module root with public exports"
+        - path: "crates/apm2-core/src/coordination/state.rs"
+          purpose: "CoordinationState, CoordinationSession, BindingInfo types"
+        - path: "crates/apm2-core/src/coordination/events.rs"
+          purpose: "CoordinationEvent enum and payload types"
+      files_to_modify:
+        - path: "crates/apm2-core/src/lib.rs"
+          changes: "Add `pub mod coordination;` export"
+      implementation_steps:
+        - step: 1
+          action: "Create coordination module directory"
+          details: "mkdir -p crates/apm2-core/src/coordination"
+        - step: 2
+          action: "Define CoordinationBudget and BudgetUsage structs"
+          details: |
+            Per AD-COORD-004: max_episodes (u32), max_duration_ms (u64), max_tokens (Option<u64>).
+            BudgetUsage tracks consumed_episodes, elapsed_ms, consumed_tokens.
+        - step: 3
+          action: "Define CoordinationStatus enum"
+          details: "Initializing, Running, Completed(StopCondition), Aborted(AbortReason)"
+        - step: 4
+          action: "Define StopCondition enum with priority ordering"
+          details: |
+            Per AD-COORD-013: CircuitBreakerTriggered > BudgetExhausted(Duration) >
+            BudgetExhausted(Tokens) > BudgetExhausted(Episodes) > MaxAttemptsExceeded > WorkCompleted
+        - step: 5
+          action: "Define CoordinationSession struct"
+          details: |
+            coordination_id, work_queue, work_index, budget, budget_usage,
+            consecutive_failures, status, started_at
+        - step: 6
+          action: "Define BindingInfo struct"
+          details: "session_id, attempt_number, bound_at timestamp"
+        - step: 7
+          action: "Define CoordinationState struct"
+          details: |
+            coordinations: HashMap<String, CoordinationSession>
+            bindings: HashMap<String, BindingInfo>
+        - step: 8
+          action: "Define CoordinationEvent enum"
+          details: |
+            Per AD-COORD-009: Serialize/Deserialize via serde_json.
+            Variants: Started, SessionBound, SessionUnbound, Completed, Aborted
+        - step: 9
+          action: "Add module export in lib.rs"
+          details: "pub mod coordination; re-export key types"
+      acceptance_criteria:
+        - criterion: "All types derive Serialize, Deserialize, Debug, Clone"
+          verification: "cargo build passes"
+        - criterion: "Types are Send + Sync for async runtime"
+          verification: "Compile with tokio runtime"
+        - criterion: "JSON round-trip serialization works"
+          verification: "Unit tests for serde round-trip"
+      test_requirements:
+        - test_id: UT-COORD-STATE-001
+          description: "CoordinationState serialization round-trip"
+          verification_command: "cargo test -p apm2-core coordination::state::tests"
+        - test_id: UT-COORD-EVENT-001
+          description: "CoordinationEvent serialization round-trip"
+          verification_command: "cargo test -p apm2-core coordination::events::tests"
+
+    - ticket_id: TCK-00149
+      title: "Implement CoordinationReducer with determinism property tests"
+      requirement_ids:
+        - REQ-COORD-0001
+      depends_on:
+        - TCK-00148
+      summary: |
+        Implement CoordinationReducer following the Reducer trait pattern from
+        session/reducer.rs. Reducer processes coordination events and projects
+        to CoordinationState. Include property tests for determinism and idempotency.
+      files_to_create:
+        - path: "crates/apm2-core/src/coordination/reducer.rs"
+          purpose: "CoordinationReducer implementation"
+        - path: "crates/apm2-core/src/coordination/tests.rs"
+          purpose: "Unit and property tests for reducer"
+      files_to_modify:
+        - path: "crates/apm2-core/src/coordination/mod.rs"
+          changes: "Add reducer module export"
+      implementation_steps:
+        - step: 1
+          action: "Create CoordinationReducer struct"
+          details: "state: CoordinationState field"
+        - step: 2
+          action: "Implement apply() for each event type"
+          details: |
+            Started: Initialize CoordinationSession in coordinations map
+            SessionBound: Add BindingInfo to bindings, set work_index
+            SessionUnbound: Remove binding, update outcome, handle retry logic
+            Completed: Set status to Completed(stop_condition)
+            Aborted: Set status to Aborted(reason)
+        - step: 3
+          action: "Implement checkpoint() and restore()"
+          details: |
+            Per OQ-COORD-002: Follow CheckpointableReducer pattern.
+            Serialize state to JSON, deterministic key ordering.
+        - step: 4
+          action: "Implement property test for determinism"
+          details: |
+            Compare replay-from-genesis with replay-from-checkpoint.
+            Same event sequence must produce identical state.
+        - step: 5
+          action: "Implement property test for idempotency"
+          details: "Applying same event twice is no-op"
+        - step: 6
+          action: "Implement property test for budget monotonicity"
+          details: "budget_usage.consumed_* never decreases"
+      acceptance_criteria:
+        - criterion: "Reducer implements CheckpointableReducer trait"
+          verification: "Type compiles against trait bounds"
+        - criterion: "All event types are handled in apply()"
+          verification: "Match exhaustiveness"
+        - criterion: "Determinism property holds"
+          verification: "proptest passes 1000 iterations"
+        - criterion: "Idempotency property holds"
+          verification: "proptest passes 1000 iterations"
+      test_requirements:
+        - test_id: PT-COORD-REDUCE-001
+          description: "Reducer determinism property test"
+          verification_command: "cargo test -p apm2-core coordination::tests::prop_reducer_determinism"
+        - test_id: PT-COORD-REDUCE-002
+          description: "Reducer idempotency property test"
+          verification_command: "cargo test -p apm2-core coordination::tests::prop_reducer_idempotency"
+        - test_id: PT-COORD-REDUCE-003
+          description: "Budget monotonicity property test"
+          verification_command: "cargo test -p apm2-core coordination::tests::prop_budget_monotonicity"
+
+    - ticket_id: TCK-00150
+      title: "Implement CoordinationController serial execution loop"
+      requirement_ids:
+        - REQ-COORD-0002
+        - REQ-COORD-0004
+      depends_on:
+        - TCK-00148
+        - TCK-00149
+      summary: |
+        Implement CoordinationController with serial execution loop per AD-COORD-002.
+        Controller generates session IDs (AD-COORD-007), checks work freshness (AD-COORD-006),
+        emits binding events, and orchestrates session spawn/termination observation.
+      files_to_create:
+        - path: "crates/apm2-core/src/coordination/controller.rs"
+          purpose: "CoordinationController implementation"
+        - path: "crates/apm2-core/src/coordination/error.rs"
+          purpose: "Error types for coordination operations"
+      files_to_modify:
+        - path: "crates/apm2-core/src/coordination/mod.rs"
+          changes: "Add controller, error module exports"
+      implementation_steps:
+        - step: 1
+          action: "Define CoordinationController struct"
+          details: |
+            ledger: Arc<Ledger>
+            work_reducer: Arc<RwLock<WorkReducer>>
+            session_reducer: Arc<RwLock<SessionReducer>>
+            cas: Arc<ContentAddressedStore>
+            coordination_reducer: Arc<RwLock<CoordinationReducer>>
+        - step: 2
+          action: "Implement start() method"
+          details: |
+            Validate config (work_ids non-empty, budget params positive).
+            Per AD-COORD-008: Reject if work_ids.len() > max_work_queue_size.
+            Generate coordination_id (UUID v4).
+            Emit coordination.started event.
+        - step: 3
+          action: "Implement check_work_freshness()"
+          details: |
+            Per AD-COORD-006: Read work state at known ledger seq.
+            Check is_claimable(). Record seq_id for spawn event.
+            Return error if work changed since check.
+        - step: 4
+          action: "Implement spawn_session_for_work()"
+          details: |
+            Per AD-COORD-007: Generate session_id = UUID::new_v4().
+            Emit coordination.session_bound BEFORE orchestrating session spawn.
+            Pass session_id to spawn_holon().
+        - step: 5
+          action: "Implement observe_session_termination()"
+          details: |
+            Poll SessionReducerState.get(session_id) until terminal.
+            Extract outcome from exit_classification.
+            Emit coordination.session_unbound with outcome.
+        - step: 6
+          action: "Implement run_loop() method"
+          details: |
+            Serial loop: for work_id in work_queue:
+              1. Check stop condition
+              2. Check work freshness
+              3. Spawn session
+              4. Observe termination
+              5. Handle outcome (retry or advance)
+        - step: 7
+          action: "Define CoordinationConfig struct"
+          details: |
+            work_ids: Vec<WorkId>
+            budget: CoordinationBudget
+            max_attempts_per_work: u32 (default 3)
+            max_work_queue_size: Option<u32> (default 1000)
+      acceptance_criteria:
+        - criterion: "Binding events bracket session lifecycle"
+          verification: "session_bound emitted before session.started"
+        - criterion: "Work freshness validated before spawn"
+          verification: "Stale work skipped, coordination continues"
+        - criterion: "Serial execution (one session at a time)"
+          verification: "Integration test confirms no parallel sessions"
+        - criterion: "Session ID generated before binding event"
+          verification: "UUID in binding matches spawned session"
+      test_requirements:
+        - test_id: IT-COORD-CTRL-001
+          description: "Serial execution integration test"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_serial_execution"
+        - test_id: IT-COORD-CTRL-002
+          description: "Work freshness failure handling"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_freshness_failure"
+        - test_id: IT-COORD-CTRL-003
+          description: "Binding bracket ordering"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_binding_bracket"
+
+    - ticket_id: TCK-00151
+      title: "Implement coordination budget enforcement and tracking"
+      requirement_ids:
+        - REQ-COORD-0003
+      depends_on:
+        - TCK-00150
+      summary: |
+        Implement budget enforcement per AD-COORD-004 and token aggregation per AD-COORD-011.
+        Budget checks happen before each session spawn. Token consumption aggregated from
+        SessionTerminated events via final_entropy.
+      files_to_modify:
+        - path: "crates/apm2-core/src/coordination/controller.rs"
+          changes: "Add budget enforcement logic"
+        - path: "crates/apm2-core/src/coordination/state.rs"
+          changes: "Add budget tracking helper methods"
+      implementation_steps:
+        - step: 1
+          action: "Implement BudgetUsage tracking"
+          details: |
+            consumed_episodes: incremented on each session spawn
+            elapsed_ms: computed from started_at to now
+            consumed_tokens: aggregated from session outcomes
+        - step: 2
+          action: "Implement budget ceiling checks"
+          details: |
+            check_episode_budget(): consumed_episodes >= max_episodes
+            check_duration_budget(): elapsed_ms >= max_duration_ms
+            check_token_budget(): consumed_tokens >= max_tokens (if set)
+        - step: 3
+          action: "Implement token aggregation"
+          details: |
+            Per AD-COORD-011: On session.terminated observation:
+            1. Read final_entropy from SessionReducerState
+            2. Add to budget_usage.consumed_tokens
+            3. Check against max_tokens ceiling
+        - step: 4
+          action: "Integrate budget checks in run_loop()"
+          details: |
+            Before each iteration:
+            1. Update elapsed_ms
+            2. Check all budget ceilings
+            3. If any exceeded, emit Completed(BudgetExhausted(type))
+        - step: 5
+          action: "Emit budget-related stop conditions"
+          details: |
+            Priority: Duration > Tokens > Episodes (per AD-COORD-013)
+            Report highest-priority exceeded budget type
+      acceptance_criteria:
+        - criterion: "Episode budget enforced"
+          verification: "Coordination stops at max_episodes"
+        - criterion: "Duration budget enforced"
+          verification: "Coordination stops at max_duration_ms"
+        - criterion: "Token budget enforced (when set)"
+          verification: "Coordination stops at max_tokens"
+        - criterion: "Token aggregation from session outcomes"
+          verification: "consumed_tokens reflects session final_entropy"
+      test_requirements:
+        - test_id: IT-COORD-BUDGET-001
+          description: "Episode budget exhaustion"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_episode_budget"
+        - test_id: IT-COORD-BUDGET-002
+          description: "Duration budget exhaustion"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_duration_budget"
+        - test_id: IT-COORD-BUDGET-003
+          description: "Token budget exhaustion"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_token_budget"
+        - test_id: IT-COORD-BUDGET-004
+          description: "Token aggregation accuracy"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_token_aggregation"
+
+    - ticket_id: TCK-00152
+      title: "Implement stop conditions and circuit breaker logic"
+      requirement_ids:
+        - REQ-COORD-0005
+      depends_on:
+        - TCK-00151
+      summary: |
+        Implement stop condition evaluation per AD-COORD-013 priority ordering and
+        circuit breaker per AD-COORD-005. Retry semantics per AD-COORD-010 distinguish
+        per-work retries from cross-work circuit breaker.
+      files_to_modify:
+        - path: "crates/apm2-core/src/coordination/controller.rs"
+          changes: "Add stop condition and circuit breaker logic"
+        - path: "crates/apm2-core/src/coordination/state.rs"
+          changes: "Add consecutive_failures tracking"
+      implementation_steps:
+        - step: 1
+          action: "Implement check_stop_condition()"
+          details: |
+            Per AD-COORD-013 priority:
+            1. Check CircuitBreakerTriggered
+            2. Check BudgetExhausted (Duration, Tokens, Episodes)
+            3. Check MaxAttemptsExceeded
+            4. Check WorkCompleted
+            Return highest-priority satisfied condition
+        - step: 2
+          action: "Implement circuit breaker logic"
+          details: |
+            Per AD-COORD-005: Abort after 3 consecutive failures.
+            Per AD-COORD-010:
+            - Track consecutive_failures across work items
+            - Reset to 0 on any session success
+            - Trigger when consecutive_failures >= 3
+        - step: 3
+          action: "Implement retry semantics"
+          details: |
+            Per AD-COORD-010:
+            - Per-work attempt_count tracked in BindingInfo
+            - If attempt_count < max_attempts_per_work: retry same work
+            - If attempt_count >= max_attempts_per_work: mark SKIPPED, advance
+            - Retry does NOT increment consecutive_failures
+        - step: 4
+          action: "Implement work completion detection"
+          details: |
+            WorkCompleted when:
+            - work_index >= work_queue.len() AND
+            - All work items either succeeded or exhausted retries
+        - step: 5
+          action: "Handle stop condition in run_loop()"
+          details: |
+            When stop condition detected:
+            1. Emit coordination.completed or coordination.aborted
+            2. Build and store receipt
+            3. Return from run_loop()
+      acceptance_criteria:
+        - criterion: "Circuit breaker triggers on 3 consecutive failures"
+          verification: "Integration test with mock failures"
+        - criterion: "Circuit breaker resets on success"
+          verification: "Test success after 2 failures resets counter"
+        - criterion: "Retry vs circuit breaker distinction"
+          verification: "Retry exhaustion for one work doesn't trigger circuit breaker alone"
+        - criterion: "Stop condition priority ordering"
+          verification: "When multiple conditions met, highest priority reported"
+      test_requirements:
+        - test_id: IT-COORD-STOP-001
+          description: "Circuit breaker trigger test"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_circuit_breaker_trigger"
+        - test_id: IT-COORD-STOP-002
+          description: "Circuit breaker reset on success"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_circuit_breaker_reset"
+        - test_id: IT-COORD-STOP-003
+          description: "Retry exhaustion behavior"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_retry_exhaustion"
+        - test_id: IT-COORD-STOP-004
+          description: "Stop condition priority ordering"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_stop_condition_priority"
+        - test_id: PT-COORD-STOP-001
+          description: "Binding completeness (no orphan bindings)"
+          verification_command: "cargo test -p apm2-core coordination::tests::prop_binding_completeness"
+
+    - ticket_id: TCK-00153
+      title: "Implement apm2 coordinate CLI command"
+      requirement_ids:
+        - REQ-COORD-0006
+      depends_on:
+        - TCK-00152
+      summary: |
+        Implement machine-readable CLI command for coordination per CTR-COORD-006.
+        Command accepts work IDs or query, budget parameters, and outputs JSON receipt.
+        Includes max_work_queue validation per AD-COORD-008.
+      files_to_create:
+        - path: "crates/apm2-cli/src/commands/coordinate.rs"
+          purpose: "CLI command implementation"
+      files_to_modify:
+        - path: "crates/apm2-cli/src/main.rs"
+          changes: "Add coordinate subcommand"
+        - path: "crates/apm2-cli/src/commands/mod.rs"
+          changes: "Add coordinate module export"
+      implementation_steps:
+        - step: 1
+          action: "Define CoordinateArgs struct with clap"
+          details: |
+            --work-ids: Vec<String> (comma-separated)
+            --work-query: Option<String> (filter expression)
+            --max-episodes: u32 (required)
+            --max-duration-ms: u64 (required)
+            --max-tokens: Option<u64>
+            --max-attempts: u32 (default 3)
+            --max-work-queue: u32 (default 1000)
+            --json: bool (default true)
+            --quiet: bool
+        - step: 2
+          action: "Implement work ID resolution"
+          details: |
+            If --work-ids: parse comma-separated list
+            If --work-query: execute query against WorkReducer
+            Validate work IDs exist and are eligible
+        - step: 3
+          action: "Implement argument validation"
+          details: |
+            Per AD-COORD-008: Reject if work_ids.len() > max_work_queue
+            Budget params must be positive
+            Either --work-ids or --work-query required
+        - step: 4
+          action: "Implement coordination execution"
+          details: |
+            1. Build CoordinationConfig
+            2. Call controller.start()
+            3. Call controller.run_loop()
+            4. Output receipt as JSON
+        - step: 5
+          action: "Implement exit codes"
+          details: |
+            0: WorkCompleted
+            1: Any other stop condition
+            2: Invalid arguments
+        - step: 6
+          action: "Implement --quiet mode"
+          details: "Suppress progress events, output only final receipt"
+        - step: 7
+          action: "Add to main.rs Command enum"
+          details: "Coordinate(CoordinateArgs)"
+      acceptance_criteria:
+        - criterion: "Command parses all options correctly"
+          verification: "clap help output matches spec"
+        - criterion: "Exit codes follow specification"
+          verification: "E2E tests verify exit codes"
+        - criterion: "JSON output is valid and complete"
+          verification: "Receipt parses successfully"
+        - criterion: "Work queue size validation"
+          verification: "Rejects queue > max_work_queue"
+      test_requirements:
+        - test_id: E2E-COORD-CLI-001
+          description: "Valid coordination run"
+          verification_command: "cargo test -p apm2-cli e2e::coordinate::test_valid_run"
+        - test_id: E2E-COORD-CLI-002
+          description: "Invalid budget rejection"
+          verification_command: "cargo test -p apm2-cli e2e::coordinate::test_invalid_budget"
+        - test_id: E2E-COORD-CLI-003
+          description: "Work queue size validation"
+          verification_command: "cargo test -p apm2-cli e2e::coordinate::test_queue_size_limit"
+        - test_id: E2E-COORD-CLI-004
+          description: "Exit code verification"
+          verification_command: "cargo test -p apm2-cli e2e::coordinate::test_exit_codes"
+
+    - ticket_id: TCK-00154
+      title: "Implement CoordinationReceipt and CAS storage"
+      requirement_ids:
+        - REQ-COORD-0007
+      depends_on:
+        - TCK-00152
+      summary: |
+        Implement CoordinationReceipt per CTR-COORD-005 and CAS storage with hash-locked
+        completion per AD-COORD-012. Receipt provides tamper-evident audit trail for
+        coordination execution.
+      files_to_create:
+        - path: "crates/apm2-core/src/coordination/evidence.rs"
+          purpose: "CoordinationReceipt and builder"
+      files_to_modify:
+        - path: "crates/apm2-core/src/coordination/mod.rs"
+          changes: "Add evidence module export"
+        - path: "crates/apm2-core/src/coordination/controller.rs"
+          changes: "Integrate receipt building and CAS storage"
+      implementation_steps:
+        - step: 1
+          action: "Define CoordinationReceipt struct"
+          details: |
+            coordination_id, work_outcomes, budget_usage, budget_ceiling,
+            stop_condition, started_at, completed_at, total_sessions,
+            successful_sessions, failed_sessions
+        - step: 2
+          action: "Define WorkOutcome struct"
+          details: "work_id, attempts, final_outcome, session_ids"
+        - step: 3
+          action: "Implement ReceiptBuilder"
+          details: |
+            Incrementally track outcomes during coordination.
+            Methods: add_session_outcome(), update_budget(), finalize()
+        - step: 4
+          action: "Implement finalization"
+          details: |
+            Per AD-COORD-012:
+            1. Set stop_condition, completed_at
+            2. Compute derived fields
+            3. Serialize to canonical JSON
+            4. Compute receipt_hash = BLAKE3(json_bytes)
+        - step: 5
+          action: "Implement CAS storage"
+          details: |
+            1. cas.put(json_bytes) -> cas_hash
+            2. Assert cas_hash == receipt_hash (content addressing)
+            3. Include receipt_hash in completion event
+        - step: 6
+          action: "Emit completion event with receipt hash"
+          details: |
+            coordination.completed { coordination_id, stop_condition, receipt_hash }
+            Hash must match CAS content hash
+      acceptance_criteria:
+        - criterion: "Receipt includes all required fields"
+          verification: "Schema validation passes"
+        - criterion: "Receipt hash matches CAS content"
+          verification: "Tamper-evidence test"
+        - criterion: "Receipt is immutable after completion event"
+          verification: "Hash computed before event emission"
+        - criterion: "Incremental tracking during coordination"
+          verification: "Builder accumulates outcomes correctly"
+      test_requirements:
+        - test_id: UT-COORD-RECEIPT-001
+          description: "Receipt serialization round-trip"
+          verification_command: "cargo test -p apm2-core coordination::evidence::tests::test_receipt_serde"
+        - test_id: UT-COORD-RECEIPT-002
+          description: "Receipt hash computation"
+          verification_command: "cargo test -p apm2-core coordination::evidence::tests::test_receipt_hash"
+        - test_id: IT-COORD-RECEIPT-001
+          description: "CAS storage integration"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_receipt_cas_storage"
+        - test_id: IT-COORD-RECEIPT-002
+          description: "Completion event hash consistency"
+          verification_command: "cargo test -p apm2-core coordination::tests::test_completion_hash_consistency"
+
+    - ticket_id: TCK-00155
+      title: "Implement coordination end-to-end integration tests"
+      requirement_ids: []
+      depends_on:
+        - TCK-00153
+        - TCK-00154
+      summary: |
+        Create comprehensive integration tests covering happy path, failure modes,
+        and edge cases. Include mock session spawner for controlled testing.
+        Document coordination usage patterns.
+      files_to_create:
+        - path: "crates/apm2-core/tests/coordination_integration.rs"
+          purpose: "Integration test suite"
+      files_to_modify:
+        - path: "crates/apm2-core/src/coordination/mod.rs"
+          changes: "Add AGENTS.md documentation"
+      implementation_steps:
+        - step: 1
+          action: "Create MockSessionSpawner"
+          details: |
+            Configurable mock that controls session outcomes.
+            Methods: set_outcome(work_id, outcome), set_delay(ms)
+        - step: 2
+          action: "Implement happy path test"
+          details: |
+            Process 3 work items successfully.
+            Verify receipt shows WORK_COMPLETED.
+            Verify all items in work_outcomes.
+        - step: 3
+          action: "Implement circuit breaker test"
+          details: |
+            Mock 3 consecutive session failures.
+            Verify receipt shows CIRCUIT_BREAKER_TRIGGERED.
+            Verify consecutive_failures == 3.
+        - step: 4
+          action: "Implement budget exhaustion tests"
+          details: |
+            Episode limit: Stop at max_episodes.
+            Duration limit: Mock clock advance.
+            Token limit: Mock high-entropy sessions.
+        - step: 5
+          action: "Implement work freshness test"
+          details: |
+            Mock work state change between check and spawn.
+            Verify coordination proceeds to next item.
+        - step: 6
+          action: "Implement retry test"
+          details: |
+            Configure 2 failures then success for work item.
+            Verify 3 sessions spawned, work succeeds.
+        - step: 7
+          action: "Create AGENTS.md documentation"
+          details: |
+            Document module purpose, integration patterns,
+            and usage guidance for AI agents.
+      acceptance_criteria:
+        - criterion: "All integration tests pass"
+          verification: "cargo test coordination_integration"
+        - criterion: "Happy path produces valid receipt"
+          verification: "Receipt validation in test"
+        - criterion: "Edge cases handled correctly"
+          verification: "Tests for each failure mode"
+        - criterion: "AGENTS.md follows module pattern"
+          verification: "Documentation review"
+      test_requirements:
+        - test_id: IT-COORD-E2E-001
+          description: "Happy path: work queue completion"
+          verification_command: "cargo test -p apm2-core coordination_integration::test_happy_path"
+        - test_id: IT-COORD-E2E-002
+          description: "Circuit breaker behavior"
+          verification_command: "cargo test -p apm2-core coordination_integration::test_circuit_breaker"
+        - test_id: IT-COORD-E2E-003
+          description: "Budget exhaustion scenarios"
+          verification_command: "cargo test -p apm2-core coordination_integration::test_budget_exhaustion"
+        - test_id: IT-COORD-E2E-004
+          description: "Work freshness handling"
+          verification_command: "cargo test -p apm2-core coordination_integration::test_work_freshness"
+        - test_id: IT-COORD-E2E-005
+          description: "Retry behavior"
+          verification_command: "cargo test -p apm2-core coordination_integration::test_retry_behavior"
+
+  decomposition_gates:
+    - gate: GATE-TCK-ATOMICITY
+      status: PASS
+      notes: |
+        Each ticket produces a single PR:
+        - TCK-00148: Types only, no runtime dependencies
+        - TCK-00149: Reducer depends only on types
+        - TCK-00150: Controller depends on reducer
+        - TCK-00151-152: Incremental feature additions
+        - TCK-00153: CLI integration (isolated crate)
+        - TCK-00154: Evidence layer (isolated module)
+        - TCK-00155: Tests (no production code changes)
+
+    - gate: GATE-TCK-IMPLEMENTABILITY
+      status: PASS
+      notes: |
+        All tickets reference concrete architecture decisions:
+        - Session ID generation (AD-COORD-007)
+        - JSON serialization (AD-COORD-009)
+        - Token aggregation (AD-COORD-011)
+        - Receipt finalization (AD-COORD-012)
+        - Stop condition priority (AD-COORD-013)
+        Evidence references provide code location guidance.
+
+    - gate: GATE-TCK-ANTI-COUSIN
+      status: PASS
+      notes: |
+        Coordination is net-new module. No cousin abstractions:
+        - Follows established reducer pattern (SessionReducer, WorkReducer)
+        - Uses existing extension points (ledger, CAS, checkpoint)
+        - Read-only observer for Work/Session state
+        - Single-writer invariant preserved

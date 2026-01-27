@@ -173,10 +173,17 @@ struct RequirementContent {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct EvidenceBlock {
     #[serde(default)]
     evidence_ids: Vec<String>,
+    /// Whether evidence is inherited from PRD (optional metadata).
+    #[serde(default)]
+    #[allow(dead_code)]
+    inherited_from_prd: Option<bool>,
+    /// Additional notes about evidence requirements (optional metadata).
+    #[serde(default)]
+    #[allow(dead_code)]
+    notes: Vec<String>,
 }
 
 /// Fit score for component matching.
@@ -594,7 +601,12 @@ pub fn parse_requirements(
             reason: e.to_string(),
         })?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "yaml" || e == "yml") {
+        // Only process REQ-*.yaml files to skip index/readme files
+        let is_req_file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("REQ-"));
+        if is_req_file && path.extension().is_some_and(|e| e == "yaml" || e == "yml") {
             yaml_files.push(path);
         }
     }

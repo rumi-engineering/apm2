@@ -1,0 +1,121 @@
+rfc_rollout_and_ops:
+  schema_version: "2026-01-26"
+  template_version: "2026-01-26"
+
+  rollout_strategy:
+    overview: |
+      The coordination layer is new functionality with no existing users.
+      Rollout focuses on gradual enablement with monitoring and safety gates.
+
+    phases:
+      - phase_id: PHASE-1A
+        name: "Core Implementation"
+        description: |
+          Implement CoordinationReducer, events, and state types.
+          No controller or CLI integration yet.
+        deliverables:
+          - "crates/apm2-core/src/coordination/reducer.rs"
+          - "crates/apm2-core/src/coordination/state.rs"
+          - "crates/apm2-core/src/coordination/events.rs"
+          - "Unit tests for reducer determinism and idempotency"
+        gate: "GATE-COORD-REDUCER: Reducer passes property tests"
+
+      - phase_id: PHASE-1B
+        name: "Controller Implementation"
+        description: |
+          Implement CoordinationController with serial execution loop.
+          Budget enforcement, circuit breaker, and freshness checks.
+        deliverables:
+          - "crates/apm2-core/src/coordination/controller.rs"
+          - "Integration tests with mock session spawning"
+        gate: "GATE-COORD-CONTROLLER: Controller passes stop condition tests"
+
+      - phase_id: PHASE-1C
+        name: "Evidence and CLI"
+        description: |
+          Implement CoordinationReceipt and apm2 coordinate command.
+          Full integration with CAS storage.
+        deliverables:
+          - "crates/apm2-core/src/coordination/evidence.rs"
+          - "crates/apm2-cli/src/commands/coordinate.rs"
+          - "End-to-end integration tests"
+        gate: "GATE-COORD-CLI: CLI produces valid receipts"
+
+      - phase_id: PHASE-2
+        name: "Production Enablement"
+        description: |
+          Enable coordination in production workflows.
+          Monitor metrics and gather feedback.
+        deliverables:
+          - "Documentation and operator guides"
+          - "Monitoring dashboards"
+        gate: "GATE-COORD-PROD: 80% autonomous session completion rate"
+
+  operational_considerations:
+    monitoring:
+      - metric: "coordination_sessions_total"
+        type: counter
+        description: "Total sessions spawned by coordination"
+        labels: ["coordination_id", "outcome"]
+
+      - metric: "coordination_budget_usage"
+        type: gauge
+        description: "Current budget consumption"
+        labels: ["coordination_id", "budget_type"]
+
+      - metric: "coordination_circuit_breaker_triggers"
+        type: counter
+        description: "Circuit breaker trigger count"
+        labels: []
+
+      - metric: "coordination_duration_ms"
+        type: histogram
+        description: "Coordination execution duration"
+        labels: ["stop_condition"]
+
+    alerting:
+      - alert: "HighCircuitBreakerRate"
+        condition: "coordination_circuit_breaker_triggers / coordination_sessions_total > 0.1"
+        severity: warning
+        description: "More than 10% of coordinations hitting circuit breaker"
+
+      - alert: "BudgetExhaustionRate"
+        condition: "rate of BUDGET_EXHAUSTED stop condition > threshold"
+        severity: info
+        description: "Coordinations frequently hitting budget limits"
+
+    troubleshooting:
+      - symptom: "Coordination aborts with CIRCUIT_BREAKER_TRIGGERED"
+        diagnosis: |
+          Check recent session failures in coordination receipt.
+          Look for common failure patterns (timeout, error type).
+          Review work item specifications for issues.
+        resolution: |
+          Fix underlying session failure cause.
+          Restart coordination with fresh state.
+
+      - symptom: "Coordination aborts with BUDGET_EXHAUSTED"
+        diagnosis: |
+          Check budget_usage in receipt against ceiling.
+          Determine which budget type was exhausted (episodes, duration, tokens).
+        resolution: |
+          Increase budget if work scope requires it.
+          Consider splitting work queue into multiple coordinations.
+
+      - symptom: "Work freshness check fails"
+        diagnosis: |
+          Work state changed between coordination start and session spawn.
+          Check ledger events around failure time.
+        resolution: |
+          Coordination will proceed to next work item automatically.
+          If frequent, investigate what's modifying work state.
+
+  backwards_compatibility:
+    impact: |
+      Coordination is additive functionality. No existing features are modified.
+      Ledger event schema is extended (new event family).
+      No migration required for existing data.
+
+    migration_path: |
+      No migration needed. Coordination module is opt-in via CLI command.
+      Existing work/session workflows continue unchanged.

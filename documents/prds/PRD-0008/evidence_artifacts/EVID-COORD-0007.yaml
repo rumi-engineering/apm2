@@ -1,0 +1,54 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-COORD-0007"
+  category: "CLI_INTEGRATION_RESULTS"
+  title: "CLI command integration tests"
+  description: |
+    Validates CLI command functionality including work queue specification,
+    budget parameter validation, progress event emission, and receipt output.
+  capture:
+    paths:
+      - "evidence/coordination/cli/"
+  verification:
+    commands:
+      - id: "CMD-COORD-0007-01"
+        shell: "bash"
+        command: "cargo test --package apm2-cli --lib commands::coordinate::tests::arg_parsing"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test --work-ids parsing"
+          - "Test --work-query parsing"
+          - "Test budget parameter parsing"
+      - id: "CMD-COORD-0007-02"
+        shell: "bash"
+        command: "cargo test --package apm2-cli --lib commands::coordinate::tests::validation"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test rejection without budget params"
+          - "Test rejection without work specification"
+      - id: "CMD-COORD-0007-03"
+        shell: "bash"
+        command: "cargo test --package apm2-cli --lib commands::coordinate::tests::output"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test structured JSON output"
+          - "Test progress events"
+          - "Test receipt on completion"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

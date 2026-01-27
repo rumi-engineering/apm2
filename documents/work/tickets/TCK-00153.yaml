@@ -1,0 +1,39 @@
+acceptance_criteria:
+  - criterion: Command parses all options correctly
+    verification: clap help output matches spec
+  - criterion: Exit codes follow specification
+    verification: E2E tests verify exit codes
+  - criterion: JSON output is valid and complete
+    verification: Receipt parses successfully
+  - criterion: Work queue size validation
+    verification: Rejects queue > max_work_queue
+implementation:
+  code_examples: []
+  files_to_create:
+    - path: crates/apm2-cli/src/commands/coordinate.rs
+      purpose: CLI command implementation
+  files_to_modify:
+    - changes: Add coordinate subcommand
+      path: crates/apm2-cli/src/main.rs
+    - changes: Add coordinate module export
+      path: crates/apm2-cli/src/commands/mod.rs
+  implementation_steps: []
+  summary: ""
+notes: "Phase: PHASE-1\nGenerated from RFC RFC-0012 ticket decomposition on 2026-01-27."
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+test_requirements:
+  - description: Unit tests pass
+    test_id: UT-00153-01
+    verification_command: cargo test -p apm2-core tck_00153
+  - description: Integration test
+    test_id: IT-00153-01
+    verification_command: cargo run --bin apm2 -- factory tickets emit --rfc RFC-0012
+ticket:
+  depends_on: []
+  id: TCK-00153
+  requirement_ids:
+    - REQ-COORD-0006
+  rfc_id: RFC-0012
+  status: READY
+  title: Implement apm2 coordinate CLI command

@@ -1,0 +1,23 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-COORD-0001"
+  type: "FUNCTIONAL"
+  title: "CoordinationReducer implementation"
+  statement: |
+    CoordinationReducer MUST implement event-sourced state projection following
+    established reducer patterns (SessionReducer, WorkReducer). The reducer MUST
+    process coordination events from the ledger deterministically and maintain
+    CoordinationState that is reconstructable from event replay. Checkpointing
+    MUST be supported for incremental state recovery.
+  acceptance_criteria:
+    - "CoordinationReducer processes ledger events deterministically. Verified by: Property tests comparing replay-from-genesis with replay-from-checkpoint produce identical state."
+    - "CoordinationState is reconstructable from event replay. Verified by: Integration tests replay event sequences and verify state consistency."
+    - "Reducer supports checkpointing. Verified by: Checkpoint save/restore produces state identical to full replay."
+    - "Reducer follows established patterns. Verified by: Code review confirms adherence to SessionReducer/WorkReducer patterns."
+  evidence:
+    evidence_ids:
+      - EVID-COORD-0005
+    inherited_from_prd: false
+    notes:
+      - "Pattern compliance is critical for maintainability and system consistency."

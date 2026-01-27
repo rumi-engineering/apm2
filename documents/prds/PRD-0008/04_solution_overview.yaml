@@ -1,0 +1,205 @@
+prd_solution_overview:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  proposed_solution:
+    overview: |
+      The Agent Coordination Layer provides event-sourced state management for autonomous
+      work loop execution. CoordinationReducer maintains coordination state as a projection
+      over ledger events, following the established patterns of SessionReducer and WorkReducer.
+      The coordination controller binds work items to agent sessions, enforces budgets and
+      stop conditions, and emits evidence receipts proving coordination outcomes.
+
+      Key insight: Coordination does NOT directly modify Work/Session/Lease state. It reacts
+      to their events and emits coordination-specific events. This preserves the separation
+      of concerns and allows each reducer to maintain its own invariants.
+    key_components:
+      - name: CoordinationReducer
+        component_id: COORD-REDUCER
+        type: rust_library
+        description: |
+          Event-sourced reducer tracking coordination state. Consumes events from the
+          ledger and maintains CoordinationState projection. Supports checkpointing
+          for incremental replay.
+        interfaces:
+          - "apply(event) -> Result<(), Error>"
+          - "state() -> &CoordinationState"
+          - "checkpoint() -> Checkpoint"
+        location: "apm2-core/src/coordination/reducer.rs"
+      - name: CoordinationState
+        component_id: COORD-STATE
+        type: rust_struct
+        description: |
+          State structure maintained by CoordinationReducer. Tracks active coordinations,
+          work-session bindings, budget consumption, attempt counts, and stop condition
+          status.
+        fields:
+          - "coordinations: HashMap<CoordinationId, CoordinationSession>"
+          - "bindings: HashMap<WorkId, SessionId>"
+          - "budget_usage: BudgetUsage"
+          - "stop_condition: Option<StopCondition>"
+        location: "apm2-core/src/coordination/state.rs"
+      - name: Coordination Events
+        component_id: COORD-EVENTS
+        type: rust_enums
+        description: |
+          Event payloads for coordination state transitions. All events are recorded
+          in the ledger and drive reducer state changes.
+        events:
+          - name: coordination.started
+            fields: "coordination_id, work_queue, budget, created_at"
+          - name: coordination.session_bound
+            fields: "coordination_id, work_id, session_id, attempt_number"
+          - name: coordination.session_unbound
+            fields: "coordination_id, work_id, session_id, outcome (success|failure|timeout)"
+          - name: coordination.completed
+            fields: "coordination_id, stop_condition, receipt_hash"
+          - name: coordination.aborted
+            fields: "coordination_id, reason, receipt_hash"
+        location: "apm2-core/src/coordination/events.rs"
+      - name: CoordinationController
+        component_id: COORD-CONTROLLER
+        type: rust_struct
+        description: |
+          Implements the serial execution loop. Processes work queue, spawns sessions,
+          monitors outcomes, and enforces stop conditions. Emits coordination events
+          to the ledger.
+        interfaces:
+          - "start(config: CoordinationConfig) -> Result<CoordinationId, Error>"
+          - "run_loop() -> Result<CoordinationReceipt, Error>"
+          - "check_stop_condition() -> Option<StopCondition>"
+        location: "apm2-core/src/coordination/controller.rs"
+      - name: CoordinationReceipt
+        component_id: COORD-RECEIPT
+        type: rust_struct
+        description: |
+          Evidence artifact proving coordination execution. Includes work outcomes,
+          budget usage, stop condition, and timing information. Stored in CAS and
+          referenced in completion event.
+        fields:
+          - "coordination_id: CoordinationId"
+          - "work_outcomes: Vec<WorkOutcome>"
+          - "budget_usage: BudgetUsage"
+          - "stop_condition: StopCondition"
+          - "started_at: Timestamp"
+          - "completed_at: Timestamp"
+          - "total_sessions: u32"
+          - "successful_sessions: u32"
+          - "failed_sessions: u32"
+        location: "apm2-core/src/coordination/evidence.rs"
+      - name: CLI Command (apm2 coordinate)
+        component_id: COORD-CLI
+        type: cli_command
+        description: |
+          Machine-readable CLI command for starting and monitoring coordination sessions.
+          Accepts work queue specification and budget configuration. Returns coordination
+          receipt on completion.
+        usage: |
+          apm2 coordinate --work-ids <id1,id2,...> --max-episodes <n> --max-duration-ms <ms>
+          apm2 coordinate --work-query <filter> --max-episodes <n> --max-duration-ms <ms>
+        location: "apm2-cli/src/commands/coordinate.rs"
+    external_dependencies:
+      - name: "APM2 Kernel"
+        interface: "ledger::Ledger, ledger::KernelEvent"
+        contract: "append(event) -> Result<EventId, Error>; replay() -> impl Iterator<Item=EventRecord>"
+        stability: stable
+        description: "Signed hash-chained ledger, KernelEvent families."
+      - name: "WorkReducer"
+        interface: "work::reducer::WorkReducer"
+        contract: "apply(&EventRecord, &ReducerContext) -> Result<(), Error>; state() -> &WorkState"
+        stability: stable
+        description: "Work state projection (open, in_progress, completed)."
+      - name: "SessionReducer"
+        interface: "session::reducer::SessionReducer"
+        contract: "apply(&EventRecord, &ReducerContext) -> Result<(), Error>; state() -> &SessionState"
+        stability: stable
+        description: "Session state projection (active, terminated)."
+      - name: "LeaseReducer"
+        interface: "lease::reducer::LeaseReducer"
+        contract: "apply(&EventRecord, &ReducerContext) -> Result<(), Error>; state() -> &LeaseState"
+        stability: stable
+        description: "Budget and lease enforcement."
+      - name: "Content-Addressed Store (CAS)"
+        interface: "cas::ContentAddressedStore"
+        contract: "put(bytes) -> Hash; get(Hash) -> Option<bytes>"
+        stability: stable
+        description: "Evidence receipt storage."
+  system_model:
+    architecture_diagram: |
+      ```
+                          +-----------------------------+
+                          |    CoordinationReducer      |
+                          |  (event-sourced state)      |
+                          +-------------+---------------+
+                                        |
+           +----------------------------+----------------------------+
+           |                            |                            |
+           v                            v                            v
+      +----------------+      +----------------+      +----------------+
+      |  WorkReducer   |      | SessionReducer |      |  LeaseReducer  |
+      +----------------+      +----------------+      +----------------+
+           |                            |                            |
+           +----------------------------+----------------------------+
+                                        |
+                                        v
+                                 +-----------+
+                                 |   Ledger  |
+                                 +-----------+
+      ```
+    core_components:
+      - id: COMP-COORD-REDUCER
+        name: CoordinationReducer
+        responsibilities:
+          - Process coordination events from ledger.
+          - Maintain CoordinationState projection.
+          - Support checkpointing and replay.
+      - id: COMP-COORD-CONTROLLER
+        name: CoordinationController
+        responsibilities:
+          - Implement serial execution loop.
+          - Spawn agent sessions for work items.
+          - Monitor session outcomes.
+          - Enforce budget and stop conditions.
+          - Emit coordination events to ledger.
+      - id: COMP-COORD-EVIDENCE
+        name: CoordinationReceipt Builder
+        responsibilities:
+          - Assemble evidence from coordination execution.
+          - Store receipt in CAS.
+          - Emit receipt reference in completion event.
+    entities:
+      - id: ENT-COORDINATION
+        name: CoordinationSession
+        definition: An active coordination managing a work queue with budget limits.
+        identity:
+          - coordination_id
+        state_machine:
+          - INITIALIZING -> RUNNING -> COMPLETED
+          - RUNNING -> ABORTED
+      - id: ENT-BINDING
+        name: WorkSessionBinding
+        definition: A binding relationship between a work item and an agent session.
+        identity:
+          - coordination_id
+          - work_id
+          - session_id
+      - id: ENT-BUDGET
+        name: CoordinationBudget
+        definition: Budget limits for coordination execution.
+        fields:
+          - max_episodes (required)
+          - max_duration_ms (required)
+          - max_tokens (optional)
+      - id: ENT-STOP-CONDITION
+        name: StopCondition
+        definition: Condition that terminates coordination.
+        variants:
+          - WORK_COMPLETED
+          - BUDGET_EXHAUSTED
+          - MAX_ATTEMPTS_EXCEEDED
+          - CIRCUIT_BREAKER_TRIGGERED
+  interfaces:
+    external_apis: []
+    user_surfaces:
+      - "apm2 coordinate - Start coordination session with work queue and budget."
+      - "apm2 coordination status - Query coordination state (future)."
+      - "apm2 coordination cancel - Cancel active coordination (future)."

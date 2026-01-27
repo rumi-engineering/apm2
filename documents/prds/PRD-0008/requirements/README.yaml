@@ -1,0 +1,54 @@
+requirements_readme:
+  schema_version: "2026-01-23"
+  prd_id: "PRD-0008"
+  description: |
+    This directory contains individual requirement files for the Agent Coordination
+    Layer PRD. Each requirement is stored in a separate YAML file following the
+    prd_requirement schema.
+
+  requirements:
+    - id: "REQ-COORD-0001"
+      title: "CoordinationReducer implementation"
+      type: "FUNCTIONAL"
+      file: "REQ-COORD-0001.yaml"
+    - id: "REQ-COORD-0002"
+      title: "Work-session binding events"
+      type: "FUNCTIONAL"
+      file: "REQ-COORD-0002.yaml"
+    - id: "REQ-COORD-0003"
+      title: "Coordination budget enforcement"
+      type: "NON_FUNCTIONAL"
+      file: "REQ-COORD-0003.yaml"
+    - id: "REQ-COORD-0004"
+      title: "Serial execution loop"
+      type: "FUNCTIONAL"
+      file: "REQ-COORD-0004.yaml"
+    - id: "REQ-COORD-0005"
+      title: "Stop conditions and circuit breaker"
+      type: "NON_FUNCTIONAL"
+      file: "REQ-COORD-0005.yaml"
+    - id: "REQ-COORD-0006"
+      title: "CLI command (apm2 coordinate)"
+      type: "FUNCTIONAL"
+      file: "REQ-COORD-0006.yaml"
+    - id: "REQ-COORD-0007"
+      title: "Coordination evidence receipts"
+      type: "FUNCTIONAL"
+      file: "REQ-COORD-0007.yaml"
+
+  traceability:
+    goal_mapping:
+      - goal: "COORD-G-0001"
+        requirements: ["REQ-COORD-0001"]
+      - goal: "COORD-G-0002"
+        requirements: ["REQ-COORD-0002"]
+      - goal: "COORD-G-0003"
+        requirements: ["REQ-COORD-0003"]
+      - goal: "COORD-G-0004"
+        requirements: ["REQ-COORD-0004"]
+      - goal: "COORD-G-0005"
+        requirements: ["REQ-COORD-0005"]
+      - goal: "COORD-G-0006"
+        requirements: ["REQ-COORD-0006"]
+      - goal: "COORD-G-0007"
+        requirements: ["REQ-COORD-0007"]

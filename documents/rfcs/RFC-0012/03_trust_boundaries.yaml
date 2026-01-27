@@ -1,0 +1,111 @@
+rfc_trust_boundaries:
+  schema_version: "2026-01-26"
+  template_version: "2026-01-26"
+
+  trust_model:
+    overview: |
+      The Coordination Layer operates within the APM2 kernel trust boundary.
+      It orchestrates agent sessions but does not directly execute untrusted code.
+      Agent sessions spawned by coordination inherit session-level trust boundaries.
+      Coordination events and receipts are stored in the trusted ledger and CAS.
+
+    boundaries:
+      - boundary_id: TB-COORD-001
+        name: "Coordination Controller"
+        type: TRUSTED
+        description: |
+          CoordinationController runs within the apm2 CLI/daemon process.
+          It has access to ledger (read/write), WorkReducer state (read),
+          SessionReducer state (read), and session spawn capability.
+        assets_protected:
+          - "Coordination state (coordinations, bindings, budgets)"
+          - "Budget enforcement integrity"
+          - "Circuit breaker state"
+        invariants:
+          - "Controller only emits coordination events; does not modify work/session state"
+          - "Budget consumption monotonically increases"
+          - "All coordination actions are recorded in ledger"
+
+      - boundary_id: TB-COORD-002
+        name: "Agent Sessions"
+        type: SPAWNED_PROCESS
+        description: |
+          Agent sessions are spawned by coordination but run in their own process
+          context with session-level trust boundaries (from SessionReducer).
+          Coordination observes session outcomes but does not control session internals.
+        invariants:
+          - "Sessions inherit existing session-level security boundaries"
+          - "Coordination receives outcome events; does not inject into sessions"
+          - "Session failures do not corrupt coordination state"
+
+      - boundary_id: TB-COORD-003
+        name: "Coordination Receipt"
+        type: AUDIT_TRAIL
+        description: |
+          CoordinationReceipt is stored in CAS and referenced in completion events.
+          Receipt provides tamper-evident record of coordination execution.
+        invariants:
+          - "Receipt hash in completion event matches CAS content"
+          - "Receipt includes all required fields per schema"
+          - "Receipt is immutable after completion event"
+
+      - boundary_id: TB-COORD-004
+        name: "Work Queue Input"
+        type: VALIDATED_INPUT
+        description: |
+          Work queue specification comes from CLI input (--work-ids or --work-query).
+          Work IDs are validated against WorkReducer state before coordination starts.
+        validation_requirements:
+          - "Work IDs must exist in WorkReducer state"
+          - "Work items must be in eligible state (open or ready)"
+          - "Work queue must be non-empty"
+          - "Budget parameters must be positive integers"
+
+  threat_model:
+    - threat_id: TH-COORD-001
+      description: "Unbounded resource consumption via missing budget"
+      mitigation: |
+        Budget parameters (max_episodes, max_duration_ms) are mandatory.
+        CLI and controller reject requests without valid budgets.
+        Budget enforcement is checked before each session spawn.
+      residual_risk: LOW
+
+    - threat_id: TH-COORD-002
+      description: "Crash loop exhausts resources"
+      mitigation: |
+        Circuit breaker triggers after 3 consecutive failures.
+        Coordination aborts with CIRCUIT_BREAKER_TRIGGERED stop condition.
+        Receipt records failure pattern for post-mortem analysis.
+      residual_risk: LOW
+
+    - threat_id: TH-COORD-003
+      description: "Stale work state causes duplicate execution"
+      mitigation: |
+        Work freshness check validates state at known ledger sequence.
+        Session validates work state at start; fails fast if stale.
+        Coordination handles session failure gracefully.
+      residual_risk: LOW
+
+    - threat_id: TH-COORD-004
+      description: "Coordination state corruption on crash"
+      mitigation: |
+        CoordinationReducer is deterministic and idempotent.
+        State reconstructable from ledger replay.
+        Checkpointing enables efficient recovery.
+      residual_risk: LOW
+
+    - threat_id: TH-COORD-005
+      description: "Malicious work item causes session to exceed resource limits"
+      mitigation: |
+        Session-level leases (LeaseReducer) enforce per-session limits.
+        Coordination-level budgets cap total session count and duration.
+        Defense in depth: both layers must pass.
+      residual_risk: LOW
+
+  security_contacts:
+    - role: AUTH_SECURITY
+      responsibilities:
+        - "Review coordination trust boundary definitions"
+        - "Approve budget enforcement implementation"
+        - "Audit circuit breaker logic"
+        - "Review work freshness validation"

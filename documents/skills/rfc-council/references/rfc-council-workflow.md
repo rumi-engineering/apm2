@@ -87,8 +87,9 @@ decision_tree:
         - id: MODE_DECOMPOSE
           if: "mode is DECOMPOSE"
           then:
-            next_reference: references/create-mode.md # Reuse decomposition logic
+            next_reference: references/create-mode.md # Populates decomposition YAML, delegates to CLI
             step: PHASE_3_TICKET_CREATION
+            note: "Populates 06_ticket_decomposition.yaml then runs: apm2 factory tickets emit --rfc RFC-XXXX"
         - id: MODE_REVIEW
           if: "mode is REVIEW"
           then:

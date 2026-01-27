@@ -1,0 +1,43 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-COORD-0001"
+  category: "COORDINATION_RECEIPT_ARTIFACTS"
+  title: "Coordination evidence receipt validation"
+  description: |
+    Validates that coordination produces complete evidence receipts with all
+    required fields, proper CAS storage, and ledger event references.
+  capture:
+    paths:
+      - "evidence/coordination/receipts/"
+  verification:
+    commands:
+      - id: "CMD-COORD-0001-01"
+        shell: "bash"
+        command: "cargo test --package apm2-core --lib coordination::evidence::tests"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test suite verifies receipt schema compliance"
+          - "Test suite verifies CAS storage"
+          - "Test suite verifies event reference"
+      - id: "CMD-COORD-0001-02"
+        shell: "bash"
+        command: "cargo test --package apm2-core --lib coordination::receipt_fields"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Verifies all required fields present"
+          - "Verifies work_outcomes per item"
+          - "Verifies budget_usage tracking"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

@@ -1,0 +1,130 @@
+prd_risks_questions:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  risks:
+    - id: RSK-COORD-0001
+      statement: Session spawn latency causes coordination timeout before work completion.
+      impact: Work items fail due to infrastructure latency, not execution issues.
+      likelihood: MEDIUM
+      mitigations:
+        - Set max_duration_ms conservatively with headroom for spawn overhead.
+        - Track spawn latency separately from execution time in receipts.
+        - Provide guidance for budget sizing based on observed spawn latencies.
+      evidence_ids:
+        - EVID-COORD-0001
+    - id: RSK-COORD-0002
+      statement: Work state changes between freshness check and session spawn.
+      impact: Race condition causes session to execute stale or already-completed work.
+      likelihood: LOW
+      mitigations:
+        - Use ledger event sequence for consistency (CNS-COORD-0005).
+        - Session validates work state at start, fails fast if stale.
+        - Coordination handles session failure gracefully and proceeds.
+      evidence_ids:
+        - EVID-COORD-0004
+    - id: RSK-COORD-0003
+      statement: Circuit breaker triggers prematurely on transient failures.
+      impact: Recoverable issues cause coordination abort instead of retry.
+      likelihood: MEDIUM
+      mitigations:
+        - Consecutive failure threshold (3) chosen based on cost/benefit analysis.
+        - Consider exponential backoff between retries in future version.
+        - Provide escape hatch for operators to override circuit breaker (manual restart).
+      evidence_ids:
+        - EVID-COORD-0002
+      tradeoff_cluster: AVAILABILITY_VS_SAFETY
+    - id: RSK-COORD-0004
+      statement: Serial execution limits throughput for large work queues.
+      impact: Long coordination sessions for queues that could benefit from parallelism.
+      likelihood: HIGH
+      mitigations:
+        - Serial execution is MVP scope; parallel is planned for Phase 2.
+        - Operators can run multiple coordinations for independent work subsets.
+        - Document serial constraint and expected throughput.
+      evidence_ids:
+        - EVID-COORD-0006
+    - id: RSK-COORD-0005
+      statement: Budget estimation is difficult without historical data.
+      impact: Operators over-provision (waste) or under-provision (premature termination).
+      likelihood: HIGH
+      mitigations:
+        - Collect budget usage data from early coordinations.
+        - Provide budget recommendation based on work type and historical patterns.
+        - Allow budget adjustment during coordination (future enhancement).
+      evidence_ids:
+        - EVID-COORD-0003
+  open_questions:
+    - id: Q-COORD-0001
+      question: |
+        Should coordination support pause/resume functionality in MVP?
+      decision_needed_by: Implementation Phase 1a
+      resolution_plan: |
+        Current decision: No pause/resume in MVP. Evaluate need based on early usage.
+        Pause/resume adds state complexity and partial receipt handling.
+    - id: Q-COORD-0002
+      question: |
+        How should coordination handle work items that become invalid (deleted, blocked)
+        during execution?
+      decision_needed_by: Implementation Phase 1b
+      resolution_plan: |
+        Work freshness check catches most cases. For mid-coordination invalidation,
+        session will fail and coordination proceeds to next item. Document as expected behavior.
+    - id: Q-COORD-0003
+      question: |
+        Should circuit breaker threshold (3 consecutive failures) be configurable?
+      decision_needed_by: Implementation Phase 1b
+      resolution_plan: |
+        Start with fixed threshold for simplicity. Make configurable if operators
+        demonstrate need for different thresholds based on work type.
+    - id: Q-COORD-0004
+      question: |
+        How should coordination interact with work priority changes during execution?
+      decision_needed_by: Post-MVP
+      resolution_plan: |
+        MVP processes queue in initial order. Dynamic reordering deferred to Phase 2
+        alongside parallel execution support.
+  tradeoff_analyses:
+    - id: TRADEOFF-COORD-0001
+      name: Availability vs Safety (Circuit Breaker)
+      cluster_id: AVAILABILITY_VS_SAFETY
+      linked_risks:
+        - RSK-COORD-0003
+      description: |
+        Circuit breaker threshold balances availability (completing work) against
+        safety (preventing resource exhaustion). Lower threshold = safer but more
+        false positives. Higher threshold = more attempts but higher exhaustion risk.
+      criteria_ranking:
+        - criterion: Safety (prevent resource exhaustion)
+          weight: 0.60
+          rationale: Phase 1 priority is autonomous operation; crash loops undermine trust
+        - criterion: Availability (complete work)
+          weight: 0.30
+          rationale: Important but secondary to safety in early adoption
+        - criterion: Simplicity (fixed threshold)
+          weight: 0.10
+          rationale: Reduces configuration complexity
+      quantified_thresholds:
+        consecutive_failure_threshold: 3
+        rationale: |
+          3 consecutive failures indicates systematic issue, not transient failure.
+          At 3 failures with typical session cost, resource consumption is bounded
+          while still allowing retry for transient issues.
+      pareto_configurations:
+        - id: CONFIG-AGGRESSIVE
+          description: Low threshold (2 failures)
+          safety: 0.9
+          availability: 0.6
+          simplicity: 1.0
+          recommendation: Not recommended; too many false positives
+        - id: CONFIG-BALANCED
+          description: Medium threshold (3 failures)
+          safety: 0.8
+          availability: 0.8
+          simplicity: 1.0
+          recommendation: RECOMMENDED; balances concerns
+        - id: CONFIG-PERMISSIVE
+          description: High threshold (5 failures)
+          safety: 0.5
+          availability: 0.95
+          simplicity: 1.0
+          recommendation: Not recommended; excessive resource risk

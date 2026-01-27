@@ -1,0 +1,55 @@
+adjudication:
+  duplication_risks: []
+  high_confidence_count: 0
+  needs_review_count: 0
+  net_new_requirements: []
+  total_requirements: 0
+ccp_index_hash: "07d25735f7063e11a50e983d48e5d615e1d7ab3e3ffa9a56c879da167fa34be6"
+content_hash: eede9ef806b7bdd7842f7f7e9d1b631baadc3e70aba99b2cd78bb233a986daaf
+generated_at: "2026-01-27T17:43:39.624743513Z"
+prd_id: PRD-0008
+requirement_mappings: []
+schema_version: "2026-01-26"
+summary:
+  duplication_risks: 0
+  high_confidence_matches: 0
+  needs_review: 0
+  net_new_count: 0
+  total_requirements: 7
+  unresolved_count: 7
+unresolved_mappings:
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-COORD-0001
+    requirement_statement: "CoordinationReducer MUST implement event-sourced state projection following\nestablished reducer patterns (SessionReducer, WorkReducer). The reducer MUST\nprocess coordination events from the ledger ..."
+    requirement_title: CoordinationReducer implementation
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-COORD-0002
+    requirement_statement: "Coordination MUST emit work-session binding events to create and release\nrelationships between work items and agent sessions. coordination.session_bound\nMUST be emitted before session spawn, linkin..."
+    requirement_title: Work-session binding events
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-COORD-0003
+    requirement_statement: "Coordination MUST enforce hard budget ceilings to prevent unbounded resource\nconsumption. max_episodes (maximum number of sessions to spawn) and max_duration_ms\n(maximum wall-clock time) MUST be ma..."
+    requirement_title: Coordination budget enforcement
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-COORD-0004
+    requirement_statement: "CoordinationController MUST implement a serial execution loop that processes\nwork items sequentially. At most one agent session MUST be active per coordination\nat any time. The controller MUST spaw..."
+    requirement_title: Serial execution loop
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-COORD-0005
+    requirement_statement: "Coordination MUST enforce stop conditions to terminate execution. Stop conditions\ninclude: WORK_COMPLETED (queue exhausted), BUDGET_EXHAUSTED (ceiling reached),\nMAX_ATTEMPTS_EXCEEDED (work item ret..."
+    requirement_title: Stop conditions and circuit breaker
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-COORD-0006
+    requirement_statement: "The APM2 CLI MUST provide a `coordinate` command for starting coordination\nsessions. The command MUST accept work queue specification (--work-ids or\n--work-query) and budget configuration (--max-ep..."
+    requirement_title: CLI command (apm2 coordinate)
+    suggested_action: Requires human review or LLM-assisted matching to determine target component
+  - reason: No component matches found (Jaccard similarity below threshold)
+    requirement_id: REQ-COORD-0007
+    requirement_statement: "Coordination MUST produce structured evidence receipts (receipt.coordination)\nproving execution outcomes. Receipts MUST include: coordination_id, work_outcomes\n(per-item success/failure), budget_us..."
+    requirement_title: Coordination evidence receipts
+    suggested_action: Requires human review or LLM-assisted matching to determine target component

@@ -1,0 +1,42 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-COORD-0002"
+  category: "CIRCUIT_BREAKER_RESULTS"
+  title: "Circuit breaker enforcement tests"
+  description: |
+    Validates that circuit breaker triggers after 3 consecutive failures and
+    resets on successful session completion. Verifies proper stop condition
+    recording and diagnostic information in receipts.
+  capture:
+    paths:
+      - "evidence/coordination/circuit_breaker/"
+  verification:
+    commands:
+      - id: "CMD-COORD-0002-01"
+        shell: "bash"
+        command: "cargo test --package apm2-core --lib coordination::controller::tests::circuit_breaker"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test triggers circuit breaker after 3 consecutive failures"
+          - "Test verifies reset on success"
+          - "Test verifies stop_condition=CIRCUIT_BREAKER_TRIGGERED"
+      - id: "CMD-COORD-0002-02"
+        shell: "bash"
+        command: "cargo test --package apm2-core --lib coordination::controller::tests::failure_history"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test verifies failure history in receipt"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

@@ -1,0 +1,24 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-COORD-0003"
+  type: "NON_FUNCTIONAL"
+  title: "Coordination budget enforcement"
+  statement: |
+    Coordination MUST enforce hard budget ceilings to prevent unbounded resource
+    consumption. max_episodes (maximum number of sessions to spawn) and max_duration_ms
+    (maximum wall-clock time) MUST be mandatory parameters. Budget consumption MUST
+    be tracked per coordination and enforced continuously. Budget exhaustion MUST
+    trigger coordination termination with BUDGET_EXHAUSTED stop condition.
+  acceptance_criteria:
+    - "max_episodes and max_duration_ms are mandatory. Verified by: CLI and controller reject requests missing budget parameters."
+    - "Budget consumption tracked per coordination. Verified by: Coordination state includes consumed_episodes and elapsed_ms."
+    - "Budget ceiling enforced. Verified by: Coordination terminates when either ceiling reached."
+    - "BUDGET_EXHAUSTED stop condition recorded. Verified by: Receipt shows stop_condition=BUDGET_EXHAUSTED when budget exceeded."
+  evidence:
+    evidence_ids:
+      - EVID-COORD-0003
+    inherited_from_prd: false
+    notes:
+      - "GRD-COORD-001 requires mandatory budget parameters."
+      - "INV-COORD-0003 ensures monotonic budget consumption."
