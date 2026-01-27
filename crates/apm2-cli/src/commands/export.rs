@@ -387,7 +387,9 @@ fn load_dcp_index(index_path: &std::path::Path) -> Result<DcpIndex, ExportCliErr
 /// content. In production, this would integrate with the CAS.
 fn create_content_resolver(_index: &DcpIndex, pack: &CompiledContextPack) -> MemoryContentResolver {
     // SECURITY: Warn users that placeholder content is being used
-    eprintln!("WARNING: Exporting using placeholder content. Real content requires daemon connection.");
+    eprintln!(
+        "WARNING: Exporting using placeholder content. Real content requires daemon connection."
+    );
 
     let mut resolver = MemoryContentResolver::new();
 
@@ -766,8 +768,9 @@ delivery_constraints:
         assert_eq!(exit_code, exit_codes::ERROR);
     }
 
-    // Note: test_export_missing_index removed because --index is now required by Clap
-    // The error handling is done by Clap at argument parsing time, not in our code
+    // Note: test_export_missing_index removed because --index is now required by
+    // Clap The error handling is done by Clap at argument parsing time, not in
+    // our code
 
     // =========================================================================
     // Output Format Tests
