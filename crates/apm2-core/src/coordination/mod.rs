@@ -91,8 +91,8 @@ pub use events::{
 };
 pub use state::{
     AbortReason, BindingInfo, BudgetType, BudgetUsage, CoordinationBudget, CoordinationError,
-    CoordinationSession, CoordinationState, CoordinationStatus, MAX_WORK_QUEUE_SIZE,
-    SessionOutcome, StopCondition, WorkItemOutcome, WorkItemTracking,
+    CoordinationSession, CoordinationState, CoordinationStatus, MAX_HASHMAP_SIZE,
+    MAX_WORK_QUEUE_SIZE, SessionOutcome, StopCondition, WorkItemOutcome, WorkItemTracking,
 };
 
 #[cfg(test)]
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn tck_00148_types_derive_required_traits() {
         // Test Debug (via format!)
-        let budget = CoordinationBudget::new(10, 60_000, None);
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
         let _ = format!("{budget:?}");
 
         let usage = BudgetUsage::new();
@@ -155,7 +155,7 @@ mod tests {
         let _ = format!("{state:?}");
 
         // Test Clone (via clone() and then use it)
-        let budget2 = CoordinationBudget::new(10, 60_000, None);
+        let budget2 = CoordinationBudget::new(10, 60_000, None).unwrap();
         let budget_clone = budget2.clone();
         assert_eq!(budget2, budget_clone);
 
@@ -178,7 +178,7 @@ mod tests {
         let session2 = CoordinationSession::new(
             "c".to_string(),
             vec!["w".to_string()],
-            CoordinationBudget::new(10, 60_000, None),
+            CoordinationBudget::new(10, 60_000, None).unwrap(),
             3,
             1000,
         )
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn tck_00148_json_roundtrip_comprehensive() {
         // Build a complete CoordinationState with all nested types
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000));
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
         let mut session = CoordinationSession::new(
             "coord-123".to_string(),
             vec!["work-1".to_string(), "work-2".to_string()],

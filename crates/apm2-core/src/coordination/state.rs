@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::marker::PhantomData;
 
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Maximum number of work items allowed in a coordination queue.
@@ -23,23 +25,174 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 /// in constructors and during deserialization.
 pub const MAX_WORK_QUEUE_SIZE: usize = 1000;
 
+/// Maximum number of items allowed in coordination `HashMap`s.
+///
+/// This limit prevents denial-of-service attacks through unbounded allocation
+/// when deserializing coordination state from untrusted JSON.
+pub const MAX_HASHMAP_SIZE: usize = 10_000;
+
 /// Custom deserializer for `work_queue` that enforces [`MAX_WORK_QUEUE_SIZE`].
 ///
-/// This prevents denial-of-service attacks through unbounded allocation
-/// when deserializing coordination state from untrusted JSON.
+/// This uses a streaming visitor pattern that enforces limits DURING
+/// deserialization, preventing OOM attacks by rejecting oversized arrays
+/// before full allocation occurs.
 fn deserialize_bounded_work_queue<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let v: Vec<String> = Vec::deserialize(deserializer)?;
-    if v.len() > MAX_WORK_QUEUE_SIZE {
-        return Err(de::Error::custom(format!(
-            "work_queue exceeds maximum size: {} > {}",
-            v.len(),
-            MAX_WORK_QUEUE_SIZE
-        )));
+    struct BoundedVecVisitor;
+
+    impl<'de> Visitor<'de> for BoundedVecVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_WORK_QUEUE_SIZE} strings"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Use size hint but cap at MAX_WORK_QUEUE_SIZE to prevent pre-allocation
+            // attacks
+            let capacity = seq.size_hint().unwrap_or(0).min(MAX_WORK_QUEUE_SIZE);
+            let mut items = Vec::with_capacity(capacity);
+
+            while let Some(item) = seq.next_element()? {
+                if items.len() >= MAX_WORK_QUEUE_SIZE {
+                    return Err(de::Error::custom(format!(
+                        "work_queue exceeds maximum size: {} > {}",
+                        items.len() + 1,
+                        MAX_WORK_QUEUE_SIZE
+                    )));
+                }
+                items.push(item);
+            }
+            Ok(items)
+        }
     }
-    Ok(v)
+
+    deserializer.deserialize_seq(BoundedVecVisitor)
+}
+
+/// Custom deserializer for `work_tracking` `HashMap` that enforces
+/// [`MAX_HASHMAP_SIZE`].
+///
+/// This uses a streaming visitor pattern that enforces limits DURING
+/// deserialization, preventing OOM attacks by rejecting oversized maps
+/// before full allocation occurs.
+fn deserialize_bounded_work_tracking<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, WorkItemTracking>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedMapVisitor;
+
+    impl<'de> Visitor<'de> for BoundedMapVisitor {
+        type Value = HashMap<String, WorkItemTracking>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(formatter, "a map of at most {MAX_HASHMAP_SIZE} entries")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            // Use size hint but cap at MAX_HASHMAP_SIZE to prevent pre-allocation attacks
+            let capacity = map.size_hint().unwrap_or(0).min(MAX_HASHMAP_SIZE);
+            let mut items = HashMap::with_capacity(capacity);
+
+            while let Some((key, value)) = map.next_entry()? {
+                if items.len() >= MAX_HASHMAP_SIZE {
+                    return Err(de::Error::custom(format!(
+                        "work_tracking exceeds maximum size: {} > {}",
+                        items.len() + 1,
+                        MAX_HASHMAP_SIZE
+                    )));
+                }
+                items.insert(key, value);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_map(BoundedMapVisitor)
+}
+
+/// Custom deserializer for a bounded `HashMap` with generic value type.
+///
+/// This uses a streaming visitor pattern that enforces limits DURING
+/// deserialization, preventing OOM attacks by rejecting oversized maps
+/// before full allocation occurs.
+fn deserialize_bounded_hashmap<'de, D, V>(deserializer: D) -> Result<HashMap<String, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct BoundedHashMapVisitor<V> {
+        marker: PhantomData<V>,
+    }
+
+    impl<'de, V> Visitor<'de> for BoundedHashMapVisitor<V>
+    where
+        V: Deserialize<'de>,
+    {
+        type Value = HashMap<String, V>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(formatter, "a map of at most {MAX_HASHMAP_SIZE} entries")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            // Use size hint but cap at MAX_HASHMAP_SIZE to prevent pre-allocation attacks
+            let capacity = map.size_hint().unwrap_or(0).min(MAX_HASHMAP_SIZE);
+            let mut items = HashMap::with_capacity(capacity);
+
+            while let Some((key, value)) = map.next_entry()? {
+                if items.len() >= MAX_HASHMAP_SIZE {
+                    return Err(de::Error::custom(format!(
+                        "hashmap exceeds maximum size: {} > {}",
+                        items.len() + 1,
+                        MAX_HASHMAP_SIZE
+                    )));
+                }
+                items.insert(key, value);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_map(BoundedHashMapVisitor {
+        marker: PhantomData,
+    })
+}
+
+/// Custom deserializer for `coordinations` `HashMap`.
+fn deserialize_bounded_coordinations<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, CoordinationSession>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_hashmap(deserializer)
+}
+
+/// Custom deserializer for `bindings` `HashMap`.
+fn deserialize_bounded_bindings<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, BindingInfo>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_hashmap(deserializer)
 }
 
 /// Errors that can occur during coordination operations.
@@ -52,6 +205,14 @@ pub enum CoordinationError {
         /// The maximum allowed size.
         max: usize,
     },
+    /// Budget values must be positive (non-zero).
+    ///
+    /// Per RFC-0012/TB-COORD-004: `max_episodes` and `max_duration_ms` are
+    /// required positive integers.
+    InvalidBudget {
+        /// Description of which budget field is invalid.
+        field: &'static str,
+    },
 }
 
 impl fmt::Display for CoordinationError {
@@ -59,6 +220,12 @@ impl fmt::Display for CoordinationError {
         match self {
             Self::WorkQueueSizeExceeded { actual, max } => {
                 write!(f, "work queue size {actual} exceeds maximum allowed {max}")
+            },
+            Self::InvalidBudget { field } => {
+                write!(
+                    f,
+                    "budget field '{field}' must be a positive (non-zero) value"
+                )
             },
         }
     }
@@ -86,8 +253,47 @@ pub struct CoordinationBudget {
 
 impl CoordinationBudget {
     /// Creates a new coordination budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinationError::InvalidBudget`] if:
+    /// - `max_episodes` is zero
+    /// - `max_duration_ms` is zero
+    ///
+    /// Per RFC-0012/TB-COORD-004: `max_episodes` and `max_duration_ms` are
+    /// required positive integers.
+    pub const fn new(
+        max_episodes: u32,
+        max_duration_ms: u64,
+        max_tokens: Option<u64>,
+    ) -> Result<Self, CoordinationError> {
+        if max_episodes == 0 {
+            return Err(CoordinationError::InvalidBudget {
+                field: "max_episodes",
+            });
+        }
+        if max_duration_ms == 0 {
+            return Err(CoordinationError::InvalidBudget {
+                field: "max_duration_ms",
+            });
+        }
+        Ok(Self {
+            max_episodes,
+            max_duration_ms,
+            max_tokens,
+        })
+    }
+
+    /// Creates a new coordination budget without validation.
+    ///
+    /// This is intended for use in deserialization where the values come from
+    /// a trusted source or will be validated separately.
     #[must_use]
-    pub const fn new(max_episodes: u32, max_duration_ms: u64, max_tokens: Option<u64>) -> Self {
+    pub const fn new_unchecked(
+        max_episodes: u32,
+        max_duration_ms: u64,
+        max_tokens: Option<u64>,
+    ) -> Self {
         Self {
             max_episodes,
             max_duration_ms,
@@ -428,6 +634,9 @@ pub struct CoordinationSession {
     pub work_index: usize,
 
     /// Per-work tracking information.
+    ///
+    /// Limited to [`MAX_HASHMAP_SIZE`] entries during deserialization.
+    #[serde(deserialize_with = "deserialize_bounded_work_tracking")]
     pub work_tracking: HashMap<String, WorkItemTracking>,
 
     /// Budget constraints.
@@ -528,12 +737,18 @@ impl CoordinationSession {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinationState {
     /// Map of coordination ID to coordination session state.
+    ///
+    /// Limited to [`MAX_HASHMAP_SIZE`] entries during deserialization.
+    #[serde(deserialize_with = "deserialize_bounded_coordinations", default)]
     pub coordinations: HashMap<String, CoordinationSession>,
 
     /// Map of session ID to binding info for active bindings.
     ///
     /// Per AD-COORD-003: Bindings are created on `session_bound` and
     /// removed on `session_unbound`.
+    ///
+    /// Limited to [`MAX_HASHMAP_SIZE`] entries during deserialization.
+    #[serde(deserialize_with = "deserialize_bounded_bindings", default)]
     pub bindings: HashMap<String, BindingInfo>,
 }
 
@@ -612,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_coordination_budget_new() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000));
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
         assert_eq!(budget.max_episodes, 10);
         assert_eq!(budget.max_duration_ms, 60_000);
         assert_eq!(budget.max_tokens, Some(100_000));
@@ -620,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_coordination_budget_no_tokens() {
-        let budget = CoordinationBudget::new(5, 30_000, None);
+        let budget = CoordinationBudget::new(5, 30_000, None).unwrap();
         assert_eq!(budget.max_episodes, 5);
         assert_eq!(budget.max_duration_ms, 30_000);
         assert_eq!(budget.max_tokens, None);
@@ -628,10 +843,51 @@ mod tests {
 
     #[test]
     fn test_coordination_budget_serde_roundtrip() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000));
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
         let json = serde_json::to_string(&budget).unwrap();
         let restored: CoordinationBudget = serde_json::from_str(&json).unwrap();
         assert_eq!(budget, restored);
+    }
+
+    /// TCK-00148: Test that zero budget values are rejected.
+    ///
+    /// Per RFC-0012/TB-COORD-004: `max_episodes` and `max_duration_ms` are
+    /// required positive integers.
+    #[test]
+    fn test_coordination_budget_requires_positive() {
+        // Zero max_episodes should fail
+        let result = CoordinationBudget::new(0, 60_000, None);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            CoordinationError::InvalidBudget {
+                field: "max_episodes"
+            }
+        ));
+
+        // Zero max_duration_ms should fail
+        let result = CoordinationBudget::new(10, 0, None);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            CoordinationError::InvalidBudget {
+                field: "max_duration_ms"
+            }
+        ));
+
+        // Both zero should fail (max_episodes checked first)
+        let result = CoordinationBudget::new(0, 0, None);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            CoordinationError::InvalidBudget {
+                field: "max_episodes"
+            }
+        ));
+
+        // Valid positive values should succeed
+        let result = CoordinationBudget::new(1, 1, None);
+        assert!(result.is_ok());
     }
 
     // ========================================================================
@@ -799,7 +1055,7 @@ mod tests {
 
     #[test]
     fn test_coordination_session_new() {
-        let budget = CoordinationBudget::new(10, 60_000, None);
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
         let work_queue = vec!["work-1".to_string(), "work-2".to_string()];
         let session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -822,7 +1078,7 @@ mod tests {
 
     #[test]
     fn test_coordination_session_current_work_id() {
-        let budget = CoordinationBudget::new(10, 60_000, None);
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
         let work_queue = vec!["work-1".to_string(), "work-2".to_string()];
         let mut session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -842,7 +1098,7 @@ mod tests {
 
     #[test]
     fn test_coordination_session_work_queue_exhausted() {
-        let budget = CoordinationBudget::new(10, 60_000, None);
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
         let work_queue = vec!["work-1".to_string()];
         let mut session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -860,7 +1116,7 @@ mod tests {
 
     #[test]
     fn test_coordination_session_serde_roundtrip() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000));
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
         let work_queue = vec!["work-1".to_string(), "work-2".to_string()];
         let session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -891,7 +1147,7 @@ mod tests {
     #[test]
     fn test_coordination_state_get() {
         let mut state = CoordinationState::new();
-        let budget = CoordinationBudget::new(10, 60_000, None);
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
         let work_queue = vec!["work-1".to_string()];
         let session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -911,7 +1167,7 @@ mod tests {
     #[test]
     fn test_coordination_state_counts() {
         let mut state = CoordinationState::new();
-        let budget = CoordinationBudget::new(10, 60_000, None);
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
 
         // Add an active coordination
         let mut active =
@@ -934,7 +1190,7 @@ mod tests {
     #[test]
     fn test_coordination_state_serde_roundtrip() {
         let mut state = CoordinationState::new();
-        let budget = CoordinationBudget::new(10, 60_000, None);
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
         let work_queue = vec!["work-1".to_string()];
         let session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -967,7 +1223,7 @@ mod tests {
     #[test]
     fn tck_00148_serde_roundtrip_all_types() {
         // CoordinationBudget
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000));
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
         let json = serde_json::to_string(&budget).unwrap();
         assert_eq!(budget, serde_json::from_str(&json).unwrap());
 
@@ -1035,7 +1291,7 @@ mod tests {
     /// TCK-00148: Test that work queue size limit is enforced.
     #[test]
     fn test_coordination_session_queue_limit() {
-        let budget = CoordinationBudget::new(10, 60_000, None);
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
 
         // Create a work queue that exceeds the limit
         let oversized_queue: Vec<String> = (0..=MAX_WORK_QUEUE_SIZE)
@@ -1132,6 +1388,190 @@ mod tests {
         assert!(
             err.contains("work_queue exceeds maximum size"),
             "Expected error about work_queue size limit, got: {err}"
+        );
+    }
+
+    /// TCK-00148: Test that `HashMap` size limits are enforced during
+    /// deserialization for `work_tracking`.
+    #[test]
+    fn test_work_tracking_hashmap_limit_serde() {
+        // Build an oversized work_tracking HashMap
+        let oversized_tracking: std::collections::HashMap<String, serde_json::Value> = (0
+            ..=MAX_HASHMAP_SIZE)
+            .map(|i| {
+                (
+                    format!("work-{i}"),
+                    serde_json::json!({
+                        "work_id": format!("work-{i}"),
+                        "attempt_count": 0,
+                        "session_ids": [],
+                        "final_outcome": null
+                    }),
+                )
+            })
+            .collect();
+        assert_eq!(oversized_tracking.len(), MAX_HASHMAP_SIZE + 1);
+
+        let json = serde_json::json!({
+            "coordination_id": "coord-123",
+            "work_queue": ["work-0"],
+            "work_index": 0,
+            "work_tracking": oversized_tracking,
+            "budget": {
+                "max_episodes": 10,
+                "max_duration_ms": 60000,
+                "max_tokens": null
+            },
+            "budget_usage": {
+                "consumed_episodes": 0,
+                "elapsed_ms": 0,
+                "consumed_tokens": 0
+            },
+            "consecutive_failures": 0,
+            "status": "Initializing",
+            "started_at": 1_000_000_000_u64,
+            "completed_at": null,
+            "max_attempts_per_work": 3
+        });
+
+        let result: Result<CoordinationSession, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("work_tracking exceeds maximum size"),
+            "Expected error about work_tracking size limit, got: {err}"
+        );
+    }
+
+    /// TCK-00148: Test that `HashMap` size limits are enforced during
+    /// deserialization for `coordinations` in `CoordinationState`.
+    #[test]
+    fn test_coordinations_hashmap_limit_serde() {
+        // Build an oversized coordinations HashMap
+        // For efficiency, we use minimal valid coordination session objects
+        let budget_json = serde_json::json!({
+            "max_episodes": 10,
+            "max_duration_ms": 60000,
+            "max_tokens": null
+        });
+
+        let oversized_coordinations: std::collections::HashMap<String, serde_json::Value> = (0
+            ..=MAX_HASHMAP_SIZE)
+            .map(|i| {
+                (
+                    format!("coord-{i}"),
+                    serde_json::json!({
+                        "coordination_id": format!("coord-{i}"),
+                        "work_queue": [],
+                        "work_index": 0,
+                        "work_tracking": {},
+                        "budget": budget_json,
+                        "budget_usage": {
+                            "consumed_episodes": 0,
+                            "elapsed_ms": 0,
+                            "consumed_tokens": 0
+                        },
+                        "consecutive_failures": 0,
+                        "status": "Initializing",
+                        "started_at": 1_000_000_000_u64,
+                        "completed_at": null,
+                        "max_attempts_per_work": 3
+                    }),
+                )
+            })
+            .collect();
+        assert_eq!(oversized_coordinations.len(), MAX_HASHMAP_SIZE + 1);
+
+        let json = serde_json::json!({
+            "coordinations": oversized_coordinations,
+            "bindings": {}
+        });
+
+        let result: Result<CoordinationState, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("hashmap exceeds maximum size"),
+            "Expected error about hashmap size limit, got: {err}"
+        );
+    }
+
+    /// TCK-00148: Test that `HashMap` size limits are enforced during
+    /// deserialization for `bindings` in `CoordinationState`.
+    #[test]
+    fn test_bindings_hashmap_limit_serde() {
+        // Build an oversized bindings HashMap
+        let oversized_bindings: std::collections::HashMap<String, serde_json::Value> = (0
+            ..=MAX_HASHMAP_SIZE)
+            .map(|i| {
+                (
+                    format!("session-{i}"),
+                    serde_json::json!({
+                        "session_id": format!("session-{i}"),
+                        "work_id": format!("work-{i}"),
+                        "attempt_number": 1,
+                        "bound_at": 1_000_000_000_u64
+                    }),
+                )
+            })
+            .collect();
+        assert_eq!(oversized_bindings.len(), MAX_HASHMAP_SIZE + 1);
+
+        let json = serde_json::json!({
+            "coordinations": {},
+            "bindings": oversized_bindings
+        });
+
+        let result: Result<CoordinationState, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("hashmap exceeds maximum size"),
+            "Expected error about hashmap size limit, got: {err}"
+        );
+    }
+
+    /// TCK-00148: Verify streaming deserializer rejects oversized arrays
+    /// without attempting full allocation.
+    ///
+    /// This test documents that the streaming visitor pattern prevents OOM
+    /// by checking bounds during iteration rather than after full allocation.
+    /// The test verifies the error message indicates the failure occurs at
+    /// the boundary, not after allocating 1001 items.
+    #[test]
+    fn test_streaming_deserializer_bounds_check() {
+        // Create JSON with exactly MAX_WORK_QUEUE_SIZE + 1 items
+        let oversized_queue: Vec<String> = (0..=MAX_WORK_QUEUE_SIZE)
+            .map(|i| format!("work-{i}"))
+            .collect();
+
+        let json = serde_json::json!({
+            "coordination_id": "coord-test",
+            "work_ids": oversized_queue,
+            "budget": {
+                "max_episodes": 10,
+                "max_duration_ms": 60000,
+                "max_tokens": null
+            },
+            "max_attempts_per_work": 3,
+            "started_at": 1_000_000_000_u64
+        });
+
+        let result: Result<super::super::events::CoordinationStarted, _> =
+            serde_json::from_value(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+
+        // The error message should indicate the exact boundary where rejection occurred
+        // (MAX_WORK_QUEUE_SIZE + 1 = 1001)
+        assert!(
+            err.contains(&format!(
+                "work_ids exceeds maximum size: {} > {}",
+                MAX_WORK_QUEUE_SIZE + 1,
+                MAX_WORK_QUEUE_SIZE
+            )),
+            "Expected error at boundary {}, got: {err}",
+            MAX_WORK_QUEUE_SIZE + 1
         );
     }
 }

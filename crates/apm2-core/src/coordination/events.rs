@@ -8,6 +8,9 @@
 //! Events follow the existing pattern used by `SessionStarted`,
 //! `WorkTransitioned`, and other event payloads.
 
+use std::fmt;
+
+use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use super::state::{
@@ -17,21 +20,49 @@ use super::state::{
 
 /// Custom deserializer for `work_ids` that enforces [`MAX_WORK_QUEUE_SIZE`].
 ///
-/// This prevents denial-of-service attacks through unbounded allocation
-/// when deserializing coordination events from untrusted JSON.
+/// This uses a streaming visitor pattern that enforces limits DURING
+/// deserialization, preventing OOM attacks by rejecting oversized arrays
+/// before full allocation occurs.
 fn deserialize_bounded_work_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let v: Vec<String> = Vec::deserialize(deserializer)?;
-    if v.len() > MAX_WORK_QUEUE_SIZE {
-        return Err(de::Error::custom(format!(
-            "work_ids exceeds maximum size: {} > {}",
-            v.len(),
-            MAX_WORK_QUEUE_SIZE
-        )));
+    struct BoundedVecVisitor;
+
+    impl<'de> Visitor<'de> for BoundedVecVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_WORK_QUEUE_SIZE} strings"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Use size hint but cap at MAX_WORK_QUEUE_SIZE to prevent pre-allocation
+            // attacks
+            let capacity = seq.size_hint().unwrap_or(0).min(MAX_WORK_QUEUE_SIZE);
+            let mut items = Vec::with_capacity(capacity);
+
+            while let Some(item) = seq.next_element()? {
+                if items.len() >= MAX_WORK_QUEUE_SIZE {
+                    return Err(de::Error::custom(format!(
+                        "work_ids exceeds maximum size: {} > {}",
+                        items.len() + 1,
+                        MAX_WORK_QUEUE_SIZE
+                    )));
+                }
+                items.push(item);
+            }
+            Ok(items)
+        }
     }
-    Ok(v)
+
+    deserializer.deserialize_seq(BoundedVecVisitor)
 }
 
 /// Event type constant for coordination started.
@@ -406,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_coordination_started_new() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000));
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
         let event = CoordinationStarted::new(
             "coord-123".to_string(),
             vec!["work-1".to_string(), "work-2".to_string()],
@@ -424,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_coordination_started_serde_roundtrip() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000));
+        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
         let event = CoordinationStarted::new(
             "coord-123".to_string(),
             vec!["work-1".to_string()],
@@ -661,7 +692,7 @@ mod tests {
             CoordinationStarted::new(
                 "c".to_string(),
                 vec![],
-                CoordinationBudget::new(10, 60_000, None),
+                CoordinationBudget::new(10, 60_000, None).unwrap(),
                 3,
                 1000,
             )
@@ -712,7 +743,7 @@ mod tests {
 
     #[test]
     fn test_coordination_event_coordination_id() {
-        let budget = CoordinationBudget::new(10, 60_000, None);
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
         let event = CoordinationEvent::Started(
             CoordinationStarted::new("coord-test".to_string(), vec![], budget, 3, 1000).unwrap(),
         );
@@ -726,7 +757,7 @@ mod tests {
                 CoordinationStarted::new(
                     "c".to_string(),
                     vec!["w1".to_string(), "w2".to_string()],
-                    CoordinationBudget::new(10, 60_000, Some(100_000)),
+                    CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap(),
                     3,
                     1000,
                 )
@@ -790,7 +821,7 @@ mod tests {
         let started = CoordinationStarted::new(
             "coord-1".to_string(),
             vec!["work-1".to_string()],
-            CoordinationBudget::new(10, 60_000, Some(100_000)),
+            CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap(),
             3,
             1000,
         )
@@ -880,7 +911,7 @@ mod tests {
     /// `CoordinationStarted`.
     #[test]
     fn test_coordination_started_queue_limit() {
-        let budget = CoordinationBudget::new(10, 60_000, None);
+        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
 
         // Create a work_ids list that exceeds the limit
         let oversized_work_ids: Vec<String> = (0..=MAX_WORK_QUEUE_SIZE)
