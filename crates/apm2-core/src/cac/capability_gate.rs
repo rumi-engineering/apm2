@@ -1104,8 +1104,8 @@ mod tests {
     /// SECURITY TEST: Verify receipt with too many capabilities is rejected.
     ///
     /// This test proves that receipts with unbounded `capabilities_tested`
-    /// vectors are rejected before canonicalization to prevent denial-of-service attacks
-    /// via OOM or CPU exhaustion.
+    /// vectors are rejected before canonicalization to prevent
+    /// denial-of-service attacks via OOM or CPU exhaustion.
     #[test]
     fn test_verify_receipt_too_many_capabilities() {
         let (gate, generator) = make_gate_and_generator();
