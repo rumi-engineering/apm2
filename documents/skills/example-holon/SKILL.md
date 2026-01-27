@@ -191,7 +191,7 @@ let result = spawn_holon(&mut holon, input, config, || current_time_ns())?;
 ## Related Documentation
 
 - [RFC-0003: Holonic Framework](../../../documents/rfcs/RFC-0003/00_meta.yaml)
-- [Principia Holonica](../holonic-agent-network/references/principia-holonic.md)
+- [Grand Unified Theory](../laws-of-holonic-agent-systems/references/unified-theory.md) (dcp://apm2.local/governance/holonic_unified_theory@v1)
 - [apm2-holon AGENTS.md](../../../crates/apm2-holon/AGENTS.md)
 
 ## Invariants

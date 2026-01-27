@@ -2933,10 +2933,6 @@
           "ref": "documents/skills/laws-of-holonic-agent-systems/SKILL.md",
           "node_class": "BACKGROUND"
         },
-        "principia-holonic": {
-          "ref": "documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/principia-holonic.md",
-          "node_class": "BACKGROUND"
-        },
         "agent-native-software (holonic-agent-network)": {
           "ref": "documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/agent-native-software.md",
           "node_class": "BACKGROUND"
