@@ -807,7 +807,7 @@ mod tests {
     /// Creates a valid hex content hash for testing.
     /// Uses hex characters (0-9, a-f) to create valid hashes.
     fn test_hash(seed: u8) -> String {
-        format!("{:02x}", seed).repeat(32) // 32 * 2 = 64 chars
+        format!("{seed:02x}").repeat(32) // 32 * 2 = 64 chars
     }
 
     /// Schema ID used in tests.
