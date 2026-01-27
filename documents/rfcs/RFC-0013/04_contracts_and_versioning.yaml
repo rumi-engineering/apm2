@@ -246,6 +246,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         Episode lifecycle control messages.
+        Defined in `proto/daemon_protocol.proto`.
       interface: |
         message CreateEpisode {
           bytes envelope_hash = 1;
@@ -291,6 +292,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         I/O streaming messages.
+        Defined in `proto/daemon_protocol.proto`.
       interface: |
         message SendInput {
           string episode_id = 1;
@@ -315,6 +317,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         Tool request/response messages.
+        Defined in `proto/daemon_protocol.proto`.
       interface: |
         message ToolRequest {
           string episode_id = 1;
@@ -352,6 +355,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         Telemetry streaming messages.
+        Defined in `proto/daemon_protocol.proto`.
       interface: |
         message TelemetryFrame {
           string episode_id = 1;
@@ -377,6 +381,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         Receipt and evidence publication messages.
+        Defined in `proto/daemon_protocol.proto`.
       interface: |
         message PublishEvidence {
           bytes artifact_hash = 1;

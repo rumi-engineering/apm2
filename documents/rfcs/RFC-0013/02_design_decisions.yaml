@@ -292,7 +292,8 @@ rfc_design_decisions:
         - UDS-only default; no network exposure
         - Default deny tool capabilities; read-only by default
         - No ambient credentials in harness environment
-        - Session sandboxing: filesystem confinement + no network namespace
+        - Session sandboxing: filesystem confinement + network namespace isolation
+          (REQUIRED for tier 3+; OPTIONAL for tier 1-2)
         - Stop-state check before any actuation; fail closed on unverifiable stop
 
         Threat classes addressed:

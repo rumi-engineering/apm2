@@ -1,7 +1,7 @@
 rfc_meta:
   schema_version: "2026-01-27"
   template_version: "2026-01-27"
-  version: v2
+  version: v4
   rfc:
     id: RFC-0013
     title: "APM2 Kernel Daemon and Holonic Runtime Protocol v1"

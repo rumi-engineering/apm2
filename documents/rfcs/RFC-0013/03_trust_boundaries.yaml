@@ -153,7 +153,7 @@ rfc_trust_boundaries:
       attack_vector: "Shell command execution, direct file access"
       mitigation:
         - "Filesystem confinement via bind mounts"
-        - "Network namespace isolation (optional)"
+        - "Network namespace isolation (REQUIRED for risk tier 3+; OPTIONAL for tier 1-2)"
         - "No ambient credentials in harness environment"
         - "All external access via tool broker"
       residual_risk: MEDIUM

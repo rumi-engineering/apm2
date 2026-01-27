@@ -319,7 +319,7 @@ rfc_risks_and_open_questions:
         - Evidence pinning (DefectRecord → evidence.pinned)
         - TTL expiration events
         - Compaction completion
-      status: DEFERRED_V4
+      status: RESOLVED_V4
       proposed_answer: |
         **v2 Architectural Principle (established):**
         - Ring buffers are daemon-local transient capture
@@ -327,13 +327,13 @@ rfc_risks_and_open_questions:
         - Reducers compute all metrics (no parallel pipelines)
         - Ledger is the substrate for evidence economics
 
-        **v4 Event Vocabulary (to be finalized):**
+        **Finalized Event Vocabulary:**
         - `telemetry.frame`: High-rate metrics from cgroup probes
         - `evidence.pinned`: Artifact pinned by DefectRecord/incident
         - `evidence.ttl_expired`: Artifact eligible for compaction
         - `compaction.completed`: Summary receipt referencing dropped artifacts
 
-        **v4 Reducer Extensions:**
+        **Reducer Extensions:**
         - EvidenceReducer: pin_state tracking, TTL event handling
         - MetricsReducer: Scorecard computation from event stream
         - CompactionReducer: Process compaction.completed events
@@ -345,25 +345,21 @@ rfc_risks_and_open_questions:
         - No parallel pipelines (Prometheus scrape) that bypass receipts
         - Ring buffers emit events on trigger; reducers compute projections
 
-        **Existing Infrastructure:**
-        | Component | Path | Status |
-        |-----------|------|--------|
-        | Reducer trait | crates/apm2-core/src/reducer/traits.rs | Foundation |
-        | EvidenceReducer | crates/apm2-core/src/evidence/reducer.rs | Extend for pin/TTL |
-        | DefectRecord | crates/apm2-holon/src/defect.rs | Wire to evidence.pinned |
-        | CAS | crates/apm2-core/src/evidence/cas.rs | Exists |
-        | Evidence state | crates/apm2-core/src/evidence/state.rs | Needs pin_state field |
+        **Finalized Event Vocabulary:**
+        1. `telemetry.frame`: Sourced from ring buffer on trigger (seq, ts, cpu, mem, io)
+        2. `evidence.pinned`: Binds a DefectRecord or Incident to a specific artifact hash
+        3. `evidence.ttl_expired`: Emitted by EvidenceReducer when artifact crosses TTL threshold
+        4. `compaction.completed`: Captures the new compaction receipt hash and tombstoned digests
 
-        **Deferred to v4:**
-        - Event vocabulary schema definitions
-        - EvidenceReducer pin/TTL extensions
-        - MetricsReducer full design
-        - DefectRecord → evidence.pinned wiring
+        **Implementation Plan:**
+        - Add `pin_state` to `crates/apm2-core/src/evidence/state.rs`
+        - Implement `EvidenceReducer` extensions for pin/TTL events
+        - Wire `DefectRecord::emit()` to produce `evidence.pinned` events
       evidence_refs:
         - "AD-EVID-003 (architectural principle)"
         - "crates/apm2-core/src/reducer/traits.rs"
         - "crates/apm2-core/src/evidence/reducer.rs"
-        - "crates/apm2-holon/src/defect.rs"
+        - "crates/apm2-core/src/cac/defect.rs"
       owner: AUTH_ARCHITECTURE
 
     - question_id: OQ-DAEMON-007
