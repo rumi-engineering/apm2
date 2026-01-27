@@ -152,8 +152,12 @@ impl CoordinationReducer {
         // Update work tracking
         if let Some(tracking) = coordination.work_tracking.get_mut(&event.work_id) {
             tracking.attempt_count = event.attempt_number;
-            // Only add session_id if within bounds (MAX_SESSION_IDS_PER_WORK)
-            if tracking.session_ids.len() < super::state::MAX_SESSION_IDS_PER_WORK {
+            // Only add session_id if:
+            // 1. Not already present (idempotency - prevents duplicates on replay)
+            // 2. Within bounds (MAX_SESSION_IDS_PER_WORK)
+            if !tracking.session_ids.contains(&event.session_id)
+                && tracking.session_ids.len() < super::state::MAX_SESSION_IDS_PER_WORK
+            {
                 tracking.session_ids.push(event.session_id.clone());
             }
         }
@@ -491,6 +495,63 @@ mod unit_tests {
         // Verify status transitioned to Running
         let coord = reducer.state().get("coord-1").unwrap();
         assert!(matches!(coord.status, CoordinationStatus::Running));
+    }
+
+    #[test]
+    fn tck_00149_handle_session_bound_idempotent_session_ids() {
+        let mut reducer = CoordinationReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start coordination
+        let start_payload = started_payload("coord-1", vec!["work-1".to_string()]);
+        reducer
+            .apply(&create_event(EVENT_TYPE_STARTED, &start_payload), &ctx)
+            .unwrap();
+
+        // Bind session for the first time
+        let bound_data = bound_payload("coord-1", "session-1", "work-1", 1);
+        let bound_event = create_event(EVENT_TYPE_SESSION_BOUND, &bound_data);
+        reducer.apply(&bound_event, &ctx).unwrap();
+
+        // Count session_ids after first bind
+        let coord = reducer.state().get("coord-1").unwrap();
+        let tracking = coord.work_tracking.get("work-1").unwrap();
+        assert_eq!(
+            tracking.session_ids.len(),
+            1,
+            "Should have exactly 1 session_id"
+        );
+        assert_eq!(tracking.session_ids[0], "session-1");
+
+        // Replay the same bound event (simulating duplicate/replay)
+        reducer.apply(&bound_event, &ctx).unwrap();
+        reducer.apply(&bound_event, &ctx).unwrap();
+        reducer.apply(&bound_event, &ctx).unwrap();
+
+        // Verify session_ids did not grow (idempotency)
+        let coord = reducer.state().get("coord-1").unwrap();
+        let tracking = coord.work_tracking.get("work-1").unwrap();
+        assert_eq!(
+            tracking.session_ids.len(),
+            1,
+            "Replayed bound events should not duplicate session_ids"
+        );
+
+        // Bind a new session - should be recorded
+        let bound_data_2 = bound_payload("coord-1", "session-2", "work-1", 2);
+        reducer
+            .apply(&create_event(EVENT_TYPE_SESSION_BOUND, &bound_data_2), &ctx)
+            .unwrap();
+
+        let coord = reducer.state().get("coord-1").unwrap();
+        let tracking = coord.work_tracking.get("work-1").unwrap();
+        assert_eq!(
+            tracking.session_ids.len(),
+            2,
+            "New session should be recorded after replays"
+        );
+        assert!(tracking.session_ids.contains(&"session-1".to_string()));
+        assert!(tracking.session_ids.contains(&"session-2".to_string()));
     }
 
     #[test]
