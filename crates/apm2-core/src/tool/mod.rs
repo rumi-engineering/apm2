@@ -32,6 +32,7 @@
 //!
 //! // Create a file read request
 //! let request = ToolRequest {
+//!     consumption_mode: false,
 //!     request_id: "req-001".to_string(),
 //!     session_token: "session-abc".to_string(),
 //!     dedupe_key: String::new(),

@@ -8,6 +8,7 @@ use super::*;
 #[test]
 fn test_file_read_roundtrip() {
     let request = ToolRequest {
+        consumption_mode: false,
         request_id: "req-001".to_string(),
         session_token: "session-abc".to_string(),
         dedupe_key: "key-123".to_string(),
@@ -39,6 +40,7 @@ fn test_file_read_roundtrip() {
 fn test_file_write_roundtrip() {
     let content = b"Hello, World!".to_vec();
     let request = ToolRequest {
+        consumption_mode: false,
         request_id: "req-002".to_string(),
         session_token: "session-abc".to_string(),
         dedupe_key: String::new(),
@@ -67,6 +69,7 @@ fn test_file_write_roundtrip() {
 #[test]
 fn test_file_edit_roundtrip() {
     let request = ToolRequest {
+        consumption_mode: false,
         request_id: "req-003".to_string(),
         session_token: "session-abc".to_string(),
         dedupe_key: String::new(),
@@ -93,6 +96,7 @@ fn test_file_edit_roundtrip() {
 #[test]
 fn test_shell_exec_roundtrip() {
     let request = ToolRequest {
+        consumption_mode: false,
         request_id: "req-004".to_string(),
         session_token: "session-abc".to_string(),
         dedupe_key: String::new(),
@@ -124,6 +128,7 @@ fn test_shell_exec_roundtrip() {
 #[test]
 fn test_git_operation_roundtrip() {
     let request = ToolRequest {
+        consumption_mode: false,
         request_id: "req-005".to_string(),
         session_token: "session-abc".to_string(),
         dedupe_key: String::new(),
@@ -153,6 +158,7 @@ fn test_inference_call_roundtrip() {
     let system_hash = vec![0xcd; 32];
 
     let request = ToolRequest {
+        consumption_mode: false,
         request_id: "req-006".to_string(),
         session_token: "session-abc".to_string(),
         dedupe_key: String::new(),
@@ -187,6 +193,7 @@ fn test_artifact_publish_roundtrip() {
     let content_hash = vec![0xef; 32];
 
     let request = ToolRequest {
+        consumption_mode: false,
         request_id: "req-007".to_string(),
         session_token: "session-abc".to_string(),
         dedupe_key: String::new(),
@@ -317,6 +324,7 @@ fn test_tool_response_error_retryable() {
 #[test]
 fn test_canonical_encoding_deterministic() {
     let request = ToolRequest {
+        consumption_mode: false,
         request_id: "req-001".to_string(),
         session_token: "session-abc".to_string(),
         dedupe_key: "key-123".to_string(),
@@ -360,6 +368,7 @@ fn test_large_content() {
     let large_content = vec![0xffu8; 1024 * 1024]; // 1MB
 
     let request = ToolRequest {
+        consumption_mode: false,
         request_id: "req-large".to_string(),
         session_token: "session-abc".to_string(),
         dedupe_key: String::new(),
@@ -477,6 +486,7 @@ fn test_validation_integration() {
 
     // Valid request
     let valid = ToolRequest {
+        consumption_mode: false,
         request_id: "req-001".to_string(),
         session_token: "session-abc".to_string(),
         dedupe_key: String::new(),
@@ -490,6 +500,7 @@ fn test_validation_integration() {
 
     // Invalid request (empty request_id)
     let invalid = ToolRequest {
+        consumption_mode: false,
         request_id: String::new(),
         session_token: "session-abc".to_string(),
         dedupe_key: String::new(),

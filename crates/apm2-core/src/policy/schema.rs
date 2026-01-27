@@ -102,6 +102,10 @@ pub struct Rule {
     #[serde(default)]
     pub ports: Vec<u16>,
 
+    /// For consumption mode rules: allowed stable IDs.
+    #[serde(default)]
+    pub stable_ids: Vec<String>,
+
     /// Optional condition expression for rule activation.
     #[serde(default)]
     pub condition: Option<String>,
@@ -134,6 +138,8 @@ pub enum RuleType {
     Secrets,
     /// Rule for inference/model access control.
     Inference,
+    /// Rule for consumption mode restrictions.
+    ConsumptionMode,
 }
 
 impl RuleType {
@@ -152,6 +158,7 @@ impl RuleType {
             "filesystem" => Ok(Self::Filesystem),
             "secrets" => Ok(Self::Secrets),
             "inference" => Ok(Self::Inference),
+            "consumption_mode" => Ok(Self::ConsumptionMode),
             _ => Err(PolicyError::InvalidRuleType {
                 value: s.to_string(),
             }),
@@ -169,6 +176,7 @@ impl RuleType {
             Self::Filesystem => "filesystem",
             Self::Secrets => "secrets",
             Self::Inference => "inference",
+            Self::ConsumptionMode => "consumption_mode",
         }
     }
 }
@@ -367,6 +375,10 @@ mod tests {
         assert_eq!(RuleType::parse("filesystem").unwrap(), RuleType::Filesystem);
         assert_eq!(RuleType::parse("secrets").unwrap(), RuleType::Secrets);
         assert_eq!(RuleType::parse("inference").unwrap(), RuleType::Inference);
+        assert_eq!(
+            RuleType::parse("consumption_mode").unwrap(),
+            RuleType::ConsumptionMode
+        );
     }
 
     #[test]
@@ -384,6 +396,7 @@ mod tests {
         assert_eq!(RuleType::Filesystem.as_str(), "filesystem");
         assert_eq!(RuleType::Secrets.as_str(), "secrets");
         assert_eq!(RuleType::Inference.as_str(), "inference");
+        assert_eq!(RuleType::ConsumptionMode.as_str(), "consumption_mode");
     }
 
     #[test]

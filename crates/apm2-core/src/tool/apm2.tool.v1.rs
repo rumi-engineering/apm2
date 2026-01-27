@@ -19,8 +19,11 @@ pub struct ToolRequest {
     /// within the same session.
     #[prost(string, tag = "3")]
     pub dedupe_key: ::prost::alloc::string::String,
+    /// Whether the request is part of a consumption workflow (read-only/strict).
+    #[prost(bool, tag = "4")]
+    pub consumption_mode: bool,
     /// The specific tool operation requested.
-    #[prost(oneof = "tool_request::Tool", tags = "10, 11, 12, 13, 14, 15, 16")]
+    #[prost(oneof = "tool_request::Tool", tags = "10, 11, 12, 13, 14, 15, 16, 17")]
     pub tool: ::core::option::Option<tool_request::Tool>,
 }
 /// Nested message and enum types in `ToolRequest`.
@@ -43,6 +46,8 @@ pub mod tool_request {
         Inference(super::InferenceCall),
         #[prost(message, tag = "16")]
         ArtifactPublish(super::ArtifactPublish),
+        #[prost(message, tag = "17")]
+        ArtifactFetch(super::ArtifactFetch),
     }
 }
 /// Request to read file contents.
@@ -211,6 +216,35 @@ pub struct ArtifactPublish {
     /// Optional metadata as key=value strings.
     #[prost(string, repeated, tag = "4")]
     pub metadata: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Request to fetch an artifact by stable ID or content hash.
+///
+/// In consumption mode, policy enforces that only allowlisted stable_ids
+/// can be fetched to ensure hermeticity.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ArtifactFetch {
+    /// Stable identifier for resolution (e.g., "org:ticket:TCK-001").
+    /// If set, the kernel resolves this to a content hash.
+    #[prost(string, tag = "1")]
+    pub stable_id: ::prost::alloc::string::String,
+    /// Direct content hash reference (BLAKE3, 32 bytes).
+    /// Policy may restrict usage in consumption mode to prevent side-channel bypass.
+    /// Note: Changed from string (hex) to bytes for consistency with ArtifactPublish.
+    #[prost(bytes = "vec", tag = "2")]
+    pub content_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Expected content hash for validation when using stable_id (BLAKE3, 32 bytes).
+    /// If resolution yields a different hash, the fetch fails.
+    /// Note: Changed from string (hex) to bytes for consistency with content_hash.
+    #[prost(bytes = "vec", tag = "3")]
+    pub expected_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Maximum bytes to return (inline or total).
+    #[prost(uint64, tag = "4")]
+    pub max_bytes: u64,
+    /// Requested format (e.g., "json", "yaml", "raw").
+    /// The kernel may perform transcoding if supported.
+    #[prost(string, tag = "5")]
+    pub format: ::prost::alloc::string::String,
 }
 /// Tool response from kernel to agent.
 ///
