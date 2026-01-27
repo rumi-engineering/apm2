@@ -676,6 +676,76 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
         });
     }
 
+    /// Atomic check-and-mark that uses a single write lock to prevent race
+    /// conditions.
+    ///
+    /// Unlike the default implementation which uses separate `contains()` and
+    /// `mark()` calls with separate locks, this implementation holds the
+    /// write lock for the entire operation to ensure that only one thread
+    /// can mark a given delivery ID.
+    fn check_and_mark(&self, delivery_id: &str) -> bool {
+        let now = Instant::now();
+
+        // Probabilistic cleanup
+        let count = self
+            .check_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.config.cleanup_interval > 0
+            && count > 0
+            && count % self.config.cleanup_interval == 0
+        {
+            self.cleanup();
+        }
+
+        // Single write lock for atomic check-and-mark
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Check if entry exists and is not expired
+        if let Some(entry) = state.entries.get(delivery_id) {
+            let elapsed = now
+                .checked_duration_since(entry.inserted_at)
+                .unwrap_or(Duration::ZERO);
+            if elapsed < self.config.ttl {
+                return false; // Exists and not expired - duplicate
+            }
+            // Entry expired - will be replaced below
+        }
+
+        // Check if entry exists and is expired - remove it first
+        if state.entries.contains_key(delivery_id) {
+            // We already know it's expired from the check above
+            state.entries.remove(delivery_id);
+        }
+
+        // Enforce max_entries limit with O(1) eviction ([INV-CI004])
+        while state.entries.len() >= self.config.max_entries {
+            if let Some(queue_entry) = state.insertion_order.pop_front() {
+                if let Some(map_entry) = state.entries.get(&queue_entry.key) {
+                    if queue_entry.inserted_at == map_entry.inserted_at {
+                        state.entries.remove(&queue_entry.key);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Insert the new entry with timestamp
+        state.entries.insert(
+            delivery_id.to_string(),
+            DeliveryIdEntry { inserted_at: now },
+        );
+        state.insertion_order.push_back(QueueEntry {
+            key: delivery_id.to_string(),
+            inserted_at: now,
+        });
+
+        true // New entry marked
+    }
+
     fn len(&self) -> usize {
         self.state
             .read()
