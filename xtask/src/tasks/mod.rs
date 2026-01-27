@@ -5,6 +5,7 @@
 //! ones.
 
 mod aat;
+pub mod capabilities;
 mod check;
 mod commit;
 mod finish;
@@ -12,6 +13,7 @@ pub mod lint;
 mod push;
 mod review;
 mod security_review_exec;
+pub mod selftest;
 mod start_ticket;
 
 use anyhow::Result;
