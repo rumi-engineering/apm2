@@ -1120,6 +1120,28 @@ pub enum SpawnOutcome {
 
 ---
 
+## Architectural Notes
+
+### Pack Miss Tracking (TCK-00138)
+
+The episode controller includes foundational plumbing for context pack miss tracking
+via `EpisodeController::record_pack_miss`. This helper is currently not invoked during
+episode execution because pack misses occur within the `Holon::execute_episode`
+implementation, which returns an opaque `EpisodeResult`.
+
+Integration will happen when artifact fetching is implemented in a future ticket.
+At that point, one of the following approaches will be used:
+
+1. Extend `EpisodeResult` to include pack miss information
+2. Pass a callback/channel into the execution context
+3. Add a new method to the `Holon` trait for querying accumulated pack misses
+
+The infrastructure (`RunReceiptBuilder`, `DefectRecord::pack_miss`, and the
+`record_pack_miss` helper) is in place and tested; only the integration point
+with actual artifact fetching remains.
+
+---
+
 ## References
 
 - [rust-textbook: 04_ownership_borrowing_model.md] - Ownership patterns for state management

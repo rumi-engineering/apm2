@@ -42,7 +42,8 @@
 mod controller;
 
 pub use controller::{
-    EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome, EpisodeLoopResult,
+    ContextPackConfig, EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome,
+    EpisodeLoopResult, Hash,
 };
 
 /// Default maximum number of episodes per execution loop.

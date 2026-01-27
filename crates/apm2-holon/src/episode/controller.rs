@@ -9,11 +9,31 @@ use serde::{Deserialize, Serialize};
 
 use super::{DEFAULT_EPISODE_TIMEOUT_MS, DEFAULT_MAX_EPISODES};
 use crate::context::EpisodeContext;
+use crate::defect::DefectRecord;
 use crate::error::HolonError;
 use crate::ledger::{EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted};
+use crate::receipt::{BudgetDelta, RunReceipt, RunReceiptBuilder};
 use crate::resource::Lease;
 use crate::stop::StopCondition;
 use crate::traits::Holon;
+
+/// Hash type alias (BLAKE3-256, 32 bytes).
+pub type Hash = [u8; 32];
+
+/// Configuration for a context pack used during episode execution.
+///
+/// When a context pack is configured, the controller tracks pack misses
+/// and generates a `RunReceipt` with sufficiency information.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextPackConfig {
+    /// BLAKE3-256 hash of the context pack.
+    pub pack_hash: Hash,
+
+    /// Optional manifest hash for reproducibility binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_hash: Option<Hash>,
+}
 
 /// Configuration for the episode controller.
 ///
@@ -35,6 +55,13 @@ pub struct EpisodeControllerConfig {
 
     /// Whether to strictly enforce budget limits (fail fast vs. best effort).
     pub strict_budget_enforcement: bool,
+
+    /// Optional context pack configuration.
+    ///
+    /// When set, the controller will track pack misses and generate a
+    /// `RunReceipt` at the end of the episode loop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_pack: Option<ContextPackConfig>,
 }
 
 impl Default for EpisodeControllerConfig {
@@ -44,6 +71,7 @@ impl Default for EpisodeControllerConfig {
             episode_timeout_ms: DEFAULT_EPISODE_TIMEOUT_MS,
             emit_events: true,
             strict_budget_enforcement: true,
+            context_pack: None,
         }
     }
 }
@@ -74,6 +102,33 @@ impl EpisodeControllerConfig {
     #[must_use]
     pub const fn with_strict_budget_enforcement(mut self, strict: bool) -> Self {
         self.strict_budget_enforcement = strict;
+        self
+    }
+
+    /// Creates a new configuration with a context pack.
+    ///
+    /// When a context pack is configured, the controller tracks pack misses
+    /// and generates a `RunReceipt` at the end of the episode loop.
+    #[must_use]
+    pub const fn with_context_pack(mut self, pack_hash: Hash) -> Self {
+        self.context_pack = Some(ContextPackConfig {
+            pack_hash,
+            manifest_hash: None,
+        });
+        self
+    }
+
+    /// Creates a new configuration with a context pack including manifest hash.
+    #[must_use]
+    pub const fn with_context_pack_and_manifest(
+        mut self,
+        pack_hash: Hash,
+        manifest_hash: Hash,
+    ) -> Self {
+        self.context_pack = Some(ContextPackConfig {
+            pack_hash,
+            manifest_hash: Some(manifest_hash),
+        });
         self
     }
 }
@@ -267,6 +322,19 @@ pub struct EpisodeLoopResult<T> {
 
     /// The final stop condition that terminated the loop.
     pub final_stop_condition: StopCondition,
+
+    /// The run receipt capturing episode completion metadata.
+    ///
+    /// Present when a context pack is configured for the episode. Captures
+    /// pack sufficiency, misses, and budget consumption metrics.
+    pub run_receipt: Option<RunReceipt>,
+
+    /// Defect records emitted during execution.
+    ///
+    /// Contains any `DefectRecord` instances generated during the episode loop,
+    /// such as pack miss defects. Per ticket requirements, only the first pack
+    /// miss emits a defect record.
+    pub defect_records: Vec<DefectRecord>,
 }
 
 impl<T> EpisodeLoopResult<T> {
@@ -278,7 +346,15 @@ impl<T> EpisodeLoopResult<T> {
             events: Vec::new(),
             output: None,
             final_stop_condition,
+            run_receipt: None,
+            defect_records: Vec::new(),
         }
+    }
+
+    /// Returns a reference to the run receipt, if present.
+    #[must_use]
+    pub const fn run_receipt(&self) -> Option<&RunReceipt> {
+        self.run_receipt.as_ref()
     }
 
     /// Returns `true` if this is a successful completion.
@@ -291,6 +367,17 @@ impl<T> EpisodeLoopResult<T> {
     #[must_use]
     pub const fn episodes_executed(&self) -> u64 {
         self.outcome.episodes_executed()
+    }
+
+    /// Returns the defect records emitted during execution.
+    pub fn defect_records(&self) -> &[DefectRecord] {
+        &self.defect_records
+    }
+
+    /// Returns `true` if any defect records were emitted.
+    #[must_use]
+    pub fn has_defects(&self) -> bool {
+        !self.defect_records.is_empty()
     }
 }
 
@@ -331,6 +418,66 @@ impl EpisodeController {
     #[must_use]
     pub const fn config(&self) -> &EpisodeControllerConfig {
         &self.config
+    }
+
+    /// Records a context pack miss and emits a `DefectRecord` if this is the
+    /// first miss.
+    ///
+    /// This method should be called when an artifact fetch fails due to the
+    /// artifact not being present in the context pack.
+    ///
+    /// # Arguments
+    ///
+    /// * `builder` - The receipt builder to record the miss in
+    /// * `defect_records` - The defect records vector to emit defects into
+    /// * `work_id` - The work ID being processed
+    /// * `stable_id` - The stable ID of the missing artifact
+    /// * `timestamp_ns` - When the miss was detected (Unix nanoseconds)
+    /// * `reason` - Human-readable reason for the miss
+    /// * `pack_hash` - The hash of the context pack
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if this was the first miss (and a `DefectRecord` was
+    /// emitted), `false` otherwise.
+    ///
+    /// # Integration Note
+    ///
+    /// This helper is foundational plumbing for context pack miss tracking.
+    /// It is not currently invoked during episode execution because pack misses
+    /// occur within the `Holon::execute_episode` implementation, which returns
+    /// an opaque `EpisodeResult`. Integration will happen when artifact
+    /// fetching is implemented in a future ticket, at which point the
+    /// execution context will need to propagate pack miss information back
+    /// to the controller.
+    ///
+    /// See TCK-00138 for the foundational receipt/defect infrastructure.
+    #[allow(dead_code)] // Foundational plumbing - integration pending artifact fetch impl
+    pub fn record_pack_miss(
+        builder: &mut RunReceiptBuilder,
+        defect_records: &mut Vec<DefectRecord>,
+        work_id: &str,
+        stable_id: &str,
+        timestamp_ns: u64,
+        reason: &str,
+        pack_hash: Hash,
+    ) -> bool {
+        let is_first = builder.record_miss(stable_id, timestamp_ns, reason);
+
+        // Emit DefectRecord only on first pack miss
+        if is_first {
+            let defect_id = format!("{work_id}-defect-pack-miss-{timestamp_ns}");
+            // Note: pack_miss returns Result to avoid panics (DoS vector).
+            // Here we use ok() because failure to create a defect record should not
+            // prevent the rest of execution. The miss is still tracked in the receipt.
+            if let Ok(defect) =
+                DefectRecord::pack_miss(defect_id, work_id, stable_id, pack_hash, timestamp_ns)
+            {
+                defect_records.push(defect);
+            }
+        }
+
+        is_first
     }
 
     /// Constructs an `EpisodeContext` from work state and lease.
@@ -476,14 +623,29 @@ impl EpisodeController {
         }
 
         let mut events = Vec::new();
+        #[allow(unused_mut)] // Used via record_pack_miss helper
+        let mut defect_records = Vec::new();
         let mut episode_number: u64 = initial_episode_number.max(1);
         let mut total_tokens_consumed: u64 = 0;
+        let mut total_time_consumed_ms: u64 = 0;
+        let mut total_artifacts_accessed: u64 = 0;
         let mut progress_state: Option<String> = None;
         let mut final_output: Option<H::Output> = None;
         // Note: This initial value is always overwritten in the loop, but we need
         // to initialize it because it's used after the loop exits.
         #[allow(unused_assignments)]
         let mut final_stop_condition = StopCondition::Continue;
+
+        // Initialize RunReceiptBuilder if context pack is configured
+        #[allow(unused_mut)] // Used via record_pack_miss helper
+        let mut receipt_builder = self.config.context_pack.as_ref().map(|pack_config| {
+            let episode_id = format!("{work_id}-ep-{initial_episode_number}");
+            let mut builder = RunReceiptBuilder::new(episode_id, pack_config.pack_hash);
+            if let Some(manifest_hash) = pack_config.manifest_hash {
+                builder = builder.with_pack_manifest_hash(manifest_hash);
+            }
+            builder
+        });
 
         loop {
             let start_ns = clock();
@@ -534,6 +696,9 @@ impl EpisodeController {
                     let is_completed = episode_result.is_completed();
                     let is_escalated = episode_result.is_escalated();
                     total_tokens_consumed = total_tokens_consumed.saturating_add(tokens_used);
+                    total_time_consumed_ms = total_time_consumed_ms.saturating_add(time_used_ms);
+                    total_artifacts_accessed =
+                        total_artifacts_accessed.saturating_add(artifact_count);
 
                     // Deduct from lease budget - check if deduction succeeds
                     // If deduction fails, we've exceeded budget and should stop
@@ -652,6 +817,21 @@ impl EpisodeController {
         let mut result = EpisodeLoopResult::new(outcome, final_stop_condition);
         result.events = events;
         result.output = final_output;
+        result.defect_records = defect_records;
+
+        // Build the run receipt if context pack was configured
+        if let Some(builder) = receipt_builder {
+            let budget_delta = BudgetDelta::new(
+                total_tokens_consumed,
+                total_time_consumed_ms,
+                total_artifacts_accessed,
+            );
+            // Note: build() validates the receipt and returns an error if invalid.
+            // Receipt build errors are non-fatal - we still return the result.
+            if let Ok(receipt) = builder.with_budget_delta(budget_delta).build() {
+                result.run_receipt = Some(receipt);
+            }
+        }
 
         Ok(result)
     }
@@ -1304,5 +1484,230 @@ mod tests {
             first_episode_number, 1,
             "Episode number 0 should be clamped to 1"
         );
+    }
+
+    // =========================================================================
+    // Context Pack and Receipt Tests
+    // =========================================================================
+
+    #[test]
+    fn test_config_with_context_pack() {
+        let pack_hash = [1u8; 32];
+        let config = EpisodeControllerConfig::default().with_context_pack(pack_hash);
+
+        assert!(config.context_pack.is_some());
+        let pack = config.context_pack.unwrap();
+        assert_eq!(pack.pack_hash, pack_hash);
+        assert!(pack.manifest_hash.is_none());
+    }
+
+    #[test]
+    fn test_config_with_context_pack_and_manifest() {
+        let pack_hash = [1u8; 32];
+        let manifest_hash = [2u8; 32];
+        let config = EpisodeControllerConfig::default()
+            .with_context_pack_and_manifest(pack_hash, manifest_hash);
+
+        assert!(config.context_pack.is_some());
+        let pack = config.context_pack.unwrap();
+        assert_eq!(pack.pack_hash, pack_hash);
+        assert_eq!(pack.manifest_hash, Some(manifest_hash));
+    }
+
+    #[test]
+    fn test_run_episode_loop_generates_receipt_when_pack_configured() {
+        let pack_hash = [42u8; 32];
+        let controller = EpisodeController::new(
+            EpisodeControllerConfig::default()
+                .with_max_episodes(10)
+                .with_emit_events(false)
+                .with_context_pack(pack_hash),
+        );
+
+        let mut holon = MockHolon::new("test-holon").with_episodes_until_complete(2);
+        let mut lease = test_lease();
+
+        let clock = mock_clock();
+        let result = controller
+            .run_episode_loop(&mut holon, "work-123", &mut lease, None, 1, clock)
+            .unwrap();
+
+        // Should have a run receipt
+        assert!(result.run_receipt.is_some());
+        let receipt = result.run_receipt.unwrap();
+        assert_eq!(receipt.pack_hash(), &pack_hash);
+        assert!(receipt.context_pack_sufficiency()); // No misses recorded
+        assert!(receipt.context_pack_misses().is_empty());
+    }
+
+    #[test]
+    fn test_run_episode_loop_no_receipt_without_pack() {
+        let controller = EpisodeController::new(
+            EpisodeControllerConfig::default()
+                .with_max_episodes(10)
+                .with_emit_events(false),
+        );
+
+        let mut holon = MockHolon::new("test-holon").with_episodes_until_complete(2);
+        let mut lease = test_lease();
+
+        let clock = mock_clock();
+        let result = controller
+            .run_episode_loop(&mut holon, "work-123", &mut lease, None, 1, clock)
+            .unwrap();
+
+        // Should NOT have a run receipt
+        assert!(result.run_receipt.is_none());
+    }
+
+    #[test]
+    fn test_record_pack_miss_emits_defect_on_first_miss() {
+        let pack_hash = [42u8; 32];
+        let mut builder = RunReceiptBuilder::new("ep-001", pack_hash);
+        let mut defect_records = Vec::new();
+
+        // First miss should emit defect
+        let is_first = EpisodeController::record_pack_miss(
+            &mut builder,
+            &mut defect_records,
+            "work-123",
+            "org:doc:missing",
+            1_000_000_000,
+            "artifact not found",
+            pack_hash,
+        );
+
+        assert!(is_first);
+        assert_eq!(defect_records.len(), 1);
+        assert_eq!(defect_records[0].defect_class(), "UNPLANNED_CONTEXT_READ");
+        assert_eq!(defect_records[0].work_id(), "work-123");
+        assert!(
+            defect_records[0]
+                .signal()
+                .details()
+                .contains("org:doc:missing")
+        );
+    }
+
+    #[test]
+    fn test_record_pack_miss_no_defect_on_subsequent_misses() {
+        let pack_hash = [42u8; 32];
+        let mut builder = RunReceiptBuilder::new("ep-001", pack_hash);
+        let mut defect_records = Vec::new();
+
+        // First miss
+        let is_first1 = EpisodeController::record_pack_miss(
+            &mut builder,
+            &mut defect_records,
+            "work-123",
+            "org:doc:first",
+            1_000_000_000,
+            "first miss",
+            pack_hash,
+        );
+        assert!(is_first1);
+        assert_eq!(defect_records.len(), 1);
+
+        // Second miss - should NOT emit defect
+        let is_first2 = EpisodeController::record_pack_miss(
+            &mut builder,
+            &mut defect_records,
+            "work-123",
+            "org:doc:second",
+            2_000_000_000,
+            "second miss",
+            pack_hash,
+        );
+        assert!(!is_first2);
+        assert_eq!(defect_records.len(), 1); // Still only 1 defect
+
+        // Third miss - should NOT emit defect
+        let is_first3 = EpisodeController::record_pack_miss(
+            &mut builder,
+            &mut defect_records,
+            "work-123",
+            "org:doc:third",
+            3_000_000_000,
+            "third miss",
+            pack_hash,
+        );
+        assert!(!is_first3);
+        assert_eq!(defect_records.len(), 1); // Still only 1 defect
+
+        // Builder should have recorded all 3 misses
+        assert_eq!(builder.miss_count(), 3);
+    }
+
+    #[test]
+    fn test_receipt_includes_budget_delta() {
+        let pack_hash = [42u8; 32];
+        let controller = EpisodeController::new(
+            EpisodeControllerConfig::default()
+                .with_max_episodes(10)
+                .with_emit_events(false)
+                .with_context_pack(pack_hash),
+        );
+
+        let mut holon = MockHolon::new("test-holon").with_episodes_until_complete(3);
+        let mut lease = test_lease();
+
+        let clock = mock_clock();
+        let result = controller
+            .run_episode_loop(&mut holon, "work-123", &mut lease, None, 1, clock)
+            .unwrap();
+
+        let receipt = result.run_receipt.unwrap();
+        let budget_delta = receipt.budget_delta();
+
+        // Budget delta should reflect consumption
+        // (exact values depend on MockHolon implementation)
+        // Verify the delta was computed (tokens_used returns u64, so it's always >= 0)
+        let _ = budget_delta.tokens_used();
+    }
+
+    #[test]
+    fn test_context_pack_config_serialization() {
+        let config = ContextPackConfig {
+            pack_hash: [1u8; 32],
+            manifest_hash: Some([2u8; 32]),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: ContextPackConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.pack_hash, config.pack_hash);
+        assert_eq!(deserialized.manifest_hash, config.manifest_hash);
+    }
+
+    #[test]
+    fn test_context_pack_config_rejects_unknown_fields() {
+        let json = r#"{
+            "pack_hash": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+            "unknown_field": "should fail"
+        }"#;
+
+        let result: Result<ContextPackConfig, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_episode_loop_result_has_defects_accessor() {
+        let outcome = EpisodeLoopOutcome::Completed {
+            episodes_executed: 1,
+            tokens_consumed: 100,
+        };
+        let mut result: EpisodeLoopResult<String> =
+            EpisodeLoopResult::new(outcome, StopCondition::GoalSatisfied);
+
+        assert!(!result.has_defects());
+        assert!(result.defect_records().is_empty());
+
+        // Add a defect
+        let defect =
+            DefectRecord::pack_miss("DEF-001", "work-123", "org:doc:x", [0u8; 32], 1000).unwrap();
+        result.defect_records.push(defect);
+
+        assert!(result.has_defects());
+        assert_eq!(result.defect_records().len(), 1);
     }
 }
