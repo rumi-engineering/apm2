@@ -74,6 +74,7 @@
 //! assert!(result.is_ok());
 //! ```
 
+pub mod aat_receipt;
 mod cas;
 mod category;
 mod classification;
@@ -86,6 +87,10 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub use aat_receipt::{
+    AATReceipt, AATReceiptError, AATReceiptGenerator, BudgetConsumed as AATBudgetConsumed,
+    TestSummary, verify_aat_receipt,
+};
 pub use cas::{CasError, ContentAddressedStore, MemoryCas};
 pub use category::EvidenceCategory;
 pub use classification::DataClassification;
