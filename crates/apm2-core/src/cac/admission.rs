@@ -48,8 +48,8 @@
 //!     &schema,
 //! );
 //!
-//! let receipt = gate.admit(request).unwrap();
-//! assert!(receipt.new_hash.len() == 64); // BLAKE3 hex
+//! let result = gate.admit(request).unwrap();
+//! assert!(result.receipt.new_hash.len() == 64); // BLAKE3 hex
 //! ```
 
 use chrono::{DateTime, Utc};
