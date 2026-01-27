@@ -10,22 +10,10 @@ prd_requirement:
     Compilation MUST be deterministic given resolved inputs and target profile. Context
     budgets MUST be enforced during compilation.
   acceptance_criteria:
-    - id: AC-0012-01
-      description: ContextPackSpec compiles to ContextPackManifest.
-      verification_method: apm2 pack compile produces manifest from spec.
-    - id: AC-0012-02
-      description: Transitive dependencies are resolved and pinned.
-      verification_method: Manifest includes all dependency stable_ids with content_hashes.
-    - id: AC-0012-03
-      description: Compilation is deterministic.
-      verification_method: Same inputs produce identical manifest and derived artifacts.
-    - id: AC-0012-04
-      description: Budget ceilings are enforced.
-      verification_method: Pack exceeding token/artifact/byte budget fails compilation.
-  source_pipeline_stage: CAC-STAGE-05
+    - "ContextPackSpec compiles to ContextPackManifest. Verified by: apm2 pack compile produces manifest from spec."
+    - "Transitive dependencies are resolved and pinned. Verified by: Manifest includes all dependency stable_ids with content_hashes."
+    - "Compilation is deterministic. Verified by: Same inputs produce identical manifest and derived artifacts."
+    - "Budget ceilings are enforced. Verified by: Pack exceeding token/artifact/byte budget fails compilation."
   evidence:
     evidence_ids:
       - EVID-0010
-    inherited_from_prd: false
-    notes:
-      - Derived from pipeline stage CAC-STAGE-05 in source PRD.

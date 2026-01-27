@@ -10,22 +10,10 @@ prd_requirement:
     planned/unplanned and feed defect signals into pack compiler improvement. Admissions
     MUST include a ChangeSet report to summarize semantic deltas.
   acceptance_criteria:
-    - id: AC-0004-01
-      description: Production holons operate under explicit lease/budget refs.
-      verification_method: PatchRecord inputs include budget/lease refs; budget exceeded emits event.
-    - id: AC-0004-02
-      description: Tool calls are classified as planned/unplanned.
-      verification_method: ToolEvent includes planned/unplanned classification.
-    - id: AC-0004-03
-      description: Admissions include ChangeSetReport.
-      verification_method: Admission requires ChangeSetReport for patch streams.
-    - id: AC-0004-04
-      description: Evidence snapshots are published to CAS.
-      verification_method: EvidencePublished events reference CAS hashes for production evidence.
-  source_goal_id: CAC-G-0004
+    - "Production holons operate under explicit lease/budget refs. Verified by: PatchRecord inputs include budget/lease refs; budget exceeded emits event."
+    - "Tool calls are classified as planned/unplanned. Verified by: ToolEvent includes planned/unplanned classification."
+    - "Admissions include ChangeSetReport. Verified by: Admission requires ChangeSetReport for patch streams."
+    - "Evidence snapshots are published to CAS. Verified by: EvidencePublished events reference CAS hashes for production evidence."
   evidence:
     evidence_ids:
       - EVID-0003
-    inherited_from_prd: false
-    notes:
-      - Maps to engineering goal CAC-G-0004 from source PRD.

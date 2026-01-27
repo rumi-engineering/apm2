@@ -1,0 +1,49 @@
+schema_version: 2026-01-26
+generated_at: 2026-01-27T00:27:48.194093917Z
+repo_root: /home/ubuntu/Projects/apm2
+components:
+- id: COMP-APM2_CLI
+  name: apm2-cli
+  crate_path: crates/apm2-cli
+  component_type: binary
+  description: Command-line interface for managing AI CLI processes via IPC communication with the daemon.
+  agents_md_path: crates/apm2-cli/AGENTS.md
+  invariants: []
+  contracts: []
+  extension_points: []
+- id: COMP-APM2_CORE
+  name: apm2-core
+  crate_path: crates/apm2-core
+  component_type: library
+  description: Component for apm2-core (no AGENTS.md)
+  agents_md_path: null
+  invariants: []
+  contracts: []
+  extension_points: []
+- id: COMP-APM2_DAEMON
+  name: apm2-daemon
+  crate_path: crates/apm2-daemon
+  component_type: binary
+  description: Unix socket daemon for managing AI CLI processes through IPC handlers and shared state.
+  agents_md_path: crates/apm2-daemon/AGENTS.md
+  invariants: []
+  contracts: []
+  extension_points: []
+- id: COMP-APM2_HOLON
+  name: apm2-holon
+  crate_path: crates/apm2-holon
+  component_type: library
+  description: Core trait contract and resource types for holonic AI coordination
+  agents_md_path: crates/apm2-holon/AGENTS.md
+  invariants: []
+  contracts: []
+  extension_points: []
+- id: COMP-XTASK
+  name: xtask
+  crate_path: xtask
+  component_type: xtask
+  description: Component for xtask (no AGENTS.md)
+  agents_md_path: null
+  invariants: []
+  contracts: []
+  extension_points: []
