@@ -130,16 +130,24 @@ rfc_design_decisions:
       tradeoff_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#TRADEOFF-COORD-0001"
 
     - decision_id: AD-COORD-006
-      title: "Atomic work binding using transition counts"
+      title: "Normative atomic work binding (CAS-at-commit)"
       description: |
-        Before spawning a session, the controller checks work state and includes
-        the `expected_transition_count` in the `coordination.session_bound` event.
-        The `WorkReducer` or an admission gate MUST reject the binding if the
-        work's actual transition count has diverged.
+        Atomicity is achieved via a Compare-And-Swap (CAS) check at the ledger
+        admission boundary.
+
+        NORMATIVE ORDERING:
+        1. Controller reads `WorkState` and `transition_count` (K).
+        2. Controller emits `coordination.session_bound(expected_transition_count=K)`.
+        3. Ledger admission gate MUST verify `work.transition_count == K`.
+        4. IF AND ONLY IF the event is successfully committed to the ledger,
+           the controller proceeds to spawn the session via the `SessionSpawner`.
+
+        This ensures that no session is spawned unless the binding is
+        authoritatively recorded and validated against the pinned state.
       rationale: |
-        Event ordering alone is insufficient for atomicity in a distributed
-        environment. Explicit transition pinning prevents TOCTOU races where
-        work is modified between the coordination decision and session start.
+        "Check-then-spawn" is vulnerable to TOCTOU races. Placing the
+        binding commit *before* the side effect (spawning) and making it
+        conditional on state freshness ensures deterministic coordination.
       constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0005"
 
     - decision_id: AD-COORD-007
@@ -185,18 +193,24 @@ rfc_design_decisions:
       constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0002"
 
     - decision_id: AD-COORD-009
-      title: "Deterministic event serialization via JCS"
+      title: "Versioned canonical serialization"
       description: |
-        Coordination events MUST use deterministic JSON serialization (JCS -
-        RFC 8785) for the payload field. This ensures that signatures and
-        hashes are stable across different library versions and architectures.
+        Coordination events and receipts MUST use a versioned canonical
+        serialization contract to ensure stable hashes and signatures.
 
-        No .proto file is required for MVP, but the use of `serde_json` MUST
-        be wrapped in a canonicalization layer (e.g., `serde_jcs`).
+        CONTRACT REQUIREMENTS:
+        - `canonicalizer_id`: "JCS" (RFC 8785)
+        - `canonicalizer_version`: "1.0"
+        - Every structure used in coordination MUST provide a `canonical_bytes()`
+          method that invokes the specified versioned canonicalizer.
+        - `mcp-testkit` MUST include golden test vectors (raw bytes + expected hashes)
+          for all coordination structures.
+        - SIGNING/HASHING POLICY: Always sign/hash the output of `canonical_bytes()`,
+          never the standard `serde` serialization or memory representation.
       rationale: |
-        Non-deterministic serialization breaks ledger integrity (LAW-15).
-        Field reordering in standard JSON libraries causes hash divergence
-        during replay or signature verification.
+        Non-deterministic serialization (standard `serde_json`) breaks ledger
+        integrity (LAW-15) when dependencies or architectures change. A
+        versioned contract with golden vectors ensures permanence.
       evidence_ref: "crates/apm2-core/src/session/reducer.rs:113-114"
 
     - decision_id: AD-COORD-010

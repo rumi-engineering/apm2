@@ -182,7 +182,7 @@ rfc_contracts_and_versioning:
       stability: stable
 
 
-    - contract_id: CTR-COORD-005
+    - contract_id: CTR-COORD-006
       name: "CoordinationReceipt"
       type: rust_struct
       description: |
@@ -209,7 +209,7 @@ rfc_contracts_and_versioning:
         }
       stability: stable
 
-    - contract_id: CTR-COORD-006
+    - contract_id: CTR-COORD-007
       name: "CLI Command (apm2 coordinate)"
       type: cli_command
       description: |
