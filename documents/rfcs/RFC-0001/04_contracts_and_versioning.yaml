@@ -11,7 +11,9 @@ rfc_contracts_and_versioning:
       compatibility_rules:
       - "Minor versions add optional fields only"
       - "Breaking changes require major version bump"
-      - "Signed payloads use canonical protobuf encoding"
+      - "Signed payloads use deterministic protobuf encoding (prost v0 deterministic bytes)"
+      - "Hashing/Signing policy: Hash unsigned message form excluding signature field"
+      - "Payload fields (actor_id, session_id) MUST match envelope; mismatch is a schema violation"
       - "Maps are forbidden in signed messages"
     schemas:
     - id: SCH-0001
@@ -63,12 +65,10 @@ rfc_contracts_and_versioning:
         }
 
         message SessionStarted {
-          string session_id = 1;
-          string actor_id = 2;
-          string adapter_type = 3;
-          string work_id = 4;
-          string lease_id = 5;
-          uint64 entropy_budget = 6;
+          string adapter_type = 1;
+          string work_id = 2;
+          string lease_id = 3;
+          uint64 entropy_budget = 4;
         }
 
         message SessionProgress {
@@ -341,13 +341,15 @@ rfc_contracts_and_versioning:
 
         message FileWrite {
           string path = 1;
-          bytes content = 2;
+          bytes content_hash = 2; // Full content stored in CAS
+          uint64 size = 3;
+          bytes inline_content = 4; // Optional for small payloads (< 4KB)
         }
 
         message FileEdit {
           string path = 1;
-          string old_content = 2;
-          string new_content = 3;
+          bytes old_content_hash = 2;
+          bytes new_content_hash = 3;
         }
 
         message ShellExec {
@@ -474,6 +476,10 @@ rfc_contracts_and_versioning:
             pub spec_snapshot: SpecSnapshot,
             pub policy_context: PolicyContext,
             pub entropy_budget: u64,
+            /// Context as Code (DCP) hooks.
+            pub context_pack_hash: Option<Vec<u8>>,
+            pub dcp_refs: Vec<String>,
+            pub pinned_snapshot_hash: Option<Vec<u8>>,
         }
 
     evidence_ids:

@@ -601,12 +601,17 @@ pub fn parse_requirements(
             reason: e.to_string(),
         })?;
         let path = entry.path();
-        // Only process REQ-*.yaml files to skip index/readme files
+
+        // Only process REQ-*.yaml files to skip index/readme files.
         let is_req_file = path
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("REQ-"));
-        if is_req_file && path.extension().is_some_and(|e| e == "yaml" || e == "yml") {
+        let is_yaml = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"));
+
+        if is_req_file && is_yaml {
             yaml_files.push(path);
         }
     }
