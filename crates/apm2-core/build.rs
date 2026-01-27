@@ -72,6 +72,15 @@ fn generate_bootstrap_manifest() -> Result<(), Box<dyn std::error::Error>> {
         entries.sort_by_key(std::fs::DirEntry::file_name);
 
         for entry in entries {
+            // Security: Reject symlinks to prevent directory traversal attacks
+            if entry.file_type()?.is_symlink() {
+                return Err(format!(
+                    "Symlinks not allowed in bootstrap/schemas: {}",
+                    entry.path().display()
+                )
+                .into());
+            }
+
             let path = entry.path();
             let filename = entry.file_name().to_string_lossy().to_string();
             let content = fs::read_to_string(&path)?;
@@ -135,11 +144,12 @@ fn generate_bootstrap_manifest() -> Result<(), Box<dyn std::error::Error>> {
     output.push_str("pub const BOOTSTRAP_SCHEMAS: &[(&str, &str, [u8; 32])] = &[\n");
 
     for (stable_id, (content, hash)) in &schemas {
-        // Use raw string literal - no escaping needed with r#"..."#
-        // For JSON content this is typically safe
+        // Security: Use debug formatting ({:?}) to properly escape string content
+        // This prevents code injection if content contains sequences like `"#`
         writeln!(
             output,
-            "    (\n        \"{stable_id}\",\n        r#\"{content}\"#,\n        {hash:?},\n    ),"
+            "    (\n        \"{stable_id}\",\n        {:?},\n        {hash:?},\n    ),",
+            content
         )?;
     }
 
