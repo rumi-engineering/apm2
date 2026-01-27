@@ -44,6 +44,9 @@ pub enum EvidenceCategory {
 
     /// Deployment records and release artifacts.
     DeploymentRecords,
+
+    /// Bootstrap schema artifacts (immutable trust root).
+    BootstrapSchema,
 }
 
 impl std::fmt::Display for EvidenceCategory {
@@ -74,6 +77,7 @@ impl EvidenceCategory {
             "DOCUMENTATION" => Ok(Self::Documentation),
             "BENCHMARKS" => Ok(Self::Benchmarks),
             "DEPLOYMENT_RECORDS" => Ok(Self::DeploymentRecords),
+            "BOOTSTRAP_SCHEMA" => Ok(Self::BootstrapSchema),
             _ => Err(EvidenceError::InvalidCategory {
                 value: s.to_string(),
             }),
@@ -94,6 +98,7 @@ impl EvidenceCategory {
             Self::Documentation => "DOCUMENTATION",
             Self::Benchmarks => "BENCHMARKS",
             Self::DeploymentRecords => "DEPLOYMENT_RECORDS",
+            Self::BootstrapSchema => "BOOTSTRAP_SCHEMA",
         }
     }
 
@@ -111,6 +116,7 @@ impl EvidenceCategory {
             Self::Documentation,
             Self::Benchmarks,
             Self::DeploymentRecords,
+            Self::BootstrapSchema,
         ]
     }
 
@@ -127,7 +133,8 @@ impl EvidenceCategory {
             | Self::AuditLogs
             | Self::ConfigSnapshots
             | Self::Documentation
-            | Self::DeploymentRecords => false,
+            | Self::DeploymentRecords
+            | Self::BootstrapSchema => false,
         }
     }
 }
@@ -182,6 +189,14 @@ mod unit_tests {
             EvidenceCategory::parse("DEPLOYMENT_RECORDS").unwrap(),
             EvidenceCategory::DeploymentRecords
         );
+        assert_eq!(
+            EvidenceCategory::parse("BOOTSTRAP_SCHEMA").unwrap(),
+            EvidenceCategory::BootstrapSchema
+        );
+        assert_eq!(
+            EvidenceCategory::parse("bootstrap_schema").unwrap(),
+            EvidenceCategory::BootstrapSchema
+        );
     }
 
     #[test]
@@ -214,6 +229,10 @@ mod unit_tests {
             EvidenceCategory::DeploymentRecords.as_str(),
             "DEPLOYMENT_RECORDS"
         );
+        assert_eq!(
+            EvidenceCategory::BootstrapSchema.as_str(),
+            "BOOTSTRAP_SCHEMA"
+        );
     }
 
     #[test]
@@ -224,10 +243,11 @@ mod unit_tests {
     #[test]
     fn test_category_all() {
         let all = EvidenceCategory::all();
-        assert_eq!(all.len(), 10);
+        assert_eq!(all.len(), 11);
         assert!(all.contains(&EvidenceCategory::TestResults));
         assert!(all.contains(&EvidenceCategory::LintReports));
         assert!(all.contains(&EvidenceCategory::DeploymentRecords));
+        assert!(all.contains(&EvidenceCategory::BootstrapSchema));
     }
 
     #[test]
@@ -243,6 +263,7 @@ mod unit_tests {
         assert!(!EvidenceCategory::ConfigSnapshots.requires_verification());
         assert!(!EvidenceCategory::Documentation.requires_verification());
         assert!(!EvidenceCategory::DeploymentRecords.requires_verification());
+        assert!(!EvidenceCategory::BootstrapSchema.requires_verification());
     }
 
     #[test]

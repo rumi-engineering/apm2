@@ -35,6 +35,7 @@
 
 pub mod adapter;
 pub mod agent;
+pub mod bootstrap;
 pub mod budget;
 pub mod cac;
 pub mod ccp;

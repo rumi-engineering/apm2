@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use apm2_core::bootstrap::verify_bootstrap_hash;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -190,6 +191,10 @@ enum FactoryCommands {
 }
 
 fn main() -> Result<()> {
+    // Verify bootstrap schema integrity before proceeding.
+    // This is a critical security check that must pass before any CAC operations.
+    verify_bootstrap_hash().context("bootstrap schema integrity check failed")?;
+
     let cli = Cli::parse();
 
     // Initialize logging

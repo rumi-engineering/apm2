@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use apm2_core::bootstrap::verify_bootstrap_hash;
 use apm2_core::config::EcosystemConfig;
 use apm2_core::process::ProcessState;
 use apm2_core::supervisor::Supervisor;
@@ -238,6 +239,10 @@ async fn main() -> Result<()> {
             .with(tracing_subscriber::fmt::layer())
             .init();
     }
+
+    // Verify bootstrap schema integrity before proceeding.
+    // This is a critical security check that must pass before any CAC operations.
+    verify_bootstrap_hash().context("bootstrap schema integrity check failed")?;
 
     // Daemonize if requested
     #[allow(unsafe_code)] // fork() requires unsafe
