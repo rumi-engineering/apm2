@@ -74,7 +74,8 @@ pub struct ExportArgs {
     /// Run conformance tests after export.
     ///
     /// When enabled, runs determinism, provenance, and schema verification
-    /// tests and outputs an `ExportReceipt` instead of just an `ExportManifest`.
+    /// tests and outputs an `ExportReceipt` instead of just an
+    /// `ExportManifest`.
     #[arg(long, default_value = "false")]
     pub verify: bool,
 
@@ -206,9 +207,9 @@ fn run_export_inner(args: &ExportArgs) -> Result<ExportResult, ExportCliError> {
 
     // Compile the pack
     let compiler = ContextPackCompiler::new(&index);
-    let compilation_result = compiler.compile(&pack_spec).map_err(|e| {
-        ExportCliError::Validation(format!("pack compilation failed: {e}"))
-    })?;
+    let compilation_result = compiler
+        .compile(&pack_spec)
+        .map_err(|e| ExportCliError::Validation(format!("pack compilation failed: {e}")))?;
 
     // Create content resolver from index
     // For now, we use an empty resolver since actual content loading
@@ -355,12 +356,10 @@ fn parse_pack_spec(
         .to_lowercase();
 
     let spec: ContextPackSpec = match extension.as_str() {
-        "yaml" | "yml" => serde_yaml::from_str(content).map_err(|e| {
-            ExportCliError::Validation(format!("invalid YAML in pack file: {e}"))
-        })?,
-        _ => serde_json::from_str(content).map_err(|e| {
-            ExportCliError::Validation(format!("invalid JSON in pack file: {e}"))
-        })?,
+        "yaml" | "yml" => serde_yaml::from_str(content)
+            .map_err(|e| ExportCliError::Validation(format!("invalid YAML in pack file: {e}")))?,
+        _ => serde_json::from_str(content)
+            .map_err(|e| ExportCliError::Validation(format!("invalid JSON in pack file: {e}")))?,
     };
 
     // Validate the spec
@@ -664,8 +663,9 @@ delivery_constraints:
                 target_profile: "test-profile".to_string(),
                 entries: vec![ManifestEntry {
                     stable_id: "org:doc:readme".to_string(),
-                    content_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        .to_string(),
+                    content_hash:
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_string(),
                     schema_id: "org:schema:doc".to_string(),
                     dependencies: vec![],
                 }],
