@@ -106,6 +106,10 @@ enum Commands {
     /// Context-as-Code (CAC) commands
     Cac(commands::cac::CacCommand),
 
+    // === Pack (ContextPack) operations ===
+    /// Pack commands (compile and manage `ContextPacks`)
+    Pack(commands::pack::PackCommand),
+
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
@@ -261,6 +265,14 @@ fn main() -> Result<()> {
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
             let exit_code = commands::cac::run_cac(&cac_cmd);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Pack(pack_cmd) => {
+            // Pack commands use specific exit codes per TCK-00139:
+            // 0=success, 1=budget_exceeded, 2=validation_error
+            // We use std::process::exit to bypass anyhow Result handling
+            // and ensure precise exit codes are returned.
+            let exit_code = commands::pack::run_pack(&pack_cmd);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {
