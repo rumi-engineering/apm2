@@ -8,12 +8,31 @@
 //! Events follow the existing pattern used by `SessionStarted`,
 //! `WorkTransitioned`, and other event payloads.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 use super::state::{
     AbortReason, BudgetUsage, CoordinationBudget, CoordinationError, MAX_WORK_QUEUE_SIZE,
     SessionOutcome, StopCondition,
 };
+
+/// Custom deserializer for `work_ids` that enforces [`MAX_WORK_QUEUE_SIZE`].
+///
+/// This prevents denial-of-service attacks through unbounded allocation
+/// when deserializing coordination events from untrusted JSON.
+fn deserialize_bounded_work_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Vec<String> = Vec::deserialize(deserializer)?;
+    if v.len() > MAX_WORK_QUEUE_SIZE {
+        return Err(de::Error::custom(format!(
+            "work_ids exceeds maximum size: {} > {}",
+            v.len(),
+            MAX_WORK_QUEUE_SIZE
+        )));
+    }
+    Ok(v)
+}
 
 /// Event type constant for coordination started.
 pub const EVENT_TYPE_STARTED: &str = "coordination.started";
@@ -39,6 +58,10 @@ pub struct CoordinationStarted {
     pub coordination_id: String,
 
     /// Work item IDs in the queue.
+    ///
+    /// Limited to [`MAX_WORK_QUEUE_SIZE`] items. This limit is enforced both
+    /// in [`CoordinationStarted::new`] and during deserialization.
+    #[serde(deserialize_with = "deserialize_bounded_work_ids")]
     pub work_ids: Vec<String>,
 
     /// Budget constraints for this coordination.
@@ -897,5 +920,37 @@ mod tests {
             1_000_000_000,
         );
         assert!(result.is_ok());
+    }
+
+    /// TCK-00148: Test that `work_ids` queue size limit is enforced during
+    /// deserialization, preventing denial-of-service via oversized JSON
+    /// payloads.
+    #[test]
+    fn test_coordination_started_queue_limit_serde() {
+        // Build a JSON string with MAX_WORK_QUEUE_SIZE + 1 work_ids
+        let oversized_work_ids: Vec<String> = (0..=MAX_WORK_QUEUE_SIZE)
+            .map(|i| format!("work-{i}"))
+            .collect();
+        assert_eq!(oversized_work_ids.len(), MAX_WORK_QUEUE_SIZE + 1);
+
+        let json = serde_json::json!({
+            "coordination_id": "coord-123",
+            "work_ids": oversized_work_ids,
+            "budget": {
+                "max_episodes": 10,
+                "max_duration_ms": 60000,
+                "max_tokens": null
+            },
+            "max_attempts_per_work": 3,
+            "started_at": 1_000_000_000_u64
+        });
+
+        let result: Result<CoordinationStarted, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("work_ids exceeds maximum size"),
+            "Expected error about work_ids size limit, got: {err}"
+        );
     }
 }

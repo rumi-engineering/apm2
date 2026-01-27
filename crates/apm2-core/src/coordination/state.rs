@@ -14,13 +14,33 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Maximum number of work items allowed in a coordination queue.
 ///
 /// This limit prevents denial-of-service attacks through unbounded allocation
-/// when deserializing coordination events from JSON.
+/// when deserializing coordination events from JSON. The limit is enforced both
+/// in constructors and during deserialization.
 pub const MAX_WORK_QUEUE_SIZE: usize = 1000;
+
+/// Custom deserializer for `work_queue` that enforces [`MAX_WORK_QUEUE_SIZE`].
+///
+/// This prevents denial-of-service attacks through unbounded allocation
+/// when deserializing coordination state from untrusted JSON.
+fn deserialize_bounded_work_queue<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Vec<String> = Vec::deserialize(deserializer)?;
+    if v.len() > MAX_WORK_QUEUE_SIZE {
+        return Err(de::Error::custom(format!(
+            "work_queue exceeds maximum size: {} > {}",
+            v.len(),
+            MAX_WORK_QUEUE_SIZE
+        )));
+    }
+    Ok(v)
+}
 
 /// Errors that can occur during coordination operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +418,10 @@ pub struct CoordinationSession {
     pub coordination_id: String,
 
     /// Work queue (list of work item IDs to process).
+    ///
+    /// Limited to [`MAX_WORK_QUEUE_SIZE`] items. This limit is enforced both
+    /// in [`CoordinationSession::new`] and during deserialization.
+    #[serde(deserialize_with = "deserialize_bounded_work_queue")]
     pub work_queue: Vec<String>,
 
     /// Current index in work queue (0-indexed).
@@ -1051,5 +1075,63 @@ mod tests {
             1_000_000_000,
         );
         assert!(result.is_ok());
+    }
+
+    /// TCK-00148: Test that `work_queue` size limit is enforced during
+    /// deserialization, preventing denial-of-service via oversized JSON
+    /// payloads.
+    #[test]
+    fn test_coordination_session_queue_limit_serde() {
+        // Build a JSON string with MAX_WORK_QUEUE_SIZE + 1 work items
+        let oversized_queue: Vec<String> = (0..=MAX_WORK_QUEUE_SIZE)
+            .map(|i| format!("work-{i}"))
+            .collect();
+        assert_eq!(oversized_queue.len(), MAX_WORK_QUEUE_SIZE + 1);
+
+        // Build work_tracking HashMap for the oversized queue
+        let work_tracking: std::collections::HashMap<String, serde_json::Value> = oversized_queue
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    serde_json::json!({
+                        "work_id": id,
+                        "attempt_count": 0,
+                        "session_ids": [],
+                        "final_outcome": null
+                    }),
+                )
+            })
+            .collect();
+
+        let json = serde_json::json!({
+            "coordination_id": "coord-123",
+            "work_queue": oversized_queue,
+            "work_index": 0,
+            "work_tracking": work_tracking,
+            "budget": {
+                "max_episodes": 10,
+                "max_duration_ms": 60000,
+                "max_tokens": null
+            },
+            "budget_usage": {
+                "consumed_episodes": 0,
+                "elapsed_ms": 0,
+                "consumed_tokens": 0
+            },
+            "consecutive_failures": 0,
+            "status": "Initializing",
+            "started_at": 1_000_000_000_u64,
+            "completed_at": null,
+            "max_attempts_per_work": 3
+        });
+
+        let result: Result<CoordinationSession, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("work_queue exceeds maximum size"),
+            "Expected error about work_queue size limit, got: {err}"
+        );
     }
 }
