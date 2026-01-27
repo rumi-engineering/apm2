@@ -73,7 +73,8 @@ pub enum BootstrapError {
     /// Schema content hash verification failed.
     ///
     /// This indicates the schema content does not match its expected hash,
-    /// which could indicate binary tampering. The application should not proceed.
+    /// which could indicate binary tampering. The application should not
+    /// proceed.
     #[error("schema content hash mismatch for {stable_id}: expected {expected}, computed {actual}")]
     ContentHashMismatch {
         /// The stable ID of the schema with mismatched content.
