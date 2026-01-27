@@ -260,19 +260,6 @@ Comprehensive error types with JSON path locations.
 - Size limit errors are distinct for DoS attack detection
 - `#[non_exhaustive]` allows adding error variants without breaking semver
 
-## Constants
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `MAX_ARRAY_MEMBERS` | 100,000 | Maximum array size |
-| `MAX_OBJECT_PROPERTIES` | 100,000 | Maximum object size |
-| `MAX_DEPTH` | 128 | Maximum nesting depth |
-| `MAX_STABLE_ID_LENGTH` | 1024 | Maximum stable ID length |
-| `MAX_CONTENT_HASH_LENGTH` | 64 | Hex-encoded BLAKE3 hash length |
-| `MAX_DEPENDENCIES` | 128 | Maximum dependencies per artifact |
-| `MAX_ARTIFACTS_IN_PACK` | 10,000 | Maximum artifacts in a compiled pack |
-| `MAX_RESOLUTION_DEPTH` | 256 | Maximum dependency resolution depth |
-
 ## Public API
 
 | Function | Description |
@@ -408,6 +395,91 @@ match validator.validate(&value) {
 - Pre-validating size limits prevents DoS attacks via maliciously large inputs
 - `unevaluatedProperties: false` ensures schema bypass attacks fail
 - Unknown field rejection provides defense-in-depth against schema evolution attacks
+
+### `ConformanceTest`
+
+```rust
+pub struct ConformanceTest {
+    pub test_id: String,
+    pub expected_hash: Option<String>,
+    pub pack_ref: String,
+}
+```
+
+A conformance test specification for export verification.
+
+**Contracts:**
+- [CTR-0038] `test_id` must be unique within a test suite
+- [CTR-0039] `expected_hash` format is `sha256:...` or `blake3:...` when provided
+
+### `ExportReceipt`
+
+```rust
+pub struct ExportReceipt {
+    pub schema: String,
+    pub schema_version: String,
+    pub pack_hash: String,
+    pub profile_id: String,
+    pub conformance_tests: Vec<ConformanceTestResult>,
+    pub overall_passed: bool,
+    pub timestamp: String,
+    pub total_duration_ms: Option<u64>,
+}
+```
+
+Receipt documenting the results of export conformance testing.
+
+**Invariants:**
+- [INV-0049] `overall_passed` is true if and only if all conformance tests passed
+- [INV-0050] `timestamp` is ISO 8601 format (YYYY-MM-DDTHH:MM:SSZ)
+- [INV-0051] All structs use `#[serde(deny_unknown_fields)]` for strict validation
+
+**Contracts:**
+- [CTR-0040] `new()` automatically computes `overall_passed` from test results
+- [CTR-0041] `summary()` returns human-readable test result summary
+
+### `ConformanceError`
+
+```rust
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ConformanceError {
+    DeterminismFailure { hash1: String, hash2: String, path: String },
+    ProvenanceParsingFailed { path: String, reason: String },
+    ProvenanceMissingField { field: String, path: String },
+    ProvenanceInvalidField { field: String, path: String, reason: String },
+    SchemaValidationFailed { path: String, reason: String },
+    ExportFailed(ExportError),
+    TooManyTests { count: usize, max: usize },
+    InvalidTestSpec { reason: String },
+    InvalidUtf8 { path: String },
+}
+```
+
+Comprehensive error types for conformance testing failures.
+
+### Conformance Functions
+
+| Function | Description |
+|----------|-------------|
+| `verify_determinism(pack, resolver, ...)` | Export twice and compare for byte-identical output |
+| `verify_provenance(content, path, profile)` | Parse and validate YAML frontmatter provenance |
+| `verify_schema(content, path, format)` | Validate output matches expected format schema |
+| `run_conformance_suite(pack, resolver, ...)` | Run full conformance suite and produce receipt |
+
+## Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MAX_ARRAY_MEMBERS` | 100,000 | Maximum array size |
+| `MAX_OBJECT_PROPERTIES` | 100,000 | Maximum object size |
+| `MAX_DEPTH` | 128 | Maximum nesting depth |
+| `MAX_STABLE_ID_LENGTH` | 1024 | Maximum stable ID length |
+| `MAX_CONTENT_HASH_LENGTH` | 64 | Hex-encoded BLAKE3 hash length |
+| `MAX_DEPENDENCIES` | 128 | Maximum dependencies per artifact |
+| `MAX_ARTIFACTS_IN_PACK` | 10,000 | Maximum artifacts in a compiled pack |
+| `MAX_RESOLUTION_DEPTH` | 256 | Maximum dependency resolution depth |
+| `MAX_CONFORMANCE_TESTS` | 1,000 | Maximum conformance tests per suite |
 
 ## Related Modules
 
