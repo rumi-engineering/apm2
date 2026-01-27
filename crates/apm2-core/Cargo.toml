@@ -52,6 +52,10 @@ glob.workspace = true
 # Unicode normalization
 unicode-normalization.workspace = true
 
+# JSON Schema validation
+# SECURITY: Disable default features to prevent SSRF via resolve-http (reqwest)
+jsonschema = { workspace = true, default-features = false }
+
 # Filesystem
 tempfile.workspace = true
 
