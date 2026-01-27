@@ -60,12 +60,28 @@ use thiserror::Error;
 ///
 /// Arrays with more than 100,000 members are rejected with
 /// [`ValidationError::ArrayTooLarge`].
+///
+/// # Rationale
+///
+/// This limit is specified by RFC-0011 (Context-as-Code v1) to accommodate
+/// large CAC artifacts such as batch ticket lists or comprehensive audit logs.
+/// DoS attacks are mitigated by performing this size check **before** schema
+/// validation, ensuring expensive schema operations never run on oversized
+/// inputs.
 pub const MAX_ARRAY_MEMBERS: usize = 100_000;
 
 /// Maximum number of properties allowed in a JSON object.
 ///
 /// Objects with more than 100,000 properties are rejected with
 /// [`ValidationError::ObjectTooLarge`].
+///
+/// # Rationale
+///
+/// This limit is specified by RFC-0011 (Context-as-Code v1) to accommodate
+/// large CAC artifacts such as property-heavy configuration objects.
+/// DoS attacks are mitigated by performing this size check **before** schema
+/// validation, ensuring expensive schema operations never run on oversized
+/// inputs.
 pub const MAX_OBJECT_PROPERTIES: usize = 100_000;
 
 /// Maximum nesting depth allowed in JSON structures.

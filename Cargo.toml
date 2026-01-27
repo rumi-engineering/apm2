@@ -113,7 +113,8 @@ libc = "0.2"
 unicode-normalization = "0.1"
 
 # JSON Schema validation
-jsonschema = "0.40"
+# SECURITY: Disable default features to prevent SSRF via resolve-http (reqwest)
+jsonschema = { version = "0.40", default-features = false }
 
 # Internal crates
 apm2-core = { version = "0.3.0", path = "crates/apm2-core" }
