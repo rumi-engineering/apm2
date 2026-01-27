@@ -172,6 +172,7 @@
 pub mod admission;
 pub mod compiler;
 pub mod dcp_index;
+pub mod export;
 pub mod pack_spec;
 pub mod patch_engine;
 pub mod target_profile;
@@ -187,6 +188,12 @@ pub use dcp_index::{
     DcpEntry, DcpIndex, DcpIndexError, DcpIndexReducer, DcpIndexReducerError, DcpIndexState,
     EVENT_TYPE_ARTIFACT_DEPRECATED, EVENT_TYPE_ARTIFACT_REGISTERED, MAX_CONTENT_HASH_LENGTH,
     MAX_STABLE_ID_LENGTH, RESERVED_PREFIXES, parse_stable_id,
+};
+// Export pipeline exports
+pub use export::{
+    ContentResolver, DEFAULT_EXPORTER_VERSION, ExportConfig, ExportError, ExportManifest,
+    ExportOutput, ExportPipeline, ExportPipelineBuilder, MAX_RENDERED_CONTENT_BYTES,
+    MemoryContentResolver, Provenance,
 };
 pub use pack_spec::{
     BudgetConstraint, BudgetConstraintBuilder, CONTEXT_PACK_SPEC_SCHEMA, CONTEXT_PACK_SPEC_VERSION,
