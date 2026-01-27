@@ -42,6 +42,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
@@ -239,134 +240,126 @@ pub fn validate_and_parse(input: &str) -> Result<CacJson, CacJsonError> {
     Ok(CacJson::new(value))
 }
 
-/// Parses JSON with duplicate key detection.
+/// Parses JSON with duplicate key detection using serde's Visitor pattern.
 ///
 /// Standard JSON parsers silently accept duplicate keys (last value wins).
-/// This function explicitly rejects duplicate keys.
+/// This function explicitly rejects duplicate keys by using a custom
+/// deserializer that checks for duplicates after decoding key strings, ensuring
+/// escape sequences like `"\u0061"` are properly decoded before comparison.
 fn parse_with_duplicate_detection(input: &str) -> Result<Value, CacJsonError> {
-    // First, do a basic parse to check syntax
-    let value: Value = serde_json::from_str(input).map_err(|e| CacJsonError::ParseError {
-        message: e.to_string(),
+    // Use custom deserializer that detects duplicates on decoded keys
+    let mut deserializer = serde_json::Deserializer::from_str(input);
+    let value = ValueWithDuplicateCheck::deserialize(&mut deserializer).map_err(|e| {
+        // Check if this is our duplicate key error
+        let msg = e.to_string();
+        if msg.starts_with("duplicate key: ") {
+            // Extract just the key, removing serde_json's " at line X column Y" suffix
+            let key_with_location = msg.strip_prefix("duplicate key: ").unwrap_or("");
+            // serde_json appends " at line X column Y", so strip it
+            let key = key_with_location
+                .split(" at line ")
+                .next()
+                .unwrap_or(key_with_location)
+                .to_string();
+            CacJsonError::DuplicateKey { key }
+        } else {
+            CacJsonError::ParseError { message: msg }
+        }
     })?;
 
-    // Now check for duplicates by re-parsing with a custom approach
-    // We check if the serialized form matches what we'd expect
-    check_for_duplicates(input)?;
-
-    Ok(value)
+    Ok(value.0)
 }
 
-/// Checks for duplicate keys by analyzing the raw JSON string.
-///
-/// This is necessary because `serde_json` silently accepts duplicates.
-fn check_for_duplicates(input: &str) -> Result<(), CacJsonError> {
-    // Use a state machine to track object context and detect duplicates
-    let mut stack: Vec<BTreeSet<String>> = Vec::new();
-    let mut in_string = false;
-    let mut escape_next = false;
-    let mut current_key: Option<String> = None;
-    let mut key_buffer = String::new();
-    let mut collecting_key = false;
-    let mut after_colon = false;
+/// Wrapper type for JSON values that checks for duplicate keys during
+/// deserialization.
+struct ValueWithDuplicateCheck(Value);
 
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
+impl<'de> Deserialize<'de> for ValueWithDuplicateCheck {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ValueVisitor;
 
-    while i < chars.len() {
-        let c = chars[i];
+        impl<'de> Visitor<'de> for ValueVisitor {
+            type Value = Value;
 
-        if escape_next {
-            if collecting_key {
-                key_buffer.push(c);
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("any valid JSON value")
             }
-            escape_next = false;
-            i += 1;
-            continue;
-        }
 
-        if c == '\\' && in_string {
-            escape_next = true;
-            if collecting_key {
-                key_buffer.push(c);
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(Value::Bool(v))
             }
-            i += 1;
-            continue;
-        }
 
-        if c == '"' {
-            if in_string {
-                // End of string
-                in_string = false;
-                if collecting_key {
-                    current_key = Some(key_buffer.clone());
-                    key_buffer.clear();
-                    collecting_key = false;
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(Value::Number(v.into()))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(Value::Number(v.into()))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                // Convert to Number, preserving float representation
+                Number::from_f64(v)
+                    .map(Value::Number)
+                    .ok_or_else(|| de::Error::custom("invalid float value"))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(Value::String(v.to_owned()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(Value::String(v))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut vec = Vec::new();
+                while let Some(elem) = seq.next_element::<ValueWithDuplicateCheck>()? {
+                    vec.push(elem.0);
                 }
-            } else {
-                // Start of string
-                in_string = true;
-                if !stack.is_empty() && !after_colon && current_key.is_none() {
-                    // This is a key in an object
-                    collecting_key = true;
-                    key_buffer.clear();
-                }
+                Ok(Value::Array(vec))
             }
-            i += 1;
-            continue;
-        }
 
-        if in_string {
-            if collecting_key {
-                key_buffer.push(c);
-            }
-            i += 1;
-            continue;
-        }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut seen_keys = BTreeSet::new();
+                let mut obj = Map::new();
 
-        match c {
-            '{' => {
-                stack.push(BTreeSet::new());
-                after_colon = false;
-                current_key = None;
-            },
-            '}' => {
-                stack.pop();
-                after_colon = false;
-                current_key = None;
-            },
-            '[' => {
-                // Arrays don't have keys, push a marker
-                // We use an empty set but won't check duplicates for arrays
-                stack.push(BTreeSet::new());
-                after_colon = true; // Treat array contents like values
-            },
-            ']' => {
-                stack.pop();
-                after_colon = false;
-            },
-            ':' => {
-                after_colon = true;
-                // Register the key
-                if let Some(ref key) = current_key {
-                    if let Some(keys) = stack.last_mut() {
-                        if keys.contains(key) {
-                            return Err(CacJsonError::DuplicateKey { key: key.clone() });
-                        }
-                        keys.insert(key.clone());
+                while let Some(key) = map.next_key::<String>()? {
+                    // Check for duplicates using the decoded key
+                    if !seen_keys.insert(key.clone()) {
+                        return Err(de::Error::custom(format!("duplicate key: {key}")));
                     }
+                    let value = map.next_value::<ValueWithDuplicateCheck>()?;
+                    obj.insert(key, value.0);
                 }
-            },
-            ',' => {
-                after_colon = false;
-                current_key = None;
-            },
-            _ => {},
+                Ok(Value::Object(obj))
+            }
         }
 
-        i += 1;
+        deserializer
+            .deserialize_any(ValueVisitor)
+            .map(ValueWithDuplicateCheck)
     }
-
-    Ok(())
 }
 
 /// Recursively validates a JSON value against CAC constraints.
@@ -471,23 +464,33 @@ fn emit_number(n: &Number, output: &mut String) {
     }
 }
 
-/// Emits a string in canonical form with minimal escaping.
+/// Emits a string in canonical form with minimal escaping per RFC 8785 Section
+/// 3.2.2.2.
+///
+/// Per JCS, only the following characters MUST be escaped:
+/// - Quotation mark (U+0022): \"
+/// - Reverse solidus (U+005C): \\
+/// - Control characters U+0000 through U+001F
+///
+/// For control characters, we use the short escapes where defined (\b, \f, \n,
+/// \r, \t) and \uXXXX for others.
 fn emit_string(s: &str, output: &mut String) {
     output.push('"');
     for c in s.chars() {
         match c {
             '"' => output.push_str("\\\""),
             '\\' => output.push_str("\\\\"),
-            // Control characters that must be escaped
+            // Control characters U+0000 through U+001F that have short escapes
             '\u{0008}' => output.push_str("\\b"),
             '\u{000C}' => output.push_str("\\f"),
             '\n' => output.push_str("\\n"),
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
-            // Other control characters use \uXXXX
-            c if c.is_control() => {
+            // Other control characters in U+0000..=U+001F use \uXXXX
+            c if ('\u{0000}'..='\u{001F}').contains(&c) => {
                 let _ = write!(output, "\\u{:04x}", c as u32);
             },
+            // All other characters are output as-is (including U+007F and C1 controls)
             c => output.push(c),
         }
     }
@@ -710,6 +713,29 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_reject_duplicate_key_with_escape_sequence() {
+        // "a" and "\u0061" are the same key after decoding (U+0061 is 'a')
+        // This should be rejected as a duplicate
+        let input = r#"{"a": 1, "\u0061": 2}"#;
+        let result = canonicalize_json(input);
+        assert!(matches!(
+            result,
+            Err(CacJsonError::DuplicateKey { key }) if key == "a"
+        ));
+    }
+
+    #[test]
+    fn test_reject_duplicate_key_with_multiple_escapes() {
+        // Both keys decode to "abc"
+        let input = r#"{"abc": 1, "\u0061\u0062\u0063": 2}"#;
+        let result = canonicalize_json(input);
+        assert!(matches!(
+            result,
+            Err(CacJsonError::DuplicateKey { key }) if key == "abc"
+        ));
+    }
+
     // =========================================================================
     // NFC Normalization Tests
     // =========================================================================
@@ -847,6 +873,38 @@ mod tests {
         let cac = CacJson::new(value);
         let result = cac.to_canonical_string();
         assert!(result.contains("\\u0000"));
+    }
+
+    #[test]
+    fn test_jcs_minimal_escaping_del() {
+        // U+007F (DEL) should NOT be escaped per RFC 8785 Section 3.2.2.2
+        // Only U+0000 through U+001F must be escaped (plus \ and ")
+        let value = serde_json::json!({"text": "\u{007F}"});
+        let cac = CacJson::new(value);
+        let result = cac.to_canonical_string();
+        // Should contain the raw byte, not an escape sequence
+        assert!(
+            !result.contains("\\u007f"),
+            "DEL should not be escaped: {result}"
+        );
+        assert!(
+            result.contains('\u{007F}'),
+            "DEL should be raw in output: {result}"
+        );
+    }
+
+    #[test]
+    fn test_jcs_minimal_escaping_c1_controls() {
+        // C1 control characters (U+0080 through U+009F) should NOT be escaped
+        // per RFC 8785 minimal escaping rules
+        let value = serde_json::json!({"text": "\u{0085}"});
+        let cac = CacJson::new(value);
+        let result = cac.to_canonical_string();
+        // Should NOT contain escape sequence
+        assert!(
+            !result.contains("\\u0085"),
+            "C1 controls should not be escaped: {result}"
+        );
     }
 
     // =========================================================================
