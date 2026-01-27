@@ -171,6 +171,7 @@
 
 pub mod admission;
 pub mod compiler;
+pub mod conformance;
 pub mod dcp_index;
 pub mod export;
 pub mod pack_spec;
@@ -183,6 +184,13 @@ pub use compiler::{
     BudgetUsed, CompilationError, CompilationReceipt, CompilationResult, CompilationWarning,
     CompiledContextPack, CompiledManifest, ContextPackCompiler, MAX_ARTIFACTS_IN_PACK,
     MAX_RESOLUTION_DEPTH, ManifestEntry,
+};
+// Conformance exports
+pub use conformance::{
+    CONFORMANCE_VERSION, ConformanceError, ConformanceSuiteConfig, ConformanceTest,
+    ConformanceTestResult, EXPORT_RECEIPT_SCHEMA, ExportReceipt, MAX_CONFORMANCE_TESTS,
+    OutputFormat as ConformanceOutputFormat, run_conformance_suite, verify_determinism,
+    verify_provenance, verify_schema,
 };
 pub use dcp_index::{
     DcpEntry, DcpIndex, DcpIndexError, DcpIndexReducer, DcpIndexReducerError, DcpIndexState,
