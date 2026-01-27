@@ -49,6 +49,9 @@ once_cell.workspace = true
 memchr.workspace = true
 glob.workspace = true
 
+# Unicode normalization
+unicode-normalization.workspace = true
+
 # Filesystem
 tempfile.workspace = true
 

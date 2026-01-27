@@ -5,6 +5,8 @@
 //!
 //! - **YAML Canonicalization**: Produces identical output regardless of input
 //!   key order or formatting
+//! - **JSON Canonicalization (CAC-JSON)**: RFC 8785 JCS-based canonicalization
+//!   with CAC-specific constraints (integer-only, NFC strings, depth limits)
 //! - **Atomic File Writes**: Ensures files are either fully written or not
 //!   modified, preventing corruption on crashes
 //! - **Diff Classification**: Distinguishes structural changes from free-text
@@ -22,7 +24,7 @@
 //!
 //! ```
 //! use apm2_core::determinism::{
-//!     DiffClassification, canonicalize_yaml, classify_diff,
+//!     DiffClassification, canonicalize_json, canonicalize_yaml, classify_diff,
 //! };
 //! use serde_yaml::Value;
 //!
@@ -37,6 +39,10 @@
 //! let canonical = canonicalize_yaml(&yaml).unwrap();
 //! assert!(canonical.starts_with("apple:"));
 //!
+//! // Canonicalize JSON (CAC-JSON profile)
+//! let json_canonical = canonicalize_json(r#"{"z": 1, "a": 2}"#).unwrap();
+//! assert_eq!(json_canonical, r#"{"a":2,"z":1}"#);
+//!
 //! // Classify changes between versions
 //! let old = "id: TCK-001\ndescription: Old desc";
 //! let new = "id: TCK-001\ndescription: New desc";
@@ -46,16 +52,22 @@
 //! # Module Structure
 //!
 //! - `canonicalize`: YAML canonicalization functions
+//! - `canonicalize_json`: CAC-JSON canonicalization (RFC 8785 JCS profile)
 //! - `atomic_write`: Crash-safe file writing
 //! - `diff_classify`: Diff classification logic
 
 mod atomic_write;
 mod canonicalize;
+mod canonicalize_json;
 mod diff_classify;
 
 // Re-export primary API
 pub use atomic_write::{AtomicWriteError, write_atomic};
 pub use canonicalize::{CanonicalizeError, canonicalize_yaml};
+pub use canonicalize_json::{
+    CANONICALIZER_ID, CANONICALIZER_VERSION, CacJson, CacJsonError, MAX_DEPTH, canonicalize_json,
+    is_canonical, validate_and_parse,
+};
 pub use diff_classify::{
     DEFAULT_FREE_TEXT_FIELDS, DiffClassification, classify_diff, classify_diff_with_fields,
 };

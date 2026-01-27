@@ -4,13 +4,15 @@
 
 ## Overview
 
-The `apm2_core::determinism` module provides foundational capabilities for ensuring deterministic, reproducible output from all compiler stages. It addresses three core challenges:
+The `apm2_core::determinism` module provides foundational capabilities for ensuring deterministic, reproducible output from all compiler stages. It addresses four core challenges:
 
 1. **YAML Canonicalization**: Produces identical output regardless of input key order or formatting, enabling meaningful diffs and reproducible builds.
 
-2. **Atomic File Writes**: Ensures files are either fully written or not modified at all, preventing corruption on crashes or interruptions.
+2. **JSON Canonicalization (CAC-JSON)**: RFC 8785 JCS-based canonicalization with CAC-specific constraints for Context-as-Code artifacts. Ensures deterministic hashing across platforms.
 
-3. **Diff Classification**: Distinguishes structural changes from free-text content changes, enabling intelligent merge decisions in the compiler.
+3. **Atomic File Writes**: Ensures files are either fully written or not modified at all, preventing corruption on crashes or interruptions.
+
+4. **Diff Classification**: Distinguishes structural changes from free-text content changes, enabling intelligent merge decisions in the compiler.
 
 ## Key Types
 
@@ -49,6 +51,53 @@ pub enum CanonicalizeError {
 
 **Design Rationale:**
 Complex keys (sequences or mappings used as YAML keys) are explicitly rejected rather than silently dropped. This prevents silent data loss and forces callers to handle edge cases explicitly.
+
+### `canonicalize_json` (CAC-JSON)
+
+```rust
+pub fn canonicalize_json(input: &str) -> Result<String, CacJsonError>
+```
+
+Canonicalizes a JSON string to CAC-JSON canonical form (RFC 8785 JCS profile with CAC constraints).
+
+**Invariants:**
+- [INV-0010] Object keys are sorted lexicographically (byte order)
+- [INV-0011] No whitespace between tokens
+- [INV-0012] Idempotent: `canonicalize_json(canonicalize_json(s)) == canonicalize_json(s)`
+- [INV-0013] Output is deterministic across platforms
+
+**Contracts:**
+- [CTR-0008] Rejects floating-point numbers (`CacJsonError::FloatNotAllowed`)
+- [CTR-0009] Rejects numbers outside i64 range (`CacJsonError::NumberOutOfRange`)
+- [CTR-0010] Rejects duplicate object keys (`CacJsonError::DuplicateKey`)
+- [CTR-0011] Rejects non-NFC normalized strings (`CacJsonError::NonNfcString`)
+- [CTR-0012] Rejects nesting deeper than 128 levels (`CacJsonError::MaxDepthExceeded`)
+
+### `CacJsonError`
+
+```rust
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CacJsonError {
+    FloatNotAllowed,
+    NumberOutOfRange { value: String },
+    DuplicateKey { key: String },
+    NonNfcString { path: String },
+    MaxDepthExceeded { max_depth: usize },
+    ParseError { message: String },
+}
+```
+
+**Design Rationale:**
+CAC-JSON is a strict JSON profile designed for deterministic hashing of context artifacts. Integer-only numbers eliminate float representation ambiguity. NFC normalization ensures consistent string comparison. Duplicate key rejection prevents parser-dependent behavior. The depth limit prevents stack overflow attacks.
+
+### `CacJson`
+
+```rust
+pub struct CacJson { /* validated JSON value */ }
+```
+
+A validated CAC-JSON value that has passed all constraints. Use `validate_and_parse()` to create, then `to_canonical_string()` for output.
 
 ### `write_atomic`
 
@@ -117,6 +166,9 @@ pub fn classify_diff_with_fields(old: &str, new: &str, free_text_fields: &[&str]
 | Function | Description |
 |----------|-------------|
 | `canonicalize_yaml(value)` | Convert YAML value to canonical string |
+| `canonicalize_json(input)` | Convert JSON string to CAC-JSON canonical form |
+| `validate_and_parse(input)` | Parse and validate JSON against CAC constraints |
+| `is_canonical(input)` | Check if JSON string is already canonical |
 | `write_atomic(path, content)` | Write file atomically (crash-safe) |
 | `classify_diff(old, new)` | Classify changes between two strings |
 | `classify_diff_with_fields(old, new, fields)` | Classify with custom free-text fields |
@@ -124,6 +176,9 @@ pub fn classify_diff_with_fields(old: &str, new: &str, free_text_fields: &[&str]
 | Constant | Description |
 |----------|-------------|
 | `DEFAULT_FREE_TEXT_FIELDS` | Default fields considered free-text |
+| `CANONICALIZER_ID` | CAC-JSON canonicalizer identifier (`"cac-json-v1"`) |
+| `CANONICALIZER_VERSION` | CAC-JSON canonicalizer semver (`"1.0.0"`) |
+| `MAX_DEPTH` | Maximum nesting depth (128) |
 
 ## Examples
 
@@ -185,6 +240,34 @@ assert!(matches!(
     result,
     Err(CanonicalizeError::UnsupportedComplexKey { key_type: "sequence" })
 ));
+```
+
+### Canonicalize JSON (CAC-JSON Profile)
+
+```rust
+use apm2_core::determinism::{canonicalize_json, CacJsonError};
+
+// Keys are sorted, whitespace removed
+let canonical = canonicalize_json(r#"{"z": 1, "a": 2}"#).unwrap();
+assert_eq!(canonical, r#"{"a":2,"z":1}"#);
+
+// Floats are rejected
+let err = canonicalize_json(r#"{"x": 1.5}"#).unwrap_err();
+assert!(matches!(err, CacJsonError::FloatNotAllowed));
+
+// Duplicate keys are rejected
+let err = canonicalize_json(r#"{"a": 1, "a": 2}"#).unwrap_err();
+assert!(matches!(err, CacJsonError::DuplicateKey { .. }));
+```
+
+### Check if JSON is Canonical
+
+```rust
+use apm2_core::determinism::is_canonical;
+
+assert!(is_canonical(r#"{"a":1,"b":2}"#));
+assert!(!is_canonical(r#"{"b":2,"a":1}"#));  // Wrong key order
+assert!(!is_canonical(r#"{ "a": 1 }"#));     // Has whitespace
 ```
 
 ## Design Principles
