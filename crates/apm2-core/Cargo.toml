@@ -104,6 +104,8 @@ serde_json.workspace = true
 default = []
 # Enable test utilities for deterministic testing
 test-utils = []
+# Enable canonicalization test vectors for cross-platform verification
+test_vectors = []
 
 [lints]
 workspace = true

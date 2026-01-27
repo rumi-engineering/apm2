@@ -4,7 +4,7 @@
 //! provides a no-op implementation that always reports the filter as
 //! not enforced.
 
-use super::{SeccompError, SeccompProfile, SeccompProfileLevel, SeccompResult};
+use super::{SeccompError, SeccompProfile, SeccompResult};
 
 /// Stub implementation that always returns "not applied."
 ///
@@ -38,6 +38,7 @@ pub fn apply_seccomp_filter(profile: &SeccompProfile) -> Result<SeccompResult, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::seccomp::SeccompProfileLevel;
 
     #[test]
     fn test_stub_returns_not_applied() {
