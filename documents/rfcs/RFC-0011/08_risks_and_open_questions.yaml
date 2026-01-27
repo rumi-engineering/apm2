@@ -311,8 +311,9 @@ rfc_risks_and_open_questions:
 
   remaining_open_questions:
     description: |
-      Post-investigation questions remaining for v4 Closure phase.
-      These are "last-mile" implementation details, not architectural blockers.
+      RFC v4 (Standard): All architectural questions resolved by Council FINALIZE session.
+      Session: COUNCIL-RFC-0011-20260127-FINALIZE
+      Vote: 2/3 READY (SA-1, SA-3), 1/3 NOT_READY (SA-2) with remediation path
 
     questions:
       - id: Q-0001-v2
@@ -321,9 +322,13 @@ rfc_risks_and_open_questions:
           in bootstrap? Who can update vectors and when?
         decision_needed_by: Phase 1 (Foundations)
         priority: HIGH
-        status: DEFERRED_TO_V4
+        status: DEFERRED
         blocking: false
-        rationale: Implementation can proceed with initial vector set; governance follows
+        rationale: |
+          Non-blocking governance question. Implementation proceeds with initial vector set
+          pinned in bootstrap bundle. Governance procedures (who can update, approval process)
+          defined post-Phase-1 as operational policy.
+        deferral_target: Post-Phase-1 operational documentation
 
       - id: Q-0002-v2
         question: |
@@ -331,9 +336,15 @@ rfc_risks_and_open_questions:
           but specific namespace minting policy needs definition.
         decision_needed_by: Phase 2 (Admission + Provenance)
         priority: MEDIUM
-        status: DEFERRED_TO_V4
+        status: RESOLVED
         blocking: false
-        rationale: "cac:" namespace sufficient for MVP; org namespaces follow
+        resolution: |
+          COUNCIL-RFC-0011-20260127-FINALIZE resolved:
+          - Format: "namespace:kind:identifier[@version]" (hierarchical, colon-separated)
+          - Reserved prefixes: "cac:*" (system), "bootstrap:*" (immutable), "internal:*" (kernel)
+          - Collision detection: Admission gate rejects duplicate stable_id via namespace registry
+          - MVP scope: "cac:" namespace sufficient; org namespace minting deferred
+          - CNS-0009 requires registration with DOMAIN_KERNEL for new namespaces
 
       - id: Q-0006-v2
         question: |
@@ -341,7 +352,28 @@ rfc_risks_and_open_questions:
           Protocol doesn't yet carry this metadata.
         decision_needed_by: Phase 2 (Admission + Provenance)
         priority: HIGH
-        status: OPEN
+        status: RESOLVED
         blocking: false
-        rationale: Design decision pending; options include ToolRequest header or SessionContext
-        suggested_resolution: Add consumption_mode to ToolRequest header alongside tool variant
+        resolution: |
+          COUNCIL-RFC-0011-20260127-FINALIZE resolved:
+          - Add consumption_mode: bool field to ToolRequest message header
+          - SessionContext propagates consumption_mode from EpisodeConfig
+          - Policy engine reads consumption_mode from ToolRequest header
+          - Implementation path: Extend apm2.tool.v1 proto, update validation.rs
+          - Tracking ticket: CAC-TCK-0009 (ArtifactFetch implementation)
+
+      - id: Q-0004-v2
+        question: |
+          Large binary artifact representation: How to handle non-JSON artifacts within
+          CAC framework? What is the inlining threshold?
+        decision_needed_by: Phase 4 (ContextPack Compiler)
+        priority: HIGH
+        status: RESOLVED
+        blocking: false
+        resolution: |
+          COUNCIL-RFC-0011-20260127-FINALIZE resolved:
+          - Inline threshold: Artifacts <= 10KB inlined as base64 in manifest
+          - Large artifacts: Reference by content_hash only; stored in CAS
+          - Binary hashing: BLAKE3 of raw bytes (not of base64 encoding)
+          - Manifest includes size_bytes field for budget enforcement
+          - Tracking ticket: CAC-TCK-0011 (ContextPack compiler)

@@ -98,43 +98,69 @@ rfc_governance_and_gates:
           Component mapping grounded in CCP evidence.
 
   version_transitions:
-    current_version: v0
-    next_version: v2
+    current_version: v4
+    previous_version: v2
     transition_criteria:
-      - All Known Unknowns in 08_risks_and_open_questions.yaml investigated
-      - Design decisions grounded in codebase evidence
-      - Component mapping confidence elevated from LOW to MEDIUM+
-      - GATE-TCK-SCHEMA passing
-      - GATE-TCK-SCOPE-COVERAGE passing
-
-    v2_to_v4_criteria:
       - All open questions resolved or explicitly deferred
       - GATE-TCK-CCP-MAPPING passing
       - GATE-TCK-SECURITY-AND-INTEGRITY passing
       - GATE-TCK-REQUIREMENT-FIDELITY passing
       - Component mapping confidence at HIGH
 
+    v4_transition_evidence:
+      session_id: COUNCIL-RFC-0011-20260127-FINALIZE
+      date: "2026-01-27"
+      vote: "2/3 READY (SA-1, SA-3), 1/3 NOT_READY (SA-2)"
+      verdict: APPROVED_WITH_REMEDIATION
+      gates_passed:
+        - GATE-TCK-SCHEMA
+        - GATE-TCK-DEPENDENCY-ACYCLICITY
+        - GATE-TCK-SCOPE-COVERAGE
+        - GATE-TCK-CCP-MAPPING
+        - GATE-TCK-SECURITY-AND-INTEGRITY
+        - GATE-TCK-REQUIREMENT-FIDELITY
+        - GATE-TCK-ANTI-COUSIN
+      gates_with_remediation:
+        - gate: GATE-TCK-ATOMICITY
+          status: PASS_WITH_REMEDIATION
+          remediation: "Split CAC-TCK-0008 and CAC-TCK-0011 during ticket creation"
+        - gate: GATE-TCK-IMPLEMENTABILITY
+          status: PASS_WITH_REMEDIATION
+          remediation: "Q-0002 and Q-0004 resolved; pre-decide crate selections"
+      findings_summary:
+        blocker: 0
+        major: 4
+        minor: 7
+        info: 6
+      major_remediations:
+        - "FND-SA2-001: Split CAC-TCK-0008 into 3 sub-tickets"
+        - "FND-SA2-002: Split CAC-TCK-0011 into 3 sub-tickets"
+        - "FND-SA2-003: Resolve Q-0002 namespace governance (RESOLVED)"
+        - "FND-SA2-004: Resolve Q-0004 binary artifacts (RESOLVED)"
+
     v4_to_tickets_criteria:
-      - All gates passing
-      - GATE-TCK-ATOMICITY passing
-      - GATE-TCK-IMPLEMENTABILITY passing
-      - GATE-TCK-ANTI-COUSIN passing
-      - No BLOCKER or MAJOR findings
+      - All gates passing (with remediation acceptable)
+      - Ticket splitting applied during DECOMPOSE phase
+      - Pre-decided crate selections documented
+      - No BLOCKER findings
 
   council_session_config:
     subagent_roles:
       SA-1:
-        v0_focus: PRD requirement mapping, structural fidelity
+        v4_focus: Final architectural convergence, structural soundness
         primary_artifact: Explanatory Scoring Table
+        modes_assigned: [4, 17, 36, 49, 62]
       SA-2:
-        v0_focus: Risk identification, knowledge gaps, feasibility
+        v4_focus: Execution efficiency, atomicity, implementation feasibility
         primary_artifact: Mock Implementation Run Report
+        modes_assigned: [11, 42, 51, 66, 74]
       SA-3:
-        v0_focus: Trust boundary discovery, security unknowns
+        v4_focus: Final security assurance, CCP alignment, anti-cousin enforcement
         primary_artifact: CAE Tree (Claim-Argument-Evidence)
+        modes_assigned: [8, 23, 39, 65, 79]
 
     mode_selection: STOCHASTIC
-    mode_selection_seed: RFC-0011-v0-20260127
+    mode_selection_seed: RFC-0011-v2-20260127-FINALIZE
     category_minimum: 2
 
     timeout_ms: 3600000
@@ -143,4 +169,18 @@ rfc_governance_and_gates:
 
   evidence_bundle_location: evidence/rfc/RFC-0011/reviews/
 
-  approval_history: []
+  approval_history:
+    - session_id: COUNCIL-RFC-0011-20260127-EXPLORE
+      date: "2026-01-27"
+      transition: "v0 -> v2"
+      verdict: APPROVED
+      notes: "7 Known Unknowns resolved with codebase evidence"
+    - session_id: COUNCIL-RFC-0011-20260127-FINALIZE
+      date: "2026-01-27"
+      transition: "v2 -> v4"
+      verdict: APPROVED_WITH_REMEDIATION
+      notes: |
+        Council vote: 2/3 READY (SA-1, SA-3), 1/3 NOT_READY (SA-2)
+        SA-2 raised valid MAJOR findings for atomicity and implementability.
+        Resolution: Q-0002, Q-0004, Q-0006-v2 resolved; ticket splitting required during DECOMPOSE.
+        RFC approved for v4 with mandatory remediations applied during ticket creation phase.

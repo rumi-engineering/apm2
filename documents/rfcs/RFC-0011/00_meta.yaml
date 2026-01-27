@@ -4,12 +4,12 @@ rfc_meta:
   rfc:
     id: RFC-0011
     title: "Context-as-Code (CAC) v1: Canonical Context Pipeline for the APM2 Holonic Kernel"
-    version: v2
-    status: DRAFT
+    version: v4
+    status: APPROVED
     created_date: "2026-01-27"
     last_updated_date: "2026-01-27"
-    council_session: COUNCIL-RFC-0011-20260127-EXPLORE
-    phase_transition: "v0 (Discovery) -> v2 (Grounded)"
+    council_session: COUNCIL-RFC-0011-20260127-FINALIZE
+    phase_transition: "v2 (Grounded) -> v4 (Standard)"
   binds_to_prd:
     prd_id: PRD-0007
     prd_base_path: "documents/prds/PRD-0007"
@@ -17,11 +17,11 @@ rfc_meta:
     evidence_bundle_ref: "documents/prds/PRD-0007/12_evidence_bundle.yaml"
     prd_meta_ref: "documents/prds/PRD-0007/00_meta.yaml"
     rationale: |
-      RFC v2 (Grounded) for PRD-0007: Context-as-Code (CAC) v1 specification.
+      RFC v4 (Standard) for PRD-0007: Context-as-Code (CAC) v1 specification.
       CAC makes context the authoritative program in an agent-native factory, providing
       a canonical context substrate, patch-first authoring, hermetic consumption, and
-      target interoperability through compiled payloads. Council investigation resolved
-      7 Known Unknowns with evidence-backed design decisions anchored in existing codebase.
+      target interoperability through compiled payloads. Council FINALIZE session resolved
+      all open questions and approved transition to v4 with ticket decomposition ready.
   protocol_profile:
     id: NONE
     applies: false
