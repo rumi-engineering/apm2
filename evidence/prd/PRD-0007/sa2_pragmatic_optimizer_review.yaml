@@ -1,0 +1,400 @@
+agent_id: SA-2
+emergent_role: Pragmatic Optimizer
+selected_modes: [45, 46, 49, 51, 76]
+cycle: 1
+findings:
+  # MODE 45: Decision-theoretic reasoning
+  - finding_id: SA2-M45-F001
+    source_mode: 45
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: COMPLETENESS
+    title: "Graduated enforcement lacks explicit decision rule for acceleration clause"
+    description: |
+      TRADEOFF-0001 specifies "If MET-0002 >85% at week 5, advance to HARD_FAIL at week 6"
+      but does not specify WHO makes the advancement decision, WHEN the measurement is taken
+      (week 5 start vs end), or how to handle edge cases (e.g., 84.9% with confidence interval
+      spanning 85%). Under uncertainty, decision-makers will hesitate or disagree, delaying
+      the acceleration benefit. This is a decision-theoretic failure: the rule specifies a
+      threshold but not the complete decision procedure under uncertainty.
+    location: "08_risks_questions.yaml:TRADEOFF-0001"
+    remediation: |
+      Specify: (1) Decision authority (DOMAIN_COMPILER + AUTH_PRODUCT), (2) Exact measurement
+      time (end of week 5 = Friday EOD), (3) Confidence interval handling (use lower bound
+      of 80% CI; advance if lower bound ≥85%), (4) Tie-breaking rule if authorities disagree
+      (default to NOT accelerating).
+    agreement_status: PENDING
+
+  - finding_id: SA2-M45-F002
+    source_mode: 45
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: COMPLETENESS
+    title: "Missing expected value analysis for strictness vs velocity tradeoff"
+    description: |
+      TRADEOFF-0001 provides Pareto configurations but does not quantify expected costs/benefits
+      under uncertainty. CONFIG-GRADUATED is "RECOMMENDED" but lacks an explicit expected value
+      calculation showing it dominates alternatives. Without EV analysis, stakeholders may
+      challenge the recommendation, especially if early velocity hits exceed predictions. A
+      pragmatic decision requires quantified tradeoffs, not just weighted criteria.
+    location: "08_risks_questions.yaml:TRADEOFF-0001"
+    remediation: |
+      Add expected_value_analysis section with: (1) Estimated probability distributions for
+      velocity_reduction and failure_rate under each config, (2) Cost model (e.g., $/hour delay,
+      $/defect recurrence), (3) EV calculation showing CONFIG-GRADUATED has highest expected
+      utility. Use historical data from similar rollouts if available; otherwise, use expert
+      elicitation with calibration.
+    agreement_status: PENDING
+
+  - finding_id: SA2-M45-F003
+    source_mode: 45
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: COMPLETENESS
+    title: "Emergency override signoff ceremony lacks probability of successful completion"
+    description: |
+      CNS-0006 emergency override requires triple-signoff within 15-minute ceremony window.
+      No analysis is provided for the probability that all three authorities complete signoffs
+      within 15 minutes under realistic emergency conditions (e.g., geographic distribution,
+      time zones, HSM availability). If P(success) is low, the ceremony becomes a false
+      guarantee of recovery capability.
+    location: "06_constraints_invariants.yaml:CNS-0006"
+    remediation: |
+      Add ceremony_feasibility_analysis with: (1) Assumed authority availability and response
+      time distributions, (2) Estimated P(ceremony_success) under various emergency scenarios
+      (business hours vs off-hours, same timezone vs distributed), (3) Mitigation if P(success)
+      <90% (e.g., longer window, pre-staged signoffs, or delegate authorities).
+    agreement_status: PENDING
+
+  # MODE 46: Multi-criteria decision analysis (MCDA)
+  - finding_id: SA2-M46-F001
+    source_mode: 46
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: COMPLETENESS
+    title: "Criteria weights in TRADEOFF-0001 lack justification or sensitivity analysis"
+    description: |
+      TRADEOFF-0001 assigns weights (Security: 0.40, Velocity: 0.30, Observability: 0.20,
+      Reversibility: 0.10) but provides no rationale for these specific values. Are they
+      derived from stakeholder elicitation, historical data, or assertion? Small weight changes
+      could flip the recommendation; without sensitivity analysis, the decision is fragile.
+      MCDA requires transparent weight derivation and robustness checks.
+    location: "08_risks_questions.yaml:TRADEOFF-0001:criteria_ranking"
+    remediation: |
+      Add: (1) weight_derivation section explaining how weights were determined (stakeholder
+      voting, AHP, swing weighting, etc.), (2) sensitivity_analysis showing how recommendation
+      changes if weights vary by ±10%, (3) robustness_check confirming CONFIG-GRADUATED remains
+      dominant across reasonable weight perturbations.
+    agreement_status: PENDING
+
+  - finding_id: SA2-M46-F002
+    source_mode: 46
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: CONSISTENCY
+    title: "Pareto scores lack measurement methodology; appear subjective"
+    description: |
+      CONFIG-GRADUATED has scores (security: 0.9, velocity: 0.8, observability: 0.9,
+      reversibility: 0.7) but these are not derived from quantified metrics. How was
+      "security: 0.9" determined? Is it based on "90% of security posture" or expert judgment?
+      Subjective scores undermine MCDA credibility and make the decision non-reproducible.
+    location: "08_risks_questions.yaml:TRADEOFF-0001:pareto_configurations"
+    remediation: |
+      Replace subjective scores with objective metrics: (1) security = (admitted artifacts
+      with validation / total artifacts), (2) velocity = (1 - cycle_time_increase / baseline),
+      (3) observability = (defects detected / defects injected), (4) reversibility = (hours
+      to rollback / acceptable_rollback_window). Map quantified values to 0-1 scale with
+      explicit mapping function.
+    agreement_status: PENDING
+
+  - finding_id: SA2-M46-F003
+    source_mode: 46
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: COMPLETENESS
+    title: "No explicit aggregation function for multi-criteria scores"
+    description: |
+      TRADEOFF-0001 provides criteria weights and Pareto scores but does not specify how to
+      aggregate them. Is it weighted sum? Weighted product? Minimum? Without an explicit
+      aggregation function, different reviewers may compute different overall scores and reach
+      different conclusions.
+    location: "08_risks_questions.yaml:TRADEOFF-0001"
+    remediation: |
+      Specify aggregation function explicitly, e.g., "weighted_sum = Σ(weight_i × score_i)".
+      Justify choice (e.g., additive independence assumption). If using non-linear aggregation
+      (e.g., Cobb-Douglas), explain rationale.
+    agreement_status: PENDING
+
+  # MODE 49: Robust/worst-case reasoning
+  - finding_id: SA2-M49-F001
+    source_mode: 49
+    gate: GATE-PRD-CONTENT
+    severity: BLOCKER
+    category: SECURITY
+    title: "Bootstrap deadlock recovery requires external audit sink but sink failure blocks override"
+    description: |
+      CNS-0006 specifies "Failed delivery MUST block emergency override activation" for external
+      audit sink. This creates a deadlock: if bootstrap verification fails AND external audit
+      sink is unreachable (network partition, sink outage), emergency override cannot proceed.
+      System remains locked out with NO recovery path. This is a worst-case scenario failure:
+      two simultaneous failures (bootstrap + audit sink) create permanent unavailability.
+    location: "06_constraints_invariants.yaml:CNS-0006:external_audit_sink"
+    remediation: |
+      Add degraded_audit_mode: If external audit sink is unreachable for >30 minutes, system
+      MAY proceed with emergency override IFF: (1) Audit events are buffered locally with
+      cryptographic integrity, (2) Post-recovery, buffered events are force-pushed to audit
+      sink, (3) Failure to deliver buffered events triggers INCIDENT with board escalation,
+      (4) Local buffer size is bounded (e.g., 1000 events) to prevent DoS.
+    agreement_status: PENDING
+
+  - finding_id: SA2-M49-F002
+    source_mode: 49
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: SECURITY
+    title: "Delegate authority registry lacks protection against simultaneous primary and delegate unavailability"
+    description: |
+      CNS-0006 specifies delegate_authority_registry for backup signatories but does not address
+      the worst case where BOTH primary AND all delegates for a role are unavailable (e.g.,
+      company-wide outage, mass departure, coordinated unavailability attack). In this case,
+      triple-signoff becomes impossible, and TIER_2 escalation cannot proceed. System deadlocks.
+    location: "06_constraints_invariants.yaml:CNS-0006:delegate_authority_registry"
+    remediation: |
+      Add last_resort_escalation: If primary + all delegates for ANY role are unavailable for
+      >24 hours, system MUST escalate to TIER_3 (Board-level). Board authority can authorize
+      a time-bounded single-authority override with: (1) Maximum 48-hour TTL, (2) Read-only
+      operations only (no state mutations), (3) Mandatory post-incident root cause analysis,
+      (4) Mandatory process improvement to prevent recurrence.
+    agreement_status: PENDING
+
+  - finding_id: SA2-M49-F003
+    source_mode: 49
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: RELIABILITY
+    title: "Pack miss escalation TTL creates availability risk if pack improvement SLA is missed"
+    description: |
+      REQ-0003 specifies escalation_ttl for pack misses but does not address the case where
+      TTL expires BEFORE pack improvement completes. If pack improvement SLA (24h standard)
+      is missed and escalation TTL is short (e.g., 4 hours), consumption holons will hard-fail
+      repeatedly with no forward progress. This is a worst-case outcome: escalation provides
+      temporary relief but does not guarantee timely resolution.
+    location: "requirements/REQ-0003.yaml:AC-0003-04"
+    remediation: |
+      Add escalation_renewal_policy: (1) If pack improvement is in-progress (tracked via JIRA
+      or similar), escalation TTL auto-renews up to MAX_TOTAL_TTL (e.g., 7 days), (2) Each
+      renewal requires re-approval with updated justification, (3) If MAX_TOTAL_TTL is reached
+      without resolution, system emits ESCALATION_ABUSE defect and blocks further renewals,
+      forcing either pack fix or workflow redesign.
+    agreement_status: PENDING
+
+  - finding_id: SA2-M49-F004
+    source_mode: 49
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: TESTABILITY
+    title: "No worst-case testing for simultaneous canonicalizer divergence across platforms"
+    description: |
+      EVID-0001 specifies canonicalization tests but does not require testing the worst case:
+      canonicalizer divergence discovered AFTER artifacts have been admitted and used in
+      production. If divergence is discovered late (e.g., cross-platform test fails after
+      months of production use), existing CAS hashes may be inconsistent, breaking provenance
+      and deterministic reads. No recovery procedure is specified.
+    location: "evidence_artifacts/EVID-0001.yaml"
+    remediation: |
+      Add canonicalizer_divergence_drill to AAT suite: (1) Simulate divergence by introducing
+      a known canonicalization bug, (2) Verify detection via hash mismatch, (3) Execute
+      recovery procedure: canonicalizer version rollback, artifact re-canonicalization,
+      hash reconciliation, provenance audit. (4) Drill MUST be run quarterly to validate
+      recovery procedure.
+    agreement_status: PENDING
+
+  # MODE 51: Satisficing
+  - finding_id: SA2-M51-F001
+    source_mode: 51
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: COMPLETENESS
+    title: "Tiered recovery protocol may be over-engineered for MVP; simpler 2-tier may suffice"
+    description: |
+      CNS-0006 defines TIER_1, TIER_2, TIER_3 escalation with complex state machine, external
+      witness, and board escalation. For MVP, a simpler 2-tier model (normal + emergency board
+      escalation) may satisfy the requirement of "prevent permanent lockout" at lower cost.
+      TIER_2 (degraded ops with external witness) adds complexity without clear evidence that
+      it reduces TIER_3 escalations. Satisficing principle: meet the constraint with minimal
+      complexity, then iterate.
+    location: "06_constraints_invariants.yaml:CNS-0006:tiered_recovery_protocol"
+    remediation: |
+      For MVP, defer TIER_2. Use 2-tier model: TIER_1 (triple-signoff) and TIER_3 (board
+      escalation). Post-MVP, evaluate whether TIER_3 escalations are frequent enough to justify
+      TIER_2 investment. If board escalations <1/quarter, TIER_2 is YAGNI. Document this as
+      DEFER-04 in yagni_analysis.
+    agreement_status: PENDING
+
+  - finding_id: SA2-M51-F002
+    source_mode: 51
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: COMPLETENESS
+    title: "Dependency provenance review may be sufficient without author identity checks"
+    description: |
+      CNS-0010 requires pack specs to include author_identity for each dependency and warns
+      if author is not on approved producer list. This adds review overhead. For MVP, hash
+      pinning at review time (dependency_review_hash) already prevents timing-based injection.
+      Author identity verification provides defense-in-depth but may not be necessary if hash
+      review is rigorous. Satisficing: meet security requirement with hash pinning alone,
+      defer author checks post-MVP if no incidents occur.
+    location: "06_constraints_invariants.yaml:CNS-0010"
+    remediation: |
+      Document as DEFER-05 in yagni_analysis: "Dependency author identity verification can
+      be deferred if hash review proves sufficient. Re-evaluate after 6 months if unauthorized
+      dependency injection incidents occur." Simplifies pack spec schema and review process
+      for MVP.
+    agreement_status: PENDING
+
+  - finding_id: SA2-M51-F003
+    source_mode: 51
+    gate: GATE-PRD-CONTENT
+    severity: OBSERVATION
+    category: COMPLETENESS
+    title: "ChangeSetReport compaction may be YAGNI for MVP; defer until patch depth observed"
+    description: |
+      RSK-0006 addresses "patch soup" and proposes compaction with ChangeSetReport summaries.
+      However, no data is provided on expected patch depth during MVP. If typical artifacts
+      have <10 patches, compaction may not be needed for months. Implementing compaction
+      upfront adds complexity without evidence of need. Satisficing: emit ChangeSetReports
+      but defer compaction logic until patch depth exceeds threshold (e.g., >50 patches).
+    location: "08_risks_questions.yaml:RSK-0006"
+    remediation: |
+      Move compaction logic to post-MVP. For MVP, emit ChangeSetReports but do NOT implement
+      automated compaction. Add metric MET-COMP-001: "Average patch depth per artifact kind".
+      If MET-COMP-001 exceeds 50 patches, prioritize compaction implementation. Document as
+      DEFER-06 in yagni_analysis.
+    agreement_status: PENDING
+
+  # MODE 76: Calibration/epistemic humility
+  - finding_id: SA2-M76-F001
+    source_mode: 76
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: TESTABILITY
+    title: "Success metrics lack confidence intervals; point estimates suggest overconfidence"
+    description: |
+      MET-0001 specifies "<5 per 1000 work items within 6 months" but this is a point target
+      without confidence interval. Given the uncertainty in adoption dynamics, baseline
+      variability, and pack improvement velocity, a point target suggests overconfidence. If
+      actual outcome is 7 per 1000 (statistically indistinguishable from 5 given noise), did
+      we fail? Calibrated metrics require uncertainty quantification.
+    location: "05_success_metrics.yaml:MET-0001"
+    remediation: |
+      Replace point targets with confidence intervals derived from baseline uncertainty and
+      effect size assumptions. E.g., "≤5 per 1000 (80% CI: 3-8 per 1000)". Use Bayesian updating
+      or bootstrapping to refine intervals as data accumulates. Document confidence level
+      rationale (80% balances precision and attainability).
+    agreement_status: PENDING
+
+  - finding_id: SA2-M76-F002
+    source_mode: 76
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: COMPLETENESS
+    title: "Baseline establishment lacks pre-registration of measurement methodology"
+    description: |
+      Multiple metrics state "Baseline established from first 30 days post-deployment" but do
+      not pre-register the measurement methodology. Without pre-registration, teams may
+      unconsciously p-hack by adjusting measurement definitions until baseline looks favorable,
+      inflating apparent improvements. Epistemic hygiene requires pre-committing to measurement
+      procedures before observing data.
+    location: "05_success_metrics.yaml:MET-0001, MET-0002, MET-0003, MET-0004, MET-0005, MET-0007"
+    remediation: |
+      Before deployment, publish a measurement_protocol document specifying: (1) Exact event
+      types counted, (2) Filtering criteria (e.g., exclude synthetic tests), (3) Aggregation
+      method (mean, median, p95), (4) Confidence interval method (Wilson, Clopper-Pearson,
+      bootstrap), (5) Statistical test to use (Mann-Whitney, t-test, regression). Freeze
+      protocol before observing any post-deployment data.
+    agreement_status: PENDING
+
+  - finding_id: SA2-M76-F003
+    source_mode: 76
+    gate: GATE-PRD-CONTENT
+    severity: MAJOR
+    category: TESTABILITY
+    title: "Pareto configuration scores lack calibration check; expert judgments may be miscalibrated"
+    description: |
+      CONFIG-GRADUATED assigns scores like "security: 0.9" but does not assess whether the
+      estimators are calibrated. If experts consistently overestimate security posture, all
+      configs will score higher than reality, and the recommendation will be systematically
+      biased. Calibration is essential for trustworthy expert judgment.
+    location: "08_risks_questions.yaml:TRADEOFF-0001:pareto_configurations"
+    remediation: |
+      After deployment, track actual outcomes (e.g., actual_security_score = admitted_artifacts
+      / total_artifacts) and compare to predicted scores. Compute calibration error (mean
+      absolute deviation). If calibration error >0.15, recalibrate expert judgments using
+      empirical data and update recommendations. Publish calibration report post-MVP.
+    agreement_status: PENDING
+
+  - finding_id: SA2-M76-F004
+    source_mode: 76
+    gate: GATE-PRD-CONTENT
+    severity: MINOR
+    category: COMPLETENESS
+    title: "Open questions lack explicit epistemic status; some may be resolvable with evidence"
+    description: |
+      08_risks_questions.yaml lists 7 open questions but does not classify them by epistemic
+      status: (a) resolvable with evidence (empirical), (b) resolvable with analysis (deductive),
+      (c) unresolvable until post-deployment data (fundamental uncertainty). Without this
+      classification, teams may defer questions that could be answered now, or prematurely
+      commit to questions that should remain open.
+    location: "08_risks_questions.yaml:open_questions"
+    remediation: |
+      Add epistemic_status field to each question: EMPIRICAL_RESOLVABLE (can test now),
+      ANALYTICAL_RESOLVABLE (can derive answer), DEFERRED_TO_DATA (must wait for deployment),
+      STAKEHOLDER_DEPENDENT (requires external input). Prioritize EMPIRICAL_RESOLVABLE and
+      ANALYTICAL_RESOLVABLE for Phase 1 resolution.
+    agreement_status: PENDING
+
+north_star_assessment:
+  phase_scores:
+    P1_recursive_improvement: 0.95
+    P2_innovation: 0.80
+    P3_enterprise: 0.70
+    P4_partnership: 0.40
+    P5_life_sciences: 0.20
+  primary_phase_alignment: P1_recursive_improvement
+  strategic_recommendations:
+    - "PRD-0007 strongly aligns with P1 (recursive improvement) by making context machine-native and closing feedback loops from defects to pack improvements. This is foundational infrastructure for accelerating all future phases."
+    - "P2 (innovation) is well-served through CapabilityManifest and hermetic consumption, enabling deterministic experimentation. However, innovation velocity depends on strictness rollout; recommend prioritizing CONFIG-GRADUATED to balance innovation speed with safety."
+    - "P3 (enterprise) alignment is moderate; CAC provides necessary governance and auditability for enterprise adoption but does not directly address enterprise customer onboarding or commercial packaging. Recommend follow-on PRD for enterprise delivery layer."
+    - "P4 (partnership) and P5 (life sciences) are weakly addressed in this PRD. Context-as-Code is enabling infrastructure but does not directly accelerate partnerships or life sciences applications. Recommend explicit P4/P5 requirements in follow-on PRDs to ensure CAC supports these phases."
+  violations: []
+
+summary: |
+  SA-2 (Pragmatic Optimizer) reviewed PRD-0007 through 5 reasoning modes: decision-theoretic
+  reasoning, multi-criteria decision analysis, robust/worst-case reasoning, satisficing, and
+  calibration/epistemic humility. Key findings:
+
+  1. BLOCKER (SA2-M49-F001): External audit sink failure can deadlock emergency override,
+     creating permanent unavailability. Requires degraded audit mode.
+
+  2. MAJOR decision-theoretic gaps: Acceleration clause lacks explicit decision procedure
+     (SA2-M45-F001), no expected value analysis for tradeoff (SA2-M45-F002).
+
+  3. MAJOR MCDA gaps: Criteria weights lack justification and sensitivity analysis
+     (SA2-M46-F001), Pareto scores are subjective and non-reproducible (SA2-M46-F002).
+
+  4. MAJOR worst-case gaps: Delegate authority deadlock if primary + delegates unavailable
+     (SA2-M49-F002), pack miss escalation TTL creates availability risk (SA2-M49-F003),
+     no canonicalizer divergence drill (SA2-M49-F004).
+
+  5. MAJOR calibration gaps: Metrics lack confidence intervals (SA2-M76-F001), no
+     pre-registered measurement protocol (SA2-M76-F002), Pareto scores lack calibration
+     check (SA2-M76-F003).
+
+  6. Satisficing observations: Tiered recovery may be over-engineered for MVP (SA2-M51-F001),
+     compaction may be YAGNI (SA2-M51-F003).
+
+  Overall, PRD-0007 is pragmatically strong but suffers from insufficient quantification of
+  uncertainty, missing worst-case recovery paths, and overconfidence in point estimates. The
+  PRD is APPROVABLE after addressing the BLOCKER and MAJOR findings. The work strongly supports
+  P1 (recursive improvement) with good P2 (innovation) support, but P3/P4/P5 require follow-on
+  work.

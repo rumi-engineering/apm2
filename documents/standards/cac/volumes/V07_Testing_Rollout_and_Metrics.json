@@ -1,0 +1,229 @@
+{
+  "schema": "apm2.prd.volume.v1",
+  "schema_version": "1.0.0",
+  "sections": [
+    {
+      "content": {
+        "aat_strategy": {
+          "principle": "Small, hermetic, sub-minute AATs gate the innermost loop; larger E2E tests run nightly.",
+          "receipt_policy": {
+            "gating": [
+              "Cutover to CLI requires recent passing AATReceipt pinned by hash.",
+              "Agent planning gates require verifying receipt hash in CapabilityManifest."
+            ],
+            "receipt_kind": "receipt.aat",
+            "receipt_storage": "CAS + EvidencePublished event",
+            "required": true
+          },
+          "required_aat_suites": [
+            {
+              "max_duration_ms": 60000,
+              "purpose": "Validate bootstrap trust root, CAC admission pipeline, canonicalization metadata, schema validation, and replay protection.",
+              "suite_id": "AAT-CAC-CORE"
+            },
+            {
+              "max_duration_ms": 60000,
+              "purpose": "Validate ArtifactFetch/DcpResolve determinism and consumption-mode enforcement.",
+              "suite_id": "AAT-CAC-FETCH"
+            },
+            {
+              "max_duration_ms": 60000,
+              "purpose": "Validate target delivery determinism and conformance.",
+              "suite_id": "AAT-CAC-EXPORT"
+            },
+            {
+              "max_duration_ms": 60000,
+              "purpose": "Truth capabilities manifest against actual CLI behavior.",
+              "suite_id": "AAT-CAC-CAP"
+            }
+          ]
+        },
+        "acceptance_tests": [
+          {
+            "asserts": [
+              "canonicalize(canonical_bytes) == canonical_bytes",
+              "hash stability across platforms and runs"
+            ],
+            "id": "CAC-AT-0001",
+            "name": "Canonicalization idempotence"
+          },
+          {
+            "asserts": [
+              "Unknown fields are rejected",
+              "Artifacts exceeding size/depth limits are rejected"
+            ],
+            "id": "CAC-AT-0002",
+            "name": "Schema strictness"
+          },
+          {
+            "asserts": [
+              "Patch with wrong expected_base_hash is rejected",
+              "Accepted patch emits AdmissionReceipt referencing base + new hashes"
+            ],
+            "id": "CAC-AT-0003",
+            "name": "Patch replay protection"
+          },
+          {
+            "asserts": [
+              "stable_id resolves to pinned hash deterministically from ledger projection",
+              "Resolution can be reconstructed from ledger events"
+            ],
+            "id": "CAC-AT-0004",
+            "name": "DCP resolution determinism"
+          },
+          {
+            "asserts": [
+              "Consumption holon cannot fetch artifacts not listed in ContextPack manifest allowlist",
+              "Attempted discretionary read emits PolicyViolation and DefectRecord"
+            ],
+            "id": "CAC-AT-0005",
+            "name": "Hermetic consumption enforcement"
+          },
+          {
+            "asserts": [
+              "Exports from identical inputs produce byte-identical trees",
+              "ExportManifest hashes match",
+              "Conformance test report passes"
+            ],
+            "id": "CAC-AT-0006",
+            "name": "Vendor export determinism"
+          },
+          {
+            "asserts": [
+              "CapabilityManifest validates against schema",
+              "Declared commands are invocable and produce declared outputs"
+            ],
+            "id": "CAC-AT-0007",
+            "name": "Capabilities truthing"
+          },
+          {
+            "asserts": [
+              "Bootstrap manifest hashes match the compiled bundle",
+              "Patch targeting a bootstrap stable ID is rejected",
+              "Validator operates using only the bootstrap schema set"
+            ],
+            "id": "CAC-AT-0008",
+            "name": "Bootstrap trust root"
+          },
+          {
+            "asserts": [
+              "TargetProfile budgets are enforced during pack compilation",
+              "Rendering policy is honored for derived payloads"
+            ],
+            "id": "CAC-AT-0009",
+            "name": "Target profile enforcement"
+          },
+          {
+            "asserts": [
+              "Transitive dependencies are included in ContextPack manifests",
+              "Consumption does not require additional discretionary reads"
+            ],
+            "id": "CAC-AT-0010",
+            "name": "Deep pinning closure"
+          },
+          {
+            "asserts": [
+              "context_pack_miss triggers DefectRecord and run failure by default",
+              "RunReceipt records sufficiency and budget deltas"
+            ],
+            "id": "CAC-AT-0011",
+            "name": "Run receipt gating"
+          },
+          {
+            "asserts": [
+              "Typed quantities reject unknown units",
+              "Scaled integer quantities round-trip deterministically"
+            ],
+            "id": "CAC-AT-0012",
+            "name": "Typed quantity validation"
+          }
+        ],
+        "metrics": {
+          "lagging": [
+            {
+              "definition": "Median time from work opened to work completed + merged.",
+              "id": "CAC-M-LAG-0001",
+              "name": "PR cycle time",
+              "target": "improve after CAC adoption"
+            },
+            {
+              "definition": "Repeat incidence of UNPLANNED_CONTEXT_READ defects on similar work types.",
+              "id": "CAC-M-LAG-0002",
+              "name": "Defect recurrence rate (missing-context class)",
+              "target": "decrease month-over-month"
+            }
+          ],
+          "leading": [
+            {
+              "definition": "Count of denied or defect-emitting context reads per work item.",
+              "id": "CAC-M-LEAD-0001",
+              "name": "Unplanned context reads in consumption mode",
+              "target": "monotonic decrease toward zero"
+            },
+            {
+              "definition": "Fraction of work items completed without unplanned reads.",
+              "id": "CAC-M-LEAD-0002",
+              "name": "ContextPack completeness rate",
+              "target": "increase toward 99%+"
+            },
+            {
+              "definition": "Rate of context_pack_miss entries per run receipt.",
+              "id": "CAC-M-LEAD-0004",
+              "name": "ContextPack miss rate",
+              "target": "decrease toward zero"
+            },
+            {
+              "definition": "Fraction of runs where context_pack_sufficiency=true.",
+              "id": "CAC-M-LEAD-0005",
+              "name": "ContextPack sufficiency rate",
+              "target": "increase toward 99%+"
+            },
+            {
+              "definition": "Schema/canonicalization/replay/policy rejection counts.",
+              "id": "CAC-M-LEAD-0003",
+              "name": "Admission rejection rate by category",
+              "target": "high early, then stabilizes as authoring improves"
+            }
+          ]
+        },
+        "rollout_plan": {
+          "phases": [
+            {
+              "ci_behavior": "warnings only",
+              "duration_days": 7,
+              "name": "Warn-only linting + bootstrap schemas",
+              "phase_id": "CAC-R-01"
+            },
+            {
+              "ci_behavior": "fail on admission violations for new artifacts",
+              "duration_days": 14,
+              "name": "Admission pipeline enabled + receipts",
+              "phase_id": "CAC-R-02"
+            },
+            {
+              "ci_behavior": "fail on discretionary reads; file defects automatically",
+              "duration_days": 14,
+              "name": "Hermetic consumption + run receipt gating",
+              "phase_id": "CAC-R-03"
+            },
+            {
+              "ci_behavior": "fail on export drift; require passing AATReceipt for cutover",
+              "duration_days": 14,
+              "name": "Target delivery + capabilities gating for CLI cutover",
+              "phase_id": "CAC-R-04"
+            }
+          ],
+          "principle": "Start with capability truthing + deterministic fetch; then shift workflows to CAC packs; keep fallbacks until confidence is high."
+        }
+      },
+      "section_id": "TESTING",
+      "title": "Testing and Rollout"
+    }
+  ],
+  "volume": {
+    "generated_at": "2026-01-26",
+    "source_prd_id": "APM2-PRD-CAC-0001",
+    "title": "Testing, Rollout, and Metrics",
+    "volume_id": "V07"
+  }
+}

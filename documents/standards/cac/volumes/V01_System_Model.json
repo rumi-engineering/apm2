@@ -1,0 +1,170 @@
+{
+  "schema": "apm2.prd.volume.v1",
+  "schema_version": "1.0.0",
+  "sections": [
+    {
+      "content": {
+        "core_components": [
+          {
+            "existing_primitives_in_apm2": [
+              "Signed, hash-chained KernelEvent ledger entries (apm2.kernel.v1.KernelEvent).",
+              "Tool protocol messages (apm2.tool.v1.ToolRequest/ToolResponse).",
+              "Evidence CAS (BLAKE3 hashes) and EvidencePublished events."
+            ],
+            "id": "COMP-KERNEL",
+            "name": "Holonic Kernel",
+            "responsibilities": [
+              "Enforce policy, budgets, and leases.",
+              "Persist signed events in an append-only ledger.",
+              "Mediate tool execution (default-deny) and record tool events.",
+              "Publish evidence artifacts to CAS and emit evidence events."
+            ]
+          },
+          {
+            "hash_algorithm": "BLAKE3-256 (as implemented in APM2 evidence module)",
+            "id": "COMP-CAS",
+            "name": "Content-Addressed Store (CAS)",
+            "responsibilities": [
+              "Store immutable blobs addressed by cryptographic content hashes.",
+              "Verify integrity on store and retrieve."
+            ]
+          },
+          {
+            "id": "COMP-LEDGER",
+            "name": "Ledger",
+            "responsibilities": [
+              "Append-only, hash-chained log of signed kernel events.",
+              "Source of truth for all state transitions and provenance."
+            ]
+          },
+          {
+            "id": "COMP-DCP",
+            "name": "Deterministic Content Plane (DCP)",
+            "note": "DCP is implemented as an index/projection over immutable artifacts and ledger events; not an independent mutable source of truth.",
+            "responsibilities": [
+              "Provide stable-ID addressing for normative artifacts.",
+              "Enable deterministic, preauthorized reads by stable ID in consumption mode.",
+              "Track dependency edges between artifacts and expose graph closure for pack compilation."
+            ]
+          },
+          {
+            "id": "COMP-CAC-REGISTRY",
+            "name": "CAC Artifact & Schema Registry",
+            "responsibilities": [
+              "Define artifact kinds and schema IDs.",
+              "Validate and canonicalize artifacts for admission.",
+              "Ship and verify a bootstrap schema bundle pinned by hash; enforce immutability of bootstrap stable IDs.",
+              "Manage schema evolution rules and compatibility."
+            ]
+          },
+          {
+            "id": "COMP-COMPILER",
+            "name": "Context Compiler",
+            "responsibilities": [
+              "Compile ContextPacks for consumption holons.",
+              "Compile foreign ABI exports (vendor layouts) from internal IR.",
+              "Emit provenance receipts and evidence."
+            ]
+          }
+        ],
+        "end_to_end_flow": {
+          "key_invariants": [
+            "Bootstrap schema bundle is verified at startup and immutable via the standard patch pipeline.",
+            "No normative artifact influences execution without schema validation and canonicalization.",
+            "No consumption holon uses open-ended discovery for context; misses are treated as pack compiler failures and fail the run by default.",
+            "Target profiles define rendering, retrieval, and delivery constraints for compilation and execution.",
+            "Every step is evidence-backed and message-represented in the signed ledger."
+          ],
+          "narrative": [
+            "Machine authors propose changes as PatchRecords with ChangeSet reports.",
+            "Kernel validates patch + schema, applies it with replay protection, canonicalizes the resulting artifact, stores it in CAS, and updates DCP index via ledger events.",
+            "Context compiler builds ContextPacks using target profiles and deep-pins the transitive dependency closure, emitting receipts to CAS and ledger.",
+            "Consumption holons execute tasks using only ContextPacks and stable-ID fetches; pack misses emit defects and fail runs unless explicitly escalated, feeding back into pack compiler and schema evolution."
+          ]
+        },
+        "entities": [
+          {
+            "definition": "A normative CAC-JSON document that influences holonic behavior (policies, packs, skills, capabilities, contracts).",
+            "id": "ENT-ARTIFACT",
+            "identity": [
+              "stable_id",
+              "content_hash",
+              "schema_ref"
+            ],
+            "name": "ControlArtifact"
+          },
+          {
+            "definition": "A versioned schema (JSON Schema) used to validate a ControlArtifact kind.",
+            "id": "ENT-SCHEMA",
+            "name": "SchemaDefinition"
+          },
+          {
+            "definition": "A single machine-authored patch operation (JSON Patch or Merge Patch) with replay protection and provenance, typically transported as JSONL.",
+            "id": "ENT-PATCH",
+            "name": "PatchRecord"
+          },
+          {
+            "definition": "A bounded set of stable-ID addressed artifacts required for a consumption holon to execute a task without discretionary discovery.",
+            "id": "ENT-PACK",
+            "name": "ContextPack"
+          },
+          {
+            "definition": "A machine-readable declaration of what the runtime/CLI actually supports, used for capability negotiation and gating.",
+            "id": "ENT-CAP",
+            "name": "CapabilityManifest"
+          },
+          {
+            "definition": "A machine-readable profile describing how to compile internal artifacts into a vendor-required ABI (filesystem layout + Markdown templates), plus conformance tests.",
+            "id": "ENT-VENDOR",
+            "name": "VendorProfile"
+          },
+          {
+            "definition": "A machine-readable target profile defining context budgets, rendering policy, retrieval policy, and delivery constraints independent of model intelligence.",
+            "id": "ENT-TARGET",
+            "name": "TargetProfile"
+          },
+          {
+            "definition": "A structured evidence record proving an action occurred and met its contract (admission receipt, pack compilation receipt, export receipt, AAT/selftest receipt).",
+            "id": "ENT-RECEIPT",
+            "name": "Receipt"
+          },
+          {
+            "definition": "A standardized semantic delta report describing patch effects, compatibility notes, and affected packs.",
+            "id": "ENT-CHANGESET",
+            "name": "ChangeSetReport"
+          },
+          {
+            "definition": "A run receipt capturing context pack sufficiency, misses, and budget usage for a consumption execution.",
+            "id": "ENT-RUN-RECEIPT",
+            "name": "RunReceipt"
+          },
+          {
+            "definition": "Canonicalization test vectors pinned as governed artifacts for cross-runtime determinism.",
+            "id": "ENT-CANON-VECTORS",
+            "name": "CanonicalizerVectors"
+          }
+        ],
+        "modes": [
+          {
+            "id": "MODE-PRODUCE",
+            "name": "Context Production Mode",
+            "tooling_policy": "Tools allowed under explicit lease/budget; all outputs must emit evidence and be replayable to the maximum extent possible."
+          },
+          {
+            "id": "MODE-CONSUME",
+            "name": "Context Consumption Mode",
+            "tooling_policy": "No discretionary context discovery; only deterministic, preauthorized stable-ID fetches plus narrowly scoped actuation tools."
+          }
+        ]
+      },
+      "section_id": "SYSTEM_MODEL",
+      "title": "System Model"
+    }
+  ],
+  "volume": {
+    "generated_at": "2026-01-26",
+    "source_prd_id": "APM2-PRD-CAC-0001",
+    "title": "System Model",
+    "volume_id": "V01"
+  }
+}

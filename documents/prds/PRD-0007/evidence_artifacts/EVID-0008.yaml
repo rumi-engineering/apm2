@@ -1,0 +1,36 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0008"
+  category: "SECURITY_SCAN_RESULTS"
+  title: "Bootstrap trust root tests"
+  description: |
+    Tests verifying bootstrap trust root immutability: manifest hashes match
+    compiled bundle, patches targeting bootstrap stable IDs are rejected,
+    validator operates using only bootstrap schema set.
+  source_acceptance_test: CAC-AT-0008
+  capture:
+    paths:
+      - "test/cac/bootstrap/"
+      - "evidence/bootstrap_manifest.json"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --package apm2-cac -- bootstrap::trust_root"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 120
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Bootstrap bundle embedded in binary"
+  assertions:
+    - "Bootstrap manifest hashes match the compiled bundle"
+    - "Patch targeting a bootstrap stable ID is rejected"
+    - "Validator operates using only the bootstrap schema set"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

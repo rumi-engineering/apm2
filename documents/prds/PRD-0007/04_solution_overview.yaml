@@ -1,0 +1,343 @@
+prd_solution_overview:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  proposed_solution:
+    overview: |
+      Context-as-Code (CAC) makes context the authoritative program in an agent-native factory.
+      The solution provides a canonical context substrate (CAC-JSON), patch-first authoring
+      with replay protection, hermetic consumption with deterministic reads, and target
+      interoperability through compiled payloads. All state transitions are recorded as
+      signed kernel messages referencing immutable hashes. The key insight is that if
+      context is complete and correct, code can be generated deterministically; therefore,
+      the highest-leverage engineering work is to make context machine-native, canonical,
+      and enforceable.
+    key_components:
+      - name: CAC Canonicalizer
+        component_id: CAC-CANON
+        type: rust_library
+        description: |
+          Parses CAC-JSON without floats and with strict limits. Emits canonical bytes
+          deterministically following a JCS-like canonicalization scheme. Exposes
+          test-vector based verification for cross-platform determinism.
+        interfaces:
+          - "canonicalize(bytes) -> canonical_bytes"
+          - "hash(canonical_bytes) -> b3-256"
+      - name: CAC Validator
+        component_id: CAC-VALID
+        type: rust_library
+        description: |
+          Validates artifacts against JSON Schemas (draft 2020-12 minimum). Enforces
+          validator profile with unknown fields rejected and size/depth bounds.
+          Validates PatchRecord streams and enforces typed-quantity constraints.
+      - name: Bootstrap Schema Bundle
+        component_id: CAC-BOOTSTRAP
+        type: binary_embedded_data
+        description: |
+          Embeds a minimal schema bundle pinned by hash in the apm2 binary (Phase-0
+          trust root). Exposes read-only bootstrap manifest to validator and admission
+          pipeline. Rejects any patch or artifact that modifies bootstrap stable IDs.
+      - name: Patch Engine
+        component_id: CAC-PATCH
+        type: rust_library
+        description: |
+          Applies JSON Patch / Merge Patch to canonical JSON trees. Enforces replay
+          protection via expected_base_hash. Emits ChangeSetReport for review and
+          compaction.
+      - name: DCP Index / Resolver
+        component_id: CAC-DCP
+        type: projection_service_or_library
+        description: |
+          Resolves stable_id to pinned content_hash and schema refs. Provides
+          deterministic reads for consumption mode via ArtifactFetch. Reconstructs
+          index from ledger events. Provides dependency graph closure for pack
+          compilation.
+      - name: Context Compiler
+        component_id: CAC-COMPILER
+        type: service_or_library
+        description: |
+          Compiles ContextPackSpec into ContextPackManifest with derived artifacts.
+          Deep-pins transitive dependencies to produce self-contained packs. Compiles
+          target payloads per TargetProfile. Emits receipts and evidence.
+      - name: APM2 CLI CAC Commands
+        component_id: CAC-CLI
+        type: cli_surface
+        description: |
+          Machine-readable CLI commands for CAC operations. All commands are listed
+          in capability manifest with declared inputs/outputs.
+        commands:
+          - "apm2 cac lint"
+          - "apm2 cac fmt"
+          - "apm2 cac apply-patch"
+          - "apm2 pack compile"
+          - "apm2 export --profile <target>"
+          - "apm2 capabilities --json"
+          - "apm2 selftest"
+      - name: Selftest/AAT Harness
+        component_id: CAC-AAT
+        type: test_harness
+        description: |
+          Runs hermetic acceptance tests for CLI contracts, tool protocol, and export
+          determinism. Emits structured AATReceipt stored in CAS and referenced in
+          ledger. Gates critical cutovers and agent planning.
+    external_dependencies:
+      - "APM2 Kernel: Signed hash-chained ledger, KernelEvent families, tool protocol."
+      - "Content-Addressed Store (CAS): BLAKE3-256 hashed immutable blobs."
+      - "Existing APM2 evidence module for provenance and evidence publishing."
+  system_model:
+    core_components:
+      - id: COMP-KERNEL
+        name: Holonic Kernel
+        responsibilities:
+          - Enforce policy, budgets, and leases.
+          - Persist signed events in an append-only ledger.
+          - Mediate tool execution (default-deny) and record tool events.
+          - Publish evidence artifacts to CAS and emit evidence events.
+      - id: COMP-CAS
+        name: Content-Addressed Store (CAS)
+        hash_algorithm: "BLAKE3-256"
+        responsibilities:
+          - Store immutable blobs addressed by cryptographic content hashes.
+          - Verify integrity on store and retrieve.
+      - id: COMP-LEDGER
+        name: Ledger
+        responsibilities:
+          - Append-only, hash-chained log of signed kernel events.
+          - Source of truth for all state transitions and provenance.
+      - id: COMP-DCP
+        name: Deterministic Content Plane (DCP)
+        note: |
+          DCP is implemented as an index/projection over immutable artifacts and
+          ledger events; not an independent mutable source of truth.
+        responsibilities:
+          - Provide stable-ID addressing for normative artifacts.
+          - Enable deterministic, preauthorized reads by stable ID in consumption mode.
+          - Track dependency edges between artifacts and expose graph closure for pack compilation.
+      - id: COMP-CAC-REGISTRY
+        name: CAC Artifact and Schema Registry
+        responsibilities:
+          - Define artifact kinds and schema IDs.
+          - Validate and canonicalize artifacts for admission.
+          - Ship and verify bootstrap schema bundle pinned by hash.
+          - Manage schema evolution rules and compatibility.
+    entities:
+      - id: ENT-ARTIFACT
+        name: ControlArtifact
+        definition: A normative CAC-JSON document that influences holonic behavior.
+        identity:
+          - stable_id
+          - content_hash
+          - schema_ref
+      - id: ENT-SCHEMA
+        name: SchemaDefinition
+        definition: A versioned schema (JSON Schema) used to validate a ControlArtifact kind.
+      - id: ENT-PATCH
+        name: PatchRecord
+        definition: A single machine-authored patch operation with replay protection and provenance.
+      - id: ENT-PACK
+        name: ContextPack
+        definition: A bounded set of stable-ID addressed artifacts for hermetic consumption.
+      - id: ENT-CAP
+        name: CapabilityManifest
+        definition: A machine-readable declaration of what the CLI/kernel actually supports.
+      - id: ENT-TARGET
+        name: TargetProfile
+        definition: A machine-readable profile defining budgets, rendering, and delivery constraints.
+      - id: ENT-RECEIPT
+        name: Receipt
+        definition: A structured evidence record proving an action occurred and met its contract.
+      - id: ENT-RUN-RECEIPT
+        name: RunReceipt
+        definition: A run receipt capturing context pack sufficiency, misses, and budget usage.
+  artifact_kinds:
+    registry_version: "1.0.0"
+    kinds:
+      - kind_id: schema.definition
+        schema_id: cac.schema_definition.v1
+        normative: true
+        consume_allowed: true
+        purpose: Defines schemas used to validate other artifacts.
+      - kind_id: policy.profile
+        schema_id: cac.policy_profile.v1
+        normative: true
+        consume_allowed: true
+        purpose: Defines policy rules for tools, reads, budgets, and consumption hermeticity.
+      - kind_id: budget.profile
+        schema_id: cac.budget_profile.v1
+        normative: true
+        consume_allowed: true
+        purpose: Defines budgets/limits used in leases and tool calls.
+      - kind_id: holon.contract
+        schema_id: cac.holon_contract.v1
+        normative: true
+        consume_allowed: true
+        purpose: Defines holon roles, modes, inputs/outputs, and allowed operations.
+      - kind_id: skill.spec
+        schema_id: cac.skill_spec.v1
+        normative: true
+        consume_allowed: true
+        purpose: Defines agent skill/instruction bundles as machine-native context.
+      - kind_id: target.profile
+        schema_id: cac.target_profile.v1
+        normative: true
+        consume_allowed: true
+        purpose: Defines rendering, retrieval, and delivery constraints independent of model intelligence; drives compilation.
+      - kind_id: canonicalizer.vectors
+        schema_id: cac.canonicalizer_vectors.v1
+        normative: true
+        consume_allowed: true
+        purpose: Governed canonicalization test vectors pinned in the bootstrap trust root.
+      - kind_id: vendor.profile
+        schema_id: cac.vendor_profile.v1
+        normative: false
+        consume_allowed: true
+        purpose: Derived vendor delivery profile compiled from TargetProfile (compatibility surface, not normative).
+      - kind_id: capabilities.manifest
+        schema_id: cac.capabilities_manifest.v1
+        normative: true
+        consume_allowed: true
+        purpose: Declares what the CLI/kernel actually supports (truth surface for agents).
+      - kind_id: context_pack.spec
+        schema_id: cac.context_pack_spec.v1
+        normative: true
+        consume_allowed: true
+        purpose: Defines which stable IDs constitute a ContextPack and the pack's consumption contract.
+        prd_refinement:
+          dependency_trust_boundary: |
+            Pack specs MUST capture resolved hashes at review time via dependency_review_hash
+            field. Compilation fails if resolved hash differs from reviewed hash.
+      - kind_id: context_pack.manifest
+        schema_id: cac.context_pack_manifest.v1
+        normative: false
+        consume_allowed: true
+        purpose: Compiled output listing resolved stable IDs, hashes, and derived pack artifacts.
+      - kind_id: export.manifest
+        schema_id: cac.export_manifest.v1
+        normative: false
+        consume_allowed: true
+        purpose: Derived output describing a vendor export tree and its provenance.
+      - kind_id: changeset.report
+        schema_id: cac.changeset_report.v1
+        normative: false
+        consume_allowed: true
+        purpose: Standardized semantic delta report for patch admissions and compaction.
+      - kind_id: receipt.admission
+        schema_id: cac.admission_receipt.v1
+        normative: false
+        consume_allowed: true
+        purpose: Evidence receipt proving an artifact was admitted (validated, canonicalized, stored, indexed).
+      - kind_id: receipt.aat
+        schema_id: cac.aat_receipt.v1
+        normative: false
+        consume_allowed: true
+        purpose: Evidence receipt proving acceptance/selftests passed with bounded resources.
+      - kind_id: receipt.run
+        schema_id: cac.run_receipt.v1
+        normative: false
+        consume_allowed: true
+        purpose: Evidence receipt for consumption runs (pack sufficiency, misses, and budget usage).
+      - kind_id: defect.record
+        schema_id: cac.defect_record.v1
+        normative: false
+        consume_allowed: true
+        purpose: Evidence-backed defect records feeding improvement loops.
+    common_types:
+      typed_quantity:
+        schema_id: cac.common.v1#/$defs/quantity
+        note: |
+          All budgets, timeouts, costs, and probabilities MUST use this typed quantity
+          standard with explicit units (ms, bytes, tokens, count, percent, usd).
+  pipeline:
+    overview: |
+      A closed-loop, message-native context pipeline: machines propose patches with semantic
+      deltas; kernel admits canonical artifacts; compiler builds deep-pinned packs and
+      target-specific payloads; consumption is hermetic and budgeted; misses create defects;
+      improvements feed back into pack compilation and target profiles.
+    stages:
+      - stage_id: CAC-STAGE-01
+        name: Patch Authoring
+        mode: PRODUCE
+        description: Machine authors propose changes as PatchRecords with ChangeSet reports.
+      - stage_id: CAC-STAGE-02
+        name: Admission Gate - Validate
+        mode: KERNEL
+        description: Fail-closed validation of patch against schema and policy.
+      - stage_id: CAC-STAGE-03
+        name: Admission Gate - Apply and Canonicalize
+        mode: KERNEL
+        description: Apply patch with replay protection, canonicalize, emit AdmissionReceipt.
+      - stage_id: CAC-STAGE-04
+        name: Publish to CAS and Update DCP
+        mode: KERNEL
+        description: Store canonical artifact in CAS, update DCP index via ledger events.
+      - stage_id: CAC-STAGE-05
+        name: Compile ContextPacks
+        mode: PRODUCE
+        description: Deep-pin transitive dependencies, produce manifests and derived packs.
+      - stage_id: CAC-STAGE-06
+        name: Target Delivery Rendering
+        mode: PRODUCE
+        description: Deterministic rendering to vendor layouts with provenance.
+      - stage_id: CAC-STAGE-07
+        name: Capability Truthing and Selftest (AAT)
+        mode: PRODUCE
+        description: Generate CapabilityManifest and AATReceipt from binary selftests.
+      - stage_id: CAC-STAGE-08
+        name: Consume (Execution/Review/Ops)
+        mode: CONSUME
+        description: |
+          Hermetic consumption with RunReceipt emission and defect tracking.
+          Unplanned reads/tool calls are treated as compiler defects.
+    closed_loop:
+      description: |
+        The system treats unplanned reads/tool calls in consumption mode as compiler
+        defects, not execution necessities. These signals feed back into the
+        pipeline to drive systematic improvements.
+      feedback_targets:
+        - ContextPack compiler rules
+        - Schema evolution (tighten or expand)
+        - Capability manifest updates
+        - Target profile updates
+        - ChangeSet compaction rules
+      signals:
+        - PolicyViolation events
+        - BudgetExceeded events
+        - Unplanned tool call attempts in consumption mode
+        - Selftest/AAT failures
+        - Export conformance failures
+      operational_refinement:
+        description: |
+          Operational triggers for defect aggregation and pack review (PRD elaboration).
+        trigger_conditions:
+          - id: TRIGGER-SIGNATURE-THRESHOLD
+            condition: "Same defect signature occurs ≥3 times within 7 days"
+            action: "Emit PACK_SPEC_REVIEW_NEEDED event"
+          - id: TRIGGER-ESCALATION-FREQUENCY
+            threshold: "≥2 escalations for same stable_id within 14 days"
+            action: "Emergency pack review"
+        sla:
+          standard_review: "48 hours from trigger to pack spec update"
+          emergency_review: "4 hours from trigger to pack spec update"
+  interfaces:
+    external_apis:
+      - name: ArtifactFetch Tool Protocol
+        description: |
+          Deterministic retrieval of context artifacts by stable ID or content hash.
+          Policy enforces only stable-ID allowlisted reads in consumption mode.
+        request_fields:
+          - "stable_id (optional)"
+          - "content_hash (optional)"
+          - "expected_hash (optional)"
+          - "max_bytes (required)"
+          - "format (required): raw_bytes | utf8_text | json_canonical"
+      - name: DcpResolve Tool Protocol
+        description: |
+          Resolve stable_id to pinned content hash and schema ref without fetching
+          full content. Consumption-mode reads are still enforced.
+    user_surfaces:
+      - "apm2 cac lint - Validate CAC-JSON against schema."
+      - "apm2 cac fmt - Canonicalize CAC-JSON to stable bytes."
+      - "apm2 cac apply-patch - Submit patch with replay protection."
+      - "apm2 pack compile - Compile ContextPacks from specs."
+      - "apm2 export --profile <target> - Export to vendor layouts."
+      - "apm2 capabilities --json - Generate capability manifest."
+      - "apm2 selftest - Run AAT suite and emit receipt."

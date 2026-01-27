@@ -1,0 +1,31 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0012"
+  type: "FUNCTIONAL"
+  title: "ContextPack compilation"
+  statement: |
+    The system MUST compile ContextPackSpec into ContextPackManifest with derived artifacts.
+    Compilation MUST deep-pin transitive dependencies to produce self-contained packs.
+    Compilation MUST be deterministic given resolved inputs and target profile. Context
+    budgets MUST be enforced during compilation.
+  acceptance_criteria:
+    - id: AC-0012-01
+      description: ContextPackSpec compiles to ContextPackManifest.
+      verification_method: apm2 pack compile produces manifest from spec.
+    - id: AC-0012-02
+      description: Transitive dependencies are resolved and pinned.
+      verification_method: Manifest includes all dependency stable_ids with content_hashes.
+    - id: AC-0012-03
+      description: Compilation is deterministic.
+      verification_method: Same inputs produce identical manifest and derived artifacts.
+    - id: AC-0012-04
+      description: Budget ceilings are enforced.
+      verification_method: Pack exceeding token/artifact/byte budget fails compilation.
+  source_pipeline_stage: CAC-STAGE-05
+  evidence:
+    evidence_ids:
+      - EVID-0010
+    inherited_from_prd: false
+    notes:
+      - Derived from pipeline stage CAC-STAGE-05 in source PRD.

@@ -1,0 +1,324 @@
+{
+  "schema_version": "1.0.0",
+  "prd_id": "PRD-0007",
+  "review_timestamp": "2026-01-26T22:40:00Z",
+  "review_depth": "COUNCIL",
+
+  "impact_vector": {
+    "requirement_count": {"value": 15, "rating": "HIGH"},
+    "external_dependencies": {"value": 3, "rating": "HIGH"},
+    "net_new_abstractions": {"value": 8, "rating": "HIGH"},
+    "data_classification": {"value": "INTERNAL", "rating": "MEDIUM"},
+    "blast_radius": {"value": "system_wide", "rating": "HIGH"}
+  },
+
+  "gates": [
+    {
+      "gate_id": "GATE-PRD-SCHEMA",
+      "type": "TRUSTED",
+      "status": "PASSED",
+      "findings": [],
+      "evidence": {"files_checked": 41, "parse_errors": 0}
+    },
+    {
+      "gate_id": "GATE-PRD-LINT",
+      "type": "TRUSTED",
+      "status": "PASSED",
+      "findings": [],
+      "evidence": {"id_format_violations": 0, "placeholder_violations": 0}
+    },
+    {
+      "gate_id": "GATE-PRD-TRACEABILITY",
+      "type": "DETERMINISTIC",
+      "status": "NEEDS_REMEDIATION",
+      "findings": ["FND-COUNCIL-001", "FND-COUNCIL-002"],
+      "evidence": {"orphan_requirements": ["REQ-0007"], "broken_refs": []}
+    },
+    {
+      "gate_id": "GATE-PRD-CCP-MAPPING",
+      "type": "DETERMINISTIC",
+      "status": "PASSED",
+      "findings": [],
+      "evidence": {"components_defined": 7}
+    },
+    {
+      "gate_id": "GATE-PRD-QUALITY-COVERAGE",
+      "type": "DETERMINISTIC",
+      "status": "PASSED",
+      "findings": [],
+      "evidence": {"dimensions_count": 18}
+    },
+    {
+      "gate_id": "GATE-PRD-EVIDENCE-STANDARDS",
+      "type": "DETERMINISTIC",
+      "status": "PASSED",
+      "findings": [],
+      "evidence": {"artifacts_checked": 12}
+    },
+    {
+      "gate_id": "GATE-PRD-CONTENT",
+      "type": "LLM-ASSISTED",
+      "status": "NEEDS_REMEDIATION",
+      "findings": ["FND-COUNCIL-003", "FND-COUNCIL-004", "FND-COUNCIL-005", "FND-COUNCIL-006", "FND-COUNCIL-007", "FND-COUNCIL-008", "FND-COUNCIL-009", "FND-COUNCIL-010"],
+      "evidence": {
+        "council_executed": true,
+        "subagents": 3,
+        "cycles_completed": 3,
+        "quorum_achieved": true
+      }
+    }
+  ],
+
+  "findings": [
+    {
+      "finding_id": "FND-COUNCIL-001",
+      "gate_id": "GATE-PRD-TRACEABILITY",
+      "cluster_id": "CLU-002",
+      "category": "TRACEABILITY_DEFECT",
+      "subcategory": "MISSING_CHAIN",
+      "severity": "MAJOR",
+      "location": {
+        "file": "documents/prds/PRD-0007/requirements/REQ-0007.yaml",
+        "yaml_path": "prd_requirement.evidence.evidence_ids"
+      },
+      "description": "REQ-0007 (Measurable throughput and quality gains) has empty evidence_ids. All three council subagents unanimously confirmed this finding. The requirement claims measurability but provides no evidence artifacts to verify the acceptance criteria.",
+      "remediation": "Create evidence artifacts EVID-0013 (PR cycle time measurement) and EVID-0014 (defect recurrence tracking). Link these to REQ-0007 evidence_ids.",
+      "agreement_status": "UNANIMOUS",
+      "source_agents": ["SA-1", "SA-2", "SA-3"],
+      "signature": "council-traceability-001"
+    },
+    {
+      "finding_id": "FND-COUNCIL-002",
+      "gate_id": "GATE-PRD-TRACEABILITY",
+      "cluster_id": "CLU-002",
+      "category": "EVIDENCE_DEFECT",
+      "subcategory": "COVERAGE_GAP",
+      "severity": "MAJOR",
+      "location": {
+        "file": "documents/prds/PRD-0007/05_success_metrics.yaml",
+        "yaml_path": "prd_success_metrics.metrics[5].evidence_ids, metrics[6].evidence_ids"
+      },
+      "description": "MET-0006 (PR cycle time) and MET-0007 (Defect recurrence rate) have empty evidence_ids. These metrics are key success indicators but lack defined evidence artifacts for baseline or post-adoption measurement.",
+      "remediation": "Create EVID-0013 and EVID-0014 with: baseline capture commands, comparison methodology, statistical significance thresholds, confounder controls.",
+      "agreement_status": "UNANIMOUS",
+      "source_agents": ["SA-1", "SA-2", "SA-3"],
+      "signature": "council-evidence-002"
+    },
+    {
+      "finding_id": "FND-COUNCIL-003",
+      "gate_id": "GATE-PRD-CONTENT",
+      "cluster_id": "CLU-001",
+      "category": "EVIDENCE_DEFECT",
+      "subcategory": "CRITERION_VAGUE",
+      "severity": "MAJOR",
+      "location": {
+        "file": "documents/prds/PRD-0007/05_success_metrics.yaml",
+        "yaml_path": "prd_success_metrics.metrics[0].target, metrics[1].target"
+      },
+      "description": "Success metrics use aspirational language ('monotonic decrease toward zero', 'increase toward 99%+') without quantified thresholds, timelines, or confidence intervals. All three subagents identified this as a fundamental verifiability gap.",
+      "remediation": "Replace with quantified targets: MET-0001 should specify '≥20% decrease MoM, <5 per 1000 work items within 6 months'; MET-0002 should specify '95% within 3 months, 99% within 12 months'. Add 80% confidence intervals.",
+      "agreement_status": "UNANIMOUS",
+      "source_agents": ["SA-1", "SA-2", "SA-3"],
+      "signature": "council-vague-metrics-003"
+    },
+    {
+      "finding_id": "FND-COUNCIL-004",
+      "gate_id": "GATE-PRD-CONTENT",
+      "cluster_id": "CLU-003",
+      "category": "SPEC_DEFECT",
+      "subcategory": "INCOMPLETENESS",
+      "severity": "MAJOR",
+      "location": {
+        "file": "documents/prds/PRD-0007/requirements/REQ-0003.yaml",
+        "yaml_path": "prd_requirement.acceptance_criteria[3]"
+      },
+      "description": "Escalation mechanism for pack misses is undefined. AC-0003-04 states 'Pack misses fail runs by default unless escalated' but does not define: who can authorize escalation, what conditions allow it, how it is recorded, when it expires, or how escalation frequency feeds back to pack improvement.",
+      "remediation": "Define EscalationPolicy artifact with authority_role, escalation_criteria, escalation_ttl, audit_event_type, and escalation_count_metric.",
+      "agreement_status": "UNANIMOUS",
+      "source_agents": ["SA-1", "SA-2"],
+      "signature": "council-escalation-004"
+    },
+    {
+      "finding_id": "FND-COUNCIL-005",
+      "gate_id": "GATE-PRD-CONTENT",
+      "cluster_id": "CLU-004",
+      "category": "SPEC_DEFECT",
+      "subcategory": "HIDDEN_COST",
+      "severity": "MAJOR",
+      "location": {
+        "file": "documents/prds/PRD-0007/08_risks_questions.yaml",
+        "yaml_path": "prd_risks_questions.risks[1], risks[3]"
+      },
+      "description": "RSK-0002 (schema strictness) and RSK-0004 (consumption hermeticity) represent the same fundamental tradeoff (strictness vs. velocity) but are analyzed independently without unified criteria weighting. SA-2 proposed severity upgrade from MINOR to MAJOR based on adoption risk.",
+      "remediation": "Create unified tradeoff analysis with explicit criteria ranking, quantified thresholds ('accept X% velocity reduction for Y% security'), Pareto frontier showing configurations, and coordinated mitigation strategy.",
+      "agreement_status": "MAJORITY",
+      "source_agents": ["SA-1", "SA-2", "SA-3"],
+      "quorum_vote": {"SUPPORT": 3, "OPPOSE": 0},
+      "signature": "council-tradeoff-005"
+    },
+    {
+      "finding_id": "FND-COUNCIL-006",
+      "gate_id": "GATE-PRD-CONTENT",
+      "cluster_id": "CLU-005",
+      "category": "SPEC_DEFECT",
+      "subcategory": "INCONSISTENCY",
+      "severity": "MAJOR",
+      "location": {
+        "file": "documents/prds/PRD-0007/03_goals_scope.yaml",
+        "yaml_path": "prd_goals_scope.goals[2].measurable_outcomes, goals[6].measurable_outcomes"
+      },
+      "description": "G-0003 states discretionary context discovery is 'denied' while G-0007 states unplanned tool calls 'trend toward zero'. If denied, the count should be zero; if trending, there must be allowed violations. These goals express conflicting enforcement models.",
+      "remediation": "Choose one model: (A) Strict - G-0007 says 'reaches zero upon full enforcement', or (B) Graduated - G-0003 says 'defect-emitting initially, transitioning to denied after stabilization'. Apply consistently.",
+      "agreement_status": "MAJORITY",
+      "source_agents": ["SA-1"],
+      "quorum_vote": {"SUPPORT": 2, "OPPOSE": 1},
+      "signature": "council-goal-inconsistency-006"
+    },
+    {
+      "finding_id": "FND-COUNCIL-007",
+      "gate_id": "GATE-PRD-CONTENT",
+      "cluster_id": "CLU-006",
+      "category": "SPEC_DEFECT",
+      "subcategory": "INCOMPLETENESS",
+      "severity": "MAJOR",
+      "location": {
+        "file": "documents/prds/PRD-0007/04_solution_overview.yaml",
+        "yaml_path": "prd_solution_overview.pipeline"
+      },
+      "description": "The defect-to-improvement feedback loop is conceptually present but operationally underspecified. No explicit mechanism defines how DefectRecords aggregate, when pack specifications are reviewed, or what feedback latency SLA applies.",
+      "remediation": "Add explicit feedback mechanism: DefectRecord aggregation trigger conditions, pack specification review cadence, feedback latency SLA, and metric for pack spec evolution rate.",
+      "agreement_status": "MAJORITY",
+      "source_agents": ["SA-2"],
+      "quorum_vote": {"SUPPORT": 2, "OPPOSE": 1},
+      "signature": "council-feedback-loop-007"
+    },
+    {
+      "finding_id": "FND-COUNCIL-008",
+      "gate_id": "GATE-PRD-CONTENT",
+      "cluster_id": "CLU-007",
+      "category": "SPEC_DEFECT",
+      "subcategory": "MISSING_FALLBACK",
+      "severity": "MAJOR",
+      "location": {
+        "file": "documents/prds/PRD-0007/06_constraints_invariants.yaml",
+        "yaml_path": "prd_constraints_invariants.guardrails[0]"
+      },
+      "description": "Bootstrap verification failure 'requires binary update' per GRD-0001, but no recovery path is defined for the deadlock scenario where neither old nor new binary can operate due to ledger/bootstrap incompatibility.",
+      "remediation": "Add recovery procedure: bootstrap-safe mode (read-only diagnosis), ledger compatibility check before upgrade, rollback compatibility matrix, emergency override with dual-signoff.",
+      "agreement_status": "MAJORITY",
+      "source_agents": ["SA-2"],
+      "quorum_vote": {"SUPPORT": 2, "OPPOSE": 1},
+      "signature": "council-bootstrap-recovery-008"
+    },
+    {
+      "finding_id": "FND-COUNCIL-009",
+      "gate_id": "GATE-PRD-CONTENT",
+      "cluster_id": "CLU-010",
+      "category": "SPEC_DEFECT",
+      "subcategory": "WEAK_CUSTOMER",
+      "severity": "MINOR",
+      "location": {
+        "file": "documents/prds/PRD-0007/02_problem.yaml",
+        "yaml_path": "prd_problem.observed_failure_modes"
+      },
+      "description": "The abductive inference from failure modes to CAC as the solution does not explicitly rule out simpler alternatives. For each failure mode, alternative interventions could address the symptoms.",
+      "remediation": "For each failure mode, list 2-3 alternative interventions and explain why CAC is superior. Document the 'YAGNI test' - which CAC features could be deferred if simpler interventions partially succeed.",
+      "agreement_status": "QUORUM_SUPPORT",
+      "source_agents": ["SA-3"],
+      "quorum_vote": {"SUPPORT": 2, "OPPOSE": 1},
+      "signature": "council-abductive-009"
+    },
+    {
+      "finding_id": "FND-COUNCIL-010",
+      "gate_id": "GATE-PRD-CONTENT",
+      "cluster_id": "CLU-011",
+      "category": "SECURITY_DEFECT",
+      "subcategory": "TRUST_BOUNDARY_VIOLATION",
+      "severity": "MAJOR",
+      "location": {
+        "file": "documents/prds/PRD-0007/04_solution_overview.yaml",
+        "yaml_path": "prd_solution_overview.key_components[4]"
+      },
+      "description": "Dependency trust boundary attack vector: An adversary can inject malicious content via stable_id resolution timing. Pack specs referencing stable_ids resolve to latest hash at compilation time, which may have changed since pack spec was reviewed.",
+      "remediation": "Pack specs referencing stable_ids MUST capture resolved hashes at review time. Compilation MUST warn/fail if resolved hash differs from reviewed hash. Add 'dependency_review_hash' field in pack spec.",
+      "agreement_status": "UNANIMOUS",
+      "source_agents": ["SA-1", "SA-2", "SA-3"],
+      "quorum_vote": {"SUPPORT": 3, "OPPOSE": 0},
+      "signature": "council-trust-boundary-010"
+    }
+  ],
+
+  "council_metadata": {
+    "session_id": "COUNCIL-PRD-0007-20260126-100000",
+    "subagents": [
+      {
+        "agent_id": "SA-1",
+        "emergent_role": "Formal Rigorist",
+        "selected_modes": [7, 6, 8, 1, 75]
+      },
+      {
+        "agent_id": "SA-2",
+        "emergent_role": "Systems Thinker",
+        "selected_modes": [43, 37, 47, 49, 79]
+      },
+      {
+        "agent_id": "SA-3",
+        "emergent_role": "Epistemic Auditor",
+        "selected_modes": [76, 45, 13, 80, 46]
+      }
+    ],
+    "cycles_completed": 3,
+    "total_findings_generated": 41,
+    "findings_after_dedup": 10,
+    "contested_items_resolved": 4,
+    "quorum_achieved": true,
+    "elapsed_time_seconds": 420
+  },
+
+  "north_star_assessment": {
+    "phase_scores": {
+      "P1_recursive_improvement": 0.85,
+      "P2_innovation": 0.70,
+      "P3_enterprise": 0.72,
+      "P4_partnership": 0.53,
+      "P5_life_sciences": 0.32
+    },
+    "primary_phase_alignment": "P1_recursive_improvement",
+    "alignment_consensus": true,
+    "strategic_recommendations": [
+      {
+        "id": "STRAT-001",
+        "target_phase": "P1",
+        "recommendation": "Close the feedback loop by defining explicit DefectRecord aggregation and pack specification evolution mechanism"
+      },
+      {
+        "id": "STRAT-002",
+        "target_phase": "P1",
+        "recommendation": "Add falsifiable predictions for metrics with quantified thresholds and statistical tests"
+      },
+      {
+        "id": "STRAT-003",
+        "target_phase": "P3",
+        "recommendation": "Add explicit ROI model quantifying productivity gains and adoption costs"
+      },
+      {
+        "id": "STRAT-004",
+        "target_phase": "P4",
+        "recommendation": "Consider ecosystem growth strategy for target profile sharing with partners"
+      }
+    ],
+    "violations": []
+  },
+
+  "verdict": "NEEDS_REMEDIATION",
+  "verdict_reason": "Council reached consensus with 10 findings (8 MAJOR, 2 MINOR). All required angles executed across 3 subagents with 15 unique reasoning modes. Quorum achieved on all contested findings. No BLOCKER findings identified. PRD is fundamentally sound but requires remediation of MAJOR findings before RFC transition.",
+  "confidence": "HIGH",
+
+  "reviewer": {
+    "agent_type": "council",
+    "model": "claude-opus-4-5",
+    "review_mode": "COUNCIL",
+    "subagent_count": 3,
+    "modes_applied": 15
+  }
+}

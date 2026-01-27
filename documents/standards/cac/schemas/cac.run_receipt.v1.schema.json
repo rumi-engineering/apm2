@@ -1,0 +1,132 @@
+{
+  "$id": "cac.run_receipt.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "receipt.run"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "budget_remaining": {
+              "additionalProperties": false,
+              "properties": {
+                "artifacts": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "bytes": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "time_ms": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "tokens": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "tool_calls": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                }
+              },
+              "type": "object"
+            },
+            "budget_used": {
+              "additionalProperties": false,
+              "properties": {
+                "artifacts": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "bytes": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "time_ms": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "tokens": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                },
+                "tool_calls": {
+                  "$ref": "cac.common.v1.schema.json#/$defs/quantity"
+                }
+              },
+              "type": "object"
+            },
+            "context_pack_manifest_hash": {
+              "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+            },
+            "context_pack_miss": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  },
+                  "requested_at": {
+                    "$ref": "cac.common.v1.schema.json#/$defs/timestamp"
+                  },
+                  "stable_id": {
+                    "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+                  },
+                  "tool": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "stable_id"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "context_pack_sufficiency": {
+              "additionalProperties": false,
+              "properties": {
+                "sufficient": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "sufficient"
+              ],
+              "type": "object"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "stage": {
+              "enum": [
+                "plan",
+                "implement",
+                "review",
+                "ops"
+              ],
+              "type": "string"
+            },
+            "target_profile_id": {
+              "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+            },
+            "work_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "work_id",
+            "context_pack_manifest_hash",
+            "target_profile_id",
+            "context_pack_sufficiency"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.run_receipt.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC RunReceipt v1"
+}

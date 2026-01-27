@@ -1,0 +1,35 @@
+{
+  "kind": "budget.profile",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-01-26T00:00:00Z",
+    "dependencies": [],
+    "labels": [
+      "budget"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-KERNEL-GOVERNANCE",
+      "work_id": "work_example_budget"
+    },
+    "stable_id": "dcp://apm2.local/budgets/production_research@v1"
+  },
+  "payload": {
+    "budget_name": "production_research_v1",
+    "limits": {
+      "time_ms": {
+        "unit": "ms",
+        "value_i64": 900000
+      },
+      "tokens": {
+        "unit": "tokens",
+        "value_i64": 500000
+      },
+      "tool_calls": {
+        "unit": "count",
+        "value_i64": 200
+      }
+    }
+  },
+  "schema": "cac.budget_profile.v1",
+  "schema_version": "1.0.0"
+}

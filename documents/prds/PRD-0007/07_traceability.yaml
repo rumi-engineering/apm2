@@ -1,0 +1,166 @@
+prd_traceability:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  requirement_registry:
+    mode: "FILE_PER_REQUIREMENT"
+    local_root: "requirements/"
+    local_requirements:
+      - requirement_id: "REQ-0001"
+        requirement_ref: "requirements/REQ-0001.yaml#prd_requirement"
+      - requirement_id: "REQ-0002"
+        requirement_ref: "requirements/REQ-0002.yaml#prd_requirement"
+      - requirement_id: "REQ-0003"
+        requirement_ref: "requirements/REQ-0003.yaml#prd_requirement"
+      - requirement_id: "REQ-0004"
+        requirement_ref: "requirements/REQ-0004.yaml#prd_requirement"
+      - requirement_id: "REQ-0005"
+        requirement_ref: "requirements/REQ-0005.yaml#prd_requirement"
+      - requirement_id: "REQ-0006"
+        requirement_ref: "requirements/REQ-0006.yaml#prd_requirement"
+      - requirement_id: "REQ-0007"
+        requirement_ref: "requirements/REQ-0007.yaml#prd_requirement"
+      - requirement_id: "REQ-0008"
+        requirement_ref: "requirements/REQ-0008.yaml#prd_requirement"
+      - requirement_id: "REQ-0009"
+        requirement_ref: "requirements/REQ-0009.yaml#prd_requirement"
+      - requirement_id: "REQ-0010"
+        requirement_ref: "requirements/REQ-0010.yaml#prd_requirement"
+      - requirement_id: "REQ-0011"
+        requirement_ref: "requirements/REQ-0011.yaml#prd_requirement"
+      - requirement_id: "REQ-0012"
+        requirement_ref: "requirements/REQ-0012.yaml#prd_requirement"
+      - requirement_id: "REQ-0013"
+        requirement_ref: "requirements/REQ-0013.yaml#prd_requirement"
+      - requirement_id: "REQ-0014"
+        requirement_ref: "requirements/REQ-0014.yaml#prd_requirement"
+      - requirement_id: "REQ-0015"
+        requirement_ref: "requirements/REQ-0015.yaml#prd_requirement"
+    imports: []
+  mapping:
+    requirement_to_sections:
+      - requirement_id: "REQ-0001"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.CAC-CANON"
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.CAC-VALID"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints.CNS-0001"
+      - requirement_id: "REQ-0002"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.CAC-PATCH"
+          - "04_solution_overview.yaml#prd_solution_overview.pipeline.stages.CAC-STAGE-01"
+          - "04_solution_overview.yaml#prd_solution_overview.pipeline.stages.CAC-STAGE-02"
+          - "04_solution_overview.yaml#prd_solution_overview.pipeline.stages.CAC-STAGE-03"
+      - requirement_id: "REQ-0003"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.pipeline.stages.CAC-STAGE-08"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.invariants.INV-0003"
+      - requirement_id: "REQ-0004"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.pipeline.stages.CAC-STAGE-01"
+          - "01_customer.yaml#prd_customer.user_journeys.UJ-0001"
+      - requirement_id: "REQ-0005"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.pipeline.stages.CAC-STAGE-06"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.invariants.INV-0004"
+      - requirement_id: "REQ-0006"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.system_model.core_components.COMP-KERNEL"
+      - requirement_id: "REQ-0007"
+        section_refs:
+          - "05_success_metrics.yaml#prd_success_metrics.metrics"
+      - requirement_id: "REQ-0008"
+        section_refs:
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints.CNS-0002"
+          - "04_solution_overview.yaml#prd_solution_overview.artifact_kinds"
+      - requirement_id: "REQ-0009"
+        section_refs:
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.security_controls.SEC-CTRL-0009"
+          - "04_solution_overview.yaml#prd_solution_overview.artifact_kinds.kinds.canonicalizer.vectors"
+      - requirement_id: "REQ-0010"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.CAC-BOOTSTRAP"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints.CNS-0006"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.security_controls.SEC-CTRL-0008"
+      - requirement_id: "REQ-0011"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.interfaces.external_apis.ArtifactFetch"
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.CAC-DCP"
+      - requirement_id: "REQ-0012"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.CAC-COMPILER"
+          - "04_solution_overview.yaml#prd_solution_overview.pipeline.stages.CAC-STAGE-05"
+      - requirement_id: "REQ-0013"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.pipeline.stages.CAC-STAGE-06"
+      - requirement_id: "REQ-0014"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.key_components.CAC-AAT"
+          - "04_solution_overview.yaml#prd_solution_overview.pipeline.stages.CAC-STAGE-07"
+      - requirement_id: "REQ-0015"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.pipeline.stages.CAC-STAGE-08"
+  source_mapping:
+    goal_to_requirement:
+      - source_goal_id: "CAC-G-0001"
+        requirement_ids:
+          - "REQ-0001"
+      - source_goal_id: "CAC-G-0002"
+        requirement_ids:
+          - "REQ-0002"
+      - source_goal_id: "CAC-G-0003"
+        requirement_ids:
+          - "REQ-0003"
+      - source_goal_id: "CAC-G-0004"
+        requirement_ids:
+          - "REQ-0004"
+      - source_goal_id: "CAC-G-0005"
+        requirement_ids:
+          - "REQ-0005"
+      - source_goal_id: "CAC-G-0006"
+        requirement_ids:
+          - "REQ-0006"
+      - source_goal_id: "CAC-G-0007"
+        requirement_ids:
+          - "REQ-0007"
+      - source_goal_id: "CAC-G-0008"
+        requirement_ids:
+          - "REQ-0008"
+      - source_goal_id: "CAC-G-0009"
+        requirement_ids:
+          - "REQ-0009"
+    acceptance_test_to_evidence:
+      - source_test_id: "CAC-AT-0001"
+        evidence_ids:
+          - "EVID-0001"
+      - source_test_id: "CAC-AT-0002"
+        evidence_ids:
+          - "EVID-0002"
+      - source_test_id: "CAC-AT-0003"
+        evidence_ids:
+          - "EVID-0003"
+      - source_test_id: "CAC-AT-0004"
+        evidence_ids:
+          - "EVID-0004"
+      - source_test_id: "CAC-AT-0005"
+        evidence_ids:
+          - "EVID-0005"
+      - source_test_id: "CAC-AT-0006"
+        evidence_ids:
+          - "EVID-0006"
+      - source_test_id: "CAC-AT-0007"
+        evidence_ids:
+          - "EVID-0007"
+      - source_test_id: "CAC-AT-0008"
+        evidence_ids:
+          - "EVID-0008"
+      - source_test_id: "CAC-AT-0009"
+        evidence_ids:
+          - "EVID-0009"
+      - source_test_id: "CAC-AT-0010"
+        evidence_ids:
+          - "EVID-0010"
+      - source_test_id: "CAC-AT-0011"
+        evidence_ids:
+          - "EVID-0011"
+      - source_test_id: "CAC-AT-0012"
+        evidence_ids:
+          - "EVID-0012"

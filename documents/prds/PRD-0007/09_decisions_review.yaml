@@ -1,0 +1,86 @@
+prd_decisions_review:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  decisions:
+    - id: DEC-0001
+      statement: |
+        Selected Design: JSON-First CAC with Ledger-Native DCP Projection and
+        Deterministic Fetch (CAC-DESIGN-A + CAC-DESIGN-C combined).
+      rationale: |
+        MVP must ship quickly and integrate with existing APM2 evidence/ledger patterns.
+        Ledger-native projections preserve auditability and prevent split-brain sources
+        of truth. Typed proto events are valuable but introduce coordination and migration
+        costs; deferred until CAC artifacts and workflows stabilize.
+      alternatives_considered:
+        - id: CAC-DESIGN-A
+          description: JSON-First CAC with metadata-only kernel integration.
+          status: SELECTED_PRIMARY
+        - id: CAC-DESIGN-B
+          description: Proto-native control artifacts with typed kernel events.
+          status: DEFERRED
+          reason: Coordination and migration costs outweigh immediate benefits.
+        - id: CAC-DESIGN-C
+          description: Ledger-native DCP projection with deterministic fetch surface.
+          status: SELECTED_PRIMARY
+      evidence_ids: []
+    - id: DEC-0002
+      statement: |
+        ArtifactFetch is a P0 requirement for deterministic stable-ID fetch surface.
+      rationale: |
+        Hermetic consumption requires a deterministic read surface that policy can
+        enforce. Without ArtifactFetch, consumption holons cannot be isolated from
+        discretionary context discovery.
+      alternatives_considered:
+        - id: ALT-FILE-READ
+          description: Use FileRead with stable-ID to path mapping.
+          status: REJECTED
+          reason: FileRead does not provide hash verification or policy enforcement.
+      evidence_ids: []
+    - id: DEC-0003
+      statement: |
+        Fail-closed validation and canonicalization prior to admission is P0.
+      rationale: |
+        Security properties depend on all normative artifacts being validated and
+        canonical. Permissive admission would undermine the entire system.
+      alternatives_considered:
+        - id: ALT-WARN-ONLY
+          description: Warn on validation failures but admit artifacts.
+          status: REJECTED
+          reason: Would allow invalid artifacts to influence execution.
+      evidence_ids: []
+    - id: DEC-0004
+      statement: |
+        Consumption hermeticity with defect emission for unplanned reads is P0.
+      rationale: |
+        The closed-loop improvement system depends on capturing pack misses as defects.
+        Without hermeticity, packs cannot be systematically improved.
+      alternatives_considered:
+        - id: ALT-SOFT-ENFORCEMENT
+          description: Log but allow unplanned reads.
+          status: REJECTED
+          reason: Would not drive pack compiler improvements; breaks determinism.
+      evidence_ids: []
+    - id: DEC-0005
+      statement: |
+        Use EvidencePublished events with metadata for MVP control plane signaling.
+      rationale: |
+        Avoids proto changes for MVP. Existing evidence infrastructure is sufficient.
+        Typed events can be added post-MVP if queryability demands it.
+      alternatives_considered:
+        - id: ALT-TYPED-EVENTS
+          description: Add ControlArtifactEvent family to kernel proto.
+          status: DEFERRED
+          reason: Proto evolution coordination; defer until artifacts stabilize.
+      evidence_ids: []
+  gate_reviews:
+    - gate_id: GATE-PRD-SECURITY
+      status: PENDING
+      evidence_ids: []
+    - gate_id: GATE-PRD-PRODUCT
+      status: PENDING
+      evidence_ids: []
+  waivers: []
+  future_upgrade_path:
+    - Introduce typed ControlArtifactEvent when queryability and policy enforcement demand it.
+    - Generate typed events from existing EvidencePublished metadata to preserve continuity.
+    - Optionally move schema definitions to proto once the artifact set stabilizes.

@@ -1,0 +1,61 @@
+{
+  "$id": "cac.canonicalizer_vectors.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "canonicalizer.vectors"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "canonicalizer_id": {
+              "type": "string"
+            },
+            "canonicalizer_version": {
+              "type": "string"
+            },
+            "vectors": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "canonical_json": {
+                    "type": "string"
+                  },
+                  "expected_hash": {
+                    "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+                  },
+                  "input_json": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "input_json",
+                  "canonical_json",
+                  "expected_hash"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "vectors"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.canonicalizer_vectors.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC CanonicalizerVectors v1"
+}

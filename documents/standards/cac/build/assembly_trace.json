@@ -1,0 +1,98 @@
+{
+  "assembly_rules": [
+    "Start with 00_doc_meta.json as base.",
+    "Merge subsequent fragments by top-level keys (shallow merge for dicts).",
+    "Attach design_selection and parallel_designs references.",
+    "Generate volumes as structured subsets of master sections."
+  ],
+  "generated_at": "2026-01-26",
+  "inputs": {
+    "fragment_files": [
+      "workspace/fragments/00_doc_meta.json",
+      "workspace/fragments/01_summary.json",
+      "workspace/fragments/02_problem.json",
+      "workspace/fragments/03_goals.json",
+      "workspace/fragments/04_principles.json",
+      "workspace/fragments/05_system_model.json",
+      "workspace/fragments/06_format_policy.json",
+      "workspace/fragments/07_artifact_kinds.json",
+      "workspace/fragments/08_schema_registry.json",
+      "workspace/fragments/09_pipeline.json",
+      "workspace/fragments/10_messaging_integration.json",
+      "workspace/fragments/11_security.json",
+      "workspace/fragments/12_implementation.json",
+      "workspace/fragments/13_testing_rollout_metrics.json",
+      "workspace/fragments/14_risks_open_questions.json",
+      "workspace/fragments/15_definition_of_done.json",
+      "workspace/fragments/16_references.json"
+    ],
+    "fragments_dir": "workspace/fragments",
+    "parallel_design_inputs": [
+      "parallel/option_A.json",
+      "parallel/option_B.json",
+      "parallel/option_C.json",
+      "build/merge_rationale.json"
+    ]
+  },
+  "outputs": {
+    "examples": [
+      "examples/aat_receipt.example.json",
+      "examples/admission_receipt.example.json",
+      "examples/budget_profile.example.json",
+      "examples/capabilities_manifest.example.json",
+      "examples/context_pack_manifest.example.json",
+      "examples/context_pack_spec.example.json",
+      "examples/defect_record.example.json",
+      "examples/export_manifest.example.json",
+      "examples/holon_contract.example.json",
+      "examples/patch_record_stream.example.jsonl",
+      "examples/policy_profile.example.json",
+      "examples/schema_definition.example.json",
+      "examples/skill_spec.example.json",
+      "examples/vendor_profile_claude_code.example.json",
+      "examples/target_profile.example.json",
+      "examples/changeset_report.example.json",
+      "examples/run_receipt.example.json",
+      "examples/canonicalizer_vectors.example.json"
+    ],
+    "master_prd": "MASTER.json",
+    "schemas": [
+      "schemas/apm2.prd.cac.v1.schema.json",
+      "schemas/apm2.prd.volume.v1.schema.json",
+      "schemas/cac.aat_receipt.v1.schema.json",
+      "schemas/cac.admission_receipt.v1.schema.json",
+      "schemas/cac.artifact.envelope.v1.schema.json",
+      "schemas/cac.budget_profile.v1.schema.json",
+      "schemas/cac.capabilities_manifest.v1.schema.json",
+      "schemas/cac.common.v1.schema.json",
+      "schemas/cac.context_pack_manifest.v1.schema.json",
+      "schemas/cac.context_pack_spec.v1.schema.json",
+      "schemas/cac.defect_record.v1.schema.json",
+      "schemas/cac.export_manifest.v1.schema.json",
+      "schemas/cac.holon_contract.v1.schema.json",
+      "schemas/cac.patch_record.v1.schema.json",
+      "schemas/cac.policy_profile.v1.schema.json",
+      "schemas/cac.schema_definition.v1.schema.json",
+      "schemas/cac.skill_spec.v1.schema.json",
+      "schemas/cac.vendor_profile.v1.schema.json",
+      "schemas/cac.target_profile.v1.schema.json",
+      "schemas/cac.changeset_report.v1.schema.json",
+      "schemas/cac.run_receipt.v1.schema.json",
+      "schemas/cac.canonicalizer_vectors.v1.schema.json"
+    ],
+    "volumes": [
+      "volumes/V00_Executive_Summary_Problem_Goals_Principles.json",
+      "volumes/V01_System_Model.json",
+      "volumes/V02_Formats_Canonicalization_Artifact_Kinds_Schema_Registry.json",
+      "volumes/V03_End-to-End_Pipeline.json",
+      "volumes/V04_Messaging_Integration.json",
+      "volumes/V05_Security_and_Integrity.json",
+      "volumes/V06_Implementation_Plan.json",
+      "volumes/V07_Testing_Rollout_and_Metrics.json",
+      "volumes/V08_Parallel_Designs_and_Selection.json",
+      "volumes/V09_Risks_Open_Questions_Definition_of_Done_References.json"
+    ]
+  },
+  "schema": "apm2.build.assembly_trace.v1",
+  "schema_version": "1.0.0"
+}

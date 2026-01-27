@@ -1,0 +1,62 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0015"
+  category: "TEST_RESULTS"
+  title: "Escalation policy governance verification"
+  description: |
+    Verifies the escalation mechanism for pack misses is properly governed:
+    authority roles are enforced, escalations are bounded by TTL, audit events
+    are emitted, and escalation counts feed back into pack improvement.
+  source_acceptance_test: CAC-AT-0015
+  capture:
+    paths:
+      - "test/cac/escalation/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --package apm2-cac -- escalation::policy"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 60
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "EscalationPolicy schema deployed"
+          - "Audit event types registered"
+      - id: "CMD-0002"
+        shell: "bash"
+        command: "cargo test --package apm2-cac -- escalation::ttl_enforcement"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 60
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "TTL enforcement logic deployed"
+  assertions:
+    - "Escalation requires authorized role (AUTH_OPS or AUTH_PRODUCT)"
+    - "Escalation TTL is bounded (max 24 hours without re-authorization)"
+    - "Escalation events are recorded in ledger with full context"
+    - "Escalation count metrics trigger PACK_SPEC_REVIEW_NEEDED at threshold"
+  escalation_policy_spec:
+    authority_roles:
+      - "AUTH_OPS"
+      - "AUTH_PRODUCT"
+    escalation_criteria:
+      - "Pack miss is blocking critical path work item"
+      - "Remediation via pack update not feasible within SLA"
+      - "Risk assessment completed and documented"
+    escalation_ttl_max: "24h"
+    audit_event_type: "EscalationGranted"
+    escalation_count_metric: "escalation_count_by_stable_id"
+    feedback_threshold:
+      count: 3
+      window: "7d"
+      action: "PACK_SPEC_REVIEW_NEEDED"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

@@ -1,0 +1,101 @@
+{
+  "engineering_goals": [
+    {
+      "id": "CAC-G-0001",
+      "name": "Canonical context substrate (CAC-JSON)",
+      "success_criteria": [
+        "All normative control artifacts are stored as CAC-JSON and canonicalized to stable bytes prior to admission.",
+        "Artifacts validate against versioned schemas with fail-closed behavior (unknown fields rejected).",
+        "Artifacts are addressable by stable IDs and immutable content hashes (CAS)."
+      ]
+    },
+    {
+      "id": "CAC-G-0002",
+      "name": "Patch-first machine authoring",
+      "success_criteria": [
+        "Machines produce patch streams (JSON Patch / Merge Patch) rather than whole-document rewrites.",
+        "Admission enforces replay protection via expected base hash.",
+        "Every accepted patch produces an admission receipt (evidence) and emits ledger provenance."
+      ]
+    },
+    {
+      "id": "CAC-G-0003",
+      "name": "Hermetic consumption with deterministic reads",
+      "success_criteria": [
+        "Consumption holons can complete tasks using only preauthorized stable-ID fetches plus actuation tools.",
+        "Discretionary context discovery during consumption is denied and/or defect-emitting by policy.",
+        "ContextPack manifests include transitive dependency closure (deep pinning).",
+        "Run receipts capture context_pack_miss and context_pack_sufficiency; misses gate consumption unless explicitly escalated."
+      ]
+    },
+    {
+      "id": "CAC-G-0004",
+      "name": "Bounded context production with replayable evidence",
+      "success_criteria": [
+        "Production holons operate under explicit leases/budgets and publish replayable evidence (snapshots, extraction logs, diffs).",
+        "Tool calls are classified as planned/unplanned and feed defect signals into pack compiler improvement.",
+        "Admissions include a ChangeSet report to summarize semantic deltas and enable compaction."
+      ]
+    },
+    {
+      "id": "CAC-G-0005",
+      "name": "Target interoperability without drift",
+      "success_criteria": [
+        "Target profiles define rendering, retrieval, and delivery constraints independent of model intelligence.",
+        "Target payloads (vendor layouts, model IRs) are compiled deterministically from CAC sources and never treated as normative.",
+        "Export manifests provide provenance and are verified by conformance tests."
+      ]
+    },
+    {
+      "id": "CAC-G-0006",
+      "name": "Messaging-native control plane compatibility",
+      "success_criteria": [
+        "CAC actions (admission, compilation, export, selftest) are reflected in kernel messages (ledger events) with hash references.",
+        "Holons can negotiate capabilities and retrieve required context via stable IDs referenced in messages."
+      ]
+    },
+    {
+      "id": "CAC-G-0007",
+      "name": "Measurable throughput and quality gains",
+      "success_criteria": [
+        "Unplanned tool calls in consumption mode trend toward zero.",
+        "PR cycle time and defect recurrence improve after adoption.",
+        "AAT receipts gate critical operations with high pass rates."
+      ]
+    },
+    {
+      "id": "CAC-G-0008",
+      "name": "Typed quantities and context budgets",
+      "success_criteria": [
+        "Budgets, timeouts, costs, and probabilities are expressed as typed quantities with explicit units.",
+        "ContextPack compilation and validation reject packs exceeding token/artifact/byte budgets."
+      ]
+    },
+    {
+      "id": "CAC-G-0009",
+      "name": "Canonicalizer governance",
+      "success_criteria": [
+        "Canonicalizer id/version are recorded in envelopes and receipts for all normative artifacts.",
+        "Canonicalization test vectors are governed artifacts pinned in the bootstrap bundle."
+      ]
+    }
+  ],
+  "non_goals": [
+    {
+      "id": "CAC-NG-0001",
+      "statement": "Humans authoring normative context artifacts."
+    },
+    {
+      "id": "CAC-NG-0002",
+      "statement": "Using token-optimized formats (e.g., TOON) as normative storage."
+    },
+    {
+      "id": "CAC-NG-0003",
+      "statement": "Replacing all existing kernel Protobuf schemas in this phase."
+    },
+    {
+      "id": "CAC-NG-0004",
+      "statement": "Building a universal cross-vendor standard; we compile to target profiles and delivery payloads instead."
+    }
+  ]
+}

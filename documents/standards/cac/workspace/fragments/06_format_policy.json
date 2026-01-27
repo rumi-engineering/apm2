@@ -1,0 +1,127 @@
+{
+  "format_policy": {
+    "artifact_hashing_policy": {
+      "algorithm": "BLAKE3-256",
+      "hash_id_format": "b3-256:<hex>",
+      "note": "Align with existing APM2 Evidence/CAS hashing to keep the stack coherent."
+    },
+    "typed_quantities": {
+      "note": "All budgets, timeouts, costs, and probabilities must use typed quantities with explicit units to avoid ad hoc string formats.",
+      "schema_ref": "cac.common.v1#/$defs/quantity",
+      "unit_rules": [
+        "Units must be explicit (e.g., ms, bytes, tokens, count, percent, usd).",
+        "Values are integers; scaling is expressed via the scale field.",
+        "Probabilities are represented as scaled integers (e.g., percent or ppm)."
+      ]
+    },
+    "canonicalizer_metadata": {
+      "required_fields": [
+        "canonicalizer_id",
+        "canonicalizer_version",
+        "vectors_ref"
+      ],
+      "rule": "Every normative artifact envelope and receipt must record the canonicalizer id/version and reference the governed test-vector artifact."
+    },
+    "derived_formats": [
+      {
+        "id": "FMT-TOON",
+        "name": "TOON",
+        "policy": "Derived-only; never normative",
+        "required_invariants": [
+          "Must be derivable deterministically from canonical IR.",
+          "Must have a defined reverse mapping back to canonical IR OR be explicitly declared one-way."
+        ],
+        "role": "Optional derived prompt-pack encoding for LLM consumption",
+        "selection_heuristics": [
+          "Prefer TOON for large, repetitive tabular arrays or repeated keys where token savings are material.",
+          "Prefer compact JSON for deep, irregular, or highly nested structures."
+        ]
+      },
+      {
+        "id": "FMT-MARKDOWN",
+        "name": "Markdown (Vendor ABI)",
+        "notes": [
+          "Generated Markdown should embed provenance metadata in frontmatter where the vendor allows.",
+          "Direct edits to generated trees are rejected by CI unless routed through an import pipeline."
+        ],
+        "policy": "Derived-only; never normative",
+        "role": "Vendor-required human-readable interface"
+      }
+    ],
+    "normative_formats": [
+      {
+        "canonicalization": {
+          "id": "CANON-JCS",
+          "name": "JSON Canonicalization Scheme (JCS-like)",
+          "note": "Adopt RFC 8785 JCS where feasible; if deviating, publish explicit test vectors as governed artifacts and treat the canonicalizer as a versioned component.",
+          "requirements": [
+            "Deterministic object member ordering.",
+            "Deterministic number rendering (for allowed integers: minimal decimal form).",
+            "Deterministic string escaping.",
+            "No insignificant whitespace (canonical bytes)."
+          ]
+        },
+        "constraints": {
+          "arrays": {
+            "max_length": 100000
+          },
+          "duplicate_keys": "FORBIDDEN",
+          "encoding": "UTF-8",
+          "json_standard": "RFC 8259-compatible",
+          "max_depth": 128,
+          "numbers": {
+            "notes": [
+              "Avoid float parsing ambiguity across implementations.",
+              "If non-integer values are required, represent them as strings with an explicit unit/type."
+            ],
+            "policy": "integers_only",
+            "range": "signed_64_bit"
+          },
+          "objects": {
+            "max_members": 100000,
+            "member_name_constraints": {
+              "notes": [
+                "Keep member names stable and tool-friendly; avoid whitespace."
+              ],
+              "pattern": "^[A-Za-z0-9_./:-]{1,256}$"
+            }
+          },
+          "strings": {
+            "max_bytes": 1048576,
+            "normalization": "NFC recommended"
+          }
+        },
+        "id": "FMT-CAC-JSON",
+        "name": "CAC-JSON",
+        "role": "Sole normative representation for control artifacts"
+      },
+      {
+        "constraints": {
+          "encoding": "UTF-8",
+          "max_line_bytes": 10485760,
+          "newline_rule": "Each record terminates with \\n; no embedded newlines unless escaped within JSON strings.",
+          "record_rule": "Each line is a complete JSON value."
+        },
+        "id": "FMT-JSONL",
+        "name": "JSON Lines (JSONL)",
+        "role": "Append-only record streams (patch streams, receipts, defect streams)"
+      }
+    ],
+    "patch_authoring_policy": {
+      "allowed_patch_kinds": [
+        "json_patch_rfc6902",
+        "json_merge_patch_rfc7396"
+      ],
+      "default_patch_kind": "json_patch_rfc6902",
+      "replay_protection": {
+        "mechanism": "PatchRecord must include expected_base_hash; admission rejects mismatches.",
+        "required": true
+      },
+      "whole_document_rewrite_policy": {
+        "allowed": "discouraged",
+        "reason": "Large rewrites increase review cost and reduce cache/utilization benefits.",
+        "rule": "If a patch replaces >X% of nodes, system emits a warning or requires explicit justification code."
+      }
+    }
+  }
+}

@@ -1,0 +1,84 @@
+prd_goals_scope:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  goals:
+    - id: CAC-G-0001
+      statement: Canonical context substrate (CAC-JSON) - All normative control artifacts are stored, validated, and canonicalized as CAC-JSON.
+      measurable_outcomes:
+        - All normative control artifacts are stored as CAC-JSON and canonicalized to stable bytes prior to admission.
+        - Artifacts validate against versioned schemas with fail-closed behavior (unknown fields rejected).
+        - Artifacts are addressable by stable IDs and immutable content hashes (CAS).
+    - id: CAC-G-0002
+      statement: Patch-first machine authoring - Machines produce typed patch streams with replay protection and admission receipts.
+      measurable_outcomes:
+        - Machines produce patch streams (JSON Patch / Merge Patch) rather than whole-document rewrites.
+        - Admission enforces replay protection via expected base hash.
+        - Every accepted patch produces an admission receipt (evidence) and emits ledger provenance.
+    - id: CAC-G-0003
+      statement: Hermetic consumption with deterministic reads - Consumption holons operate without discretionary context discovery.
+      measurable_outcomes:
+        - Consumption holons can complete tasks using only preauthorized stable-ID fetches plus actuation tools.
+        - Discretionary context discovery during consumption is denied and/or defect-emitting by policy.
+        - ContextPack manifests include transitive dependency closure (deep pinning).
+        - Run receipts capture context_pack_miss and context_pack_sufficiency; misses gate consumption unless explicitly escalated.
+    - id: CAC-G-0004
+      statement: Bounded context production with replayable evidence - Production holons operate under explicit budgets with replayable outputs.
+      measurable_outcomes:
+        - Production holons operate under explicit leases/budgets and publish replayable evidence (snapshots, extraction logs, diffs).
+        - Tool calls are classified as planned/unplanned and feed defect signals into pack compiler improvement.
+        - Admissions include a ChangeSet report to summarize semantic deltas and enable compaction.
+    - id: CAC-G-0005
+      statement: Target interoperability without drift - Target profiles govern compilation to vendor payloads without making those payloads normative.
+      measurable_outcomes:
+        - Target profiles define rendering, retrieval, and delivery constraints independent of model intelligence.
+        - Target payloads (vendor layouts, model IRs) are compiled deterministically from CAC sources and never treated as normative.
+        - Export manifests provide provenance and are verified by conformance tests.
+    - id: CAC-G-0006
+      statement: Messaging-native control plane compatibility - CAC actions are reflected in kernel messages with hash references.
+      measurable_outcomes:
+        - CAC actions (admission, compilation, export, selftest) are reflected in kernel messages (ledger events) with hash references.
+        - Holons can negotiate capabilities and retrieve required context via stable IDs referenced in messages.
+    - id: CAC-G-0007
+      statement: Measurable throughput and quality gains - System improvements are tracked via leading and lagging metrics.
+      measurable_outcomes:
+        - Unplanned tool calls in consumption mode trend toward zero.
+        - PR cycle time and defect recurrence improve after adoption.
+        - AAT receipts gate critical operations with high pass rates.
+    - id: CAC-G-0008
+      statement: Typed quantities and context budgets - All budgets, timeouts, and costs use typed quantities with explicit units.
+      measurable_outcomes:
+        - Budgets, timeouts, costs, and probabilities are expressed as typed quantities with explicit units.
+        - ContextPack compilation and validation reject packs exceeding token/artifact/byte budgets.
+    - id: CAC-G-0009
+      statement: Canonicalizer governance - Canonicalization is versioned, tested, and recorded in all normative artifacts.
+      measurable_outcomes:
+        - Canonicalizer id/version are recorded in envelopes and receipts for all normative artifacts.
+        - Canonicalization test vectors are governed artifacts pinned in the bootstrap bundle.
+  scope:
+    in_scope:
+      - "CAC-JSON profile with strict canonicalization (JCS-like) and integer-only numbers."
+      - "Bootstrap schema bundle embedded and hash-pinned in the apm2 binary."
+      - "Patch admission pipeline (apply-patch) with replay protection and admission receipts."
+      - "DCP stable-ID resolution index as a projection over ledger events."
+      - "ArtifactFetch tool protocol extension for deterministic reads."
+      - "ContextPack spec and compiler producing deep-pinned manifests."
+      - "TargetProfile schema and compiler integration."
+      - "CapabilityManifest generator and selftest receipt pipeline (AAT)."
+      - "Target delivery pipeline with export manifest and conformance tests."
+      - "ChangeSetReport emission for patch admissions."
+      - "RunReceipt emission for consumption runs."
+      - "Defect records for unplanned consumption reads/tool calls."
+    out_of_scope:
+      - "Two-way import of vendor Markdown into CAC (optional future)."
+      - "Full defect triage UI; defects can be emitted as structured records/events."
+      - "Optional typed kernel events (ControlArtifactEvent) - deferred post-MVP."
+      - "Hybrid/PQ signature support for critical receipts/events - future enhancement."
+      - "Richer semantic diff tooling for patch review at scale - post-MVP."
+  success_criteria_summary:
+    - All normative context artifacts are CAC-JSON, schema-validated, and canonicalized.
+    - Bootstrap schema bundle verifies at startup and is immutable via patch admission.
+    - Consumption holons complete tasks without discretionary context discovery.
+    - ContextPack manifests are deep-pinned and self-contained.
+    - Capability manifests match reality (selftested) and gate agent planning.
+    - Target delivery is deterministic and CI-enforced as derived output.
+    - Unplanned tool calls in consumption mode trend toward zero.

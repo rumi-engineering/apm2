@@ -1,0 +1,34 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0010"
+  category: "TEST_RESULTS"
+  title: "Deep pinning closure tests"
+  description: |
+    Tests verifying transitive dependency closure in ContextPack compilation:
+    all dependencies are included in manifests, consumption does not require
+    additional discretionary reads.
+  source_acceptance_test: CAC-AT-0010
+  capture:
+    paths:
+      - "test/cac/pack_closure/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --package apm2-cac -- pack::deep_pinning"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 180
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "DCP index available for dependency resolution"
+  assertions:
+    - "Transitive dependencies are included in ContextPack manifests"
+    - "Consumption does not require additional discretionary reads"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

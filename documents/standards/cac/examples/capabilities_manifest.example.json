@@ -1,0 +1,108 @@
+{
+  "kind": "capabilities.manifest",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-01-26T00:00:00Z",
+    "dependencies": [],
+    "labels": [
+      "capabilities",
+      "aat"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-AAT",
+      "work_id": "work_example_005"
+    },
+    "stable_id": "dcp://apm2.local/capabilities/apm2_cli@2026-01-26"
+  },
+  "payload": {
+    "apm2_version": "0.2.0-dev",
+    "build_id": "git:deadbeef",
+    "command_inventory": [
+      {
+        "args": [
+          "cac",
+          "apply-patch"
+        ],
+        "argv0": "apm2",
+        "command": "apm2 cac apply-patch",
+        "exit_codes": [
+          0,
+          1
+        ],
+        "inputs": [
+          "jsonl"
+        ],
+        "outputs": [
+          "admission_receipt_json"
+        ]
+      },
+      {
+        "args": [
+          "pack",
+          "compile"
+        ],
+        "argv0": "apm2",
+        "command": "apm2 pack compile",
+        "exit_codes": [
+          0,
+          1
+        ],
+        "inputs": [
+          "context_pack_spec_json"
+        ],
+        "outputs": [
+          "context_pack_manifest_json"
+        ]
+      },
+      {
+        "args": [
+          "export"
+        ],
+        "argv0": "apm2",
+        "command": "apm2 export",
+        "exit_codes": [
+          0,
+          1
+        ],
+        "inputs": [
+          "target_profile_json"
+        ],
+        "outputs": [
+          "export_manifest_json"
+        ]
+      },
+      {
+        "args": [
+          "selftest"
+        ],
+        "argv0": "apm2",
+        "command": "apm2 selftest",
+        "exit_codes": [
+          0,
+          1
+        ],
+        "inputs": [],
+        "outputs": [
+          "aat_receipt_json"
+        ]
+      }
+    ],
+    "schemas_supported": [
+      "cac.skill_spec.v1",
+      "cac.context_pack_spec.v1",
+      "cac.target_profile.v1",
+      "cac.capabilities_manifest.v1",
+      "cac.canonicalizer_vectors.v1",
+      "cac.changeset_report.v1",
+      "cac.run_receipt.v1"
+    ],
+    "selftest_receipt_hash": "b3-256:f1dc33aab00b3c636cf38946d604201256dde986f1e470bebaaf4473314bb0f4",
+    "selftest_receipt_stable_id": "dcp://apm2.local/receipts/aat/apm2_cli@2026-01-26",
+    "target_profiles_supported": [
+      "dcp://apm2.local/targets/claude_code@v1"
+    ],
+    "tool_protocol_version": "0.1.0"
+  },
+  "schema": "cac.capabilities_manifest.v1",
+  "schema_version": "1.0.0"
+}

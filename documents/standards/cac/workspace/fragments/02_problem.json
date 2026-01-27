@@ -1,0 +1,75 @@
+{
+  "problem": {
+    "observed_failure_modes": [
+      {
+        "id": "CAC-FM-0001",
+        "impact": [
+          "agents mis-plan",
+          "reviewers miss implicit assumptions",
+          "system behavior diverges from declared behavior"
+        ],
+        "mechanism": "Normative requirements appear in Markdown/scripts without schema validation or canonicalization.",
+        "name": "Contract drift encoded in prose"
+      },
+      {
+        "id": "CAC-FM-0002",
+        "impact": [
+          "agents freeze mid-flight",
+          "manual debugging",
+          "slow iteration",
+          "loss of trust in automation"
+        ],
+        "mechanism": "CLI claims features via docs or flags but behavior is untested or partial.",
+        "name": "Capability ambiguity in the CLI"
+      },
+      {
+        "id": "CAC-FM-0003",
+        "impact": [
+          "non-determinism",
+          "leaky policies",
+          "hidden dependencies",
+          "repeat incidents"
+        ],
+        "mechanism": "Consumption holons perform discretionary reads/browsing because required context was not compiled into a pack.",
+        "name": "Unplanned tool calls during consumption"
+      },
+      {
+        "id": "CAC-FM-0004",
+        "impact": [
+          "irreproducible outputs",
+          "cannot audit",
+          "cannot improve pack compiler"
+        ],
+        "mechanism": "Context production uses tools without explicit leases/budgets and without publishing evidence snapshots.",
+        "name": "Non-replayable research behavior"
+      },
+      {
+        "id": "CAC-FM-0005",
+        "impact": [
+          "drift",
+          "unclear provenance",
+          "unsafe edits to generated artifacts"
+        ],
+        "mechanism": "External systems require Markdown + directory layouts; without a compiler, teams treat these outputs as source of truth.",
+        "name": "Vendor ABI requirements dominate internal design"
+      }
+    ],
+    "primary_bottleneck": {
+      "definition": "The cycle time and defect rate of the tight loop: change intent → code generation → review → merge → verification.",
+      "name": "Innermost loop throughput",
+      "why_context_blocks_it": [
+        "Agents spend time searching or asking for context that should have been pre-packaged.",
+        "Reviewers catch important bugs, but root cause is often missing or inconsistent context rather than coding mistakes.",
+        "CLI/xtask mismatch causes brittle workflows and manual intervention."
+      ]
+    },
+    "root_causes": [
+      "No normative representation for context (schema-validated, canonical, versioned).",
+      "No patch-first authoring pipeline with replay protection and evidence receipts.",
+      "No stable-ID deterministic read plane for consumption holons.",
+      "No capability truthing/selftest receipts gating agent plans.",
+      "No principled compiler boundary between internal context IR and vendor-required ABIs."
+    ],
+    "statement": "The system lacks a single, canonical, machine-validated source of truth for the context that governs planning, execution, review, and operation. This forces discretionary context discovery, increases drift, and blocks safe cutover to the APM2 CLI as the holonic control surface."
+  }
+}

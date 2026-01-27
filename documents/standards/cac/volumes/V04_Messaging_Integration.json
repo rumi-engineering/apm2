@@ -1,0 +1,174 @@
+{
+  "schema": "apm2.prd.volume.v1",
+  "schema_version": "1.0.0",
+  "sections": [
+    {
+      "content": {
+        "capability_negotiation": {
+          "mechanism": [
+            "Agent/holon obtains CapabilityManifest (stable_id) and verifies AATReceipt pinned hash.",
+            "Agent gates plan generation on declared capabilities and versions; if missing, it files a defect instead of probing."
+          ],
+          "required_fields_in_manifest": [
+            "apm2_version",
+            "command_inventory",
+            "schemas_supported",
+            "tool_protocol_version",
+            "selftest_receipt_ref",
+            "target_profiles_supported"
+          ]
+        },
+        "current_messaging_assets": {
+          "cas_hash": {
+            "algorithm": "BLAKE3-256",
+            "proto_representation": "bytes (32 bytes)"
+          },
+          "kernel_events_proto": {
+            "file": "proto/kernel_events.proto",
+            "notable_constraints": [
+              "Signed events over canonical bytes; maps forbidden; repeated fields must be sorted before signing."
+            ],
+            "package": "apm2.kernel.v1",
+            "relevant_event_families": [
+              "EvidenceEvent (EvidencePublished, GateReceiptGenerated)",
+              "PolicyEvent (PolicyLoaded, PolicyViolation, BudgetExceeded)",
+              "ToolEvent (ToolRequested, ToolDecided, ToolExecuted)",
+              "WorkEvent, SessionEvent, LeaseEvent, AdjudicationEvent"
+            ]
+          },
+          "tool_protocol_proto": {
+            "existing_tools": [
+              "FileRead, FileWrite, FileEdit",
+              "ShellExec",
+              "GitOperation",
+              "InferenceCall",
+              "ArtifactPublish"
+            ],
+            "file": "proto/tool_protocol.proto",
+            "gap": "No tool exists to fetch CAS/DCP artifacts by stable ID (required for hermetic consumption).",
+            "package": "apm2.tool.v1"
+          }
+        },
+        "mapping_strategy_v1": {
+          "evidence_categories": [
+            "CONTROL_ARTIFACT",
+            "SCHEMA_DEFINITION",
+            "CONTEXT_PACK",
+            "PROMPT_PACK",
+            "TARGET_PROFILE",
+            "VENDOR_EXPORT",
+            "CAPABILITY_MANIFEST",
+            "AAT_RECEIPT",
+            "ADMISSION_RECEIPT",
+            "CHANGESET_REPORT",
+            "RUN_RECEIPT",
+            "CANONICALIZER_VECTORS"
+          ],
+          "metadata_encoding": {
+            "format": "key=value strings (aligns with EvidencePublished.metadata)",
+            "rules": [
+              "Keys must be ASCII lowercase with underscores (e.g., dcp_id=...).",
+              "Values must be URL-escaped if they contain spaces or '='."
+            ]
+          },
+          "principle": "Use existing kernel event families (EvidencePublished + metadata) as the initial control-plane signal carrier; avoid proto changes for MVP unless necessary.",
+          "required_evidence_metadata_keys": [
+            "dcp_id",
+            "artifact_kind",
+            "schema_id",
+            "schema_hash",
+            "canonicalization",
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "target_profile_id"
+          ]
+        },
+        "optional_kernel_schema_extensions": [
+          {
+            "benefit": "Typed fields instead of metadata strings; easier querying and policy enforcement.",
+            "id": "CAC-MSG-OPT-0001",
+            "proposal": "Add ControlArtifactEvent family to apm2.kernel.v1.KernelEvent payload.",
+            "risk": "Proto evolution coordination; requires updating reducers and clients.",
+            "status": "optional_post_mvp"
+          }
+        ],
+        "required_protocol_extensions": [
+          {
+            "id": "CAC-MSG-REQ-0001",
+            "priority": "P0",
+            "proposal": {
+              "purpose": "Deterministic retrieval of context artifacts by stable ID or content hash.",
+              "request_fields": [
+                {
+                  "name": "stable_id",
+                  "required": false,
+                  "type": "string"
+                },
+                {
+                  "name": "content_hash",
+                  "required": false,
+                  "type": "bytes"
+                },
+                {
+                  "name": "expected_hash",
+                  "required": false,
+                  "type": "bytes"
+                },
+                {
+                  "name": "max_bytes",
+                  "required": true,
+                  "type": "uint64"
+                },
+                {
+                  "name": "format",
+                  "notes": [
+                    "raw_bytes",
+                    "utf8_text",
+                    "json_canonical"
+                  ],
+                  "required": true,
+                  "type": "string"
+                }
+              ],
+              "response_contract": [
+                "Returns result_hash and/or inline_result per ToolSuccess.",
+                "Policy enforces: only stable-ID allowlisted reads in consumption mode.",
+                "If expected_hash provided and mismatch occurs, return ToolError and emit PolicyViolation/Defect."
+              ],
+              "tool_name": "ArtifactFetch"
+            },
+            "target": "apm2.tool.v1.ToolRequest"
+          },
+          {
+            "id": "CAC-MSG-REQ-0002",
+            "priority": "P1",
+            "proposal": {
+              "purpose": "Resolve a stable_id to a pinned content hash and schema ref without fetching full content.",
+              "request_fields": [
+                {
+                  "name": "stable_id",
+                  "required": true,
+                  "type": "string"
+                }
+              ],
+              "response_contract": [
+                "Returns resolved_hash + schema_id + schema_hash as a small inline JSON payload.",
+                "Consumption-mode reads are still enforced; resolve itself is deterministic."
+              ],
+              "tool_name": "DcpResolve"
+            },
+            "target": "apm2.tool.v1.ToolRequest"
+          }
+        ]
+      },
+      "section_id": "MESSAGING",
+      "title": "Messaging Integration"
+    }
+  ],
+  "volume": {
+    "generated_at": "2026-01-26",
+    "source_prd_id": "APM2-PRD-CAC-0001",
+    "title": "Messaging Integration",
+    "volume_id": "V04"
+  }
+}

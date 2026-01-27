@@ -1,0 +1,39 @@
+{
+  "references": [
+    {
+      "id": "REF-JSON",
+      "title": "The JavaScript Object Notation (JSON) Data Interchange Format (RFC 8259)",
+      "url": "https://www.rfc-editor.org/rfc/rfc8259"
+    },
+    {
+      "id": "REF-JCS",
+      "title": "JSON Canonicalization Scheme (RFC 8785)",
+      "url": "https://www.rfc-editor.org/rfc/rfc8785"
+    },
+    {
+      "id": "REF-JSONPATCH",
+      "title": "JSON Patch (RFC 6902)",
+      "url": "https://www.rfc-editor.org/rfc/rfc6902"
+    },
+    {
+      "id": "REF-JSONMERGE",
+      "title": "JSON Merge Patch (RFC 7396)",
+      "url": "https://www.rfc-editor.org/rfc/rfc7396"
+    },
+    {
+      "id": "REF-JSONSCHEMA",
+      "title": "JSON Schema (2020-12)",
+      "url": "https://json-schema.org/draft/2020-12/json-schema-core.html"
+    },
+    {
+      "id": "REF-APM2-KERNEL",
+      "title": "APM2 Kernel Event Schema (repo)",
+      "url": "file:proto/kernel_events.proto"
+    },
+    {
+      "id": "REF-APM2-TOOL",
+      "title": "APM2 Tool Protocol Schema (repo)",
+      "url": "file:proto/tool_protocol.proto"
+    }
+  ]
+}

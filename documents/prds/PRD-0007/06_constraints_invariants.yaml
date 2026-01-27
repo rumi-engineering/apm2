@@ -1,0 +1,558 @@
+prd_constraints_invariants:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  constraints:
+    - id: CNS-0001
+      statement: CAC-JSON is the sole normative representation for control artifacts.
+      rationale: |
+        A single canonical format ensures deterministic parsing, validation, and hashing
+        across all implementations. Derived formats (TOON, Markdown) are never authoritative.
+      enforcement: Schema admission rejects non-CAC-JSON normative artifacts.
+      evidence_ids:
+        - EVID-0001
+    - id: CNS-0002
+      statement: JSON numbers are restricted to integers within signed 64-bit range.
+      rationale: |
+        Avoids float parsing ambiguity across implementations. Non-integer values are
+        represented as strings with explicit unit/type.
+      enforcement: Canonicalizer rejects floating-point numbers; validator enforces range.
+      evidence_ids:
+        - EVID-0001
+    - id: CNS-0003
+      statement: Maximum JSON depth is 128; maximum array length and object members are 100000.
+      rationale: DoS resistance and predictable memory usage during parsing and validation.
+      enforcement: Parser and validator enforce hard limits; violations rejected.
+      evidence_ids:
+        - EVID-0002
+    - id: CNS-0004
+      statement: Duplicate object keys are forbidden.
+      rationale: Ensures deterministic canonicalization and prevents ambiguous interpretation.
+      enforcement: Parser rejects documents with duplicate keys.
+      evidence_ids:
+        - EVID-0001
+    - id: CNS-0005
+      statement: |
+        String values MUST be UTF-8 encoded and NFC normalized. Canonicalizer MUST
+        reject artifacts containing non-NFC strings. All string comparisons MUST
+        normalize to NFC before comparison. NFD, NFKC, and NFKD representations
+        MUST be rejected.
+      rationale: |
+        Ensures consistent string comparison and hash stability. Prevents Unicode
+        normalization ambiguity attacks where semantically identical strings hash
+        differently due to normalization form variance.
+      enforcement: |
+        Canonicalizer validates NFC normalization during canonicalization.
+        Artifacts with non-NFC strings fail admission with UNICODE_NORMALIZATION_ERROR.
+      evidence_ids:
+        - EVID-0001
+    - id: CNS-0006
+      statement: Bootstrap schema bundle is immutable via the standard patch pipeline.
+      rationale: |
+        Bootstrap trust root must be stable and verifiable. Updates require binary release,
+        not runtime patches.
+      enforcement: Admission rejects patches targeting bootstrap stable IDs.
+      evidence_ids:
+        - EVID-0008
+      recovery_procedure:
+        description: |
+          Recovery path for bootstrap verification failure, addressing the deadlock scenario
+          where neither old nor new binary can operate due to ledger/bootstrap incompatibility.
+        bootstrap_safe_mode:
+          description: "Read-only diagnostic mode that bypasses bootstrap verification"
+          activation: "apm2 --bootstrap-safe-mode"
+          capabilities:
+            - "Read ledger events (read-only)"
+            - "Inspect bootstrap hash mismatch details"
+            - "Generate compatibility diagnostic report"
+          restrictions:
+            - "No admission operations"
+            - "No context compilation"
+            - "No consumption execution"
+        pre_upgrade_check:
+          description: "Ledger compatibility check before binary upgrade"
+          command: "apm2 upgrade --check-compatibility --target-version <version>"
+          outputs:
+            - "Compatibility verdict (COMPATIBLE, REQUIRES_MIGRATION, INCOMPATIBLE)"
+            - "Migration steps if needed"
+            - "Rollback safety assessment"
+        rollback_compatibility_matrix:
+          description: "Matrix of binary versions and their ledger compatibility"
+          location: "bootstrap/COMPATIBILITY_MATRIX.json"
+          fields:
+            - "binary_version"
+            - "min_compatible_ledger_version"
+            - "max_compatible_ledger_version"
+            - "migration_path_available"
+        emergency_override:
+          description: "Last-resort override for deadlock scenarios with cryptographic binding"
+          activation: "apm2 --emergency-override --signoff-1 <hash> --signoff-2 <hash> --signoff-3 <hash>"
+          requirements:
+            - "Triple-signoff from AUTH_SECURITY, AUTH_OPS, and AUTH_ENGINEERING"
+            - "Signoff hashes generated via offline signing ceremony"
+            - "Audit event emitted with full context"
+            - "Time-bounded (expires after 1 hour)"
+            - "24-hour cooldown period between emergency overrides"
+          ceremony_procedure:
+            ceremony_window: "15 minutes"
+            description: "All three signatories must complete signoffs within a shared ceremony window"
+            shared_nonce: "All signatories MUST sign the same nonce to bind the ceremony"
+            ceremony_timeout: "If all 3 signatories do not complete within 15-minute window, ceremony is invalid and must restart"
+            atomic_initiation: |
+              First signatory MUST acquire the emergency_override_ceremony_lock.
+              Lock acquisition: (1) Verify no active ceremony, (2) Atomically set lock
+              with ceremony_nonce and ceremony_start_timestamp. Only one ceremony
+              active globally at any time.
+            ceremony_binding:
+              - "Ceremony begins when first signatory generates ceremony_start_timestamp and ceremony_nonce"
+              - "All subsequent signatories MUST reference the same ceremony_start_timestamp and ceremony_nonce"
+              - "Ceremony expires if third signatory does not complete within 15 minutes of ceremony_start_timestamp"
+              - "Lock prevents any other ceremony initiation during active ceremony window"
+          signoff_protocol:
+            description: "Cryptographically bound triple-signoff ceremony"
+            input_fields:
+              override_action: "string - exact command being authorized"
+              target_hash: "string - bootstrap hash being overridden"
+              timestamp: "ISO-8601 - time of signoff"
+              nonce: "string - shared ceremony nonce, identical for all three signatories"
+              ceremony_start_timestamp: "ISO-8601 - timestamp when ceremony began"
+              authority_pubkey: "string - signing authority's public key"
+            signature_format: |
+              signoff_hash = HMAC-SHA256(
+                key = authority_private_key,
+                message = CONCAT(override_action, target_hash, timestamp, nonce, ceremony_start_timestamp)
+              )
+            verification:
+              - "All THREE authorities MUST sign the SAME input tuple (prevents mix-and-match)"
+              - "System verifies: (a) all three signatures valid, (b) timestamp within 1-hour window"
+              - "System verifies: (c) nonce not previously used, (d) override_action matches command"
+              - "System verifies: (e) all three signoffs completed within 15-minute ceremony window"
+              - "System verifies: (f) no emergency override used within past 24 hours (cooldown)"
+              - "Signoffs are single-use and expire after 1 hour"
+              - "System MUST reject signoffs if timestamp corresponds to non-active ceremony (lock released/expired)"
+            audit_requirements:
+              - "All emergency override attempts logged with full input tuple"
+              - "Both successful and failed attempts emit audit events"
+              - "Nonce registry persisted to prevent replay after restart"
+              - "Cooldown violations logged with attempted override details"
+              - "Fallback audit buffering supported if external sink unreachable (SEC-CTRL-0011)"
+          external_audit_sink:
+            description: "Near-real-time external audit event delivery for emergency overrides"
+            requirements:
+              - "All emergency override events MUST be delivered to external audit system"
+              - "Maximum delivery latency: 5 seconds from event emission"
+              - "Audit events MUST include: ceremony_nonce, all three authority identities, timestamps, outcome"
+              - "Failed delivery MUST block emergency override activation"
+              - "Bootstrap-safe-mode audit supports direct write bypassing bus (SEC-CTRL-0012)"
+            delivery_guarantee: "At-least-once delivery with deduplication by ceremony_nonce"
+        post_override_obligations:
+          description: "Mandatory actions after emergency override execution"
+          purpose: "Ensure emergency override triggers accountability and remediation"
+          immediate_obligations:
+            - obligation_id: "OBL-OVERRIDE-001"
+              responsible_role: "AUTH_SECURITY"
+              action: "Initiate incident investigation within 4 hours"
+            - obligation_id: "OBL-OVERRIDE-002"
+              responsible_role: "All three signatory authorities"
+              action: "Initial incident report within 24 hours"
+          investigation_obligations:
+            - obligation_id: "OBL-OVERRIDE-003"
+              responsible_role: "AUTH_SECURITY"
+              action: "Complete incident investigation within 72 hours"
+          governance_obligations:
+            - obligation_id: "OBL-OVERRIDE-004"
+              responsible_role: "DOMAIN_GOVERNANCE"
+              action: "Review incident report and determine corrective actions within 7 days"
+          recurrence_obligations:
+            - obligation_id: "OBL-OVERRIDE-005"
+              responsible_role: "DOMAIN_GOVERNANCE + Board"
+              action: "Board briefing if used ≥2 times within 90 days"
+          prohibition:
+            - prohibition_id: "PROH-OVERRIDE-001"
+              statement: "Emergency override CANNOT be used for the same root cause twice without board approval."
+          enforcement:
+            incomplete_investigation_consequence: "MAJOR defect emitted if deadlines missed"
+            recurrence_without_remediation_consequence: "CRITICAL defect + automatic board escalation"
+        state_repair_protocol:
+          description: "Offline tooling for ledger state inspection and repair in cold-start scenarios"
+          components:
+            - name: apm2-ledger-inspect
+              type: offline_binary
+              capabilities:
+                - "Read ledger events without bootstrap verification"
+                - "Compute compatibility report against any binary version"
+                - "Export ledger state to portable format for external analysis"
+              restrictions:
+                - "Read-only; cannot modify ledger state"
+                - "Does not require running kernel"
+            - name: apm2-bootstrap-repair
+              type: emergency_binary
+              capabilities:
+                - "Reset bootstrap trust root to known-good checkpoint"
+                - "Replay ledger from checkpoint with new bootstrap"
+                - "Requires dual-signoff HSM or printed recovery keys"
+              restrictions:
+                - "Requires physical HSM access or offline ceremony"
+                - "All repair operations logged to external audit system"
+                - "Cannot be invoked from normal runtime environment"
+          cold_start_signoff:
+            description: "Offline ceremony for cold-start recovery"
+            procedure:
+              - "Generate recovery request hash from apm2-ledger-inspect output"
+              - "Obtain dual-signoff using offline HSM or printed recovery keys"
+              - "Execute apm2-bootstrap-repair with signed recovery request"
+              - "Validate ledger integrity post-repair using independent auditor"
+        delegate_authority_registry:
+          description: "Pre-designated backup signatories for each authority role"
+          purpose: "Prevents permanent system lockout when primary authorities are unavailable beyond TTL"
+          fields:
+            authority_role: "string - authority role identifier (AUTH_SECURITY, AUTH_OPS, AUTH_ENGINEERING)"
+            primary_holder: "string - primary authority holder identity"
+            delegate_list: "array<string> - ordered list of backup signatories"
+            activation_conditions: "string - conditions under which delegate assumes authority"
+          constraint: "Delegates cannot be same person as primary for any role"
+          sla_commitment: "99.9%+ availability for recovery path"
+        tiered_recovery_protocol:
+          description: "Four-tier recovery protocol with escalation path for authority unavailability"
+          purpose: "Prevents permanent lockout while maintaining security controls appropriate to degraded state"
+          state_machine:
+            TIER_1:
+              name: "Normal Operations"
+              requirements:
+                - "Triple-signoff: AUTH_SECURITY + AUTH_OPS + AUTH_ENGINEERING"
+                - "All primary authorities available"
+              ttl: "1 hour"
+              capabilities: "Full system operations"
+            TIER_2:
+              name: "Degraded Operations"
+              activation_conditions:
+                - "Primary authority unavailable AND delegate unavailable for >4 hours"
+              requirements:
+                - "Remaining available authorities + external witness (DOMAIN_GOVERNANCE)"
+              restrictions:
+                - "Read-only operations only"
+                - "No state mutations"
+                - "External witness attestation required"
+              audit_requirements:
+                - "External witness attestation recorded"
+                - "All TIER_2 activations logged with full context"
+              ttl: "24 hours maximum before TIER_3 escalation"
+            TIER_3:
+              name: "Emergency Escalation"
+              activation_conditions:
+                - "TIER_2 insufficient for >24 hours"
+                - "OR critical system failure requiring immediate action"
+              requirements:
+                - "Board-level escalation"
+              sla: "<24 hours to resolution"
+              audit_requirements:
+                - "Full incident report"
+                - "Root cause analysis"
+                - "Post-mortem with preventive measures"
+              ttl: "48 hours maximum before TIER_4 activation"
+            TIER_4:
+              name: "Dead Man's Switch - Ultimate Fallback"
+              activation_conditions:
+                - "TIER_3 board escalation exceeds 48 hours without resolution"
+                - "OR all recovery paths exhausted"
+              capabilities: "READ_ONLY_ARCHIVE mode; state export to cold storage"
+              restrictions: "No state mutations; no new event emissions"
+              recovery_path: "Manual cold-start rebuild from checkpoint (expected latency >72h)"
+              audit_requirements: "CRITICAL severity incident; board must authorize rebuild"
+          transitions:
+            - "TIER_1 → TIER_2: Primary authority unavailability >4 hours"
+            - "TIER_2 → TIER_3: Degraded state >24 hours OR critical failure"
+            - "TIER_3 → TIER_4: Resolution failure >48 hours"
+            - "TIER_4 → TIER_1: Manual restoration completed"
+            - "TIER_3 → TIER_1: Board resolution + authority availability restored"
+            - "TIER_2 → TIER_1: Authority availability restored"
+        external_witness:
+          description: "DOMAIN_GOVERNANCE role as external witness for TIER_2 operations"
+          role: "DOMAIN_GOVERNANCE"
+          qualification_requirements:
+            - "Independent from operational authorities (AUTH_SECURITY, AUTH_OPS, AUTH_ENGINEERING)"
+            - "Authorized by governance charter"
+            - "Cryptographic signing capability"
+          attestation_format:
+            description: "Cryptographically signed attestation for TIER_2 operations"
+            required_fields:
+              witness_identity: "string - DOMAIN_GOVERNANCE signatory identity"
+              operation_hash: "string - hash of operation being witnessed"
+              timestamp: "ISO-8601 - attestation time"
+              scope: "string - description of witnessed operation"
+              witness_signature: "string - cryptographic signature binding attestation"
+            verification:
+              - "Signature verifiable against DOMAIN_GOVERNANCE public key registry"
+              - "Timestamp within valid window (not expired)"
+              - "Operation hash matches actual operation being executed"
+        board_escalation:
+          description: "Board-level escalation protocol for TIER_3 emergency scenarios"
+          trigger_conditions:
+            - "TIER_2 degraded operations active for >24 hours"
+            - "Critical system failure requiring state mutation under authority unavailability"
+            - "Security incident requiring emergency response beyond TIER_2 capabilities"
+          sla: "<24 hours from escalation to resolution"
+          reporting_requirements:
+            - "Incident summary with timeline"
+            - "Root cause analysis"
+            - "Impact assessment (systems affected, operations degraded)"
+            - "Resolution plan with specific actions and accountability"
+            - "Post-mortem report with preventive measures"
+          resolution_authority: "Board has full authority to authorize emergency actions including state mutations"
+          audit_trail: "All board escalations recorded in immutable ledger with full incident context"
+    - id: CNS-0007
+      statement: All patch admissions require expected_base_hash matching current artifact state.
+      rationale: Replay protection prevents stale or duplicate patches from corrupting state.
+      enforcement: Admission gate rejects hash mismatches; emits replay violation event.
+      evidence_ids:
+        - EVID-0003
+    - id: CNS-0008
+      statement: |
+        All typed quantities MUST validate against cac.typed_quantity.v1 schema.
+        Unit mismatches between referenced quantities MUST be rejected at validation.
+        Arithmetic operations across quantities with different units MUST fail
+        at compile time.
+      rationale: Prevents unit mismatch errors that could cause silent failures in budget enforcement.
+      enforcement: Schema validation rejects quantities without valid unit field; compiler rejects cross-unit arithmetic.
+      evidence_ids:
+        - EVID-0012
+    - id: CNS-0009
+      statement: |
+        Stable ID namespaces MUST be registered with DOMAIN_KERNEL. Collisions
+        within a namespace are admission errors. Format: "namespace:kind:identifier[@version]".
+      rationale: Prevents stable_id collisions and enables namespace governance per Q-0002.
+      enforcement: Admission validates stable_id format and namespace registration.
+      evidence_ids:
+        - EVID-0004
+    - id: CNS-0010
+      statement: |
+        Pack specs referencing dependencies MUST include provenance review:
+        author_identity and admission_receipt_hash for each stable_id.
+        Compilation SHOULD warn if author_identity is not on approved producer
+        list for the dependency kind.
+      rationale: Prevents review-time compromise by verifying who authored dependencies.
+      enforcement: Pack compiler validates provenance fields; warns on unknown authors.
+      evidence_ids:
+        - EVID-0010
+  invariants:
+    - id: INV-0001
+      statement: Canonicalization is deterministic and idempotent.
+      rationale: |
+        canonicalize(canonical_bytes) == canonical_bytes must hold for all valid inputs.
+        Hash stability across platforms and runs depends on this property.
+      enforcement: Golden test vectors committed and run in CI; canonicalizer versioned.
+      evidence_ids:
+        - EVID-0001
+    - id: INV-0002
+      statement: No normative artifact influences execution without schema validation and canonicalization.
+      rationale: Fail-closed admission ensures only validated, canonical artifacts enter DCP.
+      enforcement: Admission pipeline is the only path to DCP; bypasses are impossible.
+      evidence_ids:
+        - EVID-0002
+    - id: INV-0003
+      statement: No consumption holon uses open-ended discovery for context.
+      rationale: |
+        Hermetic consumption ensures deterministic execution. Pack misses are treated as
+        compiler failures, not execution necessities.
+      enforcement: Policy denies discretionary reads; violations emit DefectRecord and fail run.
+      evidence_ids:
+        - EVID-0005
+    - id: INV-0004
+      statement: Target profiles define rendering, retrieval, and delivery constraints for compilation.
+      rationale: |
+        Decouples internal IR from vendor ABIs. Model capability is a compile-time
+        contract, not a runtime assumption.
+      enforcement: Compiler enforces target profile budgets and rendering policies.
+      evidence_ids:
+        - EVID-0009
+    - id: INV-0005
+      statement: Every state transition is recorded as a signed event referencing immutable hashes.
+      rationale: End-to-end provenance enables audit and replay.
+      enforcement: Kernel emits ledger events for all CAC actions; events are signed and hash-chained.
+      evidence_ids:
+        - EVID-0003
+        - EVID-0011
+    - id: INV-0006
+      statement: |
+        Ledger state MUST be forward-compatible with N+1 bootstrap versions.
+        Binary upgrades MUST NOT create states unreadable by previous version.
+        Pre-upgrade compatibility check is REQUIRED before binary deployment.
+      rationale: |
+        Prevents cold-start deadlock where neither old nor new binary can operate.
+        Ensures graceful rollback is always possible during bootstrap upgrades.
+      enforcement: |
+        Pre-upgrade check (apm2 upgrade --check-compatibility) is required before deployment.
+        Deployment blocked if compatibility check fails.
+  security_properties:
+    - id: SEC-PROP-0001
+      name: Fail-closed admission
+      statement: Artifacts cannot enter DCP or influence execution unless validated and canonicalized.
+      evidence_ids:
+        - EVID-0002
+    - id: SEC-PROP-0002
+      name: Replay protection
+      statement: All patch admissions require expected_base_hash matching current state.
+      evidence_ids:
+        - EVID-0003
+    - id: SEC-PROP-0003
+      name: Least privilege consumption
+      statement: Consumption holons have deterministic reads only; no open-ended browsing.
+      evidence_ids:
+        - EVID-0005
+    - id: SEC-PROP-0004
+      name: End-to-end provenance
+      statement: All state transitions are recorded as signed events referencing immutable hashes.
+      evidence_ids:
+        - EVID-0011
+    - id: SEC-PROP-0005
+      name: Algorithm agility
+      statement: |
+        Cryptographic mechanisms and canonicalization engines are versioned and upgradable.
+        Hash algorithms MUST provide ≥256-bit collision resistance or use hybrid
+        classical+quantum-resistant scheme.
+      evidence_ids:
+        - EVID-0001
+      upgrade_policy:
+        description: Hash algorithm upgrade when collision resistance degrades
+        trigger: |
+          Bootstrap schema bundle upgrade MUST mandate hash algorithm upgrade when
+          collision resistance degrades below 256-bit security level.
+        monitoring:
+          - Track NIST cryptographic security deprecation timelines
+          - Emit warning when hash algorithm within 5 years of deprecation
+          - Emit CRITICAL alert when hash algorithm deprecated
+        upgrade_procedure:
+          - New bootstrap schema bundle with upgraded hash algorithm
+          - Binary release required (not runtime patch per CNS-0006)
+          - Ledger migration to re-hash all artifacts with new algorithm
+        rationale: |
+          BLAKE3-256 currently provides 128-bit collision resistance (birthday bound).
+          While adequate for short-term (5-10 years), long-term operation requires
+          explicit commitment to upgrade before collision attacks become feasible.
+    - id: SEC-PROP-0006
+      name: Dependency trust boundary integrity
+      statement: Pack specs pin dependency hashes at review time; compilation rejects drift.
+      evidence_ids:
+        - EVID-0010
+  security_controls:
+    - id: SEC-CTRL-0001
+      name: Canonical JSON profile (no floats, bounded depth)
+      type: preventative
+      details: Restrict CAC-JSON to integer-only numbers within 64-bit range; enforce max depth and size.
+    - id: SEC-CTRL-0002
+      name: Deterministic canonicalizer with test vectors
+      type: preventative
+      details: Canonicalizer is versioned; includes golden vectors and cross-platform tests.
+    - id: SEC-CTRL-0003
+      name: Schema strictness (unknown field rejection)
+      type: preventative
+      details: Validator profile rejects unknown fields; schemas use unevaluatedProperties=false.
+    - id: SEC-CTRL-0004
+      name: Signed ledger and CAS hashes
+      type: detective+preventative
+      details: Ledger events are signed and hash-chained; artifacts are content-addressed.
+    - id: SEC-CTRL-0005
+      name: Hermetic runtime sandboxing
+      type: preventative
+      details: Consumption holons have restricted filesystem and network; only ArtifactFetch permitted.
+    - id: SEC-CTRL-0006
+      name: Provenance embedding in vendor exports
+      type: detective
+      details: Generated Markdown includes provenance frontmatter; export manifest records hashes.
+    - id: SEC-CTRL-0007
+      name: DoS limits in parsers and validators
+      type: preventative
+      details: Hard bounds on max bytes, max depth, max array length, max schema complexity.
+    - id: SEC-CTRL-0008
+      name: Bootstrap trust root immutability
+      type: preventative
+      details: Bootstrap schema bundle is embedded and pinned by hash; admission rejects modifications.
+    - id: SEC-CTRL-0009
+      name: Canonicalizer governance metadata
+      type: preventative
+      details: Canonicalizer id/version and test-vector reference recorded in envelopes/receipts.
+    - id: SEC-CTRL-0010
+      name: Atomic ceremony initiation (race condition prevention)
+      type: preventative
+      details: |
+        Emergency override ceremonies use atomic initiation with distributed lock to
+        prevent concurrent ceremonies. Only one ceremony can be active globally at any time.
+      implementation:
+        lock_id: emergency_override_ceremony_lock
+        lock_acquisition: |
+          First signatory must acquire lock before generating ceremony_start_timestamp.
+          Lock acquisition includes: (1) Verify no active ceremony (lock available),
+          (2) Atomically set lock with ceremony_nonce and ceremony_start_timestamp,
+          (3) Lock expires automatically after 15 minutes.
+        requirements:
+          - Only ONE ceremony can be active globally at any time.
+          - Ceremony lock released after ceremony completes or expires.
+          - System MUST reject signoffs if timestamp corresponds to non-active ceremony.
+    - id: SEC-CTRL-0011
+      name: Degraded audit mode for emergency override
+      type: detective+compensating
+      details: |
+        Fallback audit mechanism when external sink is unreachable. Emergency override
+        MAY proceed with local audit buffering.
+      requirements:
+        - Audit events buffered with HMAC-SHA256 integrity protection.
+        - Buffer size limited to 1000 events (prevent DoS).
+        - Post-recovery: buffered events MUST be force-pushed to external sink.
+        - Failed delivery triggers INCIDENT with board escalation.
+        - Degraded mode limited to 72 hours maximum.
+    - id: SEC-CTRL-0012
+      name: Bootstrap-safe-mode audit
+      type: detective+compensating
+      details: |
+        Minimal audit capability for bootstrap-safe-mode to resolve circular dependency.
+      capabilities:
+        - Bootstrap-safe-mode MUST support emergency override audit emission.
+        - Degraded audit-only operations (no admission/compilation).
+        - Direct write to external audit sink bypassing kernel event bus.
+    - id: SEC-CTRL-0013
+      name: TIER_4 Dead Man's Switch - Ultimate Fallback
+      type: corrective+detective
+      details: |
+        Ultimate fallback when all recovery paths exhausted.
+      activation_conditions:
+        - TIER_3 board escalation exceeds 48 hours without resolution.
+        - OR all recovery paths exhausted.
+      capabilities:
+        - System enters READ_ONLY_ARCHIVE mode.
+        - All state exported to content-addressed cold storage.
+        - External audit receives cryptographic proof-of-state snapshot.
+      restrictions:
+        - No state mutations permitted.
+        - No new event emissions.
+      recovery_path:
+        process: Human operator initiates offline manual recovery.
+        expected_latency: ">72 hours"
+        requirements: Requires cold-start rebuild from last known-good checkpoint.
+        sla_ceiling: |
+          If bootstrap recovery exceeds 72 hours, system considered permanently compromised.
+    - id: SEC-CTRL-0014
+      name: Dependency trust boundary protection
+      type: preventative
+      details: |
+        Pack specs capture dependency_review_hash at review time. Compilation fails if
+        resolved hash differs from reviewed hash, preventing timing-based injection where
+        an adversary modifies stable_id content between review and compilation.
+    - id: SEC-CTRL-0015
+      name: Dependency hash drift auditing
+      type: detective
+      details: |
+        DependencyHashDrift events emitted when compilation detects hash mismatch. Events
+        include old_hash, new_hash, stable_id, and review_timestamp for investigation.
+    - id: SEC-CTRL-0016
+      name: AATReceipt binary binding
+      type: preventative
+      details: |
+        AATReceipts MUST be cryptographically bound to binary hash. Required fields:
+        binary_hash (BLAKE3-256 of apm2 binary), capability_manifest_hash, test_suite_version,
+        execution_timestamp. Receipts for mismatched binaries are rejected.
+    - id: SEC-CTRL-0017
+      name: Content-hash-only fetch restriction
+      type: preventative
+      details: |
+        Content-hash-only fetches are denied in consumption mode. All fetches
+        MUST specify stable_id for policy enforcement. This prevents bypass
+        of stable_id allowlist via content hash discovery through side channels.

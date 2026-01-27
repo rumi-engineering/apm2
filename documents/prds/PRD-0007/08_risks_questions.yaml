@@ -1,0 +1,213 @@
+prd_risks_questions:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  risks:
+    - id: RSK-0001
+      statement: Canonicalizer divergence causes hash drift across implementations or versions.
+      impact: Breaks CAS dedupe, provenance, and stable-ID pinning.
+      likelihood: MEDIUM
+      mitigations:
+        - Golden test vectors committed and run in CI.
+        - Versioned canonicalizer; include canonicalizer_version in receipts.
+        - Cross-language compatibility tests if multiple implementations exist.
+      evidence_ids:
+        - EVID-0001
+    - id: RSK-0002
+      statement: Schema strictness slows iteration during early adoption.
+      impact: Machines may fail admission frequently; frustration and workarounds.
+      likelihood: HIGH
+      mitigations:
+        - Bootstrap with small schema set and evolve intentionally.
+        - Provide machine-generated patch tooling that auto-validates before submission.
+        - Use staged rollout with warn, soft-fail, and hard-fail phases.
+      evidence_ids:
+        - EVID-0002
+      tradeoff_cluster: STRICTNESS_VS_VELOCITY
+    - id: RSK-0003
+      statement: Target delivery churn breaks export pipeline due to vendor changes.
+      impact: External agent tooling stops working or requires urgent changes.
+      likelihood: MEDIUM
+      mitigations:
+        - Version target profiles and pin in packs.
+        - Conformance tests run in AAT; failures become defects.
+        - Maintain fallback exports for critical vendors.
+      evidence_ids:
+        - EVID-0006
+    - id: RSK-0004
+      statement: Consumption hermeticity causes early friction as packs are incomplete.
+      impact: Tasks fail because packs are incomplete; perceived as regressions.
+      likelihood: HIGH
+      mitigations:
+        - Treat failures as compiler defects and fix packs quickly.
+        - Allow limited, explicitly budgeted escape hatches early with strong defect emission.
+        - Prioritize pack completeness for the most common workflows.
+      evidence_ids:
+        - EVID-0005
+        - EVID-0010
+      tradeoff_cluster: STRICTNESS_VS_VELOCITY
+    - id: RSK-0005
+      statement: Indexing DCP from ledger becomes a performance bottleneck at scale.
+      impact: Stable-ID resolution and fetch becomes slow; consumption holons blocked.
+      likelihood: MEDIUM
+      mitigations:
+        - Maintain a cached projection store (rebuildable).
+        - Shard by namespace/kind; keep hot indexes in memory.
+        - Include compaction checkpoints.
+      evidence_ids:
+        - EVID-0004
+    - id: RSK-0006
+      statement: Patch soup without compaction leads to unbounded history growth.
+      impact: Review and replay become slow or error-prone.
+      likelihood: MEDIUM
+      mitigations:
+        - Define compaction thresholds (depth/time/size) per artifact kind.
+        - Require ChangeSet summaries to accompany compaction snapshots.
+        - Maintain provenance links from snapshots back to patch chains.
+      evidence_ids:
+        - EVID-0003
+    - id: RSK-0007
+      statement: Target profile miscalibration causes frequent failures for weaker models.
+      impact: Context budgets or rendering policies miscalibrated; tasks fail.
+      likelihood: MEDIUM
+      mitigations:
+        - Default to conservative budgets; adjust via measured RunReceipt data.
+        - Maintain per-model profiles and gate by capability manifest.
+        - Automate profile tuning based on sufficiency metrics.
+      evidence_ids:
+        - EVID-0009
+  open_questions:
+    - id: Q-0001
+      question: |
+        Exact canonicalization spec: strict RFC 8785 JCS vs a stricter CAC profile;
+        how to publish, pin, and version test vectors and canonicalizer IDs?
+      decision_needed_by: Phase 1 (Foundations)
+      resolution_plan: |
+        Define CAC-specific deviations from JCS (if any). Publish test vectors as
+        governed artifacts in bootstrap bundle. Record canonicalizer_id in all receipts.
+    - id: Q-0002
+      question: |
+        Stable ID namespace governance: who can mint namespaces, and how are
+        collisions prevented across org/projects?
+      decision_needed_by: Phase 2 (Admission + Provenance)
+      resolution_plan: |
+        Define namespace minting policy. Consider hierarchical namespaces with
+        org/project prefixes. Implement collision detection in admission gate.
+    - id: Q-0003
+      question: |
+        Do we need typed kernel events (ControlArtifactEvent) in the MVP, or is
+        EvidencePublished metadata sufficient?
+      decision_needed_by: Phase 2 (Admission + Provenance)
+      resolution_plan: |
+        Start with EvidencePublished metadata. Evaluate queryability and policy
+        enforcement needs post-MVP. Add typed events if metadata proves insufficient.
+    - id: Q-0004
+      question: |
+        How to represent large binary artifacts within CAC-JSON (likely via CAS
+        refs only) and enforce policies consistently?
+      decision_needed_by: Phase 3 (Deterministic Fetch)
+      resolution_plan: |
+        Define a blob reference schema that includes CAS hash and size bounds.
+        Policy enforces max size; large artifacts are stored in CAS, not inline.
+    - id: Q-0005
+      question: |
+        Should defect records be first-class kernel events or remain evidence
+        artifacts referenced by events?
+      decision_needed_by: Phase 4 (ContextPack Compiler)
+      resolution_plan: |
+        Start with defects as evidence artifacts. Evaluate whether first-class
+        events improve queryability and recurrence detection.
+    - id: Q-0006
+      question: |
+        TargetProfile schema: what is the minimal stage taxonomy (plan/implement/
+        review/ops) and which policies must be mandatory vs optional?
+      decision_needed_by: Phase 5 (Target Delivery)
+      resolution_plan: |
+        Define minimal stage set based on current workflows. Make budget policies
+        mandatory; rendering policies optional with defaults.
+    - id: Q-0007
+      question: |
+        Compaction policy: when does patch depth require snapshotting, and how
+        are ChangeSet summaries preserved across compaction?
+      decision_needed_by: Post-MVP
+      resolution_plan: |
+        Define compaction thresholds based on observed patch depths. Require
+        ChangeSet summaries as compaction inputs. Maintain provenance links.
+  tradeoff_analyses:
+    - id: TRADEOFF-0001
+      name: Strictness vs. Velocity
+      cluster_id: STRICTNESS_VS_VELOCITY
+      linked_risks:
+        - RSK-0002
+        - RSK-0004
+      description: |
+        Schema strictness (RSK-0002) and consumption hermeticity (RSK-0004) represent
+        the same fundamental tradeoff: stricter enforcement improves security and
+        determinism but reduces velocity during adoption. This unified analysis
+        provides coordinated criteria weighting and mitigation strategy.
+      criteria_ranking:
+        - criterion: Security (determinism, provenance)
+          weight: 0.40
+          rationale: Core mission; non-negotiable for production
+        - criterion: Velocity (time-to-merge, iteration speed)
+          weight: 0.30
+          rationale: Critical for adoption; blocking kills trust
+        - criterion: Observability (defect detection, feedback)
+          weight: 0.20
+          rationale: Enables learning; strictness without visibility is blind
+        - criterion: Reversibility (ability to roll back)
+          weight: 0.10
+          rationale: Reduces risk of strict enforcement
+      quantified_thresholds:
+        acceptable_velocity_reduction: "≤20% increase in median PR cycle time during adoption"
+        acceptable_failure_rate: "≤10% task failure rate due to pack incompleteness in first 30 days"
+        required_security_posture: "Zero admitted artifacts bypass validation; 100% provenance coverage"
+        feedback_latency_sla: "Pack spec updates within 48h of recurring defect pattern"
+      pareto_configurations:
+        - id: CONFIG-STRICT
+          description: Full enforcement from day 1
+          security: 1.0
+          velocity: 0.5
+          observability: 0.8
+          reversibility: 0.3
+          recommendation: Not recommended; adoption risk too high
+        - id: CONFIG-GRADUATED
+          description: Warn → soft-fail → hard-fail over 90 days
+          security: 0.9
+          velocity: 0.8
+          observability: 0.9
+          reversibility: 0.7
+          recommendation: RECOMMENDED; balances risk and adoption
+        - id: CONFIG-PERMISSIVE
+          description: Defect-emit only; never fail
+          security: 0.6
+          velocity: 1.0
+          observability: 1.0
+          reversibility: 1.0
+          recommendation: Not recommended; security posture insufficient
+      coordinated_mitigation:
+        rollout_phases:
+          - phase: "CAC-R-01 (7 days)"
+            mode: WARN
+            description: "Warn-only linting + bootstrap schemas; all violations logged but not blocking."
+          - phase: "CAC-R-02 (14 days)"
+            mode: ADMISSION_FAIL
+            description: "Admission pipeline enabled; fail on admission violations for new artifacts."
+          - phase: "CAC-R-03 (14 days)"
+            mode: CONSUMPTION_FAIL
+            description: "Hermetic consumption + run receipt gating; fail on discretionary reads."
+          - phase: "CAC-R-04 (14 days)"
+            mode: RELEASE_FAIL
+            description: "Target delivery + capabilities gating; fail on export drift; require AATReceipt."
+        acceleration_clause: |
+          If CAC-M-LEAD-0002 (pack completeness) >85% at week 5, advance to CAC-R-03/04
+          acceleration. Data-driven acceleration rewards faster-than-expected adoption.
+        rollout_sla:
+          during_rollout: "24h standard, 4h emergency"
+          post_rollout: "48h standard, 4h emergency"
+        feedback_integration:
+          - "DefectRecord patterns automatically trigger pack spec review"
+          - "Escalation frequency feeds into pack completeness prioritization"
+          - "Weekly strictness-vs-velocity dashboard review"
+        escape_hatches:
+          - "Bounded escalation (max 24h TTL, audit required)"
+          - "Emergency override with dual-signoff (AUTH_OPS + AUTH_PRODUCT)"

@@ -1,0 +1,90 @@
+{
+  "$id": "cac.admission_receipt.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "receipt.admission"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "base_hash": {
+              "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+            },
+            "canonicalization": {
+              "type": "string"
+            },
+            "canonicalizer_id": {
+              "type": "string"
+            },
+            "canonicalizer_version": {
+              "type": "string"
+            },
+            "canonicalizer_vectors_ref": {
+              "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+            },
+            "decision": {
+              "enum": [
+                "ADMIT",
+                "DENY"
+              ],
+              "type": "string"
+            },
+            "new_hash": {
+              "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+            },
+            "notes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "patch_record_hash": {
+              "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+            },
+            "policy_hash": {
+              "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+            },
+            "receipt_id": {
+              "type": "string"
+            },
+            "schema_hash": {
+              "$ref": "cac.common.v1.schema.json#/$defs/content_hash"
+            },
+            "schema_id": {
+              "type": "string"
+            },
+            "target_stable_id": {
+              "$ref": "cac.common.v1.schema.json#/$defs/stable_id"
+            },
+            "validator_version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "receipt_id",
+            "decision",
+            "target_stable_id",
+            "base_hash",
+            "new_hash",
+            "patch_record_hash",
+            "schema_id",
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "canonicalizer_vectors_ref"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.admission_receipt.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC AdmissionReceipt v1"
+}

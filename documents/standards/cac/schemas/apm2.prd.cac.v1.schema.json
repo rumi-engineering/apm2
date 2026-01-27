@@ -1,0 +1,237 @@
+{
+  "$id": "apm2.prd.cac.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_kinds": {
+      "additionalProperties": false,
+      "properties": {
+        "kinds": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "consume_allowed": {
+                "type": "boolean"
+              },
+              "kind_id": {
+                "$ref": "cac.common.v1.schema.json#/$defs/artifact_kind"
+              },
+              "normative": {
+                "type": "boolean"
+              },
+              "purpose": {
+                "type": "string"
+              },
+              "schema_id": {
+                "$ref": "cac.common.v1.schema.json#/$defs/schema_id"
+              }
+            },
+            "required": [
+              "kind_id",
+              "purpose",
+              "schema_id",
+              "normative",
+              "consume_allowed"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "registry_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kinds",
+        "registry_version"
+      ],
+      "type": "object"
+    },
+    "classification": {
+      "additionalProperties": false,
+      "properties": {
+        "default_data_classification": {
+          "$ref": "cac.common.v1.schema.json#/$defs/classification"
+        },
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "security_critical": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "security_critical",
+        "default_data_classification"
+      ],
+      "type": "object"
+    },
+    "definition_of_done": {
+      "type": "object"
+    },
+    "design_selection": {
+      "type": "object"
+    },
+    "doc": {
+      "additionalProperties": false,
+      "properties": {
+        "audience": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "created_at": {
+          "format": "date",
+          "type": "string"
+        },
+        "id": {
+          "$ref": "cac.common.v1.schema.json#/$defs/id_string"
+        },
+        "last_updated_at": {
+          "format": "date",
+          "type": "string"
+        },
+        "owners": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "holon_id": {
+                "$ref": "cac.common.v1.schema.json#/$defs/id_string"
+              },
+              "role": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "holon_id",
+              "role"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "priority": {
+          "enum": [
+            "P0",
+            "P1",
+            "P2",
+            "P3"
+          ],
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "scope_tags": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "review",
+            "approved",
+            "superseded"
+          ],
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "status",
+        "priority",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "engineering_goals": {
+      "type": "array"
+    },
+    "format_policy": {
+      "type": "object"
+    },
+    "implementation": {
+      "type": "object"
+    },
+    "messaging_integration": {
+      "type": "object"
+    },
+    "non_goals": {
+      "type": "array"
+    },
+    "parallel_designs": {
+      "type": "array"
+    },
+    "pipeline": {
+      "type": "object"
+    },
+    "principles": {
+      "type": "array"
+    },
+    "problem": {
+      "type": "object"
+    },
+    "references": {
+      "type": "array"
+    },
+    "risks_and_open_questions": {
+      "type": "object"
+    },
+    "schema": {
+      "const": "apm2.prd.cac.v1"
+    },
+    "schema_registry": {
+      "type": "object"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "security": {
+      "type": "object"
+    },
+    "summary": {
+      "type": "object"
+    },
+    "system_model": {
+      "type": "object"
+    },
+    "testing_and_rollout": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "doc",
+    "classification",
+    "summary",
+    "problem",
+    "engineering_goals",
+    "principles",
+    "pipeline",
+    "messaging_integration",
+    "security",
+    "implementation",
+    "testing_and_rollout",
+    "definition_of_done"
+  ],
+  "title": "APM2 PRD: Context-as-Code (CAC) v1",
+  "type": "object"
+}

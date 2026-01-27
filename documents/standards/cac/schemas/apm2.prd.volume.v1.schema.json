@@ -1,0 +1,71 @@
+{
+  "$id": "apm2.prd.volume.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "apm2.prd.volume.v1"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "sections": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "object"
+          },
+          "section_id": {
+            "$ref": "cac.common.v1.schema.json#/$defs/id_string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "section_id",
+          "title",
+          "content"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "volume": {
+      "additionalProperties": false,
+      "properties": {
+        "generated_at": {
+          "format": "date",
+          "type": "string"
+        },
+        "source_prd_id": {
+          "$ref": "cac.common.v1.schema.json#/$defs/id_string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "volume_id": {
+          "pattern": "^V[0-9]{2}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "volume_id",
+        "title",
+        "source_prd_id",
+        "generated_at"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "volume",
+    "sections"
+  ],
+  "title": "APM2 PRD Volume v1",
+  "type": "object"
+}
