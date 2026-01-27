@@ -40,6 +40,7 @@ pub mod budget;
 pub mod cac;
 pub mod ccp;
 pub mod config;
+pub mod coordination;
 pub mod credentials;
 pub mod crypto;
 pub mod determinism;
