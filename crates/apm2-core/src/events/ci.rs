@@ -537,25 +537,39 @@ impl InMemoryDeliveryIdStore {
     ///
     /// Uses O(1) eviction by popping entries from the front of the queue
     /// until finding a non-expired entry ([INV-CI004]).
+    ///
+    /// # Lock Poisoning
+    ///
+    /// If the lock is poisoned, cleanup is skipped. This is safe because
+    /// cleanup is an optimization; skipping it just means we may hold onto
+    /// expired entries slightly longer until the next successful cleanup.
     fn cleanup(&self) {
         let now = Instant::now();
         let ttl = self.config.ttl;
 
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Fail-open for cleanup: if lock is poisoned, skip cleanup rather than
+        // propagating potentially corrupt state. Cleanup is non-critical.
+        let Ok(mut state) = self.state.write() else {
+            return;
+        };
 
         // O(1) amortized: pop expired entries from the front of the queue
         // Since entries are inserted in chronological order, expired entries
         // will be at the front. We stop as soon as we find a non-expired entry.
-        while let Some(queue_entry) = state.insertion_order.front() {
+        //
+        // Using pop-then-inspect pattern to avoid borrow checker issues with
+        // front() + pop_front() in the same loop iteration.
+        loop {
+            let Some(queue_entry) = state.insertion_order.pop_front() else {
+                break;
+            };
+
             if let Some(map_entry) = state.entries.get(&queue_entry.key) {
                 // Check if this queue entry matches the current map entry's timestamp
                 // (detects ghost entries from reused keys)
                 if queue_entry.inserted_at != map_entry.inserted_at {
                     // Ghost entry - different timestamp means key was reinserted
-                    state.insertion_order.pop_front();
+                    // Already popped, continue to next entry
                     continue;
                 }
 
@@ -564,17 +578,16 @@ impl InMemoryDeliveryIdStore {
                     .checked_duration_since(map_entry.inserted_at)
                     .unwrap_or(Duration::ZERO);
                 if elapsed >= ttl {
-                    // Entry expired, remove it
-                    let entry = state.insertion_order.pop_front().unwrap();
-                    state.entries.remove(&entry.key);
+                    // Entry expired, remove it from the map
+                    state.entries.remove(&queue_entry.key);
                 } else {
-                    // Found a non-expired entry, stop cleanup
+                    // Found a non-expired entry, push it back and stop cleanup
+                    state.insertion_order.push_front(queue_entry);
                     break;
                 }
-            } else {
-                // Key not in map (already removed), remove ghost from queue
-                state.insertion_order.pop_front();
             }
+            // Key not in map (already removed) - ghost entry already popped,
+            // continue
         }
     }
 }
@@ -586,6 +599,13 @@ impl Default for InMemoryDeliveryIdStore {
 }
 
 impl DeliveryIdStore for InMemoryDeliveryIdStore {
+    /// Checks if a delivery ID exists and is not expired.
+    ///
+    /// # Lock Poisoning
+    ///
+    /// If the lock is poisoned, returns `true` (fail-closed). This prevents
+    /// potential duplicate processing by treating unknown state as "already
+    /// seen".
     fn contains(&self, delivery_id: &str) -> bool {
         let now = Instant::now();
 
@@ -601,10 +621,11 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
         }
 
         // Check if already exists (read lock)
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Fail-closed on poison: return true (treat as duplicate) to prevent
+        // potential duplicate processing with corrupted state.
+        let Ok(state) = self.state.read() else {
+            return true;
+        };
 
         if let Some(entry) = state.entries.get(delivery_id) {
             // Check if still within TTL
@@ -620,14 +641,24 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
         false // Does not exist or expired
     }
 
+    /// Marks a delivery ID as seen.
+    ///
+    /// # Lock Poisoning
+    ///
+    /// If the lock is poisoned, this method is a no-op. This is fail-safe
+    /// because not marking an ID means it could be processed again, which
+    /// is acceptable given the corrupted state. The alternative (proceeding
+    /// with corrupt state) could cause unbounded memory growth.
     fn mark(&self, delivery_id: &str) {
         let now = Instant::now();
 
         // Insert new entry (write lock)
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Fail-safe on poison: skip marking to avoid corrupting state further.
+        // Not marking means potential duplicate processing, which is safer than
+        // unbounded memory growth from desynchronized entries/queue.
+        let Ok(mut state) = self.state.write() else {
+            return;
+        };
 
         // Check if entry exists and is expired - remove it first
         if let Some(entry) = state.entries.get(delivery_id) {
@@ -683,6 +714,13 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
     /// `mark()` calls with separate locks, this implementation holds the
     /// write lock for the entire operation to ensure that only one thread
     /// can mark a given delivery ID.
+    ///
+    /// # Lock Poisoning
+    ///
+    /// If the lock is poisoned (another thread panicked while holding it),
+    /// this method returns `false` (fail-closed). This is the safe default
+    /// for idempotency: treating the ID as a duplicate prevents duplicate
+    /// processing, which is safer than allowing potential duplicates through.
     fn check_and_mark(&self, delivery_id: &str) -> bool {
         let now = Instant::now();
 
@@ -698,10 +736,11 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
         }
 
         // Single write lock for atomic check-and-mark
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Fail-closed on poison: return false (treat as duplicate) to prevent
+        // potential duplicate processing with corrupted state.
+        let Ok(mut state) = self.state.write() else {
+            return false;
+        };
 
         // Check if entry exists and is not expired
         if let Some(entry) = state.entries.get(delivery_id) {
@@ -746,12 +785,14 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
         true // New entry marked
     }
 
+    /// Returns the number of tracked delivery IDs.
+    ///
+    /// # Lock Poisoning
+    ///
+    /// If the lock is poisoned, returns 0. This is safe for observability
+    /// purposes and won't affect correctness of duplicate detection.
     fn len(&self) -> usize {
-        self.state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entries
-            .len()
+        self.state.read().map(|s| s.entries.len()).unwrap_or(0)
     }
 }
 
