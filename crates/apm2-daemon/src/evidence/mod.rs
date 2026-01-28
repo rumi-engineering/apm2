@@ -15,7 +15,10 @@
 //!     |-- signer.rs          - ReceiptSigner using Ed25519 (TCK-00167)
 //!     |-- verifier.rs        - Receipt verification predicate (TCK-00167)
 //!     |-- keychain.rs        - OS keychain integration for keys (TCK-00167)
-//!     `-- (future: recorder.rs, ttl.rs, compaction.rs)
+//!     |-- config.rs          - RecorderConfig per risk tier (TCK-00170)
+//!     |-- trigger.rs         - Persistence trigger conditions (TCK-00170)
+//!     |-- recorder.rs        - FlightRecorder implementation (TCK-00170)
+//!     `-- (future: ttl.rs, compaction.rs)
 //! ```
 //!
 //! # Security Model
@@ -47,9 +50,22 @@ pub mod keychain;
 pub mod signer;
 pub mod verifier;
 
+// TCK-00170: Flight recorder with ring buffers
+pub mod config;
+pub mod recorder;
+pub mod trigger;
+
 // Re-export core receipt types
 // Re-export binding types
 pub use binding::{EvidenceBinding, ToolEvidenceCollector};
+// Re-export flight recorder types (TCK-00170)
+pub use config::{
+    ESTIMATED_PTY_CHUNK_SIZE, ESTIMATED_TELEMETRY_FRAME_SIZE, ESTIMATED_TOOL_EVENT_SIZE,
+    MAX_BUFFER_CAPACITY, MIN_BUFFER_CAPACITY, RecorderConfig, RecorderConfigBuilder,
+    TIER_1_PTY_CAPACITY, TIER_1_TELEMETRY_CAPACITY, TIER_1_TOOL_CAPACITY, TIER_2_PTY_CAPACITY,
+    TIER_2_TELEMETRY_CAPACITY, TIER_2_TOOL_CAPACITY, TIER_3_PLUS_PTY_CAPACITY,
+    TIER_3_PLUS_TELEMETRY_CAPACITY, TIER_3_PLUS_TOOL_CAPACITY,
+};
 // Re-export keychain types (TCK-00167)
 pub use keychain::{
     InMemoryKeyStore, KEYCHAIN_SERVICE_NAME, KeyInfo, KeychainError, MAX_STORED_KEYS, OsKeychain,
@@ -63,8 +79,13 @@ pub use receipt::{
 };
 // Re-export builder
 pub use receipt_builder::{ReceiptBuilder, ReceiptSigning};
+pub use recorder::{EvidenceBundle, FlightRecorder, PersistResult, ToolEvent};
 // Re-export signer types (TCK-00167)
 pub use signer::{INITIAL_KEY_VERSION, KeyId, MAX_KEY_ID_LEN, ReceiptSigner, SignerError};
+pub use trigger::{
+    MAX_ACTOR_LEN, MAX_GATE_ID_LEN, MAX_REASON_LEN, MAX_RESOURCE_LEN,
+    MAX_RULE_ID_LEN as MAX_TRIGGER_RULE_ID_LEN, MAX_VIOLATION_LEN, PersistTrigger, TriggerCategory,
+};
 // Re-export verifier types (TCK-00167)
 pub use verifier::{
     VerificationError, VerificationResult, verify_receipt, verify_receipt_integrity,
@@ -72,6 +93,5 @@ pub use verifier::{
 };
 
 // Placeholder exports for future evidence types.
-// TODO(TCK-00170): Implement FlightRecorder, RingBuffer, and retention types.
 // TODO(TCK-00171): Implement TTL and pinning types.
 // TODO(TCK-00172): Implement compaction types.
