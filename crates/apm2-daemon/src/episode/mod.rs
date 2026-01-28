@@ -63,6 +63,10 @@
 //!
 //! # Modules
 //!
+//! - [`adapter`]: `HarnessAdapter` trait and event types for normalizing
+//!   harness behavior
+//! - [`registry`]: `AdapterRegistry` for managing harness adapters
+//! - [`raw_adapter`]: Raw adapter implementation for unstructured output
 //! - [`budget`]: Episode budget and resource limits
 //! - [`envelope`]: Episode envelope and configuration
 //! - [`snapshot`]: Pinned snapshot for reproducibility
@@ -99,7 +103,17 @@ pub mod output;
 pub mod pty;
 pub mod ring_buffer;
 
+// TCK-00162: Harness adapter and registry
+pub mod adapter;
+pub mod raw_adapter;
+pub mod registry;
+
 // Re-export envelope types (TCK-00159)
+// Re-export adapter types (TCK-00162)
+pub use adapter::{
+    AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
+    HarnessEventStream, HarnessHandle, OutputKind, TerminationClassification,
+};
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 pub use envelope::{
     ContextRefs, DeterminismClass, EnvelopeError, EpisodeEnvelope, EpisodeEnvelopeBuilder,
@@ -111,6 +125,10 @@ pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal}
 // Re-export PTY types (TCK-00161)
 pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};
 pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
+pub use raw_adapter::{
+    RawAdapter, RawAdapterHolon, RawAdapterOutput, RawAdapterState, SharedAdapterState,
+};
+pub use registry::AdapterRegistry;
 pub use ring_buffer::{RingBuffer, tier_defaults};
 pub use runtime::{
     EpisodeEvent, EpisodeRuntime, EpisodeRuntimeConfig, Hash, MAX_CONCURRENT_EPISODES,

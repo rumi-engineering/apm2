@@ -126,6 +126,7 @@ json-patch = "4.1"
 
 # Internal crates
 apm2-core = { version = "0.3.0", path = "crates/apm2-core" }
+apm2-holon = { version = "0.3.0", path = "crates/apm2-holon" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
