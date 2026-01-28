@@ -55,7 +55,6 @@
 
 use std::ffi::{CString, OsStr};
 use std::io::{self, Read};
-use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -69,7 +68,6 @@ use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, close, execvp, fork, setsid};
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -82,6 +80,30 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Default read buffer size for PTY output.
 const READ_BUFFER_SIZE: usize = 8192;
+
+/// Maximum allowed read buffer size (64KB) to prevent denial-of-service via
+/// memory exhaustion.
+///
+/// This limit ensures that even with maximum ring buffer capacity, memory usage
+/// per PTY runner is bounded: `MAX_READ_BUFFER_SIZE * MAX_RING_BUFFER_CAPACITY`
+/// = 64KB * 4096 = 256MB worst case per PTY.
+const MAX_READ_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Maximum allowed ring buffer capacity to prevent denial-of-service via memory
+/// exhaustion.
+///
+/// Combined with `MAX_READ_BUFFER_SIZE`, this bounds total memory per PTY.
+const MAX_RING_BUFFER_CAPACITY: usize = 4096;
+
+/// Maximum allowed channel capacity.
+const MAX_CHANNEL_CAPACITY: usize = 8192;
+
+/// Grace period for SIGTERM before SIGKILL in drop (milliseconds).
+///
+/// This is intentionally short (10ms) to avoid blocking tokio workers.
+/// If the process needs longer to clean up, it should handle shutdown
+/// before the runner is dropped.
+const DROP_GRACE_PERIOD_MS: u64 = 10;
 
 /// PTY runner errors.
 #[derive(Debug, Error)]
@@ -164,6 +186,18 @@ pub enum PtyError {
     /// Failed to set non-blocking mode.
     #[error("failed to set non-blocking: {0}")]
     NonBlocking(#[source] std::io::Error),
+
+    /// Failed to duplicate file descriptor.
+    #[error("failed to dup fd: {0}")]
+    DupFd(#[source] std::io::Error),
+
+    /// Failed to create `AsyncFd`.
+    #[error("failed to create AsyncFd: {0}")]
+    AsyncFd(#[source] std::io::Error),
+
+    /// Invalid configuration value.
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }
 
 /// Exit status of the child process.
@@ -195,16 +229,27 @@ impl ExitStatus {
 }
 
 /// Configuration for PTY runner.
+///
+/// All fields are private to enforce validation. Use the builder methods
+/// to configure, or use `Default::default()` for safe defaults.
+///
+/// # Security
+///
+/// Configuration values are bounded to prevent denial-of-service via memory
+/// exhaustion:
+/// - `read_buffer_size`: max 64KB
+/// - `ring_buffer_capacity`: max 4096
+/// - `channel_capacity`: max 8192
 #[derive(Debug, Clone, Copy)]
 pub struct PtyConfig {
-    /// Initial window size.
-    pub window_size: (u16, u16),
+    /// Initial window size (cols, rows).
+    window_size: (u16, u16),
     /// Ring buffer capacity for output.
-    pub ring_buffer_capacity: usize,
+    ring_buffer_capacity: usize,
     /// Channel capacity for output messages.
-    pub channel_capacity: usize,
+    channel_capacity: usize,
     /// Read buffer size.
-    pub read_buffer_size: usize,
+    read_buffer_size: usize,
 }
 
 impl Default for PtyConfig {
@@ -219,6 +264,85 @@ impl Default for PtyConfig {
 }
 
 impl PtyConfig {
+    /// Creates a new `PtyConfig` with validated parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PtyError::InvalidConfig` if any parameter exceeds bounds:
+    /// - `read_buffer_size` > 64KB
+    /// - `ring_buffer_capacity` > 4096
+    /// - `channel_capacity` > 8192
+    /// - `read_buffer_size` or `ring_buffer_capacity` is 0
+    pub fn new(
+        window_size: (u16, u16),
+        ring_buffer_capacity: usize,
+        channel_capacity: usize,
+        read_buffer_size: usize,
+    ) -> Result<Self, PtyError> {
+        // Validate bounds to prevent DoS via memory exhaustion
+        if read_buffer_size == 0 {
+            return Err(PtyError::InvalidConfig(
+                "read_buffer_size must be > 0".to_string(),
+            ));
+        }
+        if read_buffer_size > MAX_READ_BUFFER_SIZE {
+            return Err(PtyError::InvalidConfig(format!(
+                "read_buffer_size {read_buffer_size} exceeds max {MAX_READ_BUFFER_SIZE}"
+            )));
+        }
+        if ring_buffer_capacity == 0 {
+            return Err(PtyError::InvalidConfig(
+                "ring_buffer_capacity must be > 0".to_string(),
+            ));
+        }
+        if ring_buffer_capacity > MAX_RING_BUFFER_CAPACITY {
+            return Err(PtyError::InvalidConfig(format!(
+                "ring_buffer_capacity {ring_buffer_capacity} exceeds max {MAX_RING_BUFFER_CAPACITY}"
+            )));
+        }
+        if channel_capacity == 0 {
+            return Err(PtyError::InvalidConfig(
+                "channel_capacity must be > 0".to_string(),
+            ));
+        }
+        if channel_capacity > MAX_CHANNEL_CAPACITY {
+            return Err(PtyError::InvalidConfig(format!(
+                "channel_capacity {channel_capacity} exceeds max {MAX_CHANNEL_CAPACITY}"
+            )));
+        }
+
+        Ok(Self {
+            window_size,
+            ring_buffer_capacity,
+            channel_capacity,
+            read_buffer_size,
+        })
+    }
+
+    /// Returns the window size (cols, rows).
+    #[must_use]
+    pub const fn window_size(&self) -> (u16, u16) {
+        self.window_size
+    }
+
+    /// Returns the ring buffer capacity.
+    #[must_use]
+    pub const fn ring_buffer_capacity(&self) -> usize {
+        self.ring_buffer_capacity
+    }
+
+    /// Returns the channel capacity.
+    #[must_use]
+    pub const fn channel_capacity(&self) -> usize {
+        self.channel_capacity
+    }
+
+    /// Returns the read buffer size.
+    #[must_use]
+    pub const fn read_buffer_size(&self) -> usize {
+        self.read_buffer_size
+    }
+
     /// Creates a config with the specified window size.
     #[must_use]
     pub const fn with_window_size(mut self, cols: u16, rows: u16) -> Self {
@@ -227,9 +351,47 @@ impl PtyConfig {
     }
 
     /// Creates a config with the specified ring buffer capacity.
+    ///
+    /// The capacity is clamped to `MAX_RING_BUFFER_CAPACITY` (4096).
     #[must_use]
     pub const fn with_ring_buffer_capacity(mut self, capacity: usize) -> Self {
-        self.ring_buffer_capacity = capacity;
+        self.ring_buffer_capacity = if capacity > MAX_RING_BUFFER_CAPACITY {
+            MAX_RING_BUFFER_CAPACITY
+        } else if capacity == 0 {
+            1
+        } else {
+            capacity
+        };
+        self
+    }
+
+    /// Creates a config with the specified channel capacity.
+    ///
+    /// The capacity is clamped to `MAX_CHANNEL_CAPACITY` (8192).
+    #[must_use]
+    pub const fn with_channel_capacity(mut self, capacity: usize) -> Self {
+        self.channel_capacity = if capacity > MAX_CHANNEL_CAPACITY {
+            MAX_CHANNEL_CAPACITY
+        } else if capacity == 0 {
+            1
+        } else {
+            capacity
+        };
+        self
+    }
+
+    /// Creates a config with the specified read buffer size.
+    ///
+    /// The size is clamped to `MAX_READ_BUFFER_SIZE` (64KB).
+    #[must_use]
+    pub const fn with_read_buffer_size(mut self, size: usize) -> Self {
+        self.read_buffer_size = if size > MAX_READ_BUFFER_SIZE {
+            MAX_READ_BUFFER_SIZE
+        } else if size == 0 {
+            1
+        } else {
+            size
+        };
         self
     }
 }
@@ -315,9 +477,10 @@ impl PtyRunner {
         }
 
         // Create PTY pair
+        let (cols, rows) = config.window_size();
         let winsize = Winsize {
-            ws_row: config.window_size.1,
-            ws_col: config.window_size.0,
+            ws_row: rows,
+            ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
@@ -325,7 +488,7 @@ impl PtyRunner {
         let pty = openpty(Some(&winsize), None).map_err(PtyError::PtyAllocation)?;
 
         // Create channel for output
-        let (output_tx, output_rx) = mpsc::channel(config.channel_capacity);
+        let (output_tx, output_rx) = mpsc::channel(config.channel_capacity());
 
         // Fork child process
         // SAFETY: We perform minimal operations in the child before exec.
@@ -404,15 +567,18 @@ impl PtyRunner {
                 drop(pty.slave);
 
                 // Create ring buffer
-                let ring_buffer = RingBuffer::new(config.ring_buffer_capacity);
+                let ring_buffer = RingBuffer::new(config.ring_buffer_capacity());
 
                 // Convert master fd to async
                 // Note: We keep the OwnedFd but spawn a task to read from it
                 let master_fd = pty.master;
 
-                // Spawn output capture task
-                let capture_task =
-                    spawn_capture_task(master_fd.as_raw_fd(), output_tx, config.read_buffer_size);
+                // Spawn output capture task (fail-closed: propagate errors)
+                let capture_task = spawn_capture_task(
+                    master_fd.as_raw_fd(),
+                    output_tx,
+                    config.read_buffer_size(),
+                )?;
 
                 Ok(Self {
                     master_fd: Some(master_fd),
@@ -473,18 +639,57 @@ impl PtyRunner {
     ///
     /// Returns `PtyError::Write` if the write fails.
     /// Returns `PtyError::NotRunning` if the process has exited.
+    ///
+    /// # Note
+    ///
+    /// This method uses blocking I/O via `spawn_blocking` because PTY master
+    /// fds don't have reliable async write support. The write is typically
+    /// fast (kernel buffer) so blocking is acceptable. For high-throughput
+    /// scenarios, consider batching writes.
     pub async fn send_input(&mut self, data: &[u8]) -> Result<(), PtyError> {
         let master_fd = self.master_fd.as_ref().ok_or(PtyError::NotRunning)?;
-
-        // Create async file from raw fd
-        // SAFETY: We're borrowing the fd temporarily for the write.
-        // We use ManuallyDrop to prevent the file from closing our fd when dropped.
-        // This is panic-safe: even if a panic occurs during the await, ManuallyDrop
-        // ensures the destructor never runs, preventing double-close.
         let fd = master_fd.as_raw_fd();
-        let mut file = ManuallyDrop::new(unsafe { tokio::fs::File::from_raw_fd(fd) });
 
-        file.write_all(data).await.map_err(PtyError::Write)
+        // Copy data to owned buffer for spawn_blocking
+        let data = data.to_vec();
+
+        // Use spawn_blocking to avoid blocking the tokio runtime.
+        // PTY writes are typically fast (kernel buffer copy), but we don't want
+        // to risk blocking the async runtime if the buffer is full.
+        tokio::task::spawn_blocking(move || {
+            let mut written = 0;
+            while written < data.len() {
+                // SAFETY: Writing from a valid buffer to a valid fd.
+                let n = unsafe {
+                    libc::write(
+                        fd,
+                        data[written..].as_ptr().cast::<libc::c_void>(),
+                        data.len() - written,
+                    )
+                };
+                if n < 0 {
+                    let err = io::Error::last_os_error();
+                    // Handle EINTR by retrying
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    // Handle WouldBlock by yielding and retrying
+                    // (shouldn't happen often for PTY writes, but handle it)
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    return Err(PtyError::Write(err));
+                }
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    written += n as usize;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| PtyError::Write(io::Error::other(e)))?
     }
 
     /// Sends a signal to the child process.
@@ -634,23 +839,29 @@ impl PtyRunner {
 
 impl Drop for PtyRunner {
     fn drop(&mut self) {
-        // Close master fd
+        // Close master fd first - this signals EOF to the child
         self.master_fd.take();
 
         // Try to reap the child if not already done
         if self.exit_status.is_none() {
-            // Send SIGTERM first
-            if self.signal(Signal::SIGTERM).is_ok() {
-                // Give it a moment to exit
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-
-            // Check if exited
+            // Check if already exited (non-blocking)
             if matches!(self.try_wait(), Ok(ExitStatus::Running)) {
-                // Force kill
-                warn!(pid = %self.child_pid, "sending SIGKILL to orphan process");
-                let _ = self.signal(Signal::SIGKILL);
-                let _ = self.wait();
+                // Send SIGTERM
+                if self.signal(Signal::SIGTERM).is_ok() {
+                    // Brief grace period - kept short (10ms) to avoid blocking tokio workers.
+                    // Closing master_fd above already signals the child via EOF.
+                    // If a process needs longer cleanup, it should be terminated gracefully
+                    // before dropping the runner.
+                    std::thread::sleep(std::time::Duration::from_millis(DROP_GRACE_PERIOD_MS));
+
+                    // Check again
+                    if matches!(self.try_wait(), Ok(ExitStatus::Running)) {
+                        // Force kill
+                        warn!(pid = %self.child_pid, "sending SIGKILL to orphan process");
+                        let _ = self.signal(Signal::SIGKILL);
+                        let _ = self.wait();
+                    }
+                }
             }
         }
     }
@@ -755,11 +966,24 @@ impl Read for ReadableFd {
 /// For replay/simulation scenarios where deterministic timestamps are required,
 /// the flight recorder should be fed pre-timestamped data rather than capturing
 /// live.
+///
+/// # Errors
+///
+/// Returns `PtyError` if:
+/// - `dup()` fails to duplicate the FD
+/// - `set_nonblocking()` fails
+/// - `AsyncFd::new()` fails
+///
+/// # Security (Fail-Closed)
+///
+/// This function returns an error instead of spawning a no-op task on failure.
+/// This ensures that PTY spawn fails if output capture cannot be established,
+/// following the fail-closed principle.
 fn spawn_capture_task(
     master_fd: i32,
     output_tx: mpsc::Sender<PtyOutput>,
     buffer_size: usize,
-) -> tokio::task::JoinHandle<()> {
+) -> Result<tokio::task::JoinHandle<()>, PtyError> {
     // Duplicate the FD so the capture task has its own owned copy.
     // This avoids IO Safety violations from having multiple File handles to the
     // same raw FD. The duplicated FD will be closed when the task's OwnedFd is
@@ -770,9 +994,8 @@ fn spawn_capture_task(
     // semantics.
     let capture_fd = unsafe { libc::dup(master_fd) };
     if capture_fd < 0 {
-        // If dup fails, we can't capture output. Log and return a no-op task.
-        error!("failed to dup master fd for capture: {}", Errno::last());
-        return tokio::spawn(async {});
+        // Fail-closed: return error instead of spawning no-op task
+        return Err(PtyError::DupFd(io::Error::last_os_error()));
     }
 
     // SAFETY: capture_fd is a valid FD from dup(). We take ownership via
@@ -780,26 +1003,19 @@ fn spawn_capture_task(
     let owned_fd = unsafe { OwnedFd::from_raw_fd(capture_fd) };
 
     // Set to non-blocking mode for use with AsyncFd
-    if let Err(e) = set_nonblocking(owned_fd.as_fd()) {
-        error!("failed to set non-blocking mode: {}", e);
-        return tokio::spawn(async {});
-    }
+    // Fail-closed: propagate error
+    set_nonblocking(owned_fd.as_fd())?;
 
     // Wrap in ReadableFd for AsyncFd
     let readable_fd = ReadableFd(owned_fd);
 
     // Create AsyncFd for event-driven I/O
-    let async_fd = match AsyncFd::new(readable_fd) {
-        Ok(fd) => fd,
-        Err(e) => {
-            error!("failed to create AsyncFd: {}", e);
-            return tokio::spawn(async {});
-        },
-    };
+    // Fail-closed: propagate error
+    let async_fd = AsyncFd::new(readable_fd).map_err(PtyError::AsyncFd)?;
 
     // Use tokio::spawn (not spawn_blocking) for async I/O.
     // This does not block a thread per PTY, enabling scale to 10,000+ episodes.
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         let mut seq_gen = SequenceGenerator::new();
         let mut buf = vec![0u8; buffer_size];
 
@@ -866,7 +1082,7 @@ fn spawn_capture_task(
         }
 
         // OwnedFd will close capture_fd when async_fd is dropped here
-    })
+    }))
 }
 
 /// Gets the current monotonic timestamp in nanoseconds.
@@ -1028,8 +1244,10 @@ mod tests {
     #[test]
     fn test_pty_config_default() {
         let config = PtyConfig::default();
-        assert_eq!(config.window_size, (80, 24));
-        assert_eq!(config.ring_buffer_capacity, 1024);
+        assert_eq!(config.window_size(), (80, 24));
+        assert_eq!(config.ring_buffer_capacity(), 1024);
+        assert_eq!(config.channel_capacity(), OUTPUT_CHANNEL_CAPACITY);
+        assert_eq!(config.read_buffer_size(), READ_BUFFER_SIZE);
     }
 
     #[test]
@@ -1038,8 +1256,68 @@ mod tests {
             .with_window_size(120, 40)
             .with_ring_buffer_capacity(2048);
 
-        assert_eq!(config.window_size, (120, 40));
-        assert_eq!(config.ring_buffer_capacity, 2048);
+        assert_eq!(config.window_size(), (120, 40));
+        assert_eq!(config.ring_buffer_capacity(), 2048);
+    }
+
+    #[test]
+    fn test_pty_config_new_validation() {
+        // Valid config
+        let config = PtyConfig::new((80, 24), 1024, 1024, 8192);
+        assert!(config.is_ok());
+
+        // read_buffer_size too large
+        let config = PtyConfig::new((80, 24), 1024, 1024, MAX_READ_BUFFER_SIZE + 1);
+        assert!(config.is_err());
+        assert!(config.unwrap_err().to_string().contains("read_buffer_size"));
+
+        // ring_buffer_capacity too large
+        let config = PtyConfig::new((80, 24), MAX_RING_BUFFER_CAPACITY + 1, 1024, 8192);
+        assert!(config.is_err());
+        assert!(
+            config
+                .unwrap_err()
+                .to_string()
+                .contains("ring_buffer_capacity")
+        );
+
+        // channel_capacity too large
+        let config = PtyConfig::new((80, 24), 1024, MAX_CHANNEL_CAPACITY + 1, 8192);
+        assert!(config.is_err());
+        assert!(config.unwrap_err().to_string().contains("channel_capacity"));
+
+        // Zero values
+        let config = PtyConfig::new((80, 24), 0, 1024, 8192);
+        assert!(config.is_err());
+
+        let config = PtyConfig::new((80, 24), 1024, 0, 8192);
+        assert!(config.is_err());
+
+        let config = PtyConfig::new((80, 24), 1024, 1024, 0);
+        assert!(config.is_err());
+    }
+
+    #[test]
+    fn test_pty_config_builder_clamping() {
+        // Builder methods should clamp values, not reject them
+        let config = PtyConfig::default()
+            .with_ring_buffer_capacity(MAX_RING_BUFFER_CAPACITY * 2)
+            .with_channel_capacity(MAX_CHANNEL_CAPACITY * 2)
+            .with_read_buffer_size(MAX_READ_BUFFER_SIZE * 2);
+
+        assert_eq!(config.ring_buffer_capacity(), MAX_RING_BUFFER_CAPACITY);
+        assert_eq!(config.channel_capacity(), MAX_CHANNEL_CAPACITY);
+        assert_eq!(config.read_buffer_size(), MAX_READ_BUFFER_SIZE);
+
+        // Zero values should be clamped to 1
+        let config = PtyConfig::default()
+            .with_ring_buffer_capacity(0)
+            .with_channel_capacity(0)
+            .with_read_buffer_size(0);
+
+        assert_eq!(config.ring_buffer_capacity(), 1);
+        assert_eq!(config.channel_capacity(), 1);
+        assert_eq!(config.read_buffer_size(), 1);
     }
 
     #[test]
