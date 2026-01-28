@@ -7,7 +7,16 @@ rfc_meta:
     status: DRAFT
     created_date: "2026-01-28"
     last_updated_date: "2026-01-28"
-    version: "0.1.0"
+    version: "2.0.0"
+    version_history:
+      - version: "0.1.0"
+        date: "2026-01-28"
+        phase: "v0 (Discovery)"
+        notes: "Initial RFC creation from PRD-0007"
+      - version: "2.0.0"
+        date: "2026-01-28"
+        phase: "v2 (Grounded)"
+        notes: "EXPLORE mode complete - design decisions grounded in codebase evidence"
     abstract: |
       This RFC specifies a distributed consensus and replication layer that extends APM2's
       append-only ledger and content-addressed storage (CAS) to multi-node operation. The

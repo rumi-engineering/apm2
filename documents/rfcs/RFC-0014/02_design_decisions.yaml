@@ -1,6 +1,59 @@
 rfc_design_decisions:
   schema_version: "2026-01-28"
 
+  version_transition:
+    from_version: "0.1.0"
+    to_version: "2.0.0"
+    transition_date: "2026-01-28"
+    mode: EXPLORE
+    summary: |
+      EXPLORE mode completed. All design decisions grounded in existing codebase patterns.
+      Key findings: Reducer trait pattern validates determinism requirements (INV-0101),
+      KeyManager infrastructure supports T2/T3 key management, EventHasher provides
+      hash-chain foundation for Merkle trees and quorum certificates.
+
+  exploration_findings:
+    - id: EXP-0001
+      title: "Async Trait Pattern Established"
+      discovery: |
+        The crates/apm2-core/src/adapter/traits.rs module demonstrates the
+        Pin<Box<dyn Future<Output=...> + Send + 'a>> pattern for async trait methods.
+        This pattern is used by Adapter and should be adopted by LedgerBackend,
+        ConsensusLayer, and SchemaRegistry traits.
+      affected_decisions: [DD-0001, DD-0002, DD-0004]
+
+    - id: EXP-0002
+      title: "Determinism Infrastructure Complete"
+      discovery: |
+        The Reducer trait in coordination/reducer.rs and canonicalization in
+        determinism/canonicalize.rs provide complete determinism infrastructure.
+        BFT consensus reducers can follow this pattern directly.
+      affected_decisions: [DD-0001, DD-0004]
+
+    - id: EXP-0003
+      title: "Key Management Extensible"
+      discovery: |
+        KeyManager in crypto/keys.rs uses KeyStorage enum (Memory, File) pattern.
+        This can extend to KeyStorage::Hsm for T1 validator keys without breaking
+        T2/T3 actor key handling.
+      affected_decisions: [DD-0003]
+
+    - id: EXP-0004
+      title: "Hash Chain Primitives Available"
+      discovery: |
+        EventHasher provides hash_event(content, prev_hash), verify_chain(), and
+        GENESIS_PREV_HASH constant. Merkle tree implementation extends these primitives
+        without duplication. Consensus epoch genesis can adopt ledger head hash directly.
+      affected_decisions: [DD-0006, DD-0007]
+
+    - id: EXP-0005
+      title: "Ed25519 Signing Infrastructure Complete"
+      discovery: |
+        Signer in crypto/sign.rs provides sign(), verify(), and verifying_key() with
+        zeroize support. QuorumCertificate verification uses verify_signature() directly.
+        Deterministic signatures (test_deterministic_signatures) confirm no randomness.
+      affected_decisions: [DD-0007]
+
   architectural_overview:
     summary: |
       The distributed consensus layer employs a hybrid architecture scoped to local quorums
@@ -122,6 +175,16 @@ rfc_design_decisions:
       decision: |
         Employ HotStuff/PBFT-based BFT consensus for control plane events (total ordering)
         and CRDT/anti-entropy for data plane observations (eventual consistency).
+      codebase_grounding:
+        - file: "crates/apm2-core/src/coordination/reducer.rs"
+          pattern: "Reducer trait with deterministic apply() for state transitions"
+          relevance: "BFT consensus requires deterministic reducers (INV-0101)"
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "Ed25519 Signer with deterministic signatures (test_deterministic_signatures)"
+          relevance: "Consensus attestations use existing Ed25519 infrastructure"
+        - file: "crates/apm2-core/src/adapter/traits.rs"
+          pattern: "BoxFuture pattern for async trait methods"
+          relevance: "ConsensusLayer trait follows established async trait pattern"
       alternatives:
         - id: ALT-0001-A
           name: "OPT-SEQ: Single-writer sequencer per namespace"
@@ -159,6 +222,16 @@ rfc_design_decisions:
       decision: |
         Introduce a LedgerBackend trait that abstracts over storage backends (SQLite,
         consensus-backed) with async methods for append, read, and verification.
+      codebase_grounding:
+        - file: "crates/apm2-core/src/adapter/traits.rs"
+          pattern: "Adapter trait with Pin<Box<dyn Future<Output=...> + Send + 'a>>"
+          relevance: "LedgerBackend follows exact async trait pattern"
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "EventHasher::verify_chain() for hash chain integrity"
+          relevance: "verify_chain() method delegates to existing hash chain verification"
+        - file: "crates/apm2-core/src/coordination/reducer.rs"
+          pattern: "Reducer trait with state(), reset() methods"
+          relevance: "Trait abstraction pattern proven in codebase"
       rationale:
         - "Preserves backward compatibility with existing Ledger usage"
         - "Enables gradual migration via feature flags"
@@ -202,6 +275,19 @@ rfc_design_decisions:
         Establish four signer tiers: T0 (root/genesis), T1 (validators), T2 (holons),
         T3 (sessions). Each tier can only delegate to lower tiers. T0 actions require a
         3-of-5 Organisational Threshold Signature.
+      codebase_grounding:
+        - file: "crates/apm2-core/src/crypto/keys.rs"
+          pattern: "KeyManager with KeyStorage::Memory and KeyStorage::File variants"
+          relevance: "T2/T3 actor keys use existing KeyManager infrastructure"
+        - file: "crates/apm2-core/src/crypto/keys.rs"
+          pattern: "secure_file_permissions() with mode 0o600"
+          relevance: "Key file security patterns extend to validator key management"
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "Signer::secret_key_bytes() returns Zeroizing container"
+          relevance: "Zeroize pattern for T1-T3 key material lifecycle"
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "SignerError::InvalidKey for key validation"
+          relevance: "Key validation errors propagate through trust hierarchy"
       rationale:
         - "Clear authority separation per existing OCAP model (LAW-05)"
         - "Genesis key (T0) isolated from network operations"
@@ -240,6 +326,16 @@ rfc_design_decisions:
       decision: |
         Implement a distributed schema registry where all nodes must agree on schema
         digests before accepting events. Unknown schemas trigger rejection (fail-closed).
+      codebase_grounding:
+        - file: "crates/apm2-core/src/determinism/canonicalize.rs"
+          pattern: "TypedKey enum for type-safe canonical ordering"
+          relevance: "Schema digests use existing canonical serialization"
+        - file: "crates/apm2-core/src/determinism/canonicalize.rs"
+          pattern: "CanonicalizerError::RecursionLimitExceeded"
+          relevance: "Fail-closed error handling pattern"
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "EventHasher::hash_content() for content-addressed digests"
+          relevance: "Schema digests use Blake3 content hashing"
       rationale:
         - "LAW-13 (Semantic Contracting): Events must be verifiable against contracts"
         - "Prevents silent data corruption from schema drift"
@@ -331,6 +427,16 @@ rfc_design_decisions:
       decision: |
         Use BLAKE3-based Merkle trees for efficient anti-entropy reconciliation.
         Nodes exchange tree digests to identify divergent ranges, then pull missing events.
+      codebase_grounding:
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "blake3::Hasher with incremental update()"
+          relevance: "Merkle tree uses existing Blake3 hasher"
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "HASH_SIZE = 32, Hash = [u8; 32]"
+          relevance: "Tree node digests use standard 32-byte hash type"
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "EventHasher::hash_event(content, prev_hash)"
+          relevance: "Merkle tree leaves derived from event hash chain"
       rationale:
         - "O(log n) sync complexity vs O(n) full scan"
         - "Pull-based prevents byzantine event spread"
@@ -347,6 +453,19 @@ rfc_design_decisions:
       decision: |
         Authority events include a quorum certificate containing 2f+1 validator signatures
         over the event hash, enabling independent verification.
+      codebase_grounding:
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "verify_signature(verifying_key, message, signature)"
+          relevance: "Quorum cert verification uses existing signature verification"
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "parse_signature() and parse_verifying_key()"
+          relevance: "Certificate parsing uses existing byte-to-type utilities"
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "SIGNATURE_SIZE = 64, PUBLIC_KEY_SIZE = 32"
+          relevance: "Wire format sizes match existing Ed25519 constants"
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "EventHasher::hash_event() returns certified_hash input"
+          relevance: "Quorum certificate commits to event hash chain"
       structure: |
         message QuorumCertificate {
           // Event range this certificate covers
