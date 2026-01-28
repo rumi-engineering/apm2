@@ -10,9 +10,14 @@ All pull requests must pass these security gates before merge.
 | Tests | `cargo test` | All PRs | Yes | Functionality verification |
 | Security Audit | `cargo-audit` | All PRs | Yes | Known vulnerability check |
 | Dependency Check | `cargo-deny` | All PRs | Yes | License/ban/advisory checks |
+| Formal Proofs | `kani` / `prusti` | Unsafe-touching PRs | Yes | Formal safety proofs for unsafe blocks |
+| Agent Complexity | `clippy::cognitive_complexity` | Agent-authored PRs | Yes | Complexity cap for agent-written modules |
 | Secret Scan | `gitleaks` | All PRs | Yes | Detect committed secrets |
 | SBOM Generation | `syft` | Release | Yes | Software bill of materials |
 | Vulnerability Scan | `grype` | Release | High/Critical | Container/artifact scanning |
+| SLSA L4 Provenance | `slsa-github-generator` | Release | Yes | Hermetic build + two-person review provenance |
+| Rekor Transparency | `rekor-cli` / `cosign` | Dependency updates + Release | Yes | Binary transparency verification |
+| OIDC Claim Lock | `cosign` / policy | Release | Yes | OIDC issuer/subject/audience enforcement |
 
 ## Gate Details
 
@@ -47,6 +52,45 @@ Checks for:
 - Known vulnerabilities in dependencies
 - Unmaintained crates
 - Yanked versions
+
+### Formal Proofs (Unsafe Code)
+
+Unsafe code must include formal proofs using Kani or Prusti in `apm2-core` and `apm2-daemon`.
+
+```bash
+rg "unsafe" crates/apm2-core crates/apm2-daemon -l | xargs -r rg -L "kani::proof|prusti::"
+```
+
+Any output from the command indicates a missing proof annotation.
+
+Unsafe blocks must also include a machine-parseable SAFETY-PROOF block:
+
+```bash
+rg -n "// SAFETY-PROOF:" crates/
+```
+
+**CI Gate**: The `safety-proof-coverage` job in CI verifies that every `unsafe {}` block has a corresponding `// SAFETY-PROOF:` comment. This is a release-blocking security invariant—unsafe code without documented safety proofs is a security risk.
+
+```yaml
+safety-proof-coverage:
+  name: Safety Proof Coverage
+  runs-on: ubuntu-24.04
+  steps:
+    - uses: actions/checkout@v4
+    - name: Check SAFETY-PROOF documentation
+      run: |
+        # Count unsafe blocks vs SAFETY-PROOF comments per file
+        # Fail if any file has more unsafe blocks than proofs
+```
+
+### Agent Complexity (Cognitive Complexity <= 10)
+
+Agent-authored modules must include an `AGENT-AUTHORED` marker and pass the clippy cognitive complexity cap.
+
+```bash
+rg -n "AGENT-AUTHORED" crates/
+cargo clippy -- -A clippy::all -W clippy::cognitive_complexity
+```
 
 ### Cargo Deny
 
@@ -112,6 +156,68 @@ Scans artifacts for vulnerabilities:
     severity-cutoff: high
 ```
 
+### SLSA L4 Provenance (Release Only)
+
+Releases must satisfy SLSA L4 requirements (two-person review + hermetic build) and generate provenance.
+
+```yaml
+- name: SLSA Provenance
+  uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2
+```
+
+Policy requires L4 controls even if the generator is L3-compatible; branch protection and hermetic build constraints must be enforced alongside provenance.
+
+### Rekor Transparency Verification (CTR-1913)
+
+Binary transparency verification is mandatory for dependency updates and releases. All signed release artifacts must have verifiable Rekor inclusion entries.
+
+**CI Gate**: The release workflow includes a `Verify Rekor transparency entries` step that runs after artifact signing:
+
+```yaml
+- name: Verify Rekor transparency entries
+  run: |
+    cd artifacts
+    OIDC_ISSUER="https://token.actions.githubusercontent.com"
+    CERT_IDENTITY="https://github.com/${{ github.repository }}/.*"
+
+    for file in *.sig; do
+      base="${file%.sig}"
+      if [[ -f "$base" && -f "${base}.pem" ]]; then
+        cosign verify-blob \
+          --certificate "${base}.pem" \
+          --signature "${file}" \
+          --certificate-identity-regexp "$CERT_IDENTITY" \
+          --certificate-oidc-issuer "$OIDC_ISSUER" \
+          "$base" || exit 1
+      fi
+    done
+```
+
+For manual verification:
+
+```bash
+rekor-cli verify --artifact <artifact> --signature <sig> --public-key <key>
+```
+
+For keyless signatures, use `cosign verify-blob` with issuer + identity constraints and confirm Rekor inclusion.
+
+### OIDC Claim Lock (CTR-1912)
+
+Release workflows must lock OIDC issuer, subject, and audience (where supported). Verification must enforce these claims.
+
+**CI Gate**: OIDC claim enforcement is combined with Rekor verification above. The `cosign verify-blob` command enforces both Rekor verification AND OIDC claim constraints via:
+- `--certificate-oidc-issuer`: Ensures the certificate was issued for GitHub Actions workflows
+- `--certificate-identity-regexp`: Ensures the signing identity matches the repository
+
+Manual verification:
+
+```bash
+cosign verify-blob \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  --certificate-identity-regexp "https://github.com/.*/apm2/.*" \
+  <artifact>
+```
+
 ## Local Verification
 
 Run all gates locally before pushing:
@@ -134,6 +240,9 @@ cargo deny check
 
 # Secret scan
 gitleaks detect
+
+# Cognitive complexity for agent-authored code
+cargo clippy -- -A clippy::all -W clippy::cognitive_complexity
 ```
 
 ## Pre-commit Hooks

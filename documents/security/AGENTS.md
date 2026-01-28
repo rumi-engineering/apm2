@@ -63,6 +63,7 @@ This project operates within the constraints of a GitHub Free personal account:
 | [SECRETS_MANAGEMENT.md](SECRETS_MANAGEMENT.md) | Credential handling |
 | [INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md) | What to do when things go wrong |
 | [THREAT_MODEL.md](THREAT_MODEL.md) | Attack scenarios and mitigations |
+| [PQC_TRANSITION_PLAN.cac.json](PQC_TRANSITION_PLAN.cac.json) | Forward-looking post-quantum migration plan |
 
 ## Key Insight: Keyless Signing
 

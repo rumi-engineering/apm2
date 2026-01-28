@@ -197,6 +197,43 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # SAFETY-PROOF comment coverage for unsafe code (security gate)
+  # Verifies that all unsafe blocks have documented safety proofs
+  safety-proof-coverage:
+    name: Safety Proof Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check SAFETY-PROOF documentation
+        run: |
+          echo "Checking for unsafe blocks without SAFETY-PROOF documentation..."
+
+          # Find all files with unsafe blocks
+          UNSAFE_FILES=$(rg -l "unsafe\s*\{" crates/apm2-core crates/apm2-daemon || true)
+
+          if [[ -n "$UNSAFE_FILES" ]]; then
+            # Check each file has corresponding SAFETY-PROOF comments
+            MISSING_PROOFS=""
+            for file in $UNSAFE_FILES; do
+              # Count unsafe blocks vs SAFETY-PROOF comments
+              UNSAFE_COUNT=$(rg -c "unsafe\s*\{" "$file" || echo "0")
+              PROOF_COUNT=$(rg -c "// SAFETY-PROOF:" "$file" || echo "0")
+
+              if [[ "$UNSAFE_COUNT" -gt "$PROOF_COUNT" ]]; then
+                MISSING_PROOFS="$MISSING_PROOFS\n$file: $UNSAFE_COUNT unsafe blocks, $PROOF_COUNT SAFETY-PROOF comments"
+              fi
+            done
+
+            if [[ -n "$MISSING_PROOFS" ]]; then
+              echo "ERROR: Files with unsafe blocks missing SAFETY-PROOF documentation:"
+              echo -e "$MISSING_PROOFS"
+              exit 1
+            fi
+          fi
+
+          echo "All unsafe blocks have SAFETY-PROOF documentation"
+
   # Release build check
   build:
     name: Release Build
@@ -238,7 +275,7 @@ jobs:
   # Final check that all CI jobs passed
   ci-success:
     name: CI Success
-    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, secrets, build, semver]
+    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, secrets, build, semver, safety-proof-coverage]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -257,3 +294,4 @@ jobs:
           if [[ "${{ needs.secrets.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.build.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.semver.result }}" != "success" && "${{ needs.semver.result }}" != "skipped" ]]; then exit 1; fi
+          if [[ "${{ needs.safety-proof-coverage.result }}" != "success" ]]; then exit 1; fi

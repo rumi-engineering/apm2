@@ -105,6 +105,27 @@ jobs:
             fi
           done
 
+      # Verify Rekor transparency entries (CTR-1913) and OIDC claim-lock (CTR-1912)
+      - name: Verify Rekor transparency entries
+        run: |
+          cd artifacts
+          OIDC_ISSUER="https://token.actions.githubusercontent.com"
+          CERT_IDENTITY="https://github.com/${{ github.repository }}/.*"
+
+          for file in *.sig; do
+            base="${file%.sig}"
+            if [[ -f "$base" && -f "${base}.pem" ]]; then
+              echo "Verifying Rekor entry for $base..."
+              cosign verify-blob \
+                --certificate "${base}.pem" \
+                --signature "${file}" \
+                --certificate-identity-regexp "$CERT_IDENTITY" \
+                --certificate-oidc-issuer "$OIDC_ISSUER" \
+                "$base" || { echo "ERROR: Rekor verification failed for $base"; exit 1; }
+            fi
+          done
+          echo "All artifacts verified in Rekor transparency log"
+
       # Generate SBOM
       - name: Generate SBOM
         uses: anchore/sbom-action@62ad5284b8ced813296287a0b63906cb364b73ee # v0
