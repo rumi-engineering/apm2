@@ -4,6 +4,25 @@
 //! processes. The daemon supervises agent processes, handles IPC requests, and
 //! maintains runtime state through event sourcing.
 //!
+//! # Runtime Requirements
+//!
+//! This crate requires a **multi-threaded tokio runtime** for full
+//! functionality. Specifically, the [`episode::RawAdapterHolon`] uses
+//! `tokio::task::block_in_place` to bridge synchronous `Holon` trait methods
+//! with async process spawning. Using a single-threaded runtime will cause
+//! a panic when using the holon interface.
+//!
+//! The `apm2-daemon` binary configures tokio with `flavor = "multi_thread"` by
+//! default. If you are using this library directly, ensure your runtime is
+//! configured appropriately:
+//!
+//! ```rust,ignore
+//! #[tokio::main(flavor = "multi_thread")]
+//! async fn main() {
+//!     // Use apm2-daemon components here
+//! }
+//! ```
+//!
 //! # Modules
 //!
 //! - [`episode`]: Episode runtime for bounded execution management

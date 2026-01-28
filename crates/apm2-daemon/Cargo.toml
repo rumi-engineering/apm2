@@ -23,6 +23,7 @@ path = "src/main.rs"
 [dependencies]
 # Internal crates
 apm2-core.workspace = true
+apm2-holon = { workspace = true, features = ["test-utils"] }
 
 # Async runtime
 tokio.workspace = true
@@ -69,6 +70,9 @@ zbus.workspace = true
 
 # Error types
 thiserror.workspace = true
+
+# Security
+secrecy.workspace = true
 
 [dev-dependencies]
 # Testing utilities
