@@ -301,9 +301,8 @@ fn run_coordination(
         }
 
         // Prepare spawn - this generates the session_bound event
-        // The expected_transition_count is 0 for this test (simplified)
         let spawn_result = controller
-            .prepare_session_spawn(&work_id, 0, 1, timestamp_ns)
+            .prepare_session_spawn(&work_id, 1, timestamp_ns)
             .expect("prepare_session_spawn should succeed");
 
         // CRITICAL: At this point, session_bound event should be emitted
@@ -419,9 +418,9 @@ fn tck_00155_cas_at_commit_ordering_session_bound_before_spawn() {
     let work_id = controller.current_work_id().unwrap().to_string();
 
     // Prepare spawn - this should emit session_bound event
-    // The expected_transition_count is 42 for this test to verify it's included
+    // Use with_transition_count to test explicit transition count
     let spawn_result = controller
-        .prepare_session_spawn(&work_id, 42, 1, timestamp_ns)
+        .prepare_session_spawn_with_transition_count(&work_id, 42, 1, timestamp_ns)
         .expect("prepare_session_spawn should succeed");
 
     // CRITICAL CHECK: session_bound event should be emitted BEFORE we call spawn
@@ -788,7 +787,8 @@ fn tck_00155_receipt_hash_changes_with_content() {
 fn tck_00155_session_bound_includes_expected_transition_count() {
     use apm2_core::coordination::CoordinationSessionBound;
 
-    let event = CoordinationSessionBound::new(
+    // Use with_transition_count to explicitly set the transition count
+    let event = CoordinationSessionBound::with_transition_count(
         "coord-123".to_string(),
         "session-456".to_string(),
         "work-789".to_string(),
@@ -809,6 +809,17 @@ fn tck_00155_session_bound_includes_expected_transition_count() {
 
     let restored: CoordinationSessionBound = serde_json::from_str(&json).unwrap();
     assert_eq!(restored.expected_transition_count, 42);
+
+    // Verify default constructor uses 0
+    let default_event = CoordinationSessionBound::new(
+        "coord-123".to_string(),
+        "session-456".to_string(),
+        "work-789".to_string(),
+        1,
+        100,
+        2_000_000_000,
+    );
+    assert_eq!(default_event.expected_transition_count, 0);
 }
 
 /// TCK-00155: Golden test vector for receipt canonical encoding.
@@ -879,7 +890,7 @@ fn tck_00155_receipt_canonical_encoding_golden_vector() {
 fn tck_00155_session_bound_json_golden_vector() {
     use apm2_core::coordination::CoordinationSessionBound;
 
-    let event = CoordinationSessionBound::new(
+    let event = CoordinationSessionBound::with_transition_count(
         "coord-test".to_string(),
         "sess-test".to_string(),
         "work-test".to_string(),

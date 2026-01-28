@@ -102,7 +102,6 @@ fn arb_bound_event(
             session_id,
             work_id.clone(),
             attempt,
-            0, // expected_transition_count
             100,
             2_000_000_000,
         )
@@ -339,7 +338,6 @@ proptest! {
                 session_id.clone(),
                 work_id.clone(),
                 attempt,
-                0, // expected_transition_count
                 100,
                 2_000_000_000,
             );
@@ -529,7 +527,6 @@ fn tck_00149_determinism_complex_sequence() {
             "session-1".to_string(),
             "work-1".to_string(),
             1,
-            0, // expected_transition_count
             100,
             2_000_000_000,
         )),
@@ -548,7 +545,6 @@ fn tck_00149_determinism_complex_sequence() {
             "session-2".to_string(),
             "work-1".to_string(),
             2,
-            0, // expected_transition_count
             200,
             4_000_000_000,
         )),
@@ -567,7 +563,6 @@ fn tck_00149_determinism_complex_sequence() {
             "session-3".to_string(),
             "work-2".to_string(),
             1,
-            0, // expected_transition_count
             300,
             6_000_000_000,
         )),
@@ -640,7 +635,6 @@ fn tck_00149_checkpoint_replay_equals_genesis_replay() {
             "session-1".to_string(),
             "work-1".to_string(),
             1,
-            0, // expected_transition_count
             100,
             2_000_000_000,
         )),

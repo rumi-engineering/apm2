@@ -176,9 +176,38 @@ pub struct CoordinationSessionBound {
 
 impl CoordinationSessionBound {
     /// Creates a new session bound payload.
+    ///
+    /// This constructor uses a default `expected_transition_count` of 0.
+    /// For explicit control over optimistic concurrency, use
+    /// [`Self::with_transition_count`].
+    #[must_use]
+    pub const fn new(
+        coordination_id: String,
+        session_id: String,
+        work_id: String,
+        attempt_number: u32,
+        freshness_seq_id: u64,
+        bound_at: u64,
+    ) -> Self {
+        Self {
+            coordination_id,
+            session_id,
+            work_id,
+            attempt_number,
+            expected_transition_count: 0,
+            freshness_seq_id,
+            bound_at,
+        }
+    }
+
+    /// Creates a new session bound payload with explicit transition count.
+    ///
+    /// Per AD-COORD-006: The `expected_transition_count` is used for optimistic
+    /// concurrency control (CAS-at-commit). If the work item's transition count
+    /// has changed since binding was initiated, the binding is rejected.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub const fn with_transition_count(
         coordination_id: String,
         session_id: String,
         work_id: String,
@@ -503,7 +532,6 @@ mod tests {
             "session-456".to_string(),
             "work-789".to_string(),
             1,
-            42, // expected_transition_count
             100,
             2_000_000_000,
         );
@@ -512,9 +540,24 @@ mod tests {
         assert_eq!(event.session_id, "session-456");
         assert_eq!(event.work_id, "work-789");
         assert_eq!(event.attempt_number, 1);
-        assert_eq!(event.expected_transition_count, 42);
+        assert_eq!(event.expected_transition_count, 0); // default
         assert_eq!(event.freshness_seq_id, 100);
         assert_eq!(event.bound_at, 2_000_000_000);
+    }
+
+    #[test]
+    fn test_coordination_session_bound_with_transition_count() {
+        let event = CoordinationSessionBound::with_transition_count(
+            "coord-123".to_string(),
+            "session-456".to_string(),
+            "work-789".to_string(),
+            1,
+            42, // expected_transition_count
+            100,
+            2_000_000_000,
+        );
+
+        assert_eq!(event.expected_transition_count, 42);
     }
 
     #[test]
@@ -524,7 +567,6 @@ mod tests {
             "session-456".to_string(),
             "work-789".to_string(),
             2,
-            55, // expected_transition_count
             150,
             2_000_000_000,
         );
@@ -730,7 +772,6 @@ mod tests {
             "s".to_string(),
             "w".to_string(),
             1,
-            0, // expected_transition_count
             1,
             1000,
         ));
@@ -794,7 +835,6 @@ mod tests {
                 "s".to_string(),
                 "w1".to_string(),
                 1,
-                0, // expected_transition_count
                 10,
                 2000,
             )),
@@ -856,8 +896,8 @@ mod tests {
         let json = serde_json::to_string(&started).unwrap();
         assert_eq!(started, serde_json::from_str(&json).unwrap());
 
-        // CoordinationSessionBound
-        let bound = CoordinationSessionBound::new(
+        // CoordinationSessionBound (uses with_transition_count for explicit test)
+        let bound = CoordinationSessionBound::with_transition_count(
             "coord-1".to_string(),
             "sess-1".to_string(),
             "work-1".to_string(),
@@ -1037,7 +1077,6 @@ mod tests {
                 "s".to_string(),
                 "w1".to_string(),
                 1,
-                0, // expected_transition_count
                 10,
                 2000,
             )),
