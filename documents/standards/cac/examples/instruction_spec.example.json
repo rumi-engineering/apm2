@@ -1,0 +1,121 @@
+{
+  "kind": "instruction.spec",
+  "schema": "cac.instruction_spec.v1",
+  "schema_version": "1.0.0",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-01-28T00:00:00Z",
+    "dependencies": [],
+    "labels": [
+      "instruction",
+      "v0"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-INSTR-EMITTER",
+      "work_id": "work_example_instruction"
+    },
+    "stable_id": "dcp://apm2.local/instructions/example@v1"
+  },
+  "payload": {
+    "i": "Enforce gate consistency across RFC Council docs.",
+    "pb": "Gate drift leads to skipped checks.",
+    "t": {
+      "sys": "APM2",
+      "repo": "/home/ubuntu/Projects/apm2-rfc-consensus",
+      "scope": [
+        "documents/skills/rfc-council"
+      ]
+    },
+    "lex": {
+      "A1": "All 9 gates must be listed in invariant order everywhere."
+    },
+    "dir": [
+      [
+        "D1",
+        3,
+        "@A1",
+        [
+          "gates"
+        ],
+        []
+      ]
+    ],
+    "g": [
+      [
+        "G1",
+        "D",
+        1,
+        [
+          "@A1"
+        ],
+        [
+          "E1"
+        ],
+        "FAIL_IF_MISSING"
+      ]
+    ],
+    "ev": [
+      [
+        "E1",
+        "gate_inventory_snapshot",
+        true,
+        "md",
+        [
+          "documents/skills/rfc-council"
+        ],
+        [
+          "rg -n \"GATE-TCK\" documents/skills/rfc-council"
+        ]
+      ]
+    ],
+    "chg": [
+      [
+        "C1",
+        "MOD",
+        [
+          "documents/skills/rfc-council/SKILL.md"
+        ],
+        [
+          "documents/skills/rfc-council/SKILL.md#L217"
+        ],
+        "Align gate list"
+      ]
+    ],
+    "dep": [
+      [
+        "DP1",
+        [
+          "C1"
+        ],
+        "Gate list fix precedes rubric update"
+      ]
+    ],
+    "r": {
+      "depth": "D",
+      "modes": [
+        79,
+        36,
+        47
+      ],
+      "ob": [
+        "A",
+        "R",
+        "I",
+        "V",
+        "E",
+        "D"
+      ],
+      "trace": "C"
+    },
+    "out": [
+      [
+        "changeset.report",
+        "dcp://apm2.local/changesets/example@v1",
+        "cac.changeset_report.v1"
+      ]
+    ],
+    "q": [
+      "All nine gates appear in SKILL + review-mode + workflow + rubric"
+    ]
+  }
+}

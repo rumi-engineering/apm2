@@ -15,6 +15,8 @@ Measurements and receipts MUST be tamper-evident; omission of required evidence 
 1. **Tamper-Evidence:** All receipts must be signed and hash-chained.
 2. **Mandatory Fields:** Admission fails if mandatory evidence fields are empty.
 3. **Fail-Closed:** If the measurement pipeline itself is compromised or offline, high-risk transitions must be blocked.
+4. **Evaluator Validity:** Gate evaluators MUST be periodically audited for false negatives (cases where correct work is rejected) and instruction-checker alignment.
+5. **Evaluator Brittleness as Defect:** Non-deterministic or misaligned evaluators produce `EVALUATOR_DRIFT` DefectRecords; measured performance deltas must account for evaluator uncertainty.
 
 ## Rationale
 If the evidence can be forged or selectively ignored, the entire holonic SDLC becomes gameable. Measurement integrity is the ultimate substrate of trust.

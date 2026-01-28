@@ -14,6 +14,7 @@
       "examples/policy_profile.example.json",
       "examples/schema_definition.example.json",
       "examples/skill_spec.example.json",
+      "examples/instruction_spec.example.json",
       "examples/vendor_profile_claude_code.example.json",
       "examples/target_profile.example.json",
       "examples/changeset_report.example.json",
@@ -22,14 +23,14 @@
     ],
     "files": [
       {
-        "bytes": 16786,
+        "bytes": 17497,
         "path": "MANIFEST.json",
         "sha256": "0beb9655af8edcf81e7a19bb0f56d414b5938cae6c69a455e3f6301ff2189efa"
       },
       {
-        "bytes": 76626,
+        "bytes": 77144,
         "path": "MASTER.json",
-        "sha256": "c51aa2701d4267e3170f4487004f4928c3b14558135d2730c88f3f328556849e"
+        "sha256": "f67276eb35d84c443f961bab7d5af243fb6a9ad8e4e867fff06b25f535a83e0c"
       },
       {
         "bytes": 4193,
@@ -162,9 +163,9 @@
         "sha256": "b8d5f67900c74136db69904bbd50fba16576db7518712996cda8f53071bc133a"
       },
       {
-        "bytes": 2093,
+        "bytes": 2148,
         "path": "schemas/cac.common.v1.schema.json",
-        "sha256": "f2e87a1a0c5470826aa1f365bb627d0196b6c457803554a06d4b179e32a7099c"
+        "sha256": "bbfbc17d16a343d3915ee55aa1a87e864126d7197c6cf373f26d24a83f50f92a"
       },
       {
         "bytes": 3647,
@@ -227,9 +228,9 @@
         "sha256": "dad21c273a5c92ecb895ca261b5e71a3ab42003040b2b1d14060225d38393af4"
       },
       {
-        "bytes": 13453,
+        "bytes": 14455,
         "path": "volumes/V02_Formats_Canonicalization_Artifact_Kinds_Schema_Registry.json",
-        "sha256": "d5ba789a752e7326a6856515fade1bdacc74d32862d51f63c1b20b8e4a4207ca"
+        "sha256": "b3ac55e1ce5505d7f367f1deab8797b7820f42f554d651fa2551025c1af0bd81"
       },
       {
         "bytes": 10435,
@@ -302,9 +303,9 @@
         "sha256": "17335a6fee1843984d68fa771e1654bd893c2ccf06425dac1c1d339b4080fe5c"
       },
       {
-        "bytes": 4761,
+        "bytes": 5273,
         "path": "workspace/fragments/07_artifact_kinds.json",
-        "sha256": "1715095c9196497f69b5979c7f656c5a226055639a9819fa1a8e8f2a03ca34ff"
+        "sha256": "5790a146b36f2c34e64956ad8d5fcbf53f5280d9b2330e3a68a3cd994291a3bd"
       },
       {
         "bytes": 1986,
@@ -390,6 +391,21 @@
         "bytes": 1612,
         "path": "schemas/cac.canonicalizer_vectors.v1.schema.json",
         "sha256": "859a992914832aaf4e7ecb9ecad8d6ccd072025dbbb2bf67d9bd0fb871ccf022"
+      },
+      {
+        "bytes": 2208,
+        "path": "examples/instruction_spec.example.json",
+        "sha256": "7e19c2b7cd0299fc0348f84bde59b0537cf007b2fc4234989f61d7869c86579a"
+      },
+      {
+        "bytes": 8012,
+        "path": "schemas/cac.instruction_spec.v1.schema.json",
+        "sha256": "3b6f9c5b459bd6ae12a25a159f886f796912ef8ec6ab203225e703201eb9ffa3"
+      },
+      {
+        "bytes": 2179,
+        "path": "schemas/cac.bundle_manifest.v1.schema.json",
+        "sha256": "9ab11bc0b7840bf3c3b6d52887a6234f3b45d3659b49291f3838a567f42a500c"
       }
     ],
     "parallel_designs": [
@@ -415,9 +431,11 @@
       "schemas/cac.policy_profile.v1.schema.json",
       "schemas/cac.schema_definition.v1.schema.json",
       "schemas/cac.skill_spec.v1.schema.json",
+      "schemas/cac.instruction_spec.v1.schema.json",
       "schemas/cac.vendor_profile.v1.schema.json",
       "schemas/cac.target_profile.v1.schema.json",
       "schemas/cac.changeset_report.v1.schema.json",
+      "schemas/cac.bundle_manifest.v1.schema.json",
       "schemas/cac.run_receipt.v1.schema.json",
       "schemas/cac.canonicalizer_vectors.v1.schema.json"
     ],

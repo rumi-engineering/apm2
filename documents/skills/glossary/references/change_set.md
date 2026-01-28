@@ -13,6 +13,16 @@ Every ChangeSet must trace back to a **Plan-of-Record**. This binding ensures th
 ### Ledger Integration
 ChangeSets decouple work tracking from the forge (e.g., GitHub). While a ChangeSet may currently map to a Git commit range, its identity is maintained in the internal ledger. This allows agents to reason about work states without polling external APIs.
 
+## Mapping to Git (Concrete)
+
+In today's implementation, ChangeSets are often transported via Git primitives, but Git is treated as a projection:
+
+- **Base**: the pinned commit/tree the change is intended to apply to (do not rely on a moving branch name).
+- **Patch**: a commit range or patch-set whose identity can be represented by a stable digest (e.g., a canonical patch encoding hash).
+- **Tip**: the resulting commit(s) in a forge/branch. This is a transport artifact until a **Merge Receipt** binds the promoted result.
+
+Important distinction: Git `HEAD` is "what is currently checked out"; a ChangeSet is "what is proposed to change," and may be reviewed/verified without being `HEAD` in any working copy.
+
 ## Data Structure References
 
 *   **`apm2_core::work::Work`** (`crates/apm2-core/src/work/state.rs`): The underlying data structure for all work items. A ChangeSet is a `Work` instance (often with `WorkType::Ticket` or a specialized type) that tracks the lifecycle of the code change.

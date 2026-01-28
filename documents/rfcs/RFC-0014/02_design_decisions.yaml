@@ -1,0 +1,589 @@
+rfc_design_decisions:
+  schema_version: "2026-01-28"
+
+  version_transition:
+    from_version: "0.1.0"
+    to_version: "2.0.0"
+    transition_date: "2026-01-28"
+    mode: EXPLORE
+    summary: |
+      EXPLORE mode completed. All design decisions grounded in existing codebase patterns.
+      Key findings: Reducer trait pattern validates determinism requirements (INV-0101),
+      KeyManager infrastructure supports T2/T3 key management, EventHasher provides
+      hash-chain foundation for Merkle trees and quorum certificates.
+
+  exploration_findings:
+    - id: EXP-0001
+      title: "Async Trait Pattern Established"
+      discovery: |
+        The crates/apm2-core/src/adapter/traits.rs module demonstrates the
+        Pin<Box<dyn Future<Output=...> + Send + 'a>> pattern for async trait methods.
+        This pattern is used by Adapter and should be adopted by LedgerBackend,
+        ConsensusLayer, and SchemaRegistry traits.
+      affected_decisions: [DD-0001, DD-0002, DD-0004]
+
+    - id: EXP-0002
+      title: "Determinism Infrastructure Complete"
+      discovery: |
+        The Reducer trait in coordination/reducer.rs and canonicalization in
+        determinism/canonicalize.rs provide complete determinism infrastructure.
+        BFT consensus reducers can follow this pattern directly.
+      affected_decisions: [DD-0001, DD-0004]
+
+    - id: EXP-0003
+      title: "Key Management Extensible"
+      discovery: |
+        KeyManager in crypto/keys.rs uses KeyStorage enum (Memory, File) pattern.
+        This can extend to KeyStorage::Hsm for T1 validator keys without breaking
+        T2/T3 actor key handling.
+      affected_decisions: [DD-0003]
+
+    - id: EXP-0004
+      title: "Hash Chain Primitives Available"
+      discovery: |
+        EventHasher provides hash_event(content, prev_hash), verify_chain(), and
+        GENESIS_PREV_HASH constant. Merkle tree implementation extends these primitives
+        without duplication. Consensus epoch genesis can adopt ledger head hash directly.
+      affected_decisions: [DD-0006, DD-0007]
+
+    - id: EXP-0005
+      title: "Ed25519 Signing Infrastructure Complete"
+      discovery: |
+        Signer in crypto/sign.rs provides sign(), verify(), and verifying_key() with
+        zeroize support. QuorumCertificate verification uses verify_signature() directly.
+        Deterministic signatures (test_deterministic_signatures) confirm no randomness.
+      affected_decisions: [DD-0007]
+
+  architectural_overview:
+    summary: |
+      The distributed consensus layer employs a hybrid architecture scoped to local quorums
+      (4-7 nodes): HotStuff/PBFT-based BFT consensus for control plane operations
+      (authority events) and CRDT/anti-entropy for data plane observations. This aligns
+      with LAW-03, LAW-10, and PHY-04. The network assumption is p99 < 500ms latency.
+      Planetary-scale federation is explicitly deferred.
+
+    constraints:
+      - id: CON-SCALE-001
+        name: "Local-Quorum Scale"
+        description: "Target quorum size is 4-7 validators per namespace/holon."
+      - id: CON-GENESIS-001
+        name: "Consensus Epoch Genesis Adoption"
+        description: "Consensus epoch 0 adopts the existing ledger head hash without rehashing history."
+
+    components:
+      - name: "LedgerBackend"
+        role: "Trait abstraction over storage backends"
+        responsibilities:
+          - "append() with ordering guarantee metadata"
+          - "read_from() with namespace scoping"
+          - "verify_chain() for hash chain integrity"
+          - "head() for current sequence position"
+
+      - name: "ConsensusLayer"
+        role: "BFT-based total ordering for control plane"
+        responsibilities:
+          - "Proposal submission and quorum collection"
+          - "Leader election and view changes"
+          - "Quorum certificate generation"
+          - "Validator set management"
+
+      - name: "AntiEntropyLayer"
+        role: "CRDT sync for data plane"
+        responsibilities:
+          - "Merkle tree digest computation"
+          - "Pull-based reconciliation"
+          - "Merge operator application"
+          - "Conflict recording"
+
+      - name: "SchemaRegistry"
+        role: "Distributed schema governance"
+        responsibilities:
+          - "Schema digest registration and lookup"
+          - "Peer handshake validation"
+          - "Fail-closed unknown schema rejection"
+          - "Canonicalizer version tracking"
+
+      - name: "TrustHierarchy"
+        role: "Signer tier management"
+        responsibilities:
+          - "T0 root key verification"
+          - "T1 validator key rotation"
+          - "T2/T3 actor key delegation"
+          - "Revocation propagation"
+
+    architecture_diagram: |
+      +==============================================================================+
+      |                          APM2 HYBRID CONSENSUS LAYER                         |
+      +==============================================================================+
+
+                             CONTROL PLANE (BFT Consensus)
+      +------------------------------------------------------------------------------+
+      |  +------------------+     +------------------+     +------------------+       |
+      |  | Namespace        |     | Namespace        |     | Namespace        |       |
+      |  | Authority BFT    |     | Authority BFT    |     | Authority BFT    |       |
+      |  | Quorum (kernel)  |     | Quorum (holon-A) |     | Quorum (holon-B) |       |
+      |  +--------+---------+     +--------+---------+     +--------+---------+       |
+      |           |                        |                        |                |
+      |           v                        v                        v                |
+      |  +--------+---------+     +--------+---------+     +--------+---------+       |
+      |  | AuthorityLog     |     | AuthorityLog     |     | AuthorityLog     |       |
+      |  | - LeaseIssued    |     | - LeaseIssued    |     | - LeaseIssued    |       |
+      |  | - CapabilityGranted|   | - PolicyChange   |     | - WorkTransition |       |
+      |  | - KeyRotated     |     | - Promotion      |     | - Promotion      |       |
+      |  +------------------+     +------------------+     +------------------+       |
+      +------------------------------------------------------------------------------+
+                                        |
+                                        | Quorum Registry
+                                        v
+      +------------------------------------------------------------------------------+
+      |                         SCHEMA REGISTRY (Consensus)                          |
+      |  +------------------+     +------------------+     +------------------+       |
+      |  | Schema Version   |     | Canonicalizer    |     | Event Type       |       |
+      |  | Registry         |     | Versions         |     | Validators       |       |
+      +------------------------------------------------------------------------------+
+                                        |
+                                        v
+                             DATA PLANE (Anti-Entropy + CRDTs)
+      +------------------------------------------------------------------------------+
+      |  +------------------+     +------------------+     +------------------+       |
+      |  | Observation      |     | Telemetry        |     | Evidence         |       |
+      |  | CRDT (G-Counter) |     | CRDT (LWW-Reg)   |     | CAS (hash-addr)  |       |
+      |  +--------+---------+     +--------+---------+     +--------+---------+       |
+      |           |                        |                        |                |
+      |           +------------------------+------------------------+                |
+      |                                    |                                         |
+      |                                    v                                         |
+      |  +-----------------------------------------------------------------------+   |
+      |  |                     ANTI-ENTROPY GOSSIP LAYER                         |   |
+      |  |  - Merkle tree digests       - Pull-based reconciliation              |   |
+      |  |  - Conflict recording        - Declared merge operators               |   |
+      |  +-----------------------------------------------------------------------+   |
+      +------------------------------------------------------------------------------+
+                                        |
+                                        v
+      +------------------------------------------------------------------------------+
+      |                          LOCAL STORAGE (per-node)                            |
+      |  +------------------+     +------------------+     +------------------+       |
+      |  | SQLite WAL       |     | Checkpoint       |     | Content-Addressed|       |
+      |  | (Authority Log)  |     | Store            |     | Storage (CAS)    |       |
+      +------------------------------------------------------------------------------+
+
+  design_decisions:
+    - id: DD-0001
+      title: "Hybrid Consensus Model (OPT-HYBRID)"
+      status: DECIDED
+      decision: |
+        Employ HotStuff/PBFT-based BFT consensus for control plane events (total ordering)
+        and CRDT/anti-entropy for data plane observations (eventual consistency).
+      codebase_grounding:
+        - file: "crates/apm2-core/src/coordination/reducer.rs"
+          pattern: "Reducer trait with deterministic apply() for state transitions"
+          relevance: "BFT consensus requires deterministic reducers (INV-0101)"
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "Ed25519 Signer with deterministic signatures (test_deterministic_signatures)"
+          relevance: "Consensus attestations use existing Ed25519 infrastructure"
+        - file: "crates/apm2-core/src/adapter/traits.rs"
+          pattern: "BoxFuture pattern for async trait methods"
+          relevance: "ConsensusLayer trait follows established async trait pattern"
+      alternatives:
+        - id: ALT-0001-A
+          name: "OPT-SEQ: Single-writer sequencer per namespace"
+          rejected_reason: |
+            Single point of failure; no fault tolerance. Violates availability
+            requirements for production deployments.
+        - id: ALT-0001-B
+          name: "OPT-RAFT: Raft for all events"
+          rejected_reason: |
+            Standard Raft is only CFT, not BFT. Fails security requirements for
+            federated authority. Consensus overhead for observations is prohibitive.
+        - id: ALT-0001-D
+          name: "OPT-SIGNED-RAFT: Signed-Proof Raft (CFT + detection)"
+          rejected_reason: |
+            Detection-only byzantine logic is insufficient for Admission integrity.
+            The system must remain safe under malicious validators, not merely detect them.
+        - id: ALT-0001-C
+          name: "OPT-FED: Federated signed chains with merge receipts"
+          rejected_reason: |
+            Weak ordering; requires complex merge adjudication. Higher operational
+            complexity without proportional benefit for single-network operation.
+      rationale:
+        - "LAW-03: Control plane events require strict total ordering; data plane is commutative"
+        - "LAW-10: Anti-entropy with declared merge operators for data plane"
+        - "PHY-04: 'Reserve consensus for small control planes; prefer convergent replication'"
+        - "BFT commitment ensures Admission integrity against malicious nodes"
+      requirement_ids:
+        - DCS-REQ-0004
+      evidence_ids:
+        - EVID-0001
+
+    - id: DD-0002
+      title: "LedgerBackend Trait Abstraction"
+      status: DECIDED
+      decision: |
+        Introduce a LedgerBackend trait that abstracts over storage backends (SQLite,
+        consensus-backed) with async methods for append, read, and verification.
+      codebase_grounding:
+        - file: "crates/apm2-core/src/adapter/traits.rs"
+          pattern: "Adapter trait with Pin<Box<dyn Future<Output=...> + Send + 'a>>"
+          relevance: "LedgerBackend follows exact async trait pattern"
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "EventHasher::verify_chain() for hash chain integrity"
+          relevance: "verify_chain() method delegates to existing hash chain verification"
+        - file: "crates/apm2-core/src/coordination/reducer.rs"
+          pattern: "Reducer trait with state(), reset() methods"
+          relevance: "Trait abstraction pattern proven in codebase"
+      rationale:
+        - "Preserves backward compatibility with existing Ledger usage"
+        - "Enables gradual migration via feature flags"
+        - "Allows testing with in-memory or mock backends"
+        - "Follows existing patterns in Reducer and Adapter traits"
+      interface_sketch: |
+        pub trait LedgerBackend: Send + Sync {
+            fn append<'a>(
+                &'a self,
+                event: &'a EventRecord,
+                metadata: &'a EventMetadata,
+            ) -> Pin<Box<dyn Future<Output = Result<AppendResult, LedgerBackendError>> + Send + 'a>>;
+
+            fn read_from<'a>(
+                &'a self,
+                namespace: &'a str,
+                cursor: SeqId,
+                limit: u64,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<EventRecord>, LedgerBackendError>> + Send + 'a>>;
+
+            fn head<'a>(
+                &'a self,
+                namespace: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<SeqId, LedgerBackendError>> + Send + 'a>>;
+
+            fn verify_chain<'a>(
+                &'a self,
+                namespace: &'a str,
+                from_seq_id: SeqId,
+            ) -> Pin<Box<dyn Future<Output = Result<(), LedgerBackendError>> + Send + 'a>>;
+        }
+      requirement_ids:
+        - DCS-REQ-0005
+      evidence_ids:
+        - EVID-0002
+
+    - id: DD-0003
+      title: "Four-Tier Trust Hierarchy"
+      status: DECIDED
+      decision: |
+        Establish four signer tiers: T0 (root/genesis), T1 (validators), T2 (holons),
+        T3 (sessions). Each tier can only delegate to lower tiers. T0 actions require a
+        3-of-5 Organisational Threshold Signature.
+      codebase_grounding:
+        - file: "crates/apm2-core/src/crypto/keys.rs"
+          pattern: "KeyManager with KeyStorage::Memory and KeyStorage::File variants"
+          relevance: "T2/T3 actor keys use existing KeyManager infrastructure"
+        - file: "crates/apm2-core/src/crypto/keys.rs"
+          pattern: "secure_file_permissions() with mode 0o600"
+          relevance: "Key file security patterns extend to validator key management"
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "Signer::secret_key_bytes() returns Zeroizing container"
+          relevance: "Zeroize pattern for T1-T3 key material lifecycle"
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "SignerError::InvalidKey for key validation"
+          relevance: "Key validation errors propagate through trust hierarchy"
+      rationale:
+        - "Clear authority separation per existing OCAP model (LAW-05)"
+        - "Genesis key (T0) isolated from network operations"
+        - "Threshold signatures prevent single-entity root compromise"
+        - "Validator keys (T1) support HSM integration"
+        - "Actor/session keys (T2/T3) use existing KeyManager"
+      trust_model: |
+        TIER 0: ROOT AUTHORITY (3-of-5 Organisational entities)
+          - Signs: Genesis block, validator set changes, emergency revocation
+          - Rotation: Offline ceremony, multi-party (FROST/SSS)
+          - Compromise: Network halt + new genesis
+
+        TIER 1: VALIDATOR QUORUM (HSM Recommended)
+          - Signs: Consensus proposals, block finalization
+          - Rotation: KeyRotated event + quorum approval
+          - Compromise: Slash + remove from validator set
+
+        TIER 2: HOLON SIGNERS (KeyManager)
+          - Signs: Events, leases, evidence
+          - Rotation: KeyRotated event
+          - Compromise: Revoke leases, quarantine
+
+        TIER 3: SESSION SIGNERS (Ephemeral)
+          - Signs: Tool requests, session events
+          - Rotation: On session termination
+          - Compromise: Terminate session
+      requirement_ids:
+        - DCS-REQ-0002
+        - DCS-REQ-0007
+      evidence_ids:
+        - EVID-0003
+
+    - id: DD-0004
+      title: "Schema Registry with Fail-Closed Validation"
+      status: DECIDED
+      decision: |
+        Implement a distributed schema registry where all nodes must agree on schema
+        digests before accepting events. Unknown schemas trigger rejection (fail-closed).
+      codebase_grounding:
+        - file: "crates/apm2-core/src/determinism/canonicalize.rs"
+          pattern: "TypedKey enum for type-safe canonical ordering"
+          relevance: "Schema digests use existing canonical serialization"
+        - file: "crates/apm2-core/src/determinism/canonicalize.rs"
+          pattern: "CanonicalizerError::RecursionLimitExceeded"
+          relevance: "Fail-closed error handling pattern"
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "EventHasher::hash_content() for content-addressed digests"
+          relevance: "Schema digests use Blake3 content hashing"
+      rationale:
+        - "LAW-13 (Semantic Contracting): Events must be verifiable against contracts"
+        - "Prevents silent data corruption from schema drift"
+        - "Enables cross-version verification with canonicalizer tracking"
+        - "Existing HelloAck.policy_hash pattern extends naturally"
+      interface_sketch: |
+        pub trait SchemaRegistry: Send + Sync {
+            fn register<'a>(
+                &'a self,
+                entry: &'a SchemaEntry,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SchemaRegistryError>> + Send + 'a>>;
+
+            fn lookup_by_digest<'a>(
+                &'a self,
+                digest: &'a SchemaDigest,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<SchemaEntry>, SchemaRegistryError>> + Send + 'a>>;
+
+            fn handshake<'a>(
+                &'a self,
+                peer_digests: &'a [SchemaDigest],
+            ) -> Pin<Box<dyn Future<Output = Result<HandshakeResult, SchemaRegistryError>> + Send + 'a>>;
+        }
+      requirement_ids:
+        - DCS-REQ-0003
+      evidence_ids:
+        - EVID-0004
+
+    - id: DD-0005
+      title: "Event Classification by Ordering Guarantee"
+      status: DECIDED
+      decision: |
+        Classify all kernel event types by required ordering guarantee (TotalOrder vs Eventual).
+        Implement StrictlyOrderedEvidence rule: EvidencePublished events gating Admission
+        MUST use TotalOrder. All LWW merges MUST use Hybrid Logical Clocks (HLC).
+      classification_table:
+        total_order:
+          - LeaseIssued
+          - LeaseRenewed
+          - LeaseReleased
+          - LeaseExpired
+          - LeaseConflict
+          - PolicyLoaded
+          - PolicyViolation
+          - KeyRotated
+          - WorkOpened
+          - WorkTransitioned
+          - WorkCompleted
+          - WorkAborted
+          - WorkPrAssociated
+          - CapabilityRequired
+          - CapabilityGranted
+          - CapabilityDelegated
+          - CapabilityRevoked
+          - AdjudicationRequested
+          - AdjudicationVote
+          - AdjudicationResolved
+          - AdjudicationTimeout
+          - ToolRequested
+          - ToolDecided
+          - GateReceiptGenerated
+          - MergeReceiptGenerated
+          - SessionStarted
+          - SessionTerminated
+          - SessionQuarantined
+        eventual_lww_hlc:
+          - SessionProgress
+          - ToolExecuted
+          - BudgetExceeded
+        eventual_set_union:
+          - EvidencePublished
+          - SessionCrashDetected
+          - SessionRestartScheduled
+        conflict_recording:
+          - DefectRecorded
+      rationale:
+        - "Authority events must be totally ordered for deterministic state"
+        - "Admission-critical evidence requires TotalOrder to prevent stale evidence attacks"
+        - "HLC preserves causality for state replay during network partitions"
+        - "Observations are commutative and can use CRDT merge"
+      requirement_ids:
+        - DCS-REQ-0004
+        - DCS-REQ-0008
+      evidence_ids:
+        - EVID-0005
+
+    - id: DD-0006
+      title: "Merkle Tree for Anti-Entropy Sync"
+      status: DECIDED
+      decision: |
+        Use BLAKE3-based Merkle trees for efficient anti-entropy reconciliation.
+        Nodes exchange tree digests to identify divergent ranges, then pull missing events.
+      codebase_grounding:
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "blake3::Hasher with incremental update()"
+          relevance: "Merkle tree uses existing Blake3 hasher"
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "HASH_SIZE = 32, Hash = [u8; 32]"
+          relevance: "Tree node digests use standard 32-byte hash type"
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "EventHasher::hash_event(content, prev_hash)"
+          relevance: "Merkle tree leaves derived from event hash chain"
+      rationale:
+        - "O(log n) sync complexity vs O(n) full scan"
+        - "Pull-based prevents byzantine event spread"
+        - "BLAKE3 consistency with existing hashing infrastructure"
+        - "Checkpoint integration for bounded replay"
+      requirement_ids:
+        - DCS-REQ-0008
+      evidence_ids:
+        - EVID-0006
+
+    - id: DD-0007
+      title: "Quorum Certificate Structure"
+      status: DECIDED
+      decision: |
+        Authority events include a quorum certificate containing 2f+1 validator signatures
+        over the event hash, enabling independent verification.
+      codebase_grounding:
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "verify_signature(verifying_key, message, signature)"
+          relevance: "Quorum cert verification uses existing signature verification"
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "parse_signature() and parse_verifying_key()"
+          relevance: "Certificate parsing uses existing byte-to-type utilities"
+        - file: "crates/apm2-core/src/crypto/sign.rs"
+          pattern: "SIGNATURE_SIZE = 64, PUBLIC_KEY_SIZE = 32"
+          relevance: "Wire format sizes match existing Ed25519 constants"
+        - file: "crates/apm2-core/src/crypto/hash.rs"
+          pattern: "EventHasher::hash_event() returns certified_hash input"
+          relevance: "Quorum certificate commits to event hash chain"
+      structure: |
+        message QuorumCertificate {
+          // Event range this certificate covers
+          uint64 first_seq_id = 1;
+          uint64 last_seq_id = 2;
+
+          // Hash being certified
+          bytes certified_hash = 3;
+
+          // Consensus epoch and round
+          uint64 epoch = 4;
+          uint64 round = 5;
+
+          // Validator signatures (must have >= 2f+1)
+          repeated ValidatorSignature signatures = 6;
+        }
+
+        message ValidatorSignature {
+          string validator_id = 1;
+          bytes signature = 2;
+        }
+      rationale:
+        - "Enables offline verification without consensus participation"
+        - "Proves quorum agreement at specific point in log"
+        - "Supports light client verification"
+      requirement_ids:
+        - DCS-REQ-0001
+        - DCS-REQ-0007
+      evidence_ids:
+        - EVID-0007
+
+    - id: DD-0008
+      title: "Control Plane Traffic Analysis Mitigation"
+      status: DECIDED
+      decision: |
+        All control plane messages between consensus nodes and relay holons MUST use
+        mandatory padding or fixed-size frames to prevent information leakage via
+        message timing or size analysis.
+      rationale:
+        - "TB-0004 requirement for secure inter-node comms"
+        - "Prevents attackers from inferring proposal frequency or voter distribution"
+      requirement_ids:
+        - DCS-REQ-0012
+
+    - id: DD-0009
+      title: "Capability Proof Model and Cross-Node Verification"
+      status: DECIDED
+      decision: |
+        Introduce explicit capability lifecycle events to support cross-node verification.
+        A capability proof is a delegation chain rooted in a CapabilityGranted event and
+        optionally extended by CapabilityDelegated events, with revocation recorded via
+        CapabilityRevoked. All capability events are TotalOrder authority events.
+      rationale:
+        - "DCS-REQ-0014 requires cross-node, ledger-verifiable authority"
+        - "OCAP model demands explicit, auditable capability grants"
+        - "Namespace binding prevents cross-namespace replay"
+        - "Reuse Lease/LeaseScope for scope and budget semantics"
+      proof_model:
+        - "Proof includes ordered list of capability events (grant + delegation chain)"
+        - "Each delegation references parent capability hash and is signed by delegator"
+        - "Proof must include namespace, scope_hash, and expires_at for replay protection"
+      mapping_to_leases:
+        - "capability_id == lease_id"
+        - "scope_hash references serialized LeaseScope (CAS)"
+        - "budget_hash optional; if present references serialized Budget (CAS)"
+      requirement_ids:
+        - DCS-REQ-0014
+      evidence_ids:
+        - EVID-0005
+
+  component_mapping:
+    - requirement_id: DCS-REQ-0001
+      verified_components:
+        - path: "crates/apm2-core/src/ledger/storage.rs"
+          status: EXTEND
+          changes: "Add consensus_epoch, consensus_round, quorum_cert fields to EventRecord"
+      new_components:
+        - path: "crates/apm2-core/src/consensus/bft.rs"
+          status: NEW
+          purpose: "BFT consensus implementation (HotStuff/PBFT variant)"
+      confidence: HIGH
+
+    - requirement_id: DCS-REQ-0003
+      verified_components:
+        - path: "crates/apm2-daemon/src/protocol/handshake.rs"
+          status: EXTEND
+          changes: "Add schema digest exchange to Hello/HelloAck"
+      new_components:
+        - path: "crates/apm2-core/src/schema_registry/mod.rs"
+          status: NEW
+          purpose: "Schema registry trait and implementations"
+      confidence: HIGH
+
+    - requirement_id: DCS-REQ-0005
+      verified_components:
+        - path: "crates/apm2-core/src/ledger/storage.rs"
+          status: REFACTOR
+          changes: "Extract LedgerBackend trait; existing Ledger becomes SqliteLedgerBackend"
+      confidence: HIGH
+
+    - requirement_id: DCS-REQ-0008
+      verified_components:
+        - path: "crates/apm2-core/src/crypto/hash.rs"
+          status: EXTEND
+          changes: "Add Merkle tree digest computation"
+      new_components:
+        - path: "crates/apm2-core/src/consensus/anti_entropy.rs"
+          status: NEW
+          purpose: "Anti-entropy gossip protocol"
+      confidence: MEDIUM
+
+    - requirement_id: DCS-REQ-0014
+      verified_components:
+        - path: "crates/apm2-core/src/lease/"
+          status: EXTEND
+          changes: "Expose lease scope hashes and delegation-chain verification utilities"
+      new_components:
+        - path: "crates/apm2-core/src/lease/capability.rs"
+          status: NEW
+          purpose: "Cross-node capability proof verification"
+      confidence: MEDIUM

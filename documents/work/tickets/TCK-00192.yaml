@@ -1,0 +1,39 @@
+acceptance_criteria:
+  - criterion: HSM interface trait abstraction
+    verification: Manual verification required
+  - criterion: YubiHSM implementation (reference)
+    verification: Manual verification required
+  - criterion: Software fallback for development
+    verification: Manual verification required
+  - criterion: Key rotation via HSM
+    verification: Manual verification required
+  - criterion: Configuration for HSM connection
+    verification: Manual verification required
+implementation:
+  code_examples: []
+  files_to_create:
+    - path: crates/apm2-core/src/crypto/hsm.rs
+      purpose: HSM interface trait
+    - path: crates/apm2-core/src/crypto/yubihsm.rs
+      purpose: YubiHSM implementation
+  files_to_modify: []
+  implementation_steps: []
+  summary: "Integrate with HSM (e.g., YubiHSM, AWS CloudHSM) for T1 validator key\nstorage. Keys never leave HSM; signing operations performed via HSM API.\nFallback to software keys for development.\n"
+notes: "Phase: P3\nGenerated from RFC RFC-0014 ticket decomposition on 2026-01-28."
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+test_requirements:
+  - description: Unit tests pass
+    test_id: UT-00192-01
+    verification_command: cargo test -p apm2-core tck_00192
+  - description: Integration test
+    test_id: IT-00192-01
+    verification_command: cargo run --bin apm2 -- factory tickets emit --rfc RFC-0014
+ticket:
+  depends_on:
+    - TCK-00189
+  id: TCK-00192
+  requirement_ids: []
+  rfc_id: RFC-0014
+  status: READY
+  title: HSM Integration for T1 Validator Keys

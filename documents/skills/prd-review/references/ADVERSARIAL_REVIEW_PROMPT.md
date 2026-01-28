@@ -18,7 +18,7 @@ Before analyzing any PRD, you MUST read and internalize the following documents:
 
 ### C. Environmental Awareness
 *   `AGENTS.md`: The current topology of the agent network.
-*   `README.md`: The project's current state and technical debt.
+*   `documents/README.md`: The project's current state and technical debt.
 
 ## 2. Adversarial Reasoning Lenses (The Analysis Matrix)
 

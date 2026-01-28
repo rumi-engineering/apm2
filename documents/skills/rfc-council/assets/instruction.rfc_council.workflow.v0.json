@@ -1,0 +1,82 @@
+{
+  "kind": "instruction.spec",
+  "schema": "cac.instruction_spec.v1",
+  "schema_version": "1.0.0",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-01-28T00:00:00Z",
+    "dependencies": [],
+    "labels": [
+      "rfc-council",
+      "workflow",
+      "v0"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-INSTR-EMITTER",
+      "work_id": "rfc_council_workflow_v0"
+    },
+    "stable_id": "dcp://apm2.local/instructions/rfc_council/workflow@v0"
+  },
+  "payload": {
+    "i": "RFC Council workflow (validate inputs, select mode/depth, gate order).",
+    "pb": "Provide CAC-native decision tree for RFC Council entrypoint.",
+    "t": {
+      "sys": "APM2",
+      "repo": "/home/ubuntu/Projects/apm2-rfc-consensus",
+      "scope": [
+        "documents/skills/rfc-council/references/rfc-council-workflow.md"
+      ]
+    },
+    "ctx": [
+      "documents/skills/rfc-council/references/rfc-council-workflow.md"
+    ],
+    "lex": {
+      "W1": "Validate input ID format (PRD-XXXX or RFC-XXXX); map to PRD/RFC roots + tickets by rfc_id.",
+      "W2": "If RFC target, load latest evidence bundle (rfc_review_*.yaml) to resume unresolved gates.",
+      "W3": "Auto-select mode from RFC version: v0->EXPLORE, v2->FINALIZE, v4->DECOMPOSE unless tickets exist => REVIEW.",
+      "W4": "Compute review depth from ticket count, cross-crate, net-new; COUNCIL if any high or explicit flag.",
+      "W5": "Gate order (9): SCHEMA, DEP-ACYCLICITY, SCOPE-COVERAGE, CCP-MAPPING, ATOMICITY, IMPLEMENTABILITY, SECURITY-INTEGRITY, REQUIREMENT-FIDELITY, ANTI-COUSIN."
+    },
+    "dir": [
+      ["D1", 3, "@W1", ["inputs"], []],
+      ["D2", 3, "@W2", ["evidence"], []],
+      ["D3", 3, "@W3", ["mode"], []],
+      ["D4", 3, "@W4", ["depth"], []],
+      ["D5", 3, "@W5", ["gates"], []]
+    ],
+    "g": [
+      ["G-SOURCE", "D", 1, ["@W1", "@W2", "@W3", "@W4", "@W5"], ["E1"], "FAIL_IF_MISSING"]
+    ],
+    "ev": [
+      ["E1", "source_doc", true, "md", ["documents/skills/rfc-council/references/rfc-council-workflow.md"], []]
+    ],
+    "chg": [
+      ["C1", "CFG", ["documents/skills/rfc-council/references/rfc-council-workflow.md"], ["documents/skills/rfc-council/references/rfc-council-workflow.md#L1"], "Canonicalize workflow into instruction.spec"]
+    ],
+    "r": {
+      "depth": "M",
+      "modes": [
+        47,
+        36,
+        79
+      ],
+      "ob": [
+        "A",
+        "R",
+        "I",
+        "V",
+        "E",
+        "D",
+        "S"
+      ],
+      "trace": "C"
+    },
+    "out": [
+      ["instruction.spec", "dcp://apm2.local/instructions/rfc_council/workflow@v0", "cac.instruction_spec.v1"]
+    ],
+    "q": [
+      "Mode selection uses RFC version + ticket existence",
+      "Gate order listed and consistent"
+    ]
+  }
+}

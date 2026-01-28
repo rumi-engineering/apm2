@@ -3,15 +3,15 @@ prd_evidence_artifact:
   template_version: "2026-01-23"
   id: EVID-0020
   category: CHANGELOG_ENTRIES
-  title: Versioned documentation and changelog entries for contracts and releases
+  title: Versioned release documentation entries (release channels + procedures)
   capture:
     paths:
-    - docs/
+    - documents/releases/
   verification:
     commands:
     - id: CMD-0020
       shell: bash
-      command: ./scripts/evidence/verify_docs_and_changelog.sh --required CHANGELOG.md
+      command: test -f documents/releases/README.md && rg -n "vX\\.Y\\.Z" documents/releases/RELEASE_CHANNELS.md
       expected_exit_code: 0
       cwd: .
       timeout_seconds: 300

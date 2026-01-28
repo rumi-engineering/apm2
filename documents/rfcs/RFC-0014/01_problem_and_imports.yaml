@@ -1,0 +1,249 @@
+rfc_problem_and_imports:
+  schema_version: "2026-01-28"
+
+  problem_statement:
+    primary: |
+      APM2's truth substrate—the append-only ledger and content-addressed storage (CAS)—currently
+      operates as a single-node SQLite WAL database. This design provides strong local guarantees
+      (hash-chaining, Ed25519 signatures, BLAKE3 integrity) but cannot scale beyond a single
+      daemon process. As APM2 evolves toward federated holon networks, the kernel requires a
+      distributed consensus layer scoped to local quorums (4-7 nodes) that preserves the existing
+      security model while enabling fault tolerance. Planetary-scale federation is explicitly
+      deferred to a future RFC.
+
+    current_state:
+      ledger_implementation:
+        - "SQLite WAL mode with single-writer semantics"
+        - "Hash-chained events: event_hash = BLAKE3(payload || prev_hash)"
+        - "Ed25519 signatures per actor/event"
+        - "Sequence IDs via SQLite AUTOINCREMENT (gap-free, monotonic)"
+      crypto_primitives:
+        - "BLAKE3 for content hashing and chain integrity"
+        - "Ed25519 for actor signatures via KeyManager"
+        - "JCS (RFC 8785) for canonical JSON; sorted protobuf for canonical wire format"
+      networking:
+        - "Local-only: Unix Domain Socket (UDS) for CLI/daemon IPC"
+        - "No TCP/IP transport for inter-node communication"
+        - "No peer discovery or membership protocol"
+
+    why_now:
+      - "PRD-0007 (Context-as-Code) establishes ledger as authoritative control plane"
+      - "Local-quorum scale (4-7 nodes) provides production-grade availability"
+      - "Single point of failure unacceptable for production deployments"
+      - "BFT commitment (HotStuff/PBFT) ensures Admission integrity against malicious actors"
+
+  failure_modes:
+    - id: FM-0001
+      name: "Single Point of Failure"
+      mechanism: "Daemon crash or hardware failure loses all in-progress work and ledger access"
+      impact: "Complete service outage; potential data loss of uncommitted state"
+      solution: "N+1 redundancy via replicated consensus group"
+
+    - id: FM-0002
+      name: "Split Brain"
+      mechanism: "Network partition allows independent writes to divergent ledger copies"
+      impact: "Conflicting event sequences; violated hash-chain invariants"
+      solution: "Quorum-based consensus prevents minority partition from making progress"
+
+    - id: FM-0003
+      name: "Schema Drift"
+      mechanism: "Nodes running different event schema versions accept incompatible events"
+      impact: "Deserialization failures; silent data corruption; verification failures"
+      solution: "Schema registry with digest handshake; fail-closed for unknown schemas"
+
+    - id: FM-0004
+      name: "Hash Chain Fork"
+      mechanism: "Concurrent appends without coordination create divergent prev_hash linkages"
+      impact: "Hash chain verification fails; audit trail broken"
+      solution: "Total ordering via consensus for authority events"
+
+    - id: FM-0005
+      name: "Byzantine Node"
+      mechanism: "Compromised or malicious node signs conflicting events"
+      impact: "Data integrity compromise; trust model violation"
+      solution: "BFT consensus with equivocation detection and slashing"
+
+    - id: FM-0006
+      name: "Replay Attack"
+      mechanism: "Attacker resubmits previously-valid signed event"
+      impact: "Duplicate effects; resource exhaustion"
+      solution: "Monotonic sequence IDs; dedupe keys; consensus log prevents reordering"
+
+  imported_requirements:
+    - prd_requirement_id: REQ-0006
+      rfc_local_id: DCS-REQ-0001
+      title: "Messaging-Native Control Plane"
+      statement: |
+        All authority operations (promotions, capability grants, policy changes) MUST be
+        reflected as signed kernel messages with total ordering guarantees provided by
+        a BFT protocol (HotStuff/PBFT variant) scoped to local quorums (4-7 nodes).
+      acceptance_criteria:
+        - "Authority events committed only after BFT quorum (2f+1 of 3f+1)"
+        - "Event sequence deterministically reproducible across nodes"
+        - "Quorum certificate attached to every authority event"
+
+    - prd_requirement_id: REQ-0010
+      rfc_local_id: DCS-REQ-0002
+      title: "Bootstrap Trust Root Immutability"
+      statement: |
+        The network genesis and validator set MUST be established via an immutable trust
+        root signed by an air-gapped authority key.
+      acceptance_criteria:
+        - "Genesis block signed by T0 (root) key"
+        - "Initial validator set enumerated in genesis"
+        - "T0 key never exposed to network operations"
+
+    - prd_requirement_id: REQ-0009
+      rfc_local_id: DCS-REQ-0003
+      title: "Canonicalizer Governance"
+      statement: |
+        Every event envelope MUST include schema_version, schema_digest, canonicalizer_id, and
+        canonicalizer_version to enable fail-closed validation and cross-version verification.
+      acceptance_criteria:
+        - "Schema registry tracks all known schema digests"
+        - "Unknown schema_digest triggers event rejection"
+        - "Canonicalizer version mismatch prevents signature verification"
+
+  additional_requirements:
+    - id: DCS-REQ-0004
+      title: "Hybrid Ordering Model"
+      statement: |
+        The system MUST support two ordering guarantees: TotalOrder (BFT consensus) for
+        control plane operations and Eventual (anti-entropy) for data plane observations.
+      acceptance_criteria:
+        - "Event metadata includes OrderingGuarantee enum"
+        - "Control plane events routed to consensus layer"
+        - "Data plane events use CRDT merge operators"
+      law_refs:
+        - LAW-03
+        - LAW-10
+
+    - id: DCS-REQ-0005
+      title: "LedgerBackend Abstraction"
+      statement: |
+        The ledger storage MUST be abstracted behind a trait that supports both local SQLite
+        and distributed consensus implementations without breaking existing code.
+      acceptance_criteria:
+        - "LedgerBackend trait with append/read_from/verify_chain methods"
+        - "SqliteLedgerBackend wraps existing Ledger implementation"
+        - "ConsensusLedgerBackend routes to BFT quorum"
+        - "Trait is async-compatible (Pin<Box<Future>>)"
+
+    - id: DCS-REQ-0006
+      title: "Migration Path Preservation"
+      statement: |
+        Migration from single-node to distributed mode MUST preserve the existing hash chain
+        without gaps, reordering, or signature invalidation.
+      acceptance_criteria:
+        - "All pre-migration events remain verifiable post-migration"
+        - "No seq_id gaps introduced during migration"
+        - "Rollback to single-node preserves all finalized events"
+
+    - id: DCS-REQ-0007
+      title: "Byzantine Fault Tolerance"
+      statement: |
+        The consensus layer MUST tolerate up to f Byzantine (arbitrarily malicious) nodes
+        in a 3f+1 validator set while maintaining safety and liveness.
+      acceptance_criteria:
+        - "Equivocation detection for double-signing"
+        - "Byzantine fault evidence recorded in ledger"
+        - "Faulty validators removed from active set"
+
+    - id: DCS-REQ-0008
+      title: "Anti-Entropy Reconciliation"
+      statement: |
+        Data plane events MUST converge across nodes via periodic anti-entropy sync with
+        declared merge operators and conflict recording (per LAW-10).
+      acceptance_criteria:
+        - "Merkle tree digests for efficient diff computation"
+        - "Pull-based reconciliation (prevents byzantine spread)"
+        - "Merge conflicts recorded as DefectRecorded events"
+      law_refs:
+        - LAW-10
+
+    - id: DCS-REQ-0009
+      title: "Strictly Ordered Evidence"
+      statement: |
+        EvidencePublished events that gate Admission MUST be totally ordered and finalized
+        by the control-plane BFT quorum before GateReceipt generation.
+      acceptance_criteria:
+        - "Admission-critical EvidencePublished events carry TotalOrder metadata"
+        - "GateReceipt generation rejects evidence without TotalOrder finalization"
+        - "Strictly ordered evidence is auditable in the ledger"
+
+    - id: DCS-REQ-0010
+      title: "Hybrid Logical Clocks for LWW"
+      statement: |
+        All LWW merge operators MUST use Hybrid Logical Clocks (HLC) instead of wall time
+        to preserve causality and determinism under partition.
+      acceptance_criteria:
+        - "EventMetadata includes HLC timestamp"
+        - "LWW merge uses HLC ordering"
+        - "Determinism tests validate HLC ordering across nodes"
+
+    - id: DCS-REQ-0011
+      title: "Outbound-Only Networking via Relay Holons"
+      statement: |
+        Nodes behind NAT/firewall MUST participate via outbound-only reverse-TLS tunnels
+        terminated at Relay Holons. Relay Holons are availability infrastructure and do not
+        participate in consensus.
+      acceptance_criteria:
+        - "Outbound-only nodes can join quorum via relay tunnel"
+        - "Relay compromise does not allow consensus forgery"
+        - "Relay downtime degrades availability but not safety"
+
+    - id: DCS-REQ-0012
+      title: "Control Plane Traffic Analysis Mitigation"
+      statement: |
+        All control plane messages MUST use fixed-size frames or mandatory padding to
+        prevent timing or size-based traffic analysis.
+      acceptance_criteria:
+        - "Control plane frames are padded to a fixed size or constant envelope"
+        - "Padding is applied before encryption and signing"
+        - "Frame size is configurable and documented"
+        - "Message dispatch includes random jitter (default 0-50ms)"
+        - "Connection pooling is enabled for control plane channels"
+
+    - id: DCS-REQ-0013
+      title: "Membership Admission Hardening"
+      statement: |
+        Join attempts MUST be rate-limited and require a bootstrap credential signed
+        by the validator quorum to prevent join/leave abuse.
+      acceptance_criteria:
+        - "Join attempts rate-limited per source IP or identity"
+        - "Joining node presents invitation token signed by T1 quorum"
+        - "Invalid or missing token rejects membership"
+        - "Tokens are single-use"
+        - "Tokens expire within configurable window (default 24h)"
+        - "Tokens bound to joining node public key"
+
+    - id: DCS-REQ-0014
+      title: "Cross-Node Capability Verification"
+      statement: |
+        Capabilities granted on any node MUST be verifiable by other nodes using
+        ledger state and signature chains.
+      acceptance_criteria:
+        - "Capability proofs include signed delegation chain"
+        - "Any node can verify capability via ledger state"
+        - "Invalid chains are rejected deterministically"
+        - "Capability proofs include namespace binding"
+
+  non_goals:
+    - id: NG-0001
+      statement: "Full BFT for data plane observations"
+      clarification: |
+        Observations (telemetry, tool results) use eventual consistency via CRDTs,
+        not consensus. This is intentional per PHY-04: "Reserve consensus for small
+        control planes; prefer convergent replication for data planes."
+
+    - id: NG-0002
+      statement: "Horizontal auto-scaling of validator set"
+      clarification: |
+        Validator membership changes require governance votes, not automatic scaling.
+        This preserves explicit authority and prevents Sybil attacks.
+
+    - id: NG-0003
+      statement: "Cross-network federation in this RFC"
+      clarification: |
+        Federation across independent APM2 networks (different genesis blocks) is
+        deferred to a future RFC. This RFC covers single-network multi-node operation.

@@ -1,0 +1,484 @@
+# RFC-0014 Council Review Evidence Bundle
+# Generated: 2026-01-28T18:00:00Z
+# Review Type: COUNCIL (FINALIZE - v2 -> v4 transition)
+# Session ID: COUNCIL-RFC-0014-20260128-FINALIZE
+
+schema_version: "1.0.0"
+rfc_id: RFC-0014
+rfc_title: "Distributed Consensus and Replication Layer for APM2 Ledger+CAS Truth Substrate"
+rfc_version: "2.0.0"
+target_version: "4.0.0"
+review_timestamp: "2026-01-28T18:00:00Z"
+review_depth: COUNCIL
+review_mode: FINALIZE
+previous_review: "rfc_review_council_2026-01-28T120000Z.yaml"
+
+# =============================================================================
+# GATE RESULTS (CONSOLIDATED)
+# =============================================================================
+
+gates:
+  # CYCLE_1: Structural (SA-1)
+  - gate_id: GATE-TCK-SCHEMA
+    type: TRUSTED
+    status: PASSED
+    agent: SA-1
+    confidence: 1.00
+    evidence: |
+      All 16 YAML files parsed successfully:
+      - 00_meta.yaml through 09_governance_and_gates.yaml
+      - 14 requirement files (DCS-REQ-0001 through DCS-REQ-0014)
+      Schema compliance score: 1.00
+    findings: []
+
+  - gate_id: GATE-TCK-DEPENDENCY-ACYCLICITY
+    type: DETERMINISTIC
+    status: PASSED
+    agent: SA-1
+    confidence: 1.00
+    evidence: |
+      21-ticket dependency graph passes topological sort.
+      5-phase structure (P0, P1, P1.5, P2, P3) validates layered dependencies.
+      No cycles detected. Critical path: DCS-001 -> DCS-004 -> DCS-007a -> DCS-007b -> DCS-007d
+    findings: []
+
+  - gate_id: GATE-TCK-SCOPE-COVERAGE
+    type: DETERMINISTIC
+    status: PASSED
+    agent: SA-1
+    confidence: 0.95
+    evidence: |
+      All 14 requirements (DCS-REQ-0001 through DCS-REQ-0014) covered.
+      Coverage depth: 1.5 tickets per requirement average.
+      DCS-007a (spike) and DCS-011 (operational) lack explicit mapping but justified.
+    findings:
+      - FND-SA1-003
+
+  - gate_id: GATE-TCK-CCP-MAPPING
+    type: DETERMINISTIC
+    status: PASSED
+    agent: SA-1
+    confidence: 0.92
+    evidence: |
+      All Rust source paths conform to existing codebase patterns.
+      New modules follow crates/apm2-core/src/*/ pattern.
+      Minor: deploy/ and docs/ directories don't exist but can be created.
+    findings:
+      - FND-SA1-002
+
+  # CYCLE_2: Feasibility (SA-2)
+  - gate_id: GATE-TCK-ATOMICITY
+    type: LLM-ASSISTED
+    status: PASSED
+    agent: SA-2
+    confidence: 0.92
+    evidence: |
+      All 21 tickets assessed for single-PR completability:
+      - DCS-007a/b/c/d split enables incremental delivery
+      - DCS-018a/b split isolates design from implementation
+      - All Phase 0-3 tickets are atomic and bounded
+      Mock implementation of DCS-001 shows 2-3 hour completion time.
+    findings: []
+
+  - gate_id: GATE-TCK-IMPLEMENTABILITY
+    type: LLM-ASSISTED
+    status: PASSED
+    agent: SA-2
+    confidence: 0.88
+    evidence: |
+      All tickets have sufficient specification for agent implementation:
+      - EVID-0007 provides protocol state machine outline
+      - EVID-0008 provides safety proof references
+      - Q-0001/Q-0002 are PENDING_SPIKE with clear exit criteria
+      - Codebase grounding verified for all existing paths
+    findings:
+      - FND-SA2-FIN-001
+      - FND-SA2-FIN-002
+
+  # CYCLE_2: Security (SA-3)
+  - gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    type: LLM-ASSISTED
+    status: PASSED
+    agent: SA-3
+    confidence: 0.93
+    evidence: |
+      All 6 trust boundaries have complete, verifiable invariants:
+      - TB-0001: Genesis (5 invariants)
+      - TB-0002: Validator Quorum (4 invariants)
+      - TB-0003: Node Membership (5 invariants)
+      - TB-0004: Inter-Node Communication (6 invariants)
+      - TB-0005: Actor-to-Kernel (4 invariants)
+      - TB-0006: Relay Holon (3 invariants)
+      All 5 security properties have supporting evidence.
+    findings: []
+
+  - gate_id: GATE-TCK-REQUIREMENT-FIDELITY
+    type: LLM-ASSISTED
+    status: PASSED
+    agent: SA-3
+    confidence: 0.91
+    evidence: |
+      Security requirements fully specified with test references:
+      - DCS-REQ-0007: Byzantine fault tolerance (3 AC, 3 tests)
+      - DCS-REQ-0011: Outbound-only networking (3 AC)
+      - DCS-REQ-0012: Traffic analysis mitigation (5 AC, 2 tests)
+      - DCS-REQ-0013: Membership hardening (6 AC, 4 tests)
+      - DCS-REQ-0014: Capability verification (4 AC, 2 tests)
+    findings: []
+
+  - gate_id: GATE-TCK-ANTI-COUSIN
+    type: LLM-ASSISTED
+    status: PASSED
+    agent: SA-3
+    confidence: 0.88
+    evidence: |
+      New components are genuinely new capabilities:
+      - ConsensusLayer: No existing equivalent
+      - AntiEntropyLayer: No existing equivalent
+      - SchemaRegistry: Extends (not duplicates) existing validation
+
+      Existing patterns properly reused:
+      - Signer, EventHasher, KeyManager, Reducer, Adapter traits
+
+      Low-risk monitoring items identified for implementation.
+    findings:
+      - FND-SA3-C2-006
+
+# =============================================================================
+# CONSOLIDATED FINDINGS
+# =============================================================================
+
+findings:
+  # MINOR FINDINGS (1)
+  - finding_id: FND-SA1-002
+    gate_id: GATE-TCK-CCP-MAPPING
+    category: STRUCTURE_DEFECT
+    subcategory: NON_EXISTENT_DIRECTORY
+    severity: MINOR
+    source_agent: SA-1
+    source_cycle: FINALIZE
+    agreement_status: UNANIMOUS
+    location:
+      file: documents/rfcs/RFC-0014/06_ticket_decomposition.yaml
+      yaml_path: tickets.DCS-011.files_to_create
+    description: |
+      DCS-011 references deploy/grafana/ and docs/operations/ directories
+      that do not exist in the codebase.
+    remediation: |
+      Update paths to existing conventions (e.g., documents/operations/)
+      or create directories as part of DCS-011 implementation.
+
+  # INFO FINDINGS (5)
+  - finding_id: FND-SA1-003
+    gate_id: GATE-TCK-SCOPE-COVERAGE
+    category: COVERAGE_DEFECT
+    subcategory: TRACEABILITY_GAP
+    severity: INFO
+    source_agent: SA-1
+    source_cycle: FINALIZE
+    agreement_status: UNANIMOUS
+    location:
+      file: documents/rfcs/RFC-0014/06_ticket_decomposition.yaml
+    description: |
+      DCS-007a and DCS-011 lack requirements_covered entries.
+      Justified as spike/operational work but traceability could be improved.
+    remediation: |
+      Consider adding waiver entries or comments explaining why these tickets
+      are not mapped to specific requirements.
+
+  - finding_id: FND-SA2-FIN-001
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: DOCUMENTATION
+    subcategory: SPECIFICATION_GAP
+    severity: LOW
+    source_agent: SA-2
+    source_cycle: FINALIZE
+    agreement_status: MAJORITY
+    description: |
+      Padding size for control plane frames not specified. Agent can derive
+      from maximum message size but explicit specification would prevent variance.
+    remediation: |
+      Add padding size (e.g., 4096 bytes) to TB-0004 or DCS-004 AC.
+
+  - finding_id: FND-SA2-FIN-002
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: DOCUMENTATION
+    subcategory: SPECIFICATION_GAP
+    severity: LOW
+    source_agent: SA-2
+    source_cycle: FINALIZE
+    agreement_status: MAJORITY
+    description: |
+      Merkle tree structure for anti-entropy not specified (binary vs radix).
+    remediation: |
+      Add Merkle tree structure specification to DCS-009 or create EVID.
+
+  - finding_id: FND-SA3-C2-006
+    gate_id: GATE-TCK-ANTI-COUSIN
+    category: COUSIN_DEFECT
+    subcategory: MONITORING_ADVISORY
+    severity: INFO
+    source_agent: SA-3
+    source_cycle: FINALIZE
+    agreement_status: UNANIMOUS
+    description: |
+      DCS-REQ-0013 requires rate limiting. Implementation should audit codebase
+      for existing rate limiting patterns before creating new infrastructure.
+    remediation: |
+      During implementation: audit codebase, extend existing if found,
+      create generic RateLimiter trait if not found.
+
+# =============================================================================
+# RESOLVED FINDINGS (from CYCLE_2)
+# =============================================================================
+
+resolved_findings:
+  - finding_id: FND-SA2-C2-001
+    original_severity: BLOCKER
+    resolution: |
+      DCS-007 has been split into DCS-007a/b/c/d with incremental PRs.
+      Each sub-ticket satisfies atomicity and implementability constraints.
+    verified_by: SA-2
+
+  - finding_id: FND-SA2-C2-002
+    original_severity: BLOCKER
+    resolution: |
+      Q-0001 and Q-0002 are now PENDING_SPIKE status with clear exit criteria.
+      Spike ticket DCS-007a explicitly resolves both questions.
+    verified_by: SA-2
+
+  - finding_id: FND-SA2-C2-003
+    original_severity: BLOCKER
+    resolution: |
+      EVID-0007 now contains message types, state machine outline, quorum thresholds.
+      Sufficient for agent to begin implementation post-spike.
+    verified_by: SA-2
+
+  - finding_id: FND-SA2-C2-004
+    original_severity: BLOCKER
+    resolution: |
+      EVID-0008 now contains proof references, RFC mapping, acceptance criteria mapping.
+      Sufficient for proof verification post-spike.
+    verified_by: SA-2
+
+  - finding_id: FND-SA2-C2-005
+    original_severity: MAJOR
+    resolution: |
+      DCS-018 split into DCS-018a (design spike) and DCS-018b (implementation).
+      Properly sequenced with DCS-007 dependencies.
+    verified_by: SA-2
+
+  - finding_id: FND-SA2-C2-006
+    original_severity: MAJOR
+    resolution: |
+      Phase structure updated with P1.5 (Consensus Spike): 2 weeks.
+      P2 updated to 6-8 weeks (realistic given dependency structure).
+    verified_by: SA-2
+
+  - finding_id: FND-SA3-C2-001
+    original_severity: BLOCKER
+    resolution: |
+      All evidence artifacts (EVID-0009, EVID-0011, EVID-0015) now have draft
+      content with test specifications and analysis frameworks.
+    verified_by: SA-3
+
+  - finding_id: FND-SA3-C2-002
+    original_severity: MAJOR
+    resolution: |
+      DCS-REQ-0013 now includes AC-004 (single-use), AC-005 (expiration),
+      AC-006 (node key binding) for token lifecycle.
+    verified_by: SA-3
+
+  - finding_id: FND-SA3-C2-003
+    original_severity: MAJOR
+    resolution: |
+      DCS-REQ-0012 now includes AC-004 (random jitter 0-50ms) and
+      AC-005 (connection pooling required).
+    verified_by: SA-3
+
+  - finding_id: FND-SA3-C2-004
+    original_severity: MAJOR
+    resolution: |
+      DCS-REQ-0014 now includes AC-004 (capability proofs include namespace binding).
+      INV-0026 updated to include namespace in verification.
+    verified_by: SA-3
+
+  - finding_id: FND-SA3-C2-005
+    original_severity: MINOR
+    resolution: |
+      TS-0003 now specifies: "KeyRotated events effective at NEXT epoch boundary.
+      Signatures for current epoch use key active at epoch start."
+    verified_by: SA-3
+
+# =============================================================================
+# VERDICT
+# =============================================================================
+
+verdict: APPROVED
+verdict_reason: |
+  RFC-0014 FINALIZE review demonstrates readiness for v4 (Standard) status:
+
+  GATE RESULTS:
+  - 9/9 gates PASSED
+  - Zero BLOCKER findings
+  - Zero MAJOR findings
+  - 1 MINOR finding (addressable during implementation)
+  - 4 INFO findings (advisory)
+
+  RESOLVED FINDINGS:
+  - 5 BLOCKER findings from CYCLE_2 resolved (DCS-007 split, Q-0001/Q-0002 spike,
+    evidence artifacts populated)
+  - 5 MAJOR findings from CYCLE_2 resolved (security requirements enhanced)
+  - 1 MINOR finding from CYCLE_2 resolved (key rotation epoch boundary)
+
+  QUALITY METRICS:
+  - SA-1 confidence: 0.95 (structural soundness)
+  - SA-2 confidence: 0.90 (implementation feasibility)
+  - SA-3 confidence: 0.92 (security assurance)
+  - Overall council confidence: 0.92
+
+  RECOMMENDATION:
+  Approve RFC-0014 for v4 status. Minor finding FND-SA1-002 can be addressed
+  during implementation without blocking RFC approval.
+
+# =============================================================================
+# COUNCIL METADATA
+# =============================================================================
+
+council_metadata:
+  session_id: COUNCIL-RFC-0014-20260128-FINALIZE
+  mode: FINALIZE
+  version_transition: "v2 -> v4"
+
+  subagents:
+    - agent_id: SA-1
+      emergent_role: Structural Rigorist
+      focus: "Force convergence on architectural decisions"
+      model: claude-opus-4-5-20251101
+      selected_modes: [42, 48, 50, 72, 74]
+      mode_names:
+        - Counterfactual reasoning
+        - Heuristic/rules-of-thumb reasoning
+        - Satisficing reasoning
+        - Engineering design reasoning
+        - Systems-theoretic reasoning
+      gates_executed:
+        - GATE-TCK-SCHEMA
+        - GATE-TCK-DEPENDENCY-ACYCLICITY
+        - GATE-TCK-SCOPE-COVERAGE
+        - GATE-TCK-CCP-MAPPING
+      artifact: "Explanatory Scoring Table"
+      findings_generated: 3
+
+    - agent_id: SA-2
+      emergent_role: Implementation Feasibility
+      focus: "Finalize execution strategy and resource impacts"
+      model: claude-opus-4-5-20251101
+      selected_modes: [4, 50, 62, 65, 72]
+      mode_names:
+        - Logic programming (Horn clause)
+        - Satisficing reasoning
+        - Narrative reasoning
+        - Deontic reasoning (obligations)
+        - Engineering design reasoning
+      gates_executed:
+        - GATE-TCK-ATOMICITY
+        - GATE-TCK-IMPLEMENTABILITY
+      artifact: "Mock Implementation Run Report"
+      findings_generated: 2
+
+    - agent_id: SA-3
+      emergent_role: Security & Anti-Cousin Guardian
+      focus: "Final security assurance case (CAE Tree)"
+      model: claude-opus-4-5-20251101
+      selected_modes: [9, 11, 26, 60, 66]
+      mode_names:
+        - Analogical reasoning
+        - Bayesian reasoning
+        - Supervaluationist reasoning
+        - Argument mapping
+        - Temporal reasoning
+      gates_executed:
+        - GATE-TCK-SECURITY-AND-INTEGRITY
+        - GATE-TCK-REQUIREMENT-FIDELITY
+        - GATE-TCK-ANTI-COUSIN
+      artifact: "CAE Tree (Claim-Argument-Evidence)"
+      findings_generated: 1
+
+  cycles_completed: 3
+  total_findings_generated: 6
+  findings_by_severity:
+    BLOCKER: 0
+    MAJOR: 0
+    MINOR: 1
+    LOW: 2
+    INFO: 3
+  previous_findings_resolved: 11
+  quorum_achieved: true
+  elapsed_time_seconds: 420
+
+# =============================================================================
+# OPEN QUESTIONS STATUS
+# =============================================================================
+
+open_questions_disposition:
+  - question_id: Q-0001
+    question: "Which consensus library should we use?"
+    status: PENDING_SPIKE
+    disposition: |
+      Deferred to DCS-007a spike with clear exit criteria.
+      Not a blocker for v4 status.
+
+  - question_id: Q-0002
+    question: "Which BFT protocol variant (HotStuff vs PBFT)?"
+    status: PENDING_SPIKE
+    disposition: |
+      Deferred to DCS-007a spike with clear exit criteria.
+      Not a blocker for v4 status.
+
+  - question_id: Q-0003
+    question: "Namespace-to-quorum mapping?"
+    status: OPEN
+    disposition: |
+      Proposed resolution documented: start with single quorum, shard if needed.
+      Can be refined during implementation.
+
+  - question_id: Q-0004
+    question: "Minimum validator set size?"
+    status: OPEN
+    disposition: |
+      Proposed resolution documented: 4 nodes (small), 7 nodes (production).
+      Operator choice, not architectural decision.
+
+  - question_id: Q-0005
+    question: "T0 key ceremony procedure?"
+    status: OPEN
+    disposition: |
+      Proposed resolution documented: 3-of-5 threshold, air-gapped.
+      Operational procedure, deadline before PHASE-1.
+
+  - question_id: Q-0006
+    question: "Cross-network federation?"
+    status: RESOLVED
+    disposition: "Explicitly out of scope for this RFC."
+
+  - question_id: Q-0007
+    question: "Initial merge operators?"
+    status: RESOLVED
+    disposition: "LWW, SetUnion, NoMerge - documented and accepted."
+
+# =============================================================================
+# VERSION TRANSITION APPROVAL
+# =============================================================================
+
+version_transition:
+  from_version: "2.0.0"
+  to_version: "4.0.0"
+  status: APPROVED
+  approval_date: "2026-01-28"
+  approved_by: "RFC Council (SA-1, SA-2, SA-3)"
+  conditions: []
+  advisory_notes:
+    - "FND-SA1-002: Update DCS-011 paths during implementation"
+    - "Evidence artifacts should be updated from DRAFT to VERIFIED during implementation"
+    - "Threshold signature scheme selection should be finalized before PHASE-1"

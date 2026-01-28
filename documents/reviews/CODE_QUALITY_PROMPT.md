@@ -26,7 +26,8 @@ decision_tree:
       context_files[26]:
         - path: AGENTS.md
           purpose: "Repository-wide agent instructions."
-        - path: CONTRIBUTING.md
+        - path: documents/README.md
+        - path: documents/skills/README.md
           purpose: "Development workflow, required commands, and CI expectations."
         - path: documents/security/AGENTS.md
           purpose: "Security documentation index and quick reference."
@@ -210,8 +211,8 @@ decision_tree:
             - match: "file_path matches any documentation pattern"
               patterns[3]:
                 - "*.md"
-                - "CONTRIBUTING.md"
-                - "README.md"
+                - "documents/README.md"
+                - "documents/skills/README.md"
               actions[1]:
                 - "Read and verify accuracy against code."
         - id: READ_ADJACENT_CONTEXT

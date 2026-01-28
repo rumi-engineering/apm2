@@ -1,0 +1,407 @@
+{
+  "$id": "cac.instruction_spec.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "instruction.spec"
+        },
+        "schema": {
+          "const": "cac.instruction_spec.v1"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "i": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pb": {
+              "type": "string"
+            },
+            "t": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sys": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "repo": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "ver": {
+                  "type": "string"
+                },
+                "scope": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "sys",
+                "repo"
+              ]
+            },
+            "ctx": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "lex": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "dir": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/dir"
+              },
+              "minItems": 1
+            },
+            "g": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/gate"
+              },
+              "minItems": 1
+            },
+            "ev": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ev"
+              },
+              "minItems": 1
+            },
+            "chg": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/chg"
+              },
+              "minItems": 1
+            },
+            "dep": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/dep"
+              }
+            },
+            "r": {
+              "$ref": "#/$defs/rsn"
+            },
+            "out": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/out"
+              },
+              "minItems": 1
+            },
+            "q": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "x": {
+              "$ref": "#/$defs/exec"
+            }
+          },
+          "required": [
+            "i",
+            "t",
+            "dir",
+            "g",
+            "ev",
+            "chg",
+            "r",
+            "out"
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Z0-9][A-Z0-9._-]{0,31}$"
+    },
+    "lvl": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    "gtype": {
+      "type": "string",
+      "enum": [
+        "T",
+        "D",
+        "L"
+      ]
+    },
+    "anchor": {
+      "type": "string",
+      "pattern": "^.+(#L|:)[0-9]+$"
+    },
+    "ob": {
+      "type": "string",
+      "enum": [
+        "H",
+        "A",
+        "R",
+        "I",
+        "V",
+        "E",
+        "D",
+        "S"
+      ]
+    },
+    "dir": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 5,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/id"
+        },
+        {
+          "$ref": "#/$defs/lvl"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "gate": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 6,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/id"
+        },
+        {
+          "$ref": "#/$defs/gtype"
+        },
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "ev": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 6,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/id"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "chg": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 5,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/id"
+        },
+        {
+          "type": "string",
+          "enum": [
+            "ADD",
+            "MOD",
+            "DEL",
+            "MOVE",
+            "CFG"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/anchor"
+          }
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "dep": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/id"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "out": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "rsn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "type": "string",
+          "enum": [
+            "S",
+            "M",
+            "D"
+          ]
+        },
+        "modes": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 80
+          }
+        },
+        "ob": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ob"
+          },
+          "minItems": 1
+        },
+        "trace": {
+          "type": "string",
+          "enum": [
+            "N",
+            "C",
+            "F"
+          ]
+        }
+      },
+      "required": [
+        "depth",
+        "ob"
+      ]
+    },
+    "exec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "bud": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tok": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "tc": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "ms": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  },
+  "title": "CAC InstructionSpec v1 (compact)"
+}

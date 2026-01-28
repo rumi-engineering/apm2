@@ -1,0 +1,45 @@
+requirement:
+  id: DCS-REQ-0005
+  title: "LedgerBackend Abstraction"
+  imported_from: null
+  status: ACTIVE
+
+  statement: |
+    The ledger storage MUST be abstracted behind a trait that supports both local SQLite
+    and distributed consensus implementations without breaking existing code.
+
+  rationale: |
+    Abstraction enables gradual migration, testing flexibility, and future extensibility.
+    Existing code using Ledger should work unchanged with SqliteLedgerBackend.
+
+  acceptance_criteria:
+    - id: AC-001
+      description: "LedgerBackend trait with append/read_from/verify_chain methods"
+      verification: "Trait definition exists and is exported"
+
+    - id: AC-002
+      description: "SqliteLedgerBackend wraps existing Ledger implementation"
+      verification: "Implementation delegates to existing methods"
+
+    - id: AC-003
+      description: "ConsensusLedgerBackend routes to BFT quorum"
+      verification: "Implementation uses consensus protocol"
+
+    - id: AC-004
+      description: "Trait is async-compatible (Pin<Box<Future>>)"
+      verification: "Methods return futures; can be awaited"
+
+    - id: AC-005
+      description: "All existing ledger tests pass with SqliteLedgerBackend"
+      verification: "cargo test passes without changes to tests"
+
+  design_references:
+    - "02_design_decisions.yaml#DD-0002"
+    - "04_contracts_and_versioning.yaml#CTR-0001"
+
+  test_references:
+    - "07_test_and_evidence.yaml#TEST-HC-001"
+    - "07_test_and_evidence.yaml#TEST-HC-002"
+
+  ticket_references:
+    - "DCS-001"

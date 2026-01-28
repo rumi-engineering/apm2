@@ -618,6 +618,20 @@
       },
       {
         "consume_allowed": true,
+        "kind_id": "instruction.spec",
+        "normative": true,
+        "purpose": "Defines individual instruction blocks and their execution contracts.",
+        "schema_id": "cac.instruction_spec.v1"
+      },
+      {
+        "consume_allowed": true,
+        "kind_id": "bundle.manifest",
+        "normative": false,
+        "purpose": "Delivery wrapper that groups instruction/skill artifacts with index references.",
+        "schema_id": "cac.bundle_manifest.v1"
+      },
+      {
+        "consume_allowed": true,
         "kind_id": "target.profile",
         "normative": true,
         "purpose": "Defines rendering, retrieval, and delivery constraints independent of model intelligence; drives compilation.",

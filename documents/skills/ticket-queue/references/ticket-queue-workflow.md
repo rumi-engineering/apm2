@@ -6,7 +6,8 @@ decision_tree:
     - id: INIT
       purpose: "Initialize orchestration posture, then loop until all tickets are merged."
       context_files[4]:
-        - path: README.md
+        - path: documents/README.md
+        - path: documents/skills/README.md
           purpose: "Root-level module index, repository-wide constraints, and canonical dev workflow."
         - path: documents/skills/dev-eng-ticket/SKILL.md
           purpose: "Instructions to be passed to the implementer subagent. The orchestrator MUST NOT execute this skill itself."
@@ -46,4 +47,3 @@ decision_tree:
           if: "always"
           then:
             next_reference: references/ticket-queue-loop.md
-

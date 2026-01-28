@@ -1,6 +1,6 @@
 # Agent Acceptance Testing (AAT)
 
-**Definition:** A formal verification gate where an independent agent validates that a change meets its specified intent using hypothesis-driven evidence.
+**Definition:** An agent-driven (stochastic) evaluation gate where an independent agent attempts to validate that a change meets its specified intent using hypothesis-driven evidence.
 
 **Purpose:**
 -   **Trust Separation:** Distinct from unit/integration tests (which verify the code works); AAT verifies the *intent* was satisfied.
@@ -20,5 +20,6 @@
     -   Invoked via `apm2 factory gate run --type aat`.
     -   The AAT Agent reads the `Plan-of-Record` and the modified code.
     -   It generates an `EvidenceBundle` containing logs, screenshots, or terminal captures.
--   **Blocking:** A ChangeSet cannot be merged (converted to a `Merge Receipt`) until the AAT Gate passes.
+-   **Blocking (policy-defined):** Some portfolios may require AAT for higher tiers, but AAT is an advisory/stochastic evaluator unless it produces terminal-verifier evidence.
+-   **Terminal-verifier anchor:** AAT is not itself a terminal verifier. Authoritative promotion still requires machine-checkable terminal-verifier evidence (tests/builds/signature checks) bound to artifacts and attested environment metadata.
 -   **Feedback Loop:** Findings from AAT are fed back into the `Refactor Radar` to improve future prompts and lint rules.

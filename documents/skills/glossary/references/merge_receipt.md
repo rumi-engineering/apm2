@@ -8,11 +8,30 @@
 -   **Atomicity:** The receipt is emitted only if the merge transition (State A -> State B) is valid and authorized.
 
 ## Content
--   `prev_state_hash`: Git tree hash before merge.
--   `new_state_hash`: Git tree hash after merge.
--   `changeset_id`: The ID of the work being merged.
--   `gate_receipts`: List of signed `GatePassed` events (AAT, Lint, Security).
--   `approver_signature`: Ed25519 signature of the Holon/User authorizing the merge.
+-   `inputs`: digests identifying what was merged (ChangeSet digest + pinned base state).
+-   `outputs`: digests identifying the promoted trunk state.
+-   `gate_receipts`: signed gate receipts bound to evidence bundles (terminal verifiers + any advisory checks).
+-   `policy_version`: which policy permitted the promotion.
+-   `attestation`: runner/toolchain/environment identity for the merge operation (at least image/toolchain digests).
+-   `approver_signature`: Ed25519 signature(s) authorizing the promotion.
+
+## Mapping to Git (Concrete)
+
+In a Git-backed workflow, a merge receipt typically binds:
+
+- **Base**: a pinned commit/tree selector representing trunk *before* promotion.
+- **Result**: the new trunk commit/tree selector *after* promotion.
+- **Algorithm**: Git object IDs may be SHA-1 or SHA-256; store `(algo, object_id)` instead of assuming one.
+
+Notes:
+
+- GitHub "merged" state (PR UI) is a projection; the receipt is the authority.
+- `HEAD` is not a commitment; receipts should record the resolved commit/tree IDs.
+
+## See Also
+
+- **Git Digest Conventions**: commit vs tree vs `HEAD`, SHA-1 vs SHA-256.
+- **Attestation**: how merge operations are bound to an environment/toolchain.
 
 **Context:**
 The final artifact of a successful `Work Lifecycle`.

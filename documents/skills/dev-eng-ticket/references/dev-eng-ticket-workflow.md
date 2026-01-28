@@ -6,7 +6,8 @@ decision_tree:
     - id: INIT_AND_CLASSIFY
       purpose: "Initialize worktree and choose the correct workflow path."
       context_files[6]:
-        - path: README.md
+        - path: documents/README.md
+        - path: documents/skills/README.md
           purpose: "Root-level module index, documentation discovery, and repository-wide constraints."
         - path: documents/skills/rust-textbook/SKILL.md
           purpose: "Rust quality guidance; choose relevant sections later."

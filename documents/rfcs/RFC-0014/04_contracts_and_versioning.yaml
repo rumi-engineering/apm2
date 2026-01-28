@@ -1,0 +1,717 @@
+rfc_contracts_and_versioning:
+  schema_version: "2026-01-28"
+
+  contracts:
+    - id: CTR-0001
+      name: "LedgerBackend Trait"
+      type: API
+      versioning:
+        scheme: SEMVER
+        current_version: "0.1.0"
+        compatibility_rules:
+          - "Trait methods are additive-only"
+          - "Error variants may be added but not removed"
+          - "EventMetadata fields may be added with defaults"
+      schema:
+        format: RUST_TRAIT
+        definition: |
+          //! Ledger backend abstraction for pluggable storage.
+          //!
+          //! This trait enables transparent operation across single-node SQLite
+          //! and distributed consensus backends.
+
+          use std::future::Future;
+          use std::pin::Pin;
+
+          /// Hash type (32 bytes, BLAKE3)
+          pub type Hash = [u8; 32];
+
+          /// Sequence number type
+          pub type SeqId = u64;
+
+          /// Result of appending to the ledger
+          #[derive(Debug, Clone)]
+          pub struct AppendResult {
+              /// Assigned sequence ID
+              pub seq_id: SeqId,
+              /// Event hash (prev_hash || content)
+              pub event_hash: Hash,
+              /// For consensus backends: BFT term/round/index
+              pub consensus_index: Option<ConsensusIndex>,
+          }
+
+          /// Consensus-specific metadata
+          #[derive(Debug, Clone, Copy)]
+          pub struct ConsensusIndex {
+              pub epoch: u64,
+              pub round: u64,
+              pub index: u64,
+          }
+
+          /// Ordering guarantee for the operation
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub enum OrderingGuarantee {
+              /// Requires total ordering (BFT consensus for control plane)
+              TotalOrder,
+              /// Eventual consistency acceptable (anti-entropy for data plane)
+              Eventual,
+          }
+
+          /// Merge operator for CRDT-style convergence
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          pub enum MergeOperator {
+              /// Last-writer-wins by timestamp
+              LastWriterWins,
+              /// Grow-only counter (sum)
+              GCounter,
+              /// Set union (no duplicates by hash)
+              SetUnion,
+              /// Authority-tier selection (higher authority wins)
+              AuthorityTier,
+              /// No merge allowed (conflict = defect)
+              NoMerge,
+          }
+
+          /// Event metadata for routing and merge
+          #[derive(Debug, Clone)]
+          pub struct EventMetadata {
+              /// Namespace for quorum routing
+              pub namespace: String,
+              /// Required ordering guarantee
+              pub ordering: OrderingGuarantee,
+              /// Merge operator for conflict resolution
+              pub merge_op: MergeOperator,
+              /// Admission-critical evidence flag (requires TotalOrder)
+              pub strict_evidence: bool,
+              /// Actor ID (signer)
+              pub actor_id: String,
+              /// Dedupe key for idempotency
+              pub dedupe_key: Option<Hash>,
+              /// Hybrid Logical Clock (HLC) timestamp
+              pub hlc_timestamp: HlcTimestamp,
+              /// Canonicalizer metadata
+              pub canonicalizer_id: String,
+              pub canonicalizer_version: String,
+          }
+
+          /// Hybrid Logical Clock timestamp
+          #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+          pub struct HlcTimestamp {
+              pub wall_time_ns: u64,
+              pub logical_counter: u32,
+          }
+
+          /// Ledger backend errors
+          #[derive(Debug, thiserror::Error)]
+          #[non_exhaustive]
+          pub enum LedgerBackendError {
+              #[error("not leader for namespace {namespace}, leader hint: {leader_hint:?}")]
+              NotLeader {
+                  namespace: String,
+                  leader_hint: Option<String>,
+              },
+
+              #[error("consensus timeout after {timeout_ms}ms")]
+              ConsensusTimeout { timeout_ms: u64 },
+
+              #[error("schema mismatch: expected {expected}, got {actual}")]
+              SchemaMismatch { expected: String, actual: String },
+
+              #[error("hash chain broken at seq_id={seq_id}: {details}")]
+              HashChainBroken { seq_id: SeqId, details: String },
+
+              #[error("signature verification failed for actor {actor_id}")]
+              SignatureInvalid { actor_id: String },
+
+              #[error("merge conflict for event type {event_type}: {details}")]
+              MergeConflict { event_type: String, details: String },
+
+              #[error("storage error: {0}")]
+              Storage(String),
+
+              #[error("namespace {namespace} not found in cluster")]
+              NamespaceNotFound { namespace: String },
+          }
+
+          /// Core trait for ledger backends (local or distributed)
+          pub trait LedgerBackend: Send + Sync {
+              /// Appends an event with the specified ordering guarantee.
+              ///
+              /// For `TotalOrder`: Routes to BFT leader, waits for commit.
+              /// For `Eventual`: Appends locally, triggers anti-entropy sync.
+              fn append<'a>(
+                  &'a self,
+                  event: &'a EventRecord,
+                  metadata: &'a EventMetadata,
+              ) -> Pin<Box<dyn Future<Output = Result<AppendResult, LedgerBackendError>> + Send + 'a>>;
+
+              /// Reads events starting from cursor, respecting namespace scope.
+              fn read_from<'a>(
+                  &'a self,
+                  namespace: &'a str,
+                  cursor: SeqId,
+                  limit: u64,
+              ) -> Pin<Box<dyn Future<Output = Result<Vec<EventRecord>, LedgerBackendError>> + Send + 'a>>;
+
+              /// Gets the current head (max seq_id) for a namespace.
+              fn head<'a>(
+                  &'a self,
+                  namespace: &'a str,
+              ) -> Pin<Box<dyn Future<Output = Result<SeqId, LedgerBackendError>> + Send + 'a>>;
+
+              /// Verifies hash chain integrity from genesis or checkpoint.
+              fn verify_chain<'a>(
+                  &'a self,
+                  namespace: &'a str,
+                  from_seq_id: SeqId,
+              ) -> Pin<Box<dyn Future<Output = Result<(), LedgerBackendError>> + Send + 'a>>;
+
+              /// Returns cluster membership for a namespace (for leader hints).
+              fn cluster_members<'a>(
+                  &'a self,
+                  namespace: &'a str,
+              ) -> Pin<Box<dyn Future<Output = Result<Vec<NodeInfo>, LedgerBackendError>> + Send + 'a>>;
+          }
+
+          /// Node information for cluster membership
+          #[derive(Debug, Clone)]
+          pub struct NodeInfo {
+              pub node_id: String,
+              pub address: String,
+              pub is_leader: bool,
+              pub last_seen_ns: u64,
+          }
+      evidence_ids:
+        - EVID-0002
+
+    - id: CTR-0002
+      name: "Consensus Protocol Messages"
+      type: EVENT_SCHEMA
+      versioning:
+        scheme: SEMVER
+        current_version: "0.1.0"
+        compatibility_rules:
+          - "Message fields are additive-only"
+          - "Enum values may be added but not removed"
+          - "Maps forbidden in signed messages (canonical encoding)"
+          - "Repeated fields sorted before signing"
+      schema:
+        format: PROTOBUF
+        path: "proto/consensus_v1.proto"
+        definition: |
+          // APM2 Consensus Protocol Schema
+          // Version: 0.1.0
+
+          syntax = "proto3";
+          package apm2.consensus.v1;
+
+          import "google/protobuf/timestamp.proto";
+
+          // ============================================================
+          // GENESIS AND VALIDATOR SET
+          // ============================================================
+
+          // Genesis block establishing network root of trust
+          message GenesisBlock {
+            // Network identifier (unique per network)
+            string network_id = 1;
+            // Timestamp of genesis creation
+            google.protobuf.Timestamp genesis_time = 2;
+            // Initial validator set
+            repeated ValidatorRegistration validators = 3;
+            // Root authority signature (T0 key)
+            bytes root_signature = 4;
+            // BLAKE3 hash of this genesis block (becomes prev_hash for seq_id=1)
+            bytes genesis_hash = 5;
+            // Schema registry bootstrap (initial schemas)
+            repeated SchemaEntry initial_schemas = 6;
+          }
+
+          // Validator registration in genesis or via governance
+          message ValidatorRegistration {
+            // Unique validator identifier
+            string validator_id = 1;
+            // Ed25519 public key
+            bytes public_key = 2;
+            // Network address (host:port)
+            string address = 3;
+            // Initial voting weight (typically 1)
+            uint64 weight = 4;
+            // Registration timestamp
+            google.protobuf.Timestamp registered_at = 5;
+          }
+
+          // ============================================================
+          // CONSENSUS MESSAGES
+          // ============================================================
+
+          // Proposal for a new event to be finalized
+          message ConsensusProposal {
+            // Proposer validator ID
+            string proposer_id = 1;
+            // Consensus epoch
+            uint64 epoch = 2;
+            // Round within epoch
+            uint64 round = 3;
+            // Proposed sequence ID
+            uint64 proposed_seq_id = 4;
+            // Hash of proposed event
+            bytes event_hash = 5;
+            // Previous event hash (for chain verification)
+            bytes prev_hash = 6;
+            // Proposer signature
+            bytes signature = 7;
+            // Timestamp of proposal
+            google.protobuf.Timestamp timestamp = 8;
+          }
+
+          // Vote on a proposal
+          message ConsensusVote {
+            // Voter validator ID
+            string voter_id = 1;
+            // Epoch and round being voted on
+            uint64 epoch = 2;
+            uint64 round = 3;
+            // Hash of proposal being voted for
+            bytes proposal_hash = 4;
+            // Vote type
+            VoteType vote_type = 5;
+            // Voter signature
+            bytes signature = 6;
+          }
+
+          enum VoteType {
+            VOTE_TYPE_UNSPECIFIED = 0;
+            VOTE_TYPE_PREVOTE = 1;
+            VOTE_TYPE_PRECOMMIT = 2;
+          }
+
+          // Quorum certificate proving 2f+1 agreement
+          message QuorumCertificate {
+            // Event range this certificate covers
+            uint64 first_seq_id = 1;
+            uint64 last_seq_id = 2;
+            // Hash being certified
+            bytes certified_hash = 3;
+            // Consensus epoch and round
+            uint64 epoch = 4;
+            uint64 round = 5;
+            // Validator signatures (must have >= 2f+1)
+            repeated ValidatorSignature signatures = 6;
+          }
+
+          message ValidatorSignature {
+            string validator_id = 1;
+            bytes signature = 2;
+          }
+
+          // ============================================================
+          // VALIDATOR SET CHANGES
+          // ============================================================
+
+          // Proposal to change validator set
+          message ValidatorSetChange {
+            // Change type
+            ChangeType change_type = 1;
+            // Validator being added or removed
+            ValidatorRegistration validator = 2;
+            // Proposer ID
+            string proposer_id = 3;
+            // Governance evidence (e.g., adjudication result)
+            bytes governance_evidence_hash = 4;
+          }
+
+          enum ChangeType {
+            CHANGE_TYPE_UNSPECIFIED = 0;
+            CHANGE_TYPE_ADD = 1;
+            CHANGE_TYPE_REMOVE = 2;
+            CHANGE_TYPE_UPDATE_WEIGHT = 3;
+          }
+
+          // ============================================================
+          // BYZANTINE EVIDENCE
+          // ============================================================
+
+          // Evidence of Byzantine behavior
+          message ByzantineEvidence {
+            // Type of Byzantine fault
+            FaultType fault_type = 1;
+            // Validator that committed the fault
+            string faulty_validator_id = 2;
+            // Evidence data (depends on fault type)
+            oneof evidence {
+              EquivocationEvidence equivocation = 10;
+              InvalidSignatureEvidence invalid_signature = 11;
+            }
+            // Timestamp when evidence was generated
+            google.protobuf.Timestamp detected_at = 3;
+          }
+
+          enum FaultType {
+            FAULT_TYPE_UNSPECIFIED = 0;
+            FAULT_TYPE_EQUIVOCATION = 1;
+            FAULT_TYPE_INVALID_SIGNATURE = 2;
+            FAULT_TYPE_INVALID_PROPOSAL = 3;
+          }
+
+          // Evidence of double-signing
+          message EquivocationEvidence {
+            // First signed message
+            bytes message_a = 1;
+            bytes signature_a = 2;
+            // Conflicting signed message (same epoch/round)
+            bytes message_b = 3;
+            bytes signature_b = 4;
+          }
+
+          // Evidence of invalid signature
+          message InvalidSignatureEvidence {
+            bytes message = 1;
+            bytes claimed_signature = 2;
+            bytes expected_public_key = 3;
+          }
+
+          // ============================================================
+          // SCHEMA REGISTRY
+          // ============================================================
+
+          // Schema entry in registry
+          message SchemaEntry {
+            // Schema identifier
+            string schema_id = 1;
+            // Version (semver)
+            string version = 2;
+            // BLAKE3 digest of canonical schema bytes
+            bytes digest = 3;
+            // Protobuf descriptor bytes
+            bytes descriptor = 4;
+            // Canonicalization method
+            CanonicalizerKind canonicalizer = 5;
+            // Event types defined by this schema
+            repeated string event_types = 6;
+            // Registration timestamp
+            uint64 registered_at_ns = 7;
+            // Actor who registered this schema
+            string registered_by = 8;
+          }
+
+          enum CanonicalizerKind {
+            CANONICALIZER_KIND_UNSPECIFIED = 0;
+            CANONICALIZER_KIND_JCS = 1;
+            CANONICALIZER_KIND_PROTOBUF_SORTED = 2;
+          }
+
+          // ============================================================
+          // ANTI-ENTROPY SYNC
+          // ============================================================
+
+          // Merkle tree digest for efficient sync
+          message MerkleDigest {
+            // Namespace being synced
+            string namespace = 1;
+            // Sequence range
+            uint64 from_seq_id = 2;
+            uint64 to_seq_id = 3;
+            // Root hash of Merkle tree
+            bytes root_hash = 4;
+            // Tree depth
+            uint32 depth = 5;
+          }
+
+          // Request for events in a range
+          message SyncRequest {
+            // Requesting node
+            string requester_id = 1;
+            // Namespace
+            string namespace = 2;
+            // Sequence range needed
+            uint64 from_seq_id = 3;
+            uint64 to_seq_id = 4;
+            // Optional: specific hashes if known
+            repeated bytes known_hashes = 5;
+          }
+
+          // Response with events
+          message SyncResponse {
+            // Events in requested range
+            repeated bytes events = 1;
+            // Merkle proofs for verification
+            repeated MerkleProof proofs = 2;
+          }
+
+          message MerkleProof {
+            bytes leaf_hash = 1;
+            repeated bytes path = 2;
+            repeated bool path_sides = 3;  // true = right, false = left
+          }
+      evidence_ids:
+        - EVID-0007
+
+    - id: CTR-0003
+      name: "Schema Registry Interface"
+      type: API
+      versioning:
+        scheme: SEMVER
+        current_version: "0.1.0"
+        compatibility_rules:
+          - "Trait methods are additive-only"
+          - "SchemaEntry fields may be added with defaults"
+          - "HandshakeResult is append-only"
+      schema:
+        format: RUST_TRAIT
+        definition: |
+          //! Schema registry for fail-closed validation of event types.
+
+          use std::future::Future;
+          use std::pin::Pin;
+
+          /// Schema digest (BLAKE3 hash of canonical schema definition)
+          pub type SchemaDigest = [u8; 32];
+
+          /// Schema entry in the registry
+          #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+          pub struct SchemaEntry {
+              /// Unique schema identifier
+              pub schema_id: String,
+              /// Semantic version
+              pub version: SchemaVersion,
+              /// BLAKE3 digest of canonical schema bytes
+              pub digest: SchemaDigest,
+              /// Protobuf descriptor bytes (for validation)
+              pub descriptor: Vec<u8>,
+              /// Canonicalization method
+              pub canonicalizer: CanonicalizerKind,
+              /// Event types defined by this schema
+              pub event_types: Vec<String>,
+              /// Timestamp when registered
+              pub registered_at_ns: u64,
+              /// Actor who registered this schema
+              pub registered_by: String,
+          }
+
+          #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+          pub struct SchemaVersion {
+              pub major: u32,
+              pub minor: u32,
+              pub patch: u32,
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+          pub enum CanonicalizerKind {
+              /// JSON Canonicalization Scheme (RFC 8785)
+              Jcs,
+              /// Protobuf with sorted repeated fields (no maps)
+              ProtobufSorted,
+          }
+
+          /// Result of schema handshake between peers
+          #[derive(Debug, Clone)]
+          pub struct HandshakeResult {
+              /// Schemas we have that peer is missing
+              pub peer_missing: Vec<SchemaDigest>,
+              /// Schemas peer has that we are missing (fail-closed trigger)
+              pub local_missing: Vec<SchemaDigest>,
+              /// Whether handshake passed (local_missing must be empty)
+              pub accepted: bool,
+          }
+
+          /// Schema registry errors
+          #[derive(Debug, thiserror::Error)]
+          pub enum SchemaRegistryError {
+              #[error("schema digest {digest} not found")]
+              NotFound { digest: String },
+              #[error("schema {schema_id} already exists with different digest")]
+              DigestMismatch { schema_id: String },
+              #[error("fail-closed: unknown schemas from peer: {digests:?}")]
+              FailClosed { digests: Vec<String> },
+              #[error("consensus error: {0}")]
+              Consensus(String),
+          }
+
+          /// Schema registry trait
+          pub trait SchemaRegistry: Send + Sync {
+              /// Registers a new schema (requires consensus for distributed mode).
+              fn register<'a>(
+                  &'a self,
+                  entry: &'a SchemaEntry,
+              ) -> Pin<Box<dyn Future<Output = Result<(), SchemaRegistryError>> + Send + 'a>>;
+
+              /// Looks up schema by digest (fast path for validation).
+              fn lookup_by_digest<'a>(
+                  &'a self,
+                  digest: &'a SchemaDigest,
+              ) -> Pin<Box<dyn Future<Output = Result<Option<SchemaEntry>, SchemaRegistryError>> + Send + 'a>>;
+
+              /// Performs digest handshake with a peer.
+              fn handshake<'a>(
+                  &'a self,
+                  peer_digests: &'a [SchemaDigest],
+              ) -> Pin<Box<dyn Future<Output = Result<HandshakeResult, SchemaRegistryError>> + Send + 'a>>;
+          }
+      evidence_ids:
+        - EVID-0004
+
+    - id: CTR-0004
+      name: "Extended Kernel Event Envelope"
+      type: EVENT_SCHEMA
+      versioning:
+        scheme: SEMVER
+        current_version: "0.2.0"
+        compatibility_rules:
+          - "New fields are optional with zero-value defaults"
+          - "Existing field numbers unchanged"
+          - "Backward compatible with v0.1.0 readers"
+      schema:
+        format: PROTOBUF
+        path: "proto/kernel_events.proto"
+        changes: |
+          // Extended KernelEvent envelope for consensus
+          message KernelEvent {
+            // ... existing fields 1-18 unchanged ...
+
+            // NEW: Consensus attestation (optional, present in distributed mode)
+            uint64 consensus_epoch = 20;
+            uint64 consensus_round = 21;
+            QuorumCertificate quorum_cert = 22;
+
+            // NEW: Schema and Canonicalizer governance
+            bytes schema_digest = 23;
+            string canonicalizer_id = 24;
+            string canonicalizer_version = 25;
+
+            // NEW: Hybrid Logical Clock (HLC)
+            uint64 hlc_wall_time = 26;
+            uint32 hlc_counter = 27;
+          }
+      evidence_ids:
+        - EVID-0012
+
+    - id: CTR-0005
+      name: "Gate Receipt Evidence Predicates"
+      type: EVENT_SCHEMA
+      versioning:
+        scheme: SEMVER
+        current_version: "0.2.0"
+        compatibility_rules:
+          - "New fields are optional with zero-value defaults"
+          - "Existing field numbers unchanged"
+      schema:
+        format: PROTOBUF
+        path: "proto/kernel_events.proto"
+        changes: |
+          // GateReceiptGenerated extended with evidence predicates
+          message GateReceiptGenerated {
+            // ... existing fields 1-6 unchanged ...
+            repeated EvidencePredicate evidence_predicates = 7;
+          }
+
+          message EvidencePredicate {
+            string predicate_id = 1;
+            string command_id = 2;
+            int32 exit_code = 3;
+            bytes artifact_hash = 4;
+          }
+      evidence_ids:
+        - EVID-0014
+
+    - id: CTR-0006
+      name: "Capability Event Extensions"
+      type: EVENT_SCHEMA
+      versioning:
+        scheme: SEMVER
+        current_version: "0.2.0"
+        compatibility_rules:
+          - "New event variants are additive"
+          - "Existing field numbers unchanged"
+      schema:
+        format: PROTOBUF
+        path: "proto/kernel_events.proto"
+        changes: |
+          // Capability events extended for cross-node verification
+          message CapabilityEvent {
+            oneof event {
+              CapabilityRequired required = 1;
+              CapabilityGranted granted = 2;
+              CapabilityDelegated delegated = 3;
+              CapabilityRevoked revoked = 4;
+            }
+          }
+
+          // capability_id == lease_id; scope_hash/budget_hash are CAS references
+          message CapabilityGranted {
+            string capability_id = 1;
+            string namespace = 2;
+            string subject_id = 3;
+            string issuer_id = 4;
+            bytes scope_hash = 5;
+            bytes budget_hash = 6;
+            uint64 issued_at = 7;
+            uint64 expires_at = 8;
+          }
+
+          message CapabilityDelegated {
+            string capability_id = 1;
+            string parent_capability_id = 2;
+            string namespace = 3;
+            string delegatee_id = 4;
+            string delegator_id = 5;
+            bytes scope_hash = 6;
+            bytes budget_hash = 7;
+            uint64 delegated_at = 8;
+            uint64 expires_at = 9;
+          }
+
+          message CapabilityRevoked {
+            string capability_id = 1;
+            string namespace = 2;
+            string revoked_by = 3;
+            uint64 revoked_at = 4;
+            string reason = 5;
+          }
+      evidence_ids:
+        - EVID-0005
+
+  outputs:
+    artifacts_produced:
+      - id: OUT-0001
+        name: "Consensus module"
+        path: "crates/apm2-core/src/consensus/"
+        format: "Rust module"
+      - id: OUT-0002
+        name: "Schema registry module"
+        path: "crates/apm2-core/src/schema_registry/"
+        format: "Rust module"
+      - id: OUT-0003
+        name: "Consensus protocol definitions"
+        path: "proto/consensus_v1.proto"
+        format: ".proto file"
+      - id: OUT-0004
+        name: "Extended kernel events"
+        path: "proto/kernel_events.proto"
+        format: ".proto file (modified)"
+
+    failure_modes:
+      - id: FM-OUT-0001
+        condition: "Leader crash during proposal"
+        detection: "Heartbeat timeout (150-300ms)"
+        recovery: "Automatic leader election; clients redirect via leader hint"
+      - id: FM-OUT-0002
+        condition: "Network partition"
+        detection: "Quorum failure; sync timeout"
+        recovery: "Minority read-only; majority continues; auto-reconcile on heal"
+      - id: FM-OUT-0003
+        condition: "Hash chain corruption"
+        detection: "verify_chain() failure"
+        recovery: "Node quarantined; replay from peer checkpoint"
+      - id: FM-OUT-0004
+        condition: "Schema drift"
+        detection: "Handshake fails with local_missing non-empty"
+        recovery: "Node rejected; admin registers missing schemas"
+      - id: FM-OUT-0005
+        condition: "Merge conflict (data plane)"
+        detection: "Anti-entropy divergent hashes"
+        recovery: "Merge operator applied; conflict recorded as defect"
+      - id: FM-OUT-0006
+        condition: "Byzantine equivocation"
+        detection: "Conflicting signatures for same round"
+        recovery: "Evidence recorded; validator removed from set"
