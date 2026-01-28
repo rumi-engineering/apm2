@@ -15,6 +15,26 @@
 //! - **`StopConditions`**: Termination predicates.
 //! - **`RiskTier`**: Security tier determining gates and evidence strength.
 //! - **`DeterminismClass`**: Declared reproducibility level.
+//! - **`EpisodeRuntime`**: Daemon-layer runtime managing episode lifecycle.
+//!
+//! The episode module implements the daemon-layer episode runtime per
+//! AD-LAYER-001. It operates as the authoritative plant controller,
+//! managing process lifetime, state machines, and event emission.
+//!
+//! # State Machine
+//!
+//! Episodes follow the state machine defined in AD-EPISODE-002:
+//!
+//! ```text
+//! CREATED ──────► RUNNING ──────► TERMINATED
+//!                    │
+//!                    └──────────► QUARANTINED
+//! ```
+//!
+//! - **CREATED**: Envelope accepted, resources not yet allocated
+//! - **RUNNING**: Harness process spawned, I/O streaming active
+//! - **TERMINATED**: Normal completion, evidence finalized
+//! - **QUARANTINED**: Abnormal termination, evidence pinned for investigation
 //!
 //! # Canonicalization
 //!
@@ -32,22 +52,57 @@
 //! let digest = envelope.digest();
 //! ```
 //!
+//! # Invariants
+//!
+//! - [INV-EP001] All state transitions emit events
+//! - [INV-EP002] Terminal states (TERMINATED, QUARANTINED) have no outgoing
+//!   transitions
+//! - [INV-EP003] RUNNING requires valid lease
+//! - [INV-EP004] Episode IDs are unique within the runtime
+//! - [INV-EP005] Maximum concurrent episodes is bounded (CTR-1303)
+//!
+//! # Modules
+//!
+//! - [`budget`]: Episode budget and resource limits
+//! - [`envelope`]: Episode envelope and configuration
+//! - [`snapshot`]: Pinned snapshot for reproducibility
+//! - [`error`]: Episode error types
+//! - [`state`]: State machine and transitions
+//! - [`handle`]: Session handle for running episodes
+//! - [`runtime`]: Episode runtime implementation
+//!
 //! # Contract References
 //!
 //! - AD-EPISODE-001: Immutable episode envelope
+//! - AD-EPISODE-002: Session state machine
 //! - AD-VERIFY-001: Deterministic Protobuf serialization
 //! - AD-LAYER-001: `EpisodeRuntime` extends `EpisodeController`
 //! - REQ-EPISODE-001: Episode envelope requirements
 
+// TCK-00159: Envelope and budget types
 pub mod budget;
 pub mod envelope;
 pub mod golden_vectors;
 pub mod snapshot;
 
-// Re-export primary types at module level
+// TCK-00160: Runtime and state machine
+mod error;
+mod handle;
+mod runtime;
+mod state;
+
+// Re-export envelope types (TCK-00159)
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 pub use envelope::{
     ContextRefs, DeterminismClass, EnvelopeError, EpisodeEnvelope, EpisodeEnvelopeBuilder,
     RiskTier, StopConditions,
 };
+// Re-export runtime types (TCK-00160)
+pub use error::{EpisodeError, EpisodeId, MAX_EPISODE_ID_LEN};
+pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal};
+pub use runtime::{
+    EpisodeEvent, EpisodeRuntime, EpisodeRuntimeConfig, Hash, MAX_CONCURRENT_EPISODES,
+    new_shared_runtime,
+};
 pub use snapshot::{PinnedSnapshot, PinnedSnapshotBuilder};
+pub use state::{EpisodeState, QuarantineReason, TerminationClass, validate_transition};
