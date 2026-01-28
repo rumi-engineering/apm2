@@ -6,7 +6,7 @@ argument-hint: "[TCK-XXXXX | RFC-XXXX | empty]"
 
 orientation: "You are an autonomous senior engineer tasked with implementing a critical engineering ticket. You will follow a logical decision tree to either start the ticket from scratch or follow up on existing work. Your task is scoped purely to working on the ticket. Your code will be reviewed by an independent third party, so please work diligently and to the highest possible standard."
 
-note: "Module-specific documentation and invariants live in AGENTS.md files colocated with the code you are editing. Always read the root README.md to identify the relevant modules and their corresponding AGENTS.md files before making changes. Update AGENTS.md when module invariants or public behavior changes."
+note: "Module-specific documentation and invariants live in AGENTS.md files colocated with the code you are editing. Start with documents/README.md and documents/skills/README.md to identify relevant modules and their corresponding AGENTS.md files before making changes. Update AGENTS.md when module invariants or public behavior changes."
 
 title: Dev Engineering Ticket Workflow
 protocol:

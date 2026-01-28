@@ -4,7 +4,7 @@
   "title": "RepoRootMarkdownOnboarding",
   "description": "Token-efficient, machine-readable onboarding index for root Markdown docs. Intended for CAC ingestion and audit (hashes + file pointers) without embedding full doc text.",
   "type": "object",
-  "required": ["schema", "schema_version", "repo", "onboarding", "root_markdown", "facts"],
+  "required": ["schema", "schema_version", "repo", "onboarding", "root_markdown"],
   "properties": {
     "schema": {
       "type": "string",
@@ -14,6 +14,23 @@
       "type": "string",
       "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
     },
+    "meta": {
+      "type": "object",
+      "required": ["generated_at_utc", "generator"],
+      "properties": {
+        "generated_at_utc": { "type": "string", "format": "date-time" },
+        "generator": {
+          "type": "object",
+          "required": ["id"],
+          "properties": {
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "version": { "type": "string", "minLength": 1, "maxLength": 64 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "repo": {
       "type": "object",
       "required": ["name", "root", "git"],
@@ -22,8 +39,9 @@
         "root": { "type": "string", "minLength": 1, "maxLength": 256 },
         "git": {
           "type": "object",
-          "required": ["head_commit", "head_tree", "dirty_worktree_expected"],
+          "required": ["origin_remote", "head_commit", "head_tree", "dirty_worktree_expected"],
           "properties": {
+            "origin_remote": { "type": "string", "minLength": 1, "maxLength": 2048 },
             "head_commit": { "$ref": "git_object_ref.schema.json" },
             "head_tree": { "$ref": "git_object_ref.schema.json" },
             "dirty_worktree_expected": { "type": "boolean" }
@@ -35,13 +53,7 @@
     },
     "onboarding": {
       "type": "object",
-      "required": [
-        "goals",
-        "read_first",
-        "precedence",
-        "ticket_agent_exclusions",
-        "worktree_rules"
-      ],
+      "required": ["goals", "read_first", "precedence", "worktree_rules"],
       "properties": {
         "goals": {
           "type": "array",
@@ -58,17 +70,11 @@
           "items": { "type": "string" },
           "minItems": 1
         },
-        "ticket_agent_exclusions": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["path", "why"],
-            "properties": {
-              "path": { "type": "string", "minLength": 1 },
-              "why": { "type": "string", "minLength": 1, "maxLength": 1024 }
-            },
-            "additionalProperties": false
-          }
+        "schema_map": {
+          "type": "object",
+          "maxProperties": 128,
+          "propertyNames": { "pattern": "^[A-Za-z0-9_.:-]{1,128}$" },
+          "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 256 }
         },
         "worktree_rules": {
           "type": "array",
@@ -83,11 +89,12 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["path", "bytes", "sha256", "audience", "agent_onboarding", "abstract"],
+        "required": ["path", "schema", "bytes", "content_hash", "agent_onboarding"],
         "properties": {
           "path": { "type": "string", "minLength": 1 },
+          "schema": { "type": "string", "minLength": 1, "maxLength": 128 },
           "bytes": { "type": "integer", "minimum": 0 },
-          "sha256": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+          "content_hash": { "type": "string", "pattern": "^b3-256:[a-f0-9]{64}$" },
           "audience": {
             "type": "array",
             "items": { "type": "string", "minLength": 1, "maxLength": 64 },
@@ -111,35 +118,6 @@
         },
         "additionalProperties": false
       }
-    },
-    "facts": {
-      "type": "object",
-      "required": ["project", "summary", "key_paths"],
-      "properties": {
-        "project": {
-          "type": "object",
-          "required": ["name", "version", "edition", "msrv"],
-          "properties": {
-            "name": { "type": "string", "minLength": 1, "maxLength": 256 },
-            "version": { "type": "string", "minLength": 1, "maxLength": 64 },
-            "edition": { "type": "string", "minLength": 1, "maxLength": 16 },
-            "msrv": { "type": "string", "minLength": 1, "maxLength": 16 }
-          },
-          "additionalProperties": false
-        },
-        "summary": {
-          "type": "array",
-          "items": { "type": "string", "minLength": 1, "maxLength": 512 },
-          "minItems": 1
-        },
-        "key_paths": {
-          "type": "object",
-          "maxProperties": 64,
-          "propertyNames": { "pattern": "^[A-Za-z0-9_./:-]{1,64}$" },
-          "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 256 }
-        }
-      },
-      "additionalProperties": false
     }
   },
   "unevaluatedProperties": false
