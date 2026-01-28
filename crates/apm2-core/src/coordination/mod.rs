@@ -82,6 +82,7 @@
 pub mod controller;
 pub mod error;
 pub mod events;
+pub mod evidence;
 pub mod reducer;
 pub mod state;
 
@@ -100,6 +101,11 @@ pub use events::{
     BLAKE3_HASH_SIZE, CoordinationAborted, CoordinationCompleted, CoordinationEvent,
     CoordinationSessionBound, CoordinationSessionUnbound, CoordinationStarted, EVENT_TYPE_ABORTED,
     EVENT_TYPE_COMPLETED, EVENT_TYPE_SESSION_BOUND, EVENT_TYPE_SESSION_UNBOUND, EVENT_TYPE_STARTED,
+};
+// Re-export evidence types (TCK-00154)
+pub use evidence::{
+    CoordinationReceipt, MAX_SESSION_IDS_PER_OUTCOME, MAX_WORK_OUTCOMES, ReceiptBuilder,
+    ReceiptError, WorkOutcome,
 };
 // Re-export reducer types
 pub use reducer::{CoordinationReducer, CoordinationReducerError};

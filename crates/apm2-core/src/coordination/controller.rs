@@ -116,10 +116,13 @@ use super::events::{
     BLAKE3_HASH_SIZE, CoordinationAborted, CoordinationCompleted, CoordinationEvent,
     CoordinationSessionBound, CoordinationSessionUnbound, CoordinationStarted,
 };
+use super::evidence::{ReceiptBuilder, WorkOutcome};
 use super::state::{
     AbortReason, BudgetUsage, CoordinationBudget, CoordinationStatus, MAX_WORK_QUEUE_SIZE,
     SessionOutcome, StopCondition, WorkItemOutcome,
 };
+use crate::crypto::Hash;
+use crate::evidence::ContentAddressedStore;
 
 /// Maximum number of attempts per work item (default).
 pub const DEFAULT_MAX_ATTEMPTS_PER_WORK: u32 = 3;
@@ -359,11 +362,20 @@ pub struct CoordinationController {
     /// Start time for duration tracking.
     started_at: Option<Instant>,
 
+    /// Start timestamp in nanoseconds (for receipt).
+    started_at_ns: u64,
+
     /// Current status.
     status: CoordinationStatus,
 
     /// Emitted events (for testing and verification).
     emitted_events: Vec<CoordinationEvent>,
+
+    /// Receipt builder for evidence generation (TCK-00154).
+    ///
+    /// Created when coordination starts, populated during execution,
+    /// and finalized when coordination completes.
+    receipt_builder: Option<ReceiptBuilder>,
 }
 
 impl CoordinationController {
@@ -392,8 +404,10 @@ impl CoordinationController {
             successful_sessions: 0,
             failed_sessions: 0,
             started_at: None,
+            started_at_ns: 0,
             status: CoordinationStatus::Initializing,
             emitted_events: Vec::new(),
+            receipt_builder: None,
         }
     }
 
@@ -488,8 +502,16 @@ impl CoordinationController {
 
         // Record start time
         self.started_at = Some(Instant::now());
+        self.started_at_ns = timestamp_ns;
         self.coordination_id = Some(coordination_id.clone());
         self.status = CoordinationStatus::Running;
+
+        // Initialize receipt builder (TCK-00154)
+        self.receipt_builder = Some(ReceiptBuilder::new(
+            coordination_id.clone(),
+            self.config.budget.clone(),
+            timestamp_ns,
+        ));
 
         // Build and emit the started event
         let started_event = CoordinationStarted::new(
@@ -687,6 +709,7 @@ impl CoordinationController {
     ///
     /// Returns an error if the coordination is not running or `session_id`
     /// doesn't match the active session.
+    #[allow(clippy::too_many_lines)]
     pub fn record_session_termination(
         &mut self,
         session_id: &str,
@@ -750,8 +773,15 @@ impl CoordinationController {
         // Note: work_index hasn't been incremented yet, so it points to current work
         let tracking = &mut self.work_tracking[self.work_index];
 
+        // Record session in receipt builder (TCK-00154)
+        if let Some(ref mut builder) = self.receipt_builder {
+            builder.record_session(outcome);
+        }
+
         // Handle outcome per AD-COORD-010 (circuit breaker tracks consecutive WORK ITEM
         // failures)
+        // Track if work item is complete (for receipt builder)
+        let work_complete;
         match outcome {
             SessionOutcome::Success => {
                 // Work item succeeded - reset circuit breaker
@@ -760,6 +790,7 @@ impl CoordinationController {
 
                 // Mark work item as succeeded
                 tracking.final_outcome = Some(WorkItemOutcome::Succeeded);
+                work_complete = true;
 
                 // Advance to next work item
                 self.work_index += 1;
@@ -771,6 +802,7 @@ impl CoordinationController {
                 if tracking.attempt_count >= self.config.max_attempts_per_work {
                     // Per AD-COORD-010: Mark as SKIPPED when exhausting retries
                     tracking.final_outcome = Some(WorkItemOutcome::Skipped);
+                    work_complete = true;
 
                     // Per AD-COORD-010: Increment circuit breaker only when work item
                     // PERMANENTLY fails (exhausts retries)
@@ -778,10 +810,35 @@ impl CoordinationController {
 
                     // Advance to next work item
                     self.work_index += 1;
+                } else {
+                    // Otherwise, stay on same work item for retry (no circuit
+                    // breaker increment)
+                    work_complete = false;
                 }
-                // Otherwise, stay on same work item for retry (no circuit
-                // breaker increment)
             },
+        }
+
+        // Record work outcome in receipt builder if work item is complete (TCK-00154)
+        if work_complete {
+            // Get the tracking again (we need to re-borrow after mutation)
+            let tracking = &self.work_tracking[self.work_index.saturating_sub(1)];
+            if let Some(ref mut builder) = self.receipt_builder {
+                // Create work outcome from tracking state
+                let work_outcome = WorkOutcome::new(
+                    tracking.work_id.clone(),
+                    tracking.attempt_count,
+                    outcome,
+                    tracking.session_ids.clone(),
+                )
+                .map_err(|e| ControllerError::Internal {
+                    message: format!("failed to create work outcome: {e}"),
+                })?;
+                builder.record_work_outcome(work_outcome).map_err(|e| {
+                    ControllerError::Internal {
+                        message: format!("failed to record work outcome: {e}"),
+                    }
+                })?;
+            }
         }
 
         // Create unbound event (AD-COORD-003: emitted AFTER session.terminated)
@@ -932,7 +989,8 @@ impl CoordinationController {
             }
         }
 
-        // Compute receipt hash (placeholder - actual hash computation is in TCK-00154)
+        // Use placeholder hash (no CAS provided)
+        // For CAS storage, use complete_with_cas() instead
         let receipt_hash = [0u8; BLAKE3_HASH_SIZE];
 
         let completed_event = CoordinationCompleted::new(
@@ -951,6 +1009,91 @@ impl CoordinationController {
             .push(CoordinationEvent::Completed(completed_event.clone()));
 
         Ok(completed_event)
+    }
+
+    /// Completes the coordination with receipt storage (TCK-00154).
+    ///
+    /// Builds the receipt, stores it in CAS, and emits `coordination.completed`
+    /// with the receipt's canonical hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `cas` - Content-addressed store for receipt storage
+    /// * `stop_condition` - The stop condition that caused completion
+    /// * `timestamp_ns` - Current timestamp in nanoseconds
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (`completed_event`, `canonical_hash`, `cas_hash`).
+    /// - `canonical_hash`: The tamper-evidence hash included in the event
+    /// - `cas_hash`: The CAS content hash for retrieval
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if already in terminal state or receipt storage fails.
+    pub fn complete_with_cas<C: ContentAddressedStore>(
+        &mut self,
+        cas: &C,
+        stop_condition: StopCondition,
+        timestamp_ns: u64,
+    ) -> ControllerResult<(CoordinationCompleted, Hash, Hash)> {
+        if self.status.is_terminal() {
+            return Err(ControllerError::CoordinationTerminal {
+                coordination_id: self.coordination_id.clone().unwrap_or_default(),
+            });
+        }
+
+        let coordination_id =
+            self.coordination_id
+                .clone()
+                .ok_or_else(|| ControllerError::Internal {
+                    message: "coordination not started".to_string(),
+                })?;
+
+        // Update elapsed time
+        if let Some(started_at) = self.started_at {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                self.budget_usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+            }
+        }
+
+        // Build and store receipt (TCK-00154)
+        let receipt_builder =
+            self.receipt_builder
+                .take()
+                .ok_or_else(|| ControllerError::Internal {
+                    message: "receipt builder not initialized".to_string(),
+                })?;
+
+        let (receipt, canonical_hash, cas_hash) = receipt_builder
+            .build_and_store(
+                cas,
+                stop_condition.clone(),
+                self.budget_usage.clone(),
+                timestamp_ns,
+            )
+            .map_err(|e| ControllerError::Internal {
+                message: format!("failed to store receipt: {e}"),
+            })?;
+
+        // Use canonical hash in the completion event (tamper-evidence)
+        let completed_event = CoordinationCompleted::new(
+            coordination_id,
+            stop_condition.clone(),
+            self.budget_usage.clone(),
+            receipt.total_sessions,
+            receipt.successful_sessions,
+            receipt.failed_sessions,
+            canonical_hash,
+            timestamp_ns,
+        );
+
+        self.status = CoordinationStatus::Completed(stop_condition);
+        self.emitted_events
+            .push(CoordinationEvent::Completed(completed_event.clone()));
+
+        Ok((completed_event, canonical_hash, cas_hash))
     }
 
     /// Aborts the coordination with the given reason.
@@ -2942,5 +3085,193 @@ mod tests {
                 "Session {session_id} was bound but never unbound (orphan binding)"
             );
         }
+    }
+
+    // =========================================================================
+    // TCK-00154: Receipt Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn tck_00154_controller_complete_with_cas_stores_receipt() {
+        use crate::coordination::evidence::CoordinationReceipt;
+        use crate::evidence::MemoryCas;
+
+        let cas = MemoryCas::new();
+        let config = test_config(vec!["work-1".to_string(), "work-2".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        // Start coordination
+        let _coord_id = controller.start(1_000_000_000).unwrap();
+
+        // Process work-1: success on first attempt
+        let work_id = controller.current_work_id().unwrap().to_string();
+        let spawn = controller
+            .prepare_session_spawn(&work_id, 1, 1_001_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn.session_id,
+                &work_id,
+                SessionOutcome::Success,
+                5000,
+                1_002_000_000,
+            )
+            .unwrap();
+
+        // Process work-2: success on first attempt
+        let work_id = controller.current_work_id().unwrap().to_string();
+        let spawn = controller
+            .prepare_session_spawn(&work_id, 2, 1_003_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn.session_id,
+                &work_id,
+                SessionOutcome::Success,
+                3000,
+                1_004_000_000,
+            )
+            .unwrap();
+
+        // Check stop condition
+        let stop = controller.check_stop_condition().unwrap();
+        assert!(matches!(stop, StopCondition::WorkCompleted));
+
+        // Complete with CAS storage
+        let (completed_event, canonical_hash, cas_hash) = controller
+            .complete_with_cas(&cas, stop, 1_005_000_000)
+            .unwrap();
+
+        // Verify receipt was stored
+        assert_eq!(cas.len(), 1, "Receipt should be stored in CAS");
+
+        // Load receipt from CAS
+        let loaded_receipt = CoordinationReceipt::load(&cas, &cas_hash).unwrap();
+
+        // Verify receipt contents
+        assert_eq!(loaded_receipt.work_outcomes.len(), 2);
+        assert_eq!(loaded_receipt.total_sessions, 2);
+        assert_eq!(loaded_receipt.successful_sessions, 2);
+        assert_eq!(loaded_receipt.failed_sessions, 0);
+        assert!(matches!(
+            loaded_receipt.stop_condition,
+            StopCondition::WorkCompleted
+        ));
+
+        // Verify canonical hash in completion event matches receipt
+        assert_eq!(
+            completed_event.receipt_hash, canonical_hash,
+            "Completion event should contain canonical hash"
+        );
+
+        // Verify tamper-evidence
+        assert!(
+            loaded_receipt.verify(&canonical_hash).is_ok(),
+            "Receipt should verify against canonical hash"
+        );
+    }
+
+    #[test]
+    fn tck_00154_controller_records_failed_sessions_in_receipt() {
+        use crate::coordination::evidence::CoordinationReceipt;
+        use crate::evidence::MemoryCas;
+
+        let cas = MemoryCas::new();
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        controller.start(1_000_000_000).unwrap();
+
+        // Work-1: fail first attempt, succeed second
+        let work_id = controller.current_work_id().unwrap().to_string();
+
+        // First attempt - failure
+        let spawn1 = controller
+            .prepare_session_spawn(&work_id, 1, 1_001_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn1.session_id,
+                &work_id,
+                SessionOutcome::Failure,
+                2000,
+                1_002_000_000,
+            )
+            .unwrap();
+
+        // Second attempt - success
+        let spawn2 = controller
+            .prepare_session_spawn(&work_id, 2, 1_003_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn2.session_id,
+                &work_id,
+                SessionOutcome::Success,
+                3000,
+                1_004_000_000,
+            )
+            .unwrap();
+
+        // Complete
+        let stop = controller.check_stop_condition().unwrap();
+        let (_, canonical_hash, cas_hash) = controller
+            .complete_with_cas(&cas, stop, 1_005_000_000)
+            .unwrap();
+
+        // Load and verify
+        let receipt = CoordinationReceipt::load(&cas, &cas_hash).unwrap();
+        assert_eq!(receipt.total_sessions, 2);
+        assert_eq!(receipt.successful_sessions, 1);
+        assert_eq!(receipt.failed_sessions, 1);
+        assert_eq!(receipt.work_outcomes.len(), 1);
+        assert_eq!(receipt.work_outcomes[0].attempts, 2);
+
+        // Verify hash
+        assert!(receipt.verify(&canonical_hash).is_ok());
+    }
+
+    #[test]
+    fn tck_00154_controller_receipt_hash_before_completion_event() {
+        // This test verifies that the receipt hash is computed BEFORE
+        // the completion event is emitted (per ticket requirement)
+        use crate::evidence::MemoryCas;
+
+        let cas = MemoryCas::new();
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        controller.start(1_000_000_000).unwrap();
+
+        // Complete one work item
+        let work_id = controller.current_work_id().unwrap().to_string();
+        let spawn = controller
+            .prepare_session_spawn(&work_id, 1, 1_001_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn.session_id,
+                &work_id,
+                SessionOutcome::Success,
+                5000,
+                1_002_000_000,
+            )
+            .unwrap();
+
+        // Complete and get hash
+        let stop = controller.check_stop_condition().unwrap();
+        let (completed_event, canonical_hash, _cas_hash) = controller
+            .complete_with_cas(&cas, stop, 1_005_000_000)
+            .unwrap();
+
+        // The completion event should contain the canonical hash (non-zero)
+        assert_ne!(
+            completed_event.receipt_hash, [0u8; 32],
+            "Completion event should have real receipt hash, not placeholder"
+        );
+        assert_eq!(
+            completed_event.receipt_hash, canonical_hash,
+            "Completion event hash should match returned canonical hash"
+        );
     }
 }
