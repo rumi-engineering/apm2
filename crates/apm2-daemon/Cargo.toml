@@ -71,6 +71,9 @@ zbus.workspace = true
 # Error types
 thiserror.workspace = true
 
+# Async traits
+async-trait.workspace = true
+
 # Security
 secrecy.workspace = true
 

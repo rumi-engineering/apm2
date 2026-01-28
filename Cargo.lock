@@ -182,6 +182,7 @@ dependencies = [
  "anyhow",
  "apm2-core",
  "apm2-holon",
+ "async-trait",
  "blake3",
  "bytes",
  "chrono",
