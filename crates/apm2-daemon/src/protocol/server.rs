@@ -376,9 +376,9 @@ pub struct ConnectionPermit {
 ///
 /// # Security
 ///
-/// Connections are initialized with [`MAX_HANDSHAKE_FRAME_SIZE`] to prevent `DoS`
-/// during the unauthenticated handshake phase. After a successful handshake,
-/// the connection should be upgraded to [`MAX_FRAME_SIZE`] using
+/// Connections are initialized with [`MAX_HANDSHAKE_FRAME_SIZE`] to prevent
+/// `DoS` during the unauthenticated handshake phase. After a successful
+/// handshake, the connection should be upgraded to [`MAX_FRAME_SIZE`] using
 /// [`Connection::upgrade_to_full_frame_size`].
 pub struct Connection {
     /// The framed stream.
