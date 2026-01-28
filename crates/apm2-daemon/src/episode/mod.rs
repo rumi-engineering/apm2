@@ -94,6 +94,11 @@ mod handle;
 mod runtime;
 mod state;
 
+// TCK-00161: PTY spawning and output capture
+pub mod output;
+pub mod pty;
+pub mod ring_buffer;
+
 // Re-export envelope types (TCK-00159)
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 pub use envelope::{
@@ -103,6 +108,10 @@ pub use envelope::{
 // Re-export runtime types (TCK-00160)
 pub use error::{EpisodeError, EpisodeId, MAX_EPISODE_ID_LEN};
 pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal};
+// Re-export PTY types (TCK-00161)
+pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};
+pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
+pub use ring_buffer::{RingBuffer, tier_defaults};
 pub use runtime::{
     EpisodeEvent, EpisodeRuntime, EpisodeRuntimeConfig, Hash, MAX_CONCURRENT_EPISODES,
     new_shared_runtime,
