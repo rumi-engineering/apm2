@@ -31,12 +31,29 @@ pub fn reject_if_any_symlink(path: &Path) -> io::Result<()> {
 }
 ```
 
+[HAZARD: RSK-1502] Predictable Temp File Names and Permissions.
+- TRIGGER: Uses of `std::env::temp_dir()` or direct `/tmp/` paths with predictable names.
+- FAILURE MODE: symlink attacks; race conditions; information disclosure via world-readable permissions; state leakage via missing cleanup.
+- REJECT IF: temp paths are derived from PID/time/user input in shared temp directories.
+- ENFORCE BY:
+  - use `tempfile::NamedTempFile` or `TempDir` (provides unpredictable names, 0600 permissions, and RAII cleanup).
+  - explicitly manage cleanup in error handlers if manual temp files are used.
+  - verify no sensitive data (keys, prompts) is written to predictable paths.
+[PROVENANCE] APM2 Security Policy; CTR-2607.
+
 [CONTRACT: CTR-1504] Path Sanitization and Traversal Rejection.
 - REJECT IF: untrusted paths are used without sanitizing `..` components or absolute path prefixes.
 - ENFORCE BY:
+  - normalize paths and check against an allowed root.
   - iterate over `components()` and reject `ParentDir`, `RootDir`, or `Prefix`.
-  - confine paths to a known root.
+  - protect against symlink tricks in workspace-confined paths.
 [PROVENANCE] APM2 Security Policy; CTR-2609.
+
+[CONTRACT: CTR-1505] Permissions and Secret Leakage.
+- REJECT IF: secret material (keys, session tokens) appears in logs or error dumps.
+- REJECT IF: key files are created with permissive (non-0600) permissions.
+- ENFORCE BY: `secrecy` crate; explicit `umask` or restrictive `mode` at create-time; filter logs for sensitive patterns.
+[PROVENANCE] SECRETS_MANAGEMENT.md; CTR-2611.
 
 ```rust
 // Pattern: Path Sanitization
