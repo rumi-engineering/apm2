@@ -76,6 +76,9 @@ async-trait.workspace = true
 
 # Security
 secrecy.workspace = true
+keyring.workspace = true
+zeroize.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 # Testing utilities
