@@ -16,6 +16,8 @@ Any exploration MUST run under a lease with a termination policy; failure to con
 2. **Progress Signals:** Periodic telemetry to detect "looping" or stagnant reasoning.
 3. **Stop Conditions:** Explicit criteria for success or "give up" states.
 4. **Defect Tracking:** Non-convergent loops produce a `UNBOUNDED_SEARCH` DefectRecord.
+5. **Repetition Detection:** Progress telemetry MUST detect template-like repetitive reasoning (entropy collapse, reward variance flatlining) as a termination trigger and defect signal.
+6. **Degeneration as Defect:** Detected echo-trap patterns produce `REASONING_DEGENERATION` DefectRecords.
 
 ## Rationale
 Stochastic planners can easily enter infinite feedback loops or unproductive search paths. Forcing termination discipline protects the system's resource availability.

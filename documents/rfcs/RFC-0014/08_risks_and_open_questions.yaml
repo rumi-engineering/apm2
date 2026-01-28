@@ -1,0 +1,253 @@
+rfc_risks_and_open_questions:
+  schema_version: "2026-01-28"
+
+  risks:
+    - id: RISK-0001
+      name: "Consensus Library Selection"
+      likelihood: MEDIUM
+      impact: HIGH
+      description: |
+        The choice of BFT consensus implementation (custom HotStuff/PBFT variant or
+        off-the-shelf library) significantly affects development time, security, and
+        maintainability. Wrong choice may require rewrite.
+      mitigation:
+        - "Evaluate existing Rust BFT consensus libraries or frameworks"
+        - "Prototype with abstraction layer to enable swap"
+        - "Prioritize libraries with formal verification or extensive production use"
+        - "Plan for at least 2 weeks of library evaluation before commitment"
+      residual_risk: "Library may have undiscovered bugs; maintain abstraction for swap"
+      owner: "Architect"
+
+    - id: RISK-0002
+      name: "Network Protocol Complexity"
+      likelihood: MEDIUM
+      impact: MEDIUM
+      description: |
+        Distributed consensus introduces network protocol complexity (message
+        ordering, retries, timeouts) that may cause subtle bugs.
+      mitigation:
+        - "Use deterministic simulation testing (Jepsen-style)"
+        - "Implement comprehensive fault injection tests"
+        - "Start with leader-based replication (simpler) before full consensus"
+        - "Document all network protocol state machines"
+      residual_risk: "Edge cases in partition scenarios may emerge in production"
+      owner: "Engineer"
+
+    - id: RISK-0003
+      name: "Performance Degradation"
+      likelihood: MEDIUM
+      impact: MEDIUM
+      description: |
+        Consensus adds latency to control plane operations. If latency is too
+        high, it may affect user experience or system responsiveness.
+      mitigation:
+        - "Benchmark early and often"
+        - "Optimize critical path (pre-prepare → commit)"
+        - "Pipeline proposals when possible"
+        - "Keep consensus for control plane only (data plane uses anti-entropy)"
+      residual_risk: "Geo-distributed deployments may have higher latency"
+      owner: "Engineer"
+
+    - id: RISK-0004
+      name: "HSM Integration Complexity"
+      likelihood: LOW
+      impact: MEDIUM
+      description: |
+        HSM integration for T1 keys may introduce vendor-specific complexity
+        and operational overhead.
+      mitigation:
+        - "Define abstract HSM interface; implement software fallback first"
+        - "Choose HSM with good Rust SDK (e.g., YubiHSM)"
+        - "Plan for HSM-specific testing environment"
+        - "Document key ceremony procedures"
+      residual_risk: "HSM hardware failures may require manual intervention"
+      owner: "Security"
+
+    - id: RISK-0005
+      name: "Migration Data Loss"
+      likelihood: LOW
+      impact: CRITICAL
+      description: |
+        Migration from single-node to distributed mode may introduce bugs
+        that corrupt or lose historical data.
+      mitigation:
+        - "Mandatory backup before migration"
+        - "Migration runs in dry-run mode first"
+        - "Verify hash chain before and after"
+        - "Documented rollback procedure tested in staging"
+      residual_risk: "Rollback may lose post-migration events"
+      owner: "Operations"
+
+    - id: RISK-0006
+      name: "Validator Key Compromise"
+      likelihood: LOW
+      impact: HIGH
+      description: |
+        Compromise of a validator key allows attacker to participate in
+        consensus with one vote.
+      mitigation:
+        - "HSM storage for T1 keys"
+        - "Regular key rotation (quarterly)"
+        - "Rapid revocation via governance vote"
+        - "Monitoring for unusual signing patterns"
+      residual_risk: "Attacker has one vote; cannot unilaterally finalize"
+      owner: "Security"
+
+    - id: RISK-0007
+      name: "Anti-Entropy Divergence"
+      likelihood: MEDIUM
+      impact: LOW
+      description: |
+        Data plane events may diverge significantly between nodes if
+        anti-entropy sync is slow or merge conflicts are frequent.
+      mitigation:
+        - "Tune sync frequency based on event rate"
+        - "Monitor conflict rate; alert on high divergence"
+        - "Record all conflicts as DefectRecorded events for analysis"
+        - "Prioritize CRDT-friendly event designs"
+      residual_risk: "Temporary inconsistency in non-authority data"
+      owner: "Engineer"
+
+    - id: RISK-0008
+      name: "Relay Holon Compromise"
+      likelihood: LOW
+      impact: MEDIUM
+      description: |
+        An attacker compromises a Relay Holon and attempts to intercept or drop
+        messages between workers and the consensus network.
+      mitigation:
+        - "mTLS ensures relay cannot spoof identity of workers"
+        - "End-to-end signature verification of consensus proposals"
+        - "Redundant relays; workers can fail over to secondary relays"
+        - "Relay capabilities strictly limited to NAT traversal"
+      residual_risk: "Denial of service for workers behind the compromised relay"
+      owner: "Security"
+
+  open_questions:
+    - id: Q-0001
+      question: "Which consensus library should we use?"
+      status: PENDING_SPIKE
+      context: |
+        Options include:
+        - BFT libraries or frameworks with HotStuff/PBFT semantics
+        - Custom implementation
+        Each has different trade-offs in maturity, features, and maintenance.
+      proposed_resolution: |
+        Conduct 2-week evaluation with prototype of each option (DCS-007a). Criteria:
+        - API compatibility with LedgerBackend
+        - Testing infrastructure quality
+        - Byzantine fault tolerance (required)
+        - Maintenance and community activity
+        Spike exit criteria:
+        - Select a library OR commit to custom implementation
+        - Document rationale and known limitations
+        - Provide minimal integration plan for DCS-007b/c/d
+      decision_owner: "Architect"
+      decision_deadline: "Before DCS-007b implementation"
+
+    - id: Q-0002
+      question: "Which BFT protocol variant should we use (HotStuff vs PBFT)?"
+      status: PENDING_SPIKE
+      context: |
+        Both HotStuff and PBFT satisfy BFT safety/liveness at local quorum scale,
+        but differ in message complexity, implementation complexity, and available
+        Rust libraries.
+      proposed_resolution: |
+        Evaluate HotStuff and PBFT variants during DCS-007a spike. Select based on:
+        - Message complexity vs latency at 4-7 nodes
+        - Availability of reference implementations or libraries
+        - Ease of QC integration and evidence export
+        Spike exit criteria:
+        - Choose HotStuff or PBFT variant for v1
+        - Record the message types and phase transitions
+        - Map to evidence artifacts EVID-0007 and EVID-0008
+      decision_owner: "Security + Architect"
+      decision_deadline: "Before DCS-007b implementation"
+
+    - id: Q-0003
+      question: "How should namespace-to-quorum mapping work?"
+      status: OPEN
+      context: |
+        Options:
+        - One BFT quorum per namespace (fine-grained but many groups)
+        - One BFT quorum for all control plane (simple but potential bottleneck)
+        - Hierarchical grouping (complex)
+      proposed_resolution: |
+        Start with single BFT quorum for all control plane. Add namespace
+        sharding only if performance requires. Monitor proposal rate to
+        determine if sharding is needed.
+      decision_owner: "Architect"
+      decision_deadline: "Before DCS-005 implementation"
+
+    - id: Q-0004
+      question: "What is the minimum validator set size for production?"
+      status: OPEN
+      context: |
+        Trade-off between fault tolerance and operational complexity:
+        - 4 nodes (f=1): Simple but marginal fault tolerance
+        - 7 nodes (f=2): Better tolerance but more operational overhead
+        - More nodes: Diminishing returns on tolerance
+      proposed_resolution: |
+        Recommend 4 nodes for small deployments, 7 for production.
+        Document trade-offs and let operators choose.
+      decision_owner: "Operations"
+      decision_deadline: "Before PHASE-3"
+
+    - id: Q-0005
+      question: "How should T0 key ceremony be conducted?"
+      status: OPEN
+      context: |
+        T0 (root) key is critical infrastructure. Ceremony must balance
+        security (multi-party, air-gapped) with practicality.
+      proposed_resolution: |
+        Define ceremony protocol with:
+        - 3-of-5 threshold signing
+        - Air-gapped signing machine
+        - Witnessed by multiple stakeholders
+        - Video recording of ceremony
+        Document as operational procedure.
+      decision_owner: "Security"
+      decision_deadline: "Before PHASE-1"
+
+    - id: Q-0006
+      question: "Should we support cross-network federation in this RFC?"
+      status: RESOLVED
+      resolution: |
+        No. Cross-network federation (multiple independent APM2 networks
+        with different genesis blocks) is out of scope for this RFC.
+        A future RFC will address federation.
+      decision_date: "2026-01-28"
+      decision_owner: "Architect"
+
+    - id: Q-0007
+      question: "What merge operators should we support initially?"
+      status: RESOLVED
+      resolution: |
+        Initial set:
+        - LastWriterWins (LWW): For SessionProgress, ToolExecuted
+        - SetUnion: For EvidencePublished, SessionCrashDetected
+        - NoMerge: For control plane events (conflict = defect)
+        Additional operators can be added as needed.
+      decision_date: "2026-01-28"
+      decision_owner: "Architect"
+
+  constraints:
+    - id: CON-0001
+      description: "Must maintain backward compatibility with existing single-node deployments"
+      rationale: "Cannot break existing users; migration must be optional"
+
+    - id: CON-0002
+      description: "Must preserve hash chain integrity during and after migration"
+      rationale: "Hash chain is audit foundation; cannot be broken"
+
+    - id: CON-0003
+      description: "Must not introduce ambient authority"
+      rationale: "OCAP model requires explicit capability delegation"
+
+    - id: CON-0004
+      description: "Must work without external dependencies (no etcd, Consul, etc.)"
+      rationale: "Self-contained deployment; minimize operational complexity"
+
+    - id: CON-0005
+      description: "Must support operation behind NAT/firewall with only outbound connectivity"
+      rationale: "Many deployment environments restrict inbound connections"

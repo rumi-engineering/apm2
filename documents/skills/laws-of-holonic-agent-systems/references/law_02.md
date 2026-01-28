@@ -17,6 +17,8 @@ The system must track and optimize for the following control objectives:
 2. **Unplanned Tool Calls:** Unauthorized discovery actions taken to compensate for missing information.
 3. **Defect Escape Rate:** Correlating missing context with downstream logic errors.
 4. **Agent "Stuck" Proxies:** Tracking rollbacks and task resets as indicators of context poverty.
+5. **Subtask Isolation:** Decomposed subtasks MUST receive scoped ContextPacks; monolithic trace injection across subtask boundaries is a context defect (CONTEXT_BLEED).
+6. **Explicit Inter-Subtask Interface:** State shared between subtasks flows via typed summaries/receipts (LAW-07), not implicit context bleed.
 
 ## Rationale
 Since context windows are finite and precious, the "quality" of a context pack is not subjective. It is a measurable engineering parameter that determines the probability of task success.

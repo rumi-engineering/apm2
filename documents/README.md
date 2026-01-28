@@ -6,16 +6,18 @@ This directory contains all project documentation, standards, and specifications
 
 | Directory | Purpose | Entry Point |
 |-----------|---------|-------------|
-| `standards/` | Schemas, enums, and lint rules | `standards/00_standards_meta.yaml` |
-| `prds/` | Product Requirements Documents | `prds/template/` for new PRDs |
-| `rfcs/` | Request for Comments | `rfcs/template/` for new RFCs |
-| `protocol_profiles/` | Agent protocol configurations | |
-| `strategy/` | Strategy & SDLC Pipeline | [SDLC_PIPELINE.md](./strategy/SDLC_PIPELINE.md) |
-| `skills/` | Agent skill definitions | [README.md](./skills/README.md) |
+| `standards/` | Document standards (schemas/enums/lint) + CAC specs | `standards/00_standards_meta.yaml` |
+| `standards/cac/` | Context-as-Code (CAC) spec bundle (schemas/examples/volumes) | `standards/cac/MASTER.json` |
+| `prds/` | Product Requirements Documents + AIPs | `prds/template/` |
+| `rfcs/` | Request for Comments | `rfcs/template/` |
+| `protocol_profiles/` | Protocol configuration profiles | `protocol_profiles/README.yaml` |
+| `protocols/` | Normative runtime/agent protocols | `protocols/AGENT_EXIT_PROTOCOL.md` |
+| `strategy/` | Strategy & SDLC pipeline | `strategy/SDLC_PIPELINE.md` |
+| `skills/` | Agent skills (executable specifications) | `skills/README.md` |
 | `work/` | Tickets and work tracking | `work/tickets/` |
-| `coding/` | Coding guidelines | |
-| `security/` | Security documentation | |
-| `releases/` | Release documentation | |
+| `reviews/` | Review prompts + CI expectations | `reviews/` |
+| `security/` | Security documentation | `security/SECURITY_POLICY.md` |
+| `releases/` | Release documentation | `releases/README.md` |
 
 ## Standards
 
@@ -24,12 +26,14 @@ Standards define the schemas and validation rules for all documents.
 ```
 documents/standards/
 ├── 00_standards_meta.yaml    # Entry point - start here
+├── cac/                      # Context-as-Code spec bundle (JSON)
 ├── enums/                    # Enumerated types (status codes, roles, etc.)
+├── instructions/             # Shared instruction fragments and standards
 ├── schemas/                  # YAML schemas for PRDs, RFCs, tickets, etc.
 └── lint/                     # Lint rules for document validation
 ```
 
-**For agents:** To understand the document structure, read `standards/00_standards_meta.yaml` first, then explore `schemas/` for specific document types.
+**For agents:** To understand document structure, read `standards/00_standards_meta.yaml` first, then consult `standards/schemas/` for specific document types.
 
 ## Document Structure Convention
 
@@ -61,7 +65,8 @@ This convention enables:
 
 If you're an agent trying to understand this project:
 
-1. **Start with standards** - Read `standards/00_standards_meta.yaml`
-2. **Understand schemas** - Check `standards/schemas/` for document structures
-3. **Check enums** - `standards/enums/` defines all valid status codes and types
-4. **Read the skill** - `skills/holonic-agent-network/SKILL.md` defines agent behavior
+1. **Root onboarding** - `AGENTS.md` + `ROOT_ONBOARDING.cac.md` (repo-level pointers) + `SECURITY.md` (security policy summary)
+2. **Start with standards** - Read `standards/00_standards_meta.yaml`
+3. **Understand schemas** - Check `standards/schemas/` for document structures
+4. **Check enums** - `standards/enums/` defines valid status codes and types
+5. **Use skills (preferred)** - `skills/glossary/SKILL.md` (terms), `skills/laws-of-holonic-agent-systems/SKILL.md` (laws), `skills/ticket-queue/SKILL.md` (orchestration), `skills/dev-eng-ticket/SKILL.md` (implementation)

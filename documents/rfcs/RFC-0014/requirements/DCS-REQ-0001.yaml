@@ -1,0 +1,42 @@
+requirement:
+  id: DCS-REQ-0001
+  title: "Messaging-Native Control Plane"
+  imported_from: "PRD-0007/REQ-0006"
+  status: ACTIVE
+
+  statement: |
+    All authority operations (promotions, capability grants, policy changes) MUST be
+    reflected as signed kernel messages with total ordering guarantees provided by
+    a BFT quorum (HotStuff/PBFT) at local-quorum scale.
+
+  rationale: |
+    Authority operations change the security posture of the system. They must be
+    totally ordered to prevent race conditions and ensure deterministic state.
+    Signatures provide non-repudiation and auditability.
+
+  acceptance_criteria:
+    - id: AC-001
+      description: "Authority events committed only after consensus quorum (2f+1 of 3f+1)"
+      verification: "Verify quorum certificate attached to authority events"
+
+    - id: AC-002
+      description: "Event sequence deterministically reproducible across nodes"
+      verification: "Compare event logs across nodes; assert identical ordering"
+
+    - id: AC-003
+      description: "Quorum certificate attached to every authority event"
+      verification: "Parse quorum_cert field; verify >= 2f+1 signatures"
+
+  design_references:
+    - "02_design_decisions.yaml#DD-0001"
+    - "02_design_decisions.yaml#DD-0007"
+
+  test_references:
+    - "07_test_and_evidence.yaml#TEST-CS-001"
+    - "07_test_and_evidence.yaml#TEST-CS-002"
+    - "07_test_and_evidence.yaml#TEST-CS-003"
+    - "07_test_and_evidence.yaml#TEST-CS-004"
+
+  law_refs:
+    - LAW-03
+    - LAW-15

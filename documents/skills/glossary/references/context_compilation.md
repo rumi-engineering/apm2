@@ -8,8 +8,11 @@ Traditional agent workflows rely on the agent to "find" the relevant files. **Co
 ## Key Principles
 - **Pruning:** Removing irrelevant boilerplate to fit within a `ContextBudget`.
 - **Content Addressing:** Binding the context to specific hashes to prevent "drift by update."
-- **Sufficiency:** The compiled pack must be sufficient for a "Zero-Tool Ideal" execution.
+- **Sufficiency (role-relative):** The compiled pack must be sufficient for the task *within the agent's granted capabilities*. If the smallest sufficient pack violates containment policy, the system must fail-closed and decompose/escalate.
+- **Commitment + addressability:** Packs carry a **View Commitment** and **Selectors** so omitted referenced facts remain auditable.
 
 ## See Also
 - **ContextPack**: The output of compilation.
+- **View Commitment**: how bounded packs stay synchronized with an unbounded ledger.
+- **Selector**: how omitted referenced facts remain retrievable.
 - **Zero-Tool Ideal (ZTI)**: The design goal.

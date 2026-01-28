@@ -1,0 +1,27 @@
+requirement:
+  id: DCS-REQ-0002
+  title: "Bootstrap Trust Root Immutability"
+  imported_from: PRD-0007/REQ-0010
+  status: ACTIVE
+
+  statement: |
+    The network genesis and validator set MUST be established via an immutable trust
+    root signed by an air-gapped authority key.
+
+  rationale: |
+    Genesis establishes the root of trust for the distributed ledger. It must be
+    immutable and independently verifiable to prevent trust bootstrapping attacks.
+
+  acceptance_criteria:
+    - id: AC-001
+      description: "Genesis block signed by T0 (root) key"
+      verification: "Verify root_signature against T0 public key"
+    - id: AC-002
+      description: "Initial validator set enumerated in genesis"
+      verification: "Validate validator list count and signatures"
+    - id: AC-003
+      description: "T0 key never exposed to network operations"
+      verification: "Confirm offline signing ceremony and key handling"
+
+  design_references:
+    - "02_design_decisions.yaml#DD-0003"

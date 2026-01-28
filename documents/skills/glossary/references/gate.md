@@ -19,8 +19,11 @@ The `GateReceipt` is the cryptographic proof of the gate's outcome. It includes:
 *   `bundle_hash`: Links the receipt to the specific evidence bundle verified.
 
 ### Types of Gates
-*   **TRUSTED Gates**: Rely on the authority of the tool running them (e.g., a linter, a compiler, a security scanner). The gate verifies the *presence* and *result* of the tool's output.
-*   **DETERMINISTIC Gates**: Rely on pure computation that can be re-run by anyone to get the same result (e.g., checking that a file hash matches a manifest).
+*   **TERMINAL Gates**: Reduce to **Terminal Verifiers** (machine-checkable predicates with replayable evidence). These are the anchors for authoritative promotion.
+*   **ADVISORY Gates**: Produce useful signals (risk scoring, hypothesis generation, AAT-style evaluation), but are not sufficient alone for high-risk authoritative transitions.
+*   **HYBRID Gates**: Orchestrate terminal verifiers and incorporate advisory signals into the overall receipt/findings.
+
+In practice, the "gate" is often an orchestrator: it runs terminal verifiers, bundles evidence, and emits a receipt. The authority comes from the terminal-verifier evidence + attestation, not from an LLM saying "PASS."
 
 ## Data Structure References
 *   **`GateReceipt`** (`crates/apm2-core/src/evidence/receipt.rs`): The signed output record proving gate passage or failure.

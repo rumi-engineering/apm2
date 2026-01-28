@@ -1,0 +1,31 @@
+requirement:
+  id: DCS-REQ-0010
+  title: "Hybrid Logical Clocks for LWW"
+  imported_from: null
+  status: ACTIVE
+
+  statement: |
+    All LWW merge operators MUST use Hybrid Logical Clocks (HLC) instead of wall time
+    to preserve causality and determinism under partition.
+
+  rationale: |
+    HLC provides a deterministic, causality-preserving ordering of events even with
+    clock skew and partitions.
+
+  acceptance_criteria:
+    - id: AC-001
+      description: "EventMetadata includes HLC timestamp"
+      verification: "HLC fields present in event metadata"
+    - id: AC-002
+      description: "LWW merge uses HLC ordering"
+      verification: "Merge compares HLC timestamp"
+    - id: AC-003
+      description: "Determinism tests validate HLC ordering across nodes"
+      verification: "HLC ordering test passes"
+
+  design_references:
+    - "02_design_decisions.yaml#DD-0005"
+
+  test_references:
+    - "07_test_and_evidence.yaml#TEST-ORD-001"
+    - "07_test_and_evidence.yaml#TEST-AE-004"

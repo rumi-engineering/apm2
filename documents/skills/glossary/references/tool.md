@@ -7,6 +7,12 @@
 ### Default-Deny Security
 Agents have no inherent capabilities beyond pure computation. To read a file or run a command, they must construct a `ToolRequest`. The Kernel validates this request against the active Policy and the agent's Lease. If not explicitly allowed, the request is denied.
 
+### Scoped Reads vs Ambient Paths
+Tooling should prefer *addressable* reads over ambient filesystem paths:
+
+- **Consumption (read-only, hermetic)**: fetch artifacts by stable ID/content hash (e.g., `ArtifactFetch`) rather than arbitrary `FileRead`.
+- **Actuation (editing)**: write authority is scoped to a workspace root and path allowlists. The workspace is a projection; changes should be captured as patch/diff artifacts for replay and audit.
+
 ### Protocol Buffer Interface
 Tools are defined strictly via Protocol Buffers (`apm2.tool.v1`). This ensures a language-agnostic, strongly typed contract between the agent (client) and the kernel (server). There are no "magic" internal APIs; everything flows through this explicit message bus.
 
@@ -24,3 +30,5 @@ Every tool execution is an event. The request, the decision (allow/deny), and th
 *   **[Policy](policy.md)**: The rules engine that adjudicates Tool requests.
 *   **[Lease / Budget](lease_and_budget.md)**: The authority grant that permits Tool usage.
 *   **[Ledger](ledger.md)**: The record of all Tool executions.
+*   **Content Resolver**: how stable IDs and hashes become scoped bytes.
+*   **Workspace Delta**: how dirty state is represented without relying on ambient disk.

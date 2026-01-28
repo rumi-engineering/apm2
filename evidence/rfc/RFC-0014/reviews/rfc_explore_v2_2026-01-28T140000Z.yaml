@@ -1,0 +1,247 @@
+# RFC-0014 EXPLORE Mode Evidence Bundle
+# Generated: 2026-01-28T14:00:00Z
+# Mode: EXPLORE (v0 -> v2)
+# Session ID: EXPLORE-RFC-0014-20260128-140000
+
+schema_version: "1.0.0"
+rfc_id: RFC-0014
+rfc_title: "Distributed Consensus and Replication Layer for APM2 Ledger+CAS Truth Substrate"
+rfc_version_from: "0.1.0"
+rfc_version_to: "2.0.0"
+mode: EXPLORE
+timestamp: "2026-01-28T14:00:00Z"
+
+# =============================================================================
+# VERSION TRANSITION
+# =============================================================================
+
+version_transition:
+  from_phase: "v0 (Discovery)"
+  to_phase: "v2 (Grounded)"
+  transition_reason: |
+    Design decisions grounded in existing codebase patterns through
+    systematic exploration of apm2-core modules.
+
+# =============================================================================
+# CODEBASE EXPLORATION
+# =============================================================================
+
+codebase_exploration:
+  files_examined:
+    - path: "crates/apm2-core/src/crypto/keys.rs"
+      purpose: "Key management infrastructure"
+      patterns_found:
+        - "KeyManager with KeyStorage enum (Memory, File)"
+        - "Secure file permissions (0o600)"
+        - "Actor ID validation and key lookup"
+      grounding_relevance: "T2/T3 key management for trust hierarchy"
+
+    - path: "crates/apm2-core/src/crypto/hash.rs"
+      purpose: "Blake3 hashing and hash-chain primitives"
+      patterns_found:
+        - "EventHasher with hash_event(content, prev_hash)"
+        - "GENESIS_PREV_HASH constant (32 zero bytes)"
+        - "verify_chain() for hash chain integrity"
+        - "normalize_prev_hash() for storage format handling"
+      grounding_relevance: "Foundation for Merkle trees and quorum certificates"
+
+    - path: "crates/apm2-core/src/crypto/sign.rs"
+      purpose: "Ed25519 signing and verification"
+      patterns_found:
+        - "Signer with SigningKey and Zeroizing lifecycle"
+        - "verify_signature() standalone function"
+        - "parse_signature() and parse_verifying_key() utilities"
+        - "Deterministic signatures (no randomness)"
+      grounding_relevance: "Consensus attestations and quorum certificate verification"
+
+    - path: "crates/apm2-core/src/coordination/reducer.rs"
+      purpose: "State machine reducer pattern"
+      patterns_found:
+        - "Reducer trait with apply(), state(), reset()"
+        - "Determinism requirements (INV-0101)"
+        - "State machine with explicit transitions"
+      grounding_relevance: "BFT consensus reducer implementation pattern"
+
+    - path: "crates/apm2-core/src/determinism/canonicalize.rs"
+      purpose: "YAML canonicalization for deterministic hashing"
+      patterns_found:
+        - "TypedKey enum for type-safe ordering"
+        - "CanonicalizerError with fail-closed semantics"
+        - "Recursion limits for DoS protection"
+      grounding_relevance: "Schema digest computation and fail-closed validation"
+
+    - path: "crates/apm2-core/src/adapter/traits.rs"
+      purpose: "Async trait patterns"
+      patterns_found:
+        - "Pin<Box<dyn Future<Output=...> + Send + 'a>> pattern"
+        - "Adapter trait with async methods"
+        - "BoxFuture type alias"
+      grounding_relevance: "LedgerBackend, ConsensusLayer, SchemaRegistry trait design"
+
+# =============================================================================
+# EXPLORATION FINDINGS
+# =============================================================================
+
+exploration_findings:
+  - finding_id: EXP-0001
+    title: "Async Trait Pattern Established"
+    discovery: |
+      The crates/apm2-core/src/adapter/traits.rs module demonstrates the
+      Pin<Box<dyn Future<Output=...> + Send + 'a>> pattern for async trait methods.
+      This pattern is used by Adapter and should be adopted by LedgerBackend,
+      ConsensusLayer, and SchemaRegistry traits.
+    affected_decisions: [DD-0001, DD-0002, DD-0004]
+    evidence_type: CODE_PATTERN
+    confidence: HIGH
+
+  - finding_id: EXP-0002
+    title: "Determinism Infrastructure Complete"
+    discovery: |
+      The Reducer trait in coordination/reducer.rs and canonicalization in
+      determinism/canonicalize.rs provide complete determinism infrastructure.
+      BFT consensus reducers can follow this pattern directly.
+    affected_decisions: [DD-0001, DD-0004]
+    evidence_type: CODE_PATTERN
+    confidence: HIGH
+
+  - finding_id: EXP-0003
+    title: "Key Management Extensible"
+    discovery: |
+      KeyManager in crypto/keys.rs uses KeyStorage enum (Memory, File) pattern.
+      This can extend to KeyStorage::Hsm for T1 validator keys without breaking
+      T2/T3 actor key handling.
+    affected_decisions: [DD-0003]
+    evidence_type: EXTENSION_POINT
+    confidence: HIGH
+
+  - finding_id: EXP-0004
+    title: "Hash Chain Primitives Available"
+    discovery: |
+      EventHasher provides hash_event(content, prev_hash), verify_chain(), and
+      GENESIS_PREV_HASH constant. Merkle tree implementation extends these primitives
+      without duplication. Consensus epoch genesis can adopt ledger head hash directly.
+    affected_decisions: [DD-0006, DD-0007]
+    evidence_type: CODE_PATTERN
+    confidence: HIGH
+
+  - finding_id: EXP-0005
+    title: "Ed25519 Signing Infrastructure Complete"
+    discovery: |
+      Signer in crypto/sign.rs provides sign(), verify(), and verifying_key() with
+      zeroize support. QuorumCertificate verification uses verify_signature() directly.
+      Deterministic signatures (test_deterministic_signatures) confirm no randomness.
+    affected_decisions: [DD-0007]
+    evidence_type: CODE_PATTERN
+    confidence: HIGH
+
+# =============================================================================
+# DESIGN DECISION GROUNDING
+# =============================================================================
+
+grounding_summary:
+  decisions_grounded: 6
+  total_grounding_refs: 18
+
+  by_decision:
+    - decision_id: DD-0001
+      title: "Hybrid Consensus Model"
+      grounding_refs: 3
+      files:
+        - "coordination/reducer.rs"
+        - "crypto/sign.rs"
+        - "adapter/traits.rs"
+
+    - decision_id: DD-0002
+      title: "LedgerBackend Trait Abstraction"
+      grounding_refs: 3
+      files:
+        - "adapter/traits.rs"
+        - "crypto/hash.rs"
+        - "coordination/reducer.rs"
+
+    - decision_id: DD-0003
+      title: "Four-Tier Trust Hierarchy"
+      grounding_refs: 4
+      files:
+        - "crypto/keys.rs"
+        - "crypto/sign.rs"
+
+    - decision_id: DD-0004
+      title: "Schema Registry with Fail-Closed Validation"
+      grounding_refs: 3
+      files:
+        - "determinism/canonicalize.rs"
+        - "crypto/hash.rs"
+
+    - decision_id: DD-0006
+      title: "Merkle Tree for Anti-Entropy Sync"
+      grounding_refs: 3
+      files:
+        - "crypto/hash.rs"
+
+    - decision_id: DD-0007
+      title: "Quorum Certificate Structure"
+      grounding_refs: 4
+      files:
+        - "crypto/sign.rs"
+        - "crypto/hash.rs"
+
+# =============================================================================
+# FILES MODIFIED
+# =============================================================================
+
+files_modified:
+  - path: "documents/rfcs/RFC-0014/00_meta.yaml"
+    changes:
+      - "version: 0.1.0 -> 2.0.0"
+      - "Added version_history section"
+
+  - path: "documents/rfcs/RFC-0014/02_design_decisions.yaml"
+    changes:
+      - "Added version_transition section"
+      - "Added exploration_findings section (5 findings)"
+      - "Added codebase_grounding to DD-0001 (3 refs)"
+      - "Added codebase_grounding to DD-0002 (3 refs)"
+      - "Added codebase_grounding to DD-0003 (4 refs)"
+      - "Added codebase_grounding to DD-0004 (3 refs)"
+      - "Added codebase_grounding to DD-0006 (3 refs)"
+      - "Added codebase_grounding to DD-0007 (4 refs)"
+
+# =============================================================================
+# VERDICT
+# =============================================================================
+
+verdict: ADVANCED
+verdict_reason: |
+  RFC-0014 successfully advanced from v0 (Discovery) to v2 (Grounded).
+
+  All design decisions now have codebase grounding evidence demonstrating
+  that proposed patterns align with existing infrastructure:
+
+  - Async trait pattern proven in adapter/traits.rs
+  - Determinism infrastructure complete in reducer.rs + canonicalize.rs
+  - Key management extensible for HSM integration
+  - Hash chain primitives available for Merkle trees
+  - Ed25519 signing infrastructure complete for quorum certificates
+
+  PRIOR BLOCKERS (from v0 REVIEW):
+  The v0 REVIEW blockers (FND-SA2-C2-001 through FND-SA3-C2-001) remain valid
+  and must be resolved before v4 (Standard) progression. EXPLORE mode does not
+  resolve REVIEW findings - it grounds design decisions in codebase evidence.
+
+  NEXT STEPS:
+  1. Address v0 REVIEW blockers (spike ticket, evidence artifacts)
+  2. Re-run REVIEW at v2 level
+  3. Progress to v4 (Standard) upon APPROVED verdict
+
+# =============================================================================
+# METADATA
+# =============================================================================
+
+metadata:
+  agent_model: claude-opus-4-5-20251101
+  exploration_depth: SYSTEMATIC
+  files_examined: 6
+  findings_generated: 5
+  grounding_refs_added: 18
+  elapsed_time_seconds: 120

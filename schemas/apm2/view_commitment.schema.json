@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/view_commitment.schema.json",
+  "title": "ViewCommitment",
+  "description": "Cryptographic binding that synchronizes a bounded view (ContextPack/Snapshot/SummaryReceipt) to authoritative truth via a ledger head/checkpoint commitment plus deterministic addressability (selectors).",
+  "type": "object",
+  "required": ["schema", "schema_version", "ledger_anchor", "selectors"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.view_commitment.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "ledger_anchor": {
+      "type": "object",
+      "description": "Anchor into the authoritative ledger. This is the synchronization point for the view.",
+      "oneOf": [
+        {
+          "title": "LedgerEventAnchor",
+          "required": ["anchor_kind", "seq_id", "event_hash"],
+          "properties": {
+            "anchor_kind": { "const": "ledger_event" },
+            "seq_id": { "type": "integer", "minimum": 0 },
+            "event_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+          },
+          "unevaluatedProperties": false
+        },
+        {
+          "title": "SnapshotAnchor",
+          "required": ["anchor_kind", "snapshot_event_hash"],
+          "properties": {
+            "anchor_kind": { "const": "snapshot" },
+            "snapshot_event_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+          },
+          "unevaluatedProperties": false
+        }
+      ]
+    },
+    "pins": {
+      "type": "object",
+      "description": "Pinned world state identifiers the view assumes (repo/deps/policy/toolchain).",
+      "properties": {
+        "git_commit": {
+          "allOf": [
+            { "$ref": "git_object_ref.schema.json" },
+            {
+              "properties": { "object_kind": { "const": "commit" } },
+              "required": ["object_kind"]
+            }
+          ]
+        },
+        "git_tree": {
+          "allOf": [
+            { "$ref": "git_object_ref.schema.json" },
+            {
+              "properties": { "object_kind": { "const": "tree" } },
+              "required": ["object_kind"]
+            }
+          ]
+        },
+        "policy_digest": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "toolchain_digest": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "workspace_delta": {
+          "description": "Optional reference to a WorkspaceDelta artifact (dirty state) that this view assumes.",
+          "allOf": [{ "$ref": "selector.schema.json" }],
+          "properties": { "kind": { "const": "cas" } },
+          "required": ["kind"]
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "selectors": {
+      "type": "array",
+      "description": "Selectors enabling deterministic zoom-in retrieval of omitted referenced facts/artifacts.",
+      "maxItems": 100000,
+      "items": { "$ref": "selector.schema.json" }
+    },
+    "canonicalizer_id": {
+      "type": "string",
+      "description": "Canonicalizer identifier used to produce the committed bytes (if applicable).",
+      "maxLength": 128
+    },
+    "canonicalizer_version": {
+      "type": "string",
+      "description": "Canonicalizer version used to produce the committed bytes (if applicable).",
+      "maxLength": 64
+    }
+  },
+  "unevaluatedProperties": false
+}

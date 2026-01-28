@@ -7,12 +7,32 @@
 ### Content-Addressable Storage (CAS)
 Artifacts are stored and retrieved by their BLAKE3 hash, ensuring perfect integrity and automatic deduplication. The hash is the unique identifier for the content itself, meaning if the content changes, the ID changes.
 
+### Evidence vs Derived Artifacts
+
+Not all useful artifacts are equivalent:
+
+- **Evidence (raw)**: primary artifacts produced by tools or observations (test output, compiler diagnostics, scan reports, command transcripts).
+- **Derived artifacts**: summaries, indices, embeddings, or snapshots computed from evidence/history.
+
+Derived artifacts are still content-addressed and useful, but must declare derivation method/version and a loss profile. They are admissible for planning/triage; gates that require exactness must validate against underlying evidence (zoom-in).
+
 ### Data Classification
 Every piece of evidence is classified to enforce security policies and progressive disclosure.
 *   **PUBLIC**: No restrictions.
 *   **INTERNAL**: Default classification for factory-internal work.
 *   **CONFIDENTIAL**: Restricted to authorized actors; requires progressive disclosure.
 *   **RESTRICTED**: Highly sensitive; strict access control.
+
+### Provenance and Attestation
+
+For evidence to be replayable/auditable, it should carry (or reference) provenance:
+
+- command transcript (or transcript hash + CAS pointer)
+- toolchain versions
+- pinned inputs (repo commit/tree, lockfiles, policy version)
+- environment identity (runner/container digest)
+
+This is the practical minimum **Attestation** needed to avoid verifier regress.
 
 ### Evidence Bundle
 A collection of related `Evidence` artifacts for a single work item. Bundles are the atomic inputs for `Gate` verification, ensuring that all required quality artifacts (e.g., tests, lints, scans) are reviewed together.
@@ -27,3 +47,5 @@ A collection of related `Evidence` artifacts for a single work item. Bundles are
 *   **Gate**: The verification function that consumes Evidence.
 *   **Ledger**: Stores the `EvidencePublished` events.
 *   **Artifact**: The raw binary content referenced by Evidence.
+*   **Summary Receipt**: A derived, lossy artifact with evidence pointers.
+*   **Attestation**: How evidence is bound to an execution environment.

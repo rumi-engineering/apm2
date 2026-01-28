@@ -1,0 +1,33 @@
+requirement:
+  id: DCS-REQ-0008
+  title: "Anti-Entropy Reconciliation"
+  imported_from: null
+  status: ACTIVE
+
+  statement: |
+    Data plane events MUST converge across nodes via periodic anti-entropy sync with
+    declared merge operators and conflict recording (per LAW-10).
+
+  rationale: |
+    Eventual consistency enables high-volume observation replication without consensus.
+
+  acceptance_criteria:
+    - id: AC-001
+      description: "Merkle tree digests for efficient diff computation"
+      verification: "Digest comparison identifies divergence"
+    - id: AC-002
+      description: "Pull-based reconciliation (prevents byzantine spread)"
+      verification: "Receiver initiates sync"
+    - id: AC-003
+      description: "Merge conflicts recorded as DefectRecorded events"
+      verification: "Conflict emits DefectRecorded"
+
+  design_references:
+    - "02_design_decisions.yaml#DD-0006"
+
+  test_references:
+    - "07_test_and_evidence.yaml#TEST-AE-001"
+    - "07_test_and_evidence.yaml#TEST-AE-007"
+
+  law_refs:
+    - LAW-10

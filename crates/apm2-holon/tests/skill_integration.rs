@@ -749,6 +749,17 @@ fn rfc_council_skill_path() -> PathBuf {
         .join("documents/skills/rfc-council/SKILL.md")
 }
 
+/// Returns the path to the rfc-council CAC assets index.json file.
+fn rfc_council_assets_index_path() -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(manifest_dir)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("documents/skills/rfc-council/assets/index.json")
+}
+
 /// TCK-00048 Criterion 1: rfc-council skill has holon: configuration.
 ///
 /// Verifies that the SKILL.md file parses successfully and contains
@@ -792,10 +803,23 @@ fn test_rfc_council_skill_has_holon_config() {
         Some("RfcCouncilProgress".to_string())
     );
 
-    // Verify body contains holon documentation
-    assert!(body.contains("## Holon Configuration"));
-    assert!(body.contains("Stop Conditions"));
-    assert!(body.contains("Tool Permissions"));
+    // Verify body references CAC assets (migrated from markdown documentation)
+    assert!(
+        body.contains("assets/"),
+        "body should reference CAC assets directory"
+    );
+    assert!(
+        body.contains("index.json"),
+        "body should reference assets/index.json"
+    );
+
+    // Verify CAC assets index exists
+    let assets_index = rfc_council_assets_index_path();
+    assert!(
+        assets_index.exists(),
+        "CAC assets index.json should exist at {}",
+        assets_index.display()
+    );
 }
 
 /// TCK-00048 Criterion 2: Stop conditions appropriate for RFC work.
@@ -916,28 +940,75 @@ fn test_rfc_council_executes_as_holon() {
 
 /// TCK-00048 Criterion 5: No regression in existing behavior.
 ///
-/// Verifies that the skill documentation still contains all the
-/// original content and the skill can still be understood without
-/// the holon configuration.
+/// Verifies that the skill's CAC assets index contains all required
+/// instruction specs for complete RFC council functionality.
 #[test]
 fn test_rfc_council_no_regression() {
     let skill_path = rfc_council_skill_path();
-    let (frontmatter, body) = parse_skill_file(&skill_path).expect("should parse");
-
-    // Verify original content is preserved
-    assert!(body.contains("# RFC Council Skill"));
-    assert!(body.contains("## Prerequisites"));
-    assert!(body.contains("## Modes"));
-    assert!(body.contains("## Gate Structure"));
-    assert!(body.contains("## Council Subagents"));
-    assert!(body.contains("## Review Cycles"));
-    assert!(body.contains("## Verdict Rules"));
-    assert!(body.contains("## Success Metrics"));
-    assert!(body.contains("## Holon Configuration"));
+    let (frontmatter, _body) = parse_skill_file(&skill_path).expect("should parse");
 
     // Verify skill metadata is correct
     assert_eq!(frontmatter.name, "rfc-council");
     assert!(frontmatter.user_invocable);
+
+    // Verify CAC assets index exists and is valid JSON
+    let assets_index_path = rfc_council_assets_index_path();
+    assert!(
+        assets_index_path.exists(),
+        "CAC assets index.json should exist"
+    );
+
+    let index_content =
+        std::fs::read_to_string(&assets_index_path).expect("should read index.json");
+    let index: serde_json::Value =
+        serde_json::from_str(&index_content).expect("index.json should be valid JSON");
+
+    // Verify index has expected structure
+    let entries = index
+        .get("rfc_council_cac_index")
+        .and_then(|idx| idx.get("entries"))
+        .and_then(|e| e.as_array())
+        .expect("index should have rfc_council_cac_index.entries array");
+
+    // Collect all entry IDs
+    let entry_ids: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e.get("id").and_then(|id| id.as_str()))
+        .collect();
+
+    // Verify all required instruction specs are present (migrated from markdown
+    // sections)
+    let required_specs = [
+        "skill",              // Core skill spec
+        "workflow",           // Workflow (was ## Modes + ## Gate Structure)
+        "create_mode",        // CREATE mode
+        "explore_mode",       // EXPLORE mode
+        "review_mode",        // REVIEW mode (was ## Review Cycles)
+        "closure_mode",       // Closure mode
+        "review_rubric",      // Review rubric (was ## Gate Structure details)
+        "council_protocol",   // Council protocol (was ## Council Subagents)
+        "finding_categories", // Finding categories (was ## Verdict Rules)
+        "commands",           // Commands reference
+    ];
+
+    for spec_id in required_specs {
+        assert!(
+            entry_ids.contains(&spec_id),
+            "CAC assets index should contain '{spec_id}' instruction spec"
+        );
+    }
+
+    // Verify bundle manifest is present
+    assert!(
+        entry_ids.contains(&"bundle"),
+        "CAC assets index should contain bundle manifest"
+    );
+
+    // Verify skill_spec entry is present
+    assert!(
+        entry_ids.contains(&"skill_spec"),
+        "CAC assets index should contain skill_spec"
+    );
 }
 
 /// Test that rfc-council tool permissions are appropriate.

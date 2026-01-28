@@ -1,0 +1,328 @@
+rfc_trust_boundaries:
+  schema_version: "2026-01-28"
+
+  trust_model:
+    overview: |
+      The distributed consensus layer operates in a partially trusted environment where
+      up to f of 3f+1 nodes may be Byzantine (arbitrarily malicious). Trust is established
+      through cryptographic attestation at four hierarchical tiers, with each tier able
+      to delegate only to lower tiers.
+      This model applies to local quorums (4-7 nodes); planetary-scale federation is deferred.
+
+    adversary_model:
+      assumptions:
+        - "Network is asynchronous with eventual delivery (no timing assumptions for safety)"
+        - "Adversary controls up to f of 3f+1 validator nodes"
+        - "Adversary can delay, reorder, or drop messages (but not indefinitely)"
+        - "Adversary cannot break Ed25519 or BLAKE3 cryptographic primitives"
+        - "Adversary may have read access to all network traffic (encryption required)"
+        - "Relay Holons are trusted for availability but not for control plane integrity"
+      capabilities:
+        - "Sign arbitrary messages with compromised validator keys"
+        - "Create network partitions between honest nodes"
+        - "Selectively delay consensus messages"
+        - "Propose invalid or conflicting events"
+      limitations:
+        - "Cannot forge signatures without private keys"
+        - "Cannot violate BFT quorum requirements (2f+1 honest signatures required)"
+        - "Cannot rewrite finalized history (hash-chained with quorum certs)"
+
+  trust_boundaries:
+    - id: TB-0001
+      name: "Network Genesis Boundary"
+      description: |
+        The genesis block establishes the network's root of trust. Consensus epoch 0
+        adopts the existing ledger head hash to maintain audit continuity.
+      trust_level: CRITICAL
+      invariants:
+        - id: INV-0001
+          statement: "Genesis block is signed by T0 (root) key"
+          verification: "verify_signature(genesis.root_signature, genesis.hash, t0_public_key)"
+        - id: INV-0002
+          statement: "Genesis block contains complete initial validator set"
+          verification: "genesis.validators.len() >= 4 (minimum 3f+1 where f=1)"
+        - id: INV-0003
+          statement: "Genesis hash refers to pre-existing ledger head"
+          verification: "consensus_epoch_0.prev_hash == ledger_head.hash"
+        - id: INV-0004
+          statement: "Genesis timestamp freshness (±24h) on initial bootstrap"
+          verification: "abs(now() - genesis.timestamp) <= 24h OR has_root_waiver(genesis)"
+        - id: INV-0005
+          statement: "Anti-rollback: nodes MUST NOT accept a different genesis for the same network_id"
+          verification: "persistent_store.get_genesis(network_id) == received_genesis"
+      threats:
+        - threat: "Malicious genesis with attacker-controlled validators"
+          mitigation: "T0 key ceremony with multi-party verification; genesis hash published out-of-band"
+        - threat: "Genesis key compromise"
+          mitigation: "Air-gapped storage; multi-sig ceremony; key never exposed to network"
+
+    - id: TB-0006
+      name: "Relay Holon Boundary"
+      description: |
+        The Relay Holon provides NAT traversal via reverse-TLS management tunnels.
+        It enables worker holons with outbound-only connectivity to participate
+        in the consensus network.
+      trust_level: MEDIUM
+      invariants:
+        - id: INV-0021
+          statement: "All management tunnels use mutual TLS"
+          verification: "tunnel.tls_version >= TLS_1_3 && tunnel.client_cert.chain_to(network_ca)"
+        - id: INV-0022
+          statement: "Relay cannot sign consensus proposals on behalf of workers"
+          verification: "proposals.signature.verify(worker.public_key)"
+        - id: INV-0023
+          statement: "Tunnel idle timeout + forced relay rotation to prevent connection squatting"
+          verification: "tunnel.last_activity + TUNNEL_IDLE_TIMEOUT < now() OR tunnel.age > MAX_RELAY_ASSIGNMENT_DURATION"
+      threats:
+        - threat: "Relay compromise (DoS/Eavesdropping)"
+          mitigation: "mTLS ensures relay cannot spoof messages; worker signs all events; multiple relays"
+        - threat: "Man-in-the-middle on tunnel"
+          mitigation: "Certificate pinning; end-to-end encryption of consensus payloads"
+
+    - id: TB-0002
+      name: "Validator Quorum Boundary"
+      description: |
+        Validator nodes form the consensus quorum. Events are finalized only with
+        2f+1 validator signatures, ensuring safety against f Byzantine faults.
+      trust_level: HIGH
+      invariants:
+        - id: INV-0006
+          statement: "Quorum certificates contain >= 2f+1 valid signatures"
+          verification: "qc.signatures.filter(verify).count() >= 2*f + 1"
+        - id: INV-0007
+          statement: "All signatures in QC are from registered validators"
+          verification: "qc.signatures.all(|s| validator_set.contains(s.validator_id))"
+        - id: INV-0008
+          statement: "Validator keys are rotated only via KeyRotated events with quorum"
+          verification: "key_rotation_event.quorum_cert.is_valid()"
+        - id: INV-0009
+          statement: "Validator set change rate limit: max 1 change per epoch"
+          verification: "epoch.changes.len() <= 1"
+      threats:
+        - threat: "Validator key compromise"
+          mitigation: "HSM storage for T1 keys; key rotation via consensus; revocation propagation"
+        - threat: "Equivocation (double-signing)"
+          mitigation: "Equivocation detection; cryptographic proof recorded; automatic slashing (immediate removal from validator set; optional stake penalty)"
+        - threat: "Colluding validators (>f)"
+          mitigation: "Geographic/organizational diversity requirements; stake distribution"
+
+    - id: TB-0003
+      name: "Node Membership Boundary"
+      description: |
+        New nodes joining the network must complete a schema handshake and sync
+        from existing nodes before participating in consensus.
+      trust_level: MEDIUM
+      invariants:
+        - id: INV-0010
+          statement: "Joining nodes must have all required schemas"
+          verification: "handshake.local_missing.is_empty()"
+        - id: INV-0011
+          statement: "Joining nodes sync from quorum of existing nodes"
+          verification: "sync_sources.len() >= 2*f + 1"
+        - id: INV-0012
+          statement: "Synced state matches quorum-attested checkpoint"
+          verification: "verify_checkpoint(state, checkpoint_qc)"
+        - id: INV-0013
+          statement: "Join attempts rate-limited per source IP or identity"
+          verification: "rate_limiter.check(join_request.source)"
+        - id: INV-0014
+          statement: "Joining nodes MUST present identity bootstrap credential (single-use, expiring, bound to node key)"
+          verification: "token.is_unused && token.expires_at > now() && token.node_public_key == join_request.node_public_key && verify_signature(join_request.token, join_request.payload, t1_quorum_public_key)"
+      threats:
+        - threat: "Malicious node providing false sync data"
+          mitigation: "Sync from multiple sources; verify against quorum checkpoint"
+        - threat: "Eclipse attack (isolating joining node)"
+          mitigation: "Multiple bootstrap nodes; out-of-band checkpoint verification"
+
+    - id: TB-0004
+      name: "Inter-Node Communication Boundary"
+      description: |
+        All inter-node communication must be authenticated and encrypted. Control
+        plane messages MUST use traffic-analysis mitigations.
+      trust_level: HIGH
+      invariants:
+        - id: INV-0015
+          statement: "All inter-node connections use mutual TLS"
+          verification: "connection.tls_version >= TLS_1_3 && connection.client_cert.is_some()"
+        - id: INV-0016
+          statement: "Node certificates chain to network CA"
+          verification: "verify_cert_chain(node_cert, network_ca)"
+        - id: INV-0017
+          statement: "Control plane messages use fixed-size frames or mandatory padding"
+          verification: "message.frame_size == config.control_plane_frame_size"
+        - id: INV-0018
+          statement: "Consensus messages are signed by sender"
+          verification: "verify_signature(message.signature, message.payload, sender.public_key)"
+        - id: INV-0019
+          statement: "Control plane connections use pooling and reuse"
+          verification: "connection_pool.reuse_count > 0"
+        - id: INV-0020
+          statement: "Control plane dispatch uses bounded jitter"
+          verification: "dispatch_jitter_ms <= config.max_control_plane_jitter_ms"
+      threats:
+        - threat: "Man-in-the-middle attack"
+          mitigation: "Mutual TLS with certificate pinning"
+        - threat: "Message replay"
+          mitigation: "Monotonic sequence numbers; nonce in handshake"
+        - threat: "Traffic analysis"
+          mitigation: "Mandatory padding or fixed-size frames; connection pooling required"
+
+    - id: TB-0005
+      name: "Actor-to-Kernel Boundary"
+      description: |
+        Actors (holons, sessions) interact with the kernel via the tool protocol.
+        All requests are authenticated and authorized via leases and capabilities.
+      trust_level: MEDIUM
+      invariants:
+        - id: INV-0024
+          statement: "Tool requests are signed by actor with valid lease"
+          verification: "verify_signature(request.signature, request.payload, actor.public_key) && lease.is_valid()"
+        - id: INV-0025
+          statement: "Actor capabilities are subset of parent's capabilities"
+          verification: "child.capabilities.subset_of(parent.capabilities)"
+        - id: INV-0026
+          statement: "Capability proof must be verifiable on any node via ledger state + signature chain with namespace binding"
+          verification: "ledger.verify_capability_path(namespace, capability_id, actor_id, signature_chain)"
+        - id: INV-0027
+          statement: "Session keys are delegated from holon keys"
+          verification: "session.delegation_chain.verify(holon.public_key)"
+      threats:
+        - threat: "Confused deputy attack"
+          mitigation: "Capability-based access (OCAP); no ambient authority"
+        - threat: "Lease forgery"
+          mitigation: "Leases signed by registrar; verified against ledger state"
+        - threat: "Privilege escalation"
+          mitigation: "Strict subset delegation; policy enforcement at kernel"
+
+  security_properties:
+    - id: SEC-PROP-0001
+      name: "Safety (Agreement)"
+      statement: |
+        No two honest nodes finalize different events at the same sequence ID, even in
+        the presence of f Byzantine faults.
+      verification: "Proven via BFT consensus properties (HotStuff/PBFT)"
+      evidence_ids:
+        - EVID-0008
+
+    - id: SEC-PROP-0002
+      name: "Liveness (Termination)"
+      statement: |
+        If the network is synchronous and fewer than f nodes are Byzantine,
+        proposed events eventually finalize.
+      verification: "Proven via HotStuff/PBFT liveness under synchrony"
+      evidence_ids:
+        - EVID-0008
+
+    - id: SEC-PROP-0003
+      name: "Accountability (Non-Repudiation)"
+      statement: |
+        Byzantine behavior produces cryptographic evidence that identifies the faulty node.
+      verification: "Equivocation proof contains two conflicting signed messages"
+      evidence_ids:
+        - EVID-0009
+
+    - id: SEC-PROP-0004
+      name: "Hash Chain Integrity"
+      statement: |
+        The hash chain from genesis to any event is tamper-evident. Modifying any
+        historical event invalidates all subsequent hashes.
+      verification: "verify_chain() from genesis"
+      evidence_ids:
+        - EVID-0010
+
+    - id: SEC-PROP-0005
+      name: "Key Compromise Containment"
+      statement: |
+        Key rotation via KeyRotated events limits future exposure after compromise while
+        preserving historical verification. This is not forward secrecy for signatures.
+      verification: "Historical events remain verifiable with old key recorded in KeyRotated"
+      evidence_ids:
+        - EVID-0011
+
+  threat_scenarios:
+    - id: TS-0001
+      name: "Validator Key Compromise"
+      likelihood: LOW
+      impact: HIGH
+      description: |
+        An attacker compromises a validator's signing key and can sign arbitrary
+        consensus messages.
+      attack_vector:
+        - "Exploit in key storage system"
+        - "Insider threat with key access"
+        - "Supply chain attack on HSM"
+      mitigations:
+        - "HSM storage for validator keys"
+        - "Key rotation schedule (e.g., monthly)"
+        - "T0 Threshold Signing: 3-of-5 organisational entities required for root actions"
+        - "Rapid revocation via governance vote"
+      residual_risk: "Attacker has one vote in consensus; cannot unilaterally finalize events"
+
+    - id: TS-0002
+      name: "Network Partition During Consensus"
+      likelihood: MEDIUM
+      impact: MEDIUM
+      description: |
+        Network partition separates validators into groups that cannot communicate.
+      attack_vector:
+        - "BGP hijacking"
+        - "DNS poisoning"
+        - "Physical infrastructure failure"
+      mitigations:
+        - "Quorum requirement ensures minority partition cannot finalize"
+        - "Partition detection via heartbeat monitoring"
+        - "Partition duration policy: if partition persists > 4h, require manual intervention"
+        - "Automatic reconciliation on partition heal"
+      residual_risk: "Temporary liveness loss; no safety violation"
+
+    - id: TS-0003
+      name: "Equivocation Attack"
+      likelihood: LOW
+      impact: HIGH
+      description: |
+        Byzantine validator signs conflicting proposals for the same round,
+        attempting to create a fork.
+      attack_vector:
+        - "Compromised validator software"
+        - "Malicious validator operator"
+      mitigations:
+        - "Equivocation detection keyed on (validator_id, epoch, round) to prevent key-rotation ambiguity"
+        - "Replay-safe slashing proof: requires conflicting messages with matching nonces and current epoch"
+        - "Automatic slashing: removal from validator set and recorded in ledger"
+        - "Equivocation evidence recorded in ledger"
+        - "KeyRotated events effective at next epoch boundary; current epoch uses key active at epoch start"
+      residual_risk: "Fork impossible with 2f+1 honest; attacker identified and removed"
+
+    - id: TS-0004
+      name: "Schema Poisoning"
+      likelihood: LOW
+      impact: HIGH
+      description: |
+        Attacker registers a malicious schema that causes incorrect event parsing
+        or validation bypass.
+      attack_vector:
+        - "Compromised schema registration process"
+        - "Vulnerability in schema validation"
+      mitigations:
+        - "Schema registration requires consensus vote"
+        - "Schema digest verification at every event"
+        - "Fail-closed for unknown schemas"
+        - "Canonical encoding prevents parsing ambiguity"
+      residual_risk: "Requires compromising quorum to register malicious schema"
+
+    - id: TS-0005
+      name: "Anti-Entropy Poisoning"
+      likelihood: MEDIUM
+      impact: LOW
+      description: |
+        Byzantine node sends invalid events during anti-entropy sync, attempting
+        to pollute peer state.
+      attack_vector:
+        - "Compromised node in sync source set"
+        - "Race condition during sync"
+      mitigations:
+        - "Pull-based sync (receiver initiates)"
+        - "Events verified against schema and signatures"
+        - "Merkle proof verification"
+        - "Multi-source sync with majority agreement"
+      residual_risk: "Invalid events rejected; sync source flagged"

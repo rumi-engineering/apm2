@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/summary_receipt.schema.json",
+  "title": "SummaryReceipt",
+  "description": "Derived, lossy receipt summarizing evidence/events while preserving verifiability via deterministic selectors and a view commitment.",
+  "type": "object",
+  "required": ["schema", "schema_version", "derivation", "loss_profile", "view_commitment", "selectors"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.summary_receipt.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "derivation": {
+      "type": "object",
+      "required": ["method", "version"],
+      "properties": {
+        "method": {
+          "type": "string",
+          "description": "Derivation method identifier (e.g., 'summary-v1').",
+          "maxLength": 128
+        },
+        "version": {
+          "type": "string",
+          "description": "Derivation method version (semver recommended).",
+          "maxLength": 64
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "loss_profile": {
+      "type": "object",
+      "description": "Declares what is preserved vs discarded/approximated by this summary.",
+      "properties": {
+        "keeps": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 256 },
+          "maxItems": 10000
+        },
+        "drops": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 256 },
+          "maxItems": 10000
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "view_commitment": {
+      "$ref": "view_commitment.schema.json"
+    },
+    "selectors": {
+      "type": "array",
+      "description": "Evidence/event selectors enabling deterministic zoom-in from the summary.",
+      "maxItems": 100000,
+      "items": { "$ref": "selector.schema.json" }
+    },
+    "summary_text": {
+      "type": "string",
+      "description": "Optional human-readable summary text (non-authoritative).",
+      "maxLength": 65536
+    }
+  },
+  "unevaluatedProperties": false
+}

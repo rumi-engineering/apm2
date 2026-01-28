@@ -4,7 +4,7 @@
 
 **Core Doctrine:**
 -   **Spec/State Separation:** Specification content (YAML files in `documents/work/`) is distinct from workflow state (derived from the Ledger).
--   **Event Authority:** Truth is defined by the append-only event log (SQLite WAL), not by mutable database tables or external tools (GitHub/Jira).
+-   **Event Authority:** Authority is defined by the append-only event ledger + evidence digests (and deterministic addressability), not by mutable database tables or external tools (GitHub/Jira).
 
 ## Work Object Types
 
@@ -14,6 +14,15 @@
 -   **Finding:** Structured defect report with severity and location.
 -   **EvidenceBundle:** Content-addressed proofs (logs, artifacts) hashed with BLAKE3.
 -   **Decision:** Governed adjudication (e.g., "Accept Risk", "Approve Plan").
+
+## Dirty State vs Authority
+
+Implementation agents may keep a dirty working copy while iterating. The Work Substrate remains coherent by requiring that any verified/published/proposed transition is bound to:
+
+- a pinned base state (e.g., Git commit/tree selector), and
+- an explicit delta/patch artifact (**Workspace Delta** / ChangeSet digest),
+
+not to "whatever is currently on disk."
 
 ## Data Structure References
 
@@ -29,5 +38,5 @@
     2.  `Idea Compiler` compiles it into `Tickets` (YAML).
     3.  Agent accepts a `Ticket` -> `WorkStarted` event.
     4.  Agent submits `ChangeSet` -> `WorkSubmitted` event.
-    5.  `AAT` verifies -> `GatePassed` event.
-    6.  Merge -> `MergeReceipt` event.
+    5.  Gates run terminal verifiers (tests/builds/scans) and may run advisory checks (AAT) -> signed receipts bound to evidence.
+    6.  Merge/promotion -> `MergeReceipt` event binds inputs->output digests (often including Git commit/tree selectors).

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/attestation.schema.json",
+  "title": "Attestation",
+  "description": "Binds evidence/receipts to an identifiable execution environment and toolchain. This reduces verifier regress by making verification replayable and attributable.",
+  "type": "object",
+  "required": ["schema", "schema_version", "attestation_level"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.attestation.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "description": "Schema version for the attestation payload.",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "attestation_level": {
+      "type": "string",
+      "description": "Attestation strength level.",
+      "enum": ["L0", "L1", "L2"]
+    },
+    "runner_image_digest": {
+      "type": "string",
+      "description": "Container/runner image digest (recommended for L1+).",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "toolchain": {
+      "type": "object",
+      "description": "Toolchain identity (versions or digests). Keys should be stable (e.g., 'rustc', 'cargo').",
+      "maxProperties": 64,
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 256
+      }
+    },
+    "policy_version": {
+      "type": "string",
+      "description": "Policy version identifier evaluated for this run.",
+      "maxLength": 256
+    },
+    "policy_digest": {
+      "type": "string",
+      "description": "Hex-encoded 32-byte hash of the policy artifact (optional but recommended).",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "command_transcript_hash": {
+      "type": "string",
+      "description": "Hex-encoded 32-byte hash of the command transcript (transcript stored in CAS).",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "env_digest": {
+      "type": "string",
+      "description": "Hex-encoded 32-byte hash of normalized environment inputs (optional).",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "notes": {
+      "type": "string",
+      "description": "Optional human-readable notes (non-authoritative).",
+      "maxLength": 4096
+    }
+  },
+  "unevaluatedProperties": false
+}

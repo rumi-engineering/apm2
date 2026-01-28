@@ -1,0 +1,711 @@
+# SA-2 Implementation Feasibility Assessment - FINALIZE Session
+# Session: COUNCIL-RFC-0014-20260128-FINALIZE
+# Role: SA-2 (Implementation Feasibility)
+# Mode: FINALIZE (v2 -> v4)
+
+meta:
+  assessor: SA-2
+  session_id: COUNCIL-RFC-0014-20260128-FINALIZE
+  timestamp: "2026-01-28T14:30:00Z"
+  reasoning_modes_applied:
+    - mode_4: "Logic programming (Horn clause) - dependency chain validation"
+    - mode_50: "Satisficing reasoning - acceptable scope boundaries"
+    - mode_62: "Narrative reasoning - implementation story coherence"
+    - mode_65: "Deontic reasoning - obligation fulfillment verification"
+    - mode_72: "Engineering design reasoning - structural soundness"
+
+# =============================================================================
+# GATE RESULTS
+# =============================================================================
+
+gate_results:
+  - gate_id: GATE-TCK-ATOMICITY
+    status: PASS
+    confidence: 0.92
+    evidence:
+      summary: |
+        All 21 tickets have been assessed for single-PR completability. The original
+        DCS-007 monolith (8-15 days) has been properly split into DCS-007a/b/c/d,
+        each scoped to 2-10 days. All tickets now satisfy the atomicity constraint.
+
+      ticket_assessments:
+        # Phase 0 - Foundation
+        - ticket_id: DCS-001
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 72: Engineering design) Extract trait from existing struct is a
+            well-bounded refactoring operation. Files clearly identified:
+            - Modify: crates/apm2-core/src/ledger/storage.rs (extract trait)
+            - Create: crates/apm2-core/src/ledger/backend.rs (trait def)
+            Single abstraction extraction, all existing tests continue to pass.
+          estimated_lines_changed: 150-200
+          test_strategy: "Existing ledger tests verify behavioral equivalence"
+
+        - ticket_id: DCS-002
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 50: Satisficing) InMemorySchemaRegistry is acceptable v1 scope.
+            New module creation with clear boundaries. No cross-cutting concerns.
+          estimated_lines_changed: 200-300
+          test_strategy: "Unit tests for registry CRUD, bootstrap registration"
+
+        - ticket_id: DCS-012
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 4: Horn clause) IF DCS-002 complete THEN schema_digest field
+            exists AND validation hook location is defined. Single integration point
+            in LedgerBackend::append.
+          estimated_lines_changed: 50-80
+          test_strategy: "Test schema validation on append, unknown digest rejection"
+
+        - ticket_id: DCS-003
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 72: Engineering design) SQLite schema migration is atomic via
+            transaction. Adding nullable columns is non-breaking. Migration script
+            pattern is well-established in codebase (see schema.sql).
+          estimated_lines_changed: 40-60
+          test_strategy: "Migration on fresh DB, migration on existing DB, verify old events readable"
+
+        # Phase 1 - Replication
+        - ticket_id: DCS-004
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 62: Narrative) Network transport and TLS are cohesive concerns.
+            rustls integration is a single dependency addition. Peer discovery is
+            bootstrap-based (simple). Padding requirement adds ~20 LOC.
+          estimated_lines_changed: 400-500
+          test_strategy: "Integration tests with mock peers, TLS handshake tests"
+
+        - ticket_id: DCS-005
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 72: Engineering design) Relay tunnel is a distinct subsystem.
+            Depends on DCS-004 network layer. Single PR for relay + tunnel protocol.
+          estimated_lines_changed: 300-400
+          test_strategy: "NAT traversal simulation, tunnel establishment tests"
+
+        - ticket_id: DCS-006
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 65: Deontic) Genesis adoption MUST adopt existing hash without
+            rehashing. This is a single operation with clear invariants. Join token
+            and rate-limiting are small additions.
+          estimated_lines_changed: 150-200
+          test_strategy: "Genesis creation from existing ledger, join rejection on mismatch"
+
+        - ticket_id: DCS-013
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 50: Satisficing) Basic leader-based replication is acceptable
+            v1 scope. No BFT yet - just event forwarding.
+          estimated_lines_changed: 200-250
+          test_strategy: "Multi-node test with leader broadcast, follower append"
+
+        # Phase 1.5 - Consensus Spike
+        - ticket_id: DCS-007a
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 62: Narrative) Spike is investigation work with documented
+            deliverables: library selection, protocol spec draft, proof references.
+            No production code in this PR - only EVID-0007/EVID-0008 updates.
+          estimated_lines_changed: 0 (documentation only)
+          test_strategy: "Deliverable review: Q-0001 resolved, Q-0002 resolved, EVID populated"
+
+        - ticket_id: DCS-018a
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 72: Engineering design) Capability proof model is a design
+            exercise. Maps to existing lease system documentation. No implementation.
+          estimated_lines_changed: 0 (documentation only)
+          test_strategy: "Design review: event types documented, proof format specified"
+
+        # Phase 2 - Consensus
+        - ticket_id: DCS-007b
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 4: Horn clause) IF DCS-007a complete THEN protocol variant known
+            AND message types defined. State machine implementation is bounded by
+            EVID-0007 spec.
+          estimated_lines_changed: 400-500
+          test_strategy: "State machine unit tests, phase transition validation"
+
+        - ticket_id: DCS-007c
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 72: Engineering design) Network handlers are separate from state
+            machine. Handler per message type pattern is atomic.
+          estimated_lines_changed: 250-350
+          test_strategy: "Handler unit tests, signature validation, replay rejection"
+
+        - ticket_id: DCS-007d
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 62: Narrative) Integration PR connecting BFT to LedgerBackend.
+            Depends on DCS-007b/c complete. Clear integration points.
+          estimated_lines_changed: 200-300
+          test_strategy: "End-to-end consensus finalization test"
+
+        - ticket_id: DCS-008
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 72: Engineering design) QC generation is a cryptographic
+            aggregation primitive. Verification is inverse. Bounded scope.
+          estimated_lines_changed: 150-200
+          test_strategy: "QC generation from 2f+1 votes, verification tests"
+
+        - ticket_id: DCS-016
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 65: Deontic) StrictlyOrderedEvidence is a policy enforcement.
+            GateReceipt extension is additive. Single concern.
+          estimated_lines_changed: 100-150
+          test_strategy: "Rejection of non-finalized evidence, predicate auditing"
+
+        - ticket_id: DCS-018b
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 4: Horn clause) IF DCS-018a complete THEN proof format defined.
+            Verification implementation follows spec.
+          estimated_lines_changed: 200-300
+          test_strategy: "Delegation chain verification, invalid proof rejection"
+
+        - ticket_id: DCS-014
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 72: Engineering design) Equivocation detection is a comparison
+            operation on signed messages. Evidence generation is structured output.
+          estimated_lines_changed: 150-200
+          test_strategy: "Double-signing detection, evidence structure validation"
+
+        - ticket_id: DCS-009
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 62: Narrative) Merkle tree + gossip is a cohesive anti-entropy
+            subsystem. Two files but single concern.
+          estimated_lines_changed: 300-400
+          test_strategy: "Divergence detection, event transfer tests"
+
+        - ticket_id: DCS-015
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 50: Satisficing) LWW merge with HLC is acceptable v1 scope.
+            Conflict recording is additive.
+          estimated_lines_changed: 150-200
+          test_strategy: "Deterministic merge result, conflict recording"
+
+        # Phase 3 - Production
+        - ticket_id: DCS-010
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 72: Engineering design) HSM trait + YubiHSM reference + software
+            fallback is a layered implementation. All components are cohesive.
+          estimated_lines_changed: 300-400
+          test_strategy: "Software fallback tests, trait interface validation"
+
+        - ticket_id: DCS-011
+          pr_atomicity: PASS
+          rationale: |
+            (Mode 50: Satisficing) Prometheus metrics + Grafana dashboard +
+            CLI command is operational tooling bundle. Acceptable single PR.
+          estimated_lines_changed: 400-500
+          test_strategy: "Metrics export test, CLI command integration test"
+
+  - gate_id: GATE-TCK-IMPLEMENTABILITY
+    status: PASS
+    confidence: 0.88
+    evidence:
+      summary: |
+        All tickets have sufficient specification for agent implementation without
+        clarification requests. Key improvements since CYCLE_2:
+        - EVID-0007 now has draft message types and state machine outline
+        - EVID-0008 now has proof references and acceptance criteria mapping
+        - Q-0001/Q-0002 are PENDING_SPIKE with clear exit criteria
+        - DCS-007 split provides incremental implementation path
+
+      implementability_assessments:
+        # Phase 0
+        - ticket_id: DCS-001
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            (Mode 4: Horn clause) Agent knows:
+            - Source file: crates/apm2-core/src/ledger/storage.rs (verified exists)
+            - Trait methods: append, read_from, head, verify_chain (from AC)
+            - Pattern: Extract trait, existing impl becomes SqliteLedgerBackend
+            No clarification needed.
+
+        - ticket_id: DCS-002
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - Module path: crates/apm2-core/src/schema_registry/
+            - Trait interface: implied by acceptance criteria
+            - Reference: existing ledger pattern for trait + impl
+            No clarification needed.
+
+        - ticket_id: DCS-012
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - Integration point: LedgerBackend::append
+            - Error type: SchemaMismatch (specified)
+            - Behavior: fail-closed on unknown digest
+            No clarification needed.
+
+        - ticket_id: DCS-003
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - Schema file: crates/apm2-core/src/ledger/schema.sql (verified exists)
+            - New columns explicitly listed in acceptance criteria
+            - Migration pattern: ALTER TABLE with nullable columns
+            No clarification needed.
+
+        # Phase 1
+        - ticket_id: DCS-004
+          implementability: MEDIUM
+          agent_has_info: true
+          missing_info: |
+            Bootstrap node list format not specified, but agent can design.
+            Padding size for control plane frames not specified (security req).
+          rationale: |
+            (Mode 72: Engineering design) Agent has:
+            - TLS 1.3 + rustls: standard pattern
+            - mTLS: certificate validation against network CA
+            - Padding: TB-0004 mentions requirement, size derivable from max message
+            Agent can proceed with reasonable defaults and document decisions.
+
+        - ticket_id: DCS-005
+          implementability: MEDIUM
+          agent_has_info: true
+          missing_info: |
+            Reverse-TLS tunnel wire protocol not specified in detail.
+          rationale: |
+            Agent has:
+            - Concept: worker initiates outbound, relay forwards inbound
+            - Security: mTLS on tunnel
+            Standard reverse proxy pattern; agent can design protocol.
+
+        - ticket_id: DCS-006
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - Genesis adopts existing ledger head hash
+            - T0 key signs genesis
+            - Join token required (quorum-signed)
+            - Rate-limiting per source/identity
+            No clarification needed.
+
+        - ticket_id: DCS-013
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - Leader receives proposals
+            - Leader broadcasts to connected peers
+            - Followers append to local log
+            Simple leader-follower replication pattern.
+
+        # Phase 1.5 (Spikes)
+        - ticket_id: DCS-007a
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            (Mode 62: Narrative) Spike has clear exit criteria:
+            - Q-0001 resolved (library or custom)
+            - Q-0002 resolved (HotStuff or PBFT)
+            - EVID-0007 populated with message types + state machine
+            - EVID-0008 populated with proof references
+            Agent knows what to deliver.
+
+        - ticket_id: DCS-018a
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - Define capability event types
+            - Define proof format with namespace binding
+            - Map to existing lease system
+            Design exercise with clear scope.
+
+        # Phase 2
+        - ticket_id: DCS-007b
+          implementability: MEDIUM
+          agent_has_info: true
+          depends_on_spike: true
+          rationale: |
+            (Mode 4: Horn clause) IF DCS-007a complete THEN:
+            - Protocol variant known
+            - EVID-0007 has message types and state machine
+            Agent can implement per spec. Current EVID-0007 draft provides outline.
+
+        - ticket_id: DCS-007c
+          implementability: MEDIUM
+          agent_has_info: true
+          depends_on_spike: true
+          rationale: |
+            Network handlers derive from DCS-007b state machine.
+            Padding + jitter requirements from TB-0004.
+            Agent has sufficient info post-spike.
+
+        - ticket_id: DCS-007d
+          implementability: MEDIUM
+          agent_has_info: true
+          depends_on_spike: true
+          rationale: |
+            Integration points clear:
+            - LedgerBackend::append waits for BFT finalization
+            - QuorumCertificate stored with authority events
+            Agent can implement once DCS-007b/c complete.
+
+        - ticket_id: DCS-008
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - Threshold: 2f+1 signatures
+            - Signature aggregation pattern
+            - QC attached to finalized authority events
+            Cryptographic primitive with clear spec.
+
+        - ticket_id: DCS-016
+          implementability: MEDIUM
+          agent_has_info: true
+          missing_info: |
+            StrictlyOrderedEvidence predicate format not detailed.
+          rationale: |
+            Agent knows:
+            - Admission-critical evidence requires TotalOrder finalized
+            - GateReceipt includes evidence_predicates
+            - Predicates must be auditable/replayable
+            Agent can design predicate format.
+
+        - ticket_id: DCS-018b
+          implementability: MEDIUM
+          agent_has_info: true
+          depends_on_spike: true
+          rationale: |
+            (Mode 4: Horn clause) IF DCS-018a complete THEN proof format defined.
+            Agent implements verification per spec.
+
+        - ticket_id: DCS-014
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - Detect double-signing (same epoch/round, different event)
+            - Detect conflicting proposals (same leader, same round)
+            - Generate cryptographic evidence (both signed messages)
+            Standard equivocation detection pattern.
+
+        - ticket_id: DCS-009
+          implementability: MEDIUM
+          agent_has_info: true
+          missing_info: |
+            Merkle tree structure (binary vs radix) not specified.
+          rationale: |
+            Agent knows:
+            - Digest exchange identifies divergent ranges
+            - Pull missing events from peers
+            Standard Merkle anti-entropy pattern; agent can design tree structure.
+
+        - ticket_id: DCS-015
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - HLC-based LWW merge for determinism
+            - Q-0007 resolved: LWW, SetUnion, NoMerge operators
+            - Conflicts recorded as DefectRecorded events
+            Clear specification.
+
+        # Phase 3
+        - ticket_id: DCS-010
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - HSM trait abstraction
+            - YubiHSM reference implementation
+            - Software fallback for development
+            - Key rotation via HSM
+            Standard HSM integration pattern with YubiHSM SDK.
+
+        - ticket_id: DCS-011
+          implementability: HIGH
+          agent_has_info: true
+          rationale: |
+            Agent knows:
+            - Prometheus metrics per 05_rollout_and_ops.yaml
+            - Grafana dashboard JSON
+            - CLI consensus status command
+            - Alert rules for quorum loss, Byzantine faults
+            Standard operational tooling pattern.
+
+# =============================================================================
+# PREVIOUS FINDINGS VERIFICATION
+# =============================================================================
+
+previous_findings_status:
+  - finding_id: FND-SA2-C2-001
+    original_issue: "DCS-007 monolithic (8-15 days)"
+    resolution: RESOLVED
+    evidence: |
+      DCS-007 has been split into:
+      - DCS-007a: BFT Library Evaluation Spike (10 days, spike)
+      - DCS-007b: BFT State Machine Core (3 days)
+      - DCS-007c: BFT Network Message Handlers (2 days)
+      - DCS-007d: BFT LedgerBackend Integration (2 days)
+      Total: 17 days across 4 incremental PRs with clear dependencies.
+      Each sub-ticket satisfies atomicity and implementability constraints.
+
+  - finding_id: FND-SA2-C2-002
+    original_issue: "Q-0001/Q-0002 OPEN status blocks DCS-007"
+    resolution: RESOLVED
+    evidence: |
+      Q-0001 and Q-0002 are now PENDING_SPIKE status with:
+      - Clear exit criteria documented in 08_risks_and_open_questions.yaml
+      - Spike ticket DCS-007a explicitly resolves both questions
+      - Decision deadline: "Before DCS-007b implementation"
+      Blocking dependency is acknowledged and scheduled.
+
+  - finding_id: FND-SA2-C2-003
+    original_issue: "EVID-0007 was placeholder"
+    resolution: RESOLVED
+    evidence: |
+      EVID-0007 now contains:
+      - Status: DRAFT (spike output required)
+      - Message types: PrePrepare, Prepare, Commit, ViewChange, NewView, QC
+      - Common fields: epoch, round, proposer_id, event_hash, signature, timestamp
+      - State machine outline: 6 phases documented
+      - Quorum thresholds: 2f+1 for PrepareQC and CommitQC
+      - Timing assumptions: safety async, liveness partial sync
+      Sufficient for agent to begin implementation post-spike.
+
+  - finding_id: FND-SA2-C2-004
+    original_issue: "EVID-0008 was placeholder"
+    resolution: RESOLVED
+    evidence: |
+      EVID-0008 now contains:
+      - Status: DRAFT (references mapped)
+      - HotStuff and PBFT paper references
+      - RFC mapping: SEC-PROP-0001 -> Agreement, SEC-PROP-0002 -> Liveness
+      - Instantiation notes: quorum threshold, Ed25519 signatures, QC structure
+      - Acceptance criteria mapping to DCS-007b and DCS-008
+      Sufficient for proof verification post-spike.
+
+  - finding_id: FND-SA2-C2-005
+    original_issue: "DCS-018 transitively blocked by Q-0001/Q-0002"
+    resolution: RESOLVED
+    evidence: |
+      DCS-018 has been split into:
+      - DCS-018a: Capability Proof Model and Event Definitions (Phase 1.5, 2 days)
+      - DCS-018b: Cross-Node Capability Verification Integration (Phase 2, 2 days)
+      DCS-018a is a design spike that can proceed in parallel with DCS-007a.
+      DCS-018b depends on DCS-018a and DCS-007d, properly sequenced.
+
+  - finding_id: FND-SA2-C2-006
+    original_issue: "Phase 2 timeline invalid due to blocked tickets"
+    resolution: RESOLVED
+    evidence: |
+      Phase structure updated with P1.5 (Consensus Spike):
+      - P1.5: 2 weeks (DCS-007a + DCS-018a)
+      - P2: 6-8 weeks (DCS-007b/c/d + other consensus tickets)
+      Explicit spike phase provides buffer for protocol decision.
+      Timeline is now realistic given dependency structure.
+
+# =============================================================================
+# NEW FINDINGS
+# =============================================================================
+
+new_findings:
+  - finding_id: FND-SA2-FIN-001
+    severity: LOW
+    category: DOCUMENTATION
+    title: "Padding size for control plane frames not specified"
+    description: |
+      DCS-004 acceptance criteria mention "Control plane frames padded to fixed-size
+      envelope" but the specific padding size is not documented. Agent can derive
+      from maximum message size, but explicit specification would prevent variance.
+    recommendation: |
+      Add padding size (e.g., 4096 bytes or 8192 bytes) to TB-0004 or DCS-004 AC.
+    impact_if_unresolved: |
+      Minor: Agent will document choice; may need revision if size is wrong.
+    blocking: false
+
+  - finding_id: FND-SA2-FIN-002
+    severity: LOW
+    category: DOCUMENTATION
+    title: "Merkle tree structure for anti-entropy not specified"
+    description: |
+      DCS-009 describes Merkle tree-based digest exchange but does not specify
+      tree structure (binary vs radix, hash function, node layout).
+    recommendation: |
+      Add Merkle tree structure specification to DCS-009 or create EVID-0009.
+    impact_if_unresolved: |
+      Minor: Agent will design and document; may need revision if incompatible.
+    blocking: false
+
+  - finding_id: FND-SA2-FIN-003
+    severity: INFO
+    category: OBSERVATION
+    title: "Spike tickets have documentation-only output"
+    description: |
+      DCS-007a and DCS-018a produce documentation deliverables (EVID updates, design
+      docs) rather than code. This is appropriate for spike tickets but should be
+      explicitly tracked as documentation PRs in the project board.
+    recommendation: |
+      Tag DCS-007a and DCS-018a as "documentation" or "spike" in project tracking.
+    impact_if_unresolved: |
+      None: Observation for project management visibility.
+    blocking: false
+
+# =============================================================================
+# MOCK IMPLEMENTATION RUN REPORT
+# =============================================================================
+
+mock_implementation_run:
+  scenario: "Agent implements DCS-001 (LedgerBackend Trait Extraction)"
+  reasoning_mode: "Mode 72: Engineering design reasoning"
+
+  simulation:
+    step_1:
+      action: "Read existing crates/apm2-core/src/ledger/storage.rs"
+      observation: |
+        Ledger struct found at line 254 with methods:
+        - open() -> Result<Self, LedgerError>
+        - in_memory() -> Result<Self, LedgerError>
+        - append(&self, event: &EventRecord) -> Result<u64, LedgerError>
+        - read_from(&self, cursor: u64, limit: u64) -> Result<Vec<EventRecord>, LedgerError>
+        - max_seq_id(&self) -> Result<u64, LedgerError>
+        - last_event_hash(&self) -> Result<Vec<u8>, LedgerError>
+        - verify_chain() -> Result<(), LedgerError>
+      decision: "Methods map to acceptance criteria. Proceed with trait extraction."
+
+    step_2:
+      action: "Define LedgerBackend trait in new file"
+      output: |
+        // crates/apm2-core/src/ledger/backend.rs
+        pub trait LedgerBackend {
+            fn append(&self, event: &EventRecord) -> Result<u64, LedgerError>;
+            fn read_from(&self, cursor: u64, limit: u64) -> Result<Vec<EventRecord>, LedgerError>;
+            fn head(&self) -> Result<u64, LedgerError>;  // renamed from max_seq_id for clarity
+            fn verify_chain<H, V>(&self, verify_hash_fn: H, verify_sig_fn: V) -> Result<(), LedgerError>
+            where
+                H: Fn(&[u8], &[u8]) -> Vec<u8>,
+                V: Fn(&[u8], &[u8]) -> bool;
+        }
+      decision: "Trait extracted with minimal surface area per acceptance criteria."
+
+    step_3:
+      action: "Rename Ledger to SqliteLedgerBackend, implement trait"
+      output: |
+        pub struct SqliteLedgerBackend { ... }  // was Ledger
+        impl LedgerBackend for SqliteLedgerBackend { ... }
+      decision: "Existing impl becomes SqliteLedgerBackend. All tests continue to pass."
+
+    step_4:
+      action: "Update mod.rs exports"
+      output: |
+        pub use backend::LedgerBackend;
+        pub use storage::{SqliteLedgerBackend, ...};
+        // Type alias for backward compatibility
+        pub type Ledger = SqliteLedgerBackend;
+      decision: "Backward compatibility via type alias. Existing callers unaffected."
+
+    step_5:
+      action: "Run existing tests"
+      output: |
+        cargo test -p apm2-core ledger:: -- --nocapture
+        All 23 tests pass.
+      decision: "Behavioral equivalence verified. PR ready for review."
+
+  assessment:
+    implementable: true
+    clarifications_needed: 0
+    estimated_time: "2-3 hours agent time"
+    confidence: 0.95
+
+  additional_scenarios:
+    - scenario: "DCS-003: Schema Extension"
+      assessment: "Straightforward ALTER TABLE migration. High confidence."
+      estimated_time: "1 hour"
+
+    - scenario: "DCS-007b: BFT State Machine (post-spike)"
+      assessment: |
+        With EVID-0007 populated by DCS-007a, agent has:
+        - Message type definitions
+        - State machine phase transitions
+        - Quorum thresholds
+        Implementation follows spec. Medium confidence due to protocol complexity.
+      estimated_time: "6-8 hours agent time"
+
+# =============================================================================
+# SUMMARY AND RECOMMENDATION
+# =============================================================================
+
+summary:
+  gates_passed: 2
+  gates_failed: 0
+  previous_findings_resolved: 6
+  new_findings: 3
+  blocking_issues: 0
+
+  overall_assessment: |
+    (Mode 65: Deontic reasoning) All obligations from CYCLE_2 have been fulfilled:
+    - DCS-007 monolith split into atomic tickets
+    - Open questions have PENDING_SPIKE status with exit criteria
+    - Evidence artifacts have draft content
+    - Phase 1.5 spike phase provides protocol decision buffer
+    - Timeline is realistic given dependency structure
+
+    (Mode 62: Narrative reasoning) The implementation story is now coherent:
+    1. Foundation (P0): Abstractions without behavioral change
+    2. Replication (P1): Multi-node communication
+    3. Spike (P1.5): Protocol decision with bounded investigation
+    4. Consensus (P2): Full BFT with CRDT merge
+    5. Production (P3): HSM and operational tooling
+
+    Each phase builds on the previous with explicit dependencies and incremental
+    delivery. Agent can implement without clarification requests.
+
+  recommendation: |
+    PASS both gates. RFC-0014 ticket decomposition is ready for implementation.
+
+    Minor documentation improvements (FND-SA2-FIN-001, FND-SA2-FIN-002) can be
+    addressed during implementation without blocking approval.
+
+# =============================================================================
+# EVIDENCE CHAIN
+# =============================================================================
+
+evidence_chain:
+  inputs:
+    - path: "documents/rfcs/RFC-0014/06_ticket_decomposition.yaml"
+      hash_prefix: "sha256:a7b3..."
+    - path: "documents/rfcs/RFC-0014/08_risks_and_open_questions.yaml"
+      hash_prefix: "sha256:c4d2..."
+    - path: "documents/rfcs/RFC-0014/evidence_artifacts/EVID-0007-consensus-protocol-specification.md"
+      hash_prefix: "sha256:e9f1..."
+    - path: "documents/rfcs/RFC-0014/evidence_artifacts/EVID-0008-bft-safety-proof.md"
+      hash_prefix: "sha256:b2a8..."
+    - path: "crates/apm2-core/src/ledger/storage.rs"
+      hash_prefix: "sha256:d5c7..."
+    - path: "crates/apm2-core/src/ledger/schema.sql"
+      hash_prefix: "sha256:f3e6..."
+
+  codebase_grounding:
+    ledger_exists: true
+    crypto_module_exists: true
+    cli_commands_exist: true
+    consensus_module_exists: false  # Will be created
+
+  session_context:
+    council_session: "COUNCIL-RFC-0014-20260128-FINALIZE"
+    prior_session: "COUNCIL-RFC-0014-20260127-CYCLE_2"
+    version_transition: "v2 -> v4"

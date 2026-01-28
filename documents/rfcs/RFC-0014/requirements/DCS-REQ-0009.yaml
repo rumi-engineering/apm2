@@ -1,0 +1,30 @@
+requirement:
+  id: DCS-REQ-0009
+  title: "Strictly Ordered Evidence"
+  imported_from: null
+  status: ACTIVE
+
+  statement: |
+    EvidencePublished events that gate Admission MUST be totally ordered and finalized
+    by the control-plane BFT quorum before GateReceipt generation.
+
+  rationale: |
+    Admission integrity requires that evidence cannot arrive late or be reordered after
+    a gate decision has been finalized.
+
+  acceptance_criteria:
+    - id: AC-001
+      description: "Admission-critical EvidencePublished events carry TotalOrder metadata"
+      verification: "OrderingGuarantee == TotalOrder"
+    - id: AC-002
+      description: "GateReceipt generation rejects evidence without TotalOrder finalization"
+      verification: "GateReceipt denied for eventual evidence"
+    - id: AC-003
+      description: "Strictly ordered evidence is auditable in the ledger"
+      verification: "Evidence is present in total-order log"
+
+  design_references:
+    - "02_design_decisions.yaml#DD-0005"
+
+  test_references:
+    - "07_test_and_evidence.yaml#TEST-ORD-002"

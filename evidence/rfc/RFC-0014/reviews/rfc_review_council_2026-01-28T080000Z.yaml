@@ -1,0 +1,382 @@
+# RFC-0014 Council Review Evidence Bundle
+# Generated: 2026-01-28T08:00:00Z
+# Review Type: COUNCIL (v0 -> v2 progression assessment)
+
+schema_version: "1.0.0"
+rfc_id: RFC-0014
+rfc_title: "Distributed Consensus and Replication Layer for APM2 Ledger+CAS Truth Substrate"
+rfc_version: "0.1.0"
+review_timestamp: "2026-01-28T08:00:00Z"
+review_depth: COUNCIL
+review_mode: REVIEW
+
+gates:
+  - gate_id: GATE-TCK-SCHEMA
+    type: TRUSTED
+    status: PASSED
+    evidence: |
+      All 10 RFC YAML files + 11 requirement files verified:
+      - 00_meta.yaml: schema_version 2026-01-28, rfc.id RFC-0014, status DRAFT
+      - 01_problem_and_imports.yaml: 6 failure modes, 3 imported + 8 additional requirements
+      - 02_design_decisions.yaml: 7 design decisions (DD-0001 through DD-0007)
+      - 03_trust_boundaries.yaml: 6 trust boundaries, 5 security properties, 5 threat scenarios
+      - 04_contracts_and_versioning.yaml: 5 contracts (API traits, protobuf schemas)
+      - 05_rollout_and_ops.yaml: 4 phases (P0-P3), migration path, observability
+      - 06_ticket_decomposition.yaml: 16 tickets (DCS-001 through DCS-016)
+      - 07_test_and_evidence.yaml: 8 test categories, 15 evidence artifacts
+      - 08_risks_and_open_questions.yaml: 8 risks, 7 open questions
+      - 09_governance_and_gates.yaml: 10 implementation gates, 4 SLOs
+      - requirements/DCS-REQ-*.yaml: All 11 files present with required fields
+    findings: []
+
+  - gate_id: GATE-TCK-DEPENDENCY-ACYCLICITY
+    type: DETERMINISTIC
+    status: PASSED
+    evidence: |
+      Topological sort of 16-ticket DAG confirms acyclic ordering:
+      {DCS-001, DCS-002, DCS-003} -> DCS-012 -> {DCS-004, DCS-006} -> DCS-005 ->
+      DCS-013 -> DCS-007 -> {DCS-008, DCS-009, DCS-014} -> {DCS-015, DCS-016} ->
+      {DCS-010, DCS-011}
+
+      Maximum parallelism: 3 tickets at P0 start.
+      Critical path: DCS-001 -> DCS-004 -> DCS-007 -> DCS-008
+    findings: []
+
+  - gate_id: GATE-TCK-SCOPE-COVERAGE
+    type: DETERMINISTIC
+    status: PASSED
+    evidence: |
+      All 11 requirements (DCS-REQ-0001 through DCS-REQ-0011) have ticket coverage.
+      All 6 trust boundaries (TB-0001 through TB-0006) have ticket coverage.
+
+      Coverage Matrix:
+      - DCS-REQ-0001: DCS-003, DCS-007, DCS-008, DCS-013
+      - DCS-REQ-0002: DCS-006
+      - DCS-REQ-0003: DCS-002, DCS-012
+      - DCS-REQ-0004: DCS-015
+      - DCS-REQ-0005: DCS-001
+      - DCS-REQ-0006: DCS-003, DCS-006
+      - DCS-REQ-0007: DCS-007, DCS-008, DCS-014
+      - DCS-REQ-0008: DCS-009
+      - DCS-REQ-0009: DCS-016
+      - DCS-REQ-0010: DCS-015
+      - DCS-REQ-0011: DCS-005
+    findings:
+      - finding_id: FND-RFC-0014-001
+        severity: MINOR
+        description: "DCS-011 (Operational Monitoring) has empty requirements_covered field"
+        recommendation: "Link to SLO definitions in 09_governance_and_gates.yaml"
+
+  - gate_id: GATE-TCK-CCP-MAPPING
+    type: DETERMINISTIC
+    status: PASSED
+    evidence: |
+      CCP Alignment Verified:
+      - Existing crates: apm2-core, apm2-daemon, apm2-cli, apm2-holon (all present)
+      - New modules: crates/apm2-core/src/consensus/, crates/apm2-core/src/schema_registry/
+      - Extension points: storage.rs, crypto/hash.rs, protocol/handshake.rs (all exist)
+      - Proto files: consensus_v1.proto (NEW), kernel_events.proto (EXTEND)
+
+      All proposed paths map to existing CCP structure.
+    findings: []
+
+  - gate_id: GATE-TCK-ATOMICITY
+    type: LLM-ASSISTED
+    status: CONCERN
+    evidence: |
+      14 of 16 tickets pass atomicity assessment.
+
+      CONCERNS:
+      - DCS-007 (BFT State Machine): Estimated 3 days but encompasses protocol selection,
+        state machine, leader election, view changes, and integration. Calibrated estimate:
+        8-15 days. Violates single-PR atomicity constraint.
+      - DCS-005 (Relay Holon): HIGH complexity marked but 3-day estimate. Includes tunnel
+        establishment, message multiplexing, reconnection logic. May need splitting.
+    findings:
+      - finding_id: FND-RFC-0014-002
+        severity: MAJOR
+        description: "DCS-007 violates atomicity constraint; should be split into 4 tickets"
+        recommendation: |
+          Split into: DCS-007A (Library Eval), DCS-007B (State Machine Core),
+          DCS-007C (Leader Election), DCS-007D (LedgerBackend Integration)
+
+  - gate_id: GATE-TCK-IMPLEMENTABILITY
+    type: LLM-ASSISTED
+    status: CONCERN
+    evidence: |
+      Overall implementability: MEDIUM (confidence 0.72)
+
+      Mock Implementation Results:
+      - DCS-001: SUCCESS (3 days as estimated), P(success)=0.90
+      - DCS-007: BLOCKED (OPEN questions Q-0001, Q-0002), P(success)=0.55
+      - DCS-009: SUCCESS (3 days as estimated), P(success)=0.80
+
+      BLOCKERS:
+      - Q-0001 (Which consensus library?) is OPEN
+      - Q-0002 (HotStuff vs PBFT?) is OPEN
+      - EVID-0007 (Consensus Protocol Specification) is PENDING placeholder
+      - EVID-0008 (BFT Safety Proof) is PENDING placeholder
+    findings:
+      - finding_id: FND-RFC-0014-003
+        severity: BLOCKER
+        description: "DCS-007 has OPEN questions (Q-0001, Q-0002) blocking agent implementation"
+        recommendation: "Add spike ticket DCS-007A to resolve library/protocol selection before DCS-007"
+      - finding_id: FND-RFC-0014-004
+        severity: MAJOR
+        description: "Evidence artifacts EVID-0007 and EVID-0008 are empty placeholders"
+        recommendation: "Populate with state machine diagram, message flows, safety proof references"
+
+  - gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    type: LLM-ASSISTED
+    status: CONCERN
+    evidence: |
+      Security posture: ADEQUATE (confidence 0.72)
+
+      Trust Boundary Assessment:
+      - TB-0001 (Genesis): ADEQUATE - minor gap in timestamp validity
+      - TB-0002 (Validator Quorum): ADEQUATE
+      - TB-0003 (Node Membership): CONCERN - missing join rate limiting
+      - TB-0004 (Inter-Node Comms): ADEQUATE
+      - TB-0005 (Actor-to-Kernel): ADEQUATE
+      - TB-0006 (Relay Holon): ADEQUATE - missing failover specification
+
+      Threat Coverage:
+      - TS-0001 through TS-0005: All mitigated, some partial
+
+      Security Claims (CAE Tree):
+      - SEC-PROP-0001 (Safety): SUPPORTED pending EVID-0008
+      - SEC-PROP-0002 (Liveness): PARTIALLY SUPPORTED
+      - SEC-PROP-0003 (Accountability): PARTIALLY SUPPORTED - scoping ambiguity
+      - SEC-PROP-0004 (Hash Chain Integrity): STRONGLY SUPPORTED
+      - SEC-PROP-0005 (Key Compromise Containment): PARTIALLY SUPPORTED
+    findings:
+      - finding_id: FND-RFC-0014-005
+        severity: MAJOR
+        description: "TB-0003 missing join rate limiting and identity bootstrap invariants"
+        recommendation: "Add INV-0010 (rate limit) and INV-0011 (invitation token)"
+      - finding_id: FND-RFC-0014-006
+        severity: MAJOR
+        description: "TS-0003 equivocation detection scoping ambiguous (public_key vs validator_id)"
+        recommendation: "Clarify detection keys on (validator_id, epoch, round)"
+      - finding_id: FND-RFC-0014-007
+        severity: BLOCKER
+        description: "Critical security evidence artifacts (EVID-0008, EVID-0009, EVID-0011, EVID-0015) are placeholders"
+        recommendation: "Populate before PHASE-1 gate"
+
+  - gate_id: GATE-TCK-REQUIREMENT-FIDELITY
+    type: LLM-ASSISTED
+    status: PASSED
+    evidence: |
+      Design decisions align with PRD-0007 requirements:
+      - DD-0001 (Hybrid Consensus) implements REQ-0006 (Messaging-Native Control Plane)
+      - DD-0002 (LedgerBackend) preserves existing Ledger semantics
+      - DD-0003 (Trust Hierarchy) aligns with OCAP model (LAW-05)
+      - DD-0004 (Schema Registry) implements LAW-13 (Semantic Contracting)
+      - DD-0005 (Event Classification) aligns with LAW-03, LAW-10
+
+      Law References verified: LAW-03, LAW-10, LAW-11, LAW-13, LAW-15
+    findings: []
+
+  - gate_id: GATE-TCK-ANTI-COUSIN
+    type: LLM-ASSISTED
+    status: PASSED
+    evidence: |
+      Anti-Cousin Assessment: COMPLIANT (confidence 0.85)
+
+      New abstractions EXTEND rather than DUPLICATE:
+      - LedgerBackend: Trait extraction from existing Ledger (EXTEND)
+      - SchemaRegistry: Genuinely new capability, no existing equivalent
+      - TrustHierarchy: T2/T3 uses existing KeyManager; T1/T0 new (EXTEND)
+      - ConsensusLayer: Genuinely new capability
+      - AntiEntropyLayer: Genuinely new capability
+
+      Monitoring Points:
+      - SchemaRegistry vs existing event validation (potential overlap)
+      - QuorumCertificate vs existing signature patterns (should reuse crypto primitives)
+    findings:
+      - finding_id: FND-RFC-0014-008
+        severity: MINOR
+        description: "Monitor for cousin emergence during implementation"
+        recommendation: "Enforce use of existing crypto primitives (ed25519-dalek, blake3)"
+
+findings:
+  - finding_id: FND-RFC-0014-001
+    gate_id: GATE-TCK-SCOPE-COVERAGE
+    category: COVERAGE_DEFECT
+    subcategory: EVIDENCE_GAP
+    severity: MINOR
+    description: "DCS-011 (Operational Monitoring) has empty requirements_covered field"
+    remediation: "Link to SLO definitions in 09_governance_and_gates.yaml"
+
+  - finding_id: FND-RFC-0014-002
+    gate_id: GATE-TCK-ATOMICITY
+    category: ATOMICITY_DEFECT
+    subcategory: SCOPE_TOO_LARGE
+    severity: MAJOR
+    description: "DCS-007 violates atomicity constraint; estimated 3 days but calibrated 8-15 days"
+    remediation: "Split into 4 tickets: Library Eval, State Machine, Leader Election, Integration"
+
+  - finding_id: FND-RFC-0014-003
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: INCOMPLETE_PLAN
+    severity: BLOCKER
+    description: "DCS-007 has OPEN questions (Q-0001, Q-0002) blocking agent implementation"
+    remediation: "Add spike ticket DCS-007A to resolve library/protocol selection before DCS-007"
+
+  - finding_id: FND-RFC-0014-004
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: AGENT_CONTEXT_GAP
+    severity: MAJOR
+    description: "Evidence artifacts EVID-0007 and EVID-0008 are empty placeholders"
+    remediation: "Populate with state machine diagram, message flows, safety proof references"
+
+  - finding_id: FND-RFC-0014-005
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: BOUNDARY_VIOLATION
+    severity: MAJOR
+    description: "TB-0003 missing join rate limiting and identity bootstrap invariants"
+    remediation: "Add INV-0010 (rate limit) and INV-0011 (invitation token)"
+
+  - finding_id: FND-RFC-0014-006
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: INVARIANT_FAILURE
+    severity: MAJOR
+    description: "TS-0003 equivocation detection scoping ambiguous"
+    remediation: "Clarify detection keys on (validator_id, epoch, round)"
+
+  - finding_id: FND-RFC-0014-007
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: UNMITIGATED_THREAT
+    severity: BLOCKER
+    description: "Critical security evidence artifacts are placeholders"
+    remediation: "Populate EVID-0008, EVID-0009, EVID-0011, EVID-0015 before PHASE-1 gate"
+
+  - finding_id: FND-RFC-0014-008
+    gate_id: GATE-TCK-ANTI-COUSIN
+    category: COUSIN_DEFECT
+    subcategory: IGNORED_EXTENSION_POINT
+    severity: MINOR
+    description: "Potential cousin patterns during implementation"
+    remediation: "Enforce use of existing crypto primitives"
+
+verdict: APPROVED_WITH_REMEDIATION
+verdict_reason: |
+  RFC-0014 v0 passes structural gates but has 2 BLOCKER findings that must be
+  remediated before v2 progression:
+
+  1. FND-RFC-0014-003 (BLOCKER): OPEN questions Q-0001/Q-0002 block DCS-007
+  2. FND-RFC-0014-007 (BLOCKER): Critical security evidence artifacts are placeholders
+
+  Additionally, 5 MAJOR findings require attention:
+  - FND-RFC-0014-002: DCS-007 atomicity violation
+  - FND-RFC-0014-004: EVID-0007/EVID-0008 missing content
+  - FND-RFC-0014-005: Join rate limiting missing
+  - FND-RFC-0014-006: Equivocation scoping ambiguity
+
+  The RFC demonstrates strong architectural design with:
+  - Well-defined type abstractions (LedgerBackend, SchemaRegistry traits)
+  - Appropriate precedent alignment (HotStuff/PBFT, CRDT anti-entropy)
+  - Explicit epistemic markers (OPEN questions with resolution paths)
+  - Coherent 4-phase rollout with local-quorum focus
+
+  Recommendation: Resolve BLOCKERs via spike ticket for library evaluation and
+  evidence artifact population before attempting v2 progression.
+
+council_metadata:
+  session_id: COUNCIL-RFC-0014-20260128-080000
+  subagents:
+    - agent_id: SA-1
+      emergent_role: Structural Rigorist
+      selected_modes: [3, 17, 29, 47, 62]
+      mode_names:
+        - Type-theoretic reasoning
+        - Analogical reasoning
+        - Epistemic reasoning
+        - Planning/Policy reasoning
+        - Narrative reasoning
+      gates_executed:
+        - GATE-TCK-SCHEMA
+        - GATE-TCK-DEPENDENCY-ACYCLICITY
+        - GATE-TCK-SCOPE-COVERAGE
+        - GATE-TCK-CCP-MAPPING
+      artifact: "Explanatory Scoring Table"
+
+    - agent_id: SA-2
+      emergent_role: Implementation Feasibility
+      selected_modes: [11, 39, 51, 70, 76]
+      mode_names:
+        - Bayesian reasoning
+        - Counterfactual reasoning
+        - Satisficing reasoning
+        - Engineering Design reasoning
+        - Calibration reasoning
+      gates_executed:
+        - GATE-TCK-ATOMICITY
+        - GATE-TCK-IMPLEMENTABILITY
+      artifact: "Mock Implementation Run Report"
+
+    - agent_id: SA-3
+      emergent_role: Security & Anti-Cousin Guardian
+      selected_modes: [8, 35, 49, 65, 72]
+      mode_names:
+        - Counterexample-Guided reasoning
+        - Argumentation reasoning
+        - Robust/Worst-Case reasoning
+        - Deontic reasoning
+        - Moral/Ethical reasoning
+      gates_executed:
+        - GATE-TCK-SECURITY-AND-INTEGRITY
+        - GATE-TCK-REQUIREMENT-FIDELITY
+        - GATE-TCK-ANTI-COUSIN
+      artifact: "CAE Tree (Claim-Argument-Evidence)"
+
+  cycles_completed: 1
+  total_findings_generated: 8
+  findings_by_severity:
+    BLOCKER: 2
+    MAJOR: 5
+    MINOR: 1
+    INFO: 0
+  quorum_achieved: true
+  elapsed_time_seconds: 240
+
+remediation_plan:
+  immediate:
+    - action: "Create spike ticket DCS-007A: BFT Library and Protocol Evaluation"
+      resolves: [FND-RFC-0014-003]
+      owner: Architect
+      deadline: "Before v2 progression"
+
+    - action: "Populate EVID-0008 with BFT safety proof reference"
+      resolves: [FND-RFC-0014-007, FND-RFC-0014-004]
+      owner: Security
+      deadline: "Before PHASE-1 gate"
+
+    - action: "Populate EVID-0007 with state machine specification"
+      resolves: [FND-RFC-0014-003, FND-RFC-0014-004]
+      owner: Architect
+      deadline: "Before DCS-007 implementation"
+
+  before_v2:
+    - action: "Split DCS-007 into 4 atomic tickets"
+      resolves: [FND-RFC-0014-002]
+      owner: Engineer
+
+    - action: "Add join rate limiting invariants to TB-0003"
+      resolves: [FND-RFC-0014-005]
+      owner: Security
+
+    - action: "Clarify equivocation detection scoping in TS-0003"
+      resolves: [FND-RFC-0014-006]
+      owner: Security
+
+    - action: "Link DCS-011 to SLO requirements"
+      resolves: [FND-RFC-0014-001]
+      owner: Engineer
+
+next_review: "After BLOCKER remediation, re-run COUNCIL for v2 progression assessment"

@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/selector.schema.json",
+  "title": "Selector",
+  "description": "Typed, deterministic pointer used in bounded views/receipts to keep omitted facts addressable (ledger events, CAS artifacts, DCP stable IDs, Git objects).",
+  "type": "object",
+  "required": ["kind"],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": ["ledger_event", "ledger_range", "cas", "dcp", "git_object"]
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/LedgerEventSelector" },
+    { "$ref": "#/$defs/LedgerRangeSelector" },
+    { "$ref": "#/$defs/CasSelector" },
+    { "$ref": "#/$defs/DcpSelector" },
+    { "$ref": "#/$defs/GitObjectSelector" }
+  ],
+  "$defs": {
+    "Hash32Hex": {
+      "type": "string",
+      "description": "Hex-encoded 32-byte hash (64 lowercase hex chars). Used for BLAKE3-256 and ledger event hashes in APM2.",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "StableId": {
+      "type": "string",
+      "description": "Stable identifier for deterministic artifact resolution (DCP).",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[A-Za-z0-9_./:@-]{1,1024}$"
+    },
+    "LedgerEventSelector": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "ledger_event" },
+        "seq_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Ledger sequence id (monotone index)."
+        },
+        "event_hash": {
+          "$ref": "#/$defs/Hash32Hex"
+        }
+      },
+      "oneOf": [{ "required": ["seq_id"] }, { "required": ["event_hash"] }],
+      "unevaluatedProperties": false
+    },
+    "LedgerRangeSelector": {
+      "type": "object",
+      "required": ["kind", "start_seq_id", "end_seq_id", "range_root_hash"],
+      "properties": {
+        "kind": { "const": "ledger_range" },
+        "start_seq_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Start of covered ledger range (inclusive)."
+        },
+        "end_seq_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "End of covered ledger range (inclusive)."
+        },
+        "range_root_hash": {
+          "$ref": "#/$defs/Hash32Hex"
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "CasSelector": {
+      "type": "object",
+      "required": ["kind", "content_hash"],
+      "properties": {
+        "kind": { "const": "cas" },
+        "content_hash": {
+          "$ref": "#/$defs/Hash32Hex"
+        },
+        "artifact_kind": {
+          "type": "string",
+          "description": "Optional kind hint (e.g., 'test_results', 'patch', 'context_pack').",
+          "maxLength": 128
+        },
+        "classification": {
+          "type": "string",
+          "description": "Optional data classification hint (PUBLIC/INTERNAL/CONFIDENTIAL/RESTRICTED).",
+          "maxLength": 64
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "DcpSelector": {
+      "type": "object",
+      "required": ["kind", "stable_id", "content_hash"],
+      "properties": {
+        "kind": { "const": "dcp" },
+        "stable_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "content_hash": {
+          "$ref": "#/$defs/Hash32Hex"
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "GitObjectSelector": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "git_object" }
+      },
+      "allOf": [{ "$ref": "git_object_ref.schema.json" }],
+      "unevaluatedProperties": false
+    }
+  }
+}
