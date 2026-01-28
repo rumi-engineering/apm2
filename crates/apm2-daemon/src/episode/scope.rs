@@ -735,16 +735,26 @@ fn contains_path_traversal(path: &str) -> bool {
 /// Simple glob pattern matching.
 ///
 /// Supports:
+/// - Exact path matching (e.g., `/workspace/main.rs`)
 /// - `*` matches any sequence of characters in a single component
 /// - `**` matches any sequence of path components
-/// - Exact literal matching otherwise
+/// - Directory-relative patterns (e.g., `src/*.rs`)
 ///
 /// # Security
 ///
 /// Uses `Path::starts_with` for component-aware prefix matching to prevent
 /// boundary bypass attacks. For example, `/workspace/**/*.rs` should match
 /// `/workspace/src/main.rs` but NOT `/workspace_secrets/file.rs`.
+///
+/// Suffix matching also respects component boundaries. For example,
+/// `/a/**/b.rs` should match `/a/dir/b.rs` but NOT `/a/other_b.rs`.
 fn matches_glob(path: &Path, pattern: &str) -> bool {
+    // Handle exact path matching first (no wildcards)
+    if !pattern.contains('*') {
+        // Exact match: pattern must equal the full path
+        return path == Path::new(pattern);
+    }
+
     // Handle ** for recursive matching
     if pattern.contains("**") {
         // Convert ** to regex-like matching
@@ -763,20 +773,92 @@ fn matches_glob(path: &Path, pattern: &str) -> bool {
                 }
             }
             if !suffix.is_empty() {
-                // Check if any component matches the suffix pattern
-                let path_str = path.to_string_lossy();
-                return path_str.ends_with(suffix)
-                    || path
-                        .file_name()
-                        .is_some_and(|name| matches_simple_glob(&name.to_string_lossy(), suffix));
+                // Security: Check suffix with component boundary awareness.
+                // String-based ends_with would allow `/a/other_b.rs` to match `b.rs`
+                // because `other_b.rs` ends with `b.rs`. We must ensure the suffix
+                // matches complete path components.
+                return matches_suffix_with_boundary(path, suffix);
             }
             return true;
         }
     }
 
-    // Handle single * for filename matching
+    // Handle directory-relative patterns (e.g., `src/*.rs`)
+    // These contain a `/` but no `**`
+    if pattern.contains('/') {
+        return matches_directory_pattern(path, pattern);
+    }
+
+    // Handle single * for filename matching only
     path.file_name()
         .is_some_and(|file_name| matches_simple_glob(&file_name.to_string_lossy(), pattern))
+}
+
+/// Matches a suffix pattern with path component boundary awareness.
+///
+/// # Security
+///
+/// This function ensures that suffix patterns match at component boundaries.
+/// For example, `b.rs` should match the file `b.rs` but NOT `other_b.rs`.
+/// This prevents path suffix attacks similar to hostname suffix attacks.
+fn matches_suffix_with_boundary(path: &Path, suffix: &str) -> bool {
+    // If suffix contains a directory separator, we need to match multiple
+    // trailing components
+    if suffix.contains('/') {
+        // Count trailing components in the suffix
+        let suffix_path = Path::new(suffix);
+        let suffix_components: Vec<_> = suffix_path.components().collect();
+        let path_components: Vec<_> = path.components().collect();
+
+        if path_components.len() < suffix_components.len() {
+            return false;
+        }
+
+        // Match each trailing component
+        let start = path_components.len() - suffix_components.len();
+        for (i, suffix_comp) in suffix_components.iter().enumerate() {
+            let path_comp = &path_components[start + i];
+            let suffix_str = suffix_comp.as_os_str().to_string_lossy();
+            let path_str = path_comp.as_os_str().to_string_lossy();
+
+            if !matches_simple_glob(&path_str, &suffix_str) {
+                return false;
+            }
+        }
+        true
+    } else {
+        // Single component suffix - must match the filename exactly
+        // (or with simple glob patterns like `*.rs`)
+        path.file_name()
+            .is_some_and(|name| matches_simple_glob(&name.to_string_lossy(), suffix))
+    }
+}
+
+/// Matches a directory-relative pattern like `src/*.rs`.
+///
+/// This handles patterns that contain `/` but no `**`. The pattern is matched
+/// against trailing path components.
+fn matches_directory_pattern(path: &Path, pattern: &str) -> bool {
+    let pattern_path = Path::new(pattern);
+    let pattern_components: Vec<_> = pattern_path.components().collect();
+    let path_components: Vec<_> = path.components().collect();
+
+    if path_components.len() < pattern_components.len() {
+        return false;
+    }
+
+    // Match from the end of the path
+    let start = path_components.len() - pattern_components.len();
+    for (i, pattern_comp) in pattern_components.iter().enumerate() {
+        let path_comp = &path_components[start + i];
+        let pattern_str = pattern_comp.as_os_str().to_string_lossy();
+        let path_str = path_comp.as_os_str().to_string_lossy();
+
+        if !matches_simple_glob(&path_str, &pattern_str) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Simple single-component glob matching.
@@ -1162,5 +1244,136 @@ mod tests {
         // Verify it actually enforces limits
         assert!(scope.allows_read_size(100 * 1024 * 1024)); // 100 MB OK
         assert!(!scope.allows_read_size(101 * 1024 * 1024)); // 101 MB rejected
+    }
+
+    /// Regression test for [BLOCKER] Exact and Relative Path Matching.
+    ///
+    /// The vulnerable implementation only handled `**` recursive patterns or
+    /// filename-only matching via `path.file_name()`. It failed to match:
+    /// - Exact absolute paths (e.g., `/workspace/src/main.rs`)
+    /// - Non-recursive directory patterns (e.g., `src/*.rs`)
+    ///
+    /// Fix: Add exact path matching and directory-relative pattern matching.
+    #[test]
+    fn test_glob_exact_path_matching_regression() {
+        // MUST match exact absolute paths
+        assert!(
+            matches_glob(
+                Path::new("/workspace/src/main.rs"),
+                "/workspace/src/main.rs"
+            ),
+            "exact absolute path should match"
+        );
+        assert!(
+            matches_glob(Path::new("/etc/passwd"), "/etc/passwd"),
+            "exact path should match"
+        );
+
+        // MUST reject paths that don't match exactly
+        assert!(
+            !matches_glob(
+                Path::new("/workspace/src/main.rs"),
+                "/workspace/src/other.rs"
+            ),
+            "different filename should not match"
+        );
+        assert!(
+            !matches_glob(Path::new("/workspace/src/main.rs"), "/workspace/main.rs"),
+            "different directory should not match"
+        );
+    }
+
+    /// Regression test for [BLOCKER] Non-recursive Directory Pattern Matching.
+    ///
+    /// Patterns like `src/*.rs` should match files in the `src` directory
+    /// but not in subdirectories.
+    #[test]
+    fn test_glob_directory_pattern_matching_regression() {
+        // MUST match files in the specified directory
+        assert!(
+            matches_glob(Path::new("/workspace/src/main.rs"), "src/*.rs"),
+            "src/*.rs should match /workspace/src/main.rs"
+        );
+        assert!(
+            matches_glob(Path::new("/project/src/lib.rs"), "src/*.rs"),
+            "src/*.rs should match /project/src/lib.rs"
+        );
+
+        // MUST match files matching the directory pattern at the end of path
+        assert!(
+            matches_glob(Path::new("/a/b/c/file.txt"), "c/*.txt"),
+            "c/*.txt should match /a/b/c/file.txt"
+        );
+
+        // MUST reject files that don't match the pattern
+        assert!(
+            !matches_glob(Path::new("/workspace/src/main.rs"), "tests/*.rs"),
+            "tests/*.rs should not match /workspace/src/main.rs"
+        );
+
+        // MUST reject files in subdirectories (non-recursive)
+        assert!(
+            !matches_glob(Path::new("/workspace/src/subdir/main.rs"), "src/*.rs"),
+            "src/*.rs should NOT match files in subdirectories"
+        );
+    }
+
+    /// Regression test for [BLOCKER] Path Suffix Matching Vulnerability.
+    ///
+    /// The vulnerable implementation used string-based `ends_with(suffix)`
+    /// without checking component boundaries. This allowed `/a/**/b.rs` to
+    /// match `/a/other_b.rs` because `other_b.rs` ends with `b.rs`.
+    ///
+    /// Fix: Ensure suffix matching respects path component boundaries.
+    #[test]
+    fn test_glob_suffix_boundary_attack_regression() {
+        // MUST match files with exact filename suffix
+        assert!(
+            matches_glob(Path::new("/a/dir/b.rs"), "/a/**/b.rs"),
+            "exact filename b.rs should match"
+        );
+        assert!(
+            matches_glob(Path::new("/a/deep/nested/b.rs"), "/a/**/b.rs"),
+            "deeply nested b.rs should match"
+        );
+
+        // MUST REJECT files where suffix is a substring of filename
+        // This was the security vulnerability
+        assert!(
+            !matches_glob(Path::new("/a/other_b.rs"), "/a/**/b.rs"),
+            "SECURITY: other_b.rs must NOT match **/b.rs"
+        );
+        assert!(
+            !matches_glob(Path::new("/a/xb.rs"), "/a/**/b.rs"),
+            "SECURITY: xb.rs must NOT match **/b.rs"
+        );
+        assert!(
+            !matches_glob(Path::new("/a/notb.rs"), "/a/**/b.rs"),
+            "SECURITY: notb.rs must NOT match **/b.rs"
+        );
+        assert!(
+            !matches_glob(Path::new("/a/subdir/prefixb.rs"), "/a/**/b.rs"),
+            "SECURITY: prefixb.rs must NOT match **/b.rs"
+        );
+
+        // Edge cases with extension-like patterns
+        assert!(
+            matches_glob(Path::new("/workspace/src/main.rs"), "/workspace/**/*.rs"),
+            "*.rs pattern should match main.rs"
+        );
+        assert!(
+            !matches_glob(Path::new("/workspace/src/main.rsx"), "/workspace/**/*.rs"),
+            "*.rs should NOT match main.rsx"
+        );
+
+        // Multi-component suffix patterns
+        assert!(
+            matches_glob(Path::new("/a/b/c/d.rs"), "/a/**/c/d.rs"),
+            "multi-component suffix should match"
+        );
+        assert!(
+            !matches_glob(Path::new("/a/b/xc/d.rs"), "/a/**/c/d.rs"),
+            "SECURITY: xc/d.rs must NOT match c/d.rs suffix"
+        );
     }
 }

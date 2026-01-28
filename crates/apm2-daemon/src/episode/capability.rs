@@ -35,6 +35,7 @@
 //! - AD-EPISODE-001: Capability manifest hash in envelope
 //! - REQ-TOOL-001: Tool access control requirements
 //! - CTR-1303: Bounded collections with MAX_* constants
+//! - HOLONIC-BOUNDARY-001: Deterministic time via clock injection
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -45,6 +46,63 @@ use serde::{Deserialize, Serialize};
 use super::envelope::RiskTier;
 use super::scope::{CapabilityScope, ScopeError};
 use super::tool_class::ToolClass;
+
+// =============================================================================
+// Clock Abstraction
+//
+// Per HOLONIC-BOUNDARY-001, time-dependent operations should use injected
+// clocks rather than direct SystemTime access. This enables:
+// - Deterministic testing
+// - Reproducible audit trails
+// - Time-travel debugging
+// =============================================================================
+
+/// Trait for clock implementations.
+///
+/// Per HOLONIC-BOUNDARY-001, this abstraction allows deterministic testing
+/// and auditing of time-dependent operations like expiration checks.
+pub trait Clock: Send + Sync {
+    /// Returns the current Unix timestamp in seconds.
+    fn now_secs(&self) -> u64;
+}
+
+/// System clock that uses the real system time.
+///
+/// This is the default clock for production use.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_secs(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs()
+    }
+}
+
+/// Fixed clock for testing that returns a constant timestamp.
+///
+/// This allows deterministic testing of expiration logic.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedClock {
+    /// The fixed timestamp to return.
+    pub timestamp: u64,
+}
+
+impl FixedClock {
+    /// Creates a new fixed clock with the given timestamp.
+    #[must_use]
+    pub const fn new(timestamp: u64) -> Self {
+        Self { timestamp }
+    }
+}
+
+impl Clock for FixedClock {
+    fn now_secs(&self) -> u64 {
+        self.timestamp
+    }
+}
 
 /// Maximum number of capabilities in a manifest.
 pub const MAX_CAPABILITIES: usize = 1000;
@@ -495,17 +553,44 @@ impl CapabilityManifest {
         Ok(())
     }
 
-    /// Returns `true` if this manifest has expired.
+    /// Returns `true` if this manifest has expired using the system clock.
+    ///
+    /// For deterministic testing, use [`is_expired_with_clock`] instead.
     #[must_use]
     pub fn is_expired(&self) -> bool {
+        self.is_expired_with_clock(&SystemClock)
+    }
+
+    /// Returns `true` if this manifest has expired using the given clock.
+    ///
+    /// Per HOLONIC-BOUNDARY-001, this method accepts a clock for deterministic
+    /// testing and auditing of expiration logic.
+    ///
+    /// # Arguments
+    ///
+    /// * `clock` - The clock to use for determining the current time
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use apm2_daemon::episode::capability::{CapabilityManifest, FixedClock};
+    ///
+    /// let manifest = /* create manifest with expires_at = 1000 */;
+    ///
+    /// // Test with a fixed clock before expiration
+    /// let clock = FixedClock::new(500);
+    /// assert!(!manifest.is_expired_with_clock(&clock));
+    ///
+    /// // Test with a fixed clock after expiration
+    /// let clock = FixedClock::new(1500);
+    /// assert!(manifest.is_expired_with_clock(&clock));
+    /// ```
+    #[must_use]
+    pub fn is_expired_with_clock(&self, clock: &dyn Clock) -> bool {
         if self.expires_at == 0 {
             return false;
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs();
-        now > self.expires_at
+        clock.now_secs() > self.expires_at
     }
 
     /// Returns `true` if this manifest has no capabilities.
@@ -605,6 +690,113 @@ impl CapabilityManifest {
 
         // No capability matched - determine best reason
         // This provides the most specific denial reason
+        if let Some(ref path) = request.path {
+            return CapabilityDecision::Deny {
+                reason: DenyReason::PathNotAllowed {
+                    path: path.to_string_lossy().to_string(),
+                },
+            };
+        }
+
+        if let Some((ref host, port)) = request.network {
+            return CapabilityDecision::Deny {
+                reason: DenyReason::NetworkNotAllowed {
+                    host: host.clone(),
+                    port,
+                },
+            };
+        }
+
+        // Fall back to risk tier reason
+        if let Some(cap) = self.find_by_tool_class(request.tool_class).next() {
+            return CapabilityDecision::Deny {
+                reason: DenyReason::InsufficientRiskTier {
+                    required: cap.risk_tier_required,
+                    actual: request.risk_tier,
+                },
+            };
+        }
+
+        CapabilityDecision::Deny {
+            reason: DenyReason::NoMatchingCapability {
+                tool_class: request.tool_class,
+            },
+        }
+    }
+
+    /// Validates a tool request with a custom clock for expiration checks.
+    ///
+    /// Per HOLONIC-BOUNDARY-001, this method accepts a clock for deterministic
+    /// testing and auditing.
+    pub fn validate_request_with_clock(
+        &self,
+        request: &ToolRequest,
+        clock: &dyn Clock,
+    ) -> CapabilityDecision {
+        // Check expiration first using the provided clock
+        if self.is_expired_with_clock(clock) {
+            return CapabilityDecision::Deny {
+                reason: DenyReason::ManifestExpired,
+            };
+        }
+
+        // Delegate to the internal validation logic
+        self.validate_request_internal(request)
+    }
+
+    /// Internal validation logic without expiration check.
+    fn validate_request_internal(&self, request: &ToolRequest) -> CapabilityDecision {
+        // Find capabilities matching the tool class
+        let matching: Vec<_> = self.find_by_tool_class(request.tool_class).collect();
+
+        if matching.is_empty() {
+            return CapabilityDecision::Deny {
+                reason: DenyReason::NoMatchingCapability {
+                    tool_class: request.tool_class,
+                },
+            };
+        }
+
+        // Try each matching capability
+        for cap in matching {
+            // Check risk tier
+            if !cap.risk_tier_sufficient(request.risk_tier) {
+                continue;
+            }
+
+            // Check path if applicable
+            if let Some(ref path) = request.path {
+                if !cap.allows_path(path) {
+                    continue;
+                }
+            }
+
+            // Check size limits if applicable
+            if let Some(size) = request.size {
+                let size_allowed = match request.tool_class {
+                    ToolClass::Read => cap.allows_read_size(size),
+                    ToolClass::Write => cap.allows_write_size(size),
+                    _ => true,
+                };
+                if !size_allowed {
+                    continue;
+                }
+            }
+
+            // Check network access if applicable
+            if let Some((ref host, port)) = request.network {
+                if !cap.allows_network(host, port) {
+                    continue;
+                }
+            }
+
+            // All checks passed
+            return CapabilityDecision::Allow {
+                capability_id: cap.capability_id.clone(),
+            };
+        }
+
+        // No capability matched - determine best reason
         if let Some(ref path) = request.path {
             return CapabilityDecision::Deny {
                 reason: DenyReason::PathNotAllowed {
@@ -837,20 +1029,40 @@ impl ToolRequest {
 ///
 /// Per AD-TOOL-002, the validator integrates with the policy engine
 /// to provide OCAP enforcement.
+///
+/// Per HOLONIC-BOUNDARY-001, the validator supports clock injection for
+/// deterministic testing of time-dependent operations.
 #[derive(Debug, Clone)]
 pub struct CapabilityValidator {
     manifest: CapabilityManifest,
 }
 
 impl CapabilityValidator {
-    /// Creates a new validator with the given manifest.
+    /// Creates a new validator with the given manifest using the system clock.
+    ///
+    /// For deterministic testing, use [`new_with_clock`] instead.
     ///
     /// # Errors
     ///
     /// Returns an error if the manifest is invalid or expired.
     pub fn new(manifest: CapabilityManifest) -> Result<Self, CapabilityError> {
+        Self::new_with_clock(manifest, &SystemClock)
+    }
+
+    /// Creates a new validator with the given manifest and clock.
+    ///
+    /// Per HOLONIC-BOUNDARY-001, this method accepts a clock for deterministic
+    /// testing of expiration checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest is invalid or expired.
+    pub fn new_with_clock(
+        manifest: CapabilityManifest,
+        clock: &dyn Clock,
+    ) -> Result<Self, CapabilityError> {
         manifest.validate()?;
-        if manifest.is_expired() {
+        if manifest.is_expired_with_clock(clock) {
             return Err(CapabilityError::ManifestExpired);
         }
         Ok(Self { manifest })
@@ -911,6 +1123,299 @@ impl CapabilityValidator {
         self.validate(&request)
     }
 }
+
+// =============================================================================
+// PolicyEngine Integration
+//
+// Per AD-TOOL-002 step 5, the capability validator integrates with the
+// PolicyEngine from apm2_core for unified policy enforcement.
+// =============================================================================
+
+/// Error type for manifest loading operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestLoadError {
+    /// Content not found in CAS.
+    NotFound {
+        /// The hash that was not found (hex-encoded).
+        hash: String,
+    },
+
+    /// Hash mismatch during verification.
+    HashMismatch {
+        /// Expected hash (hex-encoded).
+        expected: String,
+        /// Actual hash (hex-encoded).
+        actual: String,
+    },
+
+    /// Failed to deserialize manifest.
+    DeserializationError {
+        /// Description of the error.
+        message: String,
+    },
+
+    /// Manifest validation failed.
+    ValidationError(CapabilityError),
+
+    /// CAS storage error.
+    StorageError {
+        /// Description of the error.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for ManifestLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { hash } => write!(f, "manifest not found: {hash}"),
+            Self::HashMismatch { expected, actual } => {
+                write!(f, "hash mismatch: expected {expected}, got {actual}")
+            },
+            Self::DeserializationError { message } => {
+                write!(f, "deserialization failed: {message}")
+            },
+            Self::ValidationError(e) => write!(f, "validation failed: {e}"),
+            Self::StorageError { message } => write!(f, "storage error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ManifestLoadError {}
+
+impl From<CapabilityError> for ManifestLoadError {
+    fn from(e: CapabilityError) -> Self {
+        Self::ValidationError(e)
+    }
+}
+
+/// Trait for loading capability manifests from content-addressed storage.
+///
+/// Per AD-TOOL-002, capability manifests are referenced by their BLAKE3 hash
+/// in episode envelopes. This trait defines the interface for loading
+/// manifests from CAS.
+///
+/// # Implementation Notes
+///
+/// Implementations should:
+/// 1. Retrieve the serialized manifest by hash from CAS
+/// 2. Verify the content hash matches the requested hash
+/// 3. Deserialize the manifest
+/// 4. Validate the manifest structure
+/// 5. Return the validated manifest
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use apm2_daemon::episode::capability::{ManifestLoader, CapabilityManifest};
+///
+/// struct MyCasLoader { /* ... */ }
+///
+/// impl ManifestLoader for MyCasLoader {
+///     fn load_manifest(&self, hash: &[u8; 32]) -> Result<CapabilityManifest, ManifestLoadError> {
+///         let bytes = self.cas.retrieve(hash)?;
+///         let manifest: CapabilityManifest = serde_json::from_slice(&bytes)?;
+///         manifest.validate()?;
+///         Ok(manifest)
+///     }
+/// }
+/// ```
+pub trait ManifestLoader: Send + Sync {
+    /// Loads a capability manifest by its content hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The BLAKE3 hash of the manifest content (32 bytes)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The hash is not found in storage
+    /// - The content doesn't match the hash
+    /// - Deserialization fails
+    /// - Manifest validation fails
+    fn load_manifest(&self, hash: &[u8; 32]) -> Result<CapabilityManifest, ManifestLoadError>;
+
+    /// Stores a capability manifest and returns its content hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - The manifest to store
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Manifest validation fails
+    /// - Storage operation fails
+    fn store_manifest(&self, manifest: &CapabilityManifest) -> Result<[u8; 32], ManifestLoadError>;
+
+    /// Checks if a manifest with the given hash exists.
+    fn manifest_exists(&self, hash: &[u8; 32]) -> bool;
+}
+
+/// Policy-integrated capability validator.
+///
+/// Per AD-TOOL-002 step 5, this validator integrates with the `PolicyEngine`
+/// from `apm2_core` to provide unified policy enforcement. The `PolicyEngine`
+/// handles coarse-grained policy rules while the `CapabilityValidator` handles
+/// fine-grained capability scoping.
+///
+/// # Architecture
+///
+/// ```text
+/// ToolRequest
+///     │
+///     ├─────────────────────────────────┐
+///     │                                 │
+///     ▼                                 ▼
+/// PolicyEngine                  CapabilityValidator
+/// (coarse rules)                (fine scopes)
+///     │                                 │
+///     └─────────────────────────────────┘
+///                     │
+///                     ▼
+///              Final Decision
+///               (AND logic)
+/// ```
+///
+/// # Security Model
+///
+/// Both checks must pass for a request to be allowed:
+/// 1. `PolicyEngine` evaluates policy rules (`tool_allow`, filesystem, network,
+///    etc.)
+/// 2. `CapabilityValidator` evaluates capability scopes (paths, sizes,
+///    patterns)
+///
+/// This provides defense-in-depth: even if a policy allows a broad category
+/// of operations, capabilities can further restrict to specific paths/sizes.
+///
+/// # TODO: Full Integration
+///
+/// The `PolicyEngine` integration is defined as an interface here. Full
+/// integration requires:
+/// - TCK-XXXXX: Implement `PolicyEngine` adapter for `CapabilityValidator`
+/// - TCK-XXXXX: Add `PolicyEngine`-based validation to `EpisodeRuntime`
+#[derive(Debug, Clone)]
+pub struct PolicyIntegratedValidator<L: ManifestLoader> {
+    /// The capability validator for fine-grained scope checks.
+    validator: CapabilityValidator,
+
+    /// The manifest loader for CAS-based manifest retrieval.
+    /// Note: Wrapped in Option for incremental integration.
+    #[allow(dead_code)] // Reserved for future CAS integration
+    loader: Option<std::sync::Arc<L>>,
+}
+
+impl<L: ManifestLoader> PolicyIntegratedValidator<L> {
+    /// Creates a new policy-integrated validator.
+    ///
+    /// # Arguments
+    ///
+    /// * `manifest` - The capability manifest to validate against
+    /// * `loader` - Optional manifest loader for CAS integration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest is invalid or expired.
+    pub fn new(
+        manifest: CapabilityManifest,
+        loader: Option<std::sync::Arc<L>>,
+    ) -> Result<Self, CapabilityError> {
+        let validator = CapabilityValidator::new(manifest)?;
+        Ok(Self { validator, loader })
+    }
+
+    /// Creates a validator by loading a manifest from CAS.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash` - The BLAKE3 hash of the manifest
+    /// * `loader` - The manifest loader to use
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading or validation fails.
+    pub fn from_hash(
+        hash: &[u8; 32],
+        loader: std::sync::Arc<L>,
+    ) -> Result<Self, ManifestLoadError> {
+        let manifest = loader.load_manifest(hash)?;
+        let validator = CapabilityValidator::new(manifest)?;
+        Ok(Self {
+            validator,
+            loader: Some(loader),
+        })
+    }
+
+    /// Returns a reference to the underlying manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> &CapabilityManifest {
+        self.validator.manifest()
+    }
+
+    /// Validates a tool request against capability scopes.
+    ///
+    /// # Note
+    ///
+    /// This validates against capability scopes only. For full policy
+    /// integration, use `validate_with_policy` (TODO: implement in future
+    /// ticket).
+    #[must_use]
+    pub fn validate(&self, request: &ToolRequest) -> CapabilityDecision {
+        self.validator.validate(request)
+    }
+
+    /// Validates a read request.
+    #[must_use]
+    pub fn validate_read(&self, path: &Path, size: u64, risk_tier: RiskTier) -> CapabilityDecision {
+        self.validator.validate_read(path, size, risk_tier)
+    }
+
+    /// Validates a write request.
+    #[must_use]
+    pub fn validate_write(
+        &self,
+        path: &Path,
+        size: u64,
+        risk_tier: RiskTier,
+    ) -> CapabilityDecision {
+        self.validator.validate_write(path, size, risk_tier)
+    }
+}
+
+/// Placeholder manifest loader that always returns `NotFound`.
+///
+/// This is used when CAS integration is not yet available. It will be
+/// replaced with a real implementation in a future ticket.
+///
+/// # TODO
+///
+/// - TCK-XXXXX: Implement real CAS-backed `ManifestLoader`
+#[derive(Debug, Clone, Default)]
+pub struct StubManifestLoader;
+
+impl ManifestLoader for StubManifestLoader {
+    fn load_manifest(&self, hash: &[u8; 32]) -> Result<CapabilityManifest, ManifestLoadError> {
+        Err(ManifestLoadError::NotFound {
+            hash: hex::encode(hash),
+        })
+    }
+
+    fn store_manifest(
+        &self,
+        _manifest: &CapabilityManifest,
+    ) -> Result<[u8; 32], ManifestLoadError> {
+        Err(ManifestLoadError::StorageError {
+            message: "stub loader does not support storage".to_string(),
+        })
+    }
+
+    fn manifest_exists(&self, _hash: &[u8; 32]) -> bool {
+        false
+    }
+}
+
+/// Convenience type alias for validators using the stub loader.
+pub type BasicValidator = PolicyIntegratedValidator<StubManifestLoader>;
 
 #[cfg(test)]
 mod tests {
@@ -1170,5 +1675,203 @@ mod tests {
         // Wrong host
         let denied = validator.validate_network("evil.com", 443, RiskTier::Tier0);
         assert!(denied.is_denied());
+    }
+
+    // ==========================================================================
+    // Clock Injection Tests (HOLONIC-BOUNDARY-001)
+    //
+    // These tests verify the clock abstraction for deterministic testing of
+    // time-dependent operations like expiration checks.
+    // ==========================================================================
+
+    #[test]
+    fn test_fixed_clock() {
+        let clock = FixedClock::new(1000);
+        assert_eq!(clock.now_secs(), 1000);
+
+        let clock2 = FixedClock::new(2000);
+        assert_eq!(clock2.now_secs(), 2000);
+    }
+
+    #[test]
+    fn test_is_expired_with_clock_not_expired() {
+        let manifest = CapabilityManifest {
+            manifest_id: "test".to_string(),
+            capabilities: vec![make_read_capability(
+                "cap-1",
+                vec![PathBuf::from("/workspace")],
+            )],
+            delegator_id: "delegator".to_string(),
+            created_at: 1000,
+            expires_at: 2000, // Expires at timestamp 2000
+        };
+
+        // Clock is before expiration
+        let clock = FixedClock::new(1500);
+        assert!(
+            !manifest.is_expired_with_clock(&clock),
+            "manifest should NOT be expired when clock is before expires_at"
+        );
+    }
+
+    #[test]
+    fn test_is_expired_with_clock_expired() {
+        let manifest = CapabilityManifest {
+            manifest_id: "test".to_string(),
+            capabilities: vec![make_read_capability(
+                "cap-1",
+                vec![PathBuf::from("/workspace")],
+            )],
+            delegator_id: "delegator".to_string(),
+            created_at: 1000,
+            expires_at: 2000, // Expires at timestamp 2000
+        };
+
+        // Clock is after expiration
+        let clock = FixedClock::new(2500);
+        assert!(
+            manifest.is_expired_with_clock(&clock),
+            "manifest should be expired when clock is after expires_at"
+        );
+    }
+
+    #[test]
+    fn test_is_expired_with_clock_no_expiration() {
+        let manifest = CapabilityManifest {
+            manifest_id: "test".to_string(),
+            capabilities: vec![make_read_capability(
+                "cap-1",
+                vec![PathBuf::from("/workspace")],
+            )],
+            delegator_id: "delegator".to_string(),
+            created_at: 1000,
+            expires_at: 0, // No expiration
+        };
+
+        // Should never expire regardless of clock
+        let clock = FixedClock::new(u64::MAX);
+        assert!(
+            !manifest.is_expired_with_clock(&clock),
+            "manifest with expires_at=0 should never expire"
+        );
+    }
+
+    #[test]
+    fn test_validator_new_with_clock() {
+        let manifest = CapabilityManifest {
+            manifest_id: "test".to_string(),
+            capabilities: vec![make_read_capability(
+                "cap-1",
+                vec![PathBuf::from("/workspace")],
+            )],
+            delegator_id: "delegator".to_string(),
+            created_at: 1000,
+            expires_at: 2000,
+        };
+
+        // Should succeed with clock before expiration
+        let clock = FixedClock::new(1500);
+        let result = CapabilityValidator::new_with_clock(manifest.clone(), &clock);
+        assert!(
+            result.is_ok(),
+            "validator should be created when manifest is not expired"
+        );
+
+        // Should fail with clock after expiration
+        let clock = FixedClock::new(2500);
+        let result = CapabilityValidator::new_with_clock(manifest, &clock);
+        assert!(
+            matches!(result, Err(CapabilityError::ManifestExpired)),
+            "validator creation should fail for expired manifest"
+        );
+    }
+
+    #[test]
+    fn test_validate_request_with_clock() {
+        let manifest = CapabilityManifest {
+            manifest_id: "test".to_string(),
+            capabilities: vec![make_read_capability(
+                "cap-1",
+                vec![PathBuf::from("/workspace")],
+            )],
+            delegator_id: "delegator".to_string(),
+            created_at: 1000,
+            expires_at: 2000,
+        };
+
+        let request = ToolRequest::new(ToolClass::Read, RiskTier::Tier0)
+            .with_path("/workspace/file.rs")
+            .with_size(1024);
+
+        // Should allow before expiration
+        let clock = FixedClock::new(1500);
+        let decision = manifest.validate_request_with_clock(&request, &clock);
+        assert!(
+            decision.is_allowed(),
+            "request should be allowed before expiration"
+        );
+
+        // Should deny after expiration
+        let clock = FixedClock::new(2500);
+        let decision = manifest.validate_request_with_clock(&request, &clock);
+        assert!(
+            decision.is_denied(),
+            "request should be denied after expiration"
+        );
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(
+                matches!(reason, DenyReason::ManifestExpired),
+                "denial reason should be ManifestExpired"
+            );
+        }
+    }
+
+    /// Regression test for [MAJOR] Non-deterministic `SystemTime` usage.
+    ///
+    /// Per HOLONIC-BOUNDARY-001, time-dependent operations should use
+    /// injected clocks for deterministic testing and auditing.
+    ///
+    /// This test verifies that the clock abstraction provides deterministic
+    /// behavior for expiration checks.
+    #[test]
+    fn test_clock_injection_determinism_regression() {
+        // Create a manifest that expires at timestamp 1000
+        let manifest = CapabilityManifest {
+            manifest_id: "determinism-test".to_string(),
+            capabilities: vec![make_read_capability("cap", vec![PathBuf::from("/test")])],
+            delegator_id: "delegator".to_string(),
+            created_at: 0,
+            expires_at: 1000,
+        };
+
+        // Verify behavior is deterministic with fixed clock
+        let before_expiry = FixedClock::new(999);
+        let at_expiry = FixedClock::new(1000);
+        let after_expiry = FixedClock::new(1001);
+
+        // Before expiry: NOT expired
+        assert!(
+            !manifest.is_expired_with_clock(&before_expiry),
+            "DETERMINISM: manifest must NOT be expired at timestamp 999"
+        );
+
+        // At expiry boundary: NOT expired (> check, not >=)
+        assert!(
+            !manifest.is_expired_with_clock(&at_expiry),
+            "DETERMINISM: manifest must NOT be expired at timestamp 1000 (boundary)"
+        );
+
+        // After expiry: expired
+        assert!(
+            manifest.is_expired_with_clock(&after_expiry),
+            "DETERMINISM: manifest MUST be expired at timestamp 1001"
+        );
+
+        // Run the same checks multiple times to verify determinism
+        for _ in 0..100 {
+            assert!(!manifest.is_expired_with_clock(&before_expiry));
+            assert!(!manifest.is_expired_with_clock(&at_expiry));
+            assert!(manifest.is_expired_with_clock(&after_expiry));
+        }
     }
 }
