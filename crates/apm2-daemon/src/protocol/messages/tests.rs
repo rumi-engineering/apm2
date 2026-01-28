@@ -320,8 +320,8 @@ fn test_receipt_canonical_bytes_deterministic() {
     assert_eq!(bytes2, bytes3);
 }
 
-/// Per AD-VERIFY-001: canonical_bytes must produce identical output regardless
-/// of the order in which repeated fields were added.
+/// Per AD-VERIFY-001: `canonical_bytes` must produce identical output
+/// regardless of the order in which repeated fields were added.
 #[test]
 fn test_receipt_canonical_bytes_sorts_unsorted_evidence_refs() {
     // Create two receipts with evidence_refs added in different orders
@@ -345,9 +345,10 @@ fn test_receipt_canonical_bytes_sorts_unsorted_evidence_refs() {
     );
 }
 
-/// Test that TelemetryPolicy sorts triggers by (metric, threshold) for total
+/// Test that `TelemetryPolicy` sorts triggers by (metric, threshold) for total
 /// ordering
 #[test]
+#[allow(clippy::float_cmp)] // Exact comparison is intentional for these test values
 fn test_telemetry_policy_canonicalize_total_ordering() {
     // Same metric but different thresholds - should have stable ordering
     let mut policy = TelemetryPolicy {
