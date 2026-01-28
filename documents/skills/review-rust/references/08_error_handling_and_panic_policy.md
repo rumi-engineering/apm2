@@ -54,16 +54,16 @@ discouraged_patterns:
 panic_taxonomy:
   UNACCEPTABLE:
     conditions:
-      - "derived from caller input"
+      - "derived from caller input (parsing, indexing)"
       - "triggered by plausible internal state in production"
-      - "occurs in QCP code paths (DoS risk)"
+      - "occurs in Security-Critical Path (SCP) code (DoS risk)"
     on_match:
       EMIT Finding:
         id: PANIC-UNACCEPTABLE
         severity: BLOCKER
         remediation:
           type: CODE
-          specification: "Convert to Result or add validation"
+          specification: "Replace with structured Result error and fail-closed handling"
 
   POTENTIALLY_ACCEPTABLE:
     conditions:

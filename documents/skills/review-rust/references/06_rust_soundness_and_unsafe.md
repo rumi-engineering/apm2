@@ -112,6 +112,20 @@ FOR EACH unsafe_block IN diff:
         remediation:
           type: DOC
           specification: "Safety comment must address aliasing, lifetimes, or validity"
+
+  assertion_4:
+    id: UNSAFE-SCP
+    predicate: |
+      IF is_scp_path THEN
+        justification.is_extraordinary() AND tested_with_miri
+    on_fail:
+      EMIT Finding:
+        id: RUST-UNSAFE-SCP
+        severity: CRITICAL
+        location: {unsafe_block.location}
+        remediation:
+          type: CODE
+          specification: "Unsafe in SCP must be proven necessary and defended by Miri/Fuzz tests"
 ```
 
 ---

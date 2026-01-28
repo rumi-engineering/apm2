@@ -81,6 +81,23 @@ Guarantee:
 [PROVENANCE] Rust Reference: `.await` is a suspension point; dropping a future runs destructors.
 [VERIFICATION] Async cancellation tests; Loom where the sync protocol can be modeled.
 
+[CONTRACT: CTR-1004] Bounded Concurrency and Backpressure.
+- REJECT IF: tasks are spawned based on untrusted input without a global or per-peer limit.
+- REJECT IF: message processing lacks backpressure or timeouts.
+- ENFORCE BY:
+  - `Semaphore` or bounded channel for task pools.
+  - mandatory `timeout()` on all network/IPC futures.
+  - explicit per-peer task budget.
+[PROVENANCE] THREAT_MODEL.md; RSK-1601.
+
+[CONTRACT: CTR-1005] Async Cancellation Safety.
+- REJECT IF: cancellation of a future can leave durable state (files, ledgers) in a corrupted or partial state.
+- ENFORCE BY:
+  - no partial writes (CTR-1502/1607).
+  - use `tokio::select!` carefully; ensure branches don't drop critical state half-written.
+[PROVENANCE] Rust Reference: Futures can be dropped at any suspension point.
+[VERIFICATION] Tests that inject cancellation at specific suspension points.
+
 ## References (Normative Anchors)
 
 - Rust Reference: Behavior considered undefined (data races): https://doc.rust-lang.org/reference/behavior-considered-undefined.html

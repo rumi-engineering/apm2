@@ -53,9 +53,39 @@ pub fn read_stream_bounded<R: io::Read>(mut r: R, out: &mut Vec<u8>, max: usize)
 [VERIFICATION] Golden test vectors; backward/forward compatibility tests across versions.
 
 [CONTRACT: CTR-1604] Strict Serde for Audit and Ledger Types.
-- REJECT IF: types persisted to ledgers or audit trails lack strict parsing.
-- ENFORCE BY: `#[serde(deny_unknown_fields)]` to prevent hidden data injection or ambiguity.
+- REJECT IF: types parsed from untrusted input lack strict parsing rules.
+- ENFORCE BY:
+  - `#[serde(deny_unknown_fields)]` for all boundary objects.
+  - avoid `serde(untagged)` and `flatten` on untrusted objects (ambiguity risk).
+  - avoid permissive enums at boundaries; use explicit tagging.
 [PROVENANCE] APM2 Security Policy; CTR-SERDE001.
+
+[CONTRACT: CTR-1605] Deterministic Canonicalization and Signing.
+- REJECT IF: canonicalization is non-deterministic or depends on platform-specific layout.
+- ENFORCE BY:
+  - perform canonicalization **before** signing/hashing.
+  - ensure repeated fields are sorted by a stable key (lexicographic for strings/bytes).
+  - verify verification uses the EXACT canonical bytes used for signing.
+  - avoid floating-point normalization or multiple semantic encodings.
+[PROVENANCE] AD-VERIFY-001; CTR-2612.
+
+[CONTRACT: CTR-1606] Replay and Downgrade Protection.
+- REJECT IF: security-relevant messages lack a monotonic sequence, nonce, or lease window.
+- REJECT IF: version negotiation allows silent downgrade to weaker protocol versions.
+- ENFORCE BY:
+  - strictly increasing cursors/sequence numbers.
+  - non-reusable nonces for sensitive commands.
+  - explicit minimum supported version policy.
+[PROVENANCE] THREAT_MODEL.md; INV-2615.
+
+[CONTRACT: CTR-1607] Ledger and Persistence Integrity.
+- REJECT IF: ledger writes can rewrite history or events are non-deterministically ordered.
+- REJECT IF: crash recovery "best-effort continues" on integrity failure in SCP.
+- ENFORCE BY:
+  - append-only write patterns (temp -> fsync -> rename).
+  - fail-stop on corruption detect.
+  - newline injection guards for log-based persistence.
+[PROVENANCE] APM2 Security Policy; CTR-2607.
 
 ## References (Normative Anchors)
 

@@ -125,11 +125,8 @@ pub enum ProtocolError {
 impl ProtocolError {
     /// Create a frame too large error.
     #[must_use]
-    pub const fn frame_too_large(size: usize) -> Self {
-        Self::FrameTooLarge {
-            size,
-            max: MAX_FRAME_SIZE,
-        }
+    pub const fn frame_too_large(size: usize, max: usize) -> Self {
+        Self::FrameTooLarge { size, max }
     }
 
     /// Create a version mismatch error.
@@ -189,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_frame_too_large_error() {
-        let err = ProtocolError::frame_too_large(20_000_000);
+        let err = ProtocolError::frame_too_large(20_000_000, MAX_FRAME_SIZE);
         assert!(err.is_protocol_violation());
         assert!(!err.is_recoverable());
 

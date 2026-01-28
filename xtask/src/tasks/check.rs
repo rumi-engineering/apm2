@@ -868,6 +868,7 @@ fn restart_review(
     // Use ReviewerSpawner for centralized spawn logic
     let spawner = ReviewerSpawner::new(reviewer_type, pr_url, head_sha)
         .with_prompt_file(prompt_path_ref)?
+        .with_model("gemini-3-flash-preview")
         .with_restart_count(restart_count);
 
     match spawner.spawn_background() {

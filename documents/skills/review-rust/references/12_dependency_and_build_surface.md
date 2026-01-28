@@ -173,6 +173,7 @@ interface DependencyFinding extends Finding {
   dependency_issue?: DependencyIssue;
   license_issue?: LicenseIssue;
   build_issue?: BuildIssue;
+  process_issue?: ProcessIssue;
 }
 
 type DependencyIssue =
@@ -191,4 +192,45 @@ type BuildIssue =
   | "NONDETERMINISTIC"
   | "NETWORK_ACCESS"
   | "UNDOCUMENTED_OUTPUT";
+
+type ProcessIssue =
+  | "ARGUMENT_INJECTION"
+  | "ENVIRONMENT_BLEED"
+  | "HEADLESS_FAILURE";
+
+---
+
+## State: Process Execution and Shell Safety
+
+```yaml
+IF diff.spawns_process (Command::new | shelling out):
+  auto_qcp: true
+
+  requirements:
+    - id: PROC-ARGS
+      predicate: "complex strings (prompts/markdown) NOT passed as CLI arguments"
+      on_fail:
+        EMIT Finding:
+          id: PROC-ARGS-001
+          severity: BLOCKER
+          remediation:
+            type: CODE
+            specification: "Write content to temp file and redirect via stdin"
+
+    - id: PROC-ENV
+      predicate: "explicit environment management (no silent inheritance of secrets)"
+      on_fail:
+        severity: MAJOR
+        remediation: "Clear or allowlist specific environment variables"
+
+    - id: PROC-HEADLESS
+      predicate: "behavior verified in headless/non-interactive contexts"
+      on_fail:
+        severity: MEDIUM
+        remediation: "Ensure tool does not hang or fail in headless mode (CI)"
+
+  rationale:
+    - "Argument injection: markdown backticks/quotes break CLI parsing"
+    - "Privilege bleed: child processes inherit sensitive env vars"
+```
 ```

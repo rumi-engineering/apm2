@@ -481,6 +481,8 @@ pub struct ReviewerSpawner<'a> {
     head_sha: &'a str,
     /// The prompt content (already interpolated with variables).
     prompt_content: Option<String>,
+    /// The AI model to use (e.g., "gemini-3-flash-preview").
+    model: Option<String>,
     /// Number of times this reviewer has been restarted (for remediation).
     restart_count: u32,
 }
@@ -500,6 +502,7 @@ impl<'a> ReviewerSpawner<'a> {
             pr_url,
             head_sha,
             prompt_content: None,
+            model: None,
             restart_count: 0,
         }
     }
@@ -510,6 +513,13 @@ impl<'a> ReviewerSpawner<'a> {
     #[must_use]
     pub fn with_prompt_content(mut self, content: &str) -> Self {
         self.prompt_content = Some(content.to_string());
+        self
+    }
+
+    /// Set the AI model to use.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 
@@ -582,8 +592,11 @@ impl<'a> ReviewerSpawner<'a> {
         let (_, prompt_path) = prompt_temp.keep().ok()?;
 
         // Build the script command with cleanup
-        let shell_cmd =
-            crate::shell_escape::build_script_command_with_cleanup(&prompt_path, &log_path);
+        let shell_cmd = crate::shell_escape::build_script_command_with_cleanup(
+            &prompt_path,
+            &log_path,
+            self.model.as_deref(),
+        );
 
         // Spawn the process
         let child = std::process::Command::new("sh")
@@ -669,8 +682,11 @@ impl<'a> ReviewerSpawner<'a> {
         let _ = state.save();
 
         // Build command with log capture (no cleanup - we handle it)
-        let shell_cmd =
-            crate::shell_escape::build_script_command(&prompt_temp_path, Some(&log_path));
+        let shell_cmd = crate::shell_escape::build_script_command(
+            &prompt_temp_path,
+            Some(&log_path),
+            self.model.as_deref(),
+        );
 
         // Run synchronously and wait
         let status = std::process::Command::new("sh")
