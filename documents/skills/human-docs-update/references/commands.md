@@ -13,9 +13,9 @@ commands[13]:
     command: "git checkout -b <branch-name>"
     purpose: "Create and switch to a new feature branch."
 
-  - name: run-precommit
-    command: "pre-commit run --all-files"
-    purpose: "Run all pre-commit hooks (formatting, linting, etc.)."
+  - name: run-local-hooks
+    command: ".cargo-husky/hooks/pre-commit"
+    purpose: "Run all local pre-commit hooks (formatting, linting, etc.)."
 
   - name: stage-files
     command: "git add <file1> <file2> ..."
@@ -67,8 +67,8 @@ git branch --show-current
 # 2. Create feature branch if on main
 git checkout -b docs/update-readme
 
-# 3. Run pre-commit checks
-pre-commit run --all-files
+# 3. Run local checks
+.cargo-husky/hooks/pre-commit
 
 # 4. Stage and commit
 git add documents/README.md

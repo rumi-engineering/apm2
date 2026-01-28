@@ -44,6 +44,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Generate bootstrap schema manifest
     generate_bootstrap_manifest()?;
 
+    // Manually link commit-msg hook since cargo-husky 1.5.0 doesn't support it.
+    // Also ensure core.hooksPath is unset to allow standard hooks to run.
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+
+        // Unset core.hooksPath if it exists, as it can block cargo-husky hooks
+        let _ = Command::new("git")
+            .args(["config", "--unset", "core.hooksPath"])
+            .status();
+
+        let git_hooks_dir = Path::new("../../.git/hooks");
+        let custom_hooks_dir = Path::new("../../.cargo-husky/hooks");
+        let commit_msg_hook = custom_hooks_dir.join("commit-msg");
+
+        if git_hooks_dir.exists() && commit_msg_hook.exists() {
+            let target = git_hooks_dir.join("commit-msg");
+            if !target.exists() {
+                // Use a relative symlink so it works across different checkouts.
+                // The link is created in .git/hooks/, so it needs to point back to the root.
+                let _ = std::os::unix::fs::symlink("../../.cargo-husky/hooks/commit-msg", target);
+            }
+        }
+    }
+
     Ok(())
 }
 

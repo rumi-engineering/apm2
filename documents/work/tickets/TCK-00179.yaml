@@ -1,0 +1,54 @@
+acceptance_criteria:
+  - criterion: cargo-husky integration
+    verification: Git hooks are automatically created/updated in .git/hooks upon running cargo commands.
+  - criterion: Automated hook installation
+    verification: Fresh clones or worktrees automatically set up hooks without manual intervention (beyond running cargo).
+  - criterion: Hook parity
+    verification: All checks from .pre-commit-config.yaml (fmt, clippy, tests, proto-verify, typos, taplo, markdownlint) are either ported to cargo-husky or maintained via equivalent Rust tools.
+  - criterion: Improved speed
+    verification: Hook execution is faster than the current pre-commit setup.
+implementation:
+  files_to_modify:
+    - path: Cargo.toml
+      purpose: Add cargo-husky as a dev-dependency.
+    - path: .pre-commit-config.yaml
+      purpose: Deprecate or remove in favor of cargo-husky.
+  implementation_steps:
+    - step: 1
+      action: Add cargo-husky to workspace dev-dependencies.
+      details: Configure it to run fmt, clippy, and tests.
+    - step: 2
+      action: Migrate non-Rust hooks.
+      details: Port typos, taplo, and markdownlint to cargo-husky compatible configurations or Rust-native alternatives.
+    - step: 3
+      action: Verify automatic installation.
+      details: Test with a fresh git worktree to ensure hooks are installed automatically.
+    - step: 4
+      action: Clean up.
+      details: Remove .pre-commit-config.yaml and update documentation if necessary.
+  summary: |
+    Migrate the project from pre-commit to cargo-husky. This ensures that hooks
+    are automatically installed on every clone or worktree when cargo commands
+    are run, improving onboarding and consistency. It also aims to improve
+    the speed of hook execution by using Rust-native tooling.
+notes: |
+    Requested by user to improve speed and automate hook installation.
+schema_version: "2026-01-27"
+template_version: "2026-01-27"
+test_requirements:
+  - description: Hook trigger
+    test_id: HOOK-00179-01
+    verification_command: git commit --allow-empty -m "test: trigger hooks"
+ticket:
+  depends_on: []
+  id: TCK-00179
+  requirement_ids: []
+  status: COMPLETED
+  title: Migrate from pre-commit to cargo-husky for automated git hook management
+summary: |
+  Successfully migrated git hooks from pre-commit to cargo-husky.
+  - Added cargo-husky to workspace and apm2-core dev-dependencies.
+  - Configured user-hooks in .cargo-husky/hooks/ for pre-commit and pre-push.
+  - Implemented manual linking for commit-msg hook in apm2-core build.rs.
+  - Removed .pre-commit-config.yaml.
+  Hooks are now automatically installed on any machine running 'cargo test'.

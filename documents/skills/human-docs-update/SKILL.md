@@ -76,7 +76,7 @@ decision_tree:
 This skill handles the complete workflow for getting documentation updates reviewed and merged:
 
 1. **Normalize Git State** - Handle any starting state (uncommitted changes, behind remote, etc.)
-2. **Run Local Checks** - Execute pre-commit hooks and formatting
+2. **Run Local Checks** - Execute automated git hooks and formatting
 3. **Stage & Commit** - Stage changes and create a conventional commit
 4. **Sync & Push** - Sync with origin/main, push the branch (with `--force-with-lease` for rebased history)
 5. **Create PR** - Create pull request using `gh pr create`
@@ -106,12 +106,12 @@ This skill handles the complete workflow for getting documentation updates revie
 - `Read` - Read files to understand changes
 - `Glob` - Find modified files
 - `Grep` - Search contents
-- `Bash` - Git operations, pre-commit, gh cli
+- `Bash` - Git operations, cargo-husky, gh cli
 
 ## Success Criteria
 
 - PR created with descriptive title and body
-- All local checks pass (via `pre-commit`)
+- All local checks pass (via automated git hooks)
 - Branch synced with origin/main (via `git rebase`)
 - Branch pushed with `--force-with-lease` (safe force push after rebase)
 - AI reviews requested:
