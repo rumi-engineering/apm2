@@ -47,16 +47,16 @@ use super::stats::{CpuStats, IoStats, MemoryStats, MetricSource};
 /// typically small, but we use a generous limit for safety.
 pub const MAX_PROC_FILE_SIZE: u64 = 64 * 1024;
 
-/// Fallback page size if sysconf fails (4096 bytes).
-const FALLBACK_PAGE_SIZE: u64 = 4096;
-
-/// Fallback clock ticks per second if sysconf fails (100 Hz).
-const FALLBACK_CLK_TCK: u64 = 100;
-
 /// Runtime-queried system page size.
 ///
 /// Uses libc `sysconf(_SC_PAGESIZE)` for accurate system-specific value.
-#[allow(unsafe_code)]
+///
+/// # Panics
+///
+/// Panics if `sysconf(_SC_PAGESIZE)` fails. This is fail-closed behavior per
+/// security review: on 64KB ARM64 systems, a hardcoded 4KB fallback would
+/// underreport memory by 16x, enabling budget bypass attacks.
+#[allow(unsafe_code, clippy::cast_sign_loss)]
 fn page_size() -> u64 {
     static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
     *PAGE_SIZE.get_or_init(|| {
@@ -66,15 +66,14 @@ fn page_size() -> u64 {
         let result = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if result > 0 {
             // SAFETY: We verified result > 0, so the cast is safe
-            #[allow(clippy::cast_sign_loss)]
-            let value = result as u64;
-            value
+            result as u64
         } else {
-            debug!(
-                "sysconf(_SC_PAGESIZE) failed, using fallback {}",
-                FALLBACK_PAGE_SIZE
+            // Fail-closed: sysconf failure indicates a broken system that cannot
+            // safely report memory metrics. Using a fallback could enable budget
+            // bypass on systems with larger page sizes (e.g., 64KB ARM64).
+            panic!(
+                "sysconf(_SC_PAGESIZE) failed (returned {result}): cannot safely report memory metrics"
             );
-            FALLBACK_PAGE_SIZE
         }
     })
 }
@@ -82,7 +81,13 @@ fn page_size() -> u64 {
 /// Runtime-queried clock ticks per second.
 ///
 /// Uses libc `sysconf(_SC_CLK_TCK)` for accurate system-specific value.
-#[allow(unsafe_code)]
+///
+/// # Panics
+///
+/// Panics if `sysconf(_SC_CLK_TCK)` fails. This is fail-closed behavior per
+/// security review: incorrect `CLK_TCK` values would cause CPU time
+/// calculations to be incorrect, potentially enabling budget bypass.
+#[allow(unsafe_code, clippy::cast_sign_loss)]
 fn clk_tck() -> u64 {
     static CLK_TCK: OnceLock<u64> = OnceLock::new();
     *CLK_TCK.get_or_init(|| {
@@ -92,15 +97,14 @@ fn clk_tck() -> u64 {
         let result = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         if result > 0 {
             // SAFETY: We verified result > 0, so the cast is safe
-            #[allow(clippy::cast_sign_loss)]
-            let value = result as u64;
-            value
+            result as u64
         } else {
-            debug!(
-                "sysconf(_SC_CLK_TCK) failed, using fallback {}",
-                FALLBACK_CLK_TCK
+            // Fail-closed: sysconf failure indicates a broken system that cannot
+            // safely calculate CPU time. Using a fallback could cause incorrect
+            // CPU accounting.
+            panic!(
+                "sysconf(_SC_CLK_TCK) failed (returned {result}): cannot safely calculate CPU time"
             );
-            FALLBACK_CLK_TCK
         }
     })
 }
@@ -295,12 +299,16 @@ impl ProcReader {
             "read CPU from /proc"
         );
 
-        Ok(CpuStats::new(
-            usage_ns,
-            user_ns,
-            system_ns,
-            MetricSource::Proc,
-        ))
+        // Use try_new to enforce INV-CPU001 (usage >= user + system)
+        // Note: This should always pass since we calculate usage = user + system,
+        // but explicit validation ensures we catch any future bugs.
+        CpuStats::try_new(usage_ns, user_ns, system_ns, MetricSource::Proc).map_err(|reason| {
+            ProcError::ParseFailed {
+                pid: self.pid.as_raw(),
+                file: "stat".to_string(),
+                reason,
+            }
+        })
     }
 
     /// Reads memory statistics from `/proc/{pid}/statm` and `/proc/{pid}/stat`.
@@ -314,6 +322,11 @@ impl ProcReader {
     ///
     /// `/proc/{pid}/stat` contains page fault counts at fields 10 (minflt) and
     /// 12 (majflt).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProcError::ParseFailed` if any required field is missing or
+    /// malformed. This is fail-closed behavior per security review.
     pub fn read_memory(&self) -> ProcResult<MemoryStats> {
         // Read statm for RSS
         let statm_content = self.read_file("statm")?;
@@ -337,10 +350,14 @@ impl ProcReader {
 
         let rss_bytes = resident_pages.saturating_mul(page_size());
 
-        // Read stat for page faults
+        // Read stat for page faults - fail closed on parse errors
         let proc_stat = self.read_file("stat")?;
-        let (page_faults_minor, page_faults_major) =
-            parse_stat_page_faults(&proc_stat).unwrap_or((0, 0));
+        let (page_faults_minor, page_faults_major) = parse_stat_page_faults(&proc_stat)
+            .ok_or_else(|| ProcError::ParseFailed {
+                pid: self.pid.as_raw(),
+                file: "stat".to_string(),
+                reason: "failed to parse page fault counts from stat file".to_string(),
+            })?;
 
         debug!(
             pid = %self.pid,
@@ -351,13 +368,19 @@ impl ProcReader {
         );
 
         // Note: peak_bytes is set to rss_bytes since /proc doesn't track peak
-        Ok(MemoryStats::new(
+        // Use try_new to enforce INV-MEM001 (peak >= rss)
+        MemoryStats::try_new(
             rss_bytes,
             rss_bytes, // No peak tracking in /proc
             page_faults_major,
             page_faults_minor,
             MetricSource::Proc,
-        ))
+        )
+        .map_err(|reason| ProcError::ParseFailed {
+            pid: self.pid.as_raw(),
+            file: "memory".to_string(),
+            reason,
+        })
     }
 
     /// Reads I/O statistics from `/proc/{pid}/io`.
@@ -381,34 +404,77 @@ impl ProcReader {
     /// # Permissions
     ///
     /// Reading `/proc/{pid}/io` may require `CAP_SYS_PTRACE` or same UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProcError::ParseFailed` if any required field has a malformed
+    /// value. This is fail-closed behavior per security review.
     pub fn read_io(&self) -> ProcResult<IoStats> {
         let content = self.read_file("io")?;
 
-        let mut read_bytes: u64 = 0;
-        let mut write_bytes: u64 = 0;
-        let mut read_ops: u64 = 0;
-        let mut write_ops: u64 = 0;
+        let mut read_bytes: Option<u64> = None;
+        let mut write_bytes: Option<u64> = None;
+        let mut read_ops: Option<u64> = None;
+        let mut write_ops: Option<u64> = None;
 
         for line in content.lines() {
             if let Some((key, value)) = line.split_once(':') {
                 let value = value.trim();
                 match key.trim() {
                     "read_bytes" => {
-                        read_bytes = value.parse().unwrap_or(0);
+                        read_bytes = Some(value.parse().map_err(|_| ProcError::ParseFailed {
+                            pid: self.pid.as_raw(),
+                            file: "io".to_string(),
+                            reason: format!("invalid read_bytes value: '{value}'"),
+                        })?);
                     },
                     "write_bytes" => {
-                        write_bytes = value.parse().unwrap_or(0);
+                        write_bytes = Some(value.parse().map_err(|_| ProcError::ParseFailed {
+                            pid: self.pid.as_raw(),
+                            file: "io".to_string(),
+                            reason: format!("invalid write_bytes value: '{value}'"),
+                        })?);
                     },
                     "syscr" => {
-                        read_ops = value.parse().unwrap_or(0);
+                        read_ops = Some(value.parse().map_err(|_| ProcError::ParseFailed {
+                            pid: self.pid.as_raw(),
+                            file: "io".to_string(),
+                            reason: format!("invalid syscr value: '{value}'"),
+                        })?);
                     },
                     "syscw" => {
-                        write_ops = value.parse().unwrap_or(0);
+                        write_ops = Some(value.parse().map_err(|_| ProcError::ParseFailed {
+                            pid: self.pid.as_raw(),
+                            file: "io".to_string(),
+                            reason: format!("invalid syscw value: '{value}'"),
+                        })?);
                     },
                     _ => {},
                 }
             }
         }
+
+        // Fail closed: require all expected fields to be present
+        let read_bytes = read_bytes.ok_or_else(|| ProcError::ParseFailed {
+            pid: self.pid.as_raw(),
+            file: "io".to_string(),
+            reason: "missing read_bytes field".to_string(),
+        })?;
+        let write_bytes = write_bytes.ok_or_else(|| ProcError::ParseFailed {
+            pid: self.pid.as_raw(),
+            file: "io".to_string(),
+            reason: "missing write_bytes field".to_string(),
+        })?;
+        let read_ops = read_ops.ok_or_else(|| ProcError::ParseFailed {
+            pid: self.pid.as_raw(),
+            file: "io".to_string(),
+            reason: "missing syscr field".to_string(),
+        })?;
+        let write_ops = write_ops.ok_or_else(|| ProcError::ParseFailed {
+            pid: self.pid.as_raw(),
+            file: "io".to_string(),
+            reason: "missing syscw field".to_string(),
+        })?;
 
         debug!(
             pid = %self.pid,

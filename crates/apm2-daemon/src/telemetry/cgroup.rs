@@ -526,7 +526,18 @@ pub fn episode_cgroup_path_with_root(episode_id: &str, cgroup_root: &str) -> Cgr
     Ok(PathBuf::from(cgroup_root).join(APM2_SLICE).join(scope_name))
 }
 
-/// Validates an episode ID for use in cgroup scope names.
+/// Validates an episode ID for use in cgroup scope names and D-Bus paths.
+///
+/// Per security review, this validation is strengthened to prevent:
+/// - Path injection via `/`, `\0`, `..`
+/// - D-Bus path injection via special characters
+/// - Systemd unit name violations
+///
+/// Allowed characters: alphanumeric (a-z, A-Z, 0-9), hyphen (-), underscore (_)
+/// This is the intersection of safe characters for:
+/// - Cgroup paths (no `/`, `\0`)
+/// - D-Bus object paths (alphanumeric + `_`)
+/// - Systemd unit names (alphanumeric + `-:_.@`)
 fn validate_episode_id(episode_id: &str) -> CgroupResult<()> {
     if episode_id.is_empty() {
         return Err(CgroupError::InvalidEpisodeId {
@@ -540,24 +551,35 @@ fn validate_episode_id(episode_id: &str) -> CgroupResult<()> {
         });
     }
 
-    // Forbidden characters in cgroup names
-    if episode_id.contains('/') {
-        return Err(CgroupError::InvalidEpisodeId {
-            reason: "episode ID cannot contain '/'".to_string(),
-        });
-    }
-
-    if episode_id.contains('\0') {
-        return Err(CgroupError::InvalidEpisodeId {
-            reason: "episode ID cannot contain null bytes".to_string(),
-        });
-    }
-
-    // systemd scope names have additional restrictions
+    // systemd scope names cannot start with '.'
     if episode_id.starts_with('.') {
         return Err(CgroupError::InvalidEpisodeId {
             reason: "episode ID cannot start with '.'".to_string(),
         });
+    }
+
+    // Check for path traversal patterns
+    if episode_id.contains("..") {
+        return Err(CgroupError::InvalidEpisodeId {
+            reason: "episode ID cannot contain '..' (path traversal)".to_string(),
+        });
+    }
+
+    // Validate all characters are safe for cgroups, D-Bus, and systemd
+    // Allow: a-z, A-Z, 0-9, -, _
+    // This is intentionally restrictive to be safe across all contexts
+    for (idx, ch) in episode_id.chars().enumerate() {
+        let is_safe = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_';
+        if !is_safe {
+            return Err(CgroupError::InvalidEpisodeId {
+                reason: format!(
+                    "episode ID contains invalid character '{}' at position {} \
+                     (allowed: alphanumeric, hyphen, underscore)",
+                    ch.escape_debug(),
+                    idx
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -576,11 +598,18 @@ fn check_controllers(cgroup_path: &Path) -> ControllerAvailability {
 // Cgroup Scope Creation (per AD-CGROUP-001)
 // ============================================================================
 
-/// Resource limits for an episode cgroup scope.
+/// OS-level resource limits for an episode cgroup scope.
 ///
 /// Specifies the resource constraints to apply when creating a cgroup scope.
+/// This type represents OS-level cgroup limits, distinct from the application-
+/// level `EpisodeBudget` type used for work tracking.
+///
+/// # Note
+///
+/// Named `OsResourceLimits` to avoid collision with the central `EpisodeBudget`
+/// type in the episode module, which tracks application-level resource budgets.
 #[derive(Debug, Clone, Default)]
-pub struct EpisodeBudget {
+pub struct OsResourceLimits {
     /// Memory limit in bytes (maps to `memory.max`).
     pub memory_bytes: Option<u64>,
     /// CPU time limit in microseconds per period (maps to `cpu.max`).
@@ -633,7 +662,7 @@ pub struct ScopeCreationResult {
 pub async fn create_episode_scope(
     episode_id: &str,
     pid: Pid,
-    budget: Option<&EpisodeBudget>,
+    budget: Option<&OsResourceLimits>,
 ) -> CgroupResult<ScopeCreationResult> {
     create_episode_scope_with_root(episode_id, pid, budget, CGROUP_V2_MOUNT).await
 }
@@ -644,7 +673,7 @@ pub async fn create_episode_scope(
 pub async fn create_episode_scope_with_root(
     episode_id: &str,
     pid: Pid,
-    budget: Option<&EpisodeBudget>,
+    budget: Option<&OsResourceLimits>,
     cgroup_root: &str,
 ) -> CgroupResult<ScopeCreationResult> {
     validate_episode_id(episode_id)?;
@@ -700,10 +729,14 @@ pub async fn create_episode_scope_with_root(
 /// Creates a scope via systemd transient API.
 ///
 /// Uses D-Bus to call `org.freedesktop.systemd1.Manager.StartTransientUnit`.
+///
+/// Note: Systemd unit names cannot contain slashes. The scope is placed in
+/// the APM2 slice using the `Slice=` property rather than embedding the
+/// slice name in the unit name.
 async fn create_scope_via_systemd(
     scope_name: &str,
     pid: Pid,
-    budget: Option<&EpisodeBudget>,
+    budget: Option<&OsResourceLimits>,
 ) -> CgroupResult<PathBuf> {
     use zbus::Connection;
 
@@ -724,19 +757,31 @@ async fn create_scope_via_systemd(
         ("PIDs", zbus::zvariant::Value::new(vec![pid_u32])),
         // Delegate controllers to allow nested cgroup management
         ("Delegate", zbus::zvariant::Value::new(true)),
+        // Place the scope in the APM2 slice (systemd unit names cannot contain slashes)
+        ("Slice", zbus::zvariant::Value::new(APM2_SLICE)),
     ];
 
     // Add resource limits if specified
-    if let Some(budget) = budget {
-        if let Some(memory_bytes) = budget.memory_bytes {
+    if let Some(limits) = budget {
+        if let Some(memory_bytes) = limits.memory_bytes {
             properties.push(("MemoryMax", zbus::zvariant::Value::new(memory_bytes)));
         }
-        if let Some((quota, period)) = budget.cpu_quota {
-            // CPUQuota in systemd is expressed as a percentage (e.g., 100 = 100%)
-            // Convert from (quota_usec, period_usec) to percentage
-            let percent = (quota * 100) / period;
-            properties.push(("CPUQuotaPerSecUSec", zbus::zvariant::Value::new(quota)));
-            let _ = percent; // Silence unused variable warning
+        if let Some((quota_usec, period_usec)) = limits.cpu_quota {
+            // CPUQuotaPerSecUSec expects microseconds of CPU time allowed per second.
+            // Given a quota in microseconds and a period in microseconds, we need to
+            // scale to per-second: (quota_usec / period_usec) * 1_000_000 usec/sec
+            // This simplifies to: (quota_usec * 1_000_000) / period_usec
+            //
+            // Example: quota=100000us, period=100000us means 100% of one CPU
+            //          -> (100000 * 1_000_000) / 100000 = 1_000_000 usec/sec
+            let quota_per_sec_usec = quota_usec
+                .saturating_mul(1_000_000)
+                .checked_div(period_usec)
+                .unwrap_or(0);
+            properties.push((
+                "CPUQuotaPerSecUSec",
+                zbus::zvariant::Value::new(quota_per_sec_usec),
+            ));
         }
     }
 
@@ -757,6 +802,8 @@ async fn create_scope_via_systemd(
         })?;
 
     // Use low-level call to StartTransientUnit
+    // Note: Unit name is just the scope name (e.g., "episode-abc123.scope"),
+    // NOT "{slice}/{scope}" which would contain a forbidden slash character.
     let reply: zbus::Message = connection
         .call_method(
             Some("org.freedesktop.systemd1"),
@@ -765,7 +812,7 @@ async fn create_scope_via_systemd(
             "StartTransientUnit",
             // Arguments: name, mode, properties, aux
             &(
-                format!("{APM2_SLICE}/{scope_name}"),
+                scope_name.to_string(),
                 "fail", // mode: fail if exists
                 properties,
                 Vec::<(String, Vec<(String, zbus::zvariant::Value<'_>)>)>::new(), // aux units
@@ -806,7 +853,7 @@ async fn create_scope_via_systemd(
 fn create_scope_via_direct_write(
     scope_name: &str,
     pid: Pid,
-    budget: Option<&EpisodeBudget>,
+    budget: Option<&OsResourceLimits>,
     cgroup_root: &str,
 ) -> CgroupResult<PathBuf> {
     let slice_path = PathBuf::from(cgroup_root).join(APM2_SLICE);
@@ -1078,7 +1125,7 @@ mod tests {
         let result = validate_episode_id("ep/123");
         assert!(matches!(
             result,
-            Err(CgroupError::InvalidEpisodeId { reason }) if reason.contains("'/'")
+            Err(CgroupError::InvalidEpisodeId { reason }) if reason.contains("invalid character")
         ));
     }
 
@@ -1087,8 +1134,35 @@ mod tests {
         let result = validate_episode_id("ep\x00123");
         assert!(matches!(
             result,
-            Err(CgroupError::InvalidEpisodeId { reason }) if reason.contains("null")
+            Err(CgroupError::InvalidEpisodeId { reason }) if reason.contains("invalid character")
         ));
+    }
+
+    #[test]
+    fn test_validate_episode_id_path_traversal() {
+        let result = validate_episode_id("ep..123");
+        assert!(matches!(
+            result,
+            Err(CgroupError::InvalidEpisodeId { reason }) if reason.contains("path traversal")
+        ));
+    }
+
+    #[test]
+    fn test_validate_episode_id_special_chars() {
+        // Test various special characters that should be rejected
+        for bad_char in ['@', ':', '.', '!', ' ', '\t', '\n', '\\', '`', '$', '%'] {
+            let id = format!("ep{bad_char}123");
+            let result = validate_episode_id(&id);
+            assert!(
+                matches!(result, Err(CgroupError::InvalidEpisodeId { .. })),
+                "expected rejection for character '{bad_char}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_episode_id_underscore_allowed() {
+        assert!(validate_episode_id("ep_abc_123").is_ok());
     }
 
     #[test]
