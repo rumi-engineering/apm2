@@ -77,6 +77,10 @@
 //!   (CTR-DAEMON-004)
 //! - [`decision`]: Tool request, decision, and result types
 //! - [`dedupe`]: `DedupeCache` for idempotent tool replay
+//! - [`budget_tracker`]: `BudgetTracker` for episode resource management
+//! - [`executor`]: `ToolExecutor` for budget-enforced tool execution
+//! - [`tool_handler`]: `ToolHandler` trait for tool implementations
+//! - [`handlers`]: Stub implementations of core tool handlers
 //!
 //! # Key Types
 //!
@@ -125,6 +129,12 @@ pub mod broker;
 pub mod decision;
 pub mod dedupe;
 
+// TCK-00165: Tool execution and budget charging
+pub mod budget_tracker;
+pub mod executor;
+pub mod handlers;
+pub mod tool_handler;
+
 // Re-export envelope types (TCK-00159)
 // Re-export adapter types (TCK-00162)
 pub use adapter::{
@@ -137,6 +147,8 @@ pub use broker::{
     ToolBroker, ToolBrokerConfig, new_shared_broker,
 };
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
+// Re-export tool execution types (TCK-00165)
+pub use budget_tracker::{BudgetExhaustedError, BudgetSnapshot, BudgetTracker};
 // Re-export capability types (TCK-00163)
 pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
@@ -158,7 +170,12 @@ pub use envelope::{
 };
 // Re-export runtime types (TCK-00160)
 pub use error::{EpisodeError, EpisodeId, MAX_EPISODE_ID_LEN};
+pub use executor::{
+    ContentAddressedStore, ExecutionContext, ExecutorError, SharedToolExecutor, ToolExecutor,
+    new_shared_executor,
+};
 pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal};
+pub use handlers::{ExecuteHandler, ReadFileHandler, WriteFileHandler, register_stub_handlers};
 // Re-export PTY types (TCK-00161)
 pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};
 pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
@@ -179,3 +196,8 @@ pub use scope::{
 pub use snapshot::{PinnedSnapshot, PinnedSnapshotBuilder};
 pub use state::{EpisodeState, QuarantineReason, TerminationClass, validate_transition};
 pub use tool_class::{MAX_TOOL_CLASS_NAME_LEN, ToolClass};
+pub use tool_handler::{
+    ExecuteArgs, GitArgs, InferenceArgs, MAX_HANDLERS, MAX_RESULT_MESSAGE_LEN, MAX_TOOL_ARGS_SIZE,
+    NetworkArgs, RawArgs, ReadArgs, ResultMetadata, ToolArgs, ToolHandler, ToolHandlerError,
+    ToolResultData, WriteArgs,
+};
