@@ -473,8 +473,9 @@ impl HarnessEvent {
 ///
 /// # Lifecycle
 ///
-/// 1. Call [`spawn`](HarnessAdapter::spawn) to start the process
-/// 2. Use [`output_stream`](HarnessAdapter::output_stream) to receive events
+/// 1. Call [`spawn`](HarnessAdapter::spawn) to start the process and get the
+///    event stream
+/// 2. Consume the returned [`HarnessEventStream`] to receive events
 /// 3. Optionally use [`send_input`](HarnessAdapter::send_input) to send data
 /// 4. Call [`terminate`](HarnessAdapter::terminate) to stop the process
 #[allow(clippy::type_complexity)]
