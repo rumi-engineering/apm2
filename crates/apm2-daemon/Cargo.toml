@@ -12,6 +12,10 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lib]
+name = "apm2_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "apm2-daemon"
 path = "src/main.rs"
@@ -46,6 +50,16 @@ chrono.workspace = true
 # Utilities
 directories.workspace = true
 ctrlc.workspace = true
+
+# Protocol Buffers
+prost.workspace = true
+
+# Cryptography
+blake3.workspace = true
+ed25519-dalek.workspace = true
+
+# D-Bus (systemd integration)
+zbus.workspace = true
 
 [lints]
 workspace = true
