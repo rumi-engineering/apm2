@@ -201,6 +201,8 @@ rfc_problem_and_imports:
         - "Control plane frames are padded to a fixed size or constant envelope"
         - "Padding is applied before encryption and signing"
         - "Frame size is configurable and documented"
+        - "Message dispatch includes random jitter (default 0-50ms)"
+        - "Connection pooling is enabled for control plane channels"
 
     - id: DCS-REQ-0013
       title: "Membership Admission Hardening"
@@ -211,6 +213,9 @@ rfc_problem_and_imports:
         - "Join attempts rate-limited per source IP or identity"
         - "Joining node presents invitation token signed by T1 quorum"
         - "Invalid or missing token rejects membership"
+        - "Tokens are single-use"
+        - "Tokens expire within configurable window (default 24h)"
+        - "Tokens bound to joining node public key"
 
     - id: DCS-REQ-0014
       title: "Cross-Node Capability Verification"
@@ -221,6 +226,7 @@ rfc_problem_and_imports:
         - "Capability proofs include signed delegation chain"
         - "Any node can verify capability via ledger state"
         - "Invalid chains are rejected deterministically"
+        - "Capability proofs include namespace binding"
 
   non_goals:
     - id: NG-0001

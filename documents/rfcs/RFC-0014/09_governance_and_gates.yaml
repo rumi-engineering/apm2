@@ -132,7 +132,7 @@ rfc_governance_and_gates:
       name: "Consensus Safety Verification"
       type: DETERMINISTIC
       purpose: "Verify consensus implementation maintains safety"
-      applies_to: "DCS-007, DCS-008 implementation"
+      applies_to: "DCS-007b/DCS-007c/DCS-007d, DCS-008 implementation"
       pass_criteria:
         - "All TEST-CS-* tests pass"
         - "All TEST-BZ-* tests pass"

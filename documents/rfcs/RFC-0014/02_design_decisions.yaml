@@ -75,7 +75,7 @@ rfc_design_decisions:
       |  +--------+---------+     +--------+---------+     +--------+---------+       |
       |  | AuthorityLog     |     | AuthorityLog     |     | AuthorityLog     |       |
       |  | - LeaseIssued    |     | - LeaseIssued    |     | - LeaseIssued    |       |
-      |  | - CapabilityGrant|     | - PolicyChange   |     | - WorkTransition |       |
+      |  | - CapabilityGranted|   | - PolicyChange   |     | - WorkTransition |       |
       |  | - KeyRotated     |     | - Promotion      |     | - Promotion      |       |
       |  +------------------+     +------------------+     +------------------+       |
       +------------------------------------------------------------------------------+
@@ -290,6 +290,9 @@ rfc_design_decisions:
           - WorkAborted
           - WorkPrAssociated
           - CapabilityRequired
+          - CapabilityGranted
+          - CapabilityDelegated
+          - CapabilityRevoked
           - AdjudicationRequested
           - AdjudicationVote
           - AdjudicationResolved
@@ -388,6 +391,32 @@ rfc_design_decisions:
       requirement_ids:
         - DCS-REQ-0012
 
+    - id: DD-0009
+      title: "Capability Proof Model and Cross-Node Verification"
+      status: DECIDED
+      decision: |
+        Introduce explicit capability lifecycle events to support cross-node verification.
+        A capability proof is a delegation chain rooted in a CapabilityGranted event and
+        optionally extended by CapabilityDelegated events, with revocation recorded via
+        CapabilityRevoked. All capability events are TotalOrder authority events.
+      rationale:
+        - "DCS-REQ-0014 requires cross-node, ledger-verifiable authority"
+        - "OCAP model demands explicit, auditable capability grants"
+        - "Namespace binding prevents cross-namespace replay"
+        - "Reuse Lease/LeaseScope for scope and budget semantics"
+      proof_model:
+        - "Proof includes ordered list of capability events (grant + delegation chain)"
+        - "Each delegation references parent capability hash and is signed by delegator"
+        - "Proof must include namespace, scope_hash, and expires_at for replay protection"
+      mapping_to_leases:
+        - "capability_id == lease_id"
+        - "scope_hash references serialized LeaseScope (CAS)"
+        - "budget_hash optional; if present references serialized Budget (CAS)"
+      requirement_ids:
+        - DCS-REQ-0014
+      evidence_ids:
+        - EVID-0005
+
   component_mapping:
     - requirement_id: DCS-REQ-0001
       verified_components:
@@ -427,4 +456,15 @@ rfc_design_decisions:
         - path: "crates/apm2-core/src/consensus/anti_entropy.rs"
           status: NEW
           purpose: "Anti-entropy gossip protocol"
+      confidence: MEDIUM
+
+    - requirement_id: DCS-REQ-0014
+      verified_components:
+        - path: "crates/apm2-core/src/lease/"
+          status: EXTEND
+          changes: "Expose lease scope hashes and delegation-chain verification utilities"
+      new_components:
+        - path: "crates/apm2-core/src/lease/capability.rs"
+          status: NEW
+          purpose: "Cross-node capability proof verification"
       confidence: MEDIUM

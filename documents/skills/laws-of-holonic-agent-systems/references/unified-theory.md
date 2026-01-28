@@ -167,7 +167,7 @@
           "node_class": "EXPLANATORY"
         },
         "THESIS-02": {
-          "statement": "Truth in the factory is a monotone substrate (append-only ledger + content-addressed evidence); mutable state (workspace, codebase) is a projection derived by reducers.",
+          "statement": "Truth in the factory is an authoritative monotone substrate (append-only ledger + content-addressed evidence) with deterministic addressability; agents act on bounded views committed to a ledger head/checkpoint, while mutable state (workspace, codebase) is a projection derived by reducers.",
           "implications": [
             "Correctness and auditability must not depend on external platforms (forge, consoles); they are projections/adapters.",
             "Recovery and replay are achieved by replaying facts through pure reducers; process memory is disposable (crash-only).",
@@ -215,7 +215,7 @@
         },
         "SEP-02": {
           "name": "Claim vs Evidence",
-          "statement": "Claims (summaries, approvals, narratives) are non-authoritative until bound to verifiable evidence and receipts; summaries are receipts with pointers to atomic facts.",
+          "statement": "Claims (summaries, approvals, narratives) are non-authoritative until bound to verifiable evidence and receipts; derived artifacts (summaries, indices) are not equivalent to raw evidence and must declare derivation + loss profile, with gates specifying when zoom-in to evidence is required.",
           "primary_objects": [
             "EvidenceBundle",
             "GateReceipt",
@@ -239,6 +239,22 @@
           "law_refs": [
             "LAW-03",
             "LAW-05",
+            "LAW-15"
+          ],
+          "node_class": "EXPLANATORY"
+        },
+        "SEP-04": {
+          "name": "Authority vs View",
+          "statement": "The ledger is authoritative; an agent's in-window context is a bounded, budgeted view committed to a ledger head/checkpoint and equipped with addressable selectors for any omitted referenced facts. Synchronization is by commitment hash, not by full history inclusion.",
+          "primary_objects": [
+            "ContextPack",
+            "SummaryReceipt",
+            "LedgerEvent"
+          ],
+          "law_refs": [
+            "LAW-03",
+            "LAW-06",
+            "LAW-07",
             "LAW-15"
           ],
           "node_class": "EXPLANATORY"
@@ -266,7 +282,7 @@
         "SYM-s": {
           "name": "s",
           "type": "representation",
-          "meaning": "Injected sufficient-statistics approximation of full history/state used for decision-making.",
+          "meaning": "Bounded view/representation (e.g., ContextPack + SummaryReceipts) committed to a ledger head/checkpoint; may omit history but must provide deterministic addressability (hashes/ranges) for zoom-in.",
           "node_class": "EXPLANATORY"
         },
         "SYM-I": {
@@ -456,6 +472,7 @@
         "statement": "At-least-once delivery and partial failures are default; actuation must be safe under retries and convergence must be explicit under drift.",
         "derived_rules": [
           "every side effect is idempotent or has explicit compensation/rollback",
+          "retries are conditional: issue idempotency keys and precondition/revision guards; if guards fail due to drift, no-op and replan",
           "every tool actuation emits an execution receipt bound to a dedupe key",
           "facts declare merge operators or conflict rule class; conflicts are recorded as defects",
           "reserve consensus for small control planes; prefer convergent replication for data planes"
@@ -481,7 +498,7 @@
           "attestation reduces transitive trust: downstream holons accept artifacts via evidence, not narrative",
           "default-deny tool capabilities; no ambient authority",
           "deny-by-default context reads outside ContextPacks; treat escalations as defects unless authorized",
-          "prevent confused-deputy: avoid giving an agent knowledge that enables unauthorized actuation"
+          "prevent confused-deputy: knowledge does not grant authority; bind capabilities to intent/parameters and require explicit escalation paths"
         ],
         "mechanisms": [
           "MECH-ATTESTATION",
@@ -553,6 +570,14 @@
         },
         "TRUTH-AX-03": {
           "statement": "If it cannot be proven via a signed ledger event and evidence digest, it did not happen (within the factory).",
+          "node_class": "NORMATIVE"
+        },
+        "TRUTH-AX-04": {
+          "statement": "Holons operate on bounded, budgeted views of truth (ContextPacks/snapshots/summaries) that MUST include a cryptographic commitment to the relevant ledger head/checkpoint and deterministic addressability for any omitted referenced facts.",
+          "node_class": "NORMATIVE"
+        },
+        "TRUTH-AX-05": {
+          "statement": "Compaction and summarization are monotone operations: they publish derived artifacts as new events/artifacts referencing prior history by hash/range and declaring derivation method/version and loss profile; local archival/GC is non-semantic.",
           "node_class": "NORMATIVE"
         }
       },
@@ -856,12 +881,14 @@
     "mechanisms": {
       "MECH-CONTEXTPACK": {
         "name": "ContextPack",
-        "role": "Compiled, bounded allowlist of context artifacts enabling ZTI actuation.",
+        "role": "Compiled, bounded view of context artifacts (plus selectors) enabling ZTI actuation under OCAP; each pack is synchronized by commitment to a ledger head/checkpoint.",
         "contracts": [
           "fits ContextBudget",
           "content-addressed",
+          "binds to ledger head/checkpoint commitment (hash chain head or Merkle root)",
+          "includes selectors/pointers enabling auditable on-demand retrieval of omitted referenced facts",
           "enforceable deny-by-default reads outside pack",
-          "sufficient for task completion in scoped implementation episodes"
+          "sufficient for task completion within granted capabilities; otherwise decompose/escalate per policy (containment dominates)"
         ],
         "node_class": "NORMATIVE",
         "fact_bindings": {
@@ -879,7 +906,7 @@
       },
       "MECH-CONTEXT-COMPILATION": {
         "name": "Context compilation",
-        "role": "Refinement compiler stage that constructs ContextPacks as sufficient-statistics approximations; tool-based exploration in this stage is the work product.",
+        "role": "Refinement compiler stage that constructs ContextPacks as role-relative, capability-bounded sufficient-statistics approximations; if the smallest sufficient pack violates containment policy, fail-closed and emit decomposition/escalation work.",
         "defect_hooks": [
           "pack_miss -> CONTEXT defect",
           "unplanned_context_read -> CONTEXT defect",
@@ -922,10 +949,10 @@
       },
       "MECH-GATES": {
         "name": "Gates + GateRuns",
-        "role": "Formal verifiers with rubrics and evidence contracts; GateRuns produce signed receipts and structured findings.",
+        "role": "Verification orchestrators with machine-checkable acceptance predicates and evidence contracts; GateRuns produce signed receipts and structured findings (stochastic evaluators are advisory unless reduced to terminal-verifier evidence).",
         "properties": [
           "risk-tiered gate selection",
-          "independent verification (AAT as gate)",
+          "independent verification (AAT as advisory check; terminal verifiers anchor promotion)",
           "fail-closed on missing evidence in high-risk tiers"
         ],
         "node_class": "NORMATIVE",
@@ -972,10 +999,11 @@
       },
       "MECH-RECEIPTS": {
         "name": "Receipts (gate, merge, execution, summary)",
-        "role": "Signed, machine-readable acceptance proofs binding claims to evidence and inputs/outputs.",
+        "role": "Signed, machine-readable acceptance proofs binding claims to evidence and inputs/outputs in an attested environment (command transcript/tool versions/env digest or their hashes).",
         "properties": [
           "tamper-evident (signed + hash-chained)",
           "binds decision to bundle_hash and input/output digests",
+          "includes replay/attestation metadata (toolchain versions, runner image digest, policy version)",
           "required for authoritative promotion"
         ],
         "node_class": "NORMATIVE",
@@ -1063,7 +1091,7 @@
       },
       "MECH-IDEMPOTENT-ACTUATION": {
         "name": "Idempotent actuation + dedupe keys",
-        "role": "Retry-safe effects; each actuation binds to a dedupe key and emits an execution receipt.",
+        "role": "Retry-safe effects under drift: each actuation binds to an idempotency/dedupe key, carries precondition/revision guards when applicable, and emits an execution receipt; guard failures trigger revalidation and replan.",
         "law_refs": [
           "LAW-11"
         ],
@@ -1486,7 +1514,7 @@
       "MECH-COMPACTION": {
         "node_class": "NORMATIVE",
         "name": "Ledger compaction + canonical snapshots",
-        "role": "Controls replay cost/MDL by producing verified canonical snapshots that preserve provenance via hash-links and replay-equivalence tests.",
+        "role": "Controls replay cost/MDL by publishing verified canonical snapshots/summaries as derived artifacts; preserves provenance via hash-links and replay-equivalence tests (local archival/GC is non-semantic).",
         "fact_bindings": {
           "event_kinds": {
             "emits": {
@@ -1506,7 +1534,9 @@
         },
         "invariants": [
           "Snapshot must retain a hash-link to archived history head(s).",
+          "Compaction is monotone: it publishes derived snapshot/summary artifacts as new facts; it does not delete semantic history.",
           "Compaction must be accompanied by replay-equivalence evidence over declared queries/projections.",
+          "Snapshots/summaries MUST declare derivation method/version and loss profile for any discarded information.",
           "Compaction is governance-scoped and risk-tiered; high-risk streams require stronger evidence."
         ],
         "law_refs": [
@@ -1680,7 +1710,7 @@
           "node_class": "NORMATIVE"
         },
         "INV-F-04": {
-          "statement": "Summaries are lossy claims treated as summary receipts with deterministic evidence pointers; consumers can zoom-in and verify.",
+          "statement": "Summaries are lossy derived claims treated as summary receipts with deterministic evidence pointers; admissible for planning/triage, but any gate requiring exactness MUST zoom-in to referenced evidence or fail-closed.",
           "law_refs": [
             "LAW-07"
           ],
@@ -1695,7 +1725,7 @@
           "node_class": "NORMATIVE"
         },
         "INV-F-06": {
-          "statement": "Actuation is replay-safe under retries (idempotent or compensatable) with receipts and dedupe keys.",
+          "statement": "Actuation is retry-safe under drift via idempotency/dedupe keys, execution receipts, and precondition/revision guards; failed guards trigger revalidation and replan.",
           "law_refs": [
             "LAW-11",
             "LAW-15"
@@ -1754,6 +1784,36 @@
           ],
           "mechanism_refs": [
             "MECH-COMPACTION"
+          ]
+        },
+        "INV-F-13": {
+          "node_class": "NORMATIVE",
+          "statement": "Bounded views (ContextPacks/snapshots/summaries) MUST carry a cryptographic commitment to the relevant ledger head/checkpoint and provide addressable selectors for any omitted referenced facts; view validity is by commitment hash, not by full history inclusion.",
+          "law_refs": [
+            "LAW-03",
+            "LAW-06",
+            "LAW-07",
+            "LAW-15"
+          ]
+        },
+        "INV-F-14": {
+          "node_class": "NORMATIVE",
+          "statement": "Constraint precedence: when laws conflict, apply Security/Containment > Verification/Correctness > Liveness/Progress. If containment forbids sufficient context or capabilities, fail-closed, decompose/escalate, and record a defect/decision.",
+          "law_refs": [
+            "LAW-02",
+            "LAW-05",
+            "LAW-14",
+            "LAW-15"
+          ]
+        },
+        "INV-F-15": {
+          "node_class": "NORMATIVE",
+          "statement": "Authoritative promotion requires terminal-verifier evidence: gate acceptance predicates MUST be machine-checkable and replayable in an attested environment; stochastic evaluators (LLMs) may orchestrate or advise but cannot be the sole basis for high-risk promotion.",
+          "law_refs": [
+            "LAW-01",
+            "LAW-04",
+            "LAW-14",
+            "LAW-15"
           ]
         }
       },
@@ -1891,10 +1951,10 @@
             "meaning": "Structured tool outputs with digest bindings"
           },
           "HIGH": {
-            "meaning": "Verified gate outcomes with independent attestation"
+            "meaning": "Verified terminal-verifier outcomes with independent attestation and digest bindings"
           },
           "FORMAL": {
-            "meaning": "Machine-checked proofs or exhaustive hypothesis coverage"
+            "meaning": "Machine-checkable acceptance predicates executed in an attested environment (may include formal proofs or exhaustive hypothesis coverage)"
           }
         },
         "law_refs": [
@@ -2013,8 +2073,8 @@
         },
         "GATE-AAT": {
           "node_class": "NORMATIVE",
-          "name": "Agent Acceptance Testing (independent verifier)",
-          "evidence_contract": "aat_receipt + hypotheses + replay metadata"
+          "name": "Agent Acceptance Testing (stochastic evaluator)",
+          "evidence_contract": "aat_receipt + hypotheses + replay metadata + evidence_refs"
         },
         "GATE-SECURITY": {
           "node_class": "NORMATIVE",
@@ -2632,14 +2692,14 @@
     "provisional_defaults": {
       "DEF-01": {
         "name": "Unit of truth",
-        "statement": "Truth = ledger events + content-addressed artifacts; anything not bound by digest/receipt is non-authoritative.",
+        "statement": "Truth = (append-only ledger events + content-addressed artifacts) plus deterministic addressability/retrieval; agents act on bounded views committed to a ledger head/checkpoint, not on unbounded full-history inclusion.",
         "status": "provisional",
         "node_class": "NORMATIVE",
         "maturity": "PROVISIONAL"
       },
       "DEF-02": {
         "name": "Context sufficiency",
-        "statement": "ContextPack is the compiled sufficient-statistics artifact; measure sufficiency via LAW-02 surrogates and treat pack misses as defects.",
+        "statement": "ContextPack is the compiled sufficient-statistics artifact relative to an agent role and its granted capabilities; measure sufficiency via LAW-02 surrogates, treat pack misses as defects, and fail-closed/decompose/escalate when containment forbids sufficient context.",
         "status": "provisional",
         "node_class": "NORMATIVE",
         "maturity": "PROVISIONAL"
@@ -2660,7 +2720,7 @@
       },
       "DEF-05": {
         "name": "Idempotency",
-        "statement": "Assume at-least-once for all actuation; require dedupe keys and receipts for external effects.",
+        "statement": "Assume at-least-once for all actuation; require idempotency/dedupe keys, precondition/revision guards when applicable, and execution receipts for external effects; guard failures trigger revalidation and replan.",
         "status": "provisional",
         "node_class": "NORMATIVE",
         "maturity": "PROVISIONAL"
@@ -2675,6 +2735,13 @@
       "DEF-07": {
         "name": "Early success metric",
         "statement": "Optimize for stability: recurrence reduction + replayability; treat throughput optimization as unsafe until loops are stable.",
+        "status": "provisional",
+        "node_class": "NORMATIVE",
+        "maturity": "PROVISIONAL"
+      },
+      "DEF-08": {
+        "name": "Constraint precedence",
+        "statement": "Default precedence: Security/Containment > Verification/Correctness > Liveness/Progress. When containment forbids sufficient context/capabilities, fail-closed and decompose/escalate; record a defect/decision.",
         "status": "provisional",
         "node_class": "NORMATIVE",
         "maturity": "PROVISIONAL"
@@ -2881,14 +2948,14 @@
         "LAW-01": {
           "name": "Loop Closure & Gated Promotion",
           "reference_path": "references/law_01.md",
-          "role": "Defines authoritative promotion: no shared truth transition without verification receipts. Includes hierarchical gate separation for Planner/Executor layers with layer-specific budgets.",
+          "role": "Defines authoritative promotion: no shared truth transition without verification receipts whose acceptance predicates reduce to replayable, machine-checkable terminal verifiers in an attested environment. Includes hierarchical gate separation for Planner/Executor layers with layer-specific budgets.",
           "node_class": "NORMATIVE",
           "amendments": ["Hierarchical Gate Separation", "Layer-Specific Budgets"]
         },
         "LAW-02": {
           "name": "Observable Context Sufficiency",
           "reference_path": "references/law_02.md",
-          "role": "Defines measurable surrogates for context sufficiency; drives context compiler optimization. Mandates subtask isolation with scoped ContextPacks and typed inter-subtask interfaces.",
+          "role": "Defines measurable surrogates for role-relative, capability-bounded context sufficiency; drives context compiler optimization. Mandates subtask isolation with scoped ContextPacks and typed inter-subtask interfaces; containment conflicts force decomposition/escalation (fail-closed).",
           "node_class": "NORMATIVE",
           "amendments": ["Subtask Isolation", "Inter-Subtask Interface"],
           "defect_classes": ["CONTEXT_BLEED"]
@@ -2896,7 +2963,7 @@
         "LAW-03": {
           "name": "Monotone Ledger vs. Overwritable Projection",
           "reference_path": "references/law_03.md",
-          "role": "Separates truth substrate from mutable projections; requires merge algebra and compaction discipline. Memory mutations are ledger events; retrieval is auditable tool invocation. Shared authority facts MUST be quorum-attested via BFT consensus.",
+          "role": "Separates truth substrate from mutable projections; authoritative truth is the monotone ledger + evidence + deterministic addressability, while agents operate on bounded views synchronized by ledger commitments. Requires merge algebra and monotone compaction (derived artifacts that reference history). Memory mutations are ledger events; retrieval is auditable tool invocation. Shared authority facts MUST be quorum-attested via BFT consensus.",
           "node_class": "NORMATIVE",
           "amendments": ["Memory Mutation as Ledger Events", "Retrieval as Tool Call", "BFT Consensus Quorum"],
           "defect_classes": ["SILENT_MEMORY_MUTATION"]
@@ -2904,14 +2971,14 @@
         "LAW-04": {
           "name": "Stochastic Stability",
           "reference_path": "references/law_04.md",
-          "role": "Since both transducers (agents) and verifiers (tests) are stochastic, stability is achieved only through the binding of Stability = (Contract + Receipt + Evidence). Event ordering MUST rely on Hybrid Logical Clocks (HLC) to preserve causal determinism.",
+          "role": "Since transducers (agents) are stochastic, stability is achieved only through the binding of Stability = (Contract + Receipt + Evidence) to replayable terminal verifiers and an explicit determinism envelope. Event ordering MUST rely on Hybrid Logical Clocks (HLC) to preserve causal determinism.",
           "node_class": "NORMATIVE",
           "amendments": ["Causal Determinism (HLC)"]
         },
         "LAW-05": {
           "name": "Dual-Axis Containment",
           "reference_path": "references/law_05.md",
-          "role": "Containment requires both Authority (Capabilities) and Accountability (Identity/Audit). Connectivity for contained agents MUST use Relay Holons to preserve outbound-only security boundary.",
+          "role": "Containment requires both Authority (Capabilities) and Accountability (Identity/Audit), including context-read firewalls treated as capabilities; containment dominates sufficiency and privilege escalations must be explicit. Connectivity for contained agents MUST use Relay Holons to preserve outbound-only security boundary.",
           "node_class": "NORMATIVE",
           "amendments": ["Relay-Mediated Connectivity"]
         },
@@ -2924,7 +2991,7 @@
         "LAW-07": {
           "name": "Verifiable Summaries",
           "reference_path": "references/law_07.md",
-          "role": "Summaries are receipts with evidence pointers and deterministic zoom-in.",
+          "role": "Summaries are derived receipts with evidence pointers and deterministic zoom-in; admissible for planning/triage, but gates needing exactness MUST zoom-in to evidence or fail-closed.",
           "node_class": "NORMATIVE"
         },
         "LAW-08": {
@@ -2950,7 +3017,7 @@
         "LAW-11": {
           "name": "Conservation of Work and Idempotent Actuation",
           "reference_path": "references/law_11.md",
-          "role": "Actuation must be retry-safe; dedupe keys and execution receipts.",
+          "role": "Actuation must be retry-safe under non-stationarity via idempotency/dedupe keys, precondition/revision guards when applicable, and execution receipts; drift-triggered guard failures force revalidation/replan.",
           "node_class": "NORMATIVE"
         },
         "LAW-12": {
@@ -2976,7 +3043,7 @@
         "LAW-15": {
           "name": "Measurement Integrity",
           "reference_path": "references/law_15.md",
-          "role": "Receipts are tamper-evident; omission of required evidence is a defect; fail-closed in high-risk transitions. Includes evaluator validity auditing for false negatives and instruction-checker alignment.",
+          "role": "Receipts are tamper-evident and evidence-bearing (inputs/outputs/hashes + command transcript + toolchain versions + environment digest/attestation); omission of required evidence is a defect; fail-closed in high-risk transitions. Includes evaluator validity auditing for false negatives and instruction-checker alignment.",
           "node_class": "NORMATIVE",
           "amendments": ["Evaluator Validity", "Evaluator Brittleness as Defect"],
           "defect_classes": ["EVALUATOR_DRIFT"]

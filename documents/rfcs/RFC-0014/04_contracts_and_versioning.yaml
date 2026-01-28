@@ -614,6 +614,63 @@ rfc_contracts_and_versioning:
       evidence_ids:
         - EVID-0014
 
+    - id: CTR-0006
+      name: "Capability Event Extensions"
+      type: EVENT_SCHEMA
+      versioning:
+        scheme: SEMVER
+        current_version: "0.2.0"
+        compatibility_rules:
+          - "New event variants are additive"
+          - "Existing field numbers unchanged"
+      schema:
+        format: PROTOBUF
+        path: "proto/kernel_events.proto"
+        changes: |
+          // Capability events extended for cross-node verification
+          message CapabilityEvent {
+            oneof event {
+              CapabilityRequired required = 1;
+              CapabilityGranted granted = 2;
+              CapabilityDelegated delegated = 3;
+              CapabilityRevoked revoked = 4;
+            }
+          }
+
+          // capability_id == lease_id; scope_hash/budget_hash are CAS references
+          message CapabilityGranted {
+            string capability_id = 1;
+            string namespace = 2;
+            string subject_id = 3;
+            string issuer_id = 4;
+            bytes scope_hash = 5;
+            bytes budget_hash = 6;
+            uint64 issued_at = 7;
+            uint64 expires_at = 8;
+          }
+
+          message CapabilityDelegated {
+            string capability_id = 1;
+            string parent_capability_id = 2;
+            string namespace = 3;
+            string delegatee_id = 4;
+            string delegator_id = 5;
+            bytes scope_hash = 6;
+            bytes budget_hash = 7;
+            uint64 delegated_at = 8;
+            uint64 expires_at = 9;
+          }
+
+          message CapabilityRevoked {
+            string capability_id = 1;
+            string namespace = 2;
+            string revoked_by = 3;
+            uint64 revoked_at = 4;
+            string reason = 5;
+          }
+      evidence_ids:
+        - EVID-0005
+
   outputs:
     artifacts_produced:
       - id: OUT-0001

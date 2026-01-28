@@ -28,6 +28,9 @@ These events change authority state and must be totally ordered:
 | WorkAborted | Work | Final state transition |
 | WorkPrAssociated | Work | Links external artifact |
 | CapabilityRequired | Capability | Authority negotiation |
+| CapabilityGranted | Capability | Capability issuance |
+| CapabilityDelegated | Capability | Delegation chain link |
+| CapabilityRevoked | Capability | Authority revocation |
 | AdjudicationRequested | Adjudication | Governance action |
 | AdjudicationVote | Adjudication | Governance action |
 | AdjudicationResolved | Adjudication | Governance action |

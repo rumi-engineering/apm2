@@ -22,6 +22,12 @@ requirement:
     - id: AC-003
       description: "Frame size is configurable and documented"
       verification: "Configuration exposes control_plane_frame_size"
+    - id: AC-004
+      description: "Message dispatch includes random jitter (default 0-50ms)"
+      verification: "Dispatch timestamps show bounded jitter distribution"
+    - id: AC-005
+      description: "Connection pooling is enabled for control plane channels"
+      verification: "Connections are reused; pooling metrics show reuse > 0"
 
   design_references:
     - "02_design_decisions.yaml#DD-0008"
@@ -29,3 +35,4 @@ requirement:
 
   test_references:
     - "07_test_and_evidence.yaml#TEST-TS-001"
+    - "07_test_and_evidence.yaml#TEST-TS-002"

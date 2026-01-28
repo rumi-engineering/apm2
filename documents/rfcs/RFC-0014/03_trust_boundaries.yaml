@@ -126,8 +126,8 @@ rfc_trust_boundaries:
           statement: "Join attempts rate-limited per source IP or identity"
           verification: "rate_limiter.check(join_request.source)"
         - id: INV-0014
-          statement: "Joining nodes MUST present identity bootstrap credential"
-          verification: "verify_signature(join_request.token, join_request.payload, t1_quorum_public_key)"
+          statement: "Joining nodes MUST present identity bootstrap credential (single-use, expiring, bound to node key)"
+          verification: "token.is_unused && token.expires_at > now() && token.node_public_key == join_request.node_public_key && verify_signature(join_request.token, join_request.payload, t1_quorum_public_key)"
       threats:
         - threat: "Malicious node providing false sync data"
           mitigation: "Sync from multiple sources; verify against quorum checkpoint"
@@ -153,13 +153,19 @@ rfc_trust_boundaries:
         - id: INV-0018
           statement: "Consensus messages are signed by sender"
           verification: "verify_signature(message.signature, message.payload, sender.public_key)"
+        - id: INV-0019
+          statement: "Control plane connections use pooling and reuse"
+          verification: "connection_pool.reuse_count > 0"
+        - id: INV-0020
+          statement: "Control plane dispatch uses bounded jitter"
+          verification: "dispatch_jitter_ms <= config.max_control_plane_jitter_ms"
       threats:
         - threat: "Man-in-the-middle attack"
           mitigation: "Mutual TLS with certificate pinning"
         - threat: "Message replay"
           mitigation: "Monotonic sequence numbers; nonce in handshake"
         - threat: "Traffic analysis"
-          mitigation: "Mandatory padding or fixed-size frames; connection multiplexing (optional)"
+          mitigation: "Mandatory padding or fixed-size frames; connection pooling required"
 
     - id: TB-0005
       name: "Actor-to-Kernel Boundary"
@@ -175,8 +181,8 @@ rfc_trust_boundaries:
           statement: "Actor capabilities are subset of parent's capabilities"
           verification: "child.capabilities.subset_of(parent.capabilities)"
         - id: INV-0026
-          statement: "Capability proof must be verifiable on any node via ledger state + signature chain"
-          verification: "ledger.verify_capability_path(capability_id, actor_id, signature_chain)"
+          statement: "Capability proof must be verifiable on any node via ledger state + signature chain with namespace binding"
+          verification: "ledger.verify_capability_path(namespace, capability_id, actor_id, signature_chain)"
         - id: INV-0027
           statement: "Session keys are delegated from holon keys"
           verification: "session.delegation_chain.verify(holon.public_key)"
@@ -284,6 +290,7 @@ rfc_trust_boundaries:
         - "Replay-safe slashing proof: requires conflicting messages with matching nonces and current epoch"
         - "Automatic slashing: removal from validator set and recorded in ledger"
         - "Equivocation evidence recorded in ledger"
+        - "KeyRotated events effective at next epoch boundary; current epoch uses key active at epoch start"
       residual_risk: "Fork impossible with 2f+1 honest; attacker identified and removed"
 
     - id: TS-0004

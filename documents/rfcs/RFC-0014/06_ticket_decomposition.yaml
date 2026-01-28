@@ -3,7 +3,7 @@ rfc_ticket_decomposition:
 
   decomposition_strategy:
     overview: |
-      The implementation is decomposed into 17 tickets across 4 phases. Each ticket
+      The implementation is decomposed into 21 tickets across 5 phases. Each ticket
       is scoped to be completable in 1-3 days by a single engineer. Dependencies
       are explicit and form a partial order that maximizes parallelism.
 
@@ -21,12 +21,19 @@ rfc_ticket_decomposition:
         estimated_duration: "3 weeks"
         depends_on: [P0]
 
+      - id: P1.5
+        name: "Consensus Spike"
+        description: "BFT protocol/library evaluation and capability proof model"
+        tickets: [DCS-007a, DCS-018a]
+        estimated_duration: "2 weeks"
+        depends_on: [P1]
+
       - id: P2
         name: "Consensus"
         description: "Full BFT consensus and anti-entropy with CRDT merge"
-        tickets: [DCS-007, DCS-008, DCS-016, DCS-014, DCS-009, DCS-015, DCS-018]
-        estimated_duration: "4 weeks"
-        depends_on: [P1]
+        tickets: [DCS-007b, DCS-007c, DCS-007d, DCS-008, DCS-016, DCS-014, DCS-009, DCS-015, DCS-018b]
+        estimated_duration: "6-8 weeks"
+        depends_on: [P1.5]
 
       - id: P3
         name: "Production"
@@ -217,9 +224,26 @@ rfc_ticket_decomposition:
         - DCS-004
         - DCS-005
 
-    - id: DCS-007
+    - id: DCS-007a
+      phase: P1.5
+      title: "BFT Library Evaluation Spike"
+      complexity: HIGH
+      estimated_effort: "10 days"
+      requirements_covered: []
+      description: |
+        Evaluate HotStuff vs PBFT variants and available Rust implementations.
+        Produce a minimal protocol spec and selection rationale.
+      acceptance_criteria:
+        - "Q-0001 resolved (library selection or custom implementation)"
+        - "Q-0002 resolved (HotStuff or PBFT for v1)"
+        - "EVID-0007 populated with message types + state machine"
+        - "EVID-0008 populated with safety/liveness proof references"
+      dependencies:
+        - DCS-004
+
+    - id: DCS-007b
       phase: P2
-      title: "HotStuff/PBFT Consensus State Machine"
+      title: "BFT State Machine Core"
       complexity: HIGH
       estimated_effort: "3 days"
       requirements_covered:
@@ -227,12 +251,52 @@ rfc_ticket_decomposition:
         - DCS-REQ-0007
       description: |
         Implement the core BFT consensus state machine (HotStuff or PBFT).
-        Handle three-phase commit (pre-prepare, prepare, commit) logic.
+        Handle phase transitions per EVID-0007.
       acceptance_criteria:
-        - "State machine transitions correctly through 3 phases"
+        - "State machine transitions correctly through protocol phases"
         - "Safety preserved under asynchronous network assumptions"
       files_to_create:
         - path: "crates/apm2-core/src/consensus/bft_machine.rs"
+      dependencies:
+        - DCS-007a
+
+    - id: DCS-007c
+      phase: P2
+      title: "BFT Network Message Handlers"
+      complexity: MEDIUM
+      estimated_effort: "2 days"
+      requirements_covered:
+        - DCS-REQ-0001
+      description: |
+        Implement network message handlers for BFT phases (PrePrepare, Prepare,
+        Commit, ViewChange). Integrate with transport and relay tunnels.
+      acceptance_criteria:
+        - "Handlers validate signatures and epoch/round"
+        - "Handlers reject invalid or replayed messages"
+        - "Transport integrates padding + jitter requirements"
+      dependencies:
+        - DCS-004
+        - DCS-007b
+
+    - id: DCS-007d
+      phase: P2
+      title: "BFT LedgerBackend Integration"
+      complexity: MEDIUM
+      estimated_effort: "2 days"
+      requirements_covered:
+        - DCS-REQ-0001
+        - DCS-REQ-0005
+      description: |
+        Integrate BFT finalization into LedgerBackend append path. Persist
+        quorum certificates and consensus metadata.
+      acceptance_criteria:
+        - "LedgerBackend append waits for BFT finalization"
+        - "Quorum certificates stored with authority events"
+        - "Consensus metadata persisted and replayable"
+      dependencies:
+        - DCS-007b
+        - DCS-007c
+        - DCS-008
 
     - id: DCS-008
       phase: P2
@@ -250,7 +314,7 @@ rfc_ticket_decomposition:
         - "QC verification validates signer membership and signatures"
         - "Authority events include QC in ledger record"
       dependencies:
-        - DCS-007
+        - DCS-007b
 
     - id: DCS-016
       phase: P2
@@ -267,12 +331,27 @@ rfc_ticket_decomposition:
         - "GateReceipt includes evidence_predicates metadata"
         - "Evidence predicates are auditable and replayable"
       dependencies:
-        - DCS-007
+        - DCS-007d
         - DCS-008
 
-    - id: DCS-018
+    - id: DCS-018a
+      phase: P1.5
+      title: "Capability Proof Model and Event Definitions"
+      complexity: MEDIUM
+      estimated_effort: "2 days"
+      requirements_covered:
+        - DCS-REQ-0014
+      description: |
+        Define capability event types and proof model, including namespace
+        binding and delegation chain requirements. Map to existing lease system.
+      acceptance_criteria:
+        - "Capability event types documented in RFC"
+        - "Proof format includes namespace binding"
+        - "Relationship to lease system documented"
+
+    - id: DCS-018b
       phase: P2
-      title: "Cross-Node Capability Verification"
+      title: "Cross-Node Capability Verification Integration"
       complexity: MEDIUM
       estimated_effort: "2 days"
       requirements_covered:
@@ -286,8 +365,8 @@ rfc_ticket_decomposition:
         - "Verification uses ledger state + signature chain"
         - "Invalid proofs are rejected deterministically"
       dependencies:
-        - DCS-001
-        - DCS-007
+        - DCS-018a
+        - DCS-007d
 
     - id: DCS-014
       phase: P2
@@ -303,7 +382,8 @@ rfc_ticket_decomposition:
         - "Equivocation detected and evidence generated"
         - "Byzantine node identity included in evidence"
       dependencies:
-        - DCS-007
+        - DCS-007b
+        - DCS-007c
 
     - id: DCS-009
       phase: P2
@@ -365,9 +445,9 @@ rfc_ticket_decomposition:
         - path: "crates/apm2-core/src/crypto/yubihsm.rs"
           purpose: "YubiHSM implementation"
       dependencies:
-        - DCS-007
+        - DCS-007d
       blocked_by:
-        - DCS-007
+        - DCS-007d
 
     - id: DCS-011
       phase: P3
@@ -392,33 +472,46 @@ rfc_ticket_decomposition:
           purpose: "Grafana dashboard"
         - path: "docs/operations/consensus-runbook.md"
           purpose: "Operational runbook"
-      files_to_modify:
         - path: "crates/apm2-cli/src/commands/consensus.rs"
-          changes: "Add status and diagnostic commands"
+          purpose: "Consensus status and diagnostic commands"
+      files_to_modify:
+        - path: "crates/apm2-cli/src/commands/mod.rs"
+          changes: "Export consensus commands module"
       dependencies:
-        - DCS-007
+        - DCS-007d
       blocked_by:
-        - DCS-007
+        - DCS-007d
 
   dependency_graph: |
     Phase 0 (Foundation):
-      DCS-001 ─┬─> DCS-006 ─┬─> DCS-007 ─┬─> DCS-008 ─┬─> DCS-016
-               │            │            │
-               └─> DCS-004 ─┬─> DCS-005 ─┼─> DCS-013 ─┼─> DCS-014
-                             │            │            │
-      DCS-002 ─> DCS-012 ────┼─> DCS-009 ─┘            │
-      DCS-003 ───────────────┘                         │
-                                                     └─> DCS-015
+      DCS-001 ─┬─> DCS-006
+               └─> DCS-004
+      DCS-002 ─┬─> DCS-012 ─┬─> DCS-009 ─┬─> DCS-015
+      DCS-003 ─┘            └─> (joins Phase 1.5)
 
-      DCS-007 ─┬─> DCS-010
-               ├─> DCS-011
-               └─> DCS-018
+    Phase 1 (Replication):
+      DCS-004 ─> DCS-005 ─> DCS-013
+
+    Phase 1.5 (Spike):
+      DCS-007a (BFT evaluation)
+      DCS-018a (capability proof model)
+
+    Phase 2 (Consensus):
+      DCS-007a ─> DCS-007b ─┬─> DCS-007c ─> DCS-007d ─┬─> DCS-016
+                            ├─> DCS-008 ──────────────┘
+                            └─> DCS-014
+      DCS-018a ─> DCS-018b ─┘
+
+    Phase 3 (Production):
+      DCS-007d ─┬─> DCS-010
+                └─> DCS-011
 
     Parallel Opportunities:
       - DCS-001, DCS-002, DCS-003 can be done in parallel
       - DCS-004 can proceed after DCS-001; DCS-005 follows DCS-004
       - DCS-006 can proceed after DCS-001 (parallel with DCS-004/DCS-005)
       - DCS-009 can proceed after DCS-004 and DCS-012
-      - DCS-016 can proceed after DCS-008 (parallel with DCS-014/DCS-015)
-      - DCS-018 can proceed after DCS-007
-      - DCS-010, DCS-011 can be done in parallel after DCS-007
+      - DCS-007a and DCS-018a can proceed after P1 completes
+      - DCS-008 can proceed after DCS-007b (parallel with DCS-007c)
+      - DCS-016 can proceed after DCS-007d and DCS-008
+      - DCS-010, DCS-011 can be done in parallel after DCS-007d

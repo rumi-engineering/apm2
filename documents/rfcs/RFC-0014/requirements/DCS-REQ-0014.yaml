@@ -22,9 +22,13 @@ requirement:
     - id: AC-003
       description: "Invalid chains are rejected deterministically"
       verification: "Verification fails with consistent error"
+    - id: AC-004
+      description: "Capability proofs include namespace binding"
+      verification: "Proof includes namespace; mismatch rejects verification"
 
   design_references:
     - "03_trust_boundaries.yaml#TB-0005"
 
   test_references:
     - "07_test_and_evidence.yaml#TEST-BC-001"
+    - "07_test_and_evidence.yaml#TEST-BC-004"

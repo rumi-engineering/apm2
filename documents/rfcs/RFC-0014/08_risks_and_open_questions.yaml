@@ -126,35 +126,43 @@ rfc_risks_and_open_questions:
   open_questions:
     - id: Q-0001
       question: "Which consensus library should we use?"
-      status: OPEN
+      status: PENDING_SPIKE
       context: |
         Options include:
         - BFT libraries or frameworks with HotStuff/PBFT semantics
         - Custom implementation
         Each has different trade-offs in maturity, features, and maintenance.
       proposed_resolution: |
-        Conduct 2-week evaluation with prototype of each option. Criteria:
+        Conduct 2-week evaluation with prototype of each option (DCS-007a). Criteria:
         - API compatibility with LedgerBackend
         - Testing infrastructure quality
         - Byzantine fault tolerance (required)
         - Maintenance and community activity
+        Spike exit criteria:
+        - Select a library OR commit to custom implementation
+        - Document rationale and known limitations
+        - Provide minimal integration plan for DCS-007b/c/d
       decision_owner: "Architect"
-      decision_deadline: "Before DCS-007 implementation"
+      decision_deadline: "Before DCS-007b implementation"
 
     - id: Q-0002
       question: "Which BFT protocol variant should we use (HotStuff vs PBFT)?"
-      status: OPEN
+      status: PENDING_SPIKE
       context: |
         Both HotStuff and PBFT satisfy BFT safety/liveness at local quorum scale,
         but differ in message complexity, implementation complexity, and available
         Rust libraries.
       proposed_resolution: |
-        Evaluate HotStuff and PBFT variants during DCS-007 spike. Select based on:
+        Evaluate HotStuff and PBFT variants during DCS-007a spike. Select based on:
         - Message complexity vs latency at 4-7 nodes
         - Availability of reference implementations or libraries
         - Ease of QC integration and evidence export
+        Spike exit criteria:
+        - Choose HotStuff or PBFT variant for v1
+        - Record the message types and phase transitions
+        - Map to evidence artifacts EVID-0007 and EVID-0008
       decision_owner: "Security + Architect"
-      decision_deadline: "Before DCS-007 implementation"
+      decision_deadline: "Before DCS-007b implementation"
 
     - id: Q-0003
       question: "How should namespace-to-quorum mapping work?"

@@ -22,6 +22,15 @@ requirement:
     - id: AC-003
       description: "Invalid or missing token rejects membership"
       verification: "Join fails without valid token"
+    - id: AC-004
+      description: "Tokens are single-use"
+      verification: "Second join attempt with same token is rejected"
+    - id: AC-005
+      description: "Tokens expire within configurable window (default 24h)"
+      verification: "Join fails if token timestamp older than expiration window"
+    - id: AC-006
+      description: "Tokens bound to joining node public key"
+      verification: "Token includes node public key; mismatch rejects join"
 
   design_references:
     - "03_trust_boundaries.yaml#TB-0003"
@@ -29,3 +38,5 @@ requirement:
   test_references:
     - "07_test_and_evidence.yaml#TEST-MA-001"
     - "07_test_and_evidence.yaml#TEST-MA-002"
+    - "07_test_and_evidence.yaml#TEST-MA-003"
+    - "07_test_and_evidence.yaml#TEST-MA-004"

@@ -188,6 +188,11 @@ rfc_test_and_evidence:
           description: "Forced relay rotation prevents squatting"
           verification: "Establish tunnel; maintain activity; assert forced disconnect after MAX_DURATION"
 
+        - id: TEST-BC-004
+          type: UNIT
+          description: "Capability proofs enforce namespace binding"
+          verification: "Present capability proof with mismatched namespace; assert verification failure"
+
     - category: "Schema Governance"
       description: "Tests for schema registry and fail-closed validation"
       requirements_covered:
@@ -234,6 +239,16 @@ rfc_test_and_evidence:
           description: "Joining node MUST provide valid invitation token"
           verification: "Attempt join with missing or invalid token; assert rejection"
 
+        - id: TEST-MA-003
+          type: UNIT
+          description: "Invitation tokens are single-use"
+          verification: "Reuse a previously accepted token; assert rejection"
+
+        - id: TEST-MA-004
+          type: UNIT
+          description: "Invitation tokens expire after configured window"
+          verification: "Attempt join with expired token; assert rejection"
+
     - category: "Transport Security"
       description: "Tests for control plane traffic-analysis mitigation"
       requirements_covered:
@@ -243,6 +258,11 @@ rfc_test_and_evidence:
           type: UNIT
           description: "Control plane frame padding enforced"
           verification: "Serialize control plane message; assert frame size == configured constant"
+
+        - id: TEST-TS-002
+          type: UNIT
+          description: "Control plane dispatch jitter applied"
+          verification: "Emit N messages; assert dispatch jitter within configured bounds"
 
     - category: "Ordering and Clock Semantics"
       description: "Tests for TotalOrder, HLC, and StrictlyOrderedEvidence"
@@ -492,4 +512,4 @@ rfc_test_and_evidence:
       name: "Relay Holon Security Review"
       description: |
         Threat analysis and mitigations for Relay Holon tunnels.
-      path: "evidence_artifacts/EVID-0015-relay-security.md"
+      path: "evidence_artifacts/EVID-0015-relay-holon-security-review.md"
