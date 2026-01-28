@@ -78,6 +78,9 @@ pulldown-cmark = "0.10"
 proptest = "1.0"
 tempfile = "3.10"
 
+# Git hooks
+cargo-husky = { version = "1.5.0", default-features = false }
+
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 

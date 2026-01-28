@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -e
+
+COMMIT_MSG_FILE=$1
+COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+
+# Simple regex for conventional commits
+# type(scope): description
+# types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+# Scope can contain uppercase for ticket IDs
+CONVENTIONAL_RE="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([A-Za-z0-9_-]+\))?!?: .+"
+
+if [[ ! $COMMIT_MSG =~ $CONVENTIONAL_RE ]]; then
+    echo -e "\033[0;31mERROR: Commit message does not follow conventional commit format.\033[0m"
+    echo "Example: feat(api): add new endpoint"
+    echo "Allowed types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+    echo "Current message: $COMMIT_MSG"
+    exit 1
+fi

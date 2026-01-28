@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -e
+
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+echo -e "${GREEN}Running pre-push hooks...${NC}"
+
+# 1. Tests
+echo "Running workspace tests..."
+cargo test --workspace
+
+# 2. Docs
+echo "Checking documentation generation..."
+cargo doc --workspace --no-deps
+
+echo -e "${GREEN}All pre-push hooks passed!${NC}"
