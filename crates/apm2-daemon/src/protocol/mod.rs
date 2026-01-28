@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────┐
-//! │           Application Messages           │  (TCK-00158: protobuf)
+//! │           Application Messages           │  Protobuf (messages)
 //! ├─────────────────────────────────────────┤
 //! │              Handshake                   │  Hello/HelloAck
 //! ├─────────────────────────────────────────┤
@@ -24,8 +24,11 @@
 //!
 //! - [`error`]: Protocol error types ([`ProtocolError`], [`ProtocolResult`])
 //! - [`framing`]: Length-prefixed frame codec ([`FrameCodec`])
+//! - [`golden_vectors`]: Golden test vectors for determinism verification
 //! - [`handshake`]: Version negotiation ([`Hello`], [`HelloAck`],
 //!   [`ServerHandshake`])
+//! - [`messages`]: Protocol buffer message types ([`Receipt`],
+//!   [`TelemetryFrame`], etc.)
 //! - [`server`]: UDS server ([`ProtocolServer`], [`Connection`])
 //!
 //! # Wire Format
@@ -84,7 +87,9 @@
 
 pub mod error;
 pub mod framing;
+pub mod golden_vectors;
 pub mod handshake;
+pub mod messages;
 pub mod server;
 
 // Re-export commonly used types at module level
@@ -96,6 +101,7 @@ pub use handshake::{
     ClientHandshake, HandshakeErrorCode, HandshakeMessage, HandshakeState, Hello, HelloAck,
     HelloNack, ServerHandshake, parse_handshake_message, parse_hello, serialize_handshake_message,
 };
+pub use messages::{CanonicalBytes, Canonicalize};
 pub use server::{
     Connection, ConnectionPermit, ProtocolServer, ServerConfig, connect, default_socket_path,
 };
