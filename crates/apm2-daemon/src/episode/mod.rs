@@ -66,10 +66,13 @@
 //! - [`budget`]: Episode budget and resource limits
 //! - [`envelope`]: Episode envelope and configuration
 //! - [`snapshot`]: Pinned snapshot for reproducibility
-//! - [`error`]: Episode error types
-//! - [`state`]: State machine and transitions
-//! - [`handle`]: Session handle for running episodes
-//! - [`runtime`]: Episode runtime implementation
+//!
+//! # Key Types
+//!
+//! - [`EpisodeError`]: Episode error types
+//! - [`EpisodeState`]: State machine and transitions
+//! - [`SessionHandle`]: Session handle for running episodes
+//! - [`EpisodeRuntime`]: Episode runtime implementation
 //!
 //! # Contract References
 //!
