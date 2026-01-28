@@ -24,7 +24,9 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 
 [CONTRACT: CTR-2605] State Machines Are Explicit Enums With Total Transition Logic.
 - REJECT IF: state is modeled as booleans/ints without a closed set of states and explicit transitions.
-- ENFORCE BY: enum state machine + exhaustive matches; helper predicates (`is_running`, `has_exited`) are `#[must_use]` (CTR-0704).
+- REJECT IF: session/process restart logic fails to distinguish "new session" from "resume session" (ID collision risk).
+- ENFORCE BY: enum state machine + exhaustive matches; store resume cursors/restart attempts in all state structs; verify restart counters are strictly increasing (`>` not `>=`).
+- ENFORCE BY: helper predicates (`is_running`, `has_exited`) are `#[must_use]` (CTR-0704).
 
 [CONTRACT: CTR-2606] Errors Are Typed and Actionable.
 - APPLY: CTR-0701/0703.
@@ -90,4 +92,5 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 
 [HAZARD: RSK-2618] Incomplete Struct/Enum Field Updates.
 - REJECT IF: adding a field/variant does not update constructors, matches, serialization, and invariants.
-- ENFORCE BY: exhaustive matches (avoid `_ =>` for owned enums); clippy patterns; tests that construct and round-trip every variant.
+- REJECT IF: `match` expressions use `..` or default arms for structs/enums that appear in SCP boundaries (hides missing field handling).
+- ENFORCE BY: exhaustive matches (avoid `_ =>` for owned enums); clippy patterns; tests that construct and round-trip every variant; verify new fields are included in all comparison and serialization logic.

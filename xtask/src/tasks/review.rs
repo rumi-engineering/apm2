@@ -262,8 +262,9 @@ fn run_ai_review(
     );
 
     // Use ReviewerSpawner for centralized spawn logic (synchronous mode)
-    let spawner =
-        ReviewerSpawner::new(reviewer_type_key, pr_url, head_sha).with_prompt_content(&prompt);
+    let spawner = ReviewerSpawner::new(reviewer_type_key, pr_url, head_sha)
+        .with_prompt_content(&prompt)
+        .with_model("gemini-3-flash-preview");
 
     let status_context = review_type.status_context();
     match spawner.spawn_sync() {
@@ -452,7 +453,7 @@ mod tests {
 
         // Test with a simple path (no log - uses -qec)
         let prompt_path = Path::new("/tmp/test_prompt.txt");
-        let shell_cmd = build_script_command(prompt_path, None);
+        let shell_cmd = build_script_command(prompt_path, None, None);
 
         // Verify command includes PTY allocation
         assert!(
@@ -474,7 +475,7 @@ mod tests {
 
         // Test with a path containing spaces - must be properly quoted
         let special_path = Path::new("/tmp/test file.txt");
-        let special_cmd = build_script_command(special_path, None);
+        let special_cmd = build_script_command(special_path, None, None);
 
         // Verify the command is well-formed
         assert!(

@@ -74,24 +74,42 @@ impl FrameCodec {
     /// * `max_size` - Maximum frame size in bytes. Must not exceed
     ///   [`MAX_FRAME_SIZE`].
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `max_size` exceeds [`MAX_FRAME_SIZE`].
-    #[must_use]
-    pub fn with_max_size(max_size: usize) -> Self {
-        assert!(
-            max_size <= MAX_FRAME_SIZE,
-            "max_size {max_size} exceeds protocol limit {MAX_FRAME_SIZE}"
-        );
-        Self {
-            max_frame_size: max_size,
+    /// Returns [`ProtocolError::FrameTooLarge`] if `max_size` exceeds
+    /// [`MAX_FRAME_SIZE`].
+    pub const fn with_max_size(max_size: usize) -> ProtocolResult<Self> {
+        if max_size > MAX_FRAME_SIZE {
+            return Err(ProtocolError::frame_too_large(max_size, MAX_FRAME_SIZE));
         }
+        Ok(Self {
+            max_frame_size: max_size,
+        })
     }
 
     /// Returns the maximum frame size for this codec.
     #[must_use]
     pub const fn max_frame_size(&self) -> usize {
         self.max_frame_size
+    }
+
+    /// Set the maximum frame size for this codec.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_size` - New maximum frame size in bytes. Must not exceed
+    ///   [`MAX_FRAME_SIZE`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::FrameTooLarge`] if `max_size` exceeds
+    /// [`MAX_FRAME_SIZE`].
+    pub const fn set_max_frame_size(&mut self, max_size: usize) -> ProtocolResult<()> {
+        if max_size > MAX_FRAME_SIZE {
+            return Err(ProtocolError::frame_too_large(max_size, MAX_FRAME_SIZE));
+        }
+        self.max_frame_size = max_size;
+        Ok(())
     }
 }
 
@@ -123,7 +141,7 @@ impl Decoder for FrameCodec {
 
         // CTR-1603: Validate length BEFORE allocation
         if length > self.max_frame_size {
-            return Err(ProtocolError::frame_too_large(length));
+            return Err(ProtocolError::frame_too_large(length, self.max_frame_size));
         }
 
         // Check if we have the complete frame
@@ -277,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_encode_frame_too_large() {
-        let mut codec = FrameCodec::with_max_size(100);
+        let mut codec = FrameCodec::with_max_size(100).unwrap();
         let large_payload = Bytes::from(vec![0u8; 200]);
 
         let mut buf = BytesMut::new();
@@ -331,14 +349,18 @@ mod tests {
 
     #[test]
     fn test_custom_max_size() {
-        let codec = FrameCodec::with_max_size(1024);
+        let codec = FrameCodec::with_max_size(1024).unwrap();
         assert_eq!(codec.max_frame_size(), 1024);
     }
 
     #[test]
-    #[should_panic(expected = "exceeds protocol limit")]
     fn test_custom_max_size_exceeds_limit() {
-        let _ = FrameCodec::with_max_size(MAX_FRAME_SIZE + 1);
+        let result = FrameCodec::with_max_size(MAX_FRAME_SIZE + 1);
+        assert!(matches!(
+            result,
+            Err(ProtocolError::FrameTooLarge { size, max })
+            if size == MAX_FRAME_SIZE + 1 && max == MAX_FRAME_SIZE
+        ));
     }
 
     #[test]
@@ -367,7 +389,7 @@ mod tests {
     fn test_max_valid_frame() {
         // Test encoding/decoding a frame at exactly MAX_FRAME_SIZE
         // Note: We use a smaller size for the actual test to avoid allocating 16MB
-        let mut codec = FrameCodec::with_max_size(1024);
+        let mut codec = FrameCodec::with_max_size(1024).unwrap();
         let payload = Bytes::from(vec![0xABu8; 1024]);
 
         let mut buf = BytesMut::new();

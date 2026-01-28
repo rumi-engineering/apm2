@@ -23,6 +23,8 @@ pub const REQUIRED_READING: &[&str] = &[
     "documents/security/CI_SECURITY_GATES.md",
     "documents/security/THREAT_MODEL.md",
     "documents/security/SECRETS_MANAGEMENT.md",
+    "documents/skills/review-rust/SKILL.md",
+    "documents/skills/rust-textbook/SKILL.md",
     "documents/skills/laws-of-holonic-agent-systems/references/agent-native-software/SKILL.md",
 ];
 
@@ -325,6 +327,15 @@ pub fn onboard() -> Result<()> {
     for path in REQUIRED_READING {
         println!("  {path}");
     }
+
+    println!();
+    println!("Finding Associated RFC Design Decisions:");
+    println!("---------------------------------------");
+    println!("When reviewing a PR, you should locate the associated RFC design decisions");
+    println!("to understand the architectural constraints and normative justifications.");
+    println!("1. Extract the RFC ID (e.g., RFC-0013) from the PR title or body.");
+    println!("2. The design decisions file is located at:");
+    println!("   documents/rfcs/RFC-XXXX/02_design_decisions.yaml");
 
     println!();
     println!("After reading these documents, you will be prepared to:");

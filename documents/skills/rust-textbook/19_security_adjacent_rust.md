@@ -50,6 +50,19 @@
 [PROVENANCE] Determinism is a system contract; Rust does not enforce determinism.
 [VERIFICATION] Deterministic test harnesses; CI build matrix; property tests for determinism.
 
+[HAZARD: RSK-1909] Timing Attacks and Side Channels.
+- TRIGGER: secret-dependent branching, indexing, or execution time.
+- FAILURE MODE: information leakage (keys, session state) via observable timing differences or metadata patterns (traffic volume).
+- REJECT IF: security-sensitive comparisons (signatures, tokens, passwords) do not use constant-time operations.
+- REJECT IF: SCP paths branch on secret data in a way that creates observable latency differences.
+- ENFORCE BY:
+  - use `subtle::ConstantTimeEq` for all sensitive equality checks.
+  - avoid secret-dependent indexing (memory side channels).
+  - avoid secret-dependent `if/match` in crypto or auth paths.
+  - acknowledge and bound metadata side channels (e.g., telemetry rate limits).
+[PROVENANCE] THREAT_MODEL.md; CTR-WH001.
+[VERIFICATION] Constant-time harness tests; metadata exfiltration rate analysis (e.g., 10 bps limit check).
+
 [CONTRACT: CTR-1907] Complete Audit and Ledger Data (Anti-Information Loss).
 - Audit trails and ledger events MUST capture all possible associated values to prevent information loss.
 - REJECT IF: audit/ledger fields use `Option<T>` when multiplicity (multiple associated items) is possible.
