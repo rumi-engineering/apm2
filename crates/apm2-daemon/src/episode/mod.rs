@@ -70,6 +70,9 @@
 //! - [`budget`]: Episode budget and resource limits
 //! - [`envelope`]: Episode envelope and configuration
 //! - [`snapshot`]: Pinned snapshot for reproducibility
+//! - [`capability`]: Capability manifest and validation (AD-TOOL-002)
+//! - [`scope`]: Capability scope with path, size, and network restrictions
+//! - [`tool_class`]: Tool class enumeration for capability categorization
 //!
 //! # Key Types
 //!
@@ -108,6 +111,11 @@ pub mod adapter;
 pub mod raw_adapter;
 pub mod registry;
 
+// TCK-00163: Capability manifest and validation
+pub mod capability;
+pub mod scope;
+pub mod tool_class;
+
 // Re-export envelope types (TCK-00159)
 // Re-export adapter types (TCK-00162)
 pub use adapter::{
@@ -115,6 +123,12 @@ pub use adapter::{
     HarnessEventStream, HarnessHandle, OutputKind, TerminationClassification,
 };
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
+// Re-export capability types (TCK-00163)
+pub use capability::{
+    Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
+    CapabilityManifestBuilder, CapabilityValidator, DenyReason, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES,
+    MAX_CAPABILITY_ID_LEN, MAX_MANIFEST_ID_LEN, ToolRequest,
+};
 pub use envelope::{
     ContextRefs, DeterminismClass, EnvelopeError, EpisodeEnvelope, EpisodeEnvelopeBuilder,
     RiskTier, StopConditions,
@@ -134,5 +148,11 @@ pub use runtime::{
     EpisodeEvent, EpisodeRuntime, EpisodeRuntimeConfig, Hash, MAX_CONCURRENT_EPISODES,
     new_shared_runtime,
 };
+pub use scope::{
+    CapabilityScope, CapabilityScopeBuilder, MAX_ALLOWED_PATTERNS, MAX_NETWORK_HOSTS,
+    MAX_NETWORK_PORTS, MAX_PATH_LEN, MAX_PATTERN_LEN, MAX_ROOT_PATHS, NetworkPolicy, ScopeError,
+    SizeLimits,
+};
 pub use snapshot::{PinnedSnapshot, PinnedSnapshotBuilder};
 pub use state::{EpisodeState, QuarantineReason, TerminationClass, validate_transition};
+pub use tool_class::{MAX_TOOL_CLASS_NAME_LEN, ToolClass};
