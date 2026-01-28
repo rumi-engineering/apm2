@@ -138,6 +138,8 @@ impl CoordinationStarted {
 /// Payload for `coordination.session_bound` events.
 ///
 /// Per AD-COORD-003: This event MUST be emitted before `session.started`.
+/// Per AD-COORD-006: The binding includes `expected_transition_count` for
+/// optimistic concurrency control (CAS-at-commit).
 /// Per AD-COORD-007: Session ID is generated before this event is emitted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinationSessionBound {
@@ -155,6 +157,14 @@ pub struct CoordinationSessionBound {
     /// Attempt number for this work item (1-indexed).
     pub attempt_number: u32,
 
+    /// Expected work item transition count for optimistic concurrency control.
+    ///
+    /// Per AD-COORD-006: This value is checked at ledger admission to ensure
+    /// the work item's state hasn't changed since the binding was initiated.
+    /// If `work.transition_count != expected_transition_count`, the binding
+    /// is rejected (stale binding).
+    pub expected_transition_count: u64,
+
     /// Ledger sequence ID at which work freshness was verified.
     ///
     /// Per AD-COORD-006: Work state was checked at this sequence.
@@ -166,6 +176,10 @@ pub struct CoordinationSessionBound {
 
 impl CoordinationSessionBound {
     /// Creates a new session bound payload.
+    ///
+    /// This constructor uses a default `expected_transition_count` of 0.
+    /// For explicit control over optimistic concurrency, use
+    /// [`Self::with_transition_count`].
     #[must_use]
     pub const fn new(
         coordination_id: String,
@@ -180,6 +194,34 @@ impl CoordinationSessionBound {
             session_id,
             work_id,
             attempt_number,
+            expected_transition_count: 0,
+            freshness_seq_id,
+            bound_at,
+        }
+    }
+
+    /// Creates a new session bound payload with explicit transition count.
+    ///
+    /// Per AD-COORD-006: The `expected_transition_count` is used for optimistic
+    /// concurrency control (CAS-at-commit). If the work item's transition count
+    /// has changed since binding was initiated, the binding is rejected.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn with_transition_count(
+        coordination_id: String,
+        session_id: String,
+        work_id: String,
+        attempt_number: u32,
+        expected_transition_count: u64,
+        freshness_seq_id: u64,
+        bound_at: u64,
+    ) -> Self {
+        Self {
+            coordination_id,
+            session_id,
+            work_id,
+            attempt_number,
+            expected_transition_count,
             freshness_seq_id,
             bound_at,
         }
@@ -498,8 +540,24 @@ mod tests {
         assert_eq!(event.session_id, "session-456");
         assert_eq!(event.work_id, "work-789");
         assert_eq!(event.attempt_number, 1);
+        assert_eq!(event.expected_transition_count, 0); // default
         assert_eq!(event.freshness_seq_id, 100);
         assert_eq!(event.bound_at, 2_000_000_000);
+    }
+
+    #[test]
+    fn test_coordination_session_bound_with_transition_count() {
+        let event = CoordinationSessionBound::with_transition_count(
+            "coord-123".to_string(),
+            "session-456".to_string(),
+            "work-789".to_string(),
+            1,
+            42, // expected_transition_count
+            100,
+            2_000_000_000,
+        );
+
+        assert_eq!(event.expected_transition_count, 42);
     }
 
     #[test]
@@ -838,12 +896,13 @@ mod tests {
         let json = serde_json::to_string(&started).unwrap();
         assert_eq!(started, serde_json::from_str(&json).unwrap());
 
-        // CoordinationSessionBound
-        let bound = CoordinationSessionBound::new(
+        // CoordinationSessionBound (uses with_transition_count for explicit test)
+        let bound = CoordinationSessionBound::with_transition_count(
             "coord-1".to_string(),
             "sess-1".to_string(),
             "work-1".to_string(),
             1,
+            42, // expected_transition_count
             50,
             2000,
         );

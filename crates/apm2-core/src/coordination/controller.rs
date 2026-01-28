@@ -570,19 +570,12 @@ impl CoordinationController {
 
     /// Prepares to spawn a session for the current work item.
     ///
-    /// Per AD-COORD-007: Session ID is generated BEFORE the binding event.
-    /// Per AD-COORD-003: `session_bound` is emitted BEFORE `session.started`.
+    /// This is a convenience method that calls
+    /// [`Self::prepare_session_spawn_with_transition_count`] with
+    /// `expected_transition_count` set to 0.
     ///
-    /// This method:
-    /// 1. Checks that no session is currently active (serial execution)
-    /// 2. Checks that no stop condition is met
-    /// 3. Validates the `work_id` matches the current work index
-    /// 4. Generates a new session ID (UUID v4)
-    /// 5. Creates and stores the binding event
-    /// 6. Updates attempt tracking
-    ///
-    /// The caller is responsible for actually spawning the session after
-    /// calling this method, ensuring the bracket ordering is correct.
+    /// For explicit optimistic concurrency control, use
+    /// [`Self::prepare_session_spawn_with_transition_count`] instead.
     ///
     /// # Arguments
     ///
@@ -604,6 +597,53 @@ impl CoordinationController {
     pub fn prepare_session_spawn(
         &mut self,
         work_id: &str,
+        freshness_seq_id: u64,
+        timestamp_ns: u64,
+    ) -> ControllerResult<SpawnResult> {
+        self.prepare_session_spawn_with_transition_count(work_id, 0, freshness_seq_id, timestamp_ns)
+    }
+
+    /// Prepares to spawn a session for the current work item with explicit
+    /// transition count.
+    ///
+    /// Per AD-COORD-007: Session ID is generated BEFORE the binding event.
+    /// Per AD-COORD-003: `session_bound` is emitted BEFORE `session.started`.
+    /// Per AD-COORD-006: `expected_transition_count` is included for
+    /// CAS-at-commit.
+    ///
+    /// This method:
+    /// 1. Checks that no session is currently active (serial execution)
+    /// 2. Checks that no stop condition is met
+    /// 3. Validates the `work_id` matches the current work index
+    /// 4. Generates a new session ID (UUID v4)
+    /// 5. Creates and stores the binding event with `expected_transition_count`
+    /// 6. Updates attempt tracking
+    ///
+    /// The caller is responsible for actually spawning the session after
+    /// calling this method, ensuring the bracket ordering is correct.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - The work item ID (must match current work index)
+    /// * `expected_transition_count` - The work item's transition count for CAS
+    /// * `freshness_seq_id` - The sequence ID at which freshness was verified
+    /// * `timestamp_ns` - Current timestamp in nanoseconds
+    ///
+    /// # Returns
+    ///
+    /// A [`SpawnResult`] containing the session ID and binding event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Coordination is not running
+    /// - A session is already active (serial execution violation)
+    /// - A stop condition is met
+    /// - The `work_id` doesn't match the current work index
+    pub fn prepare_session_spawn_with_transition_count(
+        &mut self,
+        work_id: &str,
+        expected_transition_count: u64,
         freshness_seq_id: u64,
         timestamp_ns: u64,
     ) -> ControllerResult<SpawnResult> {
@@ -661,11 +701,13 @@ impl CoordinationController {
         tracking.session_ids.push(session_id.clone());
 
         // Create binding event (AD-COORD-003: emitted BEFORE session.started)
-        let binding_event = CoordinationSessionBound::new(
+        // Per AD-COORD-006: Include expected_transition_count for CAS-at-commit
+        let binding_event = CoordinationSessionBound::with_transition_count(
             coordination_id,
             session_id.clone(),
             work_id.to_string(),
             attempt_number,
+            expected_transition_count,
             freshness_seq_id,
             timestamp_ns,
         );
