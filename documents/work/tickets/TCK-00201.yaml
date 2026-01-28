@@ -1,0 +1,43 @@
+acceptance_criteria:
+  - criterion: CI_SECURITY_GATES.md clearly distinguishes CI gates from internal gates
+    verification: Documentation review
+  - criterion: Agent Complexity gate documented as internal (GateRunner) not CI
+    verification: Documentation review
+  - criterion: Formal Proofs (kani/prusti) gate documented as internal not CI
+    verification: Documentation review
+  - criterion: safety-proof-coverage scope expanded to all crates or exclusions documented
+    verification: CI workflow inspection
+implementation:
+  code_examples: []
+  files_to_create: []
+  files_to_modify:
+    - documents/security/CI_SECURITY_GATES.md
+    - .github/workflows/ci.yml
+  implementation_steps:
+    - Update CI_SECURITY_GATES.md to clarify which gates run in GitHub Actions vs internal GateRunner
+    - Add "Internal Gates (per PRD-0004)" section explaining Agent Complexity and Formal Proofs belong in internal gate system
+    - Either expand safety-proof-coverage to scan all crates/ or document why xtask is excluded
+  summary: |
+    Address code quality review findings from PR #212. Per PRD-0004 (Work Substrate),
+    GitHub Actions is a projection adapter - cognitive complexity and formal verification
+    (kani/prusti) gates belong in the internal GateRunner system, not CI. Documentation
+    must clearly distinguish between CI-enforced gates and internal gates.
+notes: |
+  Follow-up from PR #212 code quality review.
+  PRD-0004 establishes that GitHub is a projection adapter and internal gates are authoritative.
+  This ticket resolves documentation discrepancy flagged as MAJOR finding.
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+test_requirements:
+  - description: Documentation accurately reflects gate architecture
+    test_id: DOC-00201-01
+    verification_command: grep -q "Internal Gates" documents/security/CI_SECURITY_GATES.md
+ticket:
+  depends_on: []
+  id: TCK-00201
+  requirement_ids:
+    - CTR-1912
+    - CTR-1913
+  rfc_id: null
+  status: READY
+  title: Clarify CI vs Internal Gate Architecture in Security Documentation
