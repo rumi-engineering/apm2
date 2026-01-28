@@ -223,7 +223,13 @@ struct StopConditionsProto {
 ///
 /// These predicates define when an episode should stop executing.
 /// They are evaluated after each episode step.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StopConditions {
     /// Maximum number of episodes to execute.
     pub max_episodes: u64,
@@ -286,7 +292,13 @@ struct ContextRefsProto {
 /// Per AD-EPISODE-001, context refs include:
 /// - `context_pack_hash`: Hash of the bundled context pack
 /// - `dcp_refs`: References to dynamic context providers
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextRefs {
     /// Hash of the context pack (bundled context artifacts).
     pub context_pack_hash: Vec<u8>,
@@ -449,7 +461,13 @@ struct EpisodeEnvelopeProto {
 /// let digest = envelope.digest();
 /// assert_eq!(digest.len(), 32);
 /// ```
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EpisodeEnvelope {
     /// Unique identifier for this episode.
     episode_id: String,

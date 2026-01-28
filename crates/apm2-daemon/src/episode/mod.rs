@@ -73,6 +73,10 @@
 //! - [`capability`]: Capability manifest and validation (AD-TOOL-002)
 //! - [`scope`]: Capability scope with path, size, and network restrictions
 //! - [`tool_class`]: Tool class enumeration for capability categorization
+//! - [`broker`]: `ToolBroker` for capability-validated tool execution
+//!   (CTR-DAEMON-004)
+//! - [`decision`]: Tool request, decision, and result types
+//! - [`dedupe`]: `DedupeCache` for idempotent tool replay
 //!
 //! # Key Types
 //!
@@ -116,11 +120,21 @@ pub mod capability;
 pub mod scope;
 pub mod tool_class;
 
+// TCK-00164: Tool broker with dedupe cache
+pub mod broker;
+pub mod decision;
+pub mod dedupe;
+
 // Re-export envelope types (TCK-00159)
 // Re-export adapter types (TCK-00162)
 pub use adapter::{
     AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
     HarnessEventStream, HarnessHandle, OutputKind, TerminationClassification,
+};
+// Re-export broker types (TCK-00164)
+pub use broker::{
+    BrokerError, PolicyDecision, SharedToolBroker, StubContentAddressedStore, StubPolicyEngine,
+    ToolBroker, ToolBrokerConfig, new_shared_broker,
 };
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 // Re-export capability types (TCK-00163)
@@ -128,6 +142,15 @@ pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
     CapabilityManifestBuilder, CapabilityValidator, DenyReason, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES,
     MAX_CAPABILITY_ID_LEN, MAX_MANIFEST_ID_LEN, ToolRequest,
+};
+pub use decision::{
+    BrokerToolRequest, BudgetDelta, DedupeKey, DedupeKeyError, MAX_DEDUPE_KEY_LEN,
+    MAX_ERROR_MESSAGE_LEN, MAX_HOST_LEN, MAX_INLINE_ARGS_SIZE, MAX_REQUEST_ID_LEN, MAX_RULE_ID_LEN,
+    MAX_TOOL_OUTPUT_SIZE, RequestValidationError, ToolDecision, ToolResult,
+};
+pub use dedupe::{
+    DEFAULT_TTL_SECS, DedupeCache, DedupeCacheConfig, DedupeCacheStats, MAX_DEDUPE_ENTRIES,
+    MAX_TTL_SECS, SharedDedupeCache, new_shared_cache,
 };
 pub use envelope::{
     ContextRefs, DeterminismClass, EnvelopeError, EpisodeEnvelope, EpisodeEnvelopeBuilder,

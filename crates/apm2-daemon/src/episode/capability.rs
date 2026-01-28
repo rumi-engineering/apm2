@@ -240,7 +240,13 @@ impl CapabilityDecision {
 }
 
 /// Reason for capability denial.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum DenyReason {
     /// No capability matches the requested tool class.
     NoMatchingCapability {
@@ -280,6 +286,17 @@ pub enum DenyReason {
 
     /// Manifest has expired.
     ManifestExpired,
+
+    /// Request was denied by policy.
+    ///
+    /// This is distinct from capability denial - policy rules provide
+    /// coarse-grained access control independent of capability scopes.
+    PolicyDenied {
+        /// The policy rule ID that caused the denial.
+        rule_id: String,
+        /// Human-readable reason for the denial.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for DenyReason {
@@ -306,6 +323,9 @@ impl std::fmt::Display for DenyReason {
             Self::ManifestExpired => {
                 write!(f, "capability manifest has expired")
             },
+            Self::PolicyDenied { rule_id, reason } => {
+                write!(f, "policy denied by rule {rule_id}: {reason}")
+            },
         }
     }
 }
@@ -315,7 +335,13 @@ impl std::fmt::Display for DenyReason {
 /// Per AD-TOOL-002, capabilities are sealed references that cannot be
 /// forged or escalated. Each capability grants access to a specific tool
 /// class within the defined scope.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Capability {
     /// Unique identifier for this capability within the manifest.
     pub capability_id: String,
@@ -475,7 +501,13 @@ impl CapabilityBuilder {
 /// - Is immutable once created
 /// - Is referenced by hash in the episode envelope
 /// - Expires at a specified time (optional)
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityManifest {
     /// Unique identifier for this manifest.
     pub manifest_id: String,
