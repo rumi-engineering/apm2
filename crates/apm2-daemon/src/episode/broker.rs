@@ -325,12 +325,12 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
 
     /// Policy engine.
     ///
-    /// TODO: Replace with Arc<PolicyEngine> in a future ticket.
+    /// TODO: Replace with `Arc<PolicyEngine>` in a future ticket.
     policy: StubPolicyEngine,
 
     /// Content-addressed store.
     ///
-    /// TODO: Replace with Arc<ContentAddressedStore> in a future ticket.
+    /// TODO: Replace with `Arc<ContentAddressedStore>` in a future ticket.
     #[allow(dead_code)]
     cas: Arc<StubContentAddressedStore>,
 
