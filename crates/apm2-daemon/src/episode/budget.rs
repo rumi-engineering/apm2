@@ -111,20 +111,25 @@ pub struct EpisodeBudget {
 }
 
 /// Internal protobuf representation for encoding/decoding.
+///
+/// Per AD-VERIFY-001, we use `optional` fields to ensure explicit serialization
+/// of all values including defaults (e.g., 0). Protobuf 3's standard encoding
+/// omits default values, which would violate deterministic encoding
+/// requirements.
 #[derive(Clone, PartialEq, Message)]
 struct EpisodeBudgetProto {
-    #[prost(uint64, tag = "1")]
-    tokens: u64,
-    #[prost(uint32, tag = "2")]
-    tool_calls: u32,
-    #[prost(uint64, tag = "3")]
-    wall_ms: u64,
-    #[prost(uint64, tag = "4")]
-    cpu_ms: u64,
-    #[prost(uint64, tag = "5")]
-    bytes_io: u64,
-    #[prost(uint64, tag = "6")]
-    evidence_bytes: u64,
+    #[prost(uint64, optional, tag = "1")]
+    tokens: Option<u64>,
+    #[prost(uint32, optional, tag = "2")]
+    tool_calls: Option<u32>,
+    #[prost(uint64, optional, tag = "3")]
+    wall_ms: Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    cpu_ms: Option<u64>,
+    #[prost(uint64, optional, tag = "5")]
+    bytes_io: Option<u64>,
+    #[prost(uint64, optional, tag = "6")]
+    evidence_bytes: Option<u64>,
 }
 
 impl EpisodeBudget {
@@ -215,16 +220,18 @@ impl EpisodeBudget {
     /// Returns the canonical bytes for this budget.
     ///
     /// Per AD-VERIFY-001, this produces deterministic bytes suitable
-    /// for hashing and signing.
+    /// for hashing and signing. All fields are explicitly serialized
+    /// even when they contain default values (e.g., 0) by using
+    /// `optional` protobuf fields.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let proto = EpisodeBudgetProto {
-            tokens: self.tokens,
-            tool_calls: self.tool_calls,
-            wall_ms: self.wall_ms,
-            cpu_ms: self.cpu_ms,
-            bytes_io: self.bytes_io,
-            evidence_bytes: self.evidence_bytes,
+            tokens: Some(self.tokens),
+            tool_calls: Some(self.tool_calls),
+            wall_ms: Some(self.wall_ms),
+            cpu_ms: Some(self.cpu_ms),
+            bytes_io: Some(self.bytes_io),
+            evidence_bytes: Some(self.evidence_bytes),
         };
         proto.encode_to_vec()
     }
@@ -237,12 +244,12 @@ impl EpisodeBudget {
     pub fn decode(buf: &[u8]) -> Result<Self, prost::DecodeError> {
         let proto = EpisodeBudgetProto::decode(buf)?;
         Ok(Self {
-            tokens: proto.tokens,
-            tool_calls: proto.tool_calls,
-            wall_ms: proto.wall_ms,
-            cpu_ms: proto.cpu_ms,
-            bytes_io: proto.bytes_io,
-            evidence_bytes: proto.evidence_bytes,
+            tokens: proto.tokens.unwrap_or(0),
+            tool_calls: proto.tool_calls.unwrap_or(0),
+            wall_ms: proto.wall_ms.unwrap_or(0),
+            cpu_ms: proto.cpu_ms.unwrap_or(0),
+            bytes_io: proto.bytes_io.unwrap_or(0),
+            evidence_bytes: proto.evidence_bytes.unwrap_or(0),
         })
     }
 

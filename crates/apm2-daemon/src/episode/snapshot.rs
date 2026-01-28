@@ -307,14 +307,22 @@ impl PinnedSnapshotBuilder {
 
     /// Sets the repository hash from a slice.
     ///
-    /// Returns `None` if the slice is not exactly 32 bytes.
-    #[must_use]
-    pub fn repo_hash_from_slice(mut self, hash: &[u8]) -> Option<Self> {
+    /// # Errors
+    ///
+    /// Returns an error if the slice is not exactly 32 bytes.
+    pub fn repo_hash_from_slice(
+        mut self,
+        hash: &[u8],
+    ) -> Result<Self, crate::episode::EnvelopeError> {
         if hash.len() != HASH_SIZE {
-            return None;
+            return Err(crate::episode::EnvelopeError::InvalidHashSize {
+                field: "repo_hash",
+                expected: HASH_SIZE,
+                actual: hash.len(),
+            });
         }
         self.repo_hash = hash.to_vec();
-        Some(self)
+        Ok(self)
     }
 
     /// Sets the lockfile hash.
@@ -326,14 +334,22 @@ impl PinnedSnapshotBuilder {
 
     /// Sets the lockfile hash from a slice.
     ///
-    /// Returns `None` if the slice is not exactly 32 bytes.
-    #[must_use]
-    pub fn lockfile_hash_from_slice(mut self, hash: &[u8]) -> Option<Self> {
+    /// # Errors
+    ///
+    /// Returns an error if the slice is not exactly 32 bytes.
+    pub fn lockfile_hash_from_slice(
+        mut self,
+        hash: &[u8],
+    ) -> Result<Self, crate::episode::EnvelopeError> {
         if hash.len() != HASH_SIZE {
-            return None;
+            return Err(crate::episode::EnvelopeError::InvalidHashSize {
+                field: "lockfile_hash",
+                expected: HASH_SIZE,
+                actual: hash.len(),
+            });
         }
         self.lockfile_hash = hash.to_vec();
-        Some(self)
+        Ok(self)
     }
 
     /// Sets the policy hash.
@@ -345,14 +361,22 @@ impl PinnedSnapshotBuilder {
 
     /// Sets the policy hash from a slice.
     ///
-    /// Returns `None` if the slice is not exactly 32 bytes.
-    #[must_use]
-    pub fn policy_hash_from_slice(mut self, hash: &[u8]) -> Option<Self> {
+    /// # Errors
+    ///
+    /// Returns an error if the slice is not exactly 32 bytes.
+    pub fn policy_hash_from_slice(
+        mut self,
+        hash: &[u8],
+    ) -> Result<Self, crate::episode::EnvelopeError> {
         if hash.len() != HASH_SIZE {
-            return None;
+            return Err(crate::episode::EnvelopeError::InvalidHashSize {
+                field: "policy_hash",
+                expected: HASH_SIZE,
+                actual: hash.len(),
+            });
         }
         self.policy_hash = hash.to_vec();
-        Some(self)
+        Ok(self)
     }
 
     /// Sets the toolchain hash.
@@ -364,14 +388,22 @@ impl PinnedSnapshotBuilder {
 
     /// Sets the toolchain hash from a slice.
     ///
-    /// Returns `None` if the slice is not exactly 32 bytes.
-    #[must_use]
-    pub fn toolchain_hash_from_slice(mut self, hash: &[u8]) -> Option<Self> {
+    /// # Errors
+    ///
+    /// Returns an error if the slice is not exactly 32 bytes.
+    pub fn toolchain_hash_from_slice(
+        mut self,
+        hash: &[u8],
+    ) -> Result<Self, crate::episode::EnvelopeError> {
         if hash.len() != HASH_SIZE {
-            return None;
+            return Err(crate::episode::EnvelopeError::InvalidHashSize {
+                field: "toolchain_hash",
+                expected: HASH_SIZE,
+                actual: hash.len(),
+            });
         }
         self.toolchain_hash = hash.to_vec();
-        Some(self)
+        Ok(self)
     }
 
     /// Sets the model profile hash.
@@ -383,14 +415,22 @@ impl PinnedSnapshotBuilder {
 
     /// Sets the model profile hash from a slice.
     ///
-    /// Returns `None` if the slice is not exactly 32 bytes.
-    #[must_use]
-    pub fn model_profile_hash_from_slice(mut self, hash: &[u8]) -> Option<Self> {
+    /// # Errors
+    ///
+    /// Returns an error if the slice is not exactly 32 bytes.
+    pub fn model_profile_hash_from_slice(
+        mut self,
+        hash: &[u8],
+    ) -> Result<Self, crate::episode::EnvelopeError> {
         if hash.len() != HASH_SIZE {
-            return None;
+            return Err(crate::episode::EnvelopeError::InvalidHashSize {
+                field: "model_profile_hash",
+                expected: HASH_SIZE,
+                actual: hash.len(),
+            });
         }
         self.model_profile_hash = hash.to_vec();
-        Some(self)
+        Ok(self)
     }
 
     /// Builds the snapshot.
@@ -478,11 +518,11 @@ mod tests {
     fn test_snapshot_from_slice_invalid_length() {
         let short_hash = [0xab; 16];
         let result = PinnedSnapshotBuilder::new().repo_hash_from_slice(&short_hash);
-        assert!(result.is_none());
+        assert!(result.is_err());
 
         let long_hash = [0xab; 64];
         let result = PinnedSnapshotBuilder::new().repo_hash_from_slice(&long_hash);
-        assert!(result.is_none());
+        assert!(result.is_err());
     }
 
     #[test]

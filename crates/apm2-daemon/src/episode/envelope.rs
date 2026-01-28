@@ -165,16 +165,20 @@ impl DeterminismClass {
 }
 
 /// Internal protobuf representation for `StopConditions`.
+///
+/// Per AD-VERIFY-001, we use `optional` fields to ensure explicit serialization
+/// of all values including defaults. This prevents encoding from omitting
+/// zero values which would violate deterministic encoding requirements.
 #[derive(Clone, PartialEq, Message)]
 struct StopConditionsProto {
-    #[prost(uint64, tag = "1")]
-    max_episodes: u64,
-    #[prost(string, tag = "2")]
-    goal_predicate: String,
-    #[prost(string, tag = "3")]
-    failure_predicate: String,
-    #[prost(string, tag = "4")]
-    escalation_predicate: String,
+    #[prost(uint64, optional, tag = "1")]
+    max_episodes: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    goal_predicate: Option<String>,
+    #[prost(string, optional, tag = "3")]
+    failure_predicate: Option<String>,
+    #[prost(string, optional, tag = "4")]
+    escalation_predicate: Option<String>,
 }
 
 /// Stop conditions for episode termination.
@@ -215,13 +219,16 @@ impl StopConditions {
     }
 
     /// Returns the canonical bytes for these conditions.
+    ///
+    /// Per AD-VERIFY-001, all fields are explicitly serialized even when
+    /// they contain default values.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let proto = StopConditionsProto {
-            max_episodes: self.max_episodes,
-            goal_predicate: self.goal_predicate.clone(),
-            failure_predicate: self.failure_predicate.clone(),
-            escalation_predicate: self.escalation_predicate.clone(),
+            max_episodes: Some(self.max_episodes),
+            goal_predicate: Some(self.goal_predicate.clone()),
+            failure_predicate: Some(self.failure_predicate.clone()),
+            escalation_predicate: Some(self.escalation_predicate.clone()),
         };
         proto.encode_to_vec()
     }
@@ -280,20 +287,23 @@ impl ContextRefs {
 }
 
 /// Internal protobuf representation for the budget in envelope.
+///
+/// Per AD-VERIFY-001, we use `optional` fields to ensure explicit serialization
+/// of all values including defaults.
 #[derive(Clone, PartialEq, Message)]
 struct BudgetProto {
-    #[prost(uint64, tag = "1")]
-    tokens: u64,
-    #[prost(uint32, tag = "2")]
-    tool_calls: u32,
-    #[prost(uint64, tag = "3")]
-    wall_ms: u64,
-    #[prost(uint64, tag = "4")]
-    cpu_ms: u64,
-    #[prost(uint64, tag = "5")]
-    bytes_io: u64,
-    #[prost(uint64, tag = "6")]
-    evidence_bytes: u64,
+    #[prost(uint64, optional, tag = "1")]
+    tokens: Option<u64>,
+    #[prost(uint32, optional, tag = "2")]
+    tool_calls: Option<u32>,
+    #[prost(uint64, optional, tag = "3")]
+    wall_ms: Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    cpu_ms: Option<u64>,
+    #[prost(uint64, optional, tag = "5")]
+    bytes_io: Option<u64>,
+    #[prost(uint64, optional, tag = "6")]
+    evidence_bytes: Option<u64>,
 }
 
 /// Internal protobuf representation for the snapshot in envelope.
@@ -313,6 +323,9 @@ struct SnapshotProto {
 }
 
 /// Internal protobuf representation for `EpisodeEnvelope`.
+///
+/// Per AD-VERIFY-001, we use `optional` fields for numeric values to ensure
+/// explicit serialization even when they contain default values.
 #[derive(Clone, PartialEq, Message)]
 struct EpisodeEnvelopeProto {
     #[prost(string, tag = "1")]
@@ -331,10 +344,10 @@ struct EpisodeEnvelopeProto {
     pinned_snapshot: Option<SnapshotProto>,
     #[prost(bytes = "vec", tag = "8")]
     capability_manifest_hash: Vec<u8>,
-    #[prost(uint32, tag = "9")]
-    risk_tier: u32,
-    #[prost(uint32, tag = "10")]
-    determinism_class: u32,
+    #[prost(uint32, optional, tag = "9")]
+    risk_tier: Option<u32>,
+    #[prost(uint32, optional, tag = "10")]
+    determinism_class: Option<u32>,
     #[prost(message, optional, tag = "11")]
     context_refs: Option<ContextRefsProto>,
 }
@@ -578,21 +591,24 @@ impl EpisodeEnvelope {
     }
 
     /// Converts to protobuf representation with sorted repeated fields.
+    ///
+    /// Per AD-VERIFY-001, all fields are explicitly serialized even when
+    /// they contain default values.
     fn to_proto(&self) -> EpisodeEnvelopeProto {
         let budget = self.budget.as_ref().map(|b| BudgetProto {
-            tokens: b.tokens(),
-            tool_calls: b.tool_calls(),
-            wall_ms: b.wall_ms(),
-            cpu_ms: b.cpu_ms(),
-            bytes_io: b.bytes_io(),
-            evidence_bytes: b.evidence_bytes(),
+            tokens: Some(b.tokens()),
+            tool_calls: Some(b.tool_calls()),
+            wall_ms: Some(b.wall_ms()),
+            cpu_ms: Some(b.cpu_ms()),
+            bytes_io: Some(b.bytes_io()),
+            evidence_bytes: Some(b.evidence_bytes()),
         });
 
         let stop_conditions = self.stop_conditions.as_ref().map(|s| StopConditionsProto {
-            max_episodes: s.max_episodes,
-            goal_predicate: s.goal_predicate.clone(),
-            failure_predicate: s.failure_predicate.clone(),
-            escalation_predicate: s.escalation_predicate.clone(),
+            max_episodes: Some(s.max_episodes),
+            goal_predicate: Some(s.goal_predicate.clone()),
+            failure_predicate: Some(s.failure_predicate.clone()),
+            escalation_predicate: Some(s.escalation_predicate.clone()),
         });
 
         let pinned_snapshot = self.pinned_snapshot.as_ref().map(|s| SnapshotProto {
@@ -624,8 +640,8 @@ impl EpisodeEnvelope {
             stop_conditions,
             pinned_snapshot,
             capability_manifest_hash: self.capability_manifest_hash.clone(),
-            risk_tier: u32::from(self.risk_tier.tier()),
-            determinism_class: u32::from(self.determinism_class.value()),
+            risk_tier: Some(u32::from(self.risk_tier.tier())),
+            determinism_class: Some(u32::from(self.determinism_class.value())),
             context_refs,
         }
     }
@@ -647,7 +663,7 @@ impl EpisodeEnvelope {
     /// - ID lengths exceed `MAX_ID_LENGTH`
     /// - DCP refs count exceeds `MAX_DCP_REFS`
     fn from_proto(proto: EpisodeEnvelopeProto) -> Result<Self, EnvelopeError> {
-        // Validate required fields - same checks as build()
+        // Validate required ID fields - same checks as build()
         if proto.episode_id.is_empty() {
             return Err(EnvelopeError::MissingEpisodeId);
         }
@@ -659,6 +675,17 @@ impl EpisodeEnvelope {
         }
         if proto.capability_manifest_hash.is_empty() {
             return Err(EnvelopeError::MissingCapabilityManifestHash);
+        }
+
+        // Validate required fields per AD-EPISODE-001 - same checks as build()
+        if proto.budget.is_none() {
+            return Err(EnvelopeError::MissingBudget);
+        }
+        if proto.stop_conditions.is_none() {
+            return Err(EnvelopeError::MissingStopConditions);
+        }
+        if proto.pinned_snapshot.is_none() {
+            return Err(EnvelopeError::MissingPinnedSnapshot);
         }
 
         // Validate ID lengths - same checks as build()
@@ -694,7 +721,7 @@ impl EpisodeEnvelope {
 
         // Validate risk_tier - FAIL-CLOSED: reject invalid values
         #[allow(clippy::cast_possible_truncation)]
-        let risk_tier_value = proto.risk_tier as u8;
+        let risk_tier_value = proto.risk_tier.unwrap_or(0) as u8;
         let risk_tier =
             RiskTier::from_u8(risk_tier_value).ok_or(EnvelopeError::InvalidRiskTier {
                 value: risk_tier_value,
@@ -702,7 +729,7 @@ impl EpisodeEnvelope {
 
         // Validate determinism_class - FAIL-CLOSED: reject invalid values
         #[allow(clippy::cast_possible_truncation)]
-        let determinism_class_value = proto.determinism_class as u8;
+        let determinism_class_value = proto.determinism_class.unwrap_or(0) as u8;
         let determinism_class = DeterminismClass::from_u8(determinism_class_value).ok_or(
             EnvelopeError::InvalidDeterminismClass {
                 value: determinism_class_value,
@@ -718,20 +745,20 @@ impl EpisodeEnvelope {
 
         let budget = proto.budget.map(|b| {
             EpisodeBudget::builder()
-                .tokens(b.tokens)
-                .tool_calls(b.tool_calls)
-                .wall_ms(b.wall_ms)
-                .cpu_ms(b.cpu_ms)
-                .bytes_io(b.bytes_io)
-                .evidence_bytes(b.evidence_bytes)
+                .tokens(b.tokens.unwrap_or(0))
+                .tool_calls(b.tool_calls.unwrap_or(0))
+                .wall_ms(b.wall_ms.unwrap_or(0))
+                .cpu_ms(b.cpu_ms.unwrap_or(0))
+                .bytes_io(b.bytes_io.unwrap_or(0))
+                .evidence_bytes(b.evidence_bytes.unwrap_or(0))
                 .build()
         });
 
         let stop_conditions = proto.stop_conditions.map(|s| StopConditions {
-            max_episodes: s.max_episodes,
-            goal_predicate: s.goal_predicate,
-            failure_predicate: s.failure_predicate,
-            escalation_predicate: s.escalation_predicate,
+            max_episodes: s.max_episodes.unwrap_or(0),
+            goal_predicate: s.goal_predicate.unwrap_or_default(),
+            failure_predicate: s.failure_predicate.unwrap_or_default(),
+            escalation_predicate: s.escalation_predicate.unwrap_or_default(),
         });
 
         // Validate pinned snapshot hash lengths - FAIL-CLOSED: reject invalid lengths
@@ -827,6 +854,18 @@ pub enum EnvelopeError {
     #[error("capability_manifest_hash is required")]
     MissingCapabilityManifestHash,
 
+    /// Budget is missing (required per AD-EPISODE-001).
+    #[error("budget is required per AD-EPISODE-001")]
+    MissingBudget,
+
+    /// Stop conditions are missing (required per AD-EPISODE-001).
+    #[error("stop_conditions is required per AD-EPISODE-001")]
+    MissingStopConditions,
+
+    /// Pinned snapshot is missing (required per AD-EPISODE-001).
+    #[error("pinned_snapshot is required per AD-EPISODE-001")]
+    MissingPinnedSnapshot,
+
     /// ID exceeds maximum length.
     #[error("{field} exceeds maximum length of {max} characters")]
     IdTooLong {
@@ -868,6 +907,17 @@ pub enum EnvelopeError {
     /// Invalid hash length in pinned snapshot.
     #[error("{field} has invalid length {actual}, expected 0 or {expected}")]
     InvalidHashLength {
+        /// Field name.
+        field: &'static str,
+        /// Expected length.
+        expected: usize,
+        /// Actual length.
+        actual: usize,
+    },
+
+    /// Invalid hash length when setting field.
+    #[error("{field} must be exactly {expected} bytes, got {actual}")]
+    InvalidHashSize {
         /// Field name.
         field: &'static str,
         /// Expected length.
@@ -998,6 +1048,16 @@ impl EpisodeEnvelopeBuilder {
 
     /// Builds the envelope, validating all required fields.
     ///
+    /// # Required Fields (per AD-EPISODE-001)
+    ///
+    /// - `episode_id`: Stable identifier for this episode
+    /// - `actor_id`: Identity of the caller (agent or user)
+    /// - `lease_id`: Lease granting authority for this episode
+    /// - `capability_manifest_hash`: Hash of OCAP tool handles
+    /// - `budget`: Resource limits for the episode
+    /// - `stop_conditions`: Termination predicates
+    /// - `pinned_snapshot`: Reproducibility digests
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -1006,7 +1066,7 @@ impl EpisodeEnvelopeBuilder {
     /// - Capability manifest hash is not 32 bytes
     /// - Too many DCP references
     pub fn build(self) -> Result<EpisodeEnvelope, EnvelopeError> {
-        // Validate required fields
+        // Validate required ID fields
         if self.episode_id.is_empty() {
             return Err(EnvelopeError::MissingEpisodeId);
         }
@@ -1018,6 +1078,17 @@ impl EpisodeEnvelopeBuilder {
         }
         if self.capability_manifest_hash.is_empty() {
             return Err(EnvelopeError::MissingCapabilityManifestHash);
+        }
+
+        // Validate required fields per AD-EPISODE-001
+        if self.budget.is_none() {
+            return Err(EnvelopeError::MissingBudget);
+        }
+        if self.stop_conditions.is_none() {
+            return Err(EnvelopeError::MissingStopConditions);
+        }
+        if self.pinned_snapshot.is_none() {
+            return Err(EnvelopeError::MissingPinnedSnapshot);
         }
 
         // Validate field lengths
@@ -1078,12 +1149,17 @@ impl EpisodeEnvelopeBuilder {
 mod tests {
     use super::*;
 
+    /// Creates a minimal valid envelope with all required fields per
+    /// AD-EPISODE-001.
     fn minimal_envelope() -> EpisodeEnvelope {
         EpisodeEnvelope::builder()
             .episode_id("ep-001")
             .actor_id("agent-007")
             .lease_id("lease-123")
             .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .build()
             .expect("valid envelope")
     }
@@ -1176,6 +1252,9 @@ mod tests {
             .episode_id("ep")
             .actor_id("actor")
             .lease_id("lease")
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .build();
 
         assert!(matches!(
@@ -1185,12 +1264,57 @@ mod tests {
     }
 
     #[test]
+    fn test_envelope_missing_budget() {
+        let result = EpisodeEnvelope::builder()
+            .episode_id("ep")
+            .actor_id("actor")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .build();
+
+        assert!(matches!(result, Err(EnvelopeError::MissingBudget)));
+    }
+
+    #[test]
+    fn test_envelope_missing_stop_conditions() {
+        let result = EpisodeEnvelope::builder()
+            .episode_id("ep")
+            .actor_id("actor")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .build();
+
+        assert!(matches!(result, Err(EnvelopeError::MissingStopConditions)));
+    }
+
+    #[test]
+    fn test_envelope_missing_pinned_snapshot() {
+        let result = EpisodeEnvelope::builder()
+            .episode_id("ep")
+            .actor_id("actor")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .build();
+
+        assert!(matches!(result, Err(EnvelopeError::MissingPinnedSnapshot)));
+    }
+
+    #[test]
     fn test_envelope_invalid_capability_hash_size() {
         let result = EpisodeEnvelope::builder()
             .episode_id("ep")
             .actor_id("actor")
             .lease_id("lease")
             .capability_manifest_hash_from_slice(&[0xab; 16]) // Wrong size
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .build();
 
         assert!(matches!(
@@ -1208,6 +1332,9 @@ mod tests {
             .actor_id("actor")
             .lease_id("lease")
             .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .build();
 
         assert!(matches!(
@@ -1228,6 +1355,9 @@ mod tests {
             .actor_id("actor")
             .lease_id("lease")
             .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .context_refs(ContextRefs {
                 context_pack_hash: vec![],
                 dcp_refs,
@@ -1256,6 +1386,9 @@ mod tests {
             .actor_id("actor")
             .lease_id("lease")
             .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .context_refs(ContextRefs {
                 context_pack_hash: vec![],
                 dcp_refs: vec!["z".to_string(), "a".to_string(), "m".to_string()],
@@ -1268,6 +1401,9 @@ mod tests {
             .actor_id("actor")
             .lease_id("lease")
             .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .context_refs(ContextRefs {
                 context_pack_hash: vec![],
                 dcp_refs: vec!["a".to_string(), "m".to_string(), "z".to_string()],
@@ -1307,6 +1443,9 @@ mod tests {
             .actor_id("agent-007")
             .lease_id("lease-123")
             .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .build()
             .expect("valid");
 
@@ -1437,6 +1576,21 @@ mod tests {
         use prost::Message;
 
         #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
         struct CraftedEnvelope {
             #[prost(string, tag = "1")]
             episode_id: String,
@@ -1444,18 +1598,29 @@ mod tests {
             actor_id: String,
             #[prost(string, tag = "4")]
             lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
             #[prost(bytes = "vec", tag = "8")]
             capability_manifest_hash: Vec<u8>,
-            #[prost(uint32, tag = "9")]
-            risk_tier: u32,
+            #[prost(uint32, optional, tag = "9")]
+            risk_tier: Option<u32>,
         }
 
         let crafted = CraftedEnvelope {
             episode_id: "ep-001".to_string(),
             actor_id: "agent-007".to_string(),
             lease_id: "lease-123".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
             capability_manifest_hash: vec![0xab; 32],
-            risk_tier: 99, // Invalid - must fail
+            risk_tier: Some(99), // Invalid - must fail
         };
 
         let crafted_bytes = crafted.encode_to_vec();
@@ -1474,6 +1639,21 @@ mod tests {
         use prost::Message;
 
         #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
         struct CraftedEnvelope {
             #[prost(string, tag = "1")]
             episode_id: String,
@@ -1481,18 +1661,29 @@ mod tests {
             actor_id: String,
             #[prost(string, tag = "4")]
             lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
             #[prost(bytes = "vec", tag = "8")]
             capability_manifest_hash: Vec<u8>,
-            #[prost(uint32, tag = "10")]
-            determinism_class: u32,
+            #[prost(uint32, optional, tag = "10")]
+            determinism_class: Option<u32>,
         }
 
         let crafted = CraftedEnvelope {
             episode_id: "ep-001".to_string(),
             actor_id: "agent-007".to_string(),
             lease_id: "lease-123".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
             capability_manifest_hash: vec![0xab; 32],
-            determinism_class: 99, // Invalid - must fail
+            determinism_class: Some(99), // Invalid - must fail
         };
 
         let crafted_bytes = crafted.encode_to_vec();
@@ -1515,6 +1706,21 @@ mod tests {
         use prost::Message;
 
         #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
         struct CraftedEnvelope {
             #[prost(string, tag = "1")]
             episode_id: String,
@@ -1522,6 +1728,12 @@ mod tests {
             actor_id: String,
             #[prost(string, tag = "4")]
             lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
             #[prost(bytes = "vec", tag = "8")]
             capability_manifest_hash: Vec<u8>,
         }
@@ -1530,6 +1742,11 @@ mod tests {
             episode_id: "x".repeat(MAX_ID_LENGTH + 1), // Too long
             actor_id: "agent".to_string(),
             lease_id: "lease".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
             capability_manifest_hash: vec![0xab; 32],
         };
 
@@ -1556,6 +1773,21 @@ mod tests {
         use prost::Message;
 
         #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
         struct CraftedContextRefs {
             #[prost(bytes = "vec", tag = "1")]
             context_pack_hash: Vec<u8>,
@@ -1571,6 +1803,12 @@ mod tests {
             actor_id: String,
             #[prost(string, tag = "4")]
             lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
             #[prost(bytes = "vec", tag = "8")]
             capability_manifest_hash: Vec<u8>,
             #[prost(message, optional, tag = "11")]
@@ -1583,6 +1821,11 @@ mod tests {
             episode_id: "ep-001".to_string(),
             actor_id: "agent".to_string(),
             lease_id: "lease".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
             capability_manifest_hash: vec![0xab; 32],
             context_refs: Some(CraftedContextRefs {
                 context_pack_hash: vec![],
@@ -1609,6 +1852,18 @@ mod tests {
         use prost::Message;
 
         #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
         struct CraftedSnapshot {
             #[prost(bytes = "vec", tag = "1")]
             repo_hash: Vec<u8>,
@@ -1622,6 +1877,10 @@ mod tests {
             actor_id: String,
             #[prost(string, tag = "4")]
             lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
             #[prost(message, optional, tag = "7")]
             pinned_snapshot: Option<CraftedSnapshot>,
             #[prost(bytes = "vec", tag = "8")]
@@ -1633,6 +1892,10 @@ mod tests {
             episode_id: "ep-001".to_string(),
             actor_id: "agent".to_string(),
             lease_id: "lease".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
             pinned_snapshot: Some(CraftedSnapshot {
                 repo_hash: vec![0xab; 16], // Truncated - must fail
             }),
@@ -1691,6 +1954,21 @@ mod tests {
         use prost::Message;
 
         #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
         struct CraftedEnvelope {
             #[prost(string, tag = "1")]
             episode_id: String,
@@ -1698,6 +1976,12 @@ mod tests {
             actor_id: String,
             #[prost(string, tag = "4")]
             lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
             #[prost(bytes = "vec", tag = "8")]
             capability_manifest_hash: Vec<u8>,
         }
@@ -1706,6 +1990,11 @@ mod tests {
             episode_id: "ep-001".to_string(),
             actor_id: "agent".to_string(),
             lease_id: "lease".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
             capability_manifest_hash: vec![0xab; 16], // Wrong size
         };
 
@@ -1718,6 +2007,160 @@ mod tests {
                 Err(EnvelopeError::InvalidCapabilityManifestHashSize)
             ),
             "decode() must reject invalid capability_manifest_hash size, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects missing budget (required per
+    /// AD-EPISODE-001).
+    #[test]
+    fn test_decode_rejects_missing_budget() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+        }
+
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent".to_string(),
+            lease_id: "lease".to_string(),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
+            capability_manifest_hash: vec![0xab; 32],
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(result, Err(EnvelopeError::MissingBudget)),
+            "decode() must reject missing budget, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects missing `stop_conditions` (required per
+    /// AD-EPISODE-001).
+    #[test]
+    fn test_decode_rejects_missing_stop_conditions() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+        }
+
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent".to_string(),
+            lease_id: "lease".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
+            capability_manifest_hash: vec![0xab; 32],
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(result, Err(EnvelopeError::MissingStopConditions)),
+            "decode() must reject missing stop_conditions, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects missing `pinned_snapshot` (required per
+    /// AD-EPISODE-001).
+    #[test]
+    fn test_decode_rejects_missing_pinned_snapshot() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+        }
+
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent".to_string(),
+            lease_id: "lease".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
+            capability_manifest_hash: vec![0xab; 32],
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(result, Err(EnvelopeError::MissingPinnedSnapshot)),
+            "decode() must reject missing pinned_snapshot, got: {result:?}"
         );
     }
 }

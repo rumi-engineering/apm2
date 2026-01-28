@@ -61,19 +61,26 @@ pub const BUDGET_DEFAULT_VECTOR: GoldenVector = GoldenVector {
 };
 
 /// Golden vector for unlimited budget.
+///
+/// Per AD-VERIFY-001, all fields are explicitly serialized even when they
+/// contain default values (0). This ensures deterministic encoding regardless
+/// of Protobuf implementation details.
 pub const BUDGET_UNLIMITED_VECTOR: GoldenVector = GoldenVector {
     name: "budget_unlimited",
     contract: "AD-EPISODE-001",
-    expected_hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
-    expected_bytes: "",
+    expected_hash: "99286982d4aad771d25451896f87d7e304930adfc03e576747c46111ff9a8fc4",
+    expected_bytes: "080010001800200028003000",
 };
 
 /// Golden vector for minimal budget.
+///
+/// Per AD-VERIFY-001, all fields are explicitly serialized including
+/// `bytes_io=0` and `evidence_bytes=0`.
 pub const BUDGET_MINIMAL_VECTOR: GoldenVector = GoldenVector {
     name: "budget_minimal",
     contract: "AD-EPISODE-001",
-    expected_hash: "9d83923951db118bca5ec5214ff621404aa1913e0ab3753b0b19f18d95a64fa7",
-    expected_bytes: "08a08d06103218cc0820a08d06",
+    expected_hash: "06b2a3eb4a3cfdb24a5d36e1323072b4789c35dbbb2e3f5c80dc3d7553474d92",
+    expected_bytes: "08a08d06103218cc0820a08d0628003000",
 };
 
 // ============================================================================
@@ -109,11 +116,14 @@ pub const SNAPSHOT_FULL_VECTOR: GoldenVector = GoldenVector {
 // ============================================================================
 
 /// Golden vector for stop conditions with max episodes only.
+///
+/// Per AD-VERIFY-001, all fields are explicitly serialized including
+/// empty predicates.
 pub const STOP_CONDITIONS_MAX_EPISODES_VECTOR: GoldenVector = GoldenVector {
     name: "stop_conditions_max_episodes",
     contract: "AD-EPISODE-001",
-    expected_hash: "fe98ed8171e45aa9432269503e7f627bf60d921cc0981d3d7b687590387b2526",
-    expected_bytes: "0864",
+    expected_hash: "8dff9a7c067be7265cc861dbf1cbadd5234c3850fcb9f33730eb5f53800f37b0",
+    expected_bytes: "086412001a002200",
 };
 
 /// Golden vector for stop conditions with predicates.
@@ -129,27 +139,36 @@ pub const STOP_CONDITIONS_WITH_PREDICATES_VECTOR: GoldenVector = GoldenVector {
 // ============================================================================
 
 /// Golden vector for minimal envelope (required fields only).
+///
+/// Per AD-EPISODE-001, minimal envelopes still include budget,
+/// `stop_conditions`, and `pinned_snapshot`. Per AD-VERIFY-001, all fields are
+/// explicitly serialized.
 pub const ENVELOPE_MINIMAL_VECTOR: GoldenVector = GoldenVector {
     name: "envelope_minimal",
     contract: "AD-EPISODE-001",
-    expected_hash: "659d0e30420949e80aa65a551a53963aed927062c29381605230a499f58a730b",
-    expected_bytes: "0a0665702d30303112096167656e742d30303722096c656173652d31323342200102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    expected_hash: "459d5e4559105c56c95076d598d444b044d1c9dc8848ad84f9b6d0b24fbd0647",
+    expected_bytes: "0a0665702d30303112096167656e742d30303722096c656173652d3132332a0c0800100018002000280030003208080012001a0022003a0042200102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2048005000",
 };
 
 /// Golden vector for envelope with all optional fields.
+///
+/// Per AD-VERIFY-001, all fields are explicitly serialized.
 pub const ENVELOPE_FULL_VECTOR: GoldenVector = GoldenVector {
     name: "envelope_full",
     contract: "AD-EPISODE-001",
-    expected_hash: "3b1393ec7e3a7f0749f144cd26b5340f8937af0286f7aabd18e658c34ddb1fc1",
-    expected_bytes: "0a0665702d30303112096167656e742d3030371a08776f726b2d34353622096c656173652d3132332a0d08a08d06103218cc0820c0cf24320208643a220a2001020304050607080102030405060708010203040506070801020304050607084220abababababababababababababababababababababababababababababababab480250025a300a20efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef1205646370313112056463703232",
+    expected_hash: "a45997b432a661c559ac674733a36c9e1a2f924ab901a91e4f5e3accbe550bf4",
+    expected_bytes: "0a0665702d30303112096167656e742d3030371a08776f726b2d34353622096c656173652d3132332a1108a08d06103218cc0820c0cf24280030003208086412001a0022003a220a2001020304050607080102030405060708010203040506070801020304050607084220abababababababababababababababababababababababababababababababab480250025a300a20efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef1205646370313112056463703232",
 };
 
 /// Golden vector for envelope with sorted context refs.
+///
+/// Per AD-VERIFY-001, all fields are explicitly serialized and DCP refs are
+/// sorted.
 pub const ENVELOPE_SORTED_DCP_REFS_VECTOR: GoldenVector = GoldenVector {
     name: "envelope_sorted_dcp_refs",
     contract: "AD-VERIFY-001",
-    expected_hash: "9c9d4a1cc938e1c74db71eeb1dccc8b0a770d2ba23aa921826a2c81c742a2866",
-    expected_bytes: "0a0265701206616374696f6e22056c65617365422001020304050607080102030405060708010203040506070801020304050607085a0c12016112016212016312017a",
+    expected_hash: "66dcc8e542d5d6d5e8ff75eadd9705203c9d6df062d5a0b5e6fe4915ee96affe",
+    expected_bytes: "0a0265701206616374696f6e22056c656173652a0c0800100018002000280030003208080012001a0022003a0042200102030405060708010203040506070801020304050607080102030405060708480050005a0c12016112016212016312017a",
 };
 
 // ============================================================================
@@ -223,6 +242,9 @@ pub fn construct_stop_conditions_with_predicates() -> StopConditions {
 }
 
 /// Constructs a minimal envelope for golden vector.
+///
+/// Per AD-EPISODE-001, minimal envelopes still require budget,
+/// `stop_conditions`, and `pinned_snapshot` fields.
 #[must_use]
 pub fn construct_envelope_minimal() -> EpisodeEnvelope {
     EpisodeEnvelope::builder()
@@ -234,6 +256,9 @@ pub fn construct_envelope_minimal() -> EpisodeEnvelope {
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
             0x1d, 0x1e, 0x1f, 0x20,
         ])
+        .budget(EpisodeBudget::unlimited())
+        .stop_conditions(StopConditions::max_episodes(0))
+        .pinned_snapshot(PinnedSnapshot::empty())
         .build()
         .expect("valid envelope")
 }
@@ -290,6 +315,9 @@ pub fn construct_envelope_sorted_dcp_refs() -> EpisodeEnvelope {
             0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04,
             0x05, 0x06, 0x07, 0x08,
         ])
+        .budget(EpisodeBudget::unlimited())
+        .stop_conditions(StopConditions::max_episodes(0))
+        .pinned_snapshot(PinnedSnapshot::empty())
         .context_refs(ContextRefs {
             context_pack_hash: vec![],
             // Intentionally unsorted - canonical_bytes should sort these
@@ -492,6 +520,9 @@ mod tests {
             .actor_id("actor")
             .lease_id("lease")
             .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::unlimited())
+            .stop_conditions(StopConditions::max_episodes(0))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .context_refs(ContextRefs {
                 context_pack_hash: vec![],
                 dcp_refs: vec!["z".to_string(), "a".to_string(), "m".to_string()],
@@ -505,6 +536,9 @@ mod tests {
             .actor_id("actor")
             .lease_id("lease")
             .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::unlimited())
+            .stop_conditions(StopConditions::max_episodes(0))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .context_refs(ContextRefs {
                 context_pack_hash: vec![],
                 dcp_refs: vec!["a".to_string(), "m".to_string(), "z".to_string()],
@@ -555,6 +589,9 @@ mod tests {
                 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
                 0x1d, 0x1e, 0x1f, 0x20,
             ])
+            .budget(EpisodeBudget::unlimited())
+            .stop_conditions(StopConditions::max_episodes(0))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .build()
             .expect("valid");
 
@@ -574,6 +611,9 @@ mod tests {
                 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
                 0x1d, 0x1e, 0x1f, 0x20,
             ])
+            .budget(EpisodeBudget::unlimited())
+            .stop_conditions(StopConditions::max_episodes(0))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .build()
             .expect("valid");
 
@@ -589,6 +629,9 @@ mod tests {
             .actor_id("agent-007")
             .lease_id("lease-123")
             .capability_manifest_hash([0xff; 32])
+            .budget(EpisodeBudget::unlimited())
+            .stop_conditions(StopConditions::max_episodes(0))
+            .pinned_snapshot(PinnedSnapshot::empty())
             .build()
             .expect("valid");
 
