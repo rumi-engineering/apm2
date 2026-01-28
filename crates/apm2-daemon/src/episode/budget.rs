@@ -83,7 +83,13 @@ pub const MAX_EVIDENCE_BYTES: u64 = u64::MAX / 2;
 /// assert_eq!(budget.tokens(), 100_000);
 /// assert!(!budget.is_unlimited());
 /// ```
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EpisodeBudget {
     /// Maximum inference tokens that can be consumed.
     /// A value of 0 means unlimited.

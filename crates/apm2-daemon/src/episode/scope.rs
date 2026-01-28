@@ -64,7 +64,11 @@ pub const MAX_PATH_LEN: usize = 4096;
 /// Per CTR-2003 (fail-closed), `Default` uses `default_limits()` which provides
 /// safe, bounded defaults rather than zeroed values that could be interpreted
 /// as unlimited.
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SizeLimits {
     /// Maximum bytes that can be read in a single operation.
     pub max_read_bytes: u64,
@@ -183,7 +187,13 @@ impl SizeLimits {
 /// Network access policy for capabilities.
 ///
 /// Defines which hosts and ports can be accessed.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
     /// Allowed host patterns (glob-style: `*.example.com`).
     /// Empty means no network access.
@@ -419,7 +429,13 @@ impl std::error::Error for ScopeError {}
 /// - Allowed patterns (file type filtering)
 /// - Size limits (resource exhaustion prevention)
 /// - Network policy (host/port restrictions)
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityScope {
     /// Allowed base directories for filesystem operations.
     /// Operations must be contained within these paths.
