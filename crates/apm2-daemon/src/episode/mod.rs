@@ -125,7 +125,9 @@ pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal}
 // Re-export PTY types (TCK-00161)
 pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};
 pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
-pub use raw_adapter::RawAdapter;
+pub use raw_adapter::{
+    RawAdapter, RawAdapterHolon, RawAdapterOutput, RawAdapterState, SharedAdapterState,
+};
 pub use registry::AdapterRegistry;
 pub use ring_buffer::{RingBuffer, tier_defaults};
 pub use runtime::{

@@ -851,10 +851,24 @@ impl HarnessEvent {
 /// 2. Consume the returned [`HarnessEventStream`] to receive events
 /// 3. Optionally use [`send_input`](HarnessAdapter::send_input) to send data
 /// 4. Call [`terminate`](HarnessAdapter::terminate) to stop the process
+///
+/// # Holon Factory
+///
+/// Per AD-LAYER-001 and AD-ADAPT-001, adapters can create per-episode Holon
+/// instances via the
+/// [`AdapterRegistry::create_holon`](crate::episode::AdapterRegistry::create_holon)
+/// factory method. This requires the [`as_any`](HarnessAdapter::as_any) method
+/// for safe downcasting.
 #[allow(clippy::type_complexity)]
 pub trait HarnessAdapter: Send + Sync {
     /// Returns the adapter type.
     fn adapter_type(&self) -> AdapterType;
+
+    /// Returns self as `&dyn Any` for downcasting.
+    ///
+    /// This enables the registry to safely downcast adapters to their concrete
+    /// types for creating per-episode Holon instances.
+    fn as_any(&self) -> &dyn std::any::Any;
 
     /// Spawns a new harness process.
     ///
