@@ -5,7 +5,6 @@
 //! a running episode.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -28,8 +27,10 @@ struct SessionHandleInner {
     session_id: String,
     /// Lease ID authorizing this session.
     lease_id: String,
-    /// When this session started.
-    started_at: Instant,
+    /// When this session started (nanoseconds since epoch).
+    ///
+    /// This is deterministic, set by the caller per HARD-TIME (M05).
+    started_at_ns: u64,
     /// Sender for stop signals.
     stop_sender: watch::Sender<StopSignal>,
 }
@@ -58,8 +59,10 @@ struct SessionHandleInner {
 /// # Invariants
 ///
 /// - [INV-SH001] Session IDs are unique within an episode
-/// - [INV-SH002] Start instant is immutable after creation
+/// - [INV-SH002] Start timestamp is immutable after creation
 /// - [INV-SH003] All clones share the same stop signal channel
+/// - [INV-SH004] All timing is deterministic via caller-supplied timestamps
+///   (HARD-TIME)
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
     /// Shared inner state.
@@ -76,17 +79,20 @@ impl SessionHandle {
     /// * `episode_id` - The episode this session belongs to
     /// * `session_id` - Unique session identifier
     /// * `lease_id` - Lease authorizing this session
+    /// * `started_at_ns` - Start timestamp in nanoseconds since epoch
+    ///   (deterministic, per HARD-TIME)
     pub fn new(
         episode_id: EpisodeId,
         session_id: impl Into<String>,
         lease_id: impl Into<String>,
+        started_at_ns: u64,
     ) -> Self {
         let (stop_sender, stop_receiver) = watch::channel(StopSignal::None);
         let inner = SessionHandleInner {
             episode_id,
             session_id: session_id.into(),
             lease_id: lease_id.into(),
-            started_at: Instant::now(),
+            started_at_ns,
             stop_sender,
         };
         Self {
@@ -113,23 +119,30 @@ impl SessionHandle {
         &self.inner.lease_id
     }
 
-    /// Returns the duration since this session started.
+    /// Returns the elapsed time in nanoseconds since this session started.
     ///
-    /// NOTE: This method uses `Instant::now()` internally, which introduces
-    /// non-determinism. For deterministic testing or replay scenarios,
-    /// use `started_at()` and compute elapsed time from a known timestamp.
+    /// # Arguments
+    ///
+    /// * `current_ns` - Current timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// Elapsed time in nanoseconds. Returns 0 if `current_ns < started_at_ns`
+    /// (fail-closed behavior for clock skew).
+    ///
+    /// This method is deterministic per HARD-TIME (M05) - timing is computed
+    /// from caller-supplied timestamps, not from `Instant::now()`.
     #[must_use]
-    pub fn elapsed(&self) -> Duration {
-        self.inner.started_at.elapsed()
+    pub fn elapsed_ns(&self, current_ns: u64) -> u64 {
+        current_ns.saturating_sub(self.inner.started_at_ns)
     }
 
-    /// Returns the start instant.
+    /// Returns the start timestamp in nanoseconds since epoch.
     ///
-    /// Use this with an external timestamp for deterministic elapsed time
-    /// calculation instead of `elapsed()`.
+    /// This is the deterministic timestamp provided at session creation.
     #[must_use]
-    pub fn started_at(&self) -> Instant {
-        self.inner.started_at
+    pub fn started_at_ns(&self) -> u64 {
+        self.inner.started_at_ns
     }
 
     /// Signals the session to stop with the given reason.
@@ -164,14 +177,24 @@ impl SessionHandle {
     }
 
     /// Creates a snapshot of the current handle state.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_ns` - Current timestamp in nanoseconds since epoch
+    ///
+    /// This method is deterministic per HARD-TIME (M05) - elapsed time is
+    /// computed from the caller-supplied timestamp.
     #[must_use]
-    pub fn snapshot(&self) -> SessionSnapshot {
+    #[allow(clippy::similar_names)] // elapsed_ns and elapsed_ms are intentionally similar
+    pub fn snapshot(&self, current_ns: u64) -> SessionSnapshot {
+        // Convert elapsed nanoseconds to milliseconds
+        let elapsed_ns = self.elapsed_ns(current_ns);
+        let elapsed_ms = elapsed_ns / 1_000_000;
         SessionSnapshot {
             episode_id: self.inner.episode_id.as_str().to_string(),
             session_id: self.inner.session_id.clone(),
             lease_id: self.inner.lease_id.clone(),
-            // Saturate to u64::MAX for durations exceeding ~584 million years
-            elapsed_ms: u64::try_from(self.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms,
             stop_signal: self.current_stop_signal(),
         }
     }
@@ -260,24 +283,41 @@ mod tests {
         EpisodeId::new("ep-test-123").unwrap()
     }
 
-    #[test]
-    fn test_session_handle_new() {
-        let handle = SessionHandle::new(test_episode_id(), "session-1", "lease-1");
-        assert_eq!(handle.episode_id().as_str(), "ep-test-123");
-        assert_eq!(handle.session_id(), "session-1");
-        assert_eq!(handle.lease_id(), "lease-1");
+    /// Test timestamp: 2024-01-01 00:00:00 UTC in nanoseconds.
+    fn test_timestamp() -> u64 {
+        1_704_067_200_000_000_000
     }
 
     #[test]
-    fn test_session_handle_elapsed() {
-        let handle = SessionHandle::new(test_episode_id(), "session-1", "lease-1");
-        // Elapsed time should be very small (essentially 0)
-        assert!(handle.elapsed().as_millis() < 100);
+    fn test_session_handle_new() {
+        let handle =
+            SessionHandle::new(test_episode_id(), "session-1", "lease-1", test_timestamp());
+        assert_eq!(handle.episode_id().as_str(), "ep-test-123");
+        assert_eq!(handle.session_id(), "session-1");
+        assert_eq!(handle.lease_id(), "lease-1");
+        assert_eq!(handle.started_at_ns(), test_timestamp());
+    }
+
+    #[test]
+    fn test_session_handle_elapsed_ns() {
+        let start_ns = test_timestamp();
+        let handle = SessionHandle::new(test_episode_id(), "session-1", "lease-1", start_ns);
+
+        // At start time, elapsed should be 0
+        assert_eq!(handle.elapsed_ns(start_ns), 0);
+
+        // 1 second later
+        let one_sec_ns = 1_000_000_000;
+        assert_eq!(handle.elapsed_ns(start_ns + one_sec_ns), one_sec_ns);
+
+        // Fail-closed: if current_ns < started_at_ns (clock skew), return 0
+        assert_eq!(handle.elapsed_ns(start_ns - 1), 0);
     }
 
     #[test]
     fn test_session_handle_stop_signal() {
-        let handle = SessionHandle::new(test_episode_id(), "session-1", "lease-1");
+        let handle =
+            SessionHandle::new(test_episode_id(), "session-1", "lease-1", test_timestamp());
 
         // Initially no stop signal
         assert!(!handle.should_stop());
@@ -298,12 +338,16 @@ mod tests {
 
     #[test]
     fn test_session_handle_snapshot() {
-        let handle = SessionHandle::new(test_episode_id(), "session-1", "lease-1");
-        let snapshot = handle.snapshot();
+        let start_ns = test_timestamp();
+        let handle = SessionHandle::new(test_episode_id(), "session-1", "lease-1", start_ns);
+        // Snapshot taken 500ms after start
+        let current_ns = start_ns + 500_000_000;
+        let snapshot = handle.snapshot(current_ns);
 
         assert_eq!(snapshot.episode_id, "ep-test-123");
         assert_eq!(snapshot.session_id, "session-1");
         assert_eq!(snapshot.lease_id, "lease-1");
+        assert_eq!(snapshot.elapsed_ms, 500);
         assert_eq!(snapshot.stop_signal, StopSignal::None);
     }
 
@@ -411,7 +455,8 @@ mod tests {
     /// channel.
     #[test]
     fn test_session_handle_is_clone() {
-        let handle1 = SessionHandle::new(test_episode_id(), "session-1", "lease-1");
+        let handle1 =
+            SessionHandle::new(test_episode_id(), "session-1", "lease-1", test_timestamp());
         let handle2 = handle1.clone();
 
         // Both handles should have the same identifiers
@@ -440,7 +485,8 @@ mod tests {
     /// Test that multiple clones all share the same channel.
     #[test]
     fn test_session_handle_multiple_clones_share_channel() {
-        let handle1 = SessionHandle::new(test_episode_id(), "session-1", "lease-1");
+        let handle1 =
+            SessionHandle::new(test_episode_id(), "session-1", "lease-1", test_timestamp());
         let handle2 = handle1.clone();
         let handle3 = handle2.clone();
         let handle4 = handle1.clone();

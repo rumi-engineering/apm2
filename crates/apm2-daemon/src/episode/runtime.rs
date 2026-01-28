@@ -34,7 +34,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
@@ -60,8 +59,8 @@ pub type Hash = [u8; 32];
 pub enum EpisodeEvent {
     /// Episode was created.
     Created {
-        /// Episode identifier.
-        episode_id: String,
+        /// Episode identifier (typed for safety).
+        episode_id: EpisodeId,
         /// Hash of the episode envelope.
         envelope_hash: Hash,
         /// Timestamp when created (nanoseconds since epoch).
@@ -69,8 +68,8 @@ pub enum EpisodeEvent {
     },
     /// Episode started running.
     Started {
-        /// Episode identifier.
-        episode_id: String,
+        /// Episode identifier (typed for safety).
+        episode_id: EpisodeId,
         /// Session identifier for the running episode.
         session_id: String,
         /// Lease ID authorizing execution.
@@ -80,8 +79,8 @@ pub enum EpisodeEvent {
     },
     /// Episode terminated normally.
     Stopped {
-        /// Episode identifier.
-        episode_id: String,
+        /// Episode identifier (typed for safety).
+        episode_id: EpisodeId,
         /// How the episode terminated.
         termination_class: TerminationClass,
         /// Timestamp when terminated (nanoseconds since epoch).
@@ -89,8 +88,8 @@ pub enum EpisodeEvent {
     },
     /// Episode was quarantined.
     Quarantined {
-        /// Episode identifier.
-        episode_id: String,
+        /// Episode identifier (typed for safety).
+        episode_id: EpisodeId,
         /// Reason for quarantine.
         reason: QuarantineReason,
         /// Timestamp when quarantined (nanoseconds since epoch).
@@ -101,7 +100,7 @@ pub enum EpisodeEvent {
 impl EpisodeEvent {
     /// Returns the episode ID for this event.
     #[must_use]
-    pub fn episode_id(&self) -> &str {
+    pub const fn episode_id(&self) -> &EpisodeId {
         match self {
             Self::Created { episode_id, .. }
             | Self::Started { episode_id, .. }
@@ -207,8 +206,6 @@ pub struct EpisodeRuntime {
     /// This counter provides uniqueness even when multiple episodes
     /// are created with the same envelope hash and timestamp.
     episode_seq: AtomicU64,
-    /// Start time for uptime calculation.
-    started_at: Instant,
 }
 
 impl EpisodeRuntime {
@@ -221,7 +218,6 @@ impl EpisodeRuntime {
             events: RwLock::new(Vec::new()),
             session_seq: AtomicU64::new(1),
             episode_seq: AtomicU64::new(1),
-            started_at: Instant::now(),
         }
     }
 
@@ -235,12 +231,6 @@ impl EpisodeRuntime {
     #[must_use]
     pub const fn config(&self) -> &EpisodeRuntimeConfig {
         &self.config
-    }
-
-    /// Returns the uptime of this runtime.
-    #[must_use]
-    pub fn uptime(&self) -> std::time::Duration {
-        self.started_at.elapsed()
     }
 
     /// Creates a new episode from an envelope.
@@ -318,7 +308,7 @@ impl EpisodeRuntime {
         // Emit event (INV-ER002)
         if self.config.emit_events {
             self.emit_event(EpisodeEvent::Created {
-                episode_id: episode_id.as_str().to_string(),
+                episode_id: episode_id.clone(),
                 envelope_hash,
                 created_at_ns: timestamp_ns,
             })
@@ -413,8 +403,13 @@ impl EpisodeRuntime {
             // Both the caller's handle and the runtime's handle share the same
             // underlying stop signal channel (INV-SH003), so signals sent via
             // `runtime.signal()` are received by the caller's handle.
-            let handle =
-                SessionHandle::new(episode_id.clone(), session_id.clone(), lease_id.clone());
+            // Pass timestamp_ns for deterministic timing per HARD-TIME (M05).
+            let handle = SessionHandle::new(
+                episode_id.clone(),
+                session_id.clone(),
+                lease_id.clone(),
+                timestamp_ns,
+            );
             entry.handle = Some(handle.clone());
 
             handle
@@ -423,7 +418,7 @@ impl EpisodeRuntime {
         // Emit event (INV-ER002)
         if self.config.emit_events {
             self.emit_event(EpisodeEvent::Started {
-                episode_id: episode_id.as_str().to_string(),
+                episode_id: episode_id.clone(),
                 session_id: handle.session_id().to_string(),
                 lease_id: handle.lease_id().to_string(),
                 started_at_ns: timestamp_ns,
@@ -514,7 +509,7 @@ impl EpisodeRuntime {
         // Emit event (INV-ER002)
         if self.config.emit_events {
             self.emit_event(EpisodeEvent::Stopped {
-                episode_id: episode_id.as_str().to_string(),
+                episode_id: episode_id.clone(),
                 termination_class,
                 terminated_at_ns: timestamp_ns,
             })
@@ -604,7 +599,7 @@ impl EpisodeRuntime {
         // Emit event (INV-ER002)
         if self.config.emit_events {
             self.emit_event(EpisodeEvent::Quarantined {
-                episode_id: episode_id.as_str().to_string(),
+                episode_id: episode_id.clone(),
                 reason,
                 quarantined_at_ns: timestamp_ns,
             })
@@ -730,7 +725,6 @@ impl std::fmt::Debug for EpisodeRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EpisodeRuntime")
             .field("config", &self.config)
-            .field("started_at", &self.started_at)
             .finish_non_exhaustive()
     }
 }

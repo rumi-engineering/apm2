@@ -11,7 +11,11 @@ use thiserror::Error;
 
 /// Unique identifier for an episode.
 ///
-/// Format: RFC 4122 UUID v7 (time-ordered) or content-derived digest.
+/// Format: `ep-{envelope_hash_prefix}-{timestamp_ns}-{seq}` where:
+/// - `envelope_hash_prefix`: First 8 bytes of BLAKE3 hash (hex-encoded)
+/// - `timestamp_ns`: Creation timestamp in nanoseconds since epoch
+/// - `seq`: Monotonic sequence number for uniqueness under concurrent creation
+///
 /// Maximum length: 128 characters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
