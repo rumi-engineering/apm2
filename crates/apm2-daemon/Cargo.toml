@@ -26,10 +26,14 @@ apm2-core.workspace = true
 
 # Async runtime
 tokio.workspace = true
+tokio-util.workspace = true
 
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+
+# Bytes
+bytes.workspace = true
 
 # CLI
 clap.workspace = true
@@ -60,6 +64,14 @@ ed25519-dalek.workspace = true
 
 # D-Bus (systemd integration)
 zbus.workspace = true
+
+# Error types
+thiserror.workspace = true
+
+[dev-dependencies]
+# Testing utilities
+tempfile.workspace = true
+futures = "0.3"
 
 [lints]
 workspace = true
