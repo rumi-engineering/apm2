@@ -23,7 +23,7 @@ decision_tree:
   nodes[7]:
     - id: PHASE_0_BOOTSTRAP
       purpose: "Load repo-wide guidance and security invariants before review actions."
-      context_files[14]:
+      context_files[26]:
         - path: AGENTS.md
           purpose: "Repository-wide agent instructions."
         - path: CONTRIBUTING.md
@@ -32,10 +32,6 @@ decision_tree:
           purpose: "Security documentation index and quick reference."
         - path: documents/security/SECURITY_POLICY.md
           purpose: "Security invariants and modes."
-        - path: documents/security/CI_SECURITY_GATES.md
-          purpose: "Required security gates and local verification commands."
-        - path: documents/security/THREAT_MODEL.md
-          purpose: "Threat model for security risk evaluation."
         - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/SKILL.md
           purpose: "Core holonic philosophy and constraints."
         - path: documents/skills/laws-of-holonic-agent-systems/references/unified-theory.md
@@ -44,12 +40,42 @@ decision_tree:
           purpose: "Agent-native architecture doctrine."
         - path: documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md
           purpose: "APM2 safe patterns and anti-patterns (token-efficient index)."
-        - path: documents/reviews/CI_EXPECTATIONS.md
-          purpose: "CI pipeline checks and fix procedures."
         - path: documents/security/SECURITY_CHECKLIST.md
           purpose: "Security review checklist."
         - path: documents/skills/rust-textbook/09_unsafe_rust_obligations.md
           purpose: "Unsafe proof obligations + APM2 unsafe policy."
+        - path: documents/skills/review-rust/SKILL.md
+          purpose: "Core Rust review protocol."
+        - path: documents/skills/review-rust/references/00_operating_mode.md
+          purpose: "Reviewer audit posture."
+        - path: documents/skills/review-rust/references/01_inputs_and_stop_conditions.md
+          purpose: "Review input validation."
+        - path: documents/skills/review-rust/references/02_qcp_classification.md
+          purpose: "Quality Control Point scoring."
+        - path: documents/skills/review-rust/references/03_triage_fast_scan.md
+          purpose: "Fast risk detection."
+        - path: documents/skills/review-rust/references/04_invariant_mapping.md
+          purpose: "Mapping code to invariants."
+        - path: documents/skills/review-rust/references/05_abstraction_and_simplification.md
+          purpose: "Design and abstraction review."
+        - path: documents/skills/review-rust/references/06_rust_soundness_and_unsafe.md
+          purpose: "Memory safety and unsafe code audit."
+        - path: documents/skills/review-rust/references/07_allocator_arena_pool_review.md
+          purpose: "Memory management audit."
+        - path: documents/skills/review-rust/references/08_error_handling_and_panic_policy.md
+          purpose: "Failure semantics review."
+        - path: documents/skills/review-rust/references/09_api_design_and_semver.md
+          purpose: "API contract and semver review."
+        - path: documents/skills/review-rust/references/10_testing_evidence_and_ci.md
+          purpose: "Verification and CI review."
+        - path: documents/skills/review-rust/references/11_performance_review.md
+          purpose: "Resource and performance audit."
+        - path: documents/skills/review-rust/references/12_dependency_and_build_surface.md
+          purpose: "Supply chain and build audit."
+        - path: documents/skills/review-rust/references/13_severity_and_verdict.md
+          purpose: "Findings severity and final verdict."
+        - path: documents/skills/review-rust/references/14_required_actions_templates.md
+          purpose: "Review output templates."
       steps[1]:
         - id: READ_BASELINE_CONTEXT
           action: "Read every context file listed above and record invariants, required gates, and review constraints."
@@ -108,9 +134,10 @@ decision_tree:
           action: define_paths
           ticket_paths:
             decomposition: "documents/rfcs/${rfc_id}/06_ticket_decomposition.yaml"
+            design_decisions: "documents/rfcs/${rfc_id}/02_design_decisions.yaml"
             meta: "documents/work/tickets/${ticket_id}.yaml"
             body: "documents/work/tickets/${ticket_id}.md"
-      decisions[4]:
+      decisions[5]:
         - id: HANDLE_MISSING_TICKET
           if: "ticket_id is empty OR no ticket_id found in pr_title/pr_body"
           then:
@@ -128,6 +155,11 @@ decision_tree:
                 actions[1]:
                   - "EMIT StopCondition STOP-NO-BINDING severity BLOCKER message 'Non-trivial changes require binding ticket'."
                 stop: true
+        - id: READ_RFC_DESIGN_DECISIONS
+          if: "rfc_id found AND ticket_paths.design_decisions exists"
+          then:
+            actions[1]:
+              - "Read RFC design decisions file to understand architectural constraints and normative justifications (AD-XXXX)."
         - id: READ_TICKET_DECOMPOSITION
           if: "ticket_id found AND rfc_id exists AND ticket_paths.decomposition exists"
           then:
@@ -223,9 +255,11 @@ decision_tree:
             failure_and_error_models:
               - "Are error types and propagation appropriate for the API surface?"
               - "Are failures observable and actionable?"
+              - "Does the error context support causal reconstruction? Verify that error messages and tracing spans bind to stable identities (e.g., WorkID, SessionID) to allow for a deterministic 'why-chain' during failure audit."
             testing_and_evidence:
               - "Do tests exercise the new or changed behavior?"
               - "Are edge cases or failure paths covered where relevant?"
+              - "Do tests provide negative evidence (falsification)? Verify that implementation invariants are strictly enforced by testing the inverse of happy paths and edge cases where silent failure might occur."
             documentation_and_communication:
               - "Are public APIs and behavior changes documented?"
               - "Are module-level constraints and AGENTS.md updates accurate?"
