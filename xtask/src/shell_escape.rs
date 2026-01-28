@@ -93,12 +93,12 @@ fn escape_for_single_quote(s: &str) -> String {
 ///
 /// With log capture (for health monitoring):
 /// ```text
-/// script -q '<log_path>' -c 'gemini --yolo < '\''<prompt_path>'\'''
+/// script -q '<log_path>' -c 'gemini --model <model> --yolo < '\''<prompt_path>'\'''
 /// ```
 ///
 /// Without log capture (synchronous reviews):
 /// ```text
-/// script -qec 'gemini --yolo < '\''<prompt_path>'\''' /dev/null
+/// script -qec 'gemini --model <model> --yolo < '\''<prompt_path>'\''' /dev/null
 /// ```
 ///
 /// # Example
@@ -108,17 +108,23 @@ fn escape_for_single_quote(s: &str) -> String {
 /// use xtask::shell_escape::build_script_command;
 ///
 /// // Without log capture
-/// let cmd = build_script_command(Path::new("/tmp/prompt.txt"), None);
+/// let cmd = build_script_command(Path::new("/tmp/prompt.txt"), None, Some("gemini-1.5-pro"));
 /// assert!(cmd.contains("script -qec"));
+/// assert!(cmd.contains("--model gemini-1.5-pro"));
 ///
 /// // With log capture
 /// let log_path = Path::new("/tmp/review.log");
-/// let cmd = build_script_command(Path::new("/tmp/prompt.txt"), Some(log_path));
+/// let cmd = build_script_command(Path::new("/tmp/prompt.txt"), Some(log_path), None);
 /// assert!(cmd.contains("script -q"));
 /// ```
-pub fn build_script_command(prompt_path: &Path, log_path: Option<&Path>) -> String {
+pub fn build_script_command(
+    prompt_path: &Path,
+    log_path: Option<&Path>,
+    model: Option<&str>,
+) -> String {
     let quoted_prompt = quote_path(prompt_path);
-    let inner_cmd = format!("gemini --yolo < {quoted_prompt}");
+    let model_flag = model.map_or_else(String::new, |m| format!("--model {m} "));
+    let inner_cmd = format!("gemini {model_flag}--yolo < {quoted_prompt}");
     let escaped_inner = escape_for_single_quote(&inner_cmd);
 
     log_path.map_or_else(
@@ -144,6 +150,7 @@ pub fn build_script_command(prompt_path: &Path, log_path: Option<&Path>) -> Stri
 ///
 /// * `prompt_path` - Path to the prompt file to redirect as input
 /// * `log_path` - Path to capture output for activity tracking
+/// * `model` - Optional AI model to use
 ///
 /// # Returns
 ///
@@ -152,13 +159,17 @@ pub fn build_script_command(prompt_path: &Path, log_path: Option<&Path>) -> Stri
 /// # Format
 ///
 /// ```text
-/// script -q '<log_path>' -c 'gemini --yolo < '\''<prompt_path>'\'''
+/// script -q '<log_path>' -c 'gemini --model <model> --yolo < '\''<prompt_path>'\'''
 /// ```
-pub fn build_script_command_with_cleanup(prompt_path: &Path, log_path: &Path) -> String {
+pub fn build_script_command_with_cleanup(
+    prompt_path: &Path,
+    log_path: &Path,
+    model: Option<&str>,
+) -> String {
     // Temp file cleanup is now handled via state tracking, not shell commands.
     // This function is kept for backward compatibility but now delegates to
     // build_script_command with log capture.
-    build_script_command(prompt_path, Some(log_path))
+    build_script_command(prompt_path, Some(log_path), model)
 }
 
 #[cfg(test)]
@@ -305,7 +316,7 @@ mod tests {
     #[test]
     fn test_build_script_command_without_log() {
         let prompt = Path::new("/tmp/prompt.txt");
-        let cmd = build_script_command(prompt, None);
+        let cmd = build_script_command(prompt, None, None);
 
         // Verify command structure
         assert!(
@@ -313,8 +324,12 @@ mod tests {
             "Command without log should use script -qec: {cmd}"
         );
         assert!(
-            cmd.contains("gemini --yolo"),
-            "Command should invoke gemini --yolo: {cmd}"
+            cmd.contains("gemini"),
+            "Command should invoke gemini: {cmd}"
+        );
+        assert!(
+            cmd.contains("--yolo"),
+            "Command should include --yolo flag: {cmd}"
         );
         assert!(
             cmd.ends_with("/dev/null"),
@@ -330,7 +345,7 @@ mod tests {
     fn test_build_script_command_with_log() {
         let prompt = Path::new("/tmp/prompt.txt");
         let log = Path::new("/tmp/review.log");
-        let cmd = build_script_command(prompt, Some(log));
+        let cmd = build_script_command(prompt, Some(log), None);
 
         // Verify command structure
         assert!(
@@ -346,12 +361,24 @@ mod tests {
             "Command with log should use -c flag with single quotes: {cmd}"
         );
         assert!(
-            cmd.contains("gemini --yolo"),
-            "Command should invoke gemini --yolo: {cmd}"
+            cmd.contains("gemini"),
+            "Command should invoke gemini: {cmd}"
         );
         assert!(
             !cmd.ends_with("/dev/null"),
             "Command with log should not redirect to /dev/null: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_build_script_command_with_model() {
+        let prompt = Path::new("/tmp/prompt.txt");
+        let model = "gemini-3-flash-preview";
+        let cmd = build_script_command(prompt, None, Some(model));
+
+        assert!(
+            cmd.contains("--model gemini-3-flash-preview"),
+            "Command should include --model flag: {cmd}"
         );
     }
 
@@ -361,14 +388,14 @@ mod tests {
         let log = Path::new("/tmp/log with spaces.log");
 
         // Without log
-        let cmd_no_log = build_script_command(prompt, None);
+        let cmd_no_log = build_script_command(prompt, None, None);
         assert!(
             cmd_no_log.contains('\''),
             "Prompt path with spaces should be quoted: {cmd_no_log}"
         );
 
         // With log
-        let cmd_with_log = build_script_command(prompt, Some(log));
+        let cmd_with_log = build_script_command(prompt, Some(log), None);
         assert!(
             cmd_with_log.contains('\''),
             "Paths with spaces should be quoted: {cmd_with_log}"
@@ -378,7 +405,7 @@ mod tests {
     #[test]
     fn test_build_script_command_handles_special_chars() {
         let prompt = Path::new("/tmp/prompt's$file.txt");
-        let cmd = build_script_command(prompt, None);
+        let cmd = build_script_command(prompt, None, None);
 
         // The command should be properly escaped
         assert!(
@@ -395,7 +422,7 @@ mod tests {
     fn test_build_script_command_with_cleanup() {
         let prompt = Path::new("/tmp/prompt.txt");
         let log = Path::new("/tmp/review.log");
-        let cmd = build_script_command_with_cleanup(prompt, log);
+        let cmd = build_script_command_with_cleanup(prompt, log, None);
 
         // Verify command structure - same as build_script_command with log
         assert!(
@@ -403,8 +430,8 @@ mod tests {
             "Command should use script -q: {cmd}"
         );
         assert!(
-            cmd.contains("gemini --yolo"),
-            "Command should invoke gemini --yolo: {cmd}"
+            cmd.contains("gemini"),
+            "Command should invoke gemini: {cmd}"
         );
         // Note: rm -f is no longer used - cleanup is handled via state tracking
         assert!(
@@ -417,7 +444,7 @@ mod tests {
     fn test_build_script_command_with_cleanup_quotes_paths() {
         let prompt = Path::new("/tmp/prompt with spaces.txt");
         let log = Path::new("/tmp/log.txt");
-        let cmd = build_script_command_with_cleanup(prompt, log);
+        let cmd = build_script_command_with_cleanup(prompt, log, None);
 
         // Path with spaces should be quoted
         assert!(
@@ -463,13 +490,13 @@ mod tests {
 
         // Without log: script -qec 'gemini --yolo < '\''<prompt_path>'\''' /dev/null
         let prompt = Path::new("/tmp/simple.txt");
-        let cmd = build_script_command(prompt, None);
+        let cmd = build_script_command(prompt, None, None);
         assert!(cmd.starts_with("script -qec"));
         assert!(cmd.ends_with("/dev/null"));
 
         // With log: script -q '<log_path>' -c 'gemini --yolo < '\''<prompt_path>'\'''
         let log = Path::new("/tmp/log.txt");
-        let cmd = build_script_command(prompt, Some(log));
+        let cmd = build_script_command(prompt, Some(log), None);
         assert!(cmd.starts_with("script -q"));
         assert!(cmd.contains("-c 'gemini"));
     }

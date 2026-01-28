@@ -296,6 +296,7 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
         println!("  Spawning Gemini security review...");
         let spawner = ReviewerSpawner::new("security", pr_url, &head_sha)
             .with_prompt_file(Path::new(&security_prompt_path))
+            .map(|s| s.with_model("gemini-3-flash-preview"))
             .ok();
 
         if let Some(spawner) = spawner {
@@ -312,6 +313,7 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
         println!("  Spawning Gemini code quality review...");
         let spawner = ReviewerSpawner::new("quality", pr_url, &head_sha)
             .with_prompt_file(Path::new(&code_quality_prompt_path))
+            .map(|s| s.with_model("gemini-3-flash-preview"))
             .ok();
 
         if let Some(spawner) = spawner {
@@ -501,7 +503,7 @@ mod tests {
 
         // Test with a simple path (no log - uses -qec)
         let prompt_path = Path::new("/tmp/test_prompt.txt");
-        let shell_cmd = build_script_command(prompt_path, None);
+        let shell_cmd = build_script_command(prompt_path, None, None);
 
         // Verify command includes PTY allocation
         assert!(
@@ -523,7 +525,7 @@ mod tests {
 
         // Test with a path containing spaces - must be properly quoted
         let special_path = Path::new("/tmp/test file.txt");
-        let special_cmd = build_script_command(special_path, None);
+        let special_cmd = build_script_command(special_path, None, None);
 
         // Verify the command is well-formed
         assert!(
