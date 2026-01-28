@@ -68,6 +68,16 @@ static HANDLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// 100 * 3 = 300 FDs, well within typical system limits.
 pub const MAX_CONCURRENT_ADAPTERS: usize = 100;
 
+/// Maximum number of events to collect in the holon's event buffer.
+///
+/// This limit prevents memory exhaustion from collecting too many events.
+/// Events beyond this limit are logged and dropped. The limit is set high
+/// enough for typical episodes but provides a safety bound.
+///
+/// Per CTR-1303 (Bounded Stores), in-memory stores must have `max_entries`
+/// limits to prevent denial-of-service via memory exhaustion.
+pub const MAX_COLLECTED_EVENTS: usize = 16384;
+
 /// Output produced by the `RawAdapter` when used as a Holon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawAdapterOutput {
@@ -433,6 +443,19 @@ pub struct RawAdapterHolon {
 
     /// Event stream receiver (if process has been spawned).
     event_rx: Option<HarnessEventStream>,
+
+    /// Collected events from the process output stream.
+    ///
+    /// Events are collected during `execute_episode` polling to preserve
+    /// PTY output for evidence collection. Bounded by [`MAX_COLLECTED_EVENTS`]
+    /// to prevent memory exhaustion (per CTR-1303).
+    collected_events: Vec<HarnessEvent>,
+
+    /// Episode ID stored for `holon_id()` access.
+    ///
+    /// Stored separately from `shared_state` to avoid mutex access in the
+    /// synchronous `holon_id()` method.
+    episode_id: Option<String>,
 }
 
 impl RawAdapterHolon {
@@ -445,6 +468,8 @@ impl RawAdapterHolon {
             shared_state: Arc::new(Mutex::new(RawAdapterState::default())),
             config: None,
             event_rx: None,
+            collected_events: Vec::new(),
+            episode_id: None,
         }
     }
 
@@ -455,6 +480,50 @@ impl RawAdapterHolon {
     #[must_use]
     pub fn shared_state(&self) -> SharedAdapterState {
         Arc::clone(&self.shared_state)
+    }
+
+    /// Returns a reference to collected output events.
+    ///
+    /// Events are collected during `execute_episode` polling and preserved
+    /// for evidence collection. This provides access to all PTY output
+    /// captured since process spawn.
+    #[must_use]
+    pub fn collected_events(&self) -> &[HarnessEvent] {
+        &self.collected_events
+    }
+
+    /// Takes ownership of collected events, clearing the internal buffer.
+    ///
+    /// This is useful when transferring events to an evidence collector
+    /// without copying.
+    pub fn take_collected_events(&mut self) -> Vec<HarnessEvent> {
+        std::mem::take(&mut self.collected_events)
+    }
+
+    /// Collects pending events from the event stream into the internal buffer.
+    ///
+    /// This method drains all available events from `event_rx` and stores them
+    /// in `collected_events` for evidence preservation. Events are bounded by
+    /// [`MAX_COLLECTED_EVENTS`] per CTR-1303 to prevent memory exhaustion.
+    ///
+    /// Events beyond the limit are logged and dropped.
+    fn collect_pending_events(&mut self) {
+        if let Some(ref mut rx) = self.event_rx {
+            while let Ok(event) = rx.try_recv() {
+                if self.collected_events.len() < MAX_COLLECTED_EVENTS {
+                    self.collected_events.push(event);
+                } else {
+                    // Log that we're dropping events due to buffer limit
+                    tracing::warn!(
+                        episode_id = ?self.episode_id,
+                        max_events = MAX_COLLECTED_EVENTS,
+                        "dropping event: collected_events buffer full (per CTR-1303)"
+                    );
+                    // Continue draining to prevent channel backup, but don't
+                    // store
+                }
+            }
+        }
     }
 }
 
@@ -472,6 +541,12 @@ impl Holon for RawAdapterHolon {
         // Store the configuration and update state
         let episode_id = input.episode_id.clone();
         self.config = Some(input);
+
+        // Store episode_id for holon_id() access (avoids mutex in sync method)
+        self.episode_id = Some(episode_id.clone());
+
+        // Clear any collected events from previous episodes
+        self.collected_events.clear();
 
         // Update shared state
         // Note: We use try_lock in synchronous context, which is safe here
@@ -502,22 +577,28 @@ impl Holon for RawAdapterHolon {
         &mut self,
         _ctx: &EpisodeContext,
     ) -> Result<EpisodeResult<Self::Output>, HolonError> {
-        // Check if intake was called
-        let state_snapshot = self.shared_state.try_lock();
-        let (intake_called, process_spawned, process_terminated, output_count, exit_code) =
-            match state_snapshot {
-                Ok(guard) => (
+        // Check if intake was called - extract values and drop guard immediately
+        // We use a separate scope and explicit drop to ensure the borrow ends
+        // before we call collect_pending_events.
+        let state_result: Option<(bool, bool, bool, u64, Option<i32>)> =
+            self.shared_state.try_lock().ok().map(|guard| {
+                (
                     guard.intake_called,
                     guard.process_spawned,
                     guard.process_terminated,
                     guard.output_event_count,
                     guard.last_exit_code,
-                ),
-                Err(_) => {
-                    // Lock held by background task, process is running
-                    return Ok(EpisodeResult::continuation());
-                },
-            };
+                )
+            });
+
+        let Some((intake_called, process_spawned, process_terminated, output_count, exit_code)) =
+            state_result
+        else {
+            // Lock held by background task, process is running
+            // Collect events even when lock is held
+            self.collect_pending_events();
+            return Ok(EpisodeResult::continuation());
+        };
 
         if !intake_called {
             return Err(HolonError::episode_failed(
@@ -564,6 +645,9 @@ impl Holon for RawAdapterHolon {
 
         // Process has been spawned, check if it has terminated
         if process_terminated {
+            // Drain any remaining events before returning completion
+            self.collect_pending_events();
+
             // Process has completed
             let output = RawAdapterOutput {
                 exit_code,
@@ -573,14 +657,13 @@ impl Holon for RawAdapterHolon {
             return Ok(EpisodeResult::completed(output));
         }
 
-        // Process is still running - drain any pending events and return continuation
-        if let Some(ref mut rx) = self.event_rx {
-            // Non-blocking drain of events
-            while rx.try_recv().is_ok() {}
-        }
+        // Process is still running - collect pending events for evidence preservation
+        // Per CTR-1303, we bound the collection to MAX_COLLECTED_EVENTS
+        self.collect_pending_events();
 
         Ok(EpisodeResult::continue_with_progress(format!(
-            "running, {output_count} events received"
+            "running, {output_count} events received, {} collected",
+            self.collected_events.len()
         )))
     }
 
@@ -644,9 +727,10 @@ impl Holon for RawAdapterHolon {
     }
 
     fn holon_id(&self) -> Option<&str> {
-        // Similar limitation as state() - we can't return a reference to data
-        // behind the mutex. Return None for now.
-        None
+        // Return the episode_id stored during intake.
+        // This is stored separately from shared_state to avoid mutex access
+        // in this synchronous method.
+        self.episode_id.as_deref()
     }
 
     fn type_name(&self) -> &'static str {
@@ -1133,5 +1217,114 @@ mod tests {
 
         // They share the same semaphore (verified by available_slots)
         assert_eq!(adapter.available_slots(), MAX_CONCURRENT_ADAPTERS);
+    }
+
+    // =========================================================================
+    // Holon ID and Event Collection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_holon_id_before_intake() {
+        let adapter = RawAdapter::new();
+        let holon = adapter.create_holon();
+
+        // Before intake, holon_id should be None
+        assert!(holon.holon_id().is_none());
+    }
+
+    #[test]
+    fn test_holon_id_after_intake() {
+        let adapter = RawAdapter::new();
+        let mut holon = adapter.create_holon();
+        let config = HarnessConfig::new("echo", "episode-id-test");
+
+        holon.intake(config, "lease-123").unwrap();
+
+        // After intake, holon_id should return the episode_id
+        assert_eq!(holon.holon_id(), Some("episode-id-test"));
+    }
+
+    #[test]
+    fn test_collected_events_initially_empty() {
+        let adapter = RawAdapter::new();
+        let holon = adapter.create_holon();
+
+        // Initially, collected_events should be empty
+        assert!(holon.collected_events().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_holon_collects_events_during_execution() {
+        let adapter = RawAdapter::new();
+        let mut holon = adapter.create_holon();
+        let config =
+            HarnessConfig::new("echo", "episode-events").with_args(vec!["test".to_string()]);
+
+        holon.intake(config, "lease-123").unwrap();
+
+        let ctx = EpisodeContext::builder()
+            .work_id("work-1")
+            .lease_id("lease-1")
+            .build();
+
+        // Spawn the process
+        let _ = holon.execute_episode(&ctx).unwrap();
+
+        // Wait for process to complete and poll
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Poll until complete - this should collect events
+        loop {
+            let result = holon.execute_episode(&ctx);
+            assert!(result.is_ok());
+            let episode_result = result.unwrap();
+            if episode_result.is_completed() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // After completion, collected_events should contain the output
+        let events = holon.collected_events();
+        assert!(!events.is_empty(), "expected collected events");
+
+        // Should contain at least one output event
+        let has_output = events
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::Output { .. }));
+        assert!(has_output, "expected at least one Output event");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_holon_take_collected_events() {
+        let adapter = RawAdapter::new();
+        let mut holon = adapter.create_holon();
+        let config = HarnessConfig::new("echo", "episode-take").with_args(vec!["test".to_string()]);
+
+        holon.intake(config, "lease-123").unwrap();
+
+        let ctx = EpisodeContext::builder()
+            .work_id("work-1")
+            .lease_id("lease-1")
+            .build();
+
+        // Spawn and wait for completion
+        let _ = holon.execute_episode(&ctx).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        loop {
+            let result = holon.execute_episode(&ctx).unwrap();
+            if result.is_completed() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Take the collected events
+        let events = holon.take_collected_events();
+        assert!(!events.is_empty(), "expected events");
+
+        // After take, the buffer should be empty
+        assert!(holon.collected_events().is_empty());
     }
 }

@@ -62,8 +62,7 @@ impl AdapterRegistry {
     /// Create a new registry with default adapters registered.
     ///
     /// This registers:
-    /// - [`RawAdapter`](super::raw_adapter::RawAdapter) for
-    ///   [`AdapterType::Raw`]
+    /// - [`RawAdapter`] for [`AdapterType::Raw`]
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
