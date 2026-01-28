@@ -387,6 +387,7 @@ mod unit_tests {
             session_id.to_string(),
             work_id.to_string(),
             attempt,
+            0, // expected_transition_count
             100,
             2_000_000_000,
         );

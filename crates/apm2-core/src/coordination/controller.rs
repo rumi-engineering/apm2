@@ -572,13 +572,15 @@ impl CoordinationController {
     ///
     /// Per AD-COORD-007: Session ID is generated BEFORE the binding event.
     /// Per AD-COORD-003: `session_bound` is emitted BEFORE `session.started`.
+    /// Per AD-COORD-006: `expected_transition_count` is included for
+    /// CAS-at-commit.
     ///
     /// This method:
     /// 1. Checks that no session is currently active (serial execution)
     /// 2. Checks that no stop condition is met
     /// 3. Validates the `work_id` matches the current work index
     /// 4. Generates a new session ID (UUID v4)
-    /// 5. Creates and stores the binding event
+    /// 5. Creates and stores the binding event with `expected_transition_count`
     /// 6. Updates attempt tracking
     ///
     /// The caller is responsible for actually spawning the session after
@@ -587,6 +589,7 @@ impl CoordinationController {
     /// # Arguments
     ///
     /// * `work_id` - The work item ID (must match current work index)
+    /// * `expected_transition_count` - The work item's transition count for CAS
     /// * `freshness_seq_id` - The sequence ID at which freshness was verified
     /// * `timestamp_ns` - Current timestamp in nanoseconds
     ///
@@ -604,6 +607,7 @@ impl CoordinationController {
     pub fn prepare_session_spawn(
         &mut self,
         work_id: &str,
+        expected_transition_count: u64,
         freshness_seq_id: u64,
         timestamp_ns: u64,
     ) -> ControllerResult<SpawnResult> {
@@ -661,11 +665,13 @@ impl CoordinationController {
         tracking.session_ids.push(session_id.clone());
 
         // Create binding event (AD-COORD-003: emitted BEFORE session.started)
+        // Per AD-COORD-006: Include expected_transition_count for CAS-at-commit
         let binding_event = CoordinationSessionBound::new(
             coordination_id,
             session_id.clone(),
             work_id.to_string(),
             attempt_number,
+            expected_transition_count,
             freshness_seq_id,
             timestamp_ns,
         );
@@ -1265,7 +1271,7 @@ mod tests {
         controller.start(1_000_000_000).unwrap();
 
         let result = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
 
         // Verify session ID is generated
@@ -1296,7 +1302,7 @@ mod tests {
 
         // Prepare spawn (emits session_bound)
         let spawn_result = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
 
         // At this point, session_bound has been emitted but session.started has NOT
@@ -1393,11 +1399,11 @@ mod tests {
 
         // First spawn succeeds
         let spawn1 = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
 
         // Second spawn before termination should fail
-        let result = controller.prepare_session_spawn("work-1", 101, 3_000_000_000);
+        let result = controller.prepare_session_spawn("work-1", 0, 101, 3_000_000_000);
         assert!(matches!(
             result,
             Err(ControllerError::SessionAlreadyBound { .. })
@@ -1416,7 +1422,7 @@ mod tests {
 
         // Now retry should succeed (max_attempts allows 3)
         let spawn2 = controller
-            .prepare_session_spawn("work-1", 102, 5_000_000_000)
+            .prepare_session_spawn("work-1", 0, 102, 5_000_000_000)
             .unwrap();
 
         // Different session ID
@@ -1431,7 +1437,7 @@ mod tests {
 
         // Spawn session for work-1
         let spawn = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
 
         // Try to terminate with wrong work_id
@@ -1464,7 +1470,7 @@ mod tests {
         // Work A: fail 2 times (exhaust retries) -> consecutive_failures = 1
         for i in 0u64..2 {
             let spawn = controller
-                .prepare_session_spawn("A", 100 + i, 2_000_000_000 + i * 1_000_000_000)
+                .prepare_session_spawn("A", 0, 100 + i, 2_000_000_000 + i * 1_000_000_000)
                 .unwrap();
             controller
                 .record_session_termination(
@@ -1482,7 +1488,7 @@ mod tests {
         // Work B: fail 2 times (exhaust retries) -> consecutive_failures = 2
         for i in 0u64..2 {
             let spawn = controller
-                .prepare_session_spawn("B", 200 + i, 10_000_000_000 + i * 1_000_000_000)
+                .prepare_session_spawn("B", 0, 200 + i, 10_000_000_000 + i * 1_000_000_000)
                 .unwrap();
             controller
                 .record_session_termination(
@@ -1499,7 +1505,7 @@ mod tests {
 
         // Work C: succeed -> consecutive_failures resets to 0
         let spawn_c = controller
-            .prepare_session_spawn("C", 300, 20_000_000_000)
+            .prepare_session_spawn("C", 0, 300, 20_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1527,7 +1533,7 @@ mod tests {
 
         // Process first "A" (index 0)
         let spawn_a1 = controller
-            .prepare_session_spawn("A", 100, 2_000_000_000)
+            .prepare_session_spawn("A", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1548,7 +1554,7 @@ mod tests {
 
         // Process "B" (index 1)
         let spawn_b = controller
-            .prepare_session_spawn("B", 200, 4_000_000_000)
+            .prepare_session_spawn("B", 0, 200, 4_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1562,7 +1568,7 @@ mod tests {
 
         // Process second "A" (index 2)
         let spawn_a2 = controller
-            .prepare_session_spawn("A", 300, 6_000_000_000)
+            .prepare_session_spawn("A", 0, 300, 6_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1593,7 +1599,7 @@ mod tests {
 
         // Process work-1
         let spawn1 = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
 
         // Before terminating, work_index should still be 0
@@ -1616,7 +1622,7 @@ mod tests {
 
         // Process work-2
         let spawn2 = controller
-            .prepare_session_spawn("work-2", 200, 4_000_000_000)
+            .prepare_session_spawn("work-2", 0, 200, 4_000_000_000)
             .unwrap();
 
         // Different session ID
@@ -1650,7 +1656,7 @@ mod tests {
 
         // Process work-1
         let spawn = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1689,7 +1695,7 @@ mod tests {
 
         // Work A fails (exhausts 1 retry) -> consecutive_failures = 1
         let spawn_a = controller
-            .prepare_session_spawn("A", 100, 2_000_000_000)
+            .prepare_session_spawn("A", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1704,7 +1710,7 @@ mod tests {
 
         // Work B fails -> consecutive_failures = 2
         let spawn_b = controller
-            .prepare_session_spawn("B", 200, 4_000_000_000)
+            .prepare_session_spawn("B", 0, 200, 4_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1719,7 +1725,7 @@ mod tests {
 
         // Work C fails -> consecutive_failures = 3 (circuit breaker threshold)
         let spawn_c = controller
-            .prepare_session_spawn("C", 300, 6_000_000_000)
+            .prepare_session_spawn("C", 0, 300, 6_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1753,7 +1759,7 @@ mod tests {
         // Use up 2 episodes
         for i in 0u64..2 {
             let spawn = controller
-                .prepare_session_spawn("work-1", 100 + i, 2_000_000_000 + i * 1_000_000_000)
+                .prepare_session_spawn("work-1", 0, 100 + i, 2_000_000_000 + i * 1_000_000_000)
                 .unwrap();
             controller
                 .record_session_termination(
@@ -1786,7 +1792,7 @@ mod tests {
         controller.start(1_000_000_000).unwrap();
 
         let spawn = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1834,7 +1840,7 @@ mod tests {
 
         // First attempt - failure
         let spawn1 = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1854,7 +1860,7 @@ mod tests {
 
         // Second attempt - success
         let spawn2 = controller
-            .prepare_session_spawn("work-1", 101, 4_000_000_000)
+            .prepare_session_spawn("work-1", 0, 101, 4_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1880,7 +1886,7 @@ mod tests {
         // Exhaust 3 attempts for work-1
         for i in 0u64..3 {
             let spawn = controller
-                .prepare_session_spawn("work-1", 100 + i, 2_000_000_000 + i * 1_000_000_000)
+                .prepare_session_spawn("work-1", 0, 100 + i, 2_000_000_000 + i * 1_000_000_000)
                 .unwrap();
             controller
                 .record_session_termination(
@@ -1961,7 +1967,7 @@ mod tests {
 
         // Process work-1 (success)
         let spawn1 = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1975,7 +1981,7 @@ mod tests {
 
         // Process work-2 (fail, retry, success)
         let spawn_work2_attempt1 = controller
-            .prepare_session_spawn("work-2", 200, 4_000_000_000)
+            .prepare_session_spawn("work-2", 0, 200, 4_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -1988,7 +1994,7 @@ mod tests {
             .unwrap();
 
         let spawn_work2_attempt2 = controller
-            .prepare_session_spawn("work-2", 201, 6_000_000_000)
+            .prepare_session_spawn("work-2", 0, 201, 6_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2002,7 +2008,7 @@ mod tests {
 
         // Process work-3 (success)
         let spawn3 = controller
-            .prepare_session_spawn("work-3", 300, 8_000_000_000)
+            .prepare_session_spawn("work-3", 0, 300, 8_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2061,7 +2067,7 @@ mod tests {
         // Consume 3 episodes with failures (still retrying same work)
         for i in 0u64..3 {
             let spawn = controller
-                .prepare_session_spawn("work-1", 100 + i, 2_000_000_000 + i * 1_000_000_000)
+                .prepare_session_spawn("work-1", 0, 100 + i, 2_000_000_000 + i * 1_000_000_000)
                 .unwrap();
             controller
                 .record_session_termination(
@@ -2133,7 +2139,7 @@ mod tests {
 
         // Consume 1000 tokens across multiple sessions
         let spawn1 = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2146,7 +2152,7 @@ mod tests {
             .unwrap();
 
         let spawn2 = controller
-            .prepare_session_spawn("work-1", 101, 4_000_000_000)
+            .prepare_session_spawn("work-1", 0, 101, 4_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2182,7 +2188,7 @@ mod tests {
 
         // Consume many tokens
         let spawn1 = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2217,7 +2223,7 @@ mod tests {
 
         // Session 1: 1000 tokens
         let spawn1 = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2232,7 +2238,7 @@ mod tests {
 
         // Session 2: 2500 tokens
         let spawn2 = controller
-            .prepare_session_spawn("work-2", 200, 4_000_000_000)
+            .prepare_session_spawn("work-2", 0, 200, 4_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2247,7 +2253,7 @@ mod tests {
 
         // Session 3: 500 tokens (even failures consume tokens)
         let spawn3 = controller
-            .prepare_session_spawn("work-3", 300, 6_000_000_000)
+            .prepare_session_spawn("work-3", 0, 300, 6_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2281,7 +2287,7 @@ mod tests {
 
         // Consume 1 episode and 1 token
         let spawn = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2323,7 +2329,7 @@ mod tests {
 
         // Process one session
         let spawn = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2357,7 +2363,7 @@ mod tests {
 
         // Process one session
         let spawn = controller
-            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .prepare_session_spawn("work-1", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2389,7 +2395,7 @@ mod tests {
 
         for i in 0u64..3 {
             let spawn = controller
-                .prepare_session_spawn("work-1", 100 + i, 2_000_000_000 + i * 1_000_000_000)
+                .prepare_session_spawn("work-1", 0, 100 + i, 2_000_000_000 + i * 1_000_000_000)
                 .unwrap();
             controller
                 .record_session_termination(
@@ -2430,7 +2436,7 @@ mod tests {
 
         for (i, work_id) in work_ids.iter().enumerate() {
             let spawn = controller
-                .prepare_session_spawn(work_id, (i as u64) * 100, 2_000_000_000)
+                .prepare_session_spawn(work_id, 0, (i as u64) * 100, 2_000_000_000)
                 .unwrap();
             controller
                 .record_session_termination(
@@ -2486,7 +2492,7 @@ mod tests {
 
         // Work A fails (exhausts 1 retry) -> consecutive_failures = 1
         let spawn_a = controller
-            .prepare_session_spawn("A", 100, 2_000_000_000)
+            .prepare_session_spawn("A", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2502,7 +2508,7 @@ mod tests {
 
         // Work B fails -> consecutive_failures = 2
         let spawn_b = controller
-            .prepare_session_spawn("B", 200, 4_000_000_000)
+            .prepare_session_spawn("B", 0, 200, 4_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2518,7 +2524,7 @@ mod tests {
 
         // Work C fails -> consecutive_failures = 3 (circuit breaker threshold)
         let spawn_c = controller
-            .prepare_session_spawn("C", 300, 6_000_000_000)
+            .prepare_session_spawn("C", 0, 300, 6_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2566,7 +2572,7 @@ mod tests {
 
         // Work A fails -> consecutive_failures = 1
         let spawn_a = controller
-            .prepare_session_spawn("A", 100, 2_000_000_000)
+            .prepare_session_spawn("A", 0, 100, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2581,7 +2587,7 @@ mod tests {
 
         // Work B fails -> consecutive_failures = 2
         let spawn_b = controller
-            .prepare_session_spawn("B", 200, 4_000_000_000)
+            .prepare_session_spawn("B", 0, 200, 4_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2596,7 +2602,7 @@ mod tests {
 
         // Work C SUCCEEDS -> consecutive_failures resets to 0
         let spawn_c = controller
-            .prepare_session_spawn("C", 300, 6_000_000_000)
+            .prepare_session_spawn("C", 0, 300, 6_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2641,7 +2647,7 @@ mod tests {
         // Each session failure within retries should NOT increment consecutive_failures
         for i in 0u64..2 {
             let spawn = controller
-                .prepare_session_spawn("A", 100 + i, 2_000_000_000 + i * 1_000_000_000)
+                .prepare_session_spawn("A", 0, 100 + i, 2_000_000_000 + i * 1_000_000_000)
                 .unwrap();
             controller
                 .record_session_termination(
@@ -2662,7 +2668,7 @@ mod tests {
 
         // Third (final) attempt for work A
         let spawn_a3 = controller
-            .prepare_session_spawn("A", 102, 5_000_000_000)
+            .prepare_session_spawn("A", 0, 102, 5_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2714,7 +2720,7 @@ mod tests {
         // Fail 3 work items (triggers both circuit breaker AND exhausts episode budget)
         for (i, work_id) in ["A", "B", "C"].iter().enumerate() {
             let spawn = controller
-                .prepare_session_spawn(work_id, (i as u64) * 100, 2_000_000_000)
+                .prepare_session_spawn(work_id, 0, (i as u64) * 100, 2_000_000_000)
                 .unwrap();
             controller
                 .record_session_termination(
@@ -2770,7 +2776,7 @@ mod tests {
         let work_ids = ["W1", "W2", "W3"];
         for (i, work_id) in work_ids.iter().enumerate() {
             let spawn = controller
-                .prepare_session_spawn(work_id, i as u64, 2_000_000_000)
+                .prepare_session_spawn(work_id, 0, i as u64, 2_000_000_000)
                 .unwrap();
             controller
                 .record_session_termination(
@@ -2822,7 +2828,7 @@ mod tests {
 
         // Fail W1
         let spawn_w1 = controller
-            .prepare_session_spawn("W1", 0, 2_000_000_000)
+            .prepare_session_spawn("W1", 0, 0, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2837,7 +2843,7 @@ mod tests {
 
         // Fail W2
         let spawn_w2 = controller
-            .prepare_session_spawn("W2", 1, 4_000_000_000)
+            .prepare_session_spawn("W2", 0, 1, 4_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2852,7 +2858,7 @@ mod tests {
 
         // W3 SUCCEEDS - resets counter
         let spawn_w3 = controller
-            .prepare_session_spawn("W3", 2, 6_000_000_000)
+            .prepare_session_spawn("W3", 0, 2, 6_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2867,7 +2873,7 @@ mod tests {
 
         // Fail W4 and W5 - only 2 failures, circuit breaker NOT triggered
         let spawn_w4 = controller
-            .prepare_session_spawn("W4", 3, 8_000_000_000)
+            .prepare_session_spawn("W4", 0, 3, 8_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2881,7 +2887,7 @@ mod tests {
         assert_eq!(controller.consecutive_failures(), 1);
 
         let spawn_w5 = controller
-            .prepare_session_spawn("W5", 4, 10_000_000_000)
+            .prepare_session_spawn("W5", 0, 4, 10_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2915,7 +2921,7 @@ mod tests {
 
         // W1: Fail, fail, then succeed (uses 3 sessions)
         let spawn_w1_1 = controller
-            .prepare_session_spawn("W1", 0, 2_000_000_000)
+            .prepare_session_spawn("W1", 0, 0, 2_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2934,7 +2940,7 @@ mod tests {
         assert_eq!(controller.work_index(), 0, "Still on W1 for retry");
 
         let spawn_w1_2 = controller
-            .prepare_session_spawn("W1", 1, 4_000_000_000)
+            .prepare_session_spawn("W1", 0, 1, 4_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2949,7 +2955,7 @@ mod tests {
         assert_eq!(controller.work_index(), 0, "Still on W1 for retry");
 
         let spawn_w1_3 = controller
-            .prepare_session_spawn("W1", 2, 6_000_000_000)
+            .prepare_session_spawn("W1", 0, 2, 6_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -2965,7 +2971,7 @@ mod tests {
 
         // W2: Succeed immediately
         let spawn_w2 = controller
-            .prepare_session_spawn("W2", 3, 8_000_000_000)
+            .prepare_session_spawn("W2", 0, 3, 8_000_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -3025,7 +3031,12 @@ mod tests {
 
         for (i, (work_id, outcome)) in outcomes.iter().enumerate() {
             let spawn = controller
-                .prepare_session_spawn(work_id, i as u64, 2_000_000_000 + i as u64 * 1_000_000_000)
+                .prepare_session_spawn(
+                    work_id,
+                    0,
+                    i as u64,
+                    2_000_000_000 + i as u64 * 1_000_000_000,
+                )
                 .unwrap();
             controller
                 .record_session_termination(
@@ -3106,7 +3117,7 @@ mod tests {
         // Process work-1: success on first attempt
         let work_id = controller.current_work_id().unwrap().to_string();
         let spawn = controller
-            .prepare_session_spawn(&work_id, 1, 1_001_000_000)
+            .prepare_session_spawn(&work_id, 0, 1, 1_001_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -3121,7 +3132,7 @@ mod tests {
         // Process work-2: success on first attempt
         let work_id = controller.current_work_id().unwrap().to_string();
         let spawn = controller
-            .prepare_session_spawn(&work_id, 2, 1_003_000_000)
+            .prepare_session_spawn(&work_id, 0, 2, 1_003_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -3187,7 +3198,7 @@ mod tests {
 
         // First attempt - failure
         let spawn1 = controller
-            .prepare_session_spawn(&work_id, 1, 1_001_000_000)
+            .prepare_session_spawn(&work_id, 0, 1, 1_001_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -3201,7 +3212,7 @@ mod tests {
 
         // Second attempt - success
         let spawn2 = controller
-            .prepare_session_spawn(&work_id, 2, 1_003_000_000)
+            .prepare_session_spawn(&work_id, 0, 2, 1_003_000_000)
             .unwrap();
         controller
             .record_session_termination(
@@ -3246,7 +3257,7 @@ mod tests {
         // Complete one work item
         let work_id = controller.current_work_id().unwrap().to_string();
         let spawn = controller
-            .prepare_session_spawn(&work_id, 1, 1_001_000_000)
+            .prepare_session_spawn(&work_id, 0, 1, 1_001_000_000)
             .unwrap();
         controller
             .record_session_termination(

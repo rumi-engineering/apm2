@@ -138,6 +138,8 @@ impl CoordinationStarted {
 /// Payload for `coordination.session_bound` events.
 ///
 /// Per AD-COORD-003: This event MUST be emitted before `session.started`.
+/// Per AD-COORD-006: The binding includes `expected_transition_count` for
+/// optimistic concurrency control (CAS-at-commit).
 /// Per AD-COORD-007: Session ID is generated before this event is emitted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinationSessionBound {
@@ -155,6 +157,14 @@ pub struct CoordinationSessionBound {
     /// Attempt number for this work item (1-indexed).
     pub attempt_number: u32,
 
+    /// Expected work item transition count for optimistic concurrency control.
+    ///
+    /// Per AD-COORD-006: This value is checked at ledger admission to ensure
+    /// the work item's state hasn't changed since the binding was initiated.
+    /// If `work.transition_count != expected_transition_count`, the binding
+    /// is rejected (stale binding).
+    pub expected_transition_count: u64,
+
     /// Ledger sequence ID at which work freshness was verified.
     ///
     /// Per AD-COORD-006: Work state was checked at this sequence.
@@ -167,11 +177,13 @@ pub struct CoordinationSessionBound {
 impl CoordinationSessionBound {
     /// Creates a new session bound payload.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         coordination_id: String,
         session_id: String,
         work_id: String,
         attempt_number: u32,
+        expected_transition_count: u64,
         freshness_seq_id: u64,
         bound_at: u64,
     ) -> Self {
@@ -180,6 +192,7 @@ impl CoordinationSessionBound {
             session_id,
             work_id,
             attempt_number,
+            expected_transition_count,
             freshness_seq_id,
             bound_at,
         }
@@ -490,6 +503,7 @@ mod tests {
             "session-456".to_string(),
             "work-789".to_string(),
             1,
+            42, // expected_transition_count
             100,
             2_000_000_000,
         );
@@ -498,6 +512,7 @@ mod tests {
         assert_eq!(event.session_id, "session-456");
         assert_eq!(event.work_id, "work-789");
         assert_eq!(event.attempt_number, 1);
+        assert_eq!(event.expected_transition_count, 42);
         assert_eq!(event.freshness_seq_id, 100);
         assert_eq!(event.bound_at, 2_000_000_000);
     }
@@ -509,6 +524,7 @@ mod tests {
             "session-456".to_string(),
             "work-789".to_string(),
             2,
+            55, // expected_transition_count
             150,
             2_000_000_000,
         );
@@ -714,6 +730,7 @@ mod tests {
             "s".to_string(),
             "w".to_string(),
             1,
+            0, // expected_transition_count
             1,
             1000,
         ));
@@ -777,6 +794,7 @@ mod tests {
                 "s".to_string(),
                 "w1".to_string(),
                 1,
+                0, // expected_transition_count
                 10,
                 2000,
             )),
@@ -844,6 +862,7 @@ mod tests {
             "sess-1".to_string(),
             "work-1".to_string(),
             1,
+            42, // expected_transition_count
             50,
             2000,
         );
@@ -1018,6 +1037,7 @@ mod tests {
                 "s".to_string(),
                 "w1".to_string(),
                 1,
+                0, // expected_transition_count
                 10,
                 2000,
             )),
