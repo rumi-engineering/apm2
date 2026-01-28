@@ -63,6 +63,10 @@
 //!
 //! # Modules
 //!
+//! - [`adapter`]: `HarnessAdapter` trait and event types for normalizing
+//!   harness behavior
+//! - [`registry`]: `AdapterRegistry` for managing harness adapters
+//! - [`raw_adapter`]: Raw adapter implementation for unstructured output
 //! - [`budget`]: Episode budget and resource limits
 //! - [`envelope`]: Episode envelope and configuration
 //! - [`snapshot`]: Pinned snapshot for reproducibility
@@ -99,6 +103,11 @@ pub mod output;
 pub mod pty;
 pub mod ring_buffer;
 
+// TCK-00162: Harness adapter and registry
+pub mod adapter;
+pub mod raw_adapter;
+pub mod registry;
+
 // Re-export envelope types (TCK-00159)
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 pub use envelope::{
@@ -118,3 +127,11 @@ pub use runtime::{
 };
 pub use snapshot::{PinnedSnapshot, PinnedSnapshotBuilder};
 pub use state::{EpisodeState, QuarantineReason, TerminationClass, validate_transition};
+
+// Re-export adapter types (TCK-00162)
+pub use adapter::{
+    AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
+    HarnessEventStream, HarnessHandle, OutputKind, TerminationClassification,
+};
+pub use raw_adapter::RawAdapter;
+pub use registry::AdapterRegistry;
