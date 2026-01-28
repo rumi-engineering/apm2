@@ -93,6 +93,24 @@ impl FrameCodec {
     pub const fn max_frame_size(&self) -> usize {
         self.max_frame_size
     }
+
+    /// Set the maximum frame size for this codec.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_size` - New maximum frame size in bytes. Must not exceed
+    ///   [`MAX_FRAME_SIZE`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_size` exceeds [`MAX_FRAME_SIZE`].
+    pub fn set_max_frame_size(&mut self, max_size: usize) {
+        assert!(
+            max_size <= MAX_FRAME_SIZE,
+            "max_size {max_size} exceeds protocol limit {MAX_FRAME_SIZE}"
+        );
+        self.max_frame_size = max_size;
+    }
 }
 
 impl Decoder for FrameCodec {
@@ -123,7 +141,7 @@ impl Decoder for FrameCodec {
 
         // CTR-1603: Validate length BEFORE allocation
         if length > self.max_frame_size {
-            return Err(ProtocolError::frame_too_large(length));
+            return Err(ProtocolError::frame_too_large(length, self.max_frame_size));
         }
 
         // Check if we have the complete frame

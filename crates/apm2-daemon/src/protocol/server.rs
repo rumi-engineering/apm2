@@ -34,7 +34,7 @@ use tokio::sync::Semaphore;
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
-use super::error::{ProtocolError, ProtocolResult};
+use super::error::{MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, ProtocolError, ProtocolResult};
 use super::framing::FrameCodec;
 
 /// Default socket filename.
@@ -373,6 +373,13 @@ pub struct ConnectionPermit {
 /// A framed connection to a client.
 ///
 /// Wraps a Unix stream with the frame codec for length-prefixed messaging.
+///
+/// # Security
+///
+/// Connections are initialized with [`MAX_HANDSHAKE_FRAME_SIZE`] to prevent DoS
+/// during the unauthenticated handshake phase. After a successful handshake,
+/// the connection should be upgraded to [`MAX_FRAME_SIZE`] using
+/// [`Connection::upgrade_to_full_frame_size`].
 pub struct Connection {
     /// The framed stream.
     framed: Framed<UnixStream, FrameCodec>,
@@ -380,10 +387,20 @@ pub struct Connection {
 
 impl Connection {
     /// Create a new connection from a Unix stream.
+    ///
+    /// Initializes with [`MAX_HANDSHAKE_FRAME_SIZE`] limit.
     fn new(stream: UnixStream) -> Self {
         Self {
-            framed: Framed::new(stream, FrameCodec::new()),
+            framed: Framed::new(stream, FrameCodec::with_max_size(MAX_HANDSHAKE_FRAME_SIZE)),
         }
+    }
+
+    /// Upgrade the connection to support full-sized frames.
+    ///
+    /// Should be called after a successful handshake to allow messages
+    /// up to [`MAX_FRAME_SIZE`].
+    pub fn upgrade_to_full_frame_size(&mut self) {
+        self.framed.codec_mut().set_max_frame_size(MAX_FRAME_SIZE);
     }
 
     /// Get a reference to the underlying framed stream.
