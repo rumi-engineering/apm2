@@ -74,6 +74,21 @@ pub const MAX_KEY_LEN: usize = 256;
 /// Maximum payload size for conflict recording.
 pub const MAX_CONFLICT_PAYLOAD_SIZE: usize = 64 * 1024; // 64 KiB
 
+/// Maximum number of nodes in a `GCounter`.
+///
+/// Bounded to prevent denial-of-service via memory exhaustion (CTR-1303).
+/// An attacker could inject arbitrary node entries to cause OOM.
+pub const MAX_GCOUNTER_NODES: usize = 1024;
+
+/// Maximum future time skew allowed for HLC timestamps (in nanoseconds).
+///
+/// Remote timestamps more than 60 seconds in the future will be rejected
+/// to prevent "bricking" attacks where a malicious peer skews the node's clock.
+pub const MAX_FUTURE_SKEW_NS: u64 = 60 * 1_000_000_000; // 60 seconds
+
+/// Maximum length of reason string for conflict records.
+pub const MAX_REASON_LEN: usize = 1024;
+
 // =============================================================================
 // Errors
 // =============================================================================
@@ -122,6 +137,33 @@ pub enum CrdtMergeError {
     UnsupportedMergeOperator {
         /// The unsupported operator.
         operator: MergeOperator,
+    },
+
+    /// `GCounter` has too many nodes.
+    #[error("GCounter node limit exceeded: {count} > {max}")]
+    GCounterNodeLimitExceeded {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
+
+    /// Remote HLC timestamp is too far in the future.
+    #[error("remote HLC timestamp too far in future: {skew_ns}ns > {max_ns}ns")]
+    FutureSkewExceeded {
+        /// Actual skew in nanoseconds.
+        skew_ns: u64,
+        /// Maximum allowed skew in nanoseconds.
+        max_ns: u64,
+    },
+
+    /// Reason string exceeds maximum length.
+    #[error("reason string too long: {len} > {max}")]
+    ReasonTooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
     },
 }
 
@@ -178,6 +220,10 @@ impl Hlc {
     /// - `new_wall_time = max(local_wall, msg_wall, physical_now)`
     /// - If wall times equal, increment the max counter
     /// - If wall time advances, reset counter
+    ///
+    /// **Note:** This method does not validate future skew. For secure
+    /// operation, use [`Self::update_with_remote`] which rejects timestamps
+    /// too far in the future.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Nanoseconds won't overflow u64 until year 2554
     pub fn receive(&self, msg_hlc: &Self) -> Self {
@@ -187,6 +233,62 @@ impl Hlc {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
 
+        self.receive_internal(msg_hlc, physical_now)
+    }
+
+    /// Updates this HLC based on a received message's HLC, with future skew
+    /// validation.
+    ///
+    /// This is the secure version of [`Self::receive`] that rejects timestamps
+    /// that are too far in the future, preventing "bricking" attacks where a
+    /// malicious peer could skew the node's clock forward indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::FutureSkewExceeded`] if the remote timestamp
+    /// is more than [`MAX_FUTURE_SKEW_NS`] ahead of the current physical time.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use apm2_core::consensus::crdt::{CrdtMergeError, Hlc, MAX_FUTURE_SKEW_NS};
+    ///
+    /// let local = Hlc::now();
+    /// let remote = Hlc::new(local.wall_time_ns + 1000, 0); // 1 microsecond ahead
+    ///
+    /// // Normal update succeeds
+    /// let updated = local.update_with_remote(&remote).unwrap();
+    ///
+    /// // Far-future timestamp is rejected
+    /// let malicious = Hlc::new(local.wall_time_ns + MAX_FUTURE_SKEW_NS + 1, 0);
+    /// assert!(local.update_with_remote(&malicious).is_err());
+    /// ```
+    #[allow(clippy::cast_possible_truncation)] // Nanoseconds won't overflow u64 until year 2554
+    pub fn update_with_remote(&self, msg_hlc: &Self) -> Result<Self, CrdtMergeError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let physical_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        // Check if remote timestamp is too far in the future
+        if msg_hlc.wall_time_ns > physical_now {
+            let skew = msg_hlc.wall_time_ns - physical_now;
+            if skew > MAX_FUTURE_SKEW_NS {
+                return Err(CrdtMergeError::FutureSkewExceeded {
+                    skew_ns: skew,
+                    max_ns: MAX_FUTURE_SKEW_NS,
+                });
+            }
+        }
+
+        Ok(self.receive_internal(msg_hlc, physical_now))
+    }
+
+    /// Internal receive implementation shared by `receive` and
+    /// `update_with_remote`.
+    #[must_use]
+    fn receive_internal(&self, msg_hlc: &Self, physical_now: u64) -> Self {
         let max_wall = self
             .wall_time_ns
             .max(msg_hlc.wall_time_ns)
@@ -416,6 +518,9 @@ pub struct ConflictRecord {
 
 impl ConflictRecord {
     /// Creates a new conflict record for LWW resolution.
+    ///
+    /// **Note:** This method does not validate input lengths. For secure
+    /// operation, use [`Self::try_lww`] which validates all inputs.
     #[must_use]
     pub const fn lww(
         local_hlc: Hlc,
@@ -439,12 +544,66 @@ impl ConflictRecord {
         }
     }
 
+    /// Creates a new conflict record for LWW resolution with input validation.
+    ///
+    /// This is the secure version of [`Self::lww`] that validates the reason
+    /// string length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::ReasonTooLong`] if the reason exceeds
+    /// [`MAX_REASON_LEN`].
+    pub fn try_lww(
+        local_hlc: Hlc,
+        local_node_id: NodeId,
+        remote_hlc: Hlc,
+        remote_node_id: NodeId,
+        resolution: MergeWinner,
+        reason: String,
+    ) -> Result<Self, CrdtMergeError> {
+        if reason.len() > MAX_REASON_LEN {
+            return Err(CrdtMergeError::ReasonTooLong {
+                len: reason.len(),
+                max: MAX_REASON_LEN,
+            });
+        }
+
+        Ok(Self::lww(
+            local_hlc,
+            local_node_id,
+            remote_hlc,
+            remote_node_id,
+            resolution,
+            reason,
+        ))
+    }
+
     /// Sets the key for this conflict record.
+    ///
+    /// **Note:** This method does not validate key length. For secure
+    /// operation, use [`Self::try_with_key`] which validates the key
+    /// length.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // Builder pattern with Into trait
     pub fn with_key(mut self, key: impl Into<String>) -> Self {
         self.key = Some(key.into());
         self
+    }
+
+    /// Sets the key for this conflict record with validation.
+    ///
+    /// This is the secure version of [`Self::with_key`] that validates the key
+    /// length against [`MAX_KEY_LEN`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::KeyTooLong`] if the key exceeds
+    /// [`MAX_KEY_LEN`].
+    pub fn try_with_key(mut self, key: impl Into<String>) -> Result<Self, CrdtMergeError> {
+        let key_str = key.into();
+        validate_key(&key_str)?;
+        self.key = Some(key_str);
+        Ok(self)
     }
 
     /// Sets the value hashes for this conflict record.
@@ -602,9 +761,56 @@ impl GCounter {
     }
 
     /// Increments this node's count.
+    ///
+    /// **Note:** This method does not enforce the node limit. For secure
+    /// operation, use [`Self::try_increment`] which rejects additions
+    /// beyond the limit.
     pub fn increment(&mut self, node_id: NodeId, delta: u64) {
         let count = self.counts.entry(node_id).or_insert(0);
         *count = count.saturating_add(delta);
+    }
+
+    /// Increments this node's count with capacity checking.
+    ///
+    /// This is the secure version of [`Self::increment`] that rejects new node
+    /// entries when the counter already has [`MAX_GCOUNTER_NODES`] nodes.
+    /// Existing nodes can always be incremented.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::GCounterNodeLimitExceeded`] if adding a new
+    /// node would exceed the limit.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use apm2_core::consensus::crdt::{
+    ///     CrdtMergeError, GCounter, MAX_GCOUNTER_NODES,
+    /// };
+    ///
+    /// let mut counter = GCounter::new();
+    /// let node_id = [0x01; 32];
+    ///
+    /// // First increment succeeds
+    /// counter.try_increment(node_id, 5).unwrap();
+    /// assert_eq!(counter.value(), 5);
+    ///
+    /// // Incrementing existing node always succeeds
+    /// counter.try_increment(node_id, 3).unwrap();
+    /// assert_eq!(counter.value(), 8);
+    /// ```
+    pub fn try_increment(&mut self, node_id: NodeId, delta: u64) -> Result<(), CrdtMergeError> {
+        // Check if this is a new node and we're at capacity
+        if !self.counts.contains_key(&node_id) && self.counts.len() >= MAX_GCOUNTER_NODES {
+            return Err(CrdtMergeError::GCounterNodeLimitExceeded {
+                count: self.counts.len() + 1,
+                max: MAX_GCOUNTER_NODES,
+            });
+        }
+
+        let count = self.counts.entry(node_id).or_insert(0);
+        *count = count.saturating_add(delta);
+        Ok(())
     }
 
     /// Returns the total count (sum of all node counts).
@@ -623,6 +829,10 @@ impl GCounter {
     ///
     /// For each node, takes the maximum of the two counts.
     /// This is commutative, associative, and idempotent.
+    ///
+    /// **Note:** This method does not enforce the node limit. For secure
+    /// operation, use [`Self::try_merge`] which rejects merges that would
+    /// exceed the limit.
     #[must_use]
     pub fn merge(&self, other: &Self) -> Self {
         let mut result = self.clone();
@@ -631,6 +841,52 @@ impl GCounter {
             *entry = (*entry).max(count);
         }
         result
+    }
+
+    /// Merges this counter with another, with capacity checking.
+    ///
+    /// This is the secure version of [`Self::merge`] that rejects merges
+    /// when the resulting counter would exceed [`MAX_GCOUNTER_NODES`] nodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::GCounterNodeLimitExceeded`] if the merge
+    /// would exceed the node limit.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use apm2_core::consensus::crdt::{
+    ///     CrdtMergeError, GCounter, MAX_GCOUNTER_NODES,
+    /// };
+    ///
+    /// let mut counter_a = GCounter::new();
+    /// counter_a.try_increment([0x01; 32], 5).unwrap();
+    ///
+    /// let mut counter_b = GCounter::new();
+    /// counter_b.try_increment([0x02; 32], 3).unwrap();
+    ///
+    /// // Merge succeeds when under limit
+    /// let merged = counter_a.try_merge(&counter_b).unwrap();
+    /// assert_eq!(merged.value(), 8);
+    /// ```
+    pub fn try_merge(&self, other: &Self) -> Result<Self, CrdtMergeError> {
+        // Count how many new nodes would be added
+        let new_nodes = other
+            .counts
+            .keys()
+            .filter(|k| !self.counts.contains_key(*k))
+            .count();
+        let total_nodes = self.counts.len() + new_nodes;
+
+        if total_nodes > MAX_GCOUNTER_NODES {
+            return Err(CrdtMergeError::GCounterNodeLimitExceeded {
+                count: total_nodes,
+                max: MAX_GCOUNTER_NODES,
+            });
+        }
+
+        Ok(self.merge(other))
     }
 
     /// Returns the number of nodes that have contributed to this counter.
@@ -1215,5 +1471,228 @@ mod tests {
         let different_data = b"different data";
         let hash3 = hash_value(different_data);
         assert_ne!(hash1, hash3);
+    }
+
+    // =========================================================================
+    // Security Limit Tests (CTR-1303)
+    // =========================================================================
+
+    /// Test `GCounter` node limit via `try_increment`.
+    #[test]
+    fn tck_00197_gcounter_node_limit_try_increment() {
+        let mut counter = GCounter::new();
+
+        // Fill up to the limit
+        for i in 0..MAX_GCOUNTER_NODES {
+            let mut node_id = [0u8; 32];
+            node_id[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            counter.try_increment(node_id, 1).unwrap();
+        }
+
+        assert_eq!(counter.node_count_len(), MAX_GCOUNTER_NODES);
+
+        // Next new node should fail
+        let new_node = [0xff; 32];
+        let result = counter.try_increment(new_node, 1);
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::GCounterNodeLimitExceeded { .. })
+        ));
+
+        // But existing node can still increment
+        let existing_node = [0u8; 32]; // First node we added
+        assert!(counter.try_increment(existing_node, 1).is_ok());
+    }
+
+    /// Test `GCounter` node limit via `try_merge`.
+    #[test]
+    fn tck_00197_gcounter_node_limit_try_merge() {
+        let mut counter_a = GCounter::new();
+        let mut counter_b = GCounter::new();
+
+        // Fill counter_a up to half the limit
+        for i in 0..(MAX_GCOUNTER_NODES / 2) {
+            let mut node_id = [0u8; 32];
+            node_id[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            counter_a.try_increment(node_id, 1).unwrap();
+        }
+
+        // Fill counter_b with different nodes, also half the limit
+        for i in (MAX_GCOUNTER_NODES / 2)..MAX_GCOUNTER_NODES {
+            let mut node_id = [0u8; 32];
+            node_id[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            counter_b.try_increment(node_id, 1).unwrap();
+        }
+
+        // Merge should succeed (exactly at limit)
+        let merged = counter_a.try_merge(&counter_b).unwrap();
+        assert_eq!(merged.node_count_len(), MAX_GCOUNTER_NODES);
+
+        // Add one more node to counter_b
+        let mut extra_node = [0u8; 32];
+        extra_node[0..8].copy_from_slice(&(MAX_GCOUNTER_NODES as u64).to_le_bytes());
+        counter_b.try_increment(extra_node, 1).unwrap();
+
+        // Now merge should fail
+        let result = merged.try_merge(&counter_b);
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::GCounterNodeLimitExceeded { .. })
+        ));
+    }
+
+    /// Test HLC future skew rejection via `update_with_remote`.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)] // Nanoseconds won't overflow u64 until year 2554
+    fn tck_00197_hlc_future_skew_rejection() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let local = Hlc::now();
+        let physical_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        // Normal update within skew limit should succeed
+        let remote_ok = Hlc::new(physical_now + MAX_FUTURE_SKEW_NS - 1_000_000_000, 0);
+        assert!(local.update_with_remote(&remote_ok).is_ok());
+
+        // Far-future timestamp should be rejected
+        let remote_bad = Hlc::new(physical_now + MAX_FUTURE_SKEW_NS + 1_000_000_000, 0);
+        let result = local.update_with_remote(&remote_bad);
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::FutureSkewExceeded { .. })
+        ));
+
+        // Past timestamp should always succeed
+        let remote_past = Hlc::new(physical_now - 1_000_000_000, 0);
+        assert!(local.update_with_remote(&remote_past).is_ok());
+    }
+
+    /// Test HLC `update_with_remote` produces correct result when valid.
+    #[test]
+    fn tck_00197_hlc_update_with_remote_valid() {
+        let local = Hlc::new(1000, 5);
+        let remote = Hlc::new(1000, 10);
+
+        // Use receive (which has no skew check) to compare behavior
+        let _received = local.receive(&remote);
+
+        // update_with_remote with a valid timestamp should produce the same result
+        // Note: we can't directly compare due to timing, but we can verify it succeeds
+        // and the result is sensible
+        let result = local.update_with_remote(&remote);
+        assert!(result.is_ok());
+
+        let updated = result.unwrap();
+        // Should have advanced beyond both inputs
+        assert!(updated.wall_time_ns >= local.wall_time_ns);
+        assert!(updated.wall_time_ns >= remote.wall_time_ns);
+    }
+
+    /// Test `ConflictRecord` validation via `try_lww`.
+    #[test]
+    fn tck_00197_conflict_record_try_lww_validation() {
+        let node_a = [0x01; 32];
+        let node_b = [0x02; 32];
+
+        // Valid reason should succeed
+        let result = ConflictRecord::try_lww(
+            Hlc::new(1000, 0),
+            node_a,
+            Hlc::new(1001, 0),
+            node_b,
+            MergeWinner::RemoteWins,
+            "valid reason".to_string(),
+        );
+        assert!(result.is_ok());
+
+        // Too long reason should fail
+        let long_reason = "x".repeat(MAX_REASON_LEN + 1);
+        let result = ConflictRecord::try_lww(
+            Hlc::new(1000, 0),
+            node_a,
+            Hlc::new(1001, 0),
+            node_b,
+            MergeWinner::RemoteWins,
+            long_reason,
+        );
+        assert!(matches!(result, Err(CrdtMergeError::ReasonTooLong { .. })));
+    }
+
+    /// Test `ConflictRecord` validation via `try_with_key`.
+    #[test]
+    fn tck_00197_conflict_record_try_with_key_validation() {
+        let node_a = [0x01; 32];
+        let node_b = [0x02; 32];
+
+        let record = ConflictRecord::lww(
+            Hlc::new(1000, 0),
+            node_a,
+            Hlc::new(1001, 0),
+            node_b,
+            MergeWinner::RemoteWins,
+            "reason".to_string(),
+        );
+
+        // Valid key should succeed
+        let result = record.clone().try_with_key("valid_key");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().key, Some("valid_key".to_string()));
+
+        // Too long key should fail
+        let long_key = "x".repeat(MAX_KEY_LEN + 1);
+        let result = record.try_with_key(long_key);
+        assert!(matches!(result, Err(CrdtMergeError::KeyTooLong { .. })));
+    }
+
+    /// Test new error variants have proper Display implementations.
+    #[test]
+    fn tck_00197_new_error_display() {
+        let errors = [
+            CrdtMergeError::GCounterNodeLimitExceeded {
+                count: 1025,
+                max: 1024,
+            },
+            CrdtMergeError::FutureSkewExceeded {
+                skew_ns: 120_000_000_000,
+                max_ns: 60_000_000_000,
+            },
+            CrdtMergeError::ReasonTooLong {
+                len: 2000,
+                max: 1024,
+            },
+        ];
+
+        for err in &errors {
+            let msg = err.to_string();
+            assert!(!msg.is_empty());
+            // Verify the error message contains relevant info
+            match err {
+                CrdtMergeError::GCounterNodeLimitExceeded { count, max } => {
+                    assert!(msg.contains(&count.to_string()));
+                    assert!(msg.contains(&max.to_string()));
+                },
+                CrdtMergeError::FutureSkewExceeded { skew_ns, max_ns } => {
+                    assert!(msg.contains(&skew_ns.to_string()));
+                    assert!(msg.contains(&max_ns.to_string()));
+                },
+                CrdtMergeError::ReasonTooLong { len, max } => {
+                    assert!(msg.contains(&len.to_string()));
+                    assert!(msg.contains(&max.to_string()));
+                },
+                _ => {},
+            }
+        }
+    }
+
+    /// Test constants are properly defined.
+    #[test]
+    fn tck_00197_security_constants_defined() {
+        // Verify constants have expected values
+        assert_eq!(MAX_GCOUNTER_NODES, 1024);
+        assert_eq!(MAX_FUTURE_SKEW_NS, 60 * 1_000_000_000); // 60 seconds
+        assert_eq!(MAX_REASON_LEN, 1024);
     }
 }
