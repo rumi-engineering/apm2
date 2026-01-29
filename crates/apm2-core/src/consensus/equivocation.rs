@@ -24,7 +24,7 @@
 //! - RFC-0014: Distributed Consensus and Replication Layer
 //! - TCK-00196: Byzantine Equivocation Detection
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
@@ -242,6 +242,14 @@ impl EquivocationEvidence {
     ///
     /// Returns an error if the evidence is invalid.
     pub fn verify(&self, validator_key: &VerifyingKey) -> Result<(), EquivocationError> {
+        // Verify the provided key matches the Byzantine validator ID
+        let key_hash: [u8; 32] = blake3::hash(validator_key.as_bytes()).into();
+        if key_hash != self.byzantine_validator_id {
+            return Err(EquivocationError::VerificationFailed(
+                "provided key does not match Byzantine validator ID".to_string(),
+            ));
+        }
+
         // Verify proposals are for the same sequence ID
         if self.proposal_a.sequence_id != self.proposal_b.sequence_id {
             return Err(EquivocationError::VerificationFailed(
@@ -365,8 +373,8 @@ pub struct EquivocationDetector {
     /// Cache of proposals keyed by (namespace, epoch, `sequence_id`,
     /// `leader_id`).
     cache: HashMap<ProposalCacheKey, CachedProposal>,
-    /// Insertion order for FIFO eviction.
-    insertion_order: Vec<ProposalCacheKey>,
+    /// Insertion order for FIFO eviction (`VecDeque` for O(1) front removal).
+    insertion_order: VecDeque<ProposalCacheKey>,
     /// Maximum cache size.
     max_cache_size: usize,
 }
@@ -389,7 +397,7 @@ impl EquivocationDetector {
     pub fn with_capacity(max_cache_size: usize) -> Self {
         Self {
             cache: HashMap::with_capacity(max_cache_size),
-            insertion_order: Vec::with_capacity(max_cache_size),
+            insertion_order: VecDeque::with_capacity(max_cache_size),
             max_cache_size,
         }
     }
@@ -442,7 +450,7 @@ impl EquivocationDetector {
                 cached_at: now,
             },
         );
-        self.insertion_order.push(key);
+        self.insertion_order.push_back(key);
 
         EquivocationCheckResult::NoConflict
     }
@@ -454,9 +462,8 @@ impl EquivocationDetector {
 
         // If still at capacity, evict oldest entries (FIFO)
         while self.cache.len() >= self.max_cache_size && !self.insertion_order.is_empty() {
-            if let Some(oldest_key) = self.insertion_order.first().cloned() {
+            if let Some(oldest_key) = self.insertion_order.pop_front() {
                 self.cache.remove(&oldest_key);
-                self.insertion_order.remove(0);
             }
         }
     }
