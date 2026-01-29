@@ -72,6 +72,7 @@ pub mod discovery;
 pub mod genesis;
 pub mod handlers;
 pub mod merkle;
+pub mod metrics;
 pub mod network;
 pub mod qc_aggregator;
 pub mod relay;
@@ -115,6 +116,11 @@ pub use handlers::{
 pub use merkle::{
     DivergentRange, EMPTY_HASH, MAX_PROOF_NODES, MAX_TREE_DEPTH, MAX_TREE_LEAVES, MerkleError,
     MerkleNode, MerkleProof, MerkleTree, RangeDigest, hash_internal, hash_leaf,
+};
+// Prometheus metrics for consensus health (TCK-00193)
+pub use metrics::{
+    ByzantineFaultType, ClusterHealth, ClusterStatus, ConflictResolution, ConsensusMetrics,
+    DEFAULT_LATENCY_BUCKETS, Histogram, LeaderElectionReason, ProposalOutcome, SyncDirection,
 };
 pub use network::{
     CONTROL_FRAME_SIZE, Connection, ConnectionPool, ControlFrame, Network, NetworkConfig,

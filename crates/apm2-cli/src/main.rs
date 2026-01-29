@@ -124,6 +124,10 @@ enum Commands {
     /// Episode commands for bounded execution management
     Episode(commands::episode::EpisodeCommand),
 
+    // === Consensus cluster management (RFC-0014) ===
+    /// Consensus commands for cluster status and diagnostics
+    Consensus(commands::consensus::ConsensusCommand),
+
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
@@ -330,6 +334,14 @@ fn main() -> Result<()> {
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
             let exit_code = commands::episode::run_episode(&episode_cmd, &socket_path);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Consensus(consensus_cmd) => {
+            // Consensus commands use specific exit codes per TCK-00193:
+            // 0=success, 1=error, 2=cluster_unhealthy
+            // We use std::process::exit to bypass anyhow Result handling
+            // and ensure precise exit codes are returned.
+            let exit_code = commands::consensus::run_consensus(&consensus_cmd, &socket_path);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {
