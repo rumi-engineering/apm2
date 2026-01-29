@@ -820,13 +820,17 @@ impl SqliteLedgerBackend {
     /// # Errors
     ///
     /// Returns an error if verification fails.
-    pub fn verify_event(
+    pub fn verify_event<H, V>(
         &self,
         event: &EventRecord,
         expected_prev_hash: &[u8],
-        verify_hash_fn: super::backend::HashFn<'_>,
-        verify_sig_fn: super::backend::VerifyFn<'_>,
-    ) -> Result<(), LedgerError> {
+        verify_hash_fn: H,
+        verify_sig_fn: V,
+    ) -> Result<(), LedgerError>
+    where
+        H: FnOnce(&[u8], &[u8]) -> Vec<u8>,
+        V: FnOnce(&[u8], &[u8]) -> bool,
+    {
         let seq_id = event.seq_id.unwrap_or(0);
 
         // Verify prev_hash matches expected
