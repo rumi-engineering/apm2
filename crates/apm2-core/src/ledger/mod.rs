@@ -14,6 +14,13 @@
 //! - **WAL mode**: Concurrent read access while writes are in progress
 //! - **Artifact references**: Links to content-addressable storage for large
 //!   payloads
+//! - **Backend trait**: Abstraction for different storage implementations
+//!
+//! # Backend Architecture
+//!
+//! The [`LedgerBackend`] trait defines the core operations for an append-only
+//! event ledger. The [`SqliteLedgerBackend`] provides the default SQLite-backed
+//! implementation. The [`Ledger`] type alias preserves backward compatibility.
 //!
 //! # Example
 //!
@@ -38,11 +45,14 @@
 //! # }
 //! ```
 
+mod backend;
 mod storage;
 
 #[cfg(test)]
 mod tests;
 
+pub use backend::{BoxFuture, HashFn, LedgerBackend, VerifyFn};
 pub use storage::{
     ArtifactRef, CURRENT_RECORD_VERSION, EventRecord, Ledger, LedgerError, LedgerStats,
+    SqliteLedgerBackend,
 };

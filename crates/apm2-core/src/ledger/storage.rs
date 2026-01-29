@@ -1,6 +1,8 @@
 //! `SQLite`-backed ledger storage implementation.
 //!
 //! This module uses `SQLite` with WAL mode for the underlying storage.
+//! The [`SqliteLedgerBackend`] struct implements the [`LedgerBackend`] trait,
+//! providing a concrete storage backend for the APM2 event ledger.
 
 // SQLite returns i64 for row IDs and counts, but they're always non-negative.
 // Timestamps won't overflow u64 until the year 2554.
@@ -17,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
+
+use super::backend::LedgerBackend;
 
 /// Schema SQL embedded at compile time.
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -251,13 +255,21 @@ pub struct LedgerStats {
 /// The ledger uses `SQLite`'s WAL mode to allow concurrent reads while
 /// writes are in progress. Events are stored with monotonically increasing
 /// sequence numbers and can never be modified or deleted.
-pub struct Ledger {
+///
+/// This struct implements the [`LedgerBackend`] trait, providing the core
+/// storage operations for the APM2 event-sourcing architecture.
+pub struct SqliteLedgerBackend {
     conn: Arc<std::sync::Mutex<Connection>>,
     #[allow(dead_code)]
     path: Option<std::path::PathBuf>,
 }
 
-impl Ledger {
+/// Type alias for backward compatibility.
+///
+/// Existing code using `Ledger` will continue to work unchanged.
+pub type Ledger = SqliteLedgerBackend;
+
+impl SqliteLedgerBackend {
     /// Opens or creates a ledger at the specified path.
     ///
     /// If the database doesn't exist, it will be created with the
@@ -623,20 +635,33 @@ impl Ledger {
         Ok(result)
     }
 
-    /// Gets the current maximum sequence ID.
+    /// Gets the current maximum sequence ID (head of the ledger).
     ///
     /// Returns 0 if the ledger is empty.
+    ///
+    /// This is the synchronous version. For the async trait method, see
+    /// [`LedgerBackend::head`].
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn max_seq_id(&self) -> Result<u64, LedgerError> {
+    pub fn head_sync(&self) -> Result<u64, LedgerError> {
         let conn = self.conn.lock().unwrap();
 
         let max: Option<i64> =
             conn.query_row("SELECT MAX(seq_id) FROM events", [], |row| row.get(0))?;
 
         Ok(max.unwrap_or(0) as u64)
+    }
+
+    /// Alias for `head_sync()` for backward compatibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    #[deprecated(since = "2.0.0", note = "Use head_sync() instead for clarity")]
+    pub fn max_seq_id(&self) -> Result<u64, LedgerError> {
+        self.head_sync()
     }
 
     /// Gets statistics about the ledger.
@@ -840,7 +865,67 @@ impl Ledger {
         Ok(())
     }
 
+    /// Verifies the hash chain from a starting sequence ID.
+    ///
+    /// This version uses trait object function pointers for object safety,
+    /// making it compatible with `Box<dyn LedgerBackend>`.
+    ///
+    /// # Arguments
+    ///
+    /// * `from_seq_id` - The sequence ID to start verification from (use 1 for
+    ///   genesis).
+    /// * `verify_hash_fn` - Function to compute event hash given payload and
+    ///   `prev_hash`.
+    /// * `verify_sig_fn` - Function to verify signature (returns true if
+    ///   valid).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any event fails verification.
+    pub fn verify_chain_from(
+        &self,
+        from_seq_id: u64,
+        verify_hash_fn: super::backend::HashFn<'_>,
+        verify_sig_fn: super::backend::VerifyFn<'_>,
+    ) -> Result<(), LedgerError> {
+        // Genesis hash (32 zero bytes) or fetch the hash of the event before
+        // from_seq_id
+        let mut expected_prev_hash: Vec<u8> = if from_seq_id <= 1 {
+            vec![0u8; 32]
+        } else {
+            // Get the previous event's hash
+            let prev_event = self.read_one(from_seq_id - 1)?;
+            prev_event.event_hash.unwrap_or_else(|| vec![0u8; 32])
+        };
+
+        // Read all events in batches starting from from_seq_id
+        let mut cursor = from_seq_id;
+        let batch_size = 1000u64;
+
+        loop {
+            let events = self.read_from(cursor, batch_size)?;
+            if events.is_empty() {
+                break;
+            }
+
+            for event in &events {
+                // Verify this event
+                self.verify_event(event, &expected_prev_hash, verify_hash_fn, verify_sig_fn)?;
+
+                // Update expected_prev_hash for next event
+                expected_prev_hash = event.event_hash.clone().unwrap_or_else(|| vec![0u8; 32]);
+            }
+
+            cursor = events.last().map_or(cursor, |e| e.seq_id.unwrap_or(0) + 1);
+        }
+
+        Ok(())
+    }
+
     /// Verifies the entire hash chain from the beginning of the ledger.
+    ///
+    /// This is the generic version that works with closures. For the
+    /// object-safe trait method, see [`LedgerBackend::verify_chain`].
     ///
     /// # Arguments
     ///
@@ -853,34 +938,79 @@ impl Ledger {
     /// Returns an error if any event fails verification.
     pub fn verify_chain<H, V>(&self, verify_hash_fn: H, verify_sig_fn: V) -> Result<(), LedgerError>
     where
-        H: Fn(&[u8], &[u8]) -> Vec<u8>,
-        V: Fn(&[u8], &[u8]) -> bool,
+        H: Fn(&[u8], &[u8]) -> Vec<u8> + Send + Sync,
+        V: Fn(&[u8], &[u8]) -> bool + Send + Sync,
     {
-        // Genesis hash (32 zero bytes)
-        let mut expected_prev_hash: Vec<u8> = vec![0u8; 32];
+        self.verify_chain_from(1, &verify_hash_fn, &verify_sig_fn)
+    }
+}
 
-        // Read all events in batches
-        let mut cursor = 1u64;
-        let batch_size = 1000u64;
+// -----------------------------------------------------------------------------
+// LedgerBackend Trait Implementation
+// -----------------------------------------------------------------------------
+//
+// INTENTIONAL DESIGN: Namespace parameter is ignored in this implementation.
+//
+// This SqliteLedgerBackend is a direct extraction of the existing Ledger struct
+// (TCK-00180 scope: "No behavioral changes to existing code"). The namespace
+// parameter was added to the LedgerBackend trait API to enable future namespace
+// isolation per RFC-0014's architectural design.
+//
+// The actual namespace isolation (table partitioning or separate databases per
+// namespace) is intentionally deferred to a future ticket. This approach:
+//
+//   1. Preserves backward compatibility with all existing code
+//   2. Enables incremental adoption of the trait abstraction
+//   3. Allows namespace isolation to be implemented with proper schema
+//      migration
+//
+// TODO(RFC-0014): Implement namespace isolation in a follow-up ticket. Options:
+//   - Per-namespace table prefixes (e.g., `{namespace}_events`)
+//   - Separate SQLite databases per namespace
+//   - Namespace column with filtered queries
+//
+// See RFC-0014 section 02_design_decisions.yaml for namespace scoping design.
+// -----------------------------------------------------------------------------
 
-        loop {
-            let events = self.read_from(cursor, batch_size)?;
-            if events.is_empty() {
-                break;
-            }
+impl LedgerBackend for SqliteLedgerBackend {
+    fn append<'a>(
+        &'a self,
+        _namespace: &'a str,
+        event: &'a EventRecord,
+    ) -> super::backend::BoxFuture<'a, Result<u64, LedgerError>> {
+        // Namespace parameter intentionally ignored - see block comment above.
+        Box::pin(async move { Self::append(self, event) })
+    }
 
-            for event in &events {
-                // Verify this event
-                self.verify_event(event, &expected_prev_hash, &verify_hash_fn, &verify_sig_fn)?;
+    fn read_from<'a>(
+        &'a self,
+        _namespace: &'a str,
+        cursor: u64,
+        limit: u64,
+    ) -> super::backend::BoxFuture<'a, Result<Vec<EventRecord>, LedgerError>> {
+        // Namespace parameter intentionally ignored - see block comment above.
+        Box::pin(async move { Self::read_from(self, cursor, limit) })
+    }
 
-                // Update expected_prev_hash for next event
-                expected_prev_hash = event.event_hash.clone().unwrap_or_else(|| vec![0u8; 32]);
-            }
+    fn head<'a>(
+        &'a self,
+        _namespace: &'a str,
+    ) -> super::backend::BoxFuture<'a, Result<u64, LedgerError>> {
+        // Namespace parameter intentionally ignored - see block comment above.
+        Box::pin(async move { self.head_sync() })
+    }
 
-            cursor = events.last().map_or(cursor, |e| e.seq_id.unwrap_or(0) + 1);
-        }
-
-        Ok(())
+    fn verify_chain<'a>(
+        &'a self,
+        _namespace: &'a str,
+        from_seq_id: u64,
+        verify_hash_fn: super::backend::HashFn<'a>,
+        verify_sig_fn: super::backend::VerifyFn<'a>,
+    ) -> super::backend::BoxFuture<'a, Result<(), LedgerError>> {
+        // Namespace parameter intentionally ignored - see block comment above.
+        Box::pin(async move {
+            Self::verify_chain_from(self, from_seq_id, verify_hash_fn, verify_sig_fn)
+        })
     }
 }
 
