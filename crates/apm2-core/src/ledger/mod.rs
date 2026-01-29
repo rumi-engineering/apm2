@@ -15,12 +15,24 @@
 //! - **Artifact references**: Links to content-addressable storage for large
 //!   payloads
 //! - **Backend trait**: Abstraction for different storage implementations
+//! - **BFT integration**: Support for distributed consensus finalization
 //!
 //! # Backend Architecture
 //!
 //! The [`LedgerBackend`] trait defines the core operations for an append-only
 //! event ledger. The [`SqliteLedgerBackend`] provides the default SQLite-backed
-//! implementation. The [`Ledger`] type alias preserves backward compatibility.
+//! implementation. The [`BftLedgerBackend`] wraps a storage backend to provide
+//! BFT consensus integration. The [`Ledger`] type alias preserves backward
+//! compatibility.
+//!
+//! # BFT Integration (RFC-0014)
+//!
+//! The [`BftLedgerBackend`] provides distributed consensus integration:
+//!
+//! - **`TotalOrder` events**: Submitted to BFT consensus, stored with quorum
+//!   certificate
+//! - **`Eventual` events**: Written directly to storage
+//! - **Crash recovery**: Consensus metadata persisted for replay
 //!
 //! # Example
 //!
@@ -46,12 +58,18 @@
 //! ```
 
 mod backend;
+mod bft_backend;
 mod storage;
 
 #[cfg(test)]
 mod tests;
 
 pub use backend::{BoxFuture, HashFn, LedgerBackend, VerifyFn};
+pub use bft_backend::{
+    AppendResult, BftLedgerBackend, BftLedgerError, ConsensusIndex, ConsensusMetadata,
+    DEFAULT_FINALIZATION_TIMEOUT_MS, EventMetadata, HlcTimestamp, MAX_PENDING_EVENTS,
+    MergeOperator, OrderingGuarantee,
+};
 pub use storage::{
     ArtifactRef, CURRENT_RECORD_VERSION, EventRecord, Ledger, LedgerError, LedgerStats,
     SqliteLedgerBackend,
