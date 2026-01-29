@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod client;
 mod commands;
 
 /// apm2 - AI CLI Process Manager
