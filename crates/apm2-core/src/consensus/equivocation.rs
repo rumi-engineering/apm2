@@ -92,8 +92,15 @@ pub enum EquivocationError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EquivocationType {
     /// Same sequence ID with different content/hash.
+    ///
+    /// This is the primary equivocation type: a validator signed two different
+    /// proposals for the same slot (namespace, epoch, `sequence_id`).
     DoubleSigning,
     /// Multiple proposals for the same slot from the same leader.
+    ///
+    /// Reserved for future use. Currently, all detected equivocations are
+    /// classified as `DoubleSigning` since evidence is only created when
+    /// proposals have different hashes.
     ConflictingProposal,
 }
 
@@ -198,12 +205,19 @@ impl EquivocationEvidence {
             .unwrap_or_default()
             .as_nanos();
 
-        // Determine equivocation type based on the conflict
-        let equivocation_type = if proposal_a.event_hash == proposal_b.event_hash {
-            EquivocationType::ConflictingProposal
-        } else {
-            EquivocationType::DoubleSigning
-        };
+        // Equivocation evidence should only be created when proposals have different
+        // hashes. If hashes are equal, the proposals are identical (not equivocation).
+        // The check_proposal method already filters out duplicates before calling
+        // new().
+        debug_assert_ne!(
+            proposal_a.event_hash, proposal_b.event_hash,
+            "EquivocationEvidence::new called with identical proposals (same hash)"
+        );
+
+        // Since we only create evidence when hashes differ, this is always
+        // double-signing: the validator signed two different values for the
+        // same sequence ID.
+        let equivocation_type = EquivocationType::DoubleSigning;
 
         // Saturating conversion from u128 to u64 - timestamps far in the future
         // are capped to u64::MAX, which is acceptable for evidence purposes
