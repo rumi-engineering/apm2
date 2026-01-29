@@ -117,6 +117,14 @@ tower = { version = "0.4", features = ["util"] }
 seccompiler = "0.5"
 libc = "0.2"
 
+# TLS
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
+webpki-roots = "0.26"
+rcgen = { version = "0.13", features = ["x509-parser"] }
+x509-cert = { version = "0.2", features = ["builder", "pem"] }
+
 # Unicode normalization
 unicode-normalization = "0.1"
 
