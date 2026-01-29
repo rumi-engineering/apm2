@@ -4,6 +4,7 @@ pub mod cac;
 pub mod coordinate;
 pub mod creds;
 pub mod daemon;
+pub mod episode;
 pub mod export;
 pub mod factory;
 pub mod pack;
