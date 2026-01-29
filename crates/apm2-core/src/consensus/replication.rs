@@ -1078,16 +1078,20 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
             });
         }
 
-        // Check outbound queue capacity BEFORE any ledger operations to prevent
-        // events being appended but never replicated (INV-F-11)
-        {
-            let queue = self.outbound_queue.read().await;
-            if queue.len() >= MAX_PENDING_PROPOSALS {
-                return Err(ReplicationError::QueueFull {
-                    size: queue.len(),
-                    max: MAX_PENDING_PROPOSALS,
-                });
-            }
+        // CRITICAL: Hold the outbound queue write lock for the entire operation to
+        // prevent a race condition where the queue fills between capacity check
+        // and push. This ensures atomic capacity check + ledger append + queue
+        // push, preventing state divergence where an event is persisted to the
+        // ledger but never queued for broadcast (TCK-00195).
+        // NOTE: We intentionally hold this lock across await points for correctness.
+        // While this is generally discouraged for performance, correctness
+        // requires serializing proposals to prevent ledger-queue divergence.
+        let mut queue_guard = self.outbound_queue.write().await;
+        if queue_guard.len() >= MAX_PENDING_PROPOSALS {
+            return Err(ReplicationError::QueueFull {
+                size: queue_guard.len(),
+                max: MAX_PENDING_PROPOSALS,
+            });
         }
 
         // Convert to ReplicatedEvent and serialize using JCS canonicalization
@@ -1130,7 +1134,7 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         // Sign the proposal
         proposal.sign(&self.signing_key)?;
 
-        // First, append to our own ledger
+        // Append to our own ledger (while holding queue lock to ensure atomicity)
         let _local_seq_id = self.backend.append(&config.namespace, event).await?;
 
         // Track the proposal for acks
@@ -1152,18 +1156,9 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
             order.push_back(sequence_id);
         }
 
-        // Queue for broadcast (capacity already verified above, but check again
-        // in case of concurrent proposals)
-        {
-            let mut queue = self.outbound_queue.write().await;
-            if queue.len() >= MAX_PENDING_PROPOSALS {
-                return Err(ReplicationError::QueueFull {
-                    size: queue.len(),
-                    max: MAX_PENDING_PROPOSALS,
-                });
-            }
-            queue.push_back(proposal);
-        }
+        // Push to queue (still holding lock from capacity check)
+        queue_guard.push_back(proposal);
+        drop(queue_guard);
 
         Ok(sequence_id)
     }
@@ -1258,7 +1253,7 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         // This catches corrupted or tampered events even if the leader's
         // proposal signature is valid.
         if !replicated_event.validate_hash() {
-            return Err(NackReason::InvalidEventSignature);
+            return Err(NackReason::InvalidHash);
         }
 
         Ok(replicated_event)
