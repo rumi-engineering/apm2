@@ -1,0 +1,15 @@
+I'll help you with that task.
+
+First, let me read the configuration file:
+
+{"tool": "Read", "args": {"path": "/etc/config.json"}}
+
+Now I'll write the updated configuration:
+
+{"tool": "Write", "args": {"path": "/tmp/output.json", "content": "{\"key\": \"value\"}"}}
+
+Finally, let me execute the command:
+
+{"tool": "Bash", "args": {"command": "echo 'Done'"}}
+
+All tasks completed successfully!

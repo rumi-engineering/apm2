@@ -119,6 +119,10 @@ pub mod adapter;
 pub mod raw_adapter;
 pub mod registry;
 
+// TCK-00173: Claude Code harness adapter
+pub mod claude_code;
+pub mod claude_parser;
+
 // TCK-00163: Capability manifest and validation
 pub mod capability;
 pub mod scope;
@@ -154,6 +158,15 @@ pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
     CapabilityManifestBuilder, CapabilityValidator, DenyReason, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES,
     MAX_CAPABILITY_ID_LEN, MAX_MANIFEST_ID_LEN, ToolRequest,
+};
+// Re-export Claude Code adapter types (TCK-00173)
+pub use claude_code::{
+    ClaudeCodeAdapter, ClaudeCodeHolon, ClaudeCodeOutput, ClaudeCodeState, SharedClaudeCodeState,
+};
+pub use claude_parser::{
+    ClaudeCodeParser, DEFAULT_RATE_LIMIT_PER_SEC, MAX_BUFFER_SIZE,
+    MAX_TOOL_ARGS_SIZE as CLAUDE_MAX_TOOL_ARGS_SIZE, MAX_TOOL_NAME_LEN, ParseResult,
+    ParsedToolCall, ParserDefect, ParserState, strip_ansi,
 };
 pub use decision::{
     BrokerToolRequest, BudgetDelta, DedupeKey, DedupeKeyError, MAX_DEDUPE_KEY_LEN,
