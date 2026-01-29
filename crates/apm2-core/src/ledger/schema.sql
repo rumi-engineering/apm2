@@ -38,7 +38,32 @@ CREATE TABLE IF NOT EXISTS events (
     event_hash BLOB,
 
     -- Ed25519 signature over the event
-    signature BLOB
+    signature BLOB,
+
+    -- RFC-0014 Consensus columns (nullable for backward compatibility)
+    -- Consensus epoch number (NULL for non-consensus events)
+    consensus_epoch INTEGER,
+
+    -- Consensus round within epoch (NULL for non-consensus events)
+    consensus_round INTEGER,
+
+    -- Quorum certificate as serialized protobuf (NULL for non-consensus events)
+    quorum_cert BLOB,
+
+    -- BLAKE3 digest of the schema definition for this event type
+    schema_digest BLOB,
+
+    -- Canonicalizer identifier used to serialize the payload
+    canonicalizer_id TEXT,
+
+    -- Canonicalizer version for reproducible canonicalization
+    canonicalizer_version TEXT,
+
+    -- Hybrid Logical Clock wall time (nanoseconds since Unix epoch)
+    hlc_wall_time INTEGER,
+
+    -- Hybrid Logical Clock counter for causal ordering within same wall time
+    hlc_counter INTEGER
 );
 
 -- Index for efficient session-based queries
@@ -91,3 +116,12 @@ ON artifact_refs (content_hash);
 -- Index for looking up artifacts by event
 CREATE INDEX IF NOT EXISTS idx_artifact_refs_event
 ON artifact_refs (event_seq_id);
+
+-- ============================================================================
+-- RFC-0014 Migration: Add consensus columns to existing databases
+-- These ALTER TABLE statements are idempotent - they will silently fail
+-- if the columns already exist (using IF NOT EXISTS simulation via pragma check)
+-- ============================================================================
+
+-- Migration is handled programmatically in storage.rs::migrate_consensus_columns()
+-- to ensure proper error handling and idempotency.
