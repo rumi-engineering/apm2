@@ -342,6 +342,89 @@ impl ReplicatedEvent {
             hlc_counter: self.hlc_counter,
         }
     }
+
+    /// Verifies that the event has a valid hash (integrity check).
+    ///
+    /// This validates that the event hash field matches the computed hash
+    /// of the payload and `prev_hash`, providing basic integrity verification.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the hash is valid or if no hash is present (for
+    /// events that don't require hashing).
+    #[must_use]
+    pub fn validate_hash(&self) -> bool {
+        match (&self.event_hash, &self.prev_hash) {
+            (Some(stored_hash), Some(prev)) => {
+                // Compute hash: BLAKE3(prev_hash || payload)
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(prev);
+                hasher.update(&self.payload);
+                let computed = hasher.finalize();
+                computed.as_bytes().ct_eq(stored_hash.as_slice()).into()
+            },
+            (Some(stored_hash), None) => {
+                // Compute hash: BLAKE3(payload) when no prev_hash
+                let computed = blake3::hash(&self.payload);
+                computed.as_bytes().ct_eq(stored_hash.as_slice()).into()
+            },
+            (None, _) => {
+                // No hash to validate - this is acceptable for some event types
+                true
+            },
+        }
+    }
+
+    /// Verifies the actor signature on this event.
+    ///
+    /// This validates that the event was signed by an authorized actor,
+    /// providing defense-in-depth against compromised leaders.
+    ///
+    /// # Arguments
+    ///
+    /// * `actor_key` - The public key of the actor who supposedly signed this
+    ///   event
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The signature is missing
+    /// - The event hash is missing
+    /// - The signature length is invalid
+    /// - The signature verification fails
+    pub fn verify_signature(&self, actor_key: &VerifyingKey) -> Result<(), ReplicationError> {
+        let Some(signature_bytes) = &self.signature else {
+            // No signature present - this could be acceptable for some event
+            // types, but for strict validation we require it
+            return Err(ReplicationError::InvalidSignature {
+                sender: self.actor_id.clone(),
+            });
+        };
+
+        let Some(event_hash) = &self.event_hash else {
+            // No hash to sign - this is a malformed event
+            return Err(ReplicationError::InvalidSignature {
+                sender: self.actor_id.clone(),
+            });
+        };
+
+        // Signature should be over the event hash
+        if signature_bytes.len() != 64 {
+            return Err(ReplicationError::InvalidSignature {
+                sender: self.actor_id.clone(),
+            });
+        }
+
+        let mut sig_array = [0u8; 64];
+        sig_array.copy_from_slice(signature_bytes);
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
+
+        actor_key
+            .verify_strict(event_hash, &signature)
+            .map_err(|_| ReplicationError::InvalidSignature {
+                sender: self.actor_id.clone(),
+            })
+    }
 }
 
 /// A proposal from the leader containing an event to replicate.
@@ -560,6 +643,8 @@ pub enum NackReason {
     InvalidHash,
     /// Payload too large.
     PayloadTooLarge,
+    /// Invalid inner event signature.
+    InvalidEventSignature,
 }
 
 impl NackReason {
@@ -575,6 +660,7 @@ impl NackReason {
             Self::LedgerError => 6,
             Self::InvalidHash => 7,
             Self::PayloadTooLarge => 8,
+            Self::InvalidEventSignature => 9,
         }
     }
 }
@@ -613,6 +699,22 @@ impl ReplicationNack {
         let msg = self.signing_message()?;
         self.signature = key.sign(&msg).to_bytes();
         Ok(())
+    }
+
+    /// Verifies the signature on this nack.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signature is invalid or the namespace is too
+    /// long.
+    pub fn verify_signature(&self, public_key: &VerifyingKey) -> Result<(), ReplicationError> {
+        let msg = self.signing_message()?;
+        let signature = ed25519_dalek::Signature::from_bytes(&self.signature);
+        public_key
+            .verify_strict(&msg, &signature)
+            .map_err(|_| ReplicationError::InvalidSignature {
+                sender: hex::encode(self.follower_id),
+            })
     }
 }
 
@@ -1109,8 +1211,18 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
         }
 
         // Deserialize the replicated event and convert to EventRecord
+        // Note: We use serde_json which has some depth limits by default, but for
+        // additional DoS protection, the payload size is already validated above.
         let replicated_event: ReplicatedEvent = serde_json::from_slice(&proposal.event_data)
             .map_err(|_| make_nack(NackReason::LedgerError))?;
+
+        // Validate the inner event's hash for integrity (defense-in-depth)
+        // This catches corrupted or tampered events even if the leader's
+        // proposal signature is valid.
+        if !replicated_event.validate_hash() {
+            return Err(make_nack(NackReason::InvalidEventSignature));
+        }
+
         let event = replicated_event.to_event_record();
 
         let local_seq_id = self
@@ -1189,11 +1301,27 @@ impl<B: LedgerBackend> ReplicationEngine<B> {
     /// # Arguments
     ///
     /// * `nack` - The nack from a follower
-    pub async fn handle_nack(&self, nack: ReplicationNack) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signature is invalid or the peer is unknown.
+    pub async fn handle_nack(&self, nack: ReplicationNack) -> Result<(), ReplicationError> {
+        // Verify signature to prevent state pollution attacks
+        let keys = self.validator_keys.read().await;
+        if let Some(follower_key) = keys.get(&nack.follower_id) {
+            nack.verify_signature(follower_key)?;
+        } else {
+            return Err(ReplicationError::UnknownPeer {
+                peer_id: hex::encode(nack.follower_id),
+            });
+        }
+        drop(keys);
+
         let mut tracker = self.ack_tracker.write().await;
         if let Some(state) = tracker.get_mut(&nack.sequence_id) {
             state.record_nack(nack);
         }
+        Ok(())
     }
 
     /// Returns the next pending proposal to broadcast.
@@ -1398,6 +1526,7 @@ mod tests {
         assert_eq!(NackReason::LedgerError.code(), 6);
         assert_eq!(NackReason::InvalidHash.code(), 7);
         assert_eq!(NackReason::PayloadTooLarge.code(), 8);
+        assert_eq!(NackReason::InvalidEventSignature.code(), 9);
     }
 
     #[test]
@@ -1623,8 +1752,9 @@ mod tck_00195_tests {
             NackReason::LedgerError,
             NackReason::InvalidHash,
             NackReason::PayloadTooLarge,
+            NackReason::InvalidEventSignature,
         ];
-        assert_eq!(reasons.len(), 8);
+        assert_eq!(reasons.len(), 9);
     }
 
     #[test]
