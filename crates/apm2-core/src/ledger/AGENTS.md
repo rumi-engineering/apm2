@@ -47,6 +47,16 @@ pub struct EventRecord {
     pub prev_hash: Option<Vec<u8>>,
     pub event_hash: Option<Vec<u8>>,
     pub signature: Option<Vec<u8>>,
+
+    // RFC-0014 Consensus fields (all optional for backward compatibility)
+    pub consensus_epoch: Option<u64>,
+    pub consensus_round: Option<u64>,
+    pub quorum_cert: Option<Vec<u8>>,
+    pub schema_digest: Option<Vec<u8>>,
+    pub canonicalizer_id: Option<String>,
+    pub canonicalizer_version: Option<String>,
+    pub hlc_wall_time: Option<u64>,
+    pub hlc_counter: Option<u32>,
 }
 ```
 
@@ -54,11 +64,16 @@ pub struct EventRecord {
 - [INV-LED-001] Events are immutable once appended; the ledger is append-only
 - [INV-LED-002] Sequence IDs are monotonically increasing and gap-free (SQLite AUTOINCREMENT)
 - [INV-LED-003] Hash chain integrity: `event_hash = BLAKE3(payload || prev_hash)`
+- [INV-LED-007] RFC-0014 consensus fields are nullable for backward compatibility with pre-consensus events
 
 **Contracts:**
 - [CTR-LED-001] `record_version` must equal `CURRENT_RECORD_VERSION` for new events
 - [CTR-LED-002] `timestamp_ns` is nanoseconds since Unix epoch (will not overflow until year 2554)
 - [CTR-LED-003] `payload` is typically JSON but stored as opaque bytes for flexibility
+- [CTR-LED-010] RFC-0014 consensus fields (`consensus_epoch`, `consensus_round`, `quorum_cert`, `schema_digest`, `canonicalizer_id`, `canonicalizer_version`, `hlc_wall_time`, `hlc_counter`) default to `None` and are nullable in the database
+- [CTR-LED-011] `quorum_cert` contains serialized protobuf `QuorumCertificate` when present
+- [CTR-LED-012] `schema_digest` is BLAKE3 hash of the schema definition for this event type
+- [CTR-LED-013] `hlc_wall_time` and `hlc_counter` together form a Hybrid Logical Clock timestamp for causal ordering
 
 ### `CURRENT_RECORD_VERSION`
 

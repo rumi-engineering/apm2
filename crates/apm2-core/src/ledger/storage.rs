@@ -117,6 +117,32 @@ pub struct EventRecord {
 
     /// Signature over the event.
     pub signature: Option<Vec<u8>>,
+
+    // RFC-0014 Consensus fields (all optional for backward compatibility)
+    /// Consensus epoch number (None for non-consensus events).
+    pub consensus_epoch: Option<u64>,
+
+    /// Consensus round within epoch (None for non-consensus events).
+    pub consensus_round: Option<u64>,
+
+    /// Quorum certificate as serialized protobuf (None for non-consensus
+    /// events).
+    pub quorum_cert: Option<Vec<u8>>,
+
+    /// BLAKE3 digest of the schema definition for this event type.
+    pub schema_digest: Option<Vec<u8>>,
+
+    /// Canonicalizer identifier used to serialize the payload.
+    pub canonicalizer_id: Option<String>,
+
+    /// Canonicalizer version for reproducible canonicalization.
+    pub canonicalizer_version: Option<String>,
+
+    /// Hybrid Logical Clock wall time (nanoseconds since Unix epoch).
+    pub hlc_wall_time: Option<u64>,
+
+    /// Hybrid Logical Clock counter for causal ordering within same wall time.
+    pub hlc_counter: Option<u32>,
 }
 
 impl EventRecord {
@@ -125,6 +151,11 @@ impl EventRecord {
     /// The `seq_id`, `prev_hash`, `event_hash`, and `signature` fields
     /// are populated when the event is appended to the ledger or
     /// when using `append_signed()` for crypto integration.
+    ///
+    /// RFC-0014 consensus fields (`consensus_epoch`, `consensus_round`,
+    /// `quorum_cert`, `schema_digest`, `canonicalizer_id`,
+    /// `canonicalizer_version`, `hlc_wall_time`, `hlc_counter`) default to
+    /// `None`.
     #[must_use]
     pub fn new(
         event_type: impl Into<String>,
@@ -148,6 +179,15 @@ impl EventRecord {
             prev_hash: None,
             event_hash: None,
             signature: None,
+            // RFC-0014 consensus fields default to None
+            consensus_epoch: None,
+            consensus_round: None,
+            quorum_cert: None,
+            schema_digest: None,
+            canonicalizer_id: None,
+            canonicalizer_version: None,
+            hlc_wall_time: None,
+            hlc_counter: None,
         }
     }
 
@@ -171,6 +211,15 @@ impl EventRecord {
             prev_hash: None,
             event_hash: None,
             signature: None,
+            // RFC-0014 consensus fields default to None
+            consensus_epoch: None,
+            consensus_round: None,
+            quorum_cert: None,
+            schema_digest: None,
+            canonicalizer_id: None,
+            canonicalizer_version: None,
+            hlc_wall_time: None,
+            hlc_counter: None,
         }
     }
 
@@ -314,6 +363,46 @@ impl SqliteLedgerBackend {
     fn initialize_connection(conn: &Connection) -> Result<(), LedgerError> {
         // Execute schema (includes PRAGMA statements)
         conn.execute_batch(SCHEMA_SQL)?;
+
+        // Run migrations for existing databases (RFC-0014 consensus columns)
+        Self::migrate_consensus_columns(conn)?;
+
+        Ok(())
+    }
+
+    /// Migrates existing databases to add RFC-0014 consensus columns.
+    ///
+    /// This migration is idempotent - it checks for column existence before
+    /// attempting to add them. `SQLite` doesn't support `ALTER TABLE ... ADD
+    /// COLUMN IF NOT EXISTS`, so we query the table schema first.
+    fn migrate_consensus_columns(conn: &Connection) -> Result<(), LedgerError> {
+        // Check if consensus columns exist by querying table info
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(events)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // RFC-0014 consensus columns to add
+        let consensus_columns = [
+            ("consensus_epoch", "INTEGER"),
+            ("consensus_round", "INTEGER"),
+            ("quorum_cert", "BLOB"),
+            ("schema_digest", "BLOB"),
+            ("canonicalizer_id", "TEXT"),
+            ("canonicalizer_version", "TEXT"),
+            ("hlc_wall_time", "INTEGER"),
+            ("hlc_counter", "INTEGER"),
+        ];
+
+        for (col_name, col_type) in consensus_columns {
+            if !columns.iter().any(|c| c == col_name) {
+                conn.execute(
+                    &format!("ALTER TABLE events ADD COLUMN {col_name} {col_type}"),
+                    [],
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -328,8 +417,8 @@ impl SqliteLedgerBackend {
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
-            "INSERT INTO events (event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO events (event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 event.event_type,
                 event.session_id,
@@ -340,6 +429,14 @@ impl SqliteLedgerBackend {
                 event.prev_hash,
                 event.event_hash,
                 event.signature,
+                event.consensus_epoch,
+                event.consensus_round,
+                event.quorum_cert,
+                event.schema_digest,
+                event.canonicalizer_id,
+                event.canonicalizer_version,
+                event.hlc_wall_time,
+                event.hlc_counter,
             ],
         )?;
 
@@ -362,8 +459,8 @@ impl SqliteLedgerBackend {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO events (event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO events (event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             )?;
 
             for event in events {
@@ -377,6 +474,14 @@ impl SqliteLedgerBackend {
                     event.prev_hash,
                     event.event_hash,
                     event.signature,
+                    event.consensus_epoch,
+                    event.consensus_round,
+                    event.quorum_cert,
+                    event.schema_digest,
+                    event.canonicalizer_id,
+                    event.canonicalizer_version,
+                    event.hlc_wall_time,
+                    event.hlc_counter,
                 ])?;
                 seq_ids.push(tx.last_insert_rowid() as u64);
             }
@@ -397,7 +502,7 @@ impl SqliteLedgerBackend {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
              FROM events
              WHERE seq_id >= ?1
              ORDER BY seq_id ASC
@@ -405,23 +510,34 @@ impl SqliteLedgerBackend {
         )?;
 
         let events = stmt
-            .query_map(params![cursor, limit], |row| {
-                Ok(EventRecord {
-                    seq_id: Some(row.get::<_, i64>(0)? as u64),
-                    event_type: row.get(1)?,
-                    session_id: row.get(2)?,
-                    actor_id: row.get(3)?,
-                    record_version: row.get::<_, i64>(4)? as u32,
-                    payload: row.get(5)?,
-                    timestamp_ns: row.get::<_, i64>(6)? as u64,
-                    prev_hash: row.get(7)?,
-                    event_hash: row.get(8)?,
-                    signature: row.get(9)?,
-                })
-            })?
+            .query_map(params![cursor, limit], Self::row_to_event_record)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(events)
+    }
+
+    /// Helper to convert a database row to an `EventRecord`.
+    fn row_to_event_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+        Ok(EventRecord {
+            seq_id: Some(row.get::<_, i64>(0)? as u64),
+            event_type: row.get(1)?,
+            session_id: row.get(2)?,
+            actor_id: row.get(3)?,
+            record_version: row.get::<_, i64>(4)? as u32,
+            payload: row.get(5)?,
+            timestamp_ns: row.get::<_, i64>(6)? as u64,
+            prev_hash: row.get(7)?,
+            event_hash: row.get(8)?,
+            signature: row.get(9)?,
+            consensus_epoch: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+            consensus_round: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+            quorum_cert: row.get(12)?,
+            schema_digest: row.get(13)?,
+            canonicalizer_id: row.get(14)?,
+            canonicalizer_version: row.get(15)?,
+            hlc_wall_time: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
+            hlc_counter: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
+        })
     }
 
     /// Reads a single event by sequence ID.
@@ -433,29 +549,16 @@ impl SqliteLedgerBackend {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
              FROM events
              WHERE seq_id = ?1",
         )?;
 
-        stmt.query_row(params![seq_id], |row| {
-            Ok(EventRecord {
-                seq_id: Some(row.get::<_, i64>(0)? as u64),
-                event_type: row.get(1)?,
-                session_id: row.get(2)?,
-                actor_id: row.get(3)?,
-                record_version: row.get::<_, i64>(4)? as u32,
-                payload: row.get(5)?,
-                timestamp_ns: row.get::<_, i64>(6)? as u64,
-                prev_hash: row.get(7)?,
-                event_hash: row.get(8)?,
-                signature: row.get(9)?,
+        stmt.query_row(params![seq_id], Self::row_to_event_record)
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => LedgerError::EventNotFound { seq_id },
+                other => LedgerError::Database(other),
             })
-        })
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => LedgerError::EventNotFound { seq_id },
-            other => LedgerError::Database(other),
-        })
     }
 
     /// Reads events for a specific session.
@@ -473,7 +576,7 @@ impl SqliteLedgerBackend {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
              FROM events
              WHERE session_id = ?1
              ORDER BY seq_id ASC
@@ -481,20 +584,7 @@ impl SqliteLedgerBackend {
         )?;
 
         let events = stmt
-            .query_map(params![session_id, limit], |row| {
-                Ok(EventRecord {
-                    seq_id: Some(row.get::<_, i64>(0)? as u64),
-                    event_type: row.get(1)?,
-                    session_id: row.get(2)?,
-                    actor_id: row.get(3)?,
-                    record_version: row.get::<_, i64>(4)? as u32,
-                    payload: row.get(5)?,
-                    timestamp_ns: row.get::<_, i64>(6)? as u64,
-                    prev_hash: row.get(7)?,
-                    event_hash: row.get(8)?,
-                    signature: row.get(9)?,
-                })
-            })?
+            .query_map(params![session_id, limit], Self::row_to_event_record)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(events)
@@ -514,7 +604,7 @@ impl SqliteLedgerBackend {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
              FROM events
              WHERE event_type = ?1 AND seq_id >= ?2
              ORDER BY seq_id ASC
@@ -522,20 +612,10 @@ impl SqliteLedgerBackend {
         )?;
 
         let events = stmt
-            .query_map(params![event_type, cursor, limit], |row| {
-                Ok(EventRecord {
-                    seq_id: Some(row.get::<_, i64>(0)? as u64),
-                    event_type: row.get(1)?,
-                    session_id: row.get(2)?,
-                    actor_id: row.get(3)?,
-                    record_version: row.get::<_, i64>(4)? as u32,
-                    payload: row.get(5)?,
-                    timestamp_ns: row.get::<_, i64>(6)? as u64,
-                    prev_hash: row.get(7)?,
-                    event_hash: row.get(8)?,
-                    signature: row.get(9)?,
-                })
-            })?
+            .query_map(
+                params![event_type, cursor, limit],
+                Self::row_to_event_record,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(events)
@@ -1029,7 +1109,7 @@ impl LedgerReader {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
              FROM events
              WHERE seq_id >= ?1
              ORDER BY seq_id ASC
@@ -1037,20 +1117,7 @@ impl LedgerReader {
         )?;
 
         let events = stmt
-            .query_map(params![cursor, limit], |row| {
-                Ok(EventRecord {
-                    seq_id: Some(row.get::<_, i64>(0)? as u64),
-                    event_type: row.get(1)?,
-                    session_id: row.get(2)?,
-                    actor_id: row.get(3)?,
-                    record_version: row.get::<_, i64>(4)? as u32,
-                    payload: row.get(5)?,
-                    timestamp_ns: row.get::<_, i64>(6)? as u64,
-                    prev_hash: row.get(7)?,
-                    event_hash: row.get(8)?,
-                    signature: row.get(9)?,
-                })
-            })?
+            .query_map(params![cursor, limit], Ledger::row_to_event_record)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(events)
@@ -1065,29 +1132,16 @@ impl LedgerReader {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature
+            "SELECT seq_id, event_type, session_id, actor_id, record_version, payload, timestamp_ns, prev_hash, event_hash, signature, consensus_epoch, consensus_round, quorum_cert, schema_digest, canonicalizer_id, canonicalizer_version, hlc_wall_time, hlc_counter
              FROM events
              WHERE seq_id = ?1",
         )?;
 
-        stmt.query_row(params![seq_id], |row| {
-            Ok(EventRecord {
-                seq_id: Some(row.get::<_, i64>(0)? as u64),
-                event_type: row.get(1)?,
-                session_id: row.get(2)?,
-                actor_id: row.get(3)?,
-                record_version: row.get::<_, i64>(4)? as u32,
-                payload: row.get(5)?,
-                timestamp_ns: row.get::<_, i64>(6)? as u64,
-                prev_hash: row.get(7)?,
-                event_hash: row.get(8)?,
-                signature: row.get(9)?,
+        stmt.query_row(params![seq_id], Ledger::row_to_event_record)
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => LedgerError::EventNotFound { seq_id },
+                other => LedgerError::Database(other),
             })
-        })
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => LedgerError::EventNotFound { seq_id },
-            other => LedgerError::Database(other),
-        })
     }
 }
 
@@ -1106,6 +1160,16 @@ mod unit_tests {
         assert_eq!(event.record_version, CURRENT_RECORD_VERSION);
         assert_eq!(event.payload, b"payload");
         assert!(event.timestamp_ns > 0);
+
+        // RFC-0014 consensus fields default to None
+        assert!(event.consensus_epoch.is_none());
+        assert!(event.consensus_round.is_none());
+        assert!(event.quorum_cert.is_none());
+        assert!(event.schema_digest.is_none());
+        assert!(event.canonicalizer_id.is_none());
+        assert!(event.canonicalizer_version.is_none());
+        assert!(event.hlc_wall_time.is_none());
+        assert!(event.hlc_counter.is_none());
     }
 
     #[test]

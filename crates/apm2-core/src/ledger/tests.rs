@@ -604,3 +604,209 @@ fn test_actor_id_preserved() {
     assert_eq!(read_event.actor_id, "actor-456");
     assert_eq!(read_event.record_version, CURRENT_RECORD_VERSION);
 }
+
+// =============================================================================
+// TCK-00182: RFC-0014 Consensus Column Tests
+// =============================================================================
+
+/// Test that new consensus fields default to None when creating events.
+#[test]
+fn tck_00182_consensus_fields_default_to_none() {
+    let ledger = Ledger::in_memory().unwrap();
+
+    let event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+    let seq_id = ledger.append(&event).unwrap();
+
+    let read_event = ledger.read_one(seq_id).unwrap();
+
+    // All RFC-0014 consensus fields should be None by default
+    assert!(read_event.consensus_epoch.is_none());
+    assert!(read_event.consensus_round.is_none());
+    assert!(read_event.quorum_cert.is_none());
+    assert!(read_event.schema_digest.is_none());
+    assert!(read_event.canonicalizer_id.is_none());
+    assert!(read_event.canonicalizer_version.is_none());
+    assert!(read_event.hlc_wall_time.is_none());
+    assert!(read_event.hlc_counter.is_none());
+}
+
+/// Test that consensus fields can be set and are preserved through storage.
+#[test]
+fn tck_00182_consensus_fields_preserved() {
+    let ledger = Ledger::in_memory().unwrap();
+
+    let mut event = EventRecord::new("consensus.event", "session-1", "actor-1", b"{}".to_vec());
+
+    // Set all consensus fields
+    event.consensus_epoch = Some(42);
+    event.consensus_round = Some(7);
+    event.quorum_cert = Some(vec![0xde, 0xad, 0xbe, 0xef]);
+    event.schema_digest = Some(vec![0xab; 32]);
+    event.canonicalizer_id = Some("jcs".to_string());
+    event.canonicalizer_version = Some("1.0.0".to_string());
+    event.hlc_wall_time = Some(1_700_000_000_000_000_000);
+    event.hlc_counter = Some(5);
+
+    let seq_id = ledger.append(&event).unwrap();
+    let read_event = ledger.read_one(seq_id).unwrap();
+
+    // Verify all fields are preserved
+    assert_eq!(read_event.consensus_epoch, Some(42));
+    assert_eq!(read_event.consensus_round, Some(7));
+    assert_eq!(read_event.quorum_cert, Some(vec![0xde, 0xad, 0xbe, 0xef]));
+    assert_eq!(read_event.schema_digest, Some(vec![0xab; 32]));
+    assert_eq!(read_event.canonicalizer_id, Some("jcs".to_string()));
+    assert_eq!(read_event.canonicalizer_version, Some("1.0.0".to_string()));
+    assert_eq!(read_event.hlc_wall_time, Some(1_700_000_000_000_000_000));
+    assert_eq!(read_event.hlc_counter, Some(5));
+}
+
+/// Test that existing events without consensus fields remain readable.
+#[test]
+fn tck_00182_existing_events_readable() {
+    let ledger = Ledger::in_memory().unwrap();
+
+    // Create events without consensus fields (simulating pre-RFC-0014 events)
+    let event1 = EventRecord::new("legacy.event", "session-1", "actor-1", b"data".to_vec());
+    let seq1 = ledger.append(&event1).unwrap();
+
+    // Create event with consensus fields
+    let mut event2 = EventRecord::new("new.event", "session-1", "actor-1", b"data".to_vec());
+    event2.consensus_epoch = Some(1);
+    let seq2 = ledger.append(&event2).unwrap();
+
+    // Both events should be readable
+    let read1 = ledger.read_one(seq1).unwrap();
+    let read2 = ledger.read_one(seq2).unwrap();
+
+    // Legacy event has None for consensus fields
+    assert!(read1.consensus_epoch.is_none());
+    assert_eq!(read1.payload, b"data");
+
+    // New event has consensus fields
+    assert_eq!(read2.consensus_epoch, Some(1));
+    assert_eq!(read2.payload, b"data");
+}
+
+/// Test batch append with consensus fields.
+#[test]
+fn tck_00182_batch_append_with_consensus_fields() {
+    let ledger = Ledger::in_memory().unwrap();
+
+    let mut batch_evt_1 = EventRecord::new("batch.1", "session-1", "actor-1", b"first".to_vec());
+    batch_evt_1.consensus_epoch = Some(1);
+    batch_evt_1.consensus_round = Some(0);
+
+    let mut batch_evt_2 = EventRecord::new("batch.2", "session-1", "actor-1", b"second".to_vec());
+    batch_evt_2.consensus_epoch = Some(1);
+    batch_evt_2.consensus_round = Some(1);
+
+    let batch_evt_3 = EventRecord::new("batch.3", "session-1", "actor-1", b"third".to_vec());
+    // No consensus fields
+
+    let seq_ids = ledger
+        .append_batch(&[batch_evt_1, batch_evt_2, batch_evt_3])
+        .unwrap();
+    assert_eq!(seq_ids.len(), 3);
+
+    let read_events = ledger.read_from(1, 10).unwrap();
+    assert_eq!(read_events.len(), 3);
+
+    assert_eq!(read_events[0].consensus_epoch, Some(1));
+    assert_eq!(read_events[0].consensus_round, Some(0));
+
+    assert_eq!(read_events[1].consensus_epoch, Some(1));
+    assert_eq!(read_events[1].consensus_round, Some(1));
+
+    assert!(read_events[2].consensus_epoch.is_none());
+    assert!(read_events[2].consensus_round.is_none());
+}
+
+/// Test migration runs successfully on existing database (idempotent).
+#[test]
+fn tck_00182_migration_idempotent() {
+    // Create ledger twice - migration should run both times without error
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("migration_test.db");
+
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        let event = EventRecord::new("test", "session", "actor", b"data".to_vec());
+        ledger.append(&event).unwrap();
+    }
+
+    // Reopen - migration should be idempotent
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        let events = ledger.read_from(1, 10).unwrap();
+        assert_eq!(events.len(), 1);
+
+        // Should be able to write events with consensus fields
+        let mut event = EventRecord::new("test2", "session", "actor", b"data2".to_vec());
+        event.consensus_epoch = Some(5);
+        ledger.append(&event).unwrap();
+
+        let events = ledger.read_from(1, 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].consensus_epoch, Some(5));
+    }
+}
+
+/// Test `read_session` includes consensus fields.
+#[test]
+fn tck_00182_read_session_includes_consensus_fields() {
+    let ledger = Ledger::in_memory().unwrap();
+
+    let mut event = EventRecord::new("test", "session-abc", "actor", b"data".to_vec());
+    event.schema_digest = Some(vec![0x12; 32]);
+    event.canonicalizer_id = Some("protobuf-sorted".to_string());
+    ledger.append(&event).unwrap();
+
+    let events = ledger.read_session("session-abc", 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].schema_digest, Some(vec![0x12; 32]));
+    assert_eq!(
+        events[0].canonicalizer_id,
+        Some("protobuf-sorted".to_string())
+    );
+}
+
+/// Test `read_by_type` includes consensus fields.
+#[test]
+fn tck_00182_read_by_type_includes_consensus_fields() {
+    let ledger = Ledger::in_memory().unwrap();
+
+    let mut event = EventRecord::new("consensus.proposal", "session", "actor", b"data".to_vec());
+    event.hlc_wall_time = Some(1_234_567_890_000_000_000);
+    event.hlc_counter = Some(42);
+    ledger.append(&event).unwrap();
+
+    let events = ledger.read_by_type("consensus.proposal", 0, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].hlc_wall_time, Some(1_234_567_890_000_000_000));
+    assert_eq!(events[0].hlc_counter, Some(42));
+}
+
+/// Test `LedgerReader` includes consensus fields.
+#[test]
+fn tck_00182_reader_includes_consensus_fields() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("reader_test.db");
+
+    let ledger = Ledger::open(&path).unwrap();
+
+    let mut event = EventRecord::new("test", "session", "actor", b"data".to_vec());
+    event.quorum_cert = Some(vec![0x01, 0x02, 0x03]);
+    let seq_id = ledger.append(&event).unwrap();
+
+    let reader = ledger.open_reader().unwrap();
+
+    // read_from
+    let events = reader.read_from(1, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].quorum_cert, Some(vec![0x01, 0x02, 0x03]));
+
+    // read_one
+    let event = reader.read_one(seq_id).unwrap();
+    assert_eq!(event.quorum_cert, Some(vec![0x01, 0x02, 0x03]));
+}
