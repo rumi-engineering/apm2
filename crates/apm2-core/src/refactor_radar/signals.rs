@@ -268,6 +268,37 @@ fn validate_git_path(path: &str, repo_root: &Path) -> Result<PathBuf, SignalErro
     Ok(PathBuf::from(path))
 }
 
+/// Creates a git [`Command`] with proper environment isolation.
+///
+/// When running in a git worktree, child git processes can inherit environment
+/// variables that cause them to operate on the wrong repository. This function
+/// creates a [`Command`] with those variables cleared and
+/// `GIT_CEILING_DIRECTORIES` set to prevent git from walking up and discovering
+/// parent repositories.
+///
+/// # Arguments
+///
+/// * `repo_root` - Path to the repository root where the command will run
+fn isolated_git_command(repo_root: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_root);
+
+    // Clear inherited git env vars to avoid using parent worktree
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR");
+
+    // Set ceiling to prevent git from walking up past the repo root.
+    // This is important when running in a worktree or nested git repo.
+    if let Some(parent) = repo_root.parent() {
+        cmd.env("GIT_CEILING_DIRECTORIES", parent);
+    }
+
+    cmd
+}
+
 /// Collector for hotspot signals based on git churn analysis.
 pub struct HotspotCollector {
     /// Time window for churn analysis.
@@ -317,9 +348,8 @@ impl HotspotCollector {
         // Run git log to get file change history
         // SEC-SIGNAL-002: Arguments are hardcoded, not user-controlled
         // SEC-SIGNAL-003: Use streaming to prevent unbounded memory usage
-        let mut child = Command::new("git")
+        let mut child = isolated_git_command(repo_root)
             .args(["log", "--format=%H", "--name-only", "--since", &since_arg])
-            .current_dir(repo_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -477,9 +507,8 @@ impl DuplicationCollector {
 
         // Find Rust source files using git ls-files for consistency
         // SEC-SIGNAL-003: Use streaming to avoid loading entire output into memory
-        let mut child = Command::new("git")
+        let mut child = isolated_git_command(repo_root)
             .args(["ls-files", "*.rs"])
-            .current_dir(repo_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -622,9 +651,8 @@ impl ComplexityCollector {
 
         // Find Rust source files using git ls-files
         // SEC-SIGNAL-003: Use streaming to avoid loading entire output into memory
-        let mut child = Command::new("git")
+        let mut child = isolated_git_command(repo_root)
             .args(["ls-files", "*.rs"])
-            .current_dir(repo_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -750,30 +778,18 @@ pub(crate) mod tests {
 
     /// Runs a git command with proper environment isolation.
     ///
-    /// When running tests in a git worktree, git commands can accidentally use
-    /// the parent worktree's configuration. This helper ensures that each
-    /// test's temporary repo is fully isolated by clearing inherited git env
-    /// vars and setting `GIT_DIR` and `GIT_WORK_TREE` explicitly.
+    /// Runs a git command with proper environment isolation for tests.
     ///
-    /// For `git init`, we don't set `GIT_DIR` since it doesn't exist yet.
+    /// Uses the production `isolated_git_command` helper for consistent
+    /// behavior, but also sets explicit `GIT_DIR` and `GIT_WORK_TREE` for
+    /// non-init commands to ensure the test repo is used even when running
+    /// in a worktree context.
     fn run_git_command(root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-        let mut cmd = Command::new("git");
-        cmd.args(args).current_dir(root);
-
-        // Clear inherited git env vars to avoid using parent worktree
-        cmd.env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_OBJECT_DIRECTORY")
-            .env_remove("GIT_COMMON_DIR");
-
-        // Set ceiling to the temp directory's parent to prevent walking up
-        // past the test repo. This is especially important for `git init`.
-        if let Some(parent) = root.parent() {
-            cmd.env("GIT_CEILING_DIRECTORIES", parent);
-        }
+        let mut cmd = isolated_git_command(root);
+        cmd.args(args);
 
         // For non-init commands, explicitly point to the test repo
+        // (init doesn't need this because GIT_DIR doesn't exist yet)
         if args.first() != Some(&"init") {
             cmd.env("GIT_DIR", root.join(".git"))
                 .env("GIT_WORK_TREE", root);
