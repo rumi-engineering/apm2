@@ -7,6 +7,8 @@
 //! - **Ed25519 signatures**: Digital signatures for event authentication
 //! - **Hash-chain linking**: Cryptographic linking between sequential events
 //! - **Key management**: Secure storage and retrieval of signing keys
+//! - **HSM integration**: Hardware Security Module support for T1 validator
+//!   keys
 //!
 //! # Hash Chain
 //!
@@ -19,6 +21,17 @@
 //! Events are signed using Ed25519 keys. The signature covers the canonical
 //! encoding of the event (excluding the signature field itself), ensuring
 //! authenticity and non-repudiation.
+//!
+//! # HSM Integration
+//!
+//! For T1 validator keys in the trust hierarchy, the [`hsm`] module provides
+//! hardware security module integration. Keys managed by an HSM never leave
+//! the secure hardware boundary; all signing operations are performed via
+//! the HSM API.
+//!
+//! Available HSM providers:
+//! - [`hsm::SoftwareHsmProvider`]: In-memory fallback for development
+//! - [`yubihsm::YubiHsmProvider`]: Reference implementation for `YubiHSM`
 //!
 //! # Example
 //!
@@ -46,8 +59,10 @@
 //! ```
 
 mod hash;
+pub mod hsm;
 mod keys;
 mod sign;
+pub mod yubihsm;
 
 #[cfg(test)]
 mod tests;
@@ -55,8 +70,13 @@ mod tests;
 pub use hash::{
     EventHasher, HASH_SIZE, Hash, HashChainError, is_genesis_prev_hash, normalize_prev_hash,
 };
+pub use hsm::{
+    HsmConfig, HsmError, HsmKeyInfo, HsmProvider, HsmProviderType, HsmResult, SoftwareHsmProvider,
+    create_hsm_provider,
+};
 pub use keys::{KeyManager, KeyManagerError, StoredKeypair};
 pub use sign::{
     PUBLIC_KEY_SIZE, SIGNATURE_SIZE, Signature, Signer, SignerError, VerifyingKey, parse_signature,
     parse_verifying_key, verify_signature,
 };
+pub use yubihsm::YubiHsmProvider;

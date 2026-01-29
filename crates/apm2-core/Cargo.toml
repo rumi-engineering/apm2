@@ -126,6 +126,9 @@ test-utils = []
 test_vectors = []
 # Enable clap introspection for CLI command enumeration
 clap-introspection = ["dep:clap"]
+# Enable YubiHSM hardware support for T1 validator keys
+# When disabled, YubiHsmProvider operates in mock mode for testing
+yubihsm = []
 
 [lints]
 workspace = true
