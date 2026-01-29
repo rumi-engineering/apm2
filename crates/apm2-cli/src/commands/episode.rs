@@ -27,10 +27,15 @@
 //! - AD-EPISODE-001: Immutable episode envelope
 //! - AD-EPISODE-002: Episode state machine
 
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
+use apm2_core::ipc::ErrorCode;
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+
+use crate::client::daemon::{DaemonClient, DaemonClientError};
 
 /// Maximum envelope file size (10 MiB).
 ///
@@ -45,7 +50,6 @@ pub mod exit_codes {
     /// General error exit code.
     pub const ERROR: u8 = 1;
     /// Episode not found exit code.
-    #[allow(dead_code)] // Reserved for future use when daemon integration is complete
     pub const NOT_FOUND: u8 = 2;
 }
 
@@ -350,63 +354,16 @@ pub fn run_episode(cmd: &EpisodeCommand, socket_path: &std::path::Path) -> u8 {
 
 /// Execute the create command.
 fn run_create(args: &CreateArgs, socket_path: &std::path::Path, json_output: bool) -> u8 {
-    // Validate envelope path exists
-    if !args.envelope.exists() {
-        return output_error(
-            json_output,
-            "file_not_found",
-            &format!("Envelope file not found: {}", args.envelope.display()),
-            exit_codes::ERROR,
-        );
-    }
-
-    // Check file size (CTR-1603)
-    match std::fs::metadata(&args.envelope) {
-        Ok(metadata) => {
-            if metadata.len() > MAX_ENVELOPE_FILE_SIZE {
-                return output_error(
-                    json_output,
-                    "file_too_large",
-                    &format!(
-                        "Envelope file exceeds maximum size of {MAX_ENVELOPE_FILE_SIZE} bytes"
-                    ),
-                    exit_codes::ERROR,
-                );
-            }
-        },
-        Err(e) => {
-            return output_error(
-                json_output,
-                "io_error",
-                &format!("Failed to read envelope metadata: {e}"),
-                exit_codes::ERROR,
-            );
-        },
-    }
-
-    // Read envelope content
-    let envelope_content = match std::fs::read_to_string(&args.envelope) {
+    // Read envelope content with TOCTOU-safe bounded reading (CTR-1603, RSK-1501).
+    // Opens file handle first, uses .take(limit) pattern to enforce size limit.
+    let envelope_content = match read_bounded_file(&args.envelope, MAX_ENVELOPE_FILE_SIZE) {
         Ok(content) => content,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "io_error",
-                &format!("Failed to read envelope file: {e}"),
-                exit_codes::ERROR,
-            );
+        Err((code, message)) => {
+            return output_error(json_output, &code, &message, exit_codes::ERROR);
         },
     };
 
-    // For now, since the daemon protocol is not fully implemented,
-    // we'll simulate the create operation by validating the envelope
-    // and returning a simulated response.
-    //
-    // In a full implementation, this would:
-    // 1. Parse the YAML to EpisodeEnvelope
-    // 2. Send CreateEpisode message to daemon via UDS
-    // 3. Receive EpisodeCreated response
-
-    // Validate YAML can be parsed
+    // Validate YAML can be parsed (local validation before daemon call)
     let envelope_value: serde_yaml::Value = match serde_yaml::from_str(&envelope_content) {
         Ok(v) => v,
         Err(e) => {
@@ -419,36 +376,25 @@ fn run_create(args: &CreateArgs, socket_path: &std::path::Path, json_output: boo
         },
     };
 
-    // Compute envelope hash (BLAKE3)
+    // Compute envelope hash (BLAKE3) for daemon request
     let envelope_hash = blake3::hash(envelope_content.as_bytes());
     let envelope_hash_hex = hex::encode(envelope_hash.as_bytes());
 
-    // Generate episode ID from hash and timestamp
-    let timestamp = chrono::Utc::now();
-    let episode_id = format!(
-        "ep-{}-{}",
-        &envelope_hash_hex[..16],
-        timestamp.timestamp_nanos_opt().unwrap_or(0)
-    );
+    // Send CreateEpisode request to daemon (episode ID is daemon-generated)
+    let client = DaemonClient::new(socket_path);
 
-    // Check daemon connection
-    if !socket_path.exists() {
-        return output_error(
-            json_output,
-            "daemon_not_running",
-            &format!(
-                "Daemon socket not found at {}. Is the daemon running?",
-                socket_path.display()
-            ),
-            exit_codes::ERROR,
-        );
-    }
+    let daemon_response = match client.create_episode(&envelope_content, &envelope_hash_hex) {
+        Ok(resp) => resp,
+        Err(e) => {
+            return handle_daemon_error(json_output, &e);
+        },
+    };
 
-    // Create response
+    // Build response from daemon-provided data
     let response = CreateResponse {
-        episode_id,
-        envelope_hash: envelope_hash_hex,
-        created_at: timestamp.to_rfc3339(),
+        episode_id: daemon_response.episode_id,
+        envelope_hash: daemon_response.envelope_hash,
+        created_at: daemon_response.created_at,
     };
 
     if json_output {
@@ -498,33 +444,22 @@ fn run_start(args: &StartArgs, socket_path: &std::path::Path, json_output: bool)
         );
     }
 
-    // Check daemon connection
-    if !socket_path.exists() {
-        return output_error(
-            json_output,
-            "daemon_not_running",
-            &format!(
-                "Daemon socket not found at {}. Is the daemon running?",
-                socket_path.display()
-            ),
-            exit_codes::ERROR,
-        );
-    }
+    // Send StartEpisode request to daemon
+    let client = DaemonClient::new(socket_path);
 
-    // Generate session ID and lease ID
-    let timestamp = chrono::Utc::now();
-    let session_id = format!("session-{}", timestamp.timestamp_nanos_opt().unwrap_or(0));
-    let lease_id = args
-        .lease_id
-        .clone()
-        .unwrap_or_else(|| format!("lease-{}", timestamp.timestamp_nanos_opt().unwrap_or(0)));
+    let daemon_response = match client.start_episode(&args.episode_id, args.lease_id.as_deref()) {
+        Ok(resp) => resp,
+        Err(e) => {
+            return handle_daemon_error(json_output, &e);
+        },
+    };
 
-    // Create response
+    // Build response from daemon-provided data
     let response = StartResponse {
-        episode_id: args.episode_id.clone(),
-        session_id,
-        lease_id,
-        started_at: timestamp.to_rfc3339(),
+        episode_id: daemon_response.episode_id,
+        session_id: daemon_response.session_id,
+        lease_id: daemon_response.lease_id,
+        started_at: daemon_response.started_at,
     };
 
     if json_output {
@@ -555,33 +490,23 @@ fn run_stop(args: &StopArgs, socket_path: &std::path::Path, json_output: bool) -
         );
     }
 
-    // Check daemon connection
-    if !socket_path.exists() {
-        return output_error(
-            json_output,
-            "daemon_not_running",
-            &format!(
-                "Daemon socket not found at {}. Is the daemon running?",
-                socket_path.display()
-            ),
-            exit_codes::ERROR,
-        );
-    }
+    // Send StopEpisode request to daemon
+    let client = DaemonClient::new(socket_path);
+    let reason_str = args.reason.to_string();
 
-    // Determine termination class from reason
-    let termination_class = match args.reason {
-        StopReason::Success => "SUCCESS",
-        StopReason::Cancelled => "CANCELLED",
-        StopReason::Failure => "FAILURE",
-    };
+    let daemon_response =
+        match client.stop_episode(&args.episode_id, &reason_str, args.message.as_deref()) {
+            Ok(resp) => resp,
+            Err(e) => {
+                return handle_daemon_error(json_output, &e);
+            },
+        };
 
-    let timestamp = chrono::Utc::now();
-
-    // Create response
+    // Build response from daemon-provided data
     let response = StopResponse {
-        episode_id: args.episode_id.clone(),
-        termination_class: termination_class.to_string(),
-        stopped_at: timestamp.to_rfc3339(),
+        episode_id: daemon_response.episode_id,
+        termination_class: daemon_response.termination_class,
+        stopped_at: daemon_response.stopped_at,
     };
 
     if json_output {
@@ -614,37 +539,31 @@ fn run_status(args: &StatusArgs, socket_path: &std::path::Path, json_output: boo
         );
     }
 
-    // Check daemon connection
-    if !socket_path.exists() {
-        return output_error(
-            json_output,
-            "daemon_not_running",
-            &format!(
-                "Daemon socket not found at {}. Is the daemon running?",
-                socket_path.display()
-            ),
-            exit_codes::ERROR,
-        );
-    }
+    // Send GetEpisodeStatus request to daemon
+    let client = DaemonClient::new(socket_path);
 
-    // For demonstration, return a simulated status
-    // In full implementation, this would query the daemon
-    let timestamp = chrono::Utc::now();
+    let daemon_response = match client.get_episode_status(&args.episode_id) {
+        Ok(resp) => resp,
+        Err(e) => {
+            return handle_daemon_error(json_output, &e);
+        },
+    };
 
+    // Build response from daemon-provided data
     let response = StatusResponse {
-        episode_id: args.episode_id.clone(),
-        state: "Created".to_string(),
-        envelope_hash: "0".repeat(64),
-        created_at: timestamp.to_rfc3339(),
-        started_at: None,
-        session_id: None,
-        lease_id: None,
-        terminated_at: None,
-        termination_class: None,
-        budget: Some(BudgetSummary {
-            tokens: "0 / 100000".to_string(),
-            tool_calls: "0 / 500".to_string(),
-            wall_ms: "0 / 3600000".to_string(),
+        episode_id: daemon_response.episode_id,
+        state: daemon_response.state,
+        envelope_hash: daemon_response.envelope_hash,
+        created_at: daemon_response.created_at,
+        started_at: daemon_response.started_at,
+        session_id: daemon_response.session_id,
+        lease_id: daemon_response.lease_id,
+        terminated_at: daemon_response.terminated_at,
+        termination_class: daemon_response.termination_class,
+        budget: daemon_response.budget.map(|b| BudgetSummary {
+            tokens: b.tokens,
+            tool_calls: b.tool_calls,
+            wall_ms: b.wall_ms,
         }),
     };
 
@@ -682,24 +601,38 @@ fn run_status(args: &StatusArgs, socket_path: &std::path::Path, json_output: boo
 
 /// Execute the list command.
 fn run_list(args: &ListArgs, socket_path: &std::path::Path, json_output: bool) -> u8 {
-    // Check daemon connection
-    if !socket_path.exists() {
-        return output_error(
-            json_output,
-            "daemon_not_running",
-            &format!(
-                "Daemon socket not found at {}. Is the daemon running?",
-                socket_path.display()
-            ),
-            exit_codes::ERROR,
-        );
-    }
+    // Send ListEpisodes request to daemon
+    let client = DaemonClient::new(socket_path);
 
-    // For demonstration, return an empty list
-    // In full implementation, this would query the daemon with the state filter
+    // Convert state filter to string for daemon
+    let state_filter = match args.state {
+        StateFilter::All => None,
+        StateFilter::Created => Some("created"),
+        StateFilter::Running => Some("running"),
+        StateFilter::Terminated => Some("terminated"),
+        StateFilter::Quarantined => Some("quarantined"),
+    };
+
+    let daemon_response = match client.list_episodes(state_filter, args.limit) {
+        Ok(resp) => resp,
+        Err(e) => {
+            return handle_daemon_error(json_output, &e);
+        },
+    };
+
+    // Build response from daemon-provided data
     let response = ListResponse {
-        episodes: vec![],
-        total: 0,
+        episodes: daemon_response
+            .episodes
+            .into_iter()
+            .map(|ep| EpisodeSummary {
+                episode_id: ep.episode_id,
+                state: ep.state,
+                created_at: ep.created_at,
+                session_id: ep.session_id,
+            })
+            .collect(),
+        total: daemon_response.total,
     };
 
     if json_output {
@@ -761,6 +694,102 @@ fn truncate(s: &str, max_len: usize) -> String {
     } else {
         s[..max_len].to_string()
     }
+}
+
+/// Handles daemon client errors and returns appropriate exit code.
+///
+/// Maps daemon errors to exit codes:
+/// - `DaemonNotRunning` -> ERROR (1)
+/// - `EpisodeNotFound` -> `NOT_FOUND` (2)
+/// - Other errors -> ERROR (1)
+fn handle_daemon_error(json_output: bool, error: &DaemonClientError) -> u8 {
+    match error {
+        DaemonClientError::DaemonNotRunning => output_error(
+            json_output,
+            "daemon_not_running",
+            "Daemon is not running. Start with: apm2 daemon",
+            exit_codes::ERROR,
+        ),
+        DaemonClientError::DaemonError { code, message } => {
+            let exit_code = match code {
+                ErrorCode::EpisodeNotFound => exit_codes::NOT_FOUND,
+                _ => exit_codes::ERROR,
+            };
+            let code_str = format!("{code:?}").to_lowercase();
+            output_error(json_output, &code_str, message, exit_code)
+        },
+        DaemonClientError::ConnectionFailed(msg) => output_error(
+            json_output,
+            "connection_failed",
+            &format!("Failed to connect to daemon: {msg}"),
+            exit_codes::ERROR,
+        ),
+        DaemonClientError::IoError(e) => output_error(
+            json_output,
+            "io_error",
+            &format!("I/O error communicating with daemon: {e}"),
+            exit_codes::ERROR,
+        ),
+        DaemonClientError::FrameTooLarge { size, max } => output_error(
+            json_output,
+            "frame_too_large",
+            &format!("Response frame too large: {size} bytes (max: {max})"),
+            exit_codes::ERROR,
+        ),
+        DaemonClientError::SerdeError(msg) => output_error(
+            json_output,
+            "serde_error",
+            &format!("Protocol error: {msg}"),
+            exit_codes::ERROR,
+        ),
+        DaemonClientError::UnexpectedResponse(msg) => output_error(
+            json_output,
+            "unexpected_response",
+            &format!("Unexpected daemon response: {msg}"),
+            exit_codes::ERROR,
+        ),
+    }
+}
+
+/// Reads a file with bounded size to prevent TOCTOU and denial-of-service
+/// attacks.
+///
+/// Opens the file handle first, then uses `.take(limit)` to enforce the
+/// size limit. This is TOCTOU-safe because we read from the handle we
+/// opened, not from a separate open operation.
+///
+/// Per CTR-1603 (Bounded Reads) and RSK-1501 (TOCTOU Canonicalization).
+fn read_bounded_file(path: &std::path::Path, max_size: u64) -> Result<String, (String, String)> {
+    let file = File::open(path).map_err(|e| {
+        (
+            "io_error".to_string(),
+            format!("Failed to open file '{}': {e}", path.display()),
+        )
+    })?;
+
+    // Use take() to limit reads - TOCTOU-safe as we read from the same handle
+    let mut reader = BufReader::new(file.take(max_size + 1));
+    let mut content = String::new();
+
+    reader.read_to_string(&mut content).map_err(|e| {
+        (
+            "io_error".to_string(),
+            format!("Failed to read file '{}': {e}", path.display()),
+        )
+    })?;
+
+    // Check if we hit the limit (read more than max_size)
+    if content.len() as u64 > max_size {
+        return Err((
+            "file_too_large".to_string(),
+            format!(
+                "File '{}' exceeds maximum size of {max_size} bytes",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(content)
 }
 
 #[cfg(test)]
@@ -849,5 +878,74 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&error).unwrap();
         assert!(json.contains("not_found"));
+    }
+
+    // =========================================================================
+    // TOCTOU-safe file reading tests (UT-00202-01)
+    // =========================================================================
+
+    #[test]
+    fn test_read_bounded_file_success() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.yaml");
+        std::fs::write(&file_path, "test content").unwrap();
+
+        let result = read_bounded_file(&file_path, 1000);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test content");
+    }
+
+    #[test]
+    fn test_read_bounded_file_exceeds_limit() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("large.yaml");
+        // Write 1001 bytes to a file with a 1000 byte limit
+        std::fs::write(&file_path, "x".repeat(1001)).unwrap();
+
+        let result = read_bounded_file(&file_path, 1000);
+        assert!(result.is_err());
+        let (code, message) = result.unwrap_err();
+        assert_eq!(code, "file_too_large");
+        assert!(message.contains("exceeds maximum size"));
+    }
+
+    #[test]
+    fn test_read_bounded_file_not_found() {
+        let result = read_bounded_file(std::path::Path::new("/nonexistent/file.yaml"), 1000);
+        assert!(result.is_err());
+        let (code, _) = result.unwrap_err();
+        assert_eq!(code, "io_error");
+    }
+
+    #[test]
+    fn test_read_bounded_file_exact_limit() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("exact.yaml");
+        // Write exactly 1000 bytes (should pass)
+        std::fs::write(&file_path, "x".repeat(1000)).unwrap();
+
+        let result = read_bounded_file(&file_path, 1000);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1000);
+    }
+
+    /// SECURITY TEST: Verify TOCTOU-safe file reading pattern.
+    /// This test verifies the pattern, not actual race conditions.
+    #[test]
+    fn test_episode_create_toctou_safe() {
+        // The read_bounded_file function:
+        // 1. Opens the file handle first
+        // 2. Uses .take(limit) on the handle
+        // 3. Reads from the same handle
+        // This is TOCTOU-safe because there's no separate stat/read operations.
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("envelope.yaml");
+        let content = "actor_id: test\nrisk_tier: 1";
+        std::fs::write(&file_path, content).unwrap();
+
+        let result = read_bounded_file(&file_path, MAX_ENVELOPE_FILE_SIZE);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), content);
     }
 }

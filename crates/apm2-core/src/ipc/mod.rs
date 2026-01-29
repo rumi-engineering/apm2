@@ -101,6 +101,47 @@ pub enum IpcRequest {
 
     /// Shutdown the daemon.
     Shutdown,
+
+    // === Episode management (RFC-0013) ===
+    /// Create a new episode from an envelope.
+    CreateEpisode {
+        /// Envelope content (YAML).
+        envelope_yaml: String,
+        /// Envelope content hash (BLAKE3, hex-encoded).
+        envelope_hash: String,
+    },
+
+    /// Start a created episode.
+    StartEpisode {
+        /// Episode ID to start.
+        episode_id: String,
+        /// Optional lease ID (daemon may generate if not provided).
+        lease_id: Option<String>,
+    },
+
+    /// Stop a running episode.
+    StopEpisode {
+        /// Episode ID to stop.
+        episode_id: String,
+        /// Stop reason (success, cancelled, failure).
+        reason: String,
+        /// Optional custom message.
+        message: Option<String>,
+    },
+
+    /// Get episode status.
+    GetEpisodeStatus {
+        /// Episode ID to query.
+        episode_id: String,
+    },
+
+    /// List episodes with optional state filter.
+    ListEpisodes {
+        /// State filter (all, created, running, terminated, quarantined).
+        state_filter: Option<String>,
+        /// Maximum number of episodes to return.
+        limit: u32,
+    },
 }
 
 /// IPC response from daemon to client.
@@ -172,6 +213,71 @@ pub enum IpcResponse {
         /// Profile metadata.
         profile: CredentialProfileMetadata,
     },
+
+    // === Episode management responses (RFC-0013) ===
+    /// Episode created successfully.
+    EpisodeCreated {
+        /// Created episode ID (daemon-generated).
+        episode_id: String,
+        /// Envelope hash (BLAKE3, hex-encoded).
+        envelope_hash: String,
+        /// Creation timestamp (RFC 3339).
+        created_at: String,
+    },
+
+    /// Episode started successfully.
+    EpisodeStarted {
+        /// Episode ID.
+        episode_id: String,
+        /// Session ID for the running episode.
+        session_id: String,
+        /// Lease ID.
+        lease_id: String,
+        /// Start timestamp (RFC 3339).
+        started_at: String,
+    },
+
+    /// Episode stopped successfully.
+    EpisodeStopped {
+        /// Episode ID.
+        episode_id: String,
+        /// Termination class (SUCCESS, CANCELLED, FAILURE).
+        termination_class: String,
+        /// Stop timestamp (RFC 3339).
+        stopped_at: String,
+    },
+
+    /// Episode status response.
+    EpisodeStatus {
+        /// Episode ID.
+        episode_id: String,
+        /// Current state (Created, Running, Terminated, Quarantined).
+        state: String,
+        /// Envelope hash.
+        envelope_hash: String,
+        /// Creation timestamp.
+        created_at: String,
+        /// Start timestamp (if started).
+        started_at: Option<String>,
+        /// Session ID (if running).
+        session_id: Option<String>,
+        /// Lease ID (if running).
+        lease_id: Option<String>,
+        /// Termination timestamp (if terminated).
+        terminated_at: Option<String>,
+        /// Termination class (if terminated).
+        termination_class: Option<String>,
+        /// Budget summary (tokens used/total, tool calls, `wall_ms`).
+        budget: Option<EpisodeBudgetSummary>,
+    },
+
+    /// Episode list response.
+    EpisodeList {
+        /// List of episode summaries.
+        episodes: Vec<EpisodeSummaryIpc>,
+        /// Total count (may be more than returned due to limit).
+        total: u32,
+    },
 }
 
 /// Error codes for IPC responses.
@@ -194,6 +300,14 @@ pub enum ErrorCode {
     InternalError,
     /// Operation not supported.
     NotSupported,
+    /// Episode not found.
+    EpisodeNotFound,
+    /// Episode already exists.
+    EpisodeExists,
+    /// Episode not in expected state for operation.
+    InvalidEpisodeState,
+    /// Invalid envelope format or content.
+    InvalidEnvelope,
 }
 
 /// Summary information about a process.
@@ -270,6 +384,34 @@ pub struct LogEntry {
     pub stream: String,
     /// Log content.
     pub content: String,
+}
+
+// ============================================================================
+// Episode management types (RFC-0013)
+// ============================================================================
+
+/// Episode summary for list responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeSummaryIpc {
+    /// Episode ID.
+    pub episode_id: String,
+    /// Current state.
+    pub state: String,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Session ID (if running).
+    pub session_id: Option<String>,
+}
+
+/// Budget summary for episode status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeBudgetSummary {
+    /// Tokens used / total.
+    pub tokens: String,
+    /// Tool calls used / total.
+    pub tool_calls: String,
+    /// Wall time used / total (ms).
+    pub wall_ms: String,
 }
 
 /// Frame a message for IPC transport.
