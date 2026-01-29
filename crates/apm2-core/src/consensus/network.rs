@@ -17,12 +17,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rand::Rng;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
+use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use zeroize::Zeroizing;
 
@@ -47,6 +50,18 @@ pub const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum dispatch jitter for traffic analysis mitigation (INV-0020).
 pub const MAX_DISPATCH_JITTER_MS: u64 = 50;
+
+/// Default timeout for TCP connection establishment.
+pub const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default timeout for TLS handshake.
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default timeout for frame send operations.
+pub const FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default timeout for frame receive operations.
+pub const FRAME_RECV_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Errors that can occur in network operations.
 #[derive(Debug, Error)]
@@ -101,6 +116,13 @@ pub enum NetworkError {
     /// Certificate validation failed.
     #[error("certificate validation failed: {0}")]
     CertificateValidation(String),
+
+    /// Operation timed out.
+    #[error("operation timed out: {operation}")]
+    Timeout {
+        /// The operation that timed out.
+        operation: String,
+    },
 }
 
 /// TLS configuration for mutual authentication.
@@ -246,36 +268,15 @@ impl TlsConfig {
 
 /// Parse PEM-encoded certificates.
 fn parse_certificates(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, NetworkError> {
-    let mut reader = io::BufReader::new(pem);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| NetworkError::Certificate(format!("failed to parse certificates: {e}")))?;
-    Ok(certs)
+        .map_err(|e| NetworkError::Certificate(format!("failed to parse certificates: {e}")))
 }
 
 /// Parse PEM-encoded private key.
 fn parse_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, NetworkError> {
-    let mut reader = io::BufReader::new(pem);
-
-    // Try parsing different key formats
-    for item in rustls_pemfile::read_all(&mut reader) {
-        match item {
-            Ok(rustls_pemfile::Item::Pkcs1Key(key)) => {
-                return Ok(PrivateKeyDer::Pkcs1(key));
-            },
-            Ok(rustls_pemfile::Item::Pkcs8Key(key)) => {
-                return Ok(PrivateKeyDer::Pkcs8(key));
-            },
-            Ok(rustls_pemfile::Item::Sec1Key(key)) => {
-                return Ok(PrivateKeyDer::Sec1(key));
-            },
-            _ => {},
-        }
-    }
-
-    Err(NetworkError::PrivateKey(
-        "no valid private key found in PEM".into(),
-    ))
+    PrivateKeyDer::from_pem_slice(pem)
+        .map_err(|e| NetworkError::PrivateKey(format!("failed to parse private key: {e}")))
 }
 
 /// A fixed-size control plane frame.
@@ -392,26 +393,68 @@ impl Connection {
         self.peer_addr
     }
 
-    /// Sends a control frame.
+    /// Sends a control frame with timeout.
     ///
     /// # Errors
     ///
-    /// Returns an error if the write fails.
+    /// Returns an error if the write fails or times out.
     pub async fn send_frame(&mut self, frame: &ControlFrame) -> Result<(), NetworkError> {
-        self.stream.write_all(frame.as_bytes()).await?;
-        self.stream.flush().await?;
+        self.send_frame_with_timeout(frame, FRAME_SEND_TIMEOUT)
+            .await
+    }
+
+    /// Sends a control frame with a custom timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails or times out.
+    pub async fn send_frame_with_timeout(
+        &mut self,
+        frame: &ControlFrame,
+        timeout_duration: Duration,
+    ) -> Result<(), NetworkError> {
+        let send_fut = async {
+            self.stream.write_all(frame.as_bytes()).await?;
+            self.stream.flush().await?;
+            Ok::<_, io::Error>(())
+        };
+
+        timeout(timeout_duration, send_fut)
+            .await
+            .map_err(|_| NetworkError::Timeout {
+                operation: "send_frame".into(),
+            })??;
+
         self.last_used = Instant::now();
         Ok(())
     }
 
-    /// Receives a control frame.
+    /// Receives a control frame with timeout.
     ///
     /// # Errors
     ///
-    /// Returns an error if the read fails or the frame is invalid.
+    /// Returns an error if the read fails, times out, or the frame is invalid.
     pub async fn recv_frame(&mut self) -> Result<ControlFrame, NetworkError> {
+        self.recv_frame_with_timeout(FRAME_RECV_TIMEOUT).await
+    }
+
+    /// Receives a control frame with a custom timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read fails, times out, or the frame is invalid.
+    pub async fn recv_frame_with_timeout(
+        &mut self,
+        timeout_duration: Duration,
+    ) -> Result<ControlFrame, NetworkError> {
         let mut data = [0u8; CONTROL_FRAME_SIZE];
-        self.stream.read_exact(&mut data).await?;
+
+        timeout(timeout_duration, self.stream.read_exact(&mut data))
+            .await
+            .map_err(|_| NetworkError::Timeout {
+                operation: "recv_frame".into(),
+            })??;
+
         self.last_used = Instant::now();
         ControlFrame::parse(&data)
     }
@@ -420,6 +463,102 @@ impl Connection {
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.last_used.elapsed() > CONNECTION_IDLE_TIMEOUT
+    }
+}
+
+/// RAII guard for a pooled connection.
+///
+/// This guard ensures connections are always returned to the pool when dropped,
+/// preventing connection pool leaks. When the guard is dropped (whether
+/// normally or due to an error/panic), the connection is automatically returned
+/// to the pool.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let guard = pool.get_pooled_connection(addr, server_name).await?;
+/// guard.send_frame(&request).await?;
+/// let response = guard.recv_frame().await?;
+/// // Connection is automatically returned when guard goes out of scope
+/// ```
+pub struct PooledConnection {
+    /// The underlying connection (Option for take on drop).
+    connection: Option<Connection>,
+    /// Reference to the pool for returning the connection.
+    pool: Arc<ConnectionPool>,
+}
+
+impl PooledConnection {
+    /// Creates a new pooled connection guard.
+    const fn new(connection: Connection, pool: Arc<ConnectionPool>) -> Self {
+        Self {
+            connection: Some(connection),
+            pool,
+        }
+    }
+
+    /// Returns the peer address.
+    #[must_use]
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.connection.as_ref().map_or_else(
+            || SocketAddr::from(([0, 0, 0, 0], 0)),
+            Connection::peer_addr,
+        )
+    }
+
+    /// Sends a control frame with timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails or times out.
+    pub async fn send_frame(&mut self, frame: &ControlFrame) -> Result<(), NetworkError> {
+        if let Some(conn) = self.connection.as_mut() {
+            conn.send_frame(frame).await
+        } else {
+            Err(NetworkError::Connection(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection already returned to pool",
+            )))
+        }
+    }
+
+    /// Receives a control frame with timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read fails, times out, or the frame is invalid.
+    pub async fn recv_frame(&mut self) -> Result<ControlFrame, NetworkError> {
+        if let Some(conn) = self.connection.as_mut() {
+            conn.recv_frame().await
+        } else {
+            Err(NetworkError::Connection(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "connection already returned to pool",
+            )))
+        }
+    }
+
+    /// Consumes the guard and explicitly returns the connection to the pool.
+    ///
+    /// This is useful when you want to return the connection early.
+    /// Note: the connection is also returned automatically on drop.
+    pub async fn return_to_pool(mut self) {
+        if let Some(conn) = self.connection.take() {
+            self.pool.return_connection(conn).await;
+        }
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.connection.take() {
+            // We need to return the connection to the pool.
+            // Since Drop is synchronous, we spawn a task to do this async.
+            let pool = self.pool.clone();
+            tokio::spawn(async move {
+                pool.return_connection(conn).await;
+            });
+        }
     }
 }
 
@@ -532,6 +671,25 @@ impl ConnectionPool {
         }
     }
 
+    /// Gets or creates a pooled connection with RAII guard.
+    ///
+    /// This is the preferred method for getting connections as the RAII guard
+    /// ensures the connection is always returned to the pool, even if an error
+    /// occurs or the code panics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection cannot be established or the pool is
+    /// exhausted.
+    pub async fn get_pooled_connection(
+        self: &Arc<Self>,
+        peer_addr: SocketAddr,
+        server_name: &str,
+    ) -> Result<PooledConnection, NetworkError> {
+        let conn = self.get_connection(peer_addr, server_name).await?;
+        Ok(PooledConnection::new(conn, Arc::clone(self)))
+    }
+
     /// Returns a connection to the pool for reuse.
     pub async fn return_connection(&self, conn: Connection) {
         let peer_addr = conn.peer_addr;
@@ -547,24 +705,33 @@ impl ConnectionPool {
         }
     }
 
-    /// Creates a new TLS connection to a peer.
+    /// Creates a new TLS connection to a peer with timeouts.
     async fn create_connection(
         &self,
         peer_addr: SocketAddr,
         server_name: &str,
     ) -> Result<Connection, NetworkError> {
-        // Connect TCP
-        let tcp_stream = TcpStream::connect(peer_addr).await?;
+        // Connect TCP with timeout
+        let tcp_stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(peer_addr))
+            .await
+            .map_err(|_| NetworkError::Timeout {
+                operation: "TCP connect".into(),
+            })??;
 
-        // Perform TLS handshake
+        // Perform TLS handshake with timeout
         let server_name = ServerName::try_from(server_name.to_owned())
             .map_err(|e| NetworkError::Handshake(format!("invalid server name: {e}")))?;
 
         let connector = self.tls_config.connector();
-        let tls_stream = connector
-            .connect(server_name, tcp_stream)
-            .await
-            .map_err(|e| NetworkError::Handshake(format!("TLS handshake failed: {e}")))?;
+        let tls_stream = timeout(
+            TLS_HANDSHAKE_TIMEOUT,
+            connector.connect(server_name, tcp_stream),
+        )
+        .await
+        .map_err(|_| NetworkError::Timeout {
+            operation: "TLS handshake".into(),
+        })?
+        .map_err(|e| NetworkError::Handshake(format!("TLS handshake failed: {e}")))?;
 
         Ok(Connection::new(TlsStream::Client(tls_stream), peer_addr))
     }
@@ -582,6 +749,29 @@ impl ConnectionPool {
     pub async fn connection_count(&self) -> usize {
         let pool = self.connections.read().await;
         pool.values().map(PeerConnections::total).sum()
+    }
+}
+
+/// Applies bounded dispatch jitter for traffic analysis mitigation (INV-0020).
+///
+/// This function introduces a random delay between 0 and
+/// `MAX_DISPATCH_JITTER_MS` milliseconds before dispatching network frames.
+/// This helps mitigate traffic analysis attacks by making timing patterns less
+/// predictable.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use apm2_core::consensus::apply_dispatch_jitter;
+///
+/// // Apply jitter before sending
+/// apply_dispatch_jitter().await;
+/// conn.send_frame(&frame).await?;
+/// ```
+pub async fn apply_dispatch_jitter() {
+    let jitter_ms = rand::thread_rng().gen_range(0..=MAX_DISPATCH_JITTER_MS);
+    if jitter_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
     }
 }
 
@@ -1007,5 +1197,89 @@ mod tck_00183_network_tests {
         let pool = ConnectionPool::new(config);
 
         assert_eq!(pool.connection_count().await, 0);
+    }
+
+    #[test]
+    fn test_tck_00183_timeout_constants_defined() {
+        // Verify all timeout constants are defined and reasonable
+        assert!(
+            TCP_CONNECT_TIMEOUT.as_secs() > 0,
+            "TCP connect timeout must be positive"
+        );
+        assert!(
+            TLS_HANDSHAKE_TIMEOUT.as_secs() > 0,
+            "TLS handshake timeout must be positive"
+        );
+        assert!(
+            FRAME_SEND_TIMEOUT.as_secs() > 0,
+            "Frame send timeout must be positive"
+        );
+        assert!(
+            FRAME_RECV_TIMEOUT.as_secs() > 0,
+            "Frame receive timeout must be positive"
+        );
+
+        // Timeouts should be reasonable (not too short, not too long)
+        assert!(
+            TCP_CONNECT_TIMEOUT.as_secs() <= 60,
+            "TCP connect timeout should be <= 60s"
+        );
+        assert!(
+            TLS_HANDSHAKE_TIMEOUT.as_secs() <= 60,
+            "TLS handshake timeout should be <= 60s"
+        );
+        assert!(
+            FRAME_SEND_TIMEOUT.as_secs() <= 120,
+            "Frame send timeout should be <= 120s"
+        );
+        assert!(
+            FRAME_RECV_TIMEOUT.as_secs() <= 120,
+            "Frame receive timeout should be <= 120s"
+        );
+    }
+
+    #[test]
+    fn test_tck_00183_dispatch_jitter_constant() {
+        // INV-0020: Bounded jitter on dispatch (0-50ms)
+        assert_eq!(
+            MAX_DISPATCH_JITTER_MS, 50,
+            "Dispatch jitter must be 50ms as per RFC-0014"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tck_00183_dispatch_jitter_bounded() {
+        // INV-0020: Verify jitter function completes within bounded time
+        let start = std::time::Instant::now();
+
+        // Call jitter multiple times to verify it's bounded
+        for _ in 0..10 {
+            apply_dispatch_jitter().await;
+        }
+
+        let elapsed = start.elapsed();
+        // 10 calls * max 50ms = 500ms max, but typically much less
+        assert!(
+            elapsed.as_millis() < 1000,
+            "Dispatch jitter should be bounded (took {}ms)",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn test_tck_00183_timeout_error_variant() {
+        // Verify timeout error variant exists and formats correctly
+        let err = NetworkError::Timeout {
+            operation: "test_operation".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timed out"),
+            "Error should mention 'timed out'"
+        );
+        assert!(
+            msg.contains("test_operation"),
+            "Error should mention operation"
+        );
     }
 }

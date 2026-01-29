@@ -50,6 +50,11 @@ pub const MAX_JOIN_ATTEMPTS_PER_MINUTE: usize = 10;
 /// Rate limit window duration.
 pub const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
+/// Maximum number of tracked sources in the rate limiter (CTR-1303: Bounded
+/// Stores). This prevents unbounded memory growth from unique source
+/// identifiers.
+pub const MAX_RATE_LIMIT_SOURCES: usize = 1024;
+
 /// Errors that can occur in peer discovery.
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
@@ -172,6 +177,9 @@ impl PeerInfo {
 }
 
 /// Rate limiter for join attempts.
+///
+/// Implements bounded tracking of join attempts per source to enforce rate
+/// limits while preventing unbounded memory growth (CTR-1303: Bounded Stores).
 struct RateLimiter {
     /// Join attempts per source.
     attempts: HashMap<String, Vec<Instant>>,
@@ -179,20 +187,44 @@ struct RateLimiter {
     max_attempts: usize,
     /// Window duration.
     window: Duration,
+    /// Maximum number of tracked sources.
+    max_sources: usize,
 }
 
 impl RateLimiter {
     fn new(max_attempts: usize, window: Duration) -> Self {
+        Self::with_max_sources(max_attempts, window, MAX_RATE_LIMIT_SOURCES)
+    }
+
+    fn with_max_sources(max_attempts: usize, window: Duration, max_sources: usize) -> Self {
         Self {
             attempts: HashMap::new(),
             max_attempts,
             window,
+            max_sources,
         }
     }
 
     /// Checks if a join attempt is allowed.
+    ///
+    /// If the maximum number of tracked sources is reached and this is a new
+    /// source, the oldest entries are evicted to make room.
     fn check(&mut self, source: &str) -> Result<(), DiscoveryError> {
         let now = Instant::now();
+
+        // If this is a new source and we're at capacity, evict old entries first
+        if !self.attempts.contains_key(source) && self.attempts.len() >= self.max_sources {
+            self.evict_oldest_entries(now);
+
+            // If still at capacity after eviction, reject the request
+            // This protects against DoS via unique source flooding
+            if self.attempts.len() >= self.max_sources {
+                return Err(DiscoveryError::RateLimitExceeded {
+                    attempts: 0,
+                    window_secs: self.window.as_secs(),
+                });
+            }
+        }
 
         let attempts = self.attempts.entry(source.to_string()).or_default();
 
@@ -210,6 +242,31 @@ impl RateLimiter {
         Ok(())
     }
 
+    /// Evicts entries with no recent attempts.
+    fn evict_oldest_entries(&mut self, now: Instant) {
+        // First, remove entries with no attempts within the window
+        self.attempts.retain(|_, attempts| {
+            attempts.retain(|t| now.duration_since(*t) < self.window);
+            !attempts.is_empty()
+        });
+
+        // If still over capacity, remove entries with oldest most-recent attempt
+        while self.attempts.len() >= self.max_sources {
+            let oldest_key = self
+                .attempts
+                .iter()
+                .filter_map(|(k, v)| v.last().map(|t| (k.clone(), *t)))
+                .min_by_key(|(_, t)| *t)
+                .map(|(k, _)| k);
+
+            if let Some(key) = oldest_key {
+                self.attempts.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Cleans up old entries.
     fn cleanup(&mut self) {
         let now = Instant::now();
@@ -217,6 +274,12 @@ impl RateLimiter {
             attempts.retain(|t| now.duration_since(*t) < self.window);
             !attempts.is_empty()
         });
+    }
+
+    /// Returns the number of tracked sources.
+    #[cfg(test)]
+    fn source_count(&self) -> usize {
+        self.attempts.len()
     }
 }
 
@@ -943,5 +1006,37 @@ mod tck_00183_discovery_tests {
 
         assert_eq!(parsed.peers.len(), 1);
         assert_eq!(parsed.peers[0].node_id, "node1");
+    }
+
+    #[test]
+    fn test_tck_00183_rate_limiter_bounded_sources() {
+        // CTR-1303: Rate limiter must have bounded source tracking
+        // This prevents DoS via unique source identifier flooding
+        let max_sources = 5;
+        let mut limiter = RateLimiter::with_max_sources(10, Duration::from_secs(60), max_sources);
+
+        // Fill up to max sources
+        for i in 0..max_sources {
+            assert!(
+                limiter.check(&format!("source{i}")).is_ok(),
+                "Should accept sources up to limit"
+            );
+        }
+
+        // Verify we hit the limit
+        assert_eq!(limiter.source_count(), max_sources);
+
+        // New source should still work (eviction will occur)
+        // but old entries without new attempts get evicted
+        assert!(
+            limiter.check("new_source").is_ok(),
+            "New source should succeed after eviction"
+        );
+
+        // Verify bounded growth
+        assert!(
+            limiter.source_count() <= max_sources,
+            "Source count must not exceed maximum"
+        );
     }
 }

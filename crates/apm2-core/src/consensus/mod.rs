@@ -45,5 +45,5 @@ pub use discovery::{
 };
 pub use network::{
     CONTROL_FRAME_SIZE, Connection, ConnectionPool, ControlFrame, Network, NetworkConfig,
-    NetworkError, TlsConfig, TlsConfigBuilder,
+    NetworkError, PooledConnection, TlsConfig, TlsConfigBuilder, apply_dispatch_jitter,
 };

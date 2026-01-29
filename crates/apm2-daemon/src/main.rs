@@ -241,6 +241,14 @@ async fn main() -> Result<()> {
             .init();
     }
 
+    // Install the rustls crypto provider before any TLS operations.
+    // This must be done before any TLS configuration is built, otherwise
+    // rustls will panic due to no default crypto provider being installed.
+    // We use the ring provider for FIPS-140 compatible cryptography.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok(); // Ignore error if already installed (e.g., in tests)
+
     // Verify bootstrap schema integrity before proceeding.
     // This is a critical security check that must pass before any CAC operations.
     verify_bootstrap_hash().context("bootstrap schema integrity check failed")?;

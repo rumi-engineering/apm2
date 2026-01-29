@@ -80,6 +80,9 @@ keyring.workspace = true
 zeroize.workspace = true
 rand.workspace = true
 
+# TLS (for crypto provider initialization)
+rustls.workspace = true
+
 [dev-dependencies]
 # Testing utilities
 tempfile.workspace = true
