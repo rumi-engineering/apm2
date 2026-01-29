@@ -760,13 +760,18 @@ pub(crate) mod tests {
         let mut cmd = Command::new("git");
         cmd.args(args).current_dir(root);
 
-        // Always clear inherited git env vars to avoid using parent worktree
+        // Clear inherited git env vars to avoid using parent worktree
         cmd.env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
             .env_remove("GIT_OBJECT_DIRECTORY")
-            .env_remove("GIT_COMMON_DIR")
-            .env_remove("GIT_CEILING_DIRECTORIES");
+            .env_remove("GIT_COMMON_DIR");
+
+        // Set ceiling to the temp directory's parent to prevent walking up
+        // past the test repo. This is especially important for `git init`.
+        if let Some(parent) = root.parent() {
+            cmd.env("GIT_CEILING_DIRECTORIES", parent);
+        }
 
         // For non-init commands, explicitly point to the test repo
         if args.first() != Some(&"init") {
