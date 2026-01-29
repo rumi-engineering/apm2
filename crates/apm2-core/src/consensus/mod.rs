@@ -67,6 +67,7 @@ pub mod bft;
 pub mod bft_machine;
 pub mod discovery;
 pub mod genesis;
+pub mod handlers;
 pub mod network;
 pub mod relay;
 pub mod tunnel;
@@ -90,6 +91,12 @@ pub use genesis::{
     Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,
     JoinRateLimiter, MAX_JOIN_ATTEMPTS_PER_MINUTE, MAX_NAMESPACE_LEN, MAX_QUORUM_SIGNATURES,
     MAX_RATE_LIMIT_SOURCES, QuorumSignature, RATE_LIMIT_WINDOW,
+};
+// BFT message handlers
+pub use handlers::{
+    BftMessageEnvelope, HandlerConfig, HandlerError, MAX_EPOCH_AGE, MAX_PENDING_INBOUND,
+    MAX_REPLAY_CACHE_SIZE, MessageHandler, PeerEndpoint, PeerManager, REPLAY_CACHE_ROUND_WINDOW,
+    ReplayCache,
 };
 pub use network::{
     CONTROL_FRAME_SIZE, Connection, ConnectionPool, ControlFrame, Network, NetworkConfig,
