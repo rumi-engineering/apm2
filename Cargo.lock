@@ -164,6 +164,7 @@ dependencies = [
  "seccompiler",
  "secrecy",
  "serde",
+ "serde_bytes",
  "serde_json",
  "serde_yaml",
  "sha2",
