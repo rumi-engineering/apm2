@@ -234,7 +234,12 @@ fn main() -> Result<()> {
                 return config.daemon.socket;
             }
         }
-        PathBuf::from("/var/run/apm2/apm2.sock")
+        // Per RFC-0013 AD-DAEMON-002: ${XDG_RUNTIME_DIR}/apm2/apm2d.sock
+        // Falls back to /tmp/apm2/apm2d.sock if XDG_RUNTIME_DIR is not set
+        std::env::var("XDG_RUNTIME_DIR").map_or_else(
+            |_| PathBuf::from("/tmp/apm2/apm2d.sock"),
+            |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("apm2d.sock"),
+        )
     });
 
     match cli.command {

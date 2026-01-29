@@ -130,7 +130,12 @@ fn default_pid_file() -> PathBuf {
 }
 
 fn default_socket() -> PathBuf {
-    PathBuf::from("/var/run/apm2/apm2.sock")
+    // Per RFC-0013 AD-DAEMON-002: ${XDG_RUNTIME_DIR}/apm2/apm2d.sock
+    // Falls back to /tmp/apm2/apm2d.sock if XDG_RUNTIME_DIR is not set
+    std::env::var("XDG_RUNTIME_DIR").map_or_else(
+        |_| PathBuf::from("/tmp/apm2/apm2d.sock"),
+        |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("apm2d.sock"),
+    )
 }
 
 fn default_log_dir() -> PathBuf {
