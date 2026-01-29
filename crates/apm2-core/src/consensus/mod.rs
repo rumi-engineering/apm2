@@ -64,6 +64,7 @@
 //! ```
 
 pub mod bft;
+pub mod bft_machine;
 pub mod discovery;
 pub mod genesis;
 pub mod network;
@@ -76,6 +77,11 @@ pub use bft::{
     MAX_PAYLOAD_SIZE, MAX_QC_SIGNATURES, MAX_VALIDATORS, MIN_ROUND_TIMEOUT, NewView, Phase,
     Proposal, QuorumCertificate, TIMEOUT_MULTIPLIER, ValidatorId, ValidatorInfo,
     ValidatorSignature, Vote,
+};
+// BFT machine driver
+pub use bft_machine::{
+    BftAction, BftEvent, BftMachine, MAX_BUFFERED_MESSAGES, MAX_PENDING_ACTIONS, MSG_BFT_NEW_VIEW,
+    MSG_BFT_PROPOSAL, MSG_BFT_QC, MSG_BFT_VOTE,
 };
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
