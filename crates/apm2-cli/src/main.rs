@@ -118,6 +118,10 @@ enum Commands {
     /// Coordinate work queue processing with budget enforcement
     Coordinate(commands::coordinate::CoordinateArgs),
 
+    // === Episode management (RFC-0013) ===
+    /// Episode commands for bounded execution management
+    Episode(commands::episode::EpisodeCommand),
+
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
@@ -297,6 +301,14 @@ fn main() -> Result<()> {
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
             let exit_code = commands::coordinate::run_coordinate(&coordinate_args);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Episode(episode_cmd) => {
+            // Episode commands use specific exit codes per TCK-00174:
+            // 0=success, 1=error, 2=episode_not_found
+            // We use std::process::exit to bypass anyhow Result handling
+            // and ensure precise exit codes are returned.
+            let exit_code = commands::episode::run_episode(&episode_cmd, &socket_path);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {

@@ -45,5 +45,9 @@ tempfile.workspace = true
 chrono.workspace = true
 regex.workspace = true
 
+# Cryptographic hashing
+blake3.workspace = true
+hex.workspace = true
+
 [lints]
 workspace = true
