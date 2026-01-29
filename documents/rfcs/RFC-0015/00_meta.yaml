@@ -7,12 +7,22 @@ rfc_meta:
     status: DRAFT
     created_date: "2026-01-29"
     last_updated_date: "2026-01-29"
-    version: "v0"
+    version: "v2"
     version_history:
       - version: "v0"
         date: "2026-01-29"
         phase: "v0 (Discovery)"
         notes: "Initial RFC creation from PRD-0009"
+      - version: "v2"
+        date: "2026-01-29"
+        phase: "v2 (Grounded)"
+        notes: |
+          EXPLORE council session completed. Design decisions grounded in codebase evidence.
+          Q-RFC-FAC-0001 resolved: extend kernel_events.proto (not new fac_events.proto).
+          Q-RFC-FAC-0002 resolved: ContextAwareValidator middleware at tool validation layer.
+          Q-RFC-FAC-0005 resolved: reuse TranscriptChunk from CAC module.
+          Pattern alignment score: 6.2/10 (upgraded from LOW to MEDIUM confidence).
+          3 critical security gaps identified; all remediable within v4 phase.
     abstract: |
       This RFC specifies the Forge Admission Cycle (FAC), an internal cryptographically-enforced
       admission protocol for APM2. FAC ensures that all gate outcomes are signed by authorized

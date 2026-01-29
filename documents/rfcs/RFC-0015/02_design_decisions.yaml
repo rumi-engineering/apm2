@@ -2,17 +2,173 @@ rfc_design_decisions:
   schema_version: "2026-01-29"
 
   version_transition:
-    from_version: null
-    to_version: "v0"
+    from_version: "v0"
+    to_version: "v2"
     transition_date: "2026-01-29"
-    mode: CREATE
+    mode: EXPLORE
     summary: |
-      Initial RFC v0 (Discovery) creation. Design decisions are hypotheses pending
-      codebase exploration in EXPLORE phase. Component mapping confidence is LOW
-      until grounded in existing patterns.
+      RFC v2 (Grounded) transition after EXPLORE council session. Design decisions
+      now grounded in codebase evidence. Component mapping confidence upgraded from
+      LOW to MEDIUM. Open questions Q-RFC-FAC-0001 and Q-RFC-FAC-0002 resolved.
 
-  exploration_findings: []
-    # To be populated during EXPLORE phase
+  exploration_findings:
+    council_session_id: COUNCIL-RFC-0015-EXPLORE-20260129
+    council_timestamp: "2026-01-29T13:00:00Z"
+    subagents:
+      - agent_id: SA-1
+        role: "Structural Rigorist"
+        modes: [4, 22, 47, 62, 75]
+        verdict: "Pattern alignment 7.2/10; proto extension feasible"
+      - agent_id: SA-2
+        role: "Implementation Feasibility"
+        modes: [11, 39, 51, 70, 76]
+        verdict: "Integration probability 41%; 20-22 week critical path"
+      - agent_id: SA-3
+        role: "Anti-Cousin Guardian"
+        modes: [8, 35, 49, 65, 80]
+        verdict: "APPROVED_WITH_CRITICAL_REMEDIATION; no cousin abstractions"
+
+    resolved_questions:
+      - question_id: Q-RFC-FAC-0001
+        resolution: "EXTEND kernel_events.proto"
+        rationale: |
+          SA-1 analysis: kernel_events.proto uses oneof payload pattern with 8 existing
+          event families. GateLease extends LeaseEvent (tag 6); GateRunCompleted and
+          MergeReceipt extend EvidenceEvent (tags 3, 4). Follows established pattern,
+          minimizes breaking changes, maintains single proto source. Evidence:
+          proto/kernel_events.proto:43-54, crates/apm2-core/src/events/apm2.kernel.v1.rs:612-626
+        confidence: HIGH
+
+      - question_id: Q-RFC-FAC-0002
+        resolution: "ContextAwareValidator middleware at tool validation layer"
+        rationale: |
+          SA-2 analysis: Tool validation layer (crates/apm2-core/src/tool/validation.rs)
+          has clean architecture for extension. Create ContextAwareValidator trait that
+          wraps existing Validator with manifest checking. Non-breaking, composable,
+          testable. Integration point: crates/apm2-core/src/tool/mod.rs:66-75.
+          Probability of success: 0.75 (highest of 3 options analyzed).
+        confidence: HIGH
+
+      - question_id: Q-RFC-FAC-0005
+        resolution: "Reuse TranscriptChunk from CAC module"
+        rationale: |
+          SA-2 analysis: CAC module already handles transcript chunking with streaming
+          hashing. Create AATTranscriptBinding wrapper that imports TranscriptChunk
+          from cac/pack_spec.rs. Avoids duplication, maintains PRD-0007 conformance.
+          Reuse rate >= 80%. Evidence: crates/apm2-core/src/cac/pack_spec.rs:1-150.
+        confidence: MEDIUM
+
+    extension_points_identified:
+      - id: EP-1
+        name: "Domain Separator Module"
+        path: "crates/apm2-core/src/fac/domain_separator.rs"
+        status: NEW
+        reuses: "Canonicalization from crates/apm2-core/src/events/canonical.rs"
+        affects: [DD-FAC-0001]
+
+      - id: EP-2
+        name: "GateLease Extension"
+        path: "crates/apm2-core/src/lease/"
+        status: EXTEND
+        reuses: "LeaseReducer, LeaseState from existing module"
+        affects: [DD-FAC-0002]
+
+      - id: EP-3
+        name: "Context Firewall Integration"
+        paths:
+          - "crates/apm2-core/src/context/manifest.rs (NEW)"
+          - "crates/apm2-core/src/context/firewall.rs (NEW)"
+          - "crates/apm2-core/src/policy/engine.rs (EXTEND)"
+        reuses: "PolicyEngine default-deny + rule evaluation"
+        affects: [DD-FAC-0003]
+
+      - id: EP-4
+        name: "Receipt Typed Payloads"
+        path: "crates/apm2-core/src/evidence/receipt.rs"
+        status: EXTEND
+        reuses: "GateReceiptGenerator, typed payload discriminator"
+        affects: [DD-FAC-0006]
+
+      - id: EP-5
+        name: "Terminal Verifier Policy"
+        path: "crates/apm2-core/src/evidence/verifier.rs"
+        status: NEW
+        reuses: "PolicyEngine rule evaluation model"
+        affects: [DD-FAC-0007]
+        deferred_to: v4
+
+      - id: EP-6
+        name: "KeyPolicy Artifact"
+        path: "crates/apm2-core/src/crypto/policy.rs"
+        status: NEW
+        reuses: "Policy schema infrastructure"
+        affects: [Q-RFC-FAC-0003]
+
+      - id: EP-7
+        name: "Projection Adapter"
+        paths:
+          - "crates/apm2-daemon/src/projection/github_sync.rs"
+          - "crates/apm2-daemon/src/projection/divergence_watchdog.rs"
+          - "crates/apm2-daemon/src/projection/projection_receipt.rs"
+        status: NEW
+        reuses: "Event contract model (not agent adapter)"
+        affects: [DD-FAC-0004]
+
+    anti_cousin_analysis:
+      verdict: "NO COUSIN ABSTRACTIONS DETECTED"
+      findings:
+        - component: "Signature Infrastructure"
+          risk: NONE
+          rationale: "Domain separation is thin wrapper on existing Signer"
+        - component: "Policy Engine"
+          risk: MITIGATED
+          rationale: "Extend PolicyEngine with manifest-aware rules; avoid separate firewall"
+        - component: "Leases"
+          risk: NONE
+          rationale: "GateLease is specialized work lease with gate_id discriminator"
+        - component: "Receipts"
+          risk: NONE
+          rationale: "AatGateReceipt is typed payload extension"
+        - component: "CI Import"
+          risk: MITIGATED
+          rationale: "Extend CIWorkflowCompleted with attestation field"
+        - component: "Projection"
+          risk: NONE
+          rationale: "Intentionally new; separate holon in daemon/projection/"
+
+    critical_security_findings:
+      - id: F-SA3-001
+        title: "Lease Revocation Gap"
+        severity: MAJOR
+        description: "No LeaseRevoked event type; compromised key valid until TTL"
+        recommendation: "Add LeaseRevoked event; reduce TTL to <15 minutes for AAT"
+        phase_to_resolve: v2
+
+      - id: F-SA3-002
+        title: "TB-0003 Runtime Enforcement Missing"
+        severity: MAJOR
+        description: "GitHub read isolation is architectural only; no runtime check"
+        recommendation: "Implement network-level policy blocking api.github.com:443"
+        phase_to_resolve: v2
+
+      - id: F-SA3-003
+        title: "WARN Phase Security Gap"
+        severity: MEDIUM
+        description: "14-day WARN phase allows context violation exfiltration"
+        recommendation: "Reduce WARN duration to 7 days maximum"
+        phase_to_resolve: v4
+
+    pattern_alignment_scores:
+      DD-FAC-0001: 8  # Ed25519 domain-separated signatures
+      DD-FAC-0002: 7  # Lease-scoped gate authority
+      DD-FAC-0003: 6  # OCAP context firewall (integration point resolved)
+      DD-FAC-0004: 6  # Projection-only GitHub
+      DD-FAC-0005: 7  # Evidence-backed CI import
+      DD-FAC-0006: 8  # Typed AAT GateReceipt payloads
+      DD-FAC-0007: 3  # Terminal verifier binding (defer to v4)
+      DD-FAC-0008: 5  # Risk-tiered AAT selection
+      DD-FAC-0009: 6  # AAT anti-downgrade enforcement
+      mean_score: 6.2
 
   architectural_overview:
     summary: |
@@ -186,7 +342,13 @@ rfc_design_decisions:
   design_decisions:
     - id: DD-FAC-0001
       title: "Ed25519 Domain-Separated Signatures for Critical Events"
-      status: HYPOTHESIS
+      status: VALIDATED
+      validation_evidence: |
+        SA-1 EXPLORE analysis confirmed: Existing Signer in crates/apm2-core/src/crypto/sign.rs:36-114
+        is directly reusable. Ed25519 via ed25519-dalek 2.x already in codebase. Domain separation
+        requires only thin wrapper (sign_with_domain helper). AATReceipt in aat_receipt.rs:20-55
+        demonstrates existing signature binding pattern. Extension point EP-1 identified:
+        crates/apm2-core/src/fac/domain_separator.rs (NEW).
       decision: |
         All critical events (GateLeaseIssued, GateRunCompleted, MergeReceipt) MUST be signed
         with Ed25519 using domain-separated prefixes. Signature covers canonical bytes with
@@ -222,7 +384,13 @@ rfc_design_decisions:
 
     - id: DD-FAC-0002
       title: "Lease-Scoped Gate Authority with Strict Scope Fields"
-      status: HYPOTHESIS
+      status: VALIDATED
+      validation_evidence: |
+        SA-1 EXPLORE analysis confirmed: Existing lease infrastructure in crates/apm2-core/src/lease/
+        (state.rs:113-149, reducer.rs:1-85) provides extensible base. LeaseIssued proto already
+        has registrar_signature field (proto:229-236). GateLease is clean extension with gate_id,
+        changeset_digest, policy_hash as additional discriminated fields. Extension point EP-2
+        uses existing LeaseReducer pattern.
       decision: |
         GateLease binds (work_id, gate_id, changeset_digest, executor_actor_id, expiry, policy_hash).
         Leases are single-use with enforced expiry. Child leases can only narrow scope (subset rule).
@@ -259,7 +427,13 @@ rfc_design_decisions:
 
     - id: DD-FAC-0003
       title: "OCAP Context Firewall with Manifest Allowlist"
-      status: HYPOTHESIS
+      status: VALIDATED
+      validation_evidence: |
+        SA-2 EXPLORE analysis confirmed: Tool validation layer (crates/apm2-core/src/tool/validation.rs)
+        provides clean extension point. Q-RFC-FAC-0002 resolved via ContextAwareValidator middleware
+        (0.75 success probability, highest of 3 options). Extension point EP-3: Create manifest.rs
+        and firewall.rs in crates/apm2-core/src/context/, extend PolicyEngine with manifest-aware
+        rules. Avoids cousin abstraction by reusing PolicyEngine default-deny model.
       decision: |
         CONSUME-mode holons operate under mechanical context firewall. All repo.read and file.read
         operations must reference a manifest entry in the RCP allowlist. Denials are hard failures
@@ -481,42 +655,70 @@ rfc_design_decisions:
       confidence: MEDIUM
 
   component_mapping:
-    # Confidence: LOW until grounded during EXPLORE phase
+    # Confidence upgraded from LOW to MEDIUM after EXPLORE phase grounding
 
     - requirement_id: FAC-REQ-0001
-      verified_components: []
+      verified_components:
+        - path: "crates/apm2-core/src/tool/validation.rs"
+          status: REUSE
+          changes: "Extend with ContextAwareValidator trait (EP-3)"
+        - path: "crates/apm2-core/src/policy/engine.rs"
+          status: REUSE
+          changes: "Add manifest-aware rule evaluation"
       new_components:
-        - path: "crates/apm2-daemon/src/context_firewall/"
+        - path: "crates/apm2-core/src/context/manifest.rs"
           status: NEW
-          purpose: "OCAP context firewall implementation"
-      confidence: LOW
+          purpose: "ContextPackManifest for allowlist checking"
+        - path: "crates/apm2-core/src/context/firewall.rs"
+          status: NEW
+          purpose: "Firewall integration with PolicyEngine"
+      confidence: MEDIUM
+      explore_evidence: "SA-2 Option C analysis; Q-RFC-FAC-0002 resolved"
 
     - requirement_id: FAC-REQ-0002
       verified_components: []
       new_components:
-        - path: "crates/apm2-daemon/src/projection/watchdog.rs"
+        - path: "crates/apm2-daemon/src/projection/divergence_watchdog.rs"
           status: NEW
-          purpose: "Divergence watchdog implementation"
-      confidence: LOW
+          purpose: "Poll-based divergence detection (30s interval)"
+        - path: "crates/apm2-daemon/src/projection/github_sync.rs"
+          status: NEW
+          purpose: "Idempotent ledger -> GitHub projection"
+      confidence: MEDIUM
+      explore_evidence: "SA-3 EP-7 analysis; no cousin risk with adapter pattern"
 
     - requirement_id: FAC-REQ-0017
       verified_components:
         - path: "crates/apm2-core/src/crypto/sign.rs"
           status: REUSE
-          changes: "Use existing Ed25519 Signer for gate outcome signing"
+          changes: "Use existing Ed25519 Signer with domain prefix wrapper"
+        - path: "crates/apm2-core/src/events/canonical.rs"
+          status: REUSE
+          changes: "Add Canonicalize impls for new event types"
       new_components:
-        - path: "crates/apm2-core/src/gate/receipt.rs"
+        - path: "crates/apm2-core/src/fac/domain_separator.rs"
           status: NEW
-          purpose: "GateReceipt with typed payloads and evidence binding"
-      confidence: LOW
+          purpose: "Domain separator constants and sign_with_domain helper"
+        - path: "crates/apm2-core/src/evidence/receipt.rs"
+          status: EXTEND
+          purpose: "GateRunCompleted, MergeReceipt with typed payloads"
+      confidence: HIGH
+      explore_evidence: "SA-1 analysis: 95% reusability; evidence at sign.rs:36-114"
 
     - requirement_id: FAC-REQ-0018
-      verified_components: []
+      verified_components:
+        - path: "crates/apm2-core/src/lease/state.rs"
+          status: REUSE
+          changes: "Extend Lease struct or create GateLease discriminated variant"
+        - path: "crates/apm2-core/src/lease/reducer.rs"
+          status: REUSE
+          changes: "Handle GateLeaseIssued events"
       new_components:
-        - path: "crates/apm2-core/src/lease/gate_lease.rs"
-          status: NEW
-          purpose: "GateLease with strict scope fields and AAT extensions"
-      confidence: LOW
+        - path: "proto/kernel_events.proto"
+          status: EXTEND
+          purpose: "Add GateLease to LeaseEvent oneof (tag 6)"
+      confidence: HIGH
+      explore_evidence: "SA-1 analysis: 90% feasibility; Q-RFC-FAC-0001 resolved"
 
     - requirement_id: FAC-REQ-0019
       verified_components: []

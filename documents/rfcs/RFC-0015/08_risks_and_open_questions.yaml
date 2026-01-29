@@ -84,7 +84,16 @@ rfc_risks_and_open_questions:
         During EXPLORE phase, examine existing proto structure in proto/kernel_events.proto
         and determine if extension is feasible without breaking existing event handling.
         Prefer typed payload extension if existing event families support it.
-      status: UNRESOLVED
+      status: RESOLVED
+      resolution: |
+        EXTEND kernel_events.proto. Council SA-1 analysis confirmed proto uses oneof payload
+        pattern with 8 existing event families. GateLease extends LeaseEvent oneof (tag 6);
+        GateRunCompleted and MergeReceipt extend EvidenceEvent oneof (tags 3, 4).
+        Evidence: proto/kernel_events.proto:43-54 shows extensible structure.
+        Creating fac_events.proto would create architectural asymmetry and add maintenance burden.
+      resolved_by: COUNCIL-RFC-0015-EXPLORE-20260129
+      resolved_date: "2026-01-29"
+      confidence: HIGH
       blocking_tickets:
         - TG-FAC-001
       related_prd_question: Q-FAC-0001
@@ -97,7 +106,21 @@ rfc_risks_and_open_questions:
       resolution_plan: |
         During EXPLORE phase, examine existing tool mediation path and determine where
         ContextPackManifest allowlist checking can be most cleanly integrated.
-      status: UNRESOLVED
+      status: RESOLVED
+      resolution: |
+        CORE LIBRARY via ContextAwareValidator middleware at tool validation layer.
+        Council SA-2 analysis evaluated 3 options:
+        - Option A (Protocol Layer): Single point but couples layers - 0.65 probability
+        - Option B (Tool Handlers): Late binding, scattered logic - 0.45 probability
+        - Option C (Validator Middleware): Non-breaking, composable, testable - 0.75 probability
+
+        Selected Option C: Create ContextAwareValidator trait in crates/apm2-core/src/tool/
+        that wraps existing Validator with manifest checking. Integration point:
+        crates/apm2-core/src/tool/mod.rs:66-75. Emit ToolDecided=DENY with rule_id
+        "CTX-ALLOWLIST-001" on manifest miss.
+      resolved_by: COUNCIL-RFC-0015-EXPLORE-20260129
+      resolved_date: "2026-01-29"
+      confidence: HIGH
       blocking_tickets:
         - TG-FAC-002
 
@@ -137,7 +160,23 @@ rfc_risks_and_open_questions:
       resolution_plan: |
         During EXPLORE phase, examine existing transcript handling in PRD-0007 CAC
         implementation and determine if existing types can be reused or extended.
-      status: UNRESOLVED
+      status: RESOLVED
+      resolution: |
+        REUSE TranscriptChunk from CAC module with FAC-specific wrapper.
+        Council SA-2 analysis confirmed CAC module already handles transcript chunking
+        with streaming hashing. Create AATTranscriptBinding wrapper:
+        ```rust
+        pub struct AATTranscriptBinding {
+            pub transcript_chunks: Vec<TranscriptChunk>,  // Imported from CAC
+            pub transcript_chain_root_hash: Hash,
+            pub run_transcript_hashes: Vec<Hash>,
+        }
+        ```
+        Reuse rate >= 80% from existing crates/apm2-core/src/cac/pack_spec.rs.
+        Avoids duplication, maintains PRD-0007 conformance.
+      resolved_by: COUNCIL-RFC-0015-EXPLORE-20260129
+      resolved_date: "2026-01-29"
+      confidence: MEDIUM
       blocking_tickets:
         - TG-FAC-005
 
@@ -175,7 +214,17 @@ rfc_risks_and_open_questions:
       resolution_plan: |
         During EXPLORE phase, examine existing policy handling and determine canonical
         location for resolved_policy_hash and policy tuple.
-      status: UNRESOLVED
+      status: RESOLVED
+      resolution: |
+        EMBEDDED in FAC-00 changeset ingestion event (ChangeSetIngested).
+        SA-1 analysis: Policy resolution is part of FAC-00 stage outputs. Include
+        resolved_policy_hash, resolved_risk_tier, resolved_determinism_class as
+        fields in ChangeSetIngested event payload. This binds policy to changeset
+        before any gate execution (CON-FAC-003: CAS-at-commit ordering).
+        Evidence: Policy pinning follows DD-FAC-0009 anti-downgrade design.
+      resolved_by: COUNCIL-RFC-0015-EXPLORE-20260129
+      resolved_date: "2026-01-29"
+      confidence: MEDIUM
       blocking_tickets:
         - TG-FAC-001
       related_prd_question: Q-FAC-0009
