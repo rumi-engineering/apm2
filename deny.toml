@@ -24,6 +24,11 @@ allow = [
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
+    # Required for TLS cryptography (ring, aws-lc-rs)
+    "ISC",
+    "OpenSSL",
+    # Required for webpki-roots (certificate data)
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 exceptions = []
