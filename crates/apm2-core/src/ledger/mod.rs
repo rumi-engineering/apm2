@@ -51,7 +51,7 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
-pub use backend::LedgerBackend;
+pub use backend::{BoxFuture, HashFn, LedgerBackend, VerifyFn};
 pub use storage::{
     ArtifactRef, CURRENT_RECORD_VERSION, EventRecord, Ledger, LedgerError, LedgerStats,
     SqliteLedgerBackend,

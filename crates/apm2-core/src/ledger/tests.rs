@@ -468,15 +468,15 @@ fn test_concurrent_read_with_wal() {
 }
 
 #[test]
-fn test_max_seq_id() {
+fn test_head_sync() {
     let (ledger, _dir) = temp_ledger();
 
-    assert_eq!(ledger.max_seq_id().unwrap(), 0);
+    assert_eq!(ledger.head_sync().unwrap(), 0);
 
     ledger
         .append(&EventRecord::new("e", "s", "a", vec![]))
         .unwrap();
-    assert_eq!(ledger.max_seq_id().unwrap(), 1);
+    assert_eq!(ledger.head_sync().unwrap(), 1);
 
     ledger
         .append(&EventRecord::new("e", "s", "a", vec![]))
@@ -484,7 +484,7 @@ fn test_max_seq_id() {
     ledger
         .append(&EventRecord::new("e", "s", "a", vec![]))
         .unwrap();
-    assert_eq!(ledger.max_seq_id().unwrap(), 3);
+    assert_eq!(ledger.head_sync().unwrap(), 3);
 }
 
 #[test]
