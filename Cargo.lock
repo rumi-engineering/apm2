@@ -108,9 +108,11 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "apm2-core",
+ "blake3",
  "chrono",
  "clap",
  "directories",
+ "hex",
  "regex",
  "serde",
  "serde_json",
