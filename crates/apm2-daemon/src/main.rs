@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use apm2_core::bootstrap::verify_bootstrap_hash;
 use apm2_core::config::EcosystemConfig;
 use apm2_core::process::ProcessState;
+use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
@@ -244,6 +245,14 @@ async fn main() -> Result<()> {
     // This is a critical security check that must pass before any CAC operations.
     verify_bootstrap_hash().context("bootstrap schema integrity check failed")?;
 
+    // Register core kernel schemas on startup (TCK-00181).
+    // This establishes the schema registry with all kernel event types
+    // before any event processing can occur.
+    let registry = InMemorySchemaRegistry::new();
+    register_kernel_schemas(&registry)
+        .await
+        .context("kernel schema registration failed")?;
+
     // Daemonize if requested
     #[allow(unsafe_code)] // fork() requires unsafe
     if !args.no_daemon {
@@ -288,10 +297,12 @@ async fn main() -> Result<()> {
     let daemon_config = DaemonConfig::new(&args)?;
     let supervisor = init_supervisor(&daemon_config.config);
 
-    // Create shared state
+    // Create shared state with schema registry
+    // The registry persists for the daemon's lifetime (TCK-00181)
     let state: SharedState = Arc::new(DaemonStateHandle::new(
         daemon_config.config.clone(),
         supervisor,
+        registry, // Pass the registry created during bootstrap
     ));
 
     // Write PID file

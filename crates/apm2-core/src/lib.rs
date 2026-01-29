@@ -32,6 +32,10 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
+// Allow large stack arrays in tests for schema registry handshake limit testing.
+// The actual code uses heap allocation (Vec), but const evaluation may trigger
+// this lint during test compilation with MAX_HANDSHAKE_DIGESTS (10000).
+#![cfg_attr(test, allow(clippy::large_stack_arrays))]
 
 pub mod adapter;
 pub mod agent;
@@ -60,6 +64,7 @@ pub mod refactor_radar;
 pub mod restart;
 pub mod rfc_framer;
 pub mod run_manifest;
+pub mod schema_registry;
 pub mod session;
 pub mod shutdown;
 pub mod state;

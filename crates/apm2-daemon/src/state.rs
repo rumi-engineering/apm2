@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use apm2_core::config::EcosystemConfig;
 use apm2_core::process::ProcessId;
 use apm2_core::process::runner::ProcessRunner;
+use apm2_core::schema_registry::InMemorySchemaRegistry;
 use apm2_core::supervisor::Supervisor;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
@@ -27,12 +28,20 @@ pub struct DaemonStateHandle {
     shutdown: AtomicBool,
     /// Time when the daemon started.
     started_at: DateTime<Utc>,
+    /// Schema registry (shared across the daemon lifetime).
+    /// Used by future handlers for schema validation (TCK-00181).
+    #[allow(dead_code)]
+    schema_registry: InMemorySchemaRegistry,
 }
 
 impl DaemonStateHandle {
     /// Create a new daemon state handle.
     #[must_use]
-    pub fn new(config: EcosystemConfig, supervisor: Supervisor) -> Self {
+    pub fn new(
+        config: EcosystemConfig,
+        supervisor: Supervisor,
+        schema_registry: InMemorySchemaRegistry,
+    ) -> Self {
         Self {
             inner: RwLock::new(DaemonState {
                 supervisor,
@@ -41,7 +50,16 @@ impl DaemonStateHandle {
             }),
             shutdown: AtomicBool::new(false),
             started_at: Utc::now(),
+            schema_registry,
         }
+    }
+
+    /// Get a reference to the schema registry.
+    /// Will be used by future handlers for schema validation (TCK-00181).
+    #[must_use]
+    #[allow(dead_code)]
+    pub const fn schema_registry(&self) -> &InMemorySchemaRegistry {
+        &self.schema_registry
     }
 
     /// Get read access to the inner state.
