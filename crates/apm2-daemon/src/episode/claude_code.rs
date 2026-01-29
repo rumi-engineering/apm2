@@ -26,7 +26,7 @@
 //! Per AD-LAYER-001 and AD-ADAPT-001, `ClaudeCodeAdapter` provides per-episode
 //! [`Holon`] instances via the factory method
 //! [`ClaudeCodeAdapter::create_holon`]. This follows the same pattern as
-//! [`RawAdapter`].
+//! [`RawAdapter`](super::raw_adapter::RawAdapter).
 //!
 //! # Contract References
 //!
@@ -118,7 +118,8 @@ pub type SharedClaudeCodeState = Arc<Mutex<ClaudeCodeState>>;
 /// Claude Code harness adapter.
 ///
 /// This adapter spawns Claude Code CLI processes and parses their PTY output
-/// to emit structured events. Unlike [`RawAdapter`], this adapter:
+/// to emit structured events. Unlike
+/// [`RawAdapter`](super::raw_adapter::RawAdapter), this adapter:
 ///
 /// - Strips ANSI escape sequences from output
 /// - Detects and parses tool invocations
