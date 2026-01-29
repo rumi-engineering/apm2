@@ -60,6 +60,78 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use super::backend::{BoxFuture, LedgerBackend};
 use super::storage::{EventRecord, LedgerError, SqliteLedgerBackend};
 use crate::consensus::bft::{BlockHash, QuorumCertificate};
+use crate::schema_registry::{SchemaDigest, SchemaRegistry, SchemaRegistryError};
+
+// =============================================================================
+// No-Op Schema Registry (for backward compatibility)
+// =============================================================================
+
+/// A no-op schema registry that accepts all schemas.
+///
+/// This is used as the default type parameter for `BftLedgerBackend` to
+/// maintain backward compatibility with existing code that doesn't need
+/// schema validation. When schema validation is needed, use
+/// `BftLedgerBackend::with_schema_registry()`.
+#[derive(Debug, Clone, Default)]
+pub struct NoOpSchemaRegistry;
+
+impl SchemaRegistry for NoOpSchemaRegistry {
+    fn register<'a>(
+        &'a self,
+        _entry: &'a crate::schema_registry::SchemaEntry,
+    ) -> crate::schema_registry::BoxFuture<'a, Result<(), SchemaRegistryError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn lookup_by_digest<'a>(
+        &'a self,
+        _digest: &'a SchemaDigest,
+    ) -> crate::schema_registry::BoxFuture<
+        'a,
+        Result<Option<std::sync::Arc<crate::schema_registry::SchemaEntry>>, SchemaRegistryError>,
+    > {
+        // NoOp registry: always returns None (schema not found).
+        // This means validation is effectively skipped for backends without
+        // a real registry configured.
+        Box::pin(async { Ok(None) })
+    }
+
+    fn lookup_by_stable_id<'a>(
+        &'a self,
+        _stable_id: &'a str,
+    ) -> crate::schema_registry::BoxFuture<
+        'a,
+        Result<Option<std::sync::Arc<crate::schema_registry::SchemaEntry>>, SchemaRegistryError>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn handshake<'a>(
+        &'a self,
+        _peer_digests: &'a [SchemaDigest],
+    ) -> crate::schema_registry::BoxFuture<
+        'a,
+        Result<crate::schema_registry::HandshakeResult, SchemaRegistryError>,
+    > {
+        Box::pin(async {
+            Ok(crate::schema_registry::HandshakeResult {
+                compatible: vec![],
+                missing_local: vec![],
+                missing_remote: vec![],
+            })
+        })
+    }
+
+    fn all_digests(
+        &self,
+    ) -> crate::schema_registry::BoxFuture<'_, Result<Vec<SchemaDigest>, SchemaRegistryError>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+
+    fn len(&self) -> crate::schema_registry::BoxFuture<'_, Result<usize, SchemaRegistryError>> {
+        Box::pin(async { Ok(0) })
+    }
+}
 
 // =============================================================================
 // Replay Constants
@@ -312,6 +384,18 @@ pub enum BftLedgerError {
     /// Block not found for finalization.
     #[error("block {0} not found in pending blocks")]
     BlockNotFound(String),
+
+    /// Schema mismatch: event has unknown `schema_digest`.
+    ///
+    /// This error is returned when an event's `schema_digest` is not registered
+    /// in the schema registry. This is a fail-closed security posture: events
+    /// with unknown schemas are rejected to prevent data corruption from schema
+    /// drift (DD-0004, TCK-00194).
+    #[error("schema mismatch: digest {digest} is not registered")]
+    SchemaMismatch {
+        /// The hex-encoded schema digest that was not found.
+        digest: String,
+    },
 }
 
 // =============================================================================
@@ -335,7 +419,7 @@ pub enum BftLedgerError {
 ///   consensus.
 /// - **Proper serialization (Finding 4)**: Uses postcard for deterministic QC
 ///   encoding.
-pub struct BftLedgerBackend {
+pub struct BftLedgerBackend<R: SchemaRegistry = NoOpSchemaRegistry> {
     /// Underlying storage backend.
     storage: Arc<SqliteLedgerBackend>,
 
@@ -355,10 +439,19 @@ pub struct BftLedgerBackend {
 
     /// Whether consensus is enabled.
     consensus_enabled: Arc<RwLock<bool>>,
+
+    /// Optional schema registry for `schema_digest` validation (TCK-00194).
+    ///
+    /// When present, events with `schema_digest` are validated against this
+    /// registry. Unknown schemas cause rejection (fail-closed per DD-0004).
+    schema_registry: Option<Arc<R>>,
 }
 
-impl BftLedgerBackend {
+impl BftLedgerBackend<NoOpSchemaRegistry> {
     /// Creates a new BFT ledger backend wrapping the given storage.
+    ///
+    /// This creates a backend without schema validation. For schema validation,
+    /// use [`BftLedgerBackend::with_schema_registry()`].
     ///
     /// # Arguments
     ///
@@ -373,16 +466,48 @@ impl BftLedgerBackend {
             consensus_metadata: Arc::new(RwLock::new(ConsensusMetadata::default())),
             finalization_timeout,
             consensus_enabled: Arc::new(RwLock::new(false)),
+            schema_registry: None,
         }
     }
 
     /// Creates a new BFT ledger backend with default timeout.
+    ///
+    /// This creates a backend without schema validation.
     #[must_use]
     pub fn with_default_timeout(storage: SqliteLedgerBackend) -> Self {
         Self::new(
             storage,
             Duration::from_millis(DEFAULT_FINALIZATION_TIMEOUT_MS),
         )
+    }
+}
+
+impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
+    /// Creates a new BFT ledger backend with schema validation (TCK-00194).
+    ///
+    /// Events with `schema_digest` set will be validated against the provided
+    /// registry. Unknown schemas cause rejection (fail-closed per DD-0004).
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - The underlying storage backend.
+    /// * `finalization_timeout` - Timeout for BFT finalization.
+    /// * `schema_registry` - The schema registry for digest validation.
+    #[must_use]
+    pub fn with_schema_registry(
+        storage: SqliteLedgerBackend,
+        finalization_timeout: Duration,
+        schema_registry: Arc<R>,
+    ) -> Self {
+        Self {
+            storage: Arc::new(storage),
+            pending_events: Arc::new(Mutex::new(HashMap::new())),
+            block_event_mapping: Arc::new(Mutex::new(BlockEventMapping::default())),
+            consensus_metadata: Arc::new(RwLock::new(ConsensusMetadata::default())),
+            finalization_timeout,
+            consensus_enabled: Arc::new(RwLock::new(false)),
+            schema_registry: Some(schema_registry),
+        }
     }
 
     /// Enables consensus mode.
@@ -419,6 +544,16 @@ impl BftLedgerBackend {
     /// and waits for finalization. For `Eventual` events, this method writes
     /// directly to storage.
     ///
+    /// # Schema Validation (TCK-00194)
+    ///
+    /// If the event has a `schema_digest` and a schema registry is configured,
+    /// the digest is validated against the registry. Unknown schemas cause
+    /// rejection with `SchemaMismatch` error (fail-closed per DD-0004).
+    ///
+    /// If no `schema_digest` is set, validation is skipped (backward
+    /// compatible). If no schema registry is configured, validation is
+    /// skipped.
+    ///
     /// # Arguments
     ///
     /// * `namespace` - The namespace for this event.
@@ -427,13 +562,21 @@ impl BftLedgerBackend {
     ///
     /// # Errors
     ///
-    /// Returns an error if the event cannot be appended or consensus times out.
+    /// - `SchemaMismatch` if the event's `schema_digest` is not registered.
+    /// - `ConsensusRequiredButDisabled` if `TotalOrder` but consensus is
+    ///   disabled.
+    /// - `ConsensusTimeout` if BFT finalization times out.
     pub async fn append_with_metadata(
         &self,
         #[allow(unused_variables)] namespace: &str,
         event: &EventRecord,
         metadata: &EventMetadata,
     ) -> Result<AppendResult, BftLedgerError> {
+        // TCK-00194: Schema validation (fail-closed for unknown schemas)
+        // This MUST happen before any storage operations to prevent events
+        // with unknown schemas from entering the ledger.
+        self.validate_schema_digest(event).await?;
+
         let consensus_enabled = self.is_consensus_enabled().await;
 
         // For eventual consistency, write directly to storage
@@ -449,6 +592,58 @@ impl BftLedgerBackend {
 
         // For TotalOrder with consensus enabled, go through consensus
         self.append_with_consensus(namespace, event, metadata).await
+    }
+
+    /// Validates an event's `schema_digest` against the registry (TCK-00194).
+    ///
+    /// # Fail-Closed Behavior
+    ///
+    /// - If `schema_digest` is `None`: validation passes (backward compatible)
+    /// - If `schema_registry` is `None`: validation passes (no registry
+    ///   configured)
+    /// - If `schema_digest` is `Some` and registered: validation passes
+    /// - If `schema_digest` is `Some` but NOT registered: **REJECT** with
+    ///   `SchemaMismatch`
+    ///
+    /// This implements DD-0004 from RFC-0014: "Unknown schemas trigger
+    /// rejection (fail-closed)."
+    async fn validate_schema_digest(&self, event: &EventRecord) -> Result<(), BftLedgerError> {
+        // If no schema_digest is set, skip validation (backward compatible)
+        let schema_digest_bytes = match &event.schema_digest {
+            Some(bytes) if !bytes.is_empty() => bytes,
+            _ => return Ok(()),
+        };
+
+        // If no schema registry is configured, skip validation
+        let Some(registry) = &self.schema_registry else {
+            return Ok(());
+        };
+
+        // Convert bytes to SchemaDigest
+        // Schema digests MUST be exactly 32 bytes (BLAKE3 output)
+        let digest: [u8; 32] = schema_digest_bytes.as_slice().try_into().map_err(|_| {
+            BftLedgerError::SchemaMismatch {
+                digest: hex_encode_slice(schema_digest_bytes),
+            }
+        })?;
+        let schema_digest = SchemaDigest::new(digest);
+
+        // Look up the schema in the registry
+        // Fail-closed: if not found, reject the event
+        let found = registry
+            .lookup_by_digest(&schema_digest)
+            .await
+            .map_err(|e| {
+                BftLedgerError::ConsensusUnavailable(format!("schema registry error: {e}"))
+            })?;
+
+        if found.is_none() {
+            return Err(BftLedgerError::SchemaMismatch {
+                digest: schema_digest.to_hex(),
+            });
+        }
+
+        Ok(())
     }
 
     /// Appends an event directly to storage (eventual consistency path).
@@ -858,10 +1053,25 @@ impl BftLedgerBackend {
 }
 
 // =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Hex-encodes a byte slice for error messages.
+fn hex_encode_slice(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+}
+
+// =============================================================================
 // LedgerBackend Implementation
 // =============================================================================
 
-impl LedgerBackend for BftLedgerBackend {
+impl<R: SchemaRegistry + 'static> LedgerBackend for BftLedgerBackend<R> {
     fn append<'a>(
         &'a self,
         _namespace: &'a str,
@@ -1437,5 +1647,352 @@ mod security_fix_tests {
         let msg = err.to_string();
         assert!(msg.contains("0xabc123"));
         assert!(msg.contains("not found"));
+    }
+
+    /// Test `SchemaMismatch` error display.
+    #[test]
+    fn tck_00194_schema_mismatch_error_display() {
+        let err = BftLedgerError::SchemaMismatch {
+            digest: "b3-256:abc123def456".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("schema mismatch"));
+        assert!(msg.contains("b3-256:abc123def456"));
+    }
+}
+
+/// Tests for TCK-00194: Schema validation in append path.
+#[cfg(test)]
+mod tck_00194_schema_validation_tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::crypto::EventHasher;
+    use crate::schema_registry::{InMemorySchemaRegistry, SchemaEntry};
+
+    /// Helper to create a schema entry.
+    fn make_schema_entry(stable_id: &str, content: &[u8]) -> SchemaEntry {
+        let digest = SchemaDigest::new(EventHasher::hash_content(content));
+        SchemaEntry {
+            stable_id: stable_id.to_string(),
+            digest,
+            content: Bytes::copy_from_slice(content),
+            canonicalizer_version: "cac-json-v1".to_string(),
+            registered_at: 0,
+            registered_by: "test-actor".to_string(),
+        }
+    }
+
+    /// AC1: Event with known `schema_digest` passes validation.
+    #[tokio::test]
+    async fn tck_00194_event_with_known_schema_passes() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let registry = Arc::new(InMemorySchemaRegistry::new());
+
+        // Register a schema
+        let content = br#"{"type": "object"}"#;
+        let entry = make_schema_entry("test:schema.v1", content);
+        let schema_digest_bytes = entry.digest.as_bytes().to_vec();
+        registry.register(&entry).await.unwrap();
+
+        // Create backend with schema registry
+        let backend = BftLedgerBackend::with_schema_registry(
+            storage,
+            Duration::from_millis(DEFAULT_FINALIZATION_TIMEOUT_MS),
+            registry,
+        );
+
+        // Create event with known schema_digest
+        let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+        event.schema_digest = Some(schema_digest_bytes);
+
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+
+        // Should pass validation
+        let result = backend
+            .append_with_metadata("kernel", &event, &metadata)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Event with known schema_digest should pass: {result:?}"
+        );
+    }
+
+    /// AC2: Event with unknown `schema_digest` fails with `SchemaMismatch`.
+    #[tokio::test]
+    async fn tck_00194_event_with_unknown_schema_fails() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let registry = Arc::new(InMemorySchemaRegistry::new());
+
+        // Register a schema (but we'll use a different digest)
+        let content = br#"{"type": "object"}"#;
+        let entry = make_schema_entry("test:schema.v1", content);
+        registry.register(&entry).await.unwrap();
+
+        // Create backend with schema registry
+        let backend = BftLedgerBackend::with_schema_registry(
+            storage,
+            Duration::from_millis(DEFAULT_FINALIZATION_TIMEOUT_MS),
+            registry,
+        );
+
+        // Create event with UNKNOWN schema_digest (different content)
+        let unknown_digest = EventHasher::hash_content(br#"{"type": "string"}"#);
+        let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+        event.schema_digest = Some(unknown_digest.to_vec());
+
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+
+        // Should fail with SchemaMismatch
+        let result = backend
+            .append_with_metadata("kernel", &event, &metadata)
+            .await;
+
+        assert!(
+            matches!(result, Err(BftLedgerError::SchemaMismatch { .. })),
+            "Event with unknown schema_digest should fail with SchemaMismatch, got: {result:?}"
+        );
+    }
+
+    /// AC3: Fail-closed behavior - unknown schema = rejection.
+    #[tokio::test]
+    async fn tck_00194_fail_closed_rejects_unknown() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let registry = Arc::new(InMemorySchemaRegistry::new());
+
+        // Empty registry (no schemas registered)
+        let backend = BftLedgerBackend::with_schema_registry(
+            storage,
+            Duration::from_millis(DEFAULT_FINALIZATION_TIMEOUT_MS),
+            registry,
+        );
+
+        // Create event with any schema_digest
+        let some_digest = EventHasher::hash_content(br#"{"any": "schema"}"#);
+        let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+        event.schema_digest = Some(some_digest.to_vec());
+
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+
+        // Fail-closed: must reject
+        let result = backend
+            .append_with_metadata("kernel", &event, &metadata)
+            .await;
+
+        assert!(
+            matches!(result, Err(BftLedgerError::SchemaMismatch { .. })),
+            "Fail-closed: empty registry must reject events with schema_digest, got: {result:?}"
+        );
+    }
+
+    /// Backward compatibility: Event without `schema_digest` passes.
+    #[tokio::test]
+    async fn tck_00194_event_without_schema_digest_passes() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let registry = Arc::new(InMemorySchemaRegistry::new());
+
+        // Create backend with schema registry (but no schemas registered)
+        let backend = BftLedgerBackend::with_schema_registry(
+            storage,
+            Duration::from_millis(DEFAULT_FINALIZATION_TIMEOUT_MS),
+            registry,
+        );
+
+        // Create event WITHOUT schema_digest
+        let event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+        assert!(event.schema_digest.is_none());
+
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+
+        // Should pass (backward compatible)
+        let result = backend
+            .append_with_metadata("kernel", &event, &metadata)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Event without schema_digest should pass (backward compatible): {result:?}"
+        );
+    }
+
+    /// Backward compatibility: Event with empty `schema_digest` passes.
+    #[tokio::test]
+    async fn tck_00194_event_with_empty_schema_digest_passes() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let registry = Arc::new(InMemorySchemaRegistry::new());
+
+        let backend = BftLedgerBackend::with_schema_registry(
+            storage,
+            Duration::from_millis(DEFAULT_FINALIZATION_TIMEOUT_MS),
+            registry,
+        );
+
+        // Create event with empty schema_digest vec
+        let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+        event.schema_digest = Some(vec![]);
+
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+
+        // Should pass (empty digest treated as None)
+        let result = backend
+            .append_with_metadata("kernel", &event, &metadata)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Event with empty schema_digest should pass: {result:?}"
+        );
+    }
+
+    /// Backend without registry skips validation.
+    #[tokio::test]
+    async fn tck_00194_no_registry_skips_validation() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+
+        // Backend without schema registry
+        let backend = BftLedgerBackend::with_default_timeout(storage);
+
+        // Create event with some schema_digest
+        let some_digest = EventHasher::hash_content(br#"{"any": "schema"}"#);
+        let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+        event.schema_digest = Some(some_digest.to_vec());
+
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+
+        // Should pass (no registry configured)
+        let result = backend
+            .append_with_metadata("kernel", &event, &metadata)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Backend without registry should skip validation: {result:?}"
+        );
+    }
+
+    /// Invalid digest length is rejected.
+    #[tokio::test]
+    async fn tck_00194_invalid_digest_length_rejected() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let registry = Arc::new(InMemorySchemaRegistry::new());
+
+        let backend = BftLedgerBackend::with_schema_registry(
+            storage,
+            Duration::from_millis(DEFAULT_FINALIZATION_TIMEOUT_MS),
+            registry,
+        );
+
+        // Create event with invalid digest length (not 32 bytes)
+        let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+        event.schema_digest = Some(vec![1, 2, 3, 4, 5]); // Only 5 bytes
+
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+
+        // Should fail with SchemaMismatch (invalid length)
+        let result = backend
+            .append_with_metadata("kernel", &event, &metadata)
+            .await;
+
+        assert!(
+            matches!(result, Err(BftLedgerError::SchemaMismatch { .. })),
+            "Invalid digest length should be rejected: {result:?}"
+        );
+    }
+
+    /// Schema validation happens before consensus check.
+    #[tokio::test]
+    async fn tck_00194_schema_validation_before_consensus_check() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let registry = Arc::new(InMemorySchemaRegistry::new());
+
+        // Empty registry
+        let backend = BftLedgerBackend::with_schema_registry(
+            storage,
+            Duration::from_millis(DEFAULT_FINALIZATION_TIMEOUT_MS),
+            registry,
+        );
+
+        // Create TotalOrder event with unknown schema_digest
+        let unknown_digest = EventHasher::hash_content(br#"{"unknown": "schema"}"#);
+        let mut event = EventRecord::new(
+            "authority.event",
+            "session-1",
+            "actor-1",
+            b"payload".to_vec(),
+        );
+        event.schema_digest = Some(unknown_digest.to_vec());
+
+        let metadata = EventMetadata::total_order("kernel", "actor-1");
+
+        // Should fail with SchemaMismatch (not ConsensusRequiredButDisabled)
+        // because schema validation happens FIRST
+        let result = backend
+            .append_with_metadata("kernel", &event, &metadata)
+            .await;
+
+        assert!(
+            matches!(result, Err(BftLedgerError::SchemaMismatch { .. })),
+            "Schema validation should happen before consensus check, got: {result:?}"
+        );
+    }
+
+    /// Multiple schemas can be registered and validated.
+    #[tokio::test]
+    async fn tck_00194_multiple_schemas() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let registry = Arc::new(InMemorySchemaRegistry::new());
+
+        // Register multiple schemas
+        let schema1 = make_schema_entry("test:schema1.v1", br#"{"type": "object"}"#);
+        let schema2 = make_schema_entry("test:schema2.v1", br#"{"type": "array"}"#);
+        registry.register(&schema1).await.unwrap();
+        registry.register(&schema2).await.unwrap();
+
+        let backend = BftLedgerBackend::with_schema_registry(
+            storage,
+            Duration::from_millis(DEFAULT_FINALIZATION_TIMEOUT_MS),
+            registry,
+        );
+
+        // Event with schema1 digest should pass
+        let mut event1 =
+            EventRecord::new("test.event1", "session-1", "actor-1", b"payload1".to_vec());
+        event1.schema_digest = Some(schema1.digest.as_bytes().to_vec());
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+        let result1 = backend
+            .append_with_metadata("kernel", &event1, &metadata)
+            .await;
+        assert!(result1.is_ok(), "Event with schema1 should pass");
+
+        // Event with schema2 digest should pass
+        let mut event2 =
+            EventRecord::new("test.event2", "session-1", "actor-1", b"payload2".to_vec());
+        event2.schema_digest = Some(schema2.digest.as_bytes().to_vec());
+        let result2 = backend
+            .append_with_metadata("kernel", &event2, &metadata)
+            .await;
+        assert!(result2.is_ok(), "Event with schema2 should pass");
+    }
+
+    /// `NoOpSchemaRegistry` always accepts (for backward compatibility).
+    #[tokio::test]
+    async fn tck_00194_noop_registry_always_accepts() {
+        let noop = NoOpSchemaRegistry;
+
+        // Lookup should return None
+        let digest = SchemaDigest::new([42u8; 32]);
+        let result = noop.lookup_by_digest(&digest).await.unwrap();
+        assert!(result.is_none());
+
+        // Register should succeed (no-op)
+        let entry = make_schema_entry("test:schema.v1", br#"{"test": true}"#);
+        noop.register(&entry).await.unwrap();
+
+        // Handshake should return empty result
+        let handshake = noop.handshake(&[digest]).await.unwrap();
+        assert!(handshake.compatible.is_empty());
+        assert!(handshake.missing_local.is_empty());
+        assert!(handshake.missing_remote.is_empty());
     }
 }

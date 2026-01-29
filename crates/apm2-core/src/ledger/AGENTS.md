@@ -337,12 +337,77 @@ let handle = thread::spawn(move || {
 ledger.append(&event)?;
 ```
 
+## BFT Ledger Backend
+
+The `BftLedgerBackend` wraps the SQLite storage with BFT consensus integration for distributed deployments.
+
+### `BftLedgerBackend<R: SchemaRegistry>`
+
+```rust
+pub struct BftLedgerBackend<R: SchemaRegistry = NoOpSchemaRegistry> {
+    storage: Arc<SqliteLedgerBackend>,
+    schema_registry: Option<Arc<R>>,
+    // ... consensus-related fields
+}
+```
+
+**Constructors:**
+- `BftLedgerBackend::new(storage, timeout)` - Without schema validation
+- `BftLedgerBackend::with_schema_registry(storage, timeout, registry)` - With schema validation (TCK-00194)
+
+### Schema Validation (TCK-00194)
+
+Events can include a `schema_digest` field referencing a registered schema in the schema registry. The `BftLedgerBackend` validates this digest on append with a **fail-closed** security posture:
+
+**Validation Rules:**
+- If `schema_digest` is `None`: validation passes (backward compatible)
+- If `schema_registry` is `None`: validation passes (no registry configured)
+- If `schema_digest` is `Some` and registered: validation passes
+- If `schema_digest` is `Some` but NOT registered: **REJECT** with `SchemaMismatch`
+
+**Invariants:**
+- [INV-LED-008] Schema validation happens BEFORE any storage operation (prevent corrupted events)
+- [INV-LED-009] Fail-closed: unknown schemas are rejected, not accepted
+
+**Error:**
+```rust
+BftLedgerError::SchemaMismatch { digest: String }
+```
+
+**Example:**
+```rust
+use apm2_core::ledger::{BftLedgerBackend, SqliteLedgerBackend};
+use apm2_core::schema_registry::InMemorySchemaRegistry;
+use std::sync::Arc;
+use std::time::Duration;
+
+let storage = SqliteLedgerBackend::in_memory().unwrap();
+let registry = Arc::new(InMemorySchemaRegistry::new());
+
+// Register schemas first
+registry.register(&my_schema_entry).await.unwrap();
+
+// Create backend with schema validation
+let backend = BftLedgerBackend::with_schema_registry(
+    storage,
+    Duration::from_secs(30),
+    registry,
+);
+
+// Events with unknown schema_digest will be rejected
+```
+
+**References:**
+- RFC-0014 DD-0004: "Unknown schemas trigger rejection (fail-closed)"
+- RFC-0014 TCK-00194: "Integrate Schema Validation into Append Path"
+
 ## Related Modules
 
 - [`apm2_core::reducer`](../reducer/AGENTS.md) - Consumes ledger events to build projections
 - [`apm2_core::evidence`](../evidence/AGENTS.md) - Uses ledger for evidence publication
 - [`apm2_core::session`](../session/AGENTS.md) - Session state derived from ledger events
 - [`apm2_core::lease`](../lease/AGENTS.md) - Lease state derived from ledger events
+- [`apm2_core::schema_registry`](../schema_registry/AGENTS.md) - Schema registration and lookup
 
 ## References
 
