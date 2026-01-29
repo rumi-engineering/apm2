@@ -69,6 +69,7 @@ pub mod anti_entropy;
 pub mod bft;
 pub mod bft_machine;
 pub mod discovery;
+pub mod equivocation;
 pub mod genesis;
 pub mod handlers;
 pub mod merkle;
@@ -102,6 +103,12 @@ pub use bft_machine::{
 };
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
+};
+// Byzantine equivocation detection (TCK-00196)
+pub use equivocation::{
+    ConflictingProposal, DOMAIN_PREFIX_EQUIVOCATION, EquivocationCheckResult, EquivocationDetector,
+    EquivocationError, EquivocationEvidence, EquivocationType, MAX_CACHED_PROPOSALS,
+    MAX_PROPOSAL_AGE_SECS,
 };
 pub use genesis::{
     Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,
