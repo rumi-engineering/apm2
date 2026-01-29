@@ -68,6 +68,7 @@
 pub mod anti_entropy;
 pub mod bft;
 pub mod bft_machine;
+pub mod crdt;
 pub mod discovery;
 pub mod equivocation;
 pub mod genesis;
@@ -100,6 +101,13 @@ pub use bft::{
 pub use bft_machine::{
     BftAction, BftEvent, BftMachine, MAX_BUFFERED_MESSAGES, MAX_PENDING_ACTIONS, MSG_BFT_NEW_VIEW,
     MSG_BFT_PROPOSAL, MSG_BFT_QC, MSG_BFT_VOTE,
+};
+// HLC-based CRDT merge operators (TCK-00197)
+pub use crdt::{
+    ConflictRecord, CrdtMergeError, GCounter, Hlc, HlcWithNodeId, LwwRegister,
+    MAX_CONFLICTS_PER_BATCH, MAX_KEY_LEN, MAX_NODE_ID_LEN, MAX_SET_ELEMENTS, MergeEngine,
+    MergeOperator, MergeResult, MergeWinner, NodeId, SetUnion, hash_value, validate_key,
+    validate_node_id,
 };
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
