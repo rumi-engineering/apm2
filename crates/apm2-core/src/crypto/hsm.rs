@@ -1,8 +1,27 @@
-//! Hardware Security Module (HSM) integration for T1 validator keys.
+//! Hardware Security Module (HSM) interface abstraction for T1 validator keys.
 //!
 //! This module provides a trait abstraction for HSM key storage and operations.
 //! Keys managed by an HSM never leave the secure hardware boundary; all signing
 //! operations are performed via the HSM API.
+//!
+//! # Architecture Overview
+//!
+//! This module defines the **HSM interface abstraction layer**, not a complete
+//! HSM implementation. It provides:
+//!
+//! - A uniform [`HsmProvider`] trait for key operations (generate, sign,
+//!   rotate)
+//! - A software fallback ([`SoftwareHsmProvider`]) for development and testing
+//! - A `YubiHsmProvider` that can operate in mock mode (default) or connect to
+//!   real hardware when the `yubihsm` feature is enabled
+//!
+//! **Important**: The current implementation is an interface abstraction with a
+//! software/mock fallback. Full hardware HSM integration (e.g., connecting to a
+//! real `YubiHSM` device) requires:
+//!
+//! 1. The `yubihsm` crate as a dependency
+//! 2. A running yubihsm-connector daemon
+//! 3. Physical `YubiHSM` hardware or a hardware emulator
 //!
 //! # Trust Hierarchy
 //!
@@ -18,17 +37,23 @@
 //!
 //! The following providers are available:
 //!
-//! - [`SoftwareHsmProvider`]: In-memory fallback for development and testing
-//! - `YubiHsmProvider`: Implementation for `YubiHSM` devices (requires
-//!   `yubihsm` feature flag). When the feature is disabled, a mock
-//!   implementation is provided for testing and development purposes.
+//! - [`SoftwareHsmProvider`]: In-memory fallback for development and testing.
+//!   **Not for production use** - keys are stored in process memory.
+//! - `YubiHsmProvider`: Implementation for `YubiHSM` devices. Without the
+//!   `yubihsm` feature flag, operates in mock mode for testing the HSM
+//!   integration logic without actual hardware.
 //!
 //! # Security Properties
 //!
+//! When using real HSM hardware:
 //! - **Key Isolation**: Private keys never leave HSM boundary
 //! - **Bounded Timeouts**: All HSM operations have configurable timeouts
 //! - **Connection Resilience**: Automatic reconnection with backoff
 //! - **Secure Deletion**: Key material zeroized on deletion
+//!
+//! **Warning**: The software provider and mock mode do NOT provide hardware
+//! security guarantees. They store keys in process memory and are vulnerable
+//! to memory-based attacks.
 //!
 //! # Example
 //!
@@ -62,6 +87,7 @@ use std::pin::Pin;
 use std::sync::RwLock;
 use std::time::Duration;
 
+use secrecy::SecretString;
 use thiserror::Error;
 
 use super::sign::{PUBLIC_KEY_SIZE, SIGNATURE_SIZE, Signature, Signer};
@@ -212,7 +238,10 @@ pub struct HsmConfig {
     pub yubihsm_auth_key_id: Option<u16>,
 
     /// `YubiHSM`-specific: Authentication key password.
-    pub yubihsm_auth_key_password: Option<String>,
+    ///
+    /// Stored as `SecretString` to prevent accidental exposure in logs or debug
+    /// output.
+    pub yubihsm_auth_key_password: Option<SecretString>,
 
     /// `YubiHSM`-specific: Domain to use for key operations (default: 1).
     pub yubihsm_domain: Option<u16>,
@@ -247,10 +276,15 @@ impl HsmConfig {
     ///
     /// * `connector_url` - URL of the `YubiHSM` connector (e.g., `http://127.0.0.1:12345`)
     /// * `auth_key_id` - Authentication key ID
-    /// * `auth_key_password` - Authentication key password
+    /// * `auth_key_password` - Authentication key password (wrapped in
+    ///   `SecretString`)
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // Cannot be const: takes String parameters
-    pub fn yubihsm(connector_url: String, auth_key_id: u16, auth_key_password: String) -> Self {
+    pub fn yubihsm(
+        connector_url: String,
+        auth_key_id: u16,
+        auth_key_password: SecretString,
+    ) -> Self {
         Self {
             provider_type: HsmProviderType::YubiHsm,
             timeout_ms: DEFAULT_HSM_TIMEOUT_MS,
@@ -533,28 +567,6 @@ impl SoftwareHsmProvider {
     pub fn default_provider() -> Self {
         Self::new(HsmConfig::software())
     }
-
-    /// Returns the next version number for a key rotation.
-    fn next_version(&self, key_id: &str) -> u32 {
-        // Extract base key ID and find highest version
-        let base_id = key_id.split("-v").next().unwrap_or(key_id);
-        let keys = self.keys.read().unwrap();
-
-        let max_version = keys
-            .iter()
-            .filter_map(|(id, entry)| {
-                let id_base = id.split("-v").next().unwrap_or(id);
-                if id_base == base_id {
-                    Some(entry.version)
-                } else {
-                    None
-                }
-            })
-            .max()
-            .unwrap_or(0);
-
-        max_version + 1
-    }
 }
 
 impl HsmProvider for SoftwareHsmProvider {
@@ -614,26 +626,39 @@ impl HsmProvider for SoftwareHsmProvider {
         Box::pin(async move {
             validate_key_id(key_id)?;
 
+            // Acquire write lock for the entire operation to prevent TOCTOU race
+            // conditions: version derivation and insertion must be atomic.
+            let mut keys = self.keys.write().unwrap();
+
             // Check that old key exists
-            {
-                let keys = self.keys.read().unwrap();
-                if !keys.contains_key(key_id) {
-                    return Err(HsmError::KeyNotFound {
-                        key_id: key_id.to_string(),
-                    });
-                }
+            if !keys.contains_key(key_id) {
+                return Err(HsmError::KeyNotFound {
+                    key_id: key_id.to_string(),
+                });
             }
 
-            // Generate new key ID with version
-            let version = self.next_version(key_id);
+            // Derive next version under the write lock
             let base_id = key_id.split("-v").next().unwrap_or(key_id);
+            let max_version = keys
+                .iter()
+                .filter_map(|(id, entry)| {
+                    let id_base = id.split("-v").next().unwrap_or(id);
+                    if id_base == base_id {
+                        Some(entry.version)
+                    } else {
+                        None
+                    }
+                })
+                .max()
+                .unwrap_or(0);
+            let version = max_version + 1;
+
             let new_key_id = format!("{base_id}-v{version}");
 
             // Validate new key ID
             validate_key_id(&new_key_id)?;
 
             // Generate and store new key
-            let mut keys = self.keys.write().unwrap();
             let signer = Signer::generate();
             keys.insert(new_key_id.clone(), SoftwareKeyEntry { signer, version });
 
@@ -743,6 +768,7 @@ pub struct HsmKeyInfo {
 #[cfg(test)]
 mod unit_tests {
     use ed25519_dalek::Verifier as _;
+    use secrecy::ExposeSecret;
 
     use super::*;
 
@@ -820,7 +846,7 @@ mod unit_tests {
         let config = HsmConfig::yubihsm(
             "http://127.0.0.1:12345".to_string(),
             1,
-            "password".to_string(),
+            SecretString::from("password"),
         );
         assert_eq!(config.provider_type, HsmProviderType::YubiHsm);
         assert_eq!(
@@ -828,6 +854,14 @@ mod unit_tests {
             Some("http://127.0.0.1:12345".to_string())
         );
         assert_eq!(config.yubihsm_auth_key_id, Some(1));
+        // Password should be accessible via expose_secret()
+        assert_eq!(
+            config
+                .yubihsm_auth_key_password
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some("password")
+        );
     }
 
     #[test]
@@ -1009,7 +1043,7 @@ mod unit_tests {
         let config = HsmConfig::yubihsm(
             "http://127.0.0.1:12345".to_string(),
             1,
-            "password".to_string(),
+            SecretString::from("password"),
         );
 
         let result = create_hsm_provider(config);

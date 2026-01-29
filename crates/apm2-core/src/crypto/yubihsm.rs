@@ -3,23 +3,38 @@
 //! This module provides an HSM provider implementation for `YubiHSM` devices.
 //! The actual `YubiHSM` SDK integration requires the `yubihsm` feature flag.
 //!
+//! # Implementation Status
+//!
+//! This module provides the **interface and mock implementation** for `YubiHSM`
+//! integration. The full hardware integration is a work in progress and
+//! requires:
+//!
+//! 1. Adding the `yubihsm` crate as a dependency (not currently included)
+//! 2. A running yubihsm-connector daemon
+//! 3. Physical `YubiHSM` hardware or a hardware emulator
+//!
+//! The current implementation allows:
+//! - Testing the HSM integration logic without hardware
+//! - Validating the API design and error handling
+//! - Development and CI testing with mock keys
+//!
 //! # Feature Flag and Mock Implementation
 //!
 //! This provider has two modes of operation:
 //!
-//! - **With `yubihsm` feature enabled**: Connects to real `YubiHSM` hardware
-//!   via the yubihsm-connector daemon. Private keys never leave the HSM
-//!   boundary.
+//! - **With `yubihsm` feature enabled**: Would connect to real `YubiHSM`
+//!   hardware via the yubihsm-connector daemon. Private keys never leave the
+//!   HSM boundary. **(SDK integration pending)**
 //!
 //! - **Without `yubihsm` feature (default)**: A mock implementation is provided
 //!   for development and testing. Keys are stored in memory and do NOT provide
 //!   hardware security guarantees. This mode allows testing HSM integration
 //!   logic without requiring actual hardware.
 //!
-//! The trait abstraction (`HsmProvider`) allows easy swapping between mock and
-//! real implementations at compile time via the feature flag.
+//! The trait abstraction ([`super::hsm::HsmProvider`]) allows easy swapping
+//! between mock and real implementations at compile time via the feature flag.
 //!
-//! To enable real `YubiHSM` support:
+//! To enable real `YubiHSM` support (once SDK integration is complete):
 //!
 //! ```toml
 //! [dependencies]
@@ -51,12 +66,13 @@
 //! ```rust,ignore
 //! use apm2_core::crypto::hsm::{HsmConfig, HsmProvider};
 //! use apm2_core::crypto::yubihsm::YubiHsmProvider;
+//! use secrecy::SecretString;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = HsmConfig::yubihsm(
 //!     "http://127.0.0.1:12345".to_string(),
 //!     1,  // auth key ID
-//!     "password".to_string(),
+//!     SecretString::from("password"),
 //! );
 //!
 //! let hsm = YubiHsmProvider::new(config)?;
@@ -296,27 +312,6 @@ impl YubiHsmProvider {
         }
         Ok(())
     }
-
-    /// Returns the next version number for a key rotation.
-    fn next_version(&self, key_id: &str) -> u32 {
-        let base_id = key_id.split("-v").next().unwrap_or(key_id);
-        let versions = self.key_versions.read().unwrap();
-
-        let max_version = versions
-            .iter()
-            .filter_map(|(id, version)| {
-                let id_base = id.split("-v").next().unwrap_or(id);
-                if id_base == base_id {
-                    Some(*version)
-                } else {
-                    None
-                }
-            })
-            .max()
-            .unwrap_or(0);
-
-        max_version + 1
-    }
 }
 
 // Allow clippy lints in this impl because conditional compilation blocks
@@ -463,19 +458,30 @@ impl HsmProvider for YubiHsmProvider {
             self.ensure_connected()?;
             Self::validate_key_id(key_id)?;
 
+            // Acquire write locks upfront to prevent TOCTOU race conditions:
+            // version derivation and insertion must be atomic.
+            let mut mapping = self.key_mapping.write().unwrap();
+            let mut versions = self.key_versions.write().unwrap();
+
             // Check that old key exists
-            {
-                let mapping = self.key_mapping.read().unwrap();
-                if !mapping.contains(key_id) {
-                    return Err(HsmError::KeyNotFound {
-                        key_id: key_id.to_string(),
-                    });
-                }
+            if !mapping.contains(key_id) {
+                return Err(HsmError::KeyNotFound {
+                    key_id: key_id.to_string(),
+                });
             }
 
-            // Generate new key ID with version
-            let version = self.next_version(key_id);
+            // Derive next version under the write lock
             let base_id = key_id.split("-v").next().unwrap_or(key_id);
+            let max_version = versions
+                .iter()
+                .filter_map(|(id, ver)| {
+                    let id_base = id.split("-v").next().unwrap_or(id);
+                    if id_base == base_id { Some(*ver) } else { None }
+                })
+                .max()
+                .unwrap_or(0);
+            let version = max_version + 1;
+
             let new_key_id = format!("{base_id}-v{version}");
 
             Self::validate_key_id(&new_key_id)?;
@@ -490,7 +496,6 @@ impl HsmProvider for YubiHsmProvider {
 
             #[cfg(not(feature = "yubihsm"))]
             {
-                let mut mapping = self.key_mapping.write().unwrap();
                 let _object_id = mapping.insert(new_key_id.clone())?;
 
                 let signer = super::sign::Signer::generate();
@@ -505,7 +510,6 @@ impl HsmProvider for YubiHsmProvider {
                     .unwrap()
                     .insert(new_key_id.clone(), signer);
 
-                let mut versions = self.key_versions.write().unwrap();
                 versions.insert(new_key_id.clone(), version);
 
                 Ok(new_key_id)
@@ -615,13 +619,15 @@ impl HsmProvider for YubiHsmProvider {
 
 #[cfg(test)]
 mod unit_tests {
+    use secrecy::SecretString;
+
     use super::*;
 
     fn test_config() -> HsmConfig {
         HsmConfig::yubihsm(
             "http://127.0.0.1:12345".to_string(),
             1,
-            "password".to_string(),
+            SecretString::from("password"),
         )
     }
 
