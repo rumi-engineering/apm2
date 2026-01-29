@@ -69,6 +69,7 @@ pub mod discovery;
 pub mod genesis;
 pub mod handlers;
 pub mod network;
+pub mod qc_aggregator;
 pub mod relay;
 pub mod tunnel;
 
@@ -101,6 +102,12 @@ pub use handlers::{
 pub use network::{
     CONTROL_FRAME_SIZE, Connection, ConnectionPool, ControlFrame, Network, NetworkConfig,
     NetworkError, PooledConnection, TlsConfig, TlsConfigBuilder, apply_dispatch_jitter,
+};
+// QC aggregation and verification (TCK-00190)
+pub use qc_aggregator::{
+    MAX_TRACKED_ROUNDS, MAX_VOTES_PER_ROUND, QcAggregator, QcVerificationContext,
+    QcVerificationResult, build_vote_message, compute_quorum_threshold, is_quorum, verify_qc,
+    verify_qc_with_message,
 };
 // Note: process_tunnel_frame is deprecated, use the internal identity-bound
 // version instead
