@@ -989,6 +989,14 @@ impl HotStuffState {
         self.committed.len()
     }
 
+    /// Returns the hash of the last committed block, if any.
+    ///
+    /// This is the block at the head of the most recent 3-chain.
+    #[must_use]
+    pub fn last_committed_hash(&self) -> Option<BlockHash> {
+        self.committed.last().copied()
+    }
+
     /// Processes an incoming proposal.
     ///
     /// If the proposal is valid and we haven't voted yet, returns a vote

@@ -64,7 +64,7 @@
 //! ```
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -139,6 +139,13 @@ pub enum BftEvent {
 ///
 /// These actions tell the coordinator what network messages to send
 /// or what state changes occurred.
+///
+/// # Traffic Analysis Mitigations (INV-0017)
+///
+/// When sending BFT messages over the network, the coordinator MUST wrap
+/// all outbound messages using [`ControlFrame`](super::network::ControlFrame)
+/// to ensure fixed-size frame padding. This prevents traffic analysis attacks
+/// that could leak consensus state through message size patterns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BftAction {
     /// Broadcast a proposal to all validators.
@@ -207,12 +214,23 @@ struct BufferedMessage {
 ///
 /// `BftMachine` is not `Send` or `Sync` by default due to the signing key.
 /// Use appropriate synchronization if sharing across threads.
+///
+/// # Determinism (HOLONIC-BOUNDARY-001)
+///
+/// This machine is designed for deterministic operation. Time-dependent methods
+/// (`tick`, `handle_event`) accept a `now` parameter representing the current
+/// time, allowing the caller to inject time for deterministic replay and
+/// testing.
 pub struct BftMachine {
     /// The underlying `HotStuff` state machine.
     state: HotStuffState,
 
     /// Ed25519 signing key for this validator.
     signing_key: SigningKey,
+
+    /// Cached validator ID (BLAKE3 hash of public key).
+    /// Computed once during initialization to avoid repeated hashing.
+    validator_id: ValidatorId,
 
     /// Pending output actions.
     actions: VecDeque<BftAction>,
@@ -224,7 +242,8 @@ pub struct BftMachine {
     base_timeout: Duration,
 
     /// When the current round started (for timeout tracking).
-    round_start: Instant,
+    /// Stored as Duration since epoch for deterministic operation.
+    round_start: Duration,
 
     /// Buffered future messages.
     buffered_messages: VecDeque<BufferedMessage>,
@@ -243,16 +262,22 @@ impl BftMachine {
     ///
     /// * `config` - The `HotStuff` configuration including validator set
     /// * `signing_key` - This node's Ed25519 signing key for message signing
+    /// * `now` - Current time as duration since an arbitrary epoch (for
+    ///   determinism)
     #[must_use]
-    pub fn new(config: HotStuffConfig, signing_key: SigningKey) -> Self {
+    pub fn new(config: HotStuffConfig, signing_key: SigningKey, now: Duration) -> Self {
         let base_timeout = config.round_timeout;
+        // Pre-compute validator ID to avoid repeated hashing
+        let public_key = signing_key.verifying_key();
+        let validator_id: ValidatorId = blake3::hash(public_key.as_bytes()).into();
         Self {
             state: HotStuffState::new(config),
             signing_key,
+            validator_id,
             actions: VecDeque::with_capacity(MAX_PENDING_ACTIONS),
             current_timeout: base_timeout,
             base_timeout,
-            round_start: Instant::now(),
+            round_start: now,
             buffered_messages: VecDeque::with_capacity(MAX_BUFFERED_MESSAGES),
             consecutive_timeouts: 0,
             last_committed: None,
@@ -326,36 +351,45 @@ impl BftMachine {
     /// coordinator calls this method for each network message or internal
     /// trigger and processes the returned actions.
     ///
+    /// # Arguments
+    ///
+    /// * `event` - The event to process
+    /// * `now` - Current time as duration since epoch (for determinism)
+    ///
     /// # Errors
     ///
     /// Returns an error if the event processing fails due to invalid messages
     /// or protocol violations.
-    pub fn handle_event(&mut self, event: BftEvent) -> Result<Vec<BftAction>, BftError> {
+    pub fn handle_event(
+        &mut self,
+        event: BftEvent,
+        now: Duration,
+    ) -> Result<Vec<BftAction>, BftError> {
         self.actions.clear();
 
         match event {
             BftEvent::ProposalReceived(proposal) => {
-                self.handle_proposal(proposal)?;
+                self.handle_proposal(proposal, now)?;
             },
             BftEvent::VoteReceived(vote) => {
-                self.handle_vote(vote)?;
+                self.handle_vote(vote, now)?;
             },
             BftEvent::NewViewReceived(ref new_view) => {
-                self.handle_new_view(new_view)?;
+                self.handle_new_view(new_view, now)?;
             },
             BftEvent::QcReceived(ref qc) => {
-                self.handle_qc(qc);
+                self.handle_qc(qc, now);
             },
             BftEvent::Timeout => {
-                self.handle_timeout();
+                self.handle_timeout(now);
             },
             BftEvent::StartRound { payload_hash } => {
-                self.start_round(payload_hash)?;
+                self.start_round(payload_hash, now)?;
             },
         }
 
         // Process any buffered messages that can now be handled
-        self.process_buffered_messages();
+        self.process_buffered_messages(now);
 
         Ok(self.drain_actions())
     }
@@ -364,13 +398,18 @@ impl BftMachine {
     ///
     /// The coordinator should call this periodically (e.g., every 100ms)
     /// to check for round timeouts. Returns actions if a timeout occurred.
+    ///
+    /// # Arguments
+    ///
+    /// * `now` - Current time as duration since epoch (for determinism)
     #[must_use]
-    pub fn tick(&mut self) -> Vec<BftAction> {
+    pub fn tick(&mut self, now: Duration) -> Vec<BftAction> {
         self.actions.clear();
 
         // Check if current round has timed out
-        if self.round_start.elapsed() >= self.current_timeout {
-            self.handle_timeout();
+        let elapsed = now.saturating_sub(self.round_start);
+        if elapsed >= self.current_timeout {
+            self.handle_timeout(now);
         }
 
         self.drain_actions()
@@ -381,18 +420,23 @@ impl BftMachine {
     /// # Arguments
     ///
     /// * `payload_hash` - BLAKE3 hash of the payload to propose
+    /// * `now` - Current time as duration since epoch (for determinism)
     ///
     /// # Errors
     ///
     /// Returns an error if this node is not the leader or signing fails.
-    pub fn propose(&mut self, payload_hash: BlockHash) -> Result<Vec<BftAction>, BftError> {
+    pub fn propose(
+        &mut self,
+        payload_hash: BlockHash,
+        now: Duration,
+    ) -> Result<Vec<BftAction>, BftError> {
         self.actions.clear();
-        self.start_round(payload_hash)?;
+        self.start_round(payload_hash, now)?;
         Ok(self.drain_actions())
     }
 
     /// Handles a received proposal.
-    fn handle_proposal(&mut self, proposal: Proposal) -> Result<(), BftError> {
+    fn handle_proposal(&mut self, proposal: Proposal, now: Duration) -> Result<(), BftError> {
         // Check if this is a future message
         if proposal.round > self.state.round() + 1 {
             self.buffer_message(proposal.round, BftEvent::ProposalReceived(proposal));
@@ -410,7 +454,7 @@ impl BftMachine {
             self.push_action(BftAction::BroadcastVote(vote));
 
             // Reset timeout on successful vote
-            self.reset_timeout();
+            self.reset_timeout(now);
         }
 
         // Check for commits
@@ -420,7 +464,7 @@ impl BftMachine {
     }
 
     /// Handles a received vote.
-    fn handle_vote(&mut self, vote: Vote) -> Result<(), BftError> {
+    fn handle_vote(&mut self, vote: Vote, now: Duration) -> Result<(), BftError> {
         // Check if this is a future message
         if vote.round > self.state.round() {
             self.buffer_message(vote.round, BftEvent::VoteReceived(vote));
@@ -431,22 +475,28 @@ impl BftMachine {
         let qc = self.state.on_vote(&vote)?;
 
         if let Some(qc) = qc {
-            // QC formed - notify coordinator and advance round
+            // QC formed - notify coordinator
             self.push_action(BftAction::QcFormed(qc.clone()));
             self.push_action(BftAction::BroadcastQc(qc));
 
-            // Advance to next round
-            self.advance_round();
-        }
+            // CRITICAL: Check for commits BEFORE advancing round.
+            // The 3-chain commit rule requires checking committed state while
+            // still in the current phase. Advancing round first would reset
+            // the phase to Idle, causing commits to be lost.
+            self.check_commits();
 
-        // Check for commits
-        self.check_commits();
+            // Now advance to next round
+            self.advance_round(now);
+        } else {
+            // Even without QC formation, check for commits
+            self.check_commits();
+        }
 
         Ok(())
     }
 
     /// Handles a received new-view message.
-    fn handle_new_view(&mut self, new_view: &NewView) -> Result<(), BftError> {
+    fn handle_new_view(&mut self, new_view: &NewView, now: Duration) -> Result<(), BftError> {
         let old_round = self.state.round();
 
         // Process through state machine
@@ -454,26 +504,26 @@ impl BftMachine {
 
         // Check if we advanced to a new round
         if self.state.round() > old_round {
-            self.on_round_advanced();
+            self.on_round_advanced(now);
         }
 
         Ok(())
     }
 
     /// Handles a received quorum certificate.
-    fn handle_qc(&mut self, qc: &QuorumCertificate) {
+    fn handle_qc(&mut self, qc: &QuorumCertificate, now: Duration) {
+        // Check for commits BEFORE advancing (3-chain rule may be satisfied)
+        self.check_commits();
+
         // A QC for a round higher than current allows us to advance
         if qc.round >= self.state.round() {
             // The QC proves we can advance
-            self.advance_round();
+            self.advance_round(now);
         }
-
-        // Check for commits (3-chain rule may be satisfied)
-        self.check_commits();
     }
 
     /// Handles a timeout event.
-    fn handle_timeout(&mut self) {
+    fn handle_timeout(&mut self, now: Duration) {
         // Get new-view message from state machine
         let mut new_view = self.state.on_timeout();
 
@@ -488,14 +538,14 @@ impl BftMachine {
 
         // Apply exponential backoff to timeout
         self.consecutive_timeouts += 1;
-        self.apply_timeout_backoff();
+        self.apply_timeout_backoff(now);
 
         // Schedule next timeout
         self.push_action(BftAction::ScheduleTimeout(self.current_timeout));
     }
 
     /// Starts a new round as leader.
-    fn start_round(&mut self, payload_hash: BlockHash) -> Result<(), BftError> {
+    fn start_round(&mut self, payload_hash: BlockHash, now: Duration) -> Result<(), BftError> {
         // Verify we are the leader
         if !self.is_leader() {
             return Err(BftError::NotLeader {
@@ -513,11 +563,11 @@ impl BftMachine {
             &self.state.high_qc().block_hash,
         );
 
-        // Create proposal
+        // Create proposal (use cached validator_id for performance)
         let mut proposal = Proposal {
             epoch: self.state.epoch(),
             round: self.state.round(),
-            proposer_id: self.validator_id(),
+            proposer_id: self.validator_id,
             block_hash,
             parent_qc: self.state.high_qc().clone(),
             payload_hash,
@@ -533,25 +583,25 @@ impl BftMachine {
         self.push_action(BftAction::BroadcastProposal(proposal));
 
         // Reset timeout for this round
-        self.reset_timeout();
+        self.reset_timeout(now);
 
         Ok(())
     }
 
     /// Advances to the next round.
-    fn advance_round(&mut self) {
+    fn advance_round(&mut self, now: Duration) {
         let old_round = self.state.round();
         self.state.advance_round();
 
         if self.state.round() > old_round {
-            self.on_round_advanced();
+            self.on_round_advanced(now);
         }
     }
 
     /// Called when the round has advanced.
-    fn on_round_advanced(&mut self) {
+    fn on_round_advanced(&mut self, now: Duration) {
         // Reset timeout tracking
-        self.reset_timeout();
+        self.reset_timeout(now);
 
         // Notify coordinator
         self.push_action(BftAction::RoundAdvanced {
@@ -564,27 +614,24 @@ impl BftMachine {
     }
 
     /// Checks for newly committed blocks.
+    ///
+    /// Detects new commits from the underlying state machine and emits
+    /// `BftAction::Commit` for the coordinator to apply to the ledger.
+    ///
+    /// # 3-Chain Commit Rule
+    ///
+    /// A block is only committed when it becomes the head of a proper 3-chain
+    /// (three consecutive certified rounds). This is verified by the underlying
+    /// `HotStuffState::try_commit()` method. We extract the committed block
+    /// hash from `last_committed_hash()`, NOT from `locked_qc` (which is
+    /// set at 2-chain).
     fn check_commits(&mut self) {
-        // The state machine tracks commits internally
-        // We detect new commits by checking committed_count
-        let committed_count = self.state.committed_count();
-
-        // For simplicity, we check if there's a new commit by comparing
-        // with the last committed block (in a real implementation, we'd
-        // track all committed blocks)
-        if committed_count > 0 {
-            // The commit action would include the block hash
-            // In a full implementation, we'd extract this from state
-            if self.state.phase() == Phase::Committed {
-                // A new commit occurred - notify coordinator
-                // Note: The actual block hash would come from state tracking
-                if let Some(locked_qc) = self.state.locked_qc() {
-                    let block_hash = locked_qc.block_hash;
-                    if self.last_committed != Some(block_hash) {
-                        self.last_committed = Some(block_hash);
-                        self.push_action(BftAction::Commit(block_hash));
-                    }
-                }
+        // Get the last committed block hash from state (proper 3-chain commit)
+        if let Some(committed_hash) = self.state.last_committed_hash() {
+            // Only emit Commit action if this is a new commit
+            if self.last_committed != Some(committed_hash) {
+                self.last_committed = Some(committed_hash);
+                self.push_action(BftAction::Commit(committed_hash));
             }
         }
     }
@@ -602,7 +649,7 @@ impl BftMachine {
     }
 
     /// Processes buffered messages that can now be handled.
-    fn process_buffered_messages(&mut self) {
+    fn process_buffered_messages(&mut self, now: Duration) {
         let current_round = self.state.round();
 
         // Extract messages for current round
@@ -629,13 +676,22 @@ impl BftMachine {
                     if let Ok(Some(mut vote)) = self.state.on_proposal(&p) {
                         vote.sign(&self.signing_key);
                         self.push_action(BftAction::BroadcastVote(vote));
+                        // Reset timeout on successful vote
+                        self.reset_timeout(now);
                     }
+                    // Check for commits after processing proposal
+                    self.check_commits();
                 },
                 BftEvent::VoteReceived(v) => {
                     if let Ok(Some(qc)) = self.state.on_vote(&v) {
                         self.push_action(BftAction::QcFormed(qc.clone()));
                         self.push_action(BftAction::BroadcastQc(qc));
-                        self.advance_round();
+                        // CRITICAL: Check commits BEFORE advancing round
+                        self.check_commits();
+                        self.advance_round(now);
+                    } else {
+                        // Check commits even without QC formation
+                        self.check_commits();
                     }
                 },
                 _ => {},
@@ -644,10 +700,11 @@ impl BftMachine {
     }
 
     /// Resets the timeout to base duration.
-    fn reset_timeout(&mut self) {
+    #[allow(clippy::missing_const_for_fn)] // Modifies self
+    fn reset_timeout(&mut self, now: Duration) {
         self.consecutive_timeouts = 0;
         self.current_timeout = self.base_timeout;
-        self.round_start = Instant::now();
+        self.round_start = now;
     }
 
     /// Applies exponential backoff to the timeout.
@@ -657,7 +714,7 @@ impl BftMachine {
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )]
-    fn apply_timeout_backoff(&mut self) {
+    fn apply_timeout_backoff(&mut self, now: Duration) {
         // Calculate new timeout with exponential backoff
         // consecutive_timeouts is capped at 10 which fits in i32 without wrapping
         // The multiplier is always positive (1.5^n) so sign loss is safe
@@ -670,7 +727,7 @@ impl BftMachine {
         let max_timeout = super::bft::MAX_ROUND_TIMEOUT;
         self.current_timeout = Duration::from_millis(new_timeout_ms).min(max_timeout);
 
-        self.round_start = Instant::now();
+        self.round_start = now;
     }
 
     /// Pushes an action to the output queue.
@@ -684,13 +741,6 @@ impl BftMachine {
     /// Drains and returns all pending actions.
     fn drain_actions(&mut self) -> Vec<BftAction> {
         self.actions.drain(..).collect()
-    }
-
-    /// Returns this node's validator ID.
-    fn validator_id(&self) -> ValidatorId {
-        // Compute validator ID from signing key's public key
-        let public_key = self.signing_key.verifying_key();
-        blake3::hash(public_key.as_bytes()).into()
     }
 
     /// Computes a block hash from its components.
@@ -719,7 +769,10 @@ mod tests {
     use rand::rngs::OsRng;
 
     use super::*;
-    use crate::consensus::bft::{HotStuffConfig, ValidatorInfo};
+    use crate::consensus::bft::{HotStuffConfig, ValidatorInfo, ValidatorSignature};
+
+    /// Test time starting point.
+    const TEST_NOW: Duration = Duration::from_secs(1000);
 
     /// Creates a test validator info from a signing key.
     fn validator_info_from_key(signing_key: &SigningKey, index: usize) -> ValidatorInfo {
@@ -772,7 +825,7 @@ mod tests {
         let keys = generate_test_keys(4);
         let (config, signing_key) = test_config(&keys, 0);
 
-        let machine = BftMachine::new(config, signing_key);
+        let machine = BftMachine::new(config, signing_key, TEST_NOW);
 
         assert_eq!(machine.epoch(), 0);
         assert_eq!(machine.round(), 1);
@@ -786,7 +839,7 @@ mod tests {
 
         // Validator 1 should be leader for round 1
         let (config, signing_key) = test_config(&keys, 1);
-        let machine = BftMachine::new(config, signing_key);
+        let machine = BftMachine::new(config, signing_key, TEST_NOW);
         assert!(
             machine.is_leader(),
             "Validator 1 should be leader for round 1"
@@ -794,7 +847,7 @@ mod tests {
 
         // Validator 0 should not be leader for round 1
         let (config, signing_key) = test_config(&keys, 0);
-        let machine = BftMachine::new(config, signing_key);
+        let machine = BftMachine::new(config, signing_key, TEST_NOW);
         assert!(
             !machine.is_leader(),
             "Validator 0 should not be leader for round 1"
@@ -806,10 +859,10 @@ mod tests {
         let keys = generate_test_keys(4);
         let (config, signing_key) = test_config(&keys, 1); // Leader for round 1
 
-        let mut machine = BftMachine::new(config, signing_key);
+        let mut machine = BftMachine::new(config, signing_key, TEST_NOW);
         let payload_hash = [0xab; 32];
 
-        let actions = machine.propose(payload_hash).unwrap();
+        let actions = machine.propose(payload_hash, TEST_NOW).unwrap();
 
         // Should produce a broadcast proposal action
         assert!(!actions.is_empty());
@@ -824,10 +877,10 @@ mod tests {
         let keys = generate_test_keys(4);
         let (config, signing_key) = test_config(&keys, 0); // Not leader for round 1
 
-        let mut machine = BftMachine::new(config, signing_key);
+        let mut machine = BftMachine::new(config, signing_key, TEST_NOW);
         let payload_hash = [0xab; 32];
 
-        let result = machine.propose(payload_hash);
+        let result = machine.propose(payload_hash, TEST_NOW);
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BftError::NotLeader { .. }));
@@ -838,9 +891,9 @@ mod tests {
         let keys = generate_test_keys(4);
         let (config, signing_key) = test_config(&keys, 0);
 
-        let mut machine = BftMachine::new(config, signing_key);
+        let mut machine = BftMachine::new(config, signing_key, TEST_NOW);
 
-        let actions = machine.handle_event(BftEvent::Timeout).unwrap();
+        let actions = machine.handle_event(BftEvent::Timeout, TEST_NOW).unwrap();
 
         // Should produce view change and new-view broadcast
         let has_view_change = actions
@@ -859,12 +912,14 @@ mod tests {
         let keys = generate_test_keys(4);
         let (config, signing_key) = test_config(&keys, 0);
 
-        let mut machine = BftMachine::new(config, signing_key);
+        let mut machine = BftMachine::new(config, signing_key, TEST_NOW);
         let initial_timeout = machine.current_timeout();
 
         // Trigger multiple timeouts
+        let mut now = TEST_NOW;
         for _ in 0..3 {
-            let _ = machine.handle_event(BftEvent::Timeout);
+            now += Duration::from_secs(10);
+            let _ = machine.handle_event(BftEvent::Timeout, now);
         }
 
         // Timeout should have increased due to exponential backoff
@@ -991,7 +1046,7 @@ mod tests {
         let keys = generate_test_keys(4);
         let (config, signing_key) = test_config(&keys, 0);
 
-        let mut machine = BftMachine::new(config, signing_key);
+        let mut machine = BftMachine::new(config, signing_key, TEST_NOW);
 
         // Create a vote for a future round
         let future_vote = Vote {
@@ -1004,7 +1059,7 @@ mod tests {
 
         // Handle the future vote
         let actions = machine
-            .handle_event(BftEvent::VoteReceived(future_vote))
+            .handle_event(BftEvent::VoteReceived(future_vote), TEST_NOW)
             .unwrap();
 
         // Should not produce any actions yet (buffered)
@@ -1024,7 +1079,7 @@ mod tests {
         let keys = generate_test_keys(4);
         let (config, signing_key) = test_config(&keys, 0);
 
-        let machine = BftMachine::new(config, signing_key);
+        let machine = BftMachine::new(config, signing_key, TEST_NOW);
 
         // Initial phase should be Idle
         assert_eq!(machine.phase(), Phase::Idle);
@@ -1037,5 +1092,219 @@ mod tests {
             Phase::Committed,
             Phase::ViewChange,
         ];
+    }
+
+    #[test]
+    fn tck_00187_deterministic_time() {
+        // Test that time is deterministic by passing explicit time values
+        let keys = generate_test_keys(4);
+        let (config, signing_key) = test_config(&keys, 0);
+
+        let now = Duration::from_secs(100);
+        let machine = BftMachine::new(config, signing_key, now);
+
+        // Machine should use the provided time
+        assert_eq!(machine.current_timeout(), Duration::from_secs(5)); // Default timeout
+    }
+
+    #[test]
+    fn tck_00187_tick_timeout_detection() {
+        let keys = generate_test_keys(4);
+        let (config, signing_key) = test_config(&keys, 0);
+
+        let start = Duration::from_secs(100);
+        let mut machine = BftMachine::new(config, signing_key, start);
+
+        // Tick before timeout - should not trigger
+        let actions = machine.tick(start + Duration::from_secs(1));
+        assert!(actions.is_empty(), "Should not timeout yet");
+
+        // Tick after timeout (default is 5 seconds)
+        let actions = machine.tick(start + Duration::from_secs(10));
+        let has_view_change = actions
+            .iter()
+            .any(|a| matches!(a, BftAction::ViewChangeStarted { .. }));
+        assert!(has_view_change, "Should trigger timeout");
+    }
+
+    /// Test that verifies 3-chain commit rule produces Commit action.
+    ///
+    /// This test simulates a full 3-chain scenario:
+    /// - Round 1: Block B1 proposed and certified (QC1)
+    /// - Round 2: Block B2 extends B1, certified (QC2) -> B1 becomes locked
+    /// - Round 3: Block B3 extends B2, certified (QC3) -> B1 should be
+    ///   committed
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn tck_00187_three_chain_commit() {
+        let keys = generate_test_keys(4);
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| validator_info_from_key(sk, i))
+            .collect();
+
+        // Create machine for validator 0
+        let (config, signing_key) = test_config(&keys, 0);
+        let mut machine = BftMachine::new(config, signing_key, TEST_NOW);
+
+        // Helper to create a signed vote
+        let create_signed_vote =
+            |key: &SigningKey, epoch: u64, round: u64, block_hash: BlockHash| {
+                let public_key = key.verifying_key();
+                let voter_id: ValidatorId = blake3::hash(public_key.as_bytes()).into();
+                let mut vote = Vote {
+                    epoch,
+                    round,
+                    voter_id,
+                    block_hash,
+                    signature: [0u8; 64],
+                };
+                vote.sign(key);
+                vote
+            };
+
+        // Helper to create QC from votes
+        let create_qc =
+            |epoch: u64, round: u64, block_hash: BlockHash, votes: &[Vote]| QuorumCertificate {
+                epoch,
+                round,
+                block_hash,
+                signatures: votes
+                    .iter()
+                    .map(|v| ValidatorSignature::new(v.voter_id, v.signature))
+                    .collect(),
+            };
+
+        // === Round 1: Leader (validator 1) proposes B1 ===
+        let genesis_qc = QuorumCertificate::genesis(0, [0u8; 32]);
+        let b1_hash = [1u8; 32];
+        let mut proposal1 = Proposal {
+            epoch: 0,
+            round: 1,
+            proposer_id: validators[1].id,
+            block_hash: b1_hash,
+            parent_qc: genesis_qc,
+            payload_hash: [0x11; 32],
+            signature: [0u8; 64],
+        };
+        // Sign proposal with leader's key
+        let leader1_msg = proposal1.signing_message();
+        proposal1.signature = keys[1].sign(&leader1_msg).to_bytes();
+
+        // Process proposal - should get vote
+        let actions = machine
+            .handle_event(BftEvent::ProposalReceived(proposal1), TEST_NOW)
+            .unwrap();
+        let has_vote = actions
+            .iter()
+            .any(|a| matches!(a, BftAction::BroadcastVote(_)));
+        assert!(has_vote, "Should vote for valid proposal");
+
+        // Collect 3 votes for B1 (quorum)
+        // Note: validator 0 (the machine) already voted when processing the proposal,
+        // so we need votes from validators 1, 2, and 3 to reach quorum of 3.
+        // Actually, the machine's internal vote isn't in the vote collection - we need
+        // to send it back as if received from network.
+        let vote1_0 = create_signed_vote(&keys[0], 0, 1, b1_hash);
+        let vote1_1 = create_signed_vote(&keys[1], 0, 1, b1_hash);
+        let vote1_2 = create_signed_vote(&keys[2], 0, 1, b1_hash);
+        let qc1 = create_qc(
+            0,
+            1,
+            b1_hash,
+            &[vote1_0.clone(), vote1_1.clone(), vote1_2.clone()],
+        );
+
+        // Process votes to form QC1 (need 3 votes for quorum)
+        // First send our own vote back (simulating network echo)
+        let _ = machine.handle_event(BftEvent::VoteReceived(vote1_0), TEST_NOW);
+        let _ = machine.handle_event(BftEvent::VoteReceived(vote1_1), TEST_NOW);
+        let actions = machine.handle_event(BftEvent::VoteReceived(vote1_2), TEST_NOW);
+
+        // Should have QC formed and round advanced
+        let qc_formed = actions
+            .as_ref()
+            .is_ok_and(|a| a.iter().any(|act| matches!(act, BftAction::QcFormed(_))));
+        assert!(qc_formed, "QC1 should be formed");
+
+        // === Round 2: Leader (validator 2) proposes B2 extending B1 ===
+        let b2_hash = [2u8; 32];
+        let mut proposal2 = Proposal {
+            epoch: 0,
+            round: 2,
+            proposer_id: validators[2].id,
+            block_hash: b2_hash,
+            parent_qc: qc1,
+            payload_hash: [0x22; 32],
+            signature: [0u8; 64],
+        };
+        let leader2_msg = proposal2.signing_message();
+        proposal2.signature = keys[2].sign(&leader2_msg).to_bytes();
+
+        let _ = machine.handle_event(BftEvent::ProposalReceived(proposal2), TEST_NOW);
+
+        // Collect votes for B2 (need 3 votes for quorum)
+        let vote2_0 = create_signed_vote(&keys[0], 0, 2, b2_hash);
+        let vote2_1 = create_signed_vote(&keys[1], 0, 2, b2_hash);
+        let vote2_2 = create_signed_vote(&keys[2], 0, 2, b2_hash);
+        let qc2 = create_qc(
+            0,
+            2,
+            b2_hash,
+            &[vote2_0.clone(), vote2_1.clone(), vote2_2.clone()],
+        );
+
+        let _ = machine.handle_event(BftEvent::VoteReceived(vote2_0), TEST_NOW);
+        let _ = machine.handle_event(BftEvent::VoteReceived(vote2_1), TEST_NOW);
+        let _ = machine.handle_event(BftEvent::VoteReceived(vote2_2), TEST_NOW);
+
+        // === Round 3: Leader (validator 3) proposes B3 extending B2 ===
+        let b3_hash = [3u8; 32];
+        let mut proposal3 = Proposal {
+            epoch: 0,
+            round: 3,
+            proposer_id: validators[3].id,
+            block_hash: b3_hash,
+            parent_qc: qc2,
+            payload_hash: [0x33; 32],
+            signature: [0u8; 64],
+        };
+        let leader3_msg = proposal3.signing_message();
+        proposal3.signature = keys[3].sign(&leader3_msg).to_bytes();
+
+        let _ = machine.handle_event(BftEvent::ProposalReceived(proposal3), TEST_NOW);
+
+        // Collect votes for B3 - this should trigger commit of B1 (need 3 votes for
+        // quorum)
+        let vote3_0 = create_signed_vote(&keys[0], 0, 3, b3_hash);
+        let vote3_1 = create_signed_vote(&keys[1], 0, 3, b3_hash);
+        let vote3_2 = create_signed_vote(&keys[2], 0, 3, b3_hash);
+
+        let _ = machine.handle_event(BftEvent::VoteReceived(vote3_0), TEST_NOW);
+        let _ = machine.handle_event(BftEvent::VoteReceived(vote3_1), TEST_NOW);
+        let actions = machine
+            .handle_event(BftEvent::VoteReceived(vote3_2), TEST_NOW)
+            .unwrap();
+
+        // Check that we got a Commit action for B1 (the grandparent in 3-chain)
+        let commit_action = actions.iter().find_map(|a| {
+            if let BftAction::Commit(hash) = a {
+                Some(*hash)
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            commit_action.is_some(),
+            "Should produce Commit action for 3-chain"
+        );
+
+        // Verify committed count increased
+        assert!(
+            machine.committed_count() > 0,
+            "Should have committed at least one block"
+        );
     }
 }
