@@ -122,6 +122,9 @@ rfc_ticket_decomposition:
         - FAC-REQ-0017
       depends_on: []
       phase: PHASE-1
+      clarifications:
+        - "Domain separator format is strict concatenation of prefix bytes + canonical_bytes (no length prefix)."
+        - "Domain prefixes are ASCII, all caps, trailing colon; mismatch is INVALID_SIGNATURE."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/mod.rs"
@@ -211,6 +214,9 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00202
       phase: PHASE-1
+      clarifications:
+        - "issued_at/expires_at are observational only; time_envelope_ref is authoritative (HTF)."
+        - "aat_extension is required iff gate_id==\"aat\"; otherwise MUST be None."
 
       files_to_modify:
         - path: "proto/kernel_events.proto"
@@ -313,6 +319,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00203
       phase: PHASE-1
+      clarifications:
+        - "revoked_at is observational only; revocation is immediate per time_envelope_ref (HTF)."
 
       files_to_modify:
         - path: "proto/kernel_events.proto"
@@ -372,6 +380,9 @@ rfc_ticket_decomposition:
         - TCK-00202
         - TCK-00203
       phase: PHASE-1
+      clarifications:
+        - "completed_at is observational only; HTF time_envelope_ref governs expiry checks."
+        - "gate_receipt_payload_type MUST be canonical: \"{payload_kind}:{payload_schema_version}\"."
 
       files_to_modify:
         - path: "proto/kernel_events.proto"
@@ -483,6 +494,9 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00202
       phase: PHASE-1
+      clarifications:
+        - "resolved_rcp_profile_ids are lexicographically sorted; resolved_rcp_manifest_hashes align by index."
+        - "resolved_verifier_policy_hashes are sorted lexicographically for canonicalization."
 
       files_to_modify:
         - path: "proto/kernel_events.proto"
@@ -548,6 +562,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00202
       phase: PHASE-1
+      clarifications:
+        - "canonical_bytes uses deterministic ordering, no maps; unknown versions rejected in enforce mode only."
 
       files_to_modify:
         - path: "proto/kernel_events.proto"
@@ -624,6 +640,9 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00202
       phase: PHASE-1
+      clarifications:
+        - "KeyPolicy artifact is stored in CAS; policy_hash is blake3 of canonical bytes."
+        - "author_actor_id comes from ChangeSetIngested metadata; COI checks use that binding."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/key_policy.rs"
@@ -700,6 +719,9 @@ rfc_ticket_decomposition:
         - FAC-REQ-0001
       depends_on: []
       phase: PHASE-1
+      clarifications:
+        - "Paths are normalized (no '..', no symlink traversal) before allowlist match."
+        - "ReadWithZoom requires content_hash match; Read may omit content_hash."
 
       files_to_create:
         - path: "crates/apm2-core/src/context/manifest.rs"
@@ -768,6 +790,9 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00209
       phase: PHASE-1
+      clarifications:
+        - "WARN mode allowed only for LOW risk and sterile runner pool; otherwise SOFT_FAIL+."
+        - "ToolDecided=DENY includes rule_id, manifest_id, and path."
 
       files_to_create:
         - path: "crates/apm2-core/src/context/firewall.rs"
@@ -859,6 +884,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00210
       phase: PHASE-1
+      clarifications:
+        - "Missing manifest => fail-closed CONTEXT_MISS; no fallback reads."
 
       files_to_modify:
         - path: "crates/apm2-core/src/policy/engine.rs"
@@ -912,6 +939,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00202
       phase: PHASE-1
+      clarifications:
+        - "GitHub reads are allowed only inside projection adapter; admission holons must not read GitHub."
 
       files_to_create:
         - path: "crates/apm2-daemon/src/projection/mod.rs"
@@ -988,6 +1017,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00212
       phase: PHASE-1
+      clarifications:
+        - "frozen_at/unfrozen_at are observational only; time_envelope_ref is authoritative (HTF)."
 
       files_to_create:
         - path: "crates/apm2-daemon/src/projection/divergence_watchdog.rs"
@@ -1080,6 +1111,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00212
       phase: PHASE-1
+      clarifications:
+        - "Tamper detection emits DefectRecord(PROJECTION_TAMPER); overwrite is idempotent."
 
       files_to_modify:
         - path: "crates/apm2-daemon/src/projection/github_sync.rs"
@@ -1133,6 +1166,9 @@ rfc_ticket_decomposition:
         - FAC-REQ-0118
       depends_on: []
       phase: PHASE-1
+      clarifications:
+        - "L1 requires workflow_run_id + downloaded_artifact_hashes + adapter signature."
+        - "Level comparison uses explicit rank mapping (L0<L1<L2<L3), not enum ordinal."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/ci_attestation.rs"
@@ -1188,6 +1224,9 @@ rfc_ticket_decomposition:
         - TCK-00215
         - TCK-00202
       phase: PHASE-1
+      clarifications:
+        - "CiImportAttestation is signed with CI_IMPORT_ATTESTATION domain prefix."
+        - "imported_at is observational only."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/ci_import.rs"
@@ -1257,6 +1296,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00216
       phase: PHASE-1
+      clarifications:
+        - "Use CiGatingPolicy.minimum_level; never hard-code L0/L1 checks."
 
       files_to_modify:
         - path: "crates/apm2-core/src/fac/ci_import.rs"
@@ -1311,6 +1352,9 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00207
       phase: PHASE-1
+      clarifications:
+        - "flake_class required when verdict=FAIL or determinism_status=MISMATCH; may be omitted for PASS+STABLE."
+        - "flake_class enum is canonical; unknown values rejected in enforce mode."
 
       files_to_modify:
         - path: "proto/kernel_events.proto"
@@ -1412,6 +1456,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00218
       phase: PHASE-1
+      clarifications:
+        - "predicate_lang is fac_predicate_v1; unknown ops => fail-closed."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/terminal_verifier.rs"
@@ -1485,6 +1531,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00218
       phase: PHASE-1
+      clarifications:
+        - "Transcript chunks are ordered by sequence index; chain root uses blake3 over canonical chunk bytes."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/transcript_binding.rs"
@@ -1539,6 +1587,9 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00218
       phase: PHASE-1
+      clarifications:
+        - "retention_window_ref is HTF; required for non-public artifacts."
+        - "redaction_profile_hash required when redaction_applied==true."
 
       files_to_modify:
         - path: "proto/kernel_events.proto"
@@ -1615,6 +1666,8 @@ rfc_ticket_decomposition:
         - FAC-REQ-0009
       depends_on: []
       phase: PHASE-1
+      clarifications:
+        - "Classification must be deterministic and policy-configurable; resolved tier is pinned in PolicyResolvedForChangeSet."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/risk_tier.rs"
@@ -1677,6 +1730,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00222
       phase: PHASE-1
+      clarifications:
+        - "Sampling uses blake3(work_id) for determinism; sample_rate must be in [0,1]."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/selection_policy.rs"
@@ -1746,6 +1801,9 @@ rfc_ticket_decomposition:
         - TCK-00206
         - TCK-00218
       phase: PHASE-1
+      clarifications:
+        - "Verify PolicyResolvedForChangeSet exists before evaluating downgrades."
+        - "rcp_profile_id must match resolved_rcp_profile_ids and rcp_manifest_hash must match resolved_rcp_manifest_hashes."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/anti_downgrade.rs"
@@ -1804,6 +1862,8 @@ rfc_ticket_decomposition:
         - TCK-00203
         - TCK-00208
       phase: PHASE-1
+      clarifications:
+        - "Bind selection_policy_id and rcp_profile_id in addition to view_commitment_hash/rcp_manifest_hash."
 
       files_to_modify:
         - path: "crates/apm2-core/src/fac/lease.rs"
@@ -1872,6 +1932,9 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00218
       phase: PHASE-1
+      clarifications:
+        - "stability_digest inputs are verdict + terminal_evidence_digest + terminal_verifier_outputs_digest."
+        - "observational evidence is excluded from stability digest."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/determinism.rs"
@@ -1938,6 +2001,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00226
       phase: PHASE-1
+      clarifications:
+        - "flake_class is canonical; determinism_status=MISMATCH restricts allowed values."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/flake_class.rs"
@@ -1998,6 +2063,9 @@ rfc_ticket_decomposition:
         - TCK-00218
         - TCK-00222
       phase: PHASE-1
+      clarifications:
+        - "Reuse window is HTF time_envelope_ref governed by policy; wall-clock not authoritative."
+        - "determinism_class must indicate deterministic (e.g., class=0) for reuse."
 
       files_to_modify:
         - path: "proto/kernel_events.proto"
@@ -2073,6 +2141,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00221
       phase: PHASE-1
+      clarifications:
+        - "redaction_profile_hash required when redaction_applied==true."
 
       files_to_modify:
         - path: "crates/apm2-core/src/fac/artifact_manifest.rs"
@@ -2131,6 +2201,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00218
       phase: PHASE-1
+      clarifications:
+        - "NetworkPolicyProfile hash is bound into AatAttestation and GateReceipt payload."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/harness_sandbox.rs"
@@ -2183,6 +2255,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00219
       phase: PHASE-1
+      clarifications:
+        - "At least one invariant must map to a terminal verifier kind."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/aat_spec.rs"
@@ -2266,6 +2340,8 @@ rfc_ticket_decomposition:
         - TCK-00202
         - TCK-00205
       phase: PHASE-1
+      clarifications:
+        - "merged_at is observational only; result_selector must be observed from external trunk."
 
       files_to_modify:
         - path: "proto/kernel_events.proto"
@@ -2360,6 +2436,8 @@ rfc_ticket_decomposition:
         - FAC-REQ-0021
       depends_on: []
       phase: PHASE-1
+      clarifications:
+        - "Retry counters reset after successful gate completion or new work_id."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/retry_manager.rs"
@@ -2422,6 +2500,8 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00233
       phase: PHASE-1
+      clarifications:
+        - "Echo-trap window is single GateRun; reset on new GateRun."
 
       files_to_create:
         - path: "crates/apm2-core/src/fac/echo_trap.rs"
@@ -2497,6 +2577,9 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00202
       phase: PHASE-1
+      clarifications:
+        - "reason is a closed enum (HARNESS_FLAKE, TEST_NONSEMANTIC, ENVIRONMENT_DRIFT, POLICY_VIOLATION, UNKNOWN)."
+        - "time_envelope_ref is HTF; wall-clock timestamps are observational only."
 
       files_to_modify:
         - path: "proto/kernel_events.proto"
