@@ -752,23 +752,24 @@ pub(crate) mod tests {
     ///
     /// When running tests in a git worktree, git commands can accidentally use
     /// the parent worktree's configuration. This helper ensures that each
-    /// test's temporary repo is fully isolated by setting `GIT_DIR` and
-    /// `GIT_WORK_TREE`.
+    /// test's temporary repo is fully isolated by clearing inherited git env
+    /// vars and setting `GIT_DIR` and `GIT_WORK_TREE` explicitly.
     ///
     /// For `git init`, we don't set `GIT_DIR` since it doesn't exist yet.
     fn run_git_command(root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
         let mut cmd = Command::new("git");
         cmd.args(args).current_dir(root);
 
-        // For init, don't set GIT_DIR (it doesn't exist yet), but clear
-        // any inherited git env vars to avoid using parent worktree
-        if args.first() == Some(&"init") {
-            cmd.env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .env_remove("GIT_OBJECT_DIRECTORY");
-        } else {
-            // For other commands, explicitly point to the test repo
+        // Always clear inherited git env vars to avoid using parent worktree
+        cmd.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_CEILING_DIRECTORIES");
+
+        // For non-init commands, explicitly point to the test repo
+        if args.first() != Some(&"init") {
             cmd.env("GIT_DIR", root.join(".git"))
                 .env("GIT_WORK_TREE", root);
         }
