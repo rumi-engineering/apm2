@@ -64,12 +64,18 @@
 //! ```
 
 pub mod discovery;
+pub mod genesis;
 pub mod network;
 pub mod relay;
 pub mod tunnel;
 
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
+};
+pub use genesis::{
+    Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,
+    JoinRateLimiter, MAX_JOIN_ATTEMPTS_PER_MINUTE, MAX_NAMESPACE_LEN, MAX_QUORUM_SIGNATURES,
+    MAX_RATE_LIMIT_SOURCES, QuorumSignature, RATE_LIMIT_WINDOW,
 };
 pub use network::{
     CONTROL_FRAME_SIZE, Connection, ConnectionPool, ControlFrame, Network, NetworkConfig,
