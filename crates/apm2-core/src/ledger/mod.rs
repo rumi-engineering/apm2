@@ -68,7 +68,7 @@ pub use backend::{BoxFuture, HashFn, LedgerBackend, VerifyFn};
 pub use bft_backend::{
     AppendResult, BftLedgerBackend, BftLedgerError, ConsensusIndex, ConsensusMetadata,
     DEFAULT_FINALIZATION_TIMEOUT_MS, EventMetadata, HlcTimestamp, MAX_PENDING_EVENTS,
-    MergeOperator, OrderingGuarantee,
+    MergeOperator, NoOpSchemaRegistry, OrderingGuarantee,
 };
 pub use storage::{
     ArtifactRef, CURRENT_RECORD_VERSION, EventRecord, Ledger, LedgerError, LedgerStats,
