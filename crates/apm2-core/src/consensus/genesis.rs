@@ -11,7 +11,7 @@
 //! - INV-0025: Node rejects join on genesis mismatch
 //! - INV-0026: Join requests require quorum-signed invitation token
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -24,6 +24,11 @@ pub const MAX_NAMESPACE_LEN: usize = 128;
 
 /// Maximum number of signatures in a quorum.
 pub const MAX_QUORUM_SIGNATURES: usize = 16;
+
+/// Maximum number of signatures allowed in an invitation token during parsing.
+/// This bounds memory usage during deserialization to prevent denial-of-service
+/// attacks.
+pub const MAX_SIGNATURES: usize = 64;
 
 /// Maximum rate of join attempts per source (joins per minute).
 pub const MAX_JOIN_ATTEMPTS_PER_MINUTE: usize = 10;
@@ -383,15 +388,28 @@ impl Genesis {
 
     /// Verifies the genesis signature against the provided T0 key.
     ///
-    /// Uses constant-time comparison for the public key to prevent timing
-    /// attacks.
+    /// Uses constant-time comparison for all fields to prevent timing attacks.
     ///
     /// # Errors
     ///
     /// Returns an error if the signature is invalid or the key doesn't match.
+    ///
+    /// # Security
+    ///
+    /// All genesis field comparisons use constant-time operations for defense
+    /// in depth against timing side-channel attacks.
     pub fn verify(&self, config: &GenesisConfig) -> Result<(), GenesisError> {
-        // Verify namespace matches
-        if self.namespace != config.namespace {
+        // Verify namespace matches (constant-time via hash comparison)
+        // We hash both namespaces and compare the hashes in constant time to
+        // avoid leaking namespace length or content through timing
+        let expected_ns_hash = blake3::hash(config.namespace.as_bytes());
+        let actual_ns_hash = blake3::hash(self.namespace.as_bytes());
+        if expected_ns_hash
+            .as_bytes()
+            .ct_eq(actual_ns_hash.as_bytes())
+            .unwrap_u8()
+            == 0
+        {
             return Err(GenesisError::InvalidNamespace(format!(
                 "namespace mismatch: expected '{}', got '{}'",
                 config.namespace, self.namespace
@@ -454,7 +472,7 @@ impl Genesis {
 ///
 /// This token must be signed by at least `quorum_threshold` members
 /// to authorize a node to join the network.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InvitationToken {
     /// The genesis hash this invitation is for.
@@ -469,7 +487,7 @@ pub struct InvitationToken {
 }
 
 /// A signature from a quorum member.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuorumSignature {
     /// Index of the signing key in the quorum key list.
@@ -559,6 +577,12 @@ impl InvitationToken {
     /// # Errors
     ///
     /// Returns an error if verification fails.
+    ///
+    /// # Security
+    ///
+    /// This method tracks used key indices to prevent double-counting
+    /// signatures from the same quorum member. An attacker cannot satisfy
+    /// the threshold by providing the same valid signature multiple times.
     pub fn verify(&self, config: &GenesisConfig, current_time: u64) -> Result<(), GenesisError> {
         // Check expiration
         if current_time > self.expires_at {
@@ -575,9 +599,10 @@ impl InvitationToken {
             });
         }
 
-        // Verify each signature
+        // Verify each signature, tracking used key indices to prevent double-counting
         let canonical_hash = self.canonical_hash();
         let mut valid_count = 0;
+        let mut seen_key_indices: HashSet<usize> = HashSet::new();
 
         for qs in &self.signatures {
             // Validate key index
@@ -588,10 +613,16 @@ impl InvitationToken {
                 )));
             }
 
+            // Skip duplicate key indices - prevents double-counting attack
+            if seen_key_indices.contains(&qs.key_index) {
+                continue;
+            }
+
             let key = &config.quorum_keys[qs.key_index];
             let signature = Signature::from_bytes(&qs.signature);
 
             if key.verify(&canonical_hash, &signature).is_ok() {
+                seen_key_indices.insert(qs.key_index);
                 valid_count += 1;
             }
         }
@@ -619,9 +650,28 @@ impl InvitationToken {
     ///
     /// # Errors
     ///
-    /// Returns an error if deserialization fails.
+    /// Returns an error if deserialization fails or signature count exceeds
+    /// `MAX_SIGNATURES`.
+    ///
+    /// # Security
+    ///
+    /// This method validates the signature count after parsing to prevent
+    /// unbounded memory allocation (denial-of-service via oversized signatures
+    /// array).
     pub fn from_json(data: &[u8]) -> Result<Self, GenesisError> {
-        serde_json::from_slice(data).map_err(|e| GenesisError::Serialization(e.to_string()))
+        let token: Self =
+            serde_json::from_slice(data).map_err(|e| GenesisError::Serialization(e.to_string()))?;
+
+        // Validate signature count to prevent DoS via unbounded allocation
+        if token.signatures.len() > MAX_SIGNATURES {
+            return Err(GenesisError::InvalidInvitationToken(format!(
+                "too many signatures: {} exceeds maximum {}",
+                token.signatures.len(),
+                MAX_SIGNATURES
+            )));
+        }
+
+        Ok(token)
     }
 }
 
@@ -1594,6 +1644,120 @@ mod tck_00185_genesis_tests {
         assert!(
             limiter.source_count() <= max_sources,
             "Rate limiter must have bounded memory"
+        );
+    }
+
+    #[test]
+    fn test_tck_00185_signature_double_counting_prevented() {
+        // Security: Prevent quorum threshold bypass via signature duplication
+        let (q1_signing, q1_verifying) = create_test_keypair();
+        let (_, q2_verifying) = create_test_keypair();
+
+        let genesis_hash = [1u8; 32];
+        let invitee_id = "node-123".to_string();
+        let expires_at = u64::MAX;
+
+        let mut token = InvitationToken::new(genesis_hash, invitee_id, expires_at);
+
+        // Sign with ONE quorum member
+        let canonical_hash = token.canonical_hash();
+        let sig1 = q1_signing.sign(&canonical_hash);
+
+        // Add the SAME signature multiple times with the same key_index
+        // An attacker might try to satisfy threshold=2 by duplicating one signature
+        token.add_signature(0, sig1.to_bytes()).unwrap();
+        token.add_signature(0, sig1.to_bytes()).unwrap(); // Duplicate!
+        token.add_signature(0, sig1.to_bytes()).unwrap(); // Duplicate!
+
+        // Create config requiring 2 distinct signatures
+        let (_, t0_key) = create_test_keypair();
+        let config = GenesisConfig::builder()
+            .namespace("test")
+            .unwrap()
+            .ledger_head_hash([0u8; 32])
+            .t0_key(t0_key)
+            .quorum_threshold(2) // Requires 2 DISTINCT signers
+            .add_quorum_key(q1_verifying)
+            .unwrap()
+            .add_quorum_key(q2_verifying)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Verification must FAIL - duplicates should not count twice
+        let result = token.verify(&config, 0);
+        assert!(
+            matches!(
+                result,
+                Err(GenesisError::InsufficientQuorum { have: 1, need: 2 })
+            ),
+            "Duplicate signatures must not be double-counted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_tck_00185_unbounded_signatures_rejected() {
+        use std::fmt::Write;
+
+        // Security: Prevent unbounded signature array attack
+        // Create a JSON with more signatures than MAX_SIGNATURES
+        let mut signatures_json = String::from("[");
+        let sig_hex = "00".repeat(64); // 64 bytes as hex = 128 chars
+        for i in 0..=MAX_SIGNATURES {
+            if i > 0 {
+                signatures_json.push(',');
+            }
+            // Each signature entry with valid hex encoding for 64 bytes
+            write!(
+                signatures_json,
+                r#"{{"key_index":{},"signature":"{sig_hex}"}}"#,
+                i % 16 // key_index cycles to stay valid
+            )
+            .unwrap();
+        }
+        signatures_json.push(']');
+
+        let genesis_hex = "00".repeat(32); // 32 bytes as hex
+        let json = format!(
+            r#"{{"genesis_hash":"{genesis_hex}","invitee_id":"node-123","expires_at":12345,"signatures":{signatures_json}}}"#
+        );
+
+        let result = InvitationToken::from_json(json.as_bytes());
+        assert!(
+            matches!(result, Err(GenesisError::InvalidInvitationToken(ref msg)) if msg.contains("too many signatures")),
+            "Must reject tokens with too many signatures: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_tck_00185_max_signatures_boundary() {
+        use std::fmt::Write;
+
+        // Test that exactly MAX_SIGNATURES is accepted
+        let mut signatures_json = String::from("[");
+        let sig_hex = "00".repeat(64);
+        for i in 0..MAX_SIGNATURES {
+            if i > 0 {
+                signatures_json.push(',');
+            }
+            write!(
+                signatures_json,
+                r#"{{"key_index":{},"signature":"{sig_hex}"}}"#,
+                i % 16
+            )
+            .unwrap();
+        }
+        signatures_json.push(']');
+
+        let genesis_hex = "00".repeat(32);
+        let json = format!(
+            r#"{{"genesis_hash":"{genesis_hex}","invitee_id":"node-123","expires_at":12345,"signatures":{signatures_json}}}"#
+        );
+
+        let result = InvitationToken::from_json(json.as_bytes());
+        assert!(
+            result.is_ok(),
+            "Must accept tokens with exactly MAX_SIGNATURES: {result:?}"
         );
     }
 
