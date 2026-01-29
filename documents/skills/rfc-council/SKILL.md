@@ -13,23 +13,20 @@ holon:
     state_type: RfcCouncilProgress
 
   # ============================================================================
-  # Stop Conditions
+  # Stop Conditions (LAW-12: Bounded Search and Termination Discipline)
   # ============================================================================
+  # Agent-native termination uses consumption-based and convergence-based
+  # bounds, not wall-clock time. Time constraints are human-centric artifacts.
   stop_conditions:
-    # Maximum episodes: RFC work involves multiple phases
-    #   - CREATE mode: RFC generation + ticket decomposition ~ 15-20 episodes
-    #   - REVIEW mode: Consolidated review + remediation ~ 20-25 episodes
+    # Episode budget: sufficient for multi-phase RFC workflows
     max_episodes: 25
 
-    # Timeout: 30 minutes for complete RFC operations
-    timeout_ms: 1800000
-
-    # Budget limits
+    # Resource budgets: hard consumption limits
     budget:
       tokens: 500000
       tool_calls: 500
 
-    # Stall detection
+    # Convergence detection: stall = failure to make progress
     max_stall_episodes: 5
 
   # ============================================================================

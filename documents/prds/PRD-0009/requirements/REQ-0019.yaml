@@ -1,0 +1,32 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0019"
+  type: "SECURITY"
+  source_id: "FAC-REQ-0118"
+  title: "CI attestation level enforcement"
+  statement: |
+    CI evidence ingestion MUST define attestation levels (L0-L3) and enforce minimum
+    acceptable levels per risk tier. L0 status-only attestation is insufficient for
+    readiness gating; L1 requires signed adapter attestation with CAS artifact digests.
+  acceptance_criteria:
+    - "Attestation levels are defined: L0 (status-only, insufficient), L1 (signed attestation + raw artifact digests in CAS), L2/L3 deferred. Verified by: Schema test."
+    - "Policy maps risk tier -> minimum CI attestation level; READY_FOR_REVIEW enforces the mapping. Verified by: Policy enforcement test."
+    - "L0 attestation is rejected when CI gating is enabled. Verified by: Negative test."
+    - "L1 attestation requires adapter signature covering workflow_run_id and downloaded_artifact_hashes. Verified by: Signature validation test."
+  evidence:
+    evidence_ids:
+      - EVID-0035
+  law_alignment:
+    - law_id: "LAW-04"
+      enforcement: "External observations require evidence-backed attestation."
+      applies_to:
+        - "CI ingestion"
+    - law_id: "LAW-15"
+      enforcement: "Measurement integrity for CI evidence import."
+      applies_to:
+        - "CI attestation"
+  defect_codes:
+    - code: "CI_ATTESTATION_LEVEL_INSUFFICIENT"
+      severity: "S1"
+      description: "CI attestation level below required minimum"

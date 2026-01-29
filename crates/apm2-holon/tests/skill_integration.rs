@@ -826,6 +826,10 @@ fn test_rfc_council_skill_has_holon_config() {
 ///
 /// Verifies that the configured stop conditions are suitable for
 /// RFC generation work (multi-phase, longer-running).
+///
+/// Per LAW-12 (Bounded Search and Termination Discipline), agent-native
+/// termination uses consumption-based bounds (tokens, episodes, stall
+/// detection), not wall-clock time constraints.
 #[test]
 fn test_rfc_council_stop_conditions_appropriate() {
     let skill_path = rfc_council_skill_path();
@@ -843,14 +847,14 @@ fn test_rfc_council_stop_conditions_appropriate() {
         "RFC work needs at least 25 episodes, got {max_episodes}"
     );
 
-    // timeout_ms: Should be >= 30 minutes (1,800,000 ms) for complex RFCs
-    let timeout_ms = stop.timeout_ms.expect("should have timeout_ms");
+    // Agent-native design: no timeout_ms (LAW-12 compliant)
+    // Termination is driven by consumption-based bounds, not wall-clock time.
     assert!(
-        timeout_ms >= 1_800_000,
-        "RFC work needs at least 30 min timeout, got {timeout_ms} ms"
+        stop.timeout_ms.is_none(),
+        "agent-native skills should not have time constraints per LAW-12"
     );
 
-    // max_stall_episodes: Should be >= 5 for exploration
+    // max_stall_episodes: Should be >= 5 for exploration (convergence detection)
     let max_stall = stop
         .max_stall_episodes
         .expect("should have max_stall_episodes");

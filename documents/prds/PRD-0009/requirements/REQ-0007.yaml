@@ -1,0 +1,36 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0007"
+  type: "SECURITY"
+  source_id: "FAC-REQ-0106"
+  title: "Terminal verifier binding for AAT"
+  statement: |
+    AAT PASS MUST be determined by schema-enforced terminal verifiers. For each
+    scenario_type, the verifier policy defines allowed verifier kinds, required
+    outputs, and machine predicates; GateReceipt MUST include verifier outputs and
+    policy hash.
+  acceptance_criteria:
+    - "Verifier policy schema defines scenario_type -> allowed_verifier_kinds + required_outputs + machine_predicate. Verified by: Schema validation test."
+    - "GateReceipt payload includes terminal_verifier_outputs and verifier_policy_hash. Verified by: Test that payload validation fails when missing."
+    - "PASS requires predicate satisfied; missing or mismatched outputs emit AAT_TERMINAL_VERIFIER_MISSING or AAT_TERMINAL_VERIFIER_MISMATCH. Verified by: Negative tests."
+  evidence:
+    evidence_ids:
+      - EVID-0023
+  law_alignment:
+    - law_id: "LAW-04"
+      enforcement: "Terminal verifiers anchor admission; advisory narratives never substitute."
+      applies_to:
+        - "GateReceipt payload"
+        - "Verifier policy"
+    - law_id: "LAW-15"
+      enforcement: "Measurement integrity requires machine-verifiable predicates."
+      applies_to:
+        - "Verifier outputs"
+  defect_codes:
+    - code: "AAT_TERMINAL_VERIFIER_MISSING"
+      severity: "S1"
+      description: "Required terminal verifier outputs missing"
+    - code: "AAT_TERMINAL_VERIFIER_MISMATCH"
+      severity: "S1"
+      description: "Verifier outputs fail machine predicate"

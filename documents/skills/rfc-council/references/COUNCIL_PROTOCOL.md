@@ -330,14 +330,15 @@ Outputs:
 
 ### ABORTED
 
-Conditions:
-- Session duration exceeds 1 hour
-- OR: Token budget exhausted
+Conditions (LAW-12 compliant - consumption-based, not time-based):
+- Token budget exhausted
+- Episode budget exhausted
+- Stall detection triggered (no progress across N episodes)
 
 Outputs:
 - `verdict`: ABORTED
 - `partial_findings`: All findings generated before abort
-- `abort_reason`: TIMEOUT or BUDGET_EXHAUSTED
+- `abort_reason`: BUDGET_EXHAUSTED | EPISODE_LIMIT | STALL_DETECTED
 - `cycles_completed`: How many cycles finished
 
 ---
@@ -374,28 +375,32 @@ council_metadata:
   findings_after_dedup: 15
   contested_items_resolved: 4
   quorum_achieved: true
-  elapsed_time_seconds: 1847
+  tokens_consumed: 142500
+  episodes_consumed: 18
 ```
 
 ---
 
-## Timeout and Budget
+## Resource Budgets (LAW-12 Compliant)
 
-### Timeout
-
-- Default: 1 hour (3600 seconds)
-- Measured from INIT to terminal state
-- On timeout: Abort with partial findings
+Agent-native termination uses consumption-based bounds, not wall-clock time.
+Time constraints are human-centric artifacts that don't apply to agent workflows.
 
 ### Token Budget
 
-- Estimated budget: ~150K tokens per council session
+- Budget: ~150K tokens per council session
 - Monitor cumulative usage across all subagents
 - On budget exhaustion: Abort with partial findings
 
+### Episode Budget
+
+- Each cycle consumes episodes proportional to finding count
+- Stall detection: no new findings across 3 consecutive sub-episodes
+- On stall: Abort with `STALL_DETECTED`
+
 ### Budget Allocation
 
-Approximate allocation per cycle:
+Approximate token allocation per cycle:
 - INIT + Mode Selection: ~5K tokens
 - CYCLE_1 (STRUCTURAL): ~40K tokens
 - CYCLE_2 (FEASIBILITY): ~50K tokens
