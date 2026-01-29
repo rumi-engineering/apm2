@@ -1,0 +1,11 @@
+Here's some output with malformed tool calls:
+
+{"tool": "Read"  <- Missing closing brace
+
+Also this incomplete one:
+{"tool": "Write", "args": {"path": "/tmp
+
+And this has invalid JSON:
+{tool: NoQuotes, args: {}}
+
+Regular text continues here without issues.

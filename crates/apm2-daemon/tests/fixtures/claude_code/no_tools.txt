@@ -1,0 +1,8 @@
+This is regular output from Claude Code without any tool calls.
+
+The conversation continues with:
+- Some bullet points
+- More discussion
+- No tool invocations at all
+
+Thank you for your question! Let me know if you need anything else.

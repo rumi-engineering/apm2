@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 
 use super::adapter::{AdapterType, HarnessAdapter};
+use super::claude_code::{ClaudeCodeAdapter, ClaudeCodeHolon};
 use super::raw_adapter::{RawAdapter, RawAdapterHolon};
 
 /// Registry for harness adapters.
@@ -63,10 +64,12 @@ impl AdapterRegistry {
     ///
     /// This registers:
     /// - [`RawAdapter`] for [`AdapterType::Raw`]
+    /// - [`ClaudeCodeAdapter`] for [`AdapterType::ClaudeCode`]
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
-        registry.register(Box::new(super::raw_adapter::RawAdapter::new()));
+        registry.register(Box::new(RawAdapter::new()));
+        registry.register(Box::new(ClaudeCodeAdapter::new()));
         registry
     }
 
@@ -136,6 +139,44 @@ impl AdapterRegistry {
         self.adapters.keys().copied()
     }
 
+    /// Creates a per-episode `RawAdapterHolon` instance.
+    ///
+    /// Per AD-LAYER-001 and AD-ADAPT-001, this factory method creates a fresh
+    /// Holon instance for each episode.
+    ///
+    /// # Arguments
+    ///
+    /// * `adapter_type` - Must be [`AdapterType::Raw`]
+    ///
+    /// # Returns
+    ///
+    /// A boxed `RawAdapterHolon`, or `None` if not registered.
+    #[must_use]
+    pub fn create_raw_holon(&self) -> Option<Box<RawAdapterHolon>> {
+        self.adapters.get(&AdapterType::Raw).and_then(|adapter| {
+            let raw_adapter = adapter.as_any().downcast_ref::<RawAdapter>()?;
+            Some(raw_adapter.create_holon())
+        })
+    }
+
+    /// Creates a per-episode `ClaudeCodeHolon` instance.
+    ///
+    /// Per AD-LAYER-001 and AD-ADAPT-001, this factory method creates a fresh
+    /// Holon instance for each episode with Claude Code parsing.
+    ///
+    /// # Returns
+    ///
+    /// A boxed `ClaudeCodeHolon`, or `None` if not registered.
+    #[must_use]
+    pub fn create_claude_code_holon(&self) -> Option<Box<ClaudeCodeHolon>> {
+        self.adapters
+            .get(&AdapterType::ClaudeCode)
+            .and_then(|adapter| {
+                let cc_adapter = adapter.as_any().downcast_ref::<ClaudeCodeAdapter>()?;
+                Some(cc_adapter.create_holon())
+            })
+    }
+
     /// Creates a per-episode Holon instance for the specified adapter type.
     ///
     /// Per AD-LAYER-001 and AD-ADAPT-001, this factory method creates a fresh
@@ -153,6 +194,12 @@ impl AdapterRegistry {
     /// A boxed Holon instance, or `None` if the adapter type is not registered
     /// or doesn't support Holon creation.
     ///
+    /// # Note
+    ///
+    /// This method returns `Box<RawAdapterHolon>` for backwards compatibility.
+    /// For Claude Code holons, use
+    /// [`create_claude_code_holon`](Self::create_claude_code_holon).
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -164,17 +211,10 @@ impl AdapterRegistry {
     #[must_use]
     pub fn create_holon(&self, adapter_type: AdapterType) -> Option<Box<RawAdapterHolon>> {
         match adapter_type {
-            AdapterType::Raw => {
-                // Downcast to RawAdapter to access create_holon method
-                self.adapters.get(&adapter_type).and_then(|adapter| {
-                    // We know this is a RawAdapter because we control registration
-                    // Safe downcast via adapter type checking
-                    let raw_adapter = adapter.as_any().downcast_ref::<RawAdapter>()?;
-                    Some(raw_adapter.create_holon())
-                })
-            },
+            AdapterType::Raw => self.create_raw_holon(),
             AdapterType::ClaudeCode => {
-                // ClaudeCode adapter not yet implemented
+                // Return None for backwards compatibility
+                // Use create_claude_code_holon() for ClaudeCode adapters
                 None
             },
         }
@@ -194,7 +234,6 @@ mod tests {
     use apm2_holon::Holon;
 
     use super::*;
-    use crate::episode::raw_adapter::RawAdapter;
 
     #[test]
     fn test_registry_new_empty() {
@@ -262,9 +301,13 @@ mod tests {
 
         assert!(!registry.is_empty());
         assert!(registry.contains(AdapterType::Raw));
+        assert!(registry.contains(AdapterType::ClaudeCode));
 
         let raw = registry.get(AdapterType::Raw).unwrap();
         assert_eq!(raw.adapter_type(), AdapterType::Raw);
+
+        let claude = registry.get(AdapterType::ClaudeCode).unwrap();
+        assert_eq!(claude.adapter_type(), AdapterType::ClaudeCode);
     }
 
     #[test]
@@ -300,6 +343,22 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_create_raw_holon() {
+        let registry = AdapterRegistry::with_defaults();
+        let holon = registry.create_raw_holon();
+        assert!(holon.is_some());
+        assert_eq!(holon.unwrap().type_name(), "RawAdapterHolon");
+    }
+
+    #[test]
+    fn test_registry_create_claude_code_holon() {
+        let registry = AdapterRegistry::with_defaults();
+        let holon = registry.create_claude_code_holon();
+        assert!(holon.is_some());
+        assert_eq!(holon.unwrap().type_name(), "ClaudeCodeHolon");
+    }
+
+    #[test]
     fn test_registry_create_holon_unregistered() {
         let registry = AdapterRegistry::new();
         let holon = registry.create_holon(AdapterType::Raw);
@@ -307,7 +366,9 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_create_holon_claude_code_not_implemented() {
+    fn test_registry_create_holon_claude_code_returns_none() {
+        // create_holon returns None for ClaudeCode for backwards compatibility
+        // Use create_claude_code_holon instead
         let registry = AdapterRegistry::with_defaults();
         let holon = registry.create_holon(AdapterType::ClaudeCode);
         assert!(holon.is_none());
@@ -330,5 +391,19 @@ mod tests {
 
         assert_eq!(holon1.type_name(), "RawAdapterHolon");
         assert_eq!(holon2.type_name(), "RawAdapterHolon");
+    }
+
+    #[test]
+    fn test_registry_create_multiple_claude_code_holons() {
+        let registry = AdapterRegistry::with_defaults();
+
+        let holon1 = registry.create_claude_code_holon();
+        let holon2 = registry.create_claude_code_holon();
+
+        assert!(holon1.is_some());
+        assert!(holon2.is_some());
+
+        assert_eq!(holon1.unwrap().type_name(), "ClaudeCodeHolon");
+        assert_eq!(holon2.unwrap().type_name(), "ClaudeCodeHolon");
     }
 }
