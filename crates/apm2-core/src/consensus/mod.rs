@@ -76,6 +76,7 @@ pub mod metrics;
 pub mod network;
 pub mod qc_aggregator;
 pub mod relay;
+pub mod replication;
 pub mod tunnel;
 
 // BFT consensus (Chained HotStuff)
@@ -139,6 +140,14 @@ pub use relay::process_tunnel_frame;
 pub use relay::{
     CLEANUP_INTERVAL, MAX_PENDING_MESSAGES, MAX_RELAY_ID_LEN, ROUTE_TIMEOUT, RelayConfig,
     RelayConfigBuilder, RelayError, RelayHolon, RelayStats, TunnelRegistry,
+};
+// Leader-based replication (TCK-00195)
+pub use replication::{
+    DEFAULT_ACK_TIMEOUT, MAX_ACKS_PER_PROPOSAL, MAX_PENDING_PROPOSALS,
+    MAX_REPLICATION_PAYLOAD_SIZE, MAX_TRACKED_PROPOSALS, MSG_REPLICATION_ACK, MSG_REPLICATION_NACK,
+    MSG_REPLICATION_PROPOSAL, NackReason, ReplicatedEvent, ReplicationAck, ReplicationConfig,
+    ReplicationEngine, ReplicationError, ReplicationMessage, ReplicationNack, ReplicationProposal,
+    ReplicationStats,
 };
 pub use tunnel::{
     HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, MAX_TUNNEL_ID_LEN, MAX_TUNNELS, MAX_WORKER_ID_LEN,
