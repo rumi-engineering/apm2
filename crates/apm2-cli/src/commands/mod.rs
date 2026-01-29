@@ -1,6 +1,7 @@
 //! CLI command implementations.
 
 pub mod cac;
+pub mod consensus;
 pub mod coordinate;
 pub mod creds;
 pub mod daemon;

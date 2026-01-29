@@ -1,0 +1,262 @@
+# APM2 Consensus Layer Alert Rules
+# Per RFC-0014 TCK-00193 - Operational Monitoring and Alerting
+#
+# These alerts should be loaded by Prometheus AlertManager.
+# See docs/operations/consensus-runbook.md for incident response procedures.
+
+groups:
+  - name: apm2_consensus_alerts
+    rules:
+      # =======================================================================
+      # ConsensusNoLeader - Frequent leader elections indicate instability
+      # =======================================================================
+      - alert: ConsensusNoLeader
+        expr: |
+          increase(apm2_consensus_leader_elections_total[1m]) > 5
+        for: 2m
+        labels:
+          severity: warning
+          component: consensus
+          rfc: RFC-0014
+        annotations:
+          summary: "Frequent leader elections detected on {{ $labels.node_id }}"
+          description: |
+            Node {{ $labels.node_id }} has experienced more than 5 leader elections
+            in the past minute. This may indicate network instability, validator
+            crashes, or timeout misconfigurations.
+
+            Current rate: {{ $value | printf "%.1f" }} elections/min
+
+            Runbook: docs/operations/consensus-runbook.md#consensusnoleader
+          runbook_url: "https://github.com/yourorg/apm2/blob/main/docs/operations/consensus-runbook.md#consensusnoleader"
+
+      # =======================================================================
+      # ConsensusQuorumLost - Insufficient validators for consensus
+      # =======================================================================
+      - alert: ConsensusQuorumLost
+        expr: |
+          apm2_consensus_validators_active < apm2_consensus_quorum_size
+        for: 1m
+        labels:
+          severity: critical
+          component: consensus
+          rfc: RFC-0014
+        annotations:
+          summary: "CRITICAL: Quorum lost on {{ $labels.node_id }}"
+          description: |
+            Node {{ $labels.node_id }} reports insufficient validators for quorum.
+
+            Active validators: {{ $value }}
+            Required quorum: {{ with query "apm2_consensus_quorum_size" }}{{ . | first | value }}{{ end }}
+
+            Consensus is STALLED. No new blocks can be committed until quorum is
+            restored.
+
+            IMMEDIATE ACTION REQUIRED:
+            1. Check validator node health
+            2. Verify network connectivity between nodes
+            3. Check for certificate expiration
+            4. Review recent deployments or configuration changes
+
+            Runbook: docs/operations/consensus-runbook.md#consensusquorumlost
+          runbook_url: "https://github.com/yourorg/apm2/blob/main/docs/operations/consensus-runbook.md#consensusquorumlost"
+
+      # =======================================================================
+      # HighFinalizationLatency - Consensus taking too long
+      # =======================================================================
+      - alert: HighFinalizationLatency
+        expr: |
+          histogram_quantile(0.99, sum(rate(apm2_consensus_finalization_latency_seconds_bucket[5m])) by (le, node_id)) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: consensus
+          rfc: RFC-0014
+        annotations:
+          summary: "High finalization latency on {{ $labels.node_id }}"
+          description: |
+            Node {{ $labels.node_id }} p99 finalization latency exceeds 500ms target.
+
+            Current p99: {{ $value | printf "%.3f" }}s
+
+            Possible causes:
+            - Network latency between validators
+            - Validator under heavy load
+            - Large payload sizes
+            - Clock skew between nodes
+
+            Runbook: docs/operations/consensus-runbook.md#highfinalizationlatency
+          runbook_url: "https://github.com/yourorg/apm2/blob/main/docs/operations/consensus-runbook.md#highfinalizationlatency"
+
+      # =======================================================================
+      # ByzantineFaultDetected - Security-critical: malicious behavior detected
+      # =======================================================================
+      - alert: ByzantineFaultDetected
+        expr: |
+          increase(apm2_byzantine_evidence_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: consensus
+          rfc: RFC-0014
+          security: byzantine
+        annotations:
+          summary: "CRITICAL: Byzantine fault detected by {{ $labels.node_id }}"
+          description: |
+            Node {{ $labels.node_id }} has detected Byzantine behavior.
+
+            Fault type: {{ $labels.fault_type }}
+            Count (5m): {{ $value }}
+
+            This indicates a validator may be compromised or malfunctioning.
+
+            IMMEDIATE SECURITY RESPONSE REQUIRED:
+            1. DO NOT dismiss this alert without investigation
+            2. Identify the faulty validator from evidence logs
+            3. Consider removing the validator from the quorum
+            4. Preserve evidence for forensic analysis
+            5. Notify security team
+
+            Runbook: docs/operations/consensus-runbook.md#byzantinefaultdetected
+          runbook_url: "https://github.com/yourorg/apm2/blob/main/docs/operations/consensus-runbook.md#byzantinefaultdetected"
+
+      # =======================================================================
+      # AntiEntropyDivergence - High conflict rate indicates sync issues
+      # =======================================================================
+      - alert: AntiEntropyDivergence
+        expr: |
+          increase(apm2_antientropy_conflicts_total[1h]) > 100
+        for: 5m
+        labels:
+          severity: warning
+          component: antientropy
+          rfc: RFC-0014
+        annotations:
+          summary: "High anti-entropy conflict rate on {{ $labels.node_id }}"
+          description: |
+            Node {{ $labels.node_id }} has experienced more than 100 merge
+            conflicts in the past hour.
+
+            Conflicts (1h): {{ $value }}
+            Resolution type: {{ $labels.resolution }}
+
+            Possible causes:
+            - Network partition recovering
+            - Clock skew affecting LWW resolution
+            - Concurrent updates to same data
+            - Node rejoining after extended offline period
+
+            Runbook: docs/operations/consensus-runbook.md#antientropydivergence
+          runbook_url: "https://github.com/yourorg/apm2/blob/main/docs/operations/consensus-runbook.md#antientropydivergence"
+
+      # =======================================================================
+      # ConsensusStalled - No proposals committed for extended period
+      # =======================================================================
+      - alert: ConsensusStalled
+        expr: |
+          increase(apm2_consensus_proposals_total{outcome="committed"}[10m]) == 0
+          and
+          apm2_consensus_validators_active >= apm2_consensus_quorum_size
+        for: 10m
+        labels:
+          severity: warning
+          component: consensus
+          rfc: RFC-0014
+        annotations:
+          summary: "Consensus stalled on {{ $labels.node_id }}"
+          description: |
+            Node {{ $labels.node_id }} has not committed any proposals in 10
+            minutes despite having quorum.
+
+            This may indicate:
+            - No pending transactions (normal if idle)
+            - Leader unable to propose
+            - Votes not reaching quorum
+            - Network partition
+
+            Check if there is pending work before escalating.
+
+            Runbook: docs/operations/consensus-runbook.md#consensusstalled
+          runbook_url: "https://github.com/yourorg/apm2/blob/main/docs/operations/consensus-runbook.md#consensusstalled"
+
+      # =======================================================================
+      # HighProposalRejectionRate - Many proposals being rejected
+      # =======================================================================
+      - alert: HighProposalRejectionRate
+        expr: |
+          sum(rate(apm2_consensus_proposals_total{outcome="rejected"}[5m])) by (node_id)
+          /
+          sum(rate(apm2_consensus_proposals_total[5m])) by (node_id)
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: consensus
+          rfc: RFC-0014
+        annotations:
+          summary: "High proposal rejection rate on {{ $labels.node_id }}"
+          description: |
+            Node {{ $labels.node_id }} rejection rate exceeds 10%.
+
+            Rejection rate: {{ $value | printf "%.1f" }}%
+
+            Possible causes:
+            - Invalid proposals from leader
+            - Safety rule violations
+            - Outdated state on proposer
+
+            Runbook: docs/operations/consensus-runbook.md#highproposalrejectionrate
+          runbook_url: "https://github.com/yourorg/apm2/blob/main/docs/operations/consensus-runbook.md#highproposalrejectionrate"
+
+      # =======================================================================
+      # SchemaRegistryEmpty - No schemas registered (startup issue)
+      # =======================================================================
+      - alert: SchemaRegistryEmpty
+        expr: |
+          apm2_schema_registry_entries == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: schema_registry
+          rfc: RFC-0014
+        annotations:
+          summary: "Schema registry empty on {{ $labels.node_id }}"
+          description: |
+            Node {{ $labels.node_id }} has no schemas registered.
+
+            This may indicate:
+            - Node startup failure
+            - Schema registration failure
+            - Database corruption
+
+            The node cannot validate events without registered schemas.
+
+            Runbook: docs/operations/consensus-runbook.md#schemaregistryempty
+          runbook_url: "https://github.com/yourorg/apm2/blob/main/docs/operations/consensus-runbook.md#schemaregistryempty"
+
+  # ===========================================================================
+  # Recording Rules for Efficiency
+  # ===========================================================================
+  - name: apm2_consensus_recording_rules
+    rules:
+      # Pre-compute proposal success rate
+      - record: apm2:consensus:proposal_success_rate
+        expr: |
+          sum(rate(apm2_consensus_proposals_total{outcome="committed"}[5m])) by (node_id)
+          /
+          sum(rate(apm2_consensus_proposals_total[5m])) by (node_id)
+
+      # Pre-compute p50 finalization latency
+      - record: apm2:consensus:finalization_latency_p50
+        expr: |
+          histogram_quantile(0.50, sum(rate(apm2_consensus_finalization_latency_seconds_bucket[5m])) by (le, node_id))
+
+      # Pre-compute p99 finalization latency
+      - record: apm2:consensus:finalization_latency_p99
+        expr: |
+          histogram_quantile(0.99, sum(rate(apm2_consensus_finalization_latency_seconds_bucket[5m])) by (le, node_id))
+
+      # Quorum health ratio
+      - record: apm2:consensus:quorum_health
+        expr: |
+          apm2_consensus_validators_active / apm2_consensus_quorum_size
