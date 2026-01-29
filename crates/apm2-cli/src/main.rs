@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use apm2_core::bootstrap::verify_bootstrap_hash;
+use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -215,6 +216,16 @@ fn main() -> Result<()> {
     // Verify bootstrap schema integrity before proceeding.
     // This is a critical security check that must pass before any CAC operations.
     verify_bootstrap_hash().context("bootstrap schema integrity check failed")?;
+
+    // Register core kernel schemas on startup (TCK-00181).
+    // This establishes the schema registry with all kernel event types
+    // before any event processing can occur.
+    let registry = InMemorySchemaRegistry::new();
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .context("Failed to build tokio runtime for kernel schema registration")?
+        .block_on(register_kernel_schemas(&registry))
+        .context("kernel schema registration failed")?;
 
     let cli = Cli::parse();
 

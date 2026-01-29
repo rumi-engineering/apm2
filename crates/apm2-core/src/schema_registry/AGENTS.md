@@ -94,7 +94,7 @@ Non-persistent implementation for testing and single-node deployments.
 **Contracts:**
 - [CTR-0020] Evicts oldest entries when capacity exceeded (O(1) FIFO)
 - [CTR-0021] `clear()` removes all schemas
-- [CTR-0022] Re-registering same digest with different stable_id updates the mapping
+- [CTR-0022] Re-registering same digest with different stable_id is a no-op (first stable_id wins)
 
 ### `SchemaRegistryError`
 

@@ -238,50 +238,79 @@ impl SchemaRegistry for InMemorySchemaRegistry {
         entry: &'a SchemaEntry,
     ) -> BoxFuture<'a, Result<(), SchemaRegistryError>> {
         Box::pin(async move {
-            // SECURITY: Perform operations in order to prevent DoS attacks.
-            // 1. Cheap validation first (no hash computation)
-            // 2. Check existence (early return for duplicates)
-            // 3. Expensive hash verification last
+            // SECURITY: Staging pattern to prevent DoS via lock contention.
             //
-            // LOCK ORDERING ([INV-0015]): insertion_order -> by_digest -> by_stable_id
-            // This prevents deadlocks with concurrent lookup_by_stable_id calls.
+            // Phase 1 (NO LOCKS): Validate input and compute hash
+            //   - Cheap validation (size limits, format)
+            //   - Expensive hash verification (BLAKE3 of up to 1MB content)
+            //
+            // Phase 2 (READ LOCKS): Quick existence check
+            //   - Check if already registered (idempotent no-op)
+            //
+            // Phase 3 (WRITE LOCKS): Commit the registration
+            //   - Re-check under write lock (double-checked locking)
+            //   - Evict if needed, then insert
+            //
+            // This prevents blocking read operations during hash verification.
+            // [INV-0015]: Lock ordering: insertion_order -> by_digest -> by_stable_id
 
-            // Step 1: Cheap validation (O(1) checks, no hashing)
+            // ===== PHASE 1: Pre-validation WITHOUT locks =====
+            // Cheap validation (O(1) checks, no hashing)
             Self::validate_entry_cheap(entry)?;
 
-            // Acquire locks in consistent order: insertion_order -> by_digest ->
+            // Expensive hash verification BEFORE acquiring any locks.
+            // This prevents DoS where an attacker submits large content
+            // and blocks all registry operations during hash computation.
+            Self::verify_hash(entry)?;
+
+            // ===== PHASE 2: Quick existence check with READ locks =====
+            // Use read locks for fast-path duplicate detection
+            {
+                let by_digest = self.by_digest.read().expect("lock poisoned");
+                let by_stable_id = self.by_stable_id.read().expect("lock poisoned");
+
+                // Check for stable ID conflict
+                if let Some(existing_digest) = by_stable_id.get(&entry.stable_id) {
+                    if *existing_digest != entry.digest {
+                        return Err(SchemaRegistryError::Conflict {
+                            stable_id: entry.stable_id.clone(),
+                        });
+                    }
+                    // Same stable ID with same digest - this is a no-op
+                    return Ok(());
+                }
+
+                // Check if digest already exists.
+                // SECURITY [INV-0014]: First stable_id wins - subsequent registrations
+                // with same digest are true no-ops. This prevents alias hijacking.
+                if by_digest.contains_key(&entry.digest) {
+                    return Ok(());
+                }
+            }
+            // Read locks released here
+
+            // ===== PHASE 3: Commit with WRITE locks =====
+            // Acquire write locks in consistent order: insertion_order -> by_digest ->
             // by_stable_id
             let mut insertion_order = self.insertion_order.write().expect("lock poisoned");
             let mut by_digest = self.by_digest.write().expect("lock poisoned");
             let mut by_stable_id = self.by_stable_id.write().expect("lock poisoned");
 
-            // Step 2: Check for stable ID conflict (early return)
+            // Double-checked locking: Re-verify under write lock since another
+            // thread may have registered between our read check and write lock
             if let Some(existing_digest) = by_stable_id.get(&entry.stable_id) {
                 if *existing_digest != entry.digest {
                     return Err(SchemaRegistryError::Conflict {
                         stable_id: entry.stable_id.clone(),
                     });
                 }
-                // Same stable ID with same digest - this is a no-op
                 return Ok(());
             }
-
-            // Step 2b: Check if digest already exists.
-            // SECURITY: If digest already exists, return Ok(()) immediately WITHOUT
-            // changing the stable_id mapping. This prevents alias hijacking attacks
-            // where an attacker registers a kernel schema's content under a different
-            // stable_id to remove the original "kernel:" mapping.
-            // [INV-0014]: First stable_id wins - subsequent registrations with same
-            // digest are true no-ops.
             if by_digest.contains_key(&entry.digest) {
-                // Digest already registered - true idempotent no-op
                 return Ok(());
             }
 
-            // Step 3: Expensive hash verification (only for new digests)
-            Self::verify_hash(entry)?;
-
-            // Step 4: Evict oldest entries if at capacity ([CTR-1303])
+            // Evict oldest entries if at capacity ([CTR-1303])
             // O(1) eviction via insertion_order VecDeque ([INV-0013])
             while by_digest.len() >= self.max_schemas {
                 if let Some(oldest_digest) = insertion_order.pop_front() {
@@ -298,7 +327,7 @@ impl SchemaRegistry for InMemorySchemaRegistry {
                 }
             }
 
-            // Step 5: Register the new schema
+            // Register the new schema
             by_digest.insert(entry.digest, entry.clone());
             by_stable_id.insert(entry.stable_id.clone(), entry.digest);
             insertion_order.push_back(entry.digest);
@@ -854,17 +883,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tck_00181_register_checks_conflict_before_hash() {
-        // Test that conflict check runs before expensive hash verification.
-        // First register a valid entry, then try to register a conflicting
-        // entry with the same stable ID but different (invalid) content.
-        // The Conflict error should be returned, not HashMismatch.
+    async fn tck_00181_register_checks_conflict_with_valid_hash() {
+        // Test that conflict detection works for valid entries.
+        // SECURITY: Hash verification now happens BEFORE conflict check (outside
+        // locks) to prevent DoS via lock contention. This means invalid hashes
+        // fail early with HashMismatch, not Conflict.
+        //
+        // This test verifies conflict detection with VALID hashes.
         let registry = InMemorySchemaRegistry::new();
 
         let entry1 = make_entry("test:schema.v1", br#"{"id": 1}"#);
         registry.register(&entry1).await.unwrap();
 
-        // Conflicting entry with same stable ID, different content, and WRONG hash
+        // Conflicting entry with same stable ID but different content (valid hash)
+        let entry2 = make_entry("test:schema.v1", br#"{"id": 2}"#);
+
+        let result = registry.register(&entry2).await;
+        assert!(
+            matches!(result, Err(SchemaRegistryError::Conflict { .. })),
+            "Expected Conflict error for same stable_id with different content"
+        );
+    }
+
+    #[tokio::test]
+    async fn tck_00181_register_hash_verified_before_conflict_check() {
+        // SECURITY: Verify that hash is checked BEFORE acquiring locks.
+        // This prevents DoS where an attacker submits entries with invalid
+        // hashes to hold locks during expensive validation.
+        //
+        // Invalid hash should fail with HashMismatch even if stable_id would
+        // conflict with an existing entry.
+        let registry = InMemorySchemaRegistry::new();
+
+        let entry1 = make_entry("test:schema.v1", br#"{"id": 1}"#);
+        registry.register(&entry1).await.unwrap();
+
+        // Entry with same stable ID but INVALID hash
         let entry2 = SchemaEntry {
             stable_id: "test:schema.v1".to_string(),
             digest: SchemaDigest::new([42u8; 32]), // Wrong hash
@@ -875,9 +929,11 @@ mod tests {
         };
 
         let result = registry.register(&entry2).await;
+        // HashMismatch is returned because hash verification happens BEFORE
+        // conflict check (outside locks, per staging pattern)
         assert!(
-            matches!(result, Err(SchemaRegistryError::Conflict { .. })),
-            "Expected Conflict error (fast check), not HashMismatch"
+            matches!(result, Err(SchemaRegistryError::HashMismatch { .. })),
+            "Expected HashMismatch error (hash verified before conflict check)"
         );
     }
 

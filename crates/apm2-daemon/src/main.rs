@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use apm2_core::bootstrap::verify_bootstrap_hash;
 use apm2_core::config::EcosystemConfig;
 use apm2_core::process::ProcessState;
+use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
@@ -243,6 +244,14 @@ async fn main() -> Result<()> {
     // Verify bootstrap schema integrity before proceeding.
     // This is a critical security check that must pass before any CAC operations.
     verify_bootstrap_hash().context("bootstrap schema integrity check failed")?;
+
+    // Register core kernel schemas on startup (TCK-00181).
+    // This establishes the schema registry with all kernel event types
+    // before any event processing can occur.
+    let registry = InMemorySchemaRegistry::new();
+    register_kernel_schemas(&registry)
+        .await
+        .context("kernel schema registration failed")?;
 
     // Daemonize if requested
     #[allow(unsafe_code)] // fork() requires unsafe
