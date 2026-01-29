@@ -240,6 +240,18 @@ rfc_trust_boundaries:
         AAT harnesses run in strict namespaces/containers. No host mounts beyond
         pinned snapshot. Egress deny by default.
 
+    - id: SEC-CTRL-FAC-0009
+      name: "Dual-Control for Kernel Operations"
+      type: PREVENTATIVE
+      boundary: TB-0001
+      details: |
+        Critical kernel operations require dual approval to mitigate insider threat (ADV-0005):
+        - KeyRotated events require dual approval
+        - InterventionUnfreeze requires dual approval
+        - Policy changes require dual approval
+        Code review gate: Changes to kernel/*, crypto/* require AUTH_SECURITY review.
+      added_by: "COUNCIL-RFC-0015-FINALIZE-20260129 (F-SA3-012 resolution)"
+
   threat_model:
     adversaries:
       - id: ADV-0001
@@ -278,6 +290,19 @@ rfc_trust_boundaries:
           - TB-0005
           - SEC-CTRL-FAC-0008
 
+      - id: ADV-0005
+        name: "Malicious Insider"
+        capabilities:
+          - "Has legitimate kernel or coordinator access"
+          - "Can modify code or configuration"
+          - "Can access internal systems"
+          - "May have key access or HSM credentials"
+        mitigations:
+          - SEC-CTRL-FAC-0009
+          - "Code review gate for kernel/* and crypto/* changes"
+          - "Audit log with tamper-evident hash chain"
+        added_by: "COUNCIL-RFC-0015-FINALIZE-20260129 (F-SA3-012 resolution)"
+
     attack_vectors:
       - id: AV-0001
         name: "Status Spoofing"
@@ -314,6 +339,24 @@ rfc_trust_boundaries:
         adversary: ADV-0001
         description: "Agent produces convincing narrative without actual test PASS"
         mitigation: "TB-0005: Terminal verifier binding; narrative non-authoritative"
+
+      - id: AV-0007
+        name: "Code Modification to Bypass TB-0003"
+        adversary: ADV-0005
+        description: "Insider modifies admission code to inject GitHub status reads"
+        mitigation: "SEC-CTRL-FAC-0009: Dual-control + code review for kernel changes"
+
+      - id: AV-0008
+        name: "Direct Ledger Manipulation"
+        adversary: ADV-0005
+        description: "Insider with ledger access directly injects or modifies events"
+        mitigation: "Audit log with tamper-evident hash chain; dual-control for writes"
+
+      - id: AV-0009
+        name: "Key Extraction from Runtime"
+        adversary: ADV-0005
+        description: "Insider extracts signing keys from runtime environment"
+        mitigation: "HSM-backed key storage (Phase 2); key usage audit logging"
 
   coi_policy:
     description: |

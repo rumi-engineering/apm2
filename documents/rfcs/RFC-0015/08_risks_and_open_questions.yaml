@@ -133,7 +133,24 @@ rfc_risks_and_open_questions:
         During EXPLORE phase, examine existing KeyManager implementation and define
         KeyPolicy schema with custody domain grouping. Implement COI validation in
         lease issuance path.
-      status: UNRESOLVED
+      status: RESOLVED
+      resolution: |
+        DEFINE KeyPolicy artifact with custody domain grouping (SA-1 FINALIZE).
+
+        KeyPolicy schema includes:
+        - policy_id, policy_hash
+        - custody_domains with key_bindings and coi_group_id
+        - coi_rules with enforcement at LEASE_ISSUANCE or ADMISSION
+        - delegation_rules for cross-domain scope allowances
+
+        Validation path:
+        1. KeyPolicy committed under CAC governance
+        2. Lease issuance checks: executor_key.coi_group_id != author.coi_group_id
+        3. UNAUTHORIZED_EXECUTOR on COI violation
+        4. Waiver via AdjudicationRequested(WAIVER) with bounded scope
+      resolved_by: COUNCIL-RFC-0015-FINALIZE-20260129
+      resolved_date: "2026-01-29"
+      confidence: HIGH
       blocking_tickets:
         - TG-FAC-001
       related_prd_question: Q-FAC-0003
@@ -147,7 +164,27 @@ rfc_risks_and_open_questions:
         Survey hosted CI providers for environment attestation capabilities.
         Document self-hosted runner requirements for L1+. Define fallback policy
         for hosted runners with explicit attestation level documentation.
-      status: UNRESOLVED
+      status: DEFERRED
+      resolution: |
+        DEFER to Phase 2 with explicit L0 policy for Phase 1 (SA-1 FINALIZE).
+
+        Phase 1 Policy:
+        - Accept L0 attestation (webhook signature + artifact hashes) for all tiers
+        - Document that L0 does not provide environment attestation
+        - Require explicit acknowledgment in CI_EVENTS_ENABLED activation
+        - For HIGH risk: recommend manual re-run in controlled environment
+
+        Phase 2 Resolution Plan:
+        - Survey hosted CI providers for environment attestation APIs
+        - Define self-hosted runner requirements for L1+
+        - Create migration path from L0 -> L1
+
+        Rationale: Hosted CI provider landscape is evolving. Forcing L1+ now would
+        require self-hosted runners with significant operational burden. L0 sufficient
+        for Phase 1 with documented limitations.
+      resolved_by: COUNCIL-RFC-0015-FINALIZE-20260129
+      resolved_date: "2026-01-29"
+      confidence: MEDIUM
       blocking_tickets:
         - TG-FAC-004
       related_prd_question: Q-FAC-0004
@@ -188,7 +225,28 @@ rfc_risks_and_open_questions:
       resolution_plan: |
         Start with N=3 for AAT in T3 (HIGH risk); evaluate throughput impact and expand
         to other gates only after stability and cost metrics meet targets.
-      status: UNRESOLVED
+      status: RESOLVED
+      resolution: |
+        DEFINE determinism envelope run count (N) by risk tier (SA-1 FINALIZE):
+
+        | Risk Tier | N (Run Count) | Rationale |
+        |-----------|---------------|-----------|
+        | HIGH      | 3             | Full stability check; latency acceptable for security |
+        | MED       | 2             | Reduced stability check; balance throughput and safety |
+        | LOW       | 1             | No stability check; nightly full AAT provides coverage |
+
+        Expansion Policy:
+        - Phase 1: N-run envelope for AAT gates only (schema ships)
+        - Phase 2: Enforcement enabled; expand to other gates if GATE_NONDETERMINISTIC >1%
+
+        Flake Classification:
+        - DETERMINISTIC: All N runs agree
+        - TEST_FLAKE: Infra-attributable disagreement
+        - TEST_NONSEMANTIC: Semantically equivalent but different format
+        - CODE_NONDETERMINISTIC: Actual behavioral nondeterminism (QUARANTINE)
+      resolved_by: COUNCIL-RFC-0015-FINALIZE-20260129
+      resolved_date: "2026-01-29"
+      confidence: HIGH
       blocking_tickets:
         - TG-FAC-007
       related_prd_question: Q-FAC-0006
@@ -201,7 +259,34 @@ rfc_risks_and_open_questions:
       resolution_plan: |
         Start with policy-defined critical domains (auth/crypto/ledger/tool mediation)
         and expand with impact expansion heuristics; revise based on escape-rate metrics.
-      status: UNRESOLVED
+      status: RESOLVED
+      resolution: |
+        DEFINE risk tier classification model (SA-1 FINALIZE):
+
+        PRIMARY SIGNALS (Policy-Defined):
+        - Module criticality: auth/*, crypto/*, ledger/*, tool/*, kernel/*
+        - File patterns: *_secret*, *credentials*, *policy*
+        - Impact domain: DOMAIN_SECURITY, DOMAIN_KERNEL
+
+        SECONDARY SIGNALS (Impact-Derived):
+        - Diff scope: >500 lines or >10 files -> raise tier
+        - Dependency fanout: >20 transitive dependents -> raise tier
+        - Test coverage delta: <0% coverage change on critical path -> raise tier
+
+        CLASSIFICATION ALGORITHM:
+        - touches_critical_module OR matches_sensitive_pattern -> HIGH
+        - large_scope OR high_fanout -> MED
+        - otherwise -> LOW
+
+        TIER DEFINITIONS:
+        - HIGH: Always requires AAT for all impacted modules
+        - MED: Requires AAT for sensitive domains; sampled otherwise
+        - LOW: 1-in-10 sampling + nightly full AAT on main
+
+        ESCAPE METRICS: Track escapes by tier; >1% escape rate triggers review.
+      resolved_by: COUNCIL-RFC-0015-FINALIZE-20260129
+      resolved_date: "2026-01-29"
+      confidence: MEDIUM
       blocking_tickets:
         - TG-FAC-006
       related_prd_question: Q-FAC-0008
@@ -236,7 +321,31 @@ rfc_risks_and_open_questions:
       resolution_plan: |
         Start with LOW-only reuse; expand based on cache integrity metrics and
         escape rate. MED reuse may require explicit waiver and audit.
-      status: UNRESOLVED
+      status: RESOLVED
+      resolution: |
+        ALLOW AAT reuse for LOW risk only; MED requires waiver (SA-1 FINALIZE):
+
+        | Risk Tier | AAT Reuse | Conditions |
+        |-----------|-----------|------------|
+        | HIGH      | NEVER     | Always fresh AAT required |
+        | MED       | WAIVER    | AdjudicationRequested(AAT_REUSE) with bounded TTL |
+        | LOW       | ALLOWED   | Exact provenance tuple match required |
+
+        PROVENANCE TUPLE:
+        - changeset_digest (content hash)
+        - view_commitment_hash
+        - rcp_profile_id
+        - verifier_policy_hash
+        - determinism_class (must be DETERMINISTIC)
+
+        REUSE EVENT: AATResultReused with original_receipt_id, provenance_tuple_hash
+        CACHE INVALIDATION: Any verifier_policy_hash change invalidates all cached results
+        TTL: 7 days for LOW reuse (nightly AAT refreshes cache)
+
+        WAIVER CEREMONY (MED): AdjudicationRequested -> AUTH_SECURITY approval -> 24h max TTL
+      resolved_by: COUNCIL-RFC-0015-FINALIZE-20260129
+      resolved_date: "2026-01-29"
+      confidence: HIGH
       blocking_tickets:
         - TG-FAC-008
       related_prd_question: Q-FAC-0010
@@ -249,7 +358,32 @@ rfc_risks_and_open_questions:
       resolution_plan: |
         Document required GitHub branch protection settings. Codify in adapter
         handshake and validate on startup. Define audit for administrator bypass.
-      status: UNRESOLVED
+      status: RESOLVED
+      resolution: |
+        DEFINE required GitHub branch protection settings (SA-1 FINALIZE):
+
+        MANDATORY SETTINGS:
+        - required_status_checks.strict: true (branch must be up to date)
+        - required_status_checks.contexts: ["fac/admission"]
+        - enforce_admins: true (admins cannot bypass)
+        - restrictions.apps: ["fac-adapter"] (only FAC can merge)
+        - allow_force_pushes: false
+        - allow_deletions: false
+        - required_linear_history: true
+
+        ADAPTER HANDSHAKE:
+        1. On startup, query GitHub API for branch protection
+        2. Compare to required settings schema
+        3. If mismatch: emit DefectRecord(BRANCH_PROTECTION_MISMATCH)
+        4. If critical mismatch (allow_force_pushes=true): refuse to project
+
+        ADMIN BYPASS AUDIT:
+        - Monitor GitHub audit log for bypass events
+        - Emit DefectRecord(ADMIN_BYPASS_DETECTED) on detection
+        - Consider InterventionFreeze if bypass merges to protected branch
+      resolved_by: COUNCIL-RFC-0015-FINALIZE-20260129
+      resolved_date: "2026-01-29"
+      confidence: HIGH
       blocking_tickets:
         - TG-FAC-003
       related_prd_question: Q-FAC-0005
@@ -457,3 +591,314 @@ rfc_risks_and_open_questions:
         - "P1: Add lease revocation mechanism to DD-FAC-0002"
         - "P1: Specify domain separator format precisely"
         - "P2: Add ADV-0005 (insider threat) to threat model"
+
+  # ============================================================================
+  # FINALIZE COUNCIL FINDINGS (v2 -> v4)
+  # ============================================================================
+
+  finalize_council_findings:
+    session_id: COUNCIL-RFC-0015-FINALIZE-20260129
+    timestamp: "2026-01-29T14:00:00Z"
+    verdict: APPROVED_FOR_V4
+    subagent: SA-1
+    role: "Structural Rigorist"
+    modes: [3, 16, 42, 58, 74]
+
+    security_finding_resolutions:
+      - finding_id: F-SA3-001
+        title: "Lease Revocation Gap"
+        resolution_status: RESOLVED
+        resolution: |
+          ADD LeaseRevoked event type to kernel_events.proto with lease_id,
+          revoked_by, revoked_at, reason, issuer_signature fields.
+          REDUCE TTL: AAT-scoped leases <= 15 minutes; other gates <= 30 minutes.
+          Revocation is immediate (no grace period).
+
+      - finding_id: F-SA3-002
+        title: "WARN Mode Security Gap"
+        resolution_status: RESOLVED
+        resolution: |
+          REDUCE FAC-R-01 WARN duration from 14 days to 7 days.
+          ADD sensitive module exclusion: auth/*, crypto/*, ledger/* denied even in WARN.
+          ADD rate limiting: Max 100 context misses per work_id before SOFT_FAIL escalation.
+
+      - finding_id: F-SA3-004
+        title: "Projection Read Path not runtime-verified"
+        resolution_status: RESOLVED
+        resolution: |
+          IMPLEMENT runtime policy enforcement for TB-0003.
+          OPTION A (RECOMMENDED): Network-level isolation via Kubernetes NetworkPolicy.
+          OPTION B: Runtime policy hook in HTTP client blocking api.github.com.
+          ADD integration test asserting admission cannot reach api.github.com.
+
+      - finding_id: F-SA3-012
+        title: "Insider Threat (ADV-0005) not modeled"
+        resolution_status: RESOLVED
+        resolution: |
+          ADD ADV-0005 to threat model with attack vectors AV-0007/0008/0009.
+          ADD SEC-CTRL-FAC-0009: Dual-control for kernel ops.
+          ADD code review gate for kernel/*, crypto/* changes.
+          ADD audit log with tamper-evident hash chain.
+
+    decision_status_upgrades:
+      - decision_id: DD-FAC-0004
+        from_status: HYPOTHESIS
+        to_status: VALIDATED
+        conditions: ["F-SA3-004 runtime enforcement required"]
+
+      - decision_id: DD-FAC-0005
+        from_status: HYPOTHESIS
+        to_status: VALIDATED
+        conditions: ["Document L0/L1 attestation levels"]
+
+      - decision_id: DD-FAC-0006
+        from_status: HYPOTHESIS
+        to_status: VALIDATED
+        conditions: []
+
+      - decision_id: DD-FAC-0007
+        from_status: HYPOTHESIS
+        to_status: VALIDATED
+        conditions: ["TerminalVerifier trait spec needed"]
+
+      - decision_id: DD-FAC-0008
+        from_status: HYPOTHESIS
+        to_status: VALIDATED
+        conditions: []
+
+      - decision_id: DD-FAC-0009
+        from_status: HYPOTHESIS
+        to_status: VALIDATED
+        conditions: []
+
+    remaining_gaps:
+      blocking:
+        - gap_id: GAP-001
+          title: "TerminalVerifier trait and VerifierPolicy schema not defined"
+          blocking_decision: DD-FAC-0007
+          estimated_effort: "2-3 days"
+
+      non_blocking:
+        - gap_id: GAP-002
+          title: "L1+ CI attestation requires self-hosted runners"
+          deferred_to: Phase 2
+
+        - gap_id: GAP-003
+          title: "Determinism envelope enforcement"
+          deferred_to: Phase 2
+
+        - gap_id: GAP-004
+          title: "HSM-backed key storage for T1 keys"
+          deferred_to: Phase 2
+
+    v4_approval_conditions:
+      required:
+        - "Resolve GAP-001: Define TerminalVerifier trait and VerifierPolicy schema"
+        - "Update design decisions with validation evidence (DONE)"
+        - "Update open questions with resolutions (DONE)"
+        - "Add LeaseRevoked event to proto extension plan"
+        - "Add ADV-0005 to threat model in 03_trust_boundaries.yaml"
+
+      recommended:
+        - "Add runtime policy enforcement for TB-0003"
+        - "Document L0/L1 attestation levels"
+        - "Create integration test for admission network isolation"
+
+    confidence_assessment:
+      overall_v4_readiness: 0.85
+      mean_decision_score: 4.08
+      all_decisions_above_threshold: true
+      expected_time_to_v4: "3-5 days"
+
+  # ============================================================================
+  # SA-2 IMPLEMENTATION FEASIBILITY ANALYSIS (FINALIZE)
+  # ============================================================================
+
+  sa2_implementation_feasibility:
+    session_id: COUNCIL-RFC-0015-FINALIZE-20260129
+    timestamp: "2026-01-29T15:30:00Z"
+    agent_id: SA-2
+    role: "Implementation Feasibility"
+    modes_applied:
+      - 11  # Bayesian Reasoning
+      - 39  # Counterfactual Reasoning
+      - 47  # Planning/Policy Reasoning
+      - 51  # Satisficing
+      - 70  # Engineering Design
+
+    artifact_reference: "documents/rfcs/RFC-0015/SA2_mock_implementation_run_report.yaml"
+
+    executive_summary: |
+      RFC-0015 FAC implementation is FEASIBLE with identified remediations.
+      Applied 5-mode analysis across all 12 ticket groups using Bayesian probability
+      updates, counterfactual path analysis, action sequence planning, satisficing
+      constraints, and engineering trade-off evaluation.
+
+      Key findings:
+      - Overall implementation probability: 68% [55%, 81%]
+      - Calibrated ticket estimate: 55 tickets (1.4x multiplier applied)
+      - Critical path: 10 weeks with 3-engineer team
+      - Phase 1: 45 tickets (8 weeks)
+      - Phase 2: 10 tickets (2 weeks)
+
+    component_feasibility_scores:
+      - component: TG-FAC-001
+        name: "Gate Event Infrastructure"
+        feasibility: HIGH
+        probability: 0.73
+        calibrated_tickets: 6
+
+      - component: TG-FAC-002
+        name: "OCAP Context Firewall"
+        feasibility: MEDIUM
+        probability: 0.66
+        calibrated_tickets: 5
+
+      - component: TG-FAC-003
+        name: "Projection Watchdog"
+        feasibility: MEDIUM
+        probability: 0.50
+        calibrated_tickets: 5
+
+      - component: TG-FAC-004
+        name: "CI Evidence Import"
+        feasibility: MEDIUM
+        probability: 0.60
+        calibrated_tickets: 4
+
+      - component: TG-FAC-005
+        name: "Typed AAT GateReceipt"
+        feasibility: MEDIUM-HIGH
+        probability: 0.67
+        calibrated_tickets: 6
+
+      - component: TG-FAC-006
+        name: "Risk-Tiered Selection"
+        feasibility: MEDIUM
+        probability: 0.53
+        calibrated_tickets: 5
+
+      - component: TG-FAC-007
+        name: "Determinism Envelope"
+        feasibility: MEDIUM
+        probability: 0.55
+        calibrated_tickets: 5
+        phase: PHASE-2
+
+      - component: TG-FAC-008
+        name: "AAT Reuse"
+        feasibility: MEDIUM
+        probability: 0.60
+        calibrated_tickets: 4
+
+      - component: TG-FAC-009
+        name: "Quorum/Sandboxing"
+        feasibility: MEDIUM
+        probability: 0.55
+        calibrated_tickets: 5
+        phase: PHASE-2
+
+      - component: TG-FAC-010
+        name: "Invariant Specs"
+        feasibility: HIGH
+        probability: 0.70
+        calibrated_tickets: 3
+
+      - component: TG-FAC-011
+        name: "Merge Receipt"
+        feasibility: HIGH
+        probability: 0.75
+        calibrated_tickets: 4
+
+      - component: TG-FAC-012
+        name: "Echo-Trap"
+        feasibility: HIGH
+        probability: 0.70
+        calibrated_tickets: 3
+
+    critical_path:
+      sequence: [TG-FAC-001, TG-FAC-005, TG-FAC-006, TG-FAC-007]
+      tickets_on_path: 22
+      elapsed_weeks: 10
+
+    parallelization_opportunities:
+      - parallel_set_1:
+          groups: [TG-FAC-002, TG-FAC-003, TG-FAC-004, TG-FAC-011, TG-FAC-012]
+          parallel_with: TG-FAC-005
+          savings_weeks: 4
+      - parallel_set_2:
+          groups: [TG-FAC-008, TG-FAC-010]
+          parallel_with: TG-FAC-006
+          savings_weeks: 2
+
+    friction_points_summary:
+      critical:
+        - id: FB-001
+          title: "Q-RFC-FAC-0003 COI Policy"
+          status: RESOLVED_BY_FINALIZE
+
+        - id: FB-002
+          title: "Q-RFC-FAC-0007 Risk Tier Classification"
+          status: RESOLVED_BY_FINALIZE
+
+        - id: FB-003
+          title: "Q-RFC-FAC-0006 Determinism N"
+          status: RESOLVED_BY_FINALIZE
+
+      major:
+        - id: MF-001
+          title: "Terminal Verifier Pattern Gap"
+          status: DEFERRED_TO_V4
+          mitigation: "Record outputs now; predicate engine in Phase 2"
+
+        - id: MF-002
+          title: "Domain Separator Format"
+          status: SPEC_PROVIDED
+          specification: "SPEC-FAC-001-A in artifact"
+
+        - id: MF-003
+          title: "Ticket Estimate Calibration"
+          status: APPLIED
+          multiplier: 1.4
+
+      minor:
+        - id: LF-001
+          title: "Q-RFC-FAC-0009 AAT Reuse Scope"
+          status: RESOLVED_BY_FINALIZE
+
+        - id: LF-002
+          title: "Q-RFC-FAC-0010 Branch Protection"
+          status: DEFERRED
+          mitigation: "Document requirements; runtime verification Phase 2"
+
+    go_no_go_recommendation:
+      recommendation: GO_WITH_REMEDIATION
+      confidence: 0.68
+
+      required_conditions:
+        - "Domain separator format documented (SPEC-FAC-001-A)"
+        - "Manifest schema defined before TG-FAC-002"
+        - "3-engineer team maintained through Phase 1"
+        - "Terminal Verifier predicate engine deferred to Phase 2"
+
+      success_factors:
+        - "Weekly sync with CAC team on TranscriptChunk"
+        - "90-day review checkpoint after Phase 1"
+        - "Context miss rate monitoring (target <15%)"
+        - "Escape rate tracking for risk tier calibration"
+
+    risk_adjusted_timeline:
+      best_case:
+        phase_1_weeks: 6
+        phase_2_weeks: 1.5
+        probability: 0.15
+
+      expected_case:
+        phase_1_weeks: 8
+        phase_2_weeks: 2
+        probability: 0.60
+
+      worst_case:
+        phase_1_weeks: 12
+        phase_2_weeks: 4
+        probability: 0.25

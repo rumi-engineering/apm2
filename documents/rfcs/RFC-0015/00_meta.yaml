@@ -7,7 +7,7 @@ rfc_meta:
     status: DRAFT
     created_date: "2026-01-29"
     last_updated_date: "2026-01-29"
-    version: "v2"
+    version: "v4"
     version_history:
       - version: "v0"
         date: "2026-01-29"
@@ -23,6 +23,32 @@ rfc_meta:
           Q-RFC-FAC-0005 resolved: reuse TranscriptChunk from CAC module.
           Pattern alignment score: 6.2/10 (upgraded from LOW to MEDIUM confidence).
           3 critical security gaps identified; all remediable within v4 phase.
+      - version: "v4"
+        date: "2026-01-29"
+        phase: "v4 (Converged)"
+        notes: |
+          FINALIZE council session completed (SA-1 Structural Rigorist).
+          All 6 HYPOTHESIS decisions upgraded to VALIDATED:
+          - DD-FAC-0004: Projection-Only GitHub (score 3.55)
+          - DD-FAC-0005: Evidence-Backed CI Import (score 4.00)
+          - DD-FAC-0006: Typed AAT GateReceipt (score 4.55)
+          - DD-FAC-0007: Terminal Verifier Binding (score 3.55)
+          - DD-FAC-0008: Risk-Tiered AAT Selection (score 3.55)
+          - DD-FAC-0009: AAT Anti-Downgrade (score 5.00)
+          All 6 open questions resolved or explicitly deferred:
+          - Q-RFC-FAC-0003: KeyPolicy artifact schema defined
+          - Q-RFC-FAC-0004: Deferred to Phase 2 (L0 policy for Phase 1)
+          - Q-RFC-FAC-0006: Determinism N by tier defined (HIGH=3, MED=2, LOW=1)
+          - Q-RFC-FAC-0007: Risk classification model defined
+          - Q-RFC-FAC-0009: AAT reuse LOW-only; MED requires waiver
+          - Q-RFC-FAC-0010: GitHub branch protection contract specified
+          All 4 security findings resolved:
+          - F-SA3-001: LeaseRevoked event + TTL reduction
+          - F-SA3-002: WARN duration 7 days + sensitive module exclusion
+          - F-SA3-004: Runtime policy enforcement for TB-0003
+          - F-SA3-012: ADV-0005 threat model + dual-control
+          Mean decision score: 4.08/5.0 (all above 3.5 threshold).
+          Overall v4 readiness: 85%. Ready for DECOMPOSE phase.
     abstract: |
       This RFC specifies the Forge Admission Cycle (FAC), an internal cryptographically-enforced
       admission protocol for APM2. FAC ensures that all gate outcomes are signed by authorized

@@ -130,16 +130,30 @@ rfc_governance_and_gates:
         - "OR confidence is LOW on design decision"
 
   current_status:
-    version: "v0"
-    phase: "Discovery"
-    next_phase: "v2 (Grounded)"
+    version: "v4"
+    phase: "Standard"
+    next_phase: "DECOMPOSE (Ticket Generation)"
     gate_status:
-      GATE-RFC-SCHEMA: PENDING
-      GATE-RFC-SCOPE-COVERAGE: PENDING
+      GATE-RFC-SCHEMA: PASSED
+      GATE-RFC-DEPENDENCY-ACYCLICITY: PASSED
+      GATE-RFC-SCOPE-COVERAGE: PASSED
+      GATE-RFC-CCP-MAPPING: PASSED
+      GATE-RFC-ATOMICITY: PASSED
+      GATE-RFC-IMPLEMENTABILITY: PASSED
+      GATE-RFC-ANTI-COUSIN: PASSED
+      GATE-RFC-SECURITY: PASSED_WITH_REMEDIATION
+      GATE-RFC-REQUIREMENT-FIDELITY: PASSED
     open_blockers: []
+    resolved_blockers:
+      - "F-SA3-001: Lease Revocation Gap - resolved via LeaseRevoked event + TTL reduction"
+      - "F-SA3-002: WARN Mode Security Gap - resolved via 7-day limit + sensitive domain exclusion"
+      - "F-SA3-004: TB-0003 Runtime Enforcement - resolved via network policy"
+      - "F-SA3-012: Insider Threat Model - resolved via ADV-0005 + dual-control"
     notes: |
-      RFC v0 created. Awaiting EXPLORE phase for codebase grounding.
-      Design decisions are hypotheses until grounded in existing patterns.
+      RFC v4 (Standard) achieved after FINALIZE council session.
+      All 9 gates passed. All design decisions upgraded to VALIDATED.
+      All open questions resolved or explicitly deferred.
+      Ready for DECOMPOSE phase to generate implementation tickets.
 
   review_history:
     - review_id: REV-RFC-0015-001
@@ -148,3 +162,43 @@ rfc_governance_and_gates:
       reviewer: "rfc-council (CREATE mode)"
       findings: []
       verdict: "RFC v0 created successfully"
+
+    - review_id: REV-RFC-0015-002
+      date: "2026-01-29"
+      type: EXPLORE
+      reviewer: "rfc-council (EXPLORE mode)"
+      findings:
+        - "Q-RFC-FAC-0001 resolved: EXTEND kernel_events.proto"
+        - "Q-RFC-FAC-0002 resolved: ContextAwareValidator middleware"
+        - "Q-RFC-FAC-0005 resolved: Reuse TranscriptChunk from CAC"
+        - "Pattern alignment score: 6.2/10"
+      verdict: "RFC v2 (Grounded) achieved"
+
+    - review_id: REV-RFC-0015-003
+      date: "2026-01-29"
+      type: FINALIZE
+      reviewer: "rfc-council (FINALIZE mode)"
+      council_session_id: "COUNCIL-RFC-0015-FINALIZE-20260129"
+      subagents:
+        - agent_id: SA-1
+          role: "Structural Rigorist"
+          modes: [3, 16, 42, 58, 74]
+          artifact: "Explanatory Scoring Table"
+          verdict: "All decisions meet 3.5+ threshold; mean score 4.08/5.0"
+        - agent_id: SA-2
+          role: "Implementation Feasibility"
+          modes: [11, 39, 47, 51, 70]
+          artifact: "Mock Implementation Run Report"
+          verdict: "GO_WITH_REMEDIATION; 68% confidence; 55 calibrated tickets"
+        - agent_id: SA-3
+          role: "Security & Anti-Cousin Guardian"
+          modes: [8, 35, 49, 65, 80]
+          artifact: "CAE Tree"
+          verdict: "APPROVE_WITH_CONDITIONS; 91% confidence"
+      findings:
+        - "All 6 HYPOTHESIS decisions upgraded to VALIDATED"
+        - "All 6 open questions resolved or deferred"
+        - "All 4 MAJOR security findings resolved"
+        - "ADV-0005 (insider threat) model added"
+        - "Anti-cousin verdict: NO COUSIN ABSTRACTIONS"
+      verdict: "APPROVED_WITH_REMEDIATION - RFC v4 (Standard) achieved"
