@@ -36,6 +36,24 @@ rfc_contracts_and_versioning:
         - "Child leases can only narrow scope (subset rule)"
       domain_separator: "GATE_LEASE_ISSUED:"
 
+    - contract_id: FAC-CONTRACT-009
+      name: "LeaseRevoked Contract"
+      description: |
+        Defines the structure and invariants for lease revocation.
+      schema: |
+        message LeaseRevoked {
+          string lease_id = 1;
+          string revoked_by = 2;
+          google.protobuf.Timestamp revoked_at = 3;
+          string reason = 4;
+          bytes issuer_signature = 5;
+        }
+      invariants:
+        - "lease_id references valid GateLease"
+        - "issuer_signature covers canonical bytes with LEASE_REVOKED: prefix"
+        - "revoked_at <= lease.expires_at"
+      domain_separator: "LEASE_REVOKED:"
+
     - contract_id: FAC-CONTRACT-002
       name: "GateRunCompleted Contract"
       description: |
@@ -59,6 +77,7 @@ rfc_contracts_and_versioning:
         }
       invariants:
         - "lease_id references valid GateLease"
+        - "no LeaseRevoked exists for lease_id with revoked_at <= completed_at"
         - "changeset_digest matches lease"
         - "executor_actor_id matches lease"
         - "executor_signature covers canonical bytes with GATE_RUN_COMPLETED: prefix"
@@ -131,6 +150,56 @@ rfc_contracts_and_versioning:
         - "All artifact_digests include data_classification"
         - "At least one terminal_verifier_output present for PASS"
         - "predicate_satisfied == true for all verifier outputs when verdict == PASS"
+
+    - contract_id: FAC-CONTRACT-007
+      name: "VerifierPolicy Contract"
+      description: |
+        Defines terminal verifier policy: scenario_type -> allowed verifiers,
+        required outputs, and machine predicate.
+      schema: |
+        verifier_policy:
+          policy_id: "VERIFIER_POLICY_FAC_V1"
+          policy_hash: "<blake3 of canonical form>"
+          schema_version: "fac.verifier_policy.v1"
+          scenario_type: "aat"
+          allowed_verifier_kinds: ["exit_code", "snapshot_diff", "structured_test_report", "invariant_check"]
+          required_outputs:
+            exit_code: ["exit_code", "command"]
+            structured_test_report: ["report_digest", "passed_count", "failed_count", "skipped_count"]
+          machine_predicate: "exit_code == 0 AND failed_count == 0"
+          predicate_lang: "fac_predicate_v1"
+      invariants:
+        - "policy_hash equals BLAKE3 of canonical policy document"
+        - "predicate_lang is supported by admission runtime"
+        - "required_outputs keys are subset of allowed_verifier_kinds"
+
+    - contract_id: FAC-CONTRACT-008
+      name: "KeyPolicy Contract"
+      description: |
+        Defines custody domains, COI groups, and key bindings for lease issuance.
+      schema: |
+        key_policy:
+          policy_id: "KEY_POLICY_FAC_V1"
+          policy_hash: "<blake3 of canonical form>"
+          schema_version: "fac.key_policy.v1"
+          custody_domains:
+            - domain_id: "DOMAIN_ADMISSION"
+              coi_group_id: "admission"
+              key_bindings:
+                - key_id: "key:ed25519:..."
+                  actor_id: "HOLON-KERNEL-GATE"
+                  role_ids: ["ROLE_ADMISSION"]
+          coi_rules:
+            - rule_id: "COI-001"
+              statement: "Executor COI group must differ from changeset author COI group"
+          delegation_rules:
+            - from_domain_id: "DOMAIN_KERNEL"
+              to_domain_id: "DOMAIN_ADMISSION"
+              allowed_gates: ["quality", "security", "aat"]
+      invariants:
+        - "policy_hash equals BLAKE3 of canonical policy document"
+        - "All key_bindings include actor_id and role_ids"
+        - "coi_group_id is defined for every custody_domain"
 
     - contract_id: FAC-CONTRACT-004
       name: "MergeReceipt Contract"
@@ -231,8 +300,8 @@ rfc_contracts_and_versioning:
       name: "Gate Event Payload Extension"
       description: |
         Existing kernel_events.proto may need extension for GateLeaseIssued, GateRunStarted,
-        GateRunCompleted payloads. Alternative: new fac_events.proto with import.
-      open_question: "Q-FAC-0001: Canonical proto placement for new payloads"
+        GateRunCompleted, and LeaseRevoked payloads.
+      resolution: "Extend kernel_events.proto (Q-RFC-FAC-0001 resolved)"
 
     - id: MIG-FAC-0002
       name: "Gradual OCAP Rollout"
@@ -242,7 +311,8 @@ rfc_contracts_and_versioning:
       phases:
         - phase: FAC-R-01
           mode: WARN
-          duration_days: 14
+          duration_days: 7
+          notes: "WARN applies only to non-sensitive domains; auth/crypto/ledger start at SOFT_FAIL"
         - phase: FAC-R-02
           mode: SOFT_FAIL
           duration_days: 14

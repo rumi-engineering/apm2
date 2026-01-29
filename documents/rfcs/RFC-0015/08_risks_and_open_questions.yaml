@@ -148,6 +148,7 @@ rfc_risks_and_open_questions:
         2. Lease issuance checks: executor_key.coi_group_id != author.coi_group_id
         3. UNAUTHORIZED_EXECUTOR on COI violation
         4. Waiver via AdjudicationRequested(WAIVER) with bounded scope
+        Reference: FAC-CONTRACT-008
       resolved_by: COUNCIL-RFC-0015-FINALIZE-20260129
       resolved_date: "2026-01-29"
       confidence: HIGH
@@ -545,7 +546,6 @@ rfc_risks_and_open_questions:
         description: |
           No existing terminal verifier infrastructure. Requires entirely new:
           TerminalVerifier trait, VerifierPolicy schema, predicate evaluation engine.
-        estimated_additional_tickets: 2-3
         phase_to_resolve: EXPLORE
 
       - id: SA2-RFC0015-F005
@@ -557,16 +557,6 @@ rfc_risks_and_open_questions:
           Without precise specification, independent implementations may diverge.
         recommendation: "Create domain_separator.rs module specification before implementation"
         phase_to_resolve: EXPLORE
-
-      - id: SA2-RFC0015-F010
-        source_agent: SA-2
-        source_mode: 76  # Calibration
-        title: "Ticket Group Estimates Appear Low by 30-50%"
-        description: |
-          Historical calibration shows initial security-critical estimates are typically
-          30-50% low due to testing and edge case handling.
-        recommendation: "Apply 1.4x multiplier to ticket estimates during DECOMPOSE"
-        affects: ALL_TICKET_GROUPS
 
     positive_findings:
       - id: SA1-RFC0015-v0-008
@@ -659,7 +649,7 @@ rfc_risks_and_open_questions:
       - decision_id: DD-FAC-0007
         from_status: HYPOTHESIS
         to_status: VALIDATED
-        conditions: ["TerminalVerifier trait spec needed"]
+        conditions: []
 
       - decision_id: DD-FAC-0008
         from_status: HYPOTHESIS
@@ -672,12 +662,7 @@ rfc_risks_and_open_questions:
         conditions: []
 
     remaining_gaps:
-      blocking:
-        - gap_id: GAP-001
-          title: "TerminalVerifier trait and VerifierPolicy schema not defined"
-          blocking_decision: DD-FAC-0007
-          estimated_effort: "2-3 days"
-
+      blocking: []
       non_blocking:
         - gap_id: GAP-002
           title: "L1+ CI attestation requires self-hosted runners"
@@ -690,14 +675,17 @@ rfc_risks_and_open_questions:
         - gap_id: GAP-004
           title: "HSM-backed key storage for T1 keys"
           deferred_to: Phase 2
+      resolved_in_v4_1:
+        - gap_id: GAP-001
+          title: "TerminalVerifier trait and VerifierPolicy schema specified"
+          resolution_ref: "FAC-CONTRACT-007"
 
     v4_approval_conditions:
       required:
-        - "Resolve GAP-001: Define TerminalVerifier trait and VerifierPolicy schema"
         - "Update design decisions with validation evidence (DONE)"
         - "Update open questions with resolutions (DONE)"
-        - "Add LeaseRevoked event to proto extension plan"
-        - "Add ADV-0005 to threat model in 03_trust_boundaries.yaml"
+        - "Add LeaseRevoked event to proto extension plan (DONE)"
+        - "Add ADV-0005 to threat model in 03_trust_boundaries.yaml (DONE)"
 
       recommended:
         - "Add runtime policy enforcement for TB-0003"
@@ -708,7 +696,6 @@ rfc_risks_and_open_questions:
       overall_v4_readiness: 0.85
       mean_decision_score: 4.08
       all_decisions_above_threshold: true
-      expected_time_to_v4: "3-5 days"
 
   # ============================================================================
   # SA-2 IMPLEMENTATION FEASIBILITY ANALYSIS (FINALIZE)
@@ -735,101 +722,82 @@ rfc_risks_and_open_questions:
       constraints, and engineering trade-off evaluation.
 
       Key findings:
-      - Overall implementation probability: 68% [55%, 81%]
-      - Calibrated ticket estimate: 55 tickets (1.4x multiplier applied)
-      - Critical path: 10 weeks with 3-engineer team
-      - Phase 1: 45 tickets (8 weeks)
-      - Phase 2: 10 tickets (2 weeks)
+      - Implementation feasible with remediation of identified gaps.
+      - Engineering estimates are intentionally omitted from this RFC artifact.
 
     component_feasibility_scores:
       - component: TG-FAC-001
         name: "Gate Event Infrastructure"
         feasibility: HIGH
         probability: 0.73
-        calibrated_tickets: 6
 
       - component: TG-FAC-002
         name: "OCAP Context Firewall"
         feasibility: MEDIUM
         probability: 0.66
-        calibrated_tickets: 5
 
       - component: TG-FAC-003
         name: "Projection Watchdog"
         feasibility: MEDIUM
         probability: 0.50
-        calibrated_tickets: 5
 
       - component: TG-FAC-004
         name: "CI Evidence Import"
         feasibility: MEDIUM
         probability: 0.60
-        calibrated_tickets: 4
 
       - component: TG-FAC-005
         name: "Typed AAT GateReceipt"
         feasibility: MEDIUM-HIGH
         probability: 0.67
-        calibrated_tickets: 6
 
       - component: TG-FAC-006
         name: "Risk-Tiered Selection"
         feasibility: MEDIUM
         probability: 0.53
-        calibrated_tickets: 5
 
       - component: TG-FAC-007
         name: "Determinism Envelope"
         feasibility: MEDIUM
         probability: 0.55
-        calibrated_tickets: 5
         phase: PHASE-2
 
       - component: TG-FAC-008
         name: "AAT Reuse"
         feasibility: MEDIUM
         probability: 0.60
-        calibrated_tickets: 4
 
       - component: TG-FAC-009
         name: "Quorum/Sandboxing"
         feasibility: MEDIUM
         probability: 0.55
-        calibrated_tickets: 5
         phase: PHASE-2
 
       - component: TG-FAC-010
         name: "Invariant Specs"
         feasibility: HIGH
         probability: 0.70
-        calibrated_tickets: 3
 
       - component: TG-FAC-011
         name: "Merge Receipt"
         feasibility: HIGH
         probability: 0.75
-        calibrated_tickets: 4
 
       - component: TG-FAC-012
         name: "Echo-Trap"
         feasibility: HIGH
         probability: 0.70
-        calibrated_tickets: 3
 
     critical_path:
       sequence: [TG-FAC-001, TG-FAC-005, TG-FAC-006, TG-FAC-007]
-      tickets_on_path: 22
-      elapsed_weeks: 10
 
     parallelization_opportunities:
       - parallel_set_1:
           groups: [TG-FAC-002, TG-FAC-003, TG-FAC-004, TG-FAC-011, TG-FAC-012]
           parallel_with: TG-FAC-005
-          savings_weeks: 4
       - parallel_set_2:
           groups: [TG-FAC-008, TG-FAC-010]
           parallel_with: TG-FAC-006
-          savings_weeks: 2
 
     friction_points_summary:
       critical:
@@ -856,11 +824,6 @@ rfc_risks_and_open_questions:
           status: SPEC_PROVIDED
           specification: "SPEC-FAC-001-A in artifact"
 
-        - id: MF-003
-          title: "Ticket Estimate Calibration"
-          status: APPLIED
-          multiplier: 1.4
-
       minor:
         - id: LF-001
           title: "Q-RFC-FAC-0009 AAT Reuse Scope"
@@ -878,27 +841,9 @@ rfc_risks_and_open_questions:
       required_conditions:
         - "Domain separator format documented (SPEC-FAC-001-A)"
         - "Manifest schema defined before TG-FAC-002"
-        - "3-engineer team maintained through Phase 1"
         - "Terminal Verifier predicate engine deferred to Phase 2"
 
       success_factors:
         - "Weekly sync with CAC team on TranscriptChunk"
-        - "90-day review checkpoint after Phase 1"
         - "Context miss rate monitoring (target <15%)"
         - "Escape rate tracking for risk tier calibration"
-
-    risk_adjusted_timeline:
-      best_case:
-        phase_1_weeks: 6
-        phase_2_weeks: 1.5
-        probability: 0.15
-
-      expected_case:
-        phase_1_weeks: 8
-        phase_2_weeks: 2
-        probability: 0.60
-
-      worst_case:
-        phase_1_weeks: 12
-        phase_2_weeks: 4
-        probability: 0.25

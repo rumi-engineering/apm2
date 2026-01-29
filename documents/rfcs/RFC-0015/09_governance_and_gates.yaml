@@ -130,7 +130,7 @@ rfc_governance_and_gates:
         - "OR confidence is LOW on design decision"
 
   current_status:
-    version: "v4"
+    version: "v4.1"
     phase: "Standard"
     next_phase: "DECOMPOSE (Ticket Generation)"
     gate_status:
@@ -189,7 +189,7 @@ rfc_governance_and_gates:
           role: "Implementation Feasibility"
           modes: [11, 39, 47, 51, 70]
           artifact: "Mock Implementation Run Report"
-          verdict: "GO_WITH_REMEDIATION; 68% confidence; 55 calibrated tickets"
+          verdict: "GO_WITH_REMEDIATION; confidence recorded in SA-2 artifact"
         - agent_id: SA-3
           role: "Security & Anti-Cousin Guardian"
           modes: [8, 35, 49, 65, 80]

@@ -37,7 +37,7 @@
       "C3": "Cycle 1: structural gates; Cycle 2: feasibility gates; Cycle 3: quorum resolve.",
       "C4": "Quorum: 2/3 vote resolves contested findings; deadlock => NEEDS_ADJUDICATION.",
       "C5": "Council outputs evidence bundle with council_metadata and gate results.",
-      "C6": "Timeout/budget abort => ABORTED with partial findings; subagent failure => adjust quorum."
+      "C6": "Budget/episode/stall abort => ABORTED with partial findings; subagent failure => adjust quorum."
     },
     "dir": [
       ["D1", 3, "@C1", ["agents"], []],

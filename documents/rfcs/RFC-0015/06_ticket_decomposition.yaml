@@ -8,6 +8,7 @@ rfc_ticket_decomposition:
     This file will contain the ticket decomposition for RFC-0015 once the RFC reaches
     version v4 (Standard phase) and DECOMPOSE mode is executed. The DECOMPOSE phase
     transforms the planned_ticket_structure into full tickets with implementation details.
+    Engineering estimates are intentionally omitted from this RFC artifact.
 
   planned_ticket_structure:
     # High-level ticket grouping identified during v0 (Discovery)
@@ -19,7 +20,6 @@ rfc_ticket_decomposition:
         requirements:
           - FAC-REQ-0017
           - FAC-REQ-0018
-        estimated_tickets: 3-5
         dependencies: []
         description: |
           Implement GateLeaseIssued, GateRunStarted, GateRunCompleted events with
@@ -29,7 +29,6 @@ rfc_ticket_decomposition:
         name: "OCAP Context Firewall"
         requirements:
           - FAC-REQ-0001
-        estimated_tickets: 2-4
         dependencies:
           - TG-FAC-001
         description: |
@@ -41,7 +40,6 @@ rfc_ticket_decomposition:
         requirements:
           - FAC-REQ-0002
           - FAC-REQ-0019
-        estimated_tickets: 2-4
         dependencies:
           - TG-FAC-001
         description: |
@@ -52,7 +50,6 @@ rfc_ticket_decomposition:
         name: "CI Evidence Import"
         requirements:
           - FAC-REQ-0003
-        estimated_tickets: 2-3
         dependencies:
           - TG-FAC-001
         description: |
@@ -64,7 +61,6 @@ rfc_ticket_decomposition:
           - FAC-REQ-0004
           - FAC-REQ-0006
           - FAC-REQ-0007
-        estimated_tickets: 3-5
         dependencies:
           - TG-FAC-001
         description: |
@@ -77,7 +73,6 @@ rfc_ticket_decomposition:
           - FAC-REQ-0009
           - FAC-REQ-0010
           - FAC-REQ-0012
-        estimated_tickets: 2-4
         dependencies:
           - TG-FAC-005
         description: |
@@ -89,7 +84,6 @@ rfc_ticket_decomposition:
         requirements:
           - FAC-REQ-0005
           - FAC-REQ-0008
-        estimated_tickets: 2-4
         dependencies:
           - TG-FAC-005
         phase: PHASE-2
@@ -102,7 +96,6 @@ rfc_ticket_decomposition:
         requirements:
           - FAC-REQ-0013
           - FAC-REQ-0014
-        estimated_tickets: 2-3
         dependencies:
           - TG-FAC-005
         description: |
@@ -114,7 +107,6 @@ rfc_ticket_decomposition:
         requirements:
           - FAC-REQ-0015
           - FAC-REQ-0016
-        estimated_tickets: 2-4
         dependencies:
           - TG-FAC-006
         phase: PHASE-2
@@ -126,7 +118,6 @@ rfc_ticket_decomposition:
         name: "Invariant-First AAT Specs"
         requirements:
           - FAC-REQ-0011
-        estimated_tickets: 1-2
         dependencies:
           - TG-FAC-005
         description: |
@@ -136,7 +127,6 @@ rfc_ticket_decomposition:
         name: "Atomic Merge Receipt"
         requirements:
           - FAC-REQ-0020
-        estimated_tickets: 2-3
         dependencies:
           - TG-FAC-001
         description: |
@@ -147,7 +137,6 @@ rfc_ticket_decomposition:
         name: "Bounded Retries and Echo-Trap"
         requirements:
           - FAC-REQ-0021
-        estimated_tickets: 1-2
         dependencies:
           - TG-FAC-001
         description: |

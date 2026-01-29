@@ -394,7 +394,7 @@ sa1_finalize_artifact:
               Partial analogy to formal verification property checkers (model checkers,
               property-based testing). allowed_verifier_kinds map to verification artifact
               types. Gap: No existing pattern in codebase for TerminalVerifier trait or
-              predicate evaluation engine. Requires 2-3 additional tickets per SA2 estimate.
+              predicate evaluation engine required before enforcement.
 
           root_cause:
             score: 4
@@ -1036,7 +1036,6 @@ sa1_finalize_artifact:
         severity: MEDIUM
         blocking_decision: DD-FAC-0007
         resolution_path: "Create spec document before v4 approval"
-        estimated_effort: "2-3 days"
 
     non_blocking:
       - gap_id: GAP-002
@@ -1126,7 +1125,7 @@ sa1_finalize_artifact:
     final_verdict: |
       RFC-0015 is READY FOR v4 APPROVAL with the following conditions:
 
-      1. GAP-001 must be resolved (TerminalVerifier spec) - estimated 2-3 days
+      1. GAP-001 must be resolved (TerminalVerifier spec)
       2. Design decision files must be updated with status upgrades
       3. Open questions must be updated with resolutions
       4. Security finding remediations must be incorporated
@@ -1135,4 +1134,4 @@ sa1_finalize_artifact:
       DD-FAC-0004 and DD-FAC-0007 are CONDITIONAL on implementation specs.
       DD-FAC-0005, DD-FAC-0006, DD-FAC-0008, DD-FAC-0009 are APPROVED for immediate upgrade.
 
-      Overall confidence: 85% v4 readiness. Expected time to v4: 3-5 days with focused effort.
+      Overall confidence: 85% v4 readiness.

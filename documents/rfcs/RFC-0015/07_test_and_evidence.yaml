@@ -64,6 +64,15 @@ rfc_test_and_evidence:
         Test that expired leases are rejected. Test that child leases cannot broaden scope.
         Test that mismatched changeset_digest rejects.
 
+    - evidence_id: EVID-FAC-0021
+      requirement_ids:
+        - FAC-REQ-0018
+      description: "Lease revocation enforcement tests"
+      test_type: UNIT + INTEGRATION
+      verification_method: |
+        Test that LeaseRevoked invalidates a lease immediately.
+        Test that GateRunCompleted with revoked lease is rejected.
+
     - evidence_id: EVID-FAC-0003
       requirement_ids:
         - FAC-REQ-0001
@@ -165,6 +174,15 @@ rfc_test_and_evidence:
         Test that AAT lease binds view_commitment_hash and rcp_manifest_hash.
         Test that AAT executor keys in wrong custody domain are rejected.
 
+    - evidence_id: EVID-FAC-0022
+      requirement_ids:
+        - FAC-REQ-0010
+      description: "KeyPolicy custody domain/COI enforcement tests"
+      test_type: UNIT + INTEGRATION
+      verification_method: |
+        Test that KeyPolicy mapping enforces coi_group separation at lease issuance.
+        Test that policy_hash mismatch rejects lease issuance.
+
     - evidence_id: EVID-FAC-0013
       requirement_ids:
         - FAC-REQ-0011
@@ -222,6 +240,15 @@ rfc_test_and_evidence:
         Test that egress is deny by default.
         Test that host mounts beyond pinned snapshot are blocked.
         Test that network violations are recorded in receipts.
+
+    - evidence_id: EVID-FAC-0023
+      requirement_ids:
+        - FAC-REQ-0019
+      description: "Admission network isolation tests"
+      test_type: INTEGRATION + ADVERSARIAL
+      verification_method: |
+        Test that admission-path holons cannot reach api.github.com:443.
+        Test that only HOLON-GITHUB-ADAPTER has GitHub API egress permission.
 
     - evidence_id: EVID-FAC-0019
       requirement_ids:

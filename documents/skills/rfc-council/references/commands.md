@@ -99,4 +99,4 @@ Override automatic mode selection when needed:
 | 0 | Success (APPROVED or APPROVED_WITH_REMEDIATION) |
 | 1 | Rejected (REJECTED verdict) |
 | 2 | Needs human review (NEEDS_ADJUDICATION) |
-| 3 | Aborted (timeout or budget exhausted) |
+| 3 | Aborted (budget or episode limit exhausted) |

@@ -72,8 +72,8 @@ sa2_mock_implementation_run_report:
             description: "Create separate GateEvent message family"
             intervention: "Add new oneof family tag 19 for GateEvent"
             predicted_outcome: |
-              Would require new reducer, new event handling path. Increases ticket
-              count by 2. Probability of clean integration drops to 0.55 due to
+              Would require new reducer, new event handling path. Increases scope.
+              Probability of clean integration drops to 0.55 due to
               code duplication and maintenance burden.
             recommendation: REJECT
 
@@ -93,25 +93,19 @@ sa2_mock_implementation_run_report:
           - action: "Define GateLeaseIssued, GateRunStarted, GateRunCompleted, MergeReceipt in kernel_events.proto"
             preconditions: []
             postconditions: ["proto compiles", "Rust bindings generate"]
-            estimated_effort_hours: 4
           - action: "Create domain_separator.rs with GATE_* prefixes"
             preconditions: ["proto defined"]
             postconditions: ["sign_with_domain helper available"]
-            estimated_effort_hours: 3
           - action: "Extend LeaseReducer with GateLease handling"
             preconditions: ["proto defined", "domain separator ready"]
             postconditions: ["GateLease state transitions work"]
-            estimated_effort_hours: 8
           - action: "Create GateReceiptReducer for evidence events"
             preconditions: ["proto defined"]
             postconditions: ["GateRunCompleted ingestion works"]
-            estimated_effort_hours: 6
           - action: "Add signature verification to event ingestion"
             preconditions: ["domain separator ready", "reducers ready"]
             postconditions: ["INVALID_SIGNATURE rejected", "tests pass"]
-            estimated_effort_hours: 8
 
-        critical_path_hours: 29
         parallelization_factor: 1.4
         adjusted_hours: 21
 
@@ -167,8 +161,6 @@ sa2_mock_implementation_run_report:
       implementation_verdict:
         feasibility: HIGH
         confidence: 0.73
-        estimated_tickets: 4
-        calibrated_tickets: 6  # 4 * 1.4 = 5.6, rounded up
         critical_blockers: []
         recommendations:
           - "Resolve domain separator format (SPEC-FAC-001-A) before implementation"
@@ -231,25 +223,19 @@ sa2_mock_implementation_run_report:
           - action: "Create context/manifest.rs with ContextPackManifest struct"
             preconditions: []
             postconditions: ["Manifest struct with stable_id, path, hash fields"]
-            estimated_effort_hours: 4
           - action: "Create context/firewall.rs with ContextAwareValidator trait"
             preconditions: ["manifest.rs ready"]
             postconditions: ["Trait wraps Validator, checks manifest"]
-            estimated_effort_hours: 6
           - action: "Integrate with PolicyEngine for CTX-ALLOWLIST-001 rule"
             preconditions: ["firewall.rs ready"]
             postconditions: ["ToolDecided=DENY emitted on manifest miss"]
-            estimated_effort_hours: 5
           - action: "Implement ContextRefinementRequest handling"
             preconditions: ["firewall integrated"]
             postconditions: ["Context miss terminates session, triggers refinement"]
-            estimated_effort_hours: 4
           - action: "Add CONTEXT_MISS defect tracking"
             preconditions: ["refinement handling ready"]
             postconditions: ["Metrics and defect records generated"]
-            estimated_effort_hours: 3
 
-        critical_path_hours: 22
         parallelization_factor: 1.3
         adjusted_hours: 17
 
@@ -308,8 +294,6 @@ sa2_mock_implementation_run_report:
       implementation_verdict:
         feasibility: MEDIUM
         confidence: 0.66
-        estimated_tickets: 3
-        calibrated_tickets: 5  # 3 * 1.4 = 4.2, rounded up to 5
         critical_blockers: []
         recommendations:
           - "Define manifest schema before implementation"
@@ -369,21 +353,16 @@ sa2_mock_implementation_run_report:
           - action: "Create projection/github_sync.rs with idempotent write logic"
             preconditions: []
             postconditions: ["Can project ledger state to GitHub"]
-            estimated_effort_hours: 8
           - action: "Create projection/divergence_watchdog.rs with 30s polling"
             preconditions: ["sync module ready"]
             postconditions: ["Detects trunk HEAD vs MergeReceipt mismatch"]
-            estimated_effort_hours: 6
           - action: "Implement InterventionFreeze emission on divergence"
             preconditions: ["watchdog ready"]
             postconditions: ["Factory freeze triggered automatically"]
-            estimated_effort_hours: 4
           - action: "Create projection/projection_receipt.rs for audit trail"
             preconditions: ["sync module ready"]
             postconditions: ["Signed receipt for each projection operation"]
-            estimated_effort_hours: 4
 
-        critical_path_hours: 22
         parallelization_factor: 1.2
         adjusted_hours: 18
 
@@ -434,8 +413,6 @@ sa2_mock_implementation_run_report:
       implementation_verdict:
         feasibility: MEDIUM
         confidence: 0.50
-        estimated_tickets: 3
-        calibrated_tickets: 5  # 3 * 1.4 = 4.2, rounded up
         critical_blockers:
           - "Q-RFC-FAC-0010 unresolved (branch protection contract)"
         recommendations:
@@ -499,21 +476,16 @@ sa2_mock_implementation_run_report:
           - action: "Define AATGatePayload proto with required fields"
             preconditions: ["TG-FAC-001 proto work done"]
             postconditions: ["Proto with view_commitment, transcript, verifier fields"]
-            estimated_effort_hours: 4
           - action: "Create AATTranscriptBinding wrapper using CAC TranscriptChunk"
             preconditions: ["payload proto defined"]
             postconditions: ["Streaming hash, chunk binding working"]
-            estimated_effort_hours: 6
           - action: "Implement evidence binding validation"
             preconditions: ["transcript binding ready"]
             postconditions: ["artifact_digests, transcript_chain_root verified"]
-            estimated_effort_hours: 6
           - action: "Add AAT-specific fields to GateReceiptGenerated handling"
             preconditions: ["evidence binding ready"]
             postconditions: ["Admission accepts typed AAT receipts"]
-            estimated_effort_hours: 5
 
-        critical_path_hours: 21
         parallelization_factor: 1.3
         adjusted_hours: 16
 
@@ -576,8 +548,6 @@ sa2_mock_implementation_run_report:
       implementation_verdict:
         feasibility: MEDIUM-HIGH
         confidence: 0.67
-        estimated_tickets: 4
-        calibrated_tickets: 6  # 4 * 1.4 = 5.6, rounded up
         critical_blockers: []
         recommendations:
           - "Coordinate with CAC team on TranscriptChunk import"
@@ -637,25 +607,19 @@ sa2_mock_implementation_run_report:
           - action: "Define RiskTier enum and classification interface"
             preconditions: []
             postconditions: ["HIGH, MED, LOW tiers defined"]
-            estimated_effort_hours: 3
           - action: "Implement critical domain detection (auth/crypto/ledger/tool)"
             preconditions: ["tier enum ready"]
             postconditions: ["Files in critical domains flagged HIGH"]
-            estimated_effort_hours: 5
           - action: "Implement diff scope heuristics for MED classification"
             preconditions: ["domain detection ready"]
             postconditions: ["Large diffs, cross-module changes flagged MED"]
-            estimated_effort_hours: 4
           - action: "Integrate with AAT gate selection in coordinator"
             preconditions: ["classification ready"]
             postconditions: ["AAT required/sampled based on tier"]
-            estimated_effort_hours: 5
           - action: "Add selection_policy_id to GateReceipt"
             preconditions: ["integration ready"]
             postconditions: ["Audit trail includes selection rationale"]
-            estimated_effort_hours: 2
 
-        critical_path_hours: 19
         parallelization_factor: 1.2
         adjusted_hours: 16
 
@@ -712,8 +676,6 @@ sa2_mock_implementation_run_report:
       implementation_verdict:
         feasibility: MEDIUM
         confidence: 0.53
-        estimated_tickets: 3
-        calibrated_tickets: 5  # 3 * 1.4 = 4.2, rounded up
         critical_blockers:
           - "Q-RFC-FAC-0007 needs resolution for precise classification"
         recommendations:
@@ -766,21 +728,16 @@ sa2_mock_implementation_run_report:
           - action: "Define TerminalVerifierOutput proto message"
             preconditions: []
             postconditions: ["Output schema ready for recording"]
-            estimated_effort_hours: 2
           - action: "Record verifier outputs in AAT receipt without predicate evaluation"
             preconditions: ["output proto defined"]
             postconditions: ["Outputs captured for future evaluation"]
-            estimated_effort_hours: 3
           - action: "[v4] Define TerminalVerifier trait"
             preconditions: ["outputs being recorded"]
             postconditions: ["Trait interface defined"]
-            estimated_effort_hours: 4
           - action: "[v4] Implement verifier predicate engine"
             preconditions: ["trait defined"]
             postconditions: ["Machine predicates evaluated"]
-            estimated_effort_hours: 8
 
-        critical_path_hours: 17
         parallelization_factor: 1.0
         adjusted_hours: 17
 
@@ -828,8 +785,6 @@ sa2_mock_implementation_run_report:
         feasibility: LOW (for full implementation)
         feasibility_partial: HIGH (for output recording only)
         confidence: 0.35
-        estimated_tickets: 3  # 2-3 per SA2-RFC0015-F003
-        calibrated_tickets: 5  # 3 * 1.4 = 4.2, rounded up
         critical_blockers: []
         recommendations:
           - "Implement output recording in Phase 1"
@@ -894,11 +849,9 @@ sa2_mock_implementation_run_report:
         severity: MAJOR
         description: |
           SA2-RFC0015-F003: No existing terminal verifier infrastructure.
-          Requires 2-3 additional tickets.
         affects: [TG-FAC-005]
         mitigation: |
           Defer full verifier to v4 (EP-5). Record outputs now.
-          Estimate already includes 2-3 tickets for output recording.
 
       - friction_id: MF-002
         title: "Domain Separator Prefix Format Underdetermined"
@@ -910,17 +863,6 @@ sa2_mock_implementation_run_report:
         mitigation: |
           Resolve with SPEC-FAC-001-A: UTF-8 prefix + canonical bytes.
           Document in domain_separator.rs before implementation.
-
-      - friction_id: MF-003
-        title: "Ticket Estimate Calibration"
-        severity: MAJOR
-        description: |
-          SA2-RFC0015-F010: Historical estimates 30-50% low for security-critical.
-          Applied 1.4x multiplier to all estimates.
-        affects: [ALL_TICKET_GROUPS]
-        mitigation: |
-          Calibrated estimates used throughout this report.
-          Monitor actual vs estimated during implementation.
 
     minor_friction:
       - friction_id: LF-001
@@ -944,102 +886,11 @@ sa2_mock_implementation_run_report:
         affects: [TG-FAC-004]
         mitigation: "L0 attestation (webhook + artifact hashes) sufficient for Phase 1."
 
-  # ============================================================================
-  # SECTION 3: CALIBRATED TICKET ESTIMATES
-  # ============================================================================
-
-  calibrated_estimates:
-    calibration_multiplier: 1.4
-    calibration_rationale: |
-      SA2-RFC0015-F010 finding: Historical estimates for security-critical features
-      are 30-50% low. Applied 1.4x (40%) multiplier to all estimates.
-
-    ticket_groups:
-      - group_id: TG-FAC-001
-        name: "Gate Event Infrastructure"
-        original_range: "3-5"
-        original_midpoint: 4
-        calibrated_estimate: 6
-        phase: PHASE-1
-        dependencies: []
-
-      - group_id: TG-FAC-002
-        name: "OCAP Context Firewall"
-        original_range: "2-4"
-        original_midpoint: 3
-        calibrated_estimate: 5
-        phase: PHASE-1
-        dependencies: [TG-FAC-001]
-
-      - group_id: TG-FAC-003
-        name: "Projection and Divergence Watchdog"
-        original_range: "2-4"
-        original_midpoint: 3
-        calibrated_estimate: 5
-        phase: PHASE-1
-        dependencies: [TG-FAC-001]
-
-      - group_id: TG-FAC-004
-        name: "CI Evidence Import"
-        original_range: "2-3"
-        original_midpoint: 2.5
-        calibrated_estimate: 4
-        phase: PHASE-1
-        dependencies: [TG-FAC-001]
-
-      - group_id: TG-FAC-005
-        name: "Typed AAT GateReceipt"
-        original_range: "3-5"
-        original_midpoint: 4
-        calibrated_estimate: 6
-        phase: PHASE-1
-        dependencies: [TG-FAC-001]
-
-      - group_id: TG-FAC-006
-        name: "Risk-Tiered AAT Selection"
-        original_range: "2-4"
-        original_midpoint: 3
-        calibrated_estimate: 5
-        phase: PHASE-1
-        dependencies: [TG-FAC-005]
-
-      - group_id: TG-FAC-007
-        name: "Determinism Envelope (Phase 2)"
-        original_range: "2-4"
-        original_midpoint: 3
-        calibrated_estimate: 5
-        phase: PHASE-2
-        dependencies: [TG-FAC-005]
-
-      - group_id: TG-FAC-008
-        name: "AAT Reuse and Evidence Hygiene"
-        original_range: "2-3"
-        original_midpoint: 2.5
-        calibrated_estimate: 4
-        phase: PHASE-1
-        dependencies: [TG-FAC-005]
-
-      - group_id: TG-FAC-009
-        name: "AAT Quorum and Harness Sandboxing"
-        original_range: "2-4"
-        original_midpoint: 3
-        calibrated_estimate: 5
-        phase: PHASE-2
-        dependencies: [TG-FAC-006]
-
-      - group_id: TG-FAC-010
-        name: "Invariant-First AAT Specs"
-        original_range: "1-2"
-        original_midpoint: 1.5
-        calibrated_estimate: 3
-        phase: PHASE-1
-        dependencies: [TG-FAC-005]
 
       - group_id: TG-FAC-011
         name: "Atomic Merge Receipt"
         original_range: "2-3"
         original_midpoint: 2.5
-        calibrated_estimate: 4
         phase: PHASE-1
         dependencies: [TG-FAC-001]
 
@@ -1047,24 +898,14 @@ sa2_mock_implementation_run_report:
         name: "Bounded Retries and Echo-Trap"
         original_range: "1-2"
         original_midpoint: 1.5
-        calibrated_estimate: 3
         phase: PHASE-1
         dependencies: [TG-FAC-001]
 
     totals:
       original_midpoint_sum: 33
-      calibrated_sum: 55
-      phase_1_tickets: 45
-      phase_2_tickets: 10
 
     effort_conversion:
-      tickets_per_engineer_week: 2
-      phase_1_engineer_weeks: 22.5
-      phase_2_engineer_weeks: 5
-      total_engineer_weeks: 27.5
       recommended_team_size: 3
-      phase_1_elapsed_weeks: 8
-      phase_2_elapsed_weeks: 2
 
   # ============================================================================
   # SECTION 4: QUESTION RESOLUTIONS
@@ -1106,9 +947,7 @@ sa2_mock_implementation_run_report:
         - KeyRotated events maintain chain of custody
       resolution_confidence: 0.70
       implementation_impact: |
-        Adds 2 tickets to TG-FAC-001:
-        - KeyPolicy schema and validation
-        - COI check integration in lease issuance
+        Adds KeyPolicy schema validation and COI check integration to TG-FAC-001.
 
     - question_id: Q-RFC-FAC-0006
       question: "Determinism N by risk tier"
@@ -1128,7 +967,7 @@ sa2_mock_implementation_run_report:
         - Flake classification triggers on any mismatch
 
         **Calibration:**
-        - Review after 90 days of Phase 2 operation
+        - Review after initial Phase 2 data collection
         - Adjust N based on flake rate and throughput impact
       resolution_confidence: 0.60
       implementation_impact: |
@@ -1194,90 +1033,6 @@ sa2_mock_implementation_run_report:
       resolution_confidence: 0.70
       implementation_impact: |
         Affects TG-FAC-008. Scope limited to LOW reduces implementation complexity.
-
-  # ============================================================================
-  # SECTION 5: CRITICAL PATH ANALYSIS
-  # ============================================================================
-
-  critical_path_analysis:
-
-    dependency_graph:
-      # Level 0: No dependencies
-      level_0:
-        - TG-FAC-001  # Gate Event Infrastructure (foundational)
-
-      # Level 1: Depends on TG-FAC-001
-      level_1:
-        - TG-FAC-002  # OCAP Context Firewall
-        - TG-FAC-003  # Projection and Divergence Watchdog
-        - TG-FAC-004  # CI Evidence Import
-        - TG-FAC-005  # Typed AAT GateReceipt
-        - TG-FAC-011  # Atomic Merge Receipt
-        - TG-FAC-012  # Bounded Retries and Echo-Trap
-
-      # Level 2: Depends on TG-FAC-005
-      level_2:
-        - TG-FAC-006  # Risk-Tiered AAT Selection
-        - TG-FAC-008  # AAT Reuse and Evidence Hygiene
-        - TG-FAC-010  # Invariant-First AAT Specs
-
-      # Level 3: Depends on TG-FAC-006 (Phase 2)
-      level_3:
-        - TG-FAC-007  # Determinism Envelope
-        - TG-FAC-009  # AAT Quorum and Harness Sandboxing
-
-    critical_path:
-      path: [TG-FAC-001, TG-FAC-005, TG-FAC-006, TG-FAC-007]
-      path_name: "Gate -> AAT Receipt -> Risk Tiers -> Determinism"
-      tickets_on_path: 22  # 6 + 6 + 5 + 5
-      estimated_weeks: 11  # At 2 tickets/week
-
-    parallelization_opportunities:
-      - parallel_set: "Level 1 parallelization"
-        groups: [TG-FAC-002, TG-FAC-003, TG-FAC-004, TG-FAC-011, TG-FAC-012]
-        can_run_with: TG-FAC-005
-        savings_weeks: 4
-
-      - parallel_set: "Level 2 parallelization"
-        groups: [TG-FAC-008, TG-FAC-010]
-        can_run_with: TG-FAC-006
-        savings_weeks: 2
-
-    recommended_execution_order:
-      week_1_2:
-        focus: TG-FAC-001
-        parallel: []
-        rationale: "Foundation must complete first"
-
-      week_3_4:
-        focus: TG-FAC-005
-        parallel: [TG-FAC-002, TG-FAC-011]
-        rationale: "AAT receipt is critical path; firewall and merge can parallelize"
-
-      week_5_6:
-        focus: TG-FAC-006
-        parallel: [TG-FAC-003, TG-FAC-004, TG-FAC-012]
-        rationale: "Risk tiers critical; projection and CI can parallelize"
-
-      week_7_8:
-        focus: TG-FAC-008
-        parallel: [TG-FAC-010]
-        rationale: "Reuse safety and invariant specs can parallelize"
-
-      phase_2_week_1_2:
-        focus: TG-FAC-007
-        parallel: [TG-FAC-009]
-        rationale: "Determinism and quorum can parallelize"
-
-    phase_1_completion:
-      elapsed_weeks: 8
-      engineer_requirement: 3
-      tickets_completed: 45
-
-    phase_2_completion:
-      elapsed_weeks: 2
-      engineer_requirement: 3
-      tickets_completed: 10
 
   # ============================================================================
   # SECTION 6: CONFIDENCE ASSESSMENT
@@ -1351,35 +1106,14 @@ sa2_mock_implementation_run_report:
         confidence: 0.70
         rationale: "Signature pattern detection; well-defined"
 
-    risk_adjusted_timeline:
-      best_case:
-        phase_1_weeks: 6
-        phase_2_weeks: 1.5
-        total_weeks: 7.5
-        probability: 0.15
-
-      expected_case:
-        phase_1_weeks: 8
-        phase_2_weeks: 2
-        total_weeks: 10
-        probability: 0.60
-
-      worst_case:
-        phase_1_weeks: 12
-        phase_2_weeks: 4
-        total_weeks: 16
-        probability: 0.25
-
     go_no_go_recommendation:
       recommendation: GO_WITH_REMEDIATION
       conditions:
         - "Resolve Q-RFC-FAC-0003 (COI policy) before TG-FAC-001 completion"
         - "Resolve Q-RFC-FAC-0007 (risk tiers) before TG-FAC-006 start"
         - "Document domain separator format (SPEC-FAC-001-A) before implementation"
-        - "Plan 90-day review checkpoint after Phase 1"
 
       critical_success_factors:
-        - "Maintain 3-engineer team throughout Phase 1"
         - "Weekly sync with CAC team on TranscriptChunk integration"
         - "Defer Terminal Verifier predicate engine to Phase 2"
         - "Monitor context miss rate during rollout (target <15%)"
@@ -1403,12 +1137,6 @@ sa2_mock_implementation_run_report:
       - finding: "Terminal Verifier should be deferred to v4 (EP-5)"
         confidence: 0.80
 
-      - finding: "Ticket estimates calibrated 1.4x; total 55 tickets"
-        confidence: 0.75
-
-      - finding: "Critical path is 10 weeks with 3 engineers"
-        confidence: 0.70
-
     blockers_requiring_resolution:
       - Q-RFC-FAC-0003 (COI grouping)
       - Q-RFC-FAC-0007 (risk tier classification)
@@ -1422,7 +1150,6 @@ sa2_mock_implementation_run_report:
 
     final_verdict: |
       RFC-0015 FAC implementation is FEASIBLE with identified remediations.
-      Phase 1 can complete in 8 weeks with 3-engineer team. Phase 2 adds 2 weeks.
       Critical blockers (COI policy, risk tiers, domain separator format) must be
       resolved before implementation begins. Terminal Verifier enforcement deferred
       to Phase 2 per EP-5. Overall implementation probability: 68%.

@@ -81,6 +81,8 @@ rfc_trust_boundaries:
           enforcement: "Signature verification on ingestion; INVALID_SIGNATURE rejects"
         - rule: "Lease must be valid and unexpired"
           enforcement: "Lease validation; UNAUTHORIZED_EXECUTOR rejects"
+        - rule: "Lease must not be revoked"
+          enforcement: "LeaseRevoked lookup; revoked leases reject GateRunCompleted"
         - rule: "MergeReceipt emitted only after result_selector observed"
           enforcement: "Atomic merge semantics; MERGE_NONATOMIC defect on failure"
       law_refs:
@@ -109,7 +111,7 @@ rfc_trust_boundaries:
         Only HOLON-GITHUB-ADAPTER may write to GitHub.
       crossing_rules:
         - rule: "Admission reads internal projections only"
-          enforcement: "Code architecture; no GitHub reads in admission path"
+          enforcement: "Runtime egress policy denies api.github.com for admission-path holons"
         - rule: "Only adapter writes to GitHub"
           enforcement: "Policy enforcement; PROJECTION_WRITE_UNAUTHORIZED on violation"
         - rule: "Divergence triggers freeze"
@@ -200,6 +202,15 @@ rfc_trust_boundaries:
         Continuous polling (30s) of external trunk HEAD vs MergeReceipt result_selector.
         Divergence triggers InterventionFreeze with AdjudicationRequested.
 
+    - id: SEC-CTRL-FAC-0010
+      name: "Projection Read Isolation (Runtime)"
+      type: PREVENTATIVE
+      boundary: TB-0003
+      details: |
+        Admission-path holons run with network egress policy that blocks api.github.com:443.
+        Only HOLON-GITHUB-ADAPTER has GitHub API egress permission. Violations emit
+        PolicyViolation(NETWORK_EGRESS_BLOCKED) and terminate the session.
+
     - id: SEC-CTRL-FAC-0004
       name: "Lease Expiry Enforcement"
       type: PREVENTATIVE
@@ -207,6 +218,14 @@ rfc_trust_boundaries:
       details: |
         All leases have mandatory expires_at. GateRunCompleted verification rejects if
         timestamp exceeds lease expiry.
+
+    - id: SEC-CTRL-FAC-0011
+      name: "Lease Revocation Enforcement"
+      type: PREVENTATIVE
+      boundary: TB-0001
+      details: |
+        LeaseRevoked immediately invalidates a lease. Admission verifies no revocation
+        exists for lease_id prior to GateRunCompleted acceptance.
 
     - id: SEC-CTRL-FAC-0005
       name: "CI Evidence Attestation"
@@ -369,5 +388,4 @@ rfc_trust_boundaries:
         enforcement: "COI grouping policy under CAC governance"
       - rule: "Waiver requires explicit adjudication"
         enforcement: "AdjudicationRequested(WAIVER) with bounded scope and TTL"
-    open_question: |
-      Q-FAC-0003: Formal COI grouping policy and KeyPolicy artifact definition
+    keypolicy_ref: "FAC-CONTRACT-008"

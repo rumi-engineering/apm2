@@ -5,7 +5,7 @@ rfc_rollout_and_ops:
     overview: |
       FAC rollout follows a phased approach with graduated strictness and feature flags.
       Phase 1 focuses on core admission hardening; Phase 2 adds measurement integrity;
-      Phase 3 enables autonomous improvement. Context firewall adoption uses a 6-week
+      Phase 3 enables autonomous improvement. Context firewall adoption uses a 5-week
       graduated rollout to allow pack completeness improvements.
 
     phases:
@@ -25,6 +25,7 @@ rfc_rollout_and_ops:
           - "Evidence hygiene enforcement"
           - "AAT reuse safety with provenance validation"
           - "AAT harness sandboxing"
+          - "Determinism metadata captured in AAT receipts (enforcement gated to Phase 2)"
         definition_of_done:
           - "An autonomous agent cannot flip a gate outcome or merge by manipulating GitHub or xtask"
           - "A GateRun cannot proceed with missing context; it terminates and triggers pack refinement"
@@ -42,6 +43,11 @@ rfc_rollout_and_ops:
           - name: FAC_DIVERGENCE_WATCHDOG_ENABLED
             default: true
             description: "Enable projection divergence watchdog"
+
+    phase_1_limitations:
+      - "CI evidence attestation is L0 only in Phase 1; L1+ deferred to Phase 2."
+      - "AAT reuse is limited to LOW risk; MED requires waiver; HIGH is never reused."
+      - "Determinism envelope enforcement is disabled in Phase 1 (schema only)."
 
       - phase_id: PHASE-2
         name: "Measurement Integrity + Goodhart Resistance"
@@ -81,13 +87,13 @@ rfc_rollout_and_ops:
 
     context_firewall_rollout:
       description: |
-        Graduated rollout of context firewall enforcement over 6 weeks to allow
+        Graduated rollout of context firewall enforcement over 5 weeks to allow
         pack completeness improvements without blocking development.
       phases:
         - phase: FAC-R-01
           mode: WARN
-          duration_days: 14
-          description: "Context firewall in warn-only mode; all violations logged but not blocking"
+          duration_days: 7
+          description: "Warn-only for non-sensitive domains; auth/crypto/ledger enforced at SOFT_FAIL"
         - phase: FAC-R-02
           mode: SOFT_FAIL
           duration_days: 14

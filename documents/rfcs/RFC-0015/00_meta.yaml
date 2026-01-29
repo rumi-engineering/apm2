@@ -7,7 +7,7 @@ rfc_meta:
     status: DRAFT
     created_date: "2026-01-29"
     last_updated_date: "2026-01-29"
-    version: "v4"
+    version: "v4.1"
     version_history:
       - version: "v0"
         date: "2026-01-29"
@@ -49,6 +49,15 @@ rfc_meta:
           - F-SA3-012: ADV-0005 threat model + dual-control
           Mean decision score: 4.08/5.0 (all above 3.5 threshold).
           Overall v4 readiness: 85%. Ready for DECOMPOSE phase.
+      - version: "v4.1"
+        date: "2026-01-29"
+        phase: "v4.1 (Corrections)"
+        notes: |
+          Clarified Phase 1 vs Phase 2 determinism enforcement.
+          Added formal TerminalVerifier/VerifierPolicy and KeyPolicy specifications.
+          Added LeaseRevoked contract and runtime projection isolation requirements.
+          Reduced WARN rollout to 7 days with sensitive-module exclusion.
+          Removed engineering estimates from RFC artifacts.
     abstract: |
       This RFC specifies the Forge Admission Cycle (FAC), an internal cryptographically-enforced
       admission protocol for APM2. FAC ensures that all gate outcomes are signed by authorized
@@ -164,8 +173,5 @@ rfc_meta:
         purpose: "Async runtime for gate execution"
     proto_files:
       - path: "proto/kernel_events.proto"
-        purpose: "Extended with GateLeaseIssued, GateRunStarted, GateRunCompleted payloads"
+        purpose: "Extended with GateLeaseIssued, GateRunStarted, GateRunCompleted, LeaseRevoked payloads"
         status: EXTEND
-      - path: "proto/fac_events.proto"
-        purpose: "New FAC-specific event shapes (optional placement)"
-        status: NEW

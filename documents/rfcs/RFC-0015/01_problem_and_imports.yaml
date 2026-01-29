@@ -132,6 +132,7 @@ rfc_problem_and_imports:
         - "Determinism envelope enforces N identical runs for gates with determinism_class > 0"
         - "Nondeterminism emits GATE_NONDETERMINISTIC defect and fails closed"
         - "Repeated nondeterminism quarantines and aborts changesets per policy"
+        - "Phase 1 records determinism metadata; enforcement enabled in Phase 2 via FAC_DETERMINISM_ENVELOPE_ENABLED"
 
     - prd_requirement_id: REQ-0006
       rfc_local_id: FAC-REQ-0006

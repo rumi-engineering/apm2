@@ -2,14 +2,14 @@ rfc_design_decisions:
   schema_version: "2026-01-29"
 
   version_transition:
-    from_version: "v2"
-    to_version: "v4"
+    from_version: "v4"
+    to_version: "v4.1"
     transition_date: "2026-01-29"
-    mode: FINALIZE
+    mode: CORRECTION
     summary: |
-      RFC v4 (Standard) transition after FINALIZE council session. All HYPOTHESIS
-      decisions upgraded to VALIDATED. All open questions resolved or explicitly deferred.
-      All security findings addressed. Ready for DECOMPOSE phase.
+      RFC v4.1 corrections: add missing specification details (TerminalVerifier,
+      VerifierPolicy, KeyPolicy, LeaseRevoked), align rollout WARN window, clarify
+      determinism Phase 1 vs Phase 2 enforcement, and remove engineering estimates.
 
   previous_transitions:
     - from_version: "v0"
@@ -20,6 +20,14 @@ rfc_design_decisions:
         RFC v2 (Grounded) transition after EXPLORE council session. Design decisions
         grounded in codebase evidence. Component mapping confidence upgraded from
         LOW to MEDIUM. Open questions Q-RFC-FAC-0001 and Q-RFC-FAC-0002 resolved.
+    - from_version: "v2"
+      to_version: "v4"
+      transition_date: "2026-01-29"
+      mode: FINALIZE
+      summary: |
+        RFC v4 (Standard) transition after FINALIZE council session. All HYPOTHESIS
+        decisions upgraded to VALIDATED. All open questions resolved or explicitly deferred.
+        All security findings addressed. Ready for DECOMPOSE phase.
 
   finalize_findings:
     council_session_id: COUNCIL-RFC-0015-FINALIZE-20260129
@@ -34,7 +42,7 @@ rfc_design_decisions:
         role: "Implementation Feasibility (Execution Strategy)"
         modes: [11, 39, 47, 51, 70]
         artifact: "Mock Implementation Run Report"
-        verdict: "GO_WITH_REMEDIATION; 68% confidence; 55 calibrated tickets"
+        verdict: "GO_WITH_REMEDIATION; confidence recorded in SA-2 artifact"
       - agent_id: SA-3
         role: "Security & Anti-Cousin Guardian (Final Security Assurance)"
         modes: [8, 35, 49, 65, 80]
@@ -61,7 +69,7 @@ rfc_design_decisions:
         from_status: HYPOTHESIS
         to_status: VALIDATED
         score: 3.55
-        rationale: "Terminal verifier kinds and predicates defined; deferred predicate engine"
+        rationale: "Terminal verifier kinds and predicates defined; verifier policy schema specified"
       - decision_id: DD-FAC-0008
         from_status: HYPOTHESIS
         to_status: VALIDATED
@@ -98,7 +106,7 @@ rfc_design_decisions:
       - agent_id: SA-2
         role: "Implementation Feasibility"
         modes: [11, 39, 51, 70, 76]
-        verdict: "Integration probability 41%; 20-22 week critical path"
+        verdict: "Integration feasibility assessed; details in SA-2 artifact"
       - agent_id: SA-3
         role: "Anti-Cousin Guardian"
         modes: [8, 35, 49, 65, 80]
@@ -171,7 +179,6 @@ rfc_design_decisions:
         status: NEW
         reuses: "PolicyEngine rule evaluation model"
         affects: [DD-FAC-0007]
-        deferred_to: v4
 
       - id: EP-6
         name: "KeyPolicy Artifact"
@@ -241,7 +248,7 @@ rfc_design_decisions:
       DD-FAC-0004: 6  # Projection-only GitHub
       DD-FAC-0005: 7  # Evidence-backed CI import
       DD-FAC-0006: 8  # Typed AAT GateReceipt payloads
-      DD-FAC-0007: 3  # Terminal verifier binding (defer to v4)
+      DD-FAC-0007: 3  # Terminal verifier binding
       DD-FAC-0008: 5  # Risk-tiered AAT selection
       DD-FAC-0009: 6  # AAT anti-downgrade enforcement
       mean_score: 6.2
@@ -432,6 +439,8 @@ rfc_design_decisions:
       domain_separators:
         - event: GateLeaseIssued
           prefix: "GATE_LEASE_ISSUED:"
+        - event: LeaseRevoked
+          prefix: "LEASE_REVOKED:"
         - event: GateRunCompleted
           prefix: "GATE_RUN_COMPLETED:"
         - event: MergeReceipt
@@ -487,6 +496,19 @@ rfc_design_decisions:
           - rcp_manifest_hash
           - rcp_profile_id
           - selection_policy_id
+        revocation:
+          event_type: LeaseRevoked
+          fields:
+            - lease_id
+            - revoked_by
+            - revoked_at
+            - reason
+            - issuer_signature
+          enforcement: "Admission rejects GateRunCompleted if a LeaseRevoked exists for lease_id with revoked_at <= completed_at"
+        ttl_policy:
+          aat_default: "<= 15 minutes"
+          aat_high_risk: "<= 10 minutes"
+          other_gates: "<= 30 minutes"
       alternatives:
         - id: ALT-0002-A
           name: "Ambient authority with post-hoc audit"
@@ -648,6 +670,9 @@ rfc_design_decisions:
         - selection_policy_id
         - risk_tier
         - attestation
+      phase_notes:
+        phase_1: "Record determinism metadata (run_count, run_receipt_hashes, stability_digest) without enforcing N-run rejection."
+        phase_2: "Enable determinism envelope enforcement; nondeterminism fails closed per FAC-REQ-0005."
       alternatives:
         - id: ALT-0006-A
           name: "Separate AATReceipt event type"
@@ -668,9 +693,8 @@ rfc_design_decisions:
         SA-1 FINALIZE analysis (COUNCIL-RFC-0015-FINALIZE-20260129): Weighted score 3.55/5.0.
         VerifierPolicy defines type signature: scenario_type -> (verifier_kinds, outputs, predicate).
         Machine predicates are deterministic first-order formulas. Addresses Goodhart drift by
-        anchoring to ground truth (exit codes, snapshot diffs). GAP-001 identified: TerminalVerifier
-        trait and VerifierPolicy schema spec needed before v4. Reference implementation for
-        exit_code verifier kind required.
+        anchoring to ground truth (exit codes, snapshot diffs). TerminalVerifier trait and
+        VerifierPolicy schema are specified in RFC-0015 contracts (FAC-CONTRACT-007).
       decision: |
         AAT PASS requires terminal verifier outputs satisfying machine-defined predicates.
         Policy defines scenario_type -> allowed_verifier_kinds + required_outputs + machine_predicate.
@@ -680,7 +704,33 @@ rfc_design_decisions:
         - snapshot_diff
         - structured_test_report
         - invariant_check
-      enforcement: "PASS requires predicate satisfied; missing outputs => FAIL or NEEDS_INPUT"
+      verifier_policy_spec:
+        contract_ref: "FAC-CONTRACT-007"
+        required_fields:
+          - policy_id
+          - policy_hash
+          - schema_version
+          - scenario_type
+          - allowed_verifier_kinds
+          - required_outputs
+          - machine_predicate
+          - predicate_lang
+      terminal_verifier_trait:
+        language: Rust
+        signature: |
+          trait TerminalVerifier {
+            fn kind(&self) -> VerifierKind;
+            fn evaluate(&self, output: &VerifierOutput, policy: &VerifierPolicy) -> VerifierVerdict;
+          }
+      predicate_language:
+        id: FAC-PREDICATE-V1
+        allowed_ops: ["==", "!=", "<", "<=", ">", ">=", "AND", "OR", "NOT"]
+        allowed_value_types: ["int", "bool", "string"]
+        reference_rule: "Predicate evaluation is pure and deterministic over verifier outputs"
+      enforcement: |
+        PASS requires predicate satisfied and required outputs present.
+        Missing outputs => FAIL or NEEDS_INPUT (policy-defined).
+        verifier_policy_hash MUST match resolved_verifier_policy_hash pinned at FAC-00.
       alternatives:
         - id: ALT-0007-A
           name: "Narrative-based acceptance"
@@ -767,6 +817,139 @@ rfc_design_decisions:
         - FAC-REQ-0012
       confidence: MEDIUM
 
+    - id: DD-FAC-0010
+      title: "KeyPolicy Artifact for COI and Custody Domains"
+      status: VALIDATED
+      validation_evidence: |
+        SA-1 FINALIZE analysis (COUNCIL-RFC-0015-FINALIZE-20260129) requires formal COI
+        grouping to make TB-0007 mechanically enforceable. KeyPolicy schema is specified
+        in FAC-CONTRACT-008 and enforced at lease issuance and admission.
+      decision: |
+        Define a KeyPolicy artifact under CAC governance that maps keys to custody domains
+        and COI groups. Lease issuance MUST validate executor custody domain against the
+        changeset author; AAT executor keys MUST be in a distinct custody domain from
+        coordinator and implementer roles.
+      keypolicy_spec:
+        contract_ref: "FAC-CONTRACT-008"
+        required_fields:
+          - policy_id
+          - policy_hash
+          - schema_version
+          - custody_domains
+          - coi_rules
+          - delegation_rules
+      enforcement:
+        - "executor_key.coi_group_id MUST NOT equal author.coi_group_id"
+        - "AAT executor custody domain MUST be disjoint from coordinator/implementer domains"
+        - "KeyPolicy changes require dual-control (SEC-CTRL-FAC-0009)"
+      requirement_ids:
+        - FAC-REQ-0010
+      confidence: MEDIUM
+
+    - id: DD-FAC-0011
+      title: "AAT Flake Classification and Policy Routing"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0008 defines determinism_class and flake_class routing.
+        Q-RFC-FAC-0006 defines flake classes for mismatch scenarios.
+      decision: |
+        AAT GateReceipts MUST record determinism_class and flake_class. Policy routes:
+        UNKNOWN -> NEEDS_INPUT, HARNESS_FLAKE -> runner pool quarantine, TEST_NONSEMANTIC ->
+        spec quarantine. No retries may convert UNKNOWN to PASS.
+      phase_notes:
+        phase_1: "Record flake_class in receipt payloads."
+        phase_2: "Enforce quarantine routing and audit metrics."
+      requirement_ids:
+        - FAC-REQ-0008
+      confidence: MEDIUM
+
+    - id: DD-FAC-0012
+      title: "Invariant-First AAT Specifications"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0011 requires invariants-first specs with machine-checkable outcomes.
+      decision: |
+        AAT specs MUST declare invariants; procedural steps are observational only.
+        Invariants are expressed in machine-checkable form (exit codes, structured reports).
+      requirement_ids:
+        - FAC-REQ-0011
+      confidence: MEDIUM
+
+    - id: DD-FAC-0013
+      title: "AAT Reuse Safety and Provenance"
+      status: VALIDATED
+      validation_evidence: |
+        Q-RFC-FAC-0009 resolution defines LOW-only reuse and provenance tuple enforcement.
+      decision: |
+        AAT reuse is provenance-bound and replay-safe. LOW tier reuse requires exact
+        provenance tuple match; MED requires waiver; HIGH never reuses.
+      requirement_ids:
+        - FAC-REQ-0013
+      confidence: MEDIUM
+
+    - id: DD-FAC-0014
+      title: "AAT Evidence Hygiene and Retention"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0014 requires classification/redaction/retention metadata.
+      decision: |
+        Evidence artifacts MUST include data classification, redaction metadata, and
+        retention TTL. Admission rejects evidence policy violations.
+      requirement_ids:
+        - FAC-REQ-0014
+      confidence: MEDIUM
+
+    - id: DD-FAC-0015
+      title: "AAT Quorum and Audit Enforcement"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0015 defines independent verification by risk tier.
+      decision: |
+        HIGH tier requires two independent AAT receipts from disjoint runner pools.
+        MED tier requires audit re-runs before admission finalizes.
+      phase_notes:
+        phase_2: "Enforcement enabled with holdout/audit infrastructure."
+      requirement_ids:
+        - FAC-REQ-0015
+      confidence: MEDIUM
+
+    - id: DD-FAC-0016
+      title: "AAT Harness Sandboxing and Egress Control"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0016 mandates sandboxing and deny-by-default egress.
+      decision: |
+        AAT harnesses run in strict sandbox with deny-by-default egress. Only policy-declared
+        network access is allowed and recorded in receipts; host mounts are limited to pinned snapshot.
+      requirement_ids:
+        - FAC-REQ-0016
+      confidence: MEDIUM
+
+    - id: DD-FAC-0017
+      title: "Atomic Merge Receipt"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0020 defines MergeReceipt binding inputs to observed trunk result.
+      decision: |
+        MergeReceipt is emitted only after result_selector is observed. Receipt binds
+        (base_selector, changeset_digest, gate_receipts, policy_hash) -> result_selector
+        and is signed with MERGE_RECEIPT domain separator.
+      requirement_ids:
+        - FAC-REQ-0020
+      confidence: MEDIUM
+
+    - id: DD-FAC-0018
+      title: "Bounded Retries and Echo-Trap Detection"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0021 requires bounded attempts and echo-trap termination.
+      decision: |
+        Coordinator enforces per-gate max attempts and global max episodes. Echo-trap
+        detection triggers REASONING_DEGENERATION termination and defect emission.
+      requirement_ids:
+        - FAC-REQ-0021
+      confidence: MEDIUM
+
   component_mapping:
     # Confidence upgraded from LOW to MEDIUM after EXPLORE phase grounding
 
@@ -829,9 +1012,21 @@ rfc_design_decisions:
       new_components:
         - path: "proto/kernel_events.proto"
           status: EXTEND
-          purpose: "Add GateLease to LeaseEvent oneof (tag 6)"
+          purpose: "Add GateLease and LeaseRevoked to LeaseEvent oneof"
       confidence: HIGH
       explore_evidence: "SA-1 analysis: 90% feasibility; Q-RFC-FAC-0001 resolved"
+
+    - requirement_id: FAC-REQ-0010
+      verified_components:
+        - path: "crates/apm2-core/src/lease/reducer.rs"
+          status: REUSE
+          changes: "Validate custody domains and lease bindings at issuance"
+      new_components:
+        - path: "crates/apm2-core/src/crypto/policy.rs"
+          status: NEW
+          purpose: "KeyPolicy artifact parsing and custody domain validation"
+      confidence: MEDIUM
+      explore_evidence: "Q-RFC-FAC-0003 resolved; KeyPolicy schema specified in FAC-CONTRACT-008"
 
     - requirement_id: FAC-REQ-0019
       verified_components: []
