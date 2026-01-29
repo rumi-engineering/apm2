@@ -333,7 +333,7 @@ pub enum BftLedgerError {
 /// - **Bounded replay (Finding 2)**: Replay uses pagination to prevent OOM.
 /// - **Fail-closed `TotalOrder` (Finding 3)**: `TotalOrder` events require
 ///   consensus.
-/// - **Proper serialization (Finding 4)**: Uses bincode for deterministic QC
+/// - **Proper serialization (Finding 4)**: Uses postcard for deterministic QC
 ///   encoding.
 pub struct BftLedgerBackend {
     /// Underlying storage backend.
@@ -614,9 +614,9 @@ impl BftLedgerBackend {
         epoch: u64,
         round: u64,
     ) -> Result<(), BftLedgerError> {
-        // Serialize quorum certificate using bincode for deterministic encoding
+        // Serialize quorum certificate using postcard for deterministic encoding
         // (Finding 4: Wire-Semantic Mismatch - RFC-0014 specifies binary format)
-        let qc_bytes = bincode::serialize(qc)
+        let qc_bytes = postcard::to_allocvec(qc)
             .map_err(|e| BftLedgerError::InvalidQc(format!("serialization failed: {e}")))?;
 
         // Get the event hashes that belong to this specific block (Finding 1)
@@ -732,7 +732,7 @@ impl BftLedgerBackend {
     ///
     /// # Note
     ///
-    /// Supports both bincode (new format) and JSON (legacy) QC deserialization
+    /// Supports both postcard (new format) and JSON (legacy) QC deserialization
     /// for backwards compatibility.
     ///
     /// # Errors
@@ -748,9 +748,9 @@ impl BftLedgerBackend {
 
         let mut results = Vec::with_capacity(events.len());
         for event in events {
-            // Try bincode first (new format), fall back to JSON (legacy)
+            // Try postcard first (new format), fall back to JSON (legacy)
             let qc = event.quorum_cert.as_ref().and_then(|bytes| {
-                bincode::deserialize(bytes)
+                postcard::from_bytes(bytes)
                     .ok()
                     .or_else(|| serde_json::from_slice(bytes).ok())
             });
@@ -842,9 +842,9 @@ impl BftLedgerBackend {
             metadata.schema_version = CONSENSUS_METADATA_VERSION;
 
             // Parse QC to get committed hash
-            // Try bincode first (new format), fall back to JSON (legacy)
+            // Try postcard first (new format), fall back to JSON (legacy)
             if let Some(qc_bytes) = &event.quorum_cert {
-                if let Ok(qc) = bincode::deserialize::<QuorumCertificate>(qc_bytes) {
+                if let Ok(qc) = postcard::from_bytes::<QuorumCertificate>(qc_bytes) {
                     metadata.last_committed_hash = Some(qc.block_hash);
                 } else if let Ok(qc) = serde_json::from_slice::<QuorumCertificate>(qc_bytes) {
                     // Legacy JSON format for backwards compatibility
@@ -1328,17 +1328,17 @@ mod security_fix_tests {
         );
     }
 
-    /// Finding 4: Bincode serialization for QC.
+    /// Finding 4: Postcard serialization for QC.
     #[test]
-    fn finding_4_bincode_qc_serialization() {
+    fn finding_4_postcard_qc_serialization() {
         let qc = QuorumCertificate::genesis(1, [0xab; 32]);
 
-        // Serialize with bincode
-        let bytes = bincode::serialize(&qc).expect("bincode serialization should work");
+        // Serialize with postcard
+        let bytes = postcard::to_allocvec(&qc).expect("postcard serialization should work");
 
         // Deserialize back
         let qc2: QuorumCertificate =
-            bincode::deserialize(&bytes).expect("bincode deserialization should work");
+            postcard::from_bytes(&bytes).expect("postcard deserialization should work");
 
         assert_eq!(qc.epoch, qc2.epoch);
         assert_eq!(qc.round, qc2.round);
