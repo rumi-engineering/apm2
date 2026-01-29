@@ -1,0 +1,33 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0009"
+  type: "OPERABILITY"
+  source_id: "FAC-REQ-0108"
+  title: "Risk-tiered AAT selection policy"
+  statement: |
+    AAT selection MUST be risk-tiered and diff-aware to preserve throughput while
+    protecting high-risk changes. GateReceipt MUST record risk_tier and
+    selection_policy_id bound to policy_hash.
+  acceptance_criteria:
+    - "Policy defines HIGH/MED/LOW tiers with explicit selection rules. Verified by: Policy schema test."
+    - "GateReceipt payload includes risk_tier and selection_policy_id. Verified by: Payload validation test."
+    - "HIGH tier requires AAT; MED/LOW follow sampling rules with nightly full AAT on main. Verified by: Policy enforcement tests."
+    - "Admission rejects mismatched selection_policy_id with AAT_POLICY_MISMATCH. Verified by: Negative test."
+  evidence:
+    evidence_ids:
+      - EVID-0024
+  law_alignment:
+    - law_id: "LAW-12"
+      enforcement: "Bounded retries and resource discipline via policy-driven selection."
+      applies_to:
+        - "Coordinator"
+        - "Policy profile"
+    - law_id: "LAW-15"
+      enforcement: "Measurement integrity via explicit policy binding in receipts."
+      applies_to:
+        - "GateReceipt payload"
+  defect_codes:
+    - code: "AAT_POLICY_MISMATCH"
+      severity: "S1"
+      description: "AAT selection policy mismatch or missing risk tier"

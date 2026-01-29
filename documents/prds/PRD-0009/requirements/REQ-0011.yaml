@@ -1,0 +1,27 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0011"
+  type: "FUNCTIONAL"
+  source_id: "FAC-REQ-0110"
+  title: "Invariant-first AAT specifications"
+  statement: |
+    AAT specifications MUST be invariant-first: invariants are required, machine-checkable,
+    and define acceptance; scenario steps are observational only.
+  acceptance_criteria:
+    - "AAT spec schema requires at least one invariant per scenario. Verified by: Spec validation test."
+    - "Invariants are expressed in machine-checkable form (exit code, structured report, invariant check). Verified by: Schema validation test."
+    - "Scenario steps cannot be used as acceptance predicates. Verified by: Policy validation test."
+  evidence:
+    evidence_ids:
+      - EVID-0027
+  law_alignment:
+    - law_id: "LAW-04"
+      enforcement: "Acceptance predicates anchored in terminal verifiers, not narratives."
+      applies_to:
+        - "AAT spec"
+        - "Verifier outputs"
+  defect_codes:
+    - code: "AAT_SPEC_INVALID"
+      severity: "S2"
+      description: "AAT spec missing invariant or uses step-based acceptance"

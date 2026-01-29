@@ -8,6 +8,13 @@ prd_governance_model:
       custody: "Agent roles that produce and modify artifacts."
       responsibility: "Domains accountable for correctness of specific surfaces."
       stewardship: "Standards governance (schemas, lint, evolution)."
+  trust_zones:
+    - zone_id: ZONE-REVENUE
+      description: "High-risk external action holons (e.g., revenue automation) operate in a separate trust zone."
+      requirements:
+        - "Separate keys and custody domains from admission/gate executors."
+        - "Separate budgets and tool allowlists with explicit human approvals for financial/external actions."
+        - "Separate ledger namespace or policy profile to prevent privilege bleed."
   gates:
     - gate_id: GATE-PRD-ARCHITECTURE
       authority_role: AUTH_ARCHITECTURE
@@ -21,6 +28,9 @@ prd_governance_model:
         - GateLease subset rule enforcement
         - MergeReceipt atomic binding verification
         - Typed GateReceipt payloads for gate_id=aat
+        - AAT evidence-chain binding (transcript + artifact digests + attestation)
+        - Terminal verifier binding schema enforcement
+        - Risk-tiered AAT selection policy enforcement
         - Determinism envelope validation (Phase 2)
     - gate_id: GATE-PRD-PRODUCT
       authority_role: AUTH_PRODUCT
@@ -42,6 +52,7 @@ prd_governance_model:
         - Critical event signature validation (Ed25519 domain-separated)
         - Context firewall deny verification (CTX-ALLOWLIST-001)
         - Lease expiry and scope enforcement
+        - AAT evidence-chain and attestation validation
         - Fail-closed handling for nondeterministic gate outcomes
   adjudication_policy:
     enabled: true
@@ -100,6 +111,7 @@ prd_governance_model:
       may_not:
         - merge
         - write external projections
+        - share custody domain with coordinator or implementer keys
     - holon_id: HOLON-KERNEL-GATE
       role_id: ROLE_ADMISSION
       may:

@@ -185,6 +185,69 @@ prd_decisions_review:
           reason: |
             High friction and environment dependency risk blocking core hardening rollout.
       evidence_ids: []
+    - id: DEC-FAC-0008
+      statement: |
+        Selected Design: Evidence-bound AAT GateReceipts with transcript hash chains and attestation.
+      rationale: |
+        AAT runners are untrusted surfaces unless receipts bind to independently verifiable
+        evidence. Transcript chains, artifact digests, and minimum attestation prevent
+        “signed nonsense” from passing admission.
+      alternatives_considered:
+        - id: ALT-NARRATIVE-ONLY
+          description: Accept narrative PASS with minimal artifacts.
+          status: REJECTED
+          reason: |
+            Narrative-only receipts are spoofable and repeat the GitHub status failure mode.
+        - id: ALT-ARTIFACT-ONLY
+          description: Require only test reports without transcript chains.
+          status: REJECTED
+          reason: |
+            Artifact-only receipts cannot prove execution conditions or ordering integrity.
+      evidence_ids: []
+    - id: DEC-FAC-0009
+      statement: |
+        Selected Design: Terminal verifier binding schema enforced for AAT PASS.
+      rationale: |
+        Schema-enforced verifier predicates prevent gradual dilution of “terminal verifiers”
+        into narratives or heuristic logs.
+      alternatives_considered:
+        - id: ALT-ALLOW-ADVISORY
+          description: Allow PASS based on advisory signals if logs look correct.
+          status: REJECTED
+          reason: |
+            Advisory-based PASS is spoofable and breaks Law-04 terminal verifier requirements.
+      evidence_ids: []
+    - id: DEC-FAC-0010
+      statement: |
+        Selected Design: Risk-tiered, diff-aware AAT selection policy.
+      rationale: |
+        Full AAT on every PR would collapse throughput; risk-tiered selection preserves
+        cadence while protecting critical domains.
+      alternatives_considered:
+        - id: ALT-FULL-AAT-ALWAYS
+          description: Require full AAT on every changeset.
+          status: REJECTED
+          reason: |
+            Throughput collapse and cost blowout without proportional safety gains.
+        - id: ALT-NO-AAT
+          description: Run AAT only on nightly main.
+          status: REJECTED
+          reason: |
+            High-risk changes would merge without acceptance coverage.
+      evidence_ids: []
+    - id: DEC-FAC-0011
+      statement: |
+        Selected Design: Invariant-first AAT specifications.
+      rationale: |
+        Invariants prevent brittle step scripts and preserve refactor freedom while still
+        enforcing product-level guarantees.
+      alternatives_considered:
+        - id: ALT-STEP-FIRST
+          description: Step scripts define acceptance; invariants optional.
+          status: REJECTED
+          reason: |
+            Step-first tests encode current behavior and block legitimate refactors.
+      evidence_ids: []
   gate_reviews:
     - gate_id: GATE-PRD-SECURITY
       status: PENDING

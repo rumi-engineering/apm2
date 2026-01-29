@@ -1,0 +1,33 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0023"
+  category: "TEST_RESULTS"
+  title: "Terminal Verifier Binding Enforcement Tests"
+  description: |
+    Tests verifying schema-enforced terminal verifier binding for AAT PASS.
+  source_acceptance_test: FAC-AT-0023
+  capture:
+    paths:
+      - "test/fac/aat_terminal_verifiers/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --package apm2-fac -- aat::terminal_verifier_binding"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 120
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Verifier policy schema enforced per scenario_type"
+          - "Missing verifier outputs invalidates PASS"
+  assertions:
+    - "Verifier policy hash is bound into GateReceipt payload"
+    - "PASS requires machine predicate satisfied"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

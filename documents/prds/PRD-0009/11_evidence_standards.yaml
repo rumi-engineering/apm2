@@ -158,6 +158,30 @@ prd_evidence_standards:
       description: "Test results demonstrating AAT GateReceipt payload binding to view_commitment_hash."
       required_for:
         - FAC-REQ-0103
+    - category: AAT_EVIDENCE_CHAIN_RESULTS
+      description: "Test results demonstrating transcript chain, artifact digest, and attestation bindings for AAT receipts."
+      required_for:
+        - FAC-REQ-0105
+    - category: AAT_TERMINAL_VERIFIER_BINDING_RESULTS
+      description: "Test results demonstrating terminal verifier schema enforcement and predicates."
+      required_for:
+        - FAC-REQ-0106
+    - category: AAT_FLAKE_CLASSIFICATION_RESULTS
+      description: "Test results demonstrating flake_class classification and policy routing."
+      required_for:
+        - FAC-REQ-0107
+    - category: AAT_RISK_TIER_SELECTION_RESULTS
+      description: "Test results demonstrating risk-tiered AAT selection policy enforcement."
+      required_for:
+        - FAC-REQ-0108
+    - category: AAT_LEASE_BINDING_RESULTS
+      description: "Test results demonstrating AAT lease scope binding and executor custody separation."
+      required_for:
+        - FAC-REQ-0109
+    - category: AAT_SPEC_INVARIANT_RESULTS
+      description: "Test results demonstrating invariant-first AAT specification validation."
+      required_for:
+        - FAC-REQ-0110
     - category: GATE_DETERMINISM_ENVELOPE_RESULTS
       description: "Test results demonstrating coordinator-managed N-run stability checks."
       required_for:

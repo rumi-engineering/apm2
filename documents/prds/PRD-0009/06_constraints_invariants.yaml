@@ -180,6 +180,63 @@ prd_constraints_invariants:
       evidence_ids:
         - EVID-0019
         - EVID-0021
+    - id: CNS-0020
+      statement: |
+        AAT GateReceipt payload MUST bind transcript_chain_root_hash, transcript_bundle_hash,
+        artifact_digests, terminal_verifier_outputs, and minimum attestation fields.
+      rationale: |
+        Prevents spoofed AAT PASS by requiring raw, independently verifiable evidence and
+        environment binding.
+      enforcement: AAT_EVIDENCE_MISSING or AAT_ATTESTATION_INVALID defect on missing fields; admission rejects.
+      evidence_ids:
+        - EVID-0022
+    - id: CNS-0021
+      statement: |
+        Terminal verifier binding is schema-enforced: for each scenario_type, allowed verifier kinds,
+        required outputs, and machine predicates MUST be present for PASS.
+      rationale: |
+        Prevents narrative-based gate passes and Goodhart drift toward non-terminal signals.
+      enforcement: AAT_TERMINAL_VERIFIER_MISSING or AAT_TERMINAL_VERIFIER_MISMATCH defect; PASS denied.
+      evidence_ids:
+        - EVID-0023
+    - id: CNS-0022
+      statement: |
+        AAT selection is risk-tiered and policy-bound; GateReceipt MUST include risk_tier and
+        selection_policy_id matching policy_hash.
+      rationale: |
+        Preserves throughput while ensuring high-risk changes always receive AAT coverage.
+      enforcement: AAT_POLICY_MISMATCH defect on mismatch; admission blocked.
+      evidence_ids:
+        - EVID-0024
+    - id: CNS-0023
+      statement: |
+        AAT failures MUST be classified into PRODUCT_DETERMINISTIC_FAIL, HARNESS_FLAKE,
+        ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, or UNKNOWN with policy-specific handling.
+      rationale: |
+        Classification prevents wasteful retries and avoids throughput collapse.
+      enforcement: UNKNOWN => NEEDS_INPUT; HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec.
+      evidence_ids:
+        - EVID-0025
+    - id: CNS-0024
+      statement: |
+        AAT GateLease scope MUST bind view_commitment_hash, rcp_aat_manifest_hash, and
+        selection_policy_id; AAT executor keys must be in a distinct custody domain.
+      rationale: |
+        Prevents orchestrator or implementer roles from spoofing AAT outcomes and ensures
+        runs occur against pinned snapshots.
+      enforcement: UNAUTHORIZED_EXECUTOR or AAT_POLICY_MISMATCH defect; lease rejected on custody violation.
+      evidence_ids:
+        - EVID-0026
+    - id: CNS-0025
+      statement: |
+        AAT specifications MUST be invariant-first: invariants are mandatory; steps are
+        observational and cannot be acceptance predicates.
+      rationale: |
+        Prevents brittle step scripts from blocking legitimate refactors and encourages
+        stable product-level guarantees.
+      enforcement: Spec validation rejects AAT suites lacking invariant declarations with AAT_SPEC_INVALID defect.
+      evidence_ids:
+        - EVID-0027
   invariants:
     - id: INV-0001
       statement: |
@@ -289,6 +346,16 @@ prd_constraints_invariants:
       evidence_ids:
         - EVID-0019
         - EVID-0021
+    - id: INV-0012
+      statement: |
+        AAT PASS requires evidence-bound receipts with transcript chains, terminal verifiers,
+        and attestation fields; narratives are non-authoritative.
+      rationale: |
+        Prevents spoofed PASS surfaces and ensures independent verification.
+      enforcement: Admission rejects AAT receipts missing evidence bindings.
+      evidence_ids:
+        - EVID-0022
+        - EVID-0023
   security_properties:
     - id: SEC-PROP-0001
       name: Cryptographic admission authority

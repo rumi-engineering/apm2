@@ -158,6 +158,61 @@ prd_success_metrics:
         abort_reason=POLICY_DENY following GATE_NONDETERMINISTIC defects.
       evidence_ids:
         - EVID-0021
+    - id: MET-0014
+      name: AAT evidence-chain completeness rate
+      description: |
+        Percentage of AAT receipts that include transcript hash chain, artifact digests,
+        terminal verifier outputs, and minimum attestation fields.
+      baseline: "0% (no evidence-chain enforcement pre-FAC)"
+      target: "100% for AAT-required gate outcomes"
+      measurement_method: |
+        Validate GateReceipt payloads for required fields (transcript_chain_root_hash,
+        transcript_bundle_hash, artifact_digests, terminal_verifier_outputs, attestation).
+      evidence_ids:
+        - EVID-0022
+    - id: MET-0015
+      name: AAT escape rate
+      description: |
+        Post-merge defects tagged as "should have been caught by AAT" per holdout and
+        production incident review.
+      baseline: "Baseline established after Phase 2 holdouts."
+      target: "<1% escape rate; trending down quarter-over-quarter"
+      measurement_method: |
+        Track defect taxonomy tags AAT_FALSE_NEGATIVE / HOLDOUT_FALSE_NEGATIVE and
+        correlate with changeset risk tier.
+      evidence_ids:
+        - EVID-0010
+    - id: MET-0016
+      name: Flake attribution distribution
+      description: |
+        Distribution of AAT failures by flake_class (HARNESS_FLAKE, ENVIRONMENT_DRIFT,
+        TEST_NONSEMANTIC, PRODUCT_DETERMINISTIC_FAIL, UNKNOWN).
+      baseline: "Baseline established after flake classification rollout."
+      target: "UNKNOWN <5%; HARNESS_FLAKE + ENVIRONMENT_DRIFT trending down"
+      measurement_method: |
+        Aggregate GateReceipt flake_class across AAT runs and correlate with quarantine events.
+      evidence_ids:
+        - EVID-0025
+    - id: MET-0017
+      name: AAT signal density
+      description: |
+        Defects per AAT-minute (or per token) to ensure AAT yields actionable signal.
+      baseline: "Baseline established after AAT rollout."
+      target: "Signal density increases quarter-over-quarter"
+      measurement_method: |
+        Compute defects linked to AAT evidence bundles divided by total AAT runtime.
+      evidence_ids:
+        - EVID-0024
+    - id: MET-0018
+      name: Median time-to-actionable AAT output
+      description: |
+        Median time from AAT failure to actionable fix (measured via defect closure).
+      baseline: "Baseline established after AAT rollout."
+      target: "<1 business day for HIGH-risk tier"
+      measurement_method: |
+        Track time between AAT defect creation and linked fix merge, stratified by risk tier.
+      evidence_ids:
+        - EVID-0027
   guardrails:
     - id: GRD-0001
       name: Admission decision internal-only
@@ -225,6 +280,22 @@ prd_success_metrics:
       evidence_ids:
         - EVID-0019
         - EVID-0021
+    - id: GRD-0009
+      name: AAT evidence-chain enforcement
+      threshold: "AAT PASS requires transcript chain + terminal verifier outputs + attestation fields."
+      response_plan: |
+        Admission rejects AAT receipts missing evidence bindings; emit AAT_EVIDENCE_MISSING
+        or AAT_TERMINAL_VERIFIER_MISSING and quarantine changeset until resolved.
+      evidence_ids:
+        - EVID-0022
+        - EVID-0023
+    - id: GRD-0010
+      name: Risk-tiered AAT selection integrity
+      threshold: "HIGH-risk changes MUST include AAT with matching selection_policy_id."
+      response_plan: |
+        AAT_POLICY_MISMATCH defect emitted; admission blocked until selection policy corrected.
+      evidence_ids:
+        - EVID-0024
   definition_of_done:
     phase_1:
       name: "Phase 1 (FAC Core Hardening)"
@@ -247,6 +318,7 @@ prd_success_metrics:
         - "False-negative rate is measured and tracked for all gate policies."
         - "Evaluator drift triggers automatic policy quarantine and adjudication requirement."
         - "Nondeterministic gate outcomes trigger GATE_NONDETERMINISTIC and fail-closed quarantine/abort."
+        - "AAT escape rate, flake attribution, and signal density are measured and reviewed."
     phase_3:
       name: "Phase 3 (Autonomous Improvement Substrate)"
       deliverables:

@@ -1,0 +1,40 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0008"
+  type: "SECURITY"
+  source_id: "FAC-REQ-0107"
+  title: "AAT flake classification and policy routing"
+  statement: |
+    AAT failures MUST be classified into PRODUCT_DETERMINISTIC_FAIL, HARNESS_FLAKE,
+    ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, or UNKNOWN. GateReceipt MUST record flake_class
+    and determinism_class; policy routes each class to a specific quarantine or escalation
+    path.
+  acceptance_criteria:
+    - "GateReceipt payload includes determinism_class and flake_class for every AAT run. Verified by: Schema validation test."
+    - "UNKNOWN failures produce NEEDS_INPUT and never PASS via retries. Verified by: Policy enforcement test."
+    - "HARNESS_FLAKE triggers runner pool quarantine; TEST_NONSEMANTIC triggers AAT spec quarantine. Verified by: Integration test with quarantine events."
+    - "ENVIRONMENT_DRIFT invalidates attestation and blocks until re-pinned environment. Verified by: Attestation drift test."
+  evidence:
+    evidence_ids:
+      - EVID-0025
+  law_alignment:
+    - law_id: "LAW-12"
+      enforcement: "Bounded retries and termination discipline; classification prevents infinite retry loops."
+      applies_to:
+        - "Coordinator"
+        - "Determinism envelope"
+    - law_id: "LAW-15"
+      enforcement: "Measurement integrity via explicit classification and routing."
+      applies_to:
+        - "GateReceipt payload"
+  defect_codes:
+    - code: "HARNESS_FLAKE"
+      severity: "S2"
+      description: "Runner/infra nondeterminism detected"
+    - code: "ENVIRONMENT_DRIFT"
+      severity: "S2"
+      description: "Toolchain or environment drift detected"
+    - code: "TEST_NONSEMANTIC"
+      severity: "S2"
+      description: "AAT spec brittle or non-semantic"

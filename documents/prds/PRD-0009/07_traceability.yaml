@@ -15,6 +15,18 @@ prd_traceability:
         requirement_ref: "requirements/REQ-0004.yaml#prd_requirement"
       - requirement_id: "REQ-0005"
         requirement_ref: "requirements/REQ-0005.yaml#prd_requirement"
+      - requirement_id: "REQ-0006"
+        requirement_ref: "requirements/REQ-0006.yaml#prd_requirement"
+      - requirement_id: "REQ-0007"
+        requirement_ref: "requirements/REQ-0007.yaml#prd_requirement"
+      - requirement_id: "REQ-0008"
+        requirement_ref: "requirements/REQ-0008.yaml#prd_requirement"
+      - requirement_id: "REQ-0009"
+        requirement_ref: "requirements/REQ-0009.yaml#prd_requirement"
+      - requirement_id: "REQ-0010"
+        requirement_ref: "requirements/REQ-0010.yaml#prd_requirement"
+      - requirement_id: "REQ-0011"
+        requirement_ref: "requirements/REQ-0011.yaml#prd_requirement"
     imports:
       - source_prd: "PRD-0004"
         requirement_id: "REQ-0009"
@@ -59,6 +71,32 @@ prd_traceability:
         section_refs:
           - "04_solution_overview.yaml#prd_solution_overview.determinism_envelope"
           - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
+      - requirement_id: "REQ-0006"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.aat_contract"
+          - "04_solution_overview.yaml#prd_solution_overview.gate_receipts"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
+      - requirement_id: "REQ-0007"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.aat_contract"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
+      - requirement_id: "REQ-0008"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.aat_contract"
+          - "04_solution_overview.yaml#prd_solution_overview.determinism_envelope"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
+      - requirement_id: "REQ-0009"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.aat_contract"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
+      - requirement_id: "REQ-0010"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.authority.gate_lease"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
+      - requirement_id: "REQ-0011"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.aat_contract"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
   source_mapping:
     fac_requirement_to_local:
       - source_id: "FAC-REQ-0100"
@@ -76,6 +114,24 @@ prd_traceability:
       - source_id: "FAC-REQ-0104"
         local_id: "REQ-0005"
         title: "Gate outcome determinism envelope"
+      - source_id: "FAC-REQ-0105"
+        local_id: "REQ-0006"
+        title: "Evidence-bound AAT GateReceipt"
+      - source_id: "FAC-REQ-0106"
+        local_id: "REQ-0007"
+        title: "Terminal verifier binding for AAT"
+      - source_id: "FAC-REQ-0107"
+        local_id: "REQ-0008"
+        title: "AAT flake classification and policy routing"
+      - source_id: "FAC-REQ-0108"
+        local_id: "REQ-0009"
+        title: "Risk-tiered AAT selection policy"
+      - source_id: "FAC-REQ-0109"
+        local_id: "REQ-0010"
+        title: "AAT lease binding and executor isolation"
+      - source_id: "FAC-REQ-0110"
+        local_id: "REQ-0011"
+        title: "Invariant-first AAT specifications"
     law_to_requirement:
       - law_id: "LAW-01"
         applies_to:
@@ -86,6 +142,8 @@ prd_traceability:
           - "PRD-0004:REQ-0009"
           - "REQ-0001"
           - "REQ-0004"
+          - "REQ-0006"
+          - "REQ-0010"
       - law_id: "LAW-02"
         applies_to:
           - "ContextPack"
@@ -93,6 +151,7 @@ prd_traceability:
         enforcement: "Context sufficiency observed; context misses terminate and trigger refinement"
         requirement_ids:
           - "REQ-0001"
+          - "REQ-0010"
       - law_id: "LAW-03"
         applies_to:
           - "GitHub adapter"
@@ -108,6 +167,9 @@ prd_traceability:
           - "REQ-0003"
           - "REQ-0004"
           - "REQ-0005"
+          - "REQ-0006"
+          - "REQ-0007"
+          - "REQ-0011"
       - law_id: "LAW-05"
         applies_to:
           - "OCAP"
@@ -133,6 +195,8 @@ prd_traceability:
         requirement_ids:
           - "REQ-0001"
           - "REQ-0005"
+          - "REQ-0008"
+          - "REQ-0009"
       - law_id: "LAW-15"
         applies_to:
           - "Metrics"
@@ -141,6 +205,11 @@ prd_traceability:
           - "REQ-0001"
           - "REQ-0004"
           - "REQ-0005"
+          - "REQ-0006"
+          - "REQ-0007"
+          - "REQ-0008"
+          - "REQ-0009"
+          - "REQ-0010"
   terminology_links:
     - term: "Gate"
       ref: "documents/skills/glossary/references/gate.md"

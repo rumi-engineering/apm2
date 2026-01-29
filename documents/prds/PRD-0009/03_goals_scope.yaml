@@ -71,6 +71,36 @@ prd_goals_scope:
         - Determinism envelope enforces N identical runs for gates with determinism_class > 0.
         - Nondeterminism emits GATE_NONDETERMINISTIC defect and fails closed.
         - Repeated nondeterminism quarantines and aborts changesets per policy.
+    - id: FAC-G-0011
+      statement: Evidence-first AAT receipts - AAT GateReceipts bind raw evidence digests, transcript chains, and attestation fields.
+      measurable_outcomes:
+        - AAT GateReceipt payload includes transcript_chain_root_hash and transcript_bundle_hash.
+        - AAT GateReceipt payload includes artifact_digests for logs, reports, snapshots, and binaries.
+        - AAT GateReceipt payload includes attestation fields (container_image_digest, toolchain_digests, runner_identity_key_id, network_policy_profile_hash).
+        - Admission rejects AAT receipts missing any required evidence bindings.
+    - id: FAC-G-0012
+      statement: Terminal verifier binding - PASS requires machine-defined verifier outputs and predicates.
+      measurable_outcomes:
+        - AAT policy defines scenario_type -> allowed_verifier_kinds + required_outputs + machine_predicate.
+        - GateReceipt payload includes terminal_verifier_outputs and verifier_policy_hash.
+        - Admission rejects AAT PASS when required verifier outputs are missing or predicate not satisfied.
+    - id: FAC-G-0013
+      statement: Flake classification and policy routing - Failures are classified and routed by policy to prevent throughput collapse.
+      measurable_outcomes:
+        - GateReceipt payload records determinism_class and flake_class for AAT runs.
+        - UNKNOWN failures never PASS via retries; NEEDS_INPUT required.
+        - HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec.
+    - id: FAC-G-0014
+      statement: Risk-tiered AAT selection - Diff-aware AAT gating preserves throughput while protecting high-risk changes.
+      measurable_outcomes:
+        - Risk tier (HIGH/MED/LOW) and selection_policy_id are recorded in GateReceipt payload.
+        - HIGH tier always requires AAT; MED/LOW are sampled by policy with nightly full AAT on main.
+        - Admission verifies selection_policy_id and risk_tier against policy_hash.
+    - id: FAC-G-0015
+      statement: Invariant-first AAT specs - Acceptance tests assert invariants, not brittle step scripts.
+      measurable_outcomes:
+        - AAT specs require invariant declarations; steps are observational only.
+        - Invariants are expressed in machine-checkable form (exit codes, structured reports, invariant checks).
   scope:
     in_scope:
       - forge
@@ -107,6 +137,9 @@ prd_goals_scope:
         - GitHub adapter projection-only; status setters outside adapter removed from skills and denied by policy.
         - Projection divergence watchdog + freeze/unfreeze path.
         - Typed GateReceipt payloads for AAT bound to view commitments.
+        - AAT evidence bindings (transcript chains, artifact digests, attestation fields) validated at admission.
+        - Terminal verifier binding schema enforced for AAT PASS.
+        - Risk-tiered AAT selection policy with diff-aware gating.
       definition_of_done:
         - An autonomous agent cannot flip a gate outcome or merge by manipulating GitHub or xtask; it must produce signed internal events and receipts.
         - A GateRun cannot proceed with missing context; it terminates and triggers pack refinement.
@@ -118,6 +151,7 @@ prd_goals_scope:
         - Auditor sampling of gate outcomes vs evidence; drift alerts and policy quarantine.
         - Echo-trap metrics feeding instruction and pack compiler updates.
         - Determinism envelope enforcement for gates with determinism_class > 0 (AAT first).
+        - Flake classification policy routing with runner-pool quarantine and test-spec quarantine.
       definition_of_done:
         - Holdout suite runs on schedule and produces false_negative_rate, finding_precision, gate_evidence_coverage metrics.
         - Auditor samples 1% of GateRuns (or min 1/day) and detects rationale/evidence drift.
@@ -144,3 +178,7 @@ prd_goals_scope:
     - Bounded retries and echo-trap detection prevent runaway loops.
     - AAT gate receipts are typed and bound to view commitments.
     - Determinism envelope prevents nondeterministic gate outcomes from passing.
+    - AAT receipts bind transcript chains, artifact digests, and attestation fields.
+    - Terminal verifier binding prevents narrative-only PASS.
+    - Risk-tiered AAT selection preserves merge cadence while protecting high-risk changes.
+    - AAT specs are invariant-first and machine-verifiable.

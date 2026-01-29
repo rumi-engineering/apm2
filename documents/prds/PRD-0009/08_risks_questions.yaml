@@ -88,6 +88,28 @@ prd_risks_questions:
         - Allow adjudication only for infra-root-cause classification; keep fail-closed for code.
         - Track nondeterminism rates to tune policy thresholds.
       evidence_ids: []
+    - id: RSK-FAC-0008
+      statement: AAT evidence-chain capture increases latency and storage costs.
+      impact: |
+        Transcript hash chains and artifact digests add compute overhead; if unchecked,
+        AAT could slow merge cadence or inflate evidence retention costs.
+      likelihood: MEDIUM
+      mitigations:
+        - Use chunked hashing and streaming digests to avoid large memory footprints.
+        - Compress and deduplicate artifacts in CAS; retain raw evidence per policy.
+        - Apply risk-tiered AAT selection to reduce overall run volume.
+      evidence_ids: []
+    - id: RSK-FAC-0009
+      statement: Terminal verifier policy drift can cause false PASS or brittle blocking.
+      impact: |
+        If verifier predicates become lax, AAT becomes spoofable; if too strict, AAT
+        blocks safe refactors and slows velocity.
+      likelihood: MEDIUM
+      mitigations:
+        - Version verifier policies with policy_hash and audit changes.
+        - Use holdout suites to detect false negatives.
+        - Require invariants-first specs to avoid step-based brittleness.
+      evidence_ids: []
   open_questions:
     - id: Q-FAC-0001
       question: |
@@ -139,6 +161,22 @@ prd_risks_questions:
       resolution_plan: |
         Start with N=3 for AAT in T3; evaluate throughput impact and expand to other
         gates only after stability and cost metrics meet targets.
+    - id: Q-FAC-0007
+      question: |
+        Transcript hash chain schema: what canonical ordering and chunking rules ensure
+        deterministic verification across environments?
+      decision_needed_by: Phase 1 (FAC Core Hardening)
+      resolution_plan: |
+        Define canonical transcript event ordering and chunk size. Publish schema and
+        reference implementation for verification.
+    - id: Q-FAC-0008
+      question: |
+        Risk tier classification model: which signals (diff scope, module criticality,
+        policy profile) determine HIGH/MED/LOW for AAT selection?
+      decision_needed_by: Phase 1 (FAC Core Hardening)
+      resolution_plan: |
+        Start with policy-defined critical domains (auth/crypto/ledger/tool mediation) and
+        expand with impact expansion heuristics; revise based on escape-rate metrics.
   tradeoff_analyses:
     - id: TRADEOFF-FAC-0001
       name: Strictness vs. Adoption

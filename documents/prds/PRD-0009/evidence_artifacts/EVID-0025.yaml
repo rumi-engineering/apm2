@@ -1,0 +1,35 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0025"
+  category: "INTEGRATION_TEST_RESULTS"
+  title: "AAT Flake Classification and Quarantine Tests"
+  description: |
+    Integration tests validating AAT flake classification and policy-driven quarantine
+    handling for runner pools and test specs.
+  source_acceptance_test: FAC-AT-0025
+  capture:
+    paths:
+      - "test/fac/aat_flake_classification/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --package apm2-fac -- aat::flake_classification"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 180
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "HARNESS_FLAKE quarantines runner pool"
+          - "TEST_NONSEMANTIC quarantines AAT spec"
+          - "UNKNOWN requires NEEDS_INPUT"
+  assertions:
+    - "GateReceipt payload records determinism_class and flake_class"
+    - "Policy routes classifications to quarantine or escalation"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

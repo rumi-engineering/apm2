@@ -49,6 +49,18 @@ prd_evidence_bundle:
           artifact_ref: "evidence_artifacts/EVID-0020.yaml#prd_evidence_artifact"
         - evidence_id: "EVID-0021"
           artifact_ref: "evidence_artifacts/EVID-0021.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0022"
+          artifact_ref: "evidence_artifacts/EVID-0022.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0023"
+          artifact_ref: "evidence_artifacts/EVID-0023.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0024"
+          artifact_ref: "evidence_artifacts/EVID-0024.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0025"
+          artifact_ref: "evidence_artifacts/EVID-0025.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0026"
+          artifact_ref: "evidence_artifacts/EVID-0026.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0027"
+          artifact_ref: "evidence_artifacts/EVID-0027.yaml#prd_evidence_artifact"
       imports: []
   collection_policy:
     evidence_freshness:

@@ -134,3 +134,39 @@ evidence_artifacts_readme:
       file: "EVID-0021.yaml"
       verifies:
         - "FAC-REQ-0104"
+    - id: "EVID-0022"
+      title: "AAT Evidence Chain and Attestation Tests"
+      category: "TEST_RESULTS"
+      file: "EVID-0022.yaml"
+      verifies:
+        - "FAC-REQ-0105"
+    - id: "EVID-0023"
+      title: "Terminal Verifier Binding Enforcement Tests"
+      category: "TEST_RESULTS"
+      file: "EVID-0023.yaml"
+      verifies:
+        - "FAC-REQ-0106"
+    - id: "EVID-0024"
+      title: "Risk-Tiered AAT Selection Policy Tests"
+      category: "INTEGRATION_TEST_RESULTS"
+      file: "EVID-0024.yaml"
+      verifies:
+        - "FAC-REQ-0108"
+    - id: "EVID-0025"
+      title: "AAT Flake Classification and Quarantine Tests"
+      category: "INTEGRATION_TEST_RESULTS"
+      file: "EVID-0025.yaml"
+      verifies:
+        - "FAC-REQ-0107"
+    - id: "EVID-0026"
+      title: "AAT Lease Binding and Executor Isolation Tests"
+      category: "INTEGRATION_TEST_RESULTS"
+      file: "EVID-0026.yaml"
+      verifies:
+        - "FAC-REQ-0109"
+    - id: "EVID-0027"
+      title: "Invariant-First AAT Spec Validation Tests"
+      category: "TEST_RESULTS"
+      file: "EVID-0027.yaml"
+      verifies:
+        - "FAC-REQ-0110"

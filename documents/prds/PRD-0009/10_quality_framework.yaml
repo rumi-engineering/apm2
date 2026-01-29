@@ -95,10 +95,18 @@ prd_quality_framework:
           - REQ-0001
           - REQ-0002
           - REQ-0005
+          - REQ-0006
+          - REQ-0007
+          - REQ-0008
+          - REQ-0010
         evidence_ids:
           - EVID-0004
           - EVID-0005
           - EVID-0021
+          - EVID-0022
+          - EVID-0023
+          - EVID-0025
+          - EVID-0026
       delegation:
         guardrails: []
         required_evidence_categories: []
@@ -146,9 +154,11 @@ prd_quality_framework:
           - REQ-0001
           - REQ-0002
           - REQ-0005
+          - REQ-0008
         evidence_ids:
           - EVID-0008
           - EVID-0021
+          - EVID-0025
       delegation:
         guardrails: []
         required_evidence_categories: []
@@ -182,11 +192,23 @@ prd_quality_framework:
           - REQ-0003
           - REQ-0004
           - REQ-0005
+          - REQ-0006
+          - REQ-0007
+          - REQ-0008
+          - REQ-0009
+          - REQ-0010
+          - REQ-0011
         evidence_ids:
           - EVID-0010
           - EVID-0011
           - EVID-0018
           - EVID-0019
+          - EVID-0022
+          - EVID-0023
+          - EVID-0024
+          - EVID-0025
+          - EVID-0026
+          - EVID-0027
       delegation:
         guardrails: []
         required_evidence_categories: []
@@ -200,8 +222,10 @@ prd_quality_framework:
       coverage:
         requirement_ids:
           - REQ-0002
+          - REQ-0009
         evidence_ids:
           - EVID-0012
+          - EVID-0024
       delegation:
         guardrails: []
         required_evidence_categories: []

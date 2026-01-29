@@ -7,11 +7,11 @@ prd_requirement:
   title: "Typed GateReceipt payloads for AAT"
   statement: |
     GateReceipt MUST support typed payloads; when gate_id=aat, the payload MUST
-    include view_commitment_hash, determinism_class, run_receipt_hashes, run_count,
-    stability_digest, and verdict, and MUST bind to the EvidenceBundle hash.
+    include view_commitment_hash, rcp_manifest_hash, determinism_class, run_receipt_hashes,
+    run_count, stability_digest, and verdict, and MUST bind to the EvidenceBundle hash.
   acceptance_criteria:
     - "GateReceipt supports typed payloads with gate_id-specific schema. Verified by: Test that GateReceipt schema validates payload variants by gate_id."
-    - "For gate_id=aat, payload includes view_commitment_hash and determinism_class. Verified by: Test that AAT GateReceipt payload requires both fields."
+    - "For gate_id=aat, payload includes view_commitment_hash, rcp_manifest_hash, and determinism_class. Verified by: Test that AAT GateReceipt payload requires these fields."
     - "For gate_id=aat, payload includes run_receipt_hashes, run_count, and stability_digest binding all runs. Verified by: Test that payload validation fails if any field missing."
     - "view_commitment_hash in AAT payload matches FAC-00-INGEST_CHANGESET output. Verified by: Test that admission rejects mismatch between GateReceipt payload and view_commitment_hash."
     - "GateReceipt signature covers the typed payload and EvidenceBundle hash. Verified by: Test that tampering with payload or evidence hash invalidates signature."

@@ -24,7 +24,7 @@ prd_evidence_artifact:
         constraints:
           - "GateReceipt payload fixtures include AAT variant"
   assertions:
-    - "AAT payload requires view_commitment_hash and determinism_class"
+    - "AAT payload requires view_commitment_hash, rcp_manifest_hash, and determinism_class"
     - "AAT payload requires run_receipt_hashes, run_count, stability_digest, verdict"
     - "Signature covers typed payload and EvidenceBundle hash"
   data:

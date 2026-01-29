@@ -28,6 +28,30 @@ requirements_readme:
       title: "Gate outcome determinism envelope"
       type: "SECURITY"
       file: "REQ-0005.yaml"
+    - id: "REQ-0006"
+      title: "Evidence-bound AAT GateReceipt"
+      type: "SECURITY"
+      file: "REQ-0006.yaml"
+    - id: "REQ-0007"
+      title: "Terminal verifier binding for AAT"
+      type: "SECURITY"
+      file: "REQ-0007.yaml"
+    - id: "REQ-0008"
+      title: "AAT flake classification and policy routing"
+      type: "SECURITY"
+      file: "REQ-0008.yaml"
+    - id: "REQ-0009"
+      title: "Risk-tiered AAT selection policy"
+      type: "OPERABILITY"
+      file: "REQ-0009.yaml"
+    - id: "REQ-0010"
+      title: "AAT lease binding and executor isolation"
+      type: "SECURITY"
+      file: "REQ-0010.yaml"
+    - id: "REQ-0011"
+      title: "Invariant-first AAT specifications"
+      type: "FUNCTIONAL"
+      file: "REQ-0011.yaml"
 
   inherited_requirements:
     source_prd: "PRD-0004"
@@ -59,9 +83,24 @@ requirements_readme:
       - goal: "FAC-G-0010"
         description: "Gate outcome determinism envelope"
         requirements: ["REQ-0005"]
+      - goal: "FAC-G-0011"
+        description: "Evidence-first AAT receipts"
+        requirements: ["REQ-0006"]
+      - goal: "FAC-G-0012"
+        description: "Terminal verifier binding"
+        requirements: ["REQ-0007"]
+      - goal: "FAC-G-0013"
+        description: "Flake classification and policy routing"
+        requirements: ["REQ-0008"]
+      - goal: "FAC-G-0014"
+        description: "Risk-tiered AAT selection"
+        requirements: ["REQ-0009"]
+      - goal: "FAC-G-0015"
+        description: "Invariant-first AAT specs"
+        requirements: ["REQ-0011"]
     law_mapping:
       - law_id: "LAW-01"
-        requirements: ["REQ-0004"]
+        requirements: ["REQ-0004", "REQ-0006", "REQ-0010"]
         enforcement: "Receipt-backed gates for authoritative promotion"
       - law_id: "LAW-02"
         requirements: ["REQ-0001"]
@@ -70,19 +109,19 @@ requirements_readme:
         requirements: ["REQ-0002"]
         enforcement: "Ledger is truth; projections overwriteable; divergence detection halts factory"
       - law_id: "LAW-04"
-        requirements: ["REQ-0003", "REQ-0004", "REQ-0005"]
+        requirements: ["REQ-0003", "REQ-0004", "REQ-0005", "REQ-0006", "REQ-0007", "REQ-0011"]
         enforcement: "Stochastic stability requires contract + receipt + evidence"
       - law_id: "LAW-05"
-        requirements: ["REQ-0001"]
+        requirements: ["REQ-0001", "REQ-0010"]
         enforcement: "Mechanical context firewall + capability scoping; no ambient credentials"
       - law_id: "LAW-10"
         requirements: ["REQ-0002"]
         enforcement: "Atomic merge receipt binds (base, changeset) -> result; anti-entropy divergence checks"
       - law_id: "LAW-12"
-        requirements: ["REQ-0001", "REQ-0005"]
+        requirements: ["REQ-0001", "REQ-0005", "REQ-0008", "REQ-0009"]
         enforcement: "Bounded retries and termination discipline"
       - law_id: "LAW-15"
-        requirements: ["REQ-0003", "REQ-0004", "REQ-0005"]
+        requirements: ["REQ-0003", "REQ-0004", "REQ-0005", "REQ-0006", "REQ-0007", "REQ-0008", "REQ-0009", "REQ-0010"]
         enforcement: "Measurement integrity and fail-closed behavior"
 
   evidence_mapping:
@@ -116,3 +155,21 @@ requirements_readme:
     - evidence_id: "EVID-0021"
       requirements: ["REQ-0005"]
       description: "Quarantine/abort policy enforcement tests"
+    - evidence_id: "EVID-0022"
+      requirements: ["REQ-0006"]
+      description: "AAT evidence chain and attestation binding tests"
+    - evidence_id: "EVID-0023"
+      requirements: ["REQ-0007"]
+      description: "Terminal verifier binding enforcement tests"
+    - evidence_id: "EVID-0024"
+      requirements: ["REQ-0009"]
+      description: "Risk-tiered AAT selection policy tests"
+    - evidence_id: "EVID-0025"
+      requirements: ["REQ-0008"]
+      description: "AAT flake classification and quarantine tests"
+    - evidence_id: "EVID-0026"
+      requirements: ["REQ-0010"]
+      description: "AAT lease binding and executor isolation tests"
+    - evidence_id: "EVID-0027"
+      requirements: ["REQ-0011"]
+      description: "Invariant-first AAT specification validation tests"
