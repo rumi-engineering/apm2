@@ -145,8 +145,8 @@ rfc_governance_and_gates:
       GATE-RFC-REQUIREMENT-FIDELITY: PASSED
     open_blockers: []
     resolved_blockers:
-      - "F-SA3-001: Lease Revocation Gap - resolved via LeaseRevoked event + TTL reduction"
-      - "F-SA3-002: WARN Mode Security Gap - resolved via 7-day limit + sensitive domain exclusion"
+      - "F-SA3-001: Lease Revocation Gap - resolved via LeaseRevoked event + HTF lease window (TIME_TBD)"
+      - "F-SA3-002: WARN Mode Security Gap - resolved via HTF WARN window (TIME_TBD) + sensitive domain exclusion"
       - "F-SA3-004: TB-0003 Runtime Enforcement - resolved via network policy"
       - "F-SA3-012: Insider Threat Model - resolved via ADV-0005 + dual-control"
     notes: |

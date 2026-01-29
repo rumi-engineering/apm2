@@ -5,8 +5,8 @@ rfc_rollout_and_ops:
     overview: |
       FAC rollout follows a phased approach with graduated strictness and feature flags.
       Phase 1 focuses on core admission hardening; Phase 2 adds measurement integrity;
-      Phase 3 enables autonomous improvement. Context firewall adoption uses a 5-week
-      graduated rollout to allow pack completeness improvements.
+      Phase 3 enables autonomous improvement. Context firewall adoption uses a multi-phase
+      graduated rollout to allow pack completeness improvements (HTF windows; TIME_TBD).
 
     phases:
       - phase_id: PHASE-1
@@ -45,7 +45,7 @@ rfc_rollout_and_ops:
             description: "Enable projection divergence watchdog"
 
     phase_1_limitations:
-      - "CI evidence attestation is L0 only in Phase 1; L1+ deferred to Phase 2."
+      - "CI evidence attestation is L1 only in Phase 1; L2+ deferred to Phase 2."
       - "AAT reuse is limited to LOW risk; MED requires waiver; HIGH is never reused."
       - "Determinism envelope enforcement is disabled in Phase 1 (schema only)."
 
@@ -87,48 +87,48 @@ rfc_rollout_and_ops:
 
     context_firewall_rollout:
       description: |
-        Graduated rollout of context firewall enforcement over 5 weeks to allow
+        Graduated rollout of context firewall enforcement across HTF windows (TIME_TBD) to allow
         pack completeness improvements without blocking development.
       phases:
         - phase: FAC-R-01
           mode: WARN
-          duration_days: 7
+          duration_htf_window: "TIME_TBD"
           description: "Warn-only for LOW risk changes on sterile runner pool (no secrets, egress denied); auth/crypto/ledger enforced at SOFT_FAIL"
         - phase: FAC-R-02
           mode: SOFT_FAIL
-          duration_days: 14
+          duration_htf_window: "TIME_TBD"
           description: "Context miss terminates session but allows retry; COI waiver auto-granted"
         - phase: FAC-R-03
           mode: HARD_FAIL
-          duration_days: 14
+          duration_htf_window: "TIME_TBD"
           description: "Full enforcement; context miss triggers refinement; COI waiver requires ceremony"
         - phase: FAC-R-04
           mode: PRODUCTION
           duration: ongoing
           description: "Continuous improvement; pack specs refined based on defect patterns"
       acceleration_clause: |
-        If CONTEXT_MISS rate <5% at week 3, advance to FAC-R-03.
-        If COI waiver rate <2% at week 4, remove auto-grant.
+        If CONTEXT_MISS rate <5% at HTF milestone window A (TIME_TBD), advance to FAC-R-03.
+        If COI waiver rate <2% at HTF milestone window B (TIME_TBD), remove auto-grant.
       thresholds:
-        acceptable_context_miss_rate: "<=15% of GateRuns in first 30 days"
+        acceptable_context_miss_rate: "<=15% of GateRuns in first HTF rollout window (TIME_TBD)"
         acceptable_coi_waiver_rate: "<=5% of admissions"
-        feedback_latency_sla: "Pack spec updates within 24h of recurring pattern"
+        feedback_latency_sla: "Pack spec updates within HTF window (TIME_TBD) of recurring pattern"
 
   operational_considerations:
     monitoring:
       - metric: fac_gate_signature_verification_failures
         type: counter
-        alert_threshold: ">0 per hour"
+        alert_threshold: ">0 per HTF window (TIME_TBD)"
         description: "Count of INVALID_SIGNATURE rejections"
 
       - metric: fac_context_miss_rate
         type: gauge
-        alert_threshold: ">15% over 24h"
+        alert_threshold: ">15% over HTF window (TIME_TBD)"
         description: "Rate of CONTEXT_MISS session terminations"
 
       - metric: fac_projection_divergence_events
         type: counter
-        alert_threshold: ">0 per hour"
+        alert_threshold: ">0 per HTF window (TIME_TBD)"
         description: "Count of PROJECTION_DIVERGENCE defects"
 
       - metric: fac_lease_expiry_rejections
@@ -138,7 +138,7 @@ rfc_rollout_and_ops:
 
       - metric: fac_echo_trap_detections
         type: counter
-        alert_threshold: ">3 per day"
+        alert_threshold: ">3 per HTF window (TIME_TBD)"
         description: "Count of ECHO_TRAP reasoning degeneration detections"
 
       - metric: aat_terminal_verifier_failures
@@ -149,7 +149,7 @@ rfc_rollout_and_ops:
       - metric: aat_flake_classification
         type: histogram
         labels: [flake_class]
-        description: "Distribution of AAT failure classifications"
+        description: "Distribution of AAT outcome_class (flake_class field) classifications"
 
     incident_response:
       - scenario: "Projection Divergence Detected"
@@ -194,7 +194,7 @@ rfc_rollout_and_ops:
         - "Wait for event to be ledger-committed"
         - "Deploy new key to executor/adapter"
         - "Revoke old key after grace period"
-      grace_period_hours: 24
+      grace_period_htf_window: "TIME_TBD"
       audit_requirements:
         - "Log all key rotation events"
         - "Alert on unexpected rotations"
@@ -229,7 +229,7 @@ rfc_rollout_and_ops:
       steps:
         - step: 1
           action: "Submit AdjudicationRequested(WAIVER)"
-          details: "Include rationale, scope, and TTL"
+          details: "Include rationale, scope, and time_envelope_ref (TIME_TBD)"
         - step: 2
           action: "Await approval"
           details: "Requires AUTH_SECURITY signoff"
@@ -238,13 +238,13 @@ rfc_rollout_and_ops:
           details: "Projection-visible for audit"
         - step: 4
           action: "Execute with waived COI"
-          details: "Limited to specified scope and TTL"
+          details: "Limited to specified scope and time_envelope_ref (TIME_TBD)"
 
     emergency_override:
       description: |
         Emergency override ceremony per PRD-0007 for critical blockers.
       requirements:
         - "Dual approval required"
-        - "Time-bounded (max 24h)"
+        - "Time-bounded via HTF time_envelope_ref (TIME_TBD)"
         - "Full audit trail"
         - "Post-incident review mandatory"

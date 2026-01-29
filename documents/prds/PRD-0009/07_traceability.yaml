@@ -37,6 +37,14 @@ prd_traceability:
         requirement_ref: "requirements/REQ-0015.yaml#prd_requirement"
       - requirement_id: "REQ-0016"
         requirement_ref: "requirements/REQ-0016.yaml#prd_requirement"
+      - requirement_id: "REQ-0017"
+        requirement_ref: "requirements/REQ-0017.yaml#prd_requirement"
+      - requirement_id: "REQ-0018"
+        requirement_ref: "requirements/REQ-0018.yaml#prd_requirement"
+      - requirement_id: "REQ-0019"
+        requirement_ref: "requirements/REQ-0019.yaml#prd_requirement"
+      - requirement_id: "REQ-0020"
+        requirement_ref: "requirements/REQ-0020.yaml#prd_requirement"
     imports:
       - source_prd: "PRD-0004"
         requirement_id: "REQ-0009"
@@ -131,6 +139,24 @@ prd_traceability:
           - "04_solution_overview.yaml#prd_solution_overview.aat_contract"
           - "04_solution_overview.yaml#prd_solution_overview.ocap_and_context"
           - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
+      - requirement_id: "REQ-0017"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.protocol.stages"
+          - "04_solution_overview.yaml#prd_solution_overview.policy_resolution_anchor"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
+      - requirement_id: "REQ-0018"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.quarantine"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
+      - requirement_id: "REQ-0019"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.ci_evidence"
+          - "11_evidence_standards.yaml#prd_evidence_standards"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
+      - requirement_id: "REQ-0020"
+        section_refs:
+          - "04_solution_overview.yaml#prd_solution_overview.gate_receipts"
+          - "06_constraints_invariants.yaml#prd_constraints_invariants.constraints"
   source_mapping:
     fac_requirement_to_local:
       - source_id: "FAC-REQ-0100"
@@ -181,6 +207,18 @@ prd_traceability:
       - source_id: "FAC-REQ-0115"
         local_id: "REQ-0016"
         title: "AAT harness sandboxing and egress control"
+      - source_id: "FAC-REQ-0116"
+        local_id: "REQ-0017"
+        title: "Policy resolution anchor event"
+      - source_id: "FAC-REQ-0117"
+        local_id: "REQ-0018"
+        title: "Quarantine events and projection"
+      - source_id: "FAC-REQ-0118"
+        local_id: "REQ-0019"
+        title: "CI attestation level enforcement"
+      - source_id: "FAC-REQ-0119"
+        local_id: "REQ-0020"
+        title: "GateReceipt versioning and canonicalization"
     law_to_requirement:
       - law_id: "LAW-01"
         applies_to:
@@ -195,6 +233,8 @@ prd_traceability:
           - "REQ-0010"
           - "REQ-0012"
           - "REQ-0015"
+          - "REQ-0017"
+          - "REQ-0020"
       - law_id: "LAW-02"
         applies_to:
           - "ContextPack"
@@ -222,6 +262,7 @@ prd_traceability:
           - "REQ-0007"
           - "REQ-0011"
           - "REQ-0016"
+          - "REQ-0019"
       - law_id: "LAW-05"
         applies_to:
           - "OCAP"
@@ -251,6 +292,7 @@ prd_traceability:
           - "REQ-0008"
           - "REQ-0009"
           - "REQ-0013"
+          - "REQ-0018"
       - law_id: "LAW-15"
         applies_to:
           - "Metrics"
@@ -267,6 +309,10 @@ prd_traceability:
           - "REQ-0012"
           - "REQ-0013"
           - "REQ-0014"
+          - "REQ-0017"
+          - "REQ-0018"
+          - "REQ-0019"
+          - "REQ-0020"
           - "REQ-0015"
   terminology_links:
     - term: "Gate"

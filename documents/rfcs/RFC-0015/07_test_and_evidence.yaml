@@ -41,7 +41,7 @@ rfc_test_and_evidence:
         examples:
           - "Status spoofing via forged GateRunCompleted"
           - "Context escape attempt outside manifest"
-          - "Replay attack with expired lease"
+          - "Replay attack with HTF-expired lease"
           - "CI evidence bypass without attestation"
           - "AAT narrative-only PASS attempt"
 
@@ -61,7 +61,7 @@ rfc_test_and_evidence:
       description: "Lease scope and expiry enforcement tests"
       test_type: UNIT + PROPERTY
       verification_method: |
-        Test that expired leases are rejected. Test that child leases cannot broaden scope.
+        Test that leases beyond HTF expiry window are rejected. Test that child leases cannot broaden scope.
         Test that mismatched changeset_digest rejects.
 
     - evidence_id: EVID-FAC-0021
@@ -111,6 +111,7 @@ rfc_test_and_evidence:
         Test that READY_FOR_REVIEW without evidence import fails.
         Test that webhook signature verification is enforced.
         Test that adapter attestation is required and signed.
+        Test that L0 attestation is rejected and L1 is accepted when CI gating is enabled.
 
     - evidence_id: EVID-FAC-0007
       requirement_ids:
@@ -168,6 +169,7 @@ rfc_test_and_evidence:
         Test that HARNESS_FLAKE triggers runner pool quarantine.
         Test that TEST_NONSEMANTIC triggers test spec quarantine.
         Test that ENVIRONMENT_DRIFT invalidates attestation and blocks admission.
+        Test that deterministic FAIL uses outcome_class=DETERMINISTIC_FAIL.
 
     - evidence_id: EVID-FAC-0012
       requirement_ids:
@@ -223,7 +225,44 @@ rfc_test_and_evidence:
       verification_method: |
         Test that evidence artifacts require data_classification.
         Test that missing redaction metadata rejects admission.
-        Test that retention_ttl is enforced.
+        Test that retention_window_ref is enforced.
+
+    - evidence_id: EVID-FAC-0024
+      requirement_ids:
+        - FAC-REQ-0116
+      description: "Policy resolution anchor tests"
+      test_type: UNIT + INTEGRATION
+      verification_method: |
+        Test that PolicyResolvedForChangeSet exists before any GateLeaseIssued.
+        Test that mismatched policy fields reject GateLeaseIssued and GateReceipt ingestion.
+
+    - evidence_id: EVID-FAC-0025
+      requirement_ids:
+        - FAC-REQ-0117
+      description: "Quarantine projection and routing tests"
+      test_type: INTEGRATION
+      verification_method: |
+        Test that RunnerPoolQuarantined blocks selection.
+        Test that AATSpecQuarantined blocks selection.
+        Test that QuarantineCleared re-enables selection.
+
+    - evidence_id: EVID-FAC-0026
+      requirement_ids:
+        - FAC-REQ-0118
+      description: "CI attestation level enforcement tests"
+      test_type: INTEGRATION
+      verification_method: |
+        Test that L0 attestation is rejected for CI-gated transitions.
+        Test that L1 attestation with CAS artifact digests is accepted.
+
+    - evidence_id: EVID-FAC-0027
+      requirement_ids:
+        - FAC-REQ-0119
+      description: "GateReceipt versioning/canonicalization tests"
+      test_type: UNIT + INTEGRATION
+      verification_method: |
+        Test that unknown receipt_version or payload_schema_version is rejected in enforce mode.
+        Test canonical_bytes() hashing matches payload_hash and signature verification.
 
     - evidence_id: EVID-FAC-0017
       requirement_ids:

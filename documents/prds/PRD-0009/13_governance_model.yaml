@@ -28,14 +28,17 @@ prd_governance_model:
         - GateLease subset rule enforcement
         - MergeReceipt atomic binding verification
         - Typed GateReceipt payloads for gate_id=aat
+        - GateReceipt envelope versioning and canonicalization enforcement
         - AAT evidence-chain binding (transcript + artifact manifest hash + attestation)
         - Terminal verifier binding schema enforcement
         - Risk-tiered AAT selection policy enforcement
         - AAT anti-downgrade enforcement for risk_tier/verifier policy/RCP profile
+        - PolicyResolvedForChangeSet anchor verification
         - AAT reuse provenance enforcement (AATResultReused)
         - AAT evidence hygiene enforcement (classification/redaction/retention)
         - AAT quorum/audit enforcement for HIGH/MED tiers
         - AAT harness sandbox and egress control verification
+        - Quarantine projection and routing enforcement (runner pools/specs)
         - Determinism envelope validation (Phase 2)
     - gate_id: GATE-PRD-PRODUCT
       authority_role: AUTH_PRODUCT
@@ -56,9 +59,11 @@ prd_governance_model:
       fac_specific_gates:
         - Critical event signature validation (Ed25519 domain-separated)
         - Context firewall deny verification (CTX-ALLOWLIST-001)
-        - Lease expiry and scope enforcement
+        - Lease HTF expiry and scope enforcement
         - AAT evidence-chain and attestation validation
         - AAT anti-downgrade and reuse safety validation
+        - PolicyResolvedForChangeSet anchor validation
+        - CI attestation level enforcement (L0/L1)
         - Evidence hygiene and retention policy validation
         - Fail-closed handling for nondeterministic gate outcomes
   adjudication_policy:
@@ -68,18 +73,18 @@ prd_governance_model:
       - WAIVER
       - GATE_REVIEW
       - EMERGENCY_RECOVERY
-  waiver_policy:
-    scope_fields:
-      - work_id
-      - changeset_digest
-      - gate_id
-      - expires_at
-      - rationale
+    waiver_policy:
+      scope_fields:
+        - work_id
+        - changeset_digest
+        - gate_id
+        - time_envelope_ref
+        - rationale
     waiver_required_keys:
       - "id"
       - "scope"
       - "rationale"
-      - "expiration_date"
+      - "time_envelope_ref"
       - "required_signoffs"
       - "status"
       - "evidence_ids"

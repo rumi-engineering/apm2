@@ -7,14 +7,14 @@ prd_requirement:
   title: "AAT anti-downgrade invariant"
   statement: |
     For a given (work_id, changeset_digest), the resolved risk_tier, determinism_class,
-    verifier_policy_hash, and rcp_profile_id MUST be pinned at FAC start and cannot be
+    verifier_policy_hashes, and rcp_profile_ids MUST be pinned at FAC start and cannot be
     lowered without an explicit waiver. Admission MUST reject AAT receipts that diverge.
   acceptance_criteria:
-    - "Resolved policy tuple is recorded at FAC-00 (resolved_policy_hash, resolved_risk_tier, resolved_verifier_policy_hash, resolved_rcp_profile_id). Verified by: Policy resolution event test."
+    - "Resolved policy tuple is recorded at FAC-00 (resolved_policy_hash, resolved_risk_tier, resolved_verifier_policy_hashes, resolved_rcp_profile_ids, resolved_rcp_manifest_hashes). Verified by: Policy resolution event test."
     - "Admission rejects AAT receipts with policy_hash != resolved_policy_hash. Verified by: Negative test."
     - "Admission rejects AAT receipts with risk_tier lower than resolved_risk_tier. Verified by: Downgrade test."
-    - "Admission rejects verifier_policy_hash not allowed for resolved tier. Verified by: Policy allowlist test."
-    - "Admission rejects rcp_aat_manifest_hash or rcp_profile_id not matching issued profile. Verified by: Profile substitution test."
+    - "Admission rejects verifier_policy_hash not in resolved_verifier_policy_hashes. Verified by: Policy allowlist test."
+    - "Admission rejects rcp_aat_manifest_hash or rcp_profile_id not matching resolved_rcp_profile_ids/manifest hashes. Verified by: Profile substitution test."
     - "Downgrades require AdjudicationRequested(WAIVER) with separate authority and are projection-visible. Verified by: Waiver audit test."
   evidence:
     evidence_ids:

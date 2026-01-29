@@ -12,7 +12,7 @@ prd_requirement:
     - "Divergence watchdog emits PROJECTION_DIVERGENCE defect and InterventionFreeze(repo). Verified by: Test that when external trunk HEAD differs from latest MergeReceipt result_selector, DefectRecord with code PROJECTION_DIVERGENCE is emitted and InterventionFreeze event with repo scope is recorded."
     - "Freeze blocks new admissions and merges for the repo until reconciliation. Verified by: Test that after InterventionFreeze, admission requests for the affected repo are rejected with freeze status and no new MergeReceipts can be issued."
     - "Unfreeze requires AdjudicationResolved(request_type=EMERGENCY_RECOVERY) or PRD-0007 emergency_override ceremony if the adapter cannot reconcile. Verified by: Test that InterventionUnfreeze is only accepted when preceded by valid AdjudicationResolved with request_type=EMERGENCY_RECOVERY or emergency_override ceremony completion."
-    - "Divergence watchdog polls at configured interval (30s default). Verified by: Test that watchdog compares external trunk HEAD to MergeReceipt result_selector at poll_interval_seconds frequency."
+    - "Divergence watchdog polls at configured HTF interval (TIME_TBD). Verified by: Test that watchdog compares external trunk HEAD to MergeReceipt result_selector at poll_interval_htf_ticks frequency."
     - "Projection tamper detection overwrites projection to match ledger truth and emits DefectRecord. Verified by: Test that when external status is modified by non-adapter identity, PROJECTION_TAMPER defect is emitted and projection is reapplied from ledger on next sync."
   evidence:
     evidence_ids:

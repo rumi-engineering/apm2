@@ -25,8 +25,9 @@ prd_evidence_artifact:
           - "HARNESS_FLAKE quarantines runner pool"
           - "TEST_NONSEMANTIC quarantines AAT spec"
           - "UNKNOWN requires NEEDS_INPUT"
+          - "DETERMINISTIC_FAIL produces deterministic FAIL (no retries)"
   assertions:
-    - "GateReceipt payload records determinism_class, determinism_status, and flake_class"
+    - "GateReceipt payload records determinism_class, determinism_status, and outcome_class (flake_class field)"
     - "Policy routes classifications to quarantine or escalation"
   data:
     classification: "INTERNAL"

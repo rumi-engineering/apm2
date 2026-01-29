@@ -13,14 +13,15 @@ rfc_contracts_and_versioning:
           string gate_id = 3;
           bytes changeset_digest = 4;
           string executor_actor_id = 5;
-          google.protobuf.Timestamp issued_at = 6;
-          google.protobuf.Timestamp expires_at = 7;
+          google.protobuf.Timestamp issued_at = 6;   // observational only
+          google.protobuf.Timestamp expires_at = 7;  // observational only
           bytes policy_hash = 8;
           string issuer_actor_id = 9;
           bytes issuer_signature = 10;
+          bytes time_envelope_ref = 11; // HTF time envelope (authoritative expiry)
 
           // AAT-specific extensions (when gate_id = "aat")
-          AatLeaseExtension aat_extension = 11;
+          AatLeaseExtension aat_extension = 12;
         }
 
         message AatLeaseExtension {
@@ -31,9 +32,10 @@ rfc_contracts_and_versioning:
         }
       invariants:
         - "lease_id is globally unique"
-        - "expires_at > issued_at"
+        - "time_envelope_ref is present (HTF-defined)"
         - "issuer_signature covers canonical bytes with GATE_LEASE_ISSUED: prefix"
         - "Child leases can only narrow scope (subset rule)"
+        - "issued_at/expires_at are observational metadata only"
       domain_separator: "GATE_LEASE_ISSUED:"
 
     - contract_id: FAC-CONTRACT-009
@@ -44,15 +46,43 @@ rfc_contracts_and_versioning:
         message LeaseRevoked {
           string lease_id = 1;
           string revoked_by = 2;
-          google.protobuf.Timestamp revoked_at = 3;
+          google.protobuf.Timestamp revoked_at = 3; // observational only
           string reason = 4;
           bytes issuer_signature = 5;
+          bytes time_envelope_ref = 6; // HTF time envelope (authoritative ordering)
         }
       invariants:
         - "lease_id references valid GateLease"
         - "issuer_signature covers canonical bytes with LEASE_REVOKED: prefix"
-        - "revoked_at <= lease.expires_at"
+        - "time_envelope_ref is present (HTF-defined)"
+        - "revoked_at is observational metadata only"
       domain_separator: "LEASE_REVOKED:"
+
+    - contract_id: FAC-CONTRACT-011
+      name: "PolicyResolvedForChangeSet Contract"
+      description: |
+        Anchors resolved policy tuple for a changeset prior to lease issuance.
+      schema: |
+        message PolicyResolvedForChangeSet {
+          string work_id = 1;
+          bytes changeset_digest = 2;
+          bytes resolved_policy_hash = 3;
+          string resolved_risk_tier = 4;
+          uint32 resolved_determinism_class = 5;
+          repeated string resolved_rcp_profile_ids = 6;
+          repeated bytes resolved_rcp_manifest_hashes = 7;
+          repeated bytes resolved_verifier_policy_hashes = 8;
+          string resolver_actor_id = 9;
+          string resolver_version = 10;
+          bytes resolver_signature = 11;
+        }
+      invariants:
+        - "resolver_signature covers canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: prefix"
+        - "Event committed before any GateLeaseIssued for same changeset"
+        - "All GateLeaseIssued and GateReceipt payloads must match resolved tuple"
+        - "resolved_rcp_profile_ids.len() == resolved_rcp_manifest_hashes.len()"
+        - "resolved_verifier_policy_hashes.len() >= 1"
+      domain_separator: "POLICY_RESOLVED_FOR_CHANGESET:"
 
     - contract_id: FAC-CONTRACT-002
       name: "GateRunCompleted Contract"
@@ -66,20 +96,47 @@ rfc_contracts_and_versioning:
           string executor_actor_id = 4;
           bytes evidence_bundle_hash = 5;
           string gate_receipt_id = 6;
-          google.protobuf.Timestamp completed_at = 7;
+          google.protobuf.Timestamp completed_at = 7; // observational only
           bytes executor_signature = 8;
           bytes gate_receipt_payload_hash = 9;
           string gate_receipt_payload_type = 10; // e.g., "aat.v1"
         }
       invariants:
         - "lease_id references valid GateLease"
-        - "no LeaseRevoked exists for lease_id with revoked_at <= completed_at"
+        - "no LeaseRevoked exists for lease_id with HTF time <= completion tick"
         - "changeset_digest matches lease"
         - "executor_actor_id matches lease"
         - "gate_receipt_payload_hash references CAS payload with type gate_receipt_payload_type"
         - "executor_signature covers canonical bytes with GATE_RUN_COMPLETED: prefix"
-        - "completed_at <= lease.expires_at"
+        - "completion HTF tick is within lease time_envelope_ref"
+        - "completed_at is observational metadata only"
       domain_separator: "GATE_RUN_COMPLETED:"
+
+    - contract_id: FAC-CONTRACT-012
+      name: "GateReceipt Envelope Contract"
+      description: |
+        Defines the envelope and versioning for gate receipts. Payloads are stored in CAS
+        and referenced by payload_hash.
+      schema: |
+        message GateReceipt {
+          string receipt_id = 1;
+          string gate_id = 2;
+          string lease_id = 3;
+          bytes changeset_digest = 4;
+          string executor_actor_id = 5;
+          uint32 receipt_version = 6;
+          string payload_kind = 7;          // e.g., "aat"
+          string payload_schema_version = 8; // e.g., "aat.v1"
+          bytes payload_hash = 9;
+          bytes evidence_bundle_hash = 10;
+          bytes receipt_signature = 11;
+        }
+      invariants:
+        - "receipt_signature covers canonical bytes with GATE_RECEIPT: prefix"
+        - "receipt_version is known and supported in enforce mode"
+        - "payload_kind and payload_schema_version are allowlisted in enforce mode"
+        - "canonicalization: deterministic encoding, no maps, stable ordering of repeated fields"
+      domain_separator: "GATE_RECEIPT:"
 
     - contract_id: FAC-CONTRACT-003
       name: "AatGateReceipt Contract"
@@ -96,7 +153,7 @@ rfc_contracts_and_versioning:
           // Determinism tracking
           uint32 determinism_class = 5;
           string determinism_status = 6; // STABLE, MISMATCH
-          string flake_class = 7;        // DETERMINISTIC, HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN
+          string flake_class = 7;        // outcome_class (legacy field name); DETERMINISTIC_FAIL, HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC(optional), UNKNOWN
           uint32 run_count = 8;
           repeated bytes run_receipt_hashes = 9;
           bytes terminal_evidence_digest = 10;
@@ -143,7 +200,8 @@ rfc_contracts_and_versioning:
         - "observational_evidence_digest excluded from determinism equality"
         - "At least one terminal_verifier_output present for PASS"
         - "predicate_satisfied == true for all verifier outputs when verdict == PASS"
-        - "determinism_status == STABLE implies flake_class == DETERMINISTIC"
+        - "determinism_status == MISMATCH implies flake_class in {HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN}"
+        - "verdict == FAIL AND determinism_status == STABLE implies flake_class == DETERMINISTIC_FAIL"
         - "stability_digest == hash(verdict, terminal_evidence_digest, terminal_verifier_outputs_digest)"
 
     - contract_id: FAC-CONTRACT-010
@@ -161,7 +219,7 @@ rfc_contracts_and_versioning:
           string data_classification = 3;
           bool redaction_applied = 4;
           bytes redaction_profile_hash = 5;
-          uint64 retention_ttl_seconds = 6;
+          bytes retention_window_ref = 6; // HTF time envelope reference
         }
       invariants:
         - "All artifacts include data_classification"
@@ -235,7 +293,7 @@ rfc_contracts_and_versioning:
         - "result_selector is observed trunk HEAD after merge"
         - "All gate_receipt_ids reference valid GateRunCompleted events"
         - "gate_signature covers canonical bytes with MERGE_RECEIPT: prefix"
-        - "merged_at reflects actual merge time (not future)"
+        - "merged_at is observational metadata only; authoritative ordering uses HTF ledger tick"
       domain_separator: "MERGE_RECEIPT:"
 
     - contract_id: FAC-CONTRACT-005
@@ -274,22 +332,63 @@ rfc_contracts_and_versioning:
           string scope = 1;  // repo, work_id
           string scope_value = 2;
           string trigger_defect_id = 3;
-          google.protobuf.Timestamp frozen_at = 4;
+          google.protobuf.Timestamp frozen_at = 4; // observational only
           string gate_actor_id = 5;
           bytes gate_signature = 6;
+          bytes time_envelope_ref = 7; // HTF time envelope (if bounded)
         }
 
         message InterventionUnfreeze {
           string freeze_id = 1;
           string resolution_type = 2;  // ADJUDICATION, EMERGENCY_OVERRIDE
           string adjudication_id = 3;
-          google.protobuf.Timestamp unfrozen_at = 4;
+          google.protobuf.Timestamp unfrozen_at = 4; // observational only
           string gate_actor_id = 5;
           bytes gate_signature = 6;
+          bytes time_envelope_ref = 7; // HTF time envelope (if bounded)
         }
       invariants:
         - "Unfreeze requires valid adjudication or emergency override ceremony"
         - "No admissions proceed while freeze is active for scope"
+        - "frozen_at/unfrozen_at are observational metadata only"
+
+    - contract_id: FAC-CONTRACT-013
+      name: "Quarantine Events Contract"
+      description: |
+        Defines quarantine events for runner pools and AAT specs with HTF time envelopes.
+      schema: |
+        message RunnerPoolQuarantined {
+          string quarantine_id = 1;
+          string pool_id = 2;
+          string reason = 3;
+          repeated bytes evidence_refs = 4;
+          bytes time_envelope_ref = 5;
+          string issuer_actor_id = 6;
+          bytes issuer_signature = 7;
+        }
+
+        message AATSpecQuarantined {
+          string quarantine_id = 1;
+          string spec_id = 2;
+          string reason = 3;
+          repeated bytes evidence_refs = 4;
+          bytes time_envelope_ref = 5;
+          string issuer_actor_id = 6;
+          bytes issuer_signature = 7;
+        }
+
+        message QuarantineCleared {
+          string quarantine_id = 1;
+          string target_id = 2;
+          string cleared_reason = 3;
+          string issuer_actor_id = 4;
+          bytes issuer_signature = 5;
+        }
+      invariants:
+        - "issuer_signature covers canonical bytes with QUARANTINE_EVENT: prefix"
+        - "time_envelope_ref is present for quarantine events"
+        - "QuarantineCleared requires prior active quarantine for target_id"
+      domain_separator: "QUARANTINE_EVENT:"
 
   versioning_strategy:
     schema_versioning:
@@ -297,6 +396,8 @@ rfc_contracts_and_versioning:
       details: |
         All event envelopes include schema_version and schema_digest. Unknown schemas
         trigger event rejection. Canonicalizer version tracked for cross-version verification.
+        GateReceipt envelopes reject unknown payload_kind or payload_schema_version in
+        enforce mode; audit mode may allow unknown versions only if explicitly configured.
 
     api_versioning:
       approach: "Semantic versioning with additive-only extensions"
@@ -326,14 +427,14 @@ rfc_contracts_and_versioning:
       phases:
         - phase: FAC-R-01
           mode: WARN
-          duration_days: 7
+          duration_htf_window: "TIME_TBD"
           notes: "WARN applies only to non-sensitive domains; auth/crypto/ledger start at SOFT_FAIL"
         - phase: FAC-R-02
           mode: SOFT_FAIL
-          duration_days: 14
+          duration_htf_window: "TIME_TBD"
         - phase: FAC-R-03
           mode: HARD_FAIL
-          duration_days: 14
+          duration_htf_window: "TIME_TBD"
         - phase: FAC-R-04
           mode: PRODUCTION
           duration: ongoing

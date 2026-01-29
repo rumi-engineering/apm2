@@ -22,7 +22,7 @@ prd_evidence_artifact:
         allowlist_hosts: []
         constraints:
           - "Lease issuance fixtures include author/executor COI groupings"
-          - "Waiver fixtures include bounded scope and expiry"
+          - "Waiver fixtures include bounded scope and time_envelope_ref (HTF)"
   assertions:
     - "Lease issuance rejects executor in same COI group as changeset author"
     - "Waiver path requires explicit adjudication and bounded scope"

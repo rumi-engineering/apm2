@@ -167,7 +167,7 @@ prd_evidence_standards:
       required_for:
         - FAC-REQ-0106
     - category: AAT_FLAKE_CLASSIFICATION_RESULTS
-      description: "Test results demonstrating flake_class classification and policy routing."
+      description: "Test results demonstrating outcome_class (flake_class field) classification and policy routing."
       required_for:
         - FAC-REQ-0107
     - category: AAT_RISK_TIER_SELECTION_RESULTS

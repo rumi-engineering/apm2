@@ -72,6 +72,22 @@ requirements_readme:
       title: "AAT harness sandboxing and egress control"
       type: "SECURITY"
       file: "REQ-0016.yaml"
+    - id: "REQ-0017"
+      title: "Policy resolution anchor event"
+      type: "SECURITY"
+      file: "REQ-0017.yaml"
+    - id: "REQ-0018"
+      title: "Quarantine events and projection"
+      type: "SECURITY"
+      file: "REQ-0018.yaml"
+    - id: "REQ-0019"
+      title: "CI attestation level enforcement"
+      type: "SECURITY"
+      file: "REQ-0019.yaml"
+    - id: "REQ-0020"
+      title: "GateReceipt versioning and canonicalization"
+      type: "SECURITY"
+      file: "REQ-0020.yaml"
 
   inherited_requirements:
     source_prd: "PRD-0004"
@@ -96,10 +112,10 @@ requirements_readme:
         requirements: ["REQ-0002"]
       - goal: "FAC-G-0003"
         description: "Evidence-backed CI integration"
-        requirements: ["REQ-0003"]
+        requirements: ["REQ-0003", "REQ-0019"]
       - goal: "FAC-G-0009"
         description: "Typed AAT gate receipts bound to view commitments"
-        requirements: ["REQ-0004"]
+        requirements: ["REQ-0004", "REQ-0020"]
       - goal: "FAC-G-0010"
         description: "Gate outcome determinism envelope"
         requirements: ["REQ-0005"]
@@ -111,7 +127,7 @@ requirements_readme:
         requirements: ["REQ-0007"]
       - goal: "FAC-G-0013"
         description: "Flake classification and policy routing"
-        requirements: ["REQ-0008"]
+        requirements: ["REQ-0008", "REQ-0018"]
       - goal: "FAC-G-0014"
         description: "Risk-tiered AAT selection"
         requirements: ["REQ-0009"]
@@ -120,7 +136,7 @@ requirements_readme:
         requirements: ["REQ-0011"]
       - goal: "FAC-G-0016"
         description: "AAT anti-downgrade enforcement"
-        requirements: ["REQ-0012"]
+        requirements: ["REQ-0012", "REQ-0017"]
       - goal: "FAC-G-0017"
         description: "AAT reuse safety"
         requirements: ["REQ-0013"]
@@ -135,7 +151,7 @@ requirements_readme:
         requirements: ["REQ-0016"]
     law_mapping:
       - law_id: "LAW-01"
-        requirements: ["REQ-0004", "REQ-0006", "REQ-0010", "REQ-0012", "REQ-0015"]
+        requirements: ["REQ-0004", "REQ-0006", "REQ-0010", "REQ-0012", "REQ-0015", "REQ-0017", "REQ-0020"]
         enforcement: "Receipt-backed gates for authoritative promotion"
       - law_id: "LAW-02"
         requirements: ["REQ-0001"]
@@ -144,7 +160,7 @@ requirements_readme:
         requirements: ["REQ-0002"]
         enforcement: "Ledger is truth; projections overwriteable; divergence detection halts factory"
       - law_id: "LAW-04"
-        requirements: ["REQ-0003", "REQ-0004", "REQ-0005", "REQ-0006", "REQ-0007", "REQ-0011", "REQ-0016"]
+        requirements: ["REQ-0003", "REQ-0004", "REQ-0005", "REQ-0006", "REQ-0007", "REQ-0011", "REQ-0016", "REQ-0019"]
         enforcement: "Stochastic stability requires contract + receipt + evidence"
       - law_id: "LAW-05"
         requirements: ["REQ-0001", "REQ-0010", "REQ-0016"]
@@ -153,10 +169,10 @@ requirements_readme:
         requirements: ["REQ-0002"]
         enforcement: "Atomic merge receipt binds (base, changeset) -> result; anti-entropy divergence checks"
       - law_id: "LAW-12"
-        requirements: ["REQ-0001", "REQ-0005", "REQ-0008", "REQ-0009", "REQ-0013"]
+        requirements: ["REQ-0001", "REQ-0005", "REQ-0008", "REQ-0009", "REQ-0013", "REQ-0018"]
         enforcement: "Bounded retries and termination discipline"
       - law_id: "LAW-15"
-        requirements: ["REQ-0003", "REQ-0004", "REQ-0005", "REQ-0006", "REQ-0007", "REQ-0008", "REQ-0009", "REQ-0010", "REQ-0012", "REQ-0013", "REQ-0014", "REQ-0015"]
+        requirements: ["REQ-0003", "REQ-0004", "REQ-0005", "REQ-0006", "REQ-0007", "REQ-0008", "REQ-0009", "REQ-0010", "REQ-0012", "REQ-0013", "REQ-0014", "REQ-0015", "REQ-0017", "REQ-0018", "REQ-0019", "REQ-0020"]
         enforcement: "Measurement integrity and fail-closed behavior"
 
   evidence_mapping:
@@ -178,6 +194,9 @@ requirements_readme:
     - evidence_id: "EVID-0006"
       requirements: ["REQ-0003"]
       description: "CI-gated transition validation tests"
+    - evidence_id: "EVID-0035"
+      requirements: ["REQ-0003", "REQ-0019"]
+      description: "CI attestation level enforcement tests (L0 reject, L1 accept)"
     - evidence_id: "EVID-0018"
       requirements: ["REQ-0004"]
       description: "Typed GateReceipt payload validation tests"
@@ -223,3 +242,12 @@ requirements_readme:
     - evidence_id: "EVID-0032"
       requirements: ["REQ-0016"]
       description: "AAT harness sandboxing and egress control tests"
+    - evidence_id: "EVID-0033"
+      requirements: ["REQ-0017"]
+      description: "Policy resolution anchor event tests"
+    - evidence_id: "EVID-0034"
+      requirements: ["REQ-0018"]
+      description: "Quarantine projection and routing tests"
+    - evidence_id: "EVID-0036"
+      requirements: ["REQ-0020"]
+      description: "GateReceipt canonicalization and versioning tests"

@@ -158,8 +158,10 @@ prd_solution_overview:
           - resolved_policy_hash
           - resolved_risk_tier
           - resolved_determinism_class
-          - resolved_verifier_policy_hash
-          - resolved_rcp_profile_id
+          - resolved_verifier_policy_hashes
+          - resolved_rcp_profile_ids
+          - resolved_rcp_manifest_hashes
+          - policy_resolved_event_id
           - run_receipt_hash
         actors:
           - HOLON-COORDINATOR
@@ -167,7 +169,8 @@ prd_solution_overview:
           - All selectors are resolved to concrete git object IDs (commit/tree), no symbolic HEAD.
           - Workspace deltas are content-addressed artifacts; never inferred from disk.
           - "CAS-at-commit: bind changeset_digest to work_id in ledger before spawning any gate episodes."
-          - "Policy resolution is pinned at ingest: resolved_policy_hash, resolved_risk_tier, resolved_verifier_policy_hash, and resolved_rcp_profile_id are immutable unless waived."
+          - "Policy resolution is pinned at ingest: resolved_policy_hash, resolved_risk_tier, resolved_verifier_policy_hashes, resolved_rcp_profile_ids, and resolved_rcp_manifest_hashes are immutable unless waived."
+          - "PolicyResolvedForChangeSet is committed before any GateLeaseIssued for this changeset."
         defects_on_violation:
           - INVALID_SELECTOR
           - UNPINNED_INPUTS
@@ -237,8 +240,9 @@ prd_solution_overview:
           - HOLON-KERNEL-GOVERNANCE
           - HOLON-COORDINATOR
         invariants:
-          - "GateLease scope is strict: (work_id, gate_id, changeset_digest, executor_actor_id, expiry, policy_hash)."
+          - "GateLease scope is strict: (work_id, gate_id, changeset_digest, executor_actor_id, expiry_ref, policy_hash)."
           - "For gate_id=aat, GateLease scope additionally binds view_commitment_hash, rcp_aat_manifest_hash, rcp_profile_id, and selection_policy_id."
+          - "PolicyResolvedForChangeSet must exist and match resolved policy tuple before lease issuance."
           - Lease issuance committed before session.spawn (CAS-at-commit ordering).
           - Lease derivation obeys subset rule (child leases can only narrow).
         defects_on_violation:
@@ -309,7 +313,8 @@ prd_solution_overview:
         invariants:
           - Admission reads only internal projections; never reads GitHub status as truth.
           - Required gates must be satisfied by valid GateRunCompleted signatures + matching unexpired leases + matching ChangeSetDigest.
-          - AAT admission validates typed GateReceipt payload (view_commitment_hash, rcp_manifest_hash, determinism_class, determinism_status, flake_class, run_receipt_hashes, run_count, stability_digest).
+          - "Admission verifies PolicyResolvedForChangeSet exists and matches resolved policy tuple for this changeset."
+          - AAT admission validates typed GateReceipt payload (view_commitment_hash, rcp_manifest_hash, determinism_class, determinism_status, outcome_class/flake_class, run_receipt_hashes, run_count, stability_digest).
           - "AAT admission validates transcript chain completeness, artifact_manifest_hash, terminal verifier outputs, terminal_evidence_digest, observational_evidence_digest, terminal_verifier_outputs_digest, verifier_policy_hash, selection_policy_id, risk_tier, and attestation fields."
           - "AAT admission enforces anti-downgrade: policy_hash matches resolved_policy_hash; risk_tier/determinism_class not lowered; verifier_policy_hash allowed for resolved tier; rcp_profile_id and manifest match resolved profile."
           - "AAT reuse is allowed only via AATResultReused with exact provenance tuple match; otherwise reuse is forbidden."
@@ -375,7 +380,48 @@ prd_solution_overview:
           - EVALUATOR_DRIFT
           - HOLDOUT_FALSE_NEGATIVE
         phase: "Phase 2"
+  policy_resolution_anchor:
+    event: "PolicyResolvedForChangeSet"
+    description: "Authoritative policy resolution anchor committed before any lease issuance."
+    required_fields:
+      - work_id
+      - changeset_digest
+      - resolved_policy_hash
+      - resolved_risk_tier
+      - resolved_determinism_class
+      - resolved_rcp_profile_ids
+      - resolved_rcp_manifest_hashes
+      - resolved_verifier_policy_hashes
+      - resolver_actor_id
+      - resolver_version
+      - resolver_signature
+    invariants:
+      - "Event must be committed before any GateLeaseIssued for this changeset."
+      - "All GateLeaseIssued and GateReceipt payloads must match resolved tuple."
+      - "Downgrades require AdjudicationRequested(WAIVER) with separate authority."
   gate_receipts:
+    envelope:
+      fields:
+        - receipt_id
+        - receipt_version
+        - payload_kind
+        - payload_schema_version
+        - payload_hash
+        - evidence_bundle_hash
+        - gate_id
+        - lease_id
+        - changeset_digest
+        - executor_actor_id
+        - receipt_signature
+      canonicalization:
+        rules:
+          - "Deterministic encoding; no maps"
+          - "Stable ordering of repeated fields"
+          - "canonical_bytes() defined and used for signature"
+        test_vectors_required: true
+      enforcement:
+        - "Unknown payload_kind or payload_schema_version rejected in enforce mode"
+        - "Audit mode may allow unknown versions only if explicitly configured"
     payloads:
       default:
         description: "GateReceipt signature covers payload_hash and EvidenceBundle hash; payloads are stored in CAS."
@@ -388,7 +434,7 @@ prd_solution_overview:
           - policy_hash
           - determinism_class
           - determinism_status
-          - flake_class
+          - outcome_class (flake_class field)
           - run_count
           - run_receipt_hashes
           - stability_digest
@@ -420,22 +466,25 @@ prd_solution_overview:
       gate_receipt_id: "GateReceipt for gate_id=aat"
       policy_hash: "AAT policy profile hash (selection + verifier binding + attestation requirements)."
       selection_policy_id: "Risk-tier selection policy identifier bound into GateReceipt payload."
+      policy_resolved_event_id: "PolicyResolvedForChangeSet event committed at FAC-00."
       resolved_policy_hash: "FAC-00-INGEST_CHANGESET resolved_policy_hash"
       resolved_risk_tier: "FAC-00-INGEST_CHANGESET resolved_risk_tier"
-      resolved_verifier_policy_hash: "FAC-00-INGEST_CHANGESET resolved_verifier_policy_hash"
-      resolved_rcp_profile_id: "FAC-00-INGEST_CHANGESET resolved_rcp_profile_id"
+      resolved_verifier_policy_hashes: "FAC-00-INGEST_CHANGESET resolved_verifier_policy_hashes"
+      resolved_rcp_profile_ids: "FAC-00-INGEST_CHANGESET resolved_rcp_profile_ids"
+      resolved_rcp_manifest_hashes: "FAC-00-INGEST_CHANGESET resolved_rcp_manifest_hashes"
       resolved_determinism_class: "FAC-00-INGEST_CHANGESET resolved_determinism_class"
     verdicts:
       - PASS
       - FAIL
       - NEEDS_INPUT
     anti_downgrade_invariant:
-      statement: "Resolved risk tier, determinism class, verifier policy, and RCP profile are pinned at FAC start and cannot be lowered without an explicit waiver."
+      statement: "Resolved risk tier, determinism class, verifier policies, and RCP profiles are pinned at FAC start and cannot be lowered without an explicit waiver."
       enforcement:
         - "policy_hash MUST equal resolved_policy_hash."
-        - "rcp_aat_manifest_hash MUST equal issued manifest hash for resolved_rcp_profile_id."
+        - "rcp_profile_id MUST be in resolved_rcp_profile_ids and rcp_aat_manifest_hash MUST match the corresponding resolved_rcp_manifest_hashes entry."
         - "risk_tier MUST NOT be lower than resolved_risk_tier."
         - "determinism_class MUST NOT be lower than resolved_determinism_class."
+        - "verifier_policy_hash MUST be in resolved_verifier_policy_hashes."
         - "verifier_policy_hash MUST be allowed for resolved_risk_tier."
         - "Downgrades require AdjudicationRequested(WAIVER) with separate authority; waiver is projection-visible."
     evidence_binding:
@@ -447,7 +496,7 @@ prd_solution_overview:
           - "environment"
           - "stdout/stderr chunk digests"
           - "exit codes"
-          - "timestamp buckets"
+          - "observed timestamp buckets (observational only)"
           - "file diffs"
       artifact_manifest_hash: "CAS hash of ArtifactManifest (logs, junit, coverage, snapshots, binaries); manifest is independently verifiable."
       terminal_evidence_digest: "Hash of machine-checkable PASS/FAIL artifacts (exit code, structured test report counts, snapshot diff digest, invariant check outputs)."
@@ -476,15 +525,22 @@ prd_solution_overview:
       determinism_status:
         - "STABLE"
         - "MISMATCH"
-      classes:
-        - "DETERMINISTIC"
-        - "HARNESS_FLAKE"
-        - "ENVIRONMENT_DRIFT"
-        - "TEST_NONSEMANTIC"
-        - "CODE_NONSEMANTIC"
-        - "UNKNOWN"
+      outcome_class:
+        field_name: "flake_class (legacy field name; semantics are outcome_class)"
+        canonical_values:
+          - "DETERMINISTIC_FAIL"
+          - "HARNESS_FLAKE"
+          - "ENVIRONMENT_DRIFT"
+          - "TEST_NONSEMANTIC"
+          - "UNKNOWN"
+        optional_values:
+          - "CODE_NONSEMANTIC"
+      rules:
+        - "determinism_status=MISMATCH requires outcome_class in {HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN}."
+        - "determinism_status=STABLE and verdict=FAIL => outcome_class=DETERMINISTIC_FAIL."
+        - "determinism_status=STABLE and verdict=PASS may omit outcome_class."
       handling:
-        DETERMINISTIC: "No mismatch; deterministic PASS/FAIL handled by verdict."
+        DETERMINISTIC_FAIL: "Deterministic FAIL; no mismatch; handled by verdict with no retries."
         HARNESS_FLAKE: "Quarantine runner pool; reroute to clean pool with attestation check."
         ENVIRONMENT_DRIFT: "Invalidate attestation; block until environment is re-pinned."
         TEST_NONSEMANTIC: "Quarantine AAT spec; open defect against test suite."
@@ -505,7 +561,7 @@ prd_solution_overview:
         - "data_classification"
         - "redaction_applied"
         - "redaction_profile_hash"
-        - "retention_ttl"
+        - "retention_window_ref"
       enforcement: "Admission rejects receipts referencing evidence artifacts that violate policy or omit classification/redaction metadata."
     quorum_audit:
       high_risk: "Require two independent AAT receipts from disjoint runner pools (distinct signing roots) for risk_tier=HIGH."
@@ -545,15 +601,53 @@ prd_solution_overview:
     default_run_count: 3
     stability_rule: "All N runs must produce identical terminal_evidence_digest and terminal_verifier_outputs_digest (and verdict)."
     proof: "GateReceipt payload includes run_receipt_hashes, run_count, terminal_evidence_digest, terminal_verifier_outputs_digest, and stability_digest."
-    classification: "Coordinator assigns determinism_status (STABLE|MISMATCH) and flake_class; GateReceipt records determinism_class + determinism_status + flake_class."
+    classification: "Coordinator assigns determinism_status (STABLE|MISMATCH) and outcome_class (flake_class field); GateReceipt records determinism_class + determinism_status + outcome_class for failures/mismatches."
     failure_actions:
       - "Emit DefectRecord(GATE_NONDETERMINISTIC)."
-      - "WorkTransitioned -> BLOCKED with rationale=QUARANTINED_CHANGESET (time-bounded)."
-      - "WorkAborted abort_reason=POLICY_DENY after repeated nondeterminism."
-      - "HARNESS_FLAKE triggers InterventionFreeze(scope=runner_pool) and rerun on clean pool."
-      - "ENVIRONMENT_DRIFT invalidates attestation and blocks until re-pinned environment."
-      - "TEST_NONSEMANTIC triggers AAT spec quarantine and defect against test suite."
+      - "RunnerPoolQuarantined event emitted on HARNESS_FLAKE; selection excludes quarantined pools."
+      - "AATSpecQuarantined event emitted on TEST_NONSEMANTIC/CODE_NONSEMANTIC; spec excluded from selection."
+      - "ENVIRONMENT_DRIFT invalidates attestation; selection excludes affected environment until re-pinned."
+      - "Quarantine windows use HTF time envelopes (TIME_TBD); work may proceed via alternate pools/specs when available."
+      - "WorkAborted abort_reason=POLICY_DENY after repeated nondeterminism with no eligible alternates."
     phase: "Phase 2"
+  quarantine:
+    events:
+      runner_pool_quarantined:
+        name: "RunnerPoolQuarantined"
+        fields:
+          - quarantine_id
+          - pool_id
+          - reason
+          - evidence_refs
+          - time_envelope_ref
+          - issuer_actor_id
+          - issuer_signature
+      aat_spec_quarantined:
+        name: "AATSpecQuarantined"
+        fields:
+          - quarantine_id
+          - spec_id
+          - reason
+          - evidence_refs
+          - time_envelope_ref
+          - issuer_actor_id
+          - issuer_signature
+      quarantine_cleared:
+        name: "QuarantineCleared"
+        fields:
+          - quarantine_id
+          - target_id
+          - cleared_reason
+          - issuer_actor_id
+          - issuer_signature
+    projection:
+      name: "QuarantineProjection"
+      key: "target_id"
+      state: "ACTIVE|CLEARED"
+      routing_invariant: "Selection MUST exclude ACTIVE quarantined pools/specs"
+    time_semantics:
+      authoritative: "HTF time_envelope_ref (TIME_TBD)"
+      observed_only: "wall-clock timestamps in events are non-authoritative"
   stop_conditions:
     boundedness:
       per_gate_max_attempts: 3
@@ -562,15 +656,15 @@ prd_solution_overview:
         review_security:
           tokens: 250000
           tool_calls: 800
-          duration_ms: 3600000
+          duration_htf_ticks: "TIME_TBD"
         review_quality:
           tokens: 250000
           tool_calls: 800
-          duration_ms: 3600000
+          duration_htf_ticks: "TIME_TBD"
         aat:
           tokens: 200000
           tool_calls: 1000
-          duration_ms: 3600000
+          duration_htf_ticks: "TIME_TBD"
     echo_trap_detection:
       signal: FindingSignature repeats without delta
       threshold: 3
@@ -581,7 +675,7 @@ prd_solution_overview:
         - Escalate via OracleRequest or AdjudicationRequested(request_type=GATE_REVIEW)
     retry_policy:
       backoff: exponential
-      max_backoff_seconds: 3600
+      max_backoff_window_htf: "TIME_TBD"
       provider_errors: "classified into retryable/non-retryable; see provider_routing"
   authority:
     identity:
@@ -608,13 +702,19 @@ prd_solution_overview:
         - gate_id
         - changeset_digest
         - executor_actor_id
-        - issued_at
-        - expires_at
+        - issued_at_observed
+        - expires_at_observed
+        - time_envelope_ref
         - policy_hash
         - issuer_actor_id
         - issuer_signature
       single_use: true
-      expiry_enforced: true
+      expiry_enforced: "HTF time envelope (TIME_TBD)"
+      time_semantics:
+        authoritative: "time_envelope_ref (HTF-defined)"
+        observed_fields:
+          - issued_at_observed
+          - expires_at_observed
       lease_outcome_binding: "GateRunCompleted must reference lease_id and include changeset_digest; mismatch rejects."
       aat_scope_extensions:
         - view_commitment_hash
@@ -634,7 +734,7 @@ prd_solution_overview:
           - work_id
           - changeset_digest
           - gate_id
-          - expires_at
+          - time_envelope_ref
           - rationale
     custody_separation:
       rule: "AAT executor keys must not share custody domains with coordinator or implementer roles."
@@ -713,7 +813,7 @@ prd_solution_overview:
         - "test reports/artifacts"
         - "workflow metadata (run id, job ids)"
       attestation:
-        level: "L1"
+        minimum_level: "L1"
         fields:
           - "runner_image_digest?"
           - "toolchain?"
@@ -721,6 +821,15 @@ prd_solution_overview:
           - "workflow_run_id"
           - "downloaded_artifact_hashes"
         signed_by: "HOLON-GITHUB-ADAPTER"
+    attestation_levels:
+      L0: "status-only (insufficient for readiness gating)"
+      L1: "signed adapter attestation + raw artifact digests in CAS"
+      L2: "replayable verifier proof (deferred)"
+      L3: "measured boot/TPM-backed attestation (deferred)"
+    minimum_level_by_risk_tier:
+      HIGH: "L1 (policy minimum)"
+      MED: "L1 (policy minimum)"
+      LOW: "L1 when CI gating enabled; policy may disable CI gating"
     feature_flags:
       CI_EVENTS_ENABLED: "false by default (fail-closed); when true, evidence-backed import is required"
       CI_GATED_QUEUE_ENABLED: "false by default (fail-closed); when true, READY_FOR_REVIEW transitions require attested evidence import"
@@ -740,7 +849,7 @@ prd_solution_overview:
         - "Emit DefectRecord(PROJECTION_TAMPER) with evidence (diff of fingerprints)."
     divergence_watchdog:
       check: "Compare external trunk HEAD commit/tree to latest internal MergeReceipt result_selector."
-      poll_interval_seconds: 30
+      poll_interval_htf_ticks: "TIME_TBD"
       on_divergence:
         - "Emit DefectRecord(PROJECTION_DIVERGENCE) with observed head + expected head"
         - "Emit InterventionFreeze(scope=repo) and halt new FAC admissions for repo"
@@ -771,7 +880,7 @@ prd_solution_overview:
     evaluator_audit:
       concept: "Sample GateRunCompleted + EvidenceBundle pairs and verify rationale codes align with raw evidence (LAW-15)."
       sampling:
-        rate: "1% of GateRuns or min 1/day"
+        rate: "1% of GateRuns or min 1 per HTF window (TIME_TBD)"
         bias: "oversample security-sensitive changes"
       actions_on_drift:
         - "Quarantine affected gate policy version"
@@ -794,6 +903,12 @@ prd_solution_overview:
       - code: "AAT_POLICY_DOWNGRADE_ATTEMPT"
         severity: "S0"
         description: "Attempt to lower risk tier, determinism class, or verifier policy without waiver"
+      - code: "POLICY_RESOLUTION_MISSING"
+        severity: "S0"
+        description: "PolicyResolvedForChangeSet missing for changeset"
+      - code: "POLICY_RESOLUTION_MISMATCH"
+        severity: "S0"
+        description: "Lease or receipt does not match resolved policy tuple"
       - code: "AAT_PROFILE_SUBSTITUTION"
         severity: "S1"
         description: "AAT receipt references unapproved RCP profile or manifest"
@@ -802,10 +917,13 @@ prd_solution_overview:
         description: "AAT reuse attempted with non-matching provenance tuple"
       - code: "AAT_EVIDENCE_POLICY_VIOLATION"
         severity: "S1"
-        description: "Evidence artifact violates classification/redaction/retention policy"
+        description: "Evidence artifact violates classification/redaction/retention window policy"
       - code: "AAT_SPEC_INVALID"
         severity: "S2"
         description: "AAT spec missing invariant or uses step-based acceptance"
+      - code: "QUARANTINE_ACTIVE"
+        severity: "S1"
+        description: "Attempted selection of quarantined runner pool or AAT spec"
       - code: "AAT_TERMINAL_VERIFIER_MISSING"
         severity: "S1"
         description: "AAT receipt missing required terminal verifier outputs"
@@ -815,9 +933,18 @@ prd_solution_overview:
       - code: "AAT_TRANSCRIPT_CHAIN_INVALID"
         severity: "S1"
         description: "AAT transcript hash chain incomplete or invalid"
+      - code: "GATE_RECEIPT_VERSION_UNKNOWN"
+        severity: "S1"
+        description: "Unknown GateReceipt payload kind or schema version"
+      - code: "GATE_RECEIPT_CANON_MISMATCH"
+        severity: "S1"
+        description: "GateReceipt canonicalization mismatch"
       - code: "CI_ATTESTATION_INVALID"
         severity: "S1"
         description: "CI import attestation signature invalid or missing fields"
+      - code: "CI_ATTESTATION_LEVEL_INSUFFICIENT"
+        severity: "S1"
+        description: "CI attestation level below required minimum"
       - code: "CI_EVIDENCE_MISSING"
         severity: "S1"
         description: "CI readiness transition attempted without imported raw evidence digests"
@@ -905,7 +1032,7 @@ prd_solution_overview:
         RATE_LIMIT: 3
         TIMEOUT: 2
         TRANSIENT_5XX: 2
-      ttl_ms: 900000
+      cooldown_htf_ticks: "TIME_TBD"
       reset_on_success: true
     recording: "All provider routing decisions and errors are recorded in ToolDecided/ToolExecuted receipts and normalized into DefectRecords."
     fallback_policy: "Deterministic routing profile per stage with ordered fallbacks; emits routing rationale."
@@ -922,6 +1049,10 @@ prd_solution_overview:
           notes:
             - "AAT uses typed GateReceipt payloads (gate_id=aat); no standalone AATReceipt event."
             - "AAT typed payload binds transcript_chain_root_hash, artifact_manifest_hash, terminal_verifier_outputs, selection_policy_id, risk_tier, and attestation fields."
+        - payload_family: "PolicyEvent"
+          messages:
+            - "PolicyResolvedForChangeSet (critical, signed; includes resolved_policy_hash, resolved_risk_tier, resolved_determinism_class, resolved_rcp_profile_ids, resolved_rcp_manifest_hashes, resolved_verifier_policy_hashes)"
+          canonicalization: "No maps; sort repeated fields before signing; domain-separated signatures."
         - payload_family: "InterventionEvent"
           messages:
             - "InterventionFreeze (repo/work scope, signed by admission authority)"
@@ -931,6 +1062,11 @@ prd_solution_overview:
             - "ProjectionApplied (receipt-backed sync attempt)"
             - "ProjectionDiverged (critical; triggers freeze)"
             - "ProjectionTamperObserved (defect signal)"
+        - payload_family: "QuarantineEvent"
+          messages:
+            - "RunnerPoolQuarantined (critical; includes pool_id, reason, evidence_refs, time_envelope_ref)"
+            - "AATSpecQuarantined (critical; includes spec_id, reason, evidence_refs, time_envelope_ref)"
+            - "QuarantineCleared (critical; includes target_id, cleared_reason)"
         - payload_family: "AATEvent"
           messages:
             - "AATResultReused (critical, signed by admission authority; includes from_receipt_hash, provenance_tuple, policy_hash, justification)"

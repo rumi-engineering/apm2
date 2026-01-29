@@ -26,7 +26,7 @@ prd_evidence_artifact:
           - "AdjudicationResolved(EMERGENCY_RECOVERY) fixtures available"
   assertions:
     - "InterventionUnfreeze requires valid adjudication or override ceremony"
-    - "Override ceremony enforces quorum, nonce binding, and TTL"
+    - "Override ceremony enforces quorum, nonce binding, and time_envelope_ref (HTF)"
   data:
     classification: "INTERNAL"
     redaction:

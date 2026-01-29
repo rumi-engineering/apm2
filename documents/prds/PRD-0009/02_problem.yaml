@@ -118,7 +118,7 @@ prd_problem:
           assessment: "Helps but does not cover all divergence causes (manual merges, sync failures); no detection mechanism."
         - id: ALT-FM004-02
           intervention: "Periodic manual reconciliation"
-          assessment: "Slow and error-prone; does not prevent divergence during reconciliation windows."
+          assessment: "Slow and error-prone; does not prevent divergence during reconciliation windows (HTF-defined)."
         - id: ALT-FM004-03
           intervention: "Webhook notifications on branch updates"
           assessment: "Provides signals but requires custom handling; no built-in freeze mechanism."

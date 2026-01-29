@@ -3,6 +3,7 @@
 # RFC-0015: Forge Admission Cycle (FAC) - Hardened Protocol with Cryptographic Gates and OCAP Containment
 # Session: COUNCIL-RFC-0015-FINALIZE-20260129
 # Cycle: FINALIZE (v2 -> v4)
+# NOTE: HTF deferral: any TTL/duration references in this artifact are historical and non-authoritative.
 
 agent_id: SA-3
 session_id: "COUNCIL-RFC-0015-FINALIZE-20260129"

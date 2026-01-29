@@ -76,7 +76,7 @@ prd_constraints_invariants:
     - id: CNS-0009
       statement: |
         GateLease scope is strict: (work_id, gate_id, changeset_digest, executor_actor_id,
-        expiry, policy_hash). Lease derivation obeys subset rule.
+        expiry_ref, policy_hash). Lease derivation obeys subset rule.
       rationale: |
         Prevents privilege escalation via lease manipulation. Child leases can only narrow
         scope, never broaden.
@@ -144,7 +144,7 @@ prd_constraints_invariants:
       rationale: |
         Detects external tampering or uncontrolled merges. Freezing prevents admission
         of changes to corrupted state.
-      enforcement: Watchdog polls every 30 seconds; InterventionFreeze on divergence.
+      enforcement: Watchdog polls at HTF-defined interval (TIME_TBD); InterventionFreeze on divergence.
       evidence_ids:
         - EVID-0005
     - id: CNS-0017
@@ -180,7 +180,7 @@ prd_constraints_invariants:
       rationale: |
         Prevents gate flakiness from compromising admission integrity; removes executor
         self-attestation of stability.
-      enforcement: GATE_NONDETERMINISTIC defect emitted; WorkTransitioned rationale=QUARANTINED_CHANGESET and WorkAborted abort_reason=POLICY_DENY after threshold.
+      enforcement: GATE_NONDETERMINISTIC defect emitted; quarantine events emitted for pools/specs; WorkAborted abort_reason=POLICY_DENY after repeated nondeterminism with no eligible alternates.
       evidence_ids:
         - EVID-0019
         - EVID-0021
@@ -215,11 +215,15 @@ prd_constraints_invariants:
         - EVID-0024
     - id: CNS-0023
       statement: |
-        AAT outcomes MUST record determinism_status (STABLE|MISMATCH) and flake_class.
-        flake_class is an enum for mismatch classification: DETERMINISTIC, HARNESS_FLAKE,
-        ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, or UNKNOWN. Deterministic
-        FAIL is represented by verdict=FAIL with determinism_status=STABLE and
-        flake_class=DETERMINISTIC.
+        AAT outcomes MUST record determinism_status (STABLE|MISMATCH) and outcome_class
+        (stored in payload field flake_class for compatibility). outcome_class is a
+        canonical enum: DETERMINISTIC_FAIL, HARNESS_FLAKE, ENVIRONMENT_DRIFT,
+        TEST_NONSEMANTIC, UNKNOWN (CODE_NONSEMANTIC optional by policy). determinism_status
+        indicates whether a behavioral mismatch occurred. Rules:
+        - determinism_status=MISMATCH => outcome_class in {HARNESS_FLAKE, ENVIRONMENT_DRIFT,
+          TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN}.
+        - determinism_status=STABLE and verdict=FAIL => outcome_class=DETERMINISTIC_FAIL.
+        - determinism_status=STABLE and verdict=PASS may omit outcome_class.
       rationale: |
         Classification prevents wasteful retries and avoids throughput collapse.
       enforcement: UNKNOWN => NEEDS_INPUT; HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec.
@@ -266,7 +270,7 @@ prd_constraints_invariants:
     - id: CNS-0028
       statement: |
         Evidence artifacts referenced by AAT receipts MUST include data_classification,
-        redaction_applied + redaction_profile_hash, and retention_ttl; policy violations
+        redaction_applied + redaction_profile_hash, and retention_window_ref (HTF); policy violations
         are admission-blocking.
       rationale: |
         Prevents permanent storage of secrets and enforces evidence hygiene without disabling auditability.
@@ -291,6 +295,47 @@ prd_constraints_invariants:
       enforcement: AAT_EVIDENCE_POLICY_VIOLATION or CONTEXT_FIREWALL_DENY defect; session terminated.
       evidence_ids:
         - EVID-0032
+    - id: CNS-0031
+      statement: |
+        PolicyResolvedForChangeSet MUST be committed before any GateLeaseIssued for the
+        same (work_id, changeset_digest). All leases and receipts MUST match the resolved
+        policy tuple; mismatches are admission-blocking unless a waiver exists.
+      rationale: |
+        Makes anti-downgrade mechanically enforceable by anchoring resolved policy prior
+        to execution.
+      enforcement: POLICY_RESOLUTION_MISSING or POLICY_RESOLUTION_MISMATCH defect; admission rejects.
+      evidence_ids:
+        - EVID-0033
+    - id: CNS-0032
+      statement: |
+        GateReceipt envelopes MUST carry receipt_version, payload_kind, payload_schema_version,
+        payload_hash, and evidence_bundle_hash with deterministic canonicalization. Unknown
+        payload kinds/versions are rejected in enforce mode.
+      rationale: |
+        Prevents receipt drift and ensures verification is stable across implementations.
+      enforcement: GATE_RECEIPT_VERSION_UNKNOWN or GATE_RECEIPT_CANON_MISMATCH defect; admission rejects.
+      evidence_ids:
+        - EVID-0036
+    - id: CNS-0033
+      statement: |
+        RunnerPoolQuarantined and AATSpecQuarantined events MUST update a QuarantineProjection.
+        Quarantined pools/specs are excluded from selection; quarantine windows use HTF
+        time_envelope_ref (TIME_TBD).
+      rationale: |
+        Separates quarantine state from work transitions and enforces routing mechanically.
+      enforcement: QUARANTINE_ACTIVE defect when selection attempts target quarantined pool/spec.
+      evidence_ids:
+        - EVID-0034
+    - id: CNS-0034
+      statement: |
+        CI attestation levels L0-L3 MUST be explicit; READY_FOR_REVIEW requires minimum
+        attestation level per risk tier (L1 minimum). L0 attestation is insufficient for
+        admission gating.
+      rationale: |
+        Prevents ambiguity in CI evidence trust and enforces fail-closed ingestion.
+      enforcement: CI_ATTESTATION_LEVEL_INSUFFICIENT defect; transition rejected.
+      evidence_ids:
+        - EVID-0035
   invariants:
     - id: INV-0001
       statement: |
@@ -344,10 +389,10 @@ prd_constraints_invariants:
         - EVID-0009
     - id: INV-0006
       statement: |
-        All leases are single-use with enforced expiry. GateRunCompleted must reference
+        All leases are single-use with enforced HTF expiry. GateRunCompleted must reference
         lease_id and include changeset_digest; mismatch rejects.
       rationale: |
-        Prevents replay attacks and ensures temporal validity of gate authority.
+        Prevents replay attacks and ensures HTF-scoped validity of gate authority.
       enforcement: Lease validation on GateRunCompleted ingestion.
       evidence_ids:
         - EVID-0007
@@ -481,13 +526,13 @@ prd_constraints_invariants:
       type: detective
       details: |
         Continuous monitoring of external trunk HEAD vs internal MergeReceipt
-        result_selector. Poll interval 30 seconds. Divergence triggers freeze.
+        result_selector. Poll interval is HTF-defined (TIME_TBD). Divergence triggers freeze.
     - id: SEC-CTRL-0004
       name: Lease expiry enforcement
       type: preventative
       details: |
-        All leases have mandatory expires_at field. GateRunCompleted verification
-        rejects if timestamp exceeds lease expiry.
+        All leases have mandatory HTF time_envelope_ref. GateRunCompleted verification
+        rejects if HTF time exceeds lease expiry window. Wall-clock timestamps are observational only.
     - id: SEC-CTRL-0005
       name: COI validation at lease issuance
       type: preventative
@@ -524,7 +569,7 @@ prd_constraints_invariants:
       details: |
         Provider errors classified into RATE_LIMIT, TIMEOUT, TRANSIENT_5XX,
         INVALID_RESPONSE, POLICY_DENY. Circuit breaker thresholds: RATE_LIMIT=3,
-        TIMEOUT=2, TRANSIENT_5XX=2. TTL 900000ms.
+        TIMEOUT=2, TRANSIENT_5XX=2. Cooldown window uses HTF time envelope (TIME_TBD).
     - id: SEC-CTRL-0011
       name: Holdout suite isolation and policy quarantine
       type: detective+corrective

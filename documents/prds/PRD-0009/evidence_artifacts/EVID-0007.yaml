@@ -3,9 +3,9 @@ prd_evidence_artifact:
   template_version: "2026-01-23"
   id: "EVID-0007"
   category: "INTEGRATION_TEST_RESULTS"
-  title: "Gate Lease Scope and Expiry Enforcement Tests"
+  title: "Gate Lease Scope and HTF Expiry Enforcement Tests"
   description: |
-    Tests verifying lease scope immutability, expiry enforcement, and GateRunCompleted
+    Tests verifying lease scope immutability, HTF expiry enforcement, and GateRunCompleted
     binding to lease_id and changeset_digest.
   source_acceptance_test: FAC-AT-0007
   capture:
@@ -22,10 +22,10 @@ prd_evidence_artifact:
         network_access: "DISALLOWED"
         allowlist_hosts: []
         constraints:
-          - "Lease fixtures include expiry and scope variants"
+          - "Lease fixtures include time_envelope_ref and scope variants"
           - "GateRunCompleted fixtures reference lease_id and changeset_digest"
   assertions:
-    - "Expired leases are rejected"
+    - "Expired leases (HTF) are rejected"
     - "Child leases cannot broaden parent scope"
     - "GateRunCompleted must reference lease_id and changeset_digest"
   data:

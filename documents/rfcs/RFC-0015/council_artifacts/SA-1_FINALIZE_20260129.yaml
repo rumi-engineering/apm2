@@ -2,6 +2,7 @@
 # RFC-0015: Forge Admission Cycle (FAC)
 # v2 -> v4 Transition Analysis
 # Session: COUNCIL-RFC-0015-FINALIZE-20260129
+# NOTE: HTF deferral: any TTL/duration references in this artifact are historical and non-authoritative.
 
 sa1_finalize_artifact:
   schema_version: "2026-01-29"

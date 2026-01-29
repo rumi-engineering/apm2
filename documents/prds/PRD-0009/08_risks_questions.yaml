@@ -49,7 +49,7 @@ prd_risks_questions:
         - Default CI_EVENTS_ENABLED=false (fail-closed) until evidence binding confirmed.
         - Document L1 attestation requirements and self-hosted runner setup.
         - For T3 (high-risk) changes, re-run critical verifiers in controlled environments.
-        - Accept L0 attestation for lower-risk changes with explicit policy documentation.
+        - Reject L0 attestation; require L1+ or rerun in controlled environments for readiness gating.
       evidence_ids: []
     - id: RSK-FAC-0005
       statement: COI enforcement blocks legitimate single-developer workflows.
@@ -128,7 +128,7 @@ prd_risks_questions:
         creating compliance and security liabilities.
       likelihood: MEDIUM
       mitigations:
-        - Enforce classification, redaction profile, and retention TTL on all evidence.
+        - Enforce classification, redaction profile, and retention window (HTF) on all evidence.
         - Reject admission when evidence hygiene requirements are not met.
         - Apply deduplication and compression to reduce unnecessary exposure.
       evidence_ids: []
@@ -152,6 +152,17 @@ prd_risks_questions:
         - Enforce strict sandboxing with deny-by-default egress and env allowlist.
         - Bind transcripts and artifacts into receipt with hash-chain completeness.
         - Require verifier policy linting to prevent tautological tests.
+      evidence_ids: []
+    - id: RSK-FAC-0014
+      statement: Time authority is undefined until HTF RFC is specified.
+      impact: |
+        If any component uses wall-clock time for lease expiry, quarantine windows, or
+        admission deadlines, protocol decisions can drift or be spoofed.
+      likelihood: MEDIUM
+      mitigations:
+        - Explicitly defer time semantics to HTF and prohibit wall-clock authority.
+        - Require HTF time_envelope_ref on time-bound events (leases, quarantines, waivers).
+        - Treat wall-clock timestamps as observational metadata only.
       evidence_ids: []
   open_questions:
     - id: Q-FAC-0001
@@ -259,20 +270,20 @@ prd_risks_questions:
           weight: 0.10
           rationale: Reduces risk of strict enforcement; provides escape valves
       quantified_thresholds:
-        acceptable_context_miss_rate: "<=15% of GateRuns trigger CONTEXT_MISS in first 30 days"
+        acceptable_context_miss_rate: "<=15% of GateRuns trigger CONTEXT_MISS in initial HTF window (TIME_TBD)"
         acceptable_coi_waiver_rate: "<=5% of admissions require COI waiver"
         required_security_posture: "Zero gate outcomes without valid lease and signature"
-        feedback_latency_sla: "Pack spec updates within 24h of recurring CONTEXT_MISS pattern"
+        feedback_latency_sla: "Pack spec updates within HTF window (TIME_TBD) of recurring CONTEXT_MISS pattern"
       pareto_configurations:
         - id: CONFIG-FAC-STRICT
-          description: Full OCAP + COI enforcement from day 1
+          description: Full OCAP + COI enforcement from initial HTF window
           security: 1.0
           velocity: 0.4
           observability: 0.8
           reversibility: 0.2
           recommendation: Not recommended; adoption risk too high
         - id: CONFIG-FAC-GRADUATED
-          description: Warn -> soft-fail -> hard-fail over 60 days; waiver path for COI
+          description: Warn -> soft-fail -> hard-fail over HTF windows (TIME_TBD); waiver path for COI
           security: 0.9
           velocity: 0.7
           observability: 0.9
@@ -287,30 +298,30 @@ prd_risks_questions:
           recommendation: Not recommended; security posture insufficient for FAC goals
       coordinated_mitigation:
         rollout_phases:
-          - phase: "FAC-R-01 (7 days)"
+          - phase: "FAC-R-01 (HTF window A)"
             mode: WARN
             description: "Warn-only for LOW risk changes on sterile runner pool (no secrets, egress denied); all violations logged but not blocking."
-          - phase: "FAC-R-02 (14 days)"
+          - phase: "FAC-R-02 (HTF window B)"
             mode: SOFT_FAIL
             description: "Context miss terminates session but allows retry; COI waiver auto-granted with audit."
-          - phase: "FAC-R-03 (14 days)"
+          - phase: "FAC-R-03 (HTF window C)"
             mode: HARD_FAIL
             description: "Full enforcement; context miss triggers refinement; COI waiver requires ceremony."
           - phase: "FAC-R-04 (ongoing)"
             mode: PRODUCTION
             description: "Continuous improvement; pack specs refined based on defect patterns."
         acceleration_clause: |
-          If CONTEXT_MISS rate <5% at week 3, advance to FAC-R-03. If COI waiver
-          rate <2% at week 4, remove auto-grant. Data-driven acceleration rewards
-          faster-than-expected pack completeness.
+          If CONTEXT_MISS rate <5% by HTF window threshold (TIME_TBD), advance to FAC-R-03.
+          If COI waiver rate <2% by HTF window threshold (TIME_TBD), remove auto-grant.
+          Data-driven acceleration rewards faster-than-expected pack completeness.
         rollout_sla:
-          during_rollout: "24h standard for pack fixes, 4h emergency"
-          post_rollout: "48h standard, 4h emergency"
+          during_rollout: "HTF window (TIME_TBD) for pack fixes; emergency window (TIME_TBD)"
+          post_rollout: "HTF window (TIME_TBD) standard; emergency window (TIME_TBD)"
         feedback_integration:
           - "CONTEXT_MISS defects automatically trigger pack spec review"
           - "COI waiver frequency feeds into policy refinement"
           - "Weekly strictness-vs-adoption dashboard review"
         escape_hatches:
           - "ContextRefinementRequest for pack incompleteness"
-          - "AdjudicationRequested(WAIVER) for COI with bounded scope and TTL"
+          - "AdjudicationRequested(WAIVER) for COI with bounded scope and HTF time_envelope_ref"
           - "Emergency override ceremony per PRD-0007 for critical blockers"

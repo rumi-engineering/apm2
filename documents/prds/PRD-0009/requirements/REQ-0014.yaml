@@ -7,12 +7,12 @@ prd_requirement:
   title: "AAT evidence hygiene and retention"
   statement: |
     Evidence artifacts referenced by AAT receipts MUST include data classification,
-    redaction status, and retention TTL; admission MUST reject evidence that violates
+    redaction status, and retention window (HTF); admission MUST reject evidence that violates
     policy or lacks required metadata.
   acceptance_criteria:
-    - "Every AAT evidence artifact includes data_classification, redaction_applied, redaction_profile_hash, and retention_ttl. Verified by: Evidence schema validation test."
+    - "Every AAT evidence artifact includes data_classification, redaction_applied, redaction_profile_hash, and retention_window_ref (HTF). Verified by: Evidence schema validation test."
     - "Admission rejects AAT receipts referencing evidence with SECRET classification without approved redaction profile. Verified by: Policy violation test."
-    - "Retention TTL is enforced per policy. Verified by: Evidence lifecycle test."
+    - "Retention window is enforced per policy (HTF). Verified by: Evidence lifecycle test."
   evidence:
     evidence_ids:
       - EVID-0030

@@ -167,22 +167,20 @@ rfc_risks_and_open_questions:
         for hosted runners with explicit attestation level documentation.
       status: DEFERRED
       resolution: |
-        DEFER to Phase 2 with explicit L0 policy for Phase 1 (SA-1 FINALIZE).
+        DEFER to Phase 2 for L2/L3; Phase 1 requires L1 minimum for CI-gated transitions.
 
         Phase 1 Policy:
-        - Accept L0 attestation (webhook signature + artifact hashes) for all tiers
-        - Document that L0 does not provide environment attestation
-        - Require explicit acknowledgment in CI_EVENTS_ENABLED activation
-        - For HIGH risk: recommend manual re-run in controlled environment
+        - L0 attestation is insufficient for readiness gating
+        - CI_EVENTS_ENABLED remains fail-closed by default; enable only when L1 evidence is available
+        - For hosted runners without L1, require manual re-run in controlled environment
 
         Phase 2 Resolution Plan:
         - Survey hosted CI providers for environment attestation APIs
-        - Define self-hosted runner requirements for L1+
-        - Create migration path from L0 -> L1
+        - Define self-hosted runner requirements for L2/L3
+        - Create migration path from L1 -> L2/L3
 
-        Rationale: Hosted CI provider landscape is evolving. Forcing L1+ now would
-        require self-hosted runners with significant operational burden. L0 sufficient
-        for Phase 1 with documented limitations.
+        Rationale: Hosted CI provider landscape is evolving. Requiring L1 for gated transitions
+        keeps admission fail-closed while allowing controlled environments to proceed.
       resolved_by: COUNCIL-RFC-0015-FINALIZE-20260129
       resolved_date: "2026-01-29"
       confidence: MEDIUM
@@ -241,7 +239,7 @@ rfc_risks_and_open_questions:
         - Phase 2: Enforcement enabled; expand to other gates if GATE_NONDETERMINISTIC >1%
 
         Flake Classification:
-        - DETERMINISTIC: determinism_status=STABLE; use verdict for PASS/FAIL (not a mismatch)
+        - DETERMINISTIC_FAIL: verdict=FAIL with determinism_status=STABLE (not a mismatch)
         - HARNESS_FLAKE: Runner/infra nondeterminism
         - ENVIRONMENT_DRIFT: Toolchain/runner environment drift
         - TEST_NONSEMANTIC: Semantically equivalent but different format
@@ -331,7 +329,7 @@ rfc_risks_and_open_questions:
         | Risk Tier | AAT Reuse | Conditions |
         |-----------|-----------|------------|
         | HIGH      | NEVER     | Always fresh AAT required |
-        | MED       | WAIVER    | AdjudicationRequested(AAT_REUSE) with bounded TTL |
+        | MED       | WAIVER    | AdjudicationRequested(AAT_REUSE) with bounded HTF window (TIME_TBD) |
         | LOW       | ALLOWED   | Exact provenance tuple match required |
 
         PROVENANCE TUPLE:
@@ -339,13 +337,13 @@ rfc_risks_and_open_questions:
         - view_commitment_hash
         - rcp_profile_id
         - verifier_policy_hash
-        - determinism_class (must be DETERMINISTIC)
+        - determinism_class (must indicate deterministic class, e.g., class=0)
 
         REUSE EVENT: AATResultReused with original_receipt_id, provenance_tuple_hash
         CACHE INVALIDATION: Any verifier_policy_hash change invalidates all cached results
-        TTL: 7 days for LOW reuse (nightly AAT refreshes cache)
+        REUSE WINDOW: HTF window (TIME_TBD) for LOW reuse (nightly AAT refreshes cache)
 
-        WAIVER CEREMONY (MED): AdjudicationRequested -> AUTH_SECURITY approval -> 24h max TTL
+        WAIVER CEREMONY (MED): AdjudicationRequested -> AUTH_SECURITY approval -> HTF waiver window (TIME_TBD)
       resolved_by: COUNCIL-RFC-0015-FINALIZE-20260129
       resolved_date: "2026-01-29"
       confidence: HIGH
@@ -507,7 +505,7 @@ rfc_risks_and_open_questions:
         description: |
           If executor key is compromised mid-lease, there is no way to invalidate
           the lease before expiry. Adversary can issue valid GateRunCompleted.
-        recommendation: "Add LeaseRevoked event type; consider short lease TTLs"
+        recommendation: "Add LeaseRevoked event type; enforce short HTF lease window (TIME_TBD)"
         phase_to_resolve: EXPLORE
 
       - id: F-SA3-002
@@ -515,9 +513,9 @@ rfc_risks_and_open_questions:
         source_mode: 49  # Robust/Worst-Case
         title: "Context Firewall WARN Mode Security Gap"
         description: |
-          During FAC-R-01 (14 days WARN mode), context violations logged but not enforced.
+          During FAC-R-01 (HTF WARN window; TIME_TBD), context violations logged but not enforced.
           Malicious agent can exfiltrate data during this window.
-        recommendation: "Shorter WARN window (7 days max); scope limitation for WARN mode"
+        recommendation: "Shorter WARN window via HTF (TIME_TBD); scope limitation for WARN mode"
         phase_to_resolve: FINALIZE
 
       - id: F-SA3-004
@@ -602,15 +600,15 @@ rfc_risks_and_open_questions:
         resolution_status: RESOLVED
         resolution: |
           ADD LeaseRevoked event type to kernel_events.proto with lease_id,
-          revoked_by, revoked_at, reason, issuer_signature fields.
-          REDUCE TTL: AAT-scoped leases <= 15 minutes; other gates <= 30 minutes.
+          revoked_by, revoked_at (observational), reason, issuer_signature fields.
+          SET HTF lease windows (TIME_TBD) for AAT-scoped leases and other gate leases.
           Revocation is immediate (no grace period).
 
       - finding_id: F-SA3-002
         title: "WARN Mode Security Gap"
         resolution_status: RESOLVED
         resolution: |
-          REDUCE FAC-R-01 WARN duration from 14 days to 7 days.
+          SET FAC-R-01 WARN HTF window (TIME_TBD).
           ADD sensitive module exclusion: auth/*, crypto/*, ledger/* denied even in WARN.
           ADD rate limiting: Max 100 context misses per work_id before SOFT_FAIL escalation.
 
@@ -641,7 +639,7 @@ rfc_risks_and_open_questions:
       - decision_id: DD-FAC-0005
         from_status: HYPOTHESIS
         to_status: VALIDATED
-        conditions: ["Document L0/L1 attestation levels"]
+        conditions: ["Document attestation levels and minimum enforcement (L1+)"]
 
       - decision_id: DD-FAC-0006
         from_status: HYPOTHESIS
@@ -691,7 +689,7 @@ rfc_risks_and_open_questions:
 
       recommended:
         - "Add runtime policy enforcement for TB-0003"
-        - "Document L0/L1 attestation levels"
+        - "Document attestation levels and minimum enforcement (L1+)"
         - "Create integration test for admission network isolation"
 
     confidence_assessment:

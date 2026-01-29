@@ -3,6 +3,7 @@
 # Session: 20260129-RFC0015-FINALIZE
 # Agent: SA-2 (Implementation Feasibility)
 # Transition: v2 (Grounded) -> v4 (Standard)
+# NOTE: HTF deferral: time/TTL references in this artifact are historical estimates, not protocol authority.
 
 sa2_mock_implementation_run_report:
   schema_version: "2026-01-29"

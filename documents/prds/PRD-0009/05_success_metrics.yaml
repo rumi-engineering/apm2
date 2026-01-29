@@ -31,8 +31,8 @@ prd_success_metrics:
       description: |
         Percentage of consumption-mode reads that are properly allowlisted via
         ContextPackManifest. Measures OCAP containment effectiveness.
-      baseline: "Baseline established from first 30 days; expected >20% denial rate initially."
-      target: "<5% denial rate within 3 months; <1% within 6 months"
+      baseline: "Baseline established from initial HTF window (TIME_TBD); expected >20% denial rate initially."
+      target: "<5% denial rate within HTF window (TIME_TBD); <1% within extended HTF window (TIME_TBD)"
       measurement_method: |
         Aggregate ToolDecided=DENY events with rule_id CTX-ALLOWLIST-001. Compute rate
         per 1000 gate runs with Wilson score interval.
@@ -43,8 +43,8 @@ prd_success_metrics:
       description: |
         Fraction of gate runs completed without CONTEXT_MISS termination,
         indicating RCP compilation quality.
-      baseline: "Baseline established from first 30 days; expected <70% initially."
-      target: ">95% within 3 months; >99% within 6 months"
+      baseline: "Baseline established from initial HTF window (TIME_TBD); expected <70% initially."
+      target: ">95% within HTF window (TIME_TBD); >99% within extended HTF window (TIME_TBD)"
       measurement_method: |
         RunReceipt analysis for context_pack_sufficiency=true. Track SessionTerminated
         events with rationale=CONTEXT_MISS.
@@ -56,10 +56,10 @@ prd_success_metrics:
         Time between external trunk divergence and PROJECTION_DIVERGENCE defect
         emission plus admission freeze.
       baseline: "No detection mechanism pre-FAC (infinite latency)."
-      target: "<60 seconds detection latency; <5 minutes to freeze"
+      target: "Detection latency <= HTF threshold (TIME_TBD); freeze within HTF threshold (TIME_TBD)"
       measurement_method: |
-        Compare divergence watchdog poll timestamps to InterventionFreeze event timestamps.
-        Track poll_interval_seconds compliance (target: 30 seconds).
+        Compare divergence watchdog poll HTF ticks to InterventionFreeze HTF ticks.
+        Track poll_interval_htf_ticks compliance (TIME_TBD).
       evidence_ids:
         - EVID-0005
     - id: MET-0006
@@ -82,8 +82,8 @@ prd_success_metrics:
       baseline: "N/A (no lease mechanism pre-FAC)"
       target: "100%; 0 gate outcomes accepted with expired leases"
       measurement_method: |
-        Compare GateRunCompleted timestamp to lease.expires_at. Track rejection rate
-        for expired-lease attempts.
+        Compare GateRunCompleted HTF time to lease time_envelope_ref. Track rejection rate
+        for expired-lease attempts (HTF).
       evidence_ids:
         - EVID-0007
     - id: MET-0008
@@ -91,7 +91,7 @@ prd_success_metrics:
       description: |
         Percentage of reasoning degeneration episodes detected and terminated
         before exceeding threshold.
-      baseline: "Baseline established from first 30 days of gate runs."
+      baseline: "Baseline established from initial HTF window (TIME_TBD)."
       target: "100% detection when FindingSignature repeats 3+ times without delta"
       measurement_method: |
         Track SessionTerminated events with rationale=REASONING_DEGENERATION and
@@ -116,7 +116,7 @@ prd_success_metrics:
         Percentage of gate policy drift detected through holdout audits and
         outcome sampling.
       baseline: "Baseline established after Phase 2 holdout suite deployment."
-      target: ">95% detection of false-negative rate exceeding threshold; <7 days to quarantine"
+      target: ">95% detection of false-negative rate exceeding threshold; quarantine within HTF window (TIME_TBD)"
       measurement_method: |
         Track FAC-90-HOLDOUT_AUDIT results. Compare false_negative_rate to threshold.
         Verify EVALUATOR_DRIFT emission and policy quarantine timing.
@@ -186,32 +186,32 @@ prd_success_metrics:
     - id: MET-0016
       name: Flake attribution distribution
       description: |
-        Distribution of AAT mismatches by flake_class (HARNESS_FLAKE, ENVIRONMENT_DRIFT,
-        TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN).
+        Distribution of AAT mismatches by outcome_class (flake_class field) values:
+        HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, UNKNOWN (CODE_NONSEMANTIC optional).
       baseline: "Baseline established after flake classification rollout."
       target: "UNKNOWN <5%; HARNESS_FLAKE + ENVIRONMENT_DRIFT trending down"
       measurement_method: |
-        Aggregate GateReceipt flake_class across AAT runs and correlate with quarantine events.
+        Aggregate GateReceipt flake_class across AAT mismatches/failures and correlate with quarantine events.
       evidence_ids:
         - EVID-0025
     - id: MET-0017
       name: AAT signal density
       description: |
-        Defects per AAT-minute (or per token) to ensure AAT yields actionable signal.
+        Defects per AAT run or per HTF tick window to ensure AAT yields actionable signal.
       baseline: "Baseline established after AAT rollout."
       target: "Signal density increases quarter-over-quarter"
       measurement_method: |
-        Compute defects linked to AAT evidence bundles divided by total AAT runtime.
+        Compute defects linked to AAT evidence bundles divided by total AAT runtime (HTF window; observational wall time only).
       evidence_ids:
         - EVID-0024
     - id: MET-0018
       name: Median time-to-actionable AAT output
       description: |
-        Median time from AAT failure to actionable fix (measured via defect closure).
+        Median HTF tick delta from AAT failure to actionable fix (measured via defect closure).
       baseline: "Baseline established after AAT rollout."
-      target: "<1 business day for HIGH-risk tier"
+      target: "<1 HTF window (TIME_TBD) for HIGH-risk tier"
       measurement_method: |
-        Track time between AAT defect creation and linked fix merge, stratified by risk tier.
+        Track HTF tick delta between AAT defect creation and linked fix merge, stratified by risk tier.
       evidence_ids:
         - EVID-0027
     - id: MET-0019
@@ -238,7 +238,7 @@ prd_success_metrics:
     - id: MET-0021
       name: Evidence hygiene compliance rate
       description: |
-        Percentage of AAT evidence artifacts with classification, redaction metadata, and retention TTL.
+        Percentage of AAT evidence artifacts with classification, redaction metadata, and retention window (HTF).
       baseline: "Baseline established after evidence hygiene enforcement."
       target: "100% compliance; 0 AAT_EVIDENCE_POLICY_VIOLATION accepted"
       measurement_method: |
@@ -283,7 +283,7 @@ prd_success_metrics:
         - EVID-0002
     - id: GRD-0004
       name: Projection divergence freeze
-      threshold: "External trunk divergence MUST trigger InterventionFreeze within 5 minutes."
+      threshold: "External trunk divergence MUST trigger InterventionFreeze within HTF window (TIME_TBD)."
       response_plan: |
         PROJECTION_DIVERGENCE defect emitted. New FAC admissions blocked for repo.
         Unfreeze requires AdjudicationResolved or emergency_override ceremony.
@@ -317,8 +317,8 @@ prd_success_metrics:
       name: Determinism envelope enforced
       threshold: "Gates with determinism_class > 0 MUST satisfy N-run stability before PASS."
       response_plan: |
-        GATE_NONDETERMINISTIC defect emitted; changeset is quarantined and aborted
-        after repeated nondeterminism per policy.
+        GATE_NONDETERMINISTIC defect emitted; quarantine events emitted for pools/specs.
+        Admission does not proceed without eligible alternates; repeated nondeterminism aborts per policy.
       evidence_ids:
         - EVID-0019
         - EVID-0021

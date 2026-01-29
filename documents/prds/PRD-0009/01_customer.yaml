@@ -128,7 +128,7 @@ prd_customer:
       description: The workflow from gate execution to merge receipt emission.
       steps:
         - Context Compiler produces RCPs for quality, security, and AAT gates.
-        - Governance mints GateLeases scoped to (work_id, gate_id, changeset_digest, executor, expiry).
+        - Governance mints GateLeases scoped to (work_id, gate_id, changeset_digest, executor, expiry_ref).
         - Gate executors run under OCAP context firewall with RCP allowlist.
         - Each gate produces signed GateRunCompleted with evidence_bundle_hash, gate_receipt_id, and gate_receipt_payload_hash (typed payload in CAS).
         - Kernel Gate verifies all required gate signatures, lease validity, and changeset_digest match.
@@ -147,7 +147,7 @@ prd_customer:
       name: Divergence Recovery
       description: The workflow when external trunk diverges from internal MergeReceipt truth.
       steps:
-        - Divergence watchdog polls external trunk HEAD every 30 seconds.
+        - Divergence watchdog polls external trunk HEAD at HTF-defined interval (TIME_TBD).
         - If external HEAD differs from latest MergeReceipt result_selector, divergence detected.
         - DefectRecord(PROJECTION_DIVERGENCE) emitted with observed vs expected heads.
         - InterventionFreeze(scope=repo) halts new FAC admissions for affected repo.

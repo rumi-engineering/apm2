@@ -84,10 +84,10 @@ rfc_design_decisions:
     security_findings_resolved:
       - finding_id: F-SA3-001
         title: "Lease Revocation Gap"
-        resolution: "Add LeaseRevoked event type; reduce AAT lease TTL to <15 minutes"
+        resolution: "Add LeaseRevoked event type; enforce short HTF lease window (TIME_TBD)"
       - finding_id: F-SA3-002
         title: "WARN Mode Security Gap"
-        resolution: "Reduce WARN duration to 7 days; exclude sensitive domains from WARN mode"
+        resolution: "Reduce WARN window using HTF time envelope (TIME_TBD); exclude sensitive domains from WARN mode"
       - finding_id: F-SA3-004
         title: "TB-0003 Runtime Enforcement"
         resolution: "Implement network-level policy blocking api.github.com:443 for admission path"
@@ -223,8 +223,8 @@ rfc_design_decisions:
       - id: F-SA3-001
         title: "Lease Revocation Gap"
         severity: MAJOR
-        description: "No LeaseRevoked event type; compromised key valid until TTL"
-        recommendation: "Add LeaseRevoked event; reduce TTL to <15 minutes for AAT"
+        description: "No LeaseRevoked event type; compromised key valid until HTF lease window (TIME_TBD)"
+        recommendation: "Add LeaseRevoked event; enforce short HTF lease window (TIME_TBD)"
         phase_to_resolve: v2
 
       - id: F-SA3-002
@@ -237,8 +237,8 @@ rfc_design_decisions:
       - id: F-SA3-003
         title: "WARN Phase Security Gap"
         severity: MEDIUM
-        description: "14-day WARN phase allows context violation exfiltration"
-        recommendation: "Reduce WARN duration to 7 days maximum"
+        description: "WARN phase without enforcement allows context violation exfiltration; HTF window (TIME_TBD)"
+        recommendation: "Reduce WARN window using HTF time envelope (TIME_TBD)"
         phase_to_resolve: v4
 
     pattern_alignment_scores:
@@ -479,8 +479,8 @@ rfc_design_decisions:
         changeset_digest, policy_hash as additional discriminated fields. Extension point EP-2
         uses existing LeaseReducer pattern.
       decision: |
-        GateLease binds (work_id, gate_id, changeset_digest, executor_actor_id, expiry, policy_hash).
-        Leases are single-use with enforced expiry. Child leases can only narrow scope (subset rule).
+        GateLease binds (work_id, gate_id, changeset_digest, executor_actor_id, expiry_ref, policy_hash).
+        Leases are single-use with enforced HTF expiry. Child leases can only narrow scope (subset rule).
       lease_structure:
         fields:
           - lease_id
@@ -488,8 +488,9 @@ rfc_design_decisions:
           - gate_id
           - changeset_digest
           - executor_actor_id
-          - issued_at
-          - expires_at
+          - issued_at_observed
+          - expires_at_observed
+          - time_envelope_ref
           - policy_hash
           - issuer_actor_id
           - issuer_signature
@@ -503,14 +504,15 @@ rfc_design_decisions:
           fields:
             - lease_id
             - revoked_by
-            - revoked_at
+            - revoked_at_observed
+            - time_envelope_ref
             - reason
             - issuer_signature
-          enforcement: "Admission rejects GateRunCompleted if a LeaseRevoked exists for lease_id with revoked_at <= completed_at"
+          enforcement: "Admission rejects GateRunCompleted if a LeaseRevoked exists for lease_id with HTF time <= completion tick"
         ttl_policy:
-          aat_default: "<= 15 minutes"
-          aat_high_risk: "<= 10 minutes"
-          other_gates: "<= 30 minutes"
+          aat_default: "HTF window (TIME_TBD)"
+          aat_high_risk: "HTF window (TIME_TBD)"
+          other_gates: "HTF window (TIME_TBD)"
       alternatives:
         - id: ALT-0002-A
           name: "Ambient authority with post-hoc audit"
@@ -583,7 +585,7 @@ rfc_design_decisions:
       projection_model:
         write_identity: HOLON-GITHUB-ADAPTER
         idempotence_key: "(work_id, changeset_digest, ledger_head)"
-        poll_interval_seconds: 30
+        poll_interval_htf_ticks: "TIME_TBD"
         on_divergence:
           - "Emit DefectRecord(PROJECTION_DIVERGENCE)"
           - "Emit InterventionFreeze(scope=repo)"
@@ -612,13 +614,20 @@ rfc_design_decisions:
         SA-1 FINALIZE analysis (COUNCIL-RFC-0015-FINALIZE-20260129): Weighted score 4.00/5.0.
         CI conclusions typed as Observation requiring Evidence conversion via attestation.
         Fail-closed default (CI_EVENTS_ENABLED=false) prevents bypass. Q-RFC-FAC-0004
-        deferred to Phase 2 with explicit L0 policy for Phase 1. L0 attestation sufficient
-        for Phase 1 with documented limitations.
+        deferred to Phase 2 with explicit attestation level definitions and minimums.
       decision: |
         CI conclusions are observations, not truth. READY_FOR_REVIEW transition requires:
         (1) webhook signature verified, (2) raw log/artifact digests imported into CAS,
         (3) adapter attestation signed and committed. Plain 'success' conclusion without
         evidence import is ignored (fail-closed).
+        Attestation levels are explicit: L0 (status-only, insufficient), L1 (signed adapter
+        attestation + CAS artifact digests), L2/L3 deferred. Policy maps risk tier to
+        minimum CI attestation level; L0 is rejected when CI gating is enabled.
+      attestation_levels:
+        L0: "status-only (insufficient for readiness gating)"
+        L1: "signed adapter attestation + raw artifact digests in CAS"
+        L2: "replayable verifier proof (deferred)"
+        L3: "measured boot/TPM-backed attestation (deferred)"
       attestation_fields:
         - workflow_run_id
         - downloaded_artifact_hashes
@@ -638,6 +647,7 @@ rfc_design_decisions:
         - "Attestation provides evidence chain for audit"
       requirement_ids:
         - FAC-REQ-0003
+        - FAC-REQ-0118
       confidence: MEDIUM
 
     - id: DD-FAC-0006
@@ -665,7 +675,7 @@ rfc_design_decisions:
         - policy_hash
         - determinism_class
         - determinism_status
-        - flake_class
+        - outcome_class (flake_class field)
         - run_count
         - run_receipt_hashes
         - terminal_evidence_digest
@@ -742,7 +752,7 @@ rfc_design_decisions:
       enforcement: |
         PASS requires predicate satisfied and required outputs present.
         Missing outputs => FAIL or NEEDS_INPUT (policy-defined).
-        verifier_policy_hash MUST match resolved_verifier_policy_hash pinned at FAC-00.
+        verifier_policy_hash MUST be in resolved_verifier_policy_hashes pinned at FAC-00.
       alternatives:
         - id: ALT-0007-A
           name: "Narrative-based acceptance"
@@ -805,17 +815,19 @@ rfc_design_decisions:
       decision: |
         Policy resolution is pinned at FAC-00 ingestion. Admission rejects AAT receipts
         where risk_tier, determinism_class, verifier_policy_hash, or rcp_profile_id are
-        lower than resolved values. Downgrades require explicit waiver.
+        lower than or not included in resolved values. Downgrades require explicit waiver.
       pinned_at_ingest:
         - resolved_policy_hash
         - resolved_risk_tier
         - resolved_determinism_class
-        - resolved_verifier_policy_hash
-        - resolved_rcp_profile_id
+        - resolved_verifier_policy_hashes
+        - resolved_rcp_profile_ids
+        - resolved_rcp_manifest_hashes
       enforcement:
         - "policy_hash MUST equal resolved_policy_hash"
         - "risk_tier MUST NOT be lower than resolved_risk_tier"
-        - "verifier_policy_hash MUST be allowed for resolved_risk_tier"
+        - "verifier_policy_hash MUST be in resolved_verifier_policy_hashes"
+        - "rcp_profile_id MUST be in resolved_rcp_profile_ids and rcp_aat_manifest_hash MUST match resolved_rcp_manifest_hashes"
         - "Downgrades require AdjudicationRequested(WAIVER)"
       alternatives:
         - id: ALT-0009-A
@@ -862,17 +874,17 @@ rfc_design_decisions:
       title: "AAT Flake Classification and Policy Routing"
       status: VALIDATED
       validation_evidence: |
-        PRD-0009 FAC-REQ-0008 defines determinism_class, determinism_status, and flake_class routing.
-        Q-RFC-FAC-0006 defines flake classes for mismatch scenarios.
+        PRD-0009 FAC-REQ-0008 defines determinism_class, determinism_status, and outcome_class routing.
+        Q-RFC-FAC-0006 defines classification for mismatch scenarios.
       decision: |
         AAT GateReceipts MUST record determinism_class, determinism_status (STABLE|MISMATCH),
-        and flake_class. flake_class is used only for mismatch routing:
+        and outcome_class (flake_class field). outcome_class routing:
         HARNESS_FLAKE -> runner pool quarantine, ENVIRONMENT_DRIFT -> attestation invalidation,
         TEST_NONSEMANTIC/CODE_NONSEMANTIC -> spec quarantine, UNKNOWN -> NEEDS_INPUT.
-        Deterministic FAIL is represented by verdict=FAIL with determinism_status=STABLE
-        and flake_class=DETERMINISTIC. No retries may convert UNKNOWN to PASS.
+        Deterministic FAIL is verdict=FAIL with determinism_status=STABLE and
+        outcome_class=DETERMINISTIC_FAIL. No retries may convert UNKNOWN to PASS.
       phase_notes:
-        phase_1: "Record determinism_status and flake_class in receipt payloads."
+        phase_1: "Record determinism_status and outcome_class (flake_class field) in receipt payloads."
         phase_2: "Enforce quarantine routing and audit metrics."
       requirement_ids:
         - FAC-REQ-0008
@@ -909,7 +921,7 @@ rfc_design_decisions:
         PRD-0009 FAC-REQ-0014 requires classification/redaction/retention metadata.
       decision: |
         Evidence artifacts MUST include data classification, redaction metadata, and
-        retention TTL. Admission rejects evidence policy violations.
+        retention window (HTF). Admission rejects evidence policy violations.
       requirement_ids:
         - FAC-REQ-0014
       confidence: MEDIUM
@@ -963,6 +975,58 @@ rfc_design_decisions:
         detection triggers REASONING_DEGENERATION termination and defect emission.
       requirement_ids:
         - FAC-REQ-0021
+      confidence: MEDIUM
+
+    - id: DD-FAC-0019
+      title: "Policy Resolution Anchor Event"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0116 defines PolicyResolvedForChangeSet and admission enforcement.
+      decision: |
+        Emit PolicyResolvedForChangeSet before any lease issuance for the changeset.
+        Admission and lease issuance MUST verify resolved policy tuple match; downgrades
+        require explicit waiver with separate authority.
+      requirement_ids:
+        - FAC-REQ-0116
+      confidence: MEDIUM
+
+    - id: DD-FAC-0020
+      title: "GateReceipt Versioning and Canonicalization"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0119 requires receipt versioning and canonicalization rules.
+      decision: |
+        GateReceipt envelopes carry receipt_version, payload_kind, payload_schema_version,
+        payload_hash, and evidence_bundle_hash. Admission rejects unknown versions in
+        enforce mode; canonicalization is deterministic with no maps and stable ordering.
+      requirement_ids:
+        - FAC-REQ-0119
+      confidence: MEDIUM
+
+    - id: DD-FAC-0021
+      title: "Quarantine Events and Projection"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0117 defines quarantine events and projection-based routing.
+      decision: |
+        RunnerPoolQuarantined and AATSpecQuarantined events update a QuarantineProjection.
+        Selection excludes quarantined targets; quarantine windows use HTF time envelopes
+        (TIME_TBD). Work transitions do not model quarantine state.
+      requirement_ids:
+        - FAC-REQ-0117
+      confidence: MEDIUM
+
+    - id: DD-FAC-0022
+      title: "CI Attestation Levels"
+      status: VALIDATED
+      validation_evidence: |
+        PRD-0009 FAC-REQ-0118 defines L0-L3 levels and minimum enforcement.
+      decision: |
+        Define CI attestation levels: L0 (status-only, insufficient), L1 (signed adapter
+        attestation + CAS artifact digests), L2/L3 deferred. Policy maps risk tier to
+        minimum level; READY_FOR_REVIEW enforces the mapping.
+      requirement_ids:
+        - FAC-REQ-0118
       confidence: MEDIUM
 
   component_mapping:

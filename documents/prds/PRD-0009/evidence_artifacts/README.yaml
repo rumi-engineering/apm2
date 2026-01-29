@@ -45,7 +45,7 @@ evidence_artifacts_readme:
       verifies:
         - "FAC-REQ-0102"
     - id: "EVID-0007"
-      title: "Gate Lease Scope and Expiry Enforcement Tests"
+      title: "Gate Lease Scope and HTF Expiry Enforcement Tests"
       category: "INTEGRATION_TEST_RESULTS"
       file: "EVID-0007.yaml"
       verifies:
@@ -183,7 +183,7 @@ evidence_artifacts_readme:
       verifies:
         - "FAC-REQ-0112"
     - id: "EVID-0030"
-      title: "AAT Evidence Hygiene and Retention Tests"
+      title: "AAT Evidence Hygiene and Retention Window Tests"
       category: "TEST_RESULTS"
       file: "EVID-0030.yaml"
       verifies:
@@ -200,3 +200,27 @@ evidence_artifacts_readme:
       file: "EVID-0032.yaml"
       verifies:
         - "FAC-REQ-0115"
+    - id: "EVID-0033"
+      title: "Policy Resolution Anchor Event Tests"
+      category: "INTEGRATION_TEST_RESULTS"
+      file: "EVID-0033.yaml"
+      verifies:
+        - "FAC-REQ-0116"
+    - id: "EVID-0034"
+      title: "Quarantine Projection and Routing Tests"
+      category: "INTEGRATION_TEST_RESULTS"
+      file: "EVID-0034.yaml"
+      verifies:
+        - "FAC-REQ-0117"
+    - id: "EVID-0035"
+      title: "CI Attestation Level Enforcement Tests"
+      category: "INTEGRATION_TEST_RESULTS"
+      file: "EVID-0035.yaml"
+      verifies:
+        - "FAC-REQ-0118"
+    - id: "EVID-0036"
+      title: "GateReceipt Canonicalization and Versioning Tests"
+      category: "TEST_RESULTS"
+      file: "EVID-0036.yaml"
+      verifies:
+        - "FAC-REQ-0119"

@@ -6,15 +6,16 @@ prd_requirement:
   source_id: "FAC-REQ-0107"
   title: "AAT flake classification and policy routing"
   statement: |
-    AAT outcomes MUST record determinism_status (STABLE|MISMATCH) and flake_class.
-    flake_class is an enum for mismatch classification: DETERMINISTIC, HARNESS_FLAKE,
-    ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, or UNKNOWN. Deterministic FAIL
-    is expressed via verdict=FAIL with determinism_status=STABLE and flake_class=DETERMINISTIC;
-    flake_class MUST NOT be used to represent deterministic failure. Policy routes each
-    class to a specific quarantine or escalation path.
+    AAT outcomes MUST record determinism_status (STABLE|MISMATCH) and outcome_class
+    (stored in payload field flake_class for compatibility). outcome_class is a canonical
+    enum: DETERMINISTIC_FAIL, HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, UNKNOWN
+    (CODE_NONSEMANTIC optional by policy). determinism_status indicates whether a behavioral
+    mismatch occurred; deterministic FAIL is verdict=FAIL with determinism_status=STABLE
+    and outcome_class=DETERMINISTIC_FAIL. Policy routes each class to a specific quarantine
+    or escalation path.
   acceptance_criteria:
-    - "GateReceipt payload includes determinism_class, determinism_status, and flake_class for every AAT run. Verified by: Schema validation test."
-    - "Deterministic FAIL uses verdict=FAIL with determinism_status=STABLE and flake_class=DETERMINISTIC. Verified by: Policy enforcement test."
+    - "GateReceipt payload includes determinism_class, determinism_status, and flake_class when verdict=FAIL or determinism_status=MISMATCH. Verified by: Schema validation test."
+    - "Deterministic FAIL uses verdict=FAIL with determinism_status=STABLE and flake_class=DETERMINISTIC_FAIL. Verified by: Policy enforcement test."
     - "UNKNOWN failures produce NEEDS_INPUT and never PASS via retries. Verified by: Policy enforcement test."
     - "HARNESS_FLAKE triggers runner pool quarantine; TEST_NONSEMANTIC triggers AAT spec quarantine. Verified by: Integration test with quarantine events."
     - "ENVIRONMENT_DRIFT invalidates attestation and blocks until re-pinned environment. Verified by: Attestation drift test."
@@ -32,9 +33,9 @@ prd_requirement:
       applies_to:
         - "GateReceipt payload"
   defect_codes:
-    - code: "DETERMINISTIC"
+    - code: "DETERMINISTIC_FAIL"
       severity: "S3"
-      description: "Deterministic outcome; no mismatch detected"
+      description: "Deterministic FAIL; no mismatch detected"
     - code: "HARNESS_FLAKE"
       severity: "S2"
       description: "Runner/infra nondeterminism detected"

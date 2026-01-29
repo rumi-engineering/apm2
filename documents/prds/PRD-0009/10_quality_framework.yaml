@@ -269,7 +269,7 @@ prd_quality_framework:
         guardrails:
           - Gate execution MUST complete within configured budget duration_ms.
           - RCP compilation MUST complete within bounded latency for consumption mode.
-          - Divergence watchdog poll_interval_seconds MUST be respected.
+          - Divergence watchdog poll_interval_htf_ticks MUST be respected (TIME_TBD).
         required_evidence_categories:
           - BENCHMARK_RESULTS
       exception:

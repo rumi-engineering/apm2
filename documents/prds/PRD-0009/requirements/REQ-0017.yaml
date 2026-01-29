@@ -1,0 +1,36 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0017"
+  type: "SECURITY"
+  source_id: "FAC-REQ-0116"
+  title: "Policy resolution anchor event"
+  statement: |
+    A PolicyResolvedForChangeSet event MUST be committed before any GateLeaseIssued
+    for the same (work_id, changeset_digest). Admission MUST verify that all leases
+    and gate receipts match the resolved policy tuple; downgrades require explicit waiver.
+  acceptance_criteria:
+    - "PolicyResolvedForChangeSet is emitted after policy resolution and before GateLeaseIssued. Verified by: Event ordering test."
+    - "Event includes work_id, changeset_digest, resolved_policy_hash, resolved_risk_tier, resolved_determinism_class, resolved_rcp_profile_ids, resolved_rcp_manifest_hashes, resolved_verifier_policy_hashes, resolver_actor_id, resolver_version, and signature. Verified by: Schema validation test."
+    - "Admission rejects GateLeaseIssued or GateReceipt when no matching PolicyResolvedForChangeSet exists. Verified by: Missing-anchor negative test."
+    - "Admission rejects any policy downgrade without AdjudicationRequested(WAIVER). Verified by: Downgrade-without-waiver test."
+  evidence:
+    evidence_ids:
+      - EVID-0033
+  law_alignment:
+    - law_id: "LAW-01"
+      enforcement: "Receipt-backed admission anchored to resolved policy."
+      applies_to:
+        - "PolicyResolvedForChangeSet"
+        - "GateReceipt"
+    - law_id: "LAW-15"
+      enforcement: "Measurement integrity via pinned policy resolution."
+      applies_to:
+        - "Admission"
+  defect_codes:
+    - code: "POLICY_RESOLUTION_MISSING"
+      severity: "S0"
+      description: "PolicyResolvedForChangeSet missing for changeset"
+    - code: "POLICY_RESOLUTION_MISMATCH"
+      severity: "S0"
+      description: "Lease or receipt does not match resolved policy tuple"

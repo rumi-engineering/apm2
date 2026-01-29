@@ -71,11 +71,19 @@ prd_evidence_bundle:
           artifact_ref: "evidence_artifacts/EVID-0031.yaml#prd_evidence_artifact"
         - evidence_id: "EVID-0032"
           artifact_ref: "evidence_artifacts/EVID-0032.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0033"
+          artifact_ref: "evidence_artifacts/EVID-0033.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0034"
+          artifact_ref: "evidence_artifacts/EVID-0034.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0035"
+          artifact_ref: "evidence_artifacts/EVID-0035.yaml#prd_evidence_artifact"
+        - evidence_id: "EVID-0036"
+          artifact_ref: "evidence_artifacts/EVID-0036.yaml#prd_evidence_artifact"
       imports: []
   collection_policy:
     evidence_freshness:
-      max_age_days: 90
-      refresh_trigger: "policy_change_or_expiry"
+      max_age_htf_ticks: "TIME_TBD"
+      refresh_trigger: "policy_change_or_htf_expiry"
     evidence_retention:
-      minimum_retention_days: 365
-      archive_policy: "compress_after_90_days"
+      minimum_retention_htf_ticks: "TIME_TBD"
+      archive_policy: "compress_after_htf_window (TIME_TBD)"

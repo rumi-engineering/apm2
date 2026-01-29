@@ -12,10 +12,10 @@ prd_goals_scope:
     - id: FAC-G-0002
       statement: Lease-bound gate authority - Gate executors operate under lease-scoped authority that cannot be broadened and expires.
       measurable_outcomes:
-        - GateLease scope is strict with fields (work_id, gate_id, changeset_digest, executor_actor_id, expiry, policy_hash).
+        - GateLease scope is strict with fields (work_id, gate_id, changeset_digest, executor_actor_id, expiry_ref, policy_hash).
         - Lease issuance committed before session spawn (CAS-at-commit ordering).
         - Child leases can only narrow scope (subset rule enforced).
-        - Expired or scope-mismatched leases rejected with LEASE_SCOPE_BROADENED or UNAUTHORIZED_EXECUTOR.
+        - Expired (HTF-enforced) or scope-mismatched leases rejected with LEASE_SCOPE_BROADENED or UNAUTHORIZED_EXECUTOR.
     - id: FAC-G-0003
       statement: OCAP context firewall for consumption holons - Gate executors can only read objects explicitly enumerated in their RCP manifest allowlist.
       measurable_outcomes:
@@ -33,7 +33,7 @@ prd_goals_scope:
     - id: FAC-G-0005
       statement: Divergence detection and emergency stop - External trunk divergence from MergeReceipt truth triggers freeze until adjudication.
       measurable_outcomes:
-        - Divergence watchdog compares external trunk HEAD to latest MergeReceipt result_selector every 30 seconds.
+        - Divergence watchdog compares external trunk HEAD to latest MergeReceipt result_selector at HTF-defined poll interval (TIME_TBD).
         - On divergence, PROJECTION_DIVERGENCE defect emitted and InterventionFreeze(repo) halts admissions.
         - Unfreeze requires AdjudicationResolved(request_type=EMERGENCY_RECOVERY) or emergency_override ceremony.
         - Zero admissions proceed during divergence freeze.
@@ -88,8 +88,8 @@ prd_goals_scope:
     - id: FAC-G-0013
       statement: Flake classification and policy routing - Failures are classified and routed by policy to prevent throughput collapse.
       measurable_outcomes:
-        - GateReceipt payload records determinism_class, determinism_status, and flake_class for AAT runs.
-        - UNKNOWN failures never PASS via retries; NEEDS_INPUT required.
+        - GateReceipt payload records determinism_class, determinism_status, and outcome_class (flake_class field) for AAT failures/mismatches.
+        - DETERMINISTIC_FAIL = verdict=FAIL with determinism_status=STABLE; UNKNOWN never PASS via retries.
         - HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec.
     - id: FAC-G-0014
       statement: Risk-tiered AAT selection - Diff-aware AAT gating preserves throughput while protecting high-risk changes.
@@ -105,7 +105,8 @@ prd_goals_scope:
     - id: FAC-G-0016
       statement: Anti-downgrade enforcement - AAT policy resolution cannot be silently weakened.
       measurable_outcomes:
-        - Resolved risk_tier, determinism_class, verifier_policy_hash, and rcp_profile_id are pinned at FAC start.
+        - Resolved risk_tier, determinism_class, verifier_policy_hashes, and rcp_profile_ids are pinned at FAC start.
+        - PolicyResolvedForChangeSet event is committed before any GateLeaseIssued for the changeset.
         - Admission rejects AAT receipts with policy_hash mismatch or lowered tiers.
         - Downgrades require explicit waiver with separate authority and projection visibility.
     - id: FAC-G-0017
@@ -116,7 +117,7 @@ prd_goals_scope:
     - id: FAC-G-0018
       statement: Evidence hygiene - AAT evidence artifacts are classified, redacted, and retention-bounded.
       measurable_outcomes:
-        - Evidence artifacts include data_classification, redaction metadata, and retention_ttl.
+        - Evidence artifacts include data_classification, redaction metadata, and retention_window_ref (HTF).
         - Admission rejects evidence policy violations.
     - id: FAC-G-0019
       statement: Quorum/audit enforcement - High-risk AAT results require independent verification.
@@ -128,6 +129,18 @@ prd_goals_scope:
       measurable_outcomes:
         - No host mounts beyond pinned snapshot.
         - Network egress is policy-declared and recorded in receipts.
+  time_semantics_deferral:
+    statement: |
+      Time authority is deferred to the Holonic Time Fabric (HTF) RFC (number TBD).
+      No protocol decision (lease expiry, TTLs, retry windows, quarantine windows, admission
+      deadlines, polling cadence) may use wall-clock time as authority.
+      Wall-clock timestamps may appear only as observational metadata in receipts/telemetry.
+    placeholders:
+      - "TIME_TBD (HTF-defined time envelope)"
+      - "HTF::LedgerTime"
+      - "HTF::CausalTime/HLC"
+      - "HTF::MonotonicTicks"
+      - "HTF::BoundedWallTime (observational only)"
   scope:
     in_scope:
       - forge
@@ -186,7 +199,7 @@ prd_goals_scope:
         - Quorum/audit enforcement for HIGH and MED risk tiers.
       definition_of_done:
         - Holdout suite runs on schedule and produces false_negative_rate, finding_precision, gate_evidence_coverage metrics.
-        - Auditor samples 1% of GateRuns (or min 1/day) and detects rationale/evidence drift.
+        - Auditor samples 1% of GateRuns (or min 1 per HTF window) and detects rationale/evidence drift.
         - Affected gate policies are quarantined when drift thresholds exceeded.
         - Determinism envelope rejects nondeterministic gate outcomes and triggers quarantine/abort policy.
     - id: PHASE-3
@@ -201,7 +214,7 @@ prd_goals_scope:
         - Routing decisions recorded with rationale in ToolDecided/ToolExecuted receipts.
   success_criteria_summary:
     - All gate outcomes are cryptographically signed with Ed25519 and verifiable from ledger.
-    - Gate executors operate under lease-scoped authority with expiry and scope enforcement.
+    - Gate executors operate under lease-scoped authority with HTF-enforced expiry and scope enforcement.
     - OCAP context firewall prevents all unauthorized reads during gate execution.
     - GitHub is projection-only; external manipulation does not affect admission.
     - Divergence detection freezes admissions automatically until adjudication.
@@ -216,6 +229,6 @@ prd_goals_scope:
     - AAT specs are invariant-first and machine-verifiable.
     - Anti-downgrade enforcement prevents silent policy weakening.
     - AAT reuse is provenance-bound and replay-safe.
-    - Evidence hygiene enforces classification, redaction, and retention.
+    - Evidence hygiene enforces classification, redaction, and retention windows (HTF).
     - HIGH-risk AAT requires independent quorum receipts.
     - AAT harnesses run in a strict sandbox with deny-by-default egress.

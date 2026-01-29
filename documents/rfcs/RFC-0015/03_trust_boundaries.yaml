@@ -83,6 +83,10 @@ rfc_trust_boundaries:
           enforcement: "Lease validation; UNAUTHORIZED_EXECUTOR rejects"
         - rule: "Lease must not be revoked"
           enforcement: "LeaseRevoked lookup; revoked leases reject GateRunCompleted"
+        - rule: "PolicyResolvedForChangeSet must exist and match leases/receipts"
+          enforcement: "POLICY_RESOLUTION_MISSING or POLICY_RESOLUTION_MISMATCH defect"
+        - rule: "GateReceipt envelope version and payload schema must be known"
+          enforcement: "GATE_RECEIPT_VERSION_UNKNOWN defect on unknown versions"
         - rule: "MergeReceipt emitted only after result_selector observed"
           enforcement: "Atomic merge semantics; MERGE_NONATOMIC defect on failure"
       law_refs:
@@ -177,6 +181,18 @@ rfc_trust_boundaries:
       law_refs:
         - LAW-05
 
+    - boundary_id: TB-0008
+      name: "Quarantine Routing Boundary"
+      description: |
+        Quarantine state is enforced via QuarantineProjection; selection excludes
+        quarantined runner pools and AAT specs.
+      crossing_rules:
+        - rule: "Selection must not target quarantined pools/specs"
+          enforcement: "QuarantineProjection lookup; QUARANTINE_ACTIVE defect"
+      law_refs:
+        - LAW-12
+        - LAW-15
+
   security_controls:
     - id: SEC-CTRL-FAC-0001
       name: "Ed25519 Signature Verification"
@@ -199,7 +215,7 @@ rfc_trust_boundaries:
       type: DETECTIVE
       boundary: TB-0003
       details: |
-        Continuous polling (30s) of external trunk HEAD vs MergeReceipt result_selector.
+        Continuous polling (HTF window, TIME_TBD) of external trunk HEAD vs MergeReceipt result_selector.
         Divergence triggers InterventionFreeze with AdjudicationRequested.
 
     - id: SEC-CTRL-FAC-0010
@@ -216,8 +232,8 @@ rfc_trust_boundaries:
       type: PREVENTATIVE
       boundary: TB-0001
       details: |
-        All leases have mandatory expires_at. GateRunCompleted verification rejects if
-        timestamp exceeds lease expiry.
+        All leases have mandatory time_envelope_ref (HTF). GateRunCompleted verification rejects if
+        HTF time exceeds lease expiry window. Wall-clock timestamps are observational only.
 
     - id: SEC-CTRL-FAC-0011
       name: "Lease Revocation Enforcement"
@@ -227,12 +243,49 @@ rfc_trust_boundaries:
         LeaseRevoked immediately invalidates a lease. Admission verifies no revocation
         exists for lease_id prior to GateRunCompleted acceptance.
 
+    - id: SEC-CTRL-FAC-0012
+      name: "Policy Resolution Anchor Enforcement"
+      type: PREVENTATIVE
+      boundary: TB-0001
+      details: |
+        PolicyResolvedForChangeSet MUST exist before any GateLeaseIssued. Admission verifies
+        resolved_policy_hash, resolved_risk_tier, resolved_determinism_class, resolved_rcp_profile_ids,
+        resolved_rcp_manifest_hashes, and resolved_verifier_policy_hashes match all GateLeaseIssued/GateReceipt
+        payloads. Downgrades
+        require explicit waiver event signed by authority.
+
+    - id: SEC-CTRL-FAC-0013
+      name: "GateReceipt Versioning + Canonicalization"
+      type: PREVENTATIVE
+      boundary: TB-0001
+      details: |
+        GateReceipt payloads are referenced by payload_hash and include receipt_version,
+        payload_kind, and payload_schema_version. Admission rejects unknown versions in enforce
+        mode and verifies canonical_bytes() hashing.
+
+    - id: SEC-CTRL-FAC-0014
+      name: "Quarantine Projection Enforcement"
+      type: PREVENTATIVE
+      boundary: TB-0008
+      details: |
+        QuarantineProjection is authoritative for selection. Quarantined runner pools or
+        AAT specs are excluded from scheduling until QuarantineCleared is committed.
+
+    - id: SEC-CTRL-FAC-0015
+      name: "CI Attestation Level Enforcement"
+      type: PREVENTATIVE
+      boundary: TB-0004
+      details: |
+        CI gating requires attestation level >= policy minimum (L1+). L0 (status-only)
+        is insufficient; fail-closed on missing or downgraded attestation.
+
     - id: SEC-CTRL-FAC-0005
       name: "CI Evidence Attestation"
       type: PREVENTATIVE
       boundary: TB-0004
       details: |
         READY_FOR_REVIEW requires signed adapter attestation with artifact hashes.
+        Attestation levels are explicit; L0 is insufficient when CI gating is enabled.
         Fail-closed on missing evidence.
 
     - id: SEC-CTRL-FAC-0006
@@ -387,5 +440,5 @@ rfc_trust_boundaries:
       - rule: "Keys in same COI group are treated as same actor"
         enforcement: "COI grouping policy under CAC governance"
       - rule: "Waiver requires explicit adjudication"
-        enforcement: "AdjudicationRequested(WAIVER) with bounded scope and TTL"
+        enforcement: "AdjudicationRequested(WAIVER) with bounded scope and HTF time_envelope_ref"
     keypolicy_ref: "FAC-CONTRACT-008"

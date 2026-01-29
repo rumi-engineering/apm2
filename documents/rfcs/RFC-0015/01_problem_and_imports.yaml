@@ -29,6 +29,19 @@ rfc_problem_and_imports:
       - "The existing kernel primitives (ledger, CAS, holonic execution) and CAC infrastructure provide the foundation"
       - "Admission must be impossible to spoof for production-grade agent autonomy"
 
+  time_semantics_deferral:
+    statement: |
+      Time authority is deferred to the Holonic Time Fabric (HTF) RFC (number TBD).
+      No protocol decision (lease expiry, TTLs, retry windows, quarantine windows, admission
+      deadlines, polling cadence) may use wall-clock time as authority.
+      Wall-clock timestamps are permitted only as observational metadata in receipts/telemetry.
+    placeholders:
+      - "TIME_TBD (HTF-defined time envelope)"
+      - "HTF::LedgerTime"
+      - "HTF::CausalTime/HLC"
+      - "HTF::MonotonicTicks"
+      - "HTF::BoundedWallTime (observational only)"
+
   failure_modes:
     - id: FM-0001
       name: "Status spoofing via external forge manipulation"
@@ -94,7 +107,7 @@ rfc_problem_and_imports:
         If external trunk HEAD differs from latest MergeReceipt result_selector, emit
         PROJECTION_DIVERGENCE defect and InterventionFreeze halting admissions.
       acceptance_criteria:
-        - "Divergence watchdog compares external trunk HEAD to MergeReceipt result_selector every 30 seconds"
+        - "Divergence watchdog compares external trunk HEAD to MergeReceipt result_selector at HTF-defined interval (TIME_TBD)"
         - "On divergence, PROJECTION_DIVERGENCE defect emitted and InterventionFreeze(repo) halts admissions"
         - "Unfreeze requires AdjudicationResolved(EMERGENCY_RECOVERY) or emergency override ceremony"
         - "Zero admissions proceed during divergence freeze"
@@ -168,7 +181,7 @@ rfc_problem_and_imports:
         Failures are classified and routed by policy to prevent throughput collapse; UNKNOWN
         failures never PASS via retries.
       acceptance_criteria:
-        - "GateReceipt payload records determinism_class, determinism_status, and flake_class for AAT runs"
+        - "GateReceipt payload records determinism_class, determinism_status, and outcome_class (flake_class field) for AAT failures/mismatches"
         - "UNKNOWN failures never PASS via retries; NEEDS_INPUT required"
         - "HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec"
 
@@ -230,7 +243,7 @@ rfc_problem_and_imports:
         Evidence artifacts are classified, redacted, and retention-bounded; policy violations
         are admission-blocking.
       acceptance_criteria:
-        - "Evidence artifacts include data_classification, redaction metadata, retention_ttl"
+        - "Evidence artifacts include data_classification, redaction metadata, retention_window_ref"
         - "Admission rejects evidence policy violations"
 
     - prd_requirement_id: REQ-0015
@@ -253,6 +266,49 @@ rfc_problem_and_imports:
         - "No host mounts beyond pinned snapshot"
         - "Network egress is policy-declared and recorded in receipts"
 
+    - prd_requirement_id: REQ-0017
+      rfc_local_id: FAC-REQ-0116
+      title: "Policy resolution anchor event"
+      statement: |
+        PolicyResolvedForChangeSet is committed before lease issuance; admission verifies
+        resolved policy tuple matches all leases and receipts.
+      acceptance_criteria:
+        - "PolicyResolvedForChangeSet emitted before GateLeaseIssued for changeset"
+        - "Admission rejects leases/receipts without matching PolicyResolvedForChangeSet"
+        - "Downgrades require AdjudicationRequested(WAIVER)"
+
+    - prd_requirement_id: REQ-0018
+      rfc_local_id: FAC-REQ-0117
+      title: "Quarantine events and projection"
+      statement: |
+        Quarantine is modeled with explicit events and QuarantineProjection; routing excludes
+        quarantined pools/specs.
+      acceptance_criteria:
+        - "RunnerPoolQuarantined/AATSpecQuarantined/QuarantineCleared events are signed"
+        - "QuarantineProjection enforces exclusion from selection"
+        - "Quarantine windows use HTF time_envelope_ref (TIME_TBD)"
+
+    - prd_requirement_id: REQ-0019
+      rfc_local_id: FAC-REQ-0118
+      title: "CI attestation level enforcement"
+      statement: |
+        CI attestation levels L0-L3 are explicit; readiness gating requires minimum level
+        per policy (L1 minimum). L0 is insufficient for gating.
+      acceptance_criteria:
+        - "L0 rejected when CI gating enabled; L1 requires signed attestation + CAS digests"
+        - "Policy maps risk tier to minimum CI attestation level"
+
+    - prd_requirement_id: REQ-0020
+      rfc_local_id: FAC-REQ-0119
+      title: "GateReceipt versioning and canonicalization"
+      statement: |
+        GateReceipt envelope includes explicit versioning and canonicalization; unknown
+        payload kinds/versions are rejected in enforce mode.
+      acceptance_criteria:
+        - "Receipt includes receipt_version, payload_kind, payload_schema_version, payload_hash, evidence_bundle_hash"
+        - "Canonicalization rules are deterministic with stable ordering"
+        - "Unknown versions rejected in enforce mode"
+
   additional_requirements:
     - id: FAC-REQ-0017
       title: "Cryptographically signed gate outcomes"
@@ -273,10 +329,10 @@ rfc_problem_and_imports:
       statement: |
         Gate executors operate under lease-scoped authority that cannot be broadened and expires.
       acceptance_criteria:
-        - "GateLease scope is strict with fields (work_id, gate_id, changeset_digest, executor_actor_id, expiry, policy_hash)"
+        - "GateLease scope is strict with fields (work_id, gate_id, changeset_digest, executor_actor_id, expiry_ref, policy_hash)"
         - "Lease issuance committed before session spawn (CAS-at-commit ordering)"
         - "Child leases can only narrow scope (subset rule enforced)"
-        - "Expired or scope-mismatched leases rejected with LEASE_SCOPE_BROADENED or UNAUTHORIZED_EXECUTOR"
+        - "Expired (HTF-enforced) or scope-mismatched leases rejected with LEASE_SCOPE_BROADENED or UNAUTHORIZED_EXECUTOR"
       law_refs:
         - LAW-05
 
