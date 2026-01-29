@@ -63,12 +63,20 @@
 //! // ... handle incoming connections
 //! ```
 
+pub mod bft;
 pub mod discovery;
 pub mod genesis;
 pub mod network;
 pub mod relay;
 pub mod tunnel;
 
+// BFT consensus (Chained HotStuff)
+pub use bft::{
+    BftError, DEFAULT_ROUND_TIMEOUT, HotStuffConfig, HotStuffConfigBuilder, HotStuffState,
+    MAX_PAYLOAD_SIZE, MAX_QC_SIGNATURES, MAX_VALIDATORS, MIN_ROUND_TIMEOUT, NewView, Phase,
+    Proposal, QuorumCertificate, TIMEOUT_MULTIPLIER, ValidatorId, ValidatorInfo,
+    ValidatorSignature, Vote,
+};
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
 };
