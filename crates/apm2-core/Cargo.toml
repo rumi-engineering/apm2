@@ -93,6 +93,7 @@ clap = { workspace = true, optional = true }
 rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
+x509-cert.workspace = true
 
 # Unix-specific (for TOCTOU mitigation via O_NOFOLLOW)
 [target.'cfg(unix)'.dependencies]

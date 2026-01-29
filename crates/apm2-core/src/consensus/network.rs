@@ -28,6 +28,8 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
+use x509_cert::Certificate;
+use x509_cert::der::Decode;
 use zeroize::Zeroizing;
 
 /// Fixed size for control plane frames (1024 bytes).
@@ -382,7 +384,9 @@ pub struct Connection {
 
 impl Connection {
     /// Creates a new connection wrapper.
-    fn new(stream: TlsStream<TcpStream>, peer_addr: SocketAddr) -> Self {
+    ///
+    /// This is `pub(crate)` to allow the tunnel module to create connections.
+    pub(crate) fn new(stream: TlsStream<TcpStream>, peer_addr: SocketAddr) -> Self {
         Self {
             stream,
             peer_addr,
@@ -394,6 +398,67 @@ impl Connection {
     #[must_use]
     pub const fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
+    }
+
+    /// Returns the Common Name (CN) from the peer's verified TLS certificate.
+    ///
+    /// This method extracts the CN directly from the TLS connection's peer
+    /// certificate chain, providing a mechanically-bound identity that cannot
+    /// be spoofed by callers.
+    ///
+    /// # Security
+    ///
+    /// This method is critical for identity validation (INV-0023). The CN is
+    /// extracted from the peer certificate that was cryptographically verified
+    /// during the TLS handshake, ensuring the identity is bound to the
+    /// connection.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(cn)` if a valid peer certificate with a CN was found
+    /// - `None` if no peer certificates are available or the CN cannot be
+    ///   extracted
+    #[must_use]
+    pub fn peer_common_name(&self) -> Option<String> {
+        // Get peer certificates from the TLS connection
+        let peer_certs = match &self.stream {
+            TlsStream::Client(client_stream) => client_stream.get_ref().1.peer_certificates(),
+            TlsStream::Server(server_stream) => server_stream.get_ref().1.peer_certificates(),
+        }?;
+
+        // Get the first (leaf) certificate
+        let leaf_cert = peer_certs.first()?;
+
+        // Parse the certificate using x509-cert
+        let cert = Certificate::from_der(leaf_cert.as_ref()).ok()?;
+
+        // Extract CN from the subject
+        // Note: SetOfVec doesn't implement IntoIterator for references, so we use
+        // iter()
+        #[allow(clippy::explicit_iter_loop)]
+        for rdn in cert.tbs_certificate.subject.0.iter() {
+            for attr in rdn.0.iter() {
+                // OID for Common Name: 2.5.4.3
+                if attr.oid.to_string() == "2.5.4.3" {
+                    // Try to extract the CN value as a string
+                    if let Ok(cn) = attr
+                        .value
+                        .decode_as::<x509_cert::der::asn1::Utf8StringRef>()
+                    {
+                        return Some(cn.to_string());
+                    }
+                    // Also try PrintableString which is common for CNs
+                    if let Ok(cn) = attr
+                        .value
+                        .decode_as::<x509_cert::der::asn1::PrintableStringRef>()
+                    {
+                        return Some(cn.to_string());
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Sends a control frame with timeout.
@@ -466,6 +531,20 @@ impl Connection {
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.last_used.elapsed() > CONNECTION_IDLE_TIMEOUT
+    }
+
+    /// Splits the connection into read and write halves for concurrent I/O.
+    ///
+    /// This enables sending heartbeats and receiving frames concurrently
+    /// without blocking each other.
+    #[must_use]
+    pub fn into_split(
+        self,
+    ) -> (
+        tokio::io::ReadHalf<TlsStream<TcpStream>>,
+        tokio::io::WriteHalf<TlsStream<TcpStream>>,
+    ) {
+        tokio::io::split(self.stream)
     }
 }
 
