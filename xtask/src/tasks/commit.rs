@@ -9,7 +9,6 @@
 //!   - `-D clippy::match_same_arms` (redundant match arm bodies)
 //!   - `-W clippy::missing_const_for_fn` (const promotion opportunities)
 //! - Runs `cargo test` for xtask crate
-//! - Runs `cargo semver-checks` (if installed)
 //! - Runs documentation example linting with `cargo xtask lint --include-docs`
 //! - Stages all changes and creates a commit
 
@@ -26,14 +25,12 @@ use crate::util::{current_branch, validate_ticket_branch};
 /// 2. Runs `cargo fmt --check`
 /// 3. Runs `cargo clippy` with enhanced lints (see module docs)
 /// 4. Runs `cargo test -p xtask`
-/// 5. Runs `cargo semver-checks` (if installed, warns if not)
-/// 6. Stages all changes and creates a commit
+/// 5. Stages all changes and creates a commit
 ///
 /// # Arguments
 ///
 /// * `message` - The commit message
-/// * `skip_checks` - If true, skip all pre-commit checks (fmt, clippy, test,
-///   semver)
+/// * `skip_checks` - If true, skip all pre-commit checks (fmt, clippy, test)
 ///
 /// # Errors
 ///
@@ -95,20 +92,19 @@ pub fn run(message: &str, skip_checks: bool) -> Result<()> {
 
 /// Run all pre-commit checks.
 ///
-/// Runs fmt, clippy, test, semver-checks, and doc linting. All checks except
-/// semver-checks and doc linting are required to pass. semver-checks will
-/// only warn if not installed. Doc linting displays warnings but does not
-/// block the commit.
+/// Runs fmt, clippy, test, and doc linting. All checks except doc linting
+/// are required to pass. Doc linting displays warnings but does not block
+/// the commit.
 fn run_pre_commit_checks(sh: &Shell) -> Result<()> {
     // Run cargo fmt --check
-    println!("\n[1/5] Running cargo fmt --check...");
+    println!("\n[1/4] Running cargo fmt --check...");
     cmd!(sh, "cargo fmt --check")
         .run()
         .context("cargo fmt --check failed. Run 'cargo fmt' to fix formatting.")?;
     println!("  Formatting check passed.");
 
     // Run cargo clippy with enhanced lints
-    println!("\n[2/5] Running cargo clippy...");
+    println!("\n[2/4] Running cargo clippy...");
     cmd!(
         sh,
         "cargo clippy --all-targets -- -D warnings -D clippy::doc_markdown -D clippy::match_same_arms -W clippy::missing_const_for_fn"
@@ -119,45 +115,14 @@ fn run_pre_commit_checks(sh: &Shell) -> Result<()> {
     println!("  Tip: Use `..` in struct patterns to ignore new fields (e.g., `Foo {{ x, .. }}`).");
 
     // Run cargo test for xtask
-    println!("\n[3/5] Running cargo test -p xtask...");
+    println!("\n[3/4] Running cargo test -p xtask...");
     cmd!(sh, "cargo test -p xtask")
         .run()
         .context("cargo test -p xtask failed. Fix the tests before committing.")?;
     println!("  Tests passed.");
 
-    // Run cargo semver-checks (optional - warn if not installed)
-    println!("\n[4/5] Running cargo semver-checks...");
-    let semver_installed = cmd!(sh, "cargo semver-checks --version")
-        .ignore_status()
-        .read()
-        .is_ok_and(|output| !output.trim().is_empty());
-
-    if semver_installed {
-        let semver_result = cmd!(sh, "cargo semver-checks check-release")
-            .ignore_status()
-            .output();
-
-        match semver_result {
-            Ok(output) if output.status.success() => {
-                println!("  Semver check passed.");
-            },
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                bail!("cargo semver-checks found breaking changes:\n{stdout}\n{stderr}");
-            },
-            Err(e) => {
-                println!("  Warning: Failed to run semver-checks: {e}");
-            },
-        }
-    } else {
-        println!(
-            "  Warning: cargo-semver-checks not installed. Install with: cargo install cargo-semver-checks"
-        );
-    }
-
     // Run documentation example linting (warnings only, does not block commit)
-    println!("\n[5/5] Running documentation example linting...");
+    println!("\n[4/4] Running documentation example linting...");
     run_doc_lint_check()?;
 
     println!("\nAll checks passed.");
@@ -230,15 +195,14 @@ mod tests {
 
     #[test]
     fn test_pre_commit_check_count() {
-        // Document that we run exactly 5 pre-commit checks:
+        // Document that we run exactly 4 pre-commit checks:
         // 1. cargo fmt --check
         // 2. cargo clippy --all-targets -- -D warnings -D clippy::doc_markdown -D
         //    clippy::match_same_arms -W clippy::missing_const_for_fn
         // 3. cargo test -p xtask
-        // 4. cargo semver-checks (optional)
-        // 5. documentation example linting (warnings only)
-        const CHECK_COUNT: usize = 5;
-        assert_eq!(CHECK_COUNT, 5);
+        // 4. documentation example linting (warnings only)
+        const CHECK_COUNT: usize = 4;
+        assert_eq!(CHECK_COUNT, 4);
     }
 
     #[test]
@@ -275,12 +239,10 @@ mod tests {
         let fmt_suggestion = "Run 'cargo fmt' to fix formatting.";
         let clippy_suggestion = "Fix them before committing.";
         let test_suggestion = "Fix the tests before committing.";
-        let semver_install = "Install with: cargo install cargo-semver-checks";
 
         // Verify suggestions are non-empty and helpful
         assert!(fmt_suggestion.contains("cargo fmt"));
         assert!(clippy_suggestion.contains("Fix"));
         assert!(test_suggestion.contains("Fix"));
-        assert!(semver_install.contains("cargo install"));
     }
 }

@@ -42,8 +42,7 @@ pub fn start_ticket(target: Option<&str>, print_path_only: bool) -> Result<()> {
 /// # Arguments
 ///
 /// * `message` - The commit message
-/// * `skip_checks` - If true, skip all pre-commit checks (fmt, clippy, test,
-///   semver)
+/// * `skip_checks` - If true, skip all pre-commit checks (fmt, clippy, test)
 ///
 /// # Errors
 ///
