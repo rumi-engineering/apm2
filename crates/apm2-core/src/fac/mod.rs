@@ -76,6 +76,6 @@ pub use domain_separator::{
 pub use lease::{AatLeaseExtension, GateLease, GateLeaseBuilder, LeaseError};
 // Re-export policy resolution types
 pub use policy_resolution::{
-    MAX_RCP_PROFILES, MAX_VERIFIER_POLICIES, PolicyResolutionError, PolicyResolvedForChangeSet,
-    PolicyResolvedForChangeSetBuilder, PolicyResolvedForChangeSetProto,
+    MAX_RCP_PROFILES, MAX_STRING_LENGTH, MAX_VERIFIER_POLICIES, PolicyResolutionError,
+    PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder, PolicyResolvedForChangeSetProto,
 };

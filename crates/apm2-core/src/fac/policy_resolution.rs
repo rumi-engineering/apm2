@@ -1,3 +1,4 @@
+// AGENT-AUTHORED
 //! Policy resolution types for the Forge Admission Cycle.
 //!
 //! This module defines [`PolicyResolvedForChangeSet`] which is the anchor event
@@ -70,6 +71,10 @@ pub const MAX_RCP_PROFILES: usize = 256;
 
 /// Maximum number of verifier policy hashes allowed in a policy resolution.
 pub const MAX_VERIFIER_POLICIES: usize = 256;
+
+/// Maximum length of any string field in a policy resolution.
+/// This prevents denial-of-service attacks via oversized strings.
+pub const MAX_STRING_LENGTH: usize = 4096;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -156,6 +161,28 @@ pub enum PolicyResolutionError {
         /// The profile ID that was checked.
         profile_id: String,
     },
+
+    /// String field exceeds maximum length.
+    #[error("string field {field} exceeds max length: {actual} > {max}")]
+    StringTooLong {
+        /// Name of the field that exceeded the limit.
+        field: &'static str,
+        /// Actual length of the string.
+        actual: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Duplicate RCP profile ID found.
+    #[error("duplicate rcp_profile_id: {profile_id}")]
+    DuplicateProfileId {
+        /// The duplicate profile ID.
+        profile_id: String,
+    },
+
+    /// Array lengths do not match (safety check for zip truncation).
+    #[error("internal error: array lengths do not match for zip operation")]
+    ArrayLengthMismatch,
 }
 
 // =============================================================================
@@ -284,6 +311,11 @@ impl PolicyResolvedForChangeSet {
     /// Uses length-prefixed encoding (4-byte big-endian u32) for
     /// variable-length strings to prevent canonicalization collision
     /// attacks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rcp_profile_ids.len() != rcp_manifest_hashes.len()`.
+    /// Callers must ensure this invariant is upheld.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Collection sizes are validated by MAX_RCP_PROFILES
     fn compute_policy_hash(
@@ -293,6 +325,13 @@ impl PolicyResolvedForChangeSet {
         rcp_manifest_hashes: &[[u8; 32]],
         verifier_policy_hashes: &[[u8; 32]],
     ) -> [u8; 32] {
+        // Safety: panic if lengths don't match to prevent zip truncation
+        assert_eq!(
+            rcp_profile_ids.len(),
+            rcp_manifest_hashes.len(),
+            "BUG: rcp_profile_ids and rcp_manifest_hashes must have equal lengths"
+        );
+
         let mut hasher = blake3::Hasher::new();
 
         // Risk tier and determinism class
@@ -338,6 +377,12 @@ impl PolicyResolvedForChangeSet {
     /// Uses length-prefixed encoding (4-byte big-endian u32) for
     /// variable-length strings to prevent canonicalization collision
     /// attacks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `resolved_rcp_profile_ids.len() !=
+    /// resolved_rcp_manifest_hashes.len()`. This invariant is enforced
+    /// during construction via builder and proto conversion.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Collection sizes are validated by MAX_RCP_PROFILES
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -368,6 +413,13 @@ impl PolicyResolvedForChangeSet {
             + 4 + self.resolver_version.len();
 
         let mut bytes = Vec::with_capacity(capacity);
+
+        // Safety: assert lengths match to prevent zip truncation
+        assert_eq!(
+            self.resolved_rcp_profile_ids.len(),
+            self.resolved_rcp_manifest_hashes.len(),
+            "BUG: rcp_profile_ids and rcp_manifest_hashes must have equal lengths"
+        );
 
         // 1. work_id (length-prefixed)
         bytes.extend_from_slice(&(self.work_id.len() as u32).to_be_bytes());
@@ -703,6 +755,11 @@ impl PolicyResolvedForChangeSetBuilder {
     /// different lengths.
     /// Returns [`PolicyResolutionError::CollectionTooLarge`] if any collection
     /// exceeds resource limits.
+    /// Returns [`PolicyResolutionError::StringTooLong`] if any string field
+    /// exceeds the maximum length.
+    /// Returns [`PolicyResolutionError::DuplicateProfileId`] if there are
+    /// duplicate profile IDs.
+    #[allow(clippy::too_many_lines)]
     pub fn try_build_and_sign(
         self,
         signer: &crate::crypto::Signer,
@@ -744,6 +801,47 @@ impl PolicyResolvedForChangeSetBuilder {
                 actual: self.resolved_verifier_policy_hashes.len(),
                 max: MAX_VERIFIER_POLICIES,
             });
+        }
+
+        // Validate string lengths
+        if self.work_id.len() > MAX_STRING_LENGTH {
+            return Err(PolicyResolutionError::StringTooLong {
+                field: "work_id",
+                actual: self.work_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if resolver_actor_id.len() > MAX_STRING_LENGTH {
+            return Err(PolicyResolutionError::StringTooLong {
+                field: "resolver_actor_id",
+                actual: resolver_actor_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if resolver_version.len() > MAX_STRING_LENGTH {
+            return Err(PolicyResolutionError::StringTooLong {
+                field: "resolver_version",
+                actual: resolver_version.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+
+        // Check for duplicate profile IDs
+        for (i, id) in self.resolved_rcp_profile_ids.iter().enumerate() {
+            if id.len() > MAX_STRING_LENGTH {
+                return Err(PolicyResolutionError::StringTooLong {
+                    field: "resolved_rcp_profile_ids",
+                    actual: id.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            for (j, other_id) in self.resolved_rcp_profile_ids.iter().enumerate() {
+                if i != j && id == other_id {
+                    return Err(PolicyResolutionError::DuplicateProfileId {
+                        profile_id: id.clone(),
+                    });
+                }
+            }
         }
 
         // Zip profile IDs with manifest hashes, sort by ID, then unzip
@@ -839,6 +937,7 @@ pub struct PolicyResolvedForChangeSetProto {
 impl TryFrom<PolicyResolvedForChangeSetProto> for PolicyResolvedForChangeSet {
     type Error = PolicyResolutionError;
 
+    #[allow(clippy::too_many_lines)]
     fn try_from(proto: PolicyResolvedForChangeSetProto) -> Result<Self, Self::Error> {
         // Validate resource limits on repeated fields FIRST to prevent DoS
         if proto.resolved_rcp_profile_ids.len() > MAX_RCP_PROFILES {
@@ -869,6 +968,46 @@ impl TryFrom<PolicyResolvedForChangeSetProto> for PolicyResolvedForChangeSet {
                 profile_count: proto.resolved_rcp_profile_ids.len(),
                 hash_count: proto.resolved_rcp_manifest_hashes.len(),
             });
+        }
+
+        // Validate string lengths to prevent DoS
+        if proto.work_id.len() > MAX_STRING_LENGTH {
+            return Err(PolicyResolutionError::StringTooLong {
+                field: "work_id",
+                actual: proto.work_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if proto.resolver_actor_id.len() > MAX_STRING_LENGTH {
+            return Err(PolicyResolutionError::StringTooLong {
+                field: "resolver_actor_id",
+                actual: proto.resolver_actor_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if proto.resolver_version.len() > MAX_STRING_LENGTH {
+            return Err(PolicyResolutionError::StringTooLong {
+                field: "resolver_version",
+                actual: proto.resolver_version.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        for (i, id) in proto.resolved_rcp_profile_ids.iter().enumerate() {
+            if id.len() > MAX_STRING_LENGTH {
+                return Err(PolicyResolutionError::StringTooLong {
+                    field: "resolved_rcp_profile_ids",
+                    actual: id.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            // Check for duplicates (O(n^2) but n is bounded by MAX_RCP_PROFILES=256)
+            for (j, other_id) in proto.resolved_rcp_profile_ids.iter().enumerate() {
+                if i != j && id == other_id {
+                    return Err(PolicyResolutionError::DuplicateProfileId {
+                        profile_id: id.clone(),
+                    });
+                }
+            }
         }
 
         let changeset_digest: [u8; 32] = proto.changeset_digest.try_into().map_err(|_| {
@@ -1722,5 +1861,101 @@ pub mod tests {
 
         // Canonical bytes should be different
         assert_ne!(resolution1.canonical_bytes(), resolution2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_duplicate_profile_id_rejected() {
+        let signer = Signer::generate();
+
+        let result = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .resolved_rcp_profile_ids(vec![
+                "profile-a".to_string(),
+                "profile-a".to_string(), // Duplicate
+            ])
+            .resolved_rcp_manifest_hashes(vec![[0xAA; 32], [0xBB; 32]])
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::DuplicateProfileId { .. })
+        ));
+    }
+
+    #[test]
+    fn test_string_too_long_rejected() {
+        let signer = Signer::generate();
+        let long_string = "x".repeat(MAX_STRING_LENGTH + 1);
+
+        let result = PolicyResolvedForChangeSetBuilder::new(long_string, [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::StringTooLong {
+                field: "work_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_proto_duplicate_profile_id_rejected() {
+        let proto = PolicyResolvedForChangeSetProto {
+            work_id: "work-001".to_string(),
+            changeset_digest: vec![0x42; 32],
+            resolved_policy_hash: vec![0x00; 32],
+            resolved_risk_tier: 0,
+            resolved_determinism_class: 0,
+            resolved_rcp_profile_ids: vec![
+                "profile-a".to_string(),
+                "profile-a".to_string(), // Duplicate
+            ],
+            resolved_rcp_manifest_hashes: vec![vec![0x00; 32], vec![0x11; 32]],
+            resolved_verifier_policy_hashes: vec![],
+            resolver_actor_id: "resolver-001".to_string(),
+            resolver_version: "1.0.0".to_string(),
+            resolver_signature: vec![0u8; 64],
+        };
+
+        let result = PolicyResolvedForChangeSet::try_from(proto);
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::DuplicateProfileId { .. })
+        ));
+    }
+
+    #[test]
+    fn test_proto_string_too_long_rejected() {
+        let long_string = "x".repeat(MAX_STRING_LENGTH + 1);
+        let proto = PolicyResolvedForChangeSetProto {
+            work_id: long_string,
+            changeset_digest: vec![0x42; 32],
+            resolved_policy_hash: vec![0x00; 32],
+            resolved_risk_tier: 0,
+            resolved_determinism_class: 0,
+            resolved_rcp_profile_ids: vec![],
+            resolved_rcp_manifest_hashes: vec![],
+            resolved_verifier_policy_hashes: vec![],
+            resolver_actor_id: "resolver-001".to_string(),
+            resolver_version: "1.0.0".to_string(),
+            resolver_signature: vec![0u8; 64],
+        };
+
+        let result = PolicyResolvedForChangeSet::try_from(proto);
+        assert!(matches!(
+            result,
+            Err(PolicyResolutionError::StringTooLong {
+                field: "work_id",
+                ..
+            })
+        ));
     }
 }

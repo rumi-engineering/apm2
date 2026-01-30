@@ -1,3 +1,4 @@
+// AGENT-AUTHORED
 //! Gate lease types for the Forge Admission Cycle.
 //!
 //! This module defines [`GateLease`] which represents a cryptographically
