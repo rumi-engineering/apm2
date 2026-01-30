@@ -74,6 +74,8 @@ use super::event::create_policy_violation_event;
 use super::parser::LoadedPolicy;
 use super::schema::{Decision, Rule, RuleType};
 use crate::budget::BudgetTracker;
+use crate::context::ContextPackManifest;
+use crate::context::firewall::{ContextAwareValidator, ContextFirewallError, FirewallMode};
 use crate::events::{PolicyEvent, ToolDecided};
 use crate::tool::{ToolRequest, tool_request};
 
@@ -83,8 +85,16 @@ pub const DEFAULT_DENY_RULE_ID: &str = "DEFAULT_DENY";
 /// Rule ID used when a request is denied due to budget exceeded.
 pub const BUDGET_EXCEEDED_RULE_ID: &str = "BUDGET_EXCEEDED";
 
+/// Rule ID used when a request is denied due to context miss (not in manifest
+/// allowlist).
+pub const CONTEXT_MISS_RULE_ID: &str = "CONTEXT_MISS";
+
 /// Rationale code for default-deny decisions.
 pub const DEFAULT_DENY_RATIONALE: &str = "NO_MATCHING_RULE";
+
+/// Rationale code for context miss decisions (file read not in manifest
+/// allowlist).
+pub const CONTEXT_MISS_RATIONALE: &str = "NOT_IN_MANIFEST_ALLOWLIST";
 
 /// The policy evaluation engine.
 ///
@@ -217,6 +227,142 @@ impl PolicyEngine {
 
         // Budget OK - proceed with normal policy evaluation
         self.evaluate(request)
+    }
+
+    /// Evaluates a file read request against a manifest allowlist for CONSUME
+    /// mode.
+    ///
+    /// This method enforces the context firewall for CONSUME mode sessions by
+    /// validating file reads against the manifest allowlist. If the path is not
+    /// in the manifest, the request is denied with `CONTEXT_MISS`.
+    ///
+    /// # CONSUME Mode Context Firewall
+    ///
+    /// Per RFC-0015 (FAC), CONSUME mode sessions are constrained to read only
+    /// files explicitly listed in the context pack manifest. This prevents
+    /// information leakage outside the declared context.
+    ///
+    /// # Flow
+    ///
+    /// 1. Extract path from `FileRead` request
+    /// 2. Validate against manifest using `ContextAwareValidator`
+    /// 3. On DENY in `HardFail` mode: return `CONTEXT_MISS` with
+    ///    `should_terminate_session: true`
+    /// 4. On ALLOW: proceed with normal policy evaluation
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The tool request (must be a `FileRead` for manifest
+    ///   checking)
+    /// * `manifest` - The context pack manifest defining allowed files
+    /// * `mode` - The firewall enforcement mode
+    ///
+    /// # Returns
+    ///
+    /// A `ManifestEvaluationResult` indicating:
+    /// - `Allowed`: File is in manifest, proceed with policy evaluation
+    /// - `ContextMiss`: File is not in manifest, session should be terminated
+    /// - `NotApplicable`: Request is not a `FileRead` (skip manifest check)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use apm2_core::policy::PolicyEngine;
+    /// use apm2_core::context::{ContextPackManifest, firewall::FirewallMode};
+    ///
+    /// let engine = PolicyEngine::new(&policy);
+    /// let result = engine.evaluate_with_manifest(&request, &manifest, FirewallMode::HardFail);
+    ///
+    /// match result {
+    ///     ManifestEvaluationResult::ContextMiss { path, manifest_id, .. } => {
+    ///         // Emit SessionTerminated with CONTEXT_MISS rationale
+    ///         // Emit ContextRefinementRequest to coordinator
+    ///     },
+    ///     ManifestEvaluationResult::Allowed => {
+    ///         // Proceed with normal policy evaluation
+    ///     },
+    ///     ManifestEvaluationResult::NotApplicable => {
+    ///         // Not a FileRead, skip manifest check
+    ///     },
+    /// }
+    /// ```
+    #[must_use]
+    pub fn evaluate_with_manifest(
+        &self,
+        request: &ToolRequest,
+        manifest: &ContextPackManifest,
+        mode: FirewallMode,
+    ) -> ManifestEvaluationResult {
+        // Only check manifest for FileRead requests in consumption mode
+        if !request.consumption_mode {
+            return ManifestEvaluationResult::NotApplicable;
+        }
+
+        let Some(tool) = &request.tool else {
+            return ManifestEvaluationResult::NotApplicable;
+        };
+
+        // Extract path from FileRead
+        let path = match tool {
+            tool_request::Tool::FileRead(read) => &read.path,
+            _ => return ManifestEvaluationResult::NotApplicable,
+        };
+
+        // Create firewall and validate
+        let firewall = crate::context::firewall::DefaultContextFirewall::new(manifest, mode);
+
+        match firewall.validate_read(path, None) {
+            Ok(_) => ManifestEvaluationResult::Allowed,
+            Err(ContextFirewallError::AccessDenied {
+                path,
+                reason,
+                event,
+                should_terminate_session,
+            }) => ManifestEvaluationResult::ContextMiss {
+                path,
+                manifest_id: manifest.manifest_id.clone(),
+                reason,
+                should_terminate_session,
+                firewall_event: Some(event),
+            },
+            Err(ContextFirewallError::PathTooLong { actual, max }) => {
+                ManifestEvaluationResult::ContextMiss {
+                    path: path.clone(),
+                    manifest_id: manifest.manifest_id.clone(),
+                    reason: format!("path too long: {actual} > {max}"),
+                    should_terminate_session: mode == FirewallMode::HardFail,
+                    firewall_event: None,
+                }
+            },
+            Err(ContextFirewallError::InvalidPath(e)) => ManifestEvaluationResult::ContextMiss {
+                path: path.clone(),
+                manifest_id: manifest.manifest_id.clone(),
+                reason: format!("invalid path: {e}"),
+                should_terminate_session: mode == FirewallMode::HardFail,
+                firewall_event: None,
+            },
+            Err(e) => ManifestEvaluationResult::ContextMiss {
+                path: path.clone(),
+                manifest_id: manifest.manifest_id.clone(),
+                reason: e.to_string(),
+                should_terminate_session: mode == FirewallMode::HardFail,
+                firewall_event: e.event().cloned(),
+            },
+        }
+    }
+
+    /// Creates a `CONTEXT_MISS` denial result.
+    ///
+    /// This is a convenience method for creating a denial result when a file
+    /// read is not in the manifest allowlist.
+    #[must_use]
+    pub fn context_miss_result(&self, path: &str, manifest_id: &str) -> EvaluationResult {
+        EvaluationResult::denied(
+            CONTEXT_MISS_RULE_ID.to_string(),
+            CONTEXT_MISS_RATIONALE.to_string(),
+            self.policy.content_hash,
+            format!("File read denied: path '{path}' not in manifest allowlist '{manifest_id}'"),
+        )
     }
 
     /// Evaluates a single rule against a tool request.
@@ -600,6 +746,92 @@ impl EvaluationResult {
             self.rule_id.clone(),
             self.message.clone(),
         ))
+    }
+}
+
+/// Result of evaluating a file read request against a manifest allowlist.
+///
+/// This enum represents the outcome of manifest-aware evaluation for CONSUME
+/// mode sessions. The context firewall uses this to determine whether a file
+/// read should proceed or trigger a `CONTEXT_MISS` termination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestEvaluationResult {
+    /// File is in the manifest allowlist; proceed with normal policy
+    /// evaluation.
+    Allowed,
+
+    /// Request is not a `FileRead` or not in consumption mode; skip manifest
+    /// check.
+    NotApplicable,
+
+    /// File is not in the manifest allowlist; session should be terminated.
+    ///
+    /// Per RFC-0015: When a CONSUME mode session attempts to read a file not
+    /// in the manifest, the session must be terminated with `CONTEXT_MISS`
+    /// rationale, and a `ContextRefinementRequest` should be emitted to the
+    /// coordinator.
+    ContextMiss {
+        /// The path that was attempted.
+        path: String,
+        /// The manifest ID for audit traceability.
+        manifest_id: String,
+        /// Human-readable reason for the denial.
+        reason: String,
+        /// Whether the session should be terminated (true for `HardFail` mode).
+        should_terminate_session: bool,
+        /// The firewall decision event for audit logging.
+        firewall_event: Option<crate::context::firewall::FirewallDecision>,
+    },
+}
+
+impl ManifestEvaluationResult {
+    /// Returns `true` if the file access is allowed.
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+
+    /// Returns `true` if this is a context miss (file not in manifest).
+    #[must_use]
+    pub const fn is_context_miss(&self) -> bool {
+        matches!(self, Self::ContextMiss { .. })
+    }
+
+    /// Returns `true` if the check was not applicable (not a `FileRead` or not
+    /// consumption mode).
+    #[must_use]
+    pub const fn is_not_applicable(&self) -> bool {
+        matches!(self, Self::NotApplicable)
+    }
+
+    /// Returns `true` if the session should be terminated.
+    #[must_use]
+    pub const fn should_terminate_session(&self) -> bool {
+        match self {
+            Self::ContextMiss {
+                should_terminate_session,
+                ..
+            } => *should_terminate_session,
+            _ => false,
+        }
+    }
+
+    /// Returns the path if this is a context miss.
+    #[must_use]
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::ContextMiss { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Returns the manifest ID if this is a context miss.
+    #[must_use]
+    pub fn manifest_id(&self) -> Option<&str> {
+        match self {
+            Self::ContextMiss { manifest_id, .. } => Some(manifest_id),
+            _ => None,
+        }
     }
 }
 

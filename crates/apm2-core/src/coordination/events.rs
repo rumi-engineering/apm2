@@ -80,6 +80,9 @@ pub const EVENT_TYPE_COMPLETED: &str = "coordination.completed";
 /// Event type constant for coordination aborted.
 pub const EVENT_TYPE_ABORTED: &str = "coordination.aborted";
 
+/// Event type constant for context refinement request.
+pub const EVENT_TYPE_CONTEXT_REFINEMENT: &str = "coordination.context_refinement_request";
+
 /// Payload for `coordination.started` events.
 ///
 /// Emitted when a coordination begins processing its work queue.
@@ -400,6 +403,111 @@ impl CoordinationAborted {
     }
 }
 
+/// Payload for `coordination.context_refinement_request` events.
+///
+/// Emitted when a CONSUME mode session is terminated due to a `CONTEXT_MISS`.
+/// This signals to the coordinator that the context pack needs to be refined
+/// to include the missing file.
+///
+/// # RFC-0015: FAC Context Refinement Flow
+///
+/// When a CONSUME mode session attempts to read a file not in the manifest:
+/// 1. Session is terminated with `CONTEXT_MISS` rationale
+/// 2. Coordinator receives this `ContextRefinementRequest`
+/// 3. Coordinator reissues the work with a refined context pack
+///
+/// The refinement loop continues until:
+/// - The context pack includes all needed files, or
+/// - A maximum refinement count is reached, or
+/// - The coordinator determines the request is invalid
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextRefinementRequest {
+    /// Session ID that was terminated.
+    pub session_id: String,
+
+    /// Coordination ID (if bound to a coordination).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coordination_id: Option<String>,
+
+    /// Work item ID that was being processed.
+    pub work_id: String,
+
+    /// The manifest ID that was in use.
+    pub manifest_id: String,
+
+    /// The path that triggered the context miss.
+    pub missed_path: String,
+
+    /// The rationale code from the session termination.
+    pub rationale_code: String,
+
+    /// Number of refinement attempts so far for this work item.
+    pub refinement_count: u32,
+
+    /// Timestamp when the context miss occurred (nanoseconds since epoch).
+    pub timestamp: u64,
+}
+
+impl ContextRefinementRequest {
+    /// Creates a new context refinement request.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        session_id: String,
+        coordination_id: Option<String>,
+        work_id: String,
+        manifest_id: String,
+        missed_path: String,
+        rationale_code: String,
+        refinement_count: u32,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            session_id,
+            coordination_id,
+            work_id,
+            manifest_id,
+            missed_path,
+            rationale_code,
+            refinement_count,
+            timestamp,
+        }
+    }
+
+    /// Creates a context refinement request from a context miss result.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID that was terminated
+    /// * `coordination_id` - The coordination ID (if applicable)
+    /// * `work_id` - The work item ID
+    /// * `manifest_id` - The manifest ID from the context miss
+    /// * `missed_path` - The path that was not in the manifest
+    /// * `refinement_count` - The number of refinement attempts so far
+    /// * `timestamp` - The timestamp in nanoseconds since epoch
+    #[must_use]
+    pub fn from_context_miss(
+        session_id: impl Into<String>,
+        coordination_id: Option<String>,
+        work_id: impl Into<String>,
+        manifest_id: impl Into<String>,
+        missed_path: impl Into<String>,
+        refinement_count: u32,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            coordination_id,
+            work_id: work_id.into(),
+            manifest_id: manifest_id.into(),
+            missed_path: missed_path.into(),
+            rationale_code: "CONTEXT_MISS".to_string(),
+            refinement_count,
+            timestamp,
+        }
+    }
+}
+
 /// Coordination event enum.
 ///
 /// Contains all coordination event variants as a tagged union for
@@ -431,6 +539,10 @@ pub enum CoordinationEvent {
     /// Coordination aborted.
     #[serde(rename = "coordination.aborted")]
     Aborted(CoordinationAborted),
+
+    /// Context refinement request (CONSUME mode context miss).
+    #[serde(rename = "coordination.context_refinement_request")]
+    ContextRefinementRequest(ContextRefinementRequest),
 }
 
 impl CoordinationEvent {
@@ -443,10 +555,15 @@ impl CoordinationEvent {
             Self::SessionUnbound(_) => EVENT_TYPE_SESSION_UNBOUND,
             Self::Completed(_) => EVENT_TYPE_COMPLETED,
             Self::Aborted(_) => EVENT_TYPE_ABORTED,
+            Self::ContextRefinementRequest(_) => EVENT_TYPE_CONTEXT_REFINEMENT,
         }
     }
 
     /// Returns the coordination ID for this event.
+    ///
+    /// Note: For `ContextRefinementRequest`, returns an empty string if no
+    /// coordination ID was set (the session may not be bound to a
+    /// coordination).
     #[must_use]
     pub fn coordination_id(&self) -> &str {
         match self {
@@ -455,6 +572,7 @@ impl CoordinationEvent {
             Self::SessionUnbound(e) => &e.coordination_id,
             Self::Completed(e) => &e.coordination_id,
             Self::Aborted(e) => &e.coordination_id,
+            Self::ContextRefinementRequest(e) => e.coordination_id.as_deref().unwrap_or(""),
         }
     }
 
