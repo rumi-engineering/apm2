@@ -269,8 +269,12 @@ impl ConsumeSessionHandler {
             Ok(_) => Ok(()),
             Err(e) => {
                 let reason = e.to_string();
+                // SECURITY: Truncate path BEFORE creating the error to prevent
+                // local DoS via oversized paths in error variants. The truncation
+                // is applied at the earliest entry point before any String
+                // allocation of untrusted input.
                 Err(ConsumeSessionError::ContextMiss {
-                    path: path.to_string(),
+                    path: ContextRefinementRequest::truncate_path_str(path),
                     manifest_id: self.context.manifest_id().to_string(),
                     reason,
                 })
@@ -433,11 +437,15 @@ pub fn validate_tool_request(
     let firewall = DefaultContextFirewall::new(manifest, mode);
     match firewall.validate_read(path, None) {
         Ok(_) => Ok(()),
-        Err(e) => Err(ConsumeSessionError::ContextMiss {
-            path: path.clone(),
-            manifest_id: manifest.manifest_id.clone(),
-            reason: e.to_string(),
-        }),
+        Err(e) => {
+            // SECURITY: Truncate path BEFORE creating the error to prevent
+            // local DoS via oversized paths in error variants.
+            Err(ConsumeSessionError::ContextMiss {
+                path: ContextRefinementRequest::truncate_path_str(path),
+                manifest_id: manifest.manifest_id.clone(),
+                reason: e.to_string(),
+            })
+        },
     }
 }
 
