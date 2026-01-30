@@ -70,6 +70,7 @@
 #[allow(
     clippy::derive_partial_eq_without_eq,
     clippy::doc_markdown,
+    clippy::large_enum_variant,
     clippy::match_single_binding,
     clippy::redundant_closure,
     clippy::struct_field_names,
