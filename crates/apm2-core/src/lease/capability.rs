@@ -392,9 +392,9 @@ impl Capability {
 ///
 /// The `event_hash` must be cryptographically bound to the metadata fields
 /// (`capability_id`, `holder_actor_id`, `delegator_actor_id`, `scope_hash`,
-/// `namespace`, `expires_at`). Use [`DelegationChainEntry::compute_event_hash`]
-/// to compute the canonical hash and
-/// [`DelegationChainEntry::verify_event_hash_binding`] to verify binding.
+/// `budget_hash`, `namespace`, `expires_at`). Use
+/// [`DelegationChainEntry::compute_event_hash`] to compute the canonical hash
+/// and [`DelegationChainEntry::verify_event_hash_binding`] to verify binding.
 ///
 /// **HIGH-02 (Chain Continuity)**: The `delegator_actor_id` field ensures that
 /// the delegation chain is cryptographically continuous. Each entry's
@@ -427,6 +427,15 @@ pub struct DelegationChainEntry {
     /// Hash of the serialized scope at this level.
     pub scope_hash: Vec<u8>,
 
+    /// Hash of the serialized budget at this level (may be empty).
+    ///
+    /// # Security (HIGH-02)
+    ///
+    /// This field MUST be included in the event hash computation to
+    /// cryptographically bind the budget to the delegation.
+    #[serde(default)]
+    pub budget_hash: Vec<u8>,
+
     /// Expiration time for this entry (Unix nanos).
     pub expires_at: u64,
 
@@ -447,25 +456,27 @@ impl DelegationChainEntry {
     ///
     /// The hash is computed over the canonical serialization of:
     /// `capability_id || holder_actor_id || delegator_actor_id || namespace ||
-    /// scope_hash || expires_at || depth`
+    /// scope_hash || budget_hash || expires_at || depth`
     ///
     /// This ensures that all metadata is cryptographically bound to the hash
     /// that is signed, preventing metadata substitution attacks.
     ///
     /// # Security (HIGH-02)
     ///
-    /// The `delegator_actor_id` is included in the hash to cryptographically
-    /// bind the delegation chain. This prevents an attacker from creating a
-    /// fake chain where `entry[i]` claims to be delegated from a different
-    /// actor than `entry[i-1]`'s holder.
+    /// The `delegator_actor_id` and `budget_hash` are included in the hash to
+    /// cryptographically bind the delegation chain and budget. This prevents
+    /// an attacker from creating a fake chain where `entry[i]` claims to be
+    /// delegated from a different actor than `entry[i-1]`'s holder, or from
+    /// substituting a different budget.
     #[must_use]
     pub fn compute_event_hash(&self) -> Vec<u8> {
-        Self::compute_event_hash_from_parts_with_delegator(
+        Self::compute_event_hash_from_parts_with_delegator_and_budget(
             &self.capability_id,
             &self.holder_actor_id,
             &self.delegator_actor_id,
             &self.namespace,
             &self.scope_hash,
+            &self.budget_hash,
             self.expires_at,
             self.depth,
         )
@@ -534,9 +545,12 @@ impl DelegationChainEntry {
 
     /// Computes the event hash from individual fields with delegator binding.
     ///
-    /// This is the secure version that includes `delegator_actor_id` in the
-    /// hash computation, which cryptographically binds the delegation chain
-    /// (HIGH-02 fix).
+    /// # Deprecated
+    ///
+    /// This method is deprecated because it does not include `budget_hash` in
+    /// the hash computation. Use
+    /// [`Self::compute_event_hash_from_parts_with_delegator_and_budget`]
+    /// instead.
     ///
     /// # Arguments
     ///
@@ -544,6 +558,10 @@ impl DelegationChainEntry {
     ///   root grants, this should be the registrar identifier (e.g.,
     ///   "_registrar_" or the actual registrar actor ID).
     #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "Use compute_event_hash_from_parts_with_delegator_and_budget for secure budget binding"
+    )]
     #[allow(clippy::cast_possible_truncation)] // ID lengths are bounded by MAX_ID_LEN (128)
     #[allow(clippy::too_many_arguments)]
     pub fn compute_event_hash_from_parts_with_delegator(
@@ -552,6 +570,45 @@ impl DelegationChainEntry {
         delegator_actor_id: &str,
         namespace: &str,
         scope_hash: &[u8],
+        expires_at: u64,
+        depth: u32,
+    ) -> Vec<u8> {
+        // Delegate to new method with empty budget_hash for backward compatibility
+        Self::compute_event_hash_from_parts_with_delegator_and_budget(
+            capability_id,
+            holder_actor_id,
+            delegator_actor_id,
+            namespace,
+            scope_hash,
+            &[], // empty budget_hash for backward compatibility
+            expires_at,
+            depth,
+        )
+    }
+
+    /// Computes the event hash from individual fields with delegator and budget
+    /// binding.
+    ///
+    /// This is the fully secure version that includes both `delegator_actor_id`
+    /// and `budget_hash` in the hash computation, cryptographically binding
+    /// both the delegation chain and budget constraints.
+    ///
+    /// # Arguments
+    ///
+    /// * `delegator_actor_id` - The actor who delegated this capability. For
+    ///   root grants, this should be the registrar identifier (e.g.,
+    ///   "_registrar_" or the actual registrar actor ID).
+    /// * `budget_hash` - Hash of the serialized budget (may be empty).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // ID lengths are bounded by MAX_ID_LEN (128)
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_event_hash_from_parts_with_delegator_and_budget(
+        capability_id: &str,
+        holder_actor_id: &str,
+        delegator_actor_id: &str,
+        namespace: &str,
+        scope_hash: &[u8],
+        budget_hash: &[u8],
         expires_at: u64,
         depth: u32,
     ) -> Vec<u8> {
@@ -578,6 +635,10 @@ impl DelegationChainEntry {
         // scope_hash (length-prefixed)
         data.extend_from_slice(&(scope_hash.len() as u32).to_le_bytes());
         data.extend_from_slice(scope_hash);
+
+        // HIGH-02: budget_hash (length-prefixed) - cryptographically binds budget
+        data.extend_from_slice(&(budget_hash.len() as u32).to_le_bytes());
+        data.extend_from_slice(budget_hash);
 
         // expires_at (fixed size)
         data.extend_from_slice(&expires_at.to_le_bytes());
@@ -674,10 +735,20 @@ pub struct CapabilityProof {
 impl CapabilityProof {
     /// Creates a new capability proof for a root capability (no delegation).
     ///
+    /// # Deprecated
+    ///
+    /// This method is deprecated because it does not accept
+    /// `delegator_actor_id` which is required for proper event hash binding
+    /// verification. Use [`Self::new_root_with_delegator`] instead.
+    ///
     /// The `root_event_hash` should be computed using
-    /// [`DelegationChainEntry::compute_event_hash_from_parts_with_delegator`]
+    /// [`DelegationChainEntry::compute_event_hash_from_parts_with_delegator_and_budget`]
     /// to ensure correct binding between metadata and the signed hash.
     #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "Use new_root_with_delegator for proper delegator_actor_id binding"
+    )]
     #[allow(clippy::too_many_arguments)]
     pub fn new_root(
         capability_id: String,
@@ -689,19 +760,58 @@ impl CapabilityProof {
         root_event_hash: Vec<u8>,
         registrar_signature: Vec<u8>,
     ) -> Self {
+        // Default to empty delegator_actor_id for backward compatibility
+        // Note: This will cause verify_event_hash_binding to fail unless
+        // the root_event_hash was computed with an empty delegator_actor_id
+        Self::new_root_with_delegator(
+            capability_id,
+            namespace,
+            holder_actor_id,
+            scope_hash,
+            budget_hash,
+            expires_at,
+            String::new(),
+            root_event_hash,
+            registrar_signature,
+        )
+    }
+
+    /// Creates a new capability proof for a root capability (no delegation)
+    /// with explicit delegator actor ID.
+    ///
+    /// The `delegator_actor_id` should be the registrar identifier (e.g.,
+    /// "_registrar_") that was used when computing the `root_event_hash`.
+    ///
+    /// The `root_event_hash` should be computed using
+    /// [`DelegationChainEntry::compute_event_hash_from_parts_with_delegator_and_budget`]
+    /// to ensure correct binding between metadata and the signed hash.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_root_with_delegator(
+        capability_id: String,
+        namespace: String,
+        holder_actor_id: String,
+        scope_hash: Vec<u8>,
+        budget_hash: Vec<u8>,
+        expires_at: u64,
+        delegator_actor_id: String,
+        root_event_hash: Vec<u8>,
+        registrar_signature: Vec<u8>,
+    ) -> Self {
         Self {
             capability_id: capability_id.clone(),
             namespace: namespace.clone(),
             holder_actor_id: holder_actor_id.clone(),
             scope_hash: scope_hash.clone(),
-            budget_hash,
+            budget_hash: budget_hash.clone(),
             expires_at,
             delegation_chain: vec![DelegationChainEntry {
                 capability_id,
                 holder_actor_id,
-                delegator_actor_id: String::new(), // Caller should set via event_hash
+                delegator_actor_id,
                 namespace,
                 scope_hash,
+                budget_hash,
                 expires_at,
                 event_hash: root_event_hash,
                 signature: registrar_signature,
@@ -944,6 +1054,8 @@ impl CapabilityProof {
         }
 
         // Validate that the last entry matches the proof's top-level identity
+        // MEDIUM-03: Verify all redundant top-level fields match the delegation chain
+        // tail
         if let Some(last_entry) = self.delegation_chain.last() {
             if last_entry.capability_id != self.capability_id {
                 return Err(LeaseError::InvalidInput {
@@ -954,6 +1066,27 @@ impl CapabilityProof {
             if last_entry.holder_actor_id != self.holder_actor_id {
                 return Err(LeaseError::InvalidInput {
                     field: "holder_actor_id".to_string(),
+                    reason: "does not match the tail of the delegation chain".to_string(),
+                });
+            }
+            // MEDIUM-03: Verify scope_hash consistency
+            if last_entry.scope_hash != self.scope_hash {
+                return Err(LeaseError::InvalidInput {
+                    field: "scope_hash".to_string(),
+                    reason: "does not match the tail of the delegation chain".to_string(),
+                });
+            }
+            // MEDIUM-03: Verify budget_hash consistency
+            if last_entry.budget_hash != self.budget_hash {
+                return Err(LeaseError::InvalidInput {
+                    field: "budget_hash".to_string(),
+                    reason: "does not match the tail of the delegation chain".to_string(),
+                });
+            }
+            // MEDIUM-03: Verify expires_at consistency
+            if last_entry.expires_at != self.expires_at {
+                return Err(LeaseError::InvalidInput {
+                    field: "expires_at".to_string(),
                     reason: "does not match the tail of the delegation chain".to_string(),
                 });
             }
@@ -1296,7 +1429,8 @@ impl CapabilityProof {
     /// 1. Exist in the registry
     /// 2. Are not revoked
     /// 3. Are not expired
-    /// 4. Have matching metadata (holder, namespace, scope)
+    /// 4. Have matching metadata (holder, namespace, `scope_hash`,
+    ///    `expires_at`)
     fn verify_against_registry(
         &self,
         current_time: u64,
@@ -1346,6 +1480,28 @@ impl CapabilityProof {
                     ),
                 });
             }
+
+            // HIGH-01: Verify scope_hash consistency between proof and registry
+            if capability.scope_hash != entry.scope_hash {
+                return Err(LeaseError::InvalidInput {
+                    field: format!("delegation_chain[{i}].scope_hash"),
+                    reason: format!(
+                        "scope_hash mismatch: proof has '{:?}', registry has '{:?}'",
+                        entry.scope_hash, capability.scope_hash
+                    ),
+                });
+            }
+
+            // HIGH-01: Verify expires_at consistency between proof and registry
+            if capability.expires_at != entry.expires_at {
+                return Err(LeaseError::InvalidInput {
+                    field: format!("delegation_chain[{i}].expires_at"),
+                    reason: format!(
+                        "expires_at mismatch: proof has '{}', registry has '{}'",
+                        entry.expires_at, capability.expires_at
+                    ),
+                });
+            }
         }
 
         // Verify the proof's top-level metadata matches the final capability
@@ -1358,6 +1514,26 @@ impl CapabilityProof {
                         reason: format!(
                             "proof namespace '{}' does not match registry '{}'",
                             self.namespace, capability.namespace
+                        ),
+                    });
+                }
+                // HIGH-01: Verify scope_hash consistency at proof level
+                if self.scope_hash != capability.scope_hash {
+                    return Err(LeaseError::InvalidInput {
+                        field: "scope_hash".to_string(),
+                        reason: format!(
+                            "proof scope_hash '{:?}' does not match registry '{:?}'",
+                            self.scope_hash, capability.scope_hash
+                        ),
+                    });
+                }
+                // HIGH-01: Verify expires_at consistency at proof level
+                if self.expires_at != capability.expires_at {
+                    return Err(LeaseError::InvalidInput {
+                        field: "expires_at".to_string(),
+                        reason: format!(
+                            "proof expires_at '{}' does not match registry '{}'",
+                            self.expires_at, capability.expires_at
                         ),
                     });
                 }
@@ -1630,6 +1806,7 @@ impl CapabilityRegistryState {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // Allow testing deprecated methods for backward compatibility
 mod tck_00199_tests {
     use super::*;
 
@@ -1888,6 +2065,7 @@ mod tck_00199_tests {
                 delegator_actor_id: "_registrar_".to_string(),
                 namespace: "ns".to_string(),
                 scope_hash: vec![5],
+                budget_hash: vec![],
                 expires_at: 2_000_000_000,
                 event_hash: vec![1],
                 signature: vec![2],
@@ -1899,6 +2077,7 @@ mod tck_00199_tests {
                 delegator_actor_id: "alice".to_string(), // Delegated by alice
                 namespace: "ns".to_string(),
                 scope_hash: vec![5],
+                budget_hash: vec![],
                 expires_at: 2_000_000_000,
                 event_hash: vec![3],
                 signature: vec![4],
@@ -1936,6 +2115,7 @@ mod tck_00199_tests {
                 },
                 namespace: "ns".to_string(),
                 scope_hash: vec![],
+                budget_hash: vec![],
                 expires_at: 2_000_000_000,
                 event_hash: vec![(i & 0xFF) as u8],
                 signature: vec![(i & 0xFF) as u8],
@@ -2114,6 +2294,7 @@ mod tck_00199_tests {
             delegator_actor_id: "_registrar_".to_string(),
             namespace: "ns".to_string(),
             scope_hash: vec![],
+            budget_hash: vec![],
             expires_at: 2_000_000_000,
             event_hash: vec![1],
             signature: vec![2],
@@ -2559,6 +2740,7 @@ mod tck_00199_tests {
                 },
                 namespace: "ns".to_string(),
                 scope_hash: vec![],
+                budget_hash: vec![],
                 expires_at: 2_000_000_000,
                 event_hash: vec![(i & 0xFF) as u8],
                 signature: vec![(i & 0xFF) as u8],
@@ -3115,6 +3297,7 @@ mod tck_00199_tests {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(deprecated)] // Allow testing deprecated methods for backward compatibility
 mod tck_00200_signature_tests {
     use std::collections::HashMap;
 
@@ -3132,8 +3315,9 @@ mod tck_00200_signature_tests {
     /// binding.
     ///
     /// This creates an entry where the `event_hash` is correctly derived from
-    /// the metadata fields (including `delegator_actor_id` for HIGH-02 chain
-    /// continuity), and the signature is over that `event_hash`.
+    /// the metadata fields (including `delegator_actor_id` and `budget_hash`
+    /// for HIGH-02 chain continuity), and the signature is over that
+    /// `event_hash`.
     ///
     /// # Arguments
     ///
@@ -3151,16 +3335,44 @@ mod tck_00200_signature_tests {
         depth: u32,
         signer: &Signer,
     ) -> DelegationChainEntry {
-        // Compute the canonical event hash from metadata (CRITICAL-01, HIGH-02)
-        let event_hash = DelegationChainEntry::compute_event_hash_from_parts_with_delegator(
+        create_signed_entry_with_budget(
             capability_id,
             holder_actor_id,
             delegator_actor_id,
             namespace,
             scope_hash,
+            &[], // empty budget_hash for backward compatibility
             expires_at,
             depth,
-        );
+            signer,
+        )
+    }
+
+    /// Helper to create a signed delegation chain entry with budget hash.
+    #[allow(clippy::too_many_arguments)]
+    fn create_signed_entry_with_budget(
+        capability_id: &str,
+        holder_actor_id: &str,
+        delegator_actor_id: &str,
+        namespace: &str,
+        scope_hash: &[u8],
+        budget_hash: &[u8],
+        expires_at: u64,
+        depth: u32,
+        signer: &Signer,
+    ) -> DelegationChainEntry {
+        // Compute the canonical event hash from metadata (CRITICAL-01, HIGH-02)
+        let event_hash =
+            DelegationChainEntry::compute_event_hash_from_parts_with_delegator_and_budget(
+                capability_id,
+                holder_actor_id,
+                delegator_actor_id,
+                namespace,
+                scope_hash,
+                budget_hash,
+                expires_at,
+                depth,
+            );
 
         // Sign the event hash
         let signature = signer.sign(&event_hash);
@@ -3171,6 +3383,7 @@ mod tck_00200_signature_tests {
             delegator_actor_id: delegator_actor_id.to_string(),
             namespace: namespace.to_string(),
             scope_hash: scope_hash.to_vec(),
+            budget_hash: budget_hash.to_vec(),
             expires_at,
             event_hash,
             signature: signature.to_bytes().to_vec(),
@@ -3557,6 +3770,7 @@ mod tck_00200_signature_tests {
             delegator_actor_id: TEST_REGISTRAR_ID.to_string(),
             namespace: TEST_NAMESPACE.to_string(),
             scope_hash: TEST_SCOPE_HASH.to_vec(),
+            budget_hash: vec![],
             expires_at: TEST_EXPIRES_AT,
             event_hash,
             signature: vec![], // Empty signature!
@@ -3596,6 +3810,7 @@ mod tck_00200_signature_tests {
             delegator_actor_id: TEST_REGISTRAR_ID.to_string(),
             namespace: TEST_NAMESPACE.to_string(),
             scope_hash: TEST_SCOPE_HASH.to_vec(),
+            budget_hash: vec![],
             expires_at: TEST_EXPIRES_AT,
             event_hash: vec![], // Empty event hash!
             signature: signature.to_bytes().to_vec(),
@@ -3937,6 +4152,7 @@ mod tck_00200_signature_tests {
             delegator_actor_id: alice_entry.delegator_actor_id.clone(),
             namespace: alice_entry.namespace.clone(),
             scope_hash: alice_entry.scope_hash.clone(),
+            budget_hash: alice_entry.budget_hash.clone(),
             expires_at: alice_entry.expires_at,
             event_hash: alice_entry.event_hash.clone(), // Uses Alice's event_hash
             signature: alice_entry.signature.clone(),   // Uses Alice's signature
@@ -3990,6 +4206,7 @@ mod tck_00200_signature_tests {
             delegator_actor_id: legitimate_entry.delegator_actor_id.clone(),
             namespace: "ns-ATTACKER".to_string(), // Attacker substitutes namespace!
             scope_hash: legitimate_entry.scope_hash.clone(),
+            budget_hash: legitimate_entry.budget_hash.clone(),
             expires_at: legitimate_entry.expires_at,
             event_hash: legitimate_entry.event_hash.clone(), // Uses original hash
             signature: legitimate_entry.signature.clone(),   // Uses original sig
@@ -4350,6 +4567,7 @@ mod tck_00200_signature_tests {
             delegator_actor_id: "carol".to_string(), // ATTACK: Different delegator!
             namespace: legitimate_delegation.namespace.clone(),
             scope_hash: legitimate_delegation.scope_hash.clone(),
+            budget_hash: legitimate_delegation.budget_hash.clone(),
             expires_at: legitimate_delegation.expires_at,
             event_hash: legitimate_delegation.event_hash.clone(), // Reuses legitimate hash
             signature: legitimate_delegation.signature.clone(),   // Reuses legitimate sig
@@ -4558,6 +4776,393 @@ mod tck_00200_signature_tests {
         assert!(
             result.is_ok(),
             "Valid chain should pass signature check: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // HIGH-01: Ledger State Verification Tests (scope_hash and expires_at)
+    // =========================================================================
+
+    #[test]
+    fn test_verify_against_registry_rejects_scope_hash_mismatch() {
+        // HIGH-01: Test that verify_against_registry rejects when proof's
+        // scope_hash doesn't match registry's scope_hash
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry(
+            "cap-root",
+            "alice",
+            TEST_REGISTRAR_ID,
+            TEST_NAMESPACE,
+            TEST_SCOPE_HASH, // scope_hash = [1, 2, 3]
+            TEST_EXPIRES_AT,
+            0,
+            &registrar_signer,
+        );
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            TEST_NAMESPACE.to_string(),
+            "alice".to_string(),
+            TEST_SCOPE_HASH.to_vec(),
+            vec![],
+            TEST_EXPIRES_AT,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        // Create registry with a DIFFERENT scope_hash
+        let mut registry = CapabilityRegistryState::new();
+        let capability = Capability::new(
+            "cap-root".to_string(),
+            TEST_NAMESPACE.to_string(),
+            "alice".to_string(),
+            "registrar".to_string(),
+            vec![9, 9, 9], // DIFFERENT scope_hash!
+            vec![],
+            1_000_000_000,
+            TEST_EXPIRES_AT,
+            vec![1],
+            true,
+        );
+        registry.insert(capability).unwrap();
+
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // HIGH-01: Should fail because scope_hash doesn't match
+        let result = proof.verify_with_state(1_500_000_000, &registrar_pk, get_actor_pk, &registry);
+        assert!(
+            matches!(&result, Err(LeaseError::InvalidInput { field, .. })
+                if field.contains("scope_hash")),
+            "scope_hash mismatch MUST be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_against_registry_rejects_expires_at_mismatch() {
+        // HIGH-01: Test that verify_against_registry rejects when proof's
+        // expires_at doesn't match registry's expires_at
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry(
+            "cap-root",
+            "alice",
+            TEST_REGISTRAR_ID,
+            TEST_NAMESPACE,
+            TEST_SCOPE_HASH,
+            TEST_EXPIRES_AT, // expires_at = 2_000_000_000
+            0,
+            &registrar_signer,
+        );
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            TEST_NAMESPACE.to_string(),
+            "alice".to_string(),
+            TEST_SCOPE_HASH.to_vec(),
+            vec![],
+            TEST_EXPIRES_AT,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        // Create registry with a DIFFERENT expires_at
+        let mut registry = CapabilityRegistryState::new();
+        let capability = Capability::new(
+            "cap-root".to_string(),
+            TEST_NAMESPACE.to_string(),
+            "alice".to_string(),
+            "registrar".to_string(),
+            TEST_SCOPE_HASH.to_vec(),
+            vec![],
+            1_000_000_000,
+            3_000_000_000, // DIFFERENT expires_at!
+            vec![1],
+            true,
+        );
+        registry.insert(capability).unwrap();
+
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // HIGH-01: Should fail because expires_at doesn't match
+        let result = proof.verify_with_state(1_500_000_000, &registrar_pk, get_actor_pk, &registry);
+        assert!(
+            matches!(&result, Err(LeaseError::InvalidInput { field, .. })
+                if field.contains("expires_at")),
+            "expires_at mismatch MUST be rejected: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // HIGH-02: Budget Hash Binding Tests
+    // =========================================================================
+
+    #[test]
+    fn test_budget_hash_included_in_event_hash() {
+        // HIGH-02: Test that budget_hash is included in event hash computation
+        let (signer, _pk) = create_test_signer();
+
+        // Create two entries with different budget_hash values
+        let entry1 = create_signed_entry_with_budget(
+            "cap-1",
+            "alice",
+            TEST_REGISTRAR_ID,
+            TEST_NAMESPACE,
+            TEST_SCOPE_HASH,
+            &[1, 2, 3], // budget_hash = [1, 2, 3]
+            TEST_EXPIRES_AT,
+            0,
+            &signer,
+        );
+
+        let entry2 = create_signed_entry_with_budget(
+            "cap-1",
+            "alice",
+            TEST_REGISTRAR_ID,
+            TEST_NAMESPACE,
+            TEST_SCOPE_HASH,
+            &[4, 5, 6], // DIFFERENT budget_hash = [4, 5, 6]
+            TEST_EXPIRES_AT,
+            0,
+            &signer,
+        );
+
+        // Event hashes MUST be different because budget_hash differs
+        assert_ne!(
+            entry1.event_hash, entry2.event_hash,
+            "Different budget_hash values MUST produce different event hashes"
+        );
+    }
+
+    #[test]
+    fn test_budget_hash_substitution_attack_rejected() {
+        // HIGH-02: Test that an attacker cannot substitute a different budget_hash
+        // while keeping the original signature
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        // Create a legitimate entry with budget_hash = [1, 2, 3]
+        let legitimate_entry = create_signed_entry_with_budget(
+            "cap-root",
+            "alice",
+            TEST_REGISTRAR_ID,
+            TEST_NAMESPACE,
+            TEST_SCOPE_HASH,
+            &[1, 2, 3], // Original budget_hash
+            TEST_EXPIRES_AT,
+            0,
+            &registrar_signer,
+        );
+
+        // Attacker creates an entry with different budget_hash but reuses signature
+        let attack_entry = DelegationChainEntry {
+            capability_id: legitimate_entry.capability_id.clone(),
+            holder_actor_id: legitimate_entry.holder_actor_id.clone(),
+            delegator_actor_id: legitimate_entry.delegator_actor_id.clone(),
+            namespace: legitimate_entry.namespace.clone(),
+            scope_hash: legitimate_entry.scope_hash.clone(),
+            budget_hash: vec![9, 9, 9], // ATTACK: Different budget_hash!
+            expires_at: legitimate_entry.expires_at,
+            event_hash: legitimate_entry.event_hash.clone(), // Reuses original hash
+            signature: legitimate_entry.signature.clone(),   // Reuses original sig
+            depth: legitimate_entry.depth,
+        };
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            TEST_NAMESPACE.to_string(),
+            "alice".to_string(),
+            TEST_SCOPE_HASH.to_vec(),
+            vec![9, 9, 9], // Attacker's budget_hash
+            TEST_EXPIRES_AT,
+            vec![attack_entry],
+        )
+        .unwrap();
+
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // HIGH-02: Should fail because event_hash was computed with different
+        // budget_hash
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            matches!(result, Err(LeaseError::InvalidInput { ref field, .. }) if field.contains("event_hash")),
+            "Budget hash substitution attack MUST be rejected: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // MEDIUM-03: Top-Level Field Consistency Tests
+    // =========================================================================
+
+    #[test]
+    fn test_validate_structure_rejects_scope_hash_inconsistency() {
+        // MEDIUM-03: Test that validate_structure rejects when proof's scope_hash
+        // doesn't match the delegation chain tail
+        let (registrar_signer, _registrar_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry(
+            "cap-root",
+            "alice",
+            TEST_REGISTRAR_ID,
+            TEST_NAMESPACE,
+            &[1, 2, 3], // Entry has scope_hash = [1, 2, 3]
+            TEST_EXPIRES_AT,
+            0,
+            &registrar_signer,
+        );
+
+        // Proof claims different scope_hash than the chain tail
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            TEST_NAMESPACE.to_string(),
+            "alice".to_string(),
+            vec![9, 9, 9], // DIFFERENT scope_hash!
+            vec![],
+            TEST_EXPIRES_AT,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        // MEDIUM-03: Should fail because scope_hash doesn't match chain tail
+        let result = proof.validate_structure(1_500_000_000);
+        assert!(
+            matches!(&result, Err(LeaseError::InvalidInput { field, reason })
+                if field == "scope_hash" && reason.contains("delegation chain")),
+            "scope_hash inconsistency MUST be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_structure_rejects_budget_hash_inconsistency() {
+        // MEDIUM-03: Test that validate_structure rejects when proof's budget_hash
+        // doesn't match the delegation chain tail
+        let (registrar_signer, _registrar_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry_with_budget(
+            "cap-root",
+            "alice",
+            TEST_REGISTRAR_ID,
+            TEST_NAMESPACE,
+            TEST_SCOPE_HASH,
+            &[1, 2, 3], // Entry has budget_hash = [1, 2, 3]
+            TEST_EXPIRES_AT,
+            0,
+            &registrar_signer,
+        );
+
+        // Proof claims different budget_hash than the chain tail
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            TEST_NAMESPACE.to_string(),
+            "alice".to_string(),
+            TEST_SCOPE_HASH.to_vec(),
+            vec![9, 9, 9], // DIFFERENT budget_hash!
+            TEST_EXPIRES_AT,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        // MEDIUM-03: Should fail because budget_hash doesn't match chain tail
+        let result = proof.validate_structure(1_500_000_000);
+        assert!(
+            matches!(&result, Err(LeaseError::InvalidInput { field, reason })
+                if field == "budget_hash" && reason.contains("delegation chain")),
+            "budget_hash inconsistency MUST be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_structure_rejects_expires_at_inconsistency() {
+        // MEDIUM-03: Test that validate_structure rejects when proof's expires_at
+        // doesn't match the delegation chain tail
+        let (registrar_signer, _registrar_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry(
+            "cap-root",
+            "alice",
+            TEST_REGISTRAR_ID,
+            TEST_NAMESPACE,
+            TEST_SCOPE_HASH,
+            2_000_000_000, // Entry has expires_at = 2_000_000_000
+            0,
+            &registrar_signer,
+        );
+
+        // Proof claims different expires_at than the chain tail
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            TEST_NAMESPACE.to_string(),
+            "alice".to_string(),
+            TEST_SCOPE_HASH.to_vec(),
+            vec![],
+            3_000_000_000, // DIFFERENT expires_at!
+            vec![root_entry],
+        )
+        .unwrap();
+
+        // MEDIUM-03: Should fail because expires_at doesn't match chain tail
+        let result = proof.validate_structure(1_500_000_000);
+        assert!(
+            matches!(&result, Err(LeaseError::InvalidInput { field, reason })
+                if field == "expires_at" && reason.contains("delegation chain")),
+            "expires_at inconsistency MUST be rejected: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR-04: new_root_with_delegator Tests
+    // =========================================================================
+
+    #[test]
+    fn test_new_root_with_delegator_creates_valid_proof() {
+        // MAJOR-04: Test that new_root_with_delegator properly sets delegator_actor_id
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        // Compute event hash with proper delegator_actor_id
+        let event_hash =
+            DelegationChainEntry::compute_event_hash_from_parts_with_delegator_and_budget(
+                "cap-root",
+                "alice",
+                TEST_REGISTRAR_ID, // This is the delegator for root grants
+                TEST_NAMESPACE,
+                TEST_SCOPE_HASH,
+                &[],
+                TEST_EXPIRES_AT,
+                0,
+            );
+
+        let signature = registrar_signer.sign(&event_hash);
+
+        let proof = CapabilityProof::new_root_with_delegator(
+            "cap-root".to_string(),
+            TEST_NAMESPACE.to_string(),
+            "alice".to_string(),
+            TEST_SCOPE_HASH.to_vec(),
+            vec![],
+            TEST_EXPIRES_AT,
+            TEST_REGISTRAR_ID.to_string(), // Proper delegator_actor_id
+            event_hash,
+            signature.to_bytes().to_vec(),
+        );
+
+        // Structure validation should pass
+        let result = proof.validate_structure(1_500_000_000);
+        assert!(
+            result.is_ok(),
+            "new_root_with_delegator should create valid proof: {result:?}"
+        );
+
+        // Signature validation should pass
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            result.is_ok(),
+            "new_root_with_delegator should create proof with valid signature: {result:?}"
+        );
+
+        // Verify that delegator_actor_id is correctly set in the chain entry
+        assert_eq!(
+            proof.delegation_chain[0].delegator_actor_id, TEST_REGISTRAR_ID,
+            "delegator_actor_id should be set correctly"
         );
     }
 }
