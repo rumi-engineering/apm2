@@ -45,6 +45,7 @@ pub mod cac;
 pub mod ccp;
 pub mod config;
 pub mod consensus;
+pub mod context;
 pub mod coordination;
 pub mod credentials;
 pub mod crypto;
