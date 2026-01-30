@@ -378,6 +378,7 @@ message EvidenceEvent {
   oneof event {
     EvidencePublished published = 1;
     GateReceiptGenerated gate_receipt = 2;
+    GateRunCompleted gate_run_completed = 3;
   }
 }
 
@@ -402,6 +403,32 @@ message GateReceiptGenerated {
   string result = 4;  // PASS, FAIL
   repeated string evidence_ids = 5;
   bytes receipt_signature = 6;
+}
+
+// Emitted when a gate run completes execution under a GateLease.
+// This is the critical event for FAC admission decisions.
+// All validation steps must pass for admission to proceed.
+message GateRunCompleted {
+  // Unique identifier for this completion event
+  string run_id = 1;
+  // Gate this run completed for
+  string gate_id = 2;
+  // Work item this run is associated with
+  string work_id = 3;
+  // Lease ID authorizing this run
+  string lease_id = 4;
+  // Hash of the changeset executed
+  bytes changeset_digest = 5;
+  // Actor who executed the run
+  string executor_actor_id = 6;
+  // Outcome of the run: PASS, FAIL
+  string result = 7;
+  // Evidence IDs produced by this run
+  repeated string evidence_ids = 8;
+  // HTF timestamp when the run completed (Unix millis)
+  uint64 completed_at = 9;
+  // Ed25519 signature over canonical bytes with GATE_RUN_COMPLETED: prefix
+  bytes executor_signature = 10;
 }
 
 // ============================================================

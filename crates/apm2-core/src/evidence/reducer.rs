@@ -333,7 +333,9 @@ impl Reducer for EvidenceReducer {
                 self.handle_gate_receipt(e, timestamp);
                 Ok(())
             },
-            None => Ok(()),
+            // GateRunCompleted events are handled by the FAC admission logic,
+            // not the evidence reducer
+            Some(evidence_event::Event::GateRunCompleted(_)) | None => Ok(()),
         }
     }
 
