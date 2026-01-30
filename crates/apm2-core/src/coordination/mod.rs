@@ -137,9 +137,10 @@ pub use controller::{
 pub use error::{ControllerError, ControllerResult};
 // Re-export event types
 pub use events::{
-    BLAKE3_HASH_SIZE, CoordinationAborted, CoordinationCompleted, CoordinationEvent,
-    CoordinationSessionBound, CoordinationSessionUnbound, CoordinationStarted, EVENT_TYPE_ABORTED,
-    EVENT_TYPE_COMPLETED, EVENT_TYPE_SESSION_BOUND, EVENT_TYPE_SESSION_UNBOUND, EVENT_TYPE_STARTED,
+    BLAKE3_HASH_SIZE, ContextRefinementRequest, CoordinationAborted, CoordinationCompleted,
+    CoordinationEvent, CoordinationSessionBound, CoordinationSessionUnbound, CoordinationStarted,
+    EVENT_TYPE_ABORTED, EVENT_TYPE_COMPLETED, EVENT_TYPE_CONTEXT_REFINEMENT,
+    EVENT_TYPE_SESSION_BOUND, EVENT_TYPE_SESSION_UNBOUND, EVENT_TYPE_STARTED,
 };
 // Re-export evidence types (TCK-00154)
 pub use evidence::{

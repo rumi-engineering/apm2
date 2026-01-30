@@ -85,8 +85,8 @@ mod validator;
 mod tests;
 
 pub use engine::{
-    BUDGET_EXCEEDED_RULE_ID, DEFAULT_DENY_RATIONALE, DEFAULT_DENY_RULE_ID, EvaluationResult,
-    PolicyEngine,
+    BUDGET_EXCEEDED_RULE_ID, CONTEXT_MISS_RATIONALE, CONTEXT_MISS_RULE_ID, DEFAULT_DENY_RATIONALE,
+    DEFAULT_DENY_RULE_ID, EvaluationResult, ManifestEvaluationResult, PolicyEngine,
 };
 pub use error::PolicyError;
 pub use event::{create_policy_loaded_event, create_policy_loaded_event_from_parts};
