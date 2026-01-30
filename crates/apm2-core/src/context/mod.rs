@@ -1,7 +1,8 @@
 //! Context module for file access control.
 //!
 //! This module provides types for managing context pack manifests, which define
-//! the OCAP (Object-Capability) allowlist for file reads.
+//! the OCAP (Object-Capability) allowlist for file reads, and the context
+//! firewall middleware that enforces access control.
 //!
 //! # Components
 //!
@@ -9,6 +10,11 @@
 //! - [`ManifestEntry`]: Individual file entry with path and content hash
 //! - [`ManifestEntryBuilder`]: Builder for constructing manifest entries
 //! - [`AccessLevel`]: Read or `ReadWithZoom` access levels
+//! - [`firewall::ContextAwareValidator`]: Trait for context-aware validation
+//! - [`firewall::DefaultContextFirewall`]: Default implementation of the
+//!   firewall
+//! - [`firewall::FirewallMode`]: Enforcement mode (Warn, `SoftFail`,
+//!   `HardFail`)
 //!
 //! # Security Model
 //!
@@ -18,10 +24,20 @@
 //! 2. Content hashes prevent TOCTOU (time-of-check-to-time-of-use) attacks
 //! 3. All reads outside the allowlist are denied
 //! 4. Path normalization prevents traversal attacks
+//! 5. [`firewall::FirewallDecision`] events are emitted for audit logging
+//!
+//! # Firewall Modes
+//!
+//! - **Warn**: Log warning, allow read (for monitoring/debugging)
+//! - **`SoftFail`**: Return error, allow retry (default for graceful handling)
+//! - **`HardFail`**: Return error, terminate session (strict enforcement)
 //!
 //! # Example
 //!
 //! ```rust
+//! use apm2_core::context::firewall::{
+//!     ContextAwareValidator, DefaultContextFirewall, FirewallMode,
+//! };
 //! use apm2_core::context::{
 //!     AccessLevel, ContextPackManifest, ContextPackManifestBuilder,
 //!     ManifestEntryBuilder,
@@ -37,12 +53,20 @@
 //!         )
 //!         .build();
 //!
-//! // Check if access is allowed (hash optional for Read access level)
-//! if manifest.is_allowed("/project/src/main.rs", None).unwrap() {
-//!     println!("Access granted");
-//! }
+//! // Create firewall with SoftFail mode
+//! let firewall =
+//!     DefaultContextFirewall::new(&manifest, FirewallMode::SoftFail);
+//!
+//! // Validate reads through the firewall
+//! let result = firewall.validate_read("/project/src/main.rs", None);
+//! assert!(result.is_ok());
+//!
+//! // Denied reads return errors in SoftFail mode
+//! let result = firewall.validate_read("/etc/passwd", None);
+//! assert!(result.is_err());
 //! ```
 
+pub mod firewall;
 mod manifest;
 
 pub use manifest::{

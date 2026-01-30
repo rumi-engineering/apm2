@@ -222,6 +222,14 @@ pub enum ManifestError {
 /// assert!(normalize_path("/foo\0bar").is_err()); // null byte
 /// ```
 pub fn normalize_path(path: &str) -> Result<String, ManifestError> {
+    // Defense in depth: enforce path length limit early
+    if path.len() > MAX_PATH_LENGTH {
+        return Err(ManifestError::PathTooLong {
+            actual: path.len(),
+            max: MAX_PATH_LENGTH,
+        });
+    }
+
     // Reject embedded null bytes
     if path.contains('\0') {
         return Err(ManifestError::InvalidPath {
@@ -1071,6 +1079,23 @@ pub mod tests {
         assert!(matches!(
             normalize_path(""),
             Err(ManifestError::InvalidPath { reason }) if reason.contains("empty")
+        ));
+    }
+
+    #[test]
+    fn test_normalize_path_rejects_too_long() {
+        // Path exactly at limit should succeed
+        let at_limit = "/".to_string() + &"x".repeat(MAX_PATH_LENGTH - 1);
+        assert_eq!(at_limit.len(), MAX_PATH_LENGTH);
+        assert!(normalize_path(&at_limit).is_ok());
+
+        // Path one byte over limit should fail
+        let over_limit = "/".to_string() + &"x".repeat(MAX_PATH_LENGTH);
+        assert_eq!(over_limit.len(), MAX_PATH_LENGTH + 1);
+        assert!(matches!(
+            normalize_path(&over_limit),
+            Err(ManifestError::PathTooLong { actual, max })
+                if actual == MAX_PATH_LENGTH + 1 && max == MAX_PATH_LENGTH
         ));
     }
 
