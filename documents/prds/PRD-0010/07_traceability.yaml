@@ -41,6 +41,9 @@ prd_traceability:
     - requirement_id: REQ-0013
       goal_ids:
         - DCP-G-0009
+    - requirement_id: REQ-0014
+      goal_ids:
+        - DCP-G-0010
   goal_to_problem:
     - goal_id: DCP-G-0001
       problem_ids:

@@ -5,11 +5,39 @@ rfc_meta:
   rfc:
     id: RFC-0016
     title: "Holonic Time Fabric (HTF)"
-    status: DRAFT
+    status: APPROVED
     created_date: "2026-01-30"
     last_updated_date: "2026-01-30"
-    version: "v0.1"
+    version: "v4.0"
     version_history:
+      - version: "v4.0"
+        date: "2026-01-30"
+        phase: "v4 (Standard)"
+        notes: |
+          Advanced to v4 (Standard) after FINALIZE council review.
+          Council verdict: APPROVED with documented conditions.
+
+          Key outcomes:
+          - All 9 gates passed (GATE-TCK-SCHEMA through GATE-TCK-ANTI-COUSIN)
+          - CAE Tree demonstrates full security assurance for HTF substrate
+          - Zero cousin abstractions; proper reuse of existing HLC
+          - All 7 requirements covered by 12 tickets
+
+          Conditions documented in 08_risks_and_open_questions.yaml:
+          - HLC bootstrap policy clarified (wall-time acceptable at initial bootstrap only)
+          - LedgerBackend trait: minimal stub interface defined for Phase 1
+          - TCK-00239: critical event enumeration added
+          - TCK-00240 atomicity: implementation note added (may require commit boundaries)
+      - version: "v2.0"
+        date: "2026-01-30"
+        phase: "v2 (Grounded)"
+        notes: |
+          Advanced to v2 (Grounded) after EXPLORE codebase investigation.
+          Design decisions now backed by codebase evidence:
+          - Existing HLC in crdt.rs validated as basis for CausalTime
+          - Wall-time patterns in coordination/lease modules identified for conversion
+          - Determinism infrastructure confirmed for canonicalization vectors
+          - Open questions Q-HTF-0001/0003/0004 resolved; Q-HTF-0002 deferred to Phase 2
       - version: "v0.1"
         date: "2026-01-30"
         phase: "v0 (Council Drafting)"

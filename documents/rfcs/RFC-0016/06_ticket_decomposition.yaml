@@ -120,13 +120,42 @@ rfc_ticket_decomposition:
         Extend proto/kernel_events.proto critical event payloads to include a
         time_envelope_ref (CAS hash bytes).
 
-        Legacy timestamp fields remain observational.
+        Critical events requiring time_envelope_ref:
+        - SessionStarted, SessionTerminated
+        - ToolExecuted (decision and execution receipts)
+        - LeaseIssued, LeaseRevoked, LeaseReleased
+        - AdjudicationDecision
+        - EvidenceSubmitted
+        - MergeReceipt
+        - ProjectionReceipt
+
+        Legacy timestamp fields remain observational. Mark with comment:
+        "// OBSERVATIONAL - see HTF RFC-0016"
       files_to_modify:
         - path: "proto/kernel_events.proto"
           changes: "Add time_envelope_ref to critical events/receipts; document legacy timestamp non-authority"
+      implementation_steps:
+        - step: 1
+          action: "Add TimeEnvelopeRef message type"
+          details: |
+            message TimeEnvelopeRef {
+              bytes hash = 1;  // CAS content hash (32 bytes)
+            }
+        - step: 2
+          action: "Add optional time_envelope_ref field to critical events"
+          details: |
+            Add to each critical event message:
+            optional TimeEnvelopeRef time_envelope_ref = <next_field_number>;
+        - step: 3
+          action: "Add observational comment to legacy timestamp fields"
+          details: |
+            Mark existing timestamp_ns, issued_at, expires_at fields with:
+            // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority
       acceptance_criteria:
         - criterion: "Protobuf schema changes are backwards-compatible where possible"
           verification: "Compile + decode/encode tests"
+        - criterion: "All critical events enumerated above have time_envelope_ref field"
+          verification: "Schema review"
 
     - ticket_id: TCK-00240
       title: "HTF: Implement HolonicClock service and TimeEnvelope stamping in daemon"

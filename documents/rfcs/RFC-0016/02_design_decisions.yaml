@@ -233,3 +233,153 @@ rfc_design_decisions:
         - "documents/rfcs/**"
         - "documents/skills/**"
         - "documents/laws/**"
+
+  # ============================================================================
+  # v2 GROUNDING: Codebase Evidence (added during EXPLORE phase)
+  # ============================================================================
+
+  codebase_grounding:
+    phase: "v2 (Grounded)"
+    exploration_date: "2026-01-30"
+    summary: |
+      EXPLORE phase investigation confirmed HTF design decisions are compatible
+      with existing codebase patterns. Key findings anchor each design decision
+      in concrete code locations.
+
+    evidence_by_decision:
+      - decision_id: DD-HTF-0001
+        title: "Four-clock HTF model"
+        codebase_evidence:
+          - finding: "LedgerTime distinct from TotalOrderProof"
+            location: "crates/apm2-core/src/evidence/strictly_ordered.rs:317-341"
+            analysis: |
+              TotalOrderProof uses (epoch, round, block_hash) for BFT finalization.
+              LedgerTime (ledger_id, epoch, seq) is semantically distinct - it tracks
+              ledger position for ordering, not consensus finalization. NOT_COUSIN.
+          - finding: "Existing HLC implementation in crdt.rs"
+            location: "crates/apm2-core/src/consensus/crdt.rs:196-200"
+            analysis: |
+              Hlc struct already implements wall_time_ns + logical_counter semantics.
+              HTF CausalTime (C) should REUSE this implementation, extending it with
+              HtfTick integration. EXTENSION pattern, not cousin.
+
+      - decision_id: DD-HTF-0002
+        title: "TimeEnvelope mandatory on critical artifacts"
+        codebase_evidence:
+          - finding: "Existing CAS content-hash pattern"
+            location: "crates/apm2-core/src/evidence/cas.rs"
+            analysis: |
+              CAS already uses content hashes for artifact references.
+              TimeEnvelopeRef follows this established pattern exactly.
+          - finding: "StrictlyOrderedEvidence requires proof"
+            location: "crates/apm2-core/src/evidence/strictly_ordered.rs:486-558"
+            analysis: |
+              try_new() validates TotalOrderProof before accepting evidence.
+              TimeEnvelope validation can follow the same fail-closed pattern.
+
+      - decision_id: DD-HTF-0005
+        title: "Reducers are time-pure"
+        codebase_evidence:
+          - finding: "Lease reducer accepts timestamps as data"
+            location: "crates/apm2-core/src/lease/reducer.rs"
+            analysis: |
+              LeaseReducer processes issued_at/expires_at from events, not from
+              runtime clocks. This is the correct pattern for HTF compliance.
+          - finding: "Coordination reducer pattern"
+            location: "crates/apm2-core/src/coordination/reducer.rs"
+            analysis: |
+              Reducer accepts timestamp_ns from events. HTF formalizes this as
+              the canonical pattern for all reducers.
+
+      - decision_id: DD-HTF-0006
+        title: "Metrics axes use ledger windows + tick deltas"
+        codebase_evidence:
+          - finding: "Budget uses elapsed_ms (wall-time) - needs conversion"
+            location: "crates/apm2-core/src/coordination/controller.rs:810,961"
+            analysis: |
+              elapsed_ms computed from Instant::now().elapsed(). TCK-00242 targets
+              this for conversion to tick-based tracking.
+          - finding: "Lease uses expires_at as Unix nanos"
+            location: "crates/apm2-core/src/lease/state.rs:130-133"
+            analysis: |
+              issued_at/expires_at stored as u64 Unix nanos. TCK-00241 targets
+              conversion to tick-based expiry with TimeEnvelopeRef containment.
+
+    wall_time_usage_inventory:
+      description: |
+        Comprehensive inventory of wall-time usage patterns that must be
+        addressed by HTF enforcement tickets.
+      patterns:
+        - pattern: "std::time::Instant usage"
+          locations:
+            - "crates/apm2-core/src/coordination/controller.rs:112"
+            - "crates/apm2-core/src/coordination/controller.rs:363"
+            - "crates/apm2-core/src/coordination/controller.rs:504"
+          target_tickets: [TCK-00242, TCK-00246]
+
+        - pattern: "elapsed() calls for duration tracking"
+          locations:
+            - "crates/apm2-core/src/coordination/controller.rs:810"
+            - "crates/apm2-core/src/coordination/controller.rs:1030"
+            - "crates/apm2-core/src/coordination/controller.rs:1099"
+            - "crates/apm2-core/src/coordination/controller.rs:1180"
+          target_tickets: [TCK-00242]
+
+        - pattern: "max_duration_ms budget checking"
+          locations:
+            - "crates/apm2-core/src/coordination/state.rs:301"
+            - "crates/apm2-core/src/coordination/state.rs:421-422"
+          target_tickets: [TCK-00242]
+
+        - pattern: "Lease expiry timestamps"
+          locations:
+            - "crates/apm2-core/src/lease/state.rs:130-133"
+            - "crates/apm2-core/src/lease/state.rs:196-197"
+          target_tickets: [TCK-00241]
+
+    anti_cousin_analysis:
+      summary: |
+        Analyzed proposed HTF types against existing codebase constructs.
+        No cousin abstractions identified; all proposals are either distinct
+        concepts or explicit extensions of existing patterns.
+      verdicts:
+        - proposed: LedgerTime
+          existing: "TotalOrderProof.epoch/round"
+          verdict: NOT_COUSIN
+          rationale: "Distinct tuple semantics; LedgerTime for ordering, TotalOrder for BFT"
+
+        - proposed: HtfTick
+          existing: "u64 timestamps throughout codebase"
+          verdict: NOT_COUSIN
+          rationale: "Newtype enforces tick semantics; prevents implicit wall-time usage"
+
+        - proposed: HlcStamp
+          existing: "consensus/crdt.rs::Hlc"
+          verdict: REUSE
+          rationale: "Existing HLC implementation should be reused/extended for HTF"
+
+        - proposed: TimeEnvelopeRef
+          existing: "CAS content hashes"
+          verdict: EXTENSION
+          rationale: "Follows established content-addressing pattern"
+
+        - proposed: BoundedWallInterval
+          existing: "None"
+          verdict: NEW
+          rationale: "Novel type for explicit wall-time uncertainty; no existing equivalent"
+
+    determinism_infrastructure:
+      description: |
+        Existing determinism module provides foundation for HTF canonicalization.
+      available:
+        - capability: "JSON canonicalization (JCS/RFC 8785)"
+          location: "crates/apm2-core/src/determinism/canonicalize_json.rs"
+          relevance: "Base for TimeEnvelope/ClockProfile canonicalization vectors"
+
+        - capability: "Atomic file writes"
+          location: "crates/apm2-core/src/determinism/atomic_write.rs"
+          relevance: "Safe persistence of ClockProfile governed artifacts"
+
+        - capability: "Diff classification"
+          location: "crates/apm2-core/src/determinism/diff_classify.rs"
+          relevance: "Detecting structural vs cosmetic changes in time schemas"

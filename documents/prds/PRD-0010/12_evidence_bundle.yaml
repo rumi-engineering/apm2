@@ -45,6 +45,6 @@ prd_evidence_bundle:
         title: "Daemon crash recovery integration test"
         category: INTEGRATION_TEST
     coverage:
-      requirements_covered: 13
-      requirements_total: 13
+      requirements_covered: 14
+      requirements_total: 14
       coverage_percentage: 100

@@ -24,6 +24,7 @@ prd_quality_framework:
       coverage:
         requirement_ids:
           - REQ-0001
+          - REQ-0014
         notes: "xtask deprecation with migration path ensures backward compatibility during transition."
     - dimension_id: COST_EFFICIENCY
       applicability: APPLIES
@@ -150,4 +151,5 @@ prd_quality_framework:
           - REQ-0006
           - REQ-0007
           - REQ-0008
-        notes: "Adversarial test suite (ADV-001 through ADV-009) validates security properties."
+          - REQ-0014
+        notes: "Adversarial test suite (ADV-001 through ADV-008) validates security properties including xtask divergence."

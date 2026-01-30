@@ -1,6 +1,65 @@
 rfc_governance_and_gates:
   schema_version: "2026-01-30"
 
+  # ============================================================================
+  # v4 FINALIZE: Council Review Summary
+  # ============================================================================
+
+  v4_council_review:
+    review_date: "2026-01-30"
+    review_mode: FINALIZE
+    verdict: APPROVED
+    confidence: HIGH
+
+    subagent_assessments:
+      - agent_id: SA-1
+        role: "Structural Rigorist"
+        verdict: CONDITIONAL_PASS
+        reasoning_modes: [6, 23, 47, 62, 79]
+        key_findings:
+          - "All structural gates passed (SCHEMA, DEPENDENCY, COVERAGE, CCP)"
+          - "2 MAJOR conditions documented and resolved"
+          - "Architectural decisions rated 8.3/10 overall maturity"
+
+      - agent_id: SA-2
+        role: "Implementation Feasibility"
+        verdict: CONDITIONAL_PASS
+        reasoning_modes: [11, 39, 51, 70, 76]
+        key_findings:
+          - "9/12 tickets fully implementable without clarification"
+          - "TCK-00239 event enumeration resolved"
+          - "TCK-00240 atomicity guidance documented"
+          - "Parallel execution plan: 3 waves, ~12 agent-days"
+
+      - agent_id: SA-3
+        role: "Security / Anti-Cousin Guardian"
+        verdict: PASS
+        reasoning_modes: [8, 35, 49, 65, 72]
+        key_findings:
+          - "CAE Tree fully supports top claim with HIGH confidence"
+          - "All 5 threats mitigated, all 3 trust boundaries enforced"
+          - "Zero cousin abstractions; proper HLC reuse mandated"
+          - "4 deontic obligations with mechanical enforcement"
+
+    gate_summary:
+      passed:
+        - GATE-TCK-SCHEMA
+        - GATE-TCK-DEPENDENCY-ACYCLICITY
+        - GATE-TCK-SCOPE-COVERAGE
+        - GATE-TCK-CCP-MAPPING
+        - GATE-TCK-ATOMICITY
+        - GATE-TCK-IMPLEMENTABILITY
+        - GATE-TCK-SECURITY-AND-INTEGRITY
+        - GATE-TCK-REQUIREMENT-FIDELITY
+        - GATE-TCK-ANTI-COUSIN
+      failed: []
+      conditions_documented: 4
+
+    quorum_decision: |
+      All 3 subagents agree RFC-0016 can proceed to v4 (Standard).
+      Conditions ADA-004, ADA-005, FND-HTF-001, FND-HTF-002 resolved
+      and documented in 08_risks_and_open_questions.yaml.
+
   governance_overview:
     description: |
       HTF is a protocol substrate RFC. It constrains multiple domains

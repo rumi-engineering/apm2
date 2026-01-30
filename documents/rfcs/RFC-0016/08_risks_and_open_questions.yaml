@@ -59,20 +59,197 @@ rfc_risks_and_open_questions:
   open_questions:
     - id: Q-HTF-0001
       question: "Tick quantum representation: store raw monotonic ns vs fixed-rate ticks"
-      notes:
-        - "Recommendation: store raw monotonic ns internally and expose policy in logical ticks."
+      status: RESOLVED
+      resolution: |
+        Store raw monotonic nanoseconds internally; expose policy-defined tick_rate_hz.
+        HtfTick newtype wraps u64 with checked/saturating arithmetic.
+      codebase_evidence:
+        - file: crates/apm2-core/src/ledger/bft_backend.rs
+          lines: "198-205"
+          pattern: "HlcTimestamp already separates wall_time_ns from logical_counter"
+        - file: crates/apm2-core/src/consensus/crdt.rs
+          lines: "199-225"
+          pattern: "HLC-based merge operators use lexicographic (wall_ns, logical, node_id)"
+      decision: |
+        - HtfTick as newtype(u64) for monotonic nanoseconds
+        - Reuse existing HlcTimestamp for C-clock (causal time)
+        - ClockProfile.tick_rate_hz for logical representation
 
     - id: Q-HTF-0002
       question: "Cross-ledger mapping when multiple ledgers exist"
-      notes:
-        - "Do we need explicit signed checkpoint exchange events for reconciliation?"
+      status: RESOLVED_PHASE1
+      resolution: |
+        Phase 1: Single ledger; LedgerTime = (ledger_id, epoch, seq).
+        Phase 2+: Federation checkpoint protocol for multi-ledger reconciliation.
+      codebase_evidence:
+        - file: crates/apm2-core/src/ledger/bft_backend.rs
+          lines: "271-279"
+          pattern: "ConsensusIndex with epoch, round, index already exists"
+        - file: crates/apm2-core/src/evidence/strictly_ordered.rs
+          lines: "318-341"
+          pattern: "TotalOrderProof provides (epoch, round) for ordering"
+      decision: |
+        - LedgerTime tuple: (ledger_id, epoch, seq)
+        - HolonicClock.observed_ledger_head() queries LedgerBackend::head()
+        - ledger_id from deployment config; epoch default=0 in Phase 1
+        - Cross-ledger checkpoint exchange deferred to RFC-0014 replication layer
 
     - id: Q-HTF-0003
       question: "Bounded wall-time source selection and confidence representation"
-      notes:
-        - "Unify confidence across deployments to support consistent UI overlays."
+      status: RESOLVED
+      resolution: |
+        ClockProfile is a per-node governed artifact published once on daemon start.
+        Confidence tied to deployment policy via max_wall_uncertainty_ns field.
+      codebase_evidence:
+        - file: crates/apm2-core/src/lease/state.rs
+          lines: "129-149"
+          pattern: "Current wall-time fields (issued_at, expires_at) are observational"
+        - file: crates/apm2-daemon/src/evidence/receipt.rs
+          lines: "17,482,833"
+          pattern: "timestamp_ns fields are observational, not used for gate truth"
+      decision: |
+        - ClockProfile governs: tick_rate_hz, monotonic_source, wall_time_source, max_wall_uncertainty_ns
+        - Daemon publishes ClockProfile once; content hash pinned in all TimeEnvelopes
+        - Wall-time confidence unified via profile; no per-envelope variance
 
     - id: Q-HTF-0004
       question: "Handling monotonic anomalies under suspend/migration"
-      notes:
-        - "Define policy tiers for jump thresholds and quarantine routing."
+      status: RESOLVED
+      resolution: |
+        Policy-tier framework: regressions always fatal; jump thresholds policy-dependent.
+        Emit CLOCK_REGRESSION defect and quarantine high-risk episodes.
+      codebase_evidence:
+        - file: crates/apm2-core/src/consensus/crdt.rs
+          lines: "45-50"
+          pattern: "MAX_FUTURE_SKEW_NS = 60 seconds guards against remote time skew"
+        - file: crates/apm2-daemon/src/episode/state.rs
+          lines: "72-103"
+          pattern: "QuarantineReason struct for anomaly pinning already exists"
+      decision: |
+        - monotonic_policy in daemon config: tier (PRODUCTION|DEVELOPMENT|TESTING)
+        - Regression handling: FAIL_CLOSED (default) or EMIT_DEFECT
+        - max_jump_threshold_ns: policy-dependent (strict in PRODUCTION)
+        - On anomaly: emit defect, fail-closed for high-risk, quarantine episode
+
+  # ============================================================================
+  # v2 GROUNDING: Last-Mile Implementation Details
+  # ============================================================================
+
+  last_mile_details:
+    phase: "v2 (Grounded)"
+    description: |
+      Remaining implementation details that do not block architectural decisions
+      but require attention during ticket execution.
+
+    items:
+      - id: LM-HTF-0001
+        area: "HLC reuse from crdt.rs"
+        detail: |
+          TCK-00240 should explicitly import and extend the existing Hlc struct
+          from consensus/crdt.rs:196-200 rather than creating a new type.
+          The HlcStamp in HTF should be a thin wrapper or type alias.
+        target_ticket: TCK-00240
+
+      - id: LM-HTF-0002
+        area: "Clippy disallowed_methods configuration"
+        detail: |
+          TCK-00246 specifies clippy::disallowed_methods for wall-time APIs.
+          Exact module paths for #![deny] attributes:
+          - crates/apm2-core/src/admission/
+          - crates/apm2-core/src/lease/reducer.rs
+          - crates/apm2-core/src/coordination/reducer.rs
+          - crates/apm2-core/src/evidence/reducer.rs
+        target_ticket: TCK-00246
+
+      - id: LM-HTF-0003
+        area: "Canonicalization vector format"
+        detail: |
+          TCK-00238 produces canonicalization vectors. Format should match
+          existing test_vectors module structure in determinism/test_vectors.rs.
+          Output path: evidence/htf/vectors/*.json
+        target_ticket: TCK-00238
+
+      - id: LM-HTF-0004
+        area: "LedgerBackend trait dependency"
+        detail: |
+          TCK-00240 HolonicClock.observed_ledger_head() requires LedgerBackend trait.
+          Verify trait exists or define minimal interface for head() query.
+          May need coordination with RFC-0014 ledger abstraction.
+        target_ticket: TCK-00240
+        v4_resolution: |
+          RESOLVED for Phase 1: Define minimal stub interface in TCK-00240:
+          ```rust
+          pub trait LedgerBackend {
+              fn head(&self, namespace: &str) -> Result<u64, LedgerError>;
+          }
+          ```
+          Full trait specification deferred to RFC-0014 replication layer.
+          Phase 1 uses in-memory stub for single-ledger assumption.
+
+  # ============================================================================
+  # v4 FINALIZE: Council Conditions
+  # ============================================================================
+
+  v4_council_conditions:
+    phase: "v4 (Standard)"
+    council_date: "2026-01-30"
+    verdict: APPROVED
+    description: |
+      RFC-0016 advanced to v4 (Standard) after FINALIZE council review.
+      All 9 gates passed. The following conditions were documented during
+      council deliberation to address MAJOR findings.
+
+    conditions:
+      - id: COND-V4-0001
+        finding_ref: ADA-004
+        title: "HLC bootstrap policy clarification"
+        status: RESOLVED
+        resolution: |
+          HLC initialization from wall time is acceptable ONLY at initial bootstrap
+          (before any critical artifacts exist). This is a trust boundary that must
+          be explicitly documented.
+
+          Policy:
+          - First daemon start: Initialize HLC from SystemTime::now() with logical=0
+          - Subsequent restarts: Seed from persisted HLC or most recent TimeEnvelope
+          - If neither available: Treat as fresh bootstrap (acceptable for Phase 1)
+
+          Acceptance criterion added to TCK-00240: "Verify HLC persistence across
+          daemon restarts or document fresh-init limitation."
+
+      - id: COND-V4-0002
+        finding_ref: ADA-005
+        title: "LedgerBackend trait stub interface"
+        status: RESOLVED
+        resolution: |
+          Minimal LedgerBackend trait defined for Phase 1 in LM-HTF-0004.
+          Full trait specification coordinated with RFC-0014.
+
+      - id: COND-V4-0003
+        finding_ref: FND-HTF-001
+        title: "TCK-00239 critical event enumeration"
+        status: RESOLVED
+        resolution: |
+          Critical events requiring time_envelope_ref explicitly enumerated:
+          - SessionStarted, SessionTerminated
+          - ToolExecuted (decision and execution receipts)
+          - LeaseIssued, LeaseRevoked, LeaseReleased
+          - AdjudicationDecision
+          - EvidenceSubmitted
+          - MergeReceipt
+          - ProjectionReceipt
+
+          Added to TCK-00239 summary as explicit enumeration.
+
+      - id: COND-V4-0004
+        finding_ref: FND-HTF-002
+        title: "TCK-00240 atomicity guidance"
+        status: DOCUMENTED
+        resolution: |
+          TCK-00240 scope is acknowledged as larger than typical single-PR.
+          Implementation guidance: Use clear commit boundaries within PR:
+          1. Commit: HolonicClock struct and methods (~300 LoC)
+          2. Commit: Daemon runtime integration and stamping (~350 LoC)
+
+          Splitting into separate tickets (TCK-00240a/b) is optional based
+          on implementer preference. Single PR with logical commits acceptable.
