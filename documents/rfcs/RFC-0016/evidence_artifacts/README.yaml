@@ -1,0 +1,35 @@
+rfc_evidence_artifacts_readme:
+  schema_version: "2026-01-30"
+  rfc_id: "RFC-0016"
+  description: |
+    RFC-0016 evidence artifact definitions.
+
+    These files define the evidence that implementation tickets must produce.
+    Evidence IDs are HTF-scoped (EVID-HTF-xxxx).
+
+  artifacts:
+    - id: EVID-HTF-0001
+      title: "TimeEnvelope canonicalization vectors"
+      file: "EVID-HTF-0001.yaml"
+    - id: EVID-HTF-0002
+      title: "MonotonicTicks regression detection"
+      file: "EVID-HTF-0002.yaml"
+    - id: EVID-HTF-0003
+      title: "Lease expiry correctness"
+      file: "EVID-HTF-0003.yaml"
+    - id: EVID-HTF-0004
+      title: "HLC monotonicity and causality tests"
+      file: "EVID-HTF-0004.yaml"
+    - id: EVID-HTF-0005
+      title: "Normative doc time-unit lint"
+      file: "EVID-HTF-0005.yaml"
+    - id: EVID-HTF-0006
+      title: "Reducer replay determinism under HTF"
+      file: "EVID-HTF-0006.yaml"
+    - id: EVID-HTF-0100
+      title: "ClockProfile attestation proof-of-concept"
+      file: "EVID-HTF-0100.yaml"
+      optional: true
+
+  note_on_template_files:
+    - "evidence_artifacts/EVID-1000.yaml is a template placeholder and is not used by RFC-0016."

@@ -437,6 +437,6 @@ The holon types are used by agent implementations, while core types are used by 
 
 ## References
 
-- Rust-textbook Chapter 07: Errors, Panics, Diagnostics - Error type design
-- Rust-textbook Chapter 12: API Design, stdlib Quality - State machine patterns
+- `documents/skills/rust-standards/references/15_errors_panics_diagnostics.md` - Error type design
+- `documents/skills/rust-standards/references/25_api_design_stdlib_quality.md` - State machine patterns
 - README.md: Work Lifecycle State Machine section

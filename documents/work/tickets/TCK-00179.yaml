@@ -38,7 +38,7 @@ template_version: "2026-01-27"
 test_requirements:
   - description: Hook trigger
     test_id: HOOK-00179-01
-    verification_command: git commit --allow-empty -m "test: trigger hooks"
+    verification_command: "git commit --allow-empty -m 'test: trigger hooks'"
 ticket:
   depends_on: []
   id: TCK-00179

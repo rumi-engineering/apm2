@@ -1,0 +1,35 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0003"
+  type: "SECURITY"
+  source_id: "DCP-G-0002"
+  title: "GateLeaseIssued Precondition"
+  statement: |
+    apm2-daemon SpawnEpisode for GATE_EXECUTOR roles MUST require valid GateLeaseIssued
+    matching (work_id, gate_id, changeset_digest, executor_actor_id); spawn without
+    valid lease MUST be rejected.
+  acceptance_criteria:
+    - "SpawnEpisode for GATE_EXECUTOR role verifies GateLeaseIssued exists and matches. Verified by: ADV-004 test shows GateOutcome attempt without lease returns GATE_LEASE_MISSING error."
+    - "Lease validation checks work_id, gate_id, changeset_digest, executor_actor_id match. Verified by: Test shows mismatched lease is rejected with LEASE_MISMATCH error."
+    - "GateLeaseIssued binding recorded in EpisodeSpawned event. Verified by: Event inspection confirms lease_id field populated."
+  evidence:
+    evidence_ids:
+      - EVID-0004
+  law_alignment:
+    - law_id: "LAW-01"
+      enforcement: "Loop Closure: Gate execution requires lease"
+      applies_to:
+        - "GATE_EXECUTOR spawn"
+        - "GateLeaseIssued"
+    - law_id: "LAW-05"
+      enforcement: "Dual-Axis Containment: Lease scopes gate authority"
+      applies_to:
+        - "Gate execution"
+  defect_codes:
+    - code: "GATE_LEASE_MISSING"
+      severity: "S1"
+      description: "Gate executor spawn without valid GateLeaseIssued"
+    - code: "LEASE_MISMATCH"
+      severity: "S1"
+      description: "GateLeaseIssued does not match spawn parameters"

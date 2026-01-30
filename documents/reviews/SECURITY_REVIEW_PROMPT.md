@@ -29,7 +29,7 @@ decision_tree:
         - path: documents/security/CI_SECURITY_GATES.md
         - path: documents/security/THREAT_MODEL.md
         - path: documents/security/SECRETS_MANAGEMENT.md
-        - path: documents/skills/rust-textbook/SKILL.md
+        - path: documents/skills/rust-standards/SKILL.md
         - path: documents/skills/glossary/SKILL.md
         - path: documents/skills/modes-of-reasoning/references/79-adversarial-red-team.md
         - path: documents/skills/modes-of-reasoning/references/08-counterexample-guided.md
@@ -120,52 +120,52 @@ decision_tree:
         - lens: "Side-Channel & Timing Sensitivity"
           strategy: "Search for secret-dependent branching or indexing. Demand constant-time operations for ALL sensitive comparisons."
           reasoning: [8, 49] # Counterexample-Guided & Robust
-          references: ["documents/skills/rust-textbook/19_security_adjacent_rust.md"]
+          references: ["documents/skills/rust-standards/references/34_security_adjacent_rust.md"]
       audit_categories[6]:
         - category: "Identity, Cryptography, and Wire Semantics"
           focus: "Signing, verification, hashing, and deterministic representation."
           references:
             - documents/security/THREAT_MODEL.md
             - documents/security/SECRETS_MANAGEMENT.md
-            - documents/skills/rust-textbook/16_io_protocol_boundaries.md
-            - documents/skills/rust-textbook/19_security_adjacent_rust.md
+            - documents/skills/rust-standards/references/31_io_protocol_boundaries.md
+            - documents/skills/rust-standards/references/34_security_adjacent_rust.md
             - documents/skills/laws-of-holonic-agent-systems/references/law_09.md (Temporal Pinning & Freshness)
         - category: "Network and IPC Boundaries"
           focus: "Parsing untrusted data, framing, and DoS mitigation."
           references:
-            - documents/skills/rust-textbook/16_io_protocol_boundaries.md
-            - documents/skills/rust-textbook/10_concurrency_atomics_memory_order.md
-            - documents/skills/review-rust/references/08_error_handling_and_panic_policy.md
+            - documents/skills/rust-standards/references/31_io_protocol_boundaries.md
+            - documents/skills/rust-standards/references/21_concurrency_atomics_memory_order.md
+            - documents/skills/rust-standards/references/16_error_handling_and_panic_policy.md
             - documents/skills/laws-of-holonic-agent-systems/references/law_05.md (Dual-Axis Containment)
             - documents/skills/laws-of-holonic-agent-systems/references/law_06.md (MDL as a Gated Budget)
             - documents/skills/laws-of-holonic-agent-systems/references/law_12.md (Bounded Search and Termination)
         - category: "Filesystem and Process Boundaries"
           focus: "Path traversal, temp files, shell injection, and permissions."
           references:
-            - documents/skills/rust-textbook/15_paths_filesystem_os.md
-            - documents/skills/review-rust/references/12_dependency_and_build_surface.md
-            - documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md
+            - documents/skills/rust-standards/references/30_paths_filesystem_os.md
+            - documents/skills/rust-standards/references/24_dependency_and_build_surface.md
+            - documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md
             - documents/skills/laws-of-holonic-agent-systems/references/law_11.md (Idempotent Actuation)
         - category: "Ledger and Evidence Integrity"
           focus: "Append-only persistence, crash recovery, and history verification."
           references:
             - documents/security/SECURITY_POLICY.md
-            - documents/skills/rust-textbook/16_io_protocol_boundaries.md
-            - documents/skills/rust-textbook/25_time_monotonicity_determinism.md
+            - documents/skills/rust-standards/references/31_io_protocol_boundaries.md
+            - documents/skills/rust-standards/references/40_time_monotonicity_determinism.md
             - documents/skills/laws-of-holonic-agent-systems/references/law_03.md (Monotone Ledger)
             - documents/skills/laws-of-holonic-agent-systems/references/law_07.md (Verifiable Summaries)
         - category: "Memory Safety and Soundness"
           focus: "Unsafe code, async cancellation safety, and resource exhaustion."
           references:
-            - documents/skills/review-rust/references/06_rust_soundness_and_unsafe.md
-            - documents/skills/rust-textbook/09_unsafe_rust_obligations.md
-            - documents/skills/rust-textbook/11_async_pin_cancellation.md
+            - documents/skills/rust-standards/references/12_rust_soundness_and_unsafe.md
+            - documents/skills/rust-standards/references/19_unsafe_rust_obligations.md
+            - documents/skills/rust-standards/references/23_async_pin_cancellation.md
             - documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-system-defects/SKILL.md
         - category: "Gate, Policy, and Supply Chain"
           focus: "Changes to security docs, CI gates, and new dependencies."
           references:
             - documents/security/CI_SECURITY_GATES.md
-            - documents/skills/review-rust/references/12_dependency_and_build_surface.md
+            - documents/skills/rust-standards/references/24_dependency_and_build_surface.md
             - documents/reviews/SECURITY_REVIEW_PROMPT.md
             - documents/skills/laws-of-holonic-agent-systems/references/law_08.md (Goodhart Resistance)
             - documents/skills/laws-of-holonic-agent-systems/references/law_14.md (Risk-Weighted Evidence)

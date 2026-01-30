@@ -8,13 +8,10 @@ prd_requirement:
     and terminate sessions that exceed their budget, forcing a clean respawn from
     the immutable ledger.'
   acceptance_criteria:
-  - Supervisor tracks entropy signals: repeated tool failures, policy violations,
-    and lack of progress.
-  - Exceeding the entropy budget triggers a SESSION.ENTROPY_EXCEEDED event and immediate
-    termination.
-  - Recovery is performed by a new session replaying the ledger state from a valid
-    cursor.
-  - No attempt is made to "fix" or "repair" a corrupted internal session state.
+  - "Supervisor tracks entropy signals: repeated tool failures, policy violations, and lack of progress."
+  - "Exceeding the entropy budget triggers a SESSION.ENTROPY_EXCEEDED event and immediate termination."
+  - "Recovery is performed by a new session replaying the ledger state from a valid cursor."
+  - "No attempt is made to fix or repair a corrupted internal session state."
   evidence:
     evidence_ids:
     - EVID-0004

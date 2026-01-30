@@ -1,0 +1,41 @@
+requirement:
+  id: REQ-HTF-0006
+  title: "No human-time units in normative artifacts by default"
+  status: ACTIVE
+
+  statement: |
+    Normative artifacts (PRDs, RFCs, skills, laws, and policy documents) must
+    not introduce human-time units by default.
+
+    Human time is permitted only in explicit external-facing contexts.
+    An escape hatch exists for externally-scoped statements, but it must be
+    mechanically detectable and auditable.
+
+  rationale: |
+    Human time units in normative docs inevitably become authority inputs.
+    They also drift under interpretation and undermine replayable reasoning.
+
+    HTF forces internal semantics to be expressed in ledger windows and ticks.
+
+  acceptance_criteria:
+    - id: AC-HTF-0006-001
+      description: "Doc-lint rejects human-time units in scoped normative directories."
+      verification: "Doc-lint unit tests with fixture files."
+
+    - id: AC-HTF-0006-002
+      description: "Escape hatch exists for explicit external-facing contexts only."
+      verification: "Doc-lint tests allow the external marker and still reject unmarked durations."
+
+    - id: AC-HTF-0006-003
+      description: "Metrics primary indexing uses ledger windows and tick deltas; wall time is a bounded overlay."
+      verification: "Metrics schema review and tests."
+
+  design_references:
+    - "02_design_decisions.yaml#doc_lint_policy"
+    - "05_rollout_and_ops.yaml#metrics_alignment"
+
+  test_references:
+    - "07_test_and_evidence.yaml#Normative Doc Lint"
+
+  law_refs:
+    - LAW-15

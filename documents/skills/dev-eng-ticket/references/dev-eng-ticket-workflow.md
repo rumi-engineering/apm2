@@ -9,7 +9,7 @@ decision_tree:
         - path: documents/README.md
         - path: documents/skills/README.md
           purpose: "Root-level module index, documentation discovery, and repository-wide constraints."
-        - path: documents/skills/rust-textbook/SKILL.md
+        - path: documents/skills/rust-standards/SKILL.md
           purpose: "Rust quality guidance; choose relevant sections later."
         - path: documents/security/AGENTS.md
           purpose: "Security documentation index and quick reference."

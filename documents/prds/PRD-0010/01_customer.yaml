@@ -1,0 +1,44 @@
+prd_customer:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  customer_segments:
+    - id: CS-0001
+      name: Engineering Agents
+      description: |
+        Autonomous agents executing work items (implementation, review, testing) that
+        require controlled access to tools, credentials, and context. These agents
+        operate within bounded episodes and must not have ambient authority.
+      pain_points:
+        - "Currently can bypass control plane via direct xtask invocation"
+        - "No mechanical enforcement of capability boundaries"
+        - "Credentials potentially accessible during execution"
+      desired_outcomes:
+        - "Clear capability boundaries enforced mechanically"
+        - "Zero ambient credential access"
+        - "Predictable tool mediation with audit trail"
+    - id: CS-0002
+      name: Human Operators (Developers)
+      description: |
+        Developers running local tests, debugging workflows, and iterating on
+        implementation. Use CLI to interact with daemon for work orchestration.
+      pain_points:
+        - "xtask commands bypass security controls"
+        - "Unclear what capabilities are granted during execution"
+        - "No visibility into control plane decisions"
+      desired_outcomes:
+        - "Clear CLI interface for daemon-mediated operations"
+        - "Transparency into capability grants and denials"
+        - "Consistent behavior between local and CI execution"
+    - id: CS-0003
+      name: Human Operators (SREs/Security)
+      description: |
+        Operations and security personnel monitoring daemon health, auditing
+        control plane decisions, and responding to security incidents.
+      pain_points:
+        - "Limited visibility into agent capability grants"
+        - "No centralized enforcement point for security policy"
+        - "Difficult to audit tool access patterns"
+      desired_outcomes:
+        - "Centralized daemon metrics for health monitoring"
+        - "Complete audit trail of capability grants and denials"
+        - "Clear security boundary at daemon IPC layer"

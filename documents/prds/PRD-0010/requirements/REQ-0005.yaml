@@ -1,0 +1,36 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0005"
+  type: "SECURITY"
+  source_id: "DCP-G-0004"
+  title: "Context Firewall Enforcement"
+  statement: |
+    apm2-daemon tool broker MUST enforce context firewall with deny + terminate
+    semantics; reads outside ContextPack allowlist MUST terminate session immediately,
+    not log and continue.
+  acceptance_criteria:
+    - "Reads outside ContextPack allowlist emit ToolDecided=DENY with rule_id CTX-ALLOWLIST-001. Verified by: ADV-003 test shows denied read event with correct rule_id."
+    - "SessionTerminated event emitted with rationale=CONTEXT_FIREWALL_VIOLATION within 100ms of denied read. Verified by: Timing measurement confirms <100ms from denial to termination."
+    - "Session process receives SIGTERM after denial. Verified by: Process monitoring confirms termination signal sent."
+    - "Context miss triggers refinement loop, not fallback read. Verified by: Test shows ContextRefinementRequest emitted, no fallback data returned."
+  evidence:
+    evidence_ids:
+      - EVID-0003
+  law_alignment:
+    - law_id: "LAW-02"
+      enforcement: "Observable Context Sufficiency: Context misses terminate session"
+      applies_to:
+        - "Tool mediation"
+        - "ContextPack enforcement"
+    - law_id: "LAW-05"
+      enforcement: "Dual-Axis Containment: Mechanical context firewall"
+      applies_to:
+        - "Tool broker"
+  defect_codes:
+    - code: "CONTEXT_FIREWALL_DENY"
+      severity: "S2"
+      description: "Attempted read outside pack allowlist"
+    - code: "CONTEXT_MISS"
+      severity: "S2"
+      description: "Pack lacks required context; session terminated"

@@ -144,14 +144,17 @@ pub struct ParsedRequirement {
 }
 
 /// Raw YAML structure for requirement files.
+///
+/// Note: We deliberately do NOT use `deny_unknown_fields` here to maintain
+/// forward compatibility with evolving PRD schemas. Fields like `source_id`,
+/// `law_alignment`, and `defect_codes` may be present in newer PRDs but are
+/// not required for impact map generation.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RequirementYaml {
     prd_requirement: RequirementContent,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RequirementContent {
     id: String,
     #[serde(rename = "type")]

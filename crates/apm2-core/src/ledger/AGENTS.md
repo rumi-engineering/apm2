@@ -413,19 +413,19 @@ let backend = BftLedgerBackend::with_schema_registry(
 
 ### Rust Textbook Chapters
 
-- [Chapter 07: Errors, Panics, Diagnostics](/.claude/skills/rust-textbook/07_errors_panics_diagnostics.md)
+- [Chapter 07: Errors, Panics, Diagnostics](/documents/skills/rust-standards/references/15_errors_panics_diagnostics.md)
   - [CTR-0703] Error types are structured for programmatic handling
   - [RSK-0701] Database errors return `Result`, not panics
 
-- [Chapter 10: Concurrency, Atomics, Memory Ordering](/.claude/skills/rust-textbook/10_concurrency_atomics_memory_order.md)
+- [Chapter 10: Concurrency, Atomics, Memory Ordering](/documents/skills/rust-standards/references/21_concurrency_atomics_memory_order.md)
   - [INV-1001] `Arc<Mutex<Connection>>` provides data race freedom
   - [CTR-1001] `Ledger` is `Send + Sync` via interior mutability
 
-- [Chapter 16: I/O and Protocol Boundaries](/.claude/skills/rust-textbook/16_io_protocol_boundaries.md)
+- [Chapter 16: I/O and Protocol Boundaries](/documents/skills/rust-standards/references/31_io_protocol_boundaries.md)
   - [CTR-1601] Frame format is explicit (length-prefixed SQLite rows)
   - [CTR-1602] Schema versioned via `record_version` field
 
-- [Chapter 19: Security-Adjacent Rust](/.claude/skills/rust-textbook/19_security_adjacent_rust.md)
+- [Chapter 19: Security-Adjacent Rust](/documents/skills/rust-standards/references/34_security_adjacent_rust.md)
   - [CTR-1901] Threat model includes DoS via large payloads
   - [RSK-1906] Timestamp determinism via explicit nanosecond fields
 

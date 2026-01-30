@@ -1,0 +1,29 @@
+rfc_evidence_artifact:
+  schema_version: "2026-01-30"
+  id: "EVID-HTF-0004"
+  category: "TEST_RESULTS"
+  title: "HLC monotonicity and causality tests"
+  description: |
+    Tests for HLC tick/receive behavior at message boundaries, including
+    monotonicity enforcement and bounded acceptance policies.
+  capture:
+    paths:
+      - "htf/hlc/"
+  verification:
+    commands:
+      - id: "CMD-HTF-0004"
+        shell: "bash"
+        command: "cargo test -p apm2-core hlc"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 600
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "HLC receive preserves causality"
+          - "HLC regressions emit defects"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

@@ -87,12 +87,12 @@ enum Commands {
 
     /// Run checks and create a commit.
     ///
-    /// Runs cargo fmt, clippy, test, and semver-checks, then
-    /// creates a commit with the given message.
+    /// Runs cargo fmt, clippy, and test, then creates a commit
+    /// with the given message.
     Commit {
         /// The commit message
         message: String,
-        /// Skip all pre-commit checks (fmt, clippy, test, semver)
+        /// Skip all pre-commit checks (fmt, clippy, test)
         #[arg(long)]
         skip_checks: bool,
     },

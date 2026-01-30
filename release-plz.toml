@@ -17,8 +17,8 @@ pr_labels = ["release"]
 # Commit message format
 publish_timeout = "10m"
 
-# Semver check on release
-semver_check = true
+# Semver check on release (disabled until v1.0.0)
+semver_check = false
 
 # Package-specific configuration
 [[package]]

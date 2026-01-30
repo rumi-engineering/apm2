@@ -568,6 +568,6 @@ Even after policy approval, execution is sandboxed:
 
 ## References
 
-- rust-textbook Chapter 16: I/O Protocol Boundaries - wire protocol design patterns
-- rust-textbook Chapter 19: Security Adjacent Rust - input validation and trust boundaries
-- rust-textbook Chapter 12: API Design, stdlib Quality - protobuf message design
+- [31 — I/O Protocol Boundaries](/documents/skills/rust-standards/references/31_io_protocol_boundaries.md) - wire protocol design patterns
+- [34 — Security-Adjacent Rust](/documents/skills/rust-standards/references/34_security_adjacent_rust.md) - input validation and trust boundaries
+- [25 — API Design, stdlib Quality](/documents/skills/rust-standards/references/25_api_design_stdlib_quality.md) - protobuf message design

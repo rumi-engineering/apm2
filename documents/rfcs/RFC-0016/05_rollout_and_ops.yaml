@@ -1,0 +1,115 @@
+rfc_rollout_and_ops:
+  schema_version: "2026-01-30"
+
+  integration_points:
+    ledger:
+      changes:
+        - "Expose LedgerTime tuple (ledger_id, epoch, seq) in append responses and view commitments."
+        - "Ensure projections and receipts can reference ledger anchors without wall time."
+      notes:
+        - "Phase 1 single-node: epoch fixed; seq increments per append."
+        - "Phase 2 multi-node: epoch maps to consensus term/config; seq maps to commit index."
+
+    leases_and_budgets:
+      authoritative_fields:
+        - "expires_at_tick (M)"
+        - "optional ledger window limits via (ledger_id, seq delta)"
+      replace:
+        - "expires_at_timestamp -> expires_at_tick (authoritative)"
+        - "duration_ms -> duration_ticks (authoritative)"
+      edge_cases:
+        - "Monotonic regression -> CLOCK_REGRESSION defect; fail-closed for high-risk"
+        - "Large monotonic jump -> CLOCK_ANOMALY defect; quarantine by policy"
+
+    events_and_receipts:
+      must_add_time_envelope_to:
+        - "WorkEvent state transitions that gate admission"
+        - "Gate leases (issued/revoked/released)"
+        - "Gate outcomes and gate receipts"
+        - "AAT receipts"
+        - "Merge receipts"
+        - "Run receipts (episode)"
+        - "Tool decision/execution receipts"
+        - "Projection receipts"
+        - "Quarantine events"
+      guidance:
+        - "Prefer CAS-referenced envelopes (time_envelope_ref) for hot paths."
+        - "Define point vs span semantics per artifact kind."
+
+    daemon_episode_runtime:
+      add:
+        - "HolonicClock service: now_mono_tick(), now_hlc(), observed_ledger_head()."
+        - "TimeEnvelope stamping at episode start/end and tool call boundaries."
+        - "ClockProfile publication and hash pinning in envelope meta."
+      ocap:
+        - "Agents cannot access wall clock for authority; provide HTF time API only."
+        - "Disallow direct SystemTime usage in privileged logic via lint/deny rules."
+
+    coordination_reducer_controller:
+      replay:
+        - "Reducers do not call now() during replay; use recorded envelopes only."
+        - "Live scheduling may consult monotonic ticks, but never writes them into projection truth except via receipts."
+      update:
+        - "Backoff windows use tick arithmetic."
+        - "Circuit breaker windows use ticks; store breaker state with (start_tick, end_tick, failure_count)."
+
+    aat_and_determinism:
+      requirements:
+        - "AAT determinism windows and retry cooldowns use ticks."
+        - "Runner pool quarantine TTL uses ticks."
+      receipts:
+        - "AATReceipt includes TimeEnvelope (embedded or referenced)."
+
+    projection_adapters:
+      rules:
+        - "Projection schedules may use wall time for external cron integration, but must record BoundedWallTime and map to ledger anchors."
+        - "Projection divergence detection remains ledger-truth based; time used only for alerting/display."
+
+  migration_plan:
+    phase_1:
+      - "Introduce HTF types and CAC schemas (ClockProfileV1, TimeEnvelopeV1)."
+      - "Add TimeEnvelope to critical receipts/events (minimum fields: L anchor + M ticks)."
+      - "Convert TTL/timeout/backoff policies to ticks; keep wall time only as display overlay."
+      - "Add doc-lint and code-lint gates; ratchet from new/modified artifacts to full repo."
+
+    phase_1_compatibility_strategy:
+      - "If legacy wall timestamp fields exist, mark them deprecated and non-authoritative."
+      - "Admission and reducers ignore legacy wall timestamps for authority decisions."
+
+    phase_2:
+      - "Require HLC stamps for cross-node message boundaries."
+      - "Enforce clock anomaly quarantine routing."
+      - "Enable optional bounded wall time sources per deployment and risk tier."
+
+    phase_3:
+      - "Add attestation hooks for clock identity; enable for highest risk tiers."
+
+  ops_and_observability:
+    defect_handling:
+      - "CLOCK_REGRESSION triggers node quarantine; high-risk pipelines stop until cleared."
+      - "CLOCK_UNCERTAINTY_EXCEEDED downgrades wall-time confidence; no effect on authority decisions."
+
+    dashboards:
+      primary_axes:
+        - "Ledger sequence windows (L)"
+        - "Tick deltas (M)"
+      overlays:
+        - "Bounded wall time interval (W) for human display only"
+      required_annotations:
+        - "Any wall-time display must include uncertainty bounds or be marked best-effort."
+
+  metrics_alignment:
+    measurement_principles:
+      - "Primary indexing uses ledger seq and tick deltas (LAW-15)."
+      - "Do not use wall time as the primary axis for truth or performance claims."
+      - "Council estimation uses measured distributions derived from receipts, not calendar narratives."
+
+    derived_metrics_examples:
+      - "p50/p90 admission latency in ticks per risk tier"
+      - "lease expiry violation rate (expired lease attempts rejected)"
+      - "clock anomaly incident rate per node"
+      - "determinism stability rate (compare terminal evidence digests)"
+
+    conversion_rules:
+      - "Ticks may be rendered to approximate human durations only for display, labeled non-authoritative."
+      - "External SLAs may use EXTERNAL_TIME contexts and must record uncertainty or mapping details."

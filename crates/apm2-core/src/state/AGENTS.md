@@ -384,5 +384,5 @@ Older daemons reject newer state formats (fail-closed), while newer daemons can 
 
 ## References
 
-- rust-textbook [Chapter 16: I/O Protocol Boundaries](/.claude/skills/rust-textbook/16_io_protocol_boundaries.md) - Atomic file write patterns
-- rust-textbook [Chapter 07: Errors, Panics, Diagnostics](/.claude/skills/rust-textbook/07_errors_panics_diagnostics.md) - Error type design with `thiserror`
+- [APM2 Rust Standards] [I/O Protocol Boundaries](/documents/skills/rust-standards/references/31_io_protocol_boundaries.md) - Atomic file write patterns
+- [APM2 Rust Standards] [Errors, Panics, Diagnostics](/documents/skills/rust-standards/references/15_errors_panics_diagnostics.md) - Error type design with `thiserror`

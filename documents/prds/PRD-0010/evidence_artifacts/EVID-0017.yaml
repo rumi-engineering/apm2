@@ -1,0 +1,55 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0017"
+  category: "SECURITY_TEST"
+  title: "SSH key mediation isolation test"
+  description: |
+    Security test verifying SSH key mediation isolation. Tests that daemon
+    spawns isolated ssh-agent per work_id, sessions cannot access SSH_AUTH_SOCK,
+    and git SSH operations are mediated through tool broker.
+  source_acceptance_test: SEC-001
+  capture:
+    paths:
+      - "test/daemon/security/ssh_mediation.rs"
+      - "evidence/security/ssh_mediation/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --workspace -- daemon::security::ssh_mediation"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 120
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Daemon must be running"
+          - "SSH key available for test"
+          - "Test git repository available"
+      - id: "CMD-0002"
+        shell: "bash"
+        command: "cargo test --workspace -- daemon::security::ssh_agent_lifecycle"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 60
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Multiple work_ids tested"
+  assertions:
+    - "Daemon spawns ssh-agent child process per work_id"
+    - "SSH agent socket path is internal to daemon (not in session environment)"
+    - "Session environment dump shows SSH_AUTH_SOCK absent"
+    - "Direct git clone with SSH from session fails"
+    - "Git clone via tool broker RequestTool succeeds"
+    - "SSH agent terminates when work_id completes"
+    - "No orphaned ssh-agent processes after work completion"
+    - "HTTPS fallback with credential helper works when SSH unavailable"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: true
+      guidance:
+        - "Redact any SSH key fingerprints"
+        - "Redact repository URLs"

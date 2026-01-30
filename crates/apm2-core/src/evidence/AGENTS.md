@@ -388,6 +388,6 @@ The reducer validates:
 
 ## References
 
-- rust-textbook Chapter 17: Testing, Fuzz, Miri, Evidence - verification patterns
-- rust-textbook Chapter 12: API Design, stdlib Quality - trait design for `ContentAddressedStore`
-- rust-textbook Chapter 07: Errors, Panics, Diagnostics - error type design with `thiserror`
+- [32 — Testing, Fuzz, Miri, Evidence](/documents/skills/rust-standards/references/32_testing_fuzz_miri_evidence.md) - verification patterns
+- [25 — API Design, stdlib Quality](/documents/skills/rust-standards/references/25_api_design_stdlib_quality.md) - trait design for `ContentAddressedStore`
+- [15 — Errors, Panics, Diagnostics](/documents/skills/rust-standards/references/15_errors_panics_diagnostics.md) - error type design with `thiserror`

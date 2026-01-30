@@ -1,0 +1,43 @@
+requirement:
+  id: REQ-HTF-0003
+  title: "Tick-based TTLs and deadlines"
+  status: ACTIVE
+
+  statement: |
+    Lease validity, timeouts, retry/backoff windows, circuit breakers, and
+    quarantine TTLs are enforced using MonotonicTicks (M) and/or TimeEnvelope
+    containment checks. Wall time is never authoritative for these decisions.
+
+    Reducers never consult runtime clocks; time flows only via recorded
+    envelopes and tick values provided as data.
+
+  rationale: |
+    Using wall time for expiry or timeouts enables time manipulation and breaks
+    determinism under replay. Monotonic ticks provide stable local duration
+    semantics, and envelopes record the authoritative tick windows.
+
+  acceptance_criteria:
+    - id: AC-HTF-0003-001
+      description: "No privileged code path uses wall time for expiry/timeout/backoff decisions."
+      verification: "Code-lint + targeted unit tests."
+
+    - id: AC-HTF-0003-002
+      description: "Lease expiry checks use ticks/envelopes and are unaffected by wall time changes."
+      verification: "Lease unit tests simulate wall changes with identical decisions."
+
+    - id: AC-HTF-0003-003
+      description: "Reducers do not call now(); replay determinism holds."
+      verification: "Replay property tests and denylist instrumentation."
+
+  design_references:
+    - "02_design_decisions.yaml#DD-HTF-0005"
+
+  test_references:
+    - "07_test_and_evidence.yaml#MonotonicTicks Safety"
+    - "07_test_and_evidence.yaml#Lease Expiry"
+    - "07_test_and_evidence.yaml#Replay Determinism"
+
+  law_refs:
+    - LAW-01
+    - LAW-04
+    - LAW-15

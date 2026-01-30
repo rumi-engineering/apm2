@@ -1,0 +1,36 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0001"
+  type: "SECURITY"
+  source_id: "DCP-G-0006"
+  title: "IPC Privilege Separation"
+  statement: |
+    apm2-daemon MUST separate IPC endpoints into privileged (operator-only) and
+    session-scoped (bound to session_id) categories; agents MUST NOT be able to
+    call privileged endpoints directly.
+  acceptance_criteria:
+    - "Privileged endpoints (ClaimWork, SpawnEpisode, IssueCapability, Shutdown) require operator credential. Verified by: ADV-001 test shows agent call to ClaimWork returns PERMISSION_DENIED."
+    - "Session-scoped endpoints (RequestTool, EmitEvent, PublishEvidence, StreamTelemetry) bound to authenticated session_id. Verified by: Test shows session-scoped call without valid session_id is rejected."
+    - "Denied privilege escalation returns generic PERMISSION_DENIED without endpoint enumeration. Verified by: Error message inspection shows no endpoint names leaked."
+  evidence:
+    evidence_ids:
+      - EVID-0001
+      - EVID-0002
+  law_alignment:
+    - law_id: "LAW-05"
+      enforcement: "Dual-Axis Containment: IPC boundary separates agent from operator authority"
+      applies_to:
+        - "Privileged endpoints"
+        - "Session-scoped endpoints"
+    - law_id: "LAW-06"
+      enforcement: "MDL as Gated Budget: IPC API surface bounded and minimal"
+      applies_to:
+        - "IPC endpoint classification"
+  defect_codes:
+    - code: "IPC_PRIVILEGE_ESCALATION"
+      severity: "S0"
+      description: "Agent accessed privileged endpoint"
+    - code: "IPC_AUTH_BYPASS"
+      severity: "S0"
+      description: "Unauthenticated access to IPC endpoint"

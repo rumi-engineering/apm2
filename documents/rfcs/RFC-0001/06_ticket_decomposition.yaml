@@ -17,7 +17,7 @@ rfc_ticket_decomposition:
       title: "Implement ledger storage layer with SQLite WAL"
       ticket_files:
         meta_ref: "documents/work/tickets/TCK-00001.yaml#ticket_meta"
-              scope:
+        scope:
         in_scope:
         - "Create SQLite database with events table"
         - "Implement append-only write semantics"

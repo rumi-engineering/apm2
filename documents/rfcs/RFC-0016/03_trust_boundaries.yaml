@@ -1,0 +1,148 @@
+rfc_trust_boundaries:
+  schema_version: "2026-01-30"
+
+  trust_model:
+    summary: |
+      Time is a security surface.
+
+      HTF assumes:
+      - Wall time can be manipulated or become inaccurate.
+      - Monotonic time can regress under certain kernel/virtualization failures.
+      - Remote peers can forge timestamps.
+
+      Therefore, the protocol must:
+      - never treat wall time as authority,
+      - detect and fail-closed on monotonic anomalies for high-risk operations,
+      - treat causality stamps as advisory and validate monotonicity bounds.
+
+  trust_boundaries:
+    - id: TB-HTF-0001
+      name: "Kernel/daemon boundary (clock sources)"
+      description: |
+        The daemon reads OS clocks and exposes only HTF constructs to holons.
+        Holon code must not directly access wall time for authority decisions.
+      assets:
+        - "Monotonic tick source (CLOCK_MONOTONIC_RAW preferred)"
+        - "Optional bounded wall time source"
+        - "ClockProfile publication and hash pinning"
+      failure_modes:
+        - "Monotonic regression"
+        - "Large monotonic jump (e.g., suspend/resume)"
+        - "Wall time skew or rewind"
+
+    - id: TB-HTF-0002
+      name: "Cross-node boundary (messages and clocks)"
+      description: |
+        Peers may supply HLC stamps and wall-time observations.
+        These are untrusted inputs and must not be used for authority.
+      assets:
+        - "HLC update rules and monotonicity validation"
+        - "ClockProfile policy allowlist by risk tier"
+
+    - id: TB-HTF-0003
+      name: "Operator/external boundary (EXTERNAL_TIME)"
+      description: |
+        Interactions with humans and external systems require wall time.
+        HTF allows wall time only as bounded intervals and only for external
+        contexts (display, audits, notifications, external SLAs).
+      assets:
+        - "BoundedWallTime interval validation"
+        - "Explicit EXTERNAL_TIME escape hatch for doc/policy text"
+
+  threats:
+    - id: TH-HTF-0001
+      name: "Wall time rewind/skew"
+      mechanism: "NTP adjustments, manual changes, misconfigured time sources"
+      impact:
+        - "Lease resurrection if wall time is used for expiry"
+        - "Incorrect ordering if wall time is used to sort events"
+      mitigation:
+        - "Wall time never used as authority (INV-HTF-0001)"
+        - "BoundedWallTime is interval-only and validated"
+
+    - id: TH-HTF-0002
+      name: "VM pause / suspend / migration"
+      mechanism: "Virtualization can produce large monotonic jumps"
+      impact:
+        - "False timeouts if duration logic assumes continuous progression"
+        - "Budget or retry windows may skip"
+      mitigation:
+        - "Detect large jumps and emit CLOCK_ANOMALY defect"
+        - "Policy may quarantine or require operator adjudication by risk tier"
+
+    - id: TH-HTF-0003
+      name: "Monotonic regression"
+      mechanism: "Kernel bugs, clock source regressions, environment anomalies"
+      impact:
+        - "Safety-critical expiry becomes unsound"
+      mitigation:
+        - "Treat as safety incident; emit CLOCK_REGRESSION defect"
+        - "Fail-closed for high-risk operations"
+
+    - id: TH-HTF-0004
+      name: "Remote peer forges timestamps"
+      mechanism: "Malicious node sends far-future HLC wall_ns"
+      impact:
+        - "Correlation poisoning"
+        - "Potential local HLC 'bricking' if adopted blindly"
+      mitigation:
+        - "HLC receive algorithm includes bounded acceptance and anomaly detection"
+        - "CausalTime is advisory; authority decisions never depend on it"
+
+    - id: TH-HTF-0005
+      name: "Misleading logs/receipts"
+      mechanism: "Inject misleading wall timestamps into human logs"
+      impact:
+        - "Operator confusion"
+        - "Incorrect postmortem conclusions"
+      mitigation:
+        - "Receipts carry ledger anchors and monotonic tick spans"
+        - "Wall time display must be bounded or explicitly best-effort"
+
+  controls_and_enforcement:
+    defect_taxonomy:
+      - code: CLOCK_REGRESSION
+        trigger: "M tick decreases within a session or on a node"
+        default_response: "Fail-closed for high-risk; quarantine node"
+
+      - code: CLOCK_ANOMALY
+        trigger: "M tick jump exceeds configured anomaly threshold"
+        default_response: "Quarantine by policy; require adjudication for high-risk"
+
+      - code: CLOCK_UNCERTAINTY_EXCEEDED
+        trigger: "W interval width exceeds ClockProfile.max_wall_uncertainty_ns"
+        default_response: "Downgrade wall confidence; ignore W for display"
+
+      - code: HLC_REGRESSION
+        trigger: "C stamp decreases under update rules"
+        default_response: "Record defect; quarantine sender by policy"
+
+      - code: LEDGER_ANCHOR_REGRESSION
+        trigger: "L anchor decreases within a session"
+        default_response: "Record defect; treat as data corruption or replay mismatch"
+
+    fail_closed_policy:
+      high_risk:
+        - "CLOCK_REGRESSION -> emergency stop of affected node/runner pool"
+        - "CLOCK_ANOMALY -> quarantine until adjudicated"
+      low_risk:
+        - "CLOCK_ANOMALY -> allow progress but emit defect and restrict sensitive gates"
+
+  allowed_clock_profiles:
+    governance: |
+      ClockProfileV1 is a governed artifact. Policies may restrict acceptable
+      profiles by risk tier. Phase 1 requires publication and hash pinning.
+      Phase 2+ may require attestation for high-risk tiers.
+
+    example_profile_policies:
+      - profile_policy_id: "PROFILE_LOW_RISK"
+        allows_wall_time_sources: [NONE, BEST_EFFORT_NTP]
+        requires_attestation: false
+
+      - profile_policy_id: "PROFILE_HIGH_RISK"
+        allows_wall_time_sources: [NONE, AUTHENTICATED_NTS, ROUGHTIME, CLOUD_BOUNDED]
+        requires_attestation: false
+
+      - profile_policy_id: "PROFILE_ATTESTED"
+        allows_wall_time_sources: [NONE, AUTHENTICATED_NTS, ROUGHTIME, CLOUD_BOUNDED]
+        requires_attestation: true

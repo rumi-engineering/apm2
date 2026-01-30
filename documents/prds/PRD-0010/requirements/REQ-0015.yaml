@@ -1,0 +1,36 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0015"
+  type: "SECURITY"
+  source_id: "DCP-G-0006"
+  title: "Operator Credential Definition"
+  statement: |
+    apm2-daemon Phase 1 operator authentication MUST use a mechanically enforceable
+    credential mechanism; the mechanism MUST be one of: (a) SO_PEERCRED UID/GID
+    allowlist, (b) separate privileged socket path with filesystem ACL, or
+    (c) short-lived admin token with mandatory rotation. The chosen mechanism
+    MUST be documented before RFC implementation begins.
+  acceptance_criteria:
+    - "Operator authentication mechanism selected and documented in RFC. Verified by: RFC design section specifies chosen mechanism with rationale."
+    - "Mechanism is mechanically enforceable (not advisory). Verified by: ADV-009 test shows unprivileged process cannot reach privileged endpoints regardless of request content."
+    - "If token-based: rotation interval defined and enforced. Verified by: Token older than rotation interval is rejected."
+    - "If token-based: error messages do not leak token validity information. Verified by: Error response inspection shows generic PERMISSION_DENIED only."
+    - "If socket-based: filesystem permissions documented and enforced. Verified by: Socket path has correct ownership and mode."
+  evidence:
+    evidence_ids:
+      - EVID-0014
+  law_alignment:
+    - law_id: "LAW-05"
+      enforcement: "Dual-Axis Containment: Operator vs agent privilege separation"
+      applies_to:
+        - "Privileged endpoint authentication"
+        - "Operator credential verification"
+  defect_codes:
+    - code: "OPERATOR_AUTH_UNDEFINED"
+      severity: "S0"
+      description: "Operator authentication mechanism not specified"
+    - code: "OPERATOR_AUTH_BYPASS"
+      severity: "S0"
+      description: "Unprivileged process accessed privileged endpoint"
+  review_finding_ref: "FND-PRD-0010-001"

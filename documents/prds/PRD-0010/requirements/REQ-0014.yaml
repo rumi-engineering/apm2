@@ -1,0 +1,37 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0014"
+  type: "FUNCTIONAL"
+  source_id: "DCP-G-0010"
+  title: "xtask Deprecation with Migration Path"
+  statement: |
+    xtask commands MUST be deprecated with a migration path to apm2 CLI equivalents;
+    deprecation warnings MUST point users to replacement commands; removal MUST be
+    gated on telemetry showing <5% direct xtask usage.
+  acceptance_criteria:
+    - "xtask commands emit deprecation warnings pointing to apm2 CLI equivalents. Verified by: Running any xtask command shows warning with replacement command."
+    - "--allow-deprecated flag permits continued xtask use during transition. Verified by: xtask command with flag suppresses deprecation error after Phase 2."
+    - "Deprecation gate blocks removal until telemetry shows <5% direct xtask usage. Verified by: Removal PR blocked by telemetry gate check."
+    - "During deprecation period, divergence from xtask direct writes emits WARNING, not freeze. Verified by: ADV-008 test confirms WARNING behavior during deprecation."
+  evidence:
+    evidence_ids:
+      - EVID-0008
+      - EVID-0012
+  law_alignment:
+    - law_id: "LAW-01"
+      enforcement: "Loop Closure: All work flows through daemon control plane after deprecation"
+      applies_to:
+        - "xtask deprecation"
+        - "apm2 CLI migration"
+    - law_id: "LAW-04"
+      enforcement: "Stochastic Stability: Telemetry gate ensures migration completeness before removal"
+      applies_to:
+        - "Deprecation gate"
+  defect_codes:
+    - code: "XTASK_DEPRECATED"
+      severity: "S3"
+      description: "Direct xtask usage during deprecation period"
+    - code: "XTASK_BLOCKED"
+      severity: "S2"
+      description: "Direct xtask usage after deprecation period without --allow-deprecated"

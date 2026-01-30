@@ -52,9 +52,9 @@ rfc_risks_and_open_questions:
       description: "Temp file security on shared systems"
       likelihood: LOW
       impact: MEDIUM
-        mitigation: |
-          tempfile crate creates files with 0600 permissions in secure temp
-          directory. On shared systems, ensure TMPDIR is user-private. Document
+      mitigation: |
+        tempfile crate creates files with 0600 permissions in secure temp
+        directory. On shared systems, ensure TMPDIR is user-private. Document
         security assumptions in documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md.
 
     - id: RISK-006-007
