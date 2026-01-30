@@ -586,6 +586,46 @@ impl ContextRefinementRequest {
 
     /// Creates a new context refinement request without path truncation.
     ///
+    /// This is an alias for [`Self::new_unchecked`] provided for backwards
+    /// compatibility. New code should prefer [`Self::from_context_miss`] for
+    /// untrusted input or [`Self::new_unchecked`] when working with trusted
+    /// input.
+    ///
+    /// # Safety
+    ///
+    /// This constructor does NOT truncate `missed_path`. It is intended for
+    /// use with trusted input only (e.g., internal coordination logic where
+    /// paths have already been validated).
+    ///
+    /// For untrusted input, use [`Self::from_context_miss`] which applies
+    /// truncation automatically, or call [`Self::truncate_path`] on the path
+    /// before passing it to this method.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        session_id: String,
+        coordination_id: Option<String>,
+        work_id: String,
+        manifest_id: String,
+        missed_path: String,
+        rationale_code: String,
+        refinement_count: u32,
+        timestamp: u64,
+    ) -> Self {
+        Self::new_unchecked(
+            session_id,
+            coordination_id,
+            work_id,
+            manifest_id,
+            missed_path,
+            rationale_code,
+            refinement_count,
+            timestamp,
+        )
+    }
+
+    /// Creates a new context refinement request without path truncation.
+    ///
     /// # Safety
     ///
     /// This constructor does NOT truncate `missed_path`. It is intended for
@@ -1567,6 +1607,29 @@ mod tests {
         );
 
         // new_unchecked() preserves the original path without truncation
+        assert_eq!(request.missed_path.len(), original_len);
+        assert!(!request.is_path_truncated());
+    }
+
+    #[test]
+    fn test_context_refinement_request_new_backwards_compat() {
+        // Test that ::new() is an alias for ::new_unchecked() (backwards compat)
+        let long_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH + 100);
+        let original_len = long_path.len();
+
+        // new() should behave exactly like new_unchecked()
+        let request = ContextRefinementRequest::new(
+            "session-001".to_string(),
+            None,
+            "work-001".to_string(),
+            "manifest-001".to_string(),
+            long_path,
+            "CONTEXT_MISS".to_string(),
+            0,
+            1_000_000_000,
+        );
+
+        // new() preserves the original path without truncation (same as new_unchecked)
         assert_eq!(request.missed_path.len(), original_len);
         assert!(!request.is_path_truncated());
     }
