@@ -26,13 +26,15 @@
 //! # Modules
 //!
 //! - [`episode`]: Episode runtime for bounded execution management
+//! - [`evidence`]: Flight recording and evidence retention
+//! - [`projection`]: FAC projection adapters for external system sync
 //! - [`protocol`]: UDS protocol and message framing
 //! - [`session`]: Session handling with context firewall integration
 //! - [`telemetry`]: Cgroup-based resource telemetry collection
-//! - [`evidence`]: Flight recording and evidence retention
 
 pub mod episode;
 pub mod evidence;
+pub mod projection;
 pub mod protocol;
 pub mod session;
 pub mod telemetry;
