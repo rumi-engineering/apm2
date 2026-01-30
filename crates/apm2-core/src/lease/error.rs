@@ -40,6 +40,13 @@ pub enum LeaseError {
         expired_at: u64,
     },
 
+    /// The lease has been revoked.
+    #[error("lease {lease_id} has been revoked")]
+    LeaseRevoked {
+        /// The lease ID.
+        lease_id: String,
+    },
+
     /// Invalid release reason.
     #[error("invalid release reason: {value}")]
     InvalidReleaseReason {
