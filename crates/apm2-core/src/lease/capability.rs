@@ -576,6 +576,7 @@ impl CapabilityProof {
     /// # Errors
     ///
     /// Returns `LeaseError::InvalidInput` if validation fails.
+    #[allow(clippy::too_many_lines)]
     pub fn validate_structure(&self, current_time: u64) -> Result<(), LeaseError> {
         // Validate ID lengths
         if self.capability_id.len() > MAX_ID_LEN {
@@ -611,7 +612,13 @@ impl CapabilityProof {
             });
         }
 
-        // Validate chain length
+        // Validate chain length (must not be empty)
+        if self.delegation_chain.is_empty() {
+            return Err(LeaseError::InvalidInput {
+                field: "delegation_chain".to_string(),
+                reason: "cannot be empty; must contain at least the root grant".to_string(),
+            });
+        }
         if self.delegation_chain.len() > MAX_DELEGATION_CHAIN_ENTRIES {
             return Err(LeaseError::InvalidInput {
                 field: "delegation_chain".to_string(),
@@ -654,10 +661,40 @@ impl CapabilityProof {
                     reason: format!("exceeds limit of {MAX_SIGNATURE_LEN} bytes"),
                 });
             }
+
+            // Validate depth sequence: depth must equal position in chain (zero-indexed)
+            #[allow(clippy::cast_possible_truncation)] // i bounded by MAX_DELEGATION_CHAIN_ENTRIES
+            let expected_depth = i as u32;
+            if entry.depth != expected_depth {
+                return Err(LeaseError::InvalidInput {
+                    field: format!("delegation_chain[{i}].depth"),
+                    reason: format!(
+                        "depth must match position in chain (expected {expected_depth}, found {})",
+                        entry.depth
+                    ),
+                });
+            }
+
             if entry.depth > MAX_DELEGATION_DEPTH {
                 return Err(LeaseError::InvalidInput {
                     field: format!("delegation_chain[{i}].depth"),
                     reason: format!("exceeds maximum depth {MAX_DELEGATION_DEPTH}"),
+                });
+            }
+        }
+
+        // Validate that the last entry matches the proof's top-level identity
+        if let Some(last_entry) = self.delegation_chain.last() {
+            if last_entry.capability_id != self.capability_id {
+                return Err(LeaseError::InvalidInput {
+                    field: "capability_id".to_string(),
+                    reason: "does not match the tail of the delegation chain".to_string(),
+                });
+            }
+            if last_entry.holder_actor_id != self.holder_actor_id {
+                return Err(LeaseError::InvalidInput {
+                    field: "holder_actor_id".to_string(),
+                    reason: "does not match the tail of the delegation chain".to_string(),
                 });
             }
         }
@@ -778,11 +815,18 @@ impl CapabilityRegistryState {
     ///
     /// # Errors
     ///
-    /// Returns `LeaseError::InvalidInput` if namespace capacity is exceeded.
+    /// Returns `LeaseError::LeaseAlreadyExists` if capability ID already
+    /// exists. Returns `LeaseError::InvalidInput` if namespace capacity is
+    /// exceeded.
     pub fn insert(&mut self, capability: Capability) -> Result<(), LeaseError> {
         let namespace = capability.namespace.clone();
         let holder = capability.holder_actor_id.clone();
         let cap_id = capability.capability_id.clone();
+
+        // Check for duplicate capability ID
+        if self.capabilities.contains_key(&cap_id) {
+            return Err(LeaseError::LeaseAlreadyExists { lease_id: cap_id });
+        }
 
         // Check namespace capacity
         let ns_count = self
@@ -1251,6 +1295,25 @@ mod tck_00199_tests {
     }
 
     #[test]
+    fn test_capability_proof_validate_structure_empty_chain_fails() {
+        let proof = CapabilityProof {
+            capability_id: "cap-1".to_string(),
+            namespace: "ns".to_string(),
+            holder_actor_id: "alice".to_string(),
+            scope_hash: vec![],
+            budget_hash: vec![],
+            expires_at: 2_000_000_000,
+            delegation_chain: vec![], // Empty chain
+            root_grant_seq_id: None,
+        };
+
+        let result = proof.validate_structure(1_500_000_000);
+        assert!(
+            matches!(result, Err(LeaseError::InvalidInput { field, .. }) if field == "delegation_chain")
+        );
+    }
+
+    #[test]
     fn test_capability_proof_validate_structure_id_too_long_fails() {
         let long_id = "x".repeat(MAX_ID_LEN + 1);
         let proof = CapabilityProof::new_root(
@@ -1374,6 +1437,51 @@ mod tck_00199_tests {
         let retrieved = state.get("cap-1").unwrap();
         assert_eq!(retrieved.capability_id, "cap-1");
         assert_eq!(retrieved.namespace, "ns-1");
+    }
+
+    #[test]
+    fn test_registry_state_insert_duplicate_fails() {
+        let mut state = CapabilityRegistryState::new();
+        let cap1 = Capability::new(
+            "cap-1".to_string(),
+            "ns-1".to_string(),
+            "alice".to_string(),
+            "reg".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            1_000_000_000,
+            2_000_000_000,
+            vec![4, 5, 6],
+            true,
+        );
+
+        // First insert should succeed
+        state.insert(cap1).unwrap();
+        assert_eq!(state.len(), 1);
+
+        // Second insert with same ID should fail
+        let cap1_duplicate = Capability::new(
+            "cap-1".to_string(), // Same ID as first capability
+            "ns-2".to_string(),  // Different namespace
+            "bob".to_string(),   // Different holder
+            "reg".to_string(),
+            vec![7, 8, 9],
+            vec![],
+            1_500_000_000,
+            2_500_000_000,
+            vec![10, 11, 12],
+            false,
+        );
+
+        let result = state.insert(cap1_duplicate);
+        assert!(
+            matches!(result, Err(LeaseError::LeaseAlreadyExists { lease_id }) if lease_id == "cap-1")
+        );
+
+        // State should be unchanged
+        assert_eq!(state.len(), 1);
+        let retrieved = state.get("cap-1").unwrap();
+        assert_eq!(retrieved.holder_actor_id, "alice"); // Original capability still there
     }
 
     #[test]
