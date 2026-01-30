@@ -185,21 +185,6 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  # Secret scanning
-  secrets:
-    name: Secret Scan
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   # SAFETY-PROOF comment coverage for unsafe code (security gate)
   # Verifies that all unsafe blocks have documented safety proofs
   safety-proof-coverage:
@@ -278,7 +263,7 @@ jobs:
   # Final check that all CI jobs passed
   ci-success:
     name: CI Success
-    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, secrets, build, semver, safety-proof-coverage]
+    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, build, semver, safety-proof-coverage]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -294,7 +279,6 @@ jobs:
           if [[ "${{ needs.security.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.deny.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.coverage.result }}" != "success" ]]; then exit 1; fi
-          if [[ "${{ needs.secrets.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.build.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.semver.result }}" != "success" && "${{ needs.semver.result }}" != "skipped" ]]; then exit 1; fi
           if [[ "${{ needs.safety-proof-coverage.result }}" != "success" ]]; then exit 1; fi

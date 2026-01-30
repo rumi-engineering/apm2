@@ -40,11 +40,11 @@ Procedures for handling security incidents.
 
 4. **Determine scope**
    ```bash
-   # Search git history for the secret
-   git log -p | gitleaks detect --pipe
+   # Search git history for the secret pattern
+   git log -p -S '<secret-pattern>'
 
    # Check if secret exists in any branch
-   git branch -a | xargs -I{} git log {} -p | gitleaks detect --pipe
+   git branch -a | xargs -I{} git log {} -p -S '<secret-pattern>'
    ```
 
 5. **Remove from history** (if committed)

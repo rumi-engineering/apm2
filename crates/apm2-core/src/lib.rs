@@ -51,6 +51,7 @@ pub mod crypto;
 pub mod determinism;
 pub mod events;
 pub mod evidence;
+pub mod github;
 pub mod health;
 pub mod impact_map;
 pub mod ipc;

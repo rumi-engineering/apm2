@@ -13,15 +13,38 @@ echo -e "${GREEN}Running pre-commit hooks...${NC}"
 echo "Checking for merge conflicts and trailing whitespace..."
 git diff --cached --check
 
-# 2. Rust fmt
-echo "Checking formatting (cargo fmt)..."
-cargo fmt --all -- --check
+# Capture staged Rust files before auto-fix (preserves partial staging)
+# Uses null-terminated output for safe handling of filenames with spaces/newlines
+STAGED_RS_FILES_NUL=$(git diff --cached --name-only -z --diff-filter=ACM | tr '\0' '\n' | grep '\.rs$' | tr '\n' '\0' || true)
 
-# 3. Clippy
+# Helper function to re-stage only originally staged Rust files
+# Uses null-terminated input for safe handling of filenames with spaces/newlines
+restage_rust_files() {
+    if [[ -n "$STAGED_RS_FILES_NUL" ]]; then
+        # Use printf to preserve null bytes, xargs -0 for null-separated input
+        # Note: -r flag (--no-run-if-empty) is GNU extension, not available on macOS
+        # xargs -0 on macOS will still run with empty input, but git add with no args is harmless
+        printf '%s' "$STAGED_RS_FILES_NUL" | xargs -0 git add 2>/dev/null || true
+    fi
+}
+
+# 2. Auto-fix compiler warnings (unused imports, etc.)
+echo "Auto-fixing compiler warnings..."
+if ! cargo fix --allow-dirty --allow-staged --quiet 2>/dev/null; then
+    echo -e "${YELLOW}Warning: cargo fix encountered issues, continuing...${NC}"
+fi
+restage_rust_files
+
+# 3. Rust fmt (auto-fix and re-stage)
+echo "Formatting code (cargo fmt)..."
+cargo fmt --all
+restage_rust_files
+
+# 4. Clippy
 echo "Running Clippy..."
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# 4. Proto verification
+# 5. Proto verification
 echo "Verifying generated proto code..."
 cargo build -p apm2-daemon --quiet 2>/dev/null
 if ! git diff --exit-code crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs > /dev/null; then
@@ -29,7 +52,7 @@ if ! git diff --exit-code crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs > /d
     exit 1
 fi
 
-# 5. Typos
+# 6. Typos
 if command -v typos >/dev/null 2>&1; then
     echo "Checking for typos..."
     typos
@@ -37,7 +60,7 @@ else
     echo -e "${YELLOW}Warning: typos not installed, skipping...${NC}"
 fi
 
-# 6. Taplo (TOML check)
+# 7. Taplo (TOML check)
 if command -v taplo >/dev/null 2>&1; then
     echo "Checking TOML files..."
     taplo check
@@ -46,21 +69,26 @@ else
     echo -e "${YELLOW}Warning: taplo not installed, skipping...${NC}"
 fi
 
-# 7. YAML check
+# 8. YAML check
 if command -v python3 >/dev/null 2>&1; then
     echo "Checking YAML files..."
     # Check if pyyaml is installed
     if python3 -c "import yaml" >/dev/null 2>&1; then
-        find . -name "*.yaml" -o -name "*.yml" -not -path "*/target/*" | xargs -I {} python3 -c "import yaml, sys; yaml.safe_load(open('{}'))"
+        # Use null-terminated find output and while-read loop for safe filename handling
+        # This handles filenames with spaces, newlines, and special characters
+        while IFS= read -r -d '' file; do
+            python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" "$file"
+        done < <(find . \( -name "*.yaml" -o -name "*.yml" \) -not -path "*/target/*" -print0)
     else
         echo -e "${YELLOW}Warning: pyyaml not installed, skipping YAML validation...${NC}"
     fi
 
     echo "Checking JSON files..."
-    find . -name "*.json" -not -path "*/target/*" -exec python3 -m json.tool {} + > /dev/null
+    # Use -print0 and xargs -0 for safe filename handling
+    find . -name "*.json" -not -path "*/target/*" -print0 | xargs -0 python3 -m json.tool > /dev/null
 fi
 
-# 8. Markdown lint
+# 9. Markdown lint
 if command -v markdownlint >/dev/null 2>&1; then
     echo "Linting Markdown..."
     markdownlint .

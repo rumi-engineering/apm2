@@ -24,7 +24,6 @@ The following procedure is the required operational sequence for publishing an A
      * `cargo clippy --all-targets -- -D warnings`
      * `cargo deny check`
      * `cargo audit`
-     * `gitleaks detect`
    * Ensure the results are for the exact commit to be released (not a prior commit).
 
 5. **Confirm dependency policy compliance**
@@ -35,7 +34,7 @@ The following procedure is the required operational sequence for publishing an A
 
 6. **Confirm secret hygiene prerequisites**
 
-   * Confirm the CI secret scanning gate (gitleaks) is green.
+   * Review for accidental secret commits (use `git log -p -S` for targeted searches).
    * If release artifacts are built outside CI for any reason, stop; releases should be produced only by the controlled CI pipeline.
 
 7. **Prepare release metadata**

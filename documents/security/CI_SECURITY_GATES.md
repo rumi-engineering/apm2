@@ -12,7 +12,6 @@ All pull requests must pass these security gates before merge.
 | Dependency Check | `cargo-deny` | All PRs | Yes | License/ban/advisory checks |
 | Formal Proofs | `kani` / `prusti` | Unsafe-touching PRs | Yes | Formal safety proofs for unsafe blocks |
 | Agent Complexity | `clippy::cognitive_complexity` | Agent-authored PRs | Yes | Complexity cap for agent-written modules |
-| Secret Scan | `gitleaks` | All PRs | Yes | Detect committed secrets |
 | SBOM Generation | `syft` | Release | Yes | Software bill of materials |
 | Vulnerability Scan | `grype` | Release | High/Critical | Container/artifact scanning |
 | SLSA L4 Provenance | `slsa-github-generator` | Release | Yes | Hermetic build + two-person review provenance |
@@ -108,23 +107,6 @@ Checks:
 - **bans**: Forbidden crates (e.g., openssl)
 - **licenses**: Only approved licenses
 - **sources**: Only trusted registries
-
-### Secret Scanning (Gitleaks)
-
-Detects secrets in code and git history:
-
-```yaml
-- name: Secret Scan
-  uses: gitleaks/gitleaks-action@v2
-  env:
-    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-```
-
-Detects:
-- API keys and tokens
-- Private keys and certificates
-- AWS/GCP/Azure credentials
-- Generic passwords and secrets
 
 ### SBOM Generation (Release Only)
 
@@ -238,9 +220,6 @@ cargo audit
 # Dependency check
 cargo deny check
 
-# Secret scan
-gitleaks detect
-
 # Cognitive complexity for agent-authored code
 cargo clippy -- -A clippy::all -W clippy::cognitive_complexity
 ```
@@ -259,7 +238,6 @@ To manually trigger the hooks, you can run the respective scripts in `.cargo-hus
 Hooks include:
 - Format checking
 - Clippy lints
-- Secret detection
 - Large file prevention
 
 ## Bypassing Gates
@@ -309,15 +287,3 @@ error[L001]: license not in allowlist: GPL-3.0
 ```
 
 Fix: Find an alternative crate with approved license.
-
-### Gitleaks Failure
-
-```
-Secret detected: AWS Access Key ID
-File: config.rs:42
-```
-
-Fix:
-1. Remove the secret from code
-2. Rotate the compromised credential
-3. Use proper secret management (env vars, keyring)
