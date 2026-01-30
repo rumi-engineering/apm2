@@ -1100,6 +1100,7 @@ impl CapabilityProof {
     /// This verifies:
     /// 1. The root grant's registrar signature over the root event hash
     /// 2. Each delegation's signature by the delegator (previous holder)
+    /// 3. Each event hash is correctly bound to its metadata (CRITICAL-01)
     ///
     /// # Arguments
     ///
@@ -1112,12 +1113,19 @@ impl CapabilityProof {
     ///
     /// Returns `LeaseError::InvalidSignature` if any signature is invalid.
     /// Returns `LeaseError::MissingSignature` if a signature is empty.
-    /// Returns `LeaseError::InvalidInput` if a public key cannot be resolved.
+    /// Returns `LeaseError::InvalidInput` if a public key cannot be resolved
+    /// or if event hash binding verification fails.
     ///
-    /// # Security
+    /// # Security (CRITICAL-01)
     ///
-    /// This method is deterministic: the same inputs always produce the same
-    /// result. The verification order is fixed (root first, then
+    /// This method verifies both:
+    /// 1. That each signature is valid over the event hash
+    /// 2. That each event hash is correctly bound to the metadata (prevents
+    ///    metadata substitution attacks via
+    ///    [`DelegationChainEntry::verify_event_hash_binding`])
+    ///
+    /// The verification is deterministic: the same inputs always produce the
+    /// same result. The verification order is fixed (root first, then
     /// delegations in chain order).
     pub fn validate_signatures<F>(&self, get_public_key: F) -> Result<(), LeaseError>
     where
@@ -1146,6 +1154,17 @@ impl CapabilityProof {
                     reason: "event hash cannot be empty".to_string(),
                 });
             }
+
+            // CRITICAL-01: Verify event hash is correctly bound to metadata
+            // This prevents metadata substitution attacks where an attacker
+            // reuses a valid signature but substitutes different metadata
+            entry
+                .verify_event_hash_binding()
+                .map_err(|_| LeaseError::InvalidInput {
+                    field: format!("delegation_chain[{i}].event_hash"),
+                    reason: "event hash does not match metadata (possible substitution attack)"
+                        .to_string(),
+                })?;
 
             // Determine whose public key to use for verification
             // HIGH-02: Use the delegator_actor_id from the entry (which is
