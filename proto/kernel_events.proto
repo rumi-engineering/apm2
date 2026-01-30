@@ -223,7 +223,49 @@ message LeaseEvent {
     LeaseReleased released = 3;
     LeaseExpired expired = 4;
     LeaseConflict conflict = 5;
+    GateLeaseIssued gate_lease_issued = 6;
   }
+}
+
+// GateLease issued for Forge Admission Cycle execution.
+// Binds an executor actor to a specific changeset and time window.
+message GateLeaseIssued {
+  // Unique identifier for this lease
+  string lease_id = 1;
+  // Work item this lease authorizes
+  string work_id = 2;
+  // Gate this lease applies to
+  string gate_id = 3;
+  // Hash binding the lease to specific changeset
+  bytes changeset_digest = 4;
+  // Actor authorized to execute under this lease
+  string executor_actor_id = 5;
+  // Timestamp when lease was issued (Unix millis, observational)
+  uint64 issued_at = 6;
+  // Timestamp when lease expires (Unix millis, observational)
+  uint64 expires_at = 7;
+  // Hash of the policy configuration
+  bytes policy_hash = 8;
+  // Actor who issued this lease
+  string issuer_actor_id = 9;
+  // Ed25519 signature over canonical bytes with GATE_LEASE_ISSUED: prefix
+  bytes issuer_signature = 10;
+  // HTF time envelope reference for temporal authority
+  string time_envelope_ref = 11;
+  // Optional AAT-specific extension fields
+  AatLeaseExtension aat_extension = 12;
+}
+
+// AAT (Autonomous Agent Team) lease extension fields.
+message AatLeaseExtension {
+  // Hash of the view commitment for the AAT context
+  bytes view_commitment_hash = 1;
+  // Hash of the RCP (Runnable Capability Profile) manifest
+  bytes rcp_manifest_hash = 2;
+  // Identifier for the RCP profile being used
+  string rcp_profile_id = 3;
+  // Identifier for the selection policy used
+  string selection_policy_id = 4;
 }
 
 message LeaseIssued {
