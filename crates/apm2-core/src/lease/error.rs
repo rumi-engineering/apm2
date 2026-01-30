@@ -32,12 +32,17 @@ pub enum LeaseError {
     },
 
     /// The lease has expired.
-    #[error("lease {lease_id} has expired at {expired_at}")]
+    #[error("lease {lease_id} has expired")]
     LeaseExpired {
         /// The lease ID.
         lease_id: String,
-        /// When the lease expired (Unix nanos).
-        expired_at: u64,
+    },
+
+    /// The lease has been revoked.
+    #[error("lease {lease_id} has been revoked")]
+    LeaseRevoked {
+        /// The lease ID.
+        lease_id: String,
     },
 
     /// Invalid release reason.
