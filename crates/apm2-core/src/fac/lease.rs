@@ -53,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::domain_separator::{GATE_LEASE_ISSUED_PREFIX, sign_with_domain, verify_with_domain};
+use super::policy_resolution::MAX_STRING_LENGTH;
 use crate::crypto::{Signature, VerifyingKey};
 
 // =============================================================================
@@ -74,6 +75,17 @@ pub enum LeaseError {
     /// Invalid lease data.
     #[error("invalid lease data: {0}")]
     InvalidData(String),
+
+    /// String field exceeds maximum length.
+    #[error("string field {field} exceeds max length: {actual} > {max}")]
+    StringTooLong {
+        /// Name of the field that exceeded the limit.
+        field: &'static str,
+        /// Actual length of the string.
+        actual: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
 }
 
 // =============================================================================
@@ -402,6 +414,8 @@ impl GateLeaseBuilder {
     /// # Errors
     ///
     /// Returns [`LeaseError::MissingField`] if any required field is not set.
+    /// Returns [`LeaseError::StringTooLong`] if any string field exceeds the
+    /// maximum length.
     pub fn try_build_and_sign(
         self,
         signer: &crate::crypto::Signer,
@@ -427,6 +441,66 @@ impl GateLeaseBuilder {
         let time_envelope_ref = self
             .time_envelope_ref
             .ok_or(LeaseError::MissingField("time_envelope_ref"))?;
+
+        // Validate string lengths to prevent DoS
+        if self.lease_id.len() > MAX_STRING_LENGTH {
+            return Err(LeaseError::StringTooLong {
+                field: "lease_id",
+                actual: self.lease_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.work_id.len() > MAX_STRING_LENGTH {
+            return Err(LeaseError::StringTooLong {
+                field: "work_id",
+                actual: self.work_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.gate_id.len() > MAX_STRING_LENGTH {
+            return Err(LeaseError::StringTooLong {
+                field: "gate_id",
+                actual: self.gate_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if executor_actor_id.len() > MAX_STRING_LENGTH {
+            return Err(LeaseError::StringTooLong {
+                field: "executor_actor_id",
+                actual: executor_actor_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if issuer_actor_id.len() > MAX_STRING_LENGTH {
+            return Err(LeaseError::StringTooLong {
+                field: "issuer_actor_id",
+                actual: issuer_actor_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if time_envelope_ref.len() > MAX_STRING_LENGTH {
+            return Err(LeaseError::StringTooLong {
+                field: "time_envelope_ref",
+                actual: time_envelope_ref.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if let Some(ref ext) = self.aat_extension {
+            if ext.rcp_profile_id.len() > MAX_STRING_LENGTH {
+                return Err(LeaseError::StringTooLong {
+                    field: "aat_extension.rcp_profile_id",
+                    actual: ext.rcp_profile_id.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+            if ext.selection_policy_id.len() > MAX_STRING_LENGTH {
+                return Err(LeaseError::StringTooLong {
+                    field: "aat_extension.selection_policy_id",
+                    actual: ext.selection_policy_id.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
 
         // Create lease with placeholder signature
         let mut lease = GateLease {

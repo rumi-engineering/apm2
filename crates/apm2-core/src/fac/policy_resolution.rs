@@ -1074,13 +1074,44 @@ impl TryFrom<PolicyResolvedForChangeSetProto> for PolicyResolvedForChangeSet {
             })
             .collect::<Result<_, _>>()?;
 
+        // Sort arrays for canonical representation
+        // Zip profile IDs with manifest hashes, sort by ID, then unzip
+        let mut pairs: Vec<(String, [u8; 32])> = proto
+            .resolved_rcp_profile_ids
+            .into_iter()
+            .zip(resolved_rcp_manifest_hashes)
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let (resolved_rcp_profile_ids, resolved_rcp_manifest_hashes): (Vec<_>, Vec<_>) =
+            pairs.into_iter().unzip();
+
+        // Sort verifier policy hashes
+        let mut resolved_verifier_policy_hashes = resolved_verifier_policy_hashes;
+        resolved_verifier_policy_hashes.sort_unstable();
+
+        // CRITICAL: Verify resolved_policy_hash matches computed hash
+        // This prevents a compromised resolver from binding leases to a different
+        // policy than what the audit fields indicate
+        let computed_hash = Self::compute_policy_hash(
+            resolved_risk_tier,
+            resolved_determinism_class,
+            &resolved_rcp_profile_ids,
+            &resolved_rcp_manifest_hashes,
+            &resolved_verifier_policy_hashes,
+        );
+        if computed_hash != resolved_policy_hash {
+            return Err(PolicyResolutionError::InvalidData(
+                "resolved_policy_hash does not match computed hash from fields".to_string(),
+            ));
+        }
+
         Ok(Self {
             work_id: proto.work_id,
             changeset_digest,
             resolved_policy_hash,
             resolved_risk_tier,
             resolved_determinism_class,
-            resolved_rcp_profile_ids: proto.resolved_rcp_profile_ids,
+            resolved_rcp_profile_ids,
             resolved_rcp_manifest_hashes,
             resolved_verifier_policy_hashes,
             resolver_actor_id: proto.resolver_actor_id,
