@@ -138,19 +138,6 @@ pub enum AdmissionError {
         /// Description of the serialization error.
         message: String,
     },
-
-    /// The repository is frozen due to divergence or intervention.
-    ///
-    /// This error is returned when admission is attempted on a repository
-    /// that has been frozen due to divergence detection or manual intervention.
-    /// Admission cannot proceed until the freeze is resolved via adjudication.
-    #[error("repository frozen: {reason}")]
-    RepoFrozen {
-        /// The freeze ID that caused the rejection.
-        freeze_id: String,
-        /// The reason for the freeze.
-        reason: String,
-    },
 }
 
 impl From<CasError> for AdmissionError {
