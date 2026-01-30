@@ -24,7 +24,7 @@
 //! 2. Content hashes prevent TOCTOU (time-of-check-to-time-of-use) attacks
 //! 3. All reads outside the allowlist are denied
 //! 4. Path normalization prevents traversal attacks
-//! 5. [`firewall::ToolDecided`] events are emitted for audit logging
+//! 5. [`firewall::FirewallDecision`] events are emitted for audit logging
 //!
 //! # Firewall Modes
 //!
