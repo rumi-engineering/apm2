@@ -381,7 +381,7 @@ Provides the `spawn()` function and `SpawnedProcess` type for low-level process 
 
 ## References
 
-- [rust-textbook Chapter 15: Paths, Filesystem, OS](../../.claude/skills/rust-textbook/15_paths_filesystem_os.md) - Path handling for `cwd`
-- [rust-textbook Chapter 11: Async, Pin, Cancellation](../../.claude/skills/rust-textbook/11_async_pin_cancellation.md) - Async process operations
+- [rust-textbook Chapter 15: Paths, Filesystem, OS](/documents/skills/rust-standards/references/30_paths_filesystem_os.md) - Path handling for `cwd`
+- [rust-textbook Chapter 11: Async, Pin, Cancellation](/documents/skills/rust-standards/references/23_async_pin_cancellation.md) - Async process operations
 - [tokio::process](https://docs.rs/tokio/latest/tokio/process/) - Underlying async process management
 - [nix::sys::signal](https://docs.rs/nix/latest/nix/sys/signal/) - Unix signal handling

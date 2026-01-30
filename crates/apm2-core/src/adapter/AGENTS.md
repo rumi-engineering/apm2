@@ -373,6 +373,6 @@ while let Some(event) = rx.recv().await {
 
 ## References
 
-- rust-textbook [Chapter 11: Async, Pin, and Cancellation](/.claude/skills/rust-textbook/11_async_pin_cancellation.md) - Async patterns used in adapter implementation
-- rust-textbook [Chapter 12: API Design](/.claude/skills/rust-textbook/12_api_design_stdlib_quality.md) - Builder pattern and trait design
-- rust-textbook [Chapter 19: Security-Adjacent Rust](/.claude/skills/rust-textbook/19_security_adjacent_rust.md) - Environment filtering and symlink protection
+- rust-standards [Chapter 11: Async, Pin, and Cancellation](/documents/skills/rust-standards/references/23_async_pin_cancellation.md) - Async patterns used in adapter implementation
+- rust-standards [Chapter 12: API Design](/documents/skills/rust-standards/references/18_api_design_and_semver.md) - Builder pattern and trait design
+- rust-standards [Chapter 19: Security-Adjacent Rust](/documents/skills/rust-standards/references/34_security_adjacent_rust.md) - Environment filtering and symlink protection

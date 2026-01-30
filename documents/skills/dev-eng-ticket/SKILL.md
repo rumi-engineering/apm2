@@ -44,20 +44,20 @@ The following documents define the core principles and security posture of APM2:
 
 ## Required Reading (APM2 Rust Textbook)
 
-Engineering tickets in APM2 MUST adhere to the **[APM2 Rust Textbook](/documents/skills/rust-textbook/)**. This textbook defines the normative contracts, invariants, and hazards that govern our implementation quality.
+Engineering tickets in APM2 MUST adhere to the **[APM2 Rust Standards](/documents/skills/rust-standards/)**. This skill defines the normative contracts, invariants, and hazards that govern our implementation quality.
 
 ### Foundational Chapters (Mandatory)
 
 The following chapters represent the baseline requirement for any development work in this repository:
 
-*   **[07 — Errors, Panics, Diagnostics](/documents/skills/rust-textbook/07_errors_panics_diagnostics.md)**: Structured error handling and panic safety.
-*   **[12 — API Design](/documents/skills/rust-textbook/12_api_design_stdlib_quality.md)**: Contract-first, misuse-resistant interfaces.
-*   **[13 — Collections and Allocation](/documents/skills/rust-textbook/13_collections_allocation_models.md)**: Memory DoS prevention and address stability.
-*   **[15 — Paths and Filesystem](/documents/skills/rust-textbook/15_paths_filesystem_os.md)**: Sanitization and atomic write protocols.
-*   **[16 — I/O and Protocol Boundaries](/documents/skills/rust-textbook/16_io_protocol_boundaries.md)**: Framing, bounded reads, and strict Serde.
-*   **[19 — Security-Adjacent Rust](/documents/skills/rust-textbook/19_security_adjacent_rust.md)**: Resource exhaustion and integrity failures.
-*   **[24 — Hazard Catalog](/documents/skills/rust-textbook/24_hazard_catalog_checklists.md)**: **CRITICAL** quick-scan checklist for all changes.
-*   **[26 — APM2 Safe Patterns](/documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md)**: Project-specific idioms and lessons learned.
+*   **[15 — Errors, Panics, Diagnostics](/documents/skills/rust-standards/references/15_errors_panics_diagnostics.md)**: Structured error handling and panic safety.
+*   **[25 — API Design](/documents/skills/rust-standards/references/25_api_design_stdlib_quality.md)**: Contract-first, misuse-resistant interfaces.
+*   **[27 — Collections and Allocation](/documents/skills/rust-standards/references/27_collections_allocation_models.md)**: Memory DoS prevention and address stability.
+*   **[30 — Paths and Filesystem](/documents/skills/rust-standards/references/30_paths_filesystem_os.md)**: Sanitization and atomic write protocols.
+*   **[31 — I/O and Protocol Boundaries](/documents/skills/rust-standards/references/31_io_protocol_boundaries.md)**: Framing, bounded reads, and strict Serde.
+*   **[34 — Security-Adjacent Rust](/documents/skills/rust-standards/references/34_security_adjacent_rust.md)**: Resource exhaustion and integrity failures.
+*   **[39 — Hazard Catalog](/documents/skills/rust-standards/references/39_hazard_catalog_checklists.md)**: **CRITICAL** quick-scan checklist for all changes.
+*   **[41 — APM2 Safe Patterns](/documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md)**: Project-specific idioms and lessons learned.
 
 ### PR Review Readiness Checklist
 
@@ -68,7 +68,7 @@ Before submitting a PR, verify your changes against the following specific contr
 3.  **Path Safety:** `ParentDir` (`..`) rejected; `symlink_metadata` used if sensitive ([CTR-1503], [CTR-2609]).
 4.  **Negative Tests:** Oversize input fails; traversal fails; forbidden actions denied ([INV-1701], [RSK-0701]).
 5.  **Miri Validation:** If `unsafe` is used, `// SAFETY:` comment is present and Miri passes ([CTR-0902], [RSK-1701]).
-6.  **Textbook Alignment:** Check your changes against the [Hazard Catalog](/documents/skills/rust-textbook/24_hazard_catalog_checklists.md).
+6.  **Standards Alignment:** Check your changes against the [Hazard Catalog](/documents/skills/rust-standards/references/39_hazard_catalog_checklists.md).
 7.  **Serialization Safety:** Serde operations in crypto contexts propagate errors ([CTR-1908]).
 8.  **Builder Completeness:** Builder validates ALL inputs, not just IDs ([CTR-1205], [CTR-2603]).
 9.  **Chain Integrity:** Hash chains commit to all related events ([CTR-2616]).

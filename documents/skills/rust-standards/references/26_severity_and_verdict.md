@@ -18,6 +18,7 @@ BLOCKER:
     - "unsafe code without local safety proof"
     - "soundness risk (UAF, double-free, aliasing, pointer stability)"
     - "QCP changes without adequate tests/evidence"
+    - "identity binding or cryptographic proof failure (SEC-AUDIT-001)"
     - "public API footgun making misuse likely and catastrophic"
     - "semver hazard without justification and migration"
     - "concurrency safety risk (incorrect Send/Sync, ordering, locking)"

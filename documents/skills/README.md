@@ -22,13 +22,13 @@ The core engineering workflow is governed by a sequence of skills. For a detaile
 ### Execution & Engineering
 *   [dev-eng-ticket](./dev-eng-ticket/SKILL.md) - Autonomous engineering ticket implementation.
 *   [coding](./coding/SKILL.md) - General coding assistance and idioms.
-*   [review-rust](./review-rust/SKILL.md) - Specialized Rust code review protocols.
+*   [rust-standards](./rust-standards/SKILL.md) - Normative Rust contracts, safety invariants, and review protocols.
 
 ### Reasoning & Infrastructure
 *   [modes-of-reasoning](./modes-of-reasoning/SKILL.md) - The 80 reasoning modes used by Council agents.
 *   [agent-native-software](./agent-native-software/SKILL.md) - The foundational doctrine of agent-native design.
 *   [laws-of-holonic-agent-systems](./laws-of-holonic-agent-systems/SKILL.md) - The inescapable "physics" of the holonic SDLC.
-*   [rust-textbook](./rust-textbook/) - Normative Rust contracts and safety invariants.
+*   [skill-authoring](./skill-authoring/SKILL.md) - Best practices for creating and maintaining agent skills.
 
 ## Usage
 

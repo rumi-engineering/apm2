@@ -69,6 +69,14 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 - REJECT IF: restart attempts / sequence numbers can decrease or reset across terminal states.
 - ENFORCE BY: store last-seen attempt in terminal states; require `attempt > previous`.
 
+[CONTRACT: CTR-2617] Distributed Capabilities Are Fail-Closed.
+- REJECT IF: any distributed capability, network listener, or entry point defaults to an "Enabled" or "Open" state.
+- ENFORCE BY:
+  - Capability structs MUST return empty/zero permissions in their `Default` implementation.
+  - Feature flags for network egress/ingress MUST default to `false`.
+  - Permission masks for new files/directories MUST default to `0600`/`0700` unless explicitly overridden.
+[PROVENANCE] SEC-AUDIT-003: Missing Global Fail-Closed requirement.
+
 [CONTRACT: CTR-2616] Hash Chain Integrity.
 - REJECT IF: hash chains do not commit to ALL related state (lifecycle events, data payloads).
 - ENFORCE BY: combine all relevant event hashes into the final committed hash.

@@ -390,6 +390,6 @@ Tracks work item lifecycle: `Open -> Claimed -> InProgress -> Review -> Complete
 
 ## References
 
-- [rust-textbook Chapter 25: Time, Monotonicity, Determinism](/.claude/skills/rust-textbook/25_time_monotonicity_determinism.md) - Determinism requirements for event sourcing
-- [rust-textbook Chapter 17: Testing](/.claude/skills/rust-textbook/17_testing_fuzz_miri_evidence.md) - Property-based testing patterns
+- [rust-textbook Chapter 25: Time, Monotonicity, Determinism](/documents/skills/rust-standards/references/40_time_monotonicity_determinism.md) - Determinism requirements for event sourcing
+- [rust-textbook Chapter 17: Testing](/documents/skills/rust-standards/references/20_testing_evidence_and_ci.md) - Property-based testing patterns
 - [Event Sourcing Pattern](https://martinfowler.com/eaaDev/EventSourcing.html) - Martin Fowler's foundational article

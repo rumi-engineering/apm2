@@ -327,8 +327,8 @@ assert!(lease.is_terminal());
 
 ## References
 
-- rust-textbook [Chapter 19: Security-Adjacent Rust](/.claude/skills/rust-textbook/19_security_adjacent_rust.md) - Input validation, trust boundaries
-- rust-textbook [Chapter 12: API Design](/.claude/skills/rust-textbook/12_api_design_stdlib_quality.md) - `#[non_exhaustive]`, builder patterns
+- rust-textbook [Chapter 19: Security-Adjacent Rust](/documents/skills/rust-standards/references/34_security_adjacent_rust.md) - Input validation, trust boundaries
+- rust-textbook [Chapter 12: API Design](/documents/skills/rust-standards/references/18_api_design_and_semver.md) - `#[non_exhaustive]`, builder patterns
 - RFC-0015: Forge Admission Cycle - GateLease architecture, Risk-Tiered AAT Selection Policy
 - LAW-05: Dual-Axis Containment - Authority + Accountability
 - LAW-14: Proportionality and Risk-Weighted Evidence

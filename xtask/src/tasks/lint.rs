@@ -418,7 +418,7 @@ fn check_temp_dir_usage(
             line_number,
             pattern: line.trim().to_string(),
             message: "Direct temp_dir() usage creates predictable paths vulnerable to symlink attacks".to_string(),
-            suggestion: "Use tempfile::NamedTempFile or tempfile::TempDir instead. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-2".to_string(),
+            suggestion: "Use tempfile::NamedTempFile or tempfile::TempDir instead. See documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md#anti-2".to_string(),
             severity: LintSeverity::Warning,
             lint_id: None,
         });
@@ -454,7 +454,7 @@ fn check_temp_dir_usage_in_doc(
             message:
                 "Documentation example uses std::env::temp_dir which teaches insecure patterns"
                     .to_string(),
-            suggestion: "Use tempfile::NamedTempFile in examples. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-2"
+            suggestion: "Use tempfile::NamedTempFile in examples. See documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md#anti-2"
                 .to_string(),
             severity: LintSeverity::Warning,
             lint_id: None,
@@ -502,7 +502,7 @@ fn check_unquoted_shell_paths(
                 line_number,
                 pattern: line.trim().to_string(),
                 message: "Unquoted path in shell command format string may break with special characters".to_string(),
-                suggestion: "Use quote_path() or shell_escape() for paths in shell commands. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-1".to_string(),
+                suggestion: "Use quote_path() or shell_escape() for paths in shell commands. See documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md#anti-1".to_string(),
                 severity: LintSeverity::Warning,
                 lint_id: None,
             });
@@ -567,7 +567,7 @@ fn check_shell_interpolation(
                 line_number,
                 pattern: line.trim().to_string(),
                 message: "Complex string interpolation in shell command may break with special characters".to_string(),
-                suggestion: "Write complex strings to a temp file and use stdin redirection. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-1".to_string(),
+                suggestion: "Write complex strings to a temp file and use stdin redirection. See documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md#anti-1".to_string(),
                 severity: LintSeverity::Warning,
                 lint_id: None,
             });
@@ -595,7 +595,7 @@ fn check_shell_interpolation(
             message: "Passing prompt content as command argument may break with special characters"
                 .to_string(),
             suggestion:
-                "Write prompts to a temp file and redirect stdin. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-1"
+                "Write prompts to a temp file and redirect stdin. See documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md#anti-1"
                     .to_string(),
             severity: LintSeverity::Warning,
             lint_id: None,
@@ -636,7 +636,7 @@ fn check_shell_interpolation_in_doc(
             message: "Documentation example shows shell command with unescaped format!()"
                 .to_string(),
             suggestion:
-                "Show safe pattern using temp file and stdin redirection. See documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md#anti-1"
+                "Show safe pattern using temp file and stdin redirection. See documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md#anti-1"
                     .to_string(),
             severity: LintSeverity::Warning,
             lint_id: None,
@@ -1612,7 +1612,7 @@ code line 2
     #[test]
     fn test_finding_with_doc_path() {
         let finding = LintFinding {
-            file_path: "documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md"
+            file_path: "documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
                 .to_string(),
             line_number: 50,
             pattern: "std::env::temp_dir()".to_string(),
@@ -1624,7 +1624,7 @@ code line 2
 
         let display = finding.to_string();
         assert!(display.contains(
-            "documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md:50"
+            "documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md:50"
         ));
         assert!(display.contains("Documentation example"));
     }

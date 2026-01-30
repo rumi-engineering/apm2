@@ -389,6 +389,6 @@ The kernel `apm2_core::lease` module tracks lease lifecycle via event sourcing, 
 
 ## References
 
-- rust-textbook [Chapter 07: Errors, Panics, Diagnostics](/.claude/skills/rust-textbook/07_errors_panics_diagnostics.md) - Error type design
-- rust-textbook [Chapter 12: API Design](/.claude/skills/rust-textbook/12_api_design_stdlib_quality.md) - `#[non_exhaustive]` and builder patterns
-- rust-textbook [Chapter 19: Security-Adjacent Rust](/.claude/skills/rust-textbook/19_security_adjacent_rust.md) - Trust boundaries and input validation
+- rust-textbook [Chapter 07: Errors, Panics, Diagnostics](/documents/skills/rust-standards/references/15_errors_panics_diagnostics.md) - Error type design
+- rust-textbook [Chapter 12: API Design](/documents/skills/rust-standards/references/18_api_design_and_semver.md) - `#[non_exhaustive]` and builder patterns
+- rust-textbook [Chapter 19: Security-Adjacent Rust](/documents/skills/rust-standards/references/34_security_adjacent_rust.md) - Trust boundaries and input validation

@@ -13,7 +13,7 @@ inputs: [ChangeSet, PlanOfRecord, CI_Evidence]
 outputs: [MergeReceipt | FindingReport]
 ```
 
-> **Reference**: For comprehensive Rust principles and best practices, see [`documents/skills/rust-textbook/SKILL.md`](../rust-textbook/SKILL.md).
+> **Reference**: For comprehensive Rust principles and best practices, see [`documents/skills/rust-standards/SKILL.md`](../rust-standards/SKILL.md).
 > **Required Reading**:
 > - [Agent-Native Software: Industry Textbook](../agent-native-software/SKILL.md)
 > - [Security Documentation](../../security/AGENTS.md)

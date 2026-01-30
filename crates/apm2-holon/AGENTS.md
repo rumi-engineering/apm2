@@ -1144,9 +1144,9 @@ with actual artifact fetching remains.
 
 ## References
 
-- [rust-textbook: 04_ownership_borrowing_model.md] - Ownership patterns for state management
-- [rust-textbook: 06_traits_generics_coherence.md] - Trait design with associated types
-- [rust-textbook: 07_errors_panics_diagnostics.md] - Error type design with `thiserror`
-- [rust-textbook: 12_api_design_stdlib_quality.md] - Builder pattern, method naming conventions
-- [rust-textbook: 17_testing_fuzz_miri_evidence.md] - Property-based testing for invariants
-- [rust-textbook: 25_time_monotonicity_determinism.md] - Timestamp handling and monotonic invariants
+- [rust-standards: 09_ownership_borrowing_model.md] - Ownership patterns for state management
+- [rust-standards: 13_traits_generics_coherence.md] - Trait design with associated types
+- [rust-standards: 15_errors_panics_diagnostics.md] - Error type design with `thiserror`
+- [rust-standards: 25_api_design_stdlib_quality.md] - Builder pattern, method naming conventions
+- [rust-standards: 32_testing_fuzz_miri_evidence.md] - Property-based testing for invariants
+- [rust-standards: 40_time_monotonicity_determinism.md] - Timestamp handling and monotonic invariants

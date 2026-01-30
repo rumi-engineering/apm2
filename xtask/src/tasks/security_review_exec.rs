@@ -23,8 +23,8 @@ pub const REQUIRED_READING: &[&str] = &[
     "documents/security/CI_SECURITY_GATES.md",
     "documents/security/THREAT_MODEL.md",
     "documents/security/SECRETS_MANAGEMENT.md",
-    "documents/skills/review-rust/SKILL.md",
-    "documents/skills/rust-textbook/SKILL.md",
+    "documents/skills/rust-standards/SKILL.md",
+    
     "documents/skills/laws-of-holonic-agent-systems/references/agent-native-software/SKILL.md",
 ];
 

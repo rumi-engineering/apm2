@@ -33,6 +33,14 @@
   - Explicit revocation evidence that is replicated with higher priority than standard state.
 [PROVENANCE] THREAT_MODEL.md: Identity threats dominate; revocation must handle long-lived partitions.
 
+[CONTRACT: CTR-2703] Cryptographically Bound ActorID.
+- REJECT IF: `ActorId` is represented as a raw primitive (e.g., `String`, `Uuid`, `u64`) in public APIs, signature payloads, or ledger events.
+- ENFORCE BY:
+  - Define `ActorId` as a newtype wrapping the BLAKE3 hash of the actor's `VerifyingKey` (e.g., `struct ActorId([u8; 32])`).
+  - Construction of `ActorId` MUST be bound to a validated cryptographic key at the type level.
+  - All protocols MUST use this bound type to prevent identity spoofing and non-repudiation of the identity string itself.
+[PROVENANCE] SEC-AUDIT-001: Weak ActorID binding; RFC-0010.
+
 [HAZARD: RSK-2702] Capability Amplification via Recursive Delegation.
 - TRIGGER: A sub-holon inducing a parent to perform actions using the parent's higher-trust credentials (Confused Deputy).
 - REJECT IF: Delegation tokens are not attenuated (scoped to specific purpose, time, and target).

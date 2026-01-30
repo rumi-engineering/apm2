@@ -500,11 +500,11 @@ pub enum RecoveryError {
 
 ## References
 
-### rust-textbook Chapters
+### rust-standards References
 
-- [07_errors_panics_diagnostics.md](/documents/skills/rust-textbook/07_errors_panics_diagnostics.md) - Error handling patterns used in SessionError and RecoveryError
-- [17_testing_fuzz_miri_evidence.md](/documents/skills/rust-textbook/17_testing_fuzz_miri_evidence.md) - Property-based testing with proptest (see tests.rs)
-- [25_time_monotonicity_determinism.md](/documents/skills/rust-textbook/25_time_monotonicity_determinism.md) - Monotonicity enforcement for restart_attempt
+- [15_errors_panics_diagnostics.md](/documents/skills/rust-standards/references/15_errors_panics_diagnostics.md) - Error handling patterns used in SessionError and RecoveryError
+- [32_testing_fuzz_miri_evidence.md](/documents/skills/rust-standards/references/32_testing_fuzz_miri_evidence.md) - Property-based testing with proptest (see tests.rs)
+- [40_time_monotonicity_determinism.md](/documents/skills/rust-standards/references/40_time_monotonicity_determinism.md) - Monotonicity enforcement for restart_attempt
 
 ### Design Principles
 
