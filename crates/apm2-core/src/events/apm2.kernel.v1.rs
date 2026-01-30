@@ -31,7 +31,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -63,6 +63,8 @@ pub mod kernel_event {
         GithubLease(super::GitHubLeaseEvent),
         #[prost(message, tag = "20")]
         PolicyResolvedForChangeset(super::PolicyResolvedForChangeSet),
+        #[prost(message, tag = "21")]
+        GateReceipt(super::GateReceipt),
     }
 }
 /// ============================================================
@@ -997,4 +999,53 @@ pub struct PolicyResolvedForChangeSet {
     /// Ed25519 signature over canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: domain (64 bytes)
     #[prost(bytes = "vec", tag = "11")]
     pub resolver_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// GateReceipt envelope with versioning support.
+/// This is the canonical receipt envelope that wraps gate-specific payloads.
+/// The receipt binds a gate execution result to a specific lease and changeset.
+///
+/// Versioning:
+/// - receipt_version: Envelope schema version (currently: 1)
+/// - payload_kind: Type of payload ("aat", "quality", "security")
+/// - payload_schema_version: Version of the payload schema
+///
+/// Security:
+/// - receipt_signature uses GATE_RECEIPT: domain prefix
+/// - All fields except signature are included in canonical bytes
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GateReceipt {
+    /// Unique identifier for this receipt
+    #[prost(string, tag = "1")]
+    pub receipt_id: ::prost::alloc::string::String,
+    /// Gate that generated this receipt
+    #[prost(string, tag = "2")]
+    pub gate_id: ::prost::alloc::string::String,
+    /// Lease that authorized this gate execution
+    #[prost(string, tag = "3")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Hash binding to specific changeset (32 bytes)
+    #[prost(bytes = "vec", tag = "4")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Actor who executed the gate
+    #[prost(string, tag = "5")]
+    pub executor_actor_id: ::prost::alloc::string::String,
+    /// Envelope schema version (supported: 1)
+    #[prost(uint32, tag = "6")]
+    pub receipt_version: u32,
+    /// Type of payload: "aat", "quality", "security"
+    #[prost(string, tag = "7")]
+    pub payload_kind: ::prost::alloc::string::String,
+    /// Version of the payload schema
+    #[prost(uint32, tag = "8")]
+    pub payload_schema_version: u32,
+    /// Hash of the payload content (32 bytes)
+    #[prost(bytes = "vec", tag = "9")]
+    pub payload_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Hash of the evidence bundle (32 bytes)
+    #[prost(bytes = "vec", tag = "10")]
+    pub evidence_bundle_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Ed25519 signature over canonical bytes with GATE_RECEIPT: domain (64 bytes)
+    #[prost(bytes = "vec", tag = "11")]
+    pub receipt_signature: ::prost::alloc::vec::Vec<u8>,
 }

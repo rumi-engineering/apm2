@@ -36,9 +36,9 @@
 //! ```
 
 use super::{
-    AdjudicationRequested, EvidencePublished, GateReceiptGenerated, KernelEvent, LeaseConflict,
-    PolicyResolvedForChangeSet, WorkCompleted, WorkOpened, adjudication_event, evidence_event,
-    kernel_event, lease_event, work_event,
+    AdjudicationRequested, EvidencePublished, GateReceipt, GateReceiptGenerated, KernelEvent,
+    LeaseConflict, PolicyResolvedForChangeSet, WorkCompleted, WorkOpened, adjudication_event,
+    evidence_event, kernel_event, lease_event, work_event,
 };
 
 /// Trait for canonicalizing messages before signing.
@@ -116,6 +116,14 @@ impl Canonicalize for PolicyResolvedForChangeSet {
     }
 }
 
+impl Canonicalize for GateReceipt {
+    fn canonicalize(&mut self) {
+        // GateReceipt has no repeated fields, so no sorting is needed.
+        // This implementation exists for completeness and to support
+        // KernelEvent canonicalization.
+    }
+}
+
 impl Canonicalize for KernelEvent {
     fn canonicalize(&mut self) {
         // Canonicalize nested payload if present
@@ -150,6 +158,9 @@ impl Canonicalize for KernelEvent {
             },
             Some(kernel_event::Payload::PolicyResolvedForChangeset(policy_resolved)) => {
                 policy_resolved.canonicalize();
+            },
+            Some(kernel_event::Payload::GateReceipt(gate_receipt)) => {
+                gate_receipt.canonicalize();
             },
             _ => {},
         }

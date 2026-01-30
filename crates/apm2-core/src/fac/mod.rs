@@ -10,6 +10,7 @@
 //! - **Gate Leases**: Authorization tokens binding executors to changesets
 //! - **Policy Resolution**: Anchor events locking policy decisions for
 //!   changesets
+//! - **Gate Receipts**: Versioned envelopes for gate execution results
 //!
 //! # Security Model
 //!
@@ -19,6 +20,7 @@
 //! 2. **Domain separation** prevents cross-protocol signature replay
 //! 3. **Policy resolution** locks policy decisions before lease issuance
 //! 4. **Time envelopes** enforce temporal authority bounds
+//! 5. **Gate receipts** provide cryptographic proof of gate execution
 //!
 //! # Ordering Invariant
 //!
@@ -64,6 +66,7 @@
 mod domain_separator;
 mod lease;
 mod policy_resolution;
+mod receipt;
 
 // Re-export domain separator constants and functions
 pub use domain_separator::{
@@ -79,4 +82,9 @@ pub use policy_resolution::{
     DeterminismClass, MAX_RCP_PROFILES, MAX_STRING_LENGTH, MAX_VERIFIER_POLICIES,
     PolicyResolutionError, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
     PolicyResolvedForChangeSetProto, RiskTier,
+};
+// Re-export receipt types
+pub use receipt::{
+    GateReceipt, GateReceiptBuilder, GateReceiptProto, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
+    SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
 };
