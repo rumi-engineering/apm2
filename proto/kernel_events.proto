@@ -53,6 +53,7 @@ message KernelEvent {
     CapabilityEvent capability = 18;
     GitHubLeaseEvent github_lease = 19;
     PolicyResolvedForChangeSet policy_resolved_for_changeset = 20;
+    GateReceipt gate_receipt = 21;
   }
 }
 
@@ -646,4 +647,41 @@ message PolicyResolvedForChangeSet {
   string resolver_version = 10;
   // Ed25519 signature over canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: domain (64 bytes)
   bytes resolver_signature = 11;
+}
+
+// GateReceipt envelope with versioning support.
+// This is the canonical receipt envelope that wraps gate-specific payloads.
+// The receipt binds a gate execution result to a specific lease and changeset.
+//
+// Versioning:
+// - receipt_version: Envelope schema version (currently: 1)
+// - payload_kind: Type of payload ("aat", "quality", "security")
+// - payload_schema_version: Version of the payload schema
+//
+// Security:
+// - receipt_signature uses GATE_RECEIPT: domain prefix
+// - All fields except signature are included in canonical bytes
+message GateReceipt {
+  // Unique identifier for this receipt
+  string receipt_id = 1;
+  // Gate that generated this receipt
+  string gate_id = 2;
+  // Lease that authorized this gate execution
+  string lease_id = 3;
+  // Hash binding to specific changeset (32 bytes)
+  bytes changeset_digest = 4;
+  // Actor who executed the gate
+  string executor_actor_id = 5;
+  // Envelope schema version (supported: 1)
+  uint32 receipt_version = 6;
+  // Type of payload: "aat", "quality", "security"
+  string payload_kind = 7;
+  // Version of the payload schema
+  uint32 payload_schema_version = 8;
+  // Hash of the payload content (32 bytes)
+  bytes payload_hash = 9;
+  // Hash of the evidence bundle (32 bytes)
+  bytes evidence_bundle_hash = 10;
+  // Ed25519 signature over canonical bytes with GATE_RECEIPT: domain (64 bytes)
+  bytes receipt_signature = 11;
 }
