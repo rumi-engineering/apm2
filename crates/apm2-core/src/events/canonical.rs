@@ -36,9 +36,9 @@
 //! ```
 
 use super::{
-    AdjudicationRequested, EvidencePublished, GateReceiptGenerated, KernelEvent, LeaseConflict,
-    WorkCompleted, WorkOpened, adjudication_event, evidence_event, kernel_event, lease_event,
-    work_event,
+    AdjudicationRequested, EvidencePublished, GateReceiptGenerated, GateRunCompleted, KernelEvent,
+    LeaseConflict, WorkCompleted, WorkOpened, adjudication_event, evidence_event, kernel_event,
+    lease_event, work_event,
 };
 
 /// Trait for canonicalizing messages before signing.
@@ -85,6 +85,12 @@ impl Canonicalize for GateReceiptGenerated {
     }
 }
 
+impl Canonicalize for GateRunCompleted {
+    fn canonicalize(&mut self) {
+        self.evidence_ids.sort();
+    }
+}
+
 impl Canonicalize for LeaseConflict {
     fn canonicalize(&mut self) {
         self.conflicting_lease_ids.sort();
@@ -115,6 +121,9 @@ impl Canonicalize for KernelEvent {
                     match event {
                         evidence_event::Event::Published(published) => published.canonicalize(),
                         evidence_event::Event::GateReceipt(receipt) => receipt.canonicalize(),
+                        evidence_event::Event::GateRunCompleted(run_completed) => {
+                            run_completed.canonicalize();
+                        },
                     }
                 }
             },

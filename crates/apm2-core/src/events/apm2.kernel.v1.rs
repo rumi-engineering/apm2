@@ -655,7 +655,7 @@ pub struct AdjudicationTimeout {
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EvidenceEvent {
-    #[prost(oneof = "evidence_event::Event", tags = "1, 2")]
+    #[prost(oneof = "evidence_event::Event", tags = "1, 2, 3")]
     pub event: ::core::option::Option<evidence_event::Event>,
 }
 /// Nested message and enum types in `EvidenceEvent`.
@@ -667,6 +667,8 @@ pub mod evidence_event {
         Published(super::EvidencePublished),
         #[prost(message, tag = "2")]
         GateReceipt(super::GateReceiptGenerated),
+        #[prost(message, tag = "3")]
+        GateRunCompleted(super::GateRunCompleted),
     }
 }
 #[derive(Eq, Hash)]
@@ -710,6 +712,43 @@ pub struct GateReceiptGenerated {
     pub evidence_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bytes = "vec", tag = "6")]
     pub receipt_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// Emitted when a gate run completes execution under a GateLease.
+/// This is the critical event for FAC admission decisions.
+/// All validation steps must pass for admission to proceed.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GateRunCompleted {
+    /// Unique identifier for this completion event
+    #[prost(string, tag = "1")]
+    pub run_id: ::prost::alloc::string::String,
+    /// Gate this run completed for
+    #[prost(string, tag = "2")]
+    pub gate_id: ::prost::alloc::string::String,
+    /// Work item this run is associated with
+    #[prost(string, tag = "3")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Lease ID authorizing this run
+    #[prost(string, tag = "4")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Hash of the changeset executed
+    #[prost(bytes = "vec", tag = "5")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Actor who executed the run
+    #[prost(string, tag = "6")]
+    pub executor_actor_id: ::prost::alloc::string::String,
+    /// Outcome of the run: PASS, FAIL
+    #[prost(string, tag = "7")]
+    pub result: ::prost::alloc::string::String,
+    /// Evidence IDs produced by this run
+    #[prost(string, repeated, tag = "8")]
+    pub evidence_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// HTF timestamp when the run completed (Unix millis)
+    #[prost(uint64, tag = "9")]
+    pub completed_at: u64,
+    /// Ed25519 signature over canonical bytes with GATE_RUN_COMPLETED: prefix
+    #[prost(bytes = "vec", tag = "10")]
+    pub executor_signature: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
