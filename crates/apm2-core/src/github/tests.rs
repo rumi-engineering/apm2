@@ -1,6 +1,287 @@
 //! Integration tests for the GitHub module.
 
 #[cfg(test)]
+mod validation_tests {
+    use crate::github::{
+        GitHubError, MAX_API_ENDPOINT_LEN, MAX_REPOSITORY_LEN, validate_api_endpoint,
+        validate_repository,
+    };
+
+    // ========== API Endpoint Validation Tests ==========
+
+    #[test]
+    fn test_validate_api_endpoint_valid() {
+        // Standard GitHub API endpoints
+        assert!(validate_api_endpoint("/repos/owner/repo/pulls").is_ok());
+        assert!(validate_api_endpoint("/repos/owner/repo/issues/123").is_ok());
+        assert!(validate_api_endpoint("/repos/my-org/my_repo/contents/path/to/file.rs").is_ok());
+        assert!(validate_api_endpoint("/user").is_ok());
+        assert!(validate_api_endpoint("/").is_ok());
+    }
+
+    #[test]
+    fn test_validate_api_endpoint_missing_leading_slash() {
+        let result = validate_api_endpoint("repos/owner/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("start with '/'")
+        ));
+    }
+
+    #[test]
+    fn test_validate_api_endpoint_path_traversal() {
+        // Single traversal
+        let result = validate_api_endpoint("/repos/../etc/passwd");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("..")
+        ));
+
+        // Double traversal
+        let result = validate_api_endpoint("/repos/owner/..%2f../etc");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("..")
+        ));
+
+        // At the end
+        let result = validate_api_endpoint("/repos/owner/..");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("..")
+        ));
+
+        // Multiple occurrences
+        let result = validate_api_endpoint("/repos/../owner/../repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("..")
+        ));
+    }
+
+    #[test]
+    fn test_validate_api_endpoint_control_characters() {
+        // Null byte
+        let result = validate_api_endpoint("/repos/owner\x00/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("control characters")
+        ));
+
+        // Newline
+        let result = validate_api_endpoint("/repos/owner\n/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("control characters")
+        ));
+
+        // Carriage return
+        let result = validate_api_endpoint("/repos/owner\r/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("control characters")
+        ));
+
+        // Tab
+        let result = validate_api_endpoint("/repos/owner\t/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("control characters")
+        ));
+
+        // DEL (0x7F)
+        let result = validate_api_endpoint("/repos/owner\x7F/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("control characters")
+        ));
+    }
+
+    #[test]
+    fn test_validate_api_endpoint_length_exceeded() {
+        let long_endpoint = format!("/{}", "a".repeat(MAX_API_ENDPOINT_LEN));
+        let result = validate_api_endpoint(&long_endpoint);
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("exceeds maximum")
+        ));
+    }
+
+    #[test]
+    fn test_validate_api_endpoint_max_length_ok() {
+        // Exactly at max length should be OK
+        let endpoint = format!("/{}", "a".repeat(MAX_API_ENDPOINT_LEN - 1));
+        assert!(validate_api_endpoint(&endpoint).is_ok());
+    }
+
+    #[test]
+    fn test_validate_api_endpoint_empty() {
+        let result = validate_api_endpoint("");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidApiEndpoint { reason }) if reason.contains("start with '/'")
+        ));
+    }
+
+    // ========== Repository Validation Tests ==========
+
+    #[test]
+    fn test_validate_repository_valid() {
+        assert!(validate_repository("owner/repo").is_ok());
+        assert!(validate_repository("my-org/my-repo").is_ok());
+        assert!(validate_repository("My_Org/My_Repo").is_ok());
+        assert!(validate_repository("org.name/repo.name").is_ok());
+        assert!(validate_repository("a/b").is_ok());
+        assert!(validate_repository("org123/repo456").is_ok());
+        assert!(validate_repository("Org-Name_123/Repo.Name-456_test").is_ok());
+    }
+
+    #[test]
+    fn test_validate_repository_missing_slash() {
+        let result = validate_repository("ownerrepo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("owner/repo")
+        ));
+    }
+
+    #[test]
+    fn test_validate_repository_too_many_slashes() {
+        let result = validate_repository("owner/repo/extra");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("owner/repo")
+        ));
+    }
+
+    #[test]
+    fn test_validate_repository_empty_owner() {
+        let result = validate_repository("/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("owner cannot be empty")
+        ));
+    }
+
+    #[test]
+    fn test_validate_repository_empty_repo() {
+        let result = validate_repository("owner/");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("repo cannot be empty")
+        ));
+    }
+
+    #[test]
+    fn test_validate_repository_starts_with_hyphen() {
+        let result = validate_repository("-owner/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("must start with an alphanumeric")
+        ));
+
+        let result = validate_repository("owner/-repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("must start with an alphanumeric")
+        ));
+    }
+
+    #[test]
+    fn test_validate_repository_starts_with_underscore() {
+        let result = validate_repository("_owner/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("must start with an alphanumeric")
+        ));
+    }
+
+    #[test]
+    fn test_validate_repository_starts_with_dot() {
+        let result = validate_repository(".owner/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("must start with an alphanumeric")
+        ));
+    }
+
+    #[test]
+    fn test_validate_repository_invalid_characters() {
+        // Space
+        let result = validate_repository("owner name/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("invalid character")
+        ));
+
+        // Special characters
+        let result = validate_repository("owner@name/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("invalid character")
+        ));
+
+        let result = validate_repository("owner/repo#name");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("invalid character")
+        ));
+
+        let result = validate_repository("owner/repo$name");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("invalid character")
+        ));
+    }
+
+    #[test]
+    fn test_validate_repository_length_exceeded() {
+        let long_owner = "a".repeat(MAX_REPOSITORY_LEN);
+        let result = validate_repository(&format!("{long_owner}/repo"));
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("exceeds maximum")
+        ));
+    }
+
+    #[test]
+    fn test_validate_repository_max_length_ok() {
+        // Close to max length but still valid
+        let half_len = (MAX_REPOSITORY_LEN - 2) / 2;
+        let repo = format!("{}/{}", "a".repeat(half_len), "b".repeat(half_len));
+        assert!(validate_repository(&repo).is_ok());
+    }
+
+    #[test]
+    fn test_validate_repository_path_traversal_not_applicable() {
+        // ".." is not a valid owner/repo format anyway (doesn't start with
+        // alphanumeric) but let's ensure we catch it
+        let result = validate_repository("../etc");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("must start with an alphanumeric")
+        ));
+    }
+
+    #[test]
+    fn test_validate_repository_control_characters() {
+        // Control characters in owner
+        let result = validate_repository("owner\x00name/repo");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("invalid character")
+        ));
+
+        // Control characters in repo
+        let result = validate_repository("owner/repo\nname");
+        assert!(matches!(
+            result,
+            Err(GitHubError::InvalidRepository { reason }) if reason.contains("invalid character")
+        ));
+    }
+}
+
+#[cfg(test)]
 mod integration_tests {
     use crate::github::{
         GitHubApp, GitHubLease, GitHubLeaseState, GitHubScope, MockTokenProvider, RevocationReason,

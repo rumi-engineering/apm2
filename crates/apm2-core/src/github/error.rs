@@ -126,6 +126,20 @@ pub enum GitHubError {
     #[error("failed to decode GitHub lease event: {0}")]
     DecodeError(#[from] prost::DecodeError),
 
+    /// Invalid API endpoint format.
+    #[error("invalid api_endpoint: {reason}")]
+    InvalidApiEndpoint {
+        /// The reason the endpoint is invalid.
+        reason: String,
+    },
+
+    /// Invalid repository format.
+    #[error("invalid repository format: {reason}")]
+    InvalidRepository {
+        /// The reason the repository is invalid.
+        reason: String,
+    },
+
     /// Rate limit exceeded for token issuance.
     #[error(
         "token issuance rate limit exceeded for episode {episode_id}: {issued} tokens issued, max {max} for tier {tier}"
