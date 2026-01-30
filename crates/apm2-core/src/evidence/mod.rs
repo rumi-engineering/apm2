@@ -83,6 +83,7 @@ mod publisher;
 mod receipt;
 mod reducer;
 mod state;
+pub mod strictly_ordered;
 
 #[cfg(test)]
 mod tests;
@@ -101,3 +102,10 @@ pub use receipt::{
 };
 pub use reducer::{EvidenceReducer, EvidenceReducerState};
 pub use state::{Evidence, EvidenceBundle, EvidenceSummary};
+// StrictlyOrderedEvidence and Gate Predicates (TCK-00198)
+pub use strictly_ordered::{
+    EvidencePredicate, GatePredicateReceipt, MAX_EVIDENCE_HASHES, MAX_EVIDENCE_ID_LEN,
+    MAX_EVIDENCE_PREDICATES, MAX_PREDICATE_NAME_LEN, MAX_PREDICATE_VALUE_LEN,
+    MAX_TOTAL_ORDER_SIGNATURES, MAX_WORK_ID_LEN, MIN_QUORUM_SIGNATURES, StrictlyOrderedError,
+    StrictlyOrderedEvidence, TotalOrderProof,
+};
