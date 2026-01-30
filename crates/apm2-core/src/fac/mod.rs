@@ -45,6 +45,7 @@
 //! ```
 
 mod domain_separator;
+mod gate_run;
 mod lease;
 
 // Re-export domain separator constants
@@ -53,6 +54,10 @@ pub use domain_separator::{
     GATE_RECEIPT_PREFIX, GATE_RUN_COMPLETED_PREFIX, LEASE_REVOKED_PREFIX, MERGE_RECEIPT_PREFIX,
     POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX, QUARANTINE_EVENT_PREFIX, sign_with_domain,
     verify_with_domain,
+};
+// Re-export gate run types
+pub use gate_run::{
+    GateRunCompleted, GateRunCompletedBuilder, GateRunCompletedProto, GateRunError, GateRunResult,
 };
 // Re-export lease types
 pub use lease::{
