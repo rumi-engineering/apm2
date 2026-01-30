@@ -20,7 +20,7 @@ The core engineering workflow is governed by a sequence of skills. For a detaile
 *   [holonic-agent-network](./holonic-agent-network/SKILL.md) - Principles of the agent hierarchy.
 
 ### Execution & Engineering
-*   [dev-eng-ticket](./dev-eng-ticket/SKILL.md) - Autonomous engineering ticket implementation.
+*   [ticket](./ticket/SKILL.md) - Autonomous engineering ticket implementation.
 *   [coding](./coding/SKILL.md) - General coding assistance and idioms.
 *   [rust-standards](./rust-standards/SKILL.md) - Normative Rust contracts, safety invariants, and review protocols.
 

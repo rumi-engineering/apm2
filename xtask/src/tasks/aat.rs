@@ -49,6 +49,7 @@ use crate::aat::tool_config::{AatToolConfig, AiTool};
 use crate::aat::types::{Hypothesis, HypothesisResult, ParsedPRDescription, Verdict};
 use crate::aat::validation::validate_pr_description;
 use crate::aat::variation::InputVariationGenerator;
+use crate::reviewer_state::select_review_model;
 use crate::shell_escape::build_script_command;
 
 // =============================================================================
@@ -442,7 +443,7 @@ fn build_ai_script_command(prompt_path: &Path, tool_config: &AatToolConfig) -> S
     match tool_config.ai_tool {
         AiTool::Gemini => {
             // Gemini uses build_script_command from shell_escape module
-            build_script_command(prompt_path, None, Some("gemini-3-flash-preview"))
+            build_script_command(prompt_path, None, Some(select_review_model()))
         },
         AiTool::ClaudeCode => {
             // Claude Code uses similar pattern but different command

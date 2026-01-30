@@ -1,0 +1,121 @@
+acceptance_criteria:
+  # Completed: PR context for agent onboarding
+  - criterion: PR query functions implemented with graceful network failure handling
+    verification: Unit tests cover network error scenarios
+  - criterion: New ticket output includes PR_URL field
+    verification: cargo xtask start-ticket on new branch shows "PR_URL: (none)"
+  - criterion: Resume ticket output includes PR context
+    verification: cargo xtask start-ticket on branch with PR shows PR_URL, PR_STATE, REVIEW_STATE, timeline, threads
+  - criterion: dev-eng-ticket skill reads ROOT_ONBOARDING.cac.md first
+    verification: dev-eng-ticket-workflow.md includes ROOT_ONBOARDING.cac.md
+  # New: --dry-run flag for xtask commands
+  - criterion: At least one xtask command has a --dry-run flag
+    verification: cargo xtask <command> --dry-run shows planned actions without executing
+  # New: cargo xtask --help in ticket-queue workflow
+  - criterion: cargo xtask --help output included in ticket-queue skill workflow
+    verification: ticket-queue skill references xtask help output for command discovery
+  # New: Rename dev-eng-ticket to ticket
+  - criterion: dev-eng-ticket skill renamed to ticket
+    verification: /ticket invokes the skill, all references to dev-eng-ticket updated
+  # New: One-off workflow for ticket skill
+  - criterion: ticket skill has one-off workflow for clean worktree setup
+    verification: /ticket can create worktree, identify RFC, create ticket, and proceed with work
+  # New: Pre-push hook runs cargo doc
+  - criterion: Pre-push hook runs cargo doc --workspace --no-deps --all-features
+    verification: .husky/pre-push or equivalent includes cargo doc command matching CI
+  # Unchanged
+  - criterion: All xtask tests pass
+    verification: cargo test -p xtask passes
+  - criterion: Clippy clean
+    verification: cargo clippy -p xtask returns no warnings
+implementation:
+  code_examples: []
+  files_to_create:
+    - path: documents/skills/ticket/SKILL.md
+      purpose: Renamed skill entry point (from dev-eng-ticket)
+    - path: documents/skills/ticket/references/one-off-workflow.md
+      purpose: Workflow for setting up clean worktree and creating ad-hoc tickets
+  files_to_modify:
+    # Completed work
+    - changes: |
+        Added PrDetails, TimelineEntry, ReviewThread types.
+        Added get_pr_for_branch(), get_pr_timeline(), get_unresolved_threads() functions.
+        Approximately 400 lines of code added.
+      path: xtask/src/ticket_status.rs
+    - changes: |
+        Added PR detection and resume context output.
+        Added print_resume_context() for PRs.
+        Updated print_new_context() with PR_URL: (none).
+        Approximately 150 lines of code added.
+      path: xtask/src/tasks/start_ticket.rs
+    - changes: |
+        Added ROOT_ONBOARDING.cac.md to required reading list.
+      path: documents/skills/dev-eng-ticket/references/dev-eng-ticket-workflow.md
+    # New work
+    - changes: |
+        Add --dry-run flag to at least one command (e.g., start-ticket or another).
+        When --dry-run is set, show planned actions without executing them.
+      path: xtask/src/tasks/*.rs
+    - changes: |
+        Include cargo xtask --help output or reference for command discovery.
+      path: documents/skills/ticket-queue/references/*.md
+    - changes: |
+        Rename skill from dev-eng-ticket to ticket. Update all internal references.
+      path: documents/skills/dev-eng-ticket/ -> documents/skills/ticket/
+    - changes: |
+        Add cargo doc --workspace --no-deps --all-features to match CI workflow.
+      path: .husky/pre-push (or equivalent hook configuration)
+  implementation_steps:
+    - "Add --dry-run flag to start-ticket or another xtask command"
+    - "Update ticket-queue skill to reference xtask --help output"
+    - "Rename documents/skills/dev-eng-ticket to documents/skills/ticket"
+    - "Update all references to dev-eng-ticket across codebase"
+    - "Create one-off workflow for ticket skill (worktree setup, RFC identification, ticket creation)"
+    - "Add cargo doc command to pre-push hook"
+  summary: |
+    Enhanced cargo xtask start-ticket with PR query functions to provide rich context
+    for agent onboarding when resuming work on existing PRs. Additionally includes
+    tooling improvements: --dry-run support, skill rename from dev-eng-ticket to ticket,
+    one-off workflow for ad-hoc ticket creation, and pre-push hook enhancement.
+notes: |
+  This ticket covers enhancements to xtask tooling and the ticket skill for agent workflows.
+
+  Completed work:
+  - PR query functions for agent onboarding context
+  - Resume context output with PR state, timeline, and review threads
+
+  Remaining work:
+  - Add --dry-run flag to at least one xtask command
+  - Include xtask --help in ticket-queue skill workflow
+  - Rename dev-eng-ticket skill to ticket (shorter, cleaner)
+  - Create one-off workflow: worktree setup -> RFC identification -> ticket creation
+  - Add cargo doc to pre-push hook (matching CI)
+
+  Out of scope for this ticket:
+  - Daemon integration (future work under RFC-0017)
+  - Caching of PR queries
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+test_requirements:
+  - description: All xtask unit tests pass
+    test_id: UT-00278-01
+    verification_command: cargo test -p xtask
+  - description: Clippy clean
+    test_id: UT-00278-02
+    verification_command: cargo clippy -p xtask
+  - description: Dry-run flag works without side effects
+    test_id: UT-00278-03
+    verification_command: cargo xtask start-ticket --dry-run (or equivalent command)
+  - description: Pre-push hook generates docs
+    test_id: UT-00278-04
+    verification_command: cargo doc --workspace --no-deps --all-features
+  - description: Ticket skill invocable as /ticket
+    test_id: UT-00278-05
+    verification_command: Verify /ticket skill loads correctly in Claude Code
+ticket:
+  depends_on: []
+  id: TCK-00278
+  requirement_ids: []
+  rfc_id: RFC-0017
+  status: READY
+  title: Enhanced xtask tooling and ticket skill for agent onboarding

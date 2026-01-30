@@ -79,6 +79,6 @@ cargo test --workspace
 
 # 10. Docs
 echo "Checking documentation generation..."
-cargo doc --workspace --no-deps
+cargo doc --workspace --no-deps --all-features
 
 echo -e "${GREEN}All pre-push hooks passed!${NC}"

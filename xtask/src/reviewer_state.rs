@@ -752,6 +752,24 @@ pub fn cleanup_reviewer_temp_files(
 
 /// One hour in seconds, used as the default age threshold for orphan cleanup.
 pub const ORPHAN_CLEANUP_AGE_THRESHOLD_SECS: u64 = 3600;
+
+/// Select a review model with 50/50 distribution between pro and flash.
+///
+/// Uses the nanosecond component of the current system time to provide
+/// a roughly even distribution between the two models across invocations.
+#[must_use]
+pub fn select_review_model() -> &'static str {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    if nanos % 2 == 0 {
+        "gemini-3-pro-preview"
+    } else {
+        "gemini-3-flash-preview"
+    }
+}
 /// Kill a process with SIGTERM, wait up to 5s, then SIGKILL if needed.
 ///
 /// # Arguments
@@ -912,6 +930,41 @@ mod tests {
         assert_eq!(HealthStatus::Healthy.as_str(), "HEALTHY");
         assert_eq!(HealthStatus::Stale.as_str(), "STALE");
         assert_eq!(HealthStatus::Dead.as_str(), "DEAD");
+    }
+
+    #[test]
+    fn test_select_review_model_returns_valid_model() {
+        let model = select_review_model();
+        assert!(
+            model == "gemini-3-pro-preview" || model == "gemini-3-flash-preview",
+            "Expected 'gemini-3-pro-preview' or 'gemini-3-flash-preview', got '{model}'"
+        );
+    }
+
+    #[test]
+    fn test_select_review_model_distribution() {
+        // Call the function many times and verify we get both models
+        // Note: This is probabilistic but extremely unlikely to fail
+        // (probability of all same in 100 trials ≈ 2^-99)
+        let mut saw_pro = false;
+        let mut saw_flash = false;
+
+        for _ in 0..100 {
+            let model = select_review_model();
+            match model {
+                "gemini-3-pro-preview" => saw_pro = true,
+                "gemini-3-flash-preview" => saw_flash = true,
+                _ => panic!("Unexpected model: {model}"),
+            }
+            if saw_pro && saw_flash {
+                break;
+            }
+            // Small sleep to ensure different nanosecond values
+            std::thread::sleep(std::time::Duration::from_nanos(1));
+        }
+
+        assert!(saw_pro, "Never saw gemini-3-pro-preview in 100 trials");
+        assert!(saw_flash, "Never saw gemini-3-flash-preview in 100 trials");
     }
 
     #[test]

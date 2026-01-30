@@ -23,6 +23,7 @@ use crate::ticket_status::{
     CompletedTicketsResult, get_completed_tickets, get_in_progress_tickets,
 };
 use crate::util::main_worktree;
+use crate::worktree_health::{diagnose_worktree, print_health_report};
 
 /// Type of target specified for start-ticket command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,7 @@ struct TicketInfo {
 ///
 /// * `target` - Optional RFC ID (RFC-XXXX), ticket ID (TCK-XXXXX), or None
 /// * `print_path_only` - If true, only print the worktree path (for scripting)
+/// * `force` - If true, auto-cleanup remediable worktree issues
 ///
 /// # Errors
 ///
@@ -85,7 +87,8 @@ struct TicketInfo {
 /// - No pending tickets are found
 /// - All pending tickets are blocked by incomplete dependencies
 /// - Worktree or branch creation fails
-pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
+/// - Worktree has issues requiring manual intervention (without --force)
+pub fn run(target: Option<&str>, print_path_only: bool, force: bool) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
     let main_worktree_path = main_worktree(&sh)?;
 
@@ -260,7 +263,33 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
     let worktree_exists = worktree_path.exists();
 
     if worktree_exists {
-        println!("Worktree already exists at {}", worktree_path.display());
+        // Diagnose worktree health before proceeding
+        let health =
+            diagnose_worktree(&sh, &worktree_path).context("Failed to diagnose worktree health")?;
+
+        if health.has_issues() {
+            print_health_report(&health);
+
+            let manual_issues = health.manual_issues();
+            if !manual_issues.is_empty() {
+                bail!(
+                    "Cannot proceed: worktree has issues requiring manual intervention.\n\
+                     Resolve above issues, or commit/stash changes first."
+                );
+            }
+
+            if !force {
+                bail!(
+                    "Worktree has issues that can be auto-cleaned.\n\
+                     Use --force to auto-cleanup, or fix issues manually."
+                );
+            }
+
+            println!("--force specified, proceeding with cleanup...");
+        } else {
+            println!("Worktree already exists at {}", worktree_path.display());
+        }
+
         println!("Removing existing worktree...");
         cmd!(sh, "git worktree remove --force {worktree_path}")
             .run()
@@ -288,12 +317,52 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
             .context("Failed to create worktree with new branch")?;
     }
 
+    // Copy .claude directory to worktree
+    copy_claude_directory(&main_worktree_path, &worktree_path)?;
+    println!("Copied .claude/ to worktree");
+
     println!();
     println!("Worktree created at: {}", worktree_path.display());
     println!();
 
     // Output context for implementation
     print_context(&main_worktree_path, ticket);
+
+    Ok(())
+}
+
+/// Copy `.claude` directory from main worktree to the new worktree.
+///
+/// This ensures Claude Code skills and configuration are available in
+/// ticket worktrees. Silently skips if source `.claude` doesn't exist.
+fn copy_claude_directory(main_worktree: &Path, worktree_path: &Path) -> Result<()> {
+    let source = main_worktree.join(".claude");
+    let dest = worktree_path.join(".claude");
+
+    if !source.exists() {
+        return Ok(());
+    }
+
+    copy_dir_recursive(&source, &dest).context("Failed to copy .claude directory to worktree")?;
+
+    Ok(())
+}
+
+/// Recursively copy a directory and its contents.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
 
     Ok(())
 }

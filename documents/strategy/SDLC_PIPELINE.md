@@ -11,7 +11,7 @@ This document defines the normative SDLC pipeline for the APM2 project, spanning
 | **1. Idea** | Rough Intent | Draft PRD / RFC | `idea-compiler` |
 | **2. PRD** | Draft PRD | Approved PRD | `prd-review` |
 | **3. RFC & Tickets** | Approved PRD | Agent-Ready Tickets | `rfc-council` |
-| **4. Implementation** | Engineering Ticket | Pull Request | `dev-eng-ticket` |
+| **4. Implementation** | Engineering Ticket | Pull Request | `ticket` |
 | **5. Verification** | Pull Request | AAT Evidence Bundle | `aat` |
 | **6. Merge** | AAT + Code Review | Merged Code | GitHub CI |
 
@@ -41,13 +41,13 @@ The technical blueprinting phase. Decomposes the PRD into "Agent-Native" enginee
 *   **Anti-Cousin Gate:** Every file path in a ticket MUST be mapped to the CCP atlas or explicitly justified as a net-new substrate.
 *   **Command:** `/rfc-council [create|refine|review] RFC-XXXX`
 
-## 4. Implementation ([`dev-eng-ticket`](../skills/dev-eng-ticket/SKILL.md))
+## 4. Implementation ([`ticket`](../skills/ticket/SKILL.md))
 
 The autonomous engineering phase where the heavy lifting happens.
 
 *   **Doctrine:** Implementers must adhere to the **APM2 Rust Textbook** (safety, error handling, API design) and module-specific `AGENTS.md` invariants.
 *   **Output:** Functional code, unit tests, and an **Evidence Script** documenting successful implementation.
-*   **Command:** `/dev-eng-ticket TCK-XXXXX`
+*   **Command:** `/ticket TCK-XXXXX`
 
 ## 5. Verification ([`aat`](../skills/aat/SKILL.md))
 

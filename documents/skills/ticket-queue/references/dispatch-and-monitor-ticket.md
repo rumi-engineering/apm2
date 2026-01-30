@@ -9,7 +9,7 @@ decision_tree:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "Replace <TICKET_ID> and <WORKTREE_PATH>. If known, replace <IMPLEMENTER_LOG_FILE> and <IMPLEMENTER_PID> for out-of-band supervision."
         - id: ESTABLISH_IMPLEMENTER_CONTRACT
-          action: "Create/confirm an implementer subagent (separate process/session) that is allowed to edit code. Instruct the subagent to follow the `dev-eng-ticket` protocol (from `documents/skills/dev-eng-ticket/SKILL.md`) for the specific <TICKET_ID>/<WORKTREE_PATH>. Do NOT execute that skill yourself; require the subagent to: implement, `cargo xtask commit`, `cargo xtask push`, respond to failures, and get to green."
+          action: "Create/confirm an implementer subagent (separate process/session) that is allowed to edit code. Instruct the subagent to follow the `ticket` protocol (from `documents/skills/ticket/SKILL.md`) for the specific <TICKET_ID>/<WORKTREE_PATH>. Do NOT execute that skill yourself; require the subagent to: implement, `cargo xtask commit`, `cargo xtask push`, respond to failures, and get to green."
         - id: REQUIRE_DEDICATED_LOG
           action: "The implementer MUST run with a durable log you can tail out-of-band. Prefer the exact commands in `references/commands.md` (`start-claude-implementer-with-log` or `start-codex-implementer-with-json-log`). Record PID + log path."
         - id: CHECK_CADENCE

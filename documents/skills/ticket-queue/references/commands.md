@@ -1,6 +1,12 @@
 title: Ticket Queue — Command Reference
 
-commands[22]:
+commands[24]:
+  - name: xtask-help
+    command: "cargo xtask --help"
+    purpose: "List all available xtask commands and their descriptions. Use this for command discovery before running ticket workflow commands."
+  - name: xtask-start-ticket-help
+    command: "cargo xtask start-ticket --help"
+    purpose: "Show detailed help for the start-ticket command, including --dry-run and --print-path flags."
   - name: list-ticket-ids
     command: "ls documents/work/tickets/TCK-*.yaml | rg -o \"TCK-[0-9]{5}\" | sort -u"
     purpose: "List all ticket IDs that MUST be merged."

@@ -69,4 +69,4 @@ If you're an agent trying to understand this project:
 2. **Start with standards** - Read `standards/00_standards_meta.yaml`
 3. **Understand schemas** - Check `standards/schemas/` for document structures
 4. **Check enums** - `standards/enums/` defines valid status codes and types
-5. **Use skills (preferred)** - `skills/glossary/SKILL.md` (terms), `skills/laws-of-holonic-agent-systems/SKILL.md` (laws), `skills/ticket-queue/SKILL.md` (orchestration), `skills/dev-eng-ticket/SKILL.md` (implementation)
+5. **Use skills (preferred)** - `skills/glossary/SKILL.md` (terms), `skills/laws-of-holonic-agent-systems/SKILL.md` (laws), `skills/ticket-queue/SKILL.md` (orchestration), `skills/ticket/SKILL.md` (implementation)
