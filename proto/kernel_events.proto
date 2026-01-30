@@ -223,50 +223,7 @@ message LeaseEvent {
     LeaseReleased released = 3;
     LeaseExpired expired = 4;
     LeaseConflict conflict = 5;
-    GateLeaseIssued gate_lease_issued = 6;
-    LeaseRevoked lease_revoked = 7;
   }
-}
-
-// GateLease issued for Forge Admission Cycle execution.
-// Binds an executor actor to a specific changeset and time window.
-message GateLeaseIssued {
-  // Unique identifier for this lease
-  string lease_id = 1;
-  // Work item this lease authorizes
-  string work_id = 2;
-  // Gate this lease applies to
-  string gate_id = 3;
-  // Hash binding the lease to specific changeset
-  bytes changeset_digest = 4;
-  // Actor authorized to execute under this lease
-  string executor_actor_id = 5;
-  // Timestamp when lease was issued (Unix millis, observational)
-  uint64 issued_at = 6;
-  // Timestamp when lease expires (Unix millis, observational)
-  uint64 expires_at = 7;
-  // Hash of the policy configuration
-  bytes policy_hash = 8;
-  // Actor who issued this lease
-  string issuer_actor_id = 9;
-  // Ed25519 signature over canonical bytes with GATE_LEASE_ISSUED: prefix
-  bytes issuer_signature = 10;
-  // HTF time envelope reference for temporal authority
-  string time_envelope_ref = 11;
-  // Optional AAT-specific extension fields
-  AatLeaseExtension aat_extension = 12;
-}
-
-// AAT (Autonomous Agent Team) lease extension fields.
-message AatLeaseExtension {
-  // Hash of the view commitment for the AAT context
-  bytes view_commitment_hash = 1;
-  // Hash of the RCP (Runnable Capability Profile) manifest
-  bytes rcp_manifest_hash = 2;
-  // Identifier for the RCP profile being used
-  string rcp_profile_id = 3;
-  // Identifier for the selection policy used
-  string selection_policy_id = 4;
 }
 
 message LeaseIssued {
@@ -298,23 +255,6 @@ message LeaseConflict {
   string work_id = 1;
   repeated string conflicting_lease_ids = 2;
   string resolution = 3;  // CANONICAL_ROOT, ADJUDICATION_REQUIRED
-}
-
-// Immediate revocation of a lease before natural expiration.
-// Critical for incident response when a key is compromised or executor misbehaves.
-message LeaseRevoked {
-  // ID of the lease being revoked
-  string lease_id = 1;
-  // Actor who revoked the lease (must be issuer or authority)
-  string revoked_by = 2;
-  // HTF tick at which the revocation takes effect
-  uint64 revoked_at = 3;
-  // Reason for revocation: KEY_COMPROMISE, POLICY_VIOLATION, MISBEHAVIOR, VOLUNTARY
-  string reason = 4;
-  // Ed25519 signature over canonical bytes with LEASE_REVOKED: prefix
-  bytes issuer_signature = 5;
-  // HTF time envelope reference for temporal authority
-  string time_envelope_ref = 6;
 }
 
 // ============================================================
@@ -396,7 +336,6 @@ message EvidenceEvent {
   oneof event {
     EvidencePublished published = 1;
     GateReceiptGenerated gate_receipt = 2;
-    GateRunCompleted gate_run_completed = 3;
   }
 }
 
@@ -421,32 +360,6 @@ message GateReceiptGenerated {
   string result = 4;  // PASS, FAIL
   repeated string evidence_ids = 5;
   bytes receipt_signature = 6;
-}
-
-// Emitted when a gate run completes execution under a GateLease.
-// This is the critical event for FAC admission decisions.
-// All validation steps must pass for admission to proceed.
-message GateRunCompleted {
-  // Unique identifier for this completion event
-  string run_id = 1;
-  // Gate this run completed for
-  string gate_id = 2;
-  // Work item this run is associated with
-  string work_id = 3;
-  // Lease ID authorizing this run
-  string lease_id = 4;
-  // Hash of the changeset executed
-  bytes changeset_digest = 5;
-  // Actor who executed the run
-  string executor_actor_id = 6;
-  // Outcome of the run: PASS, FAIL
-  string result = 7;
-  // Evidence IDs produced by this run
-  repeated string evidence_ids = 8;
-  // HTF timestamp when the run completed (Unix millis)
-  uint64 completed_at = 9;
-  // Ed25519 signature over canonical bytes with GATE_RUN_COMPLETED: prefix
-  bytes executor_signature = 10;
 }
 
 // ============================================================

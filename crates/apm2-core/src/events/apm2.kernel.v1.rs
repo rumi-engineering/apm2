@@ -356,7 +356,7 @@ pub struct ToolExecuted {
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LeaseEvent {
-    #[prost(oneof = "lease_event::Event", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "lease_event::Event", tags = "1, 2, 3, 4, 5")]
     pub event: ::core::option::Option<lease_event::Event>,
 }
 /// Nested message and enum types in `LeaseEvent`.
@@ -374,70 +374,7 @@ pub mod lease_event {
         Expired(super::LeaseExpired),
         #[prost(message, tag = "5")]
         Conflict(super::LeaseConflict),
-        #[prost(message, tag = "6")]
-        GateLeaseIssued(super::GateLeaseIssued),
-        #[prost(message, tag = "7")]
-        LeaseRevoked(super::LeaseRevoked),
     }
-}
-/// GateLease issued for Forge Admission Cycle execution.
-/// Binds an executor actor to a specific changeset and time window.
-#[derive(Eq, Hash)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct GateLeaseIssued {
-    /// Unique identifier for this lease
-    #[prost(string, tag = "1")]
-    pub lease_id: ::prost::alloc::string::String,
-    /// Work item this lease authorizes
-    #[prost(string, tag = "2")]
-    pub work_id: ::prost::alloc::string::String,
-    /// Gate this lease applies to
-    #[prost(string, tag = "3")]
-    pub gate_id: ::prost::alloc::string::String,
-    /// Hash binding the lease to specific changeset
-    #[prost(bytes = "vec", tag = "4")]
-    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
-    /// Actor authorized to execute under this lease
-    #[prost(string, tag = "5")]
-    pub executor_actor_id: ::prost::alloc::string::String,
-    /// Timestamp when lease was issued (Unix millis, observational)
-    #[prost(uint64, tag = "6")]
-    pub issued_at: u64,
-    /// Timestamp when lease expires (Unix millis, observational)
-    #[prost(uint64, tag = "7")]
-    pub expires_at: u64,
-    /// Hash of the policy configuration
-    #[prost(bytes = "vec", tag = "8")]
-    pub policy_hash: ::prost::alloc::vec::Vec<u8>,
-    /// Actor who issued this lease
-    #[prost(string, tag = "9")]
-    pub issuer_actor_id: ::prost::alloc::string::String,
-    /// Ed25519 signature over canonical bytes with GATE_LEASE_ISSUED: prefix
-    #[prost(bytes = "vec", tag = "10")]
-    pub issuer_signature: ::prost::alloc::vec::Vec<u8>,
-    /// HTF time envelope reference for temporal authority
-    #[prost(string, tag = "11")]
-    pub time_envelope_ref: ::prost::alloc::string::String,
-    /// Optional AAT-specific extension fields
-    #[prost(message, optional, tag = "12")]
-    pub aat_extension: ::core::option::Option<AatLeaseExtension>,
-}
-/// AAT (Autonomous Agent Team) lease extension fields.
-#[derive(Eq, Hash)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AatLeaseExtension {
-    /// Hash of the view commitment for the AAT context
-    #[prost(bytes = "vec", tag = "1")]
-    pub view_commitment_hash: ::prost::alloc::vec::Vec<u8>,
-    /// Hash of the RCP (Runnable Capability Profile) manifest
-    #[prost(bytes = "vec", tag = "2")]
-    pub rcp_manifest_hash: ::prost::alloc::vec::Vec<u8>,
-    /// Identifier for the RCP profile being used
-    #[prost(string, tag = "3")]
-    pub rcp_profile_id: ::prost::alloc::string::String,
-    /// Identifier for the selection policy used
-    #[prost(string, tag = "4")]
-    pub selection_policy_id: ::prost::alloc::string::String,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -492,30 +429,6 @@ pub struct LeaseConflict {
     /// CANONICAL_ROOT, ADJUDICATION_REQUIRED
     #[prost(string, tag = "3")]
     pub resolution: ::prost::alloc::string::String,
-}
-/// Immediate revocation of a lease before natural expiration.
-/// Critical for incident response when a key is compromised or executor misbehaves.
-#[derive(Eq, Hash)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LeaseRevoked {
-    /// ID of the lease being revoked
-    #[prost(string, tag = "1")]
-    pub lease_id: ::prost::alloc::string::String,
-    /// Actor who revoked the lease (must be issuer or authority)
-    #[prost(string, tag = "2")]
-    pub revoked_by: ::prost::alloc::string::String,
-    /// HTF tick at which the revocation takes effect
-    #[prost(uint64, tag = "3")]
-    pub revoked_at: u64,
-    /// Reason for revocation: KEY_COMPROMISE, POLICY_VIOLATION, MISBEHAVIOR, VOLUNTARY
-    #[prost(string, tag = "4")]
-    pub reason: ::prost::alloc::string::String,
-    /// Ed25519 signature over canonical bytes with LEASE_REVOKED: prefix
-    #[prost(bytes = "vec", tag = "5")]
-    pub issuer_signature: ::prost::alloc::vec::Vec<u8>,
-    /// HTF time envelope reference for temporal authority
-    #[prost(string, tag = "6")]
-    pub time_envelope_ref: ::prost::alloc::string::String,
 }
 /// ============================================================
 /// POLICY EVENTS
@@ -655,7 +568,7 @@ pub struct AdjudicationTimeout {
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EvidenceEvent {
-    #[prost(oneof = "evidence_event::Event", tags = "1, 2, 3")]
+    #[prost(oneof = "evidence_event::Event", tags = "1, 2")]
     pub event: ::core::option::Option<evidence_event::Event>,
 }
 /// Nested message and enum types in `EvidenceEvent`.
@@ -667,8 +580,6 @@ pub mod evidence_event {
         Published(super::EvidencePublished),
         #[prost(message, tag = "2")]
         GateReceipt(super::GateReceiptGenerated),
-        #[prost(message, tag = "3")]
-        GateRunCompleted(super::GateRunCompleted),
     }
 }
 #[derive(Eq, Hash)]
@@ -712,43 +623,6 @@ pub struct GateReceiptGenerated {
     pub evidence_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bytes = "vec", tag = "6")]
     pub receipt_signature: ::prost::alloc::vec::Vec<u8>,
-}
-/// Emitted when a gate run completes execution under a GateLease.
-/// This is the critical event for FAC admission decisions.
-/// All validation steps must pass for admission to proceed.
-#[derive(Eq, Hash)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct GateRunCompleted {
-    /// Unique identifier for this completion event
-    #[prost(string, tag = "1")]
-    pub run_id: ::prost::alloc::string::String,
-    /// Gate this run completed for
-    #[prost(string, tag = "2")]
-    pub gate_id: ::prost::alloc::string::String,
-    /// Work item this run is associated with
-    #[prost(string, tag = "3")]
-    pub work_id: ::prost::alloc::string::String,
-    /// Lease ID authorizing this run
-    #[prost(string, tag = "4")]
-    pub lease_id: ::prost::alloc::string::String,
-    /// Hash of the changeset executed
-    #[prost(bytes = "vec", tag = "5")]
-    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
-    /// Actor who executed the run
-    #[prost(string, tag = "6")]
-    pub executor_actor_id: ::prost::alloc::string::String,
-    /// Outcome of the run: PASS, FAIL
-    #[prost(string, tag = "7")]
-    pub result: ::prost::alloc::string::String,
-    /// Evidence IDs produced by this run
-    #[prost(string, repeated, tag = "8")]
-    pub evidence_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// HTF timestamp when the run completed (Unix millis)
-    #[prost(uint64, tag = "9")]
-    pub completed_at: u64,
-    /// Ed25519 signature over canonical bytes with GATE_RUN_COMPLETED: prefix
-    #[prost(bytes = "vec", tag = "10")]
-    pub executor_signature: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]

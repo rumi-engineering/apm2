@@ -42,13 +42,11 @@ use xshell::{Shell, cmd};
 const AI_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::aat::anti_gaming::analyze_diff;
-use crate::aat::determinism_guard::{DeterminismConfig, DeterminismGuard};
 use crate::aat::evidence::EvidenceBundleBuilder;
-use crate::aat::executor::{ExecutionConfig, HypothesisExecutor};
+use crate::aat::executor::HypothesisExecutor;
 use crate::aat::parser::parse_pr_description;
 use crate::aat::tool_config::{AatToolConfig, AiTool};
 use crate::aat::types::{Hypothesis, HypothesisResult, ParsedPRDescription, Verdict};
-use crate::aat::ux_verifier::{UxAudit, UxVerifier};
 use crate::aat::validation::validate_pr_description;
 use crate::aat::variation::InputVariationGenerator;
 use crate::shell_escape::build_script_command;
@@ -750,45 +748,6 @@ fn is_cli_command(line: &str) -> bool {
 }
 
 // =============================================================================
-// UX Verification
-// =============================================================================
-
-/// Run UX verification on hypothesis outputs.
-///
-/// Analyzes the stdout/stderr from executed hypotheses to verify:
-/// - Structured output (JSON/YAML)
-/// - Error message remediation guidance
-/// - Exit code conventions
-///
-/// # Arguments
-///
-/// * `hypotheses` - The executed hypotheses with output captured
-///
-/// # Returns
-///
-/// A vector of UX audits, one per hypothesis that had output.
-fn run_ux_verification(hypotheses: &[Hypothesis]) -> Vec<UxAudit> {
-    hypotheses
-        .iter()
-        .filter(|h| h.executed_at.is_some()) // Only analyze executed hypotheses
-        .map(|h| {
-            let stdout = h.stdout.as_deref().unwrap_or("");
-            let stderr = h.stderr.as_deref().unwrap_or("");
-            let exit_code = h.exit_code;
-
-            // Use the verification_method as the command name (truncate if long)
-            let command = if h.verification_method.len() > 50 {
-                format!("{}...", &h.verification_method[..47])
-            } else {
-                h.verification_method.clone()
-            };
-
-            UxVerifier::analyze_command_output(&command, exit_code, stdout, stderr)
-        })
-        .collect()
-}
-
-// =============================================================================
 // Main AAT Command
 // =============================================================================
 
@@ -841,14 +800,14 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     println!();
 
     // Step 1: Parse PR URL
-    println!("[1/9] Parsing PR URL...");
+    println!("[1/8] Parsing PR URL...");
     let pr_info = parse_pr_url(pr_url)?;
     println!("  Owner: {}", pr_info.owner);
     println!("  Repo: {}", pr_info.repo);
     println!("  PR #: {}", pr_info.number);
 
     // Step 2: Fetch PR data
-    println!("\n[2/9] Fetching PR data...");
+    println!("\n[2/8] Fetching PR data...");
     let description = fetch_pr_description(&sh, &pr_info)?;
     println!("  Description: {} bytes", description.len());
 
@@ -859,7 +818,7 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     println!("  HEAD SHA: {sha}");
 
     // Step 3: Parse PR description
-    println!("\n[3/9] Parsing PR description...");
+    println!("\n[3/8] Parsing PR description...");
     let parsed_pr = match parse_pr_description(&description) {
         Ok(parsed) => {
             println!("  Usage: found ({} chars)", parsed.usage.len());
@@ -894,7 +853,7 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     };
 
     // Step 4: Validate PR description format
-    println!("\n[4/9] Validating PR description...");
+    println!("\n[4/8] Validating PR description...");
 
     // Get repository root for evidence script validation
     let repo_root = cmd!(sh, "git rev-parse --show-toplevel")
@@ -934,7 +893,7 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     }
 
     // Step 5: Run anti-gaming analysis (static analysis + input variation)
-    println!("\n[5/9] Running anti-gaming analysis...");
+    println!("\n[5/8] Running anti-gaming analysis...");
     let anti_gaming_result = analyze_diff(&diff, &parsed_pr.known_limitations);
     println!(
         "  Static Analysis Violations: {}",
@@ -990,7 +949,7 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     );
 
     // Step 6: Generate hypotheses
-    println!("\n[6/9] Generating hypotheses via AI...");
+    println!("\n[6/8] Generating hypotheses via AI...");
     println!(
         "  Using AI tool: {} ({})",
         tool_config.ai_tool,
@@ -1021,46 +980,10 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
         println!("    - {}: {} (PENDING)", h.id, h.prediction);
     }
 
-    // Step 7: Execute hypotheses with determinism guard
-    println!("\n[7/9] Executing hypothesis verification commands...");
-
-    // Initialize determinism guard for reproducible execution
-    let determinism_config = DeterminismConfig {
-        block_network: true,
-        enforce_random_seed: true,
-        capture_environment: true,
-    };
-    let determinism_guard = match DeterminismGuard::new(determinism_config, &sha) {
-        Ok(guard) => {
-            println!("  Determinism guard initialized");
-            if DeterminismGuard::network_blocking_available() {
-                println!("    Network blocking: enabled");
-            } else {
-                println!("    Network blocking: not available on this platform");
-            }
-            println!("    Random seed enforcement: enabled");
-            guard
-        },
-        Err(e) => {
-            // Non-fatal: continue without determinism guard
-            eprintln!("  Warning: Failed to initialize determinism guard: {e}");
-            eprintln!("    Continuing without determinism enforcement");
-            DeterminismGuard::new(
-                DeterminismConfig {
-                    block_network: false,
-                    enforce_random_seed: false,
-                    capture_environment: false,
-                },
-                &sha,
-            )?
-        },
-    };
-
-    // Create execution config from determinism guard
-    let exec_config = ExecutionConfig::from_guard(&determinism_guard);
-
+    // Step 7: Execute hypotheses
+    println!("\n[7/8] Executing hypothesis verification commands...");
     let mut hypotheses = hypotheses; // Make mutable for execution
-    match HypothesisExecutor::execute_all_with_config(&mut hypotheses, &exec_config) {
+    match HypothesisExecutor::execute_all(&mut hypotheses) {
         Ok(()) => {
             let passed = hypotheses
                 .iter()
@@ -1102,47 +1025,14 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
         println!("    - {}: {} ({})", h.id, h.prediction, result_str);
     }
 
-    // Step 8: Run UX verification on hypothesis outputs
-    println!("\n[8/9] Running UX verification...");
-    let ux_audits = run_ux_verification(&hypotheses);
-    let ux_audit_section = UxVerifier::build_audit_section(ux_audits);
-    println!(
-        "  Commands analyzed: {}",
-        ux_audit_section.command_audits.len()
-    );
-    println!(
-        "  Tools without structured output: {}",
-        ux_audit_section.tools_without_structured_output.len()
-    );
-    println!(
-        "  Errors without remediation: {}",
-        ux_audit_section.errors_without_remediation.len()
-    );
-    println!("  UX Verdict: {:?}", ux_audit_section.verdict);
-
-    // Step 9: Generate evidence bundle
-    println!("\n[9/9] Generating evidence bundle...");
-    let mut builder = EvidenceBundleBuilder::new(pr_info.number, &sha)
+    // Step 8: Generate evidence bundle
+    println!("\n[8/8] Generating evidence bundle...");
+    let bundle = EvidenceBundleBuilder::new(pr_info.number, &sha)
         .set_pr_description_parse(&parsed_pr)
         .add_hypotheses(hypotheses)
         .set_anti_gaming_result(&anti_gaming_result)
         .set_input_variation_results(&input_variation_results)
-        .set_ux_audit(ux_audit_section);
-
-    // Add environment snapshot if available
-    if let Some(snapshot) = determinism_guard.environment_snapshot() {
-        builder = builder.set_environment_snapshot(snapshot.clone());
-        println!("  Environment snapshot: captured");
-        println!("    OS: {} ({})", snapshot.os_name, snapshot.arch);
-        println!("    Rust: {}", snapshot.rustc_version);
-    }
-
-    let bundle = builder.build();
-
-    // Log verdict hash for reproducibility verification
-    if let Some(ref hash) = bundle.verdict_hash {
-        println!("  Verdict hash: {}...", &hash.hash[..16]);
-    }
+        .build();
 
     let verdict = bundle.verdict;
     let verdict_reason = bundle.verdict_reason.clone();
