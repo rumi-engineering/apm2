@@ -25,11 +25,12 @@ prd_success_metrics:
     - id: MET-0003
       name: "Tool mediation overhead"
       type: PERFORMANCE
-      target: "<5ms p50"
+      target: "<5ms p50, <20ms p99"
       measurement: |
         Tool mediation overhead excluding actual tool execution time.
         Measures capability check, context firewall validation, and
-        event emission.
+        event emission. p99 bound ensures tail latency does not degrade
+        security-critical path responsiveness.
       evidence_ids:
         - EVID-0011
     - id: MET-0004

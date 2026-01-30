@@ -5,11 +5,39 @@ rfc_meta:
   rfc:
     id: RFC-0017
     title: "Daemon as Control Plane: xtask Demotion, Capability-Minted Episodes, Receipt-Backed Orchestration"
-    status: DRAFT
+    status: APPROVED
     created_date: "2026-01-30"
     last_updated_date: "2026-01-30"
-    version: "v0"
+    version: "v4"
     version_history:
+      - version: "v4"
+        date: "2026-01-30"
+        phase: "v4 (Standard)"
+        notes: |
+          RFC v4 completed via rfc-council FINALIZE mode. Council deliberation
+          with 3 subagents (SA-1 Structural, SA-2 Feasibility, SA-3 Security)
+          produced 18 findings (0 BLOCKER, 7 MAJOR, 9 MINOR, 3 INFO).
+
+          All MAJOR findings remediated:
+          - OQ-008, OQ-009 formalized with deferral rationale and future RFC refs
+          - OQ-010 resolved with concrete SSH mediation design
+          - ADV-009, ADV-010, ADV-011 added for threat coverage gaps
+          - Proto message specification delegated to ticket scope
+
+          RFC is now implementation-ready for DECOMPOSE phase.
+      - version: "v2"
+        date: "2026-01-30"
+        phase: "v2 (Grounded)"
+        notes: |
+          RFC v2 completed via rfc-council EXPLORE mode. All open questions
+          (OQ-001 through OQ-007) resolved with codebase evidence. Key findings:
+          - Protocol decision: Protobuf Runtime Protocol adopted (OQ-001a)
+          - Capability structures: 5 existing structures found, no cousins needed
+          - Tool execution: 5-layer architecture with PreToolUse hook mediation
+          - Session persistence: Ledger-driven model with recovery infrastructure
+          - Signing: Comprehensive Ed25519 + canonicalization exists
+          - Governance: PolicyEngine exists but not wired to daemon
+          - xtask: Only 4 of 15 commands in scope for daemon control plane
       - version: "v0"
         date: "2026-01-30"
         phase: "v0 (Discovery)"

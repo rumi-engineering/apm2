@@ -3,8 +3,8 @@ rfc_design_decisions:
   template_version: "2026-01-23"
 
   design_hypotheses:
-    # v0 (Discovery) phase: These are initial design hypotheses to be grounded
-    # in codebase evidence during EXPLORE phase (v0 -> v2 transition).
+    # v2 (Grounded) phase: Design decisions grounded in codebase evidence
+    # via RFC Council EXPLORE phase completed 2026-01-30.
 
     - id: DD-001
       title: "IPC Handler Architecture"
@@ -12,6 +12,34 @@ rfc_design_decisions:
         Implement daemon IPC using Unix domain sockets with peer credential
         validation (SO_PEERCRED) for authentication. Route requests to privileged
         or session-scoped handlers based on authentication level.
+
+        CRITICAL: SO_PEERCRED provides IDENTITY/LOCALITY, not AUTHORIZATION.
+        On a single-user workstation (same UID for daemon, CLI, sessions),
+        additional privilege separation is required.
+
+      privilege_predicate:
+        privileged_endpoints:
+          requirement: |
+            SO_PEERCRED validates locality (same host, matching UID) PLUS one of:
+            - Connection on privileged socket path (e.g., $XDG_RUNTIME_DIR/apm2/operator.sock)
+              that is NOT exposed to session processes
+            - Request includes operator credential signature (Ed25519 over request body)
+            Session tokens are NEVER valid for privileged endpoints.
+          socket_topology: |
+            Two socket paths:
+            - operator.sock: Only accessible to operator CLI (0600 perms, not in session env)
+            - session.sock: Session processes connect here with session_token
+        session_endpoints:
+          requirement: |
+            Connection authenticated via session_token minted at spawn time.
+            Session token structure: HMAC-SHA256(daemon_secret, session_id || lease_id || spawn_time)
+            Token binds (session_id, lease_id, spawn_time).
+            Tokens have TTL matching lease expiration and are not transferable.
+          validation: |
+            On each session-scoped request:
+            1. Verify session_token HMAC
+            2. Verify session_id matches active session in registry
+            3. Verify lease has not been revoked
       alternatives_considered:
         - id: ALT-001-A
           description: "HTTP/REST API on localhost"
@@ -35,13 +63,27 @@ rfc_design_decisions:
 
       open_questions:
         - question: "What existing Unix socket infrastructure exists in apm2-daemon?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "See OQ-001/OQ-001a in 08_risks_and_open_questions.yaml"
         - question: "How does the current daemon handle authentication, if at all?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "Neither stack implements SO_PEERCRED; must be added to chosen protocol"
 
-      evidence_needed:
-        - "Codebase search for existing socket handling in apm2-daemon"
-        - "Review current IPC implementation patterns"
+      # v2 EVIDENCE (grounded in codebase exploration 2026-01-30)
+      evidence:
+        json_ipc:
+          file: crates/apm2-core/src/ipc/mod.rs
+          lines: 524
+          has_peer_creds: false
+          has_handshake: false
+        protobuf_protocol:
+          files:
+            - crates/apm2-daemon/src/protocol/server.rs
+            - crates/apm2-daemon/src/protocol/handshake.rs
+          has_peer_creds: false  # Must be added
+          has_handshake: true
+          has_version_negotiation: true
+        decision_ref: "DD-008 (Protocol Selection)"
 
     - id: DD-002
       title: "Policy Resolution Delegation"
@@ -65,9 +107,32 @@ rfc_design_decisions:
 
       open_questions:
         - question: "How does daemon currently interact with governance components?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "See OQ-002 in 08_risks_and_open_questions.yaml"
         - question: "What is the interface for HOLON-KERNEL-GOVERNANCE?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "PolicyEngine exists in apm2-core/src/policy/engine.rs but NOT wired to daemon"
+
+      # v2 EVIDENCE (grounded in codebase exploration 2026-01-30)
+      evidence:
+        policy_engine:
+          file: crates/apm2-core/src/policy/engine.rs
+          description: "Coarse-grained policy evaluation, default-deny model"
+          status: "EXISTS but NOT WIRED to daemon"
+        policy_resolution:
+          file: crates/apm2-core/src/fac/policy_resolution.rs
+          description: "PolicyResolvedForChangeSet FAC anchor"
+          status: "DEFINED but daemon has no call path"
+        daemon_integration:
+          file: crates/apm2-daemon/src/episode/capability.rs
+          lines: "1160-1330"
+          description: "PolicyIntegratedValidator with TODO for PolicyEngine"
+          status: "STUB - integration DEFERRED"
+        implementation_gap: |
+          Daemon handlers.rs has NO governance calls. Must add:
+          1. Define governance interface (or adopt PolicyEngine)
+          2. Add policy resolution call path
+          3. Wire PolicyEngine into EpisodeRuntime
 
     - id: DD-003
       title: "Capability Manifest Structure"
@@ -84,9 +149,32 @@ rfc_design_decisions:
 
       open_questions:
         - question: "What existing capability/permission structures exist in apm2?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "See OQ-003 in 08_risks_and_open_questions.yaml - 5 structures found"
         - question: "How does ContextPack currently define read allowlists?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "ContextPackManifest in context/manifest.rs with AccessLevel enum"
+
+      # v2 EVIDENCE (grounded in codebase exploration 2026-01-30)
+      evidence:
+        existing_structures:
+          - name: "ContextPackManifest"
+            file: crates/apm2-core/src/context/manifest.rs
+            description: "OCAP file allowlist with AccessLevel enum"
+          - name: "Capability (lease-backed)"
+            file: crates/apm2-core/src/lease/capability.rs
+            description: "Delegation chain with CapabilityState"
+          - name: "CapabilityManifest (daemon)"
+            file: crates/apm2-daemon/src/episode/capability.rs
+            description: "Tool classes with CapabilityScope"
+          - name: "CapabilityManifest (CAC)"
+            file: crates/apm2-core/src/cac/manifest.rs
+            description: "Binary capability enumeration"
+        anti_cousin_analysis: |
+          NO NEW ABSTRACTIONS NEEDED. Extend existing structures:
+          - Extend ContextPackManifest for tool_allowlist, write_allowlist
+          - Leverage CapabilityScope for fine-grained restrictions
+          - Use ToolClass enumeration for coarse grants
 
     - id: DD-004
       title: "Tool Broker Mediation Pattern"
@@ -102,6 +190,37 @@ rfc_design_decisions:
         4. If validation passes: broker executes tool with held credentials
         5. If validation fails: broker emits DENY, terminates session
 
+      shell_mediation:
+        phase_1_decision: |
+          ShellExec tool is RESTRICTED by default in capability manifests.
+          Only explicitly allowlisted shell commands may execute.
+
+        allowlist_semantics: |
+          - Command MUST match pattern exactly (no shell expansion before check)
+          - Arguments validated against path allowlist for file-touching commands
+          - Commands not in allowlist: DENY + terminate session
+          - Allowlist is pattern-based, not arbitrary string match:
+            - "cargo build" matches "cargo build --release" (prefix match)
+            - "rm" does NOT match any command (not in allowlist)
+
+        default_shell_allowlist: []
+        default_behavior: "No shell commands allowed unless governance grants shell capability"
+
+        extension_mechanism: |
+          Governance policy can grant shell_allowlist capabilities for specific roles:
+          - IMPLEMENTER may run: cargo build, cargo test, cargo clippy
+          - GATE_EXECUTOR may run: cargo test (limited scope)
+          - All shell grants require explicit policy decision
+
+        future_phase_2: |
+          Landlock/seccomp sandbox for shell execution to provide defense-in-depth
+          even for allowlisted commands. Out of scope for Phase 1.
+
+        invariant: |
+          Shell is the highest-risk tool. Default-deny, explicit-grant only.
+          Tickets implementing ShellExec mediation MUST include adversarial tests
+          attempting command injection and allowlist bypass.
+
       alternatives_considered:
         - id: ALT-004-A
           description: "Credential injection into session environment"
@@ -115,19 +234,84 @@ rfc_design_decisions:
 
       open_questions:
         - question: "How does the current tool execution work in apm2?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "See OQ-004 in 08_risks_and_open_questions.yaml - 5-layer architecture"
         - question: "What tools require credential mediation (GitHub, SSH, etc.)?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "GitOp, Inference, ArtifactPublish/Fetch require credentials"
+
+      # v2 EVIDENCE (grounded in codebase exploration 2026-01-30)
+      evidence:
+        architecture_layers:
+          - layer: "1. Protocol"
+            file: crates/apm2-core/src/tool/mod.rs
+            description: "ToolRequest with session_token, 8 tool types"
+          - layer: "2. Adapter"
+            file: crates/apm2-core/src/adapter/claude_code.rs
+            description: "PreToolUse/PostToolUse hooks, HookResponse mediation"
+          - layer: "3. Handlers"
+            files:
+              - crates/apm2-core/src/tool/shell.rs
+              - crates/apm2-core/src/tool/fs.rs
+            description: "Workspace-root sandboxing, path traversal protection"
+          - layer: "4. Session Firewall"
+            file: crates/apm2-daemon/src/session/consume.rs
+            lines: "412-442"
+            description: "validate_tool_request against ContextPackManifest"
+          - layer: "5. Daemon Mediation"
+            file: crates/apm2-daemon/src/protocol/messages.rs
+            description: "ToolRequest/ToolDecision/ToolResult protocol"
+        mediation_pattern: |
+          PreToolUse hook provides the mediation point. Extend for:
+          - Credentials held daemon-side (not in session scope)
+          - Broker mediates GitHub/SSH ops without exposing keys
 
     - id: DD-005
       title: "Session Lifecycle and Recovery"
       decision: |
         Session manager tracks all active sessions with their lease references.
         On daemon crash/restart:
-        1. Daemon recovers session list from persistent state
+        1. Daemon recovers session list from persistent state file (state_file config)
         2. Emits LEASE_REVOKED signal to each session within 5s
         3. Sessions receiving LEASE_REVOKED terminate gracefully
         4. Ledger records SessionTerminated with rationale=DAEMON_RESTART
+
+        PERSISTENCE MODEL (decided 2026-01-30 via OQ-011):
+        - Primary: Session registry state file (JSON, atomic writes)
+        - Secondary: Ledger replay for audit/reconciliation
+        - Protocol: LEASE_REVOKED message in apm2d_runtime_v1.proto
+
+      crash_recovery_mechanics:
+        problem_statement: |
+          If daemon crashes, sessions may have no live channel to receive LEASE_REVOKED.
+          Sessions blocked on I/O or with severed socket cannot receive signals.
+
+        recovery_approach: "OPTION C - Sessions are inert without daemon"
+        rationale: |
+          Sessions cannot execute tools without daemon mediation. A session with no
+          daemon connection is effectively dead even if the process continues running.
+          The next tool call fails with DAEMON_UNAVAILABLE, triggering session exit.
+
+          This approach avoids:
+          - Heartbeat overhead (rejected in ALT-005-A)
+          - Complex PID management for kill signals
+          - Race conditions in signal delivery
+
+        on_daemon_startup:
+          - "Load state file to identify sessions that were active at crash time"
+          - "Mark all such sessions as REVOKED in in-memory registry"
+          - "Emit SessionTerminated events to ledger with rationale=DAEMON_RESTART"
+          - "Any reconnecting session gets LEASE_REVOKED response to any request"
+
+        session_behavior_on_daemon_loss:
+          - "Tool request fails with connection error or DAEMON_UNAVAILABLE"
+          - "Session client library interprets this as fatal"
+          - "Session process exits cleanly with error code"
+          - "No orphaned process continues executing unsupervised"
+
+        invariant: |
+          A session CANNOT execute any tool without daemon mediation.
+          Daemon crash immediately halts all session work (fail-closed).
 
       alternatives_considered:
         - id: ALT-005-A
@@ -140,11 +324,58 @@ rfc_design_decisions:
             - "False positives on network glitches"
           rejected_because: "LEASE_REVOKED signal more reliable than heartbeat timeout"
 
+        - id: ALT-005-B
+          description: "Ledger-only recovery (no state file)"
+          pros:
+            - "Single source of truth"
+            - "No state file sync concerns"
+          cons:
+            - "In-flight sessions (spawn not committed) lost"
+            - "Ledger write latency affects recovery completeness"
+          rejected_because: "State file provides O(1) recovery vs O(n) ledger scan"
+
       open_questions:
         - question: "Does daemon currently have persistent state for session tracking?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "See OQ-005 in 08_risks_and_open_questions.yaml - ledger-driven model"
         - question: "What is the current crash recovery behavior?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "Recovery infrastructure exists; LEASE_REVOKED signaling not implemented"
+        - question: "What is the concrete persistence mechanism?"
+          status: RESOLVED
+          resolution: "See OQ-011 in 08_risks_and_open_questions.yaml - hybrid state file + ledger"
+
+      # v2 EVIDENCE (grounded in codebase exploration 2026-01-30)
+      evidence:
+        persistence_model: "HYBRID (state file + ledger)"
+        state_file:
+          config: ecosystem.example.toml
+          line: 8
+          description: "state_file = '/var/lib/apm2/state.json' - reserved, not wired"
+          status: "CONFIG_EXISTS_NOT_IMPLEMENTED"
+        ledger:
+          file: crates/apm2-core/src/ledger/storage.rs
+          description: "SQLite-backed, WAL mode, append-only events"
+        recovery:
+          file: crates/apm2-core/src/session/recovery.rs
+          functions:
+            - "replay_session_state()"
+            - "find_last_session_cursor()"
+          description: "Session state reconstruction from ledger"
+        session_state:
+          file: crates/apm2-core/src/session/state.rs
+          lines: "59-129"
+          description: "SessionState with resume_cursor and restart_attempt"
+        implementation_requirements:
+          ticket: TCK-00266
+          deliverables:
+            - "Wire state_file config to SessionManager"
+            - "Implement atomic write on session create/destroy"
+            - "Add LeaseRevoked message to apm2d_runtime_v1.proto"
+            - "Implement LEASE_REVOKED handler in session client"
+            - "Implement recovery loop in daemon startup"
+          adversarial_test: ADV-010
+          evidence_artifact: EVID-0018
 
     - id: DD-006
       title: "Event Signing Architecture"
@@ -163,11 +394,67 @@ rfc_design_decisions:
         Domain separation ensures signatures are bound to specific event types.
         Prevents replay attacks where a signature from one context is used in another.
 
+      canonicalization_authority:
+        rule: |
+          ALL kernel events (WorkClaimed, EpisodeSpawned, ToolDecided, ToolExecuted,
+          SessionTerminated) are canonicalized via apm2_core::events::canonical::Canonicalize
+          trait BEFORE signing.
+
+          The daemon protocol messages (apm2d_runtime_v1.proto) transport these events
+          as payloads. Signing happens on canonical event bytes, NOT on protocol wrapper
+          bytes or raw protobuf bytes.
+
+          INVARIANT: Canonical form is the ONLY form that may be signed.
+          Do NOT sign raw protobuf-serialized bytes for any flow.
+
+        governed_artifact: |
+          apm2_core::events::canonical.rs is the governed artifact for canonicalization.
+          Schema evolution rules:
+          - New fields MUST be added to canonical form with golden test vectors
+          - Field order changes require migration plan
+          - Existing signatures remain valid (append-only schema)
+
+        golden_vectors: |
+          Each new event type added requires golden test vectors in
+          tests/canonical_golden_vectors.rs that verify:
+          1. Deterministic serialization across runs
+          2. Signature verification with known good keypair
+          3. Round-trip through protobuf transport preserves canonical bytes
+
       open_questions:
         - question: "What signing infrastructure exists in apm2-core?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "See OQ-006 in 08_risks_and_open_questions.yaml - comprehensive Ed25519"
         - question: "How are events currently serialized for the ledger?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "Canonicalize trait in events/canonical.rs for deterministic serialization"
+
+      # v2 EVIDENCE (grounded in codebase exploration 2026-01-30)
+      evidence:
+        signing:
+          file: crates/apm2-core/src/crypto/sign.rs
+          lines: "1-283"
+          description: "Ed25519 Signer with generate, sign, verify via ed25519_dalek"
+        key_management:
+          file: crates/apm2-core/src/crypto/keys.rs
+          lines: "1-636"
+          description: "KeyManager with secure file storage (0600 perms)"
+        canonicalization:
+          file: crates/apm2-core/src/events/canonical.rs
+          lines: "1-424"
+          description: "Canonicalize trait for deterministic serialization"
+          supports:
+            - WorkOpened
+            - WorkCompleted
+            - EvidencePublished
+            - GateReceiptGenerated
+        hash_chain:
+          file: crates/apm2-core/src/crypto/hash.rs
+          description: "Blake3 hash-chain linking with GENESIS_PREV_HASH"
+        implementation_status: |
+          Ed25519 + canonicalization EXISTS and is production-ready.
+          Extend Canonicalize trait to new RFC-0017 event types:
+          - WorkClaimed, EpisodeSpawned, ToolDecided, ToolExecuted, SessionTerminated
 
     - id: DD-007
       title: "xtask Deprecation Strategy"
@@ -186,35 +473,195 @@ rfc_design_decisions:
 
       open_questions:
         - question: "What xtask commands exist and what are their daemon CLI equivalents?"
-          status: REQUIRES_EXPLORATION
+          status: RESOLVED
+          resolution: "See OQ-007 in 08_risks_and_open_questions.yaml - 15 commands, 4 in scope"
         - question: "How can we add telemetry to track xtask usage?"
-          status: REQUIRES_EXPLORATION
+          status: DEFERRED
+          resolution: "Phase 5 implementation - telemetry gate for <5% usage"
+
+      # v2 EVIDENCE (grounded in codebase exploration 2026-01-30)
+      evidence:
+        xtask_commands:
+          file: xtask/src/main.rs
+          lines: "14-38, 67-192"
+          total_commands: 15
+          in_scope_for_deprecation: 4
+        command_categories:
+          daemon_operations:
+            - "work claim"
+            - "work start"
+            - "fac ingest"
+            - "work status"
+          github_workflow:
+            - "start-ticket"
+            - "commit"
+            - "push"
+            - "check"
+            - "finish"
+            - "review *"
+            - "aat"
+          development_tools:
+            - "lint"
+            - "capabilities"
+            - "selftest"
+        deprecation_clarification: |
+          Three-phase deprecation applies to daemon operations ONLY.
+          GitHub/SCM workflow tools are OUT OF SCOPE for daemon control plane.
+
+    # =========================================================================
+    # DD-008: PROTOCOL DECISION (Added by RFC Council review 2026-01-30)
+    # This decision MUST be finalized before implementation proceeds.
+    # See: evidence/rfc/RFC-0017/reviews/rfc_review_20260130T120000.yaml
+    # =========================================================================
+    - id: DD-008
+      title: "Control-Plane IPC Protocol Selection"
+      status: DECIDED
+      decided_date: "2026-01-30"
+      decided_by: "Human (operator)"
+      council_finding: FND-RFC-0017-001
+      council_review: "evidence/rfc/RFC-0017/reviews/rfc_review_20260130T120000.yaml"
+      decision: |
+        DECISION: OPTION A - Adopt Protobuf Runtime Protocol
+
+        The Protobuf Runtime Protocol (apm2_daemon::protocol) becomes the
+        control-plane IPC for PRD-0010 Phase 1. All privileged endpoints
+        (ClaimWork, SpawnEpisode, IssueCapability) and session-scoped endpoints
+        (RequestTool, EmitEvent, PublishEvidence) route through ProtocolServer.
+
+        Implementation path:
+        1. Add SO_PEERCRED to ProtocolServer::accept() for authentication
+        2. Add control-plane messages to apm2d_runtime_v1.proto
+        3. Implement handlers in ProtocolServer for new endpoints
+        4. Create thin JSON-to-protobuf CLI adapter for backward compatibility
+        5. Deprecate JSON IPC for control-plane operations (keep for legacy CLI)
+
+        The existing JSON IPC (apm2_core::ipc) remains available for:
+        - Human CLI commands during migration (via adapter)
+        - Legacy tooling compatibility
+        - Eventually deprecated once CLI migration complete
+
+      cutover_topology:
+        pattern: A
+        pattern_name: "Protobuf-only control plane"
+        description: |
+          Daemon listens only with ProtocolServer for control-plane operations.
+          - CLI migrates to protobuf (or uses CLI-side adapter)
+          - JSON IPC (ipc_server.rs) is retired for control-plane; kept only for
+            backward-compatible legacy tooling during transition
+          - All new control-plane endpoints are ONLY in protobuf handlers
+
+        invariant: |
+          No control-plane behavior is implemented twice.
+          All enforcement logic (privilege checks, lease validation, context firewall)
+          lives ONLY in ProtocolServer handlers. If JSON adapter exists, it is a
+          pure codec shim that delegates to the same handler functions.
+
+        implementation_constraint: |
+          Ticket acceptance criteria must verify:
+          - New handler logic is NOT duplicated in ipc_server.rs
+          - ipc_server.rs either delegates to shared handler or is not called
+          - Unit tests cover protobuf handlers directly
+
+      alternatives_considered:
+        - id: ALT-008-A
+          description: "Adopt Protobuf Runtime Protocol (RECOMMENDED)"
+          pros:
+            - "Handshake with version negotiation already implemented"
+            - "Bounded reads with DoS protection (CTR-1603)"
+            - "Canonical encoding for signing workflows (AD-DAEMON-003)"
+            - "Golden test vectors for determinism (AD-VERIFY-001)"
+            - "Message types for episode control already in proto"
+            - "Future-proof: protobuf evolution is well-understood"
+          cons:
+            - "CLI must migrate from JSON to protobuf (or use adapter)"
+            - "Learning curve for protobuf tooling"
+            - "Two codepaths during transition"
+          effort: MEDIUM
+          risk: LOW
+          council_recommendation: true
+
+        - id: ALT-008-B
+          description: "Extend JSON IPC as Phase-1 Bridge"
+          pros:
+            - "CLI already uses JSON; minimal migration"
+            - "Simpler mental model initially"
+            - "Faster time-to-first-feature"
+          cons:
+            - "Must retrofit handshake, version negotiation (duplicate effort)"
+            - "No canonical encoding; signing workflows harder (violates LAW-13)"
+            - "Creates technical debt; Phase 2 must redo this work"
+            - "Divergent codepaths increase maintenance"
+          effort: LOW_INITIAL_HIGH_TOTAL
+          risk: MEDIUM
+          council_recommendation: false
+
+      evidence:
+        json_ipc:
+          file: crates/apm2-core/src/ipc/mod.rs
+          lines: 524
+          has_peer_creds: false
+          has_handshake: false
+          has_signing: false
+          current_use: "Process management, credentials, episode CRUD"
+
+        protobuf_protocol:
+          files:
+            - crates/apm2-daemon/src/protocol/mod.rs
+            - crates/apm2-daemon/src/protocol/server.rs
+            - crates/apm2-daemon/src/protocol/framing.rs
+            - crates/apm2-daemon/src/protocol/handshake.rs
+            - crates/apm2-daemon/src/protocol/messages.rs
+            - proto/apm2d_runtime_v1.proto
+          total_lines: ~3000
+          has_peer_creds: false  # Must be added
+          has_handshake: true
+          has_signing: "Supports canonical bytes for signing"
+          current_use: "Integration tests only (not in main dispatcher)"
+
+      invariants:
+        - "SO_PEERCRED MUST be added to whichever stack is chosen"
+        - "Privileged vs session-scoped endpoint separation MUST be enforced"
+        - "No 3rd protocol stack may be introduced"
+
+      open_questions:
+        - question: "Which protocol stack becomes the Phase 1 control plane?"
+          status: RESOLVED
+          resolved_date: "2026-01-30"
+          resolution: "OPTION A (Protobuf Runtime Protocol) adopted. See DD-008.decision above."
 
   architecture_overview:
+    # IMPORTANT: Locations are ACTUAL CCP paths. Do NOT create new directories.
+    # Anti-cousin principle: extend existing modules, do not create parallel hierarchies.
     components:
       - name: "Daemon IPC Handler"
         responsibility: "Authenticate clients, route to privileged/session handlers"
-        location_hypothesis: "crates/apm2-daemon/src/ipc/"
+        location: "crates/apm2-daemon/src/protocol/"
+        extension_note: "Extend ProtocolServer; wrap/retire ipc_server.rs. Do NOT create src/ipc/"
 
       - name: "Work Orchestrator"
         responsibility: "Handle ClaimWork, query governance, mint capabilities"
-        location_hypothesis: "crates/apm2-daemon/src/work/"
+        location: "crates/apm2-daemon/src/handlers.rs"
+        extension_note: "Add work orchestration handlers to existing handlers module"
 
       - name: "Episode Spawner"
         responsibility: "Spawn episodes with FAC precondition validation"
-        location_hypothesis: "crates/apm2-daemon/src/episode/"
+        location: "crates/apm2-daemon/src/episode/"
+        extension_note: "Existing module; extend capability.rs and add spawn.rs"
 
       - name: "Tool Broker"
         responsibility: "Mediate tool calls, enforce context firewall"
-        location_hypothesis: "crates/apm2-daemon/src/tools/"
+        location: "crates/apm2-daemon/src/session/consume.rs"
+        extension_note: "Extend existing consume.rs validate_tool_request pattern"
 
       - name: "Session Manager"
         responsibility: "Track sessions, handle crash recovery"
-        location_hypothesis: "crates/apm2-daemon/src/session/"
+        location: "crates/apm2-daemon/src/session/"
+        extension_note: "Existing module; add registry.rs for persistent tracking"
 
       - name: "Event Signer"
         responsibility: "Sign state transition events with Ed25519"
-        location_hypothesis: "crates/apm2-core/src/signing/"
+        location: "crates/apm2-core/src/crypto/sign.rs"
+        extension_note: "Existing Ed25519 infrastructure; extend for new event types"
 
     data_flows:
       - name: "Work Claim Flow"

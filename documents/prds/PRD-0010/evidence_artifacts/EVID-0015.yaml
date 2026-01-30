@@ -1,0 +1,50 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0015"
+  category: "SCHEMA_VALIDATION"
+  title: "Capability terminology separation validation"
+  description: |
+    Schema validation ensuring IPC protocol separates feature negotiation
+    terminology from permission capability terminology. Validates that
+    handshake fields do not use 'cap' naming and permission fields use
+    approved naming conventions.
+  source_acceptance_test: SCHEMA-001
+  capture:
+    paths:
+      - "proto/daemon/ipc.proto"
+      - "test/schema/capability_terminology.rs"
+      - "evidence/schema/capability_terminology/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --workspace -- schema::capability_terminology"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 30
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Proto files compiled"
+      - id: "CMD-0002"
+        shell: "bash"
+        command: "grep -rn 'requested_cap\\|granted_cap' proto/ && exit 1 || exit 0"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 10
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Proto directory exists"
+  assertions:
+    - "Handshake message uses 'supported_features'/'enabled_features' naming"
+    - "No 'cap' or 'caps' fields in handshake messages"
+    - "Permission capabilities use 'capability_manifest' or 'granted_capabilities'"
+    - "Feature negotiation fields cannot influence permission decisions (code path separation)"
+    - "Proto schema includes documentation distinguishing features from permissions"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

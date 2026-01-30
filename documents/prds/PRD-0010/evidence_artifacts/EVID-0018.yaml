@@ -1,0 +1,68 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0018"
+  category: "SECURITY_TEST"
+  title: "ADV-010: Crash recovery does not orphan sessions"
+  description: |
+    Adversarial test verifying daemon crash recovery prevents orphaned sessions.
+    Tests multiple crash scenarios including crash during session spawn, crash
+    after spawn but before first tool call, and crash during LEASE_REVOKED
+    signal delivery. Verifies no orphaned processes and ledger consistency.
+  source_acceptance_test: ADV-010
+  capture:
+    paths:
+      - "test/daemon/adversarial/adv_010_crash_recovery.rs"
+      - "evidence/adv/ADV-010/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --workspace -- daemon::adversarial::adv_010"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 120
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test manages daemon lifecycle via SIGKILL injection"
+          - "Test spawns multiple sessions before crash"
+          - "Test verifies process tree after recovery"
+      - id: "CMD-0002"
+        shell: "bash"
+        command: "cargo test --workspace -- daemon::adversarial::adv_010_mid_spawn"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 60
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test crashes daemon DURING SpawnEpisode handling"
+          - "Test verifies no orphaned session process"
+      - id: "CMD-0003"
+        shell: "bash"
+        command: "cargo test --workspace -- daemon::adversarial::adv_010_partial_revoke"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 90
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Test crashes daemon DURING LEASE_REVOKED delivery"
+          - "Test verifies all sessions eventually terminated"
+  assertions:
+    - "Crash during session spawn: no orphaned session process running after recovery"
+    - "Crash during session spawn: no EpisodeSpawned event without corresponding SessionTerminated"
+    - "Crash with active sessions: all sessions receive LEASE_REVOKED within 5s of restart"
+    - "Crash with active sessions: all session processes terminate within 6s of restart"
+    - "Crash during LEASE_REVOKED delivery: daemon retries delivery on restart"
+    - "Crash during LEASE_REVOKED delivery: all sessions eventually terminated"
+    - "Ledger consistency: SessionTerminated count equals EpisodeSpawned count for crashed epoch"
+    - "Process tree: no orphaned child processes of previous daemon PID"
+    - "State file: session registry persisted atomically (no partial writes)"
+    - "Recovery timing: all sessions terminated within 5s SLA"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

@@ -13,17 +13,28 @@ rfc_contracts_and_versioning:
             parameters:
               - name: actor_id
                 type: string
-                description: "Actor identifier"
+                description: "Display-only hint for actor name. Authoritative actor_id derived from credential."
                 required: true
               - name: role
                 type: string
                 enum: [IMPLEMENTER, GATE_EXECUTOR, REVIEWER, COORDINATOR]
                 description: "Role for work assignment"
                 required: true
+              - name: credential_signature
+                type: bytes
+                description: "Ed25519 signature over (actor_id || role || nonce) using operator key"
+                required: true
             validation:
               - "actor_id must be non-empty"
               - "role must be valid enum value"
-              - "Caller must have operator credential"
+              - "Caller must have operator credential (verified via SO_PEERCRED + privileged socket)"
+              - "credential_signature must verify against registered operator public key"
+              - "Authoritative actor_id is public_key_fingerprint, NOT user-supplied value"
+            security_note: |
+              User-supplied actor_id is a display hint only. The daemon derives
+              authoritative actor_id from the operator credential (public key fingerprint).
+              This prevents impersonation attacks where a malicious operator claims
+              work as another actor_id.
           response:
             success:
               type: WorkAssignment

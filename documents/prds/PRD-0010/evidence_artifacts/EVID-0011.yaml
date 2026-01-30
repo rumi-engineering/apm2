@@ -30,6 +30,7 @@ prd_evidence_artifact:
           - "1000 iterations minimum"
   assertions:
     - "p50 overhead < 5ms"
+    - "p99 overhead < 20ms"
     - "Overhead includes capability check"
     - "Overhead includes context firewall validation"
     - "Overhead includes event emission"

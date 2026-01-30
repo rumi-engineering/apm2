@@ -6,10 +6,12 @@ prd_requirement:
   source_id: "DCP-G-0001"
   title: "Tool Mediation Overhead"
   statement: |
-    apm2-daemon tool mediation overhead (excluding tool execution) MUST be <5ms p50;
-    overhead includes capability check, context firewall validation, and event emission.
+    apm2-daemon tool mediation overhead (excluding tool execution) MUST be <5ms p50
+    and <20ms p99; overhead includes capability check, context firewall validation,
+    and event emission.
   acceptance_criteria:
     - "Tool mediation overhead <5ms p50 under benchmark conditions. Verified by: Benchmark results show p50 < 5ms."
+    - "Tool mediation overhead <20ms p99 under benchmark conditions. Verified by: Benchmark results show p99 < 20ms."
     - "Overhead measurement excludes actual tool execution time. Verified by: Benchmark methodology documents tool execution exclusion."
     - "Overhead includes: capability check, context firewall validation, event emission. Verified by: Benchmark traces confirm all components measured."
   evidence:

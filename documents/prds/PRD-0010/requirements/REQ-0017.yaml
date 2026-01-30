@@ -1,0 +1,39 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0017"
+  type: "FUNCTIONAL"
+  source_id: "DCP-G-0002"
+  title: "RFC-0015 Dependency Contract"
+  statement: |
+    PRD-0010 implementation MUST enforce a strict dependency contract with RFC-0015;
+    any schema changes to PolicyResolvedForChangeSet or GateLeaseIssued events MUST
+    require PRD-0010 review before RFC-0015 merge; integration tests MUST validate
+    PRD-0010 compatibility against RFC-0015 changes.
+  acceptance_criteria:
+    - "RFC-0015 breaking change policy documented in both PRD-0010 and RFC-0015. Verified by: Both documents reference coordinated review requirement."
+    - "Integration test suite validates PolicyResolvedForChangeSet schema compatibility. Verified by: Test fails if required fields missing or types changed."
+    - "Integration test suite validates GateLeaseIssued schema compatibility. Verified by: Test fails if required fields missing or types changed."
+    - "CI gate blocks RFC-0015 merge if PRD-0010 integration tests fail. Verified by: CI configuration includes cross-dependency check."
+    - "Required event fields documented: PolicyResolvedForChangeSet(work_id, changeset_digest, policy_hash, risk_tier), GateLeaseIssued(work_id, gate_id, changeset_digest, executor_actor_id, lease_expiry). Verified by: Schema files match documented fields."
+  evidence:
+    evidence_ids:
+      - EVID-0016
+  law_alignment:
+    - law_id: "LAW-01"
+      enforcement: "Loop Closure: Dependency contracts enforce coordinated changes"
+      applies_to:
+        - "Cross-document dependencies"
+        - "Schema evolution"
+    - law_id: "LAW-13"
+      enforcement: "Contract Determinism: Explicit interface contracts"
+      applies_to:
+        - "Event schema compatibility"
+  defect_codes:
+    - code: "DEPENDENCY_CONTRACT_VIOLATION"
+      severity: "S1"
+      description: "RFC-0015 change merged without PRD-0010 compatibility review"
+    - code: "SCHEMA_INCOMPATIBILITY"
+      severity: "S1"
+      description: "Required event fields missing or incompatible"
+  review_finding_ref: "FND-PRD-0010-003"

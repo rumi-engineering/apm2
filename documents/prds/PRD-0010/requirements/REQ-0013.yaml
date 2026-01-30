@@ -14,9 +14,15 @@ prd_requirement:
     - "SessionTerminated events with rationale=DAEMON_RESTART recorded in ledger. Verified by: Ledger query after recovery shows termination events."
     - "No orphaned processes continue operating after daemon restart. Verified by: Process monitoring confirms all sessions terminated."
     - "Daemon state rebuilt from ledger replay on restart. Verified by: State inspection shows consistency with ledger."
+    - "Session registry persisted atomically to state_file on each session create/destroy. Verified by: State file inspection after crash shows no partial writes."
+    - "LEASE_REVOKED protocol message defined in apm2d_runtime_v1.proto. Verified by: Proto file contains LeaseRevoked message type."
+    - "Session client handles LEASE_REVOKED with graceful shutdown (exit 0). Verified by: Unit test confirms client behavior."
+    - "Crash during session spawn does not orphan processes. Verified by: ADV-010 adversarial test (mid-spawn crash scenario)."
+    - "Crash during LEASE_REVOKED delivery retries on restart. Verified by: ADV-010 adversarial test (partial-revoke scenario)."
   evidence:
     evidence_ids:
       - EVID-0013
+      - EVID-0018
   law_alignment:
     - law_id: "LAW-12"
       enforcement: "Bounded Search and Termination: Sessions terminated on lease revocation"

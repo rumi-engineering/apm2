@@ -107,7 +107,9 @@ prd_risks_questions:
         Git operations may require SSH authentication. Broker must mediate without
         exposing SSH private keys to session.
       proposed_answer: |
-        Daemon runs SSH agent or git credential helper. Session requests git operations;
-        broker uses internal agent/helper to authenticate. SSH_AUTH_SOCK not exposed
-        to session process.
-      status: PROPOSED
+        Daemon spawns isolated ssh-agent per work_id. Agent socket path is internal
+        to daemon. Tool broker uses SSH_AUTH_SOCK internally for git operations.
+        Session process never sees SSH_AUTH_SOCK. Fallback: For SSH-less environments,
+        git credential.helper with ephemeral token managed by daemon.
+      status: RESOLVED
+      resolved_by: REQ-0018

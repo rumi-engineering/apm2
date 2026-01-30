@@ -42,7 +42,8 @@ prd_quality_framework:
       coverage:
         requirement_ids:
           - REQ-0004
-        notes: "Zero credentials in sessions; broker-mediated access."
+          - REQ-0018
+        notes: "Zero credentials in sessions; broker-mediated access; SSH key isolation."
     - dimension_id: DEFAULT_DENY_SECURITY
       applicability: APPLIES
       disposition: EXPLICIT_REQUIREMENTS
@@ -52,6 +53,9 @@ prd_quality_framework:
           - REQ-0005
           - REQ-0006
           - REQ-0008
+          - REQ-0015
+          - REQ-0016
+          - REQ-0018
     - dimension_id: DETERMINISM
       applicability: APPLIES
       disposition: EXPLICIT_REQUIREMENTS
@@ -67,7 +71,7 @@ prd_quality_framework:
       delegation:
         rationale: "Documentation requirements delegated with specific deliverables."
         guardrails:
-          - "Migration guide for xtask -> apm2 CLI (TCK-00217)"
+          - "Migration guide for xtask -> apm2 CLI (TCK-00265)"
           - "IPC protocol documentation"
           - "Container deployment constraints"
         required_evidence_categories:
@@ -87,7 +91,8 @@ prd_quality_framework:
         requirement_ids:
           - REQ-0002
           - REQ-0003
-        notes: "Integration with FAC via PolicyResolvedForChangeSet and GateLeaseIssued."
+          - REQ-0017
+        notes: "Integration with FAC via PolicyResolvedForChangeSet and GateLeaseIssued; RFC-0015 dependency contract."
     - dimension_id: OBSERVABILITY
       applicability: APPLIES
       disposition: EXPLICIT_REQUIREMENTS
@@ -152,4 +157,8 @@ prd_quality_framework:
           - REQ-0007
           - REQ-0008
           - REQ-0014
-        notes: "Adversarial test suite (ADV-001 through ADV-008) validates security properties including xtask divergence."
+          - REQ-0015
+          - REQ-0016
+          - REQ-0017
+          - REQ-0018
+        notes: "Adversarial test suite (ADV-001 through ADV-009) validates security properties including xtask divergence, operator auth, and SSH mediation."

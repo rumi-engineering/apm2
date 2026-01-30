@@ -61,6 +61,62 @@ rfc_test_and_evidence:
             expected: "Command not found"
             requirement_ids: []
 
+          # ===================================================================
+          # ADV-009 through ADV-011: Added during FINALIZE phase 2026-01-30
+          # Per RFC Council findings FND-RFC-0017-SA3-001, SA3-003, SA3-006
+          # ===================================================================
+          - test_id: ADV-009
+            name: "Container UID remapping bypass attempt"
+            description: |
+              Deploy daemon in container WITH user namespace remapping enabled.
+              Attempt connection from a process running as remapped UID that maps
+              to privileged host UID. Validates RISK-RFC-0017-002 mitigation.
+            expected: |
+              Connection rejected OR correctly identified as different principal.
+              SO_PEERCRED returns container-namespace UID; daemon must either:
+              (a) Reject connections when user namespaces detected, or
+              (b) Correctly map container UID to non-privileged principal.
+            requirement_ids: [REQ-DCP-0008]
+            threat_coverage: [TH-002]
+            added_by: "RFC Council FINALIZE - FND-RFC-0017-SA3-001"
+
+          - test_id: ADV-010
+            name: "Rapid-fire requests after context deny"
+            description: |
+              Session issues FileRead for forbidden path (outside context pack).
+              Immediately issue 100 additional requests in tight loop before
+              SIGTERM can be processed. Tests deny-terminate atomicity and
+              validates MIT-007 residual risk handling.
+            expected: |
+              ONLY first request gets ToolDecided=DENY response.
+              All subsequent requests either:
+              (a) Fail with SESSION_TERMINATED error, or
+              (b) Fail with connection closed/reset.
+              No request after first DENY should succeed or produce ALLOW decision.
+            requirement_ids: [REQ-DCP-0005]
+            threat_coverage: [TH-007]
+            added_by: "RFC Council FINALIZE - FND-RFC-0017-SA3-003"
+
+          - test_id: ADV-011
+            name: "Session credential probe"
+            description: |
+              Session attempts to access credentials that should be broker-held:
+              1. Read environment variables: SSH_AUTH_SOCK, AWS_SECRET_ACCESS_KEY,
+                 AWS_ACCESS_KEY_ID, GITHUB_TOKEN, GH_TOKEN
+              2. Attempt FileRead of ~/.ssh/id_ed25519, ~/.ssh/id_rsa
+              3. Attempt FileRead of ~/.config/gh/hosts.yml
+              Validates INV-0002 (sessions cannot access credentials directly).
+            expected: |
+              1. Environment variables NOT present in session process scope
+                 (daemon must sanitize environment before session spawn)
+              2. File reads blocked by context firewall (credentials not in allowlist)
+                 -> ToolDecided=DENY; SessionTerminated
+              3. No credential data ever reaches session
+            requirement_ids: [REQ-DCP-0004]
+            threat_coverage: [TH-005, TH-006]
+            invariant_tested: INV-0002
+            added_by: "RFC Council FINALIZE - FND-RFC-0017-SA3-006"
+
       - category: UNIT
         description: "Isolated unit tests for individual components"
         tests:
@@ -186,9 +242,9 @@ rfc_test_and_evidence:
 
   evidence_requirements:
     - evidence_id: EVID-RFC-0017-001
-      description: "Adversarial test results for ADV-001 through ADV-008"
+      description: "Adversarial test results for ADV-001 through ADV-011"
       format: "Test output logs with pass/fail status"
-      requirement_ids: [REQ-DCP-0001, REQ-DCP-0003, REQ-DCP-0005, REQ-DCP-0006, REQ-DCP-0007]
+      requirement_ids: [REQ-DCP-0001, REQ-DCP-0003, REQ-DCP-0004, REQ-DCP-0005, REQ-DCP-0006, REQ-DCP-0007, REQ-DCP-0008]
 
     - evidence_id: EVID-RFC-0017-002
       description: "Unit test coverage report for daemon components"
@@ -236,9 +292,11 @@ rfc_test_and_evidence:
     REQ-DCP-0004:
       - INT-002
       - INT-003
+      - ADV-011
 
     REQ-DCP-0005:
       - ADV-003
+      - ADV-010
       - UT-TOOL-002
       - INT-004
 
@@ -254,6 +312,7 @@ rfc_test_and_evidence:
     REQ-DCP-0008:
       - UT-IPC-001
       - UT-IPC-002
+      - ADV-009
 
     REQ-DCP-0009:
       - BENCH-001

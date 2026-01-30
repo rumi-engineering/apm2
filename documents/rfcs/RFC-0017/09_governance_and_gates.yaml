@@ -151,8 +151,8 @@ rfc_governance_and_gates:
         description: "No cousin abstractions; reuses existing patterns"
 
   version_progression:
-    current_version: "v0"
-    current_phase: "Discovery"
+    current_version: "v4"
+    current_phase: "Standard"
 
     progression_rules:
       - from_version: "v0"
@@ -179,5 +179,61 @@ rfc_governance_and_gates:
           - "apm2 factory tickets emit succeeds"
 
   review_history:
-    # Will be populated by subsequent reviews
-    reviews: []
+    reviews:
+      - review_id: COUNCIL-RFC-0017-20260130-EXPLORE
+        date: "2026-01-30"
+        phase_transition: "v0 -> v2"
+        mode: EXPLORE
+        verdict: APPROVED
+        verdict_reason: |
+          All 7 primary open questions (OQ-001 through OQ-007) resolved with
+          codebase evidence. Protocol decision (DD-008) made. Anti-cousin
+          analysis complete.
+        findings_count: 1
+        blockers_resolved: 0
+
+      - review_id: COUNCIL-RFC-0017-20260130-FINALIZE
+        date: "2026-01-30"
+        phase_transition: "v2 -> v4"
+        mode: FINALIZE
+        verdict: APPROVED_WITH_REMEDIATION
+        verdict_reason: |
+          RFC-0017 FINALIZE Council completed with 3-agent deliberation.
+          18 total findings (0 BLOCKER, 7 MAJOR, 9 MINOR, 3 INFO).
+          All MAJOR findings remediated in-session:
+          - OQ-008, OQ-009, OQ-010 status formalized
+          - ADV-009, ADV-010, ADV-011 added for threat coverage
+          - Proto message specification delegated to ticket scope
+
+          Remaining items are documentation refinements, not architectural gaps.
+        subagent_summary:
+          SA-1:
+            role: "Structural Rigorist"
+            modes: [4, 30, 40, 49, 57]
+            findings: 5
+            artifact: "Explanatory Scoring Table"
+            overall_readiness: READY
+          SA-2:
+            role: "Implementation Feasibility"
+            modes: [26, 29, 30, 31, 48]
+            findings: 7
+            artifact: "Mock Implementation Run Report"
+            overall_feasibility: NEEDS_CLARIFICATION
+            note: "Clarifications provided in ticket scope refinements"
+          SA-3:
+            role: "Security & Anti-Cousin Guardian"
+            modes: [12, 26, 60, 61, 62]
+            findings: 6
+            artifact: "CAE Tree"
+            anti_cousin_verdict: COMPLIANT
+            overall_assurance: NEEDS_WORK
+            note: "Assurance improved by adding ADV-009, ADV-010, ADV-011"
+        findings_count: 18
+        blockers_resolved: 0
+        major_remediated: 7
+
+        council_metadata:
+          session_id: "COUNCIL-RFC-0017-20260130-FINALIZE"
+          cycles_completed: 1
+          quorum_achieved: true
+          elapsed_time_seconds: "~600"

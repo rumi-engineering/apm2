@@ -44,6 +44,18 @@ prd_traceability:
     - requirement_id: REQ-0014
       goal_ids:
         - DCP-G-0010
+    - requirement_id: REQ-0015
+      goal_ids:
+        - DCP-G-0006
+    - requirement_id: REQ-0016
+      goal_ids:
+        - DCP-G-0001
+    - requirement_id: REQ-0017
+      goal_ids:
+        - DCP-G-0002
+    - requirement_id: REQ-0018
+      goal_ids:
+        - DCP-G-0003
   goal_to_problem:
     - goal_id: DCP-G-0001
       problem_ids:
@@ -77,60 +89,60 @@ prd_traceability:
       problem_ids:
         - FM-0001
   ticket_to_requirement:
-    - ticket_id: TCK-00200
+    - ticket_id: TCK-00248
       requirement_ids:
         - REQ-0001
         - REQ-0008
-    - ticket_id: TCK-00201
+    - ticket_id: TCK-00249
       requirement_ids:
         - REQ-0001
         - REQ-0008
-    - ticket_id: TCK-00202
+    - ticket_id: TCK-00250
       requirement_ids:
         - REQ-0009
         - REQ-0010
         - REQ-0011
-    - ticket_id: TCK-00203
+    - ticket_id: TCK-00251
       requirement_ids:
         - REQ-0002
-    - ticket_id: TCK-00204
+    - ticket_id: TCK-00252
       requirement_ids:
         - REQ-0003
-    - ticket_id: TCK-00205
+    - ticket_id: TCK-00253
       requirement_ids:
         - REQ-0006
-    - ticket_id: TCK-00206
+    - ticket_id: TCK-00254
       requirement_ids:
         - REQ-0004
-    - ticket_id: TCK-00207
+    - ticket_id: TCK-00255
       requirement_ids:
         - REQ-0005
-    - ticket_id: TCK-00208
+    - ticket_id: TCK-00256
       requirement_ids:
         - REQ-0004
-    - ticket_id: TCK-00209
+    - ticket_id: TCK-00257
       requirement_ids:
         - REQ-0009
-    - ticket_id: TCK-00210
+    - ticket_id: TCK-00258
       requirement_ids:
         - REQ-0002
         - REQ-0003
-    - ticket_id: TCK-00211
+    - ticket_id: TCK-00259
       requirement_ids:
         - REQ-0002
-    - ticket_id: TCK-00212
+    - ticket_id: TCK-00260
       requirement_ids:
         - REQ-0012
-    - ticket_id: TCK-00213
+    - ticket_id: TCK-00261
       requirement_ids:
         - REQ-0001
-    - ticket_id: TCK-00214
+    - ticket_id: TCK-00262
       requirement_ids:
         - REQ-0001
-    - ticket_id: TCK-00215
+    - ticket_id: TCK-00263
       requirement_ids:
         - REQ-0001
-    - ticket_id: TCK-00216
+    - ticket_id: TCK-00264
       requirement_ids:
         - REQ-0001
         - REQ-0002
@@ -140,6 +152,9 @@ prd_traceability:
         - REQ-0006
         - REQ-0007
         - REQ-0008
-    - ticket_id: TCK-00217
+    - ticket_id: TCK-00265
       requirement_ids:
         - REQ-0001
+    - ticket_id: TCK-00266
+      requirement_ids:
+        - REQ-0013

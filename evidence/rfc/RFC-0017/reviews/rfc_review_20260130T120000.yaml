@@ -1,0 +1,460 @@
+schema_version: "1.0.0"
+rfc_id: RFC-0017
+review_timestamp: "2026-01-30T12:00:00Z"
+review_depth: COUNCIL
+
+# =============================================================================
+# RFC-0017 COUNCIL REVIEW: IPC Protocol Decision
+# =============================================================================
+# This review identifies a BLOCKER finding: the RFC must decide which existing
+# IPC stack becomes the control plane BEFORE implementation, to prevent
+# introducing a 3rd protocol (sprint-fatal failure mode).
+# =============================================================================
+
+gates:
+  - gate_id: GATE-TCK-SCHEMA
+    type: TRUSTED
+    status: PASSED
+    findings: []
+    evidence:
+      files_validated: 12
+      parse_errors: 0
+
+  - gate_id: GATE-TCK-DEPENDENCY-ACYCLICITY
+    type: DETERMINISTIC
+    status: NOT_APPLICABLE
+    findings: []
+    evidence:
+      note: "RFC is v0 (Discovery) - no tickets yet"
+
+  - gate_id: GATE-TCK-SCOPE-COVERAGE
+    type: DETERMINISTIC
+    status: NOT_APPLICABLE
+    findings: []
+    evidence:
+      note: "RFC is v0 (Discovery) - ticket decomposition pending"
+
+  - gate_id: GATE-TCK-CCP-MAPPING
+    type: DETERMINISTIC
+    status: BLOCKED
+    findings:
+      - finding_id: FND-RFC-0017-001
+    evidence:
+      note: "Cannot validate CCP mapping until protocol decision made"
+
+  - gate_id: GATE-TCK-ATOMICITY
+    type: LLM-ASSISTED
+    status: NOT_APPLICABLE
+    findings: []
+    evidence:
+      note: "RFC is v0 (Discovery) - no tickets yet"
+
+  - gate_id: GATE-TCK-IMPLEMENTABILITY
+    type: LLM-ASSISTED
+    status: BLOCKED
+    findings:
+      - finding_id: FND-RFC-0017-001
+    evidence:
+      note: "Cannot assess implementability until protocol decision made"
+
+  - gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    type: LLM-ASSISTED
+    status: BLOCKED
+    findings:
+      - finding_id: FND-RFC-0017-002
+    evidence:
+      note: "Auth/authz patterns depend on protocol choice"
+
+  - gate_id: GATE-TCK-REQUIREMENT-FIDELITY
+    type: LLM-ASSISTED
+    status: BLOCKED
+    findings:
+      - finding_id: FND-RFC-0017-001
+    evidence:
+      note: "Cannot validate REQ-DCP-0008 (IPC Authentication) until protocol decided"
+
+  - gate_id: GATE-TCK-ANTI-COUSIN
+    type: LLM-ASSISTED
+    status: BLOCKED
+    findings:
+      - finding_id: FND-RFC-0017-001
+    evidence:
+      note: "Introducing 3rd protocol would be COUSIN_VIOLATION"
+
+findings:
+  # ===========================================================================
+  # BLOCKER: Protocol Stack Decision Required
+  # ===========================================================================
+  - finding_id: FND-RFC-0017-001
+    gate_id: GATE-TCK-ANTI-COUSIN
+    category: COUSIN_DEFECT
+    subcategory: DECISION_CONFLICT
+    severity: BLOCKER
+    status: RESOLVED
+    resolved_date: "2026-01-30"
+    resolved_by: "Human decision: OPTION_A (Adopt Protobuf Runtime Protocol)"
+    location:
+      file: documents/rfcs/RFC-0017/02_design_decisions.yaml
+      yaml_path: design_hypotheses[7]  # DD-008
+    title: "IPC Protocol Stack Decision Required Before Implementation"
+    description: |
+      RFC-0017 OQ-001 asks "What existing Unix socket infrastructure exists?"
+      but the codebase already has TWO distinct IPC protocol stacks:
+
+      **Stack 1: JSON IPC (apm2_core::ipc)**
+      - Location: crates/apm2-core/src/ipc/mod.rs (525 lines)
+      - Server: crates/apm2-daemon/src/ipc_server.rs (167 lines)
+      - Encoding: JSON text with serde
+      - Framing: 4-byte BE length + JSON payload
+      - Handshake: None (immediate dispatch)
+      - Auth: NONE (relies on socket permissions only)
+      - Current use: Process management, credentials, episode CRUD
+      - Episode commands: CreateEpisode, StartEpisode, StopEpisode, etc.
+
+      **Stack 2: Protobuf Runtime Protocol (apm2_daemon::protocol)**
+      - Location: crates/apm2-daemon/src/protocol/ (7 files, ~3000 lines)
+      - Proto def: proto/apm2d_runtime_v1.proto (249 lines)
+      - Encoding: Binary protobuf with prost
+      - Framing: 4-byte BE length + binary (16 MiB general, 64 KiB handshake)
+      - Handshake: Explicit Hello/HelloAck with version negotiation
+      - Auth: Version validation only (no peer creds yet)
+      - Contract refs: AD-DAEMON-002/003, CTR-PROTO-001-006, CTR-1603
+      - Current use: Integration tests only (NOT routed through main dispatcher)
+      - Design: Episode control, tool mediation, telemetry, receipts
+
+      **Sprint-Fatal Risk**: If RFC-0017 implementation adds ClaimWork/SpawnEpisode
+      endpoints without explicitly adopting ONE of these stacks, it creates a
+      THIRD protocol - a clear COUSIN_VIOLATION that fragments the codebase.
+
+      **Decision Required**: Before any implementation work proceeds, RFC-0017
+      must add a design decision (DD-008) specifying which stack becomes the
+      control plane for Phase 1.
+
+    evidence:
+      json_ipc_files:
+        - path: crates/apm2-core/src/ipc/mod.rs
+          line_count: 525
+          has_episode_commands: true
+          has_peer_creds: false
+        - path: crates/apm2-daemon/src/ipc_server.rs
+          line_count: 167
+          socket_path: "${XDG_RUNTIME_DIR}/apm2/apm2d.sock"
+          permissions: "0600"
+
+      protobuf_protocol_files:
+        - path: crates/apm2-daemon/src/protocol/mod.rs
+          line_count: 110
+        - path: crates/apm2-daemon/src/protocol/server.rs
+          line_count: 748
+        - path: crates/apm2-daemon/src/protocol/framing.rs
+          line_count: 401
+        - path: crates/apm2-daemon/src/protocol/handshake.rs
+          line_count: 775
+        - path: crates/apm2-daemon/src/protocol/messages.rs
+          line_count: 654
+        - path: proto/apm2d_runtime_v1.proto
+          line_count: 249
+
+      prd_requirements_affected:
+        - REQ-DCP-0008: "IPC Authentication via SO_PEERCRED"
+        - REQ-DCP-0001: "IPC Privilege Separation"
+        - REQ-DCP-0007: "Signed State Transitions"
+
+    remediation:
+      action: ADD_DESIGN_DECISION
+      artifact: documents/rfcs/RFC-0017/02_design_decisions.yaml
+      content: |
+        Add DD-008 with one of two options:
+
+        **OPTION A: Adopt Protobuf Protocol (RECOMMENDED)**
+        - Rationale: Already has handshake, version negotiation, canonical
+          encoding, bounded decoding, and golden test vectors.
+        - Trade-off: Requires CLI migration from JSON to protobuf clients.
+        - Implementation: Add SO_PEERCRED to server.rs:accept(), route
+          control-plane messages through existing protocol infrastructure.
+        - LAW-13 compliance: Canonical encoding already implemented.
+
+        **OPTION B: Extend JSON IPC as Phase-1 Bridge**
+        - Rationale: CLI already uses JSON; minimizes migration work.
+        - Trade-off: Must add handshake, version negotiation, peer creds
+          to achieve PRD-0010 invariants. Creates technical debt.
+        - Constraint: MUST document explicit deprecation plan for Phase 2
+          migration to protobuf.
+        - Risk: Divergent codepaths increase maintenance burden.
+
+      recommendation: OPTION_A
+      recommendation_rationale: |
+        The protobuf protocol already implements:
+        - CTR-PROTO-001: Handshake with version negotiation
+        - CTR-1603: Bounded reads with DoS protection
+        - AD-DAEMON-003: Canonical encoding for signing workflows
+        - AD-VERIFY-001: Golden test vectors for determinism
+
+        Adding SO_PEERCRED to the existing protocol is less work than
+        retrofitting JSON IPC with all these properties. The "CLI migration
+        sooner" trade-off is acceptable because:
+        1. CLI can use a thin JSON-to-protobuf adapter initially
+        2. Episode control commands are daemon-internal (agent-to-daemon)
+        3. Human CLI commands (status, list) can remain JSON via adapter
+
+  # ===========================================================================
+  # MAJOR: Missing Peer Credential Implementation
+  # ===========================================================================
+  - finding_id: FND-RFC-0017-002
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    subcategory: BOUNDARY_VIOLATION
+    severity: MAJOR
+    location:
+      file: documents/rfcs/RFC-0017/01_problem_and_imports.yaml
+      yaml_path: imports.from_prd.requirements[7]
+    title: "Neither IPC Stack Implements SO_PEERCRED Authentication"
+    description: |
+      REQ-DCP-0008 requires: "apm2-daemon IPC MUST authenticate all clients via
+      Unix socket peer credentials (SO_PEERCRED) and issue per-connection
+      capability tokens."
+
+      Neither existing IPC stack implements SO_PEERCRED:
+
+      **JSON IPC (ipc_server.rs)**:
+      - Socket accepted via `listener.accept()` without credential inspection
+      - No UID/GID validation
+      - Security relies solely on socket file permissions (0600)
+
+      **Protobuf Protocol (server.rs)**:
+      - Handshake provides client identity string for logging only
+      - No SO_PEERCRED queries observed
+      - Policy hash verification optional
+
+      This is a known gap that must be addressed in the chosen stack.
+
+    evidence:
+      json_ipc_accept: |
+        // crates/apm2-daemon/src/ipc_server.rs
+        // Connection accepted without peer credential inspection
+        let (stream, _) = self.listener.accept().await?;
+
+      protobuf_accept: |
+        // crates/apm2-daemon/src/protocol/server.rs:125-140
+        // Also no peer credential inspection
+        let (stream, _addr) = self.listener.accept().await?;
+
+    remediation:
+      action: ADD_IMPLEMENTATION_REQUIREMENT
+      artifact: documents/rfcs/RFC-0017/02_design_decisions.yaml
+      content: |
+        Whichever stack is chosen (DD-008), add explicit implementation
+        requirement for SO_PEERCRED:
+
+        ```rust
+        // After accept(), before any data exchange:
+        use std::os::unix::net::UCred;
+
+        let ucred: UCred = stream.peer_cred()?;
+        let peer_uid = ucred.uid();
+        let peer_gid = ucred.gid();
+        let peer_pid = ucred.pid();
+
+        // Validate peer_uid against allowed operators
+        // Issue per-connection capability token
+        ```
+
+        For privileged endpoints: require peer_uid == daemon_uid OR in sudoers
+        For session-scoped endpoints: bind to session_id with peer_pid
+
+  # ===========================================================================
+  # INFO: Protobuf Protocol Not Integrated in Main Dispatcher
+  # ===========================================================================
+  - finding_id: FND-RFC-0017-003
+    gate_id: GATE-TCK-CCP-MAPPING
+    category: IMPLEMENTABILITY_DEFECT
+    subcategory: AGENT_CONTEXT_GAP
+    severity: INFO
+    location:
+      file: crates/apm2-daemon/src/protocol/server.rs
+      yaml_path: N/A
+    title: "Protobuf Protocol Exists But Not Routed Through Main Dispatcher"
+    description: |
+      The protobuf runtime protocol (Stack 2) is fully implemented and tested
+      but NOT currently integrated with the main daemon dispatcher. Evidence:
+
+      1. Integration tests exist: crates/apm2-daemon/tests/protocol_integration.rs
+      2. Golden vectors exist: crates/apm2-daemon/src/protocol/golden_vectors.rs
+      3. Message types defined: proto/apm2d_runtime_v1.proto
+
+      However, the main daemon in ipc_server.rs only handles JSON requests.
+      The protobuf protocol server exists as a separate, unused component.
+
+      If OPTION A (adopt protobuf) is chosen, the implementation must:
+      1. Route control-plane messages through ProtocolServer
+      2. Add handlers for ClaimWork, SpawnEpisode, etc.
+      3. Either deprecate JSON IPC or maintain it for legacy CLI
+
+    evidence:
+      integration_test: crates/apm2-daemon/tests/protocol_integration.rs
+      golden_vectors: crates/apm2-daemon/src/protocol/golden_vectors.rs
+      main_dispatcher: crates/apm2-daemon/src/ipc_server.rs
+
+    remediation:
+      action: DOCUMENT_INTEGRATION_PATH
+      note: |
+        If OPTION A chosen, ticket TCK-00XXX should specify:
+        - Add ProtocolServer bind alongside existing IpcServer
+        - Route privileged endpoints through protobuf
+        - Keep JSON IPC for backward-compatible human CLI commands
+
+verdict: APPROVED_WITH_REMEDIATION
+verdict_reason: |
+  RFC-0017 BLOCKER finding (FND-RFC-0017-001) has been RESOLVED.
+
+  DECISION (2026-01-30): OPTION A - Adopt Protobuf Runtime Protocol
+
+  The protocol decision unblocks implementation. RFC-0017 may proceed to
+  EXPLORE phase (v0 -> v2) with the following implementation tickets:
+
+  1. TCK-00001: Add SO_PEERCRED to ProtocolServer::accept()
+  2. TCK-00002: Add ClaimWork message to apm2d_runtime_v1.proto
+  3. TCK-00003: Implement ClaimWork handler in ProtocolServer
+  4. TCK-00004: Add JSON-to-protobuf CLI adapter (temporary)
+
+  Remaining MAJOR finding (FND-RFC-0017-002: Missing peer creds) is addressed
+  by TCK-00001 in the implementation plan.
+
+council_metadata:
+  session_id: COUNCIL-RFC-0017-20260130-120000
+  subagents:
+    - agent_id: SA-1
+      emergent_role: Structural Rigorist
+      selected_modes: [6, 13, 23, 43, 75]
+      focus: "IPC architecture mapping, protocol stack analysis"
+    - agent_id: SA-2
+      emergent_role: Implementation Feasibility
+      selected_modes: [11, 39, 47, 51, 70]
+      focus: "Migration path analysis, integration complexity"
+    - agent_id: SA-3
+      emergent_role: Anti-Cousin Guardian
+      selected_modes: [8, 14, 35, 49, 72]
+      focus: "Prevent 3rd protocol, CCP alignment"
+  cycles_completed: 1
+  total_findings_generated: 3
+  findings_after_dedup: 3
+  contested_items_resolved: 0
+  quorum_achieved: true
+  unanimous_on: FND-RFC-0017-001
+  elapsed_time_seconds: 847
+
+# =============================================================================
+# DECISION TICKET: Protocol Choice for PRD-0010 Phase 1
+# =============================================================================
+# This section documents the formal decision ticket that must be resolved.
+# =============================================================================
+
+decision_ticket:
+  id: DT-RFC-0017-001
+  title: "Control-Plane IPC Protocol Selection"
+  status: RESOLVED
+  resolved_date: "2026-01-30"
+  resolved_by: "Human (operator)"
+  selected_option: OPTION_A
+  selected_label: "Adopt Protobuf Runtime Protocol"
+
+  options:
+    - id: OPTION_A
+      label: "Adopt Protobuf Runtime Protocol"
+      description: |
+        Extend crates/apm2-daemon/src/protocol/ to become the control plane.
+        Add SO_PEERCRED to server.rs. Route ClaimWork/SpawnEpisode through
+        existing ProtocolServer infrastructure.
+      pros:
+        - "Handshake with version negotiation already implemented"
+        - "Bounded reads with DoS protection (CTR-1603)"
+        - "Canonical encoding for signing workflows (AD-DAEMON-003)"
+        - "Golden test vectors for determinism (AD-VERIFY-001)"
+        - "Message types for episode control already in proto"
+        - "Future-proof: protobuf evolution is well-understood"
+      cons:
+        - "CLI must migrate from JSON to protobuf (or use adapter)"
+        - "Learning curve for protobuf tooling"
+        - "Two codepaths during transition"
+      effort: MEDIUM
+      risk: LOW
+      recommendation: true
+
+    - id: OPTION_B
+      label: "Extend JSON IPC as Phase-1 Bridge"
+      description: |
+        Add handshake, version negotiation, and SO_PEERCRED to existing
+        JSON IPC in crates/apm2-core/src/ipc/. Document explicit deprecation
+        plan for Phase 2 migration to protobuf.
+      pros:
+        - "CLI already uses JSON; minimal migration"
+        - "Simpler mental model initially"
+        - "Faster time-to-first-feature"
+      cons:
+        - "Must retrofit handshake, version negotiation (duplicate effort)"
+        - "No canonical encoding; signing workflows harder"
+        - "Creates technical debt; Phase 2 must redo this work"
+        - "Divergent codepaths increase maintenance"
+      effort: LOW_INITIAL_HIGH_TOTAL
+      risk: MEDIUM
+      recommendation: false
+
+  council_recommendation: OPTION_A
+  council_confidence: HIGH
+  council_rationale: |
+    The protobuf protocol already satisfies most of the architectural
+    requirements (handshake, bounded reads, canonical encoding). Adding
+    SO_PEERCRED is incremental. The JSON IPC would require significant
+    retrofitting to meet the same bar, creating duplicate effort.
+
+    The "CLI migration sooner" trade-off is acceptable because:
+    1. A thin JSON-to-protobuf adapter can bridge the gap initially
+    2. Episode control commands are daemon-internal (agent-to-daemon)
+    3. Human CLI commands can remain JSON-friendly via the adapter
+    4. The adapter can be removed when CLI migration completes
+
+  implementation_sketch:
+    phase_1_protobuf:
+      - ticket: "TCK-00001: Add SO_PEERCRED to ProtocolServer::accept()"
+        files:
+          - crates/apm2-daemon/src/protocol/server.rs
+        estimate: "1-2 days"
+
+      - ticket: "TCK-00002: Add ClaimWork message to apm2d_runtime_v1.proto"
+        files:
+          - proto/apm2d_runtime_v1.proto
+          - crates/apm2-daemon/src/protocol/messages.rs
+        estimate: "1 day"
+
+      - ticket: "TCK-00003: Implement ClaimWork handler in ProtocolServer"
+        files:
+          - crates/apm2-daemon/src/protocol/server.rs
+          - crates/apm2-daemon/src/work/orchestrator.rs
+        estimate: "2-3 days"
+
+      - ticket: "TCK-00004: Add JSON-to-protobuf CLI adapter (temporary)"
+        files:
+          - crates/apm2-cli/src/protocol_adapter.rs
+        estimate: "1 day"
+
+    phase_1_json_bridge:
+      - ticket: "TCK-00001: Add handshake to JSON IPC"
+        files:
+          - crates/apm2-core/src/ipc/mod.rs
+          - crates/apm2-daemon/src/ipc_server.rs
+        estimate: "2-3 days"
+
+      - ticket: "TCK-00002: Add SO_PEERCRED to JSON IPC"
+        files:
+          - crates/apm2-daemon/src/ipc_server.rs
+        estimate: "1-2 days"
+
+      - ticket: "TCK-00003: Add ClaimWork to IpcRequest enum"
+        files:
+          - crates/apm2-core/src/ipc/mod.rs
+        estimate: "0.5 day"
+
+      - ticket: "TCK-00004: Document Phase 2 migration to protobuf"
+        files:
+          - documents/rfcs/RFC-0017/05_rollout_and_ops.yaml
+        estimate: "0.5 day"
