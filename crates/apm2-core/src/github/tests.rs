@@ -15,7 +15,7 @@ mod integration_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "installation-123".to_string(),
-            RiskTier::T2,
+            RiskTier::Med,
             "episode-456".to_string(),
         )
         .with_scopes(vec![
@@ -67,11 +67,11 @@ mod integration_tests {
     /// Tests that tier escalation is prevented.
     #[test]
     fn test_tier_escalation_prevention() {
-        // T0 agent tries to use Developer app
+        // Low risk agent tries to use Developer app
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "installation-123".to_string(),
-            RiskTier::T0,
+            RiskTier::Low,
             "episode-456".to_string(),
         );
 
@@ -92,7 +92,7 @@ mod integration_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "installation-123".to_string(),
-            RiskTier::T2,
+            RiskTier::Med,
             "episode-456".to_string(),
         )
         .with_scopes(vec![GitHubScope::ContentsWrite]);
@@ -200,81 +200,51 @@ mod integration_tests {
         }
 
         let cases = vec![
-            // T0 can only use Reader
+            // Low can only use Reader
             TestCase {
-                tier: RiskTier::T0,
+                tier: RiskTier::Low,
                 app: GitHubApp::Reader,
                 should_allow: true,
             },
             TestCase {
-                tier: RiskTier::T0,
+                tier: RiskTier::Low,
                 app: GitHubApp::Developer,
                 should_allow: false,
             },
             TestCase {
-                tier: RiskTier::T0,
+                tier: RiskTier::Low,
                 app: GitHubApp::Operator,
                 should_allow: false,
             },
-            // T1-T2 can use Reader and Developer
+            // Med can use Reader and Developer
             TestCase {
-                tier: RiskTier::T1,
+                tier: RiskTier::Med,
                 app: GitHubApp::Reader,
                 should_allow: true,
             },
             TestCase {
-                tier: RiskTier::T1,
+                tier: RiskTier::Med,
                 app: GitHubApp::Developer,
                 should_allow: true,
             },
             TestCase {
-                tier: RiskTier::T1,
+                tier: RiskTier::Med,
                 app: GitHubApp::Operator,
                 should_allow: false,
             },
+            // High can use all apps
             TestCase {
-                tier: RiskTier::T2,
+                tier: RiskTier::High,
                 app: GitHubApp::Reader,
                 should_allow: true,
             },
             TestCase {
-                tier: RiskTier::T2,
+                tier: RiskTier::High,
                 app: GitHubApp::Developer,
                 should_allow: true,
             },
             TestCase {
-                tier: RiskTier::T2,
-                app: GitHubApp::Operator,
-                should_allow: false,
-            },
-            // T3-T4 can use all apps
-            TestCase {
-                tier: RiskTier::T3,
-                app: GitHubApp::Reader,
-                should_allow: true,
-            },
-            TestCase {
-                tier: RiskTier::T3,
-                app: GitHubApp::Developer,
-                should_allow: true,
-            },
-            TestCase {
-                tier: RiskTier::T3,
-                app: GitHubApp::Operator,
-                should_allow: true,
-            },
-            TestCase {
-                tier: RiskTier::T4,
-                app: GitHubApp::Reader,
-                should_allow: true,
-            },
-            TestCase {
-                tier: RiskTier::T4,
-                app: GitHubApp::Developer,
-                should_allow: true,
-            },
-            TestCase {
-                tier: RiskTier::T4,
+                tier: RiskTier::High,
                 app: GitHubApp::Operator,
                 should_allow: true,
             },
@@ -293,23 +263,17 @@ mod integration_tests {
     /// Tests that TTL decreases with increasing risk tier.
     #[test]
     fn test_ttl_proportional_to_risk() {
-        let tiers = [
-            RiskTier::T0,
-            RiskTier::T1,
-            RiskTier::T2,
-            RiskTier::T3,
-            RiskTier::T4,
-        ];
+        let tiers = [RiskTier::Low, RiskTier::Med, RiskTier::High];
 
         for i in 0..tiers.len() - 1 {
             let current_ttl = tiers[i].default_ttl();
             let next_ttl = tiers[i + 1].default_ttl();
             assert!(
                 current_ttl > next_ttl,
-                "T{} TTL ({:?}) should be > T{} TTL ({:?})",
-                i,
+                "{} TTL ({:?}) should be > {} TTL ({:?})",
+                tiers[i],
                 current_ttl,
-                i + 1,
+                tiers[i + 1],
                 next_ttl
             );
         }
@@ -322,7 +286,7 @@ mod integration_tests {
             "app-12345".to_string(),
             "installation-67890".to_string(),
             GitHubApp::Developer,
-            RiskTier::T1,
+            RiskTier::Med,
             vec![GitHubScope::ContentsRead, GitHubScope::PullRequestsWrite],
             vec![1, 2, 3, 4, 5, 6, 7, 8],
             1_000_000_000, // issued_at

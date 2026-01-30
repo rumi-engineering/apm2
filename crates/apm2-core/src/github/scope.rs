@@ -8,23 +8,19 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// Risk tier for an agent (0-4).
+/// Risk tier for an agent (HIGH, MED, LOW).
 ///
-/// Lower tiers have fewer permissions and longer token TTLs.
-/// Higher tiers have more permissions but shorter TTLs for containment.
+/// Aligned with RFC-0015 risk-tiered AAT selection policy.
+/// Higher risk tiers have more permissions but shorter TTLs for containment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum RiskTier {
-    /// Tier 0: Read-only access. Lowest risk, longest TTL.
-    T0 = 0,
-    /// Tier 1: Can create PRs and update checks.
-    T1 = 1,
-    /// Tier 2: Extended PR operations.
-    T2 = 2,
-    /// Tier 3: Can write to protected branches.
-    T3 = 3,
-    /// Tier 4: Full operator access including admin operations.
-    T4 = 4,
+    /// Low risk: Read-only access. Longest TTL, sampled AAT.
+    Low  = 0,
+    /// Medium risk: Can create PRs and update checks. Conditional AAT.
+    Med  = 1,
+    /// High risk: Full operator access. Always requires AAT, shortest TTL.
+    High = 2,
 }
 
 impl RiskTier {
@@ -34,9 +30,9 @@ impl RiskTier {
     #[must_use]
     pub fn allowed_apps(&self) -> Vec<GitHubApp> {
         match self {
-            Self::T0 => vec![GitHubApp::Reader],
-            Self::T1 | Self::T2 => vec![GitHubApp::Reader, GitHubApp::Developer],
-            Self::T3 | Self::T4 => {
+            Self::Low => vec![GitHubApp::Reader],
+            Self::Med => vec![GitHubApp::Reader, GitHubApp::Developer],
+            Self::High => {
                 vec![GitHubApp::Reader, GitHubApp::Developer, GitHubApp::Operator]
             },
         }
@@ -46,23 +42,21 @@ impl RiskTier {
     #[must_use]
     pub const fn max_app(&self) -> GitHubApp {
         match self {
-            Self::T0 => GitHubApp::Reader,
-            Self::T1 | Self::T2 => GitHubApp::Developer,
-            Self::T3 | Self::T4 => GitHubApp::Operator,
+            Self::Low => GitHubApp::Reader,
+            Self::Med => GitHubApp::Developer,
+            Self::High => GitHubApp::Operator,
         }
     }
 
     /// Returns the default token TTL for this tier.
     ///
-    /// Higher tiers get shorter TTLs for containment.
+    /// Higher risk tiers get shorter TTLs for containment.
     #[must_use]
     pub const fn default_ttl(&self) -> Duration {
         match self {
-            Self::T0 => Duration::from_secs(3600), // 1 hour
-            Self::T1 => Duration::from_secs(1800), // 30 minutes
-            Self::T2 => Duration::from_secs(900),  // 15 minutes
-            Self::T3 => Duration::from_secs(300),  // 5 minutes
-            Self::T4 => Duration::from_secs(120),  // 2 minutes
+            Self::Low => Duration::from_secs(3600), // 1 hour
+            Self::Med => Duration::from_secs(900),  // 15 minutes
+            Self::High => Duration::from_secs(120), // 2 minutes
         }
     }
 
@@ -72,51 +66,58 @@ impl RiskTier {
     #[must_use]
     pub const fn max_ttl(&self) -> Duration {
         match self {
-            Self::T0 => Duration::from_secs(3600),            // 1 hour
-            Self::T1 | Self::T2 => Duration::from_secs(1800), // 30 minutes
-            Self::T3 | Self::T4 => Duration::from_secs(300),  // 5 minutes
+            Self::Low => Duration::from_secs(3600), // 1 hour
+            Self::Med => Duration::from_secs(1800), // 30 minutes
+            Self::High => Duration::from_secs(300), // 5 minutes
         }
     }
 
-    /// Parses a risk tier from a u32.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the value is not a valid tier (0-4).
-    pub const fn from_u32(value: u32) -> Result<Self, InvalidRiskTier> {
-        match value {
-            0 => Ok(Self::T0),
-            1 => Ok(Self::T1),
-            2 => Ok(Self::T2),
-            3 => Ok(Self::T3),
-            4 => Ok(Self::T4),
-            _ => Err(InvalidRiskTier { value }),
-        }
-    }
-
-    /// Returns this tier as a u32.
+    /// Returns this tier as a string.
     #[must_use]
-    pub const fn as_u32(&self) -> u32 {
-        *self as u32
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "LOW",
+            Self::Med => "MED",
+            Self::High => "HIGH",
+        }
+    }
+}
+
+impl std::str::FromStr for RiskTier {
+    type Err = InvalidRiskTier;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_uppercase().as_str() {
+            "LOW" => Ok(Self::Low),
+            "MED" | "MEDIUM" => Ok(Self::Med),
+            "HIGH" => Ok(Self::High),
+            _ => Err(InvalidRiskTier {
+                value: value.to_string(),
+            }),
+        }
     }
 }
 
 impl std::fmt::Display for RiskTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "T{}", self.as_u32())
+        write!(f, "{}", self.as_str())
     }
 }
 
 /// Error returned when parsing an invalid risk tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidRiskTier {
     /// The invalid value.
-    pub value: u32,
+    pub value: String,
 }
 
 impl std::fmt::Display for InvalidRiskTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid risk tier: {} (must be 0-4)", self.value)
+        write!(
+            f,
+            "invalid risk tier: '{}' (must be LOW, MED, or HIGH)",
+            self.value
+        )
     }
 }
 
@@ -129,16 +130,16 @@ impl std::error::Error for InvalidRiskTier {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum GitHubApp {
-    /// Read-only app for T0 agents.
+    /// Read-only app for LOW risk agents.
     /// Permissions: `contents:read`, `metadata:read`
     Reader,
 
-    /// Developer app for T1-T2 agents.
+    /// Developer app for MED risk agents.
     /// Permissions: Reader + `pull_requests:write`, `checks:write`,
     /// `statuses:write`
     Developer,
 
-    /// Operator app for T3-T4 agents.
+    /// Operator app for HIGH risk agents.
     /// Permissions: Developer + `contents:write`, `admin:read`,
     /// `releases:write`
     Operator,
@@ -180,9 +181,9 @@ impl GitHubApp {
     #[must_use]
     pub const fn min_tier(&self) -> RiskTier {
         match self {
-            Self::Reader => RiskTier::T0,
-            Self::Developer => RiskTier::T1,
-            Self::Operator => RiskTier::T3,
+            Self::Reader => RiskTier::Low,
+            Self::Developer => RiskTier::Med,
+            Self::Operator => RiskTier::High,
         }
     }
 
@@ -434,49 +435,39 @@ mod unit_tests {
 
     #[test]
     fn test_risk_tier_allowed_apps() {
-        assert_eq!(RiskTier::T0.allowed_apps(), vec![GitHubApp::Reader]);
+        assert_eq!(RiskTier::Low.allowed_apps(), vec![GitHubApp::Reader]);
         assert_eq!(
-            RiskTier::T1.allowed_apps(),
+            RiskTier::Med.allowed_apps(),
             vec![GitHubApp::Reader, GitHubApp::Developer]
         );
         assert_eq!(
-            RiskTier::T2.allowed_apps(),
-            vec![GitHubApp::Reader, GitHubApp::Developer]
-        );
-        assert_eq!(
-            RiskTier::T3.allowed_apps(),
-            vec![GitHubApp::Reader, GitHubApp::Developer, GitHubApp::Operator]
-        );
-        assert_eq!(
-            RiskTier::T4.allowed_apps(),
+            RiskTier::High.allowed_apps(),
             vec![GitHubApp::Reader, GitHubApp::Developer, GitHubApp::Operator]
         );
     }
 
     #[test]
     fn test_risk_tier_max_app() {
-        assert_eq!(RiskTier::T0.max_app(), GitHubApp::Reader);
-        assert_eq!(RiskTier::T1.max_app(), GitHubApp::Developer);
-        assert_eq!(RiskTier::T2.max_app(), GitHubApp::Developer);
-        assert_eq!(RiskTier::T3.max_app(), GitHubApp::Operator);
-        assert_eq!(RiskTier::T4.max_app(), GitHubApp::Operator);
+        assert_eq!(RiskTier::Low.max_app(), GitHubApp::Reader);
+        assert_eq!(RiskTier::Med.max_app(), GitHubApp::Developer);
+        assert_eq!(RiskTier::High.max_app(), GitHubApp::Operator);
     }
 
     #[test]
     fn test_risk_tier_ttl() {
-        // Higher tiers should have shorter TTLs
-        assert!(RiskTier::T0.default_ttl() > RiskTier::T1.default_ttl());
-        assert!(RiskTier::T1.default_ttl() > RiskTier::T2.default_ttl());
-        assert!(RiskTier::T2.default_ttl() > RiskTier::T3.default_ttl());
-        assert!(RiskTier::T3.default_ttl() > RiskTier::T4.default_ttl());
+        // Higher risk tiers should have shorter TTLs
+        assert!(RiskTier::Low.default_ttl() > RiskTier::Med.default_ttl());
+        assert!(RiskTier::Med.default_ttl() > RiskTier::High.default_ttl());
     }
 
     #[test]
-    fn test_risk_tier_from_u32() {
-        assert_eq!(RiskTier::from_u32(0).unwrap(), RiskTier::T0);
-        assert_eq!(RiskTier::from_u32(4).unwrap(), RiskTier::T4);
-        assert!(RiskTier::from_u32(5).is_err());
-        assert!(RiskTier::from_u32(100).is_err());
+    fn test_risk_tier_from_str() {
+        assert_eq!("LOW".parse::<RiskTier>().unwrap(), RiskTier::Low);
+        assert_eq!("low".parse::<RiskTier>().unwrap(), RiskTier::Low);
+        assert_eq!("MED".parse::<RiskTier>().unwrap(), RiskTier::Med);
+        assert_eq!("MEDIUM".parse::<RiskTier>().unwrap(), RiskTier::Med);
+        assert_eq!("HIGH".parse::<RiskTier>().unwrap(), RiskTier::High);
+        assert!("INVALID".parse::<RiskTier>().is_err());
     }
 
     #[test]
@@ -549,19 +540,20 @@ mod unit_tests {
 
     #[test]
     fn test_validate_tier_app() {
-        // T0 can only use Reader
-        assert!(validate_tier_app(RiskTier::T0, GitHubApp::Reader).is_ok());
-        assert!(validate_tier_app(RiskTier::T0, GitHubApp::Developer).is_err());
-        assert!(validate_tier_app(RiskTier::T0, GitHubApp::Operator).is_err());
+        // Low can only use Reader
+        assert!(validate_tier_app(RiskTier::Low, GitHubApp::Reader).is_ok());
+        assert!(validate_tier_app(RiskTier::Low, GitHubApp::Developer).is_err());
+        assert!(validate_tier_app(RiskTier::Low, GitHubApp::Operator).is_err());
 
-        // T1-T2 can use Reader and Developer
-        assert!(validate_tier_app(RiskTier::T1, GitHubApp::Reader).is_ok());
-        assert!(validate_tier_app(RiskTier::T1, GitHubApp::Developer).is_ok());
-        assert!(validate_tier_app(RiskTier::T1, GitHubApp::Operator).is_err());
+        // Med can use Reader and Developer
+        assert!(validate_tier_app(RiskTier::Med, GitHubApp::Reader).is_ok());
+        assert!(validate_tier_app(RiskTier::Med, GitHubApp::Developer).is_ok());
+        assert!(validate_tier_app(RiskTier::Med, GitHubApp::Operator).is_err());
 
-        // T3-T4 can use all
-        assert!(validate_tier_app(RiskTier::T3, GitHubApp::Operator).is_ok());
-        assert!(validate_tier_app(RiskTier::T4, GitHubApp::Operator).is_ok());
+        // High can use all
+        assert!(validate_tier_app(RiskTier::High, GitHubApp::Reader).is_ok());
+        assert!(validate_tier_app(RiskTier::High, GitHubApp::Developer).is_ok());
+        assert!(validate_tier_app(RiskTier::High, GitHubApp::Operator).is_ok());
     }
 
     #[test]

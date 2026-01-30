@@ -1,18 +1,18 @@
 //! GitHub App access control for holonic agents.
 //!
 //! This module implements a tiered GitHub App architecture that maps to the
-//! APM2 risk tier system (T0-T4), providing capability-bound, auditable GitHub
-//! access for AI agents.
+//! APM2 risk tier system (LOW/MED/HIGH per RFC-0015), providing
+//! capability-bound, auditable GitHub access for AI agents.
 //!
 //! # Architecture
 //!
 //! Three GitHub Apps are mapped to risk tiers:
 //!
-//! | App | Risk Tiers | Permissions | Token TTL |
-//! |-----|------------|-------------|-----------|
-//! | `apm2-reader` | T0 | `contents:read`, `metadata:read` | 1 hour |
-//! | `apm2-developer` | T1-T2 | + `pull_requests:write`, `checks:write` | 15-30 min |
-//! | `apm2-operator` | T3-T4 | + `contents:write`, `admin:read` | 2-5 min |
+//! | App | Risk Tier | Permissions | Token TTL |
+//! |-----|-----------|-------------|-----------|
+//! | `apm2-reader` | LOW | `contents:read`, `metadata:read` | 1 hour |
+//! | `apm2-developer` | MED | + `pull_requests:write`, `checks:write` | 15 min |
+//! | `apm2-operator` | HIGH | + `contents:write`, `admin:read` | 2 min |
 //!
 //! # Security Properties
 //!
@@ -36,7 +36,7 @@
 //! use apm2_core::github::{GitHubApp, GitHubScope, RiskTier};
 //!
 //! // Determine which app a tier can use
-//! let tier = RiskTier::T1;
+//! let tier = RiskTier::Med;
 //! let apps = tier.allowed_apps();
 //! assert!(apps.contains(&GitHubApp::Reader));
 //! assert!(apps.contains(&GitHubApp::Developer));

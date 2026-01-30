@@ -226,7 +226,7 @@ impl GitHubLease {
         // Validate tier can use app
         if !risk_tier.allowed_apps().contains(&app) {
             return Err(GitHubError::TierAppMismatch {
-                tier: risk_tier.as_u32(),
+                tier: risk_tier,
                 app,
             });
         }
@@ -376,7 +376,7 @@ mod unit_tests {
             "12345".to_string(),
             "67890".to_string(),
             GitHubApp::Developer,
-            RiskTier::T1,
+            RiskTier::Med,
             vec![GitHubScope::ContentsRead, GitHubScope::PullRequestsWrite],
             vec![1, 2, 3, 4, 5, 6, 7, 8], // token_hash
             1_000_000_000,                // issued_at
@@ -398,14 +398,14 @@ mod unit_tests {
 
     #[test]
     fn test_lease_tier_app_validation() {
-        // T0 cannot use Developer app
+        // Low risk tier cannot use Developer app
         let result = GitHubLease::new(
             "lease-001".to_string(),
             "episode-001".to_string(),
             "12345".to_string(),
             "67890".to_string(),
             GitHubApp::Developer,
-            RiskTier::T0, // T0 cannot use Developer
+            RiskTier::Low, // T0 cannot use Developer
             vec![GitHubScope::ContentsRead],
             vec![1, 2, 3, 4],
             1_000_000_000,
@@ -425,7 +425,7 @@ mod unit_tests {
             "12345".to_string(),
             "67890".to_string(),
             GitHubApp::Reader,
-            RiskTier::T0,
+            RiskTier::Low,
             vec![GitHubScope::PullRequestsWrite], // Not allowed for Reader
             vec![1, 2, 3, 4],
             1_000_000_000,
@@ -444,7 +444,7 @@ mod unit_tests {
             "12345".to_string(),
             "67890".to_string(),
             GitHubApp::Reader,
-            RiskTier::T0,
+            RiskTier::Low,
             vec![GitHubScope::ContentsRead],
             vec![1, 2, 3, 4],
             1_000_000_000,
@@ -463,7 +463,7 @@ mod unit_tests {
             "12345".to_string(),
             "67890".to_string(),
             GitHubApp::Reader,
-            RiskTier::T0,
+            RiskTier::Low,
             vec![GitHubScope::ContentsRead],
             vec![1, 2, 3, 4],
             2_000_000_000, // issued_at
@@ -605,7 +605,7 @@ mod unit_tests {
             "12345".to_string(),
             "67890".to_string(),
             GitHubApp::Reader,
-            RiskTier::T0,
+            RiskTier::Low,
             vec![GitHubScope::ContentsRead],
             vec![1, 2, 3, 4],
             1_000_000_000,
@@ -625,7 +625,7 @@ mod unit_tests {
             "12345".to_string(),
             "67890".to_string(),
             GitHubApp::Reader,
-            RiskTier::T0,
+            RiskTier::Low,
             scopes,
             vec![1, 2, 3, 4],
             1_000_000_000,

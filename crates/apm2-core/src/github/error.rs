@@ -2,7 +2,9 @@
 
 use thiserror::Error;
 
-use super::scope::{GitHubApp, GitHubScope, InvalidAppName, InvalidRiskTier, InvalidScope};
+use super::scope::{
+    GitHubApp, GitHubScope, InvalidAppName, InvalidRiskTier, InvalidScope, RiskTier,
+};
 
 /// Errors that can occur during GitHub operations.
 #[derive(Debug, Error)]
@@ -44,7 +46,7 @@ pub enum GitHubError {
     #[error("risk tier {tier} cannot use GitHub app {app}")]
     TierAppMismatch {
         /// The risk tier.
-        tier: u32,
+        tier: RiskTier,
         /// The app that was requested.
         app: GitHubApp,
     },
@@ -110,7 +112,7 @@ pub enum GitHubError {
         /// Maximum allowed in seconds.
         max_secs: u64,
         /// The tier.
-        tier: u32,
+        tier: RiskTier,
     },
 
     /// Invalid revocation reason.

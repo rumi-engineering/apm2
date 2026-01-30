@@ -11,7 +11,9 @@
 //!     |
 //!     +-- MockTokenProvider (for testing)
 //!     |
-//!     +-- GitHubTokenProvider (real implementation - future)
+//!     +-- GitHubTokenProvider (TODO: real implementation)
+//!         Requires GitHub App credentials infrastructure.
+//!         See: https://docs.github.com/en/apps/creating-github-apps
 //! ```
 //!
 //! # Security Notes
@@ -88,7 +90,7 @@ impl TokenRequest {
         // Validate tier can use app
         if !self.risk_tier.allowed_apps().contains(&self.app) {
             return Err(GitHubError::TierAppMismatch {
-                tier: self.risk_tier.as_u32(),
+                tier: self.risk_tier,
                 app: self.app,
             });
         }
@@ -110,7 +112,7 @@ impl TokenRequest {
                 return Err(GitHubError::TtlExceedsMaximum {
                     requested_secs: ttl.as_secs(),
                     max_secs: max_ttl.as_secs(),
-                    tier: self.risk_tier.as_u32(),
+                    tier: self.risk_tier,
                 });
             }
         }
@@ -251,13 +253,13 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T1,
+            RiskTier::Med,
             "episode-001".to_string(),
         );
 
         assert_eq!(request.app, GitHubApp::Developer);
         assert_eq!(request.installation_id, "12345");
-        assert_eq!(request.risk_tier, RiskTier::T1);
+        assert_eq!(request.risk_tier, RiskTier::Med);
         assert!(request.requested_ttl.is_none());
     }
 
@@ -266,7 +268,7 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T1,
+            RiskTier::Med,
             "episode-001".to_string(),
         )
         .with_scopes(vec![GitHubScope::ContentsRead]);
@@ -279,7 +281,7 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T1,
+            RiskTier::Med,
             "episode-001".to_string(),
         )
         .with_ttl(Duration::from_secs(600));
@@ -292,7 +294,7 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T1,
+            RiskTier::Med,
             "episode-001".to_string(),
         );
 
@@ -304,7 +306,7 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T0, // T0 cannot use Developer
+            RiskTier::Low, // Low tier cannot use Developer
             "episode-001".to_string(),
         );
 
@@ -319,7 +321,7 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Reader,
             "12345".to_string(),
-            RiskTier::T0,
+            RiskTier::Low,
             "episode-001".to_string(),
         )
         .with_scopes(vec![GitHubScope::PullRequestsWrite]);
@@ -335,10 +337,10 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T1,
+            RiskTier::Med,
             "episode-001".to_string(),
         )
-        .with_ttl(Duration::from_secs(7200)); // 2 hours, exceeds T1 max
+        .with_ttl(Duration::from_secs(7200)); // 2 hours, exceeds Med tier max
 
         assert!(matches!(
             request.validate(),
@@ -351,11 +353,11 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T1,
+            RiskTier::Med,
             "episode-001".to_string(),
         );
 
-        assert_eq!(request.effective_ttl(), RiskTier::T1.default_ttl());
+        assert_eq!(request.effective_ttl(), RiskTier::Med.default_ttl());
     }
 
     #[test]
@@ -363,13 +365,13 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T1,
+            RiskTier::Med,
             "episode-001".to_string(),
         )
         .with_ttl(Duration::from_secs(7200)); // Request 2 hours
 
-        // Should be capped to T1 max (30 minutes)
-        assert_eq!(request.effective_ttl(), RiskTier::T1.max_ttl());
+        // Should be capped to Med tier max (30 minutes)
+        assert_eq!(request.effective_ttl(), RiskTier::Med.max_ttl());
     }
 
     #[test]
@@ -392,7 +394,7 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T1,
+            RiskTier::Med,
             "episode-001".to_string(),
         );
 
@@ -410,7 +412,7 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T1,
+            RiskTier::Med,
             "episode-001".to_string(),
         );
 
@@ -428,7 +430,7 @@ mod unit_tests {
         let request = TokenRequest::new(
             GitHubApp::Developer,
             "12345".to_string(),
-            RiskTier::T0, // Invalid: T0 cannot use Developer
+            RiskTier::Low, // Invalid: T0 cannot use Developer
             "episode-001".to_string(),
         );
 

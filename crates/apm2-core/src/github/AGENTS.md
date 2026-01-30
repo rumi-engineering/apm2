@@ -4,14 +4,14 @@
 
 ## Overview
 
-The GitHub module implements a tiered architecture that maps APM2 risk tiers (T0-T4) to GitHub App permissions, providing controlled GitHub access for AI agents. The design follows the principle of least privilege with proportional containment.
+The GitHub module implements a tiered architecture that maps APM2 risk tiers (LOW/MED/HIGH per RFC-0015) to GitHub App permissions, providing controlled GitHub access for AI agents. The design follows the principle of least privilege with proportional containment.
 
 ```text
 Risk Tier    GitHub App       Token TTL    Permissions
 ---------    ----------       ---------    -----------
-T0           Reader           1 hour       contents:read, metadata:read
-T1-T2        Developer        15-30 min    + pull_requests:write, checks:write
-T3-T4        Operator         2-5 min      + contents:write, admin:read, releases:write
+LOW          Reader           1 hour       contents:read, metadata:read
+MED          Developer        15 min       + pull_requests:write, checks:write
+HIGH         Operator         2 min        + contents:write, admin:read, releases:write
 ```
 
 ## Key Types
@@ -21,21 +21,19 @@ T3-T4        Operator         2-5 min      + contents:write, admin:read, release
 ```rust
 #[repr(u8)]
 pub enum RiskTier {
-    T0 = 0,  // Read-only
-    T1 = 1,  // PR/CI operations
-    T2 = 2,  // Extended PR operations
-    T3 = 3,  // Protected branch access
-    T4 = 4,  // Full operator access
+    Low = 0,   // Read-only, sampled AAT
+    Med = 1,   // PR/CI operations, conditional AAT
+    High = 2,  // Full operator access, always requires AAT
 }
 ```
 
 **Invariants:**
-- [INV-0101] Risk tiers are ordered: T0 < T1 < T2 < T3 < T4
+- [INV-0101] Risk tiers are ordered: Low < Med < High
 - [INV-0102] Higher tiers can use apps available to lower tiers (scope attenuation only)
 - [INV-0103] TTL decreases monotonically as tier increases (containment proportionality)
 
 **Contracts:**
-- [CTR-0101] `from_u32(v)` returns error for v > 4
+- [CTR-0101] `from_str(v)` returns error for unknown tier names
 - [CTR-0102] `default_ttl()` > `max_ttl()` of next higher tier
 
 ### `GitHubApp`
@@ -43,9 +41,9 @@ pub enum RiskTier {
 ```rust
 #[non_exhaustive]
 pub enum GitHubApp {
-    Reader,     // T0+: read-only access
-    Developer,  // T1+: PR/CI operations
-    Operator,   // T3+: write/admin operations
+    Reader,     // LOW+: read-only access
+    Developer,  // MED+: PR/CI operations
+    Operator,   // HIGH: write/admin operations
 }
 ```
 
@@ -156,6 +154,10 @@ pub trait TokenProvider: Send + Sync {
 - [CTR-0602] Returns `TokenResponse` with `token_hash` (SHA-256 of raw token)
 - [CTR-0603] Implementations must be thread-safe (`Send + Sync`)
 
+**Implementations:**
+- `MockTokenProvider`: For testing, generates predictable tokens without GitHub API calls
+- `GitHubTokenProvider`: TODO - requires GitHub App credentials infrastructure
+
 ### `TokenRequest` / `TokenResponse`
 
 ```rust
@@ -197,8 +199,8 @@ pub struct TokenResponse {
 3. **Scope Attenuation**: Agents can only request scopes allowed by their tier's maximum app. Escalation attempts are rejected.
 
 4. **TTL Proportionality**: Higher-risk tiers get shorter TTLs for containment:
-   - T0: 1 hour (read-only, low risk)
-   - T4: 2 minutes (full access, highest risk)
+   - LOW: 1 hour (read-only, low risk)
+   - HIGH: 2 minutes (full access, highest risk)
 
 ### Attack Mitigations
 
@@ -246,7 +248,7 @@ let provider = MockTokenProvider::new();
 let request = TokenRequest::new(
     GitHubApp::Developer,
     "installation-12345".to_string(),
-    RiskTier::T2,
+    RiskTier::Med,
     "episode-001".to_string(),
 )
 .with_scopes(vec![GitHubScope::ContentsRead, GitHubScope::PullRequestsWrite])
@@ -273,7 +275,7 @@ let lease = GitHubLease::new(
     "app-12345".to_string(),
     "install-67890".to_string(),
     GitHubApp::Developer,
-    RiskTier::T1,
+    RiskTier::Med,
     vec![GitHubScope::ContentsRead, GitHubScope::PullRequestsWrite],
     token_hash,           // from TokenResponse
     issued_at_nanos,
@@ -308,6 +310,6 @@ assert!(lease.is_terminal());
 
 - rust-textbook [Chapter 19: Security-Adjacent Rust](/.claude/skills/rust-textbook/19_security_adjacent_rust.md) - Input validation, trust boundaries
 - rust-textbook [Chapter 12: API Design](/.claude/skills/rust-textbook/12_api_design_stdlib_quality.md) - `#[non_exhaustive]`, builder patterns
-- RFC-0015: Forge Admission Cycle - GateLease architecture
+- RFC-0015: Forge Admission Cycle - GateLease architecture, Risk-Tiered AAT Selection Policy
 - LAW-05: Dual-Axis Containment - Authority + Accountability
 - LAW-14: Proportionality and Risk-Weighted Evidence
