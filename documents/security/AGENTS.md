@@ -17,7 +17,7 @@ This directory contains security guidelines and procedures for the APM2 project.
 # Run all security checks locally
 cargo clippy --all-targets -- -D warnings
 cargo deny check
-gitleaks detect
+cargo audit
 ```
 
 ### For Users
@@ -49,7 +49,7 @@ This project operates within the constraints of a GitHub Free personal account:
 ### Workarounds
 
 - **No CodeQL in private repos**: Use `cargo clippy` with security-focused lints and `cargo-audit`
-- **No secret scanning in private repos**: Use `gitleaks` in CI and pre-commit hooks
+- **No secret scanning in private repos**: Use targeted `git log -p -S` searches for suspected patterns
 - **No environment secrets**: Use repository secrets with job-level filtering
 
 ## Documents

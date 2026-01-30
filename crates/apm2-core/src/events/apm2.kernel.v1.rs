@@ -31,7 +31,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -59,6 +59,8 @@ pub mod kernel_event {
         Key(super::KeyEvent),
         #[prost(message, tag = "18")]
         Capability(super::CapabilityEvent),
+        #[prost(message, tag = "19")]
+        GithubLease(super::GitHubLeaseEvent),
     }
 }
 /// ============================================================
@@ -792,6 +794,138 @@ pub mod key_event {
         #[prost(message, tag = "1")]
         Rotated(super::KeyRotated),
     }
+}
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GitHubLeaseEvent {
+    #[prost(oneof = "git_hub_lease_event::Event", tags = "1, 2, 3")]
+    pub event: ::core::option::Option<git_hub_lease_event::Event>,
+}
+/// Nested message and enum types in `GitHubLeaseEvent`.
+pub mod git_hub_lease_event {
+    #[derive(Eq, Hash)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        Issued(super::GitHubLeaseIssued),
+        #[prost(message, tag = "2")]
+        Revoked(super::GitHubLeaseRevoked),
+        #[prost(message, tag = "3")]
+        OperationRecorded(super::GitHubOperationRecorded),
+    }
+}
+/// Emitted when a GitHub installation access token is minted for an agent.
+/// Links to the episode via episode_id and inherits risk tier constraints.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GitHubLeaseIssued {
+    /// Unique identifier for this GitHub lease
+    #[prost(string, tag = "1")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Episode this lease is bound to
+    #[prost(string, tag = "2")]
+    pub episode_id: ::prost::alloc::string::String,
+    /// GitHub App ID (determines permission tier)
+    #[prost(string, tag = "3")]
+    pub github_app_id: ::prost::alloc::string::String,
+    /// GitHub installation ID for the target repository/organization
+    #[prost(string, tag = "4")]
+    pub installation_id: ::prost::alloc::string::String,
+    /// Risk tier of the requesting agent (0-4)
+    /// Tier determines which GitHub App can be used:
+    /// - T0: reader only
+    /// - T1-T2: reader or developer
+    /// - T3-T4: reader, developer, or operator
+    #[prost(uint32, tag = "5")]
+    pub risk_tier: u32,
+    /// Hash of the requested GitHub scopes (scope list stored in CAS)
+    #[prost(bytes = "vec", tag = "6")]
+    pub scope_hash: ::prost::alloc::vec::Vec<u8>,
+    /// SHA-256 hash of the installation access token (NEVER store raw token)
+    #[prost(bytes = "vec", tag = "7")]
+    pub token_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Timestamp when the lease was issued (Unix nanos)
+    #[prost(uint64, tag = "8")]
+    pub issued_at: u64,
+    /// Timestamp when the lease expires (Unix nanos)
+    /// TTL is proportional to risk tier:
+    /// - T0: 1 hour
+    /// - T1-T2: 15-30 minutes
+    /// - T3-T4: 2-5 minutes
+    #[prost(uint64, tag = "9")]
+    pub expires_at: u64,
+    /// Hash of the capability manifest that authorized this lease
+    #[prost(bytes = "vec", tag = "10")]
+    pub capability_manifest_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Issuer (registrar) signature over this event
+    #[prost(bytes = "vec", tag = "11")]
+    pub issuer_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// Emitted when a GitHub lease is revoked before expiration.
+/// Revocation may be voluntary or forced (policy violation, key compromise).
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GitHubLeaseRevoked {
+    /// The lease being revoked
+    #[prost(string, tag = "1")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Episode the lease was bound to
+    #[prost(string, tag = "2")]
+    pub episode_id: ::prost::alloc::string::String,
+    /// Reason for revocation: VOLUNTARY, EXPIRED, POLICY_VIOLATION, KEY_COMPROMISE
+    #[prost(string, tag = "3")]
+    pub revocation_reason: ::prost::alloc::string::String,
+    /// Timestamp when the revocation occurred (Unix nanos)
+    #[prost(uint64, tag = "4")]
+    pub revoked_at: u64,
+    /// Actor performing the revocation
+    #[prost(string, tag = "5")]
+    pub revoker_actor_id: ::prost::alloc::string::String,
+    /// Revoker signature over this event
+    #[prost(bytes = "vec", tag = "6")]
+    pub revoker_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// Emitted for each GitHub API operation made with a leased token.
+/// Provides audit trail for all GitHub interactions.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GitHubOperationRecorded {
+    /// Unique identifier for this operation record
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+    /// The lease that authorized this operation
+    #[prost(string, tag = "2")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Episode context
+    #[prost(string, tag = "3")]
+    pub episode_id: ::prost::alloc::string::String,
+    /// GitHub API endpoint called (e.g., "POST /repos/{owner}/{repo}/pulls")
+    #[prost(string, tag = "4")]
+    pub api_endpoint: ::prost::alloc::string::String,
+    /// HTTP method: GET, POST, PUT, PATCH, DELETE
+    #[prost(string, tag = "5")]
+    pub http_method: ::prost::alloc::string::String,
+    /// Target repository in owner/repo format
+    #[prost(string, tag = "6")]
+    pub repository: ::prost::alloc::string::String,
+    /// Hash of the request body (request body stored in CAS if needed)
+    #[prost(bytes = "vec", tag = "7")]
+    pub request_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Hash of the response body (response body stored in CAS if needed)
+    #[prost(bytes = "vec", tag = "8")]
+    pub response_hash: ::prost::alloc::vec::Vec<u8>,
+    /// HTTP status code returned
+    #[prost(uint32, tag = "9")]
+    pub status_code: u32,
+    /// Timestamp when the operation was performed (Unix nanos)
+    #[prost(uint64, tag = "10")]
+    pub performed_at: u64,
+    /// Duration of the API call in milliseconds
+    #[prost(uint64, tag = "11")]
+    pub duration_ms: u64,
+    /// GitHub rate limit remaining after this call
+    #[prost(uint32, tag = "12")]
+    pub rate_limit_remaining: u32,
 }
 /// Event emitted when an actor rotates their signing key.
 /// This establishes a chain of custody for key transitions.

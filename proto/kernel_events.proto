@@ -51,6 +51,7 @@ message KernelEvent {
     EvidenceEvent evidence = 16;
     KeyEvent key = 17;
     CapabilityEvent capability = 18;
+    GitHubLeaseEvent github_lease = 19;
   }
 }
 
@@ -483,6 +484,111 @@ message KeyEvent {
   oneof event {
     KeyRotated rotated = 1;
   }
+}
+
+// ============================================================
+// GITHUB LEASE EVENTS
+// ============================================================
+//
+// GitHub lease events implement tiered GitHub App access control for AI agents.
+// Each GitHub App corresponds to a risk tier range:
+// - apm2-reader (T0): contents:read, metadata:read
+// - apm2-developer (T1-T2): + pull_requests:write, checks:write, statuses:write
+// - apm2-operator (T3-T4): + contents:write, admin:read, releases:write
+//
+// Key security properties:
+// - Raw tokens are NEVER stored in the ledger (only hashes)
+// - Token TTLs are proportional to risk tier (shorter for higher tiers)
+// - Scope attenuation only (cannot escalate permissions)
+// - All operations are audited for non-repudiation
+
+message GitHubLeaseEvent {
+  oneof event {
+    GitHubLeaseIssued issued = 1;
+    GitHubLeaseRevoked revoked = 2;
+    GitHubOperationRecorded operation_recorded = 3;
+  }
+}
+
+// Emitted when a GitHub installation access token is minted for an agent.
+// Links to the episode via episode_id and inherits risk tier constraints.
+message GitHubLeaseIssued {
+  // Unique identifier for this GitHub lease
+  string lease_id = 1;
+  // Episode this lease is bound to
+  string episode_id = 2;
+  // GitHub App ID (determines permission tier)
+  string github_app_id = 3;
+  // GitHub installation ID for the target repository/organization
+  string installation_id = 4;
+  // Risk tier of the requesting agent (0-4)
+  // Tier determines which GitHub App can be used:
+  // - T0: reader only
+  // - T1-T2: reader or developer
+  // - T3-T4: reader, developer, or operator
+  uint32 risk_tier = 5;
+  // Hash of the requested GitHub scopes (scope list stored in CAS)
+  bytes scope_hash = 6;
+  // SHA-256 hash of the installation access token (NEVER store raw token)
+  bytes token_hash = 7;
+  // Timestamp when the lease was issued (Unix nanos)
+  uint64 issued_at = 8;
+  // Timestamp when the lease expires (Unix nanos)
+  // TTL is proportional to risk tier:
+  // - T0: 1 hour
+  // - T1-T2: 15-30 minutes
+  // - T3-T4: 2-5 minutes
+  uint64 expires_at = 9;
+  // Hash of the capability manifest that authorized this lease
+  bytes capability_manifest_hash = 10;
+  // Issuer (registrar) signature over this event
+  bytes issuer_signature = 11;
+}
+
+// Emitted when a GitHub lease is revoked before expiration.
+// Revocation may be voluntary or forced (policy violation, key compromise).
+message GitHubLeaseRevoked {
+  // The lease being revoked
+  string lease_id = 1;
+  // Episode the lease was bound to
+  string episode_id = 2;
+  // Reason for revocation: VOLUNTARY, EXPIRED, POLICY_VIOLATION, KEY_COMPROMISE
+  string revocation_reason = 3;
+  // Timestamp when the revocation occurred (Unix nanos)
+  uint64 revoked_at = 4;
+  // Actor performing the revocation
+  string revoker_actor_id = 5;
+  // Revoker signature over this event
+  bytes revoker_signature = 6;
+}
+
+// Emitted for each GitHub API operation made with a leased token.
+// Provides audit trail for all GitHub interactions.
+message GitHubOperationRecorded {
+  // Unique identifier for this operation record
+  string operation_id = 1;
+  // The lease that authorized this operation
+  string lease_id = 2;
+  // Episode context
+  string episode_id = 3;
+  // GitHub API endpoint called (e.g., "POST /repos/{owner}/{repo}/pulls")
+  string api_endpoint = 4;
+  // HTTP method: GET, POST, PUT, PATCH, DELETE
+  string http_method = 5;
+  // Target repository in owner/repo format
+  string repository = 6;
+  // Hash of the request body (request body stored in CAS if needed)
+  bytes request_hash = 7;
+  // Hash of the response body (response body stored in CAS if needed)
+  bytes response_hash = 8;
+  // HTTP status code returned
+  uint32 status_code = 9;
+  // Timestamp when the operation was performed (Unix nanos)
+  uint64 performed_at = 10;
+  // Duration of the API call in milliseconds
+  uint64 duration_ms = 11;
+  // GitHub rate limit remaining after this call
+  uint32 rate_limit_remaining = 12;
 }
 
 // Event emitted when an actor rotates their signing key.
