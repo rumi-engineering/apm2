@@ -2,7 +2,17 @@
 
 All pull requests must pass these security gates before merge.
 
-## Gate Summary
+## Architecture Overview
+
+Per PRD-0004 (Work Substrate), GitHub Actions serves as a **projection adapter** that projects internal ledger state to external CI/CD workflows. This document distinguishes between:
+
+1. **CI Gates (GitHub Actions)**: Automated checks running in GitHub Actions workflows. These are fast, deterministic checks suitable for external execution.
+
+2. **Internal Gates (GateRunner)**: Complex verification gates running within the internal GateRunner system. These require holonic execution context, produce evidence artifacts, and maintain audit trails in the ledger.
+
+The internal ledger is authoritative; CI results are imported as evidence artifacts via the `ci_result_import` channel.
+
+## CI Gate Summary (GitHub Actions)
 
 | Gate | Tool | Runs On | Blocking | Purpose |
 |------|------|---------|----------|---------|
@@ -10,8 +20,7 @@ All pull requests must pass these security gates before merge.
 | Tests | `cargo test` | All PRs | Yes | Functionality verification |
 | Security Audit | `cargo-audit` | All PRs | Yes | Known vulnerability check |
 | Dependency Check | `cargo-deny` | All PRs | Yes | License/ban/advisory checks |
-| Formal Proofs | `kani` / `prusti` | Unsafe-touching PRs | Yes | Formal safety proofs for unsafe blocks |
-| Agent Complexity | `clippy::cognitive_complexity` | Agent-authored PRs | Yes | Complexity cap for agent-written modules |
+| Safety Proof Coverage | `rg` | All PRs | Yes | Verify unsafe blocks have SAFETY-PROOF docs |
 | Secret Scan | `gitleaks` | All PRs | Yes | Detect committed secrets |
 | SBOM Generation | `syft` | Release | Yes | Software bill of materials |
 | Vulnerability Scan | `grype` | Release | High/Critical | Container/artifact scanning |
@@ -19,7 +28,32 @@ All pull requests must pass these security gates before merge.
 | Rekor Transparency | `rekor-cli` / `cosign` | Dependency updates + Release | Yes | Binary transparency verification |
 | OIDC Claim Lock | `cosign` / policy | Release | Yes | OIDC issuer/subject/audience enforcement |
 
-## Gate Details
+## Internal Gates (GateRunner per PRD-0004)
+
+The following gates run within the internal GateRunner system, not in GitHub Actions CI:
+
+| Gate | Tool | Trigger | Purpose |
+|------|------|---------|---------|
+| Formal Proofs | `kani` / `prusti` | Unsafe-touching changesets | Formal safety proofs for unsafe blocks |
+| Agent Complexity | `clippy::cognitive_complexity` | Agent-authored changesets | Complexity cap for agent-written modules |
+
+### Why These Gates Are Internal
+
+**Formal Proofs (Kani/Prusti)**: Formal verification requires:
+- Significant compute resources (minutes to hours per proof)
+- Holonic episode context for bounded execution
+- Evidence bundle generation for audit trails
+- Integration with the internal FindingSignature system for recurrence detection
+
+**Agent Complexity**: Cognitive complexity enforcement for agent-authored code requires:
+- AGENT-AUTHORED marker detection tied to holonic work contracts
+- GateRunner orchestration to emit GateRunStarted/Completed events
+- Evidence bundles linking complexity metrics to specific changesets
+- Integration with countermeasure work creation on threshold violations
+
+These gates produce `GateRunStarted` and `GateRunCompleted` ledger events with full provenance, which cannot be achieved in ephemeral GitHub Actions runners.
+
+## CI Gate Details
 
 ### Clippy (Security Lints)
 
@@ -53,23 +87,16 @@ Checks for:
 - Unmaintained crates
 - Yanked versions
 
-### Formal Proofs (Unsafe Code)
+### Safety Proof Coverage (CI Gate)
 
-Unsafe code must include formal proofs using Kani or Prusti in `apm2-core` and `apm2-daemon`.
+The `safety-proof-coverage` CI job verifies that every `unsafe {}` block in core library crates has a corresponding `// SAFETY-PROOF:` comment. This is a release-blocking security invariant.
 
-```bash
-rg "unsafe" crates/apm2-core crates/apm2-daemon -l | xargs -r rg -L "kani::proof|prusti::"
-```
+**Scope**: Currently scans `crates/apm2-core` and `crates/apm2-daemon` only.
 
-Any output from the command indicates a missing proof annotation.
-
-Unsafe blocks must also include a machine-parseable SAFETY-PROOF block:
-
-```bash
-rg -n "// SAFETY-PROOF:" crates/
-```
-
-**CI Gate**: The `safety-proof-coverage` job in CI verifies that every `unsafe {}` block has a corresponding `// SAFETY-PROOF:` comment. This is a release-blocking security invariant—unsafe code without documented safety proofs is a security risk.
+**Excluded crates**:
+- `xtask/`: Build tooling and developer utilities. Uses standard `// SAFETY:` comments for simpler unsafe patterns (e.g., `libc::flock`, environment variable manipulation in tests). Not shipped in production artifacts.
+- `apm2-cli/`: Currently contains no unsafe code.
+- `apm2-holon/`: Currently contains no unsafe code.
 
 ```yaml
 safety-proof-coverage:
@@ -83,14 +110,38 @@ safety-proof-coverage:
         # Fail if any file has more unsafe blocks than proofs
 ```
 
-### Agent Complexity (Cognitive Complexity <= 10)
+The CI job verifies documentation coverage; **actual formal proofs** (Kani/Prusti verification) run in the internal GateRunner system (see "Internal Gates" section above).
 
-Agent-authored modules must include an `AGENT-AUTHORED` marker and pass the clippy cognitive complexity cap.
+### Formal Proofs (Internal Gate - Not CI)
+
+> **Note**: Formal proof verification runs in the internal GateRunner system, not GitHub Actions CI. See "Internal Gates (GateRunner per PRD-0004)" section above.
+
+Unsafe code in `apm2-core` and `apm2-daemon` must include formal proofs using Kani or Prusti. The internal GateRunner verifies proof annotations:
+
+```bash
+rg "unsafe" crates/apm2-core crates/apm2-daemon -l | xargs -r rg -L "kani::proof|prusti::"
+```
+
+Any output from the command indicates a missing proof annotation.
+
+Unsafe blocks must also include a machine-parseable SAFETY-PROOF block:
+
+```bash
+rg -n "// SAFETY-PROOF:" crates/
+```
+
+### Agent Complexity (Internal Gate - Not CI)
+
+> **Note**: Agent complexity enforcement runs in the internal GateRunner system, not GitHub Actions CI. See "Internal Gates (GateRunner per PRD-0004)" section above.
+
+Agent-authored modules must include an `AGENT-AUTHORED` marker and pass the clippy cognitive complexity cap (<=10).
 
 ```bash
 rg -n "AGENT-AUTHORED" crates/
 cargo clippy -- -A clippy::all -W clippy::cognitive_complexity
 ```
+
+The GateRunner triggers this gate for changesets touching files with `AGENT-AUTHORED` markers, producing evidence bundles and emitting gate events to the ledger.
 
 ### Cargo Deny
 
