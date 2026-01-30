@@ -67,6 +67,8 @@
 //! assert!(policy.validate_coi("key-alice", "alice").is_err());
 //! ```
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -188,6 +190,22 @@ pub enum KeyPolicyError {
     DuplicateDomainId {
         /// The duplicate domain ID.
         domain_id: String,
+    },
+
+    /// Duplicate rule ID found.
+    #[error("duplicate rule_id: {rule_id}")]
+    DuplicateRuleId {
+        /// The duplicate rule ID.
+        rule_id: String,
+    },
+
+    /// Policy hash self-consistency check failed.
+    #[error("policy hash self-consistency check failed: computed={computed}, stored={stored}")]
+    SelfConsistencyCheckFailed {
+        /// The computed policy hash.
+        computed: String,
+        /// The stored policy hash.
+        stored: String,
     },
 }
 
@@ -460,22 +478,27 @@ impl KeyPolicy {
         None
     }
 
-    /// Finds the COI group ID for a given actor ID.
+    /// Finds all COI group IDs for a given actor ID.
+    ///
+    /// An actor may belong to multiple custody domains (with different keys),
+    /// and thus may be associated with multiple COI groups. This method returns
+    /// all COI groups the actor belongs to.
     ///
     /// # Returns
     ///
-    /// `Some(&str)` with the COI group ID if the actor is found, `None`
-    /// otherwise.
+    /// A `HashSet<String>` containing all COI group IDs the actor belongs to.
+    /// Returns an empty set if the actor is not found in any custody domain.
     #[must_use]
-    pub fn get_coi_group_for_actor(&self, actor_id: &str) -> Option<&str> {
+    pub fn get_coi_groups_for_actor(&self, actor_id: &str) -> HashSet<String> {
+        let mut groups = HashSet::new();
         for domain in &self.custody_domains {
             for binding in &domain.key_bindings {
                 if binding.actor_id == actor_id {
-                    return Some(&domain.coi_group_id);
+                    groups.insert(domain.coi_group_id.clone());
                 }
             }
         }
-        None
+        groups
     }
 
     /// Validates that there is no conflict of interest between an executor
@@ -484,6 +507,13 @@ impl KeyPolicy {
     /// This is the primary security check for preventing self-review attacks.
     /// The executor (identified by their key ID) must not be in the same COI
     /// group as the author (identified by their actor ID).
+    ///
+    /// # Security Notes
+    ///
+    /// - Uses constant-time comparison for COI group IDs to prevent timing
+    ///   attacks
+    /// - Checks ALL COI groups the author belongs to (not just the first),
+    ///   preventing bypass via multiple group bindings
     ///
     /// # Arguments
     ///
@@ -504,7 +534,7 @@ impl KeyPolicy {
     /// any custody domain.
     ///
     /// Returns [`KeyPolicyError::CoiViolation`] if the executor and author are
-    /// in the same COI group.
+    /// in the same COI group (or share any COI group).
     ///
     /// # Example
     ///
@@ -551,20 +581,37 @@ impl KeyPolicy {
             }
         })?;
 
-        // Find author's COI group
-        let author_coi_group = self
-            .get_coi_group_for_actor(author_actor_id)
-            .ok_or_else(|| KeyPolicyError::ActorNotFound {
-                actor_id: author_actor_id.to_string(),
-            })?;
+        // Find ALL of author's COI groups (CRITICAL: not just the first one)
+        let author_coi_groups = self.get_coi_groups_for_actor(author_actor_id);
 
-        // Check for COI violation (same group = conflict)
-        if executor_coi_group == author_coi_group {
-            return Err(KeyPolicyError::CoiViolation {
-                executor_key_id: executor_key_id.to_string(),
-                author_actor_id: author_actor_id.to_string(),
-                coi_group_id: executor_coi_group.to_string(),
+        if author_coi_groups.is_empty() {
+            return Err(KeyPolicyError::ActorNotFound {
+                actor_id: author_actor_id.to_string(),
             });
+        }
+
+        // Check for COI violation using constant-time comparison (RSK-1909)
+        // The executor's group must not intersect with ANY of the author's groups
+        for author_group in &author_coi_groups {
+            // Use constant-time comparison to prevent timing side-channel attacks
+            let executor_bytes = executor_coi_group.as_bytes();
+            let author_bytes = author_group.as_bytes();
+
+            // Constant-time comparison requires equal-length inputs; pad if necessary
+            let is_equal = if executor_bytes.len() == author_bytes.len() {
+                bool::from(executor_bytes.ct_eq(author_bytes))
+            } else {
+                // Different lengths cannot be equal
+                false
+            };
+
+            if is_equal {
+                return Err(KeyPolicyError::CoiViolation {
+                    executor_key_id: executor_key_id.to_string(),
+                    author_actor_id: author_actor_id.to_string(),
+                    coi_group_id: executor_coi_group.to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -620,6 +667,53 @@ impl KeyPolicy {
                 supported: SUPPORTED_SCHEMA_VERSIONS.to_vec(),
             });
         }
+        Ok(())
+    }
+
+    /// Verifies self-consistency by recomputing the policy hash and comparing.
+    ///
+    /// This method recomputes the policy hash from the current policy fields
+    /// and verifies it matches the stored `policy_hash`. This is useful after
+    /// deserialization to ensure the policy has not been tampered with.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the recomputed hash matches the stored hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyPolicyError::SelfConsistencyCheckFailed`] if the computed
+    /// hash does not match the stored hash.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::fac::{KeyPolicy, KeyPolicyBuilder};
+    ///
+    /// let policy = KeyPolicyBuilder::new("policy-001")
+    ///     .schema_version(1)
+    ///     .build();
+    ///
+    /// // After construction, self-consistency check passes
+    /// assert!(policy.verify_self_consistency().is_ok());
+    /// ```
+    pub fn verify_self_consistency(&self) -> Result<(), KeyPolicyError> {
+        let computed_hash = Self::compute_policy_hash(
+            &self.policy_id,
+            self.schema_version,
+            &self.custody_domains,
+            &self.coi_rules,
+            &self.delegation_rules,
+        );
+
+        // Use constant-time comparison for security-sensitive hash comparison
+        if !bool::from(computed_hash.ct_eq(&self.policy_hash)) {
+            return Err(KeyPolicyError::SelfConsistencyCheckFailed {
+                computed: hex_encode(&computed_hash),
+                stored: hex_encode(&self.policy_hash),
+            });
+        }
+
         Ok(())
     }
 }
@@ -835,8 +929,17 @@ impl KeyPolicyBuilder {
             }
         }
 
-        // Validate COI rules
+        // Validate COI rules and check for duplicates
+        let mut coi_rule_ids: Vec<&str> = Vec::new();
         for rule in &self.coi_rules {
+            // Check for duplicate rule ID
+            if coi_rule_ids.contains(&rule.rule_id.as_str()) {
+                return Err(KeyPolicyError::DuplicateRuleId {
+                    rule_id: rule.rule_id.clone(),
+                });
+            }
+            coi_rule_ids.push(&rule.rule_id);
+
             if rule.rule_id.len() > MAX_STRING_LENGTH {
                 return Err(KeyPolicyError::StringTooLong {
                     field: "coi_rule.rule_id",
@@ -853,8 +956,16 @@ impl KeyPolicyBuilder {
             }
         }
 
-        // Validate delegation rules
+        // Validate delegation rules and check for duplicates
+        let mut delegation_rule_ids: Vec<&str> = Vec::new();
         for rule in &self.delegation_rules {
+            // Check for duplicate rule ID
+            if delegation_rule_ids.contains(&rule.rule_id.as_str()) {
+                return Err(KeyPolicyError::DuplicateRuleId {
+                    rule_id: rule.rule_id.clone(),
+                });
+            }
+            delegation_rule_ids.push(&rule.rule_id);
             if rule.rule_id.len() > MAX_STRING_LENGTH {
                 return Err(KeyPolicyError::StringTooLong {
                     field: "delegation_rule.rule_id",
@@ -1133,12 +1244,19 @@ pub mod tests {
     }
 
     #[test]
-    fn test_get_coi_group_for_actor() {
+    fn test_get_coi_groups_for_actor() {
         let policy = create_test_policy();
 
-        assert_eq!(policy.get_coi_group_for_actor("alice"), Some("coi-group-a"));
-        assert_eq!(policy.get_coi_group_for_actor("bob"), Some("coi-group-b"));
-        assert_eq!(policy.get_coi_group_for_actor("unknown-actor"), None);
+        let alice_groups = policy.get_coi_groups_for_actor("alice");
+        assert!(alice_groups.contains("coi-group-a"));
+        assert_eq!(alice_groups.len(), 1);
+
+        let bob_groups = policy.get_coi_groups_for_actor("bob");
+        assert!(bob_groups.contains("coi-group-b"));
+        assert_eq!(bob_groups.len(), 1);
+
+        let unknown_groups = policy.get_coi_groups_for_actor("unknown-actor");
+        assert!(unknown_groups.is_empty());
     }
 
     // =========================================================================
@@ -1507,5 +1625,252 @@ pub mod tests {
         // Both key and actor not found
         let result = policy.validate_coi("any-key", "any-actor");
         assert!(matches!(result, Err(KeyPolicyError::KeyNotFound { .. })));
+    }
+
+    // =========================================================================
+    // COI Bypass via Multiple Group Bindings Tests (CRITICAL Security Fix)
+    // =========================================================================
+
+    #[test]
+    fn test_validate_coi_multiple_group_bindings_rejected() {
+        // CRITICAL: Actor belongs to multiple COI groups {A, B}
+        // Executor is in group B
+        // The check MUST detect the overlap and reject
+        let policy = KeyPolicyBuilder::new("policy-001")
+            .schema_version(1)
+            .add_custody_domain(CustodyDomain {
+                domain_id: "team-alpha".to_string(),
+                coi_group_id: "coi-group-a".to_string(),
+                key_bindings: vec![KeyBinding {
+                    key_id: "key-alice-alpha".to_string(),
+                    actor_id: "alice".to_string(), // Alice in group A
+                }],
+            })
+            .add_custody_domain(CustodyDomain {
+                domain_id: "team-beta".to_string(),
+                coi_group_id: "coi-group-b".to_string(),
+                key_bindings: vec![
+                    KeyBinding {
+                        key_id: "key-alice-beta".to_string(),
+                        actor_id: "alice".to_string(), // Alice ALSO in group B
+                    },
+                    KeyBinding {
+                        key_id: "key-bob".to_string(),
+                        actor_id: "bob".to_string(),
+                    },
+                ],
+            })
+            .build();
+
+        // Alice is in groups {A, B}
+        let alice_groups = policy.get_coi_groups_for_actor("alice");
+        assert_eq!(alice_groups.len(), 2);
+        assert!(alice_groups.contains("coi-group-a"));
+        assert!(alice_groups.contains("coi-group-b"));
+
+        // Bob (group B) reviewing Alice's changeset: MUST be REJECTED
+        // because Alice is ALSO in group B
+        let result = policy.validate_coi("key-bob", "alice");
+        assert!(
+            matches!(
+                &result,
+                Err(KeyPolicyError::CoiViolation {
+                    coi_group_id,
+                    ..
+                }) if coi_group_id == "coi-group-b"
+            ),
+            "COI bypass via multiple group bindings: expected rejection but got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_coi_multiple_groups_no_overlap_ok() {
+        // Actor in groups {A, B}, executor in group C - no overlap, should be OK
+        let policy = KeyPolicyBuilder::new("policy-001")
+            .schema_version(1)
+            .add_custody_domain(CustodyDomain {
+                domain_id: "team-alpha".to_string(),
+                coi_group_id: "coi-group-a".to_string(),
+                key_bindings: vec![KeyBinding {
+                    key_id: "key-alice-alpha".to_string(),
+                    actor_id: "alice".to_string(),
+                }],
+            })
+            .add_custody_domain(CustodyDomain {
+                domain_id: "team-beta".to_string(),
+                coi_group_id: "coi-group-b".to_string(),
+                key_bindings: vec![KeyBinding {
+                    key_id: "key-alice-beta".to_string(),
+                    actor_id: "alice".to_string(),
+                }],
+            })
+            .add_custody_domain(CustodyDomain {
+                domain_id: "team-gamma".to_string(),
+                coi_group_id: "coi-group-c".to_string(),
+                key_bindings: vec![KeyBinding {
+                    key_id: "key-carol".to_string(),
+                    actor_id: "carol".to_string(),
+                }],
+            })
+            .build();
+
+        // Carol (group C) reviewing Alice's (groups A, B) changeset: OK (no overlap)
+        assert!(policy.validate_coi("key-carol", "alice").is_ok());
+    }
+
+    // =========================================================================
+    // Self-Consistency Hash Verification Tests (MEDIUM Security Fix)
+    // =========================================================================
+
+    #[test]
+    fn test_verify_self_consistency_passes() {
+        let policy = create_test_policy();
+
+        // Freshly created policy should pass self-consistency
+        assert!(policy.verify_self_consistency().is_ok());
+    }
+
+    #[test]
+    fn test_verify_self_consistency_fails_on_tampered_policy() {
+        // Create a policy with a manually corrupted hash via JSON
+        let json = r#"{"policy_id":"policy-001","policy_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"schema_version":1,"custody_domains":[],"coi_rules":[],"delegation_rules":[]}"#;
+        let policy: KeyPolicy = serde_json::from_str(json).unwrap();
+
+        // Self-consistency check should fail because hash doesn't match content
+        let result = policy.verify_self_consistency();
+        assert!(
+            matches!(
+                result,
+                Err(KeyPolicyError::SelfConsistencyCheckFailed { .. })
+            ),
+            "Expected SelfConsistencyCheckFailed but got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_self_consistency_after_deserialization() {
+        let original = create_test_policy();
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&original).unwrap();
+        let recovered: KeyPolicy = serde_json::from_str(&json).unwrap();
+
+        // Self-consistency should still pass
+        assert!(recovered.verify_self_consistency().is_ok());
+    }
+
+    // =========================================================================
+    // Duplicate Rule ID Tests (LOW Security Fix)
+    // =========================================================================
+
+    #[test]
+    fn test_duplicate_coi_rule_id_rejected() {
+        let result = KeyPolicyBuilder::new("policy-001")
+            .schema_version(1)
+            .add_coi_rule(CoiRule {
+                rule_id: "rule-001".to_string(),
+                description: "First rule".to_string(),
+                enforcement_level: CoiEnforcementLevel::Reject,
+            })
+            .add_coi_rule(CoiRule {
+                rule_id: "rule-001".to_string(), // Duplicate
+                description: "Second rule with same ID".to_string(),
+                enforcement_level: CoiEnforcementLevel::Warn,
+            })
+            .try_build();
+
+        assert!(
+            matches!(
+                &result,
+                Err(KeyPolicyError::DuplicateRuleId { rule_id }) if rule_id == "rule-001"
+            ),
+            "Expected DuplicateRuleId but got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_delegation_rule_id_rejected() {
+        let result = KeyPolicyBuilder::new("policy-001")
+            .schema_version(1)
+            .add_delegation_rule(DelegationRule {
+                rule_id: "delegation-001".to_string(),
+                from_actor_id: "alice".to_string(),
+                to_actor_id: "bob".to_string(),
+                scope: None,
+                active: true,
+            })
+            .add_delegation_rule(DelegationRule {
+                rule_id: "delegation-001".to_string(), // Duplicate
+                from_actor_id: "carol".to_string(),
+                to_actor_id: "dave".to_string(),
+                scope: None,
+                active: true,
+            })
+            .try_build();
+
+        assert!(
+            matches!(
+                &result,
+                Err(KeyPolicyError::DuplicateRuleId { rule_id }) if rule_id == "delegation-001"
+            ),
+            "Expected DuplicateRuleId but got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_same_rule_id_across_coi_and_delegation_allowed() {
+        // Different namespaces: same rule_id in coi_rules and delegation_rules is
+        // allowed
+        let result = KeyPolicyBuilder::new("policy-001")
+            .schema_version(1)
+            .add_coi_rule(CoiRule {
+                rule_id: "rule-001".to_string(),
+                description: "COI rule".to_string(),
+                enforcement_level: CoiEnforcementLevel::Reject,
+            })
+            .add_delegation_rule(DelegationRule {
+                rule_id: "rule-001".to_string(), // Same ID but different collection
+                from_actor_id: "alice".to_string(),
+                to_actor_id: "bob".to_string(),
+                scope: None,
+                active: true,
+            })
+            .try_build();
+
+        // Should succeed - they're in different namespaces
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_unique_rule_ids_accepted() {
+        let result = KeyPolicyBuilder::new("policy-001")
+            .schema_version(1)
+            .add_coi_rule(CoiRule {
+                rule_id: "coi-rule-001".to_string(),
+                description: "First COI rule".to_string(),
+                enforcement_level: CoiEnforcementLevel::Reject,
+            })
+            .add_coi_rule(CoiRule {
+                rule_id: "coi-rule-002".to_string(),
+                description: "Second COI rule".to_string(),
+                enforcement_level: CoiEnforcementLevel::Warn,
+            })
+            .add_delegation_rule(DelegationRule {
+                rule_id: "delegation-001".to_string(),
+                from_actor_id: "alice".to_string(),
+                to_actor_id: "bob".to_string(),
+                scope: None,
+                active: true,
+            })
+            .add_delegation_rule(DelegationRule {
+                rule_id: "delegation-002".to_string(),
+                from_actor_id: "carol".to_string(),
+                to_actor_id: "dave".to_string(),
+                scope: None,
+                active: true,
+            })
+            .try_build();
+
+        assert!(result.is_ok());
     }
 }
