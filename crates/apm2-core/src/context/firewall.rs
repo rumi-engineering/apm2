@@ -198,15 +198,48 @@ pub struct FirewallDecision {
 const TRUNCATION_SUFFIX: &str = "...[TRUNCATED]";
 
 impl FirewallDecision {
+    /// Finds the largest index <= `index` that is a valid UTF-8 character
+    /// boundary.
+    ///
+    /// This is equivalent to `str::floor_char_boundary()` (stable since 1.91.0)
+    /// but implemented manually for MSRV compatibility.
+    #[inline]
+    fn floor_char_boundary(s: &str, index: usize) -> usize {
+        if index >= s.len() {
+            s.len()
+        } else {
+            // Scan backwards from index to find a valid UTF-8 char boundary.
+            // UTF-8 continuation bytes have the bit pattern 10xxxxxx (0x80..0xC0).
+            // Leading bytes and ASCII have patterns 0xxxxxxx or 11xxxxxx.
+            let mut i = index;
+            while i > 0 && !s.is_char_boundary(i) {
+                i -= 1;
+            }
+            i
+        }
+    }
+
     /// Truncates a path to `MAX_PATH_LENGTH` to prevent oversized paths from
     /// propagating to audit logs.
+    ///
+    /// # Safety
+    ///
+    /// Uses UTF-8-aware truncation to ensure we never split a multi-byte
+    /// UTF-8 character, which would cause a panic.
     fn truncate_path(path: String) -> String {
         if path.len() > MAX_PATH_LENGTH {
             // Truncate and append indicator that path was truncated
             // Final length: MAX_PATH_LENGTH - suffix_len + suffix_len = MAX_PATH_LENGTH
             let suffix_len = TRUNCATION_SUFFIX.len();
+            let target_len = MAX_PATH_LENGTH - suffix_len;
+
+            // Find the nearest valid UTF-8 character boundary at or before
+            // target_len. This prevents panic when truncating multi-byte UTF-8
+            // characters (e.g., emoji, CJK).
+            let safe_len = Self::floor_char_boundary(&path, target_len);
+
             let mut truncated = path;
-            truncated.truncate(MAX_PATH_LENGTH - suffix_len);
+            truncated.truncate(safe_len);
             truncated.push_str(TRUNCATION_SUFFIX);
             truncated
         } else {
@@ -267,6 +300,13 @@ impl FirewallDecision {
     /// * `budget_consumed` - Budget consumed by this operation (typically 0 for
     ///   denials)
     ///
+    /// # Rationale Code Format
+    ///
+    /// The `rationale_code` field includes both the rule ID and the path for
+    /// audit traceability: `"{rule_id}: {path}"`. For example:
+    /// - `"CTX-ALLOWLIST-001: /etc/passwd"`
+    /// - `"CTX-HASH-MISMATCH-001: /project/src/main.rs"`
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -276,6 +316,7 @@ impl FirewallDecision {
     ///     &manifest.manifest_hash(),
     ///     0,
     /// );
+    /// // proto_event.rationale_code == "CTX-ALLOWLIST-001: /etc/passwd"
     /// // Emit proto_event to ledger
     /// ```
     #[must_use]
@@ -285,12 +326,17 @@ impl FirewallDecision {
         policy_hash: &[u8; 32],
         budget_consumed: u64,
     ) -> ProtoToolDecided {
+        // Include path in rationale_code for audit traceability.
+        // Format: "{rule_id}: {path}" to preserve both rule identification and
+        // the specific file that triggered the denial.
+        let rationale_with_path = format!("{}: {}", self.rule_id, self.path);
+
         ProtoToolDecided {
             request_id: request_id.into(),
             decision: self.decision.to_string(),
             rule_id: self.rule_id.clone(),
             policy_hash: policy_hash.to_vec(),
-            rationale_code: self.reason.clone(),
+            rationale_code: rationale_with_path,
             budget_consumed,
         }
     }
@@ -600,6 +646,16 @@ impl ContextAwareValidator for DefaultContextFirewall<'_> {
             Err(e) => return Err(ContextFirewallError::InvalidPath(e)),
         };
 
+        // Defense in depth: Check normalized path length.
+        // Normalization can increase length (e.g., "foo" -> "/foo" prepends "/").
+        // This prevents oversized paths from reaching truncate_path in denial events.
+        if normalized.len() > MAX_PATH_LENGTH {
+            return Err(ContextFirewallError::PathTooLong {
+                actual: normalized.len(),
+                max: MAX_PATH_LENGTH,
+            });
+        }
+
         // Use pre-normalized path for all subsequent checks
         match self
             .manifest
@@ -794,7 +850,11 @@ pub mod tests {
         assert_eq!(proto.decision, "DENY");
         assert_eq!(proto.rule_id, CTX_ALLOWLIST_RULE_ID);
         assert_eq!(proto.policy_hash, policy_hash.to_vec());
-        assert_eq!(proto.rationale_code, ALLOWLIST_DENIAL_REASON);
+        // rationale_code includes both rule_id and path for audit traceability
+        assert_eq!(
+            proto.rationale_code,
+            format!("{CTX_ALLOWLIST_RULE_ID}: /etc/passwd")
+        );
         assert_eq!(proto.budget_consumed, 0);
     }
 
@@ -1325,5 +1385,175 @@ pub mod tests {
         // Non-allowed unicode path
         let result = firewall.validate_read("/project/src/中文.rs", None);
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // UTF-8 Boundary Tests for truncate_path
+    // =========================================================================
+
+    #[test]
+    fn test_truncate_path_respects_utf8_char_boundaries() {
+        // Test that truncate_path doesn't panic when truncating multi-byte UTF-8
+        // characters. Each emoji is 4 bytes in UTF-8.
+        use super::super::manifest::MAX_PATH_LENGTH;
+
+        // Create a path with emoji that would be split at the truncation point.
+        // We need a path longer than MAX_PATH_LENGTH where the truncation
+        // falls inside a multi-byte character.
+        let suffix_len = TRUNCATION_SUFFIX.len();
+        let target_len = MAX_PATH_LENGTH - suffix_len;
+
+        // Build a path where target_len falls inside an emoji.
+        // Fill with 'x' up to just before target_len, then add an emoji.
+        // If target_len = 4081, we put 4079 x's then a 4-byte emoji (starts at 4079).
+        // target_len (4081) would fall at byte 2 of the emoji.
+        let prefix_len = target_len - 2; // So emoji starts 2 bytes before target
+        let emoji = "🦀"; // Ferris the crab, 4 bytes in UTF-8
+        assert_eq!(emoji.len(), 4);
+
+        // Build: "/" + "x" * prefix_len + emoji + padding to exceed MAX_PATH_LENGTH
+        let mut path = "/".to_string();
+        path.push_str(&"x".repeat(prefix_len - 1)); // -1 for the leading "/"
+        path.push_str(emoji);
+        // Add more content to exceed MAX_PATH_LENGTH
+        path.push_str(&"y".repeat(100));
+
+        assert!(
+            path.len() > MAX_PATH_LENGTH,
+            "Test path should exceed MAX_PATH_LENGTH"
+        );
+
+        // This should NOT panic - it should truncate at a valid UTF-8 boundary
+        let event = FirewallDecision::deny_allowlist("manifest-001", path);
+
+        // Verify the path was truncated
+        assert!(
+            event.path.len() <= MAX_PATH_LENGTH,
+            "Truncated path should not exceed MAX_PATH_LENGTH"
+        );
+        assert!(
+            event.path.ends_with(TRUNCATION_SUFFIX),
+            "Truncated path should end with truncation suffix"
+        );
+
+        // Verify the truncated string is valid UTF-8 (would panic on iteration if not)
+        for _ in event.path.chars() {}
+    }
+
+    #[test]
+    fn test_truncate_path_with_cjk_characters() {
+        // CJK characters are 3 bytes in UTF-8
+        use super::super::manifest::MAX_PATH_LENGTH;
+
+        let suffix_len = TRUNCATION_SUFFIX.len();
+        let target_len = MAX_PATH_LENGTH - suffix_len;
+
+        // Build a path where target_len falls inside a CJK character (3 bytes)
+        let prefix_len = target_len - 1; // So CJK char starts 1 byte before target
+        let cjk_char = "中"; // Chinese character, 3 bytes in UTF-8
+        assert_eq!(cjk_char.len(), 3);
+
+        let mut path = "/".to_string();
+        path.push_str(&"x".repeat(prefix_len - 1)); // -1 for the leading "/"
+        path.push_str(cjk_char);
+        path.push_str(&"y".repeat(100));
+
+        assert!(path.len() > MAX_PATH_LENGTH);
+
+        // This should NOT panic
+        let event = FirewallDecision::deny_allowlist("manifest-001", path);
+
+        assert!(event.path.len() <= MAX_PATH_LENGTH);
+        assert!(event.path.ends_with(TRUNCATION_SUFFIX));
+
+        // Verify valid UTF-8
+        for _ in event.path.chars() {}
+    }
+
+    #[test]
+    fn test_truncate_path_all_emoji_path() {
+        // Path consisting entirely of emoji (4-byte chars)
+        use super::super::manifest::MAX_PATH_LENGTH;
+
+        // Each emoji is 4 bytes, so we need enough to exceed MAX_PATH_LENGTH
+        let num_emoji = (MAX_PATH_LENGTH / 4) + 10;
+        let path: String = std::iter::once('/')
+            .chain(std::iter::repeat_n('🦀', num_emoji))
+            .collect();
+
+        assert!(path.len() > MAX_PATH_LENGTH);
+
+        // This should NOT panic
+        let event = FirewallDecision::deny_allowlist("manifest-001", path);
+
+        assert!(event.path.len() <= MAX_PATH_LENGTH);
+        assert!(event.path.ends_with(TRUNCATION_SUFFIX));
+
+        // Verify valid UTF-8
+        for _ in event.path.chars() {}
+    }
+
+    #[test]
+    fn test_truncate_path_mixed_multibyte() {
+        // Mix of 1-byte (ASCII), 2-byte, 3-byte, and 4-byte UTF-8 characters
+        use super::super::manifest::MAX_PATH_LENGTH;
+
+        let mut path = "/".to_string();
+
+        // Add mixed characters until we exceed MAX_PATH_LENGTH
+        while path.len() <= MAX_PATH_LENGTH {
+            path.push('a'); // 1 byte
+            path.push('é'); // 2 bytes
+            path.push('中'); // 3 bytes
+            path.push('🦀'); // 4 bytes
+        }
+
+        // This should NOT panic
+        let event = FirewallDecision::deny_allowlist("manifest-001", path);
+
+        assert!(event.path.len() <= MAX_PATH_LENGTH);
+        assert!(event.path.ends_with(TRUNCATION_SUFFIX));
+
+        // Verify valid UTF-8 by iterating chars
+        for _ in event.path.chars() {}
+    }
+
+    // =========================================================================
+    // Normalized Path Length Tests
+    // =========================================================================
+
+    #[test]
+    fn test_normalized_path_length_check() {
+        // Test that paths which are valid before normalization but exceed
+        // MAX_PATH_LENGTH after normalization are rejected.
+        use super::super::manifest::MAX_PATH_LENGTH;
+
+        let manifest = create_test_manifest();
+        let firewall = DefaultContextFirewall::new(&manifest, FirewallMode::SoftFail);
+
+        // Create a relative path (no leading /) that's exactly MAX_PATH_LENGTH.
+        // After normalization, "/" is prepended, making it MAX_PATH_LENGTH + 1.
+        let path_without_slash = "x".repeat(MAX_PATH_LENGTH);
+        assert_eq!(path_without_slash.len(), MAX_PATH_LENGTH);
+
+        let result = firewall.validate_read(&path_without_slash, None);
+
+        // Should be rejected because normalized path exceeds MAX_PATH_LENGTH
+        assert!(
+            result.is_err(),
+            "Path that exceeds MAX_PATH_LENGTH after normalization should be rejected"
+        );
+
+        match result.unwrap_err() {
+            ContextFirewallError::PathTooLong { actual, max } => {
+                assert_eq!(
+                    actual,
+                    MAX_PATH_LENGTH + 1,
+                    "Actual length should be MAX_PATH_LENGTH + 1 (added /)"
+                );
+                assert_eq!(max, MAX_PATH_LENGTH);
+            },
+            other => panic!("Expected PathTooLong error, got {other:?}"),
+        }
     }
 }
