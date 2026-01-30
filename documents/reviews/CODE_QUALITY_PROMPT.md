@@ -39,43 +39,43 @@ decision_tree:
           purpose: "Grand unified theory of agent-native holonic software (dcp://apm2.local/governance/holonic_unified_theory@v1)."
         - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/agent-native-software.md
           purpose: "Agent-native architecture doctrine."
-        - path: documents/skills/rust-textbook/26_apm2_safe_patterns_and_anti_patterns.md
+        - path: documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md
           purpose: "APM2 safe patterns and anti-patterns (token-efficient index)."
         - path: documents/security/SECURITY_CHECKLIST.md
           purpose: "Security review checklist."
-        - path: documents/skills/rust-textbook/09_unsafe_rust_obligations.md
+        - path: documents/skills/rust-standards/references/19_unsafe_rust_obligations.md
           purpose: "Unsafe proof obligations + APM2 unsafe policy."
-        - path: documents/skills/review-rust/SKILL.md
-          purpose: "Core Rust review protocol."
-        - path: documents/skills/review-rust/references/00_operating_mode.md
+        - path: documents/skills/rust-standards/SKILL.md
+          purpose: "Unified Rust standards and review protocol."
+        - path: documents/skills/rust-standards/references/00_operating_mode.md
           purpose: "Reviewer audit posture."
-        - path: documents/skills/review-rust/references/01_inputs_and_stop_conditions.md
+        - path: documents/skills/rust-standards/references/02_inputs_and_stop_conditions.md
           purpose: "Review input validation."
-        - path: documents/skills/review-rust/references/02_qcp_classification.md
+        - path: documents/skills/rust-standards/references/04_qcp_classification.md
           purpose: "Quality Control Point scoring."
-        - path: documents/skills/review-rust/references/03_triage_fast_scan.md
+        - path: documents/skills/rust-standards/references/06_triage_fast_scan.md
           purpose: "Fast risk detection."
-        - path: documents/skills/review-rust/references/04_invariant_mapping.md
+        - path: documents/skills/rust-standards/references/08_invariant_mapping.md
           purpose: "Mapping code to invariants."
-        - path: documents/skills/review-rust/references/05_abstraction_and_simplification.md
+        - path: documents/skills/rust-standards/references/10_abstraction_and_simplification.md
           purpose: "Design and abstraction review."
-        - path: documents/skills/review-rust/references/06_rust_soundness_and_unsafe.md
+        - path: documents/skills/rust-standards/references/12_rust_soundness_and_unsafe.md
           purpose: "Memory safety and unsafe code audit."
-        - path: documents/skills/review-rust/references/07_allocator_arena_pool_review.md
+        - path: documents/skills/rust-standards/references/14_allocator_arena_pool_review.md
           purpose: "Memory management audit."
-        - path: documents/skills/review-rust/references/08_error_handling_and_panic_policy.md
+        - path: documents/skills/rust-standards/references/16_error_handling_and_panic_policy.md
           purpose: "Failure semantics review."
-        - path: documents/skills/review-rust/references/09_api_design_and_semver.md
+        - path: documents/skills/rust-standards/references/18_api_design_and_semver.md
           purpose: "API contract and semver review."
-        - path: documents/skills/review-rust/references/10_testing_evidence_and_ci.md
+        - path: documents/skills/rust-standards/references/20_testing_evidence_and_ci.md
           purpose: "Verification and CI review."
-        - path: documents/skills/review-rust/references/11_performance_review.md
+        - path: documents/skills/rust-standards/references/22_performance_review.md
           purpose: "Resource and performance audit."
-        - path: documents/skills/review-rust/references/12_dependency_and_build_surface.md
+        - path: documents/skills/rust-standards/references/24_dependency_and_build_surface.md
           purpose: "Supply chain and build audit."
-        - path: documents/skills/review-rust/references/13_severity_and_verdict.md
+        - path: documents/skills/rust-standards/references/26_severity_and_verdict.md
           purpose: "Findings severity and final verdict."
-        - path: documents/skills/review-rust/references/14_required_actions_templates.md
+        - path: documents/skills/rust-standards/references/28_required_actions_templates.md
           purpose: "Review output templates."
       steps[1]:
         - id: READ_BASELINE_CONTEXT
@@ -225,13 +225,11 @@ decision_tree:
 
     - id: PHASE_5_EXECUTE_REVIEW
       purpose: "Apply review criteria and generate findings."
-      context_files[3]:
-        - path: documents/skills/review-rust/SKILL.md
-          purpose: "Primary review protocol and modules."
-        - path: documents/skills/review-rust/references/
-          purpose: "Reference modules invoked by review-rust."
-        - path: documents/skills/rust-textbook/SKILL.md
-          purpose: "Rust principles referenced by review-rust."
+      context_files[2]:
+        - path: documents/skills/rust-standards/SKILL.md
+          purpose: "Primary review protocol and unified standards."
+        - path: documents/skills/rust-standards/references/
+          purpose: "Reference modules invoked by rust-standards."
       steps[5]:
         - id: LOAD_REVIEW_GUIDELINES
           action: "Read the review skill and the specific reference modules it invokes for this review."
@@ -240,8 +238,8 @@ decision_tree:
         - id: SELECT_REVIEW_FRAMEWORKS
           action: "Choose the applicable review modules and Rust reference sections based on the changeset analysis. Record which modules are applied and why."
           sources:
-            review_modules: "documents/skills/review-rust/references/"
-            rust_reference: "documents/skills/rust-textbook/"
+            review_modules: "documents/skills/rust-standards/references/"
+            rust_reference: "documents/skills/rust-standards/references/"
           output: modules_applied
         - id: APPLY_REVIEW_FRAMEWORKS
           action: "Apply the selected frameworks to the changed code and its context. Use the prompts below as optional lenses, not mandatory checklist items. Use your judgement to provide the most constructive review possible."
@@ -386,8 +384,8 @@ reference:
     ticket_decomposition: "documents/rfcs/${rfc_id}/06_ticket_decomposition.yaml"
     ticket_meta: "documents/work/tickets/${ticket_id}.yaml"
     ticket_body: "documents/work/tickets/${ticket_id}.md"
-    review_skill: "documents/skills/review-rust/SKILL.md"
-    review_refs: "documents/skills/review-rust/references/"
+    review_skill: "documents/skills/rust-standards/SKILL.md"
+    review_refs: "documents/skills/rust-standards/references/"
     agents_md: "${module_path}/AGENTS.md"
   commands:
     pr_metadata: "gh pr view $PR_URL --json number,title,body,author,files,additions,deletions"

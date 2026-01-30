@@ -186,7 +186,7 @@ anti_patterns:
   - id: TYPE-UNWRAP
     pattern: ".unwrap() hiding recoverable error"
     severity: MAJOR
-    remediation: "Propagate error or document invariant"
+    remediation: "Use CTR-2618 (Locking), CTR-2619 (Serialization), or CTR-2620 (Parsing) patterns."
 ```
 
 ---

@@ -64,10 +64,14 @@ pub enum FsEditError {
 - ENFORCE BY: workspace lint policy; local suppressions only with precise targets.
 [PROVENANCE] Rust Reference: attributes (lint attributes).
 
-[CONTRACT: CTR-0706] Non-Critical Error Visibility (Tracing over Printing).
-- REJECT IF: library code uses `println!`, `eprintln!`, or `dbg!` for diagnostics or non-critical errors.
-- ENFORCE BY: use the `tracing` crate (or `log`) for warnings and info; allow callers to decide on collection/visibility.
-[PROVENANCE] APM2 Implementation Standard.
+[CONTRACT: CTR-0706] Non-Critical Error Visibility (Structured Tracing).
+- REJECT IF: library code uses `println!`, `eprintln!`, or `dbg!` for diagnostics.
+- REJECT IF: logs embed values in the message string instead of using structured fields (key-value pairs).
+- ENFORCE BY:
+  - use `tracing` crate.
+  - use fields: `tracing::info!(user_id = %id, "user logged in")` instead of `format!`.
+  - use `valuable` or `serde` for complex structures when supported.
+[PROVENANCE] APM2 Implementation Standard; structured logging enables queryability.
 
 ## References (Normative Anchors)
 

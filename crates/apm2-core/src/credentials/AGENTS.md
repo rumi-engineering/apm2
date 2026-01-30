@@ -6,7 +6,7 @@
 
 The `apm2_core::credentials` module provides a credential management subsystem for APM2's process supervision framework. It handles the complete lifecycle of authentication credentials: secure storage via OS keyring integration, runtime retrieval with in-memory caching, hot-swapping for zero-downtime credential rotation, and automatic OAuth token refresh.
 
-This module implements the security requirements outlined in the rust-textbook [CTR-1901]: threat models include resource exhaustion, logic bugs in authorization, and supply chain considerations. Secrets are stored using the `secrecy` crate to prevent accidental exposure via `Debug` or logging.
+This module implements the security requirements outlined in the [APM2 Rust Standards] [CTR-1901]: threat models include resource exhaustion, logic bugs in authorization, and supply chain considerations. Secrets are stored using the `secrecy` crate to prevent accidental exposure via `Debug` or logging.
 
 **Architectural Position**: The credentials module is consumed by `apm2_core::process` to inject credentials into spawned agent processes. It integrates with the process supervision layer to enable credential rotation without restart via configurable signal delivery.
 
@@ -469,7 +469,7 @@ let config = CredentialConfig {
 
 ## Security Considerations
 
-Following rust-textbook [CTR-1901] and [RSK-1903]:
+Following [APM2 Rust Standards] [CTR-1901] and [RSK-1903]:
 
 1. **Secret Handling**: All sensitive values use `secrecy::SecretString` which:
    - Implements `Zeroize` for memory clearing on drop
@@ -484,9 +484,9 @@ Following rust-textbook [CTR-1901] and [RSK-1903]:
 
 ## References
 
-- rust-textbook Chapter 12: API Design - `CTR-1201` (explicit public API contracts)
-- rust-textbook Chapter 12: API Design - `CTR-1203` (visibility enforces invariants)
-- rust-textbook Chapter 19: Security-Adjacent Rust - `CTR-1901` (threat model)
-- rust-textbook Chapter 19: Security-Adjacent Rust - `RSK-1903` (unsafe code escalation)
+- [APM2 Rust Standards] [API Design](/documents/skills/rust-standards/references/18_api_design_and_semver.md) - Explicit Public API Contracts
+- [APM2 Rust Standards] [API Design](/documents/skills/rust-standards/references/18_api_design_and_semver.md) - Visibility Enforces Invariants
+- [APM2 Rust Standards] [Security-Adjacent Rust](/documents/skills/rust-standards/references/34_security_adjacent_rust.md) - [CTR-1901] (threat model)
+- [APM2 Rust Standards] [Security-Adjacent Rust](/documents/skills/rust-standards/references/34_security_adjacent_rust.md) - [RSK-1903] (unsafe code escalation)
 - [secrecy crate documentation](https://docs.rs/secrecy/)
 - [keyring crate documentation](https://docs.rs/keyring/)

@@ -82,6 +82,29 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 - ENFORCE BY: combine all relevant event hashes into the final committed hash.
 [PROVENANCE] APM2 Implementation Standard.
 
+[CONTRACT: CTR-2618] Safe Locking (Poison Handling).
+- REJECT IF: `lock().unwrap()` is used in production code (panics if a previous holder panicked).
+- ENFORCE BY:
+  - If state corruption is fatal: propagate the error (don't unwrap).
+  - If state corruption is acceptable/recoverable (e.g., metrics, cache): use `.lock().unwrap_or_else(|e| e.into_inner())` to ignore poison.
+  - Ideally: use `parking_lot` (which does not poison) if the project policy allows.
+[PROVENANCE] std `Mutex` poisons on panic; `unwrap` propagates the panic, causing cascading DoS.
+
+[CONTRACT: CTR-2619] Infallible Serialization Wrapper.
+- REJECT IF: `serde_json::to_string(&val).unwrap()` is used on internal types without a "no-fail" proof.
+- ENFORCE BY:
+  - Return `Result` even if "it should never fail" (defensive coding).
+  - Or use a wrapper `must_serialize` that logs a critical error and returns a fallback/empty string (if crashing is worse than missing data).
+  - NEVER unwrap serialization on data that contains user-controlled strings (recursion/depth limits).
+[PROVENANCE] Serde can fail on map keys, recursion limits, or custom `Serialize` impls.
+
+[CONTRACT: CTR-2620] Input Parsing Must Be Fallible.
+- REJECT IF: `parse().unwrap()`, `from_str().unwrap()`, or `try_into().unwrap()` is used on any input that originates outside the binary.
+- ENFORCE BY:
+  - `let val = input.parse().map_err(|_| Error::InvalidInput)?`
+  - Use `unwrap_or(default)` for permissive parsing.
+[PROVENANCE] RSK-0701 (Panic-as-DoS).
+
 ## Anti-Patterns (Lessons Learned)
 
 ### ANTI-1

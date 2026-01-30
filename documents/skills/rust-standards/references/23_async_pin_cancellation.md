@@ -54,6 +54,15 @@
 [PROVENANCE] std `Pin` contract; Rustonomicon pin guidance.
 [VERIFICATION] Miri for unsafe pin code; tests that move values to ensure pin requirements are enforced.
 
+[HAZARD: RSK-1105] Blocking I/O in Async Contexts (Executor Starvation).
+- TRIGGER: `std::fs`, `std::thread::sleep`, `std::net` (blocking), or heavy CPU compute in an `async fn`.
+- FAILURE MODE: starvation of the async executor; system-wide latency spikes; deadlocks if the blocking op waits for an async resource.
+- REJECT IF: blocking I/O is performed directly in an async function.
+- ENFORCE BY:
+  - use `tokio::fs`, `tokio::time::sleep` for async-native operations.
+  - use `tokio::task::spawn_blocking` for unavoidable blocking work (e.g., heavy CPU, legacy sync libraries).
+[PROVENANCE] Async runtimes (tokio) depend on cooperative multitasking; blocking a thread halts all tasks on that thread.
+
 ## References (Normative Anchors)
 
 - Rust Reference: Await expressions: https://doc.rust-lang.org/reference/expressions/await-expr.html
