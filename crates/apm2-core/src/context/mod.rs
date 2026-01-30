@@ -70,6 +70,6 @@ pub mod firewall;
 mod manifest;
 
 pub use manifest::{
-    AccessLevel, ContextPackManifest, ContextPackManifestBuilder, MAX_ENTRIES, MAX_PATH_LENGTH,
-    ManifestEntry, ManifestEntryBuilder, ManifestError, normalize_path,
+    AccessLevel, ContextPackManifest, ContextPackManifestBuilder, MAX_ENTRIES, MAX_PATH_COMPONENTS,
+    MAX_PATH_LENGTH, ManifestEntry, ManifestEntryBuilder, ManifestError, normalize_path,
 };

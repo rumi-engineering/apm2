@@ -93,6 +93,10 @@ pub const MAX_ENTRIES: usize = 10_000;
 /// Prevents memory exhaustion from extremely long paths.
 pub const MAX_PATH_LENGTH: usize = 4096;
 
+/// Maximum number of path components allowed.
+/// Prevents Vec allocation spikes from paths with many segments.
+pub const MAX_PATH_COMPONENTS: usize = 256;
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -118,6 +122,15 @@ pub enum ManifestError {
         /// Actual length of the path.
         actual: usize,
         /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Path has too many components.
+    #[error("path has too many components: {actual} > {max}")]
+    TooManyPathComponents {
+        /// Actual number of components.
+        actual: usize,
+        /// Maximum allowed components.
         max: usize,
     },
 
@@ -244,8 +257,10 @@ pub fn normalize_path(path: &str) -> Result<String, ManifestError> {
         });
     }
 
-    // Process components
-    let mut components: Vec<&str> = Vec::new();
+    // Process components with a pre-allocated Vec capped at MAX_PATH_COMPONENTS
+    // This prevents allocation spikes from paths with many segments
+    let mut components: Vec<&str> = Vec::with_capacity(MAX_PATH_COMPONENTS.min(64));
+    let mut component_count: usize = 0;
 
     for component in path.split('/') {
         match component {
@@ -260,9 +275,20 @@ pub fn normalize_path(path: &str) -> Result<String, ManifestError> {
                     });
                 }
                 components.pop();
+                // Note: component_count tracks total components seen, not final
+                // count
             },
             // Normal component
-            _ => components.push(component),
+            _ => {
+                component_count += 1;
+                if component_count > MAX_PATH_COMPONENTS {
+                    return Err(ManifestError::TooManyPathComponents {
+                        actual: component_count,
+                        max: MAX_PATH_COMPONENTS,
+                    });
+                }
+                components.push(component);
+            },
         }
     }
 
@@ -622,8 +648,29 @@ impl ContextPackManifest {
         content_hash: Option<&[u8; 32]>,
     ) -> Result<bool, ManifestError> {
         let normalized = normalize_path(path)?;
+        self.is_allowed_normalized(&normalized, content_hash)
+    }
 
-        let Some(&idx) = self.path_index.get(&normalized) else {
+    /// Checks if access to a file is allowed using a pre-normalized path.
+    ///
+    /// This is an optimization for callers that have already normalized the
+    /// path. The path MUST be normalized (via [`normalize_path`]) before
+    /// calling this method.
+    ///
+    /// # Safety
+    ///
+    /// Passing a non-normalized path may result in incorrect allowlist lookups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::ContentHashRequired`] if the entry has
+    /// `ReadWithZoom` access level but no hash was provided.
+    pub fn is_allowed_normalized(
+        &self,
+        normalized_path: &str,
+        content_hash: Option<&[u8; 32]>,
+    ) -> Result<bool, ManifestError> {
+        let Some(&idx) = self.path_index.get(normalized_path) else {
             return Ok(false);
         };
 
@@ -631,9 +678,9 @@ impl ContextPackManifest {
 
         match (entry.access_level, content_hash) {
             // ReadWithZoom requires hash
-            (AccessLevel::ReadWithZoom, None) => {
-                Err(ManifestError::ContentHashRequired { path: normalized })
-            },
+            (AccessLevel::ReadWithZoom, None) => Err(ManifestError::ContentHashRequired {
+                path: normalized_path.to_string(),
+            }),
             // Hash provided, verify it
             (_, Some(hash)) => Ok(bool::from(entry.content_hash.ct_eq(hash))),
             // Read access without hash - allowed
@@ -679,10 +726,23 @@ impl ContextPackManifest {
     /// ```
     pub fn get_entry(&self, path: &str) -> Result<Option<&ManifestEntry>, ManifestError> {
         let normalized = normalize_path(path)?;
-        Ok(self
-            .path_index
-            .get(&normalized)
-            .map(|&idx| &self.entries[idx]))
+        Ok(self.get_entry_normalized(&normalized))
+    }
+
+    /// Gets a manifest entry by pre-normalized path.
+    ///
+    /// This is an optimization for callers that have already normalized the
+    /// path. The path MUST be normalized (via [`normalize_path`]) before
+    /// calling this method.
+    ///
+    /// # Safety
+    ///
+    /// Passing a non-normalized path may result in incorrect lookups.
+    #[must_use]
+    pub fn get_entry_normalized(&self, normalized_path: &str) -> Option<&ManifestEntry> {
+        self.path_index
+            .get(normalized_path)
+            .map(|&idx| &self.entries[idx])
     }
 
     /// Gets a manifest entry by `stable_id`.
@@ -1097,6 +1157,33 @@ pub mod tests {
             Err(ManifestError::PathTooLong { actual, max })
                 if actual == MAX_PATH_LENGTH + 1 && max == MAX_PATH_LENGTH
         ));
+    }
+
+    #[test]
+    fn test_normalize_path_rejects_too_many_components() {
+        // Path with exactly MAX_PATH_COMPONENTS should succeed
+        let components: Vec<&str> = (0..MAX_PATH_COMPONENTS).map(|_| "a").collect();
+        let at_limit = format!("/{}", components.join("/"));
+        assert!(normalize_path(&at_limit).is_ok());
+
+        // Path with one component over limit should fail
+        let components: Vec<&str> = (0..=MAX_PATH_COMPONENTS).map(|_| "a").collect();
+        let over_limit = format!("/{}", components.join("/"));
+        assert!(matches!(
+            normalize_path(&over_limit),
+            Err(ManifestError::TooManyPathComponents { actual, max })
+                if actual == MAX_PATH_COMPONENTS + 1 && max == MAX_PATH_COMPONENTS
+        ));
+    }
+
+    #[test]
+    fn test_normalize_path_component_count_excludes_empty_and_dots() {
+        // Empty components and dots should not count towards the limit
+        // This path has many slashes but only 2 actual components
+        let path = "/a//b/./../b/./";
+        let result = normalize_path(path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/a/b");
     }
 
     // =========================================================================
