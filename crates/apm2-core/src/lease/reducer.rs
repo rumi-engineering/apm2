@@ -519,6 +519,12 @@ impl Reducer for LeaseReducer {
                 // but is processed separately in the Forge Admission Cycle.
                 Ok(())
             },
+            Some(lease_event::Event::LeaseRevoked(_)) => {
+                // Lease revocations are handled by the FAC module, not this reducer.
+                // This event type is included in LeaseEvent for schema compatibility
+                // but is processed separately in the Forge Admission Cycle.
+                Ok(())
+            },
             None => Ok(()),
         }
     }

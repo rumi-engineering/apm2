@@ -528,6 +528,390 @@ impl Canonicalize for GateLease {
 }
 
 // =============================================================================
+// Lease Revoked
+// =============================================================================
+
+/// Reason for lease revocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum RevocationReason {
+    /// Key compromise detected - immediate invalidation required.
+    KeyCompromise,
+    /// Executor violated policy constraints.
+    PolicyViolation,
+    /// Executor exhibited misbehavior.
+    Misbehavior,
+    /// Voluntary release by the lease holder or issuer.
+    Voluntary,
+}
+
+impl RevocationReason {
+    /// Returns the string representation for proto encoding.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::KeyCompromise => "KEY_COMPROMISE",
+            Self::PolicyViolation => "POLICY_VIOLATION",
+            Self::Misbehavior => "MISBEHAVIOR",
+            Self::Voluntary => "VOLUNTARY",
+        }
+    }
+
+    /// Parses a reason from its string representation.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "KEY_COMPROMISE" => Some(Self::KeyCompromise),
+            "POLICY_VIOLATION" => Some(Self::PolicyViolation),
+            "MISBEHAVIOR" => Some(Self::Misbehavior),
+            "VOLUNTARY" => Some(Self::Voluntary),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RevocationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A lease revocation event.
+///
+/// Represents immediate invalidation of a gate lease before its natural
+/// expiration. Critical for incident response when a key is compromised
+/// or an executor misbehaves.
+///
+/// # Fields
+///
+/// - `lease_id`: ID of the lease being revoked
+/// - `revoked_by`: Actor who revoked the lease (must be issuer or authority)
+/// - `revoked_at`: HTF tick at which the revocation takes effect
+/// - `reason`: Reason for revocation
+/// - `issuer_signature`: Ed25519 signature with `LEASE_REVOKED:` domain prefix
+/// - `time_envelope_ref`: HTF time envelope reference for temporal authority
+///
+/// # Security
+///
+/// Lease revocations must be signed by an authorized party (the original
+/// issuer or a higher authority). The `LEASE_REVOKED:` domain prefix ensures
+/// that a revocation signature cannot be replayed as any other event type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseRevoked {
+    /// ID of the lease being revoked.
+    pub lease_id: String,
+
+    /// Actor who revoked the lease (must be issuer or authority).
+    pub revoked_by: String,
+
+    /// HTF tick at which the revocation takes effect.
+    pub revoked_at: u64,
+
+    /// Reason for revocation.
+    pub reason: RevocationReason,
+
+    /// Ed25519 signature over canonical bytes with `LEASE_REVOKED:` prefix.
+    #[serde(with = "serde_bytes")]
+    pub issuer_signature: [u8; 64],
+
+    /// HTF time envelope reference for temporal authority.
+    pub time_envelope_ref: String,
+}
+
+impl LeaseRevoked {
+    /// Returns the canonical bytes for signing/verification.
+    ///
+    /// The canonical representation includes all fields except the signature,
+    /// encoded in a deterministic order.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let capacity = self.lease_id.len()
+            + 1
+            + self.revoked_by.len()
+            + 1
+            + 8
+            + self.reason.as_str().len()
+            + 1
+            + self.time_envelope_ref.len()
+            + 1;
+
+        let mut bytes = Vec::with_capacity(capacity);
+
+        // 1. lease_id
+        bytes.extend_from_slice(self.lease_id.as_bytes());
+        bytes.push(0); // null separator
+
+        // 2. revoked_by
+        bytes.extend_from_slice(self.revoked_by.as_bytes());
+        bytes.push(0);
+
+        // 3. revoked_at (big-endian for consistent ordering)
+        bytes.extend_from_slice(&self.revoked_at.to_be_bytes());
+
+        // 4. reason
+        bytes.extend_from_slice(self.reason.as_str().as_bytes());
+        bytes.push(0);
+
+        // 5. time_envelope_ref
+        bytes.extend_from_slice(self.time_envelope_ref.as_bytes());
+
+        bytes
+    }
+
+    /// Validates the revocation signature using domain separation.
+    ///
+    /// # Arguments
+    ///
+    /// * `verifying_key` - The public key of the expected revoker
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the signature is valid, `Err(LeaseError::InvalidSignature)`
+    /// otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError::InvalidSignature`] if the signature verification
+    /// fails.
+    pub fn validate_signature(&self, verifying_key: &VerifyingKey) -> Result<(), LeaseError> {
+        let signature = Signature::from_bytes(&self.issuer_signature);
+        let canonical = self.canonical_bytes();
+
+        verify_with_domain(
+            verifying_key,
+            super::domain_separator::LEASE_REVOKED_PREFIX,
+            &canonical,
+            &signature,
+        )
+        .map_err(|e| LeaseError::InvalidSignature(e.to_string()))
+    }
+}
+
+/// Builder for constructing [`LeaseRevoked`] instances.
+#[derive(Debug, Default)]
+pub struct LeaseRevokedBuilder {
+    lease_id: String,
+    revoked_by: Option<String>,
+    revoked_at: Option<u64>,
+    reason: Option<RevocationReason>,
+    time_envelope_ref: Option<String>,
+}
+
+impl LeaseRevokedBuilder {
+    /// Creates a new builder with the required lease ID.
+    #[must_use]
+    pub fn new(lease_id: impl Into<String>) -> Self {
+        Self {
+            lease_id: lease_id.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Sets the revoking actor ID.
+    #[must_use]
+    pub fn revoked_by(mut self, actor_id: impl Into<String>) -> Self {
+        self.revoked_by = Some(actor_id.into());
+        self
+    }
+
+    /// Sets the revocation tick.
+    #[must_use]
+    pub const fn revoked_at(mut self, tick: u64) -> Self {
+        self.revoked_at = Some(tick);
+        self
+    }
+
+    /// Sets the revocation reason.
+    #[must_use]
+    pub const fn reason(mut self, reason: RevocationReason) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    /// Sets the time envelope reference.
+    #[must_use]
+    pub fn time_envelope_ref(mut self, envelope_ref: impl Into<String>) -> Self {
+        self.time_envelope_ref = Some(envelope_ref.into());
+        self
+    }
+
+    /// Builds the revocation and signs it with the provided signer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if required fields are missing.
+    #[must_use]
+    pub fn build_and_sign(self, signer: &crate::crypto::Signer) -> LeaseRevoked {
+        self.try_build_and_sign(signer)
+            .expect("missing required field")
+    }
+
+    /// Attempts to build and sign the revocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError::MissingField`] if any required field is not set.
+    pub fn try_build_and_sign(
+        self,
+        signer: &crate::crypto::Signer,
+    ) -> Result<LeaseRevoked, LeaseError> {
+        let revoked_by = self
+            .revoked_by
+            .ok_or(LeaseError::MissingField("revoked_by"))?;
+        let revoked_at = self
+            .revoked_at
+            .ok_or(LeaseError::MissingField("revoked_at"))?;
+        let reason = self.reason.ok_or(LeaseError::MissingField("reason"))?;
+        let time_envelope_ref = self
+            .time_envelope_ref
+            .ok_or(LeaseError::MissingField("time_envelope_ref"))?;
+
+        // Create revocation with placeholder signature
+        let mut revoked = LeaseRevoked {
+            lease_id: self.lease_id,
+            revoked_by,
+            revoked_at,
+            reason,
+            issuer_signature: [0u8; 64],
+            time_envelope_ref,
+        };
+
+        // Sign the canonical bytes
+        let canonical = revoked.canonical_bytes();
+        let signature = sign_with_domain(
+            signer,
+            super::domain_separator::LEASE_REVOKED_PREFIX,
+            &canonical,
+        );
+        revoked.issuer_signature = signature.to_bytes();
+
+        Ok(revoked)
+    }
+}
+
+/// Proto-generated `LeaseRevoked` message for wire format.
+#[derive(Clone, PartialEq, Eq, Message)]
+#[allow(missing_docs)]
+pub struct LeaseRevokedProto {
+    #[prost(string, tag = "1")]
+    pub lease_id: String,
+
+    #[prost(string, tag = "2")]
+    pub revoked_by: String,
+
+    #[prost(uint64, tag = "3")]
+    pub revoked_at: u64,
+
+    #[prost(string, tag = "4")]
+    pub reason: String,
+
+    #[prost(bytes = "vec", tag = "5")]
+    pub issuer_signature: Vec<u8>,
+
+    #[prost(string, tag = "6")]
+    pub time_envelope_ref: String,
+}
+
+impl TryFrom<LeaseRevokedProto> for LeaseRevoked {
+    type Error = LeaseError;
+
+    fn try_from(proto: LeaseRevokedProto) -> Result<Self, Self::Error> {
+        let issuer_signature: [u8; 64] = proto.issuer_signature.try_into().map_err(|_| {
+            LeaseError::InvalidData("issuer_signature must be 64 bytes".to_string())
+        })?;
+
+        let reason = RevocationReason::parse(&proto.reason).ok_or_else(|| {
+            LeaseError::InvalidData(format!("unknown revocation reason: {}", proto.reason))
+        })?;
+
+        Ok(Self {
+            lease_id: proto.lease_id,
+            revoked_by: proto.revoked_by,
+            revoked_at: proto.revoked_at,
+            reason,
+            issuer_signature,
+            time_envelope_ref: proto.time_envelope_ref,
+        })
+    }
+}
+
+impl From<LeaseRevoked> for LeaseRevokedProto {
+    fn from(revoked: LeaseRevoked) -> Self {
+        Self {
+            lease_id: revoked.lease_id,
+            revoked_by: revoked.revoked_by,
+            revoked_at: revoked.revoked_at,
+            reason: revoked.reason.as_str().to_string(),
+            issuer_signature: revoked.issuer_signature.to_vec(),
+            time_envelope_ref: revoked.time_envelope_ref,
+        }
+    }
+}
+
+// =============================================================================
+// Revocation Checking
+// =============================================================================
+
+/// Checks if a lease has been revoked at or before a given HTF tick.
+///
+/// This function searches through a slice of revocations to find one that
+/// matches the given lease ID and has a `revoked_at` tick less than or equal
+/// to the specified tick.
+///
+/// # Arguments
+///
+/// * `lease_id` - The ID of the lease to check
+/// * `revocations` - A slice of lease revocations to search
+/// * `at_tick` - The HTF tick at which to check the revocation status
+///
+/// # Returns
+///
+/// `Some(&LeaseRevoked)` if the lease was revoked at or before `at_tick`,
+/// `None` otherwise.
+///
+/// # Example
+///
+/// ```rust
+/// use apm2_core::crypto::Signer;
+/// use apm2_core::fac::{
+///     LeaseRevoked, LeaseRevokedBuilder, RevocationReason, is_lease_revoked,
+/// };
+///
+/// let signer = Signer::generate();
+///
+/// let revocation = LeaseRevokedBuilder::new("lease-001")
+///     .revoked_by("authority-001")
+///     .revoked_at(100)
+///     .reason(RevocationReason::KeyCompromise)
+///     .time_envelope_ref("htf:tick:100")
+///     .build_and_sign(&signer);
+///
+/// let revocations = vec![revocation];
+///
+/// // Lease is revoked at tick 100
+/// assert!(is_lease_revoked("lease-001", &revocations, 100).is_some());
+///
+/// // Lease is revoked at tick 200 (revocation was at 100)
+/// assert!(is_lease_revoked("lease-001", &revocations, 200).is_some());
+///
+/// // Lease is NOT revoked at tick 50 (before revocation)
+/// assert!(is_lease_revoked("lease-001", &revocations, 50).is_none());
+///
+/// // Different lease ID is not revoked
+/// assert!(is_lease_revoked("lease-002", &revocations, 100).is_none());
+/// ```
+#[must_use]
+pub fn is_lease_revoked<'a>(
+    lease_id: &str,
+    revocations: &'a [LeaseRevoked],
+    at_tick: u64,
+) -> Option<&'a LeaseRevoked> {
+    revocations
+        .iter()
+        .find(|r| r.lease_id == lease_id && r.revoked_at <= at_tick)
+}
+
+// =============================================================================
 // Gate Lease Builder
 // =============================================================================
 
@@ -1267,5 +1651,333 @@ pub mod tests {
             "project_backup"
         ));
         assert!(!GateLeaseScope::is_namespace_covered("project", "other"));
+    }
+
+    // =========================================================================
+    // Revocation Tests
+    // =========================================================================
+
+    fn create_test_revocation(signer: &Signer, lease_id: &str, tick: u64) -> LeaseRevoked {
+        LeaseRevokedBuilder::new(lease_id)
+            .revoked_by("authority-001")
+            .revoked_at(tick)
+            .reason(RevocationReason::KeyCompromise)
+            .time_envelope_ref(format!("htf:tick:{tick}"))
+            .build_and_sign(signer)
+    }
+
+    #[test]
+    fn revoked_build_and_sign() {
+        let signer = Signer::generate();
+        let revocation = create_test_revocation(&signer, "lease-001", 100);
+
+        assert_eq!(revocation.lease_id, "lease-001");
+        assert_eq!(revocation.revoked_by, "authority-001");
+        assert_eq!(revocation.revoked_at, 100);
+        assert_eq!(revocation.reason, RevocationReason::KeyCompromise);
+        assert_eq!(revocation.time_envelope_ref, "htf:tick:100");
+    }
+
+    #[test]
+    fn revoked_signature_validation() {
+        let signer = Signer::generate();
+        let revocation = create_test_revocation(&signer, "lease-001", 100);
+
+        // Valid signature
+        assert!(
+            revocation
+                .validate_signature(&signer.verifying_key())
+                .is_ok()
+        );
+
+        // Wrong key should fail
+        let other_signer = Signer::generate();
+        assert!(
+            revocation
+                .validate_signature(&other_signer.verifying_key())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn revoked_signature_binds_to_content() {
+        let signer = Signer::generate();
+        let mut revocation = create_test_revocation(&signer, "lease-001", 100);
+
+        // Modify content after signing
+        revocation.lease_id = "lease-002".to_string();
+
+        // Signature should now be invalid
+        assert!(
+            revocation
+                .validate_signature(&signer.verifying_key())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn revoked_uses_domain_separator() {
+        // Verify that revocation uses LEASE_REVOKED: domain separator
+        // by ensuring a signature created with a different prefix fails
+        let signer = Signer::generate();
+        let revocation = create_test_revocation(&signer, "lease-001", 100);
+
+        // Create a signature with the wrong domain prefix
+        let canonical = revocation.canonical_bytes();
+        let wrong_signature = super::super::domain_separator::sign_with_domain(
+            &signer,
+            super::super::domain_separator::GATE_LEASE_ISSUED_PREFIX,
+            &canonical,
+        );
+
+        // Verification should fail because domains don't match
+        let result = super::super::domain_separator::verify_with_domain(
+            &signer.verifying_key(),
+            super::super::domain_separator::LEASE_REVOKED_PREFIX,
+            &canonical,
+            &wrong_signature,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn revoked_canonical_bytes_deterministic() {
+        let signer = Signer::generate();
+        let rev1 = create_test_revocation(&signer, "lease-001", 100);
+        let rev2 = create_test_revocation(&signer, "lease-001", 100);
+
+        // Same content should produce same canonical bytes
+        assert_eq!(rev1.canonical_bytes(), rev2.canonical_bytes());
+    }
+
+    #[test]
+    fn revoked_is_lease_revoked_finds_match() {
+        let signer = Signer::generate();
+        let rev1 = create_test_revocation(&signer, "lease-001", 100);
+        let rev2 = create_test_revocation(&signer, "lease-002", 200);
+        let revocations = vec![rev1, rev2];
+
+        // Lease revoked at tick 100, checking at tick 100
+        let result = is_lease_revoked("lease-001", &revocations, 100);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().lease_id, "lease-001");
+
+        // Lease revoked at tick 100, checking at tick 200
+        let result = is_lease_revoked("lease-001", &revocations, 200);
+        assert!(result.is_some());
+
+        // Lease revoked at tick 200, checking at tick 200
+        let result = is_lease_revoked("lease-002", &revocations, 200);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().lease_id, "lease-002");
+    }
+
+    #[test]
+    fn revoked_is_lease_revoked_before_revocation_tick() {
+        let signer = Signer::generate();
+        let revocation = create_test_revocation(&signer, "lease-001", 100);
+        let revocations = vec![revocation];
+
+        // Checking at tick 50 (before revocation at 100)
+        let result = is_lease_revoked("lease-001", &revocations, 50);
+        assert!(result.is_none());
+
+        // Checking at tick 99 (just before revocation)
+        let result = is_lease_revoked("lease-001", &revocations, 99);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn revoked_is_lease_revoked_different_lease_id() {
+        let signer = Signer::generate();
+        let revocation = create_test_revocation(&signer, "lease-001", 100);
+        let revocations = vec![revocation];
+
+        // Checking different lease ID
+        let result = is_lease_revoked("lease-002", &revocations, 100);
+        assert!(result.is_none());
+
+        let result = is_lease_revoked("lease-002", &revocations, 200);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn revoked_is_lease_revoked_empty_list() {
+        let revocations: Vec<LeaseRevoked> = vec![];
+
+        let result = is_lease_revoked("lease-001", &revocations, 100);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn revoked_proto_roundtrip() {
+        let signer = Signer::generate();
+        let original = create_test_revocation(&signer, "lease-001", 100);
+
+        // Convert to proto
+        let proto: LeaseRevokedProto = original.clone().into();
+
+        // Encode and decode
+        let encoded = proto.encode_to_vec();
+        let decoded_proto = LeaseRevokedProto::decode(encoded.as_slice()).unwrap();
+
+        // Convert back to domain type
+        let recovered = LeaseRevoked::try_from(decoded_proto).unwrap();
+
+        // Fields should match
+        assert_eq!(original.lease_id, recovered.lease_id);
+        assert_eq!(original.revoked_by, recovered.revoked_by);
+        assert_eq!(original.revoked_at, recovered.revoked_at);
+        assert_eq!(original.reason, recovered.reason);
+        assert_eq!(original.issuer_signature, recovered.issuer_signature);
+        assert_eq!(original.time_envelope_ref, recovered.time_envelope_ref);
+
+        // Signature should still be valid
+        assert!(
+            recovered
+                .validate_signature(&signer.verifying_key())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn revoked_all_reasons_roundtrip() {
+        let signer = Signer::generate();
+
+        let reasons = [
+            RevocationReason::KeyCompromise,
+            RevocationReason::PolicyViolation,
+            RevocationReason::Misbehavior,
+            RevocationReason::Voluntary,
+        ];
+
+        for reason in reasons {
+            let revocation = LeaseRevokedBuilder::new("lease-001")
+                .revoked_by("authority-001")
+                .revoked_at(100)
+                .reason(reason)
+                .time_envelope_ref("htf:tick:100")
+                .build_and_sign(&signer);
+
+            // Proto roundtrip
+            let proto: LeaseRevokedProto = revocation.clone().into();
+            let recovered = LeaseRevoked::try_from(proto).unwrap();
+
+            assert_eq!(recovered.reason, reason);
+            assert!(
+                recovered
+                    .validate_signature(&signer.verifying_key())
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn revoked_reason_string_conversion() {
+        assert_eq!(RevocationReason::KeyCompromise.as_str(), "KEY_COMPROMISE");
+        assert_eq!(
+            RevocationReason::PolicyViolation.as_str(),
+            "POLICY_VIOLATION"
+        );
+        assert_eq!(RevocationReason::Misbehavior.as_str(), "MISBEHAVIOR");
+        assert_eq!(RevocationReason::Voluntary.as_str(), "VOLUNTARY");
+
+        assert_eq!(
+            RevocationReason::parse("KEY_COMPROMISE"),
+            Some(RevocationReason::KeyCompromise)
+        );
+        assert_eq!(
+            RevocationReason::parse("POLICY_VIOLATION"),
+            Some(RevocationReason::PolicyViolation)
+        );
+        assert_eq!(
+            RevocationReason::parse("MISBEHAVIOR"),
+            Some(RevocationReason::Misbehavior)
+        );
+        assert_eq!(
+            RevocationReason::parse("VOLUNTARY"),
+            Some(RevocationReason::Voluntary)
+        );
+        assert_eq!(RevocationReason::parse("UNKNOWN"), None);
+    }
+
+    #[test]
+    fn revoked_missing_field_error() {
+        let signer = Signer::generate();
+
+        // Missing revoked_by
+        let result = LeaseRevokedBuilder::new("lease-001")
+            .revoked_at(100)
+            .reason(RevocationReason::KeyCompromise)
+            .time_envelope_ref("htf:tick:100")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(LeaseError::MissingField("revoked_by"))
+        ));
+
+        // Missing revoked_at
+        let result = LeaseRevokedBuilder::new("lease-001")
+            .revoked_by("authority-001")
+            .reason(RevocationReason::KeyCompromise)
+            .time_envelope_ref("htf:tick:100")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(LeaseError::MissingField("revoked_at"))
+        ));
+
+        // Missing reason
+        let result = LeaseRevokedBuilder::new("lease-001")
+            .revoked_by("authority-001")
+            .revoked_at(100)
+            .time_envelope_ref("htf:tick:100")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(result, Err(LeaseError::MissingField("reason"))));
+
+        // Missing time_envelope_ref
+        let result = LeaseRevokedBuilder::new("lease-001")
+            .revoked_by("authority-001")
+            .revoked_at(100)
+            .reason(RevocationReason::KeyCompromise)
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(LeaseError::MissingField("time_envelope_ref"))
+        ));
+    }
+
+    #[test]
+    fn revoked_invalid_proto_signature_length() {
+        let proto = LeaseRevokedProto {
+            lease_id: "lease-001".to_string(),
+            revoked_by: "authority-001".to_string(),
+            revoked_at: 100,
+            reason: "KEY_COMPROMISE".to_string(),
+            issuer_signature: vec![0u8; 32], // Wrong length - should be 64
+            time_envelope_ref: "htf:tick:100".to_string(),
+        };
+
+        let result = LeaseRevoked::try_from(proto);
+        assert!(matches!(result, Err(LeaseError::InvalidData(_))));
+    }
+
+    #[test]
+    fn revoked_invalid_proto_reason() {
+        let proto = LeaseRevokedProto {
+            lease_id: "lease-001".to_string(),
+            revoked_by: "authority-001".to_string(),
+            revoked_at: 100,
+            reason: "INVALID_REASON".to_string(),
+            issuer_signature: vec![0u8; 64],
+            time_envelope_ref: "htf:tick:100".to_string(),
+        };
+
+        let result = LeaseRevoked::try_from(proto);
+        assert!(matches!(result, Err(LeaseError::InvalidData(_))));
     }
 }

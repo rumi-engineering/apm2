@@ -356,7 +356,7 @@ pub struct ToolExecuted {
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LeaseEvent {
-    #[prost(oneof = "lease_event::Event", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(oneof = "lease_event::Event", tags = "1, 2, 3, 4, 5, 6, 7")]
     pub event: ::core::option::Option<lease_event::Event>,
 }
 /// Nested message and enum types in `LeaseEvent`.
@@ -376,6 +376,8 @@ pub mod lease_event {
         Conflict(super::LeaseConflict),
         #[prost(message, tag = "6")]
         GateLeaseIssued(super::GateLeaseIssued),
+        #[prost(message, tag = "7")]
+        LeaseRevoked(super::LeaseRevoked),
     }
 }
 /// GateLease issued for Forge Admission Cycle execution.
@@ -490,6 +492,30 @@ pub struct LeaseConflict {
     /// CANONICAL_ROOT, ADJUDICATION_REQUIRED
     #[prost(string, tag = "3")]
     pub resolution: ::prost::alloc::string::String,
+}
+/// Immediate revocation of a lease before natural expiration.
+/// Critical for incident response when a key is compromised or executor misbehaves.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LeaseRevoked {
+    /// ID of the lease being revoked
+    #[prost(string, tag = "1")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Actor who revoked the lease (must be issuer or authority)
+    #[prost(string, tag = "2")]
+    pub revoked_by: ::prost::alloc::string::String,
+    /// HTF tick at which the revocation takes effect
+    #[prost(uint64, tag = "3")]
+    pub revoked_at: u64,
+    /// Reason for revocation: KEY_COMPROMISE, POLICY_VIOLATION, MISBEHAVIOR, VOLUNTARY
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with LEASE_REVOKED: prefix
+    #[prost(bytes = "vec", tag = "5")]
+    pub issuer_signature: ::prost::alloc::vec::Vec<u8>,
+    /// HTF time envelope reference for temporal authority
+    #[prost(string, tag = "6")]
+    pub time_envelope_ref: ::prost::alloc::string::String,
 }
 /// ============================================================
 /// POLICY EVENTS

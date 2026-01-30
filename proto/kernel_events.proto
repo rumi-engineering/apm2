@@ -224,6 +224,7 @@ message LeaseEvent {
     LeaseExpired expired = 4;
     LeaseConflict conflict = 5;
     GateLeaseIssued gate_lease_issued = 6;
+    LeaseRevoked lease_revoked = 7;
   }
 }
 
@@ -297,6 +298,23 @@ message LeaseConflict {
   string work_id = 1;
   repeated string conflicting_lease_ids = 2;
   string resolution = 3;  // CANONICAL_ROOT, ADJUDICATION_REQUIRED
+}
+
+// Immediate revocation of a lease before natural expiration.
+// Critical for incident response when a key is compromised or executor misbehaves.
+message LeaseRevoked {
+  // ID of the lease being revoked
+  string lease_id = 1;
+  // Actor who revoked the lease (must be issuer or authority)
+  string revoked_by = 2;
+  // HTF tick at which the revocation takes effect
+  uint64 revoked_at = 3;
+  // Reason for revocation: KEY_COMPROMISE, POLICY_VIOLATION, MISBEHAVIOR, VOLUNTARY
+  string reason = 4;
+  // Ed25519 signature over canonical bytes with LEASE_REVOKED: prefix
+  bytes issuer_signature = 5;
+  // HTF time envelope reference for temporal authority
+  string time_envelope_ref = 6;
 }
 
 // ============================================================
