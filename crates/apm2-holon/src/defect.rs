@@ -201,6 +201,10 @@ pub enum SignalType {
     /// A required capability is unavailable.
     #[serde(rename = "CAPABILITY_UNAVAILABLE")]
     CapabilityUnavailable,
+
+    /// Projection divergence detected between ledger and external trunk.
+    #[serde(rename = "PROJECTION_DIVERGENCE")]
+    ProjectionDivergence,
 }
 
 impl SignalType {
@@ -215,6 +219,7 @@ impl SignalType {
             Self::ExportDrift => "EXPORT_DRIFT",
             Self::AatFail => "AAT_FAIL",
             Self::CapabilityUnavailable => "CAPABILITY_UNAVAILABLE",
+            Self::ProjectionDivergence => "PROJECTION_DIVERGENCE",
         }
     }
 }

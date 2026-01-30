@@ -685,3 +685,97 @@ message GateReceipt {
   // Ed25519 signature over canonical bytes with GATE_RECEIPT: domain (64 bytes)
   bytes receipt_signature = 11;
 }
+
+// ============================================================
+// INTERVENTION EVENTS (FAC Divergence Watchdog)
+// ============================================================
+//
+// Intervention events implement the freeze/unfreeze mechanism for the
+// Divergence Watchdog (TCK-00213). When external modifications to the
+// trunk are detected (divergence from MergeReceipt), the system emits
+// an InterventionFreeze to halt all new admissions until adjudication.
+//
+// Key security properties:
+// - Divergence detection triggers immediate freeze
+// - Frozen repos reject all new admissions with REPO_FROZEN error
+// - Unfreeze requires adjudication (cannot be bypassed)
+// - All freeze/unfreeze events are signed for non-repudiation
+
+// Scope of an intervention freeze.
+// Determines what is frozen by the intervention.
+enum InterventionScope {
+  // Unspecified scope (invalid).
+  INTERVENTION_SCOPE_UNSPECIFIED = 0;
+  // Freeze applies to a specific repository.
+  INTERVENTION_SCOPE_REPOSITORY = 1;
+  // Freeze applies to a specific work item.
+  INTERVENTION_SCOPE_WORK = 2;
+  // Freeze applies to all repositories in a namespace.
+  INTERVENTION_SCOPE_NAMESPACE = 3;
+}
+
+// Resolution type for intervention unfreeze.
+// Indicates how the freeze was resolved.
+enum InterventionResolutionType {
+  // Unspecified resolution (invalid).
+  INTERVENTION_RESOLUTION_UNSPECIFIED = 0;
+  // Resolved through adjudication process.
+  INTERVENTION_RESOLUTION_ADJUDICATION = 1;
+  // Resolved by manual operator intervention.
+  INTERVENTION_RESOLUTION_MANUAL = 2;
+  // Resolved by rollback to last known good state.
+  INTERVENTION_RESOLUTION_ROLLBACK = 3;
+  // Resolved by accepting the divergent state as new baseline.
+  INTERVENTION_RESOLUTION_ACCEPT_DIVERGENCE = 4;
+}
+
+// Emitted when divergence is detected between the ledger's MergeReceipt
+// and the external trunk HEAD. This freezes the specified scope to
+// prevent further admissions until adjudication.
+//
+// Security: Divergence detection is critical for maintaining ledger integrity.
+// Any external modification of the trunk triggers immediate freeze.
+message InterventionFreeze {
+  // Unique identifier for this freeze event.
+  string freeze_id = 1;
+  // Scope of the freeze (repository, work, namespace).
+  InterventionScope scope = 2;
+  // Value identifying the frozen scope (repo path, work_id, namespace).
+  string scope_value = 3;
+  // ID of the DefectRecord that triggered this freeze.
+  string trigger_defect_id = 4;
+  // Timestamp when the freeze was applied (Unix nanoseconds).
+  uint64 frozen_at = 5;
+  // Expected trunk HEAD from the latest MergeReceipt.
+  bytes expected_trunk_head = 6;
+  // Actual trunk HEAD observed externally.
+  bytes actual_trunk_head = 7;
+  // Actor who detected the divergence and issued the freeze.
+  string gate_actor_id = 8;
+  // Ed25519 signature over canonical bytes with INTERVENTION_FREEZE: domain (64 bytes).
+  bytes gate_signature = 9;
+  // Reference to the time envelope for temporal authority.
+  string time_envelope_ref = 10;
+}
+
+// Emitted when a frozen scope is unfrozen after adjudication.
+// The unfreeze must reference a valid adjudication decision.
+//
+// Security: Unfreeze cannot bypass adjudication. All unfreezes must
+// be traceable to a resolution decision.
+message InterventionUnfreeze {
+  // ID of the InterventionFreeze being lifted.
+  string freeze_id = 1;
+  // How the freeze was resolved.
+  InterventionResolutionType resolution_type = 2;
+  // ID of the adjudication that resolved the freeze.
+  string adjudication_id = 3;
+  // Timestamp when the unfreeze was applied (Unix nanoseconds).
+  uint64 unfrozen_at = 4;
+  // Actor who issued the unfreeze (must be authorized).
+  string gate_actor_id = 5;
+  // Ed25519 signature over canonical bytes with INTERVENTION_UNFREEZE: domain (64 bytes).
+  bytes gate_signature = 6;
+  // Reference to the time envelope for temporal authority.
+  string time_envelope_ref = 7;
+}

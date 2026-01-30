@@ -9,6 +9,7 @@
 //!   - `-D clippy::match_same_arms` (redundant match arm bodies)
 //!   - `-W clippy::missing_const_for_fn` (const promotion opportunities)
 //! - Runs `cargo test` for xtask crate
+//! - Runs `cargo semver-checks` (warns if not installed)
 //! - Runs documentation example linting with `cargo xtask lint --include-docs`
 //! - Stages all changes and creates a commit
 
@@ -25,7 +26,8 @@ use crate::util::{current_branch, validate_ticket_branch};
 /// 2. Runs `cargo fmt --check`
 /// 3. Runs `cargo clippy` with enhanced lints (see module docs)
 /// 4. Runs `cargo test -p xtask`
-/// 5. Stages all changes and creates a commit
+/// 5. Runs `cargo semver-checks` (warns if not installed)
+/// 6. Stages all changes and creates a commit
 ///
 /// # Arguments
 ///
@@ -115,14 +117,54 @@ fn run_pre_commit_checks(sh: &Shell) -> Result<()> {
     println!("  Tip: Use `..` in struct patterns to ignore new fields (e.g., `Foo {{ x, .. }}`).");
 
     // Run cargo test for xtask
-    println!("\n[3/4] Running cargo test -p xtask...");
-    cmd!(sh, "cargo test -p xtask")
+    // Note: --test-threads=1 is required because some tests manipulate environment
+    // variables, which can cause race conditions when run in parallel.
+    println!("\n[3/5] Running cargo test -p xtask...");
+    cmd!(sh, "cargo test -p xtask -- --test-threads=1")
         .run()
         .context("cargo test -p xtask failed. Fix the tests before committing.")?;
     println!("  Tests passed.");
 
+    // Run cargo semver-checks (optional - warn if not installed)
+    println!("\n[4/5] Running cargo semver-checks...");
+    let semver_installed = cmd!(sh, "cargo semver-checks --version")
+        .ignore_status()
+        .read()
+        .is_ok_and(|output| !output.trim().is_empty());
+
+    if semver_installed {
+        let semver_result = cmd!(sh, "cargo semver-checks check-release")
+            .ignore_status()
+            .output();
+
+        match semver_result {
+            Ok(output) if output.status.success() => {
+                println!("  Semver check passed.");
+            },
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Treat "not found in registry" as a warning, not an error.
+                // This happens for crates that haven't been published to crates.io yet,
+                // meaning there's no baseline to compare against.
+                if stderr.contains("not found in registry") {
+                    println!("  Warning: Crate not published to crates.io, skipping semver check.");
+                } else {
+                    bail!("cargo semver-checks found breaking changes:\n{stdout}\n{stderr}");
+                }
+            },
+            Err(e) => {
+                println!("  Warning: Failed to run semver-checks: {e}");
+            },
+        }
+    } else {
+        println!(
+            "  Warning: cargo-semver-checks not installed. Install with: cargo install cargo-semver-checks"
+        );
+    }
+
     // Run documentation example linting (warnings only, does not block commit)
-    println!("\n[4/4] Running documentation example linting...");
+    println!("\n[5/5] Running documentation example linting...");
     run_doc_lint_check()?;
 
     println!("\nAll checks passed.");
@@ -195,14 +237,15 @@ mod tests {
 
     #[test]
     fn test_pre_commit_check_count() {
-        // Document that we run exactly 4 pre-commit checks:
+        // Document that we run exactly 5 pre-commit checks:
         // 1. cargo fmt --check
         // 2. cargo clippy --all-targets -- -D warnings -D clippy::doc_markdown -D
         //    clippy::match_same_arms -W clippy::missing_const_for_fn
         // 3. cargo test -p xtask
-        // 4. documentation example linting (warnings only)
-        const CHECK_COUNT: usize = 4;
-        assert_eq!(CHECK_COUNT, 4);
+        // 4. cargo semver-checks (warns if not installed)
+        // 5. documentation example linting (warnings only)
+        const CHECK_COUNT: usize = 5;
+        assert_eq!(CHECK_COUNT, 5);
     }
 
     #[test]
@@ -239,10 +282,15 @@ mod tests {
         let fmt_suggestion = "Run 'cargo fmt' to fix formatting.";
         let clippy_suggestion = "Fix them before committing.";
         let test_suggestion = "Fix the tests before committing.";
+        let semver_install = "Install with: cargo install cargo-semver-checks";
+        let semver_unpublished = "not found in registry";
 
         // Verify suggestions are non-empty and helpful
         assert!(fmt_suggestion.contains("cargo fmt"));
         assert!(clippy_suggestion.contains("Fix"));
         assert!(test_suggestion.contains("Fix"));
+        assert!(semver_install.contains("cargo install"));
+        // Unpublished crates should be warned about, not fail
+        assert!(semver_unpublished.contains("registry"));
     }
 }

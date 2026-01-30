@@ -30,10 +30,20 @@
 //! - [`ProjectionReceipt`]: Signed proof of projection
 //! - [`ProjectedStatus`]: Status values that can be projected
 //! - [`IdempotencyKey`]: Key for idempotent projection operations
+//! - [`DivergenceWatchdog`]: Monitors for ledger/trunk divergence (TCK-00213)
+//! - [`FreezeRegistry`]: Tracks active intervention freezes
+//!
+//! # Divergence Watchdog (TCK-00213)
+//!
+//! The divergence watchdog monitors for discrepancies between the ledger's
+//! `MergeReceipt` and the external trunk HEAD. When divergence is detected:
+//!
+//! 1. Emits `DefectRecord(PROJECTION_DIVERGENCE)`
+//! 2. Creates `InterventionFreeze` to halt admissions
+//! 3. Requires adjudication-based `InterventionUnfreeze` to resume
 //!
 //! # Future Work
 //!
-//! - Divergence watchdog (TCK-00213)
 //! - Tamper detection (TCK-00214)
 //!
 //! # Example
@@ -61,10 +71,16 @@
 //! assert!(receipt.validate_signature(&adapter.verifying_key()).is_ok());
 //! ```
 
+pub mod divergence_watchdog;
 pub mod github_sync;
 pub mod projection_receipt;
 
 // Re-export main types
+pub use divergence_watchdog::{
+    DivergenceError, DivergenceWatchdog, DivergenceWatchdogConfig, FreezeRegistry, FreezeScope,
+    InterventionFreeze, InterventionFreezeBuilder, InterventionUnfreeze,
+    InterventionUnfreezeBuilder, ResolutionType,
+};
 pub use github_sync::{
     GitHubAdapterConfig, GitHubProjectionAdapter, ProjectionAdapter, ProjectionError,
 };

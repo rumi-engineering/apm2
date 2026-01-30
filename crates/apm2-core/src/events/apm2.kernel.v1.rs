@@ -1049,3 +1049,167 @@ pub struct GateReceipt {
     #[prost(bytes = "vec", tag = "11")]
     pub receipt_signature: ::prost::alloc::vec::Vec<u8>,
 }
+/// Emitted when divergence is detected between the ledger's MergeReceipt
+/// and the external trunk HEAD. This freezes the specified scope to
+/// prevent further admissions until adjudication.
+///
+/// Security: Divergence detection is critical for maintaining ledger integrity.
+/// Any external modification of the trunk triggers immediate freeze.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InterventionFreeze {
+    /// Unique identifier for this freeze event.
+    #[prost(string, tag = "1")]
+    pub freeze_id: ::prost::alloc::string::String,
+    /// Scope of the freeze (repository, work, namespace).
+    #[prost(enumeration = "InterventionScope", tag = "2")]
+    pub scope: i32,
+    /// Value identifying the frozen scope (repo path, work_id, namespace).
+    #[prost(string, tag = "3")]
+    pub scope_value: ::prost::alloc::string::String,
+    /// ID of the DefectRecord that triggered this freeze.
+    #[prost(string, tag = "4")]
+    pub trigger_defect_id: ::prost::alloc::string::String,
+    /// Timestamp when the freeze was applied (Unix nanoseconds).
+    #[prost(uint64, tag = "5")]
+    pub frozen_at: u64,
+    /// Expected trunk HEAD from the latest MergeReceipt.
+    #[prost(bytes = "vec", tag = "6")]
+    pub expected_trunk_head: ::prost::alloc::vec::Vec<u8>,
+    /// Actual trunk HEAD observed externally.
+    #[prost(bytes = "vec", tag = "7")]
+    pub actual_trunk_head: ::prost::alloc::vec::Vec<u8>,
+    /// Actor who detected the divergence and issued the freeze.
+    #[prost(string, tag = "8")]
+    pub gate_actor_id: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with INTERVENTION_FREEZE: domain (64 bytes).
+    #[prost(bytes = "vec", tag = "9")]
+    pub gate_signature: ::prost::alloc::vec::Vec<u8>,
+    /// Reference to the time envelope for temporal authority.
+    #[prost(string, tag = "10")]
+    pub time_envelope_ref: ::prost::alloc::string::String,
+}
+/// Emitted when a frozen scope is unfrozen after adjudication.
+/// The unfreeze must reference a valid adjudication decision.
+///
+/// Security: Unfreeze cannot bypass adjudication. All unfreezes must
+/// be traceable to a resolution decision.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InterventionUnfreeze {
+    /// ID of the InterventionFreeze being lifted.
+    #[prost(string, tag = "1")]
+    pub freeze_id: ::prost::alloc::string::String,
+    /// How the freeze was resolved.
+    #[prost(enumeration = "InterventionResolutionType", tag = "2")]
+    pub resolution_type: i32,
+    /// ID of the adjudication that resolved the freeze.
+    #[prost(string, tag = "3")]
+    pub adjudication_id: ::prost::alloc::string::String,
+    /// Timestamp when the unfreeze was applied (Unix nanoseconds).
+    #[prost(uint64, tag = "4")]
+    pub unfrozen_at: u64,
+    /// Actor who issued the unfreeze (must be authorized).
+    #[prost(string, tag = "5")]
+    pub gate_actor_id: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with INTERVENTION_UNFREEZE: domain (64 bytes).
+    #[prost(bytes = "vec", tag = "6")]
+    pub gate_signature: ::prost::alloc::vec::Vec<u8>,
+    /// Reference to the time envelope for temporal authority.
+    #[prost(string, tag = "7")]
+    pub time_envelope_ref: ::prost::alloc::string::String,
+}
+/// Scope of an intervention freeze.
+/// Determines what is frozen by the intervention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum InterventionScope {
+    /// Unspecified scope (invalid).
+    Unspecified = 0,
+    /// Freeze applies to a specific repository.
+    Repository = 1,
+    /// Freeze applies to a specific work item.
+    Work = 2,
+    /// Freeze applies to all repositories in a namespace.
+    Namespace = 3,
+}
+impl InterventionScope {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "INTERVENTION_SCOPE_UNSPECIFIED",
+            Self::Repository => "INTERVENTION_SCOPE_REPOSITORY",
+            Self::Work => "INTERVENTION_SCOPE_WORK",
+            Self::Namespace => "INTERVENTION_SCOPE_NAMESPACE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "INTERVENTION_SCOPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "INTERVENTION_SCOPE_REPOSITORY" => Some(Self::Repository),
+            "INTERVENTION_SCOPE_WORK" => Some(Self::Work),
+            "INTERVENTION_SCOPE_NAMESPACE" => Some(Self::Namespace),
+            _ => None,
+        }
+    }
+}
+/// Resolution type for intervention unfreeze.
+/// Indicates how the freeze was resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum InterventionResolutionType {
+    /// Unspecified resolution (invalid).
+    InterventionResolutionUnspecified = 0,
+    /// Resolved through adjudication process.
+    InterventionResolutionAdjudication = 1,
+    /// Resolved by manual operator intervention.
+    InterventionResolutionManual = 2,
+    /// Resolved by rollback to last known good state.
+    InterventionResolutionRollback = 3,
+    /// Resolved by accepting the divergent state as new baseline.
+    InterventionResolutionAcceptDivergence = 4,
+}
+impl InterventionResolutionType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::InterventionResolutionUnspecified => {
+                "INTERVENTION_RESOLUTION_UNSPECIFIED"
+            }
+            Self::InterventionResolutionAdjudication => {
+                "INTERVENTION_RESOLUTION_ADJUDICATION"
+            }
+            Self::InterventionResolutionManual => "INTERVENTION_RESOLUTION_MANUAL",
+            Self::InterventionResolutionRollback => "INTERVENTION_RESOLUTION_ROLLBACK",
+            Self::InterventionResolutionAcceptDivergence => {
+                "INTERVENTION_RESOLUTION_ACCEPT_DIVERGENCE"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "INTERVENTION_RESOLUTION_UNSPECIFIED" => {
+                Some(Self::InterventionResolutionUnspecified)
+            }
+            "INTERVENTION_RESOLUTION_ADJUDICATION" => {
+                Some(Self::InterventionResolutionAdjudication)
+            }
+            "INTERVENTION_RESOLUTION_MANUAL" => Some(Self::InterventionResolutionManual),
+            "INTERVENTION_RESOLUTION_ROLLBACK" => {
+                Some(Self::InterventionResolutionRollback)
+            }
+            "INTERVENTION_RESOLUTION_ACCEPT_DIVERGENCE" => {
+                Some(Self::InterventionResolutionAcceptDivergence)
+            }
+            _ => None,
+        }
+    }
+}

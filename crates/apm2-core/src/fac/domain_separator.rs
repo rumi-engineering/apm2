@@ -104,6 +104,16 @@ pub const GATE_RECEIPT_PREFIX: &[u8] = b"GATE_RECEIPT:";
 /// Used when signing/verifying session quarantine events.
 pub const QUARANTINE_EVENT_PREFIX: &[u8] = b"QUARANTINE_EVENT:";
 
+/// Domain prefix for intervention freeze events.
+///
+/// Used when signing/verifying divergence-triggered freeze events.
+pub const INTERVENTION_FREEZE_PREFIX: &[u8] = b"INTERVENTION_FREEZE:";
+
+/// Domain prefix for intervention unfreeze events.
+///
+/// Used when signing/verifying adjudication-resolved unfreeze events.
+pub const INTERVENTION_UNFREEZE_PREFIX: &[u8] = b"INTERVENTION_UNFREEZE:";
+
 // =============================================================================
 // Domain-Separated Signing
 // =============================================================================
@@ -318,7 +328,7 @@ pub mod tests {
 
     #[test]
     fn test_all_domain_prefixes_defined() {
-        // Verify all 10 required domain prefixes are defined
+        // Verify all 12 required domain prefixes are defined
         let prefixes = [
             GATE_LEASE_ISSUED_PREFIX,
             LEASE_REVOKED_PREFIX,
@@ -330,6 +340,8 @@ pub mod tests {
             POLICY_RESOLVED_PREFIX,
             GATE_RECEIPT_PREFIX,
             QUARANTINE_EVENT_PREFIX,
+            INTERVENTION_FREEZE_PREFIX,
+            INTERVENTION_UNFREEZE_PREFIX,
         ];
 
         // All prefixes should be non-empty and end with ':'
