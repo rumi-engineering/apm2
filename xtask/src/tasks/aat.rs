@@ -42,8 +42,9 @@ use xshell::{Shell, cmd};
 const AI_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 
 use crate::aat::anti_gaming::analyze_diff;
+use crate::aat::determinism_guard::{DeterminismConfig, DeterminismGuard};
 use crate::aat::evidence::EvidenceBundleBuilder;
-use crate::aat::executor::HypothesisExecutor;
+use crate::aat::executor::{ExecutionConfig, HypothesisExecutor};
 use crate::aat::parser::parse_pr_description;
 use crate::aat::tool_config::{AatToolConfig, AiTool};
 use crate::aat::types::{Hypothesis, HypothesisResult, ParsedPRDescription, Verdict};
@@ -1020,10 +1021,46 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
         println!("    - {}: {} (PENDING)", h.id, h.prediction);
     }
 
-    // Step 7: Execute hypotheses
+    // Step 7: Execute hypotheses with determinism guard
     println!("\n[7/9] Executing hypothesis verification commands...");
+
+    // Initialize determinism guard for reproducible execution
+    let determinism_config = DeterminismConfig {
+        block_network: true,
+        enforce_random_seed: true,
+        capture_environment: true,
+    };
+    let determinism_guard = match DeterminismGuard::new(determinism_config, &sha) {
+        Ok(guard) => {
+            println!("  Determinism guard initialized");
+            if DeterminismGuard::network_blocking_available() {
+                println!("    Network blocking: enabled");
+            } else {
+                println!("    Network blocking: not available on this platform");
+            }
+            println!("    Random seed enforcement: enabled");
+            guard
+        },
+        Err(e) => {
+            // Non-fatal: continue without determinism guard
+            eprintln!("  Warning: Failed to initialize determinism guard: {e}");
+            eprintln!("    Continuing without determinism enforcement");
+            DeterminismGuard::new(
+                DeterminismConfig {
+                    block_network: false,
+                    enforce_random_seed: false,
+                    capture_environment: false,
+                },
+                &sha,
+            )?
+        },
+    };
+
+    // Create execution config from determinism guard
+    let exec_config = ExecutionConfig::from_guard(&determinism_guard);
+
     let mut hypotheses = hypotheses; // Make mutable for execution
-    match HypothesisExecutor::execute_all(&mut hypotheses) {
+    match HypothesisExecutor::execute_all_with_config(&mut hypotheses, &exec_config) {
         Ok(()) => {
             let passed = hypotheses
                 .iter()
@@ -1085,13 +1122,27 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
 
     // Step 9: Generate evidence bundle
     println!("\n[9/9] Generating evidence bundle...");
-    let bundle = EvidenceBundleBuilder::new(pr_info.number, &sha)
+    let mut builder = EvidenceBundleBuilder::new(pr_info.number, &sha)
         .set_pr_description_parse(&parsed_pr)
         .add_hypotheses(hypotheses)
         .set_anti_gaming_result(&anti_gaming_result)
         .set_input_variation_results(&input_variation_results)
-        .set_ux_audit(ux_audit_section)
-        .build();
+        .set_ux_audit(ux_audit_section);
+
+    // Add environment snapshot if available
+    if let Some(snapshot) = determinism_guard.environment_snapshot() {
+        builder = builder.set_environment_snapshot(snapshot.clone());
+        println!("  Environment snapshot: captured");
+        println!("    OS: {} ({})", snapshot.os_name, snapshot.arch);
+        println!("    Rust: {}", snapshot.rustc_version);
+    }
+
+    let bundle = builder.build();
+
+    // Log verdict hash for reproducibility verification
+    if let Some(ref hash) = bundle.verdict_hash {
+        println!("  Verdict hash: {}...", &hash.hash[..16]);
+    }
 
     let verdict = bundle.verdict;
     let verdict_reason = bundle.verdict_reason.clone();

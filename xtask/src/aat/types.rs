@@ -391,6 +391,22 @@ pub struct EvidenceBundle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ux_audit: Option<crate::aat::ux_verifier::UxAuditSection>,
 
+    /// Environment snapshot for reproducibility verification.
+    ///
+    /// Captures OS, Rust toolchain, Cargo version, and other environment
+    /// details needed to verify that re-runs are performed in equivalent
+    /// environments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::aat::determinism_guard::EnvironmentSnapshot>,
+
+    /// Verdict hash for re-run consistency verification.
+    ///
+    /// This hash is computed from deterministic parts of the verdict
+    /// (commit SHA, verdict, hypothesis results, anti-gaming results).
+    /// Re-runs on the same commit should produce the same hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict_hash: Option<crate::aat::determinism_guard::VerdictHash>,
+
     /// Final verdict.
     pub verdict: Verdict,
 
@@ -400,7 +416,10 @@ pub struct EvidenceBundle {
 
 impl EvidenceBundle {
     /// Current schema version.
-    pub const SCHEMA_VERSION: &'static str = "1.0.0";
+    ///
+    /// Bumped to 1.1.0 to reflect addition of environment snapshot
+    /// and verdict hash fields.
+    pub const SCHEMA_VERSION: &'static str = "1.1.0";
 }
 
 #[cfg(test)]
@@ -485,12 +504,14 @@ mod tests {
             }],
             anti_gaming: AntiGamingSection::default(),
             ux_audit: None,
+            environment: None,
+            verdict_hash: None,
             verdict: Verdict::Passed,
             verdict_reason: "All hypotheses passed".to_string(),
         };
 
         let json = serde_json::to_string_pretty(&bundle).unwrap();
-        assert!(json.contains("\"schema_version\": \"1.0.0\""));
+        assert!(json.contains("\"schema_version\": \"1.1.0\""));
         assert!(json.contains("\"pr_number\": 123"));
         assert!(json.contains("\"verdict\": \"PASSED\""));
 

@@ -6,6 +6,7 @@
 
 pub mod anti_gaming;
 pub mod cac_harness;
+pub mod determinism_guard;
 pub mod evidence;
 pub mod executor;
 pub mod parser;

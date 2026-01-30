@@ -4177,6 +4177,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "apm2-core",
+ "blake3",
  "chrono",
  "clap",
  "directories",

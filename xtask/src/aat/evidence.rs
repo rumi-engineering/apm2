@@ -10,6 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 
+use crate::aat::determinism_guard::{EnvironmentSnapshot, VerdictHash};
 use crate::aat::types::{
     AntiGamingResult, AntiGamingSection, AntiGamingVerdict, EvidenceBundle, GamingViolation,
     Hypothesis, HypothesisResult, InputVariation, ParsedPRDescription, PrDescriptionParse,
@@ -31,6 +32,7 @@ use crate::aat::variation::InputVariationResult;
 ///     .add_hypothesis(hypothesis1)
 ///     .add_hypothesis(hypothesis2)
 ///     .set_anti_gaming_result(&anti_gaming)
+///     .set_environment_snapshot(snapshot)
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
@@ -41,6 +43,7 @@ pub struct EvidenceBundleBuilder {
     hypotheses: Vec<Hypothesis>,
     anti_gaming: AntiGamingSection,
     ux_audit: Option<UxAuditSection>,
+    environment: Option<EnvironmentSnapshot>,
 }
 
 impl EvidenceBundleBuilder {
@@ -59,6 +62,7 @@ impl EvidenceBundleBuilder {
             hypotheses: Vec::new(),
             anti_gaming: AntiGamingSection::default(),
             ux_audit: None,
+            environment: None,
         }
     }
 
@@ -220,6 +224,17 @@ impl EvidenceBundleBuilder {
         self
     }
 
+    /// Set the environment snapshot for reproducibility verification.
+    ///
+    /// The snapshot captures OS, Rust toolchain, Cargo version, and other
+    /// environment details needed to verify that re-runs are performed in
+    /// equivalent environments.
+    #[must_use]
+    pub fn set_environment_snapshot(mut self, snapshot: EnvironmentSnapshot) -> Self {
+        self.environment = Some(snapshot);
+        self
+    }
+
     /// Compute the final verdict based on hypotheses and anti-gaming results.
     ///
     /// # Verdict logic:
@@ -314,12 +329,16 @@ impl EvidenceBundleBuilder {
 
     /// Build the final evidence bundle.
     ///
-    /// This computes the verdict based on the accumulated results
+    /// This computes the verdict based on the accumulated results,
+    /// generates a verdict hash for re-run consistency verification,
     /// and returns a complete `EvidenceBundle`.
     #[must_use]
     pub fn build(self) -> EvidenceBundle {
         let (verdict, verdict_reason) = self.compute_verdict();
         let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+        // Compute verdict hash for determinism verification
+        let verdict_hash = self.compute_verdict_hash(verdict);
 
         EvidenceBundle {
             schema_version: EvidenceBundle::SCHEMA_VERSION.to_string(),
@@ -330,6 +349,8 @@ impl EvidenceBundleBuilder {
             hypotheses: self.hypotheses,
             anti_gaming: self.anti_gaming,
             ux_audit: self.ux_audit,
+            environment: self.environment,
+            verdict_hash: Some(verdict_hash),
             verdict,
             verdict_reason,
         }
@@ -343,6 +364,9 @@ impl EvidenceBundleBuilder {
     pub fn build_with_timestamp(self, timestamp: impl Into<String>) -> EvidenceBundle {
         let (verdict, verdict_reason) = self.compute_verdict();
 
+        // Compute verdict hash for determinism verification
+        let verdict_hash = self.compute_verdict_hash(verdict);
+
         EvidenceBundle {
             schema_version: EvidenceBundle::SCHEMA_VERSION.to_string(),
             pr_number: self.pr_number,
@@ -352,9 +376,44 @@ impl EvidenceBundleBuilder {
             hypotheses: self.hypotheses,
             anti_gaming: self.anti_gaming,
             ux_audit: self.ux_audit,
+            environment: self.environment,
+            verdict_hash: Some(verdict_hash),
             verdict,
             verdict_reason,
         }
+    }
+
+    /// Compute the verdict hash for re-run consistency verification.
+    fn compute_verdict_hash(&self, verdict: Verdict) -> VerdictHash {
+        // Extract hypothesis results for hashing
+        let hypothesis_results: Vec<(String, String, Option<String>)> = self
+            .hypotheses
+            .iter()
+            .map(|h| {
+                let result_str = h.result.map(|r| match r {
+                    HypothesisResult::Passed => "PASSED".to_string(),
+                    HypothesisResult::Failed => "FAILED".to_string(),
+                });
+                (h.id.clone(), h.prediction.clone(), result_str)
+            })
+            .collect();
+
+        // Convert verdict to string
+        let verdict_str = match &verdict {
+            Verdict::Passed => "PASSED",
+            Verdict::Failed => "FAILED",
+            Verdict::NeedsAdjudication => "NEEDS_ADJUDICATION",
+        };
+
+        // Check if anti-gaming passed
+        let anti_gaming_passed = self.anti_gaming.anti_gaming_result == AntiGamingVerdict::Passed;
+
+        VerdictHash::compute(
+            &self.commit_sha,
+            verdict_str,
+            &hypothesis_results,
+            anti_gaming_passed,
+        )
     }
 }
 
@@ -680,7 +739,7 @@ mod tests {
         let json = bundle.to_json().unwrap();
 
         // Verify required fields are present
-        assert!(json.contains("\"schema_version\": \"1.0.0\""));
+        assert!(json.contains("\"schema_version\": \"1.1.0\""));
         assert!(json.contains("\"pr_number\": 123"));
         assert!(json.contains("\"commit_sha\": \"abc123def456\""));
         assert!(json.contains("\"timestamp\": \"2026-01-24T10:15:00Z\""));
@@ -756,7 +815,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         // Check schema version
-        assert_eq!(value["schema_version"], "1.0.0");
+        assert_eq!(value["schema_version"], "1.1.0");
 
         // Check pr_description_parse structure
         assert!(
@@ -891,5 +950,118 @@ mod tests {
 
         assert_eq!(bundle.verdict, Verdict::Failed);
         assert!(bundle.verdict_reason.contains("invariance"));
+    }
+
+    // =========================================================================
+    // Environment snapshot and verdict hash tests
+    // =========================================================================
+
+    #[test]
+    fn test_set_environment_snapshot() {
+        use std::collections::BTreeMap;
+
+        let snapshot = EnvironmentSnapshot {
+            os_name: "linux".to_string(),
+            os_version: "5.15.0".to_string(),
+            arch: "x86_64".to_string(),
+            rustc_version: "rustc 1.85.0".to_string(),
+            cargo_version: "cargo 1.85.0".to_string(),
+            git_commit_sha: "abc123".to_string(),
+            captured_at: "2026-01-30T10:00:00Z".to_string(),
+            tool_versions: BTreeMap::new(),
+        };
+
+        let bundle = EvidenceBundleBuilder::new(123, "abc123")
+            .add_hypothesis(make_passed_hypothesis("H-001"))
+            .set_environment_snapshot(snapshot)
+            .build_with_timestamp("2026-01-30T10:15:00Z");
+
+        assert!(bundle.environment.is_some());
+        let env = bundle.environment.unwrap();
+        assert_eq!(env.os_name, "linux");
+        assert_eq!(env.rustc_version, "rustc 1.85.0");
+    }
+
+    #[test]
+    fn test_verdict_hash_is_computed() {
+        let bundle = EvidenceBundleBuilder::new(123, "abc123")
+            .add_hypothesis(make_passed_hypothesis("H-001"))
+            .add_hypothesis(make_passed_hypothesis("H-002"))
+            .build_with_timestamp("2026-01-30T10:15:00Z");
+
+        assert!(bundle.verdict_hash.is_some());
+        let hash = bundle.verdict_hash.unwrap();
+        assert_eq!(hash.commit_sha, "abc123");
+        assert!(!hash.hash.is_empty());
+        assert_eq!(hash.hash.len(), 64); // BLAKE3 hex = 64 chars
+    }
+
+    #[test]
+    fn test_verdict_hash_is_deterministic() {
+        let bundle1 = EvidenceBundleBuilder::new(123, "abc123")
+            .add_hypothesis(make_passed_hypothesis("H-001"))
+            .build_with_timestamp("2026-01-30T10:15:00Z");
+
+        let bundle2 = EvidenceBundleBuilder::new(123, "abc123")
+            .add_hypothesis(make_passed_hypothesis("H-001"))
+            .build_with_timestamp("2026-01-30T11:00:00Z"); // Different timestamp
+
+        // Hashes should be the same despite different timestamps
+        assert_eq!(
+            bundle1.verdict_hash.as_ref().unwrap().hash,
+            bundle2.verdict_hash.as_ref().unwrap().hash,
+            "Verdict hashes should be deterministic across runs"
+        );
+    }
+
+    #[test]
+    fn test_verdict_hash_changes_with_different_results() {
+        let bundle1 = EvidenceBundleBuilder::new(123, "abc123")
+            .add_hypothesis(make_passed_hypothesis("H-001"))
+            .build_with_timestamp("2026-01-30T10:15:00Z");
+
+        let bundle2 = EvidenceBundleBuilder::new(123, "abc123")
+            .add_hypothesis(make_failed_hypothesis("H-001"))
+            .build_with_timestamp("2026-01-30T10:15:00Z");
+
+        // Hashes should be different when results differ
+        assert_ne!(
+            bundle1.verdict_hash.as_ref().unwrap().hash,
+            bundle2.verdict_hash.as_ref().unwrap().hash,
+            "Verdict hashes should differ when hypothesis results differ"
+        );
+    }
+
+    #[test]
+    fn test_environment_snapshot_in_json() {
+        use std::collections::BTreeMap;
+
+        let snapshot = EnvironmentSnapshot {
+            os_name: "linux".to_string(),
+            os_version: "5.15.0".to_string(),
+            arch: "x86_64".to_string(),
+            rustc_version: "rustc 1.85.0".to_string(),
+            cargo_version: "cargo 1.85.0".to_string(),
+            git_commit_sha: "abc123".to_string(),
+            captured_at: "2026-01-30T10:00:00Z".to_string(),
+            tool_versions: BTreeMap::new(),
+        };
+
+        let bundle = EvidenceBundleBuilder::new(123, "abc123")
+            .add_hypothesis(make_passed_hypothesis("H-001"))
+            .set_environment_snapshot(snapshot)
+            .build_with_timestamp("2026-01-30T10:15:00Z");
+
+        let json = bundle.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // Check environment is present
+        assert!(value["environment"].is_object());
+        assert_eq!(value["environment"]["os_name"], "linux");
+        assert_eq!(value["environment"]["arch"], "x86_64");
+
+        // Check verdict_hash is present
+        assert!(value["verdict_hash"].is_object());
+        assert!(!value["verdict_hash"]["hash"].as_str().unwrap().is_empty());
     }
 }

@@ -15,6 +15,12 @@
 //! This ensures the hypothesis formation timestamp (`formed_at`) always
 //! precedes the execution timestamp, which is required for AAT integrity.
 //!
+//! # Determinism
+//!
+//! When using [`ExecutionConfig`], the executor can enforce determinism by:
+//! - Setting fixed random seeds for various tools (Rust, Python, Node.js)
+//! - Blocking network access via seccomp (Linux `x86_64` only)
+//!
 //! # Example
 //!
 //! ```ignore
@@ -44,6 +50,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use wait_timeout::ChildExt;
 
+use crate::aat::determinism_guard::DeterminismGuard;
 use crate::aat::types::{Hypothesis, HypothesisResult};
 
 /// Maximum time allowed for a single hypothesis verification command (2
@@ -77,6 +84,41 @@ const ALLOWED_ENV_VARS: &[&str] = &[
     "CARGO_HOME",     // Cargo installation directory
     "RUSTUP_HOME",    // Rustup installation directory
 ];
+
+/// Configuration for hypothesis execution with determinism controls.
+///
+/// This configuration allows customizing the execution environment for
+/// hypotheses to ensure deterministic and isolated execution.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionConfig {
+    /// Additional environment variables to set for child processes.
+    ///
+    /// These are merged with (and override) the allowlisted environment
+    /// variables from the parent process.
+    pub extra_env_vars: Vec<(String, String)>,
+
+    /// Whether to block network access (Linux `x86_64` only).
+    ///
+    /// When enabled on supported platforms, child processes will fail
+    /// with SIGSYS if they attempt to use network syscalls.
+    ///
+    /// On unsupported platforms, this is a no-op with a warning.
+    pub block_network: bool,
+}
+
+impl ExecutionConfig {
+    /// Create an execution config from a determinism guard.
+    ///
+    /// This extracts the environment variables and network blocking
+    /// settings from the guard.
+    #[must_use]
+    pub fn from_guard(guard: &DeterminismGuard) -> Self {
+        Self {
+            extra_env_vars: guard.get_env_vars().to_vec(),
+            block_network: guard.network_blocking_enabled(),
+        }
+    }
+}
 
 /// Hypothesis execution engine.
 ///
@@ -133,6 +175,28 @@ impl HypothesisExecutor {
     /// assert!(h.stdout.as_ref().unwrap().contains("hello"));
     /// ```
     pub fn execute(hypothesis: &mut Hypothesis) -> Result<()> {
+        Self::execute_with_config(hypothesis, &ExecutionConfig::default())
+    }
+
+    /// Execute a single hypothesis with custom execution configuration.
+    ///
+    /// This method is like `execute`, but allows configuring:
+    /// - Additional environment variables (e.g., for determinism)
+    /// - Network blocking (on supported platforms)
+    ///
+    /// # Arguments
+    ///
+    /// * `hypothesis` - Mutable reference to the hypothesis to execute
+    /// * `config` - Execution configuration
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` on successful execution (regardless of pass/fail
+    /// verdict), or an error if the command could not be executed.
+    pub fn execute_with_config(
+        hypothesis: &mut Hypothesis,
+        config: &ExecutionConfig,
+    ) -> Result<()> {
         // Build command with isolated environment to prevent credential leakage
         let mut cmd = Command::new("sh");
         cmd.args(["-c", &hypothesis.verification_method])
@@ -146,6 +210,26 @@ impl HypothesisExecutor {
             if let Ok(value) = std::env::var(var_name) {
                 cmd.env(var_name, value);
             }
+        }
+
+        // Add determinism environment variables from config
+        for (key, value) in &config.extra_env_vars {
+            cmd.env(key, value);
+        }
+
+        // Apply network blocking if requested (Linux `x86_64` only)
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if config.block_network {
+            Self::apply_network_blocking(&mut cmd)?;
+        }
+
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        if config.block_network {
+            eprintln!(
+                "Warning: Network blocking requested but not available on this platform. \
+                 Hypothesis {} will run without network isolation.",
+                hypothesis.id
+            );
         }
 
         let mut child = cmd.spawn().with_context(|| {
@@ -311,9 +395,72 @@ impl HypothesisExecutor {
     /// }
     /// ```
     pub fn execute_all(hypotheses: &mut [Hypothesis]) -> Result<()> {
+        Self::execute_all_with_config(hypotheses, &ExecutionConfig::default())
+    }
+
+    /// Execute all hypotheses with custom execution configuration.
+    ///
+    /// Like `execute_all`, but allows configuring determinism controls
+    /// for all hypothesis executions.
+    ///
+    /// # Arguments
+    ///
+    /// * `hypotheses` - Mutable slice of hypotheses to execute
+    /// * `config` - Execution configuration for determinism controls
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if all hypotheses were executed (regardless of
+    /// their pass/fail verdicts), or an error if any execution failed.
+    pub fn execute_all_with_config(
+        hypotheses: &mut [Hypothesis],
+        config: &ExecutionConfig,
+    ) -> Result<()> {
         for hypothesis in hypotheses {
-            Self::execute(hypothesis)?;
+            Self::execute_with_config(hypothesis, config)?;
         }
+        Ok(())
+    }
+
+    /// Apply network blocking to a command using seccomp (Linux `x86_64` only).
+    ///
+    /// This sets up a `pre_exec` hook that applies a seccomp filter blocking
+    /// network syscalls before the child process executes.
+    ///
+    /// # Safety
+    ///
+    /// The `pre_exec` hook runs in the child process after `fork()` but
+    /// before `exec()`. It must be async-signal-safe. We use a pre-compiled
+    /// seccomp filter from apm2-core which handles this correctly.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[allow(unsafe_code)]
+    fn apply_network_blocking(cmd: &mut Command) -> Result<()> {
+        use std::os::unix::process::CommandExt;
+
+        use apm2_core::adapter::{SeccompProfile, SeccompProfileLevel, compile_seccomp_filter};
+
+        // Compile the seccomp filter in the parent process (safe to allocate)
+        let profile = SeccompProfile {
+            level: SeccompProfileLevel::Restricted, // Blocks network syscalls
+            log_violations: false,
+        };
+
+        let compiled_filter = compile_seccomp_filter(&profile)?.ok_or_else(|| {
+            anyhow::anyhow!("Failed to compile seccomp filter for network blocking")
+        })?;
+
+        // SAFETY: The pre_exec hook runs in the child process after fork().
+        // The compiled filter's apply() method is async-signal-safe because
+        // it only calls prctl() without any allocations.
+        unsafe {
+            cmd.pre_exec(move || {
+                compiled_filter
+                    .apply()
+                    .map(|_| ())
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            });
+        }
+
         Ok(())
     }
 }
@@ -848,6 +995,139 @@ mod tests {
         assert!(
             !outcome.contains("truncated"),
             "Small output should not have truncation note: {outcome}"
+        );
+    }
+
+    // =========================================================================
+    // ExecutionConfig tests
+    // =========================================================================
+
+    #[test]
+    fn test_execution_config_default() {
+        let config = ExecutionConfig::default();
+
+        assert!(config.extra_env_vars.is_empty());
+        assert!(!config.block_network);
+    }
+
+    #[test]
+    fn test_execute_with_config_extra_env_vars() {
+        let config = ExecutionConfig {
+            extra_env_vars: vec![
+                ("TEST_VAR".to_string(), "test_value".to_string()),
+                ("RUST_TEST_SHUFFLE_SEED".to_string(), "12345".to_string()),
+            ],
+            block_network: false,
+        };
+
+        let mut h = make_test_hypothesis("H-CFG-001", "echo $TEST_VAR $RUST_TEST_SHUFFLE_SEED");
+
+        let result = HypothesisExecutor::execute_with_config(&mut h, &config);
+
+        assert!(result.is_ok());
+        let stdout = h.stdout.as_ref().unwrap();
+        assert!(
+            stdout.contains("test_value"),
+            "Should have TEST_VAR set: {stdout}"
+        );
+        assert!(
+            stdout.contains("12345"),
+            "Should have RUST_TEST_SHUFFLE_SEED set: {stdout}"
+        );
+    }
+
+    #[test]
+    fn test_execute_all_with_config() {
+        let config = ExecutionConfig {
+            extra_env_vars: vec![("DETERMINISM_TEST".to_string(), "active".to_string())],
+            block_network: false,
+        };
+
+        let mut hypotheses = vec![
+            make_test_hypothesis("H-CFG-002", "echo first $DETERMINISM_TEST"),
+            make_test_hypothesis("H-CFG-003", "echo second $DETERMINISM_TEST"),
+        ];
+
+        let result = HypothesisExecutor::execute_all_with_config(&mut hypotheses, &config);
+
+        assert!(result.is_ok());
+        for h in &hypotheses {
+            let stdout = h.stdout.as_ref().unwrap();
+            assert!(
+                stdout.contains("active"),
+                "All hypotheses should have DETERMINISM_TEST set: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_execution_config_from_guard() {
+        use crate::aat::determinism_guard::{DeterminismConfig, DeterminismGuard};
+
+        let guard_config = DeterminismConfig {
+            block_network: true,
+            enforce_random_seed: true,
+            capture_environment: false,
+        };
+        let guard = DeterminismGuard::new(guard_config, "abc123").unwrap();
+
+        let exec_config = ExecutionConfig::from_guard(&guard);
+
+        assert!(exec_config.block_network);
+        assert!(!exec_config.extra_env_vars.is_empty());
+
+        // Should contain RUST_TEST_SHUFFLE_SEED
+        let has_rust_seed = exec_config
+            .extra_env_vars
+            .iter()
+            .any(|(k, _)| k == "RUST_TEST_SHUFFLE_SEED");
+        assert!(has_rust_seed, "Should have RUST_TEST_SHUFFLE_SEED");
+    }
+
+    // =========================================================================
+    // Network blocking tests (platform-specific)
+    // =========================================================================
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn test_network_blocking_kills_process_on_socket_attempt() {
+        // This test verifies that network blocking actually works by
+        // attempting to create a socket, which should cause the process
+        // to be killed with SIGSYS.
+        let config = ExecutionConfig {
+            extra_env_vars: vec![],
+            block_network: true,
+        };
+
+        // Use curl or nc to attempt a network connection
+        // This should fail because socket() syscall is blocked
+        let mut h = make_test_hypothesis(
+            "H-NET-001",
+            "curl -s http://example.com 2>&1 || echo 'network blocked'",
+        );
+
+        let result = HypothesisExecutor::execute_with_config(&mut h, &config);
+
+        // The command should have run but failed (either due to SIGSYS or curl error)
+        assert!(result.is_ok(), "Execution should complete");
+
+        // Check that either:
+        // 1. Process was killed by SIGSYS (exit_code is None or signal-related)
+        // 2. Network operation failed
+        let exit_code = h.exit_code;
+        let stdout = h.stdout.as_deref().unwrap_or("");
+        let stderr = h.stderr.as_deref().unwrap_or("");
+
+        // On SIGSYS, exit_code may be None (killed by signal) or high value
+        // We just verify the command didn't succeed in connecting
+        let network_blocked = exit_code != Some(0)
+            || stdout.contains("network blocked")
+            || stderr.contains("Killed")
+            || stderr.contains("signal");
+
+        assert!(
+            network_blocked,
+            "Network should be blocked. exit_code={exit_code:?}, stdout={stdout}, stderr={stderr}"
         );
     }
 }
