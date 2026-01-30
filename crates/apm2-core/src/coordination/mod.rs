@@ -141,6 +141,7 @@ pub use events::{
     CoordinationEvent, CoordinationSessionBound, CoordinationSessionUnbound, CoordinationStarted,
     EVENT_TYPE_ABORTED, EVENT_TYPE_COMPLETED, EVENT_TYPE_CONTEXT_REFINEMENT,
     EVENT_TYPE_SESSION_BOUND, EVENT_TYPE_SESSION_UNBOUND, EVENT_TYPE_STARTED,
+    MAX_MISSED_PATH_LENGTH,
 };
 // Re-export evidence types (TCK-00154)
 pub use evidence::{

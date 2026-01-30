@@ -8,6 +8,7 @@
 //! Events follow the existing pattern used by `SessionStarted`,
 //! `WorkTransitioned`, and other event payloads.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use serde::de::{SeqAccess, Visitor};
@@ -63,6 +64,96 @@ where
     }
 
     deserializer.deserialize_seq(BoundedVecVisitor)
+}
+
+/// Custom deserializer for `missed_path` that enforces
+/// [`MAX_MISSED_PATH_LENGTH`].
+///
+/// This enforces limits DURING deserialization, preventing OOM attacks by
+/// truncating oversized strings before full allocation occurs. Unlike
+/// `deserialize_bounded_work_ids` which rejects oversized input, this
+/// truncates to maintain availability (a coordinator can still process
+/// the refinement request with a truncated path).
+fn deserialize_bounded_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedPathVisitor;
+
+    impl Visitor<'_> for BoundedPathVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                formatter,
+                "a string path (truncated to {MAX_MISSED_PATH_LENGTH} bytes if oversized)"
+            )
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(truncate_path_impl(v).into_owned())
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            // Optimize: if within bounds, return as-is without reallocation
+            if v.len() <= MAX_MISSED_PATH_LENGTH {
+                Ok(v)
+            } else {
+                Ok(truncate_path_impl(&v).into_owned())
+            }
+        }
+    }
+
+    deserializer.deserialize_string(BoundedPathVisitor)
+}
+
+/// Internal helper for path truncation that returns a `Cow` to avoid
+/// unnecessary allocations when the path is already within bounds.
+///
+/// This is used by both `deserialize_bounded_path` and `truncate_path`.
+fn truncate_path_impl(path: &str) -> Cow<'_, str> {
+    if path.len() > MAX_MISSED_PATH_LENGTH {
+        let suffix_len = MISSED_PATH_TRUNCATION_SUFFIX.len();
+        let target_len = MAX_MISSED_PATH_LENGTH - suffix_len;
+
+        // Find the nearest valid UTF-8 character boundary at or before
+        // target_len to prevent panic when truncating multi-byte UTF-8
+        // characters.
+        let safe_len = floor_char_boundary(path, target_len);
+
+        let mut truncated = String::with_capacity(MAX_MISSED_PATH_LENGTH);
+        truncated.push_str(&path[..safe_len]);
+        truncated.push_str(MISSED_PATH_TRUNCATION_SUFFIX);
+        Cow::Owned(truncated)
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
+/// Finds the largest index <= `index` that is a valid UTF-8 character boundary.
+///
+/// This is equivalent to `str::floor_char_boundary()` (stable since 1.91.0)
+/// but implemented manually for MSRV compatibility.
+#[inline]
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        s.len()
+    } else {
+        // Scan backwards from index to find a valid UTF-8 char boundary.
+        // UTF-8 continuation bytes have the bit pattern 10xxxxxx (0x80..0xC0).
+        // Leading bytes and ASCII have patterns 0xxxxxxx or 11xxxxxx.
+        let mut i = index;
+        while i > 0 && !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    }
 }
 
 /// Event type constant for coordination started.
@@ -403,6 +494,14 @@ impl CoordinationAborted {
     }
 }
 
+/// Maximum path length in bytes for `missed_path` field.
+/// Matches `MAX_PATH_LENGTH` from context manifest to prevent denial-of-service
+/// via oversized paths.
+pub const MAX_MISSED_PATH_LENGTH: usize = 4096;
+
+/// Truncation indicator appended to oversized paths.
+const MISSED_PATH_TRUNCATION_SUFFIX: &str = "...[TRUNCATED]";
+
 /// Payload for `coordination.context_refinement_request` events.
 ///
 /// Emitted when a CONSUME mode session is terminated due to a `CONTEXT_MISS`.
@@ -420,6 +519,13 @@ impl CoordinationAborted {
 /// - The context pack includes all needed files, or
 /// - A maximum refinement count is reached, or
 /// - The coordinator determines the request is invalid
+///
+/// # Security
+///
+/// The `missed_path` field is truncated to [`MAX_MISSED_PATH_LENGTH`] bytes
+/// to prevent denial-of-service attacks via oversized paths propagating
+/// through the system. Truncation is UTF-8 aware to avoid splitting
+/// multi-byte characters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextRefinementRequest {
     /// Session ID that was terminated.
@@ -436,6 +542,10 @@ pub struct ContextRefinementRequest {
     pub manifest_id: String,
 
     /// The path that triggered the context miss.
+    ///
+    /// Truncated to [`MAX_MISSED_PATH_LENGTH`] bytes if oversized.
+    /// Length is enforced during deserialization to prevent OOM attacks.
+    #[serde(deserialize_with = "deserialize_bounded_path")]
     pub missed_path: String,
 
     /// The rationale code from the session termination.
@@ -449,10 +559,88 @@ pub struct ContextRefinementRequest {
 }
 
 impl ContextRefinementRequest {
-    /// Creates a new context refinement request.
+    /// Truncates a path to [`MAX_MISSED_PATH_LENGTH`] to prevent oversized
+    /// paths from propagating to the coordinator.
+    ///
+    /// Use this method when creating a [`ContextRefinementRequest`] via
+    /// [`Self::new_unchecked`] with untrusted input. The
+    /// [`Self::from_context_miss`] builder applies truncation automatically.
+    ///
+    /// # Safety
+    ///
+    /// Uses UTF-8-aware truncation to ensure we never split a multi-byte
+    /// UTF-8 character, which would cause a panic.
+    #[must_use]
+    pub fn truncate_path(path: &str) -> String {
+        truncate_path_impl(path).into_owned()
+    }
+
+    /// Truncates a path slice to [`MAX_MISSED_PATH_LENGTH`].
+    ///
+    /// This is an alias for [`Self::truncate_path`] for clarity when working
+    /// with string slices.
+    #[must_use]
+    pub fn truncate_path_str(path: &str) -> String {
+        truncate_path_impl(path).into_owned()
+    }
+
+    /// Creates a new context refinement request without path truncation.
+    ///
+    /// This is an alias for [`Self::new_unchecked`] provided for backwards
+    /// compatibility. New code should prefer [`Self::from_context_miss`] for
+    /// untrusted input or [`Self::new_unchecked`] when working with trusted
+    /// input.
+    ///
+    /// # Safety
+    ///
+    /// This constructor does NOT truncate `missed_path`. It is intended for
+    /// use with trusted input only (e.g., internal coordination logic where
+    /// paths have already been validated).
+    ///
+    /// For untrusted input, use [`Self::from_context_miss`] which applies
+    /// truncation automatically, or call [`Self::truncate_path`] on the path
+    /// before passing it to this method.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
+        session_id: String,
+        coordination_id: Option<String>,
+        work_id: String,
+        manifest_id: String,
+        missed_path: String,
+        rationale_code: String,
+        refinement_count: u32,
+        timestamp: u64,
+    ) -> Self {
+        Self::new_unchecked(
+            session_id,
+            coordination_id,
+            work_id,
+            manifest_id,
+            missed_path,
+            rationale_code,
+            refinement_count,
+            timestamp,
+        )
+    }
+
+    /// Creates a new context refinement request without path truncation.
+    ///
+    /// # Safety
+    ///
+    /// This constructor does NOT truncate `missed_path`. It is intended for
+    /// use with trusted input only (e.g., internal coordination logic where
+    /// paths have already been validated).
+    ///
+    /// For untrusted input, use [`Self::from_context_miss`] which applies
+    /// truncation automatically, or call [`Self::truncate_path`] on the path
+    /// before passing it to this method.
+    ///
+    /// Note: Deserialization via `serde` automatically applies truncation,
+    /// so this is only a concern when constructing directly in Rust code.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new_unchecked(
         session_id: String,
         coordination_id: Option<String>,
         work_id: String,
@@ -475,6 +663,9 @@ impl ContextRefinementRequest {
     }
 
     /// Creates a context refinement request from a context miss result.
+    ///
+    /// The `missed_path` is truncated to [`MAX_MISSED_PATH_LENGTH`] if
+    /// oversized.
     ///
     /// # Arguments
     ///
@@ -500,11 +691,17 @@ impl ContextRefinementRequest {
             coordination_id,
             work_id: work_id.into(),
             manifest_id: manifest_id.into(),
-            missed_path: missed_path.into(),
+            missed_path: Self::truncate_path(&missed_path.into()),
             rationale_code: "CONTEXT_MISS".to_string(),
             refinement_count,
             timestamp,
         }
+    }
+
+    /// Returns true if the `missed_path` was truncated.
+    #[must_use]
+    pub fn is_path_truncated(&self) -> bool {
+        self.missed_path.ends_with(MISSED_PATH_TRUNCATION_SUFFIX)
     }
 }
 
@@ -1244,5 +1441,420 @@ mod tests {
                 event.event_type()
             );
         }
+    }
+
+    // ========================================================================
+    // ContextRefinementRequest Tests (TCK-00211 Security Fix)
+    // ========================================================================
+
+    #[test]
+    fn test_context_refinement_request_basic() {
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            Some("coord-001".to_string()),
+            "work-001",
+            "manifest-001",
+            "/project/src/missing.rs",
+            0,
+            1_000_000_000,
+        );
+
+        assert_eq!(request.session_id, "session-001");
+        assert_eq!(request.coordination_id, Some("coord-001".to_string()));
+        assert_eq!(request.work_id, "work-001");
+        assert_eq!(request.manifest_id, "manifest-001");
+        assert_eq!(request.missed_path, "/project/src/missing.rs");
+        assert_eq!(request.rationale_code, "CONTEXT_MISS");
+        assert_eq!(request.refinement_count, 0);
+        assert!(!request.is_path_truncated());
+    }
+
+    #[test]
+    fn test_context_refinement_request_truncates_long_path() {
+        // Create a path longer than MAX_MISSED_PATH_LENGTH
+        let long_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH + 100);
+        assert!(long_path.len() > MAX_MISSED_PATH_LENGTH);
+
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            None,
+            "work-001",
+            "manifest-001",
+            long_path,
+            0,
+            1_000_000_000,
+        );
+
+        // Path should be truncated to MAX_MISSED_PATH_LENGTH
+        assert!(
+            request.missed_path.len() <= MAX_MISSED_PATH_LENGTH,
+            "Truncated path {} should not exceed MAX_MISSED_PATH_LENGTH {}",
+            request.missed_path.len(),
+            MAX_MISSED_PATH_LENGTH
+        );
+        assert!(request.is_path_truncated());
+        assert!(request.missed_path.ends_with("...[TRUNCATED]"));
+    }
+
+    #[test]
+    fn test_context_refinement_request_preserves_normal_path() {
+        let normal_path = "/project/src/main.rs";
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            None,
+            "work-001",
+            "manifest-001",
+            normal_path,
+            0,
+            1_000_000_000,
+        );
+
+        // Path should be unchanged
+        assert_eq!(request.missed_path, normal_path);
+        assert!(!request.is_path_truncated());
+    }
+
+    #[test]
+    fn test_context_refinement_request_utf8_safe_truncation() {
+        // Test with emoji (4-byte UTF-8 characters) to ensure we don't panic
+        // when truncating multi-byte characters
+        let suffix_len = MISSED_PATH_TRUNCATION_SUFFIX.len();
+        let target_len = MAX_MISSED_PATH_LENGTH - suffix_len;
+
+        // Build a path where target_len falls inside an emoji
+        let prefix_len = target_len - 2; // emoji starts 2 bytes before target
+        let emoji = "🦀"; // 4 bytes in UTF-8
+        assert_eq!(emoji.len(), 4);
+
+        let mut path = "/".to_string();
+        path.push_str(&"x".repeat(prefix_len - 1)); // -1 for leading "/"
+        path.push_str(emoji);
+        path.push_str(&"y".repeat(100)); // exceed MAX_MISSED_PATH_LENGTH
+
+        assert!(path.len() > MAX_MISSED_PATH_LENGTH);
+
+        // This should NOT panic
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            None,
+            "work-001",
+            "manifest-001",
+            path,
+            0,
+            1_000_000_000,
+        );
+
+        // Verify the path was truncated correctly
+        assert!(request.missed_path.len() <= MAX_MISSED_PATH_LENGTH);
+        assert!(request.is_path_truncated());
+
+        // Verify valid UTF-8 (would panic on iteration if invalid)
+        for _ in request.missed_path.chars() {}
+    }
+
+    #[test]
+    fn test_context_refinement_request_cjk_truncation() {
+        // CJK characters are 3 bytes in UTF-8
+        let suffix_len = MISSED_PATH_TRUNCATION_SUFFIX.len();
+        let target_len = MAX_MISSED_PATH_LENGTH - suffix_len;
+
+        let prefix_len = target_len - 1; // CJK char starts 1 byte before target
+        let cjk_char = "中"; // 3 bytes in UTF-8
+        assert_eq!(cjk_char.len(), 3);
+
+        let mut path = "/".to_string();
+        path.push_str(&"x".repeat(prefix_len - 1));
+        path.push_str(cjk_char);
+        path.push_str(&"y".repeat(100));
+
+        assert!(path.len() > MAX_MISSED_PATH_LENGTH);
+
+        // This should NOT panic
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            None,
+            "work-001",
+            "manifest-001",
+            path,
+            0,
+            1_000_000_000,
+        );
+
+        assert!(request.missed_path.len() <= MAX_MISSED_PATH_LENGTH);
+        assert!(request.is_path_truncated());
+
+        // Verify valid UTF-8
+        for _ in request.missed_path.chars() {}
+    }
+
+    #[test]
+    fn test_context_refinement_request_new_unchecked_does_not_truncate() {
+        // Test that ::new_unchecked() does NOT truncate (it's const fn, so can't do
+        // heap ops) Callers needing truncation should use from_context_miss()
+        // or truncate_path()
+        let long_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH + 100);
+        let original_len = long_path.len();
+
+        let request = ContextRefinementRequest::new_unchecked(
+            "session-001".to_string(),
+            None,
+            "work-001".to_string(),
+            "manifest-001".to_string(),
+            long_path,
+            "CONTEXT_MISS".to_string(),
+            0,
+            1_000_000_000,
+        );
+
+        // new_unchecked() preserves the original path without truncation
+        assert_eq!(request.missed_path.len(), original_len);
+        assert!(!request.is_path_truncated());
+    }
+
+    #[test]
+    fn test_context_refinement_request_new_backwards_compat() {
+        // Test that ::new() is an alias for ::new_unchecked() (backwards compat)
+        let long_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH + 100);
+        let original_len = long_path.len();
+
+        // new() should behave exactly like new_unchecked()
+        let request = ContextRefinementRequest::new(
+            "session-001".to_string(),
+            None,
+            "work-001".to_string(),
+            "manifest-001".to_string(),
+            long_path,
+            "CONTEXT_MISS".to_string(),
+            0,
+            1_000_000_000,
+        );
+
+        // new() preserves the original path without truncation (same as new_unchecked)
+        assert_eq!(request.missed_path.len(), original_len);
+        assert!(!request.is_path_truncated());
+    }
+
+    #[test]
+    fn test_context_refinement_request_truncate_path_helper() {
+        // Test that truncate_path() can be used with new_unchecked() for truncation
+        let long_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH + 100);
+
+        let request = ContextRefinementRequest::new_unchecked(
+            "session-001".to_string(),
+            None,
+            "work-001".to_string(),
+            "manifest-001".to_string(),
+            ContextRefinementRequest::truncate_path(&long_path),
+            "CONTEXT_MISS".to_string(),
+            0,
+            1_000_000_000,
+        );
+
+        assert!(request.missed_path.len() <= MAX_MISSED_PATH_LENGTH);
+        assert!(request.is_path_truncated());
+    }
+
+    #[test]
+    fn test_context_refinement_request_serde_roundtrip() {
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            Some("coord-001".to_string()),
+            "work-001",
+            "manifest-001",
+            "/project/src/missing.rs",
+            3,
+            1_000_000_000,
+        );
+
+        let json = serde_json::to_string(&request).unwrap();
+        let restored: ContextRefinementRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, restored);
+    }
+
+    #[test]
+    fn test_context_refinement_request_without_coordination_id() {
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            None, // No coordination ID
+            "work-001",
+            "manifest-001",
+            "/project/src/missing.rs",
+            0,
+            1_000_000_000,
+        );
+
+        assert!(request.coordination_id.is_none());
+
+        // Verify serialization skips the field when None
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("coordination_id"));
+    }
+
+    // ========================================================================
+    // Deserialization Boundary Protection Tests (Security Fix TCK-00211)
+    // ========================================================================
+
+    /// TCK-00211: Test that oversized `missed_path` is truncated DURING
+    /// deserialization to prevent OOM attacks via malicious JSON payloads.
+    #[test]
+    fn test_context_refinement_request_deserialization_truncates_oversized_path() {
+        // Build a JSON string with an oversized missed_path
+        let oversized_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH + 1000);
+        assert!(oversized_path.len() > MAX_MISSED_PATH_LENGTH);
+
+        let json = serde_json::json!({
+            "session_id": "session-001",
+            "work_id": "work-001",
+            "manifest_id": "manifest-001",
+            "missed_path": oversized_path,
+            "rationale_code": "CONTEXT_MISS",
+            "refinement_count": 0,
+            "timestamp": 1_000_000_000_u64
+        });
+
+        // Deserialize - should truncate rather than reject
+        let result: Result<ContextRefinementRequest, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "Deserialization should succeed with truncation"
+        );
+
+        let request = result.unwrap();
+        assert!(
+            request.missed_path.len() <= MAX_MISSED_PATH_LENGTH,
+            "Deserialized path {} should be at most MAX_MISSED_PATH_LENGTH {}",
+            request.missed_path.len(),
+            MAX_MISSED_PATH_LENGTH
+        );
+        assert!(
+            request.is_path_truncated(),
+            "Truncated path should have truncation marker"
+        );
+    }
+
+    /// TCK-00211: Test that normal-sized paths are preserved during
+    /// deserialization.
+    #[test]
+    fn test_context_refinement_request_deserialization_preserves_normal_path() {
+        let normal_path = "/project/src/main.rs";
+
+        let json = serde_json::json!({
+            "session_id": "session-001",
+            "work_id": "work-001",
+            "manifest_id": "manifest-001",
+            "missed_path": normal_path,
+            "rationale_code": "CONTEXT_MISS",
+            "refinement_count": 0,
+            "timestamp": 1_000_000_000_u64
+        });
+
+        let result: Result<ContextRefinementRequest, _> = serde_json::from_value(json);
+        assert!(result.is_ok());
+
+        let request = result.unwrap();
+        assert_eq!(request.missed_path, normal_path);
+        assert!(!request.is_path_truncated());
+    }
+
+    /// TCK-00211: Test that deserialization handles UTF-8 multi-byte characters
+    /// correctly when truncating at a boundary.
+    #[test]
+    fn test_context_refinement_request_deserialization_utf8_safe() {
+        // Build a path with emoji where truncation would fall in the middle
+        let suffix_len = MISSED_PATH_TRUNCATION_SUFFIX.len();
+        let target_len = MAX_MISSED_PATH_LENGTH - suffix_len;
+
+        // Build a path where target_len falls inside an emoji
+        let prefix_len = target_len - 2;
+        let emoji = "🦀"; // 4 bytes
+        let mut path = "/".to_string();
+        path.push_str(&"x".repeat(prefix_len - 1));
+        path.push_str(emoji);
+        path.push_str(&"y".repeat(100));
+
+        assert!(path.len() > MAX_MISSED_PATH_LENGTH);
+
+        let json = serde_json::json!({
+            "session_id": "session-001",
+            "work_id": "work-001",
+            "manifest_id": "manifest-001",
+            "missed_path": path,
+            "rationale_code": "CONTEXT_MISS",
+            "refinement_count": 0,
+            "timestamp": 1_000_000_000_u64
+        });
+
+        // Deserialization should NOT panic when truncating at emoji boundary
+        let result: Result<ContextRefinementRequest, _> = serde_json::from_value(json);
+        assert!(result.is_ok(), "UTF-8 safe truncation should succeed");
+
+        let request = result.unwrap();
+        assert!(request.missed_path.len() <= MAX_MISSED_PATH_LENGTH);
+        assert!(request.is_path_truncated());
+
+        // Verify valid UTF-8 (would panic on iteration if invalid)
+        for _ in request.missed_path.chars() {}
+    }
+
+    /// TCK-00211: Test deserialization via `CoordinationEvent` enum also
+    /// truncates oversized paths.
+    #[test]
+    fn test_coordination_event_deserialization_truncates_missed_path() {
+        let oversized_path = "/".to_string() + &"a".repeat(MAX_MISSED_PATH_LENGTH + 500);
+
+        let json = serde_json::json!({
+            "type": "coordination.context_refinement_request",
+            "payload": {
+                "session_id": "session-001",
+                "work_id": "work-001",
+                "manifest_id": "manifest-001",
+                "missed_path": oversized_path,
+                "rationale_code": "CONTEXT_MISS",
+                "refinement_count": 0,
+                "timestamp": 1_000_000_000_u64
+            }
+        });
+
+        let result: Result<CoordinationEvent, _> = serde_json::from_value(json);
+        assert!(result.is_ok(), "Event deserialization should succeed");
+
+        let CoordinationEvent::ContextRefinementRequest(request) = result.unwrap() else {
+            panic!("Expected ContextRefinementRequest variant");
+        };
+
+        assert!(
+            request.missed_path.len() <= MAX_MISSED_PATH_LENGTH,
+            "Path should be truncated via event deserialization"
+        );
+        assert!(request.is_path_truncated());
+    }
+
+    /// TCK-00211: Test that the exact boundary (`MAX_MISSED_PATH_LENGTH`) is
+    /// preserved without truncation.
+    #[test]
+    fn test_context_refinement_request_deserialization_exact_boundary() {
+        // Path exactly at MAX_MISSED_PATH_LENGTH should NOT be truncated
+        let exact_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH - 1);
+        assert_eq!(exact_path.len(), MAX_MISSED_PATH_LENGTH);
+
+        let json = serde_json::json!({
+            "session_id": "session-001",
+            "work_id": "work-001",
+            "manifest_id": "manifest-001",
+            "missed_path": exact_path,
+            "rationale_code": "CONTEXT_MISS",
+            "refinement_count": 0,
+            "timestamp": 1_000_000_000_u64
+        });
+
+        let result: Result<ContextRefinementRequest, _> = serde_json::from_value(json);
+        assert!(result.is_ok());
+
+        let request = result.unwrap();
+        assert_eq!(request.missed_path.len(), MAX_MISSED_PATH_LENGTH);
+        assert!(
+            !request.is_path_truncated(),
+            "Exact boundary should not truncate"
+        );
     }
 }
