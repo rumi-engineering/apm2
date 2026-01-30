@@ -53,10 +53,12 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use apm2_core::crypto::Signer;
 use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tracing::debug;
 
@@ -179,8 +181,18 @@ pub trait ProjectionAdapter: Send + Sync {
 /// Maximum length for configuration string fields.
 const MAX_CONFIG_STRING_LENGTH: usize = 2048;
 
+/// Maximum response body size (64KB) to prevent OOM from large responses.
+/// This is a security control (AD-MEM-001) to limit memory allocation.
+const MAX_RESPONSE_BODY_SIZE: usize = 64 * 1024;
+
+/// Default connection timeout in seconds.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Default request timeout in seconds.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+
 /// GitHub projection adapter configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GitHubAdapterConfig {
     /// GitHub API base URL (e.g., "<https://api.github.com>").
     pub api_base_url: String,
@@ -198,7 +210,15 @@ pub struct GitHubAdapterConfig {
     pub target_url: Option<String>,
 
     /// GitHub API token for authentication.
-    pub api_token: Option<String>,
+    /// Uses `SecretString` to prevent accidental exposure in logs/debug output.
+    /// (AD-SEC-001: Proper secret type per `SECRETS_MANAGEMENT.md`)
+    pub api_token: Option<SecretString>,
+
+    /// Connection timeout.
+    pub connect_timeout: Duration,
+
+    /// Request timeout.
+    pub request_timeout: Duration,
 }
 
 impl GitHubAdapterConfig {
@@ -229,6 +249,8 @@ impl GitHubAdapterConfig {
             context: "apm2/gates".to_string(),
             target_url: None,
             api_token: None,
+            connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
+            request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
         })
     }
 
@@ -276,6 +298,9 @@ impl GitHubAdapterConfig {
 
     /// Sets the GitHub API token for authentication.
     ///
+    /// The token is stored as a `SecretString` to prevent accidental exposure
+    /// in logs and debug output, per `SECRETS_MANAGEMENT.md` requirements.
+    ///
     /// # Errors
     ///
     /// Returns [`ProjectionError::ValidationError`] if the token exceeds
@@ -283,8 +308,38 @@ impl GitHubAdapterConfig {
     pub fn with_api_token(mut self, token: impl Into<String>) -> Result<Self, ProjectionError> {
         let token = token.into();
         Self::validate_field("api_token", &token)?;
-        self.api_token = Some(token);
+        self.api_token = Some(SecretString::from(token));
         Ok(self)
+    }
+
+    /// Sets the connection timeout.
+    #[must_use]
+    pub const fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Sets the request timeout.
+    #[must_use]
+    pub const fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+}
+
+// Manual Debug implementation to avoid exposing secrets
+impl std::fmt::Debug for GitHubAdapterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubAdapterConfig")
+            .field("api_base_url", &self.api_base_url)
+            .field("owner", &self.owner)
+            .field("repo", &self.repo)
+            .field("context", &self.context)
+            .field("target_url", &self.target_url)
+            .field("api_token", &self.api_token.as_ref().map(|_| "[REDACTED]"))
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
     }
 }
 
@@ -499,6 +554,12 @@ impl IdempotencyCache {
 // =============================================================================
 
 /// HTTP client for GitHub API calls.
+///
+/// Security controls:
+/// - AD-MEM-001: Response body size limited via `http_body_util::Limited`
+/// - AD-NET-001: Request timeouts via `tokio::time::timeout`
+/// - AD-SEC-001: API token uses `SecretString` (via config)
+/// - AD-CMP-001: Cognitive complexity reduced via helper methods
 struct GitHubClient {
     config: GitHubAdapterConfig,
 }
@@ -509,31 +570,19 @@ impl GitHubClient {
         Self { config }
     }
 
-    /// Posts a commit status to GitHub.
-    ///
-    /// POST /repos/{owner}/{repo}/statuses/{sha}
-    async fn post_commit_status(
-        &self,
-        sha: &str,
-        status: ProjectedStatus,
-    ) -> Result<(), ProjectionError> {
-        use bytes::Bytes;
-        use http::{Request, StatusCode};
-        use http_body_util::{BodyExt, Full};
-        use hyper_rustls::HttpsConnectorBuilder;
-        use hyper_util::client::legacy::Client;
-        use hyper_util::rt::TokioExecutor;
-
-        // Build the URL
-        let url = format!(
+    /// Builds the GitHub API URL for posting a commit status.
+    fn build_status_url(&self, sha: &str) -> String {
+        format!(
             "{}/repos/{}/{}/statuses/{}",
             self.config.api_base_url.trim_end_matches('/'),
             self.config.owner,
             self.config.repo,
             sha
-        );
+        )
+    }
 
-        // Build the request body
+    /// Builds the JSON request body for a commit status update.
+    fn build_status_body(&self, status: ProjectedStatus) -> Result<Vec<u8>, ProjectionError> {
         let body = serde_json::json!({
             "state": status.as_str(),
             "context": self.config.context,
@@ -541,57 +590,42 @@ impl GitHubClient {
             "description": format!("APM2 FAC: {}", status.as_str())
         });
 
-        let body_bytes =
-            serde_json::to_vec(&body).map_err(|e| ProjectionError::NetworkError(e.to_string()))?;
+        serde_json::to_vec(&body).map_err(|e| ProjectionError::NetworkError(e.to_string()))
+    }
 
-        // Build the HTTPS connector
-        let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
-
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
-
-        // Build the request
-        let mut request = Request::builder()
+    /// Builds an HTTP request with appropriate headers.
+    fn build_request<B>(&self, url: &str, body: B) -> Result<http::Request<B>, ProjectionError> {
+        let mut builder = http::Request::builder()
             .method("POST")
-            .uri(&url)
+            .uri(url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "apm2-daemon/0.1")
             .header("X-GitHub-Api-Version", "2022-11-28");
 
-        // Add authentication if configured
+        // Add authentication if configured (AD-SEC-001: uses SecretString)
         if let Some(token) = &self.config.api_token {
-            request = request.header("Authorization", format!("Bearer {token}"));
+            builder = builder.header("Authorization", format!("Bearer {}", token.expose_secret()));
         }
 
-        let request = request
-            .body(Full::new(Bytes::from(body_bytes)))
-            .map_err(|e| ProjectionError::NetworkError(e.to_string()))?;
+        builder
+            .body(body)
+            .map_err(|e| ProjectionError::NetworkError(e.to_string()))
+    }
 
-        debug!(url = %url, status = %status, "posting commit status to GitHub");
-
-        // Send the request
-        let response =
-            client
-                .request(request)
-                .await
-                .map_err(|e: hyper_util::client::legacy::Error| {
-                    ProjectionError::NetworkError(e.to_string())
-                })?;
-
-        let status_code = response.status();
+    /// Checks the response status and returns an appropriate error if needed.
+    fn check_response_status(
+        status_code: http::StatusCode,
+        headers: &http::HeaderMap,
+    ) -> Result<(), ProjectionError> {
+        use http::StatusCode;
 
         // Check for rate limiting
         if status_code == StatusCode::FORBIDDEN || status_code == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after: u64 = response
-                .headers()
+            let retry_after: u64 = headers
                 .get("Retry-After")
-                .and_then(|v: &http::HeaderValue| v.to_str().ok())
-                .and_then(|s: &str| s.parse().ok())
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok())
                 .unwrap_or(60);
 
             return Err(ProjectionError::RateLimitExceeded {
@@ -606,17 +640,94 @@ impl GitHubClient {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Reads an error response body with size limits (AD-MEM-001).
+    ///
+    /// Uses `http_body_util::Limited` to prevent OOM from large responses.
+    async fn read_error_body<B>(body: B) -> String
+    where
+        B: http_body::Body + Send,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        use bytes::Buf;
+        use http_body_util::{BodyExt, Limited};
+
+        // Wrap body with size limit to prevent OOM (AD-MEM-001)
+        let limited_body = Limited::new(body, MAX_RESPONSE_BODY_SIZE);
+
+        limited_body.collect().await.map_or_else(
+            |_| "[body read error or size limit exceeded]".to_string(),
+            |collected| {
+                let bytes = collected.aggregate();
+                String::from_utf8(bytes.chunk().to_vec())
+                    .unwrap_or_else(|_| "[non-UTF8 body]".to_string())
+            },
+        )
+    }
+
+    /// Posts a commit status to GitHub.
+    ///
+    /// POST /repos/{owner}/{repo}/statuses/{sha}
+    ///
+    /// # Security Controls
+    ///
+    /// - AD-MEM-001: Response body size limited to 64KB via `Limited`
+    /// - AD-NET-001: Request timeout via `tokio::time::timeout`
+    /// - AD-SEC-001: API token uses `SecretString` (via config)
+    /// - AD-CMP-001: Logic split into helper methods
+    async fn post_commit_status(
+        &self,
+        sha: &str,
+        status: ProjectedStatus,
+    ) -> Result<(), ProjectionError> {
+        use bytes::Bytes;
+        use http_body_util::Full;
+        use hyper_rustls::HttpsConnectorBuilder;
+        use hyper_util::client::legacy::Client;
+        use hyper_util::rt::TokioExecutor;
+
+        let url = self.build_status_url(sha);
+        let body_bytes = self.build_status_body(status)?;
+
+        // Build the HTTPS connector
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+
+        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+
+        let request = self.build_request(&url, Full::new(Bytes::from(body_bytes)))?;
+
+        debug!(url = %url, status = %status, "posting commit status to GitHub");
+
+        // Send the request with timeout (AD-NET-001)
+        let response = tokio::time::timeout(self.config.request_timeout, client.request(request))
+            .await
+            .map_err(|_| {
+                ProjectionError::NetworkError(format!(
+                    "request timed out after {:?}",
+                    self.config.request_timeout
+                ))
+            })?
+            .map_err(|e: hyper_util::client::legacy::Error| {
+                ProjectionError::NetworkError(e.to_string())
+            })?;
+
+        let (parts, body) = response.into_parts();
+        let status_code = parts.status;
+
+        // Check for specific error conditions
+        Self::check_response_status(status_code, &parts.headers)?;
+
         // Check for success
         if !status_code.is_success() {
-            // Try to read the error body
-            use http_body_util::Collected;
-            let body_result: Result<Collected<Bytes>, _> = response.into_body().collect().await;
-            let body: Option<Bytes> = body_result.map(Collected::to_bytes).ok();
-
-            let message = body
-                .and_then(|b: Bytes| String::from_utf8(b.to_vec()).ok())
-                .unwrap_or_else(|| format!("HTTP {status_code}"));
-
+            let message = Self::read_error_body(body).await;
             return Err(ProjectionError::GitHubApiError {
                 message,
                 status_code: Some(status_code.as_u16()),
