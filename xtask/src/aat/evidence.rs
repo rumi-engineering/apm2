@@ -15,6 +15,7 @@ use crate::aat::types::{
     Hypothesis, HypothesisResult, InputVariation, ParsedPRDescription, PrDescriptionParse,
     SingleVariation, StaticAnalysis, TodoCheck, Verdict,
 };
+use crate::aat::ux_verifier::UxAuditSection;
 use crate::aat::variation::InputVariationResult;
 
 /// Builder for constructing evidence bundles.
@@ -39,6 +40,7 @@ pub struct EvidenceBundleBuilder {
     pr_description_parse: PrDescriptionParse,
     hypotheses: Vec<Hypothesis>,
     anti_gaming: AntiGamingSection,
+    ux_audit: Option<UxAuditSection>,
 }
 
 impl EvidenceBundleBuilder {
@@ -56,6 +58,7 @@ impl EvidenceBundleBuilder {
             pr_description_parse: PrDescriptionParse::default(),
             hypotheses: Vec::new(),
             anti_gaming: AntiGamingSection::default(),
+            ux_audit: None,
         }
     }
 
@@ -208,6 +211,15 @@ impl EvidenceBundleBuilder {
         self
     }
 
+    /// Set the UX audit section.
+    ///
+    /// This adds agent-friendly UX verification results to the evidence bundle.
+    #[must_use]
+    pub fn set_ux_audit(mut self, ux_audit: UxAuditSection) -> Self {
+        self.ux_audit = Some(ux_audit);
+        self
+    }
+
     /// Compute the final verdict based on hypotheses and anti-gaming results.
     ///
     /// # Verdict logic:
@@ -317,6 +329,7 @@ impl EvidenceBundleBuilder {
             pr_description_parse: self.pr_description_parse,
             hypotheses: self.hypotheses,
             anti_gaming: self.anti_gaming,
+            ux_audit: self.ux_audit,
             verdict,
             verdict_reason,
         }
@@ -338,6 +351,7 @@ impl EvidenceBundleBuilder {
             pr_description_parse: self.pr_description_parse,
             hypotheses: self.hypotheses,
             anti_gaming: self.anti_gaming,
+            ux_audit: self.ux_audit,
             verdict,
             verdict_reason,
         }

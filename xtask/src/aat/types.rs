@@ -387,6 +387,10 @@ pub struct EvidenceBundle {
     /// Anti-gaming analysis results.
     pub anti_gaming: AntiGamingSection,
 
+    /// UX audit results (agent-friendly CLI verification).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ux_audit: Option<crate::aat::ux_verifier::UxAuditSection>,
+
     /// Final verdict.
     pub verdict: Verdict,
 
@@ -480,6 +484,7 @@ mod tests {
                 exit_code: Some(0),
             }],
             anti_gaming: AntiGamingSection::default(),
+            ux_audit: None,
             verdict: Verdict::Passed,
             verdict_reason: "All hypotheses passed".to_string(),
         };

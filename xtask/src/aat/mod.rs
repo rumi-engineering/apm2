@@ -11,5 +11,6 @@ pub mod executor;
 pub mod parser;
 pub mod tool_config;
 pub mod types;
+pub mod ux_verifier;
 pub mod validation;
 pub mod variation;
