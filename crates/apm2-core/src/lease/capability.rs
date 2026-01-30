@@ -1102,7 +1102,7 @@ impl CapabilityProof {
     /// # Errors
     ///
     /// Returns an error if any verification step fails, including:
-    /// - Structural or signature validation errors (see [`verify`])
+    /// - Structural or signature validation errors (see [`Self::verify`])
     /// - `LeaseError::LeaseNotFound` if a capability is not in the registry
     /// - `LeaseError::LeaseRevoked` if any capability in the chain is revoked
     /// - `LeaseError::LeaseExpired` if any capability in the chain is expired
@@ -1110,7 +1110,7 @@ impl CapabilityProof {
     /// # Security (HIGH-02)
     ///
     /// This method is required for cross-node verification. Using only
-    /// [`verify`] without ledger state checks would allow presenting
+    /// [`Self::verify`] without ledger state checks would allow presenting
     /// proofs for revoked capabilities.
     pub fn verify_with_state<F>(
         &self,
