@@ -171,7 +171,7 @@ pub struct TokenRequest {
 }
 
 pub struct TokenResponse {
-    pub token: String,       // SENSITIVE - never log or store
+    pub token: SecretString, // CTR-2604: wrapped to prevent accidental logging
     pub token_hash: Vec<u8>, // Safe for ledger
     pub expires_at: u64,
     pub scopes: Vec<GitHubScope>,

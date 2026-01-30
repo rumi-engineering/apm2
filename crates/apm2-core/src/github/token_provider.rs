@@ -25,6 +25,8 @@
 
 use std::time::Duration;
 
+use secrecy::SecretString;
+
 use super::error::GitHubError;
 use super::scope::{GitHubApp, GitHubScope, RiskTier};
 
@@ -134,12 +136,11 @@ impl TokenRequest {
 }
 
 /// Response from minting an installation access token.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TokenResponse {
     /// The installation access token.
-    /// WARNING: This is sensitive and should never be logged or stored in
-    /// ledger.
-    pub token: String,
+    /// Wrapped in `SecretString` to prevent accidental logging (CTR-2604).
+    pub token: SecretString,
 
     /// SHA-256 hash of the token (safe to store in ledger).
     pub token_hash: Vec<u8>,
@@ -213,13 +214,14 @@ impl TokenProvider for MockTokenProvider {
         let counter = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let token = format!(
+        let token_str = format!(
             "ghs_mock_{}_{}_{}",
             request.app.name(),
             request.installation_id,
             counter
         );
-        let token_hash = TokenResponse::hash_token(&token);
+        let token_hash = TokenResponse::hash_token(&token_str);
+        let token = SecretString::from(token_str);
 
         // Calculate expiration
         let now = std::time::SystemTime::now()
@@ -246,6 +248,8 @@ impl TokenProvider for MockTokenProvider {
 
 #[cfg(test)]
 mod unit_tests {
+    use secrecy::ExposeSecret;
+
     use super::*;
 
     #[test]
@@ -400,7 +404,7 @@ mod unit_tests {
 
         let response = provider.mint_token(&request).unwrap();
 
-        assert!(response.token.starts_with("ghs_mock_"));
+        assert!(response.token.expose_secret().starts_with("ghs_mock_"));
         assert_eq!(response.token_hash.len(), 32);
         assert_eq!(response.installation_id, "12345");
         assert!(!response.scopes.is_empty());
@@ -420,7 +424,10 @@ mod unit_tests {
         let response2 = provider.mint_token(&request).unwrap();
 
         // Each call should produce a unique token
-        assert_ne!(response1.token, response2.token);
+        assert_ne!(
+            response1.token.expose_secret(),
+            response2.token.expose_secret()
+        );
         assert_ne!(response1.token_hash, response2.token_hash);
     }
 
