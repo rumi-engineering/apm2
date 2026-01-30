@@ -21,10 +21,11 @@
 //! - **Signed receipts**: Every projection generates a signed receipt
 //! - **Domain separation**: Receipts use `PROJECTION_RECEIPT:` prefix
 //! - **Idempotent**: Safe for retries
+//! - **Persistent cache**: Idempotency cache survives restarts (THESIS-02)
 //!
 //! # Components
 //!
-//! - [`ProjectionAdapter`]: Trait for write-only projection adapters
+//! - [`ProjectionAdapter`]: Async trait for write-only projection adapters
 //! - [`GitHubProjectionAdapter`]: GitHub commit status projection
 //! - [`ProjectionReceipt`]: Signed proof of projection
 //! - [`ProjectedStatus`]: Status values that can be projected
@@ -45,16 +46,16 @@
 //!
 //! // Create adapter
 //! let signer = Signer::generate();
-//! let config = GitHubAdapterConfig::new("https://api.github.com", "owner", "repo");
-//! let adapter = GitHubProjectionAdapter::new_mock(signer, config);
+//! let config = GitHubAdapterConfig::new("https://api.github.com", "owner", "repo")?;
+//! let adapter = GitHubProjectionAdapter::new_mock(signer, config)?;
 //!
-//! // Project a status
+//! // Project a status (async)
 //! let receipt = adapter.project_status(
 //!     "work-001",
 //!     [0x42; 32],  // changeset_digest
 //!     [0xAB; 32],  // ledger_head
 //!     ProjectedStatus::Success,
-//! )?;
+//! ).await?;
 //!
 //! // Verify the receipt
 //! assert!(receipt.validate_signature(&adapter.verifying_key()).is_ok());

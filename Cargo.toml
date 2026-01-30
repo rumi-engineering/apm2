@@ -114,6 +114,11 @@ http = "1.0"
 http-body-util = "0.1"
 tower = { version = "0.4", features = ["util"] }
 
+# HTTP Client (GitHub API)
+hyper = { version = "1.5", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "ring", "tls12", "webpki-tokio"] }
+
 # Sandboxing (Linux only)
 seccompiler = "0.5"
 libc = "0.2"

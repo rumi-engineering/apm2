@@ -86,6 +86,16 @@ uuid.workspace = true
 # TLS (for crypto provider initialization)
 rustls.workspace = true
 
+# HTTP Client (GitHub API)
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+
+# Database (persistent idempotency cache)
+rusqlite.workspace = true
+
 [dev-dependencies]
 # Testing utilities
 tempfile.workspace = true
