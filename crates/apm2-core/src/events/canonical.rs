@@ -37,8 +37,8 @@
 
 use super::{
     AdjudicationRequested, EvidencePublished, GateReceiptGenerated, KernelEvent, LeaseConflict,
-    WorkCompleted, WorkOpened, adjudication_event, evidence_event, kernel_event, lease_event,
-    work_event,
+    PolicyResolvedForChangeSet, WorkCompleted, WorkOpened, adjudication_event, evidence_event,
+    kernel_event, lease_event, work_event,
 };
 
 /// Trait for canonicalizing messages before signing.
@@ -91,6 +91,31 @@ impl Canonicalize for LeaseConflict {
     }
 }
 
+impl Canonicalize for PolicyResolvedForChangeSet {
+    fn canonicalize(&mut self) {
+        // Sort RCP profile IDs and manifest hashes together to maintain alignment.
+        // We zip them, sort by profile ID, then unzip back.
+        if self.resolved_rcp_profile_ids.len() == self.resolved_rcp_manifest_hashes.len() {
+            let mut pairs: Vec<(String, Vec<u8>)> = self
+                .resolved_rcp_profile_ids
+                .drain(..)
+                .zip(self.resolved_rcp_manifest_hashes.drain(..))
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, hash) in pairs {
+                self.resolved_rcp_profile_ids.push(id);
+                self.resolved_rcp_manifest_hashes.push(hash);
+            }
+        } else {
+            // If lengths don't match, just sort profile IDs independently
+            self.resolved_rcp_profile_ids.sort();
+        }
+
+        // Sort verifier policy hashes independently (they're not paired)
+        self.resolved_verifier_policy_hashes.sort();
+    }
+}
+
 impl Canonicalize for KernelEvent {
     fn canonicalize(&mut self) {
         // Canonicalize nested payload if present
@@ -122,6 +147,9 @@ impl Canonicalize for KernelEvent {
                 if let Some(lease_event::Event::Conflict(conflict)) = &mut lease_event.event {
                     conflict.canonicalize();
                 }
+            },
+            Some(kernel_event::Payload::PolicyResolvedForChangeset(policy_resolved)) => {
+                policy_resolved.canonicalize();
             },
             _ => {},
         }
@@ -288,5 +316,97 @@ mod tests {
         let before = opened.requirement_ids.clone();
         opened.canonicalize();
         assert_eq!(opened.requirement_ids, before);
+    }
+
+    #[test]
+    fn test_policy_resolved_for_changeset_canonicalize() {
+        let mut policy_resolved = PolicyResolvedForChangeSet {
+            work_id: "work-1".to_string(),
+            changeset_digest: vec![0x42; 32],
+            resolved_policy_hash: vec![0x00; 32],
+            resolved_risk_tier: 1,
+            resolved_determinism_class: 0,
+            // Unsorted profile IDs with corresponding manifest hashes
+            resolved_rcp_profile_ids: vec![
+                "z-profile".into(),
+                "a-profile".into(),
+                "m-profile".into(),
+            ],
+            resolved_rcp_manifest_hashes: vec![
+                vec![0x99; 32], // corresponds to z-profile
+                vec![0x11; 32], // corresponds to a-profile
+                vec![0x55; 32], // corresponds to m-profile
+            ],
+            // Unsorted verifier policy hashes
+            resolved_verifier_policy_hashes: vec![vec![0xCC; 32], vec![0xAA; 32], vec![0xBB; 32]],
+            resolver_actor_id: "resolver-1".to_string(),
+            resolver_version: "1.0.0".to_string(),
+            resolver_signature: vec![0u8; 64],
+        };
+
+        policy_resolved.canonicalize();
+
+        // Profile IDs should be sorted alphabetically
+        assert_eq!(
+            policy_resolved.resolved_rcp_profile_ids,
+            vec!["a-profile", "m-profile", "z-profile"]
+        );
+
+        // Manifest hashes should follow the same order as their corresponding profile
+        // IDs
+        assert_eq!(
+            policy_resolved.resolved_rcp_manifest_hashes,
+            vec![vec![0x11; 32], vec![0x55; 32], vec![0x99; 32]]
+        );
+
+        // Verifier policy hashes should be sorted independently
+        assert_eq!(
+            policy_resolved.resolved_verifier_policy_hashes,
+            vec![vec![0xAA; 32], vec![0xBB; 32], vec![0xCC; 32]]
+        );
+    }
+
+    #[test]
+    fn test_kernel_event_canonicalize_policy_resolved() {
+        let mut event = KernelEvent {
+            sequence: 1,
+            payload: Some(kernel_event::Payload::PolicyResolvedForChangeset(
+                PolicyResolvedForChangeSet {
+                    work_id: "work-1".to_string(),
+                    changeset_digest: vec![0x42; 32],
+                    resolved_policy_hash: vec![0x00; 32],
+                    resolved_risk_tier: 1,
+                    resolved_determinism_class: 0,
+                    resolved_rcp_profile_ids: vec!["z-profile".into(), "a-profile".into()],
+                    resolved_rcp_manifest_hashes: vec![vec![0x99; 32], vec![0x11; 32]],
+                    resolved_verifier_policy_hashes: vec![vec![0xBB; 32], vec![0xAA; 32]],
+                    resolver_actor_id: "resolver-1".to_string(),
+                    resolver_version: "1.0.0".to_string(),
+                    resolver_signature: vec![0u8; 64],
+                },
+            )),
+            ..Default::default()
+        };
+
+        event.canonicalize();
+
+        if let Some(kernel_event::Payload::PolicyResolvedForChangeset(policy_resolved)) =
+            &event.payload
+        {
+            assert_eq!(
+                policy_resolved.resolved_rcp_profile_ids,
+                vec!["a-profile", "z-profile"]
+            );
+            assert_eq!(
+                policy_resolved.resolved_rcp_manifest_hashes,
+                vec![vec![0x11; 32], vec![0x99; 32]]
+            );
+            assert_eq!(
+                policy_resolved.resolved_verifier_policy_hashes,
+                vec![vec![0xAA; 32], vec![0xBB; 32]]
+            );
+        } else {
+            panic!("Expected PolicyResolvedForChangeset payload");
+        }
     }
 }
