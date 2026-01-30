@@ -83,7 +83,7 @@ Confirm the compiler produced:
 
 ### 5) Hand-off to implementation
 
-Use `dev-eng-ticket` skill with the emitted tickets. Implementers must follow the referenced AGENTS.md invariants and the ticket verification commands.
+Use `ticket` skill with the emitted tickets. Implementers must follow the referenced AGENTS.md invariants and the ticket verification commands.
 
 ## CLI Integration
 

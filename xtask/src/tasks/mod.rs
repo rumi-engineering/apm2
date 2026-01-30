@@ -27,12 +27,13 @@ use anyhow::Result;
 /// * `target` - Optional RFC ID (RFC-XXXX), ticket ID (TCK-XXXXX), or None for
 ///   earliest unblocked globally
 /// * `print_path_only` - If true, only print the worktree path (for scripting)
+/// * `force` - If true, auto-cleanup remediable worktree issues
 ///
 /// # Errors
 ///
 /// Returns an error if the setup fails. See [`start_ticket::run`] for details.
-pub fn start_ticket(target: Option<&str>, print_path_only: bool) -> Result<()> {
-    start_ticket::run(target, print_path_only)
+pub fn start_ticket(target: Option<&str>, print_path_only: bool, force: bool) -> Result<()> {
+    start_ticket::run(target, print_path_only, force)
 }
 
 /// Run checks and create a commit.

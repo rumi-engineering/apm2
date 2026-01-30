@@ -1,11 +1,13 @@
-title: Dev Ticket Workflow Decision Tree
+title: Ticket Workflow Decision Tree
 
 decision_tree:
   entrypoint: INIT_AND_CLASSIFY
   nodes[1]:
     - id: INIT_AND_CLASSIFY
       purpose: "Initialize worktree and choose the correct workflow path."
-      context_files[6]:
+      context_files[7]:
+        - path: ROOT_ONBOARDING.cac.md
+          purpose: "Repository-level onboarding: read_first files, precedence rules, worktree policies."
         - path: documents/README.md
         - path: documents/skills/README.md
           purpose: "Root-level module index, documentation discovery, and repository-wide constraints."
@@ -17,7 +19,9 @@ decision_tree:
           purpose: "Security invariants and modes."
         - path: documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/SKILL.md
           purpose: "Core philosophy and constraints."
-      steps[5]:
+      steps[6]:
+        - id: READ_ROOT_ONBOARDING
+          action: "Read ROOT_ONBOARDING.cac.md and follow read_first directive (AGENTS.md, SECURITY.md)."
         - id: READ_BASELINE_CONTEXT
           action: "Read the context files listed above and note global constraints."
         - id: NOTE_ARGUMENT_SUBSTITUTION

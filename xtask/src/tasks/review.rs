@@ -16,7 +16,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
-use crate::reviewer_state::ReviewerSpawner;
+use crate::reviewer_state::{ReviewerSpawner, select_review_model};
 
 /// Review type determines which prompt and status check to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,7 +264,7 @@ fn run_ai_review(
     // Use ReviewerSpawner for centralized spawn logic (synchronous mode)
     let spawner = ReviewerSpawner::new(reviewer_type_key, pr_url, head_sha)
         .with_prompt_content(&prompt)
-        .with_model("gemini-3-flash-preview");
+        .with_model(select_review_model());
 
     let status_context = review_type.status_context();
     match spawner.spawn_sync() {

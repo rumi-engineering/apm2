@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
-use crate::reviewer_state::ReviewerSpawner;
+use crate::reviewer_state::{ReviewerSpawner, select_review_model};
 use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_ticket_branch};
 
 /// Push branch and create PR.
@@ -296,7 +296,7 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
         println!("  Spawning Gemini security review...");
         let spawner = ReviewerSpawner::new("security", pr_url, &head_sha)
             .with_prompt_file(Path::new(&security_prompt_path))
-            .map(|s| s.with_model("gemini-3-flash-preview"))
+            .map(|s| s.with_model(select_review_model()))
             .ok();
 
         if let Some(spawner) = spawner {
@@ -313,7 +313,7 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
         println!("  Spawning Gemini code quality review...");
         let spawner = ReviewerSpawner::new("quality", pr_url, &head_sha)
             .with_prompt_file(Path::new(&code_quality_prompt_path))
-            .map(|s| s.with_model("gemini-3-flash-preview"))
+            .map(|s| s.with_model(select_review_model()))
             .ok();
 
         if let Some(spawner) = spawner {
