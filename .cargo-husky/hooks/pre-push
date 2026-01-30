@@ -1,16 +1,83 @@
 #!/usr/bin/env bash
 set -e
 
+# Use colors for output
+RED='\033[0;31m'
 GREEN='\033[0;32m'
-NC='\033[0m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
 echo -e "${GREEN}Running pre-push hooks...${NC}"
 
-# 1. Tests
+# 1. Trailing whitespace & Merge conflicts (Fast)
+echo "Checking for merge conflicts and trailing whitespace..."
+git diff HEAD --check
+
+# 2. Rust fmt (check only - commits already made)
+echo "Checking code formatting (cargo fmt)..."
+cargo fmt --all --check
+
+# 3. Clippy
+echo "Running Clippy..."
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# 4. Proto verification
+echo "Verifying generated proto code..."
+cargo build -p apm2-daemon --quiet 2>/dev/null
+if ! git diff --exit-code crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs > /dev/null; then
+    echo -e "${RED}ERROR: Generated proto code is out of sync. Run cargo build and commit the changes.${NC}"
+    exit 1
+fi
+
+# 5. Typos
+if command -v typos >/dev/null 2>&1; then
+    echo "Checking for typos..."
+    typos
+else
+    echo -e "${YELLOW}Warning: typos not installed, skipping...${NC}"
+fi
+
+# 6. Taplo (TOML check)
+if command -v taplo >/dev/null 2>&1; then
+    echo "Checking TOML files..."
+    taplo check
+    taplo format --check
+else
+    echo -e "${YELLOW}Warning: taplo not installed, skipping...${NC}"
+fi
+
+# 7. YAML check
+if command -v python3 >/dev/null 2>&1; then
+    echo "Checking YAML files..."
+    # Check if pyyaml is installed
+    if python3 -c "import yaml" >/dev/null 2>&1; then
+        # Use null-terminated find output and while-read loop for safe filename handling
+        # This handles filenames with spaces, newlines, and special characters
+        while IFS= read -r -d '' file; do
+            python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" "$file"
+        done < <(find . \( -name "*.yaml" -o -name "*.yml" \) -not -path "*/target/*" -print0)
+    else
+        echo -e "${YELLOW}Warning: pyyaml not installed, skipping YAML validation...${NC}"
+    fi
+
+    echo "Checking JSON files..."
+    # Use -print0 and xargs -0 for safe filename handling
+    find . -name "*.json" -not -path "*/target/*" -print0 | xargs -0 python3 -m json.tool > /dev/null
+fi
+
+# 8. Markdown lint
+if command -v markdownlint >/dev/null 2>&1; then
+    echo "Linting Markdown..."
+    markdownlint .
+else
+    echo -e "${YELLOW}Warning: markdownlint not installed, skipping...${NC}"
+fi
+
+# 9. Tests
 echo "Running workspace tests..."
 cargo test --workspace
 
-# 2. Docs
+# 10. Docs
 echo "Checking documentation generation..."
 cargo doc --workspace --no-deps
 

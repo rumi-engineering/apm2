@@ -1,0 +1,222 @@
+prd_constraints_invariants:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  constraints:
+    - id: CNS-0001
+      statement: "ClaimWork MUST NOT accept requester-supplied capabilities."
+      rationale: |
+        Requester cannot supply own privileges. This is a fundamental OCAP principle.
+        Capabilities must be minted by policy, not requested by callers.
+      enforcement: "ClaimWork IPC rejects capability parameters; only accepts (actor_id, role)."
+      evidence_ids:
+        - EVID-0005
+    - id: CNS-0002
+      statement: "Episode spawn MUST block until PolicyResolvedForChangeSet exists."
+      rationale: |
+        FAC trust boundary requires policy resolution before any execution.
+        Spawn without policy resolution enables policy bypass.
+      enforcement: "SpawnEpisode verifies PolicyResolvedForChangeSet in ledger before proceeding."
+      evidence_ids:
+        - EVID-0002
+    - id: CNS-0003
+      statement: "Gate executor spawn MUST require valid GateLeaseIssued."
+      rationale: |
+        Gate execution without lease violates FAC authority model.
+        Lease binds executor to specific (work_id, gate_id, changeset_digest).
+      enforcement: "SpawnEpisode for GATE_EXECUTOR role verifies GateLeaseIssued exists and matches."
+      evidence_ids:
+        - EVID-0004
+    - id: CNS-0004
+      statement: "Sessions MUST receive ephemeral handles, never credentials."
+      rationale: |
+        OCAP containment requires no ambient secrets. Sessions should not have
+        direct access to GitHub tokens, API keys, or SSH keys.
+      enforcement: "EpisodeSpawned returns ephemeral_handle only; credentials held by daemon broker."
+      evidence_ids:
+        - EVID-0003
+    - id: CNS-0005
+      statement: "Tool broker MUST terminate session on context firewall violation; not log and continue."
+      rationale: |
+        Context firewall violations indicate potential security breach or
+        capability escape. Logging without termination is insufficient.
+      enforcement: |
+        ToolDecided=DENY emitted; SessionTerminated with rationale=CONTEXT_FIREWALL_VIOLATION
+        within 100ms; session process receives SIGTERM.
+      evidence_ids:
+        - EVID-0003
+    - id: CNS-0006
+      statement: "SoD MUST reject overlapping signing custody domains between author and gate executor."
+      rationale: |
+        Separation of Duties prevents self-review. Author cannot be their own
+        gate executor for required gates.
+      enforcement: |
+        LeaseIssueDenied event emitted with reason=SOD_VIOLATION; CLI returns non-zero
+        exit code with diagnostic message.
+      evidence_ids:
+        - EVID-0006
+    - id: CNS-0007
+      statement: "All state transitions MUST emit signed events to ledger."
+      rationale: |
+        Receipt-backed orchestration requires cryptographic proof of all transitions.
+        Unsigned events cannot be verified or audited.
+      enforcement: "Ed25519 signed events for WorkClaimed, EpisodeSpawned, ToolDecided, ToolExecuted."
+      evidence_ids:
+        - EVID-0007
+    - id: CNS-0008
+      statement: "Privileged IPC endpoints MUST require operator/internal credential."
+      rationale: |
+        IPC is a security boundary. Agents cannot call privileged endpoints
+        (ClaimWork, SpawnEpisode, IssueCapability, Shutdown) directly.
+      enforcement: |
+        Unix socket peer creds + capability token validation. Privileged endpoints
+        require operator UID/GID or internal holon signing key.
+      evidence_ids:
+        - EVID-0001
+        - EVID-0002
+    - id: CNS-0009
+      statement: "Container deployments MUST preserve UID mapping for peer credential verification."
+      rationale: |
+        SO_PEERCRED may not reflect true caller identity in all container runtimes
+        when user namespaces remap UIDs.
+      enforcement: "Container deployments use --userns=host or equivalent; documented in deployment guide."
+      evidence_ids:
+        - EVID-0001
+    - id: CNS-0010
+      statement: "Denied privilege escalation attempts MUST return generic PERMISSION_DENIED without endpoint enumeration."
+      rationale: |
+        Error messages should not leak information about what privileged
+        endpoints exist to potential attackers.
+      enforcement: "Unauthorized IPC calls return PERMISSION_DENIED; detailed logging to daemon only."
+      evidence_ids:
+        - EVID-0001
+  invariants:
+    - id: INV-0001
+      statement: |
+        An agent cannot execute privileged IPC operations; it must use session-scoped
+        endpoints only.
+      rationale: |
+        Core security boundary. Agents are untrusted and operate within bounded
+        capability manifests.
+      enforcement: "IPC authentication + endpoint classification"
+      evidence_ids:
+        - EVID-0001
+        - EVID-0002
+    - id: INV-0002
+      statement: |
+        A session cannot access credentials directly; all authenticated operations
+        are broker-mediated.
+      rationale: |
+        OCAP containment. Credential access would enable lateral movement and
+        bypass mediation controls.
+      enforcement: "Daemon tool broker holds credentials; session requests tool calls"
+      evidence_ids:
+        - EVID-0003
+    - id: INV-0003
+      statement: |
+        A gate executor cannot produce GateOutcome without valid lease binding to
+        work_id, gate_id, and changeset_digest.
+      rationale: |
+        FAC authority model. Leases bind authority to specific context.
+      enforcement: "GateOutcome validation requires lease match"
+      evidence_ids:
+        - EVID-0004
+    - id: INV-0004
+      statement: |
+        Context firewall violations result in immediate session termination, not
+        warning and continue.
+      rationale: |
+        Fail-closed security. Context escape attempts must be stopped immediately.
+      enforcement: "SessionTerminated emitted; SIGTERM to process"
+      evidence_ids:
+        - EVID-0003
+    - id: INV-0005
+      statement: |
+        All receipts are Ed25519 signed with domain-separated prefixes. Unsigned
+        receipts are defects.
+      rationale: |
+        Cryptographic integrity. Domain separation prevents cross-context replay.
+      enforcement: "Signature verification on ledger ingestion"
+      evidence_ids:
+        - EVID-0007
+    - id: INV-0006
+      statement: |
+        Daemon restart recovers active sessions within 5s via LEASE_REVOKED signal.
+        No orphaned sessions persist.
+      rationale: |
+        Reliability and security. Orphaned sessions could operate without valid
+        authority after daemon state loss.
+      enforcement: "Session manager tracks active sessions; recovery emits revocation signals"
+      evidence_ids:
+        - EVID-0013
+  security_properties:
+    - id: SEC-PROP-0001
+      name: "IPC authentication boundary"
+      statement: |
+        All daemon IPC is authenticated via peer credentials. Unauthenticated
+        requests are rejected.
+      evidence_ids:
+        - EVID-0001
+    - id: SEC-PROP-0002
+      name: "Privilege separation"
+      statement: |
+        Privileged and session-scoped endpoints are separated. Agents cannot
+        reach privileged operations.
+      evidence_ids:
+        - EVID-0001
+        - EVID-0002
+    - id: SEC-PROP-0003
+      name: "Zero ambient credentials"
+      statement: |
+        Sessions have no credential access. All authenticated operations are
+        broker-mediated.
+      evidence_ids:
+        - EVID-0003
+    - id: SEC-PROP-0004
+      name: "Policy-minted capabilities"
+      statement: |
+        Capabilities are minted by governance policy, not requested by callers.
+      evidence_ids:
+        - EVID-0005
+    - id: SEC-PROP-0005
+      name: "Fail-closed context firewall"
+      statement: |
+        Context firewall violations terminate sessions immediately.
+      evidence_ids:
+        - EVID-0003
+  security_controls:
+    - id: SEC-CTRL-0001
+      name: "Unix socket peer credential validation"
+      type: preventative
+      details: |
+        SO_PEERCRED extracts UID/GID of connecting process. Validates against
+        operator or agent credential lists.
+    - id: SEC-CTRL-0002
+      name: "Per-connection capability tokens"
+      type: preventative
+      details: |
+        Capability tokens issued at connection establishment. Tokens scope
+        available operations for the connection lifetime.
+    - id: SEC-CTRL-0003
+      name: "Context firewall enforcement"
+      type: preventative
+      details: |
+        Tool broker validates all read operations against ContextPack allowlist.
+        Denials emit DENY event and terminate session.
+    - id: SEC-CTRL-0004
+      name: "Credential broker isolation"
+      type: preventative
+      details: |
+        Credentials (GitHub tokens, API keys, SSH keys) held by daemon.
+        Sessions request operations; broker mediates without exposing credentials.
+    - id: SEC-CTRL-0005
+      name: "SoD custody domain validation"
+      type: preventative
+      details: |
+        Gate executor spawn validates custody domain separation from author.
+        Overlap triggers SOD_VIOLATION rejection.
+    - id: SEC-CTRL-0006
+      name: "Session recovery on daemon crash"
+      type: corrective
+      details: |
+        Daemon restart triggers LEASE_REVOKED to all tracked sessions within 5s.
+        Prevents orphaned sessions from continuing without valid authority.

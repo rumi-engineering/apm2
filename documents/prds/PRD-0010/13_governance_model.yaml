@@ -1,0 +1,48 @@
+prd_governance_model:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  governance:
+    authority_matrix:
+      - authority: AUTH_PRODUCT
+        responsibilities:
+          - "Approve PRD scope and goals"
+          - "Approve migration timeline"
+          - "Sign off on deprecation gates"
+        signoff_required_for:
+          - GATE-PRD-CONTENT
+          - GATE-PRD-QUALITY-COVERAGE
+      - authority: AUTH_SECURITY
+        responsibilities:
+          - "Approve security architecture"
+          - "Approve IPC authentication design"
+          - "Validate adversarial test coverage"
+        signoff_required_for:
+          - GATE-PRD-CONTENT
+          - GATE-PRD-EVIDENCE-STANDARDS
+    change_control:
+      - change_type: BREAKING
+        description: "Changes to IPC protocol, capability model, or security boundaries"
+        approval_required:
+          - AUTH_PRODUCT
+          - AUTH_SECURITY
+        notification_required:
+          - All teams using daemon IPC
+      - change_type: NON_BREAKING
+        description: "Performance improvements, additional metrics, documentation updates"
+        approval_required:
+          - AUTH_PRODUCT
+        notification_required: []
+    escalation_path:
+      - level: 1
+        authority: AUTH_PRODUCT
+        scope: "Requirement clarifications, scope questions"
+      - level: 2
+        authority: AUTH_SECURITY
+        scope: "Security architecture decisions"
+      - level: 3
+        authority: AUTH_PRINCIPAL
+        scope: "Cross-domain conflicts, law alignment disputes"
+    review_cadence:
+      pre_implementation: "Full PRD review with all gates"
+      post_phase_1: "Security audit of IPC implementation"
+      post_phase_5: "Retrospective on migration success"

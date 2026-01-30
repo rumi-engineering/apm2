@@ -1,0 +1,31 @@
+rfc_evidence_artifact:
+  schema_version: "2026-01-30"
+  id: "EVID-HTF-0006"
+  category: "INTEGRATION_TEST_RESULTS"
+  title: "Reducer replay determinism under HTF"
+  description: |
+    Tests that reducers are time-pure and replay determinism holds:
+    - reducers do not consult runtime clocks
+    - replay from genesis yields identical projections
+    - time envelopes are treated as data
+  capture:
+    paths:
+      - "htf/replay/"
+  verification:
+    commands:
+      - id: "CMD-HTF-0006"
+        shell: "bash"
+        command: "cargo test -p apm2-core reducer"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 600
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Replay-from-genesis equals replay-from-checkpoint"
+          - "No reducer uses SystemTime::now or similar"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

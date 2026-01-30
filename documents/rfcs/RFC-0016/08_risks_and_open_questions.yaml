@@ -1,0 +1,78 @@
+rfc_risks_and_open_questions:
+  schema_version: "2026-01-30"
+
+  risks:
+    - id: RSK-HTF-0001
+      title: "Legacy wall-time fields accidentally remain authoritative"
+      statement: |
+        Existing protobuf fields (timestamps, ms durations) may be used by new
+        code paths as authority if not mechanically prevented.
+      mitigation:
+        - "Introduce HTF types and deny raw timestamp parameters in privileged APIs"
+        - "Add code-lint denylist for SystemTime/Utc::now usage in admission/gate/reducer paths"
+        - "Admission validation rejects missing envelopes on required artifacts"
+      blocking_tickets: [TCK-00236, TCK-00246]
+
+    - id: RSK-HTF-0002
+      title: "Monotonic anomalies in CI/virtualized environments"
+      statement: |
+        Some CI and container environments may exhibit monotonic anomalies.
+        Overly strict handling could cause test flakiness.
+      mitigation:
+        - "Make anomaly thresholds policy-configured"
+        - "Separate high-risk fail-closed behavior from low-risk development settings"
+        - "Treat regressions as always-fatal; treat large jumps as policy-dependent"
+      blocking_tickets: [TCK-00240]
+
+    - id: RSK-HTF-0003
+      title: "HLC misuse as authority"
+      statement: |
+        HLC stamps are attractive for ordering, but are advisory only.
+        If used as authority, they reintroduce time-manipulation risk.
+      mitigation:
+        - "Explicit authority matrix in docs"
+        - "Type separation; privileged logic cannot accept HLC for ordering"
+        - "Audit and lint for comparisons used in gate truth"
+      blocking_tickets: [TCK-00236, TCK-00246]
+
+    - id: RSK-HTF-0004
+      title: "Schema and canonicalization drift"
+      statement: |
+        If canonicalization or schema semantics drift, signature verification and
+        long-term auditability break.
+      mitigation:
+        - "Pin canonicalizer_id/version and vectors_ref"
+        - "Treat vectors as signature-critical evidence"
+        - "Fail closed on unknown schema versions"
+      blocking_tickets: [TCK-00237, TCK-00238]
+
+    - id: RSK-HTF-0005
+      title: "Developer ergonomics regressions"
+      statement: |
+        Moving from human durations to ticks may reduce readability if not paired
+        with good tooling and display conversions.
+      mitigation:
+        - "CLI renders tick deltas with human-friendly labels as non-authoritative overlays"
+        - "Provide helper APIs for tick arithmetic"
+      blocking_tickets: [TCK-00247]
+
+  open_questions:
+    - id: Q-HTF-0001
+      question: "Tick quantum representation: store raw monotonic ns vs fixed-rate ticks"
+      notes:
+        - "Recommendation: store raw monotonic ns internally and expose policy in logical ticks."
+
+    - id: Q-HTF-0002
+      question: "Cross-ledger mapping when multiple ledgers exist"
+      notes:
+        - "Do we need explicit signed checkpoint exchange events for reconciliation?"
+
+    - id: Q-HTF-0003
+      question: "Bounded wall-time source selection and confidence representation"
+      notes:
+        - "Unify confidence across deployments to support consistent UI overlays."
+
+    - id: Q-HTF-0004
+      question: "Handling monotonic anomalies under suspend/migration"
+      notes:
+        - "Define policy tiers for jump thresholds and quarantine routing."

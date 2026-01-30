@@ -256,6 +256,11 @@ fn check_markdown_examples(findings: &mut Vec<LintFinding>) -> Result<()> {
 
         for entry in glob_pattern {
             let path = entry.context("Failed to read markdown glob entry")?;
+            // Some repos may contain directories that end with `.md` (e.g., skill bundles).
+            // Only attempt to parse real markdown files.
+            if !path.is_file() {
+                continue;
+            }
             check_markdown_file(&path, findings)?;
         }
     }

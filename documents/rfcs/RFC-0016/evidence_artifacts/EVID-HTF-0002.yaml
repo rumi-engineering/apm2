@@ -1,0 +1,29 @@
+rfc_evidence_artifact:
+  schema_version: "2026-01-30"
+  id: "EVID-HTF-0002"
+  category: "TEST_RESULTS"
+  title: "MonotonicTicks regression detection"
+  description: |
+    Tests that detect monotonic regression and large monotonic jumps and
+    enforce fail-closed or quarantine behavior by policy.
+  capture:
+    paths:
+      - "htf/monotonic/"
+  verification:
+    commands:
+      - id: "CMD-HTF-0002"
+        shell: "bash"
+        command: "cargo test -p apm2-daemon htf"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 600
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Regression emits CLOCK_REGRESSION defect"
+          - "Anomaly emits CLOCK_ANOMALY defect"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

@@ -1,0 +1,142 @@
+prd_traceability:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  requirement_to_goal:
+    - requirement_id: REQ-0001
+      goal_ids:
+        - DCP-G-0006
+    - requirement_id: REQ-0002
+      goal_ids:
+        - DCP-G-0002
+    - requirement_id: REQ-0003
+      goal_ids:
+        - DCP-G-0002
+    - requirement_id: REQ-0004
+      goal_ids:
+        - DCP-G-0003
+    - requirement_id: REQ-0005
+      goal_ids:
+        - DCP-G-0004
+    - requirement_id: REQ-0006
+      goal_ids:
+        - DCP-G-0005
+    - requirement_id: REQ-0007
+      goal_ids:
+        - DCP-G-0007
+    - requirement_id: REQ-0008
+      goal_ids:
+        - DCP-G-0006
+    - requirement_id: REQ-0009
+      goal_ids:
+        - DCP-G-0001
+    - requirement_id: REQ-0010
+      goal_ids:
+        - DCP-G-0001
+    - requirement_id: REQ-0011
+      goal_ids:
+        - DCP-G-0001
+    - requirement_id: REQ-0012
+      goal_ids:
+        - DCP-G-0008
+    - requirement_id: REQ-0013
+      goal_ids:
+        - DCP-G-0009
+  goal_to_problem:
+    - goal_id: DCP-G-0001
+      problem_ids:
+        - FM-0002
+    - goal_id: DCP-G-0002
+      problem_ids:
+        - FM-0001
+    - goal_id: DCP-G-0003
+      problem_ids:
+        - FM-0003
+    - goal_id: DCP-G-0004
+      problem_ids:
+        - FM-0001
+    - goal_id: DCP-G-0005
+      problem_ids:
+        - FM-0001
+    - goal_id: DCP-G-0006
+      problem_ids:
+        - FM-0001
+        - FM-0002
+    - goal_id: DCP-G-0007
+      problem_ids:
+        - FM-0002
+    - goal_id: DCP-G-0008
+      problem_ids:
+        - FM-0001
+    - goal_id: DCP-G-0009
+      problem_ids:
+        - FM-0004
+    - goal_id: DCP-G-0010
+      problem_ids:
+        - FM-0001
+  ticket_to_requirement:
+    - ticket_id: TCK-00200
+      requirement_ids:
+        - REQ-0001
+        - REQ-0008
+    - ticket_id: TCK-00201
+      requirement_ids:
+        - REQ-0001
+        - REQ-0008
+    - ticket_id: TCK-00202
+      requirement_ids:
+        - REQ-0009
+        - REQ-0010
+        - REQ-0011
+    - ticket_id: TCK-00203
+      requirement_ids:
+        - REQ-0002
+    - ticket_id: TCK-00204
+      requirement_ids:
+        - REQ-0003
+    - ticket_id: TCK-00205
+      requirement_ids:
+        - REQ-0006
+    - ticket_id: TCK-00206
+      requirement_ids:
+        - REQ-0004
+    - ticket_id: TCK-00207
+      requirement_ids:
+        - REQ-0005
+    - ticket_id: TCK-00208
+      requirement_ids:
+        - REQ-0004
+    - ticket_id: TCK-00209
+      requirement_ids:
+        - REQ-0009
+    - ticket_id: TCK-00210
+      requirement_ids:
+        - REQ-0002
+        - REQ-0003
+    - ticket_id: TCK-00211
+      requirement_ids:
+        - REQ-0002
+    - ticket_id: TCK-00212
+      requirement_ids:
+        - REQ-0012
+    - ticket_id: TCK-00213
+      requirement_ids:
+        - REQ-0001
+    - ticket_id: TCK-00214
+      requirement_ids:
+        - REQ-0001
+    - ticket_id: TCK-00215
+      requirement_ids:
+        - REQ-0001
+    - ticket_id: TCK-00216
+      requirement_ids:
+        - REQ-0001
+        - REQ-0002
+        - REQ-0003
+        - REQ-0004
+        - REQ-0005
+        - REQ-0006
+        - REQ-0007
+        - REQ-0008
+    - ticket_id: TCK-00217
+      requirement_ids:
+        - REQ-0001

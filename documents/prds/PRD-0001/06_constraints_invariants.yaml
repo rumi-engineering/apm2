@@ -126,8 +126,7 @@ prd_constraints_invariants:
       is binding only if it carries sufficient valid cryptographic signatures from
       the authorized group.'
     rationale: Removes human-in-the-loop dependencies for governance and gates.
-    enforcement: Projection reducers validate N-of-M signatures before transitioning
-    work states.
+    enforcement: "Projection reducers validate N-of-M signatures before transitioning work states."
     evidence_ids:
     - EVID-0004
   - id: INV-0008

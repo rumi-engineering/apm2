@@ -1,0 +1,110 @@
+rfc_meta:
+  schema_version: "2026-01-30"
+  template_version: "2026-01-23"
+
+  rfc:
+    id: RFC-0016
+    title: "Holonic Time Fabric (HTF)"
+    status: DRAFT
+    created_date: "2026-01-30"
+    last_updated_date: "2026-01-30"
+    version: "v0.1"
+    version_history:
+      - version: "v0.1"
+        date: "2026-01-30"
+        phase: "v0 (Council Drafting)"
+        notes: |
+          Initial HTF RFC draft created from council drafting instructions.
+          This RFC introduces a four-clock model, TimeEnvelope, ClockProfile,
+          and the policy/lint enforcement necessary to prohibit wall-time
+          authority in APM2.
+    abstract: |
+      HTF (Holonic Time Fabric) defines the time substrate for APM2.
+      It provides four clocks with explicit, non-overlapping authority:
+      LedgerTime for ordering, MonotonicTicks for deadlines/durations,
+      CausalTime (HLC) for cross-node correlation, and BoundedWallTime for
+      human-facing display and external coordination only.
+
+      HTF prohibits using wall time as authority in normative protocol
+      decisions (leases, retries, admission, gates, reducer truth).
+      All critical events/receipts must carry a TimeEnvelope (embedded or
+      CAS-referenced) pinned to a governed ClockProfile.
+
+  binds_to_prd:
+    prd_id: PRD-0001
+    prd_base_path: "documents/prds/PRD-0001/"
+    requirement_registry_ref: "07_traceability.yaml#prd_traceability.requirement_registry"
+    evidence_bundle_ref: "12_evidence_bundle.yaml#prd_evidence_bundle.bundle"
+    prd_meta_ref: "00_meta.yaml#prd_meta"
+    rationale: |
+      PRD-0001 already requires replay-safe lease semantics (no wall-clock
+      dependence for reducer truth) and deterministic accounting.
+      HTF defines the concrete time model, schemas, and enforcement needed to
+      satisfy those requirements across the kernel.
+
+  protocol_profile:
+    id: NONE
+    applies: false
+    inherited_from_prd: false
+    profile_ref: ""
+
+  custody:
+    producing_agent_roles:
+      - AGENT_AUTHOR
+      - AGENT_ARCHITECT
+    responsible_domains:
+      - DOMAIN_RUNTIME
+      - DOMAIN_SECURITY
+      - DOMAIN_OBSERVABILITY
+      - DOMAIN_INFRA
+      - DOMAIN_PRODUCT
+    authority_signoffs_required:
+      - AUTH_ARCHITECTURE
+      - AUTH_SECURITY
+      - AUTH_RELIABILITY
+      - AUTH_PRODUCT
+
+  refs:
+    standards:
+      requirement_schema: "standards/schemas/02_requirement.schema.yaml#requirement_schema"
+      evidence_artifact_schema: "standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema"
+      quality_coverage_schema: "standards/schemas/03_quality_coverage.schema.yaml#quality_coverage_schema"
+      gate_review_schema: "standards/schemas/06_gate_review.schema.yaml#gate_review_schema"
+      waiver_schema: "standards/schemas/05_waiver.schema.yaml#waiver_schema"
+      ticket_meta_schema: "standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema"
+      lint_spec: "standards/lint/LINT_SPEC.yaml#lint_spec"
+    laws:
+      - id: LAW-01
+        name: "Receipt-Backed Gate for Authoritative Promotion"
+        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_01.md"
+      - id: LAW-03
+        name: "Monotone Ledger vs. Overwritable Projection"
+        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_03.md"
+      - id: LAW-04
+        name: "Stochastic Stability Contracts"
+        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_04.md"
+      - id: LAW-05
+        name: "OCAP and Capability Scoping"
+        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_05.md"
+      - id: LAW-15
+        name: "Measurement Integrity"
+        ref: "documents/skills/laws-of-holonic-agent-systems/references/law_15.md"
+    related_documents:
+      glossary: "documents/skills/glossary/SKILL.md"
+      time_determinism_skill: "documents/skills/rust-textbook/25_time_monotonicity_determinism.md"
+      coordination: "documents/rfcs/RFC-0012/"
+      daemon_runtime: "documents/rfcs/RFC-0013/"
+      fac: "documents/rfcs/RFC-0015/"
+      fac_prd: "documents/prds/PRD-0009/"
+    protocol_refs:
+      event_schema: "proto/kernel_events.proto"
+      tool_protocol: "proto/tool_protocol.proto"
+
+  implementation:
+    language: Rust
+    edition: "2024"
+    primary_crates:
+      - apm2-core
+      - apm2-daemon
+      - apm2-cli
+      - xtask

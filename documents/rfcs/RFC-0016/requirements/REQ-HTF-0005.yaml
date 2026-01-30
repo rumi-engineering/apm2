@@ -1,0 +1,40 @@
+requirement:
+  id: REQ-HTF-0005
+  title: "Bounded wall time is interval-bounded and non-authoritative"
+  status: ACTIVE
+
+  statement: |
+    When wall time is recorded, it is represented as a bounded interval
+    (t_min_utc_ns, t_max_utc_ns) with a declared source and confidence.
+
+    The interval width must not exceed the bound declared in ClockProfile.
+    Wall time is never used for authority decisions.
+
+  rationale: |
+    Human-facing timestamps are useful, but raw wall time is not safe as a
+    protocol input. Representing wall time as a bounded interval makes
+    uncertainty explicit and prevents accidental authority use.
+
+  acceptance_criteria:
+    - id: AC-HTF-0005-001
+      description: "Wall time, when present, is an interval with explicit bounds."
+      verification: "Schema validation for BoundedWallTime."
+
+    - id: AC-HTF-0005-002
+      description: "Interval width is validated against ClockProfile.max_wall_uncertainty_ns."
+      verification: "Envelope invariant validation tests."
+
+    - id: AC-HTF-0005-003
+      description: "No authority decision consumes wall time."
+      verification: "Code-lint + review of privileged APIs."
+
+  design_references:
+    - "02_design_decisions.yaml#DD-HTF-0001"
+    - "04_contracts_and_versioning.yaml#cac_schemas"
+
+  test_references:
+    - "07_test_and_evidence.yaml#Canonicalization"
+
+  law_refs:
+    - LAW-05
+    - LAW-15

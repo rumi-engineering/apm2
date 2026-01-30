@@ -1,0 +1,36 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0013"
+  type: "RELIABILITY"
+  source_id: "DCP-G-0009"
+  title: "Daemon Crash Recovery"
+  statement: |
+    apm2-daemon restart MUST NOT orphan running episodes; sessions MUST receive
+    LEASE_REVOKED signal within 5s of daemon recovery; SessionTerminated events
+    MUST be recorded in ledger.
+  acceptance_criteria:
+    - "Sessions receive LEASE_REVOKED signal within 5s of daemon recovery. Verified by: Integration test measures signal delivery timing."
+    - "SessionTerminated events with rationale=DAEMON_RESTART recorded in ledger. Verified by: Ledger query after recovery shows termination events."
+    - "No orphaned processes continue operating after daemon restart. Verified by: Process monitoring confirms all sessions terminated."
+    - "Daemon state rebuilt from ledger replay on restart. Verified by: State inspection shows consistency with ledger."
+  evidence:
+    evidence_ids:
+      - EVID-0013
+  law_alignment:
+    - law_id: "LAW-12"
+      enforcement: "Bounded Search and Termination: Sessions terminated on lease revocation"
+      applies_to:
+        - "Daemon crash recovery"
+        - "Session lifecycle"
+    - law_id: "LAW-03"
+      enforcement: "Monotone Ledger: Daemon state is projection of ledger"
+      applies_to:
+        - "State recovery"
+  defect_codes:
+    - code: "SESSION_ORPHANED"
+      severity: "S1"
+      description: "Session continued operating after daemon restart without valid lease"
+    - code: "RECOVERY_TIMEOUT"
+      severity: "S2"
+      description: "LEASE_REVOKED signal not delivered within 5s"

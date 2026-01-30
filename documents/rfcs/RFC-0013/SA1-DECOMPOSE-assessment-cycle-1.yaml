@@ -434,9 +434,9 @@ recommendation: |
 
   Confidence in this assessment: HIGH (Mode 4 constraint analysis, Mode 48 systems analysis both converge)
 
----
-Assessment completed by: SA-1 (Structural Rigorist)
-Reasoning modes applied: [4, 22, 48, 61, 75]
-Gate pass rate: 2/3 explicit gates (PASS: ACYCLICITY, ARCHITECTURE; FAIL: COVERAGE, CCP-MAPPING)
-Supplementary gates: 2/2 (PASS: EVIDENCE, IMPLEMENTABILITY-CAVEATS)
-Confidence in verdict: HIGH (epistemic uncertainty is well-scoped to known unknowns)
+  # ---
+  # Assessment completed by: SA-1 (Structural Rigorist)
+  # Reasoning modes applied: [4, 22, 48, 61, 75]
+  # Gate pass rate: 2/3 explicit gates (PASS: ACYCLICITY, ARCHITECTURE; FAIL: COVERAGE, CCP-MAPPING)
+  # Supplementary gates: 2/2 (PASS: EVIDENCE, IMPLEMENTABILITY-CAVEATS)
+  # Confidence in verdict: HIGH (epistemic uncertainty is well-scoped to known unknowns)

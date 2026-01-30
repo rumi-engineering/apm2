@@ -1,0 +1,153 @@
+prd_quality_framework:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  dimensions:
+    - dimension_id: ACCESSIBILITY
+      applicability: DOES_NOT_APPLY
+      exception:
+        requested: true
+        rationale: "Daemon is a backend service with no user interface. CLI accessibility handled separately."
+        required_signoffs:
+          - AUTH_PRODUCT
+    - dimension_id: AGENT_FRIENDLY_UX
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0009
+          - REQ-0010
+          - REQ-0011
+          - REQ-0012
+    - dimension_id: BACKWARD_COMPATIBILITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+        notes: "xtask deprecation with migration path ensures backward compatibility during transition."
+    - dimension_id: COST_EFFICIENCY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      delegation:
+        rationale: "Cost efficiency delegated to implementation with latency guardrails."
+        guardrails:
+          - "Tool mediation overhead <5ms p50"
+          - "Spawn acknowledgment <100ms p99"
+        required_evidence_categories:
+          - BENCHMARK_RESULTS
+    - dimension_id: DATA_PRIVACY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0004
+        notes: "Zero credentials in sessions; broker-mediated access."
+    - dimension_id: DEFAULT_DENY_SECURITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0005
+          - REQ-0006
+          - REQ-0008
+    - dimension_id: DETERMINISM
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0002
+          - REQ-0003
+          - REQ-0007
+        notes: "Policy pinning and signed receipts ensure deterministic state transitions."
+    - dimension_id: DOCUMENTATION
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      delegation:
+        rationale: "Documentation requirements delegated with specific deliverables."
+        guardrails:
+          - "Migration guide for xtask -> apm2 CLI (TCK-00217)"
+          - "IPC protocol documentation"
+          - "Container deployment constraints"
+        required_evidence_categories:
+          - DOCUMENTATION
+    - dimension_id: ERROR_HANDLING
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0005
+          - REQ-0013
+        notes: "Context firewall violations terminate sessions; daemon crash recovery handles errors."
+    - dimension_id: INTEROPERABILITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0002
+          - REQ-0003
+        notes: "Integration with FAC via PolicyResolvedForChangeSet and GateLeaseIssued."
+    - dimension_id: OBSERVABILITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0012
+    - dimension_id: OPERATIONAL_READINESS
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0012
+          - REQ-0013
+    - dimension_id: PERFORMANCE
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0009
+          - REQ-0010
+          - REQ-0011
+    - dimension_id: RECOVERY_ROLLBACK
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0013
+        notes: "Daemon crash recovery; deprecation rollback via --allow-deprecated."
+    - dimension_id: RELIABILITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0013
+    - dimension_id: RESILIENCE
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0013
+    - dimension_id: SCALABILITY
+      applicability: APPLIES
+      disposition: DELEGATED_WITH_GUARDRAILS
+      delegation:
+        rationale: "Single daemon per workstation for Phase 1. Multi-tenant deferred."
+        guardrails:
+          - "Document single-workstation scope limitation"
+          - "Design IPC protocol for future sharding"
+        required_evidence_categories:
+          - ARCHITECTURE_DOCUMENTATION
+    - dimension_id: TESTABILITY
+      applicability: APPLIES
+      disposition: EXPLICIT_REQUIREMENTS
+      coverage:
+        requirement_ids:
+          - REQ-0001
+          - REQ-0002
+          - REQ-0003
+          - REQ-0004
+          - REQ-0005
+          - REQ-0006
+          - REQ-0007
+          - REQ-0008
+        notes: "Adversarial test suite (ADV-001 through ADV-009) validates security properties."

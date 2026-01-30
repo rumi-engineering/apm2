@@ -1,0 +1,41 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0011"
+  category: "BENCHMARK_RESULTS"
+  title: "Tool mediation overhead benchmark"
+  description: |
+    Benchmark measuring tool mediation overhead excluding actual tool execution.
+    Includes capability check, context firewall validation, and event emission.
+    Target: <5ms p50.
+  source_acceptance_test: BENCH-003
+  capture:
+    paths:
+      - "test/daemon/benchmark/tool_mediation_overhead.rs"
+      - "evidence/benchmark/tool_mediation/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo bench --workspace -- tool_mediation_overhead"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 300
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Daemon must be running"
+          - "Session with capability manifest active"
+          - "Tool execution mocked to isolate overhead"
+          - "1000 iterations minimum"
+  assertions:
+    - "p50 overhead < 5ms"
+    - "Overhead includes capability check"
+    - "Overhead includes context firewall validation"
+    - "Overhead includes event emission"
+    - "Tool execution time excluded"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

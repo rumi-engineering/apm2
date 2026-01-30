@@ -1,0 +1,41 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0012"
+  category: "TELEMETRY"
+  title: "xtask direct usage telemetry"
+  description: |
+    Telemetry tracking direct xtask command usage vs daemon-mediated apm2 CLI.
+    Used for deprecation gate: removal blocked until <5% direct xtask usage.
+  source_acceptance_test: TEL-001
+  capture:
+    paths:
+      - "telemetry/xtask_usage/"
+      - "evidence/telemetry/xtask_usage/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "apm2 telemetry report --metric=xtask_usage --period=7d"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 60
+        network_access: "ALLOW_LISTED_ONLY"
+        allowlist_hosts:
+          - "telemetry.internal"
+        constraints:
+          - "Telemetry collection enabled"
+          - "7-day aggregation window"
+  assertions:
+    - "Total work operations count available"
+    - "xtask direct usage count available"
+    - "apm2 CLI usage count available"
+    - "Percentage calculation correct"
+    - "No PII in telemetry data"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: true
+      guidance:
+        - "Aggregate counts only, no individual events"
+        - "Remove user identifiers"

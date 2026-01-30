@@ -1,0 +1,141 @@
+rfc_test_and_evidence:
+  schema_version: "2026-01-30"
+
+  test_strategy:
+    overview: |
+      HTF verification prioritizes:
+      - determinism under replay (reducers are time-pure)
+      - security against time manipulation (no wall-time authority)
+      - canonicalization permanence (bytes-to-hash stability)
+
+    layers:
+      - layer: UNIT
+        description: "Type invariants and envelope validation helpers"
+      - layer: INTEGRATION
+        description: "End-to-end stamping surfaces (daemon) and admission checks (core)"
+      - layer: PROPERTY
+        description: "Monotonicity and replay properties across randomized sequences"
+      - layer: CONFORMANCE
+        description: "Cross-implementation canonicalization vectors"
+
+  evidence_artifacts:
+    - id: EVID-HTF-0001
+      title: "TimeEnvelope/ClockProfile canonicalization vectors"
+      purpose: "Cross-implementation deterministic bytes for signing/hashing"
+      requirements_covered: [REQ-HTF-0002]
+
+    - id: EVID-HTF-0002
+      title: "MonotonicTicks regression detection"
+      purpose: "Detect and fail-closed on monotonic regressions and large jumps"
+      requirements_covered: [REQ-HTF-0003]
+
+    - id: EVID-HTF-0003
+      title: "Lease expiry correctness"
+      purpose: "Leases expire based on ticks; no wall-time dependence"
+      requirements_covered: [REQ-HTF-0003]
+
+    - id: EVID-HTF-0004
+      title: "HLC monotonicity and causality tests"
+      purpose: "Ensure HLC behavior at message boundaries; detect monotonicity violations"
+      requirements_covered: [REQ-HTF-0004]
+
+    - id: EVID-HTF-0005
+      title: "Normative doc time-unit lint"
+      purpose: "Prevent human-time leakage into normative artifacts"
+      requirements_covered: [REQ-HTF-0006]
+
+    - id: EVID-HTF-0006
+      title: "Reducer replay determinism under HTF"
+      purpose: "Ensure reducers do not consult runtime clocks and are replay-stable"
+      requirements_covered: [REQ-HTF-0003]
+
+    - id: EVID-HTF-0100
+      title: "ClockProfile attestation proof-of-concept"
+      purpose: "Phase 2+ groundwork: attestation hooks"
+      requirements_covered: [REQ-HTF-0007]
+      optional: true
+
+  test_categories:
+    - category: "Canonicalization"
+      description: "Deterministic canonical bytes and hashes for HTF artifacts"
+      requirements_covered: [REQ-HTF-0002]
+      evidence_ids: [EVID-HTF-0001]
+      tests:
+        - id: TEST-HTF-CAN-001
+          type: CONFORMANCE
+          description: "ClockProfile vectors verify"
+          verification: "Load vectors; canonicalize; hash; compare expected"
+        - id: TEST-HTF-CAN-002
+          type: CONFORMANCE
+          description: "TimeEnvelope vectors verify"
+          verification: "Load vectors; canonicalize; hash; compare expected"
+
+    - category: "MonotonicTicks Safety"
+      description: "Regression and anomaly handling for monotonic tick source"
+      requirements_covered: [REQ-HTF-0003]
+      evidence_ids: [EVID-HTF-0002]
+      tests:
+        - id: TEST-HTF-MONO-001
+          type: UNIT
+          description: "Tick regression triggers CLOCK_REGRESSION defect"
+          verification: "Simulate tick decrease; assert defect emitted"
+        - id: TEST-HTF-MONO-002
+          type: UNIT
+          description: "Large tick jump triggers CLOCK_ANOMALY defect"
+          verification: "Simulate configured anomaly; assert policy response"
+
+    - category: "Lease Expiry"
+      description: "Expiry checks use ticks/envelopes only"
+      requirements_covered: [REQ-HTF-0003]
+      evidence_ids: [EVID-HTF-0003]
+      tests:
+        - id: TEST-HTF-LEASE-001
+          type: UNIT
+          description: "Lease valid until expires_at_tick"
+          verification: "Check contains(tick) logic"
+        - id: TEST-HTF-LEASE-002
+          type: UNIT
+          description: "Wall time changes do not affect validity"
+          verification: "Mutate wall fields; ensure decision unchanged"
+
+    - category: "HLC Causality"
+      description: "HLC tick/receive rules preserve causality"
+      requirements_covered: [REQ-HTF-0004]
+      evidence_ids: [EVID-HTF-0004]
+      tests:
+        - id: TEST-HTF-HLC-001
+          type: UNIT
+          description: "Receive out-of-order messages preserves happens-before"
+          verification: "Apply receive rules; assert monotone and causality"
+        - id: TEST-HTF-HLC-002
+          type: UNIT
+          description: "HLC regression triggers HLC_REGRESSION defect"
+          verification: "Simulate decreasing stamp; assert defect emitted"
+
+    - category: "Normative Doc Lint"
+      description: "Prevent human-time units in normative documents"
+      requirements_covered: [REQ-HTF-0006]
+      evidence_ids: [EVID-HTF-0005]
+      tests:
+        - id: TEST-HTF-DOC-001
+          type: INTEGRATION
+          description: "Introduce forbidden duration token in scoped doc; admission fails"
+          verification: "Fixture-based test against doc-lint"
+        - id: TEST-HTF-DOC-002
+          type: INTEGRATION
+          description: "Explicit external-time escape hatch passes"
+          verification: "Fixture-based test with external-time marker"
+
+    - category: "Replay Determinism"
+      description: "Reducers are time-pure; replay yields identical projections"
+      requirements_covered: [REQ-HTF-0003]
+      evidence_ids: [EVID-HTF-0006]
+      tests:
+        - id: TEST-HTF-REPLAY-001
+          type: PROPERTY
+          description: "Replay from genesis yields identical state"
+          verification: "Compare reducer outputs across replays"
+        - id: TEST-HTF-REPLAY-002
+          type: PROPERTY
+          description: "Reducers never call runtime clocks"
+          verification: "Static denylist + runtime instrumentation tests"

@@ -1,0 +1,29 @@
+rfc_evidence_artifact:
+  schema_version: "2026-01-30"
+  id: "EVID-HTF-0100"
+  category: "TEST_RESULTS"
+  title: "ClockProfile attestation proof-of-concept"
+  description: |
+    Optional Phase 2+ evidence demonstrating that ClockProfile can carry an
+    attestation blob whose hash is pinned and enforceable by policy.
+  capture:
+    paths:
+      - "htf/attestation/"
+  verification:
+    commands:
+      - id: "CMD-HTF-0100"
+        shell: "bash"
+        command: "cargo test -p apm2-core htf::attestation"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 600
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Attestation blob hash is pinned in ClockProfile"
+          - "Policy can deny non-attested profiles when enabled"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

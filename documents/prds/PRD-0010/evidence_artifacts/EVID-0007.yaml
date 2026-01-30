@@ -1,0 +1,37 @@
+prd_evidence_artifact:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "EVID-0007"
+  category: "SECURITY_TEST"
+  title: "ADV-007: Forge unsigned receipt"
+  description: |
+    Adversarial test verifying signed receipt requirement. Test attempts to
+    submit unsigned event to ledger; expects rejection with INVALID_SIGNATURE.
+  source_acceptance_test: ADV-007
+  capture:
+    paths:
+      - "test/daemon/adversarial/adv_007_unsigned_receipt.rs"
+      - "evidence/adv/ADV-007/"
+  verification:
+    commands:
+      - id: "CMD-0001"
+        shell: "bash"
+        command: "cargo test --workspace -- daemon::adversarial::adv_007"
+        expected_exit_code: 0
+        cwd: "."
+        timeout_seconds: 60
+        network_access: "DISALLOWED"
+        allowlist_hosts: []
+        constraints:
+          - "Ledger ingestion validation enabled"
+  assertions:
+    - "Unsigned event rejected at ledger ingestion"
+    - "DefectRecord(INVALID_SIGNATURE) emitted"
+    - "Properly signed event accepted"
+    - "Domain-separated signature verified"
+    - "Modified payload fails signature verification"
+  data:
+    classification: "INTERNAL"
+    redaction:
+      required: false
+      guidance: []

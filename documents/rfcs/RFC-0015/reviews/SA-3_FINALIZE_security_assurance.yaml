@@ -616,10 +616,10 @@ trust_boundary_verification:
     security_controls: [SEC-CTRL-FAC-0001, SEC-CTRL-FAC-0004, SEC-CTRL-FAC-0007]
 
     counterexamples_tested:
-      - "Unsigned event" -> REJECTED
-      - "Expired lease" -> REJECTED
-      - "Revoked lease" -> REJECTED (with F-SA3-001)
-      - "Scope mismatch" -> REJECTED
+      - "Unsigned event -> REJECTED"
+      - "Expired lease -> REJECTED"
+      - "Revoked lease -> REJECTED (with F-SA3-001)"
+      - "Scope mismatch -> REJECTED"
 
     confidence: 0.94
 
@@ -656,8 +656,8 @@ trust_boundary_verification:
     security_controls: [SEC-CTRL-FAC-0002]
 
     counterexamples_tested:
-      - "Read outside allowlist" -> DENIED (in HARD_FAIL mode)
-      - "Discovery attempt" -> SESSION_TERMINATED
+      - "Read outside allowlist -> DENIED (in HARD_FAIL mode)"
+      - "Discovery attempt -> SESSION_TERMINATED"
 
     confidence: 0.89
 
@@ -694,9 +694,9 @@ trust_boundary_verification:
     security_controls: [SEC-CTRL-FAC-0003, SEC-CTRL-FAC-0009]
 
     counterexamples_tested:
-      - "Admission holon reads GitHub" -> NETWORK_BLOCKED (with enhancement)
-      - "Non-adapter writes GitHub" -> POLICY_DENIED
-      - "External trunk modified" -> DETECTED, FREEZE
+      - "Admission holon reads GitHub -> NETWORK_BLOCKED (with enhancement)"
+      - "Non-adapter writes GitHub -> POLICY_DENIED"
+      - "External trunk modified -> DETECTED, FREEZE"
 
     confidence: 0.91
 
@@ -728,9 +728,9 @@ trust_boundary_verification:
     security_controls: [SEC-CTRL-FAC-0005]
 
     counterexamples_tested:
-      - "CI success without evidence" -> REJECTED (fail-closed)
-      - "Unsigned attestation" -> REJECTED
-      - "Missing artifact hashes" -> REJECTED
+      - "CI success without evidence -> REJECTED (fail-closed)"
+      - "Unsigned attestation -> REJECTED"
+      - "Missing artifact hashes -> REJECTED"
 
     confidence: 0.93
 
@@ -763,9 +763,9 @@ trust_boundary_verification:
     security_controls: [SEC-CTRL-FAC-0006, SEC-CTRL-FAC-0008]
 
     counterexamples_tested:
-      - "Narrative-only PASS" -> REJECTED
-      - "Truncated transcript" -> DETECTED via run_count mismatch
-      - "Failed predicate" -> REJECTED
+      - "Narrative-only PASS -> REJECTED"
+      - "Truncated transcript -> DETECTED via run_count mismatch"
+      - "Failed predicate -> REJECTED"
 
     confidence: 0.95
 
@@ -790,8 +790,8 @@ trust_boundary_verification:
     security_controls: []
 
     counterexamples_tested:
-      - "Agent accesses GitHub token" -> POLICY_VIOLATION
-      - "Agent attempts SSH key access" -> QUARANTINE
+      - "Agent accesses GitHub token -> POLICY_VIOLATION"
+      - "Agent attempts SSH key access -> QUARANTINE"
 
     confidence: 0.92
 
@@ -820,7 +820,7 @@ trust_boundary_verification:
     security_controls: []
 
     counterexamples_tested:
-      - "Author executes own AAT" -> WOULD_BE_REJECTED (when policy defined)
+      - "Author executes own AAT -> WOULD_BE_REJECTED (when policy defined)"
 
     confidence: 0.75
 

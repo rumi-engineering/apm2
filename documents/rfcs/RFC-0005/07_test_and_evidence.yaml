@@ -123,11 +123,9 @@ rfc_test_and_evidence:
           After push, GitHub API shows both status checks exist.
           This is verified by querying the statuses endpoint.
 
+    # Manual verification supplements automated tests. Each MV has
+    # deterministic pass/fail criteria that can be evaluated objectively.
     manual_verification:
-      note: |
-        Manual verification supplements automated tests. Each MV has
-        deterministic pass/fail criteria that can be evaluated objectively.
-
       - id: MV-001
         description: "Verify xtask check detects CI failure"
         prerequisites:

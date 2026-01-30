@@ -1,0 +1,268 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-01-30"
+
+  status: POPULATED
+  v0_note: |
+    Initial ticket decomposition for HTF Phase 1.
+
+    Tickets are ordered to establish:
+    1) types + schemas + vectors,
+    2) envelope stamping surfaces,
+    3) lease/coordination conversions,
+    4) enforcement (doc/code lint),
+    5) metrics + CLI rendering.
+
+  tickets:
+    - ticket_id: TCK-00236
+      title: "HTF: Introduce core time types (LedgerTime, HtfTick, TimeEnvelopeRef)"
+      requirement_ids:
+        - REQ-HTF-0001
+        - REQ-HTF-0003
+      depends_on: []
+      summary: |
+        Add explicit HTF time domain types in apm2-core to prevent accidental
+        wall-time authority in privileged paths.
+
+        Provide:
+        - LedgerTime tuple (ledger_id, epoch, seq)
+        - HtfTick newtype for monotonic ticks
+        - TimeEnvelopeRef newtype (CAS content hash)
+        - Minimal helpers for comparisons and invariant checks.
+      files_to_modify:
+        - path: "crates/apm2-core/src/lib.rs"
+          changes: "Export new htf module"
+      files_to_create:
+        - path: "crates/apm2-core/src/htf/mod.rs"
+          purpose: "HTF module root"
+        - path: "crates/apm2-core/src/htf/types.rs"
+          purpose: "LedgerTime, HtfTick, TimeEnvelopeRef, BoundedWallInterval"
+      implementation_steps:
+        - step: 1
+          action: "Define LedgerTime and ordering helpers"
+          details: "Include ledger_id, epoch, seq; implement Ord/PartialOrd by (ledger_id, epoch, seq)."
+        - step: 2
+          action: "Define HtfTick as a newtype"
+          details: "Ensure tick arithmetic uses checked/saturating ops per policy."
+        - step: 3
+          action: "Define TimeEnvelopeRef"
+          details: "Wrap existing content-hash type used by CAS references."
+      acceptance_criteria:
+        - criterion: "Privileged APIs accept HTF types (not raw timestamps) for expiry/ordering"
+          verification: "Unit tests compile-time type checks + minimal runtime tests"
+
+    - ticket_id: TCK-00237
+      title: "HTF: Add CAC schemas for ClockProfileV1 and TimeEnvelopeV1"
+      requirement_ids:
+        - REQ-HTF-0002
+        - REQ-HTF-0007
+      depends_on: []
+      summary: |
+        Add CAC JSON schemas for:
+        - cac.clock_profile.v1
+        - cac.time_envelope.v1
+        - (optional) cac.time_sync_observation.v1
+
+        Register schemas in CAC manifest and schema registry fragments.
+      files_to_modify:
+        - path: "documents/standards/cac/MANIFEST.json"
+          changes: "Register new schema files"
+        - path: "documents/standards/cac/build/assembly_trace.json"
+          changes: "Include new schema files in assembly"
+      files_to_create:
+        - path: "documents/standards/cac/schemas/cac.clock_profile.v1.schema.json"
+          purpose: "ClockProfile CAC schema"
+        - path: "documents/standards/cac/schemas/cac.time_envelope.v1.schema.json"
+          purpose: "TimeEnvelope CAC schema"
+        - path: "documents/standards/cac/schemas/cac.time_sync_observation.v1.schema.json"
+          purpose: "Optional wall-time observation schema"
+      acceptance_criteria:
+        - criterion: "Schemas are fail-closed (additionalProperties/unevaluatedProperties false)"
+          verification: "Schema review + JSON schema validation tests"
+
+    - ticket_id: TCK-00238
+      title: "HTF: Canonicalization vectors and reference verifier for TimeEnvelope/ClockProfile"
+      requirement_ids:
+        - REQ-HTF-0002
+      depends_on:
+        - TCK-00237
+      summary: |
+        Produce deterministic canonicalization vectors for ClockProfileV1 and
+        TimeEnvelopeV1, and implement a reference verifier library that:
+        - canonicalizes input JSON
+        - computes expected hashes
+        - verifies vectors in CI.
+      files_to_create:
+        - path: "evidence/htf/vectors/clock_profile_v1.json"
+          purpose: "ClockProfile canonicalization vectors"
+        - path: "evidence/htf/vectors/time_envelope_v1.json"
+          purpose: "TimeEnvelope canonicalization vectors"
+        - path: "crates/apm2-core/src/htf/canonical.rs"
+          purpose: "Reference canonicalization/verifier helpers"
+      acceptance_criteria:
+        - criterion: "Vectors verified in CI"
+          verification: "Unit tests validate canonical bytes and expected hashes"
+
+    - ticket_id: TCK-00239
+      title: "HTF: Add time_envelope_ref surfaces to kernel event schema"
+      requirement_ids:
+        - REQ-HTF-0002
+        - REQ-HTF-0003
+      depends_on:
+        - TCK-00236
+        - TCK-00237
+      summary: |
+        Extend proto/kernel_events.proto critical event payloads to include a
+        time_envelope_ref (CAS hash bytes).
+
+        Legacy timestamp fields remain observational.
+      files_to_modify:
+        - path: "proto/kernel_events.proto"
+          changes: "Add time_envelope_ref to critical events/receipts; document legacy timestamp non-authority"
+      acceptance_criteria:
+        - criterion: "Protobuf schema changes are backwards-compatible where possible"
+          verification: "Compile + decode/encode tests"
+
+    - ticket_id: TCK-00240
+      title: "HTF: Implement HolonicClock service and TimeEnvelope stamping in daemon"
+      requirement_ids:
+        - REQ-HTF-0002
+        - REQ-HTF-0005
+        - REQ-HTF-0007
+      depends_on:
+        - TCK-00236
+        - TCK-00237
+      summary: |
+        Implement a daemon clock service that provides:
+        - now_mono_tick()
+        - now_hlc() (if enabled)
+        - observed_ledger_head()
+
+        Stamp TimeEnvelope at episode start/end and tool boundaries.
+        Publish ClockProfile and pin its hash into envelopes.
+      files_to_modify:
+        - path: "crates/apm2-daemon/src/episode/runtime.rs"
+          changes: "Stamp envelopes at runtime boundaries"
+      files_to_create:
+        - path: "crates/apm2-daemon/src/htf/clock.rs"
+          purpose: "HolonicClock service"
+      acceptance_criteria:
+        - criterion: "Episode/tool receipts include time_envelope_ref"
+          verification: "Integration tests using daemon test harness"
+
+    - ticket_id: TCK-00241
+      title: "HTF: Convert leases to tick-based expiry and ignore wall timestamps"
+      requirement_ids:
+        - REQ-HTF-0003
+      depends_on:
+        - TCK-00236
+        - TCK-00239
+      summary: |
+        Update lease issuance/verification to use expires_at_tick and/or
+        TimeEnvelopeRef containment checks. Wall timestamps remain observational.
+      files_to_modify:
+        - path: "crates/apm2-core/src/lease/"
+          changes: "Replace expiry checks with tick-based logic"
+      acceptance_criteria:
+        - criterion: "Wall time changes do not affect lease validity"
+          verification: "Unit tests using injected ticks"
+
+    - ticket_id: TCK-00242
+      title: "HTF: Convert coordination timeouts/backoff/budgets to ticks"
+      requirement_ids:
+        - REQ-HTF-0003
+        - REQ-HTF-0006
+      depends_on:
+        - TCK-00236
+      summary: |
+        Replace max_duration_ms and any wall-time-based retry/backoff windows in
+        coordination controller with tick-based arithmetic.
+
+        Remove real-time sleep-based tests; use injected ticks.
+      files_to_modify:
+        - path: "crates/apm2-core/src/coordination/controller.rs"
+          changes: "Replace Instant/wall elapsed tracking with tick tracking"
+      acceptance_criteria:
+        - criterion: "Coordination stop conditions are replay-stable"
+          verification: "Unit tests and property tests; no sleeps"
+
+    - ticket_id: TCK-00243
+      title: "HTF: Convert quarantine TTLs and AAT determinism windows to ticks"
+      requirement_ids:
+        - REQ-HTF-0003
+      depends_on:
+        - TCK-00236
+      summary: |
+        Update quarantine window representations and AAT determinism timing
+        (cooldowns, retry windows) to tick-based policy fields.
+      files_to_modify:
+        - path: "crates/apm2-core/src/determinism/"
+          changes: "Use ticks for determinism windows"
+      acceptance_criteria:
+        - criterion: "Quarantine and determinism windows do not consult wall time"
+          verification: "Unit tests with explicit tick inputs"
+
+    - ticket_id: TCK-00244
+      title: "HTF: Metrics indexing by ledger windows and tick deltas"
+      requirement_ids:
+        - REQ-HTF-0006
+      depends_on:
+        - TCK-00236
+      summary: |
+        Define metrics primary axes as ledger seq windows and tick deltas.
+        Any wall time shown is bounded or marked best-effort.
+      files_to_modify:
+        - path: "observability/"
+          changes: "Update metrics models and indices"
+      acceptance_criteria:
+        - criterion: "Primary index is ledger seq/ticks"
+          verification: "Metrics schema tests"
+
+    - ticket_id: TCK-00245
+      title: "HTF: Doc-lint rule denying human time units in normative artifacts"
+      requirement_ids:
+        - REQ-HTF-0006
+      depends_on: []
+      summary: |
+        Add a doc-lint rule that rejects human-time units in normative docs
+        (PRDs/RFCs/skills/laws) unless explicitly marked as external-facing.
+      files_to_modify:
+        - path: "documents/standards/lint/LINT_SPEC.yaml"
+          changes: "Add HTF human-time lint rule"
+        - path: "xtask/src/tasks/lint.rs"
+          changes: "Implement doc-content lint (not just code blocks) for scoped directories"
+      acceptance_criteria:
+        - criterion: "New normative docs containing human durations are rejected unless explicitly external"
+          verification: "Unit tests with fixture files"
+
+    - ticket_id: TCK-00246
+      title: "HTF: Code-lint enforcement denying wall clock authority in privileged paths"
+      requirement_ids:
+        - REQ-HTF-0006
+      depends_on:
+        - TCK-00236
+      summary: |
+        Add enforcement that denies SystemTime/Utc::now usage in privileged
+        admission/gate/reducer paths. Allow wall time only in external projection
+        adapters and only to populate bounded intervals.
+      files_to_modify:
+        - path: "crates/apm2-core/"
+          changes: "Introduce lint gates / deny patterns / annotations"
+      acceptance_criteria:
+        - criterion: "Reducers never call SystemTime::now()"
+          verification: "Clippy/lint + targeted tests"
+
+    - ticket_id: TCK-00247
+      title: "HTF: CLI rendering of ticks/ledger windows with bounded wall overlay"
+      requirement_ids:
+        - REQ-HTF-0006
+      depends_on:
+        - TCK-00236
+      summary: |
+        Update CLI to display durations and ordering using ledger seq and tick
+        deltas. Wall time is optional and displayed with uncertainty bounds.
+      files_to_modify:
+        - path: "crates/apm2-cli/"
+          changes: "Render HTF constructs; avoid accepting wall-authority inputs"
+      acceptance_criteria:
+        - criterion: "CLI does not accept wall time for authority decisions"
+          verification: "CLI tests + manual run"

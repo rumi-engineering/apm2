@@ -1,0 +1,128 @@
+prd_problem:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  context:
+    background: |
+      APM2 has a daemon process (apm2-daemon) that maintains system state as a projection
+      of the ledger. The system also has xtask commands that provide CLI utilities for
+      development workflows. Currently, xtask commands can bypass the daemon control plane
+      entirely, executing operations without proper capability minting, lease validation,
+      or receipt-backed orchestration.
+    current_state: |
+      - xtask commands can directly invoke GitHub operations, tool execution, and work
+        state mutations without daemon mediation.
+      - No IPC authentication boundary exists between agents and privileged operations.
+      - Capabilities can be requested by callers rather than minted by policy.
+      - Sessions may have access to credentials that should be broker-mediated.
+      - No mechanical enforcement of Separation of Duties (SoD) at execution time.
+    why_now: |
+      PRD-0009 (FAC) establishes the cryptographic admission protocol, but the execution
+      substrate (daemon) lacks the enforcement mechanisms to prevent bypass. Without
+      daemon-as-control-plane, agents can circumvent FAC by using xtask directly. This
+      PRD closes the execution-layer gap that would otherwise undermine FAC guarantees.
+  problem_statement:
+    primary: |
+      xtask commands bypass the daemon control plane, allowing agents and operators to
+      execute operations without capability minting, lease validation, or receipt-backed
+      orchestration. This creates an adversarial surface where FAC guarantees can be
+      circumvented at the execution layer.
+    north_star: |
+      The daemon is the sole control plane for work orchestration. All episode spawns,
+      tool invocations, and state transitions flow through authenticated daemon IPC with
+      policy-resolved capabilities and receipt-backed evidence.
+    supporting_details:
+      - "xtask commands bypass IPC authentication and capability minting"
+      - "No mechanical SoD enforcement for gate executors"
+      - "Sessions can access credentials directly instead of through tool broker"
+      - "No centralized enforcement point for context firewall rules"
+      - "Work orchestration state mutations occur outside daemon supervision"
+  observed_failure_modes:
+    - id: FM-0001
+      name: Direct xtask bypass of control plane
+      mechanism: |
+        Agents invoke xtask commands directly, bypassing daemon IPC authentication
+        and capability minting. Operations execute with ambient authority.
+      impact:
+        - "FAC gate requirements can be circumvented"
+        - "No audit trail of capability grants"
+        - "SoD violations undetected"
+      alternative_interventions:
+        - id: ALT-FM001-01
+          intervention: "Remove xtask entirely"
+          assessment: "Breaks existing workflows; no migration path"
+        - id: ALT-FM001-02
+          intervention: "Add xtask logging"
+          assessment: "Detective only; does not prevent bypass"
+      daemon_superiority: |
+        Daemon IPC authentication with peer credentials ensures all operations flow
+        through authenticated channels. xtask is demoted to a thin CLI wrapper that
+        must use daemon IPC. Privileged operations are mechanically unreachable without
+        proper authentication.
+    - id: FM-0002
+      name: Requester-supplied capabilities
+      mechanism: |
+        Current ClaimWork patterns allow requesters to specify desired capabilities,
+        violating the principle that capabilities are minted by policy.
+      impact:
+        - "Privilege escalation via capability request manipulation"
+        - "Policy bypass through over-permissive capability claims"
+      alternative_interventions:
+        - id: ALT-FM002-01
+          intervention: "Validate requested capabilities"
+          assessment: "Validation logic must mirror policy; error-prone duplication"
+      daemon_superiority: |
+        ClaimWork accepts only (actor_id, role). Daemon queries governance layer for
+        policy resolution and mints capability manifest. Requester cannot influence
+        capability set directly.
+    - id: FM-0003
+      name: Credentials in session scope
+      mechanism: |
+        Sessions may inherit or access credentials (GitHub tokens, API keys) directly,
+        violating OCAP containment principles.
+      impact:
+        - "Credential theft via compromised agent"
+        - "Lateral movement through credential reuse"
+      alternative_interventions:
+        - id: ALT-FM003-01
+          intervention: "Credential rotation"
+          assessment: "Reduces window but does not prevent access during valid period"
+      daemon_superiority: |
+        Sessions receive ephemeral handles only. Daemon tool broker holds credentials
+        and mediates all authenticated operations. Agents never see raw credentials.
+    - id: FM-0004
+      name: Missing daemon crash recovery
+      mechanism: |
+        If daemon crashes mid-episode, active sessions may be orphaned without
+        proper lease revocation or cleanup.
+      impact:
+        - "Orphaned sessions continue operating without valid lease"
+        - "State inconsistency between ledger and running processes"
+      daemon_solution: |
+        Daemon restart emits LEASE_REVOKED signal to all sessions within 5s of
+        recovery. Sessions receive termination signal and clean up gracefully.
+  non_goals:
+    - id: NG-0001
+      statement: "FAC admission decisions"
+      clarification: |
+        PRD-0010 handles execution substrate only. Admission decisions (pass/fail,
+        merge authorization) remain with FAC (PRD-0009).
+    - id: NG-0002
+      statement: "GitHub projection logic"
+      clarification: |
+        GitHub adapter projection is owned by HOLON-GITHUB-ADAPTER. PRD-0010 ensures
+        xtask cannot bypass the adapter, but does not specify projection semantics.
+    - id: NG-0003
+      statement: "Time substrate (HTF)"
+      clarification: |
+        Time authority deferred to HTF RFC. PRD-0010 uses TIME_TBD placeholders
+        for lease expiry, poll intervals, and budget durations.
+    - id: NG-0004
+      statement: "Gate pass/fail semantics"
+      clarification: |
+        Gate outcome evaluation is FAC's responsibility. PRD-0010 ensures gate
+        executors run under proper lease and capability constraints.
+    - id: NG-0005
+      statement: "Windows platform support (Phase 1)"
+      clarification: |
+        IPC authentication via SO_PEERCRED requires Unix domain sockets. Windows
+        support deferred to future phase with alternative authentication mechanism.

@@ -1,0 +1,149 @@
+prd_meta:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  prd:
+    id: PRD-0010
+    title: "Daemon as Control Plane: xtask Demotion, Capability-Minted Episodes, Receipt-Backed Orchestration"
+    status: DRAFT
+    created_date: "2026-01-30"
+    last_updated_date: "2026-01-30"
+  protocol_profile:
+    id: DAEMON-CONTROL-PLANE-001
+    applies: true
+    time_horizon: "Phase 1 (xtask deprecation) -> Phase 2 (full daemon orchestration)"
+    profile_ref: protocol_profiles/README.yaml#protocol_profiles_readme
+  custody:
+    owner_holons:
+      - holon_id: HOLON-DAEMON
+        role: IPC handler, session spawn, capability minting, tool mediation
+      - holon_id: HOLON-KERNEL-GOVERNANCE
+        role: policy resolution, authority delegation
+      - holon_id: HOLON-COORDINATOR
+        role: work orchestration via daemon IPC
+    producing_agent_roles:
+      - AGENT_IMPLEMENTER
+      - AGENT_GATE_EXECUTOR
+      - AGENT_AAT_EXECUTOR
+    responsible_domains:
+      - DOMAIN_KERNEL
+      - DOMAIN_DAEMON
+      - DOMAIN_EXECUTION
+      - DOMAIN_SECURITY
+    authority_signoffs_required:
+      - AUTH_PRODUCT
+      - AUTH_SECURITY
+  classification:
+    default_data_classification: INTERNAL
+    security_critical: true
+    risk_tier_default: T3
+    notes:
+      - "Daemon IPC is a security boundary; all control-plane operations flow through authenticated channels."
+      - "Capabilities are minted by policy, never supplied by requesters."
+      - "Sessions receive ephemeral handles, never credentials."
+  platform_scope:
+    supported:
+      - "Linux with Unix domain sockets"
+      - "macOS with Unix domain sockets"
+    out_of_scope:
+      - "Windows (Phase 1)"
+    rationale: "SO_PEERCRED for IPC authentication requires Unix domain sockets."
+  refs:
+    standards:
+      requirement_schema: standards/schemas/02_requirement.schema.yaml#requirement_schema
+      evidence_artifact_schema: standards/schemas/01_evidence_artifact.schema.yaml#evidence_artifact_schema
+      quality_coverage_schema: standards/schemas/03_quality_coverage.schema.yaml#quality_coverage_schema
+      gate_review_schema: standards/schemas/06_gate_review.schema.yaml#gate_review_schema
+      waiver_schema: standards/schemas/05_waiver.schema.yaml#waiver_schema
+      ticket_meta_schema: standards/schemas/04_ticket_meta.schema.yaml#ticket_meta_schema
+      lint_spec: standards/lint/LINT_SPEC.yaml#lint_spec
+    related_documents:
+      glossary: documents/skills/glossary/SKILL.md
+      laws: documents/skills/laws-of-holonic-agent-systems/SKILL.md
+      fac_prd: documents/prds/PRD-0009/
+      work_substrate: documents/prds/PRD-0004/
+      daemon_glossary: documents/skills/glossary/references/daemon.md
+      lease_glossary: documents/skills/glossary/references/lease_and_budget.md
+    dependencies:
+      - id: RFC-0015
+        version: "v4.1+"
+        concepts_used:
+          - PolicyResolvedForChangeSet
+          - GateLeaseIssued
+          - signed receipts
+          - key custody separation
+          - context firewall rules
+        breaking_change_policy: "Any breaking changes to FAC event schema require coordinated PRD-0010 update."
+  terminology:
+    - term: Daemon
+      ref: documents/skills/glossary/references/daemon.md
+    - term: Lease
+      ref: documents/skills/glossary/references/lease_and_budget.md
+    - term: Episode
+      ref: documents/skills/glossary/references/episode.md
+    - term: OCAP
+      ref: documents/skills/glossary/references/ocap.md
+    - term: ContextPack
+      ref: documents/skills/glossary/references/context_pack.md
+  law_alignment:
+    - law_id: LAW-01
+      applies_to:
+        - GateLeaseIssued
+        - SpawnEpisode preconditions
+      enforcement: "Gate execution requires lease + policy resolution before spawn"
+    - law_id: LAW-02
+      applies_to:
+        - ContextPack
+        - Tool mediation
+      enforcement: "Context packs sealed at spawn; reads outside terminate session"
+    - law_id: LAW-03
+      applies_to:
+        - Daemon state
+        - Work projections
+      enforcement: "All state is ledger events; work state is projection"
+    - law_id: LAW-04
+      applies_to:
+        - Gate executors
+        - Evidence
+      enforcement: "Contract + Receipt + Evidence for every transition"
+    - law_id: LAW-05
+      applies_to:
+        - Capability minting
+        - Session binding
+        - IPC authentication
+      enforcement: "Capabilities minted by policy; SoD via custody domains; no ambient credentials in sessions"
+    - law_id: LAW-06
+      applies_to:
+        - IPC API surface
+      enforcement: "IPC API surface bounded and minimal"
+    - law_id: LAW-07
+      applies_to:
+        - Receipts
+        - Evidence
+      enforcement: "Receipts link to evidence; summaries have pointers"
+    - law_id: LAW-09
+      applies_to:
+        - Episode spawn
+      enforcement: "Snapshots pinned per episode via policy_resolved_ref"
+    - law_id: LAW-11
+      applies_to:
+        - Tool mediation
+      enforcement: "Tool calls idempotent with dedupe keys"
+    - law_id: LAW-12
+      applies_to:
+        - Episode budgets
+        - Lease expiry
+      enforcement: "Episode budgets enforced; termination on exhaustion or lease expiry"
+    - law_id: LAW-13
+      applies_to:
+        - IPC protocol
+      enforcement: "Protobuf contracts; canonical encodings"
+    - law_id: LAW-14
+      applies_to:
+        - Risk tier
+        - Gate set
+      enforcement: "Risk tier determines gate set from PolicyResolved"
+    - law_id: LAW-15
+      applies_to:
+        - Receipts
+        - Events
+      enforcement: "All receipts Ed25519 signed; omission is defect"

@@ -1,0 +1,26 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0011"
+  type: "PERFORMANCE"
+  source_id: "DCP-G-0001"
+  title: "Tool Mediation Overhead"
+  statement: |
+    apm2-daemon tool mediation overhead (excluding tool execution) MUST be <5ms p50;
+    overhead includes capability check, context firewall validation, and event emission.
+  acceptance_criteria:
+    - "Tool mediation overhead <5ms p50 under benchmark conditions. Verified by: Benchmark results show p50 < 5ms."
+    - "Overhead measurement excludes actual tool execution time. Verified by: Benchmark methodology documents tool execution exclusion."
+    - "Overhead includes: capability check, context firewall validation, event emission. Verified by: Benchmark traces confirm all components measured."
+  evidence:
+    evidence_ids:
+      - EVID-0011
+  law_alignment:
+    - law_id: "LAW-06"
+      enforcement: "MDL as Gated Budget: Bounded overhead for mediation layer"
+      applies_to:
+        - "Tool broker"
+  defect_codes:
+    - code: "MEDIATION_OVERHEAD_EXCEEDED"
+      severity: "S3"
+      description: "Tool mediation overhead exceeded 5ms p50"

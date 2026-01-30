@@ -1,0 +1,32 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-0004"
+  type: "SECURITY"
+  source_id: "DCP-G-0003"
+  title: "Zero Credentials in Sessions"
+  statement: |
+    apm2-daemon MUST provide sessions with ephemeral handles only; sessions MUST NOT
+    have direct access to credentials (GitHub tokens, API keys, SSH keys); all
+    authenticated operations MUST be broker-mediated.
+  acceptance_criteria:
+    - "EpisodeSpawned returns ephemeral_handle, never raw credentials. Verified by: Inspection of EpisodeSpawned response shows no credential fields."
+    - "Session process environment excludes credential variables (GITHUB_TOKEN, SSH_AUTH_SOCK, etc.). Verified by: Process environment dump shows credential variables absent."
+    - "GitHub writes mediated through HOLON-GITHUB-ADAPTER projection path. Verified by: Test shows direct GitHub write attempt from session is rejected."
+    - "SSH/git operations mediated by daemon without exposing keys. Verified by: SSH_AUTH_SOCK not accessible in session process."
+  evidence:
+    evidence_ids:
+      - EVID-0003
+  law_alignment:
+    - law_id: "LAW-05"
+      enforcement: "Dual-Axis Containment: No ambient credentials; OCAP handles only"
+      applies_to:
+        - "Session binding"
+        - "Credential management"
+  defect_codes:
+    - code: "CREDENTIAL_LEAK"
+      severity: "S0"
+      description: "Credential accessible in session scope"
+    - code: "UNMEDIATED_AUTH_OPERATION"
+      severity: "S1"
+      description: "Authenticated operation attempted without broker"

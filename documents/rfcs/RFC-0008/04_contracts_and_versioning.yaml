@@ -129,12 +129,12 @@ rfc_contracts_and_versioning:
           }
           ```
         required_fields:
-          - "protocol" (must be "apm2_agent_exit")
+          - "protocol (must be apm2_agent_exit)"
           - "version"
           - "phase_completed"
           - "exit_reason"
         optional_fields:
-          - "pr_url" (if PR was created)
+          - "pr_url (if PR was created)"
           - "evidence_bundle_ref"
           - "notes"
       backward_compatible: true

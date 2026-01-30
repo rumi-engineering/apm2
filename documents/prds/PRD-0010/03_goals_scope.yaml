@@ -1,0 +1,171 @@
+prd_goals_scope:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  goals:
+    - id: DCP-G-0001
+      statement: "Policy-resolved capability minting - ClaimWork MUST NOT accept requester-supplied capabilities; daemon mints based on role and policy."
+      measurable_outcomes:
+        - "ClaimWork IPC accepts only (actor_id, role) parameters"
+        - "Daemon queries governance layer for policy resolution"
+        - "WorkAssignment includes capability_manifest_hash pinned by policy"
+        - "Adversarial test ADV-005 (requester supplies capabilities) is rejected"
+    - id: DCP-G-0002
+      statement: "Lease-gated episode spawn - Episode spawn MUST block until PolicyResolvedForChangeSet exists; gate executors require GateLeaseIssued."
+      measurable_outcomes:
+        - "SpawnEpisode blocks if PolicyResolvedForChangeSet missing for work_id"
+        - "Gate executor spawn (GATE_EXECUTOR role) requires valid GateLeaseIssued"
+        - "Lease binds (work_id, gate_id, changeset_digest, executor_actor_id)"
+        - "Adversarial test ADV-004 (GateOutcome without lease) is rejected"
+    - id: DCP-G-0003
+      statement: "Zero credentials in sessions - Sessions MUST receive ephemeral handles, never credentials; daemon tool broker mediates authenticated operations."
+      measurable_outcomes:
+        - "EpisodeSpawned returns ephemeral_handle, not raw credentials"
+        - "GitHub writes mediated through HOLON-GITHUB-ADAPTER projection path"
+        - "API keys held by daemon; agents request tool calls via broker"
+        - "SSH keys never exposed; daemon mediates git operations"
+    - id: DCP-G-0004
+      statement: "Context firewall enforcement - Tool broker MUST terminate session on context firewall violation; deny + terminate, not log and continue."
+      measurable_outcomes:
+        - "Reads outside ContextPack allowlist emit ToolDecided=DENY"
+        - "SessionTerminated event with rationale=CONTEXT_FIREWALL_VIOLATION emitted within 100ms"
+        - "Session process receives SIGTERM after denial"
+        - "Adversarial test ADV-003 (read outside pack) terminates session"
+    - id: DCP-G-0005
+      statement: "SoD enforcement via custody domains - Gate executor custody domain MUST NOT overlap with author custody domain."
+      measurable_outcomes:
+        - "SpawnEpisode for gate executor validates custody domain separation"
+        - "LeaseIssueDenied event emitted with reason=SOD_VIOLATION on overlap"
+        - "CLI returns non-zero exit code with diagnostic message"
+        - "Adversarial test ADV-006 (same domain author+reviewer) is rejected"
+    - id: DCP-G-0006
+      statement: "IPC security boundary - Daemon IPC MUST authenticate clients; privileged endpoints unreachable by agents."
+      measurable_outcomes:
+        - "Unix socket with SO_PEERCRED validates peer UID/GID"
+        - "Per-client capability tokens issued at connection"
+        - "Privileged endpoints (ClaimWork, SpawnEpisode, IssueCapability, Shutdown) require operator credential"
+        - "Session-scoped endpoints bound to session_id"
+        - "Adversarial tests ADV-001/ADV-002 (agent calls privileged endpoints) are denied"
+    - id: DCP-G-0007
+      statement: "Signed state transitions - All state transitions MUST emit signed events to ledger."
+      measurable_outcomes:
+        - "WorkClaimed, EpisodeSpawned, ToolDecided, ToolExecuted events signed"
+        - "Ed25519 signatures with domain separation"
+        - "Unsigned events rejected at ledger ingestion"
+        - "Adversarial test ADV-007 (forge unsigned receipt) is rejected"
+    - id: DCP-G-0008
+      statement: "Daemon health observability - Daemon MUST expose metrics for operational monitoring."
+      measurable_outcomes:
+        - "Prometheus metrics exposed: apm2_daemon_sessions_active"
+        - "Prometheus metrics exposed: apm2_daemon_tool_mediation_latency_seconds"
+        - "Prometheus metrics exposed: apm2_daemon_ipc_requests_total"
+        - "Prometheus metrics exposed: apm2_daemon_capability_grants_total"
+    - id: DCP-G-0009
+      statement: "Daemon crash recovery - Daemon restart MUST NOT orphan running episodes."
+      measurable_outcomes:
+        - "Sessions receive LEASE_REVOKED signal within 5s of daemon recovery"
+        - "Ledger records SessionTerminated with rationale=DAEMON_RESTART"
+        - "No orphaned processes continue operating after daemon restart"
+    - id: DCP-G-0010
+      statement: "xtask deprecation with migration path - xtask commands demoted with deprecation warnings; removal after telemetry confirms low usage."
+      measurable_outcomes:
+        - "xtask commands emit deprecation warnings pointing to apm2 CLI equivalents"
+        - "--allow-deprecated flag permits continued use during transition"
+        - "Deprecation gate: removal blocked until telemetry shows <5% direct xtask usage"
+        - "During deprecation, divergence from xtask direct writes emits WARNING, not freeze"
+  tradeoffs:
+    - id: TRD-0001
+      optimization: "Security (no credentials in sessions)"
+      sacrifice: "Latency (~5-20ms per authenticated tool call)"
+      justification: |
+        Tool mediation adds latency for every call requiring credential broker. This is
+        acceptable because security improvement outweighs latency cost for SDLC workloads
+        where tool calls are not in hot paths.
+    - id: TRD-0002
+      optimization: "Simplicity (single daemon per workstation)"
+      sacrifice: "Horizontal scalability"
+      justification: |
+        Phase 1 targets single-workstation use. Multi-tenant deployment with sharded
+        work_id ranges is deferred to Phase 2. Single daemon simplifies reasoning about
+        security boundaries and state consistency.
+  scope:
+    in_scope:
+      - "Daemon IPC for: spawn episode, stream events, request tool mediation"
+      - "Work orchestration commands emitting ledger events and receipts"
+      - "Capability issuance / sealing (policy-resolved manifests)"
+      - "Sandboxing / context firewall enforcement (deny + terminate)"
+      - "SoD enforcement hooks (via custody domain + lease requirements)"
+      - "IPC authentication / privilege separation"
+      - "Daemon health metrics"
+      - "Session recovery on daemon crash"
+    out_of_scope:
+      - id: NG-0001
+        statement: "Admission decisions (FAC owns this)"
+      - id: NG-0002
+        statement: "GitHub projection (HOLON-GITHUB-ADAPTER owns this)"
+      - id: NG-0003
+        statement: "Time substrate (explicit TIME_TBD / HTF)"
+      - id: NG-0004
+        statement: "Gate pass/fail semantics (FAC admission boundary)"
+      - id: NG-0005
+        statement: "Windows platform support (Phase 1)"
+  milestones:
+    - id: PHASE-1
+      name: "Phase 1: IPC Security Foundation"
+      description: "Establish authenticated IPC boundary and privilege separation."
+      deliverables:
+        - "IPC authentication via peer credentials + capability tokens"
+        - "Privileged vs session-scoped endpoint separation"
+        - "ClaimWork with policy-resolved capability minting"
+      definition_of_done:
+        - "Adversarial tests ADV-001, ADV-002, ADV-005 pass"
+    - id: PHASE-2
+      name: "Phase 2: Episode Spawn with Lease Gating"
+      description: "Enforce FAC lease requirements at spawn time."
+      deliverables:
+        - "SpawnEpisode with PolicyResolvedForChangeSet precondition"
+        - "GateLeaseIssued precondition for gate executor roles"
+        - "SoD enforcement via custody domain check"
+      definition_of_done:
+        - "Adversarial tests ADV-004, ADV-006 pass"
+    - id: PHASE-3
+      name: "Phase 3: Session Binding and Tool Mediation"
+      description: "Zero-credential sessions with broker-mediated tool access."
+      deliverables:
+        - "Ephemeral session handles (no credentials)"
+        - "Context firewall enforcement (deny + terminate)"
+        - "Daemon-held secret mediation for tool broker"
+      definition_of_done:
+        - "Adversarial test ADV-003 passes"
+        - "No credential access in session scope verified"
+    - id: PHASE-4
+      name: "Phase 4: CLI Migration"
+      description: "New apm2 CLI commands using daemon IPC."
+      deliverables:
+        - "apm2 work claim"
+        - "apm2 episode spawn"
+        - "apm2 fac ingest"
+        - "apm2 work status"
+      definition_of_done:
+        - "All commands functional via daemon IPC"
+    - id: PHASE-5
+      name: "Phase 5: xtask Deprecation"
+      description: "Deprecate and remove xtask commands."
+      deliverables:
+        - "Deprecation warnings on xtask commands"
+        - "--allow-deprecated gate"
+        - "xtask crate removal after telemetry gate"
+      definition_of_done:
+        - "Telemetry shows <5% xtask direct usage"
+        - "xtask crate removed"
+        - "Adversarial test ADV-008 passes"
+  success_criteria_summary:
+    - "All work orchestration flows through daemon IPC"
+    - "Capabilities minted by policy, never requested by agents"
+    - "Sessions have zero credential access"
+    - "Context firewall violations terminate sessions immediately"
+    - "SoD enforced mechanically via custody domain separation"
+    - "IPC authentication prevents agent access to privileged endpoints"
+    - "All state transitions emit signed events"
+    - "Daemon health metrics available for monitoring"
+    - "Daemon crash recovery prevents orphaned sessions"
+    - "xtask fully deprecated and removed"
