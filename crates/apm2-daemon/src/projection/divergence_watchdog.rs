@@ -1226,36 +1226,23 @@ impl FreezeRegistry {
 }
 
 // =============================================================================
-// FreezeCheck Trait
+// FreezeCheck Trait Implementation
 // =============================================================================
 
-/// Trait for checking freeze status before admission.
-///
-/// This trait abstracts the freeze checking logic, allowing for dependency
-/// injection and easier testing. It provides a standard interface for
-/// components that need to verify whether a scope is frozen before
-/// admitting new work.
-///
-/// # Security
-///
-/// Implementations must ensure that freeze checks are atomic and consistent.
-/// A scope that is frozen must remain frozen until explicitly unfrozen.
-pub trait FreezeCheck: Send + Sync {
-    /// Checks if admission is allowed for the given scope value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DivergenceError::RepoFrozen`] if the scope is frozen.
-    fn check_admission(&self, scope_value: &str) -> Result<(), DivergenceError>;
-
-    /// Returns whether the scope is currently frozen.
-    fn is_frozen(&self, scope_value: &str) -> bool;
-}
+// Re-export the FreezeCheck trait from apm2-core for use in this module.
+// This enables AdmissionGate in apm2-core to use FreezeRegistry from
+// apm2-daemon.
+pub use apm2_core::cac::freeze_check::{FreezeCheck, FreezeCheckError};
 
 impl FreezeCheck for FreezeRegistry {
-    fn check_admission(&self, scope_value: &str) -> Result<(), DivergenceError> {
-        // Delegate to the existing method
-        Self::check_admission(self, scope_value)
+    fn check_admission(&self, scope_value: &str) -> Result<(), FreezeCheckError> {
+        // Delegate to the existing method and convert the error
+        Self::check_admission(self, scope_value).map_err(|e| match e {
+            DivergenceError::RepoFrozen { freeze_id } => {
+                FreezeCheckError::frozen_with_reason(freeze_id, "divergence detected")
+            },
+            other => FreezeCheckError::internal(other.to_string()),
+        })
     }
 
     fn is_frozen(&self, scope_value: &str) -> bool {
@@ -1296,7 +1283,54 @@ pub trait TimeSource: Send + Sync {
 
 /// System time source using the real system clock.
 ///
-/// This is the default implementation for production use.
+/// This is the **default implementation** for development and testing. In
+/// production deployments, consider using an HTF (Holon Time Fabric) backed
+/// time source for:
+///
+/// - **Distributed consistency**: HTF provides globally-ordered timestamps
+///   across nodes, preventing clock skew issues
+/// - **Audit compliance**: HTF timestamps are cryptographically witnessed,
+///   supporting regulatory requirements
+/// - **Replay protection**: HTF-backed timestamps prevent replay attacks across
+///   temporal boundaries
+///
+/// # Production Time Source Requirements
+///
+/// For production use, implement the [`TimeSource`] trait with an HTF-backed
+/// provider:
+///
+/// ```rust,ignore
+/// use apm2_daemon::projection::{TimeSource, DivergenceWatchdog};
+///
+/// struct HtfTimeSource {
+///     htf_client: HtfClient,
+/// }
+///
+/// impl TimeSource for HtfTimeSource {
+///     fn now_nanos(&self) -> u64 {
+///         self.htf_client.current_tick_nanos()
+///     }
+///
+///     fn time_envelope_ref(&self, _pattern: &str) -> String {
+///         // Use actual HTF tick reference instead of pattern
+///         format!("htf:tick:{}", self.htf_client.current_tick_id())
+///     }
+/// }
+///
+/// // Create watchdog with HTF time source
+/// let htf_source = HtfTimeSource::new(htf_client);
+/// let watchdog = DivergenceWatchdog::with_time_source(signer, config, htf_source);
+/// ```
+///
+/// # Security Note
+///
+/// Using `SystemTimeSource` in production may result in:
+/// - Clock skew between nodes causing inconsistent freeze timestamps
+/// - Potential time-based attacks if system clock is manipulated
+/// - Non-auditable timestamps that cannot be cryptographically verified
+///
+/// These limitations are acceptable for development and testing but should
+/// be addressed for production deployments by integrating with HTF.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemTimeSource;
 

@@ -53,6 +53,7 @@
 //! ```
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,7 @@ use uuid::Uuid;
 #[cfg(test)]
 use super::dcp_index::RESERVED_PREFIXES;
 use super::dcp_index::check_reserved_prefix;
+use super::freeze_check::{FreezeCheck, FreezeCheckError, NoOpFreezeCheck};
 use super::patch_engine::{PatchEngine, PatchEngineError, PatchType};
 use super::validator::{
     CacValidator, MAX_ARRAY_MEMBERS, MAX_DEPTH, MAX_OBJECT_PROPERTIES, ValidationError,
@@ -153,6 +155,17 @@ impl From<CasError> for AdmissionError {
     fn from(err: CasError) -> Self {
         Self::StorageFailed {
             message: err.to_string(),
+        }
+    }
+}
+
+impl From<FreezeCheckError> for AdmissionError {
+    fn from(err: FreezeCheckError) -> Self {
+        match err {
+            FreezeCheckError::Frozen { freeze_id, reason } => {
+                Self::RepoFrozen { freeze_id, reason }
+            },
+            FreezeCheckError::InternalError { message } => Self::StorageFailed { message },
         }
     }
 }
@@ -692,30 +705,108 @@ pub struct AdmissionResult {
 ///
 /// The `AdmissionGate` is the sole entry point for CAC artifacts per TB-0001.
 /// It ensures all artifacts are:
-/// 1. Validated against their schema
-/// 2. Canonicalized to CAC-JSON format
-/// 3. Stored in the Content-Addressed Store
-/// 4. Accompanied by cryptographic receipts
+/// 1. **Freeze-checked**: Verify the scope is not frozen (if freeze checker is
+///    configured)
+/// 2. Validated against their schema
+/// 3. Canonicalized to CAC-JSON format
+/// 4. Stored in the Content-Addressed Store
+/// 5. Accompanied by cryptographic receipts
+///
+/// # Freeze Enforcement
+///
+/// When a `FreezeCheck` provider is configured via [`with_freeze_check`], the
+/// gate will reject admission requests for frozen scopes with
+/// [`AdmissionError::RepoFrozen`]. This enforces the divergence watchdog's
+/// freeze policy at the admission boundary.
+///
+/// The scope value for freeze checking is derived from the `dcp_id` by
+/// extracting the repository portion (first two path segments).
+///
+/// [`with_freeze_check`]: Self::with_freeze_check
 #[derive(Debug)]
-pub struct AdmissionGate<C: ContentAddressedStore> {
+pub struct AdmissionGate<C: ContentAddressedStore, F: FreezeCheck = NoOpFreezeCheck> {
     cas: C,
     patch_engine: PatchEngine,
+    /// Optional freeze checker for admission control.
+    /// If None, freeze checking is disabled (backwards compatible).
+    freeze_checker: Arc<F>,
 }
 
-impl<C: ContentAddressedStore> AdmissionGate<C> {
+impl<C: ContentAddressedStore> AdmissionGate<C, NoOpFreezeCheck> {
     /// Creates a new `AdmissionGate` with the given CAS backend.
+    ///
+    /// This constructor creates a gate without freeze checking enabled.
+    /// Use [`with_freeze_check`] to add freeze enforcement.
+    ///
+    /// [`with_freeze_check`]: Self::with_freeze_check
     #[must_use]
-    pub const fn new(cas: C) -> Self {
+    pub fn new(cas: C) -> Self {
         Self {
             cas,
             patch_engine: PatchEngine::new(),
+            freeze_checker: Arc::new(NoOpFreezeCheck),
         }
     }
 
+    /// Adds a freeze checker to the admission gate.
+    ///
+    /// When a freeze checker is configured, the gate will reject admission
+    /// requests for frozen scopes with [`AdmissionError::RepoFrozen`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use apm2_core::cac::admission::AdmissionGate;
+    /// use apm2_core::evidence::MemoryCas;
+    /// use std::sync::Arc;
+    ///
+    /// let cas = MemoryCas::new();
+    /// let freeze_registry = Arc::new(FreezeRegistry::new());
+    /// let gate = AdmissionGate::new(cas).with_freeze_check(freeze_registry);
+    /// ```
+    #[must_use]
+    pub fn with_freeze_check<F: FreezeCheck>(self, freeze_checker: Arc<F>) -> AdmissionGate<C, F> {
+        AdmissionGate {
+            cas: self.cas,
+            patch_engine: self.patch_engine,
+            freeze_checker,
+        }
+    }
+}
+
+impl<C: ContentAddressedStore, F: FreezeCheck> AdmissionGate<C, F> {
     /// Returns a reference to the underlying CAS.
     #[must_use]
     pub const fn cas(&self) -> &C {
         &self.cas
+    }
+
+    /// Returns a reference to the freeze checker.
+    #[must_use]
+    pub fn freeze_checker(&self) -> &F {
+        &self.freeze_checker
+    }
+
+    /// Extracts the scope value (repository identifier) from a DCP ID.
+    ///
+    /// The scope value is used for freeze checking. It extracts the first
+    /// two colon-separated segments of the DCP ID, which typically represent
+    /// the organization and repository.
+    ///
+    /// # Examples
+    ///
+    /// - `dcp://org/repo/artifact/id` -> `dcp://org/repo`
+    /// - `org:ticket:TCK-00213` -> `org:ticket`
+    #[must_use]
+    fn extract_scope_value(dcp_id: &str) -> String {
+        // For DCP IDs like "org:ticket:TCK-00213", extract "org:ticket"
+        // For URIs like "dcp://org/repo/...", extract "dcp://org/repo"
+        let parts: Vec<&str> = dcp_id.splitn(3, ':').collect();
+        if parts.len() >= 2 {
+            format!("{}:{}", parts[0], parts[1])
+        } else {
+            dcp_id.to_string()
+        }
     }
 
     /// Admits an artifact through the CAC pipeline.
@@ -746,9 +837,17 @@ impl<C: ContentAddressedStore> AdmissionGate<C> {
     ///   contains invalid characters
     /// - [`AdmissionError::InputComplexityExceeded`] if input exceeds
     ///   depth/size limits
+    /// - [`AdmissionError::RepoFrozen`] if the scope is frozen
     pub fn admit(&self, request: AdmissionRequest) -> Result<AdmissionResult, AdmissionError> {
         // SECURITY: Validate DCP ID first (length and character safety)
         validate_dcp_id(&request.dcp_id)?;
+
+        // SECURITY: Check freeze state before proceeding with admission.
+        // This enforces the divergence watchdog's freeze policy at the
+        // admission boundary, preventing artifacts from being admitted
+        // to frozen repositories.
+        let scope_value = Self::extract_scope_value(&request.dcp_id);
+        self.freeze_checker.check_admission(&scope_value)?;
 
         // SECURITY: Validate input complexity BEFORE any serialization/hashing
         // This prevents DoS via unbounded input that would cause expensive
@@ -2151,6 +2250,211 @@ mod tests {
         assert!(
             !json.contains("schema_id"),
             "Empty schema_id should be skipped in serialization"
+        );
+    }
+
+    // =========================================================================
+    // Freeze Check Tests (TCK-00213)
+    // =========================================================================
+
+    /// A mock freeze checker that always returns frozen for specific scopes.
+    struct MockFreezeChecker {
+        frozen_scopes: std::collections::HashSet<String>,
+    }
+
+    impl MockFreezeChecker {
+        fn new() -> Self {
+            Self {
+                frozen_scopes: std::collections::HashSet::new(),
+            }
+        }
+
+        fn freeze_scope(&mut self, scope: &str) {
+            self.frozen_scopes.insert(scope.to_string());
+        }
+    }
+
+    impl FreezeCheck for MockFreezeChecker {
+        fn check_admission(&self, scope_value: &str) -> Result<(), FreezeCheckError> {
+            if self.frozen_scopes.contains(scope_value) {
+                Err(FreezeCheckError::frozen_with_reason(
+                    "mock-freeze-001",
+                    "test freeze",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn is_frozen(&self, scope_value: &str) -> bool {
+            self.frozen_scopes.contains(scope_value)
+        }
+    }
+
+    #[test]
+    fn test_freeze_check_extract_scope_value() {
+        // Test scope extraction from various DCP ID formats
+        assert_eq!(
+            AdmissionGate::<MemoryCas>::extract_scope_value("org:ticket:TCK-00213"),
+            "org:ticket"
+        );
+        assert_eq!(
+            AdmissionGate::<MemoryCas>::extract_scope_value("company:artifact:some-id"),
+            "company:artifact"
+        );
+        assert_eq!(
+            AdmissionGate::<MemoryCas>::extract_scope_value("dcp://org/repo/path"),
+            "dcp://org/repo/path" // No colon after scheme
+        );
+        assert_eq!(
+            AdmissionGate::<MemoryCas>::extract_scope_value("single"),
+            "single"
+        );
+    }
+
+    #[test]
+    fn test_freeze_check_allows_unfrozen_scope() {
+        let cas = MemoryCas::new();
+        let freeze_checker = Arc::new(MockFreezeChecker::new());
+        let gate = AdmissionGate::new(cas).with_freeze_check(freeze_checker);
+
+        let schema = sample_schema();
+        let artifact = json!({"id": "TCK-00213"});
+
+        let request = AdmissionRequest::new_artifact(
+            "org:ticket:TCK-00213",
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        );
+
+        // Should succeed - scope is not frozen
+        let result = gate.admit(request);
+        assert!(
+            result.is_ok(),
+            "Admission should succeed for unfrozen scope"
+        );
+    }
+
+    #[test]
+    fn test_freeze_check_blocks_frozen_scope() {
+        let cas = MemoryCas::new();
+        let mut checker = MockFreezeChecker::new();
+        checker.freeze_scope("org:ticket");
+        let freeze_checker = Arc::new(checker);
+        let gate = AdmissionGate::new(cas).with_freeze_check(freeze_checker);
+
+        let schema = sample_schema();
+        let artifact = json!({"id": "TCK-00213"});
+
+        let request = AdmissionRequest::new_artifact(
+            "org:ticket:TCK-00213",
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        );
+
+        // Should fail - scope is frozen
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::RepoFrozen { ref freeze_id, .. }) if freeze_id == "mock-freeze-001"),
+            "Admission should be rejected for frozen scope, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_freeze_check_different_scopes_isolated() {
+        let cas = MemoryCas::new();
+        let mut checker = MockFreezeChecker::new();
+        checker.freeze_scope("org:ticket"); // Freeze only "org:ticket"
+        let freeze_checker = Arc::new(checker);
+        let gate = AdmissionGate::new(cas).with_freeze_check(freeze_checker);
+
+        let schema = sample_schema();
+
+        // Request to frozen scope should fail
+        let request1 = AdmissionRequest::new_artifact(
+            "org:ticket:TCK-00213",
+            ArtifactKind::Ticket,
+            json!({"id": "TCK-00213"}),
+            &schema,
+        );
+        assert!(gate.admit(request1).is_err(), "org:ticket should be frozen");
+
+        // Request to different scope should succeed
+        let request2 = AdmissionRequest::new_artifact(
+            "org:rfc:RFC-0015",
+            ArtifactKind::Rfc,
+            json!({"id": "RFC-0015"}),
+            &schema,
+        );
+        assert!(gate.admit(request2).is_ok(), "org:rfc should not be frozen");
+    }
+
+    #[test]
+    fn test_freeze_check_noop_allows_all() {
+        // Test that NoOpFreezeCheck allows all admissions (backwards compatible)
+        let gate = make_gate();
+        let schema = sample_schema();
+        let artifact = json!({"id": "TCK-00213"});
+
+        let request = AdmissionRequest::new_artifact(
+            "org:ticket:TCK-00213",
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        );
+
+        // Should succeed - NoOpFreezeCheck never blocks
+        let result = gate.admit(request);
+        assert!(
+            result.is_ok(),
+            "NoOpFreezeCheck should allow all admissions"
+        );
+    }
+
+    #[test]
+    fn test_freeze_check_error_conversion() {
+        // Test that FreezeCheckError converts correctly to AdmissionError
+        let freeze_err = FreezeCheckError::frozen_with_reason("freeze-123", "divergence detected");
+        let admission_err: AdmissionError = freeze_err.into();
+
+        match admission_err {
+            AdmissionError::RepoFrozen { freeze_id, reason } => {
+                assert_eq!(freeze_id, "freeze-123");
+                assert_eq!(reason, "divergence detected");
+            },
+            _ => panic!("Expected RepoFrozen error"),
+        }
+    }
+
+    #[test]
+    fn test_freeze_check_happens_before_validation() {
+        // Test that freeze check happens before schema validation
+        // (i.e., invalid artifacts should still trigger RepoFrozen, not
+        // ValidationFailed)
+        let cas = MemoryCas::new();
+        let mut checker = MockFreezeChecker::new();
+        checker.freeze_scope("org:ticket");
+        let freeze_checker = Arc::new(checker);
+        let gate = AdmissionGate::new(cas).with_freeze_check(freeze_checker);
+
+        let schema = sample_schema();
+        // Invalid artifact - missing required "id" field
+        let artifact = json!({"version": 1});
+
+        let request = AdmissionRequest::new_artifact(
+            "org:ticket:TCK-00213",
+            ArtifactKind::Ticket,
+            artifact,
+            &schema,
+        );
+
+        // Should fail with RepoFrozen, not ValidationFailed
+        let result = gate.admit(request);
+        assert!(
+            matches!(result, Err(AdmissionError::RepoFrozen { .. })),
+            "Freeze check should happen before validation, got: {result:?}"
         );
     }
 }
