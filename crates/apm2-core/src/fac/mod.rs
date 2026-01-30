@@ -57,5 +57,6 @@ pub use domain_separator::{
 // Re-export lease types
 pub use lease::{
     AatLeaseExtension, AatLeaseExtensionProto, GateLease, GateLeaseBuilder, GateLeaseProto,
-    GateLeaseScope, LeaseError,
+    GateLeaseScope, LeaseError, LeaseRevoked, LeaseRevokedBuilder, LeaseRevokedProto,
+    RevocationReason, is_lease_revoked,
 };
