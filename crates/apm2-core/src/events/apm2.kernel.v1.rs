@@ -624,13 +624,10 @@ pub struct GateReceiptGenerated {
     #[prost(bytes = "vec", tag = "6")]
     pub receipt_signature: ::prost::alloc::vec::Vec<u8>,
 }
-/// ============================================================
-/// CAPABILITY EVENTS
-/// ============================================================
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CapabilityEvent {
-    #[prost(oneof = "capability_event::Event", tags = "1")]
+    #[prost(oneof = "capability_event::Event", tags = "1, 2, 3, 4")]
     pub event: ::core::option::Option<capability_event::Event>,
 }
 /// Nested message and enum types in `CapabilityEvent`.
@@ -640,6 +637,12 @@ pub mod capability_event {
     pub enum Event {
         #[prost(message, tag = "1")]
         Required(super::CapabilityRequired),
+        #[prost(message, tag = "2")]
+        Granted(super::CapabilityGranted),
+        #[prost(message, tag = "3")]
+        Delegated(super::CapabilityDelegated),
+        #[prost(message, tag = "4")]
+        Revoked(super::CapabilityRevoked),
     }
 }
 /// Emitted during planning phase when a capability is required for a plan step.
@@ -662,6 +665,115 @@ pub struct CapabilityRequired {
     /// Human-readable reason for the status
     #[prost(string, tag = "5")]
     pub reason: ::prost::alloc::string::String,
+}
+/// Emitted when a capability is granted to an actor by an authority.
+/// This is the root of a delegation chain and must be signed by the registrar.
+/// Links to the lease system: capability_id == lease_id.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CapabilityGranted {
+    /// Unique identifier for this capability (equals lease_id for lease-backed capabilities)
+    #[prost(string, tag = "1")]
+    pub capability_id: ::prost::alloc::string::String,
+    /// Namespace this capability is bound to (prevents cross-namespace replay)
+    #[prost(string, tag = "2")]
+    pub namespace: ::prost::alloc::string::String,
+    /// Actor receiving the capability
+    #[prost(string, tag = "3")]
+    pub grantee_actor_id: ::prost::alloc::string::String,
+    /// Actor granting the capability (must be an authority in the namespace)
+    #[prost(string, tag = "4")]
+    pub grantor_actor_id: ::prost::alloc::string::String,
+    /// Hash of the serialized LeaseScope (stored in CAS)
+    #[prost(bytes = "vec", tag = "5")]
+    pub scope_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Optional hash of the serialized Budget (stored in CAS)
+    #[prost(bytes = "vec", tag = "6")]
+    pub budget_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Timestamp when the capability was granted (Unix nanos)
+    #[prost(uint64, tag = "7")]
+    pub granted_at: u64,
+    /// Timestamp when the capability expires (Unix nanos)
+    #[prost(uint64, tag = "8")]
+    pub expires_at: u64,
+    /// Registrar signature over this grant (proves authority)
+    #[prost(bytes = "vec", tag = "9")]
+    pub registrar_signature: ::prost::alloc::vec::Vec<u8>,
+    /// Whether this capability can be delegated to others
+    #[prost(bool, tag = "10")]
+    pub delegatable: bool,
+}
+/// Emitted when a capability holder delegates their capability to another actor.
+/// Forms part of the delegation chain for capability proofs.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CapabilityDelegated {
+    /// New capability ID for the delegated capability
+    #[prost(string, tag = "1")]
+    pub delegated_capability_id: ::prost::alloc::string::String,
+    /// Parent capability being delegated from
+    #[prost(string, tag = "2")]
+    pub parent_capability_id: ::prost::alloc::string::String,
+    /// Hash of the parent CapabilityGranted or CapabilityDelegated event
+    #[prost(bytes = "vec", tag = "3")]
+    pub parent_capability_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Namespace this delegation is bound to (must match parent)
+    #[prost(string, tag = "4")]
+    pub namespace: ::prost::alloc::string::String,
+    /// Actor receiving the delegated capability
+    #[prost(string, tag = "5")]
+    pub delegatee_actor_id: ::prost::alloc::string::String,
+    /// Actor delegating the capability (must hold parent capability)
+    #[prost(string, tag = "6")]
+    pub delegator_actor_id: ::prost::alloc::string::String,
+    /// Hash of the serialized LeaseScope (must be subset of parent scope)
+    #[prost(bytes = "vec", tag = "7")]
+    pub scope_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Optional hash of the serialized Budget (must be subset of parent budget)
+    #[prost(bytes = "vec", tag = "8")]
+    pub budget_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Timestamp when the delegation occurred (Unix nanos)
+    #[prost(uint64, tag = "9")]
+    pub delegated_at: u64,
+    /// Timestamp when the delegated capability expires (Unix nanos, must be <= parent expires_at)
+    #[prost(uint64, tag = "10")]
+    pub expires_at: u64,
+    /// Delegator's signature over this delegation (proves authority transfer)
+    #[prost(bytes = "vec", tag = "11")]
+    pub delegator_signature: ::prost::alloc::vec::Vec<u8>,
+    /// Whether this delegated capability can be further delegated
+    #[prost(bool, tag = "12")]
+    pub delegatable: bool,
+    /// Depth in the delegation chain (parent depth + 1)
+    #[prost(uint32, tag = "13")]
+    pub delegation_depth: u32,
+}
+/// Emitted when a capability is revoked before its natural expiration.
+/// Revocation cascades to all delegated capabilities in the chain.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CapabilityRevoked {
+    /// The capability being revoked
+    #[prost(string, tag = "1")]
+    pub capability_id: ::prost::alloc::string::String,
+    /// Namespace the capability belongs to
+    #[prost(string, tag = "2")]
+    pub namespace: ::prost::alloc::string::String,
+    /// Actor performing the revocation (must be grantor or authority)
+    #[prost(string, tag = "3")]
+    pub revoker_actor_id: ::prost::alloc::string::String,
+    /// Reason for revocation: VOLUNTARY, POLICY_VIOLATION, KEY_COMPROMISE, SUPERSEDED
+    #[prost(string, tag = "4")]
+    pub revocation_reason: ::prost::alloc::string::String,
+    /// Timestamp when the revocation occurred (Unix nanos)
+    #[prost(uint64, tag = "5")]
+    pub revoked_at: u64,
+    /// Revoker's signature over this revocation
+    #[prost(bytes = "vec", tag = "6")]
+    pub revoker_signature: ::prost::alloc::vec::Vec<u8>,
+    /// If true, revocation cascades to all delegated capabilities; if false, only this capability is revoked
+    #[prost(bool, tag = "7")]
+    pub cascade: bool,
 }
 /// ============================================================
 /// KEY EVENTS

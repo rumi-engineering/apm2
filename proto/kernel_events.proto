@@ -365,9 +365,23 @@ message GateReceiptGenerated {
 // ============================================================
 // CAPABILITY EVENTS
 // ============================================================
+//
+// Capability events implement the OCAP (Object Capability) model for
+// cross-node authority verification. All capability events are TotalOrder
+// authority events requiring BFT consensus finalization.
+//
+// Key concepts:
+// - capability_id == lease_id (capabilities are linked to leases)
+// - namespace binding prevents cross-namespace replay attacks
+// - Delegation chains support hierarchical authority delegation
+// - Proofs are ledger-verifiable across nodes
+
 message CapabilityEvent {
   oneof event {
     CapabilityRequired required = 1;
+    CapabilityGranted granted = 2;
+    CapabilityDelegated delegated = 3;
+    CapabilityRevoked revoked = 4;
   }
 }
 
@@ -384,6 +398,82 @@ message CapabilityRequired {
   string status = 4;
   // Human-readable reason for the status
   string reason = 5;
+}
+
+// Emitted when a capability is granted to an actor by an authority.
+// This is the root of a delegation chain and must be signed by the registrar.
+// Links to the lease system: capability_id == lease_id.
+message CapabilityGranted {
+  // Unique identifier for this capability (equals lease_id for lease-backed capabilities)
+  string capability_id = 1;
+  // Namespace this capability is bound to (prevents cross-namespace replay)
+  string namespace = 2;
+  // Actor receiving the capability
+  string grantee_actor_id = 3;
+  // Actor granting the capability (must be an authority in the namespace)
+  string grantor_actor_id = 4;
+  // Hash of the serialized LeaseScope (stored in CAS)
+  bytes scope_hash = 5;
+  // Optional hash of the serialized Budget (stored in CAS)
+  bytes budget_hash = 6;
+  // Timestamp when the capability was granted (Unix nanos)
+  uint64 granted_at = 7;
+  // Timestamp when the capability expires (Unix nanos)
+  uint64 expires_at = 8;
+  // Registrar signature over this grant (proves authority)
+  bytes registrar_signature = 9;
+  // Whether this capability can be delegated to others
+  bool delegatable = 10;
+}
+
+// Emitted when a capability holder delegates their capability to another actor.
+// Forms part of the delegation chain for capability proofs.
+message CapabilityDelegated {
+  // New capability ID for the delegated capability
+  string delegated_capability_id = 1;
+  // Parent capability being delegated from
+  string parent_capability_id = 2;
+  // Hash of the parent CapabilityGranted or CapabilityDelegated event
+  bytes parent_capability_hash = 3;
+  // Namespace this delegation is bound to (must match parent)
+  string namespace = 4;
+  // Actor receiving the delegated capability
+  string delegatee_actor_id = 5;
+  // Actor delegating the capability (must hold parent capability)
+  string delegator_actor_id = 6;
+  // Hash of the serialized LeaseScope (must be subset of parent scope)
+  bytes scope_hash = 7;
+  // Optional hash of the serialized Budget (must be subset of parent budget)
+  bytes budget_hash = 8;
+  // Timestamp when the delegation occurred (Unix nanos)
+  uint64 delegated_at = 9;
+  // Timestamp when the delegated capability expires (Unix nanos, must be <= parent expires_at)
+  uint64 expires_at = 10;
+  // Delegator's signature over this delegation (proves authority transfer)
+  bytes delegator_signature = 11;
+  // Whether this delegated capability can be further delegated
+  bool delegatable = 12;
+  // Depth in the delegation chain (parent depth + 1)
+  uint32 delegation_depth = 13;
+}
+
+// Emitted when a capability is revoked before its natural expiration.
+// Revocation cascades to all delegated capabilities in the chain.
+message CapabilityRevoked {
+  // The capability being revoked
+  string capability_id = 1;
+  // Namespace the capability belongs to
+  string namespace = 2;
+  // Actor performing the revocation (must be grantor or authority)
+  string revoker_actor_id = 3;
+  // Reason for revocation: VOLUNTARY, POLICY_VIOLATION, KEY_COMPROMISE, SUPERSEDED
+  string revocation_reason = 4;
+  // Timestamp when the revocation occurred (Unix nanos)
+  uint64 revoked_at = 5;
+  // Revoker's signature over this revocation
+  bytes revoker_signature = 6;
+  // If true, revocation cascades to all delegated capabilities; if false, only this capability is revoked
+  bool cascade = 7;
 }
 
 // ============================================================
