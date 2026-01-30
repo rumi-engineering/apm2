@@ -17,12 +17,34 @@
 //!    behavior
 //! 4. **Audit events**: Denied reads emit [`FirewallDecision`] events for
 //!    logging
+//! 5. **Denial-of-service protection**: Path length limits prevent memory
+//!    exhaustion attacks
 //!
 //! # Firewall Modes
 //!
 //! - **Warn**: Log warning, allow read (returns Ok with warning event)
 //! - **`SoftFail`**: Return error, allow retry (no session termination)
 //! - **`HardFail`**: Return error, flag for session termination
+//!
+//! # Event Emission Pattern
+//!
+//! The [`FirewallDecision`] struct serves as the event data structure for audit
+//! logging. This module follows the middleware pattern where:
+//!
+//! - The firewall validates requests and returns [`FirewallDecision`] in the
+//!   result/error
+//! - The **caller** of `validate_read()` is responsible for emitting events to
+//!   an event bus
+//! - This separation allows flexible event routing without coupling the
+//!   firewall to a specific event system
+//!
+//! Example integration:
+//! ```ignore
+//! let result = firewall.validate_read(path, hash);
+//! if let Some(event) = result.as_ref().err().and_then(|e| e.event()) {
+//!     event_bus.emit(event.clone());
+//! }
+//! ```
 //!
 //! # Example
 //!
@@ -60,7 +82,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::manifest::{ContextPackManifest, ManifestError};
+use super::manifest::{ContextPackManifest, MAX_PATH_LENGTH, ManifestError};
 
 // =============================================================================
 // Constants
@@ -309,6 +331,15 @@ pub enum ContextFirewallError {
         /// The path that requires a hash.
         path: String,
     },
+
+    /// Path exceeds maximum length (denial-of-service protection).
+    #[error("path exceeds max length: {actual} > {max}")]
+    PathTooLong {
+        /// Actual length of the path.
+        actual: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
 }
 
 impl ContextFirewallError {
@@ -324,7 +355,9 @@ impl ContextFirewallError {
                 should_terminate_session,
                 ..
             } => *should_terminate_session,
-            Self::InvalidPath(_) | Self::ContentHashRequired { .. } => false,
+            Self::InvalidPath(_) | Self::ContentHashRequired { .. } | Self::PathTooLong { .. } => {
+                false
+            },
         }
     }
 
@@ -335,7 +368,9 @@ impl ContextFirewallError {
             Self::AccessDenied { event, .. } | Self::ContentHashMismatch { event, .. } => {
                 Some(event)
             },
-            Self::InvalidPath(_) | Self::ContentHashRequired { .. } => None,
+            Self::InvalidPath(_) | Self::ContentHashRequired { .. } | Self::PathTooLong { .. } => {
+                None
+            },
         }
     }
 }
@@ -488,6 +523,16 @@ impl ContextAwareValidator for DefaultContextFirewall<'_> {
         path: &str,
         content_hash: Option<&[u8; 32]>,
     ) -> Result<ValidationResult, ContextFirewallError> {
+        // DoS protection: Check path length BEFORE any processing to prevent
+        // memory exhaustion attacks via extremely long path strings.
+        // This check must happen before normalize_path() is called.
+        if path.len() > MAX_PATH_LENGTH {
+            return Err(ContextFirewallError::PathTooLong {
+                actual: path.len(),
+                max: MAX_PATH_LENGTH,
+            });
+        }
+
         // Use the manifest's is_allowed method which handles:
         // - Path normalization and validation
         // - Allowlist lookup
@@ -1008,6 +1053,61 @@ pub mod tests {
 
         let err = result.unwrap_err();
         assert!(matches!(err, ContextFirewallError::InvalidPath(_)));
+    }
+
+    // =========================================================================
+    // DoS Protection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_path_too_long_dos_protection() {
+        use super::super::manifest::MAX_PATH_LENGTH;
+
+        let manifest = create_test_manifest();
+        let firewall = DefaultContextFirewall::new(&manifest, FirewallMode::SoftFail);
+
+        // Create a path that exceeds MAX_PATH_LENGTH
+        let long_path = "/".to_string() + &"x".repeat(MAX_PATH_LENGTH + 1);
+        assert!(long_path.len() > MAX_PATH_LENGTH);
+
+        let result = firewall.validate_read(&long_path, None);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ContextFirewallError::PathTooLong { actual, max }
+                if actual == long_path.len() && max == MAX_PATH_LENGTH
+            ),
+            "Expected PathTooLong error, got {err:?}"
+        );
+
+        // Verify DoS protection doesn't terminate session
+        assert!(!err.should_terminate_session());
+    }
+
+    #[test]
+    fn test_path_at_max_length_allowed() {
+        use super::super::manifest::MAX_PATH_LENGTH;
+
+        // Create a manifest with a path exactly at MAX_PATH_LENGTH
+        // The path must be valid (absolute) and within limits
+        let valid_path = "/".to_string() + &"a".repeat(MAX_PATH_LENGTH - 1);
+        assert_eq!(valid_path.len(), MAX_PATH_LENGTH);
+
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new(valid_path.clone(), [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+        let firewall = DefaultContextFirewall::new(&manifest, FirewallMode::SoftFail);
+
+        // Path at exactly max length should be allowed
+        let result = firewall.validate_read(&valid_path, None);
+        assert!(result.is_ok(), "Path at max length should be allowed");
     }
 
     // =========================================================================
