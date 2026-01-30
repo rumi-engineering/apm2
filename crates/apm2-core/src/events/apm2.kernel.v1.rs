@@ -31,7 +31,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -61,6 +61,8 @@ pub mod kernel_event {
         Capability(super::CapabilityEvent),
         #[prost(message, tag = "19")]
         GithubLease(super::GitHubLeaseEvent),
+        #[prost(message, tag = "20")]
+        PolicyResolvedForChangeset(super::PolicyResolvedForChangeSet),
     }
 }
 /// ============================================================
@@ -947,4 +949,52 @@ pub struct KeyRotated {
     /// Signature from the OLD key over this message (proves control of old key)
     #[prost(bytes = "vec", tag = "5")]
     pub old_key_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// The anchor event that locks policy decisions for a changeset.
+/// All subsequent lease issuance and receipt validation must reference
+/// this anchor's resolved_policy_hash.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PolicyResolvedForChangeSet {
+    /// Work item this policy resolution applies to
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Hash binding to specific changeset (32 bytes)
+    #[prost(bytes = "vec", tag = "2")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Hash of the resolved policy tuple (32 bytes)
+    /// Computed from: risk_tier || determinism_class || sorted(rcp_profile_ids) ||
+    ///                 sorted(rcp_manifest_hashes) || sorted(verifier_policy_hashes)
+    #[prost(bytes = "vec", tag = "3")]
+    pub resolved_policy_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Resolved risk tier (0-4)
+    #[prost(uint32, tag = "4")]
+    pub resolved_risk_tier: u32,
+    /// Resolved determinism class (0=non, 1=soft, 2=fully)
+    #[prost(uint32, tag = "5")]
+    pub resolved_determinism_class: u32,
+    /// Resolved RCP profile IDs (sorted for canonical encoding)
+    #[prost(string, repeated, tag = "6")]
+    pub resolved_rcp_profile_ids: ::prost::alloc::vec::Vec<
+        ::prost::alloc::string::String,
+    >,
+    /// Hashes of resolved RCP manifests (sorted, each 32 bytes)
+    #[prost(bytes = "vec", repeated, tag = "7")]
+    pub resolved_rcp_manifest_hashes: ::prost::alloc::vec::Vec<
+        ::prost::alloc::vec::Vec<u8>,
+    >,
+    /// Hashes of resolved verifier policies (sorted, each 32 bytes)
+    #[prost(bytes = "vec", repeated, tag = "8")]
+    pub resolved_verifier_policy_hashes: ::prost::alloc::vec::Vec<
+        ::prost::alloc::vec::Vec<u8>,
+    >,
+    /// Actor who performed the policy resolution
+    #[prost(string, tag = "9")]
+    pub resolver_actor_id: ::prost::alloc::string::String,
+    /// Version of the resolver component
+    #[prost(string, tag = "10")]
+    pub resolver_version: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: domain (64 bytes)
+    #[prost(bytes = "vec", tag = "11")]
+    pub resolver_signature: ::prost::alloc::vec::Vec<u8>,
 }

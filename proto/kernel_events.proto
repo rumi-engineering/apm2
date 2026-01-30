@@ -52,6 +52,7 @@ message KernelEvent {
     KeyEvent key = 17;
     CapabilityEvent capability = 18;
     GitHubLeaseEvent github_lease = 19;
+    PolicyResolvedForChangeSet policy_resolved_for_changeset = 20;
   }
 }
 
@@ -604,4 +605,45 @@ message KeyRotated {
   uint64 rotated_at = 4;
   // Signature from the OLD key over this message (proves control of old key)
   bytes old_key_signature = 5;
+}
+
+// ============================================================
+// FORGE ADMISSION CYCLE (FAC) EVENTS
+// ============================================================
+//
+// FAC events implement the policy resolution and gate lease lifecycle
+// for the Forge Admission Cycle. These events ensure that all changes
+// flow through quality gates with locked policy configurations.
+//
+// Ordering Invariant: PolicyResolvedForChangeSet MUST exist before
+// any GateLeaseIssued for the same work_id/changeset.
+
+// The anchor event that locks policy decisions for a changeset.
+// All subsequent lease issuance and receipt validation must reference
+// this anchor's resolved_policy_hash.
+message PolicyResolvedForChangeSet {
+  // Work item this policy resolution applies to
+  string work_id = 1;
+  // Hash binding to specific changeset (32 bytes)
+  bytes changeset_digest = 2;
+  // Hash of the resolved policy tuple (32 bytes)
+  // Computed from: risk_tier || determinism_class || sorted(rcp_profile_ids) ||
+  //                sorted(rcp_manifest_hashes) || sorted(verifier_policy_hashes)
+  bytes resolved_policy_hash = 3;
+  // Resolved risk tier (0-4)
+  uint32 resolved_risk_tier = 4;
+  // Resolved determinism class (0=non, 1=soft, 2=fully)
+  uint32 resolved_determinism_class = 5;
+  // Resolved RCP profile IDs (sorted for canonical encoding)
+  repeated string resolved_rcp_profile_ids = 6;
+  // Hashes of resolved RCP manifests (sorted, each 32 bytes)
+  repeated bytes resolved_rcp_manifest_hashes = 7;
+  // Hashes of resolved verifier policies (sorted, each 32 bytes)
+  repeated bytes resolved_verifier_policy_hashes = 8;
+  // Actor who performed the policy resolution
+  string resolver_actor_id = 9;
+  // Version of the resolver component
+  string resolver_version = 10;
+  // Ed25519 signature over canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: domain (64 bytes)
+  bytes resolver_signature = 11;
 }
