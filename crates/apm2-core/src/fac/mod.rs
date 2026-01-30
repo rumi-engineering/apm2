@@ -64,6 +64,7 @@
 //! ```
 
 mod domain_separator;
+mod key_policy;
 mod lease;
 mod policy_resolution;
 mod receipt;
@@ -74,6 +75,12 @@ pub use domain_separator::{
     GATE_RECEIPT_PREFIX, GATE_RUN_COMPLETED_PREFIX, LEASE_REVOKED_PREFIX, MERGE_RECEIPT_PREFIX,
     POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX, QUARANTINE_EVENT_PREFIX, sign_with_domain,
     verify_with_domain,
+};
+// Re-export key policy types
+pub use key_policy::{
+    CoiEnforcementLevel, CoiRule, CustodyDomain, DelegationRule, KeyBinding, KeyPolicy,
+    KeyPolicyBuilder, KeyPolicyError, MAX_COI_RULES, MAX_CUSTODY_DOMAINS, MAX_DELEGATION_RULES,
+    MAX_KEY_BINDINGS, SUPPORTED_SCHEMA_VERSIONS,
 };
 // Re-export lease types
 pub use lease::{AatLeaseExtension, GateLease, GateLeaseBuilder, LeaseError};
