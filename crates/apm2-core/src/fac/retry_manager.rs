@@ -239,7 +239,7 @@ mod tests {
         assert!(!manager.can_retry(gate).unwrap());
         let result = manager.record_attempt(gate);
         assert!(matches!(result, Err(RetryError::GateLimitExceeded { .. })));
-        
+
         // Counts should stay at max
         assert_eq!(manager.attempts_for(gate), 3);
         assert_eq!(manager.global_episodes(), 3);
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn test_global_limit() {
         let mut manager = RetryManager::new();
-        
+
         // Fill up global episodes with unique gates
         for i in 0..MAX_GLOBAL_EPISODES {
             let gate = format!("gate-{}", i);
@@ -260,9 +260,12 @@ mod tests {
         // Next attempt should fail globally
         let gate = "overflow-gate";
         assert!(!manager.can_retry(gate).unwrap());
-        
+
         let result = manager.record_attempt(gate);
-        assert!(matches!(result, Err(RetryError::GlobalLimitExceeded { .. })));
+        assert!(matches!(
+            result,
+            Err(RetryError::GlobalLimitExceeded { .. })
+        ));
     }
 
     #[test]
