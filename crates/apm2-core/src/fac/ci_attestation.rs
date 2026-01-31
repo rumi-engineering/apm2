@@ -224,8 +224,16 @@ pub type Hash = [u8; 32];
 /// # Builder Pattern
 ///
 /// Use [`CiAttestation::builder()`] to construct instances with validation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// # Security
+///
+/// Deserialization enforces the same resource limits as the builder:
+/// - String fields are limited to [`MAX_STRING_LENGTH`] bytes
+/// - Artifact hashes are limited to [`MAX_DOWNLOADED_ARTIFACT_HASHES`] entries
+///
+/// This prevents denial-of-service attacks via oversized payloads during
+/// deserialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CiAttestation {
     /// The attestation level indicating trustworthiness.
     level: CiAttestationLevel,
@@ -299,6 +307,84 @@ mod option_signature_bytes {
             },
             None => Ok(None),
         }
+    }
+}
+
+/// Custom deserialization that enforces resource limits.
+///
+/// This implementation validates all deserialized data against the same limits
+/// that the builder enforces, preventing denial-of-service attacks via
+/// oversized payloads.
+impl<'de> Deserialize<'de> for CiAttestation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        // Helper struct for deserialization that mirrors `CiAttestation` fields.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CiAttestationHelper {
+            level: CiAttestationLevel,
+            workflow_run_id: String,
+            downloaded_artifact_hashes: Vec<Hash>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            runner_image_digest: Option<Hash>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            toolchain: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            command_transcript_hash: Option<Hash>,
+            #[serde(default)]
+            #[serde(skip_serializing_if = "Option::is_none")]
+            #[serde(with = "option_signature_bytes")]
+            adapter_signature: Option<[u8; 64]>,
+        }
+
+        let helper = CiAttestationHelper::deserialize(deserializer)?;
+
+        // Validate workflow_run_id length
+        if helper.workflow_run_id.len() > MAX_STRING_LENGTH {
+            return Err(D::Error::custom(format!(
+                "workflow_run_id exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+                helper.workflow_run_id.len(),
+            )));
+        }
+
+        // Validate toolchain length
+        if let Some(ref toolchain) = helper.toolchain {
+            if toolchain.len() > MAX_STRING_LENGTH {
+                return Err(D::Error::custom(format!(
+                    "toolchain exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+                    toolchain.len(),
+                )));
+            }
+        }
+
+        // Validate artifact hashes count
+        if helper.downloaded_artifact_hashes.len() > MAX_DOWNLOADED_ARTIFACT_HASHES {
+            return Err(D::Error::custom(format!(
+                "too many artifact hashes: {} > {MAX_DOWNLOADED_ARTIFACT_HASHES}",
+                helper.downloaded_artifact_hashes.len(),
+            )));
+        }
+
+        // Validate L1+ requires workflow_run_id
+        if helper.level >= CiAttestationLevel::L1 && helper.workflow_run_id.is_empty() {
+            return Err(D::Error::custom(
+                "L1+ attestation requires non-empty workflow_run_id",
+            ));
+        }
+
+        Ok(Self {
+            level: helper.level,
+            workflow_run_id: helper.workflow_run_id,
+            downloaded_artifact_hashes: helper.downloaded_artifact_hashes,
+            runner_image_digest: helper.runner_image_digest,
+            toolchain: helper.toolchain,
+            command_transcript_hash: helper.command_transcript_hash,
+            adapter_signature: helper.adapter_signature,
+        })
     }
 }
 
@@ -428,8 +514,8 @@ impl CiAttestationBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error during [`build()`] if the string exceeds
-    /// [`MAX_STRING_LENGTH`].
+    /// Returns an error during [`CiAttestationBuilder::build()`] if the string
+    /// exceeds [`MAX_STRING_LENGTH`].
     #[must_use]
     pub fn workflow_run_id(mut self, id: impl Into<String>) -> Self {
         self.workflow_run_id = Some(id.into());
@@ -440,7 +526,7 @@ impl CiAttestationBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error during [`build()`] if more than
+    /// Returns an error during [`CiAttestationBuilder::build()`] if more than
     /// [`MAX_DOWNLOADED_ARTIFACT_HASHES`] are added.
     #[must_use]
     pub fn downloaded_artifact_hash(mut self, hash: Hash) -> Self {
@@ -453,7 +539,7 @@ impl CiAttestationBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error during [`build()`] if more than
+    /// Returns an error during [`CiAttestationBuilder::build()`] if more than
     /// [`MAX_DOWNLOADED_ARTIFACT_HASHES`] are provided.
     #[must_use]
     pub fn downloaded_artifact_hashes(mut self, hashes: impl IntoIterator<Item = Hash>) -> Self {
@@ -472,8 +558,8 @@ impl CiAttestationBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error during [`build()`] if the string exceeds
-    /// [`MAX_STRING_LENGTH`].
+    /// Returns an error during [`CiAttestationBuilder::build()`] if the string
+    /// exceeds [`MAX_STRING_LENGTH`].
     #[must_use]
     pub fn toolchain(mut self, toolchain: impl Into<String>) -> Self {
         self.toolchain = Some(toolchain.into());
@@ -978,6 +1064,100 @@ pub mod tests {
 
         let result: Result<CiAttestation, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Deserialization Security Tests
+    // =========================================================================
+
+    #[test]
+    fn test_deserialize_rejects_oversized_workflow_run_id() {
+        // Attempt to deserialize a payload with oversized workflow_run_id
+        let oversized_string = "x".repeat(MAX_STRING_LENGTH + 1);
+        let json = format!(
+            r#"{{"level": "L0", "workflow_run_id": "{oversized_string}", "downloaded_artifact_hashes": []}}"#,
+        );
+
+        let result: Result<CiAttestation, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("workflow_run_id exceeds maximum length"),
+            "Expected error about workflow_run_id length, got: {err_msg}",
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_oversized_toolchain() {
+        // Attempt to deserialize a payload with oversized toolchain
+        let oversized_string = "x".repeat(MAX_STRING_LENGTH + 1);
+        let json = format!(
+            r#"{{"level": "L0", "workflow_run_id": "", "downloaded_artifact_hashes": [], "toolchain": "{oversized_string}"}}"#,
+        );
+
+        let result: Result<CiAttestation, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("toolchain exceeds maximum length"),
+            "Expected error about toolchain length, got: {err_msg}",
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_too_many_artifact_hashes() {
+        // Attempt to deserialize a payload with too many artifact hashes
+        // We'll construct a JSON with MAX + 1 hashes (using byte array format)
+        let hash_array = "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]";
+        let hashes: Vec<&str> = (0..=MAX_DOWNLOADED_ARTIFACT_HASHES)
+            .map(|_| hash_array)
+            .collect();
+        let hashes_json = hashes.join(",");
+
+        let json = format!(
+            r#"{{"level": "L0", "workflow_run_id": "", "downloaded_artifact_hashes": [{hashes_json}]}}"#,
+        );
+
+        let result: Result<CiAttestation, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("too many artifact hashes"),
+            "Expected error about artifact hashes count, got: {err_msg}",
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_l1_without_workflow_run_id() {
+        // Attempt to deserialize L1 attestation without workflow_run_id
+        let json = r#"{"level": "L1", "workflow_run_id": "", "downloaded_artifact_hashes": []}"#;
+
+        let result: Result<CiAttestation, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("L1+ attestation requires non-empty workflow_run_id"),
+            "Expected error about missing workflow_run_id, got: {err_msg}",
+        );
+    }
+
+    #[test]
+    fn test_deserialize_accepts_max_valid_limits() {
+        // Verify we can deserialize at the exact limits
+        let max_string = "x".repeat(MAX_STRING_LENGTH);
+
+        // Create a valid attestation at limits via builder
+        let original = CiAttestation::builder()
+            .level(CiAttestationLevel::L1)
+            .workflow_run_id(max_string.clone())
+            .toolchain(max_string)
+            .build()
+            .unwrap();
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: CiAttestation = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
     }
 
     // =========================================================================
