@@ -98,7 +98,7 @@ pub const MAX_RUN_RECEIPT_HASHES: usize = 256;
 
 /// Maximum run count allowed. This bounds the `run_count` field to prevent
 /// resource exhaustion from excessive run requirements.
-/// Must be >= MAX_RUN_RECEIPT_HASHES to avoid overflow.
+/// Must be >= `MAX_RUN_RECEIPT_HASHES` to avoid overflow.
 pub const MAX_RUN_COUNT: u32 = 256;
 
 // =============================================================================
@@ -375,10 +375,10 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 ///
 /// # Fields
 ///
-/// - `determinism_class` - Determinism class enum (NonDeterministic,
-///   SoftDeterministic, FullyDeterministic)
+/// - `determinism_class` - Determinism class enum (`NonDeterministic`,
+///   `SoftDeterministic`, `FullyDeterministic`)
 /// - `run_count` - Number of AAT runs executed (u32 to match
-///   MAX_RUN_RECEIPT_HASHES)
+///   `MAX_RUN_RECEIPT_HASHES`)
 /// - `run_receipt_hashes` - Hashes of individual run receipts
 /// - `terminal_evidence_digest` - Digest of machine-checkable terminal evidence
 /// - `terminal_verifier_outputs_digest` - Digest of terminal verifier outputs
@@ -393,8 +393,8 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeterminismEnvelope {
-    /// Determinism class (NonDeterministic, SoftDeterministic,
-    /// FullyDeterministic).
+    /// Determinism class (`NonDeterministic`, `SoftDeterministic`,
+    /// `FullyDeterministic`).
     pub determinism_class: DeterminismClass,
 
     /// Number of AAT runs executed.
@@ -1061,10 +1061,12 @@ pub mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_max_constants() {
         assert_eq!(MAX_RUN_RECEIPT_HASHES, 256);
         assert_eq!(MAX_RUN_COUNT, 256);
         // Ensure MAX_RUN_COUNT >= MAX_RUN_RECEIPT_HASHES to prevent overflow
+        // Note: MAX_RUN_RECEIPT_HASHES is 256 which fits in u32
         assert!(MAX_RUN_COUNT >= MAX_RUN_RECEIPT_HASHES as u32);
     }
 
