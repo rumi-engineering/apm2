@@ -1065,3 +1065,76 @@ message AATResultReused {
   // Ed25519 signature over canonical bytes with AAT_RESULT_REUSED: domain (64 bytes).
   bytes gate_signature = 5;
 }
+
+// ============================================================
+// HARNESS SANDBOX SCHEMA (TCK-00230)
+// ============================================================
+//
+// Network policy profile and egress rule types for AAT harness sandboxing.
+// AAT harnesses run in strict sandbox environments with deny-by-default egress.
+//
+// Key security properties:
+// - Deny-by-default egress control
+// - Policy-declared access only
+// - Receipt recording for audit
+// - Pinned snapshot mounts
+//
+// Phase 1: Schema only. Phase 2 will implement runtime enforcement.
+
+// Namespace for harness sandbox types.
+message harness_sandbox {
+  // Intentionally empty - serves as namespace for nested types.
+}
+
+// Transport protocol for egress rules.
+enum Protocol {
+  // Unspecified protocol (invalid).
+  PROTOCOL_UNSPECIFIED = 0;
+  // Transmission Control Protocol (connection-oriented).
+  PROTOCOL_TCP = 1;
+  // User Datagram Protocol (connectionless).
+  PROTOCOL_UDP = 2;
+}
+
+// An individual egress rule defining allowed network access.
+// Each rule specifies a single (host, port, protocol) tuple that is
+// permitted for outbound network connections.
+//
+// Security:
+// - Wildcards are NOT supported (explicit hosts only)
+// - Port ranges are NOT supported (explicit ports only)
+// - CIDR notation is NOT supported for hosts
+message EgressRule {
+  // Target hostname or IP address (max 253 characters).
+  // Wildcards are not supported for security reasons.
+  string host = 1;
+  // Target port number (1-65535, port 0 is reserved).
+  uint32 port = 2;
+  // Transport protocol (TCP or UDP).
+  Protocol protocol = 3;
+}
+
+// Network policy profile for AAT harness sandboxing.
+//
+// Defines the allowed egress rules for an AAT harness execution environment.
+// The profile uses a deny-by-default model where all egress is blocked unless
+// explicitly allowed by a rule.
+//
+// Security:
+// - deny_by_default MUST be true (fail-closed security model)
+// - Egress rules are sorted by hash for canonical encoding
+// - Profile hash provides integrity verification
+// - Profile referenced by network_policy_profile_hash in AatAttestation
+message NetworkPolicyProfile {
+  // Unique identifier for this policy profile.
+  string profile_id = 1;
+  // BLAKE3 hash of the canonical profile representation (32 bytes).
+  // Computed from: profile_id || len(allowed_egress) || sorted(egress_hashes) || deny_by_default
+  bytes profile_hash = 2;
+  // List of allowed egress rules (max 256 rules).
+  // Each rule specifies a (host, port, protocol) tuple that is permitted.
+  repeated EgressRule allowed_egress = 3;
+  // Deny-by-default flag (MUST be true).
+  // When true, all egress not matching a rule is blocked.
+  bool deny_by_default = 4;
+}

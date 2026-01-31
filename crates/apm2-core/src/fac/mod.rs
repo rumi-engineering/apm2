@@ -74,6 +74,7 @@ mod ci_import;
 pub mod determinism;
 mod domain_separator;
 pub mod flake_class;
+pub mod harness_sandbox;
 mod key_policy;
 mod lease;
 mod policy_resolution;
@@ -132,6 +133,12 @@ pub use domain_separator::{
 };
 // Re-export flake classification routing types
 pub use flake_class::FlakeRouting;
+// Re-export harness sandbox types
+pub use harness_sandbox::{
+    EgressRule, HarnessSandboxError, MAX_EGRESS_RULES, MAX_HOST_LENGTH,
+    MAX_STRING_LENGTH as MAX_HARNESS_SANDBOX_STRING_LENGTH, NetworkPolicyProfile,
+    NetworkPolicyProfileBuilder, Protocol,
+};
 // Re-export key policy types
 pub use key_policy::{
     CoiEnforcementLevel, CoiRule, CustodyDomain, DelegationRule, KeyBinding, KeyPolicy,

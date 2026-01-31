@@ -1331,6 +1331,64 @@ pub struct AatResultReused {
     #[prost(bytes = "vec", tag = "5")]
     pub gate_signature: ::prost::alloc::vec::Vec<u8>,
 }
+/// Namespace for harness sandbox types.
+///
+/// Intentionally empty - serves as namespace for nested types.
+#[derive(Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct HarnessSandbox {}
+/// An individual egress rule defining allowed network access.
+/// Each rule specifies a single (host, port, protocol) tuple that is
+/// permitted for outbound network connections.
+///
+/// Security:
+/// - Wildcards are NOT supported (explicit hosts only)
+/// - Port ranges are NOT supported (explicit ports only)
+/// - CIDR notation is NOT supported for hosts
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EgressRule {
+    /// Target hostname or IP address (max 253 characters).
+    /// Wildcards are not supported for security reasons.
+    #[prost(string, tag = "1")]
+    pub host: ::prost::alloc::string::String,
+    /// Target port number (1-65535, port 0 is reserved).
+    #[prost(uint32, tag = "2")]
+    pub port: u32,
+    /// Transport protocol (TCP or UDP).
+    #[prost(enumeration = "Protocol", tag = "3")]
+    pub protocol: i32,
+}
+/// Network policy profile for AAT harness sandboxing.
+///
+/// Defines the allowed egress rules for an AAT harness execution environment.
+/// The profile uses a deny-by-default model where all egress is blocked unless
+/// explicitly allowed by a rule.
+///
+/// Security:
+/// - deny_by_default MUST be true (fail-closed security model)
+/// - Egress rules are sorted by hash for canonical encoding
+/// - Profile hash provides integrity verification
+/// - Profile referenced by network_policy_profile_hash in AatAttestation
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NetworkPolicyProfile {
+    /// Unique identifier for this policy profile.
+    #[prost(string, tag = "1")]
+    pub profile_id: ::prost::alloc::string::String,
+    /// BLAKE3 hash of the canonical profile representation (32 bytes).
+    /// Computed from: profile_id || len(allowed_egress) || sorted(egress_hashes) || deny_by_default
+    #[prost(bytes = "vec", tag = "2")]
+    pub profile_hash: ::prost::alloc::vec::Vec<u8>,
+    /// List of allowed egress rules (max 256 rules).
+    /// Each rule specifies a (host, port, protocol) tuple that is permitted.
+    #[prost(message, repeated, tag = "3")]
+    pub allowed_egress: ::prost::alloc::vec::Vec<EgressRule>,
+    /// Deny-by-default flag (MUST be true).
+    /// When true, all egress not matching a rule is blocked.
+    #[prost(bool, tag = "4")]
+    pub deny_by_default: bool,
+}
 /// Determinism status for AAT runs.
 /// Indicates whether multiple runs produced consistent terminal evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -1666,6 +1724,39 @@ impl DataClassification {
             "DATA_CLASSIFICATION_INTERNAL" => Some(Self::Internal),
             "DATA_CLASSIFICATION_CONFIDENTIAL" => Some(Self::Confidential),
             "DATA_CLASSIFICATION_RESTRICTED" => Some(Self::Restricted),
+            _ => None,
+        }
+    }
+}
+/// Transport protocol for egress rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Protocol {
+    /// Unspecified protocol (invalid).
+    Unspecified = 0,
+    /// Transmission Control Protocol (connection-oriented).
+    Tcp = 1,
+    /// User Datagram Protocol (connectionless).
+    Udp = 2,
+}
+impl Protocol {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PROTOCOL_UNSPECIFIED",
+            Self::Tcp => "PROTOCOL_TCP",
+            Self::Udp => "PROTOCOL_UDP",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PROTOCOL_UNSPECIFIED" => Some(Self::Unspecified),
+            "PROTOCOL_TCP" => Some(Self::Tcp),
+            "PROTOCOL_UDP" => Some(Self::Udp),
             _ => None,
         }
     }
