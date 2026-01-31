@@ -118,7 +118,10 @@ pub use key_policy::{
     MAX_KEY_BINDINGS, SUPPORTED_SCHEMA_VERSIONS,
 };
 // Re-export lease types
-pub use lease::{AatLeaseExtension, GateLease, GateLeaseBuilder, LeaseError};
+pub use lease::{
+    AatLeaseExtension, GateLease, GateLeaseBuilder, LeaseError, validate_custody_for_aat_lease,
+    validate_custody_for_aat_lease_by_actor,
+};
 // Re-export policy resolution types
 pub use policy_resolution::{
     DeterminismClass, MAX_RCP_PROFILES, MAX_STRING_LENGTH, MAX_VERIFIER_POLICIES,
