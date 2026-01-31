@@ -92,7 +92,7 @@ where
             serde_json::from_str(r.get())
                 .map(Some)
                 .map_err(de::Error::custom)
-        }
+        },
         None => Ok(None),
     }
 }
@@ -356,8 +356,6 @@ impl std::fmt::Display for LedgerTime {
         write!(f, "{}:{}:{}", self.ledger_id, self.epoch, self.seq)
     }
 }
-
-
 
 /// Errors that can occur when working with [`LedgerTime`].
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -1175,6 +1173,7 @@ pub enum BoundedWallIntervalError {
 pub struct ClockProfile {
     /// Optional attestation data (Phase 2+).
     /// SEC-HTF-002: Limited to `MAX_ATTESTATION_SIZE` bytes when serialized.
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "deserialize_attestation")]
     pub attestation: Option<serde_json::Value>,
@@ -1203,8 +1202,6 @@ pub struct ClockProfile {
     pub wall_time_source: WallTimeSource,
 }
 
-
-
 // =============================================================================
 // TimeEnvelope
 // =============================================================================
@@ -1230,6 +1227,7 @@ pub struct TimeEnvelope {
     pub mono: MonotonicReading,
 
     /// Optional notes about the time envelope.
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "deserialize_bounded_option_string")]
     pub notes: Option<String>,
@@ -1237,8 +1235,6 @@ pub struct TimeEnvelope {
     /// Wall clock time bounds.
     pub wall: BoundedWallInterval,
 }
-
-
 
 /// Hybrid Logical Clock timestamp components.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1290,8 +1286,6 @@ pub struct TimeSyncObservation {
     pub observed_at_envelope_ref: String,
 }
 
-
-
 /// Individual observation record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1309,8 +1303,6 @@ pub struct ObservationRecord {
     /// Uncertainty of the observation in nanoseconds.
     pub uncertainty_ns: u64,
 }
-
-
 
 // =============================================================================
 // Tests
