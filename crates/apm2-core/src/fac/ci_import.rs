@@ -178,6 +178,7 @@ impl<'de> Deserialize<'de> for CiEvidenceImport {
         // webhook_signature_verified is captured but ignored - it MUST always
         // be false after deserialization to prevent security invariant bypass.
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct CiEvidenceImportHelper {
             workflow_run_id: String,
             // This field is present to allow deserialization of serialized data,
@@ -368,7 +369,17 @@ impl CiEvidenceImportBuilder {
 /// - `artifact_digests`: Hashes of artifacts stored in CAS
 /// - `imported_at`: Timestamp (millis since epoch) when the import was created
 /// - `adapter_signature`: Signature by the adapter over the attestation
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Security
+///
+/// Deserialization enforces the same resource limits as the builder:
+/// - `import_id` is limited to [`MAX_IMPORT_ID_LENGTH`] bytes
+/// - `workflow_run_id` is limited to [`MAX_WORKFLOW_RUN_ID_LENGTH`] bytes
+/// - `artifact_digests` is limited to [`MAX_ARTIFACT_DIGESTS`] entries
+/// - `adapter_signature` is validated to be exactly 64 bytes
+///
+/// This prevents denial-of-service attacks via oversized payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CiImportAttestation {
     /// Unique identifier for this import attestation.
     import_id: String,
@@ -390,10 +401,20 @@ pub struct CiImportAttestation {
 }
 
 /// Serde helper for signature bytes.
+///
+/// # Security
+///
+/// The deserializer uses a custom visitor that deserializes directly into
+/// a `[u8; 64]` array without allocating an unbounded `Vec<u8>` first.
+/// This prevents denial-of-service attacks via oversized signature payloads.
 mod signature_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
 
     use crate::crypto::Signature;
+
+    /// Expected signature length in bytes.
+    const SIGNATURE_LENGTH: usize = 64;
 
     pub fn serialize<S>(value: &Signature, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -406,12 +427,115 @@ mod signature_bytes {
     where
         D: Deserializer<'de>,
     {
+        deserializer.deserialize_seq(SignatureBytesVisitor)
+    }
+
+    /// Visitor that deserializes signature bytes directly into a fixed-size
+    /// array.
+    ///
+    /// This avoids allocating an unbounded `Vec<u8>` before checking length,
+    /// preventing denial-of-service via oversized payloads.
+    struct SignatureBytesVisitor;
+
+    impl<'de> Visitor<'de> for SignatureBytesVisitor {
+        type Value = Signature;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "a sequence of exactly {SIGNATURE_LENGTH} bytes")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut arr = [0u8; SIGNATURE_LENGTH];
+
+            for (i, byte) in arr.iter_mut().enumerate() {
+                *byte = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::invalid_length(i, &self))?;
+            }
+
+            // Verify no extra elements (reject oversized input)
+            if seq.next_element::<u8>()?.is_some() {
+                return Err(A::Error::invalid_length(SIGNATURE_LENGTH + 1, &self));
+            }
+
+            Ok(Signature::from_bytes(&arr))
+        }
+
+        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+        where
+            E: Error,
+        {
+            let arr: [u8; SIGNATURE_LENGTH] = v
+                .try_into()
+                .map_err(|_| E::invalid_length(v.len(), &self))?;
+            Ok(Signature::from_bytes(&arr))
+        }
+    }
+}
+
+/// Custom deserialization that enforces resource limits.
+///
+/// This implementation:
+/// 1. Validates `import_id.len() <= MAX_IMPORT_ID_LENGTH`
+/// 2. Validates `workflow_run_id.len() <= MAX_WORKFLOW_RUN_ID_LENGTH`
+/// 3. Validates `artifact_digests.len() <= MAX_ARTIFACT_DIGESTS`
+///
+/// This prevents denial-of-service attacks via oversized payloads.
+impl<'de> Deserialize<'de> for CiImportAttestation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
         use serde::de::Error;
-        let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
-        let arr: [u8; 64] = bytes
-            .try_into()
-            .map_err(|_| D::Error::custom("signature must be exactly 64 bytes"))?;
-        Ok(Signature::from_bytes(&arr))
+
+        // Helper struct for deserialization with bounded signature handling.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CiImportAttestationHelper {
+            import_id: String,
+            workflow_run_id: String,
+            artifact_digests: Vec<Hash>,
+            imported_at: u64,
+            #[serde(with = "signature_bytes")]
+            adapter_signature: Signature,
+        }
+
+        let helper = CiImportAttestationHelper::deserialize(deserializer)?;
+
+        // Validate import_id length
+        if helper.import_id.len() > MAX_IMPORT_ID_LENGTH {
+            return Err(D::Error::custom(format!(
+                "import_id exceeds maximum length: {} > {MAX_IMPORT_ID_LENGTH}",
+                helper.import_id.len(),
+            )));
+        }
+
+        // Validate workflow_run_id length
+        if helper.workflow_run_id.len() > MAX_WORKFLOW_RUN_ID_LENGTH {
+            return Err(D::Error::custom(format!(
+                "workflow_run_id exceeds maximum length: {} > {MAX_WORKFLOW_RUN_ID_LENGTH}",
+                helper.workflow_run_id.len(),
+            )));
+        }
+
+        // Validate artifact_digests count
+        if helper.artifact_digests.len() > MAX_ARTIFACT_DIGESTS {
+            return Err(D::Error::custom(format!(
+                "too many artifact digests: {} > {MAX_ARTIFACT_DIGESTS}",
+                helper.artifact_digests.len(),
+            )));
+        }
+
+        Ok(Self {
+            import_id: helper.import_id,
+            workflow_run_id: helper.workflow_run_id,
+            artifact_digests: helper.artifact_digests,
+            imported_at: helper.imported_at,
+            adapter_signature: helper.adapter_signature,
+        })
     }
 }
 
@@ -1666,6 +1790,260 @@ pub mod tests {
         assert!(
             !loaded.webhook_signature_verified(),
             "webhook_signature_verified must be reset to false on deserialization"
+        );
+    }
+
+    // =========================================================================
+    // CiImportAttestation Deserialization Security Tests
+    // =========================================================================
+
+    /// Helper to create a valid signature bytes array for test JSON.
+    fn test_signature_bytes_json() -> String {
+        // 64 zeros serialized as JSON array
+        let bytes: Vec<u8> = vec![0u8; 64];
+        serde_json::to_string(&bytes).unwrap()
+    }
+
+    /// Tests that oversized `import_id` is rejected during deserialization.
+    #[test]
+    fn test_attestation_deser_rejects_oversized_import_id() {
+        let oversized_id = "x".repeat(MAX_IMPORT_ID_LENGTH + 1);
+        let sig_bytes = test_signature_bytes_json();
+
+        let json = format!(
+            r#"{{
+                "import_id": "{oversized_id}",
+                "workflow_run_id": "run-001",
+                "artifact_digests": [],
+                "imported_at": 1704067200000,
+                "adapter_signature": {sig_bytes}
+            }}"#,
+        );
+
+        let result: Result<CiImportAttestation, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "oversized import_id must be rejected");
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("import_id exceeds maximum length"),
+            "error message should mention import_id limit: {error_msg}"
+        );
+    }
+
+    /// Tests that oversized `workflow_run_id` is rejected during
+    /// `CiImportAttestation` deserialization.
+    #[test]
+    fn test_attestation_deser_rejects_oversized_workflow_run_id() {
+        let oversized_id = "x".repeat(MAX_WORKFLOW_RUN_ID_LENGTH + 1);
+        let sig_bytes = test_signature_bytes_json();
+
+        let json = format!(
+            r#"{{
+                "import_id": "import-001",
+                "workflow_run_id": "{oversized_id}",
+                "artifact_digests": [],
+                "imported_at": 1704067200000,
+                "adapter_signature": {sig_bytes}
+            }}"#,
+        );
+
+        let result: Result<CiImportAttestation, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "oversized workflow_run_id must be rejected"
+        );
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("workflow_run_id exceeds maximum length"),
+            "error message should mention workflow_run_id limit: {error_msg}"
+        );
+    }
+
+    /// Tests that too many `artifact_digests` is rejected during
+    /// `CiImportAttestation` deserialization.
+    #[test]
+    fn test_attestation_deser_rejects_too_many_artifact_digests() {
+        let hash_array = "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]";
+        let digests: Vec<&str> = (0..=MAX_ARTIFACT_DIGESTS).map(|_| hash_array).collect();
+        let digests_json = digests.join(",");
+        let sig_bytes = test_signature_bytes_json();
+
+        let json = format!(
+            r#"{{
+                "import_id": "import-001",
+                "workflow_run_id": "run-001",
+                "artifact_digests": [{digests_json}],
+                "imported_at": 1704067200000,
+                "adapter_signature": {sig_bytes}
+            }}"#,
+        );
+
+        let result: Result<CiImportAttestation, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "too many artifact_digests must be rejected"
+        );
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("too many artifact digests"),
+            "error message should mention artifact digests limit: {error_msg}"
+        );
+    }
+
+    /// Tests that invalid signature length is rejected (too short).
+    #[test]
+    fn test_attestation_deser_rejects_short_signature() {
+        // Only 32 bytes instead of 64
+        let short_sig: Vec<u8> = vec![0u8; 32];
+        let sig_bytes = serde_json::to_string(&short_sig).unwrap();
+
+        let json = format!(
+            r#"{{
+                "import_id": "import-001",
+                "workflow_run_id": "run-001",
+                "artifact_digests": [],
+                "imported_at": 1704067200000,
+                "adapter_signature": {sig_bytes}
+            }}"#,
+        );
+
+        let result: Result<CiImportAttestation, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "short signature must be rejected");
+    }
+
+    /// Tests that invalid signature length is rejected (too long).
+    #[test]
+    fn test_attestation_deser_rejects_long_signature() {
+        // 128 bytes instead of 64
+        let long_sig: Vec<u8> = vec![0u8; 128];
+        let sig_bytes = serde_json::to_string(&long_sig).unwrap();
+
+        let json = format!(
+            r#"{{
+                "import_id": "import-001",
+                "workflow_run_id": "run-001",
+                "artifact_digests": [],
+                "imported_at": 1704067200000,
+                "adapter_signature": {sig_bytes}
+            }}"#,
+        );
+
+        let result: Result<CiImportAttestation, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "oversized signature must be rejected");
+    }
+
+    /// Tests that maximum allowed sizes are accepted for `CiImportAttestation`.
+    #[test]
+    fn test_attestation_deser_accepts_max_allowed_sizes() {
+        let max_import_id = "x".repeat(MAX_IMPORT_ID_LENGTH);
+        let max_workflow_id = "x".repeat(MAX_WORKFLOW_RUN_ID_LENGTH);
+        let sig_bytes = test_signature_bytes_json();
+
+        let json = format!(
+            r#"{{
+                "import_id": "{max_import_id}",
+                "workflow_run_id": "{max_workflow_id}",
+                "artifact_digests": [],
+                "imported_at": 1704067200000,
+                "adapter_signature": {sig_bytes}
+            }}"#,
+        );
+
+        let result: Result<CiImportAttestation, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_ok(),
+            "max allowed sizes should be accepted: {:?}",
+            result.err()
+        );
+
+        let attestation = result.unwrap();
+        assert_eq!(attestation.import_id().len(), MAX_IMPORT_ID_LENGTH);
+        assert_eq!(
+            attestation.workflow_run_id().len(),
+            MAX_WORKFLOW_RUN_ID_LENGTH
+        );
+    }
+
+    /// Tests that `CiImportAttestation` serialization roundtrip works
+    /// correctly.
+    #[test]
+    fn test_attestation_serialization_roundtrip() {
+        let signer = Signer::generate();
+
+        let original = CiImportAttestation::builder()
+            .import_id("import-roundtrip")
+            .workflow_run_id("run-roundtrip")
+            .artifact_digest([0xAA; 32])
+            .imported_at(1_704_067_200_000)
+            .build_and_sign(&signer)
+            .unwrap();
+
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: CiImportAttestation = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(original, deserialized);
+        assert_eq!(original.import_id(), deserialized.import_id());
+        assert_eq!(original.workflow_run_id(), deserialized.workflow_run_id());
+        assert_eq!(original.artifact_digests(), deserialized.artifact_digests());
+        assert_eq!(original.imported_at(), deserialized.imported_at());
+        assert_eq!(
+            original.adapter_signature().to_bytes(),
+            deserialized.adapter_signature().to_bytes()
+        );
+    }
+
+    /// Tests that unknown fields are rejected during `CiImportAttestation`
+    /// deserialization (`deny_unknown_fields`).
+    #[test]
+    fn test_attestation_deser_rejects_unknown_fields() {
+        let sig_bytes = test_signature_bytes_json();
+
+        let json = format!(
+            r#"{{
+                "import_id": "import-001",
+                "workflow_run_id": "run-001",
+                "artifact_digests": [],
+                "imported_at": 1704067200000,
+                "adapter_signature": {sig_bytes},
+                "malicious_field": "injected"
+            }}"#,
+        );
+
+        let result: Result<CiImportAttestation, _> = serde_json::from_str(&json);
+        assert!(result.is_err(), "unknown fields must be rejected");
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("unknown field"),
+            "error message should mention unknown field: {error_msg}"
+        );
+    }
+
+    /// Tests that unknown fields are rejected during `CiEvidenceImport`
+    /// deserialization (`deny_unknown_fields`).
+    #[test]
+    fn test_import_deser_rejects_unknown_fields() {
+        let json = r#"{
+            "workflow_run_id": "run-001",
+            "webhook_signature_verified": false,
+            "artifact_digests": [],
+            "attestation": {
+                "level": "L0",
+                "workflow_run_id": "",
+                "downloaded_artifact_hashes": []
+            },
+            "malicious_field": "injected"
+        }"#;
+
+        let result: Result<CiEvidenceImport, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "unknown fields must be rejected");
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("unknown field"),
+            "error message should mention unknown field: {error_msg}"
         );
     }
 }
