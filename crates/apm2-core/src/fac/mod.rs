@@ -66,6 +66,7 @@
 //! ```
 
 mod aat_receipt;
+pub mod aat_reuse;
 pub mod anti_downgrade;
 mod artifact_manifest;
 mod ci_attestation;
@@ -88,6 +89,11 @@ pub use aat_receipt::{
     DeterminismStatus, FlakeClass, MAX_RUN_RECEIPT_HASHES,
     MAX_STRING_LENGTH as MAX_AAT_STRING_LENGTH, MAX_TERMINAL_VERIFIER_OUTPUTS,
     MAX_TOOLCHAIN_DIGESTS, TerminalVerifierOutput,
+};
+// Re-export AAT reuse types
+pub use aat_reuse::{
+    AATResultReused, AATResultReusedProto, AatProvenanceTuple, AatProvenanceTupleProto, ReuseError,
+    can_reuse_aat_result,
 };
 // Re-export artifact manifest types
 pub use artifact_manifest::{
