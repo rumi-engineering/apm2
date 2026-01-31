@@ -70,6 +70,7 @@ pub mod anti_downgrade;
 mod artifact_manifest;
 mod ci_attestation;
 mod ci_import;
+pub mod determinism;
 mod domain_separator;
 mod key_policy;
 mod lease;
@@ -102,6 +103,14 @@ pub use ci_import::{
     CiEvidenceImport, CiEvidenceImportBuilder, CiImportAttestation, CiImportAttestationBuilder,
     CiImportError, CiImportPolicy, MAX_ARTIFACT_DIGESTS, MAX_IMPORT_ID_LENGTH,
     MAX_WORKFLOW_RUN_ID_LENGTH, can_transition_to_ready_for_review, validate_ci_import,
+};
+// Re-export determinism types
+pub use determinism::{
+    DeterminismEnvelope, DeterminismEnvelopeBuilder, DeterminismError,
+    MAX_RUN_COUNT as MAX_DETERMINISM_RUN_COUNT,
+    MAX_RUN_RECEIPT_HASHES as MAX_DETERMINISM_RUN_HASHES, REQUIRED_RUNS_DEFAULT,
+    REQUIRED_RUNS_HIGH, REQUIRED_RUNS_LOW, REQUIRED_RUNS_MED, RISK_TIER_HIGH, RISK_TIER_LOW,
+    RISK_TIER_MED, check_stability, compute_stability_digest, required_run_count,
 };
 // Re-export domain separator constants and functions
 pub use domain_separator::{
