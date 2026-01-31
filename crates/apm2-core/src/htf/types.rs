@@ -1094,7 +1094,7 @@ pub enum BoundedWallIntervalError {
 /// `ClockProfile` defines the parameters for monotonic and wall time sources,
 /// tick rates, and uncertainty bounds. It is a CAC artifact that must be
 /// canonicalized and signed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClockProfile {
     /// Optional attestation data (Phase 2+).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1122,6 +1122,53 @@ pub struct ClockProfile {
     pub wall_time_source: WallTimeSource,
 }
 
+impl<'de> Deserialize<'de> for ClockProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        #[derive(Deserialize)]
+        struct Helper {
+            attestation: Option<serde_json::Value>,
+            build_fingerprint: String,
+            hlc_enabled: bool,
+            max_wall_uncertainty_ns: u64,
+            monotonic_source: MonotonicSource,
+            profile_policy_id: String,
+            tick_rate_hz: u64,
+            wall_time_source: WallTimeSource,
+        }
+
+        let helper = Helper::deserialize(deserializer)?;
+
+        if helper.build_fingerprint.len() > MAX_STRING_LENGTH {
+            return Err(D::Error::custom(format!(
+                "build_fingerprint exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+                helper.build_fingerprint.len()
+            )));
+        }
+        if helper.profile_policy_id.len() > MAX_STRING_LENGTH {
+            return Err(D::Error::custom(format!(
+                "profile_policy_id exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+                helper.profile_policy_id.len()
+            )));
+        }
+
+        Ok(Self {
+            attestation: helper.attestation,
+            build_fingerprint: helper.build_fingerprint,
+            hlc_enabled: helper.hlc_enabled,
+            max_wall_uncertainty_ns: helper.max_wall_uncertainty_ns,
+            monotonic_source: helper.monotonic_source,
+            profile_policy_id: helper.profile_policy_id,
+            tick_rate_hz: helper.tick_rate_hz,
+            wall_time_source: helper.wall_time_source,
+        })
+    }
+}
+
 // =============================================================================
 // TimeEnvelope
 // =============================================================================
@@ -1130,7 +1177,7 @@ pub struct ClockProfile {
 ///
 /// `TimeEnvelope` binds a monotonic tick reading, wall time bounds, and
 /// logical clock state to a specific ledger anchor and clock profile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TimeEnvelope {
     /// Content hash of the `ClockProfileV1`.
     pub clock_profile_hash: String,
@@ -1150,6 +1197,51 @@ pub struct TimeEnvelope {
 
     /// Wall clock time bounds.
     pub wall: BoundedWallInterval,
+}
+
+impl<'de> Deserialize<'de> for TimeEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        #[derive(Deserialize)]
+        struct Helper {
+            clock_profile_hash: String,
+            hlc: Hlc,
+            ledger_anchor: LedgerTime,
+            mono: MonotonicReading,
+            notes: Option<String>,
+            wall: BoundedWallInterval,
+        }
+
+        let helper = Helper::deserialize(deserializer)?;
+
+        if helper.clock_profile_hash.len() > MAX_STRING_LENGTH {
+            return Err(D::Error::custom(format!(
+                "clock_profile_hash exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+                helper.clock_profile_hash.len()
+            )));
+        }
+        if let Some(notes) = &helper.notes {
+            if notes.len() > MAX_STRING_LENGTH {
+                return Err(D::Error::custom(format!(
+                    "notes exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+                    notes.len()
+                )));
+            }
+        }
+
+        Ok(Self {
+            clock_profile_hash: helper.clock_profile_hash,
+            hlc: helper.hlc,
+            ledger_anchor: helper.ledger_anchor,
+            mono: helper.mono,
+            notes: helper.notes,
+            wall: helper.wall,
+        })
+    }
 }
 
 /// Hybrid Logical Clock timestamp components.
@@ -1184,7 +1276,7 @@ pub struct MonotonicReading {
 // =============================================================================
 
 /// A record of time synchronization observations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TimeSyncObservation {
     /// Array of time sync observation records.
     pub observations: Vec<ObservationRecord>,
@@ -1193,8 +1285,37 @@ pub struct TimeSyncObservation {
     pub observed_at_envelope_ref: String,
 }
 
+impl<'de> Deserialize<'de> for TimeSyncObservation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        #[derive(Deserialize)]
+        struct Helper {
+            observations: Vec<ObservationRecord>,
+            observed_at_envelope_ref: String,
+        }
+
+        let helper = Helper::deserialize(deserializer)?;
+
+        if helper.observed_at_envelope_ref.len() > MAX_STRING_LENGTH {
+            return Err(D::Error::custom(format!(
+                "observed_at_envelope_ref exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+                helper.observed_at_envelope_ref.len()
+            )));
+        }
+
+        Ok(Self {
+            observations: helper.observations,
+            observed_at_envelope_ref: helper.observed_at_envelope_ref,
+        })
+    }
+}
+
 /// Individual observation record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObservationRecord {
     /// Monotonic tick at observation time.
     pub observed_at_mono_tick: u64,
@@ -1207,6 +1328,39 @@ pub struct ObservationRecord {
 
     /// Uncertainty of the observation in nanoseconds.
     pub uncertainty_ns: u64,
+}
+
+impl<'de> Deserialize<'de> for ObservationRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        #[derive(Deserialize)]
+        struct Helper {
+            observed_at_mono_tick: u64,
+            observed_offset_ns: i64,
+            source: String,
+            uncertainty_ns: u64,
+        }
+
+        let helper = Helper::deserialize(deserializer)?;
+
+        if helper.source.len() > MAX_STRING_LENGTH {
+            return Err(D::Error::custom(format!(
+                "source exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+                helper.source.len()
+            )));
+        }
+
+        Ok(Self {
+            observed_at_mono_tick: helper.observed_at_mono_tick,
+            observed_offset_ns: helper.observed_offset_ns,
+            source: helper.source,
+            uncertainty_ns: helper.uncertainty_ns,
+        })
+    }
 }
 
 // =============================================================================
