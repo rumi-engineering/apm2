@@ -65,6 +65,7 @@
 //! ```
 
 mod ci_attestation;
+mod ci_import;
 mod domain_separator;
 mod key_policy;
 mod lease;
@@ -75,6 +76,12 @@ mod receipt;
 pub use ci_attestation::{
     CiAttestation, CiAttestationBuilder, CiAttestationError, CiAttestationLevel,
     MAX_DOWNLOADED_ARTIFACT_HASHES, MAX_STRING_LENGTH as MAX_CI_ATTESTATION_STRING_LENGTH,
+};
+// Re-export CI import types
+pub use ci_import::{
+    CiEvidenceImport, CiEvidenceImportBuilder, CiImportAttestation, CiImportAttestationBuilder,
+    CiImportError, CiImportPolicy, MAX_ARTIFACT_DIGESTS, MAX_IMPORT_ID_LENGTH,
+    MAX_WORKFLOW_RUN_ID_LENGTH, validate_ci_import,
 };
 // Re-export domain separator constants and functions
 pub use domain_separator::{
