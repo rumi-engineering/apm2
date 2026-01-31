@@ -56,6 +56,7 @@ message KernelEvent {
     GateReceipt gate_receipt = 21;
     InterventionFreeze intervention_freeze = 22;
     InterventionUnfreeze intervention_unfreeze = 23;
+    AATResultReused aat_result_reused = 24;
   }
 }
 
@@ -1021,4 +1022,46 @@ message ArtifactDigest {
 message ArtifactManifest {
   // List of artifact digests and metadata.
   repeated ArtifactDigest artifacts = 1;
+}
+
+// ============================================================
+// AAT REUSE EVENTS (TCK-00228)
+// ============================================================
+//
+// AATResultReused records when a previous AAT result is reused for a
+// new admission attempt. This avoids redundant execution while
+// strictly enforcing provenance matching.
+//
+// Security:
+// - Provenance tuple MUST match exactly (High/Low risk differentiation logic is in code)
+// - Policy hash binds to the current policy, not the reused one (if different)
+// - Gate signature proves authorization for the reuse decision
+
+// Provenance tuple identifying the context of an AAT execution.
+// Used to verify that a reused result is valid for the current context.
+message AatProvenanceTuple {
+  // Hash binding to specific changeset (32 bytes).
+  bytes changeset_digest = 1;
+  // Hash binding to view commitment (32 bytes).
+  bytes view_commitment_hash = 2;
+  // RCP profile identifier.
+  string rcp_profile_id = 3;
+  // Hash of the verifier policy (32 bytes).
+  bytes verifier_policy_hash = 4;
+  // Determinism class (0=non, 1=soft, 2=fully).
+  uint32 determinism_class = 5;
+}
+
+// Emitted when an AAT result is reused.
+message AATResultReused {
+  // Hash of the original AatGateReceipt being reused (32 bytes).
+  bytes from_receipt_hash = 1;
+  // Provenance tuple of the current context (must match original).
+  AatProvenanceTuple provenance = 2;
+  // Policy hash for the current admission attempt (32 bytes).
+  bytes policy_hash = 3;
+  // Human-readable justification for reuse.
+  string justification = 4;
+  // Ed25519 signature over canonical bytes with AAT_RESULT_REUSED: domain (64 bytes).
+  bytes gate_signature = 5;
 }

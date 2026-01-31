@@ -31,7 +31,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -69,6 +69,8 @@ pub mod kernel_event {
         InterventionFreeze(super::InterventionFreeze),
         #[prost(message, tag = "23")]
         InterventionUnfreeze(super::InterventionUnfreeze),
+        #[prost(message, tag = "24")]
+        AatResultReused(super::AatResultReused),
     }
 }
 /// ============================================================
@@ -1287,6 +1289,47 @@ pub struct ArtifactManifest {
     /// List of artifact digests and metadata.
     #[prost(message, repeated, tag = "1")]
     pub artifacts: ::prost::alloc::vec::Vec<ArtifactDigest>,
+}
+/// Provenance tuple identifying the context of an AAT execution.
+/// Used to verify that a reused result is valid for the current context.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AatProvenanceTuple {
+    /// Hash binding to specific changeset (32 bytes).
+    #[prost(bytes = "vec", tag = "1")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Hash binding to view commitment (32 bytes).
+    #[prost(bytes = "vec", tag = "2")]
+    pub view_commitment_hash: ::prost::alloc::vec::Vec<u8>,
+    /// RCP profile identifier.
+    #[prost(string, tag = "3")]
+    pub rcp_profile_id: ::prost::alloc::string::String,
+    /// Hash of the verifier policy (32 bytes).
+    #[prost(bytes = "vec", tag = "4")]
+    pub verifier_policy_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Determinism class (0=non, 1=soft, 2=fully).
+    #[prost(uint32, tag = "5")]
+    pub determinism_class: u32,
+}
+/// Emitted when an AAT result is reused.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AatResultReused {
+    /// Hash of the original AatGateReceipt being reused (32 bytes).
+    #[prost(bytes = "vec", tag = "1")]
+    pub from_receipt_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Provenance tuple of the current context (must match original).
+    #[prost(message, optional, tag = "2")]
+    pub provenance: ::core::option::Option<AatProvenanceTuple>,
+    /// Policy hash for the current admission attempt (32 bytes).
+    #[prost(bytes = "vec", tag = "3")]
+    pub policy_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Human-readable justification for reuse.
+    #[prost(string, tag = "4")]
+    pub justification: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with AAT_RESULT_REUSED: domain (64 bytes).
+    #[prost(bytes = "vec", tag = "5")]
+    pub gate_signature: ::prost::alloc::vec::Vec<u8>,
 }
 /// Determinism status for AAT runs.
 /// Indicates whether multiple runs produced consistent terminal evidence.
