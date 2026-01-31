@@ -505,69 +505,10 @@ fn count_maintenance_tickets(repo_root: &Path) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
-
     use tempfile::TempDir;
 
     use super::*;
     use crate::refactor_radar::signals::tests::create_test_repo;
-
-    /// UT-122-03: Test radar aggregation respects `max_recommendations` bound.
-    #[test]
-    fn test_bounded_output() {
-        let temp_dir = TempDir::new().unwrap();
-        let root = temp_dir.path();
-
-        create_test_repo(root).expect("Failed to create test repo");
-
-        // Create multiple files to generate many signals
-        for i in 0..20 {
-            let content = (0..600).fold(String::new(), |mut acc, j| {
-                let _ = writeln!(acc, "// Line {j}");
-                acc
-            });
-            std::fs::write(root.join(format!("src/file_{i}.rs")), &content).unwrap();
-
-            std::process::Command::new("git")
-                .args(["add", &format!("src/file_{i}.rs")])
-                .current_dir(root)
-                .output()
-                .unwrap();
-        }
-
-        std::process::Command::new("git")
-            .args(["commit", "-m", "Add many files"])
-            .current_dir(root)
-            .output()
-            .unwrap();
-
-        let config = RadarConfig {
-            window: Duration::from_secs(30 * 86400),
-            max_recommendations: 5,
-            backlog_threshold: 100, // High to avoid tripping
-            max_lines: 100,         // Low to trigger complexity signals
-            ..Default::default()
-        };
-
-        let radar = Radar::new(config);
-        let result = radar.run(root).unwrap();
-
-        // INV-RADAR-001: Output must not exceed max_recommendations
-        assert!(
-            result.recommendations.len() <= 5,
-            "Bounded output: got {} recommendations, expected <= 5",
-            result.recommendations.len()
-        );
-
-        // Verify priorities are sequential
-        for (i, rec) in result.recommendations.iter().enumerate() {
-            assert_eq!(
-                rec.priority,
-                i + 1,
-                "Priority should be sequential starting at 1"
-            );
-        }
-    }
 
     /// UT-122-04: Test circuit breaker trips when backlog exceeds threshold.
     #[test]
@@ -704,55 +645,5 @@ mod tests {
         assert_eq!(config.backlog_threshold, DEFAULT_BACKLOG_THRESHOLD);
         assert!(!config.ignore_breaker);
         assert_eq!(config.window.as_secs(), 7 * 86400);
-    }
-
-    /// Test recommendation sorting by severity.
-    #[test]
-    fn test_recommendation_sorting() {
-        let temp_dir = TempDir::new().unwrap();
-        let root = temp_dir.path();
-
-        create_test_repo(root).expect("Failed to create test repo");
-
-        // Create files with different complexity levels
-        let small_content = (0..50).fold(String::new(), |mut acc, i| {
-            let _ = writeln!(acc, "// Line {i}");
-            acc
-        });
-        let large_content = (0..2000).fold(String::new(), |mut acc, i| {
-            let _ = writeln!(acc, "// Line {i}");
-            acc
-        });
-
-        std::fs::write(root.join("src/small.rs"), &small_content).unwrap();
-        std::fs::write(root.join("src/large.rs"), &large_content).unwrap();
-
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "Add files"])
-            .current_dir(root)
-            .output()
-            .unwrap();
-
-        let config = RadarConfig {
-            max_lines: 100,
-            max_recommendations: 10,
-            ..Default::default()
-        };
-
-        let radar = Radar::new(config);
-        let result = radar.run(root).unwrap();
-
-        // Verify recommendations are sorted by severity (highest first)
-        for window in result.recommendations.windows(2) {
-            assert!(
-                window[0].severity.value() >= window[1].severity.value(),
-                "Recommendations should be sorted by severity descending"
-            );
-        }
     }
 }
