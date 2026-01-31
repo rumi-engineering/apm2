@@ -63,10 +63,13 @@
 //! .expect("valid interval");
 //! ```
 
+pub mod canonical;
 mod types;
 
 // Re-export all public types
+pub use canonical::{Canonicalizable, CanonicalizationError};
 pub use types::{
-    BoundedWallInterval, BoundedWallIntervalError, HtfTick, LedgerTime, LedgerTimeError,
-    MAX_STRING_LENGTH, MonotonicSource, TimeEnvelopeRef, WallTimeSource,
+    BoundedWallInterval, BoundedWallIntervalError, ClockProfile, Hlc, HtfTick, LedgerTime,
+    LedgerTimeError, MAX_STRING_LENGTH, MonotonicReading, MonotonicSource, ObservationRecord,
+    TimeEnvelope, TimeEnvelopeRef, TimeSyncObservation, WallTimeSource,
 };

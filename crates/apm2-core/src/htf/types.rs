@@ -1086,6 +1086,130 @@ pub enum BoundedWallIntervalError {
 }
 
 // =============================================================================
+// ClockProfile
+// =============================================================================
+
+/// Configuration for a node's clock behavior.
+///
+/// `ClockProfile` defines the parameters for monotonic and wall time sources,
+/// tick rates, and uncertainty bounds. It is a CAC artifact that must be
+/// canonicalized and signed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockProfile {
+    /// Optional attestation data (Phase 2+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<serde_json::Value>,
+
+    /// Daemon version + platform hash.
+    pub build_fingerprint: String,
+
+    /// Whether hybrid logical clock is enabled.
+    pub hlc_enabled: bool,
+
+    /// Maximum wall time uncertainty in nanoseconds.
+    pub max_wall_uncertainty_ns: u64,
+
+    /// Source of monotonic clock.
+    pub monotonic_source: MonotonicSource,
+
+    /// Stable identifier for policy grouping.
+    pub profile_policy_id: String,
+
+    /// Tick rate in Hz (must match envelopes).
+    pub tick_rate_hz: u64,
+
+    /// Source of wall time synchronization.
+    pub wall_time_source: WallTimeSource,
+}
+
+// =============================================================================
+// TimeEnvelope
+// =============================================================================
+
+/// A verifiable time assertion envelope.
+///
+/// `TimeEnvelope` binds a monotonic tick reading, wall time bounds, and
+/// logical clock state to a specific ledger anchor and clock profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeEnvelope {
+    /// Content hash of the `ClockProfileV1`.
+    pub clock_profile_hash: String,
+
+    /// Hybrid logical clock timestamp.
+    pub hlc: Hlc,
+
+    /// Reference to ledger position.
+    pub ledger_anchor: LedgerTime,
+
+    /// Monotonic clock reading.
+    pub mono: MonotonicReading,
+
+    /// Optional notes about the time envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+
+    /// Wall clock time bounds.
+    pub wall: BoundedWallInterval,
+}
+
+/// Hybrid Logical Clock timestamp components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Hlc {
+    /// Logical counter component.
+    pub logical: u64,
+
+    /// Wall time in nanoseconds.
+    pub wall_ns: u64,
+}
+
+/// Monotonic clock reading components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MonotonicReading {
+    /// End tick (must be >= `start_tick` when present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_tick: Option<u64>,
+
+    /// Monotonic clock source.
+    pub source: MonotonicSource,
+
+    /// Start tick value.
+    pub start_tick: u64,
+
+    /// Tick rate in Hz.
+    pub tick_rate_hz: u64,
+}
+
+// =============================================================================
+// TimeSyncObservation
+// =============================================================================
+
+/// A record of time synchronization observations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeSyncObservation {
+    /// Array of time sync observation records.
+    pub observations: Vec<ObservationRecord>,
+
+    /// `TimeEnvelopeRef` hash reference.
+    pub observed_at_envelope_ref: String,
+}
+
+/// Individual observation record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationRecord {
+    /// Monotonic tick at observation time.
+    pub observed_at_mono_tick: u64,
+
+    /// Observed clock offset in nanoseconds.
+    pub observed_offset_ns: i64,
+
+    /// Source of the observation.
+    pub source: String,
+
+    /// Uncertainty of the observation in nanoseconds.
+    pub uncertainty_ns: u64,
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
