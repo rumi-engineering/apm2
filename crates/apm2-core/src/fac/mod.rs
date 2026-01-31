@@ -74,6 +74,7 @@ mod lease;
 mod policy_resolution;
 mod receipt;
 mod terminal_verifier;
+pub mod transcript_binding;
 
 // Re-export AAT receipt types
 pub use aat_receipt::{
@@ -126,4 +127,9 @@ pub use terminal_verifier::{
     MAX_PREDICATE_NODES, MAX_REQUIRED_OUTPUTS, Predicate, PredicateOp, TerminalVerifier,
     VerifierError, VerifierKind, VerifierOutput, VerifierOutputBuilder, VerifierPolicy,
     VerifierPolicyBuilder, evaluate_predicate,
+};
+// Re-export transcript binding types
+pub use transcript_binding::{
+    AatTranscriptBinding, MAX_CHUNK_CONTENT_BYTES, MAX_RUN_TRANSCRIPT_HASHES,
+    MAX_TRANSCRIPT_CHUNKS, TranscriptBindingError, TranscriptChunk,
 };
