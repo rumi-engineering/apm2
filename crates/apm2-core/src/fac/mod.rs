@@ -75,6 +75,7 @@ mod lease;
 mod policy_resolution;
 mod receipt;
 pub mod risk_tier;
+pub mod selection_policy;
 mod terminal_verifier;
 pub mod transcript_binding;
 
@@ -132,6 +133,12 @@ pub use receipt::{
 pub use risk_tier::{
     CRITICAL_MODULES, ChangeSet, DEPENDENCY_FANOUT_THRESHOLD, FILES_CHANGED_THRESHOLD,
     LINES_CHANGED_THRESHOLD, RiskTierClass, RiskTierError, SENSITIVE_PATTERNS, classify_risk,
+};
+// Re-export selection policy types
+pub use selection_policy::{
+    AatRequirement, DEFAULT_LOW_TIER_SAMPLE_RATE, MAX_DOMAIN_LENGTH, MAX_POLICY_ID_LENGTH,
+    MAX_POLICY_SIZE, MAX_WORK_ID_LENGTH, SENSITIVE_DOMAINS, SelectionContext, SelectionPolicy,
+    SelectionPolicyBuilder, SelectionPolicyError, TierConfig,
 };
 // Re-export terminal verifier types
 pub use terminal_verifier::{
