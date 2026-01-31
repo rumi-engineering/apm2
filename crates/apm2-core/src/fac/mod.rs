@@ -98,7 +98,8 @@ pub use aat_reuse::{
 // Re-export artifact manifest types
 pub use artifact_manifest::{
     ArtifactDigest, ArtifactManifest, ArtifactManifestBuilder, ArtifactManifestError, ArtifactType,
-    DataClassification, MAX_ARTIFACTS, MAX_STRING_LENGTH as MAX_ARTIFACT_STRING_LENGTH,
+    DataClassification, HygieneError, MAX_ARTIFACTS,
+    MAX_STRING_LENGTH as MAX_ARTIFACT_STRING_LENGTH, validate_evidence_hygiene_for_admission,
 };
 // Re-export CI attestation types
 pub use ci_attestation::{

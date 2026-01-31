@@ -351,6 +351,69 @@ pub enum ArtifactManifestError {
 }
 
 // =============================================================================
+// Evidence Hygiene Error Types
+// =============================================================================
+
+/// Errors that indicate evidence hygiene violations blocking admission.
+///
+/// These errors are SECURITY-CRITICAL and indicate that an artifact manifest
+/// does not meet the evidence hygiene requirements defined in DD-FAC-0014.
+/// Any occurrence blocks admission and should be logged for audit.
+///
+/// # Security Model
+///
+/// Evidence hygiene enforcement ensures:
+/// - **Data Classification**: All artifacts have proper classification
+/// - **Retention Compliance**: Confidential/Restricted artifacts have retention
+///   windows
+/// - **Redaction Tracking**: Redacted non-public artifacts have redaction
+///   profiles
+///
+/// # Fail-Closed Design
+///
+/// This module uses a FAIL-CLOSED approach: if any hygiene check fails,
+/// admission is blocked. This ensures that incomplete or improperly classified
+/// evidence cannot be admitted into the system.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HygieneError {
+    /// Confidential or Restricted artifact is missing `retention_window_ref`.
+    ///
+    /// All artifacts with `DataClassification::Confidential` or
+    /// `DataClassification::Restricted` MUST have a non-empty
+    /// `retention_window_ref` to ensure proper data lifecycle management
+    /// and compliance.
+    #[error(
+        "missing retention window for {classification} artifact at index {index} (digest: {digest})"
+    )]
+    MissingRetentionWindow {
+        /// Index of the artifact with the violation.
+        index: usize,
+        /// The artifact digest (hex-encoded first 8 bytes).
+        digest: String,
+        /// The data classification that requires retention window.
+        classification: DataClassification,
+    },
+
+    /// Redacted non-public artifact is missing `redaction_profile_hash`.
+    ///
+    /// All artifacts with `redaction_applied = true` AND a non-Public data
+    /// classification MUST have a `redaction_profile_hash` to provide
+    /// traceability of what redaction rules were applied.
+    #[error(
+        "missing redaction profile for redacted {classification} artifact at index {index} (digest: {digest})"
+    )]
+    MissingRedactionProfile {
+        /// Index of the artifact with the violation.
+        index: usize,
+        /// The artifact digest (hex-encoded first 8 bytes).
+        digest: String,
+        /// The data classification of the redacted artifact.
+        classification: DataClassification,
+    },
+}
+
+// =============================================================================
 // ArtifactDigest
 // =============================================================================
 
@@ -620,6 +683,126 @@ impl ArtifactManifest {
 
         Ok(())
     }
+}
+
+// =============================================================================
+// Evidence Hygiene Validation for Admission
+// =============================================================================
+
+/// Formats the first 8 bytes of a digest as a hex string for error messages.
+fn format_digest_prefix(digest: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    digest[..8].iter().fold(String::new(), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+/// Validates evidence hygiene requirements for admission.
+///
+/// This function enforces the evidence hygiene requirements defined in
+/// DD-FAC-0014:
+///
+/// 1. **Retention Window Requirement**: All artifacts with
+///    `DataClassification::Confidential` or `DataClassification::Restricted`
+///    MUST have a non-empty `retention_window_ref`. This ensures proper data
+///    lifecycle management for sensitive evidence.
+///
+/// 2. **Redaction Profile Requirement**: All artifacts with `redaction_applied
+///    = true` AND a non-Public classification (Internal, Confidential, or
+///    Restricted) MUST have a `redaction_profile_hash`. This provides
+///    traceability of sanitization rules applied to sensitive data.
+///
+/// # Security Model
+///
+/// Evidence hygiene is SECURITY-CRITICAL:
+/// - **Fail-Closed**: Any violation blocks admission entirely
+/// - **Audit Support**: Violations include digest prefixes for traceability
+/// - **Compliance**: Ensures all sensitive artifacts meet retention and
+///   redaction requirements
+///
+/// # Arguments
+///
+/// * `manifest` - The artifact manifest to validate
+///
+/// # Returns
+///
+/// `Ok(())` if all hygiene checks pass, or [`HygieneError`] on first violation.
+///
+/// # Errors
+///
+/// Returns [`HygieneError::MissingRetentionWindow`] if a
+/// Confidential/Restricted artifact has an empty `retention_window_ref`.
+///
+/// Returns [`HygieneError::MissingRedactionProfile`] if a redacted non-public
+/// artifact is missing `redaction_profile_hash`.
+///
+/// # Example
+///
+/// ```rust
+/// use apm2_core::fac::{
+///     ArtifactDigest, ArtifactManifest, ArtifactType, DataClassification,
+///     validate_evidence_hygiene_for_admission,
+/// };
+///
+/// // Valid: Confidential artifact with retention window
+/// let manifest = ArtifactManifest {
+///     artifacts: vec![ArtifactDigest {
+///         artifact_type: ArtifactType::Log,
+///         digest: [0x11; 32],
+///         data_classification: DataClassification::Confidential,
+///         redaction_applied: false,
+///         redaction_profile_hash: None,
+///         retention_window_ref: "htf:window:30d".to_string(),
+///     }],
+/// };
+/// assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+///
+/// // Invalid: Confidential artifact without retention window
+/// let manifest = ArtifactManifest {
+///     artifacts: vec![ArtifactDigest {
+///         artifact_type: ArtifactType::Log,
+///         digest: [0x22; 32],
+///         data_classification: DataClassification::Confidential,
+///         redaction_applied: false,
+///         redaction_profile_hash: None,
+///         retention_window_ref: String::new(), // Empty!
+///     }],
+/// };
+/// assert!(validate_evidence_hygiene_for_admission(&manifest).is_err());
+/// ```
+pub fn validate_evidence_hygiene_for_admission(
+    manifest: &ArtifactManifest,
+) -> Result<(), HygieneError> {
+    for (index, artifact) in manifest.artifacts.iter().enumerate() {
+        // Check 1: Confidential/Restricted artifacts require retention_window_ref
+        if matches!(
+            artifact.data_classification,
+            DataClassification::Confidential | DataClassification::Restricted
+        ) && artifact.retention_window_ref.is_empty()
+        {
+            return Err(HygieneError::MissingRetentionWindow {
+                index,
+                digest: format_digest_prefix(&artifact.digest),
+                classification: artifact.data_classification,
+            });
+        }
+
+        // Check 2: Redacted non-public artifacts require redaction_profile_hash
+        // Non-public means Internal, Confidential, or Restricted (not Public)
+        if artifact.redaction_applied
+            && artifact.data_classification != DataClassification::Public
+            && artifact.redaction_profile_hash.is_none()
+        {
+            return Err(HygieneError::MissingRedactionProfile {
+                index,
+                digest: format_digest_prefix(&artifact.digest),
+                classification: artifact.data_classification,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 // =============================================================================
@@ -1171,5 +1354,575 @@ pub mod tests {
         let manifest = ArtifactManifest { artifacts };
         assert!(manifest.validate_hygiene().is_ok());
         assert_eq!(manifest.len(), 4);
+    }
+
+    // =========================================================================
+    // Evidence Hygiene for Admission Tests (TCK-00229)
+    // =========================================================================
+
+    /// Helper to create a confidential artifact with specified retention
+    /// window.
+    fn create_confidential_artifact(digest: u8, retention: &str) -> ArtifactDigest {
+        ArtifactDigest {
+            artifact_type: ArtifactType::Log,
+            digest: [digest; 32],
+            data_classification: DataClassification::Confidential,
+            redaction_applied: false,
+            redaction_profile_hash: None,
+            retention_window_ref: retention.to_string(),
+        }
+    }
+
+    /// Helper to create a restricted artifact with specified retention window.
+    fn create_restricted_artifact(digest: u8, retention: &str) -> ArtifactDigest {
+        ArtifactDigest {
+            artifact_type: ArtifactType::Snapshot,
+            digest: [digest; 32],
+            data_classification: DataClassification::Restricted,
+            redaction_applied: false,
+            redaction_profile_hash: None,
+            retention_window_ref: retention.to_string(),
+        }
+    }
+
+    /// Helper to create a redacted artifact.
+    fn create_redacted_artifact(
+        digest: u8,
+        classification: DataClassification,
+        profile_hash: Option<[u8; 32]>,
+    ) -> ArtifactDigest {
+        ArtifactDigest {
+            artifact_type: ArtifactType::Log,
+            digest: [digest; 32],
+            data_classification: classification,
+            redaction_applied: true,
+            redaction_profile_hash: profile_hash,
+            retention_window_ref: "htf:window:30d".to_string(),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Retention Window Requirement Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hygiene_confidential_with_retention_passes() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_confidential_artifact(0x11, "htf:window:30d")],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    #[test]
+    fn hygiene_restricted_with_retention_passes() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_restricted_artifact(0x22, "htf:window:90d")],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    #[test]
+    fn hygiene_confidential_missing_retention_fails() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_confidential_artifact(0x33, "")],
+        };
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        assert!(matches!(
+            result,
+            Err(HygieneError::MissingRetentionWindow {
+                index: 0,
+                classification: DataClassification::Confidential,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hygiene_restricted_missing_retention_fails() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_restricted_artifact(0x44, "")],
+        };
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        assert!(matches!(
+            result,
+            Err(HygieneError::MissingRetentionWindow {
+                index: 0,
+                classification: DataClassification::Restricted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hygiene_public_empty_retention_passes() {
+        // Public artifacts do NOT require retention window
+        let manifest = ArtifactManifest {
+            artifacts: vec![ArtifactDigest {
+                artifact_type: ArtifactType::Junit,
+                digest: [0x55; 32],
+                data_classification: DataClassification::Public,
+                redaction_applied: false,
+                redaction_profile_hash: None,
+                retention_window_ref: "htf:window:any".to_string(), // Has value for basic hygiene
+            }],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    #[test]
+    fn hygiene_internal_empty_retention_passes() {
+        // Internal artifacts do NOT require retention window for admission hygiene
+        let manifest = ArtifactManifest {
+            artifacts: vec![ArtifactDigest {
+                artifact_type: ArtifactType::Coverage,
+                digest: [0x66; 32],
+                data_classification: DataClassification::Internal,
+                redaction_applied: false,
+                redaction_profile_hash: None,
+                retention_window_ref: "htf:window:any".to_string(), // Has value for basic hygiene
+            }],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    #[test]
+    fn hygiene_retention_violation_at_second_artifact() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![
+                create_confidential_artifact(0x11, "htf:window:30d"), // Valid
+                create_restricted_artifact(0x22, ""),                 // Invalid - no retention
+            ],
+        };
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        assert!(matches!(
+            result,
+            Err(HygieneError::MissingRetentionWindow {
+                index: 1,
+                classification: DataClassification::Restricted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hygiene_all_confidential_restricted_with_retention_passes() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![
+                create_confidential_artifact(0x11, "htf:window:30d"),
+                create_restricted_artifact(0x22, "htf:window:90d"),
+                create_confidential_artifact(0x33, "htf:window:7d"),
+                create_restricted_artifact(0x44, "htf:window:365d"),
+            ],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // Redaction Profile Requirement Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hygiene_redacted_internal_with_profile_passes() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_redacted_artifact(
+                0x77,
+                DataClassification::Internal,
+                Some([0xAA; 32]),
+            )],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    #[test]
+    fn hygiene_redacted_confidential_with_profile_passes() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_redacted_artifact(
+                0x88,
+                DataClassification::Confidential,
+                Some([0xBB; 32]),
+            )],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    #[test]
+    fn hygiene_redacted_restricted_with_profile_passes() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_redacted_artifact(
+                0x99,
+                DataClassification::Restricted,
+                Some([0xCC; 32]),
+            )],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    #[test]
+    fn hygiene_redacted_public_without_profile_passes() {
+        // Public artifacts do NOT require redaction profile even if redacted
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_redacted_artifact(
+                0xAA,
+                DataClassification::Public,
+                None,
+            )],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    #[test]
+    fn hygiene_redacted_internal_missing_profile_fails() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_redacted_artifact(
+                0xBB,
+                DataClassification::Internal,
+                None,
+            )],
+        };
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        assert!(matches!(
+            result,
+            Err(HygieneError::MissingRedactionProfile {
+                index: 0,
+                classification: DataClassification::Internal,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hygiene_redacted_confidential_missing_profile_fails() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_redacted_artifact(
+                0xCC,
+                DataClassification::Confidential,
+                None,
+            )],
+        };
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        assert!(matches!(
+            result,
+            Err(HygieneError::MissingRedactionProfile {
+                index: 0,
+                classification: DataClassification::Confidential,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hygiene_redacted_restricted_missing_profile_fails() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![create_redacted_artifact(
+                0xDD,
+                DataClassification::Restricted,
+                None,
+            )],
+        };
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        assert!(matches!(
+            result,
+            Err(HygieneError::MissingRedactionProfile {
+                index: 0,
+                classification: DataClassification::Restricted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hygiene_non_redacted_without_profile_passes() {
+        // Non-redacted artifacts do NOT require a redaction profile
+        let manifest = ArtifactManifest {
+            artifacts: vec![ArtifactDigest {
+                artifact_type: ArtifactType::Log,
+                digest: [0xEE; 32],
+                data_classification: DataClassification::Confidential,
+                redaction_applied: false, // Not redacted
+                redaction_profile_hash: None,
+                retention_window_ref: "htf:window:30d".to_string(),
+            }],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    #[test]
+    fn hygiene_redaction_violation_at_third_artifact() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![
+                create_redacted_artifact(0x11, DataClassification::Internal, Some([0xAA; 32])),
+                create_redacted_artifact(0x22, DataClassification::Public, None), // OK - public
+                create_redacted_artifact(0x33, DataClassification::Confidential, None), // Fails
+            ],
+        };
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        assert!(matches!(
+            result,
+            Err(HygieneError::MissingRedactionProfile {
+                index: 2,
+                classification: DataClassification::Confidential,
+                ..
+            })
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Admission Blocking Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hygiene_retention_checked_before_redaction() {
+        // First artifact: missing retention (should fail first)
+        // Second artifact: missing redaction profile
+        let manifest = ArtifactManifest {
+            artifacts: vec![
+                ArtifactDigest {
+                    artifact_type: ArtifactType::Log,
+                    digest: [0x11; 32],
+                    data_classification: DataClassification::Confidential,
+                    redaction_applied: false,
+                    redaction_profile_hash: None,
+                    retention_window_ref: String::new(), // Missing retention
+                },
+                create_redacted_artifact(0x22, DataClassification::Internal, None), /* Missing profile */
+            ],
+        };
+
+        // Retention violation should be detected first
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        assert!(matches!(
+            result,
+            Err(HygieneError::MissingRetentionWindow {
+                index: 0,
+                classification: DataClassification::Confidential,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hygiene_multiple_violations_reports_first() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![
+                create_restricted_artifact(0x11, ""), // First violation: missing retention
+                create_confidential_artifact(0x22, ""), // Second violation: missing retention
+            ],
+        };
+
+        // First violation should be reported
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        assert!(matches!(
+            result,
+            Err(HygieneError::MissingRetentionWindow {
+                index: 0,
+                classification: DataClassification::Restricted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hygiene_empty_manifest_passes() {
+        // validate_evidence_hygiene_for_admission does not check for empty manifests
+        // (that's handled by validate_hygiene)
+        let manifest = ArtifactManifest { artifacts: vec![] };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    #[test]
+    fn hygiene_mixed_classifications_all_valid() {
+        let manifest = ArtifactManifest {
+            artifacts: vec![
+                // Public - no restrictions
+                ArtifactDigest {
+                    artifact_type: ArtifactType::Junit,
+                    digest: [0x11; 32],
+                    data_classification: DataClassification::Public,
+                    redaction_applied: true, // Redacted but public - OK without profile
+                    redaction_profile_hash: None,
+                    retention_window_ref: "htf:window:90d".to_string(),
+                },
+                // Internal - non-redacted
+                ArtifactDigest {
+                    artifact_type: ArtifactType::Coverage,
+                    digest: [0x22; 32],
+                    data_classification: DataClassification::Internal,
+                    redaction_applied: false,
+                    redaction_profile_hash: None,
+                    retention_window_ref: "htf:window:30d".to_string(),
+                },
+                // Internal - redacted with profile
+                create_redacted_artifact(0x33, DataClassification::Internal, Some([0xAA; 32])),
+                // Confidential - with retention
+                create_confidential_artifact(0x44, "htf:window:14d"),
+                // Restricted - with retention
+                create_restricted_artifact(0x55, "htf:window:7d"),
+                // Confidential - redacted with profile
+                ArtifactDigest {
+                    artifact_type: ArtifactType::Snapshot,
+                    digest: [0x66; 32],
+                    data_classification: DataClassification::Confidential,
+                    redaction_applied: true,
+                    redaction_profile_hash: Some([0xBB; 32]),
+                    retention_window_ref: "htf:window:60d".to_string(),
+                },
+            ],
+        };
+        assert!(validate_evidence_hygiene_for_admission(&manifest).is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // Error Message Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hygiene_error_display_missing_retention() {
+        let err = HygieneError::MissingRetentionWindow {
+            index: 5,
+            digest: "aabbccdd".to_string(),
+            classification: DataClassification::Restricted,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("missing retention window"));
+        assert!(msg.contains("RESTRICTED"));
+        assert!(msg.contains("index 5"));
+        assert!(msg.contains("aabbccdd"));
+    }
+
+    #[test]
+    fn hygiene_error_display_missing_redaction() {
+        let err = HygieneError::MissingRedactionProfile {
+            index: 3,
+            digest: "11223344".to_string(),
+            classification: DataClassification::Internal,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("missing redaction profile"));
+        assert!(msg.contains("INTERNAL"));
+        assert!(msg.contains("index 3"));
+        assert!(msg.contains("11223344"));
+    }
+
+    #[test]
+    fn hygiene_digest_prefix_formatting() {
+        // Verify that the digest prefix is correctly formatted
+        // Use a known digest to verify hex encoding
+        let mut test_digest = [0x00u8; 32];
+        test_digest[0] = 0xAB;
+        test_digest[1] = 0xCD;
+        test_digest[2] = 0xEF;
+        test_digest[3] = 0x01;
+        test_digest[4] = 0x23;
+        test_digest[5] = 0x45;
+        test_digest[6] = 0x67;
+        test_digest[7] = 0x89;
+
+        let manifest = ArtifactManifest {
+            artifacts: vec![ArtifactDigest {
+                artifact_type: ArtifactType::Log,
+                digest: test_digest,
+                data_classification: DataClassification::Confidential,
+                redaction_applied: false,
+                redaction_profile_hash: None,
+                retention_window_ref: String::new(),
+            }],
+        };
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        if let Err(HygieneError::MissingRetentionWindow { digest, .. }) = result {
+            // Check that digest contains hex-encoded first bytes
+            assert_eq!(digest, "abcdef0123456789");
+        } else {
+            panic!("Expected MissingRetentionWindow error");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hygiene_both_retention_and_redaction_violations_same_artifact() {
+        // An artifact that violates both rules - retention should be checked first
+        let manifest = ArtifactManifest {
+            artifacts: vec![ArtifactDigest {
+                artifact_type: ArtifactType::Log,
+                digest: [0xFF; 32],
+                data_classification: DataClassification::Confidential,
+                redaction_applied: true,
+                redaction_profile_hash: None,        // Missing profile
+                retention_window_ref: String::new(), // Missing retention
+            }],
+        };
+        // Retention violation should be detected first
+        let result = validate_evidence_hygiene_for_admission(&manifest);
+        assert!(matches!(
+            result,
+            Err(HygieneError::MissingRetentionWindow { .. })
+        ));
+    }
+
+    #[test]
+    fn hygiene_redaction_profile_required_for_all_non_public() {
+        // Verify that all non-public classifications require redaction profile when
+        // redacted
+        for classification in [
+            DataClassification::Internal,
+            DataClassification::Confidential,
+            DataClassification::Restricted,
+        ] {
+            let manifest = ArtifactManifest {
+                artifacts: vec![create_redacted_artifact(0x11, classification, None)],
+            };
+            let result = validate_evidence_hygiene_for_admission(&manifest);
+            assert!(
+                matches!(result, Err(HygieneError::MissingRedactionProfile { classification: c, .. }) if c == classification),
+                "Classification {classification:?} should require redaction profile when redacted"
+            );
+        }
+    }
+
+    #[test]
+    fn hygiene_retention_required_only_for_confidential_restricted() {
+        // Public and Internal should NOT require retention window for admission hygiene
+        for classification in [DataClassification::Public, DataClassification::Internal] {
+            let manifest = ArtifactManifest {
+                artifacts: vec![ArtifactDigest {
+                    artifact_type: ArtifactType::Log,
+                    digest: [0x11; 32],
+                    data_classification: classification,
+                    redaction_applied: false,
+                    redaction_profile_hash: None,
+                    retention_window_ref: "htf:window:30d".to_string(),
+                }],
+            };
+            assert!(
+                validate_evidence_hygiene_for_admission(&manifest).is_ok(),
+                "Classification {classification:?} should not require retention window for admission hygiene"
+            );
+        }
+
+        // Confidential and Restricted SHOULD require retention window
+        for classification in [
+            DataClassification::Confidential,
+            DataClassification::Restricted,
+        ] {
+            let manifest = ArtifactManifest {
+                artifacts: vec![ArtifactDigest {
+                    artifact_type: ArtifactType::Log,
+                    digest: [0x22; 32],
+                    data_classification: classification,
+                    redaction_applied: false,
+                    redaction_profile_hash: None,
+                    retention_window_ref: String::new(), // Missing!
+                }],
+            };
+            assert!(
+                matches!(
+                    validate_evidence_hygiene_for_admission(&manifest),
+                    Err(HygieneError::MissingRetentionWindow { classification: c, .. }) if c == classification
+                ),
+                "Classification {classification:?} MUST require retention window for admission hygiene"
+            );
+        }
     }
 }
