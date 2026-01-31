@@ -70,6 +70,19 @@ pub const MAX_POLICY_ID_LEN: usize = 128;
 /// Maximum length for ledger namespace strings.
 pub const MAX_NAMESPACE_LEN: usize = 128;
 
+/// Maximum allowed HLC offset from physical time in nanoseconds.
+///
+/// Per `THREAT_MODEL.md`, time is treated as an adversarial input. This
+/// constant defines the maximum drift tolerance when receiving HLC timestamps
+/// from remote peers. A malicious peer could attempt to push a node's HLC
+/// arbitrarily far into the future, irreversibly desynchronizing temporal
+/// ordering.
+///
+/// Default: 5 seconds (`5_000_000_000` nanoseconds) to tolerate reasonable
+/// network latency and clock skew while rejecting obviously malicious
+/// timestamps.
+pub const MAX_HLC_OFFSET_NS: u64 = 5_000_000_000;
+
 // =============================================================================
 // Errors
 // =============================================================================
@@ -109,6 +122,26 @@ pub enum ClockError {
     /// HLC not enabled.
     #[error("HLC is not enabled for this clock")]
     HlcNotEnabled,
+
+    /// Remote HLC timestamp exceeds maximum allowed drift from physical time.
+    ///
+    /// This error indicates a potential attack where a malicious peer attempts
+    /// to push the local HLC arbitrarily far into the future. Per
+    /// `THREAT_MODEL.md`, time is treated as an adversarial input.
+    #[error(
+        "remote HLC drift exceeded: remote_wall_ns={remote_wall_ns}, \
+         physical_now={physical_now}, offset={offset_ns}ns, max_allowed={max_allowed_ns}ns"
+    )]
+    HlcDriftExceeded {
+        /// Remote wall time in nanoseconds.
+        remote_wall_ns: u64,
+        /// Local physical time in nanoseconds.
+        physical_now: u64,
+        /// Actual offset between remote and physical time.
+        offset_ns: u64,
+        /// Maximum allowed offset.
+        max_allowed_ns: u64,
+    },
 
     /// Canonicalization failed.
     #[error("canonicalization failed: {0}")]
@@ -553,7 +586,14 @@ impl HolonicClock {
     /// Updates the HLC with a received remote timestamp.
     ///
     /// This implements the HLC receive algorithm for cross-node
-    /// synchronization.
+    /// synchronization with security validation.
+    ///
+    /// # Security
+    ///
+    /// Per `THREAT_MODEL.md`, time is treated as an adversarial input. This
+    /// function validates that the remote HLC is not too far ahead of physical
+    /// time to prevent malicious peers from pushing the local HLC arbitrarily
+    /// far into the future.
     ///
     /// # Arguments
     ///
@@ -561,7 +601,9 @@ impl HolonicClock {
     ///
     /// # Errors
     ///
-    /// Returns [`ClockError::HlcNotEnabled`] if HLC is not enabled.
+    /// - Returns [`ClockError::HlcNotEnabled`] if HLC is not enabled.
+    /// - Returns [`ClockError::HlcDriftExceeded`] if the remote HLC's wall time
+    ///   exceeds physical time by more than [`MAX_HLC_OFFSET_NS`].
     #[allow(clippy::cast_possible_truncation)]
     pub fn receive_hlc(&self, remote_hlc: &Hlc) -> Result<Hlc, ClockError> {
         let state_mutex = self.hlc_state.as_ref().ok_or(ClockError::HlcNotEnabled)?;
@@ -578,6 +620,29 @@ impl HolonicClock {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+
+        // SECURITY: Validate remote HLC drift against physical time.
+        // Per THREAT_MODEL.md, time is an adversarial input. A malicious peer
+        // could attempt to push our HLC arbitrarily far into the future,
+        // irreversibly desynchronizing temporal ordering.
+        if remote_hlc.wall_ns > physical_now {
+            let offset_ns = remote_hlc.wall_ns - physical_now;
+            if offset_ns > MAX_HLC_OFFSET_NS {
+                warn!(
+                    remote_wall_ns = remote_hlc.wall_ns,
+                    physical_now = physical_now,
+                    offset_ns = offset_ns,
+                    max_allowed_ns = MAX_HLC_OFFSET_NS,
+                    "rejecting remote HLC: drift exceeds maximum allowed offset"
+                );
+                return Err(ClockError::HlcDriftExceeded {
+                    remote_wall_ns: remote_hlc.wall_ns,
+                    physical_now,
+                    offset_ns,
+                    max_allowed_ns: MAX_HLC_OFFSET_NS,
+                });
+            }
+        }
 
         // HLC receive algorithm
         let max_wall = state.wall_ns.max(remote_hlc.wall_ns).max(physical_now);
@@ -1243,5 +1308,153 @@ mod tests {
 
         // Profile hash should be a valid hex string
         assert!(hex::decode(&envelope.clock_profile_hash).is_ok());
+    }
+
+    // =========================================================================
+    // TCK-00240 Security: HLC drift protection
+    // =========================================================================
+
+    /// TCK-00240 security: Verify that malicious future HLC timestamps are
+    /// rejected.
+    ///
+    /// Per `THREAT_MODEL.md`, time is treated as an adversarial input. A
+    /// malicious peer could attempt to push a node's HLC arbitrarily far into
+    /// the future (e.g., year 2100), irreversibly desynchronizing temporal
+    /// ordering.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tck_00240_receive_hlc_rejects_excessive_drift() {
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
+
+        // Get current physical time as baseline.
+        // The cast from u128 to u64 is safe: nanoseconds since UNIX epoch
+        // won't exceed u64::MAX until the year 2554.
+        let physical_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        // Create a malicious HLC far in the future (e.g., 1 year ahead)
+        // 1 year in nanoseconds = 365 * 24 * 60 * 60 * 1_000_000_000
+        let one_year_ns: u64 = 365 * 24 * 60 * 60 * 1_000_000_000;
+        let malicious_hlc = Hlc {
+            wall_ns: physical_now + one_year_ns,
+            logical: 0,
+        };
+
+        // Attempt to receive the malicious HLC - should be rejected
+        let result = clock.receive_hlc(&malicious_hlc);
+        assert!(
+            matches!(result, Err(ClockError::HlcDriftExceeded { .. })),
+            "expected HlcDriftExceeded error, got: {result:?}"
+        );
+
+        // Verify the error contains the expected information
+        if let Err(ClockError::HlcDriftExceeded {
+            remote_wall_ns,
+            offset_ns,
+            max_allowed_ns,
+            ..
+        }) = result
+        {
+            assert_eq!(remote_wall_ns, physical_now + one_year_ns);
+            assert!(offset_ns > MAX_HLC_OFFSET_NS);
+            assert_eq!(max_allowed_ns, MAX_HLC_OFFSET_NS);
+        }
+    }
+
+    /// TCK-00240 security: Verify that HLC timestamps within acceptable drift
+    /// are accepted.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tck_00240_receive_hlc_accepts_reasonable_drift() {
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
+
+        // Get current physical time as baseline.
+        // The cast from u128 to u64 is safe: nanoseconds since UNIX epoch
+        // won't exceed u64::MAX until the year 2554.
+        let physical_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        // Create an HLC slightly in the future (1 second ahead - within 5s tolerance)
+        let one_second_ns: u64 = 1_000_000_000;
+        let reasonable_hlc = Hlc {
+            wall_ns: physical_now + one_second_ns,
+            logical: 0,
+        };
+
+        // Should be accepted
+        let result = clock.receive_hlc(&reasonable_hlc);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+
+        let updated = result.unwrap();
+        // Updated HLC should have adopted the reasonable future time
+        assert!(updated.wall_ns >= reasonable_hlc.wall_ns);
+    }
+
+    /// TCK-00240 security: Verify that HLC timestamps clearly past the boundary
+    /// are rejected.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tck_00240_receive_hlc_past_boundary_drift() {
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
+
+        // Get current physical time as baseline.
+        // The cast from u128 to u64 is safe: nanoseconds since UNIX epoch
+        // won't exceed u64::MAX until the year 2554.
+        let physical_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        // Create an HLC clearly past the boundary (1 second beyond max offset)
+        // This avoids timing issues where physical time advances between calls.
+        let one_second_ns: u64 = 1_000_000_000;
+        let past_boundary_hlc = Hlc {
+            wall_ns: physical_now + MAX_HLC_OFFSET_NS + one_second_ns,
+            logical: 0,
+        };
+
+        let result = clock.receive_hlc(&past_boundary_hlc);
+        assert!(
+            matches!(result, Err(ClockError::HlcDriftExceeded { .. })),
+            "expected HlcDriftExceeded past boundary, got: {result:?}"
+        );
+    }
+
+    /// TCK-00240 security: Verify that HLC timestamps in the past are always
+    /// accepted (no drift concern).
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tck_00240_receive_hlc_accepts_past_timestamps() {
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
+
+        // Get current physical time as baseline.
+        // The cast from u128 to u64 is safe: nanoseconds since UNIX epoch
+        // won't exceed u64::MAX until the year 2554.
+        let physical_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        // Create an HLC far in the past (1 year ago)
+        let one_year_ns: u64 = 365 * 24 * 60 * 60 * 1_000_000_000;
+        let past_hlc = Hlc {
+            wall_ns: physical_now.saturating_sub(one_year_ns),
+            logical: 0,
+        };
+
+        // Should be accepted (past timestamps don't pose a drift risk)
+        let result = clock.receive_hlc(&past_hlc);
+        assert!(
+            result.is_ok(),
+            "expected Ok for past timestamp, got: {result:?}"
+        );
+
+        // The local HLC should use physical_now, not the past timestamp
+        let updated = result.unwrap();
+        assert!(updated.wall_ns >= physical_now);
     }
 }
