@@ -158,6 +158,16 @@ pub enum DowngradeError {
         /// The RCP profile ID from the receipt that was not found.
         profile_id: String,
     },
+
+    /// The resolved risk tier value is invalid (not in range 0-4).
+    ///
+    /// This indicates data corruption or a malformed policy resolution.
+    /// The check fails closed to prevent bypassing security controls.
+    #[error("invalid risk tier: resolved risk tier value {tier_value} is not valid (expected 0-4)")]
+    InvalidRiskTier {
+        /// The invalid tier value that was encountered.
+        tier_value: u8,
+    },
 }
 
 // =============================================================================
@@ -211,13 +221,8 @@ pub enum DowngradeError {
 /// hash is not in the resolved list.
 /// Returns [`DowngradeError::RcpProfileNotResolved`] if the RCP profile ID is
 /// not in the resolved list.
-///
-/// # Panics
-///
-/// Panics if the `resolved.resolved_risk_tier` contains an invalid value
-/// (not 0-4). This should never happen if the resolution was constructed
-/// via `PolicyResolvedForChangeSetBuilder` or validated during proto
-/// conversion.
+/// Returns [`DowngradeError::InvalidRiskTier`] if the resolved risk tier value
+/// is not valid (0-4). This indicates data corruption and fails closed.
 pub fn verify_no_downgrade(
     resolved: &PolicyResolvedForChangeSet,
     receipt: &AatGateReceipt,
@@ -228,9 +233,12 @@ pub fn verify_no_downgrade(
     }
 
     // Check 2: Risk tier must not be lower than resolved
-    // Convert u8 to RiskTier for comparison
-    let resolved_tier = RiskTier::try_from(resolved.resolved_risk_tier)
-        .expect("resolved_risk_tier should be valid 0-4");
+    // Convert u8 to RiskTier for comparison (fail-closed on invalid tier)
+    let resolved_tier = RiskTier::try_from(resolved.resolved_risk_tier).map_err(|_| {
+        DowngradeError::InvalidRiskTier {
+            tier_value: resolved.resolved_risk_tier,
+        }
+    })?;
     let receipt_tier = receipt.risk_tier;
 
     // RiskTier comparison: higher numeric value = higher risk = more scrutiny
@@ -1007,5 +1015,97 @@ pub mod tests {
         let msg = err.to_string();
         assert!(msg.contains("RCP profile not resolved"));
         assert!(msg.contains("my-profile"));
+
+        // InvalidRiskTier
+        let err = DowngradeError::InvalidRiskTier { tier_value: 99 };
+        let msg = err.to_string();
+        assert!(msg.contains("invalid risk tier"));
+        assert!(msg.contains("99"));
+    }
+
+    // =========================================================================
+    // Invalid Risk Tier Tests (Fail-Closed)
+    // =========================================================================
+
+    #[test]
+    fn test_invalid_resolved_risk_tier_fails_closed() {
+        // This test verifies that an invalid resolved_risk_tier value
+        // causes a fail-closed error instead of panicking.
+        //
+        // We need to manually construct a PolicyResolvedForChangeSet with
+        // an invalid risk tier to test this path.
+        use crate::crypto::Signer;
+
+        let signer = Signer::generate();
+
+        // Create a valid resolution first
+        let mut resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(2)
+            .resolved_determinism_class(0)
+            .add_rcp_profile_id("profile-001")
+            .add_rcp_manifest_hash([0x11; 32])
+            .add_verifier_policy_hash([0x22; 32])
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .build_and_sign(&signer);
+
+        // Directly mutate the risk tier to an invalid value (simulating corruption)
+        resolution.resolved_risk_tier = 99; // Invalid: not 0-4
+
+        let receipt = create_matching_receipt(
+            resolution.resolved_policy_hash(),
+            RiskTier::Tier2,
+            [0x22; 32],
+            "profile-001",
+        );
+
+        // Should return InvalidRiskTier error, NOT panic
+        let result = verify_no_downgrade(&resolution, &receipt);
+        assert!(
+            matches!(
+                result,
+                Err(DowngradeError::InvalidRiskTier { tier_value: 99 })
+            ),
+            "Expected InvalidRiskTier error for tier value 99, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_risk_tier_values_all_fail_closed() {
+        // Test that all invalid tier values (5-255) result in InvalidRiskTier error
+        use crate::crypto::Signer;
+
+        let signer = Signer::generate();
+
+        for invalid_tier in [5u8, 10, 50, 100, 200, 255] {
+            let mut resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+                .resolved_risk_tier(2)
+                .resolved_determinism_class(0)
+                .add_rcp_profile_id("profile-001")
+                .add_rcp_manifest_hash([0x11; 32])
+                .add_verifier_policy_hash([0x22; 32])
+                .resolver_actor_id("resolver-001")
+                .resolver_version("1.0.0")
+                .build_and_sign(&signer);
+
+            // Directly set invalid tier (simulating data corruption)
+            resolution.resolved_risk_tier = invalid_tier;
+
+            let receipt = create_matching_receipt(
+                resolution.resolved_policy_hash(),
+                RiskTier::Tier2,
+                [0x22; 32],
+                "profile-001",
+            );
+
+            let result = verify_no_downgrade(&resolution, &receipt);
+            assert!(
+                matches!(
+                    result,
+                    Err(DowngradeError::InvalidRiskTier { tier_value }) if tier_value == invalid_tier
+                ),
+                "Expected InvalidRiskTier error for tier value {invalid_tier}, got {result:?}"
+            );
+        }
     }
 }
