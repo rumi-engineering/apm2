@@ -1,9 +1,0 @@
-rfc_template_readme:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
-  description: "RFC template family (YAML, decomposed). Instances MUST bind to a PRD and import requirement IDs and evidence obligations."
-  decomposition:
-    - "requirements/: RFC-only requirements (one file per requirement)."
-    - "evidence_artifacts/: RFC evidence artifact definitions (one file per artifact)."
-  binding:
-    prd_binding_required: true

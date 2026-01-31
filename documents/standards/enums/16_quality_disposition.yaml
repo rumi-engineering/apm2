@@ -1,7 +1,0 @@
-quality_disposition:
-  schema_version: "2026-01-23"
-  enum_id: "ENUM_QUALITY_DISPOSITION_V1"
-  values:
-    - "EXPLICIT_REQUIREMENTS"
-    - "DELEGATED_WITH_GUARDRAILS"
-    - "NOT_APPLICABLE"
