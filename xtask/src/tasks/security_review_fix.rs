@@ -26,9 +26,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use tempfile::NamedTempFile;
-use xshell::{Shell, cmd};
+use xshell::Shell;
 
-use crate::shell_escape::quote_path;
+use crate::shell_escape::build_ai_tool_command;
 use crate::util::main_worktree;
 
 /// Default maximum number of fix iterations.
@@ -130,24 +130,26 @@ pub fn run(args: &SecurityReviewFixArgs) -> Result<()> {
     );
 }
 
-/// Detect which AI tool is available.
+/// Detect which AI tool is available and executable.
 ///
-/// Prefers claude (Claude Code) over gemini.
-fn detect_ai_tool(sh: &Shell) -> Result<String> {
-    // Check for claude first
-    if cmd!(sh, "which claude")
-        .ignore_status()
-        .read()
-        .is_ok_and(|output| !output.trim().is_empty())
+/// Prefers claude (Claude Code) over gemini. Verifies executability by
+/// running `--version` to ensure the tool is actually functional, not just
+/// present in PATH.
+fn detect_ai_tool(_sh: &Shell) -> Result<String> {
+    // Check for claude first - verify it's executable
+    if Command::new("claude")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
     {
         return Ok("claude".to_string());
     }
 
-    // Fall back to gemini
-    if cmd!(sh, "which gemini")
-        .ignore_status()
-        .read()
-        .is_ok_and(|output| !output.trim().is_empty())
+    // Fall back to gemini - verify it's executable
+    if Command::new("gemini")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
     {
         return Ok("gemini".to_string());
     }
@@ -169,22 +171,16 @@ fn spawn_security_fix_agent(_sh: &Shell, prompt: &str, ai_tool: &str) -> Result<
         .context("Failed to write prompt to temp file")?;
 
     let prompt_path = prompt_file.path();
-    let quoted_prompt = quote_path(prompt_path);
 
-    // Build the command based on AI tool
-    let shell_cmd = match ai_tool {
-        "claude" => {
-            // Claude Code uses --dangerously-skip-permissions for autonomous mode
-            format!(
-                "script -qec 'claude --dangerously-skip-permissions < {quoted_prompt}' /dev/null"
-            )
-        },
-        "gemini" => {
-            // Gemini uses --yolo for autonomous mode
-            format!("script -qec 'gemini --yolo < {quoted_prompt}' /dev/null")
-        },
+    // Get the appropriate flags for each AI tool
+    let tool_flags = match ai_tool {
+        "claude" => "--dangerously-skip-permissions",
+        "gemini" => "--yolo",
         _ => bail!("Unknown AI tool: {ai_tool}"),
     };
+
+    // Build the command using the secure shell_escape utility
+    let shell_cmd = build_ai_tool_command(ai_tool, tool_flags, prompt_path, None);
 
     // Run the command
     let status = Command::new("sh")

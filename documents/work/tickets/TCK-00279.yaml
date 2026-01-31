@@ -1,0 +1,89 @@
+ticket_meta:
+  schema_version: "2026-01-27"
+  template_version: "2026-01-27"
+  ticket:
+    id: "TCK-00279"
+    title: "Security Review Auto-Fix Command"
+  binds:
+    prd_id: null
+    rfc_id: null
+    requirements: []
+    evidence_artifacts: []
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_CLI"
+      - "DOMAIN_SECURITY"
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Create cargo xtask security-review-fix command"
+      - "Create SECURITY_FIX_PROMPT.md for AI agent instructions"
+      - "Implement loop that runs AI agent until clean or max iterations"
+      - "Support optional ticket ID argument for context"
+      - "Support --max-iterations flag (default 10)"
+      - "Exit 0 if all issues resolved, non-zero if issues remain"
+      - "Update ticket workflow documentation"
+    out_of_scope:
+      - "Modifying existing security review prompt"
+      - "Changes to AI tool selection logic beyond claude/gemini detection"
+      - "Integration with CI/CD pipelines"
+  plan:
+    steps:
+      - "Create documents/reviews/SECURITY_FIX_PROMPT.md with fix instructions"
+      - "Create xtask/src/tasks/security_review_fix.rs with loop implementation"
+      - "Add SecurityReviewFix command to xtask/src/main.rs"
+      - "Export security_review_fix module in xtask/src/tasks/mod.rs"
+      - "Update documents/skills/ticket/references/commands.md"
+      - "Update documents/skills/ticket/references/new-ticket-flow.md with pre-push step"
+  definition_of_done:
+    evidence_ids: []
+    criteria:
+      - "'cargo xtask security-review-fix --help' shows command usage"
+      - "Command detects available AI tool (claude or gemini)"
+      - "Command loops until exit 0 or max iterations"
+      - "Prompt file instructs agent to fix and commit security issues"
+      - "Documentation updated with new command and workflow step"
+      - "All tests pass: cargo test --package xtask"
+      - "Code passes clippy and fmt checks"
+  notes:
+    rust_textbook_refs:
+      - file: "documents/skills/rust-standards/references/16_error_handling_and_panic_policy.md"
+        contracts:
+          - "Result for CLI errors"
+      - file: "documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
+        contracts:
+          - "Use tempfile crate for secure temp files"
+    codebase_context:
+      new_files:
+        - path: "documents/reviews/SECURITY_FIX_PROMPT.md"
+          description: "Prompt instructing AI to fix security issues"
+        - path: "xtask/src/tasks/security_review_fix.rs"
+          description: "Loop command implementation"
+      extend_files:
+        - path: "xtask/src/main.rs"
+          description: "Add SecurityReviewFix command"
+        - path: "xtask/src/tasks/mod.rs"
+          description: "Export security_review_fix module"
+        - path: "documents/skills/ticket/references/commands.md"
+          description: "Document new command"
+        - path: "documents/skills/ticket/references/new-ticket-flow.md"
+          description: "Add security fix step before push"
+      reference_files:
+        - path: "xtask/src/tasks/review.rs"
+          description: "Pattern for AI tool spawning"
+        - path: "documents/reviews/SECURITY_REVIEW_PROMPT.md"
+          description: "Reference for security review methodology"
+    security: |
+      Uses tempfile crate for secure prompt file creation.
+      Spawns AI agent in PTY for full tool access.
+      No secrets exposed in prompt or command output.
+    architecture: |
+      Simple loop design:
+      1. Run AI agent with security fix prompt
+      2. Agent reviews, edits files, commits fixes
+      3. Agent signals if issues remain (exit non-zero) or clean (exit 0)
+      4. Loop until exit 0 or max iterations
+      5. Workflow: keep running, check in every 3-5 minutes

@@ -175,6 +175,81 @@ pub fn build_script_command_with_cleanup(
     build_script_command(prompt_path, Some(log_path), model)
 }
 
+/// Builds a script command for a generic AI tool with PTY-wrapped execution.
+///
+/// This function creates secure shell commands for any AI CLI tool (claude,
+/// gemini, etc.) with proper path escaping to prevent shell injection.
+///
+/// # Arguments
+///
+/// * `tool_name` - The AI tool executable name (e.g., "claude", "gemini")
+/// * `tool_flags` - Flags for autonomous mode (e.g., "--yolo",
+///   "--dangerously-skip-permissions")
+/// * `prompt_path` - Path to the prompt file to redirect as input
+/// * `log_path` - Optional path to capture output. If `None`, output is
+///   discarded to `/dev/null`.
+///
+/// # Returns
+///
+/// A shell command string ready for execution via `sh -c`.
+///
+/// # Format
+///
+/// Without log capture:
+/// ```text
+/// script -qec '<tool> <flags> < <prompt_path>' /dev/null
+/// ```
+///
+/// With log capture:
+/// ```text
+/// script -q '<log_path>' -c '<tool> <flags> < <prompt_path>'
+/// ```
+///
+/// # Example
+///
+/// ```ignore
+/// use std::path::Path;
+/// use xtask::shell_escape::build_ai_tool_command;
+///
+/// // Claude with autonomous mode
+/// let cmd = build_ai_tool_command(
+///     "claude",
+///     "--dangerously-skip-permissions",
+///     Path::new("/tmp/prompt.txt"),
+///     None,
+/// );
+/// assert!(cmd.contains("claude --dangerously-skip-permissions"));
+///
+/// // Gemini with log capture
+/// let cmd = build_ai_tool_command(
+///     "gemini",
+///     "--yolo",
+///     Path::new("/tmp/prompt.txt"),
+///     Some(Path::new("/tmp/output.log")),
+/// );
+/// assert!(cmd.contains("gemini --yolo"));
+/// ```
+pub fn build_ai_tool_command(
+    tool_name: &str,
+    tool_flags: &str,
+    prompt_path: &Path,
+    log_path: Option<&Path>,
+) -> String {
+    let quoted_prompt = quote_path(prompt_path);
+    let escaped_tool = escape_for_single_quote(tool_name);
+    let escaped_flags = escape_for_single_quote(tool_flags);
+    let inner_cmd = format!("{escaped_tool} {escaped_flags} < {quoted_prompt}");
+    let escaped_inner = escape_for_single_quote(&inner_cmd);
+
+    log_path.map_or_else(
+        || format!("script -qec '{escaped_inner}' /dev/null"),
+        |log| {
+            let quoted_log = quote_path(log);
+            format!("script -q {quoted_log} -c '{escaped_inner}'")
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,5 +577,100 @@ mod tests {
         let cmd = build_script_command(prompt, Some(log), None);
         assert!(cmd.starts_with("script -q"));
         assert!(cmd.contains("-c 'gemini"));
+    }
+
+    // =========================================================================
+    // build_ai_tool_command tests
+    // =========================================================================
+
+    #[test]
+    fn test_build_ai_tool_command_claude() {
+        let prompt = Path::new("/tmp/prompt.txt");
+        let cmd = build_ai_tool_command("claude", "--dangerously-skip-permissions", prompt, None);
+
+        assert!(
+            cmd.contains("script -qec"),
+            "Command without log should use script -qec: {cmd}"
+        );
+        assert!(
+            cmd.contains("claude"),
+            "Command should invoke claude: {cmd}"
+        );
+        assert!(
+            cmd.contains("--dangerously-skip-permissions"),
+            "Command should include permission flag: {cmd}"
+        );
+        assert!(
+            cmd.ends_with("/dev/null"),
+            "Command without log should redirect to /dev/null: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_build_ai_tool_command_gemini() {
+        let prompt = Path::new("/tmp/prompt.txt");
+        let cmd = build_ai_tool_command("gemini", "--yolo", prompt, None);
+
+        assert!(
+            cmd.contains("gemini"),
+            "Command should invoke gemini: {cmd}"
+        );
+        assert!(
+            cmd.contains("--yolo"),
+            "Command should include --yolo flag: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_build_ai_tool_command_with_log() {
+        let prompt = Path::new("/tmp/prompt.txt");
+        let log = Path::new("/tmp/output.log");
+        let cmd = build_ai_tool_command(
+            "claude",
+            "--dangerously-skip-permissions",
+            prompt,
+            Some(log),
+        );
+
+        assert!(
+            cmd.contains("script -q"),
+            "Command with log should use script -q: {cmd}"
+        );
+        assert!(
+            !cmd.contains("-qec"),
+            "Command with log should not use -qec: {cmd}"
+        );
+        assert!(
+            cmd.contains("-c '"),
+            "Command with log should use -c flag: {cmd}"
+        );
+        assert!(
+            !cmd.ends_with("/dev/null"),
+            "Command with log should not end with /dev/null: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_build_ai_tool_command_escapes_special_chars() {
+        let prompt = Path::new("/tmp/prompt with spaces.txt");
+        let cmd = build_ai_tool_command("claude", "--dangerously-skip-permissions", prompt, None);
+
+        assert!(
+            cmd.contains('\''),
+            "Path with spaces should be quoted: {cmd}"
+        );
+    }
+
+    #[test]
+    fn test_build_ai_tool_command_escapes_tool_name() {
+        // Ensure tool name with special chars is escaped (defensive test)
+        let prompt = Path::new("/tmp/prompt.txt");
+        let cmd = build_ai_tool_command("tool'name", "--flag", prompt, None);
+
+        // Should not break the command structure
+        assert!(
+            cmd.contains("script"),
+            "Command structure should be preserved: {cmd}"
+        );
     }
 }
