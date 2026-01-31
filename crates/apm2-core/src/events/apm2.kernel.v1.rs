@@ -31,7 +31,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -73,6 +73,12 @@ pub mod kernel_event {
         AatResultReused(super::AatResultReused),
         #[prost(message, tag = "25")]
         MergeReceipt(super::MergeReceipt),
+        #[prost(message, tag = "26")]
+        RunnerPoolQuarantined(super::RunnerPoolQuarantined),
+        #[prost(message, tag = "27")]
+        AatSpecQuarantined(super::AatSpecQuarantined),
+        #[prost(message, tag = "28")]
+        QuarantineCleared(super::QuarantineCleared),
     }
 }
 /// ============================================================
@@ -1390,6 +1396,98 @@ pub struct NetworkPolicyProfile {
     /// When true, all egress not matching a rule is blocked.
     #[prost(bool, tag = "4")]
     pub deny_by_default: bool,
+}
+/// Emitted when a runner pool is quarantined due to infrastructure flakiness.
+///
+/// This event is triggered when FlakeClass::HarnessFlake routing determines
+/// that flakiness is attributed to runner/infrastructure issues (timing,
+/// resource contention, runner-specific bugs).
+///
+/// Security: Quarantined pools are excluded from future AAT runner selection
+/// until the issue is investigated and QuarantineCleared is emitted.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RunnerPoolQuarantined {
+    /// Unique identifier for this quarantine event.
+    #[prost(string, tag = "1")]
+    pub quarantine_id: ::prost::alloc::string::String,
+    /// ID of the runner pool being quarantined.
+    #[prost(string, tag = "2")]
+    pub pool_id: ::prost::alloc::string::String,
+    /// Human-readable reason for quarantine.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+    /// References to evidence supporting the quarantine decision.
+    #[prost(string, repeated, tag = "4")]
+    pub evidence_refs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Reference to the time envelope for temporal authority.
+    #[prost(string, tag = "5")]
+    pub time_envelope_ref: ::prost::alloc::string::String,
+    /// Actor who issued the quarantine.
+    #[prost(string, tag = "6")]
+    pub issuer_actor_id: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with QUARANTINE_EVENT: domain (64 bytes).
+    #[prost(bytes = "vec", tag = "7")]
+    pub issuer_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// Emitted when an AAT spec is quarantined due to test/code flakiness.
+///
+/// This event is triggered when FlakeClass::TestNonsemantic or
+/// FlakeClass::CodeNonsemantic routing determines that flakiness is in the
+/// test specification itself (output format changes, timestamps, random IDs).
+///
+/// Security: Quarantined specs are excluded from AAT selection until the
+/// non-determinism is resolved and QuarantineCleared is emitted.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AatSpecQuarantined {
+    /// Unique identifier for this quarantine event.
+    #[prost(string, tag = "1")]
+    pub quarantine_id: ::prost::alloc::string::String,
+    /// ID of the AAT spec being quarantined.
+    #[prost(string, tag = "2")]
+    pub spec_id: ::prost::alloc::string::String,
+    /// Human-readable reason for quarantine.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+    /// References to evidence supporting the quarantine decision.
+    #[prost(string, repeated, tag = "4")]
+    pub evidence_refs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Reference to the time envelope for temporal authority.
+    #[prost(string, tag = "5")]
+    pub time_envelope_ref: ::prost::alloc::string::String,
+    /// Actor who issued the quarantine.
+    #[prost(string, tag = "6")]
+    pub issuer_actor_id: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with QUARANTINE_EVENT: domain (64 bytes).
+    #[prost(bytes = "vec", tag = "7")]
+    pub issuer_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// Emitted when a quarantine is cleared after investigation.
+///
+/// This event re-enables the previously quarantined pool or spec for selection.
+/// The target_id must match either a pool_id from RunnerPoolQuarantined or a
+/// spec_id from AATSpecQuarantined.
+///
+/// Security: Clearing requires investigation and is audited via signature.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QuarantineCleared {
+    /// ID of the original quarantine event being cleared.
+    #[prost(string, tag = "1")]
+    pub quarantine_id: ::prost::alloc::string::String,
+    /// ID of the target being cleared (pool_id or spec_id).
+    #[prost(string, tag = "2")]
+    pub target_id: ::prost::alloc::string::String,
+    /// Timestamp when the quarantine was cleared (Unix nanoseconds).
+    #[prost(uint64, tag = "3")]
+    pub cleared_at: u64,
+    /// Actor who cleared the quarantine.
+    #[prost(string, tag = "4")]
+    pub issuer_actor_id: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with QUARANTINE_EVENT: domain (64 bytes).
+    #[prost(bytes = "vec", tag = "5")]
+    pub issuer_signature: ::prost::alloc::vec::Vec<u8>,
 }
 /// Emitted when a merge is executed atomically after observing the result.
 ///
