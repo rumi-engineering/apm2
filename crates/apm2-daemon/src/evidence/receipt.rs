@@ -1111,9 +1111,10 @@ mod tests {
             bytes_some.len() > bytes_none.len(),
             "receipt with envelope ref should be larger"
         );
-        
+
         // Sanity check: ensure we can roundtrip this field if we were to decode
-        // (We don't have a decode_canonical exposed, but we can verify digest difference)
+        // (We don't have a decode_canonical exposed, but we can verify digest
+        // difference)
         assert_ne!(
             receipt_none.digest(),
             receipt_some.digest(),

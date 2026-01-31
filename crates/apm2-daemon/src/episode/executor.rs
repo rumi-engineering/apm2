@@ -1000,7 +1000,7 @@ mod tests {
         let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
         let cas = Arc::new(StubContentAddressedStore::new());
         let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None).unwrap());
-        
+
         let mut executor = ToolExecutor::new(tracker, cas).with_clock(clock);
 
         executor
