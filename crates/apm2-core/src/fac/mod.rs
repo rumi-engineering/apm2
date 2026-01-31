@@ -81,7 +81,7 @@ pub use ci_attestation::{
 pub use ci_import::{
     CiEvidenceImport, CiEvidenceImportBuilder, CiImportAttestation, CiImportAttestationBuilder,
     CiImportError, CiImportPolicy, MAX_ARTIFACT_DIGESTS, MAX_IMPORT_ID_LENGTH,
-    MAX_WORKFLOW_RUN_ID_LENGTH, validate_ci_import,
+    MAX_WORKFLOW_RUN_ID_LENGTH, can_transition_to_ready_for_review, validate_ci_import,
 };
 // Re-export domain separator constants and functions
 pub use domain_separator::{
