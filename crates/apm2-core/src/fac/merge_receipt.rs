@@ -29,7 +29,6 @@ use thiserror::Error;
 use super::domain_separator::{MERGE_RECEIPT_PREFIX, sign_with_domain, verify_with_domain};
 use super::policy_resolution::MAX_STRING_LENGTH;
 use crate::crypto::{Signature, Signer, VerifyingKey};
-
 // Re-export proto type
 pub use crate::events::MergeReceipt as MergeReceiptProto;
 
@@ -121,8 +120,9 @@ impl MergeReceipt {
     /// Creates a new `MergeReceipt` after observing the merge result.
     ///
     /// This method enforces the atomic binding between inputs and the observed
-    /// result. It canonicalizes the data, signs it with the provided signer using
-    /// the `MERGE_RECEIPT:` domain separator, and returns the signed receipt.
+    /// result. It canonicalizes the data, signs it with the provided signer
+    /// using the `MERGE_RECEIPT:` domain separator, and returns the signed
+    /// receipt.
     ///
     /// # Arguments
     ///
@@ -311,20 +311,18 @@ impl TryFrom<MergeReceiptProto> for MergeReceipt {
             }
         }
 
-        let changeset_digest = proto
-            .changeset_digest
-            .try_into()
-            .map_err(|_| MergeReceiptError::InvalidData("changeset_digest must be 32 bytes".into()))?;
+        let changeset_digest = proto.changeset_digest.try_into().map_err(|_| {
+            MergeReceiptError::InvalidData("changeset_digest must be 32 bytes".into())
+        })?;
 
         let policy_hash = proto
             .policy_hash
             .try_into()
             .map_err(|_| MergeReceiptError::InvalidData("policy_hash must be 32 bytes".into()))?;
 
-        let gate_signature = proto
-            .gate_signature
-            .try_into()
-            .map_err(|_| MergeReceiptError::InvalidData("gate_signature must be 64 bytes".into()))?;
+        let gate_signature = proto.gate_signature.try_into().map_err(|_| {
+            MergeReceiptError::InvalidData("gate_signature must be 64 bytes".into())
+        })?;
 
         Ok(Self {
             base_selector: proto.base_selector,
@@ -405,7 +403,7 @@ mod tests {
     #[test]
     fn test_limit_gate_receipts() {
         let signer = Signer::generate();
-        let ids =vec!["id".to_string(); MAX_GATE_RECEIPTS + 1];
+        let ids = vec!["id".to_string(); MAX_GATE_RECEIPTS + 1];
 
         let result = MergeReceipt::create_after_observation(
             "main".to_string(),
