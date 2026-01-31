@@ -356,6 +356,7 @@ impl Lease {
         self.expires_at_tick.is_none()
     }
 
+
     /// Returns the remaining ticks until expiration, or 0 if expired.
     ///
     /// This is the RFC-0016 HTF compliant method using monotonic ticks.
@@ -754,6 +755,7 @@ mod tck_00241 {
         assert!(lease.is_expired_at_tick_or_wall(&tick(1000), 3_000_000_000));
     }
 
+
     /// TCK-00241: Terminal leases are not considered expired.
     ///
     /// A lease in terminal state (Released/Expired) should return false
@@ -881,6 +883,7 @@ mod tck_00241 {
         assert!(lease.is_expired_at_tick(&HtfTick::new(2001, 1_000_000)));
         assert_eq!(lease.ticks_remaining(&HtfTick::new(2001, 1_000_000)), 0);
     }
+
 
     /// TCK-00241: `Lease::new_with_ticks` sets all fields correctly.
     #[test]
