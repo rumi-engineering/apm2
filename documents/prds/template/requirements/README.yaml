@@ -1,8 +1,0 @@
-prd_requirements_readme:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
-  description: "PRD requirement files (one requirement per file). Filenames MUST be <requirement_id>.yaml."
-  required_conventions:
-    - "Root key MUST be prd_requirement."
-    - "prd_requirement.id MUST match filename."
-    - "prd_requirement MUST conform to standards/schemas/02_requirement.schema.yaml#requirement_schema."

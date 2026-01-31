@@ -1,9 +1,0 @@
-[32mProcessing your request...[0m
-
-[1;34mReading file:[0m
-
-{"tool": "Read", "args": {"path": "/home/user/data.txt"}}
-
-[33mWarning: Large file detected[0m
-
-[32mDone![0m

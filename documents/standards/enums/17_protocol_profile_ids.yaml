@@ -1,6 +1,0 @@
-protocol_profile_ids:
-  schema_version: "2026-01-23"
-  enum_id: "ENUM_PROTOCOL_PROFILE_ID_V1"
-  values:
-    - "NONE"
-    - "AIP_PROFILE_V1"

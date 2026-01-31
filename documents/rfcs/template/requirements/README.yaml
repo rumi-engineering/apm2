@@ -1,8 +1,0 @@
-rfc_requirements_readme:
-  schema_version: "2026-01-23"
-  template_version: "2026-01-23"
-  description: "RFC-only requirement files (one requirement per file). Filenames MUST be <requirement_id>.yaml."
-  required_conventions:
-    - "Root key MUST be rfc_requirement."
-    - "rfc_requirement.id MUST match filename."
-    - "rfc_requirement MUST conform to standards/schemas/02_requirement.schema.yaml#requirement_schema."

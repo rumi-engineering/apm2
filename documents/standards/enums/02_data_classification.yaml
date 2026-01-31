@@ -1,9 +1,0 @@
-
-data_classification:
-  schema_version: "2026-01-23"
-  enum_id: "ENUM_DATA_CLASSIFICATION_V1"
-  values:
-    - "PUBLIC"
-    - "INTERNAL"
-    - "CONFIDENTIAL"
-    - "RESTRICTED"
