@@ -8,8 +8,8 @@
 //! # Reuse Policy (FAC-REQ-0013)
 //!
 //! - **High Risk (Tier 2-4)**: AAT results are NEVER reused. High-risk changes
-//!   require fresh execution to ensure no environment drift or ephemeral factors
-//!   affect the outcome.
+//!   require fresh execution to ensure no environment drift or ephemeral
+//!   factors affect the outcome.
 //! - **Medium Risk (Tier 1)**: Reuse is allowed only with an explicit waiver.
 //! - **Low Risk (Tier 0)**: Reuse is allowed if the provenance tuple matches
 //!   exactly.
@@ -29,10 +29,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::policy_resolution::{DeterminismClass, RiskTier};
-
 // Re-export proto types
 pub use crate::events::{
-    AatResultReused as AATResultReusedProto, AatProvenanceTuple as AatProvenanceTupleProto,
+    AatProvenanceTuple as AatProvenanceTupleProto, AatResultReused as AATResultReusedProto,
 };
 
 // =============================================================================
@@ -108,6 +107,11 @@ impl AatProvenanceTuple {
     /// # Returns
     ///
     /// `Ok(())` if they match, `Err(ReuseError::ProvenanceMismatch)` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReuseError::ProvenanceMismatch` if any field differs between
+    /// the tuples.
     pub fn verify_match(&self, other: &Self) -> Result<(), ReuseError> {
         if self.changeset_digest != other.changeset_digest {
             return Err(ReuseError::ProvenanceMismatch {
@@ -151,7 +155,7 @@ impl AatProvenanceTuple {
 /// Event payload for reused AAT results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AATResultReused {
-    /// Hash of the original AatGateReceipt being reused.
+    /// Hash of the original `AatGateReceipt` being reused.
     #[serde(with = "serde_bytes")]
     pub from_receipt_hash: [u8; 32],
 
@@ -174,7 +178,8 @@ pub struct AATResultReused {
 // Validation Logic
 // =============================================================================
 
-/// Validates whether an AAT result can be reused based on risk tier and provenance.
+/// Validates whether an AAT result can be reused based on risk tier and
+/// provenance.
 ///
 /// # Arguments
 ///
@@ -186,6 +191,13 @@ pub struct AATResultReused {
 ///
 /// `Ok(())` if reuse is allowed.
 /// `Err` if reuse is prohibited by policy or provenance mismatch.
+///
+/// # Errors
+///
+/// Returns:
+/// - `ReuseError::HighTierNoReuse` for Tier2-4 risk levels
+/// - `ReuseError::MedTierRequiresWaiver` for Tier1 risk level
+/// - `ReuseError::ProvenanceMismatch` if provenance tuples do not match exactly
 pub fn can_reuse_aat_result(
     risk_tier: RiskTier,
     original: &AatProvenanceTuple,
@@ -195,7 +207,7 @@ pub fn can_reuse_aat_result(
         // High Risk: Never reuse
         RiskTier::Tier2 | RiskTier::Tier3 | RiskTier::Tier4 => {
             Err(ReuseError::HighTierNoReuse { tier: risk_tier })
-        }
+        },
 
         // Medium Risk: Requires waiver (not implemented here, effectively blocks reuse)
         RiskTier::Tier1 => Err(ReuseError::MedTierRequiresWaiver { tier: risk_tier }),
@@ -225,9 +237,12 @@ impl TryFrom<AatProvenanceTupleProto> for AatProvenanceTuple {
             .verifier_policy_hash
             .try_into()
             .map_err(|_| ReuseError::InvalidData("verifier_policy_hash must be 32 bytes".into()))?;
-        
-        let determinism_class = DeterminismClass::try_from(u8::try_from(proto.determinism_class).map_err(|_| ReuseError::InvalidData("determinism_class too large".into()))?)
-            .map_err(|_| ReuseError::InvalidData("invalid determinism_class".into()))?;
+
+        let determinism_class = DeterminismClass::try_from(
+            u8::try_from(proto.determinism_class)
+                .map_err(|_| ReuseError::InvalidData("determinism_class too large".into()))?,
+        )
+        .map_err(|_| ReuseError::InvalidData("invalid determinism_class".into()))?;
 
         Ok(Self {
             changeset_digest,
@@ -267,7 +282,7 @@ impl TryFrom<AATResultReusedProto> for AATResultReused {
             .gate_signature
             .try_into()
             .map_err(|_| ReuseError::InvalidData("gate_signature must be 64 bytes".into()))?;
-        
+
         let provenance = proto
             .provenance
             .ok_or(ReuseError::MissingField("provenance"))?
