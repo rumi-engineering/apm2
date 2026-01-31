@@ -12,6 +12,7 @@
 //! - **Policy Resolution**: Anchor events locking policy decisions for
 //!   changesets
 //! - **Gate Receipts**: Versioned envelopes for gate execution results
+//! - **Terminal Verifiers**: Machine-checkable predicates for AAT outcomes
 //!
 //! # Security Model
 //!
@@ -72,6 +73,7 @@ mod key_policy;
 mod lease;
 mod policy_resolution;
 mod receipt;
+mod terminal_verifier;
 
 // Re-export AAT receipt types
 pub use aat_receipt::{
@@ -117,4 +119,11 @@ pub use policy_resolution::{
 pub use receipt::{
     GateReceipt, GateReceiptBuilder, GateReceiptProto, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
     SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
+};
+// Re-export terminal verifier types
+pub use terminal_verifier::{
+    CheckResult, MAX_ALLOWED_VERIFIER_KINDS, MAX_OUTPUT_VALUES, MAX_PREDICATE_DEPTH,
+    MAX_PREDICATE_NODES, MAX_REQUIRED_OUTPUTS, Predicate, PredicateOp, TerminalVerifier,
+    VerifierError, VerifierKind, VerifierOutput, VerifierOutputBuilder, VerifierPolicy,
+    VerifierPolicyBuilder, evaluate_predicate,
 };
