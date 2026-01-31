@@ -55,6 +55,7 @@ pub mod evidence;
 pub mod fac;
 pub mod github;
 pub mod health;
+pub mod htf;
 pub mod impact_map;
 pub mod ipc;
 pub mod lease;
