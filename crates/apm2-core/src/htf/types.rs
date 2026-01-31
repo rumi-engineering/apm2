@@ -15,10 +15,10 @@
 //! denial-of-service attacks via oversized payloads.
 
 use std::cmp::Ordering;
-use std::fmt;
 
-use serde::de::{self, SeqAccess, Visitor};
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 use thiserror::Error;
 
 // =============================================================================
@@ -43,91 +43,92 @@ pub const MAX_OBSERVATIONS: usize = 1000;
 pub const MAX_ATTESTATION_SIZE: usize = 65536;
 
 // =============================================================================
-// Bounded Deserialization Helpers
+// Deserialization Helpers
 // =============================================================================
 
-/// Custom deserializer for `observations` that enforces [`MAX_OBSERVATIONS`].
-///
-/// Uses a streaming visitor pattern that enforces limits DURING
-/// deserialization, preventing OOM attacks by rejecting oversized arrays before
-/// full allocation occurs. This follows the "Gold Standard" bounded visitor
-/// pattern from `coordination/state.rs`.
-fn deserialize_bounded_observations<'de, D>(
-    deserializer: D,
-) -> Result<Vec<ObservationRecord>, D::Error>
+fn deserialize_bounded_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
-    struct BoundedVecVisitor;
+    let s: String = Deserialize::deserialize(deserializer)?;
+    if s.len() > MAX_STRING_LENGTH {
+        return Err(de::Error::custom(format!(
+            "string exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+            s.len()
+        )));
+    }
+    Ok(s)
+}
 
-    impl<'de> Visitor<'de> for BoundedVecVisitor {
+fn deserialize_bounded_option_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Deserialize::deserialize(deserializer)?;
+    if let Some(ref s) = opt {
+        if s.len() > MAX_STRING_LENGTH {
+            return Err(de::Error::custom(format!(
+                "string exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+                s.len()
+            )));
+        }
+    }
+    Ok(opt)
+}
+
+fn deserialize_attestation<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw: Option<Box<RawValue>> = Deserialize::deserialize(deserializer)?;
+    match raw {
+        Some(r) => {
+            if r.get().len() > MAX_ATTESTATION_SIZE {
+                return Err(de::Error::custom(format!(
+                    "attestation exceeds maximum size: {} bytes > {MAX_ATTESTATION_SIZE} bytes",
+                    r.get().len()
+                )));
+            }
+            serde_json::from_str(r.get())
+                .map(Some)
+                .map_err(de::Error::custom)
+        }
+        None => Ok(None),
+    }
+}
+
+fn deserialize_observations<'de, D>(deserializer: D) -> Result<Vec<ObservationRecord>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ObservationsVisitor;
+
+    impl<'de> Visitor<'de> for ObservationsVisitor {
         type Value = Vec<ObservationRecord>;
 
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            write!(
-                formatter,
-                "a sequence of at most {MAX_OBSERVATIONS} observation records"
-            )
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a sequence of observation records")
         }
 
         fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
         where
-            A: SeqAccess<'de>,
+            A: de::SeqAccess<'de>,
         {
-            // Use size hint but cap at MAX_OBSERVATIONS to prevent pre-allocation attacks
-            let capacity = seq.size_hint().unwrap_or(0).min(MAX_OBSERVATIONS);
-            let mut items = Vec::with_capacity(capacity);
-
-            while let Some(item) = seq.next_element()? {
-                if items.len() >= MAX_OBSERVATIONS {
+            let mut vec = Vec::new();
+            while let Some(elem) = seq.next_element()? {
+                if vec.len() >= MAX_OBSERVATIONS {
                     return Err(de::Error::custom(format!(
                         "observations exceeds maximum count: {} > {MAX_OBSERVATIONS}",
-                        items.len() + 1,
+                        vec.len() + 1
                     )));
                 }
-                items.push(item);
+                vec.push(elem);
             }
-            Ok(items)
+            Ok(vec)
         }
     }
 
-    deserializer.deserialize_seq(BoundedVecVisitor)
-}
-
-/// Custom deserializer for `attestation` that enforces
-/// [`MAX_ATTESTATION_SIZE`].
-///
-/// SEC-HTF-002: Validates attestation size during deserialization. Note that
-/// for `serde_json::Value` types, the check occurs after parsing since Value is
-/// a fully-materialized tree structure. The bounded-during-deser pattern from
-/// `coordination/state.rs` applies to streaming types (`Vec`, `HashMap`) where
-/// we can check limits while iterating.
-///
-/// For `serde_json::Value`, the size check prevents acceptance of oversized
-/// data into the struct, though the temporary allocation during parsing is
-/// unavoidable. External untrusted input should use byte-level limits at the
-/// I/O layer for additional protection.
-fn deserialize_bounded_attestation<'de, D>(
-    deserializer: D,
-) -> Result<Option<serde_json::Value>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
-
-    if let Some(ref v) = value {
-        let serialized = serde_json::to_string(v).map_err(D::Error::custom)?;
-        if serialized.len() > MAX_ATTESTATION_SIZE {
-            return Err(D::Error::custom(format!(
-                "attestation exceeds maximum size: {} bytes > {MAX_ATTESTATION_SIZE} bytes",
-                serialized.len()
-            )));
-        }
-    }
-
-    Ok(value)
+    deserializer.deserialize_seq(ObservationsVisitor)
 }
 
 // =============================================================================
@@ -174,9 +175,11 @@ where
 /// // Different ledgers: compare by ledger_id
 /// assert!(t3 < t4);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LedgerTime {
     /// Stable identifier for a ledger namespace.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     ledger_id: String,
 
     /// Epoch number, increments on authority/configuration changes.
@@ -354,38 +357,7 @@ impl std::fmt::Display for LedgerTime {
     }
 }
 
-/// Custom deserialization that enforces resource limits.
-impl<'de> Deserialize<'de> for LedgerTime {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
 
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct LedgerTimeHelper {
-            ledger_id: String,
-            epoch: u64,
-            seq: u64,
-        }
-
-        let helper = LedgerTimeHelper::deserialize(deserializer)?;
-
-        if helper.ledger_id.len() > MAX_STRING_LENGTH {
-            return Err(D::Error::custom(format!(
-                "ledger_id exceeds maximum length: {} > {MAX_STRING_LENGTH}",
-                helper.ledger_id.len(),
-            )));
-        }
-
-        Ok(Self {
-            ledger_id: helper.ledger_id,
-            epoch: helper.epoch,
-            seq: helper.seq,
-        })
-    }
-}
 
 /// Errors that can occur when working with [`LedgerTime`].
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -441,7 +413,6 @@ pub enum LedgerTimeError {
 /// assert_eq!(elapsed, 5000);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HtfTick {
     /// The tick value.
     value: u64,
@@ -1140,6 +1111,7 @@ impl<'de> Deserialize<'de> for BoundedWallInterval {
             t_min_utc_ns: u64,
             t_max_utc_ns: u64,
             source: WallTimeSource,
+            #[serde(deserialize_with = "deserialize_bounded_string")]
             confidence: String,
         }
 
@@ -1149,13 +1121,6 @@ impl<'de> Deserialize<'de> for BoundedWallInterval {
             return Err(D::Error::custom(format!(
                 "invalid interval: t_max ({}) < t_min ({})",
                 helper.t_max_utc_ns, helper.t_min_utc_ns,
-            )));
-        }
-
-        if helper.confidence.len() > MAX_STRING_LENGTH {
-            return Err(D::Error::custom(format!(
-                "confidence exceeds maximum length: {} > {MAX_STRING_LENGTH}",
-                helper.confidence.len(),
             )));
         }
 
@@ -1205,14 +1170,17 @@ pub enum BoundedWallIntervalError {
 ///
 /// The `attestation` field is bounded by [`MAX_ATTESTATION_SIZE`] bytes when
 /// serialized to prevent denial-of-service attacks via oversized JSON values.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClockProfile {
     /// Optional attestation data (Phase 2+).
     /// SEC-HTF-002: Limited to `MAX_ATTESTATION_SIZE` bytes when serialized.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_attestation")]
     pub attestation: Option<serde_json::Value>,
 
     /// Daemon version + platform hash.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub build_fingerprint: String,
 
     /// Whether hybrid logical clock is enabled.
@@ -1225,6 +1193,7 @@ pub struct ClockProfile {
     pub monotonic_source: MonotonicSource,
 
     /// Stable identifier for policy grouping.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub profile_policy_id: String,
 
     /// Tick rate in Hz (must match envelopes).
@@ -1234,57 +1203,7 @@ pub struct ClockProfile {
     pub wall_time_source: WallTimeSource,
 }
 
-impl<'de> Deserialize<'de> for ClockProfile {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
 
-        // SEC-HTF-002: Uses bounded attestation deserializer to enforce size limits
-        // DURING deserialization via `RawValue`, preventing allocation of oversized
-        // JSON values. This follows the bounded-during-deser principle.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Helper {
-            #[serde(deserialize_with = "deserialize_bounded_attestation")]
-            attestation: Option<serde_json::Value>,
-            build_fingerprint: String,
-            hlc_enabled: bool,
-            max_wall_uncertainty_ns: u64,
-            monotonic_source: MonotonicSource,
-            profile_policy_id: String,
-            tick_rate_hz: u64,
-            wall_time_source: WallTimeSource,
-        }
-
-        let helper = Helper::deserialize(deserializer)?;
-
-        if helper.build_fingerprint.len() > MAX_STRING_LENGTH {
-            return Err(D::Error::custom(format!(
-                "build_fingerprint exceeds maximum length: {} > {MAX_STRING_LENGTH}",
-                helper.build_fingerprint.len()
-            )));
-        }
-        if helper.profile_policy_id.len() > MAX_STRING_LENGTH {
-            return Err(D::Error::custom(format!(
-                "profile_policy_id exceeds maximum length: {} > {MAX_STRING_LENGTH}",
-                helper.profile_policy_id.len()
-            )));
-        }
-
-        Ok(Self {
-            attestation: helper.attestation,
-            build_fingerprint: helper.build_fingerprint,
-            hlc_enabled: helper.hlc_enabled,
-            max_wall_uncertainty_ns: helper.max_wall_uncertainty_ns,
-            monotonic_source: helper.monotonic_source,
-            profile_policy_id: helper.profile_policy_id,
-            tick_rate_hz: helper.tick_rate_hz,
-            wall_time_source: helper.wall_time_source,
-        })
-    }
-}
 
 // =============================================================================
 // TimeEnvelope
@@ -1294,9 +1213,11 @@ impl<'de> Deserialize<'de> for ClockProfile {
 ///
 /// `TimeEnvelope` binds a monotonic tick reading, wall time bounds, and
 /// logical clock state to a specific ledger anchor and clock profile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeEnvelope {
     /// Content hash of the `ClockProfileV1`.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub clock_profile_hash: String,
 
     /// Hybrid logical clock timestamp.
@@ -1310,61 +1231,17 @@ pub struct TimeEnvelope {
 
     /// Optional notes about the time envelope.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_bounded_option_string")]
     pub notes: Option<String>,
 
     /// Wall clock time bounds.
     pub wall: BoundedWallInterval,
 }
 
-impl<'de> Deserialize<'de> for TimeEnvelope {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
 
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Helper {
-            clock_profile_hash: String,
-            hlc: Hlc,
-            ledger_anchor: LedgerTime,
-            mono: MonotonicReading,
-            notes: Option<String>,
-            wall: BoundedWallInterval,
-        }
-
-        let helper = Helper::deserialize(deserializer)?;
-
-        if helper.clock_profile_hash.len() > MAX_STRING_LENGTH {
-            return Err(D::Error::custom(format!(
-                "clock_profile_hash exceeds maximum length: {} > {MAX_STRING_LENGTH}",
-                helper.clock_profile_hash.len()
-            )));
-        }
-        if let Some(notes) = &helper.notes {
-            if notes.len() > MAX_STRING_LENGTH {
-                return Err(D::Error::custom(format!(
-                    "notes exceeds maximum length: {} > {MAX_STRING_LENGTH}",
-                    notes.len()
-                )));
-            }
-        }
-
-        Ok(Self {
-            clock_profile_hash: helper.clock_profile_hash,
-            hlc: helper.hlc,
-            ledger_anchor: helper.ledger_anchor,
-            mono: helper.mono,
-            notes: helper.notes,
-            wall: helper.wall,
-        })
-    }
-}
 
 /// Hybrid Logical Clock timestamp components.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Hlc {
     /// Logical counter component.
     pub logical: u64,
@@ -1375,7 +1252,6 @@ pub struct Hlc {
 
 /// Monotonic clock reading components.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MonotonicReading {
     /// End tick (must be >= `start_tick` when present).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1401,53 +1277,24 @@ pub struct MonotonicReading {
 ///
 /// The `observations` array is bounded by [`MAX_OBSERVATIONS`] to prevent
 /// denial-of-service attacks via unbounded arrays.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeSyncObservation {
     /// Array of time sync observation records.
     /// SEC-HTF-001: Limited to `MAX_OBSERVATIONS` entries.
+    #[serde(deserialize_with = "deserialize_observations")]
     pub observations: Vec<ObservationRecord>,
 
     /// `TimeEnvelopeRef` hash reference.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub observed_at_envelope_ref: String,
 }
 
-impl<'de> Deserialize<'de> for TimeSyncObservation {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
 
-        // SEC-HTF-001: Uses bounded visitor pattern to enforce limits DURING
-        // deserialization, preventing OOM attacks by rejecting oversized arrays
-        // before full allocation. The `deserialize_bounded_observations` function
-        // implements the "Gold Standard" streaming visitor pattern.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Helper {
-            #[serde(deserialize_with = "deserialize_bounded_observations")]
-            observations: Vec<ObservationRecord>,
-            observed_at_envelope_ref: String,
-        }
-
-        let helper = Helper::deserialize(deserializer)?;
-
-        if helper.observed_at_envelope_ref.len() > MAX_STRING_LENGTH {
-            return Err(D::Error::custom(format!(
-                "observed_at_envelope_ref exceeds maximum length: {} > {MAX_STRING_LENGTH}",
-                helper.observed_at_envelope_ref.len()
-            )));
-        }
-
-        Ok(Self {
-            observations: helper.observations,
-            observed_at_envelope_ref: helper.observed_at_envelope_ref,
-        })
-    }
-}
 
 /// Individual observation record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationRecord {
     /// Monotonic tick at observation time.
     pub observed_at_mono_tick: u64,
@@ -1456,45 +1303,14 @@ pub struct ObservationRecord {
     pub observed_offset_ns: i64,
 
     /// Source of the observation.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     pub source: String,
 
     /// Uncertainty of the observation in nanoseconds.
     pub uncertainty_ns: u64,
 }
 
-impl<'de> Deserialize<'de> for ObservationRecord {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
 
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Helper {
-            observed_at_mono_tick: u64,
-            observed_offset_ns: i64,
-            source: String,
-            uncertainty_ns: u64,
-        }
-
-        let helper = Helper::deserialize(deserializer)?;
-
-        if helper.source.len() > MAX_STRING_LENGTH {
-            return Err(D::Error::custom(format!(
-                "source exceeds maximum length: {} > {MAX_STRING_LENGTH}",
-                helper.source.len()
-            )));
-        }
-
-        Ok(Self {
-            observed_at_mono_tick: helper.observed_at_mono_tick,
-            observed_offset_ns: helper.observed_offset_ns,
-            source: helper.source,
-            uncertainty_ns: helper.uncertainty_ns,
-        })
-    }
-}
 
 // =============================================================================
 // Tests
@@ -1632,7 +1448,7 @@ mod tests {
             let result: Result<LedgerTime, _> = serde_json::from_str(&json);
             assert!(result.is_err());
             let err_msg = result.unwrap_err().to_string();
-            assert!(err_msg.contains("ledger_id exceeds maximum length"));
+            assert!(err_msg.contains("string exceeds maximum length"));
         }
 
         #[test]
@@ -2123,7 +1939,7 @@ mod tests {
             let result: Result<BoundedWallInterval, _> = serde_json::from_str(&json);
             assert!(result.is_err());
             let err_msg = result.unwrap_err().to_string();
-            assert!(err_msg.contains("confidence exceeds maximum length"));
+            assert!(err_msg.contains("string exceeds maximum length"));
         }
 
         #[test]
