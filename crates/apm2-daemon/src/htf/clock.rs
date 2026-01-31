@@ -37,8 +37,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use apm2_core::htf::{
-    BoundedWallInterval, ClockProfile, Hlc, HtfTick, LedgerTime, MAX_STRING_LENGTH,
-    MonotonicReading, MonotonicSource, TimeEnvelope, TimeEnvelopeRef, WallTimeSource,
+    BoundedWallInterval, Canonicalizable, CanonicalizationError, ClockProfile, Hlc, HtfTick,
+    LedgerTime, MAX_STRING_LENGTH, MonotonicReading, MonotonicSource, TimeEnvelope,
+    TimeEnvelopeRef, WallTimeSource,
 };
 use apm2_core::ledger::{BoxFuture, LedgerBackend, LedgerError};
 use thiserror::Error;
@@ -117,6 +118,10 @@ pub enum ClockError {
         /// Actual hash (hex).
         actual: String,
     },
+
+    /// Canonicalization failed.
+    #[error("canonicalization failed: {0}")]
+    Canonicalization(#[from] CanonicalizationError),
 }
 
 /// Record of a clock regression event for defect reporting.
@@ -412,8 +417,15 @@ impl HolonicClock {
     ///
     /// * `config` - Clock configuration
     /// * `ledger` - Optional ledger backend for head queries
-    #[must_use]
-    pub fn new(config: ClockConfig, ledger: Option<Arc<dyn LedgerBackend>>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClockError::Canonicalization`] if the clock profile cannot be
+    /// canonicalized for hashing.
+    pub fn new(
+        config: ClockConfig,
+        ledger: Option<Arc<dyn LedgerBackend>>,
+    ) -> Result<Self, ClockError> {
         let clock_profile = ClockProfile {
             attestation: None,
             build_fingerprint: config.build_fingerprint.clone(),
@@ -425,9 +437,8 @@ impl HolonicClock {
             wall_time_source: config.wall_time_source,
         };
 
-        // Compute profile hash (using canonical JSON + BLAKE3)
-        let profile_json = serde_json::to_string(&clock_profile).unwrap_or_else(|_| String::new());
-        let profile_hash = hex::encode(blake3::hash(profile_json.as_bytes()).as_bytes());
+        // Compute profile hash using canonical serialization (RFC 8785) + BLAKE3
+        let profile_hash = hex::encode(clock_profile.canonical_hash()?);
 
         let hlc_state = if config.hlc_enabled {
             Some(Mutex::new(HlcState::default()))
@@ -435,7 +446,7 @@ impl HolonicClock {
             None
         };
 
-        Self {
+        Ok(Self {
             config,
             ledger,
             epoch_instant: Instant::now(),
@@ -443,7 +454,7 @@ impl HolonicClock {
             hlc_state,
             profile_hash,
             clock_profile,
-        }
+        })
     }
 
     /// Creates a builder for `HolonicClock`.
@@ -487,8 +498,10 @@ impl HolonicClock {
         let elapsed = self.epoch_instant.elapsed();
         let current_tick = elapsed.as_nanos() as u64;
 
-        // Check for regression (INV-HC001)
-        let previous = self.last_tick.load(Ordering::Acquire);
+        // Atomically update and check for regression (INV-HC001).
+        // Using fetch_max ensures thread-safe updates without race conditions
+        // between load and store operations.
+        let previous = self.last_tick.fetch_max(current_tick, Ordering::AcqRel);
         if current_tick < previous {
             // Emit warning for defect recording
             warn!(
@@ -501,9 +514,6 @@ impl HolonicClock {
                 previous,
             });
         }
-
-        // Update last observed tick
-        self.last_tick.store(current_tick, Ordering::Release);
 
         Ok(HtfTick::new(current_tick, self.config.tick_rate_hz))
     }
@@ -716,10 +726,9 @@ impl HolonicClock {
                 wall,
             };
 
-            // Compute envelope hash for reference
-            let envelope_json = serde_json::to_string(&envelope).unwrap_or_else(|_| String::new());
-            let envelope_hash = blake3::hash(envelope_json.as_bytes());
-            let envelope_ref = TimeEnvelopeRef::new(*envelope_hash.as_bytes());
+            // Compute envelope hash using canonical serialization (RFC 8785) + BLAKE3
+            let envelope_hash = envelope.canonical_hash()?;
+            let envelope_ref = TimeEnvelopeRef::new(envelope_hash);
 
             debug!(
                 envelope_ref = %envelope_ref,
@@ -805,9 +814,9 @@ impl HolonicClock {
                 wall,
             };
 
-            let envelope_json = serde_json::to_string(&envelope).unwrap_or_else(|_| String::new());
-            let envelope_hash = blake3::hash(envelope_json.as_bytes());
-            let envelope_ref = TimeEnvelopeRef::new(*envelope_hash.as_bytes());
+            // Compute envelope hash using canonical serialization (RFC 8785) + BLAKE3
+            let envelope_hash = envelope.canonical_hash()?;
+            let envelope_ref = TimeEnvelopeRef::new(envelope_hash);
 
             debug!(
                 envelope_ref = %envelope_ref,
@@ -936,8 +945,12 @@ impl HolonicClockBuilder {
     }
 
     /// Builds the `HolonicClock`.
-    #[must_use]
-    pub fn build(self) -> HolonicClock {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClockError::Canonicalization`] if the clock profile cannot be
+    /// canonicalized for hashing.
+    pub fn build(self) -> Result<HolonicClock, ClockError> {
         HolonicClock::new(self.config, self.ledger)
     }
 }
@@ -971,7 +984,7 @@ mod tests {
 
     #[test]
     fn test_holonic_clock_mono_tick() {
-        let clock = HolonicClock::new(ClockConfig::default(), None);
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
 
         let tick1 = clock.now_mono_tick().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -982,7 +995,7 @@ mod tests {
 
     #[test]
     fn test_holonic_clock_hlc() {
-        let clock = HolonicClock::new(ClockConfig::default(), None);
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
 
         let hlc1 = clock.now_hlc().unwrap();
         let hlc2 = clock.now_hlc().unwrap();
@@ -997,7 +1010,7 @@ mod tests {
     #[test]
     fn test_holonic_clock_hlc_disabled() {
         let config = ClockConfigBuilder::new().hlc_enabled(false).build();
-        let clock = HolonicClock::new(config, None);
+        let clock = HolonicClock::new(config, None).unwrap();
 
         let result = clock.now_hlc();
         assert!(matches!(result, Err(ClockError::HlcNotEnabled)));
@@ -1005,21 +1018,21 @@ mod tests {
 
     #[test]
     fn test_holonic_clock_profile_hash() {
-        let clock1 = HolonicClock::new(ClockConfig::default(), None);
-        let clock2 = HolonicClock::new(ClockConfig::default(), None);
+        let clock1 = HolonicClock::new(ClockConfig::default(), None).unwrap();
+        let clock2 = HolonicClock::new(ClockConfig::default(), None).unwrap();
 
         // Same config should produce same hash
         assert_eq!(clock1.profile_hash(), clock2.profile_hash());
 
         // Different config should produce different hash
         let config3 = ClockConfigBuilder::new().tick_rate_hz(999).build();
-        let clock3 = HolonicClock::new(config3, None);
+        let clock3 = HolonicClock::new(config3, None).unwrap();
         assert_ne!(clock1.profile_hash(), clock3.profile_hash());
     }
 
     #[tokio::test]
     async fn test_stamp_envelope_no_ledger() {
-        let clock = HolonicClock::new(ClockConfig::default(), None);
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
 
         let (envelope, envelope_ref) = clock.stamp_envelope(None).await.unwrap();
 
@@ -1031,7 +1044,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stamp_span_end() {
-        let clock = HolonicClock::new(ClockConfig::default(), None);
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
 
         let (start_envelope, _) = clock
             .stamp_envelope(Some("start".to_string()))
@@ -1055,7 +1068,8 @@ mod tests {
         let clock = HolonicClock::builder()
             .tick_rate_hz(1_000_000)
             .hlc_enabled(true)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(clock.config().tick_rate_hz, 1_000_000);
         assert!(clock.config().hlc_enabled);
@@ -1074,7 +1088,7 @@ mod tests {
 
     #[test]
     fn test_receive_hlc() {
-        let clock = HolonicClock::new(ClockConfig::default(), None);
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
 
         let local_hlc = clock.now_hlc().unwrap();
 
@@ -1092,7 +1106,7 @@ mod tests {
 
     #[test]
     fn test_record_regression() {
-        let clock = HolonicClock::new(ClockConfig::default(), None);
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
 
         let regression = clock.record_regression(100, 200);
 
@@ -1174,7 +1188,8 @@ mod tests {
             .ledger(backend.clone())
             .ledger_id("test-ledger")
             .unwrap()
-            .build();
+            .build()
+            .unwrap();
 
         // Test initial head value
         let ledger_time = clock.observed_ledger_head().await.unwrap();
@@ -1198,7 +1213,8 @@ mod tests {
             .ledger(backend)
             .ledger_id("test-ledger")
             .unwrap()
-            .build();
+            .build()
+            .unwrap();
 
         // Stamp an envelope and verify it has a valid reference
         let (envelope, envelope_ref) = clock
@@ -1227,7 +1243,7 @@ mod tests {
     /// TCK-00240: Verify clock profile is properly hashed and pinned
     #[tokio::test]
     async fn tck_00240_clock_profile_pinned_in_envelope() {
-        let clock = HolonicClock::new(ClockConfig::default(), None);
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
 
         let (envelope, _) = clock.stamp_envelope(None).await.unwrap();
 

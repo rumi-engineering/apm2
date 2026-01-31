@@ -42,6 +42,7 @@ use tracing::{debug, info, instrument, warn};
 use super::error::{EpisodeError, EpisodeId};
 use super::handle::{SessionHandle, StopSignal};
 use super::state::{EpisodeState, QuarantineReason, TerminationClass};
+use crate::htf::HolonicClock;
 
 /// Maximum number of concurrent episodes per runtime.
 ///
@@ -235,10 +236,19 @@ pub struct EpisodeRuntime {
     /// This counter provides uniqueness even when multiple episodes
     /// are created with the same envelope hash and timestamp.
     episode_seq: AtomicU64,
+    /// Holonic clock for time envelope stamping (RFC-0016 HTF).
+    ///
+    /// When present, all episode events are stamped with a `TimeEnvelopeRef`
+    /// for temporal ordering and causality tracking.
+    clock: Option<Arc<HolonicClock>>,
 }
 
 impl EpisodeRuntime {
     /// Creates a new episode runtime with the given configuration.
+    ///
+    /// This creates a runtime without a `HolonicClock`, meaning events will
+    /// have `time_envelope_ref: None`. Use [`Self::with_clock`] to enable
+    /// time envelope stamping.
     #[must_use]
     pub fn new(config: EpisodeRuntimeConfig) -> Self {
         Self {
@@ -247,6 +257,24 @@ impl EpisodeRuntime {
             events: RwLock::new(Vec::new()),
             session_seq: AtomicU64::new(1),
             episode_seq: AtomicU64::new(1),
+            clock: None,
+        }
+    }
+
+    /// Creates a new episode runtime with the given configuration and clock.
+    ///
+    /// When a `HolonicClock` is provided, all episode events will be stamped
+    /// with a `TimeEnvelopeRef` for temporal ordering and causality tracking
+    /// per RFC-0016 (HTF).
+    #[must_use]
+    pub fn with_clock(config: EpisodeRuntimeConfig, clock: Arc<HolonicClock>) -> Self {
+        Self {
+            config,
+            episodes: RwLock::new(HashMap::new()),
+            events: RwLock::new(Vec::new()),
+            session_seq: AtomicU64::new(1),
+            episode_seq: AtomicU64::new(1),
+            clock: Some(clock),
         }
     }
 
@@ -260,6 +288,26 @@ impl EpisodeRuntime {
     #[must_use]
     pub const fn config(&self) -> &EpisodeRuntimeConfig {
         &self.config
+    }
+
+    /// Returns a reference to the holonic clock, if configured.
+    #[must_use]
+    pub const fn clock(&self) -> Option<&Arc<HolonicClock>> {
+        self.clock.as_ref()
+    }
+
+    /// Stamps a time envelope and returns the reference.
+    ///
+    /// If no clock is configured, returns `None`.
+    async fn stamp_envelope(&self, notes: Option<String>) -> Option<TimeEnvelopeRef> {
+        let clock = self.clock.as_ref()?;
+        match clock.stamp_envelope(notes).await {
+            Ok((_, envelope_ref)) => Some(envelope_ref),
+            Err(e) => {
+                warn!("failed to stamp time envelope: {e}");
+                None
+            },
+        }
     }
 
     /// Creates a new episode from an envelope.
@@ -336,11 +384,15 @@ impl EpisodeRuntime {
 
         // Emit event (INV-ER002)
         if self.config.emit_events {
+            // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            let time_envelope_ref = self
+                .stamp_envelope(Some(format!("episode.created:{}", episode_id.as_str())))
+                .await;
             self.emit_event(EpisodeEvent::Created {
                 episode_id: episode_id.clone(),
                 envelope_hash,
                 created_at_ns: timestamp_ns,
-                time_envelope_ref: None, // Set by HolonicClock when available
+                time_envelope_ref,
             })
             .await;
         }
@@ -447,12 +499,16 @@ impl EpisodeRuntime {
 
         // Emit event (INV-ER002)
         if self.config.emit_events {
+            // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            let time_envelope_ref = self
+                .stamp_envelope(Some(format!("episode.started:{}", episode_id.as_str())))
+                .await;
             self.emit_event(EpisodeEvent::Started {
                 episode_id: episode_id.clone(),
                 session_id: handle.session_id().to_string(),
                 lease_id: handle.lease_id().to_string(),
                 started_at_ns: timestamp_ns,
-                time_envelope_ref: None, // Set by HolonicClock when available
+                time_envelope_ref,
             })
             .await;
         }
@@ -539,11 +595,15 @@ impl EpisodeRuntime {
 
         // Emit event (INV-ER002)
         if self.config.emit_events {
+            // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            let time_envelope_ref = self
+                .stamp_envelope(Some(format!("episode.stopped:{}", episode_id.as_str())))
+                .await;
             self.emit_event(EpisodeEvent::Stopped {
                 episode_id: episode_id.clone(),
                 termination_class,
                 terminated_at_ns: timestamp_ns,
-                time_envelope_ref: None, // Set by HolonicClock when available
+                time_envelope_ref,
             })
             .await;
         }
@@ -630,11 +690,15 @@ impl EpisodeRuntime {
 
         // Emit event (INV-ER002)
         if self.config.emit_events {
+            // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            let time_envelope_ref = self
+                .stamp_envelope(Some(format!("episode.quarantined:{}", episode_id.as_str())))
+                .await;
             self.emit_event(EpisodeEvent::Quarantined {
                 episode_id: episode_id.clone(),
                 reason,
                 quarantined_at_ns: timestamp_ns,
-                time_envelope_ref: None, // Set by HolonicClock when available
+                time_envelope_ref,
             })
             .await;
         }
@@ -766,6 +830,20 @@ impl std::fmt::Debug for EpisodeRuntime {
 #[must_use]
 pub fn new_shared_runtime(config: EpisodeRuntimeConfig) -> Arc<EpisodeRuntime> {
     Arc::new(EpisodeRuntime::new(config))
+}
+
+/// Creates a new `Arc<EpisodeRuntime>` with a `HolonicClock` for shared usage.
+///
+/// When a clock is provided, all episode events will be stamped with a
+/// `TimeEnvelopeRef` for temporal ordering and causality tracking per
+/// RFC-0016 (HTF).
+#[must_use]
+#[allow(dead_code)] // Public API for future use
+pub fn new_shared_runtime_with_clock(
+    config: EpisodeRuntimeConfig,
+    clock: Arc<HolonicClock>,
+) -> Arc<EpisodeRuntime> {
+    Arc::new(EpisodeRuntime::with_clock(config, clock))
 }
 
 #[cfg(test)]
@@ -1372,5 +1450,112 @@ mod tests {
 
         // All 50 episodes should have unique IDs
         assert_eq!(episode_ids.len(), 50);
+    }
+
+    // =========================================================================
+    // TCK-00240: HolonicClock integration tests
+    // =========================================================================
+
+    /// TCK-00240: Verify that events include `time_envelope_ref` when clock is
+    /// provided.
+    #[tokio::test]
+    async fn tck_00240_events_have_time_envelope_ref_with_clock() {
+        use crate::htf::{ClockConfig, HolonicClock};
+
+        // Create a clock
+        let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None).unwrap());
+
+        // Create runtime with clock
+        let runtime = EpisodeRuntime::with_clock(test_config(), clock);
+
+        // Create, start, stop an episode
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        runtime
+            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .await
+            .unwrap();
+        runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Success,
+                test_timestamp() + 2000,
+            )
+            .await
+            .unwrap();
+
+        // Check that all events have time_envelope_ref
+        let events = runtime.drain_events().await;
+        assert_eq!(events.len(), 3);
+
+        for event in &events {
+            assert!(
+                event.time_envelope_ref().is_some(),
+                "Event {} should have time_envelope_ref",
+                event.event_type()
+            );
+        }
+    }
+
+    /// TCK-00240: Verify that quarantine events also get `time_envelope_ref`.
+    #[tokio::test]
+    async fn tck_00240_quarantine_event_has_time_envelope_ref() {
+        use crate::htf::{ClockConfig, HolonicClock};
+
+        let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None).unwrap());
+        let runtime = EpisodeRuntime::with_clock(test_config(), clock);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        runtime
+            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .await
+            .unwrap();
+        runtime
+            .quarantine(
+                &episode_id,
+                QuarantineReason::crash("test"),
+                test_timestamp() + 2000,
+            )
+            .await
+            .unwrap();
+
+        let events = runtime.drain_events().await;
+        assert_eq!(events.len(), 3);
+
+        // Verify the quarantine event has a time_envelope_ref
+        let quarantine_event = events
+            .iter()
+            .find(|e| matches!(e, EpisodeEvent::Quarantined { .. }));
+        assert!(quarantine_event.is_some());
+        assert!(
+            quarantine_event.unwrap().time_envelope_ref().is_some(),
+            "Quarantine event should have time_envelope_ref"
+        );
+    }
+
+    /// TCK-00240: Verify that events have `time_envelope_ref: None` when no
+    /// clock is provided (backward compatibility).
+    #[tokio::test]
+    async fn tck_00240_events_have_no_time_envelope_ref_without_clock() {
+        let runtime = EpisodeRuntime::new(test_config());
+
+        let _episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        let events = runtime.drain_events().await;
+        assert_eq!(events.len(), 1);
+
+        // Without clock, time_envelope_ref should be None
+        assert!(
+            events[0].time_envelope_ref().is_none(),
+            "Event should have no time_envelope_ref without clock"
+        );
     }
 }
