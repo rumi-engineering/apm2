@@ -58,6 +58,9 @@ message KernelEvent {
     InterventionUnfreeze intervention_unfreeze = 23;
     AATResultReused aat_result_reused = 24;
     MergeReceipt merge_receipt = 25;
+    RunnerPoolQuarantined runner_pool_quarantined = 26;
+    AATSpecQuarantined aat_spec_quarantined = 27;
+    QuarantineCleared quarantine_cleared = 28;
   }
 }
 

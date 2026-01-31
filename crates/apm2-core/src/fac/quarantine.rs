@@ -601,6 +601,37 @@ impl From<QuarantineCleared> for QuarantineClearedProto {
 }
 
 // =============================================================================
+// QuarantineEvent Proto Conversions
+// =============================================================================
+
+use crate::events::kernel_event::Payload;
+
+impl TryFrom<Payload> for QuarantineEvent {
+    type Error = QuarantineError;
+
+    fn try_from(payload: Payload) -> Result<Self, Self::Error> {
+        match payload {
+            Payload::RunnerPoolQuarantined(proto) => Ok(Self::PoolQuarantined(proto.try_into()?)),
+            Payload::AatSpecQuarantined(proto) => Ok(Self::SpecQuarantined(proto.try_into()?)),
+            Payload::QuarantineCleared(proto) => Ok(Self::Cleared(proto.try_into()?)),
+            _ => Err(QuarantineError::InvalidData(
+                "Payload is not a quarantine event".to_string(),
+            )),
+        }
+    }
+}
+
+impl From<QuarantineEvent> for Payload {
+    fn from(event: QuarantineEvent) -> Self {
+        match event {
+            QuarantineEvent::PoolQuarantined(e) => Self::RunnerPoolQuarantined(e.into()),
+            QuarantineEvent::SpecQuarantined(e) => Self::AatSpecQuarantined(e.into()),
+            QuarantineEvent::Cleared(e) => Self::QuarantineCleared(e.into()),
+        }
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1163,5 +1194,78 @@ pub mod tests {
         // Verify re-enabled
         assert!(!projection.is_pool_quarantined("pool-001"));
         assert!(!projection.is_spec_quarantined("spec-001"));
+    }
+
+    // =========================================================================
+    // QuarantineEvent Proto Conversion Tests
+    // =========================================================================
+
+    use crate::events::kernel_event::Payload;
+
+    #[test]
+    fn test_quarantine_event_pool_payload_roundtrip() {
+        let original = QuarantineEvent::PoolQuarantined(create_pool_quarantined("pool-001"));
+
+        // Convert to Payload
+        let payload: Payload = original.clone().into();
+
+        // Verify it's the correct variant
+        assert!(matches!(payload, Payload::RunnerPoolQuarantined(_)));
+
+        // Convert back
+        let recovered: QuarantineEvent = payload.try_into().unwrap();
+
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_quarantine_event_spec_payload_roundtrip() {
+        let original = QuarantineEvent::SpecQuarantined(create_spec_quarantined("spec-001"));
+
+        // Convert to Payload
+        let payload: Payload = original.clone().into();
+
+        // Verify it's the correct variant
+        assert!(matches!(payload, Payload::AatSpecQuarantined(_)));
+
+        // Convert back
+        let recovered: QuarantineEvent = payload.try_into().unwrap();
+
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_quarantine_event_cleared_payload_roundtrip() {
+        let original = QuarantineEvent::Cleared(create_cleared("target-001"));
+
+        // Convert to Payload
+        let payload: Payload = original.clone().into();
+
+        // Verify it's the correct variant
+        assert!(matches!(payload, Payload::QuarantineCleared(_)));
+
+        // Convert back
+        let recovered: QuarantineEvent = payload.try_into().unwrap();
+
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_quarantine_event_from_non_quarantine_payload_fails() {
+        // Use a non-quarantine payload (e.g., MergeReceipt)
+        let payload = Payload::MergeReceipt(crate::events::MergeReceipt {
+            base_selector: "main".to_string(),
+            changeset_digest: vec![0u8; 32],
+            gate_receipt_ids: vec![],
+            policy_hash: vec![0u8; 32],
+            result_selector: "abc123".to_string(),
+            merged_at: 1_234_567_890,
+            gate_actor_id: "gate-001".to_string(),
+            gate_signature: vec![0u8; 64],
+        });
+
+        let result: Result<QuarantineEvent, _> = payload.try_into();
+
+        assert!(matches!(result, Err(QuarantineError::InvalidData(_))));
     }
 }

@@ -31,7 +31,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -73,6 +73,12 @@ pub mod kernel_event {
         AatResultReused(super::AatResultReused),
         #[prost(message, tag = "25")]
         MergeReceipt(super::MergeReceipt),
+        #[prost(message, tag = "26")]
+        RunnerPoolQuarantined(super::RunnerPoolQuarantined),
+        #[prost(message, tag = "27")]
+        AatSpecQuarantined(super::AatSpecQuarantined),
+        #[prost(message, tag = "28")]
+        QuarantineCleared(super::QuarantineCleared),
     }
 }
 /// ============================================================
