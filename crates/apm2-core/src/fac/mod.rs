@@ -66,6 +66,7 @@
 //! ```
 
 mod aat_receipt;
+mod artifact_manifest;
 mod ci_attestation;
 mod ci_import;
 mod domain_separator;
@@ -82,6 +83,11 @@ pub use aat_receipt::{
     DeterminismStatus, FlakeClass, MAX_RUN_RECEIPT_HASHES,
     MAX_STRING_LENGTH as MAX_AAT_STRING_LENGTH, MAX_TERMINAL_VERIFIER_OUTPUTS,
     MAX_TOOLCHAIN_DIGESTS, TerminalVerifierOutput,
+};
+// Re-export artifact manifest types
+pub use artifact_manifest::{
+    ArtifactDigest, ArtifactManifest, ArtifactManifestBuilder, ArtifactManifestError, ArtifactType,
+    DataClassification, MAX_ARTIFACTS, MAX_STRING_LENGTH as MAX_ARTIFACT_STRING_LENGTH,
 };
 // Re-export CI attestation types
 pub use ci_attestation::{

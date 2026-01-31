@@ -942,3 +942,83 @@ message InterventionUnfreeze {
   // Reference to the time envelope for temporal authority.
   string time_envelope_ref = 7;
 }
+
+// ============================================================
+// ARTIFACT MANIFEST (TCK-00221)
+// ============================================================
+//
+// ArtifactManifest binds evidence artifacts to gate receipts with
+// data classification, redaction metadata, and retention policy.
+// This supports evidence hygiene requirements (FAC-REQ-0014).
+//
+// Key security properties:
+// - All artifacts have data classification for access control
+// - Redaction profiles are bound to specific sanitization rules
+// - Retention windows enable automated cleanup per policy
+// - Admission rejects evidence policy violations
+
+// Type of evidence artifact.
+enum ArtifactType {
+  // Unspecified type (invalid).
+  ARTIFACT_TYPE_UNSPECIFIED = 0;
+  // Execution logs and traces.
+  ARTIFACT_TYPE_LOG = 1;
+  // JUnit/xUnit test reports.
+  ARTIFACT_TYPE_JUNIT = 2;
+  // Code coverage reports.
+  ARTIFACT_TYPE_COVERAGE = 3;
+  // State snapshots for determinism verification.
+  ARTIFACT_TYPE_SNAPSHOT = 4;
+  // Compiled artifacts (executables, libraries).
+  ARTIFACT_TYPE_BINARY = 5;
+}
+
+// Data classification level for evidence artifacts.
+// Determines access control and handling requirements.
+enum DataClassification {
+  // Unspecified classification (invalid).
+  DATA_CLASSIFICATION_UNSPECIFIED = 0;
+  // No access restrictions.
+  DATA_CLASSIFICATION_PUBLIC = 1;
+  // Organization-internal access only.
+  DATA_CLASSIFICATION_INTERNAL = 2;
+  // Restricted access with audit logging.
+  DATA_CLASSIFICATION_CONFIDENTIAL = 3;
+  // Maximum security controls required.
+  DATA_CLASSIFICATION_RESTRICTED = 4;
+}
+
+// Digest and metadata for a single evidence artifact.
+// Each artifact is identified by its content digest and includes metadata
+// for access control, redaction tracking, and retention policy.
+message ArtifactDigest {
+  // Type of artifact (Log, Junit, Coverage, Snapshot, Binary).
+  ArtifactType artifact_type = 1;
+  // SHA-256 digest of the artifact content (32 bytes).
+  bytes digest = 2;
+  // Data classification for access control.
+  DataClassification data_classification = 3;
+  // Whether redaction/sanitization was applied to this artifact.
+  bool redaction_applied = 4;
+  // Hash of the redaction profile used (32 bytes, required if redaction_applied).
+  bytes redaction_profile_hash = 5;
+  // Reference to the retention window for this artifact.
+  // Uses HTF time envelope format (e.g., "htf:window:30d").
+  string retention_window_ref = 6;
+}
+
+// Manifest of evidence artifacts for a gate receipt.
+// The manifest binds all evidence artifacts produced during gate execution,
+// enabling independent verification and retention management.
+//
+// Invariants:
+// - Must contain at least one artifact (empty manifests are rejected)
+// - No duplicate digests allowed
+// - All artifacts must pass hygiene validation
+//
+// Security: The manifest is referenced by artifact_manifest_hash in
+// AatGateReceipt and stored in CAS for independent verification.
+message ArtifactManifest {
+  // List of artifact digests and metadata.
+  repeated ArtifactDigest artifacts = 1;
+}
