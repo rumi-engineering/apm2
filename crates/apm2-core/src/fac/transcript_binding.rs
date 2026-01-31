@@ -26,6 +26,8 @@
 //!   transcript chunks is detectable
 //! - **Completeness**: All chunks are included in the Merkle root computation
 //! - **Ordering**: Chunk order is preserved and verified
+//! - **Domain Separation**: Uses the `consensus::merkle` module which properly
+//!   separates leaf and internal nodes to prevent structural ambiguity attacks
 //!
 //! # Example
 //!
@@ -36,14 +38,14 @@
 //!
 //! // Create transcript chunks
 //! let chunks = vec![
-//!     TranscriptChunk::new(b"First message", 0),
-//!     TranscriptChunk::new(b"Second message", 1),
-//!     TranscriptChunk::new(b"Third message", 2),
+//!     TranscriptChunk::try_new(b"First message", 0).unwrap(),
+//!     TranscriptChunk::try_new(b"Second message", 1).unwrap(),
+//!     TranscriptChunk::try_new(b"Third message", 2).unwrap(),
 //! ];
 //!
 //! // Create binding with run transcript hashes
 //! let run_hashes = vec![[0x11; 32], [0x22; 32]];
-//! let binding = AatTranscriptBinding::new(chunks, run_hashes);
+//! let binding = AatTranscriptBinding::try_new(chunks, run_hashes).unwrap();
 //!
 //! // Verify chain integrity
 //! assert!(binding.validate().is_ok());
@@ -55,6 +57,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::consensus::merkle::{MerkleError, MerkleTree};
+use crate::crypto::{EventHasher, Hash};
+
 // =============================================================================
 // Resource Limits
 // =============================================================================
@@ -62,7 +67,7 @@ use thiserror::Error;
 /// Maximum number of transcript chunks allowed.
 ///
 /// This prevents denial-of-service attacks via oversized transcript
-/// collections.
+/// collections. Aligned with `consensus::merkle::MAX_TREE_LEAVES`.
 pub const MAX_TRANSCRIPT_CHUNKS: usize = 65536;
 
 /// Maximum size of a single transcript chunk content in bytes.
@@ -124,12 +129,40 @@ pub enum TranscriptBindingError {
         actual: u64,
     },
 
-    /// Duplicate chunk hash detected.
-    #[error("duplicate chunk hash detected at sequence {sequence}")]
-    DuplicateChunkHash {
-        /// Sequence number where duplicate was found.
-        sequence: u64,
-    },
+    /// Merkle tree construction failed.
+    #[error("merkle tree error: {0}")]
+    MerkleError(String),
+}
+
+impl From<MerkleError> for TranscriptBindingError {
+    fn from(e: MerkleError) -> Self {
+        Self::MerkleError(e.to_string())
+    }
+}
+
+// =============================================================================
+// Wire Format Types (for bounded deserialization)
+// =============================================================================
+
+/// Wire format for `TranscriptChunk` with bounded deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranscriptChunkWire {
+    #[serde(with = "serde_bytes")]
+    content_hash: [u8; 32],
+    sequence: u64,
+    content_size: u64,
+}
+
+/// Wire format for `AatTranscriptBinding` with bounded deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AatTranscriptBindingWire {
+    transcript_chunks: Vec<TranscriptChunkWire>,
+    #[serde(with = "serde_bytes")]
+    transcript_chain_root_hash: [u8; 32],
+    #[serde(with = "vec_hash_serde")]
+    run_transcript_hashes: Vec<[u8; 32]>,
 }
 
 // =============================================================================
@@ -152,12 +185,10 @@ pub enum TranscriptBindingError {
 ///
 /// - Sequence numbers must be monotonically increasing (0, 1, 2, ...)
 /// - Content hash must match the hash of the original content
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptChunk {
     /// BLAKE3 hash of the chunk content.
-    #[serde(with = "serde_bytes")]
-    content_hash: [u8; 32],
+    content_hash: Hash,
 
     /// Sequence number for ordering (0-indexed).
     sequence: u64,
@@ -167,21 +198,6 @@ pub struct TranscriptChunk {
 }
 
 impl TranscriptChunk {
-    /// Creates a new transcript chunk from raw content.
-    ///
-    /// # Arguments
-    ///
-    /// * `content` - The raw bytes of the transcript chunk
-    /// * `sequence` - The sequence number for ordering
-    ///
-    /// # Panics
-    ///
-    /// Panics if content exceeds [`MAX_CHUNK_CONTENT_BYTES`].
-    #[must_use]
-    pub fn new(content: &[u8], sequence: u64) -> Self {
-        Self::try_new(content, sequence).expect("content exceeds maximum size")
-    }
-
     /// Attempts to create a new transcript chunk from raw content.
     ///
     /// # Arguments
@@ -201,7 +217,7 @@ impl TranscriptChunk {
             });
         }
 
-        let content_hash = *blake3::hash(content).as_bytes();
+        let content_hash = EventHasher::hash_content(content);
 
         Ok(Self {
             content_hash,
@@ -221,7 +237,7 @@ impl TranscriptChunk {
     /// * `sequence` - The sequence number for ordering
     /// * `content_size` - The size of the original content in bytes
     #[must_use]
-    pub const fn from_hash(content_hash: [u8; 32], sequence: u64, content_size: u64) -> Self {
+    pub const fn from_hash(content_hash: Hash, sequence: u64, content_size: u64) -> Self {
         Self {
             content_hash,
             sequence,
@@ -231,7 +247,7 @@ impl TranscriptChunk {
 
     /// Returns the content hash.
     #[must_use]
-    pub const fn content_hash(&self) -> [u8; 32] {
+    pub const fn content_hash(&self) -> Hash {
         self.content_hash
     }
 
@@ -258,8 +274,36 @@ impl TranscriptChunk {
     /// `true` if the content matches the stored hash, `false` otherwise.
     #[must_use]
     pub fn verify_content(&self, content: &[u8]) -> bool {
-        let computed_hash = *blake3::hash(content).as_bytes();
+        let computed_hash = EventHasher::hash_content(content);
         computed_hash == self.content_hash
+    }
+}
+
+impl Serialize for TranscriptChunk {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        TranscriptChunkWire {
+            content_hash: self.content_hash,
+            sequence: self.sequence,
+            content_size: self.content_size,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TranscriptChunk {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = TranscriptChunkWire::deserialize(deserializer)?;
+        Ok(Self {
+            content_hash: wire.content_hash,
+            sequence: wire.sequence,
+            content_size: wire.content_size,
+        })
     }
 }
 
@@ -280,9 +324,15 @@ impl TranscriptChunk {
 ///
 /// # Merkle Root Computation
 ///
-/// The chain root is computed as a Merkle tree over the chunk content hashes.
+/// The chain root is computed using the `consensus::merkle` module which
+/// provides domain-separated hashing:
+/// - Leaf nodes are hashed with `merkle:leaf:` prefix
+/// - Internal nodes are hashed with `merkle:internal:` prefix
+///
+/// This prevents structural ambiguity attacks (e.g., duplicate leaf attacks).
+///
 /// For an empty chunk list, the root is the hash of an empty byte array.
-/// For a single chunk, the root is the chunk's content hash.
+/// For a single chunk, the root uses the domain-separated leaf hash.
 /// For multiple chunks, a balanced Merkle tree is constructed.
 ///
 /// # Security Model
@@ -292,19 +342,17 @@ impl TranscriptChunk {
 /// - **Completeness**: All chunks contribute to the root
 /// - **Ordering**: Chunk order affects the root value
 /// - **Tamper-evidence**: Any modification changes the root
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// - **Domain Separation**: Leaf and internal nodes use different prefixes
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AatTranscriptBinding {
     /// Ordered list of transcript chunks.
     transcript_chunks: Vec<TranscriptChunk>,
 
     /// Merkle root hash of the transcript chain.
-    #[serde(with = "serde_bytes")]
-    transcript_chain_root_hash: [u8; 32],
+    transcript_chain_root_hash: Hash,
 
     /// Hashes linking to individual run transcripts.
-    #[serde(with = "vec_hash_serde")]
-    run_transcript_hashes: Vec<[u8; 32]>,
+    run_transcript_hashes: Vec<Hash>,
 }
 
 /// Custom serde for Vec<[u8; 32]>.
@@ -342,29 +390,10 @@ mod vec_hash_serde {
 }
 
 impl AatTranscriptBinding {
-    /// Creates a new transcript binding from chunks and run hashes.
-    ///
-    /// The chain root hash is computed automatically from the provided chunks.
-    ///
-    /// # Arguments
-    ///
-    /// * `transcript_chunks` - Ordered list of transcript chunks
-    /// * `run_transcript_hashes` - Hashes linking to individual run transcripts
-    ///
-    /// # Panics
-    ///
-    /// Panics if the number of chunks exceeds [`MAX_TRANSCRIPT_CHUNKS`] or if
-    /// the number of run hashes exceeds [`MAX_RUN_TRANSCRIPT_HASHES`].
-    #[must_use]
-    pub fn new(
-        transcript_chunks: Vec<TranscriptChunk>,
-        run_transcript_hashes: Vec<[u8; 32]>,
-    ) -> Self {
-        Self::try_new(transcript_chunks, run_transcript_hashes)
-            .expect("chunks or run hashes exceed limits")
-    }
-
     /// Attempts to create a new transcript binding from chunks and run hashes.
+    ///
+    /// The chain root hash is computed automatically from the provided chunks
+    /// using the domain-separated Merkle tree from `consensus::merkle`.
     ///
     /// # Errors
     ///
@@ -375,7 +404,7 @@ impl AatTranscriptBinding {
     /// run hashes exceeds [`MAX_RUN_TRANSCRIPT_HASHES`].
     pub fn try_new(
         transcript_chunks: Vec<TranscriptChunk>,
-        run_transcript_hashes: Vec<[u8; 32]>,
+        run_transcript_hashes: Vec<Hash>,
     ) -> Result<Self, TranscriptBindingError> {
         if transcript_chunks.len() > MAX_TRANSCRIPT_CHUNKS {
             return Err(TranscriptBindingError::TooManyChunks {
@@ -391,7 +420,7 @@ impl AatTranscriptBinding {
             });
         }
 
-        let transcript_chain_root_hash = Self::compute_chain_root_from_chunks(&transcript_chunks);
+        let transcript_chain_root_hash = Self::compute_chain_root_from_chunks(&transcript_chunks)?;
 
         Ok(Self {
             transcript_chunks,
@@ -403,7 +432,8 @@ impl AatTranscriptBinding {
     /// Creates a transcript binding from pre-computed values.
     ///
     /// Use this when deserializing or when values are already known. The caller
-    /// is responsible for ensuring the chain root hash is valid.
+    /// is responsible for ensuring the chain root hash is valid by calling
+    /// `validate()` after construction.
     ///
     /// # Arguments
     ///
@@ -413,8 +443,8 @@ impl AatTranscriptBinding {
     #[must_use]
     pub const fn from_parts(
         transcript_chunks: Vec<TranscriptChunk>,
-        transcript_chain_root_hash: [u8; 32],
-        run_transcript_hashes: Vec<[u8; 32]>,
+        transcript_chain_root_hash: Hash,
+        run_transcript_hashes: Vec<Hash>,
     ) -> Self {
         Self {
             transcript_chunks,
@@ -431,13 +461,13 @@ impl AatTranscriptBinding {
 
     /// Returns the transcript chain root hash.
     #[must_use]
-    pub const fn transcript_chain_root_hash(&self) -> [u8; 32] {
+    pub const fn transcript_chain_root_hash(&self) -> Hash {
         self.transcript_chain_root_hash
     }
 
     /// Returns the run transcript hashes.
     #[must_use]
-    pub fn run_transcript_hashes(&self) -> &[[u8; 32]] {
+    pub fn run_transcript_hashes(&self) -> &[Hash] {
         &self.run_transcript_hashes
     }
 
@@ -460,62 +490,42 @@ impl AatTranscriptBinding {
     ///
     /// This recomputes the Merkle root from the stored chunks. Use this to
     /// verify that the stored `transcript_chain_root_hash` is valid.
-    #[must_use]
-    pub fn compute_chain_root(&self) -> [u8; 32] {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Merkle tree construction fails.
+    pub fn compute_chain_root(&self) -> Result<Hash, TranscriptBindingError> {
         Self::compute_chain_root_from_chunks(&self.transcript_chunks)
     }
 
     /// Computes the Merkle root from a list of chunks.
     ///
+    /// Uses the `consensus::merkle` module which provides:
+    /// - Domain-separated leaf hashing (`merkle:leaf:` prefix)
+    /// - Domain-separated internal node hashing (`merkle:internal:` prefix)
+    /// - Proper handling of odd node counts with empty hash padding
+    ///
     /// # Algorithm
     ///
     /// 1. If no chunks, return hash of empty byte array
-    /// 2. If one chunk, return that chunk's content hash
-    /// 3. Otherwise, build a balanced Merkle tree:
-    ///    - Collect all chunk content hashes as leaves
-    ///    - Repeatedly hash pairs until one root remains
-    ///    - If odd number of nodes, duplicate the last node
-    #[must_use]
-    pub fn compute_chain_root_from_chunks(chunks: &[TranscriptChunk]) -> [u8; 32] {
+    /// 2. Otherwise, build a Merkle tree using `MerkleTree::new()`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Merkle tree construction fails.
+    pub fn compute_chain_root_from_chunks(
+        chunks: &[TranscriptChunk],
+    ) -> Result<Hash, TranscriptBindingError> {
         if chunks.is_empty() {
             // Empty transcript: hash of empty content
-            return *blake3::hash(&[]).as_bytes();
+            return Ok(EventHasher::hash_content(&[]));
         }
 
-        if chunks.len() == 1 {
-            // Single chunk: return its hash directly
-            return chunks[0].content_hash();
-        }
+        // Build Merkle tree using domain-separated hashing
+        let leaves = chunks.iter().map(TranscriptChunk::content_hash);
+        let tree = MerkleTree::new(leaves)?;
 
-        // Multiple chunks: build Merkle tree
-        let mut level: Vec<[u8; 32]> = chunks.iter().map(TranscriptChunk::content_hash).collect();
-
-        while level.len() > 1 {
-            let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
-
-            let mut i = 0;
-            while i < level.len() {
-                let left = level[i];
-                // If odd number of nodes, duplicate the last one
-                let right = if i + 1 < level.len() {
-                    level[i + 1]
-                } else {
-                    level[i]
-                };
-
-                // Hash the concatenation of left and right
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(&left);
-                hasher.update(&right);
-                next_level.push(*hasher.finalize().as_bytes());
-
-                i += 2;
-            }
-
-            level = next_level;
-        }
-
-        level[0]
+        Ok(tree.root())
     }
 
     /// Validates the transcript chain integrity.
@@ -524,8 +534,11 @@ impl AatTranscriptBinding {
     ///
     /// 1. The stored chain root hash matches the computed Merkle root
     /// 2. Chunk sequence numbers are monotonically increasing (0, 1, 2, ...)
-    /// 3. No duplicate chunk hashes exist
-    /// 4. Collection sizes are within limits
+    /// 3. Collection sizes are within limits
+    ///
+    /// Note: Duplicate chunk hashes are allowed, as legitimate transcripts
+    /// may contain identical messages. Integrity is guaranteed by the Merkle
+    /// root and sequence numbers.
     ///
     /// # Returns
     ///
@@ -571,18 +584,8 @@ impl AatTranscriptBinding {
             }
         }
 
-        // Check for duplicate chunk hashes
-        let mut seen_hashes = std::collections::HashSet::new();
-        for chunk in &self.transcript_chunks {
-            if !seen_hashes.insert(chunk.content_hash()) {
-                return Err(TranscriptBindingError::DuplicateChunkHash {
-                    sequence: chunk.sequence(),
-                });
-            }
-        }
-
         // Verify chain root hash matches computed value
-        let computed = self.compute_chain_root();
+        let computed = self.compute_chain_root()?;
         if computed != self.transcript_chain_root_hash {
             return Err(TranscriptBindingError::ChainRootMismatch {
                 computed,
@@ -591,6 +594,70 @@ impl AatTranscriptBinding {
         }
 
         Ok(())
+    }
+}
+
+impl Serialize for AatTranscriptBinding {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let wire = AatTranscriptBindingWire {
+            transcript_chunks: self
+                .transcript_chunks
+                .iter()
+                .map(|c| TranscriptChunkWire {
+                    content_hash: c.content_hash,
+                    sequence: c.sequence,
+                    content_size: c.content_size,
+                })
+                .collect(),
+            transcript_chain_root_hash: self.transcript_chain_root_hash,
+            run_transcript_hashes: self.run_transcript_hashes.clone(),
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AatTranscriptBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = AatTranscriptBindingWire::deserialize(deserializer)?;
+
+        // Enforce resource limits during deserialization to prevent DoS
+        if wire.transcript_chunks.len() > MAX_TRANSCRIPT_CHUNKS {
+            return Err(serde::de::Error::custom(format!(
+                "too many transcript chunks: {} > {}",
+                wire.transcript_chunks.len(),
+                MAX_TRANSCRIPT_CHUNKS
+            )));
+        }
+
+        if wire.run_transcript_hashes.len() > MAX_RUN_TRANSCRIPT_HASHES {
+            return Err(serde::de::Error::custom(format!(
+                "too many run transcript hashes: {} > {}",
+                wire.run_transcript_hashes.len(),
+                MAX_RUN_TRANSCRIPT_HASHES
+            )));
+        }
+
+        let transcript_chunks = wire
+            .transcript_chunks
+            .into_iter()
+            .map(|w| TranscriptChunk {
+                content_hash: w.content_hash,
+                sequence: w.sequence,
+                content_size: w.content_size,
+            })
+            .collect();
+
+        Ok(Self {
+            transcript_chunks,
+            transcript_chain_root_hash: wire.transcript_chain_root_hash,
+            run_transcript_hashes: wire.run_transcript_hashes,
+        })
     }
 }
 
@@ -608,9 +675,9 @@ pub mod tests {
     // =========================================================================
 
     #[test]
-    fn test_transcript_chunk_new() {
+    fn test_transcript_chunk_try_new() {
         let content = b"Hello, world!";
-        let chunk = TranscriptChunk::new(content, 0);
+        let chunk = TranscriptChunk::try_new(content, 0).unwrap();
 
         assert_eq!(chunk.sequence(), 0);
         assert_eq!(chunk.content_size(), content.len() as u64);
@@ -620,16 +687,16 @@ pub mod tests {
     #[test]
     fn test_transcript_chunk_hash_determinism() {
         let content = b"Test content";
-        let chunk1 = TranscriptChunk::new(content, 0);
-        let chunk2 = TranscriptChunk::new(content, 0);
+        let chunk1 = TranscriptChunk::try_new(content, 0).unwrap();
+        let chunk2 = TranscriptChunk::try_new(content, 0).unwrap();
 
         assert_eq!(chunk1.content_hash(), chunk2.content_hash());
     }
 
     #[test]
     fn test_transcript_chunk_different_content_different_hash() {
-        let chunk1 = TranscriptChunk::new(b"Content A", 0);
-        let chunk2 = TranscriptChunk::new(b"Content B", 0);
+        let chunk1 = TranscriptChunk::try_new(b"Content A", 0).unwrap();
+        let chunk2 = TranscriptChunk::try_new(b"Content B", 0).unwrap();
 
         assert_ne!(chunk1.content_hash(), chunk2.content_hash());
     }
@@ -637,7 +704,7 @@ pub mod tests {
     #[test]
     fn test_transcript_chunk_verify_content() {
         let content = b"Verify me!";
-        let chunk = TranscriptChunk::new(content, 0);
+        let chunk = TranscriptChunk::try_new(content, 0).unwrap();
 
         assert!(chunk.verify_content(content));
         assert!(!chunk.verify_content(b"Wrong content"));
@@ -646,7 +713,7 @@ pub mod tests {
     #[test]
     fn test_transcript_chunk_from_hash() {
         let content = b"Pre-hashed content";
-        let content_hash = *blake3::hash(content).as_bytes();
+        let content_hash = EventHasher::hash_content(content);
 
         let chunk = TranscriptChunk::from_hash(content_hash, 5, content.len() as u64);
 
@@ -658,7 +725,7 @@ pub mod tests {
 
     #[test]
     fn test_transcript_chunk_serde_roundtrip() {
-        let chunk = TranscriptChunk::new(b"Serializable content", 42);
+        let chunk = TranscriptChunk::try_new(b"Serializable content", 42).unwrap();
         let json = serde_json::to_string(&chunk).unwrap();
         let deserialized: TranscriptChunk = serde_json::from_str(&json).unwrap();
 
@@ -690,9 +757,9 @@ pub mod tests {
 
     #[test]
     fn test_empty_chunks_chain_root() {
-        let binding = AatTranscriptBinding::new(vec![], vec![]);
+        let binding = AatTranscriptBinding::try_new(vec![], vec![]).unwrap();
 
-        let expected_root = *blake3::hash(&[]).as_bytes();
+        let expected_root = EventHasher::hash_content(&[]);
         assert_eq!(binding.transcript_chain_root_hash(), expected_root);
         assert!(binding.validate().is_ok());
     }
@@ -700,10 +767,13 @@ pub mod tests {
     #[test]
     fn test_single_chunk_chain_root() {
         let content = b"Single chunk content";
-        let chunk = TranscriptChunk::new(content, 0);
-        let expected_root = chunk.content_hash();
+        let chunk = TranscriptChunk::try_new(content, 0).unwrap();
 
-        let binding = AatTranscriptBinding::new(vec![chunk], vec![]);
+        let binding = AatTranscriptBinding::try_new(vec![chunk.clone()], vec![]).unwrap();
+
+        // Single chunk uses MerkleTree which applies domain separation
+        let tree = MerkleTree::new(std::iter::once(chunk.content_hash())).unwrap();
+        let expected_root = tree.root();
 
         assert_eq!(binding.transcript_chain_root_hash(), expected_root);
         assert!(binding.validate().is_ok());
@@ -711,16 +781,15 @@ pub mod tests {
 
     #[test]
     fn test_two_chunks_chain_root() {
-        let chunk1 = TranscriptChunk::new(b"First", 0);
-        let chunk2 = TranscriptChunk::new(b"Second", 1);
+        let chunk1 = TranscriptChunk::try_new(b"First", 0).unwrap();
+        let chunk2 = TranscriptChunk::try_new(b"Second", 1).unwrap();
 
-        // Expected: hash(chunk1_hash || chunk2_hash)
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&chunk1.content_hash());
-        hasher.update(&chunk2.content_hash());
-        let expected_root = *hasher.finalize().as_bytes();
+        let binding =
+            AatTranscriptBinding::try_new(vec![chunk1.clone(), chunk2.clone()], vec![]).unwrap();
 
-        let binding = AatTranscriptBinding::new(vec![chunk1, chunk2], vec![]);
+        // Build expected using MerkleTree
+        let tree = MerkleTree::new([chunk1.content_hash(), chunk2.content_hash()]).unwrap();
+        let expected_root = tree.root();
 
         assert_eq!(binding.transcript_chain_root_hash(), expected_root);
         assert!(binding.validate().is_ok());
@@ -728,34 +797,24 @@ pub mod tests {
 
     #[test]
     fn test_three_chunks_chain_root() {
-        let chunk1 = TranscriptChunk::new(b"A", 0);
-        let chunk2 = TranscriptChunk::new(b"B", 1);
-        let chunk3 = TranscriptChunk::new(b"C", 2);
+        let chunk1 = TranscriptChunk::try_new(b"A", 0).unwrap();
+        let chunk2 = TranscriptChunk::try_new(b"B", 1).unwrap();
+        let chunk3 = TranscriptChunk::try_new(b"C", 2).unwrap();
 
-        // Level 0: [h1, h2, h3]
-        // Level 1: [hash(h1||h2), hash(h3||h3)]
-        // Level 2: [hash(l1_0||l1_1)]
+        let binding = AatTranscriptBinding::try_new(
+            vec![chunk1.clone(), chunk2.clone(), chunk3.clone()],
+            vec![],
+        )
+        .unwrap();
 
-        let h1 = chunk1.content_hash();
-        let h2 = chunk2.content_hash();
-        let h3 = chunk3.content_hash();
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&h1);
-        hasher.update(&h2);
-        let l1_0 = *hasher.finalize().as_bytes();
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&h3);
-        hasher.update(&h3); // Duplicate for odd count
-        let l1_1 = *hasher.finalize().as_bytes();
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&l1_0);
-        hasher.update(&l1_1);
-        let expected_root = *hasher.finalize().as_bytes();
-
-        let binding = AatTranscriptBinding::new(vec![chunk1, chunk2, chunk3], vec![]);
+        // Build expected using MerkleTree
+        let tree = MerkleTree::new([
+            chunk1.content_hash(),
+            chunk2.content_hash(),
+            chunk3.content_hash(),
+        ])
+        .unwrap();
+        let expected_root = tree.root();
 
         assert_eq!(binding.transcript_chain_root_hash(), expected_root);
         assert!(binding.validate().is_ok());
@@ -764,14 +823,14 @@ pub mod tests {
     #[test]
     fn test_chain_root_deterministic() {
         let chunks = vec![
-            TranscriptChunk::new(b"Chunk 1", 0),
-            TranscriptChunk::new(b"Chunk 2", 1),
-            TranscriptChunk::new(b"Chunk 3", 2),
-            TranscriptChunk::new(b"Chunk 4", 3),
+            TranscriptChunk::try_new(b"Chunk 1", 0).unwrap(),
+            TranscriptChunk::try_new(b"Chunk 2", 1).unwrap(),
+            TranscriptChunk::try_new(b"Chunk 3", 2).unwrap(),
+            TranscriptChunk::try_new(b"Chunk 4", 3).unwrap(),
         ];
 
-        let binding1 = AatTranscriptBinding::new(chunks.clone(), vec![]);
-        let binding2 = AatTranscriptBinding::new(chunks, vec![]);
+        let binding1 = AatTranscriptBinding::try_new(chunks.clone(), vec![]).unwrap();
+        let binding2 = AatTranscriptBinding::try_new(chunks, vec![]).unwrap();
 
         assert_eq!(
             binding1.transcript_chain_root_hash(),
@@ -781,17 +840,20 @@ pub mod tests {
 
     #[test]
     fn test_chain_root_order_matters() {
-        let chunk1 = TranscriptChunk::new(b"First", 0);
-        let chunk2 = TranscriptChunk::new(b"Second", 1);
+        let chunk1 = TranscriptChunk::try_new(b"First", 0).unwrap();
+        let chunk2 = TranscriptChunk::try_new(b"Second", 1).unwrap();
 
-        let binding1 = AatTranscriptBinding::new(vec![chunk1.clone(), chunk2.clone()], vec![]);
+        let binding1 =
+            AatTranscriptBinding::try_new(vec![chunk1.clone(), chunk2.clone()], vec![]).unwrap();
 
         // Create with different sequence numbers to reorder
         let reordered_chunk1 =
             TranscriptChunk::from_hash(chunk2.content_hash(), 0, chunk2.content_size());
         let reordered_chunk2 =
             TranscriptChunk::from_hash(chunk1.content_hash(), 1, chunk1.content_size());
-        let binding2 = AatTranscriptBinding::new(vec![reordered_chunk1, reordered_chunk2], vec![]);
+        let binding2 =
+            AatTranscriptBinding::try_new(vec![reordered_chunk1, reordered_chunk2], vec![])
+                .unwrap();
 
         // Different order = different root
         assert_ne!(
@@ -801,12 +863,45 @@ pub mod tests {
     }
 
     // =========================================================================
+    // Domain Separation Tests (Duplicate Leaf Attack Prevention)
+    // =========================================================================
+
+    #[test]
+    fn test_merkle_tree_domain_separation() {
+        // Verify that we're using the domain-separated Merkle tree
+        // This ensures [A, B, C] produces a different root than [A, B, C, C]
+        let chunk1 = TranscriptChunk::try_new(b"A", 0).unwrap();
+        let chunk2 = TranscriptChunk::try_new(b"B", 1).unwrap();
+        let chunk3 = TranscriptChunk::try_new(b"C", 2).unwrap();
+        // chunk3_dup has the same content hash as chunk3
+        let chunk3_dup =
+            TranscriptChunk::from_hash(chunk3.content_hash(), 3, chunk3.content_size());
+
+        let binding_3 = AatTranscriptBinding::try_new(
+            vec![chunk1.clone(), chunk2.clone(), chunk3.clone()],
+            vec![],
+        )
+        .unwrap();
+
+        let binding_4 =
+            AatTranscriptBinding::try_new(vec![chunk1, chunk2, chunk3, chunk3_dup], vec![])
+                .unwrap();
+
+        // With proper domain separation, these should have different roots
+        // even though the last two chunks in binding_4 have the same hash
+        assert_ne!(
+            binding_3.transcript_chain_root_hash(),
+            binding_4.transcript_chain_root_hash()
+        );
+    }
+
+    // =========================================================================
     // AatTranscriptBinding Validation Tests
     // =========================================================================
 
     #[test]
     fn test_validate_chain_root_mismatch() {
-        let chunk = TranscriptChunk::new(b"Content", 0);
+        let chunk = TranscriptChunk::try_new(b"Content", 0).unwrap();
         let wrong_root = [0xAB; 32];
 
         let binding = AatTranscriptBinding::from_parts(vec![chunk], wrong_root, vec![]);
@@ -826,7 +921,8 @@ pub mod tests {
 
         // Compute the root from these chunks
         let root =
-            AatTranscriptBinding::compute_chain_root_from_chunks(&[chunk1.clone(), chunk2.clone()]);
+            AatTranscriptBinding::compute_chain_root_from_chunks(&[chunk1.clone(), chunk2.clone()])
+                .unwrap();
         let binding = AatTranscriptBinding::from_parts(vec![chunk1, chunk2], root, vec![]);
 
         let result = binding.validate();
@@ -840,33 +936,30 @@ pub mod tests {
     }
 
     #[test]
-    fn test_validate_duplicate_chunk_hash() {
-        // Create chunks with the same content (same hash)
+    fn test_validate_duplicate_chunk_hash_allowed() {
+        // Duplicate chunk hashes are now allowed - legitimate transcripts
+        // may contain identical messages
         let content = b"Duplicate content";
-        let chunk1 = TranscriptChunk::new(content, 0);
+        let chunk1 = TranscriptChunk::try_new(content, 0).unwrap();
         let chunk2 = TranscriptChunk::from_hash(chunk1.content_hash(), 1, chunk1.content_size());
 
-        let root =
-            AatTranscriptBinding::compute_chain_root_from_chunks(&[chunk1.clone(), chunk2.clone()]);
-        let binding = AatTranscriptBinding::from_parts(vec![chunk1, chunk2], root, vec![]);
+        let binding =
+            AatTranscriptBinding::try_new(vec![chunk1, chunk2], vec![]).expect("should succeed");
 
-        let result = binding.validate();
-        assert!(matches!(
-            result,
-            Err(TranscriptBindingError::DuplicateChunkHash { sequence: 1 })
-        ));
+        // Validation should pass - duplicates are allowed
+        assert!(binding.validate().is_ok());
     }
 
     #[test]
     fn test_validate_success() {
         let chunks = vec![
-            TranscriptChunk::new(b"Message 1", 0),
-            TranscriptChunk::new(b"Message 2", 1),
-            TranscriptChunk::new(b"Message 3", 2),
+            TranscriptChunk::try_new(b"Message 1", 0).unwrap(),
+            TranscriptChunk::try_new(b"Message 2", 1).unwrap(),
+            TranscriptChunk::try_new(b"Message 3", 2).unwrap(),
         ];
         let run_hashes = vec![[0x11; 32], [0x22; 32]];
 
-        let binding = AatTranscriptBinding::new(chunks, run_hashes);
+        let binding = AatTranscriptBinding::try_new(chunks, run_hashes).unwrap();
 
         assert!(binding.validate().is_ok());
     }
@@ -890,7 +983,7 @@ pub mod tests {
 
     #[test]
     fn test_too_many_run_hashes() {
-        let run_hashes: Vec<[u8; 32]> = (0..=MAX_RUN_TRANSCRIPT_HASHES)
+        let run_hashes: Vec<Hash> = (0..=MAX_RUN_TRANSCRIPT_HASHES)
             .map(|i| [i as u8; 32])
             .collect();
 
@@ -902,14 +995,70 @@ pub mod tests {
     }
 
     #[test]
-    fn test_at_max_chunks() {
-        // This test is expensive, so we use a smaller subset
-        let chunks: Vec<TranscriptChunk> = (0..100u64)
-            .map(|i| TranscriptChunk::from_hash([i as u8; 32], i, 10))
+    fn test_at_max_chunks_boundary() {
+        // Test exactly at the MAX_TRANSCRIPT_CHUNKS boundary
+        // Note: This test uses unique hashes to avoid MerkleTree issues
+        let chunks: Vec<TranscriptChunk> = (0..MAX_TRANSCRIPT_CHUNKS as u64)
+            .map(|i| {
+                // Create unique hashes by including sequence in the hash
+                let mut hash = [0u8; 32];
+                hash[0..8].copy_from_slice(&i.to_le_bytes());
+                TranscriptChunk::from_hash(hash, i, 10)
+            })
             .collect();
 
         let result = AatTranscriptBinding::try_new(chunks, vec![]);
-        assert!(result.is_ok());
+        assert!(
+            result.is_ok(),
+            "should accept exactly MAX_TRANSCRIPT_CHUNKS"
+        );
+    }
+
+    // =========================================================================
+    // Bounded Deserialization Tests (DoS Prevention)
+    // =========================================================================
+
+    #[test]
+    fn test_deserialize_rejects_too_many_chunks() {
+        // Create a wire format with too many chunks
+        let chunks: Vec<TranscriptChunkWire> = (0..=MAX_TRANSCRIPT_CHUNKS)
+            .map(|i| TranscriptChunkWire {
+                content_hash: [i as u8; 32],
+                sequence: i as u64,
+                content_size: 10,
+            })
+            .collect();
+
+        let wire = AatTranscriptBindingWire {
+            transcript_chunks: chunks,
+            transcript_chain_root_hash: [0u8; 32],
+            run_transcript_hashes: vec![],
+        };
+
+        let json = serde_json::to_string(&wire).unwrap();
+        let result: Result<AatTranscriptBinding, _> = serde_json::from_str(&json);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too many"));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_too_many_run_hashes() {
+        let run_hashes: Vec<[u8; 32]> = (0..=MAX_RUN_TRANSCRIPT_HASHES)
+            .map(|i| [i as u8; 32])
+            .collect();
+
+        let wire = AatTranscriptBindingWire {
+            transcript_chunks: vec![],
+            transcript_chain_root_hash: [0u8; 32],
+            run_transcript_hashes: run_hashes,
+        };
+
+        let json = serde_json::to_string(&wire).unwrap();
+        let result: Result<AatTranscriptBinding, _> = serde_json::from_str(&json);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too many"));
     }
 
     // =========================================================================
@@ -919,13 +1068,13 @@ pub mod tests {
     #[test]
     fn test_accessors() {
         let chunks = vec![
-            TranscriptChunk::new(b"A", 0),
-            TranscriptChunk::new(b"BB", 1),
-            TranscriptChunk::new(b"CCC", 2),
+            TranscriptChunk::try_new(b"A", 0).unwrap(),
+            TranscriptChunk::try_new(b"BB", 1).unwrap(),
+            TranscriptChunk::try_new(b"CCC", 2).unwrap(),
         ];
         let run_hashes = vec![[0x11; 32]];
 
-        let binding = AatTranscriptBinding::new(chunks, run_hashes);
+        let binding = AatTranscriptBinding::try_new(chunks, run_hashes).unwrap();
 
         assert_eq!(binding.chunk_count(), 3);
         assert_eq!(binding.total_content_size(), 1 + 2 + 3);
@@ -940,12 +1089,12 @@ pub mod tests {
     #[test]
     fn test_binding_serde_roundtrip() {
         let chunks = vec![
-            TranscriptChunk::new(b"First", 0),
-            TranscriptChunk::new(b"Second", 1),
+            TranscriptChunk::try_new(b"First", 0).unwrap(),
+            TranscriptChunk::try_new(b"Second", 1).unwrap(),
         ];
         let run_hashes = vec![[0x11; 32], [0x22; 32]];
 
-        let binding = AatTranscriptBinding::new(chunks, run_hashes);
+        let binding = AatTranscriptBinding::try_new(chunks, run_hashes).unwrap();
 
         let json = serde_json::to_string(&binding).unwrap();
         let deserialized: AatTranscriptBinding = serde_json::from_str(&json).unwrap();
@@ -973,16 +1122,16 @@ pub mod tests {
     #[test]
     fn test_compute_chain_root_matches_stored() {
         let chunks = vec![
-            TranscriptChunk::new(b"X", 0),
-            TranscriptChunk::new(b"Y", 1),
-            TranscriptChunk::new(b"Z", 2),
+            TranscriptChunk::try_new(b"X", 0).unwrap(),
+            TranscriptChunk::try_new(b"Y", 1).unwrap(),
+            TranscriptChunk::try_new(b"Z", 2).unwrap(),
         ];
 
-        let binding = AatTranscriptBinding::new(chunks, vec![]);
+        let binding = AatTranscriptBinding::try_new(chunks, vec![]).unwrap();
 
         // compute_chain_root should match the stored hash
         assert_eq!(
-            binding.compute_chain_root(),
+            binding.compute_chain_root().unwrap(),
             binding.transcript_chain_root_hash()
         );
     }
@@ -995,21 +1144,21 @@ pub mod tests {
     fn test_large_chunk_merkle_tree() {
         // Test with power of 2 chunks (no duplication needed)
         let chunks: Vec<TranscriptChunk> = (0..8u64)
-            .map(|i| TranscriptChunk::new(format!("Chunk {i}").as_bytes(), i))
+            .map(|i| TranscriptChunk::try_new(format!("Chunk {i}").as_bytes(), i).unwrap())
             .collect();
 
-        let binding = AatTranscriptBinding::new(chunks, vec![]);
+        let binding = AatTranscriptBinding::try_new(chunks, vec![]).unwrap();
         assert!(binding.validate().is_ok());
     }
 
     #[test]
     fn test_non_power_of_two_chunks() {
-        // Test with 7 chunks (requires duplication)
+        // Test with 7 chunks (requires padding for odd count)
         let chunks: Vec<TranscriptChunk> = (0..7u64)
-            .map(|i| TranscriptChunk::new(format!("Chunk {i}").as_bytes(), i))
+            .map(|i| TranscriptChunk::try_new(format!("Chunk {i}").as_bytes(), i).unwrap())
             .collect();
 
-        let binding = AatTranscriptBinding::new(chunks, vec![]);
+        let binding = AatTranscriptBinding::try_new(chunks, vec![]).unwrap();
         assert!(binding.validate().is_ok());
     }
 }

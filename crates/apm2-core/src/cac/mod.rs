@@ -244,8 +244,16 @@ pub use validator::{
     validate_cac_artifact,
 };
 
-// Re-export TranscriptChunk from FAC for CAC module discoverability
-// (Q-RFC-FAC-0005: Reuse TranscriptChunk from CAC module)
+// Re-export TranscriptChunk from FAC for CAC module discoverability.
+//
+// Design Note (Q-RFC-FAC-0005): The RFC specified "Reuse TranscriptChunk from
+// CAC module", but the implementation defines TranscriptChunk in FAC because:
+// 1. TranscriptChunk is semantically tied to AAT/FAC (Agent Acceptance Testing)
+// 2. It uses FAC-specific validation (sequence numbers, chain root binding)
+// 3. The consensus::merkle integration is FAC-specific (domain separation)
+//
+// We re-export here to maintain discoverability from CAC for consumers who
+// expect transcript types to be CAC-adjacent (e.g., pack_spec workflows).
 pub use crate::fac::transcript_binding::{
     MAX_CHUNK_CONTENT_BYTES, MAX_TRANSCRIPT_CHUNKS, TranscriptBindingError, TranscriptChunk,
 };
