@@ -1,3 +1,10 @@
+//! Security reproduction tests for the lease module.
+//!
+//! Note: Tests use the legacy `lease_issued_payload` function to verify
+//! backwards compatibility with events that lack tick data.
+
+#![allow(deprecated)]
+
 use super::error::LeaseError;
 use super::reducer::{LeaseReducer, helpers};
 use super::state::LeaseState;

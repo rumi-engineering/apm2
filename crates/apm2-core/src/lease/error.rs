@@ -129,4 +129,18 @@ pub enum LeaseError {
         /// The reason it is invalid.
         reason: String,
     },
+
+    /// Invalid tick timing: `expires_at_tick` must be greater than
+    /// `issued_at_tick`.
+    #[error(
+        "invalid tick timing for lease {lease_id}: expires_at_tick ({expires_at_tick}) must be greater than issued_at_tick ({issued_at_tick})"
+    )]
+    InvalidTickTiming {
+        /// The lease ID.
+        lease_id: String,
+        /// The `issued_at_tick` value.
+        issued_at_tick: u64,
+        /// The `expires_at_tick` value.
+        expires_at_tick: u64,
+    },
 }

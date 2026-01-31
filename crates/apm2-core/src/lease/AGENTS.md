@@ -88,6 +88,10 @@ pub struct Lease {
     pub issued_at: u64,
     /// Timestamp when the lease expires (Unix nanos).
     pub expires_at: u64,
+    /// Monotonic tick when the lease was issued (RFC-0016 HTF).
+    pub issued_at_tick: Option<HtfTick>,
+    /// Monotonic tick when the lease expires (RFC-0016 HTF).
+    pub expires_at_tick: Option<HtfTick>,
     /// Registrar signature over the lease issuance.
     pub registrar_signature: Vec<u8>,
     /// Number of times this lease has been renewed.
@@ -101,16 +105,25 @@ pub struct Lease {
 }
 ```
 
+**Time Model (RFC-0016 HTF):**
+- `issued_at_tick` / `expires_at_tick`: Authoritative for expiry checks (tick-based, monotonic)
+- `issued_at` / `expires_at`: Retained for backwards compatibility and audit (wall time)
+- Wall time changes do not affect lease validity when tick-based fields are present
+- SEC-CTRL-FAC-0015: Fail-closed behavior if tick data is missing
+
 **Invariants:**
 - [INV-0301] `lease_id` is unique across all leases; duplicates are rejected
 - [INV-0302] `expires_at > issued_at` (enforced at issuance; zero/negative duration rejected)
 - [INV-0303] `renewal_count` uses saturating arithmetic; cannot overflow
 - [INV-0304] `terminated_at` is set from lease's `expires_at` (not event's `expired_at`) to prevent pruning evasion
+- [INV-0305] Tick-based expiry is immune to wall-clock manipulation (RFC-0016 HTF)
 
 **Contracts:**
-- [CTR-0301] `is_expired_at(t)` returns `true` iff `state == Active && t >= expires_at`
-- [CTR-0302] `time_remaining(t)` returns `expires_at - t` (saturating to 0)
+- [CTR-0301] `is_expired_at_tick(t)` returns `true` iff `state == Active && t.value() >= expires_at_tick.value()` OR tick data missing (fail-closed)
+- [CTR-0302] `ticks_remaining(t)` returns `expires_at_tick.value() - t.value()` (saturating to 0), or 0 if tick data missing
 - [CTR-0303] `summary()` returns a lightweight view excluding signature bytes
+- [CTR-0304] `is_expired_at(t)` (DEPRECATED) uses wall time - prefer tick-based methods
+- [CTR-0305] `time_remaining(t)` (DEPRECATED) uses wall time - prefer tick-based methods
 
 ### `LeaseReducerState`
 
@@ -251,7 +264,12 @@ impl LeaseReducerState {
     /// Returns all leases for a given actor.
     pub fn leases_by_actor(&self, actor_id: &str) -> Vec<&Lease>;
 
+    /// Returns leases that have expired by the given tick (RFC-0016 HTF).
+    /// Tick-based, immune to wall-clock manipulation.
+    pub fn get_expired_but_active_at_tick(&self, current_tick: &HtfTick) -> Vec<&Lease>;
+
     /// Returns leases that have expired but are still marked Active.
+    /// DEPRECATED: Use get_expired_but_active_at_tick for tick-based expiry.
     pub fn get_expired_but_active(&self, current_time: u64) -> Vec<&Lease>;
 
     /// Returns count statistics.

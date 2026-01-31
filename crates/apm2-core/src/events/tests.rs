@@ -146,6 +146,10 @@ fn test_lease_issued_roundtrip() {
         registrar_signature: vec![0xde; 64],
         // HTF time envelope reference (RFC-0016): not yet populated.
         time_envelope_ref: None,
+        // Tick-based timing (RFC-0016 HTF).
+        issued_at_tick: 1000,
+        expires_at_tick: 5000,
+        tick_rate_hz: 1_000_000,
     };
 
     let lease_event = LeaseEvent {

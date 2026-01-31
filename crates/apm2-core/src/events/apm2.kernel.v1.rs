@@ -451,6 +451,18 @@ pub struct LeaseIssued {
     /// Binds the lease issuance to verifiable HTF time.
     #[prost(message, optional, tag = "7")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Monotonic tick when the lease was issued (RFC-0016 HTF).
+    /// Authoritative for timing decisions; immune to wall-clock manipulation.
+    #[prost(uint64, tag = "8")]
+    pub issued_at_tick: u64,
+    /// Monotonic tick when the lease expires (RFC-0016 HTF).
+    /// Authoritative for expiry checks; immune to wall-clock manipulation.
+    #[prost(uint64, tag = "9")]
+    pub expires_at_tick: u64,
+    /// Tick rate in Hz for issued_at_tick and expires_at_tick.
+    /// Required for interpreting tick values as durations.
+    #[prost(uint64, tag = "10")]
+    pub tick_rate_hz: u64,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -461,6 +473,18 @@ pub struct LeaseRenewed {
     pub new_expires_at: u64,
     #[prost(bytes = "vec", tag = "3")]
     pub registrar_signature: ::prost::alloc::vec::Vec<u8>,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the lease renewal to verifiable HTF time.
+    #[prost(message, optional, tag = "4")]
+    pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Monotonic tick when the renewed lease expires (RFC-0016 HTF).
+    /// Authoritative for expiry checks; immune to wall-clock manipulation.
+    #[prost(uint64, tag = "5")]
+    pub new_expires_at_tick: u64,
+    /// Tick rate in Hz for new_expires_at_tick.
+    /// Required for interpreting tick values as durations.
+    #[prost(uint64, tag = "6")]
+    pub tick_rate_hz: u64,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
