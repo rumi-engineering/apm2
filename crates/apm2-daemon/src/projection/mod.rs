@@ -32,6 +32,8 @@
 //! - [`IdempotencyKey`]: Key for idempotent projection operations
 //! - [`DivergenceWatchdog`]: Monitors for ledger/trunk divergence (TCK-00213)
 //! - [`FreezeRegistry`]: Tracks active intervention freezes
+//! - [`TamperEvent`]: Event emitted when tamper is detected (TCK-00214)
+//! - [`TamperResult`]: Result of handling a tamper event
 //!
 //! # Divergence Watchdog (TCK-00213)
 //!
@@ -42,9 +44,14 @@
 //! 2. Creates `InterventionFreeze` to halt admissions
 //! 3. Requires adjudication-based `InterventionUnfreeze` to resume
 //!
-//! # Future Work
+//! # Tamper Detection (TCK-00214)
 //!
-//! - Tamper detection (TCK-00214)
+//! Tamper detection identifies when GitHub status has been modified by a
+//! non-adapter identity. Unlike divergence (trunk HEAD mismatch), tamper
+//! detection focuses on status spoofing. When tamper is detected:
+//!
+//! 1. Emits `DefectRecord(PROJECTION_TAMPER)`
+//! 2. Overwrites GitHub status to match ledger truth
 //!
 //! # Example
 //!
@@ -83,7 +90,8 @@ pub use divergence_watchdog::{
     TimeSource,
 };
 pub use github_sync::{
-    GitHubAdapterConfig, GitHubProjectionAdapter, ProjectionAdapter, ProjectionError,
+    GitHubAdapterConfig, GitHubProjectionAdapter, ProjectionAdapter, ProjectionError, TamperEvent,
+    TamperResult,
 };
 pub use projection_receipt::{
     IdempotencyKey, MAX_STRING_LENGTH, ProjectedStatus, ProjectionReceipt,
