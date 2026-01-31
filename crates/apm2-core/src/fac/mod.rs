@@ -72,6 +72,7 @@ mod ci_attestation;
 mod ci_import;
 pub mod determinism;
 mod domain_separator;
+pub mod flake_class;
 mod key_policy;
 mod lease;
 mod policy_resolution;
@@ -122,6 +123,8 @@ pub use domain_separator::{
     POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX, QUARANTINE_EVENT_PREFIX, sign_with_domain,
     verify_with_domain,
 };
+// Re-export flake classification routing types
+pub use flake_class::FlakeRouting;
 // Re-export key policy types
 pub use key_policy::{
     CoiEnforcementLevel, CoiRule, CustodyDomain, DelegationRule, KeyBinding, KeyPolicy,
