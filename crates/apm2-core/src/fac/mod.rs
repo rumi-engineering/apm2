@@ -78,6 +78,7 @@ pub mod flake_class;
 pub mod harness_sandbox;
 mod key_policy;
 mod lease;
+pub mod merge_receipt;
 mod policy_resolution;
 mod receipt;
 pub mod risk_tier;
@@ -155,6 +156,11 @@ pub use key_policy::{
 pub use lease::{
     AatLeaseExtension, GateLease, GateLeaseBuilder, LeaseError, validate_custody_for_aat_lease,
     validate_custody_for_aat_lease_by_actor,
+};
+// Re-export merge receipt types
+pub use merge_receipt::{
+    MAX_GATE_RECEIPTS as MAX_MERGE_GATE_RECEIPTS, MergeReceipt, MergeReceiptError,
+    MergeReceiptProto,
 };
 // Re-export policy resolution types
 pub use policy_resolution::{

@@ -31,7 +31,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -71,6 +71,8 @@ pub mod kernel_event {
         InterventionUnfreeze(super::InterventionUnfreeze),
         #[prost(message, tag = "24")]
         AatResultReused(super::AatResultReused),
+        #[prost(message, tag = "25")]
+        MergeReceipt(super::MergeReceipt),
     }
 }
 /// ============================================================
@@ -1388,6 +1390,39 @@ pub struct NetworkPolicyProfile {
     /// When true, all egress not matching a rule is blocked.
     #[prost(bool, tag = "4")]
     pub deny_by_default: bool,
+}
+/// Emitted when a merge is executed atomically after observing the result.
+///
+/// This receipt binds the inputs (base, changeset, policy, receipts) to the
+/// observed outcome (result_selector), ensuring that the merge cannot be
+/// claimed for a different result than what was actually produced.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MergeReceipt {
+    /// Base selector (e.g., branch name "main")
+    #[prost(string, tag = "1")]
+    pub base_selector: ::prost::alloc::string::String,
+    /// Hash of the changeset being merged (32 bytes)
+    #[prost(bytes = "vec", tag = "2")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// List of gate receipt IDs that authorized this merge
+    #[prost(string, repeated, tag = "3")]
+    pub gate_receipt_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Policy hash that governed this merge decision (32 bytes)
+    #[prost(bytes = "vec", tag = "4")]
+    pub policy_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Observed result selector (e.g., new commit SHA)
+    #[prost(string, tag = "5")]
+    pub result_selector: ::prost::alloc::string::String,
+    /// Timestamp when the merge occurred (Unix nanos)
+    #[prost(uint64, tag = "6")]
+    pub merged_at: u64,
+    /// Actor who performed the merge
+    #[prost(string, tag = "7")]
+    pub gate_actor_id: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with MERGE_RECEIPT: domain (64 bytes)
+    #[prost(bytes = "vec", tag = "8")]
+    pub gate_signature: ::prost::alloc::vec::Vec<u8>,
 }
 /// Determinism status for AAT runs.
 /// Indicates whether multiple runs produced consistent terminal evidence.

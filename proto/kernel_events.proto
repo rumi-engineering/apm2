@@ -57,6 +57,7 @@ message KernelEvent {
     InterventionFreeze intervention_freeze = 22;
     InterventionUnfreeze intervention_unfreeze = 23;
     AATResultReused aat_result_reused = 24;
+    MergeReceipt merge_receipt = 25;
   }
 }
 
@@ -1137,4 +1138,32 @@ message NetworkPolicyProfile {
   // Deny-by-default flag (MUST be true).
   // When true, all egress not matching a rule is blocked.
   bool deny_by_default = 4;
+}
+
+// ============================================================
+// MERGE EVENTS
+// ============================================================
+
+// Emitted when a merge is executed atomically after observing the result.
+//
+// This receipt binds the inputs (base, changeset, policy, receipts) to the
+// observed outcome (result_selector), ensuring that the merge cannot be
+// claimed for a different result than what was actually produced.
+message MergeReceipt {
+  // Base selector (e.g., branch name "main")
+  string base_selector = 1;
+  // Hash of the changeset being merged (32 bytes)
+  bytes changeset_digest = 2;
+  // List of gate receipt IDs that authorized this merge
+  repeated string gate_receipt_ids = 3;
+  // Policy hash that governed this merge decision (32 bytes)
+  bytes policy_hash = 4;
+  // Observed result selector (e.g., new commit SHA)
+  string result_selector = 5;
+  // Timestamp when the merge occurred (Unix nanos)
+  uint64 merged_at = 6;
+  // Actor who performed the merge
+  string gate_actor_id = 7;
+  // Ed25519 signature over canonical bytes with MERGE_RECEIPT: domain (64 bytes)
+  bytes gate_signature = 8;
 }
