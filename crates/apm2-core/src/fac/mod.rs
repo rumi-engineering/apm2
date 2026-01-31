@@ -109,8 +109,10 @@ pub use determinism::{
     DeterminismEnvelope, DeterminismEnvelopeBuilder, DeterminismError,
     MAX_RUN_COUNT as MAX_DETERMINISM_RUN_COUNT,
     MAX_RUN_RECEIPT_HASHES as MAX_DETERMINISM_RUN_HASHES, REQUIRED_RUNS_DEFAULT,
-    REQUIRED_RUNS_HIGH, REQUIRED_RUNS_LOW, REQUIRED_RUNS_MED, RISK_TIER_HIGH, RISK_TIER_LOW,
-    RISK_TIER_MED, check_stability, compute_stability_digest, required_run_count,
+    REQUIRED_RUNS_HIGH, REQUIRED_RUNS_LOW, REQUIRED_RUNS_MED, REQUIRED_RUNS_TIER0,
+    REQUIRED_RUNS_TIER1, REQUIRED_RUNS_TIER2, REQUIRED_RUNS_TIER3, REQUIRED_RUNS_TIER4,
+    RISK_TIER_HIGH, RISK_TIER_LOW, RISK_TIER_MED, check_stability, compute_stability_digest,
+    required_run_count,
 };
 // Re-export domain separator constants and functions
 pub use domain_separator::{

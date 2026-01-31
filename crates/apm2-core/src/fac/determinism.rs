@@ -10,19 +10,23 @@
 //!
 //! The determinism envelope implements a **fail-closed** security posture:
 //!
-//! - Unknown risk tiers default to maximum required runs (3)
+//! - Uses the [`RiskTier`] enum for type-safe exhaustive matching
 //! - Stability checking requires explicit confirmation of identical digests
-//! - All digests use SHA-256 for cryptographic integrity
+//! - All digests use BLAKE3 for cryptographic integrity (project standard)
 //!
 //! # Required Run Counts by Risk Tier
 //!
 //! The `required_run_count` function maps risk tiers to minimum run
-//! requirements:
+//! requirements using the [`RiskTier`] enum. These mappings preserve
+//! backward compatibility with the legacy 3-tier system per SEC-CTRL-FAC-0012:
 //!
-//! - **HIGH (2)**: 3 runs required - maximum scrutiny for high-risk changes
-//! - **MED (1)**: 2 runs required - elevated scrutiny for medium-risk changes
-//! - **LOW (0)**: 1 run required - baseline verification for low-risk changes
-//! - **Unknown**: 3 runs required (fail-closed default)
+//! - **Tier4** (highest risk): 3 runs required - maximum scrutiny
+//! - **Tier3** (high risk): 3 runs required - elevated scrutiny
+//! - **Tier2** (medium-high risk): 3 runs required - preserves legacy HIGH
+//! - **Tier1** (low-medium risk): 2 runs required - preserves legacy MED
+//! - **Tier0** (lowest risk): 1 run required - minimal verification
+//!
+//! [`RiskTier`]: super::policy_resolution::RiskTier
 //!
 //! # Stability Checking
 //!
@@ -35,14 +39,14 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_core::fac::DeterminismStatus;
 //! use apm2_core::fac::determinism::{
 //!     DeterminismEnvelope, DeterminismEnvelopeBuilder, check_stability,
 //!     compute_stability_digest, required_run_count,
 //! };
+//! use apm2_core::fac::{DeterminismClass, DeterminismStatus, RiskTier};
 //!
-//! // Determine required runs for a high-risk change
-//! let runs = required_run_count(2); // HIGH risk
+//! // Determine required runs for a medium-high risk change (Tier2 = legacy HIGH)
+//! let runs = required_run_count(RiskTier::Tier2);
 //! assert_eq!(runs, 3);
 //!
 //! // Create run digests (simulating 3 identical runs)
@@ -65,7 +69,7 @@
 //!
 //! // Build envelope
 //! let envelope = DeterminismEnvelopeBuilder::new()
-//!     .determinism_class(2) // FullyDeterministic
+//!     .determinism_class(DeterminismClass::FullyDeterministic)
 //!     .run_count(3)
 //!     .run_receipt_hashes(run_hashes)
 //!     .terminal_evidence_digest(terminal_evidence_digest)
@@ -78,10 +82,10 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub use super::aat_receipt::DeterminismStatus;
+use super::aat_receipt::DeterminismStatus;
+use super::policy_resolution::{DeterminismClass, RiskTier};
 
 // =============================================================================
 // Resource Limits
@@ -95,36 +99,83 @@ pub const MAX_RUN_RECEIPT_HASHES: usize = 256;
 
 /// Maximum run count allowed. This bounds the `run_count` field to prevent
 /// resource exhaustion from excessive run requirements.
-pub const MAX_RUN_COUNT: u8 = 255;
+/// Must be >= `MAX_RUN_RECEIPT_HASHES` to avoid overflow.
+pub const MAX_RUN_COUNT: u32 = 256;
 
 // =============================================================================
-// Risk Tier Constants
+// Legacy Risk Tier Constants (Deprecated)
 // =============================================================================
+//
+// These constants map legacy risk tier numeric values to names.
+// Prefer using the RiskTier enum directly in new code.
 
 /// Risk tier value for LOW risk (minimal scrutiny).
+/// Deprecated: Use `RiskTier::Tier0` instead.
 pub const RISK_TIER_LOW: u8 = 0;
 
 /// Risk tier value for MEDIUM risk (elevated scrutiny).
+/// Deprecated: Use `RiskTier::Tier1` instead.
 pub const RISK_TIER_MED: u8 = 1;
 
 /// Risk tier value for HIGH risk (maximum scrutiny).
+/// Deprecated: Use `RiskTier::Tier2` instead.
 pub const RISK_TIER_HIGH: u8 = 2;
 
 // =============================================================================
 // Required Run Counts
 // =============================================================================
+//
+// SECURITY INVARIANT (SEC-CTRL-FAC-0012 Anti-Downgrade):
+// These run counts are designed to preserve backward compatibility with the
+// legacy 3-tier system while supporting the new 5-tier system. The key
+// constraint is that numeric risk values must never require fewer runs than
+// they did in the legacy system:
+//
+// Legacy mapping:
+//   LOW  (0) = 1 run
+//   MED  (1) = 2 runs
+//   HIGH (2) = 3 runs
+//
+// New tier mapping (preserves legacy semantics for values 0-2):
+//   Tier0 (0) = 1 run  (same as legacy LOW)
+//   Tier1 (1) = 2 runs (preserves legacy MED requirement)
+//   Tier2 (2) = 3 runs (preserves legacy HIGH requirement)
+//   Tier3 (3) = 3 runs (new tier, max scrutiny)
+//   Tier4 (4) = 3 runs (new tier, max scrutiny)
+//
+// DO NOT reduce these values without security review.
 
-/// Required run count for HIGH risk tier.
-pub const REQUIRED_RUNS_HIGH: u8 = 3;
+/// Required run count for Tier4 (highest risk).
+pub const REQUIRED_RUNS_TIER4: u32 = 3;
 
-/// Required run count for MEDIUM risk tier.
-pub const REQUIRED_RUNS_MED: u8 = 2;
+/// Required run count for Tier3 (high risk).
+pub const REQUIRED_RUNS_TIER3: u32 = 3;
 
-/// Required run count for LOW risk tier.
-pub const REQUIRED_RUNS_LOW: u8 = 1;
+/// Required run count for Tier2 (medium-high risk).
+/// Preserves legacy HIGH (value 2) = 3 runs requirement.
+pub const REQUIRED_RUNS_TIER2: u32 = 3;
+
+/// Required run count for Tier1 (low-medium risk).
+/// Preserves legacy MED (value 1) = 2 runs requirement.
+pub const REQUIRED_RUNS_TIER1: u32 = 2;
+
+/// Required run count for Tier0 (lowest risk).
+pub const REQUIRED_RUNS_TIER0: u32 = 1;
+
+/// Required run count for HIGH risk tier (legacy alias).
+/// Maps to Tier2+ in the new system.
+pub const REQUIRED_RUNS_HIGH: u32 = 3;
+
+/// Required run count for MEDIUM risk tier (legacy alias).
+/// Maps to Tier1 in the new system.
+pub const REQUIRED_RUNS_MED: u32 = 2;
+
+/// Required run count for LOW risk tier (legacy alias).
+/// Maps to Tier0 in the new system.
+pub const REQUIRED_RUNS_LOW: u32 = 1;
 
 /// Default required run count for unknown risk tiers (fail-closed).
-pub const REQUIRED_RUNS_DEFAULT: u8 = 3;
+pub const REQUIRED_RUNS_DEFAULT: u32 = 3;
 
 // =============================================================================
 // Error Types
@@ -146,7 +197,7 @@ pub enum DeterminismError {
     #[error("run_count ({run_count}) does not match run_receipt_hashes.len() ({hash_count})")]
     RunCountMismatch {
         /// The declared run count.
-        run_count: u8,
+        run_count: u32,
         /// The actual number of hashes.
         hash_count: usize,
     },
@@ -168,10 +219,6 @@ pub enum DeterminismError {
     )]
     StabilityDigestMismatch,
 
-    /// Invalid determinism class value.
-    #[error("invalid determinism_class value: {0}, must be 0-2")]
-    InvalidDeterminismClass(u8),
-
     /// Zero run count is not allowed.
     #[error("run_count must be at least 1")]
     ZeroRunCount,
@@ -183,46 +230,57 @@ pub enum DeterminismError {
 
 /// Returns the required run count for a given risk tier.
 ///
-/// This function implements the fail-closed security posture: unknown risk
-/// tiers default to the maximum required runs (3) to ensure adequate
-/// verification for unrecognized inputs.
+/// Uses the [`RiskTier`] enum from policy resolution to ensure type safety
+/// and exhaustive handling of all risk tiers.
+///
+/// # Security Invariant (SEC-CTRL-FAC-0012)
+///
+/// This mapping preserves backward compatibility with the legacy 3-tier system.
+/// Numeric risk values must never require fewer runs than they did previously:
+/// - Legacy LOW (0) required 1 run -> Tier0 requires 1 run
+/// - Legacy MED (1) required 2 runs -> Tier1 requires 2 runs
+/// - Legacy HIGH (2) required 3 runs -> Tier2 requires 3 runs
 ///
 /// # Arguments
 ///
-/// * `risk_tier` - The risk tier value (0=LOW, 1=MED, 2=HIGH)
+/// * `risk_tier` - The risk tier enum value
 ///
 /// # Returns
 ///
 /// The minimum number of runs required for the given risk tier:
-/// - `HIGH (2)`: 3 runs
-/// - `MED (1)`: 2 runs
-/// - `LOW (0)`: 1 run
-/// - Unknown: 3 runs (fail-closed default)
+/// - `Tier0` (lowest risk): 1 run
+/// - `Tier1` (low-medium risk): 2 runs (preserves legacy MED)
+/// - `Tier2` (medium-high risk): 3 runs (preserves legacy HIGH)
+/// - `Tier3` (high risk): 3 runs
+/// - `Tier4` (highest risk): 3 runs
 ///
 /// # Example
 ///
 /// ```rust
+/// use apm2_core::fac::RiskTier;
 /// use apm2_core::fac::determinism::required_run_count;
 ///
-/// assert_eq!(required_run_count(0), 1); // LOW
-/// assert_eq!(required_run_count(1), 2); // MED
-/// assert_eq!(required_run_count(2), 3); // HIGH
-/// assert_eq!(required_run_count(99), 3); // Unknown -> fail-closed
+/// assert_eq!(required_run_count(RiskTier::Tier0), 1);
+/// assert_eq!(required_run_count(RiskTier::Tier1), 2);
+/// assert_eq!(required_run_count(RiskTier::Tier2), 3);
+/// assert_eq!(required_run_count(RiskTier::Tier3), 3);
+/// assert_eq!(required_run_count(RiskTier::Tier4), 3);
 /// ```
 #[must_use]
-pub const fn required_run_count(risk_tier: u8) -> u8 {
+pub const fn required_run_count(risk_tier: RiskTier) -> u32 {
     match risk_tier {
-        RISK_TIER_LOW => REQUIRED_RUNS_LOW,
-        RISK_TIER_MED => REQUIRED_RUNS_MED,
-        RISK_TIER_HIGH => REQUIRED_RUNS_HIGH,
-        _ => REQUIRED_RUNS_DEFAULT, // Fail-closed: unknown tiers get maximum scrutiny
+        RiskTier::Tier0 => REQUIRED_RUNS_TIER0,
+        RiskTier::Tier1 => REQUIRED_RUNS_TIER1,
+        RiskTier::Tier2 => REQUIRED_RUNS_TIER2,
+        RiskTier::Tier3 => REQUIRED_RUNS_TIER3,
+        RiskTier::Tier4 => REQUIRED_RUNS_TIER4,
     }
 }
 
-/// Computes the stability digest from its components using SHA-256.
+/// Computes the stability digest from its components using BLAKE3.
 ///
 /// The stability digest is defined as:
-/// `SHA256(verdict || terminal_evidence_digest ||
+/// `BLAKE3(verdict || terminal_evidence_digest ||
 /// terminal_verifier_outputs_digest)`
 ///
 /// This provides a single hash that captures the "stable" aspects of the
@@ -236,7 +294,7 @@ pub const fn required_run_count(risk_tier: u8) -> u8 {
 ///
 /// # Returns
 ///
-/// A 32-byte SHA-256 hash of the concatenated inputs.
+/// A 32-byte BLAKE3 hash of the concatenated inputs.
 ///
 /// # Example
 ///
@@ -275,11 +333,11 @@ pub fn compute_stability_digest(
     terminal_evidence_digest: &[u8; 32],
     terminal_verifier_outputs_digest: &[u8; 32],
 ) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update([verdict]);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[verdict]);
     hasher.update(terminal_evidence_digest);
     hasher.update(terminal_verifier_outputs_digest);
-    hasher.finalize().into()
+    *hasher.finalize().as_bytes()
 }
 
 /// Checks stability by comparing run digests to determine if all runs
@@ -357,8 +415,10 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 ///
 /// # Fields
 ///
-/// - `determinism_class` - Determinism class (0=non, 1=soft, 2=fully)
-/// - `run_count` - Number of AAT runs executed
+/// - `determinism_class` - Determinism class enum (`NonDeterministic`,
+///   `SoftDeterministic`, `FullyDeterministic`)
+/// - `run_count` - Number of AAT runs executed (u32 to match
+///   `MAX_RUN_RECEIPT_HASHES`)
 /// - `run_receipt_hashes` - Hashes of individual run receipts
 /// - `terminal_evidence_digest` - Digest of machine-checkable terminal evidence
 /// - `terminal_verifier_outputs_digest` - Digest of terminal verifier outputs
@@ -373,11 +433,12 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeterminismEnvelope {
-    /// Determinism class (0=non, 1=soft, 2=fully).
-    pub determinism_class: u8,
+    /// Determinism class (`NonDeterministic`, `SoftDeterministic`,
+    /// `FullyDeterministic`).
+    pub determinism_class: DeterminismClass,
 
     /// Number of AAT runs executed.
-    pub run_count: u8,
+    pub run_count: u32,
 
     /// Hashes of individual run receipts.
     #[serde(with = "vec_hash_serde")]
@@ -439,7 +500,7 @@ impl DeterminismEnvelope {
     /// - `run_count` must be at least 1
     /// - `run_receipt_hashes.len()` must equal `run_count`
     /// - `run_receipt_hashes.len()` must not exceed `MAX_RUN_RECEIPT_HASHES`
-    /// - `determinism_class` must be 0, 1, or 2
+    /// - `determinism_class` is validated by being a proper enum variant
     ///
     /// # Returns
     ///
@@ -455,7 +516,7 @@ impl DeterminismEnvelope {
         }
 
         // Validate run_count matches run_receipt_hashes.len()
-        if usize::from(self.run_count) != self.run_receipt_hashes.len() {
+        if (self.run_count as usize) != self.run_receipt_hashes.len() {
             return Err(DeterminismError::RunCountMismatch {
                 run_count: self.run_count,
                 hash_count: self.run_receipt_hashes.len(),
@@ -471,12 +532,8 @@ impl DeterminismEnvelope {
             });
         }
 
-        // Validate determinism_class
-        if self.determinism_class > 2 {
-            return Err(DeterminismError::InvalidDeterminismClass(
-                self.determinism_class,
-            ));
-        }
+        // determinism_class is validated by the type system (DeterminismClass enum)
+        // No additional validation needed
 
         Ok(())
     }
@@ -530,8 +587,8 @@ impl DeterminismEnvelope {
 /// Builder for constructing [`DeterminismEnvelope`] instances with validation.
 #[derive(Debug, Default)]
 pub struct DeterminismEnvelopeBuilder {
-    determinism_class: Option<u8>,
-    run_count: Option<u8>,
+    determinism_class: Option<DeterminismClass>,
+    run_count: Option<u32>,
     run_receipt_hashes: Option<Vec<[u8; 32]>>,
     terminal_evidence_digest: Option<[u8; 32]>,
     terminal_verifier_outputs_digest: Option<[u8; 32]>,
@@ -545,16 +602,16 @@ impl DeterminismEnvelopeBuilder {
         Self::default()
     }
 
-    /// Sets the determinism class (0=non, 1=soft, 2=fully).
+    /// Sets the determinism class.
     #[must_use]
-    pub const fn determinism_class(mut self, class: u8) -> Self {
+    pub const fn determinism_class(mut self, class: DeterminismClass) -> Self {
         self.determinism_class = Some(class);
         self
     }
 
     /// Sets the run count.
     #[must_use]
-    pub const fn run_count(mut self, count: u8) -> Self {
+    pub const fn run_count(mut self, count: u32) -> Self {
         self.run_count = Some(count);
         self
     }
@@ -637,29 +694,50 @@ pub mod tests {
     // =========================================================================
 
     #[test]
-    fn test_required_run_count_low_risk() {
-        assert_eq!(required_run_count(RISK_TIER_LOW), REQUIRED_RUNS_LOW);
-        assert_eq!(required_run_count(0), 1);
+    fn test_required_run_count_tier0() {
+        assert_eq!(required_run_count(RiskTier::Tier0), REQUIRED_RUNS_TIER0);
+        assert_eq!(required_run_count(RiskTier::Tier0), 1);
     }
 
     #[test]
-    fn test_required_run_count_med_risk() {
-        assert_eq!(required_run_count(RISK_TIER_MED), REQUIRED_RUNS_MED);
-        assert_eq!(required_run_count(1), 2);
+    fn test_required_run_count_tier1() {
+        assert_eq!(required_run_count(RiskTier::Tier1), REQUIRED_RUNS_TIER1);
+        // Preserves legacy MED (value 1) = 2 runs requirement
+        assert_eq!(required_run_count(RiskTier::Tier1), 2);
     }
 
     #[test]
-    fn test_required_run_count_high_risk() {
-        assert_eq!(required_run_count(RISK_TIER_HIGH), REQUIRED_RUNS_HIGH);
-        assert_eq!(required_run_count(2), 3);
+    fn test_required_run_count_tier2() {
+        assert_eq!(required_run_count(RiskTier::Tier2), REQUIRED_RUNS_TIER2);
+        // Preserves legacy HIGH (value 2) = 3 runs requirement
+        assert_eq!(required_run_count(RiskTier::Tier2), 3);
     }
 
     #[test]
-    fn test_required_run_count_unknown_fail_closed() {
-        // Unknown risk tiers should fail-closed to maximum runs
-        assert_eq!(required_run_count(3), REQUIRED_RUNS_DEFAULT);
-        assert_eq!(required_run_count(99), REQUIRED_RUNS_DEFAULT);
-        assert_eq!(required_run_count(255), REQUIRED_RUNS_DEFAULT);
+    fn test_required_run_count_tier3() {
+        assert_eq!(required_run_count(RiskTier::Tier3), REQUIRED_RUNS_TIER3);
+        assert_eq!(required_run_count(RiskTier::Tier3), 3);
+    }
+
+    #[test]
+    fn test_required_run_count_tier4() {
+        assert_eq!(required_run_count(RiskTier::Tier4), REQUIRED_RUNS_TIER4);
+        assert_eq!(required_run_count(RiskTier::Tier4), 3);
+    }
+
+    #[test]
+    fn test_required_run_count_exhaustive() {
+        // Verify all tiers are handled (exhaustive match)
+        for tier in [
+            RiskTier::Tier0,
+            RiskTier::Tier1,
+            RiskTier::Tier2,
+            RiskTier::Tier3,
+            RiskTier::Tier4,
+        ] {
+            // Should not panic - proves exhaustive handling
+            let _ = required_run_count(tier);
+        }
     }
 
     // =========================================================================
@@ -787,7 +865,7 @@ pub mod tests {
         );
 
         DeterminismEnvelopeBuilder::new()
-            .determinism_class(2)
+            .determinism_class(DeterminismClass::FullyDeterministic)
             .run_count(3)
             .run_receipt_hashes(vec![[0x42; 32], [0x42; 32], [0x42; 32]])
             .terminal_evidence_digest(terminal_evidence_digest)
@@ -800,7 +878,10 @@ pub mod tests {
     #[test]
     fn test_builder_creates_valid_envelope() {
         let envelope = create_test_envelope();
-        assert_eq!(envelope.determinism_class, 2);
+        assert_eq!(
+            envelope.determinism_class,
+            DeterminismClass::FullyDeterministic
+        );
         assert_eq!(envelope.run_count, 3);
         assert_eq!(envelope.run_receipt_hashes.len(), 3);
     }
@@ -808,7 +889,7 @@ pub mod tests {
     #[test]
     fn test_builder_missing_field() {
         let result = DeterminismEnvelopeBuilder::new()
-            .determinism_class(2)
+            .determinism_class(DeterminismClass::FullyDeterministic)
             // Missing other fields
             .build();
 
@@ -832,7 +913,7 @@ pub mod tests {
         );
 
         let result = DeterminismEnvelopeBuilder::new()
-            .determinism_class(2)
+            .determinism_class(DeterminismClass::FullyDeterministic)
             .run_count(5) // Mismatch: says 5
             .run_receipt_hashes(vec![[0x42; 32], [0x42; 32], [0x42; 32]]) // But only 3
             .terminal_evidence_digest(terminal_evidence_digest)
@@ -860,7 +941,7 @@ pub mod tests {
         );
 
         let result = DeterminismEnvelopeBuilder::new()
-            .determinism_class(2)
+            .determinism_class(DeterminismClass::FullyDeterministic)
             .run_count(0)
             .run_receipt_hashes(vec![])
             .terminal_evidence_digest(terminal_evidence_digest)
@@ -869,31 +950,6 @@ pub mod tests {
             .build();
 
         assert!(matches!(result, Err(DeterminismError::ZeroRunCount)));
-    }
-
-    #[test]
-    fn test_envelope_validate_invalid_determinism_class() {
-        let terminal_evidence_digest = [0x11; 32];
-        let terminal_verifier_outputs_digest = [0x22; 32];
-        let stability_digest = compute_stability_digest(
-            1,
-            &terminal_evidence_digest,
-            &terminal_verifier_outputs_digest,
-        );
-
-        let result = DeterminismEnvelopeBuilder::new()
-            .determinism_class(3) // Invalid: must be 0-2
-            .run_count(1)
-            .run_receipt_hashes(vec![[0x42; 32]])
-            .terminal_evidence_digest(terminal_evidence_digest)
-            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
-            .stability_digest(stability_digest)
-            .build();
-
-        assert!(matches!(
-            result,
-            Err(DeterminismError::InvalidDeterminismClass(3))
-        ));
     }
 
     #[test]
@@ -910,10 +966,10 @@ pub mod tests {
         let too_many_hashes: Vec<[u8; 32]> =
             (0..=MAX_RUN_RECEIPT_HASHES).map(|_| [0x42; 32]).collect();
 
-        // Build envelope manually to bypass run_count u8 limit
+        // Build envelope manually with matching run_count
         let envelope = DeterminismEnvelope {
-            determinism_class: 2,
-            run_count: 255, // Max u8, but we have 257 hashes
+            determinism_class: DeterminismClass::FullyDeterministic,
+            run_count: 257, // Now u32 can hold 257
             run_receipt_hashes: too_many_hashes,
             terminal_evidence_digest,
             terminal_verifier_outputs_digest,
@@ -921,11 +977,10 @@ pub mod tests {
         };
 
         let result = envelope.validate();
-        // First error will be RunCountMismatch because run_count (255) != hash_count
-        // (257)
+        // Should fail on CollectionTooLarge
         assert!(matches!(
             result,
-            Err(DeterminismError::RunCountMismatch { .. })
+            Err(DeterminismError::CollectionTooLarge { .. })
         ));
     }
 
@@ -950,7 +1005,7 @@ pub mod tests {
         );
 
         let envelope = DeterminismEnvelopeBuilder::new()
-            .determinism_class(2)
+            .determinism_class(DeterminismClass::FullyDeterministic)
             .run_count(3)
             .run_receipt_hashes(vec![[0x42; 32], [0x42; 32], [0x99; 32]]) // Last differs
             .terminal_evidence_digest(terminal_evidence_digest)
@@ -1024,12 +1079,6 @@ pub mod tests {
         assert!(err.to_string().contains("run_count (5)"));
         assert!(err.to_string().contains("(3)"));
 
-        let err = DeterminismError::InvalidDeterminismClass(5);
-        assert!(
-            err.to_string()
-                .contains("invalid determinism_class value: 5")
-        );
-
         let err = DeterminismError::ZeroRunCount;
         assert!(err.to_string().contains("must be at least 1"));
     }
@@ -1054,8 +1103,46 @@ pub mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_max_constants() {
         assert_eq!(MAX_RUN_RECEIPT_HASHES, 256);
-        assert_eq!(MAX_RUN_COUNT, 255);
+        assert_eq!(MAX_RUN_COUNT, 256);
+        // Ensure MAX_RUN_COUNT >= MAX_RUN_RECEIPT_HASHES to prevent overflow
+        // Note: MAX_RUN_RECEIPT_HASHES is 256 which fits in u32
+        assert!(MAX_RUN_COUNT >= MAX_RUN_RECEIPT_HASHES as u32);
+    }
+
+    // =========================================================================
+    // DeterminismClass Type Safety Tests
+    // =========================================================================
+
+    #[test]
+    fn test_determinism_class_all_variants() {
+        // Test all variants work correctly
+        for class in [
+            DeterminismClass::NonDeterministic,
+            DeterminismClass::SoftDeterministic,
+            DeterminismClass::FullyDeterministic,
+        ] {
+            let terminal_evidence_digest = [0x11; 32];
+            let terminal_verifier_outputs_digest = [0x22; 32];
+            let stability_digest = compute_stability_digest(
+                1,
+                &terminal_evidence_digest,
+                &terminal_verifier_outputs_digest,
+            );
+
+            let envelope = DeterminismEnvelopeBuilder::new()
+                .determinism_class(class)
+                .run_count(1)
+                .run_receipt_hashes(vec![[0x42; 32]])
+                .terminal_evidence_digest(terminal_evidence_digest)
+                .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+                .stability_digest(stability_digest)
+                .build()
+                .expect("valid envelope");
+
+            assert_eq!(envelope.determinism_class, class);
+        }
     }
 }
