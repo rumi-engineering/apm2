@@ -1053,6 +1053,127 @@ pub struct GateReceipt {
     #[prost(bytes = "vec", tag = "11")]
     pub receipt_signature: ::prost::alloc::vec::Vec<u8>,
 }
+/// Output from a terminal verifier.
+/// Terminal verifiers provide ground truth (exit codes, snapshot diffs, etc.).
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TerminalVerifierOutput {
+    /// Kind of verifier: exit_code, snapshot_diff, structured_test_report, invariant_check
+    #[prost(string, tag = "1")]
+    pub verifier_kind: ::prost::alloc::string::String,
+    /// Digest of the verifier output content (32 bytes).
+    #[prost(bytes = "vec", tag = "2")]
+    pub output_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Whether the machine predicate was satisfied.
+    #[prost(bool, tag = "3")]
+    pub predicate_satisfied: bool,
+}
+/// Attestation metadata for AAT execution environment.
+/// Provides evidence chain for runtime environment verification.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AatAttestation {
+    /// Digest of the container image used (32 bytes).
+    #[prost(bytes = "vec", tag = "1")]
+    pub container_image_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Digests of toolchain components (each 32 bytes).
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub toolchain_digests: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Identity key ID of the runner.
+    #[prost(string, tag = "3")]
+    pub runner_identity_key_id: ::prost::alloc::string::String,
+    /// Hash of the network policy profile (32 bytes).
+    #[prost(bytes = "vec", tag = "4")]
+    pub network_policy_profile_hash: ::prost::alloc::vec::Vec<u8>,
+}
+/// Typed payload for AAT gate receipts (22 required fields).
+/// Stored in CAS and referenced by payload_hash from GateReceipt envelope.
+///
+/// Invariants:
+/// - view_commitment_hash matches FAC-00 output
+/// - rcp_manifest_hash matches FAC-02 output for profile
+/// - run_receipt_hashes.len() == run_count
+/// - transcript_chain_root_hash derivable from transcript_bundle_hash
+/// - artifact_manifest_hash references CAS ArtifactManifest
+/// - At least one terminal_verifier_output present for PASS
+/// - predicate_satisfied == true for all verifier outputs when verdict == PASS
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AatGateReceipt {
+    /// ============== View commitment binding (fields 1-4) ==============
+    /// Hash binding to view commitment from FAC-00 (32 bytes).
+    #[prost(bytes = "vec", tag = "1")]
+    pub view_commitment_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Hash of the RCP manifest for this profile (32 bytes).
+    #[prost(bytes = "vec", tag = "2")]
+    pub rcp_manifest_hash: ::prost::alloc::vec::Vec<u8>,
+    /// RCP profile identifier.
+    #[prost(string, tag = "3")]
+    pub rcp_profile_id: ::prost::alloc::string::String,
+    /// Policy hash for anti-downgrade verification (32 bytes).
+    #[prost(bytes = "vec", tag = "4")]
+    pub policy_hash: ::prost::alloc::vec::Vec<u8>,
+    /// ============== Determinism tracking (fields 5-13) ==============
+    /// Determinism class (0=non, 1=soft, 2=fully).
+    #[prost(uint32, tag = "5")]
+    pub determinism_class: u32,
+    /// Whether terminal evidence was stable across runs.
+    #[prost(enumeration = "DeterminismStatus", tag = "6")]
+    pub determinism_status: i32,
+    /// Classification of flakiness when mismatch occurs.
+    #[prost(enumeration = "FlakeClass", tag = "7")]
+    pub flake_class: i32,
+    /// Number of AAT runs executed.
+    #[prost(uint32, tag = "8")]
+    pub run_count: u32,
+    /// Hashes of individual run receipts (each 32 bytes, len == run_count).
+    #[prost(bytes = "vec", repeated, tag = "9")]
+    pub run_receipt_hashes: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Digest of machine-checkable terminal evidence (32 bytes).
+    #[prost(bytes = "vec", tag = "10")]
+    pub terminal_evidence_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Digest of observational evidence (logs, traces) - excluded from determinism (32 bytes).
+    #[prost(bytes = "vec", tag = "11")]
+    pub observational_evidence_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Digest of terminal verifier outputs (32 bytes).
+    #[prost(bytes = "vec", tag = "12")]
+    pub terminal_verifier_outputs_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Stability digest = hash(verdict, terminal_evidence_digest, terminal_verifier_outputs_digest) (32 bytes).
+    #[prost(bytes = "vec", tag = "13")]
+    pub stability_digest: ::prost::alloc::vec::Vec<u8>,
+    /// ============== Verdict (field 14) ==============
+    /// AAT outcome verdict.
+    #[prost(enumeration = "AatVerdict", tag = "14")]
+    pub verdict: i32,
+    /// ============== Evidence binding (fields 15-19) ==============
+    /// Root hash of the transcript chain (32 bytes).
+    #[prost(bytes = "vec", tag = "15")]
+    pub transcript_chain_root_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Hash of the transcript bundle in CAS (32 bytes).
+    #[prost(bytes = "vec", tag = "16")]
+    pub transcript_bundle_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Hash of the artifact manifest in CAS (32 bytes).
+    #[prost(bytes = "vec", tag = "17")]
+    pub artifact_manifest_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Terminal verifier outputs with predicate satisfaction.
+    #[prost(message, repeated, tag = "18")]
+    pub terminal_verifier_outputs: ::prost::alloc::vec::Vec<TerminalVerifierOutput>,
+    /// Hash of the verifier policy (32 bytes).
+    #[prost(bytes = "vec", tag = "19")]
+    pub verifier_policy_hash: ::prost::alloc::vec::Vec<u8>,
+    /// ============== Risk tier (fields 20-21) ==============
+    /// Selection policy identifier.
+    #[prost(string, tag = "20")]
+    pub selection_policy_id: ::prost::alloc::string::String,
+    /// Risk tier for AAT selection (0-4: Tier0-Tier4).
+    /// Stored as uint32 for fidelity preservation across proto roundtrips.
+    #[prost(uint32, tag = "21")]
+    pub risk_tier: u32,
+    /// ============== Attestation (field 22) ==============
+    /// Execution environment attestation.
+    #[prost(message, optional, tag = "22")]
+    pub attestation: ::core::option::Option<AatAttestation>,
+}
 /// Emitted when divergence is detected between the ledger's MergeReceipt
 /// and the external trunk HEAD. This freezes the specified scope to
 /// prevent further admissions until adjudication.
@@ -1122,6 +1243,164 @@ pub struct InterventionUnfreeze {
     /// Reference to the time envelope for temporal authority.
     #[prost(string, tag = "7")]
     pub time_envelope_ref: ::prost::alloc::string::String,
+}
+/// Determinism status for AAT runs.
+/// Indicates whether multiple runs produced consistent terminal evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DeterminismStatus {
+    /// Unspecified status (invalid).
+    Unspecified = 0,
+    /// All runs produced identical terminal evidence.
+    Stable = 1,
+    /// Runs produced different terminal evidence.
+    Mismatch = 2,
+}
+impl DeterminismStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "DETERMINISM_STATUS_UNSPECIFIED",
+            Self::Stable => "DETERMINISM_STATUS_STABLE",
+            Self::Mismatch => "DETERMINISM_STATUS_MISMATCH",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DETERMINISM_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "DETERMINISM_STATUS_STABLE" => Some(Self::Stable),
+            "DETERMINISM_STATUS_MISMATCH" => Some(Self::Mismatch),
+            _ => None,
+        }
+    }
+}
+/// Classification of flakiness when determinism mismatch occurs.
+/// Used for routing to appropriate quarantine/remediation paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FlakeClass {
+    /// Unspecified class (invalid).
+    Unspecified = 0,
+    /// Deterministic failure - consistent FAIL across all runs.
+    DeterministicFail = 1,
+    /// Flakiness due to test harness issues (e.g., timing, resource contention).
+    HarnessFlake = 2,
+    /// Flakiness due to environment drift (e.g., dependency version mismatch).
+    EnvironmentDrift = 3,
+    /// Test-level non-semantic difference (e.g., output format changes).
+    TestNonsemantic = 4,
+    /// Code-level non-semantic difference (e.g., timestamps, random IDs).
+    CodeNonsemantic = 5,
+    /// Unknown flakiness cause requiring investigation.
+    Unknown = 6,
+}
+impl FlakeClass {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FLAKE_CLASS_UNSPECIFIED",
+            Self::DeterministicFail => "FLAKE_CLASS_DETERMINISTIC_FAIL",
+            Self::HarnessFlake => "FLAKE_CLASS_HARNESS_FLAKE",
+            Self::EnvironmentDrift => "FLAKE_CLASS_ENVIRONMENT_DRIFT",
+            Self::TestNonsemantic => "FLAKE_CLASS_TEST_NONSEMANTIC",
+            Self::CodeNonsemantic => "FLAKE_CLASS_CODE_NONSEMANTIC",
+            Self::Unknown => "FLAKE_CLASS_UNKNOWN",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FLAKE_CLASS_UNSPECIFIED" => Some(Self::Unspecified),
+            "FLAKE_CLASS_DETERMINISTIC_FAIL" => Some(Self::DeterministicFail),
+            "FLAKE_CLASS_HARNESS_FLAKE" => Some(Self::HarnessFlake),
+            "FLAKE_CLASS_ENVIRONMENT_DRIFT" => Some(Self::EnvironmentDrift),
+            "FLAKE_CLASS_TEST_NONSEMANTIC" => Some(Self::TestNonsemantic),
+            "FLAKE_CLASS_CODE_NONSEMANTIC" => Some(Self::CodeNonsemantic),
+            "FLAKE_CLASS_UNKNOWN" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+/// AAT verdict outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AatVerdict {
+    /// Unspecified verdict (invalid).
+    Unspecified = 0,
+    /// All acceptance criteria passed.
+    Pass = 1,
+    /// One or more acceptance criteria failed.
+    Fail = 2,
+    /// Additional input required to determine outcome.
+    NeedsInput = 3,
+}
+impl AatVerdict {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AAT_VERDICT_UNSPECIFIED",
+            Self::Pass => "AAT_VERDICT_PASS",
+            Self::Fail => "AAT_VERDICT_FAIL",
+            Self::NeedsInput => "AAT_VERDICT_NEEDS_INPUT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AAT_VERDICT_UNSPECIFIED" => Some(Self::Unspecified),
+            "AAT_VERDICT_PASS" => Some(Self::Pass),
+            "AAT_VERDICT_FAIL" => Some(Self::Fail),
+            "AAT_VERDICT_NEEDS_INPUT" => Some(Self::NeedsInput),
+            _ => None,
+        }
+    }
+}
+/// Risk tier for AAT selection policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AatRiskTier {
+    /// Unspecified tier (invalid).
+    Unspecified = 0,
+    /// High risk - AAT always required.
+    High = 1,
+    /// Medium risk - AAT required for sensitive domains.
+    Med = 2,
+    /// Low risk - AAT sampled with nightly full coverage.
+    Low = 3,
+}
+impl AatRiskTier {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AAT_RISK_TIER_UNSPECIFIED",
+            Self::High => "AAT_RISK_TIER_HIGH",
+            Self::Med => "AAT_RISK_TIER_MED",
+            Self::Low => "AAT_RISK_TIER_LOW",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AAT_RISK_TIER_UNSPECIFIED" => Some(Self::Unspecified),
+            "AAT_RISK_TIER_HIGH" => Some(Self::High),
+            "AAT_RISK_TIER_MED" => Some(Self::Med),
+            "AAT_RISK_TIER_LOW" => Some(Self::Low),
+            _ => None,
+        }
+    }
 }
 /// Scope of an intervention freeze.
 /// Determines what is frozen by the intervention.

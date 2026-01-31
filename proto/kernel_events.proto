@@ -689,6 +689,167 @@ message GateReceipt {
 }
 
 // ============================================================
+// AAT GATE RECEIPT PAYLOAD (TCK-00218)
+// ============================================================
+//
+// AatGateReceipt is the typed payload for AAT gate receipts with evidence binding.
+// This payload is stored in CAS and referenced by payload_hash from GateReceipt.
+//
+// All 22 fields are required to ensure complete evidence binding and traceability.
+// The run_receipt_hashes.len() MUST equal run_count for validation.
+//
+// Security: This payload captures all machine-checkable evidence from AAT execution,
+// including terminal verifier outputs, determinism tracking, and attestation metadata.
+
+// Determinism status for AAT runs.
+// Indicates whether multiple runs produced consistent terminal evidence.
+enum DeterminismStatus {
+  // Unspecified status (invalid).
+  DETERMINISM_STATUS_UNSPECIFIED = 0;
+  // All runs produced identical terminal evidence.
+  DETERMINISM_STATUS_STABLE = 1;
+  // Runs produced different terminal evidence.
+  DETERMINISM_STATUS_MISMATCH = 2;
+}
+
+// Classification of flakiness when determinism mismatch occurs.
+// Used for routing to appropriate quarantine/remediation paths.
+enum FlakeClass {
+  // Unspecified class (invalid).
+  FLAKE_CLASS_UNSPECIFIED = 0;
+  // Deterministic failure - consistent FAIL across all runs.
+  FLAKE_CLASS_DETERMINISTIC_FAIL = 1;
+  // Flakiness due to test harness issues (e.g., timing, resource contention).
+  FLAKE_CLASS_HARNESS_FLAKE = 2;
+  // Flakiness due to environment drift (e.g., dependency version mismatch).
+  FLAKE_CLASS_ENVIRONMENT_DRIFT = 3;
+  // Test-level non-semantic difference (e.g., output format changes).
+  FLAKE_CLASS_TEST_NONSEMANTIC = 4;
+  // Code-level non-semantic difference (e.g., timestamps, random IDs).
+  FLAKE_CLASS_CODE_NONSEMANTIC = 5;
+  // Unknown flakiness cause requiring investigation.
+  FLAKE_CLASS_UNKNOWN = 6;
+}
+
+// AAT verdict outcome.
+enum AatVerdict {
+  // Unspecified verdict (invalid).
+  AAT_VERDICT_UNSPECIFIED = 0;
+  // All acceptance criteria passed.
+  AAT_VERDICT_PASS = 1;
+  // One or more acceptance criteria failed.
+  AAT_VERDICT_FAIL = 2;
+  // Additional input required to determine outcome.
+  AAT_VERDICT_NEEDS_INPUT = 3;
+}
+
+// Risk tier for AAT selection policy.
+enum AatRiskTier {
+  // Unspecified tier (invalid).
+  AAT_RISK_TIER_UNSPECIFIED = 0;
+  // High risk - AAT always required.
+  AAT_RISK_TIER_HIGH = 1;
+  // Medium risk - AAT required for sensitive domains.
+  AAT_RISK_TIER_MED = 2;
+  // Low risk - AAT sampled with nightly full coverage.
+  AAT_RISK_TIER_LOW = 3;
+}
+
+// Output from a terminal verifier.
+// Terminal verifiers provide ground truth (exit codes, snapshot diffs, etc.).
+message TerminalVerifierOutput {
+  // Kind of verifier: exit_code, snapshot_diff, structured_test_report, invariant_check
+  string verifier_kind = 1;
+  // Digest of the verifier output content (32 bytes).
+  bytes output_digest = 2;
+  // Whether the machine predicate was satisfied.
+  bool predicate_satisfied = 3;
+}
+
+// Attestation metadata for AAT execution environment.
+// Provides evidence chain for runtime environment verification.
+message AatAttestation {
+  // Digest of the container image used (32 bytes).
+  bytes container_image_digest = 1;
+  // Digests of toolchain components (each 32 bytes).
+  repeated bytes toolchain_digests = 2;
+  // Identity key ID of the runner.
+  string runner_identity_key_id = 3;
+  // Hash of the network policy profile (32 bytes).
+  bytes network_policy_profile_hash = 4;
+}
+
+// Typed payload for AAT gate receipts (22 required fields).
+// Stored in CAS and referenced by payload_hash from GateReceipt envelope.
+//
+// Invariants:
+// - view_commitment_hash matches FAC-00 output
+// - rcp_manifest_hash matches FAC-02 output for profile
+// - run_receipt_hashes.len() == run_count
+// - transcript_chain_root_hash derivable from transcript_bundle_hash
+// - artifact_manifest_hash references CAS ArtifactManifest
+// - At least one terminal_verifier_output present for PASS
+// - predicate_satisfied == true for all verifier outputs when verdict == PASS
+message AatGateReceipt {
+  // ============== View commitment binding (fields 1-4) ==============
+  // Hash binding to view commitment from FAC-00 (32 bytes).
+  bytes view_commitment_hash = 1;
+  // Hash of the RCP manifest for this profile (32 bytes).
+  bytes rcp_manifest_hash = 2;
+  // RCP profile identifier.
+  string rcp_profile_id = 3;
+  // Policy hash for anti-downgrade verification (32 bytes).
+  bytes policy_hash = 4;
+
+  // ============== Determinism tracking (fields 5-13) ==============
+  // Determinism class (0=non, 1=soft, 2=fully).
+  uint32 determinism_class = 5;
+  // Whether terminal evidence was stable across runs.
+  DeterminismStatus determinism_status = 6;
+  // Classification of flakiness when mismatch occurs.
+  FlakeClass flake_class = 7;
+  // Number of AAT runs executed.
+  uint32 run_count = 8;
+  // Hashes of individual run receipts (each 32 bytes, len == run_count).
+  repeated bytes run_receipt_hashes = 9;
+  // Digest of machine-checkable terminal evidence (32 bytes).
+  bytes terminal_evidence_digest = 10;
+  // Digest of observational evidence (logs, traces) - excluded from determinism (32 bytes).
+  bytes observational_evidence_digest = 11;
+  // Digest of terminal verifier outputs (32 bytes).
+  bytes terminal_verifier_outputs_digest = 12;
+  // Stability digest = hash(verdict, terminal_evidence_digest, terminal_verifier_outputs_digest) (32 bytes).
+  bytes stability_digest = 13;
+
+  // ============== Verdict (field 14) ==============
+  // AAT outcome verdict.
+  AatVerdict verdict = 14;
+
+  // ============== Evidence binding (fields 15-19) ==============
+  // Root hash of the transcript chain (32 bytes).
+  bytes transcript_chain_root_hash = 15;
+  // Hash of the transcript bundle in CAS (32 bytes).
+  bytes transcript_bundle_hash = 16;
+  // Hash of the artifact manifest in CAS (32 bytes).
+  bytes artifact_manifest_hash = 17;
+  // Terminal verifier outputs with predicate satisfaction.
+  repeated TerminalVerifierOutput terminal_verifier_outputs = 18;
+  // Hash of the verifier policy (32 bytes).
+  bytes verifier_policy_hash = 19;
+
+  // ============== Risk tier (fields 20-21) ==============
+  // Selection policy identifier.
+  string selection_policy_id = 20;
+  // Risk tier for AAT selection (0-4: Tier0-Tier4).
+  // Stored as uint32 for fidelity preservation across proto roundtrips.
+  uint32 risk_tier = 21;
+
+  // ============== Attestation (field 22) ==============
+  // Execution environment attestation.
+  AatAttestation attestation = 22;
+}
+
+// ============================================================
 // INTERVENTION EVENTS (FAC Divergence Watchdog)
 // ============================================================
 //

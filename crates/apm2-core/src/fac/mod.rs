@@ -64,6 +64,7 @@
 //! assert!(resolution.verify_lease_match(&lease).is_ok());
 //! ```
 
+mod aat_receipt;
 mod ci_attestation;
 mod ci_import;
 mod domain_separator;
@@ -72,6 +73,13 @@ mod lease;
 mod policy_resolution;
 mod receipt;
 
+// Re-export AAT receipt types
+pub use aat_receipt::{
+    AatAttestation, AatGateReceipt, AatGateReceiptBuilder, AatReceiptError, AatVerdict,
+    DeterminismStatus, FlakeClass, MAX_RUN_RECEIPT_HASHES,
+    MAX_STRING_LENGTH as MAX_AAT_STRING_LENGTH, MAX_TERMINAL_VERIFIER_OUTPUTS,
+    MAX_TOOLCHAIN_DIGESTS, TerminalVerifierOutput,
+};
 // Re-export CI attestation types
 pub use ci_attestation::{
     CiAttestation, CiAttestationBuilder, CiAttestationError, CiAttestationLevel,
