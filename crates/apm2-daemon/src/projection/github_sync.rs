@@ -51,17 +51,22 @@
 //! println!("Projected with receipt: {}", receipt.receipt_id);
 //! ```
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use apm2_core::crypto::Signer;
+use apm2_holon::defect::DefectRecord;
 use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
+use super::divergence_watchdog::{
+    FreezeRegistry, FreezeScope, InterventionFreezeBuilder, SystemTimeSource, TimeSource,
+};
 use super::projection_receipt::{
     IdempotencyKey, MAX_STRING_LENGTH, ProjectedStatus, ProjectionReceipt, ProjectionReceiptBuilder,
 };
@@ -120,7 +125,117 @@ pub enum ProjectionError {
         /// The digest that was not found.
         digest: String,
     },
+
+    /// Defect record creation failed.
+    #[error("failed to create defect record: {0}")]
+    DefectRecordFailed(String),
+
+    /// Tamper rate limit exceeded - work is now frozen.
+    ///
+    /// Returned when tamper attempts exceed the configured threshold.
+    /// No further overwrites will be attempted until the freeze is lifted.
+    #[error("tamper rate limit exceeded for work {work_id}: frozen with ID {freeze_id}")]
+    TamperRateLimitExceeded {
+        /// The work ID that has been frozen.
+        work_id: String,
+        /// The freeze ID assigned.
+        freeze_id: String,
+    },
+
+    /// Work is frozen due to prior tamper detection.
+    #[error("work {work_id} is frozen due to tamper: {freeze_id}")]
+    WorkFrozen {
+        /// The work ID that is frozen.
+        work_id: String,
+        /// The freeze ID.
+        freeze_id: String,
+    },
+
+    /// Freeze registry error.
+    #[error("freeze registry error: {0}")]
+    FreezeRegistryError(String),
 }
+
+// =============================================================================
+// TamperEvent
+// =============================================================================
+
+/// Event emitted when tamper is detected between ledger and GitHub status.
+///
+/// Per RFC-0015, tamper detection identifies when the GitHub status has been
+/// modified by a non-adapter identity. This differs from divergence detection
+/// (which detects trunk HEAD mismatch). Tamper detection:
+///
+/// 1. Compares expected status (from ledger) with actual status (from GitHub)
+/// 2. If they differ, emits a `DefectRecord(PROJECTION_TAMPER)`
+/// 3. Overwrites GitHub status to match ledger truth
+///
+/// # Security
+///
+/// Tamper detection is a security control that ensures the ledger remains
+/// the authoritative source of truth for admission status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TamperEvent {
+    /// The expected status from the ledger.
+    pub expected_status: ProjectedStatus,
+
+    /// The actual status observed on GitHub.
+    pub actual_status: ProjectedStatus,
+
+    /// When the tamper was detected (Unix nanoseconds).
+    pub detected_at: u64,
+
+    /// The work ID associated with this tamper event.
+    pub work_id: String,
+
+    /// The changeset digest for the affected commit.
+    pub changeset_digest: [u8; 32],
+}
+
+impl TamperEvent {
+    /// Creates a new tamper event with an explicit timestamp.
+    ///
+    /// # `BOUNDARY_INTEGRITY` Compliance
+    ///
+    /// Per the `BOUNDARY_INTEGRITY` constraint, the timestamp MUST be provided
+    /// by the adapter using its injected `TimeSource`. Direct use of
+    /// `SystemTime::now()` is prohibited at boundary layers.
+    #[must_use]
+    pub fn new(
+        expected_status: ProjectedStatus,
+        actual_status: ProjectedStatus,
+        work_id: impl Into<String>,
+        changeset_digest: [u8; 32],
+        detected_at: u64,
+    ) -> Self {
+        Self {
+            expected_status,
+            actual_status,
+            detected_at,
+            work_id: work_id.into(),
+            changeset_digest,
+        }
+    }
+}
+
+/// Result of handling a tamper event.
+///
+/// Contains the `DefectRecord` emitted and the `ProjectionReceipt` from
+/// overwriting the tampered status.
+#[derive(Debug, Clone)]
+pub struct TamperResult {
+    /// The defect record emitted for this tamper event.
+    pub defect: DefectRecord,
+
+    /// The projection receipt from overwriting the tampered status.
+    pub receipt: ProjectionReceipt,
+
+    /// Whether a freeze was triggered due to exceeding tamper threshold.
+    pub freeze_triggered: bool,
+}
+
+// NOTE: current_timestamp_ns() has been removed per `BOUNDARY_INTEGRITY`
+// constraint. All timestamp operations must use the injected TimeSource trait.
 
 // =============================================================================
 // ProjectionAdapter Trait (Async)
@@ -198,6 +313,11 @@ const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// Maximum number of entries in the idempotency cache.
 /// Oldest entries will be pruned when this limit is exceeded.
 const MAX_CACHE_ENTRIES: usize = 100_000;
+
+/// Default tamper attempt threshold before freeze.
+/// After this many consecutive tamper detections for the same work item,
+/// the adapter will freeze the work and stop overwriting.
+pub const DEFAULT_TAMPER_THRESHOLD: u32 = 3;
 
 /// GitHub projection adapter configuration.
 #[derive(Clone)]
@@ -879,10 +999,23 @@ impl GitHubClient {
 /// changeset_digest, ledger_head)`. If a projection is retried with the same
 /// key, the cached receipt is returned without making another API call.
 ///
+/// # Tamper Rate Limiting (Security)
+///
+/// To prevent denial-of-service from unbounded tamper loop amplification, the
+/// adapter tracks tamper attempts per work item. After `tamper_threshold`
+/// consecutive attempts, the work item is frozen and no further overwrites are
+/// attempted until the freeze is adjudicated.
+///
+/// # Time Source Injection (`BOUNDARY_INTEGRITY`)
+///
+/// Per the `BOUNDARY_INTEGRITY` constraint, the adapter accepts a
+/// [`TimeSource`] for obtaining timestamps instead of directly using
+/// `SystemTime::now()`.
+///
 /// # Thread Safety
 ///
 /// The adapter is thread-safe and can be shared across async tasks.
-pub struct GitHubProjectionAdapter {
+pub struct GitHubProjectionAdapter<T: TimeSource = SystemTimeSource> {
     /// Signer for generating receipts.
     signer: Signer,
 
@@ -899,10 +1032,28 @@ pub struct GitHubProjectionAdapter {
     ///
     /// Used for testing.
     mock_mode: bool,
+
+    /// Time source for obtaining timestamps (`BOUNDARY_INTEGRITY`).
+    time_source: T,
+
+    /// Tamper attempt counter per work item.
+    /// Key: `work_id`, Value: consecutive tamper attempts.
+    tamper_counters: RwLock<HashMap<String, u32>>,
+
+    /// Threshold for tamper attempts before freeze.
+    tamper_threshold: u32,
+
+    /// Actor ID for freeze events.
+    actor_id: String,
+
+    /// Freeze registry for tamper-based freezes.
+    freeze_registry: Arc<FreezeRegistry>,
 }
 
-impl GitHubProjectionAdapter {
+impl GitHubProjectionAdapter<SystemTimeSource> {
     /// Creates a new GitHub projection adapter with a persistent cache.
+    ///
+    /// Uses the default `SystemTimeSource` for timestamp generation.
     ///
     /// # Arguments
     ///
@@ -919,6 +1070,49 @@ impl GitHubProjectionAdapter {
         config: GitHubAdapterConfig,
         cache_path: impl AsRef<Path>,
     ) -> Result<Self, ProjectionError> {
+        Self::with_time_source(signer, config, cache_path, SystemTimeSource)
+    }
+
+    /// Creates a new adapter in mock mode for testing.
+    ///
+    /// Uses the default `SystemTimeSource` for timestamp generation.
+    /// In mock mode, the adapter does not make actual GitHub API calls.
+    /// Uses an in-memory cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::DatabaseError`] if the in-memory cache
+    /// cannot be created.
+    pub fn new_mock(signer: Signer, config: GitHubAdapterConfig) -> Result<Self, ProjectionError> {
+        Self::new_mock_with_time_source(signer, config, SystemTimeSource)
+    }
+}
+
+impl<T: TimeSource> GitHubProjectionAdapter<T> {
+    /// Creates a new GitHub projection adapter with a custom time source.
+    ///
+    /// # `BOUNDARY_INTEGRITY` Compliance
+    ///
+    /// This constructor enables injection of a custom `TimeSource`, ensuring
+    /// the adapter does not directly use `SystemTime::now()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `signer` - The signer for generating receipts
+    /// * `config` - The adapter configuration
+    /// * `cache_path` - Path to the `SQLite` cache database
+    /// * `time_source` - The time source for generating timestamps
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::DatabaseError`] if the cache cannot be
+    /// opened.
+    pub fn with_time_source(
+        signer: Signer,
+        config: GitHubAdapterConfig,
+        cache_path: impl AsRef<Path>,
+        time_source: T,
+    ) -> Result<Self, ProjectionError> {
         let cache = IdempotencyCache::open(cache_path)?;
         let client = GitHubClient::new(config.clone());
 
@@ -928,10 +1122,15 @@ impl GitHubProjectionAdapter {
             cache,
             client,
             mock_mode: false,
+            time_source,
+            tamper_counters: RwLock::new(HashMap::new()),
+            tamper_threshold: DEFAULT_TAMPER_THRESHOLD,
+            actor_id: "github-projection-adapter".to_string(),
+            freeze_registry: Arc::new(FreezeRegistry::new()),
         })
     }
 
-    /// Creates a new adapter in mock mode for testing.
+    /// Creates a new adapter in mock mode with a custom time source.
     ///
     /// In mock mode, the adapter does not make actual GitHub API calls.
     /// Uses an in-memory cache.
@@ -940,7 +1139,11 @@ impl GitHubProjectionAdapter {
     ///
     /// Returns [`ProjectionError::DatabaseError`] if the in-memory cache
     /// cannot be created.
-    pub fn new_mock(signer: Signer, config: GitHubAdapterConfig) -> Result<Self, ProjectionError> {
+    pub fn new_mock_with_time_source(
+        signer: Signer,
+        config: GitHubAdapterConfig,
+        time_source: T,
+    ) -> Result<Self, ProjectionError> {
         let cache = IdempotencyCache::in_memory()?;
         let client = GitHubClient::new(config.clone());
 
@@ -950,7 +1153,45 @@ impl GitHubProjectionAdapter {
             cache,
             client,
             mock_mode: true,
+            time_source,
+            tamper_counters: RwLock::new(HashMap::new()),
+            tamper_threshold: DEFAULT_TAMPER_THRESHOLD,
+            actor_id: "github-projection-adapter".to_string(),
+            freeze_registry: Arc::new(FreezeRegistry::new()),
         })
+    }
+
+    /// Sets a shared freeze registry for tamper-based freezes.
+    ///
+    /// Use this when you want to share a freeze registry with the
+    /// `DivergenceWatchdog` for unified freeze management.
+    #[must_use]
+    pub fn with_freeze_registry(mut self, registry: Arc<FreezeRegistry>) -> Self {
+        self.freeze_registry = registry;
+        self
+    }
+
+    /// Sets the tamper attempt threshold before freeze.
+    ///
+    /// After this many consecutive tamper attempts for the same work item,
+    /// the adapter freezes the work and stops overwriting.
+    #[must_use]
+    pub const fn with_tamper_threshold(mut self, threshold: u32) -> Self {
+        self.tamper_threshold = threshold;
+        self
+    }
+
+    /// Sets the actor ID used for freeze events.
+    #[must_use]
+    pub fn with_actor_id(mut self, actor_id: impl Into<String>) -> Self {
+        self.actor_id = actor_id.into();
+        self
+    }
+
+    /// Returns the freeze registry.
+    #[must_use]
+    pub fn freeze_registry(&self) -> Arc<FreezeRegistry> {
+        Arc::clone(&self.freeze_registry)
     }
 
     /// Returns whether the adapter is in mock mode.
@@ -1101,10 +1342,343 @@ impl GitHubProjectionAdapter {
         // Post the status to GitHub
         self.client.post_commit_status(&commit_sha, status).await
     }
+
+    // =========================================================================
+    // Tamper Detection (TCK-00214)
+    // =========================================================================
+
+    /// Returns the current timestamp from the injected time source.
+    fn now_nanos(&self) -> u64 {
+        self.time_source.now_nanos()
+    }
+
+    /// Detects tamper between the expected status (from ledger) and actual
+    /// status (from GitHub).
+    ///
+    /// Per RFC-0015, tamper detection identifies when the GitHub status has
+    /// been modified by a non-adapter identity. If the statuses differ, a
+    /// [`TamperEvent`] is returned for handling.
+    ///
+    /// # `BOUNDARY_INTEGRITY` Compliance
+    ///
+    /// Timestamps are obtained from the injected `TimeSource`, not from
+    /// `SystemTime::now()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_status` - The status expected from the ledger
+    /// * `actual_status` - The status observed on GitHub
+    /// * `work_id` - The work ID associated with this status
+    /// * `changeset_digest` - The changeset digest for the affected commit
+    ///
+    /// # Returns
+    ///
+    /// `Some(TamperEvent)` if the statuses differ, `None` otherwise.
+    #[must_use]
+    pub fn detect_tamper(
+        &self,
+        expected_status: ProjectedStatus,
+        actual_status: ProjectedStatus,
+        work_id: &str,
+        changeset_digest: [u8; 32],
+    ) -> Option<TamperEvent> {
+        if expected_status == actual_status {
+            None
+        } else {
+            debug!(
+                expected = %expected_status,
+                actual = %actual_status,
+                work_id = %work_id,
+                "tamper detected: status mismatch"
+            );
+            Some(TamperEvent::new(
+                expected_status,
+                actual_status,
+                work_id,
+                changeset_digest,
+                self.now_nanos(),
+            ))
+        }
+    }
+
+    /// Generates a unique defect ID for a tamper event.
+    fn generate_defect_id(event: &TamperEvent) -> String {
+        // Use BLAKE3 hash of (work_id, changeset_digest, detected_at) for uniqueness
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(event.work_id.as_bytes());
+        hasher.update(&event.changeset_digest);
+        hasher.update(&event.detected_at.to_be_bytes());
+        let hash = hasher.finalize();
+        format!("tamper-{}", hex::encode(&hash.as_bytes()[..8]))
+    }
+
+    /// Generates a unique freeze ID for a tamper-induced freeze.
+    fn generate_tamper_freeze_id(&self, work_id: &str) -> String {
+        let timestamp = self.now_nanos();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"tamper-freeze:");
+        hasher.update(work_id.as_bytes());
+        hasher.update(&timestamp.to_be_bytes());
+        let hash = hasher.finalize();
+        format!("tamper-freeze-{}", hex::encode(&hash.as_bytes()[..8]))
+    }
+
+    /// Increments the tamper counter for a work item and returns the new count.
+    ///
+    /// Returns `None` if the counter cannot be updated (lock poisoned).
+    fn increment_tamper_counter(&self, work_id: &str) -> Option<u32> {
+        let mut counters = self.tamper_counters.write().ok()?;
+        let count = counters.entry(work_id.to_string()).or_insert(0);
+        *count = count.saturating_add(1);
+        Some(*count)
+    }
+
+    /// Resets the tamper counter for a work item (called on successful
+    /// projection).
+    fn reset_tamper_counter(&self, work_id: &str) {
+        if let Ok(mut counters) = self.tamper_counters.write() {
+            counters.remove(work_id);
+        }
+    }
+
+    /// Gets the current tamper counter for a work item.
+    #[allow(dead_code)] // Exposed for testing and future use
+    fn get_tamper_counter(&self, work_id: &str) -> u32 {
+        self.tamper_counters
+            .read()
+            .ok()
+            .and_then(|c| c.get(work_id).copied())
+            .unwrap_or(0)
+    }
+
+    /// Checks if a work item is frozen due to tamper detection.
+    ///
+    /// Returns `Some(freeze_id)` if frozen, `None` otherwise.
+    pub fn is_work_frozen(&self, work_id: &str) -> Option<String> {
+        self.freeze_registry.is_frozen(work_id)
+    }
+
+    /// Creates a freeze for a work item due to exceeding tamper threshold.
+    ///
+    /// # Security
+    ///
+    /// This method creates an `InterventionFreeze` event when tamper attempts
+    /// exceed the configured threshold, preventing further overwrites until
+    /// adjudication.
+    fn create_tamper_freeze(
+        &self,
+        work_id: &str,
+        defect_id: &str,
+    ) -> Result<super::divergence_watchdog::InterventionFreeze, ProjectionError> {
+        let freeze_id = self.generate_tamper_freeze_id(work_id);
+        let timestamp = self.now_nanos();
+        let time_envelope_ref = format!("htf:tick:{timestamp}");
+
+        // Create the freeze event
+        let freeze = InterventionFreezeBuilder::new(&freeze_id)
+            .scope(FreezeScope::Work)
+            .scope_value(work_id)
+            .trigger_defect_id(defect_id)
+            .frozen_at(timestamp)
+            .expected_trunk_head([0u8; 32]) // Not applicable for tamper freeze
+            .actual_trunk_head([0u8; 32])   // Not applicable for tamper freeze
+            .gate_actor_id(&self.actor_id)
+            .time_envelope_ref(&time_envelope_ref)
+            .try_build_and_sign(&self.signer)
+            .map_err(|e| ProjectionError::FreezeRegistryError(e.to_string()))?;
+
+        // Register the freeze
+        self.freeze_registry
+            .register(&freeze, &self.signer.verifying_key())
+            .map_err(|e| ProjectionError::FreezeRegistryError(e.to_string()))?;
+
+        warn!(
+            freeze_id = %freeze_id,
+            work_id = %work_id,
+            "work frozen due to exceeding tamper threshold"
+        );
+
+        Ok(freeze)
+    }
+
+    /// Handles a tamper event by emitting a `DefectRecord` and conditionally
+    /// overwriting the tampered status.
+    ///
+    /// Per RFC-0015, on tamper:
+    /// 1. Check if work is already frozen - if so, return error
+    /// 2. Increment tamper counter for this work item
+    /// 3. If counter exceeds threshold, freeze the work and stop
+    /// 4. Otherwise, emit `DefectRecord(PROJECTION_TAMPER)` and overwrite
+    ///
+    /// # Rate Limiting (Security)
+    ///
+    /// This method implements rate limiting to prevent denial-of-service from
+    /// unbounded tamper loop amplification. After `tamper_threshold`
+    /// consecutive attempts, the work is frozen and no further overwrites
+    /// are attempted.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The tamper event to handle
+    /// * `ledger_head` - The current ledger head for the overwrite projection
+    ///
+    /// # Returns
+    ///
+    /// A [`TamperResult`] containing the emitted defect and projection receipt.
+    /// If the work was frozen due to threshold, `freeze_triggered` is `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::WorkFrozen`] if work is already frozen.
+    /// Returns [`ProjectionError::TamperRateLimitExceeded`] if threshold
+    /// exceeded. Returns [`ProjectionError`] if defect creation or
+    /// projection fails.
+    pub async fn on_tamper(
+        &self,
+        event: TamperEvent,
+        ledger_head: [u8; 32],
+    ) -> Result<TamperResult, ProjectionError> {
+        // 1. Check if work is already frozen
+        if let Some(freeze_id) = self.is_work_frozen(&event.work_id) {
+            debug!(
+                work_id = %event.work_id,
+                freeze_id = %freeze_id,
+                "skipping tamper overwrite: work is frozen"
+            );
+            return Err(ProjectionError::WorkFrozen {
+                work_id: event.work_id.clone(),
+                freeze_id,
+            });
+        }
+
+        debug!(
+            work_id = %event.work_id,
+            expected = %event.expected_status,
+            actual = %event.actual_status,
+            "handling tamper event"
+        );
+
+        // 2. Increment tamper counter
+        let tamper_count = self.increment_tamper_counter(&event.work_id).unwrap_or(1);
+
+        debug!(
+            work_id = %event.work_id,
+            tamper_count = tamper_count,
+            threshold = self.tamper_threshold,
+            "tamper counter updated"
+        );
+
+        // 3. Create the defect record first (needed for freeze)
+        let defect_id = Self::generate_defect_id(&event);
+        let defect = DefectRecord::projection_tamper(
+            &defect_id,
+            &event.work_id,
+            event.expected_status.as_str(),
+            event.actual_status.as_str(),
+            event.detected_at,
+        )
+        .map_err(|e| ProjectionError::DefectRecordFailed(e.to_string()))?;
+
+        debug!(
+            defect_id = %defect.defect_id(),
+            "emitted PROJECTION_TAMPER defect"
+        );
+
+        // 4. If counter exceeds threshold, freeze and return error
+        if tamper_count >= self.tamper_threshold {
+            let freeze = self.create_tamper_freeze(&event.work_id, &defect_id)?;
+            return Err(ProjectionError::TamperRateLimitExceeded {
+                work_id: event.work_id.clone(),
+                freeze_id: freeze.freeze_id,
+            });
+        }
+
+        // 5. Overwrite GitHub status to match ledger truth
+        let key = IdempotencyKey::new(&event.work_id, event.changeset_digest, ledger_head);
+
+        // For tamper handling, we bypass the idempotency cache to force overwrite
+        self.do_github_projection(&event.changeset_digest, event.expected_status)
+            .await?;
+
+        // Generate the receipt for the overwrite
+        let receipt_id = Self::generate_receipt_id(&key);
+        let projected_at = self.now_nanos();
+        let receipt = ProjectionReceiptBuilder::new(receipt_id, &event.work_id)
+            .changeset_digest(event.changeset_digest)
+            .ledger_head(ledger_head)
+            .projected_status(event.expected_status)
+            .projected_at(projected_at)
+            .try_build_and_sign(&self.signer)
+            .map_err(|e| ProjectionError::ReceiptGenerationFailed(e.to_string()))?;
+
+        // Store in cache for future idempotency
+        self.cache.put(&key, &receipt)?;
+
+        debug!(
+            receipt_id = %receipt.receipt_id,
+            "overwrote tampered status with ledger truth"
+        );
+
+        Ok(TamperResult {
+            defect,
+            receipt,
+            freeze_triggered: false,
+        })
+    }
+
+    /// Convenience method to detect tamper and handle it in one call.
+    ///
+    /// This combines `detect_tamper` and `on_tamper` for the common case
+    /// where you want to check for tamper and immediately handle it.
+    ///
+    /// # Rate Limiting (Security)
+    ///
+    /// This method includes rate limiting protection. If tamper attempts
+    /// exceed the configured threshold, the work is frozen and an error
+    /// is returned. Check for `ProjectionError::TamperRateLimitExceeded`
+    /// or `ProjectionError::WorkFrozen` to detect this condition.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_status` - The status expected from the ledger
+    /// * `actual_status` - The status observed on GitHub
+    /// * `work_id` - The work ID associated with this status
+    /// * `changeset_digest` - The changeset digest for the affected commit
+    /// * `ledger_head` - The current ledger head for overwrite projection
+    ///
+    /// # Returns
+    ///
+    /// `Some(TamperResult)` if tamper was detected and handled, `None` if
+    /// no tamper was detected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::WorkFrozen`] if work is already frozen.
+    /// Returns [`ProjectionError::TamperRateLimitExceeded`] if threshold
+    /// exceeded. Returns [`ProjectionError`] if tamper handling fails.
+    pub async fn detect_and_handle_tamper(
+        &self,
+        expected_status: ProjectedStatus,
+        actual_status: ProjectedStatus,
+        work_id: &str,
+        changeset_digest: [u8; 32],
+        ledger_head: [u8; 32],
+    ) -> Result<Option<TamperResult>, ProjectionError> {
+        if let Some(event) =
+            self.detect_tamper(expected_status, actual_status, work_id, changeset_digest)
+        {
+            let result = self.on_tamper(event, ledger_head).await?;
+            Ok(Some(result))
+        } else {
+            // No tamper detected - reset counter for this work item
+            self.reset_tamper_counter(work_id);
+            Ok(None)
+        }
+    }
 }
 
 #[async_trait]
-impl ProjectionAdapter for GitHubProjectionAdapter {
+impl<T: TimeSource> ProjectionAdapter for GitHubProjectionAdapter<T> {
     async fn project_status(
         &self,
         work_id: &str,
@@ -1130,11 +1704,13 @@ impl ProjectionAdapter for GitHubProjectionAdapter {
         // Generate deterministic receipt ID
         let receipt_id = Self::generate_receipt_id(&key);
 
-        // Generate the receipt
+        // Generate the receipt with explicit timestamp (`BOUNDARY_INTEGRITY`)
+        let projected_at = self.now_nanos();
         let receipt = ProjectionReceiptBuilder::new(receipt_id, work_id)
             .changeset_digest(changeset_digest)
             .ledger_head(ledger_head)
             .projected_status(status)
+            .projected_at(projected_at)
             .try_build_and_sign(&self.signer)
             .map_err(|e| ProjectionError::ReceiptGenerationFailed(e.to_string()))?;
 
@@ -1149,12 +1725,13 @@ impl ProjectionAdapter for GitHubProjectionAdapter {
     }
 }
 
-impl std::fmt::Debug for GitHubProjectionAdapter {
+impl<T: TimeSource> std::fmt::Debug for GitHubProjectionAdapter<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitHubProjectionAdapter")
             .field("config", &self.config)
             .field("mock_mode", &self.mock_mode)
             .field("cache_size", &self.cache.size().unwrap_or(0))
+            .field("tamper_threshold", &self.tamper_threshold)
             .finish_non_exhaustive()
     }
 }
@@ -1641,5 +2218,521 @@ mod tests {
         // Verify it still exists
         let sha = adapter.get_commit_sha(&[0x42; 32]).unwrap();
         assert_eq!(sha, Some("abc123".to_string()));
+    }
+
+    // =========================================================================
+    // Tamper Detection Tests (TCK-00214)
+    // =========================================================================
+
+    /// Submodule for tamper detection tests.
+    ///
+    /// Per the ticket requirements, these tests verify:
+    /// - Tamper is detected when GitHub status differs from ledger
+    /// - `DefectRecord(PROJECTION_TAMPER)` is emitted
+    /// - Tampered status is overwritten with ledger truth
+    /// - Rate limiting prevents unbounded tamper loop amplification
+    pub mod tamper {
+        use super::*;
+
+        // =====================================================================
+        // TamperEvent Tests
+        // =====================================================================
+
+        #[test]
+        fn test_tamper_event_creation() {
+            let timestamp = 1_000_000_000u64;
+            let event = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                timestamp,
+            );
+
+            assert_eq!(event.expected_status, ProjectedStatus::Success);
+            assert_eq!(event.actual_status, ProjectedStatus::Failure);
+            assert_eq!(event.work_id, "work-001");
+            assert_eq!(event.changeset_digest, [0x42; 32]);
+            assert_eq!(event.detected_at, timestamp);
+        }
+
+        // =====================================================================
+        // detect_tamper() Tests
+        // =====================================================================
+
+        #[test]
+        fn test_detect_tamper_status_mismatch() {
+            let adapter = create_test_adapter();
+
+            let result = adapter.detect_tamper(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+            );
+
+            assert!(result.is_some());
+            let event = result.unwrap();
+            assert_eq!(event.expected_status, ProjectedStatus::Success);
+            assert_eq!(event.actual_status, ProjectedStatus::Failure);
+        }
+
+        #[test]
+        fn test_detect_tamper_no_mismatch() {
+            let adapter = create_test_adapter();
+
+            let result = adapter.detect_tamper(
+                ProjectedStatus::Success,
+                ProjectedStatus::Success,
+                "work-001",
+                [0x42; 32],
+            );
+
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_detect_tamper_all_status_pairs() {
+            let adapter = create_test_adapter();
+
+            let statuses = [
+                ProjectedStatus::Pending,
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                ProjectedStatus::Cancelled,
+                ProjectedStatus::Error,
+            ];
+
+            // Test all pairs where expected != actual
+            for expected in &statuses {
+                for actual in &statuses {
+                    let result = adapter.detect_tamper(*expected, *actual, "work-001", [0x42; 32]);
+
+                    if expected == actual {
+                        assert!(result.is_none(), "same status should not be tamper");
+                    } else {
+                        assert!(result.is_some(), "different status should be tamper");
+                        let event = result.unwrap();
+                        assert_eq!(event.expected_status, *expected);
+                        assert_eq!(event.actual_status, *actual);
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // on_tamper() Tests
+        // =====================================================================
+
+        #[tokio::test]
+        async fn test_on_tamper_emits_defect_record() {
+            let adapter = create_test_adapter();
+
+            let event = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let result = adapter.on_tamper(event, [0xAB; 32]).await;
+            assert!(result.is_ok());
+
+            let tamper_result = result.unwrap();
+
+            // Verify DefectRecord was created
+            assert_eq!(tamper_result.defect.defect_class(), "PROJECTION_TAMPER");
+            assert!(tamper_result.defect.defect_id().starts_with("tamper-"));
+            assert_eq!(tamper_result.defect.work_id(), "work-001");
+            assert!(tamper_result.defect.signal().details().contains("success"));
+            assert!(tamper_result.defect.signal().details().contains("failure"));
+        }
+
+        #[tokio::test]
+        async fn test_on_tamper_overwrites_status() {
+            let adapter = create_test_adapter();
+
+            let event = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let result = adapter.on_tamper(event, [0xAB; 32]).await;
+            assert!(result.is_ok());
+
+            let tamper_result = result.unwrap();
+
+            // Verify projection receipt was created with correct status
+            assert_eq!(tamper_result.receipt.work_id, "work-001");
+            assert_eq!(tamper_result.receipt.changeset_digest, [0x42; 32]);
+            assert_eq!(tamper_result.receipt.ledger_head, [0xAB; 32]);
+            assert_eq!(
+                tamper_result.receipt.projected_status,
+                ProjectedStatus::Success
+            );
+        }
+
+        #[tokio::test]
+        async fn test_on_tamper_receipt_signature_valid() {
+            let adapter = create_test_adapter();
+
+            let event = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let result = adapter.on_tamper(event, [0xAB; 32]).await;
+            assert!(result.is_ok());
+
+            let tamper_result = result.unwrap();
+
+            // Verify receipt signature is valid
+            assert!(
+                tamper_result
+                    .receipt
+                    .validate_signature(&adapter.verifying_key())
+                    .is_ok()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_on_tamper_caches_receipt() {
+            let adapter = create_test_adapter();
+            let initial_size = adapter.cache_size().unwrap();
+
+            let event = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let result = adapter.on_tamper(event, [0xAB; 32]).await;
+            assert!(result.is_ok());
+
+            // Cache should have one more entry
+            assert_eq!(adapter.cache_size().unwrap(), initial_size + 1);
+        }
+
+        // =====================================================================
+        // detect_and_handle_tamper() Tests
+        // =====================================================================
+
+        #[tokio::test]
+        async fn test_detect_and_handle_tamper_detected() {
+            let adapter = create_test_adapter();
+
+            let result = adapter
+                .detect_and_handle_tamper(
+                    ProjectedStatus::Success,
+                    ProjectedStatus::Failure,
+                    "work-001",
+                    [0x42; 32],
+                    [0xAB; 32],
+                )
+                .await;
+
+            assert!(result.is_ok());
+            let maybe_result = result.unwrap();
+            assert!(maybe_result.is_some());
+
+            let tamper_result = maybe_result.unwrap();
+            assert_eq!(tamper_result.defect.defect_class(), "PROJECTION_TAMPER");
+            assert_eq!(
+                tamper_result.receipt.projected_status,
+                ProjectedStatus::Success
+            );
+        }
+
+        #[tokio::test]
+        async fn test_detect_and_handle_tamper_not_detected() {
+            let adapter = create_test_adapter();
+
+            let result = adapter
+                .detect_and_handle_tamper(
+                    ProjectedStatus::Success,
+                    ProjectedStatus::Success,
+                    "work-001",
+                    [0x42; 32],
+                    [0xAB; 32],
+                )
+                .await;
+
+            assert!(result.is_ok());
+            let maybe_result = result.unwrap();
+            assert!(maybe_result.is_none());
+        }
+
+        // =====================================================================
+        // Defect ID Generation Tests
+        // =====================================================================
+
+        #[test]
+        fn test_defect_id_deterministic() {
+            let event1 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let event2 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let id1 = GitHubProjectionAdapter::<SystemTimeSource>::generate_defect_id(&event1);
+            let id2 = GitHubProjectionAdapter::<SystemTimeSource>::generate_defect_id(&event2);
+
+            assert_eq!(id1, id2);
+            assert!(id1.starts_with("tamper-"));
+        }
+
+        #[test]
+        fn test_defect_id_unique_for_different_events() {
+            let event1 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let event2 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-002", // Different work_id
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let event3 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x99; 32], // Different changeset_digest
+                1_000_000_000,
+            );
+
+            let id1 = GitHubProjectionAdapter::<SystemTimeSource>::generate_defect_id(&event1);
+            let id2 = GitHubProjectionAdapter::<SystemTimeSource>::generate_defect_id(&event2);
+            let id3 = GitHubProjectionAdapter::<SystemTimeSource>::generate_defect_id(&event3);
+
+            assert_ne!(id1, id2);
+            assert_ne!(id1, id3);
+            assert_ne!(id2, id3);
+        }
+
+        // =====================================================================
+        // Integration Tests
+        // =====================================================================
+
+        #[tokio::test]
+        async fn test_tamper_detection_end_to_end() {
+            // Simulate the full tamper detection workflow:
+            // 1. Initial projection (ledger says Success)
+            // 2. External tamper (GitHub now shows Failure)
+            // 3. Detect tamper
+            // 4. Handle tamper (emit defect, overwrite)
+            // 5. Verify final state
+
+            let adapter = create_test_adapter();
+
+            // 1. Initial projection
+            let initial_receipt = adapter
+                .project_status("work-001", [0x42; 32], [0xAB; 32], ProjectedStatus::Success)
+                .await
+                .expect("initial projection should succeed");
+
+            assert_eq!(initial_receipt.projected_status, ProjectedStatus::Success);
+
+            // 2. Simulate external tamper (in real scenario, this would be detected by
+            //    polling GitHub)
+            let ledger_status = ProjectedStatus::Success;
+            let github_status = ProjectedStatus::Failure; // Tampered!
+
+            // 3 & 4. Detect and handle tamper
+            let tamper_result = adapter
+                .detect_and_handle_tamper(
+                    ledger_status,
+                    github_status,
+                    "work-001",
+                    [0x42; 32],
+                    [0xCD; 32], // New ledger head after tamper
+                )
+                .await
+                .expect("tamper handling should succeed");
+
+            assert!(tamper_result.is_some());
+            let result = tamper_result.unwrap();
+
+            // 5. Verify final state
+            // Defect record was emitted
+            assert_eq!(result.defect.defect_class(), "PROJECTION_TAMPER");
+
+            // Status was overwritten to match ledger truth
+            assert_eq!(result.receipt.projected_status, ProjectedStatus::Success);
+
+            // New ledger head is in the receipt
+            assert_eq!(result.receipt.ledger_head, [0xCD; 32]);
+        }
+
+        #[tokio::test]
+        async fn test_multiple_tamper_events_unique_defect_ids() {
+            let adapter = create_test_adapter();
+
+            // Handle multiple tamper events for different work items
+            let event1 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let event2 = TamperEvent::new(
+                ProjectedStatus::Pending,
+                ProjectedStatus::Cancelled,
+                "work-002",
+                [0x99; 32],
+                1_000_000_001,
+            );
+
+            let result1 = adapter.on_tamper(event1, [0xAB; 32]).await.unwrap();
+            let result2 = adapter.on_tamper(event2, [0xCD; 32]).await.unwrap();
+
+            // Each event should get a unique defect ID
+            assert_ne!(result1.defect.defect_id(), result2.defect.defect_id());
+
+            // Both should be PROJECTION_TAMPER
+            assert_eq!(result1.defect.defect_class(), "PROJECTION_TAMPER");
+            assert_eq!(result2.defect.defect_class(), "PROJECTION_TAMPER");
+        }
+
+        // =====================================================================
+        // Rate Limiting Tests (Security)
+        // =====================================================================
+
+        #[tokio::test]
+        async fn test_tamper_rate_limiting_threshold() {
+            // Create an adapter with threshold of 2
+            let signer = Signer::generate();
+            let config = GitHubAdapterConfig::new("https://api.github.com", "owner", "repo")
+                .expect("config creation should succeed");
+            let adapter = GitHubProjectionAdapter::new_mock(signer, config)
+                .expect("adapter creation should succeed")
+                .with_tamper_threshold(2);
+
+            // First tamper attempt should succeed
+            let event1 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+            let result1 = adapter.on_tamper(event1, [0xAB; 32]).await;
+            assert!(result1.is_ok());
+
+            // Second tamper attempt should trigger freeze
+            let event2 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_001,
+            );
+            let result2 = adapter.on_tamper(event2, [0xAB; 32]).await;
+            assert!(matches!(
+                result2,
+                Err(ProjectionError::TamperRateLimitExceeded { .. })
+            ));
+
+            // Verify work is now frozen
+            assert!(adapter.is_work_frozen("work-001").is_some());
+        }
+
+        #[tokio::test]
+        async fn test_frozen_work_rejects_tamper_handling() {
+            let signer = Signer::generate();
+            let config = GitHubAdapterConfig::new("https://api.github.com", "owner", "repo")
+                .expect("config creation should succeed");
+            let adapter = GitHubProjectionAdapter::new_mock(signer, config)
+                .expect("adapter creation should succeed")
+                .with_tamper_threshold(1); // Freeze on first attempt
+
+            // First attempt triggers freeze
+            let event1 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+            let result1 = adapter.on_tamper(event1, [0xAB; 32]).await;
+            assert!(matches!(
+                result1,
+                Err(ProjectionError::TamperRateLimitExceeded { .. })
+            ));
+
+            // Subsequent attempts return WorkFrozen error
+            let event2 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_002,
+            );
+            let result2 = adapter.on_tamper(event2, [0xAB; 32]).await;
+            assert!(matches!(result2, Err(ProjectionError::WorkFrozen { .. })));
+        }
+
+        #[tokio::test]
+        async fn test_different_work_items_have_independent_counters() {
+            let signer = Signer::generate();
+            let config = GitHubAdapterConfig::new("https://api.github.com", "owner", "repo")
+                .expect("config creation should succeed");
+            let adapter = GitHubProjectionAdapter::new_mock(signer, config)
+                .expect("adapter creation should succeed")
+                .with_tamper_threshold(2);
+
+            // Tamper work-001 once
+            let event1 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+            let result1 = adapter.on_tamper(event1, [0xAB; 32]).await;
+            assert!(result1.is_ok());
+
+            // Tamper work-002 once - should succeed (different counter)
+            let event2 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-002",
+                [0x99; 32],
+                1_000_000_001,
+            );
+            let result2 = adapter.on_tamper(event2, [0xCD; 32]).await;
+            assert!(result2.is_ok());
+
+            // Verify neither is frozen yet
+            assert!(adapter.is_work_frozen("work-001").is_none());
+            assert!(adapter.is_work_frozen("work-002").is_none());
+        }
     }
 }

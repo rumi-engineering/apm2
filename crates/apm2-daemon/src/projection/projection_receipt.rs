@@ -39,8 +39,6 @@
 //! assert!(receipt.validate_signature(&signer.verifying_key()).is_ok());
 //! ```
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use apm2_core::crypto::{Signature, Signer, VerifyingKey};
 use apm2_core::fac::{PROJECTION_RECEIPT_PREFIX, sign_with_domain, verify_with_domain};
 use serde::{Deserialize, Serialize};
@@ -385,11 +383,14 @@ impl ProjectionReceiptBuilder {
 
     /// Builds the receipt and signs it with the provided signer.
     ///
-    /// Uses the current system time if `projected_at` was not set.
+    /// # `BOUNDARY_INTEGRITY` Compliance
+    ///
+    /// Per the `BOUNDARY_INTEGRITY` constraint, `projected_at` MUST be
+    /// explicitly set by the adapter using its injected `TimeSource`.
     ///
     /// # Panics
     ///
-    /// Panics if required fields are missing.
+    /// Panics if required fields are missing (including `projected_at`).
     #[must_use]
     pub fn build_and_sign(self, signer: &Signer) -> ProjectionReceipt {
         self.try_build_and_sign(signer)
@@ -398,13 +399,18 @@ impl ProjectionReceiptBuilder {
 
     /// Attempts to build and sign the receipt.
     ///
-    /// Uses the current system time if `projected_at` was not set.
+    /// # `BOUNDARY_INTEGRITY` Compliance
+    ///
+    /// Per the `BOUNDARY_INTEGRITY` constraint, `projected_at` MUST be
+    /// explicitly set by the adapter using its injected `TimeSource`. This
+    /// prevents direct use of `SystemTime::now()` at the boundary layer.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectionReceiptError::MissingField`] if any required field
-    /// is not set. Returns [`ProjectionReceiptError::StringTooLong`] if any
-    /// string field exceeds the maximum length.
+    /// is not set (including `projected_at`).
+    /// Returns [`ProjectionReceiptError::StringTooLong`] if any string field
+    /// exceeds the maximum length.
     #[allow(clippy::cast_possible_truncation)]
     pub fn try_build_and_sign(
         self,
@@ -420,13 +426,11 @@ impl ProjectionReceiptBuilder {
             .projected_status
             .ok_or(ProjectionReceiptError::MissingField("projected_status"))?;
 
-        // Use current time if not specified
-        let projected_at = self.projected_at.unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-        });
+        // `BOUNDARY_INTEGRITY`: projected_at must be explicitly set by the adapter
+        // using its injected TimeSource. No SystemTime::now() fallback allowed.
+        let projected_at = self
+            .projected_at
+            .ok_or(ProjectionReceiptError::MissingField("projected_at"))?;
 
         // Validate string lengths
         if self.receipt_id.len() > MAX_STRING_LENGTH {
@@ -615,6 +619,7 @@ mod tests {
             .changeset_digest([0x42; 32])
             .ledger_head([0xAB; 32])
             .projected_status(ProjectedStatus::Success)
+            .projected_at(1_704_067_200_000_000_000)
             .try_build_and_sign(&signer);
 
         assert!(matches!(
@@ -627,17 +632,20 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_timestamp() {
+    fn test_missing_projected_at_error() {
+        // `BOUNDARY_INTEGRITY`: projected_at must be explicitly provided
         let signer = Signer::generate();
-        let receipt = ProjectionReceiptBuilder::new("receipt-001", "work-001")
+        let result = ProjectionReceiptBuilder::new("receipt-001", "work-001")
             .changeset_digest([0x42; 32])
             .ledger_head([0xAB; 32])
             .projected_status(ProjectedStatus::Success)
-            // No projected_at - should use current time
-            .build_and_sign(&signer);
+            // No projected_at - should fail
+            .try_build_and_sign(&signer);
 
-        // Should have a non-zero timestamp
-        assert!(receipt.projected_at > 0);
+        assert!(matches!(
+            result,
+            Err(ProjectionReceiptError::MissingField("projected_at"))
+        ));
     }
 
     // =========================================================================

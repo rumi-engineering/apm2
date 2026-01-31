@@ -205,6 +205,10 @@ pub enum SignalType {
     /// Projection divergence detected between ledger and external trunk.
     #[serde(rename = "PROJECTION_DIVERGENCE")]
     ProjectionDivergence,
+
+    /// Projection tamper detected: external status modified by non-adapter.
+    #[serde(rename = "PROJECTION_TAMPER")]
+    ProjectionTamper,
 }
 
 impl SignalType {
@@ -220,6 +224,7 @@ impl SignalType {
             Self::AatFail => "AAT_FAIL",
             Self::CapabilityUnavailable => "CAPABILITY_UNAVAILABLE",
             Self::ProjectionDivergence => "PROJECTION_DIVERGENCE",
+            Self::ProjectionTamper => "PROJECTION_TAMPER",
         }
     }
 }
@@ -528,6 +533,47 @@ impl DefectRecord {
             ))
             .add_remediation("Investigate the external modification to the trunk")
             .add_remediation("Initiate adjudication process for unfreeze")
+            .build()
+    }
+
+    /// Creates a defect record for projection tamper detection.
+    ///
+    /// This is a convenience constructor for emitting a defect when the
+    /// external GitHub status has been modified by a non-adapter identity.
+    /// Unlike divergence (which detects trunk HEAD mismatch), tamper
+    /// detection identifies status spoofing attempts per RFC-0015.
+    ///
+    /// # Arguments
+    ///
+    /// * `defect_id` - Unique identifier for this defect
+    /// * `work_id` - The work ID (or repo ID) this defect is associated with
+    /// * `expected_status` - The expected status from the ledger
+    /// * `actual_status` - The actual status observed on GitHub
+    /// * `timestamp_ns` - When the tamper was detected (Unix nanoseconds)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DefectError` if any input exceeds validation limits.
+    pub fn projection_tamper(
+        defect_id: impl Into<String>,
+        work_id: impl Into<String>,
+        expected_status: &str,
+        actual_status: &str,
+        timestamp_ns: u64,
+    ) -> Result<Self, DefectError> {
+        Self::builder(defect_id, "PROJECTION_TAMPER")
+            .severity(DefectSeverity::S1) // High severity - security concern
+            .work_id(work_id)
+            .detected_at(timestamp_ns)
+            .signal(DefectSignal::new(
+                SignalType::ProjectionTamper,
+                format!(
+                    "projection tamper detected: expected status '{expected_status}', actual '{actual_status}'"
+                ),
+            ))
+            .add_remediation("Investigate the external modification to the status")
+            .add_remediation("Review GitHub audit logs for unauthorized status changes")
+            .add_remediation("Status will be overwritten to match ledger truth")
             .build()
     }
 
@@ -1023,6 +1069,39 @@ mod tests {
 
         let deserialized: SignalType = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, SignalType::ProjectionDivergence);
+    }
+
+    #[test]
+    fn test_defect_record_projection_tamper() {
+        let defect = DefectRecord::projection_tamper(
+            "DEF-004",
+            "test-repo",
+            "success",
+            "failure",
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(defect.defect_id(), "DEF-004");
+        assert_eq!(defect.defect_class(), "PROJECTION_TAMPER");
+        assert_eq!(defect.severity(), DefectSeverity::S1); // High severity
+        assert_eq!(defect.work_id(), "test-repo");
+        assert_eq!(defect.signal().signal_type(), SignalType::ProjectionTamper);
+        assert!(defect.signal().details().contains("tamper detected"));
+        assert!(defect.signal().details().contains("success"));
+        assert!(defect.signal().details().contains("failure"));
+        assert!(!defect.suggested_remediations().is_empty());
+    }
+
+    #[test]
+    fn test_signal_type_projection_tamper() {
+        assert_eq!(SignalType::ProjectionTamper.as_str(), "PROJECTION_TAMPER");
+
+        let json = serde_json::to_string(&SignalType::ProjectionTamper).unwrap();
+        assert_eq!(json, "\"PROJECTION_TAMPER\"");
+
+        let deserialized: SignalType = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, SignalType::ProjectionTamper);
     }
 
     #[test]
