@@ -1244,6 +1244,50 @@ pub struct InterventionUnfreeze {
     #[prost(string, tag = "7")]
     pub time_envelope_ref: ::prost::alloc::string::String,
 }
+/// Digest and metadata for a single evidence artifact.
+/// Each artifact is identified by its content digest and includes metadata
+/// for access control, redaction tracking, and retention policy.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ArtifactDigest {
+    /// Type of artifact (Log, Junit, Coverage, Snapshot, Binary).
+    #[prost(enumeration = "ArtifactType", tag = "1")]
+    pub artifact_type: i32,
+    /// SHA-256 digest of the artifact content (32 bytes).
+    #[prost(bytes = "vec", tag = "2")]
+    pub digest: ::prost::alloc::vec::Vec<u8>,
+    /// Data classification for access control.
+    #[prost(enumeration = "DataClassification", tag = "3")]
+    pub data_classification: i32,
+    /// Whether redaction/sanitization was applied to this artifact.
+    #[prost(bool, tag = "4")]
+    pub redaction_applied: bool,
+    /// Hash of the redaction profile used (32 bytes, required if redaction_applied).
+    #[prost(bytes = "vec", tag = "5")]
+    pub redaction_profile_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Reference to the retention window for this artifact.
+    /// Uses HTF time envelope format (e.g., "htf:window:30d").
+    #[prost(string, tag = "6")]
+    pub retention_window_ref: ::prost::alloc::string::String,
+}
+/// Manifest of evidence artifacts for a gate receipt.
+/// The manifest binds all evidence artifacts produced during gate execution,
+/// enabling independent verification and retention management.
+///
+/// Invariants:
+/// - Must contain at least one artifact (empty manifests are rejected)
+/// - No duplicate digests allowed
+/// - All artifacts must pass hygiene validation
+///
+/// Security: The manifest is referenced by artifact_manifest_hash in
+/// AatGateReceipt and stored in CAS for independent verification.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ArtifactManifest {
+    /// List of artifact digests and metadata.
+    #[prost(message, repeated, tag = "1")]
+    pub artifacts: ::prost::alloc::vec::Vec<ArtifactDigest>,
+}
 /// Determinism status for AAT runs.
 /// Indicates whether multiple runs produced consistent terminal evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -1492,6 +1536,93 @@ impl InterventionResolutionType {
             "INTERVENTION_RESOLUTION_ACCEPT_DIVERGENCE" => {
                 Some(Self::InterventionResolutionAcceptDivergence)
             }
+            _ => None,
+        }
+    }
+}
+/// Type of evidence artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ArtifactType {
+    /// Unspecified type (invalid).
+    Unspecified = 0,
+    /// Execution logs and traces.
+    Log = 1,
+    /// JUnit/xUnit test reports.
+    Junit = 2,
+    /// Code coverage reports.
+    Coverage = 3,
+    /// State snapshots for determinism verification.
+    Snapshot = 4,
+    /// Compiled artifacts (executables, libraries).
+    Binary = 5,
+}
+impl ArtifactType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ARTIFACT_TYPE_UNSPECIFIED",
+            Self::Log => "ARTIFACT_TYPE_LOG",
+            Self::Junit => "ARTIFACT_TYPE_JUNIT",
+            Self::Coverage => "ARTIFACT_TYPE_COVERAGE",
+            Self::Snapshot => "ARTIFACT_TYPE_SNAPSHOT",
+            Self::Binary => "ARTIFACT_TYPE_BINARY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ARTIFACT_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "ARTIFACT_TYPE_LOG" => Some(Self::Log),
+            "ARTIFACT_TYPE_JUNIT" => Some(Self::Junit),
+            "ARTIFACT_TYPE_COVERAGE" => Some(Self::Coverage),
+            "ARTIFACT_TYPE_SNAPSHOT" => Some(Self::Snapshot),
+            "ARTIFACT_TYPE_BINARY" => Some(Self::Binary),
+            _ => None,
+        }
+    }
+}
+/// Data classification level for evidence artifacts.
+/// Determines access control and handling requirements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DataClassification {
+    /// Unspecified classification (invalid).
+    Unspecified = 0,
+    /// No access restrictions.
+    Public = 1,
+    /// Organization-internal access only.
+    Internal = 2,
+    /// Restricted access with audit logging.
+    Confidential = 3,
+    /// Maximum security controls required.
+    Restricted = 4,
+}
+impl DataClassification {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "DATA_CLASSIFICATION_UNSPECIFIED",
+            Self::Public => "DATA_CLASSIFICATION_PUBLIC",
+            Self::Internal => "DATA_CLASSIFICATION_INTERNAL",
+            Self::Confidential => "DATA_CLASSIFICATION_CONFIDENTIAL",
+            Self::Restricted => "DATA_CLASSIFICATION_RESTRICTED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DATA_CLASSIFICATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "DATA_CLASSIFICATION_PUBLIC" => Some(Self::Public),
+            "DATA_CLASSIFICATION_INTERNAL" => Some(Self::Internal),
+            "DATA_CLASSIFICATION_CONFIDENTIAL" => Some(Self::Confidential),
+            "DATA_CLASSIFICATION_RESTRICTED" => Some(Self::Restricted),
             _ => None,
         }
     }
