@@ -531,6 +531,8 @@ mod tests {
             std::process::Command::new("git")
                 .args(["add", &format!("src/file_{i}.rs")])
                 .current_dir(root)
+                .env("GIT_DIR", root.join(".git"))
+                .env("GIT_WORK_TREE", root)
                 .output()
                 .unwrap();
         }
@@ -538,6 +540,8 @@ mod tests {
         std::process::Command::new("git")
             .args(["commit", "-m", "Add many files"])
             .current_dir(root)
+            .env("GIT_DIR", root.join(".git"))
+            .env("GIT_WORK_TREE", root)
             .output()
             .unwrap();
 
@@ -730,11 +734,15 @@ mod tests {
         std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(root)
+            .env("GIT_DIR", root.join(".git"))
+            .env("GIT_WORK_TREE", root)
             .output()
             .unwrap();
         std::process::Command::new("git")
             .args(["commit", "-m", "Add files"])
             .current_dir(root)
+            .env("GIT_DIR", root.join(".git"))
+            .env("GIT_WORK_TREE", root)
             .output()
             .unwrap();
 
