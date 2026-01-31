@@ -74,6 +74,7 @@ mod key_policy;
 mod lease;
 mod policy_resolution;
 mod receipt;
+pub mod risk_tier;
 mod terminal_verifier;
 pub mod transcript_binding;
 
@@ -126,6 +127,11 @@ pub use policy_resolution::{
 pub use receipt::{
     GateReceipt, GateReceiptBuilder, GateReceiptProto, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
     SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
+};
+// Re-export risk tier classification types
+pub use risk_tier::{
+    CRITICAL_MODULES, ChangeSet, DEPENDENCY_FANOUT_THRESHOLD, FILES_CHANGED_THRESHOLD,
+    LINES_CHANGED_THRESHOLD, RiskTierClass, RiskTierError, SENSITIVE_PATTERNS, classify_risk,
 };
 // Re-export terminal verifier types
 pub use terminal_verifier::{
