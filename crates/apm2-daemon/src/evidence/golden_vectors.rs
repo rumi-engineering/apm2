@@ -156,6 +156,7 @@ pub fn construct_receipt_tool_execution() -> ToolReceipt {
         timestamp_ns: 1_704_067_200_000_000_000, // 2024-01-01 00:00:00 UTC
         unsigned_bytes_hash: [0x00; 32],         // Placeholder - will be recomputed
         tool_execution_details: Some(details),
+        time_envelope_ref: None,
         signature: None,
         signer_identity: None,
     }
@@ -175,6 +176,7 @@ pub fn construct_receipt_episode_start() -> ToolReceipt {
         timestamp_ns: 1_234_567_890_123_456_789,
         unsigned_bytes_hash: [0xcc; 32],
         tool_execution_details: None,
+        time_envelope_ref: None,
         signature: None,
         signer_identity: None,
     }
@@ -197,6 +199,7 @@ pub fn construct_receipt_sorted_evidence_refs() -> ToolReceipt {
         timestamp_ns: 5_000_000_000,
         unsigned_bytes_hash: [0xdd; 32],
         tool_execution_details: None,
+        time_envelope_ref: None,
         signature: None,
         signer_identity: None,
     }
@@ -311,6 +314,7 @@ mod tests {
             timestamp_ns: 1000,
             unsigned_bytes_hash: [0xef; 32],
             tool_execution_details: None,
+            time_envelope_ref: None,
             signature: None,
             signer_identity: None,
         };
@@ -327,6 +331,7 @@ mod tests {
             timestamp_ns: 1000,
             unsigned_bytes_hash: [0xef; 32],
             tool_execution_details: None,
+            time_envelope_ref: None,
             signature: None,
             signer_identity: None,
         };

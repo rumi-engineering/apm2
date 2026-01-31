@@ -27,6 +27,7 @@
 //!
 //! - [`episode`]: Episode runtime for bounded execution management
 //! - [`evidence`]: Flight recording and evidence retention
+//! - [`htf`]: Holonic Time Framework clock service and envelope stamping
 //! - [`projection`]: FAC projection adapters for external system sync
 //! - [`protocol`]: UDS protocol and message framing
 //! - [`session`]: Session handling with context firewall integration
@@ -34,6 +35,7 @@
 
 pub mod episode;
 pub mod evidence;
+pub mod htf;
 pub mod projection;
 pub mod protocol;
 pub mod session;

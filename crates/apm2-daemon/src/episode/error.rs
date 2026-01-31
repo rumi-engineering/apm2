@@ -157,6 +157,17 @@ pub enum EpisodeError {
         /// Error message.
         message: String,
     },
+
+    /// Clock failure during time envelope stamping.
+    ///
+    /// Per SEC-CTRL-FAC-0015 (Fail-Closed), when a clock is configured but
+    /// fails to stamp a time envelope, the operation MUST fail rather than
+    /// silently continuing without a timestamp.
+    #[error("clock failure during time stamping: {message}")]
+    ClockFailure {
+        /// Error message from the clock.
+        message: String,
+    },
 }
 
 impl EpisodeError {
@@ -178,6 +189,7 @@ impl EpisodeError {
             Self::InvalidLease { .. } => "invalid_lease",
             Self::EnvelopeValidation { .. } => "envelope_validation",
             Self::Internal { .. } => "internal",
+            Self::ClockFailure { .. } => "clock_failure",
         }
     }
 }

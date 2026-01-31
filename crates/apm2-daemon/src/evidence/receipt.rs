@@ -37,6 +37,7 @@
 
 use std::fmt;
 
+use apm2_core::htf::TimeEnvelopeRef;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -562,6 +563,13 @@ pub struct ToolReceipt {
     /// Optional tool execution details (required for `ToolExecution` kind).
     pub tool_execution_details: Option<ToolExecutionDetails>,
 
+    /// Reference to the `TimeEnvelope` for this receipt (RFC-0016 HTF).
+    ///
+    /// Per TCK-00240, tool receipts include a time envelope reference for
+    /// temporal ordering and causality tracking. The referenced envelope
+    /// should be stored in CAS for verification.
+    pub time_envelope_ref: Option<TimeEnvelopeRef>,
+
     /// Optional signature (populated after signing).
     #[serde(with = "serde_opt_signature")]
     pub signature: Option<Signature>,
@@ -672,6 +680,11 @@ impl ToolReceipt {
                 .signer_identity
                 .as_ref()
                 .map(SignerIdentity::canonical_bytes),
+            // time_envelope_ref IS included for temporal ordering (RFC-0016 HTF)
+            time_envelope_ref: self
+                .time_envelope_ref
+                .as_ref()
+                .map(|r| r.as_bytes().to_vec()),
             // NOTE: signature and unsigned_bytes_hash are EXCLUDED
             // (unsigned_bytes_hash would create circular dependency)
         };
@@ -745,6 +758,9 @@ struct ToolReceiptProto {
     // Tag 11: signer_identity - INCLUDED for cryptographic binding
     #[prost(bytes = "vec", optional, tag = "11")]
     signer_identity: Option<Vec<u8>>,
+    // Tag 12: time_envelope_ref - INCLUDED for temporal ordering (RFC-0016 HTF)
+    #[prost(bytes = "vec", optional, tag = "12")]
+    time_envelope_ref: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -771,6 +787,7 @@ mod tests {
                 result_message: Some("completed".to_string()),
                 duration_ns: 100_000_000,
             }),
+            time_envelope_ref: None,
             signature: None,
             signer_identity: None,
         };
@@ -1070,6 +1087,39 @@ mod tests {
             receipt.validate(),
             Err(ReceiptError::HashMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn test_canonical_bytes_includes_time_envelope_ref() {
+        let mut receipt_none = make_test_receipt();
+        receipt_none.time_envelope_ref = None;
+
+        let mut receipt_some = make_test_receipt();
+        let ref_bytes = [0x55; 32];
+        receipt_some.time_envelope_ref = Some(TimeEnvelopeRef::new(ref_bytes));
+
+        let bytes_none = receipt_none.canonical_bytes();
+        let bytes_some = receipt_some.canonical_bytes();
+
+        assert_ne!(
+            bytes_none, bytes_some,
+            "canonical bytes must differ when time_envelope_ref is present"
+        );
+
+        // Verify the bytes are included by decoding or checking length
+        assert!(
+            bytes_some.len() > bytes_none.len(),
+            "receipt with envelope ref should be larger"
+        );
+
+        // Sanity check: ensure we can roundtrip this field if we were to decode
+        // (We don't have a decode_canonical exposed, but we can verify digest
+        // difference)
+        assert_ne!(
+            receipt_none.digest(),
+            receipt_some.digest(),
+            "digests must differ"
+        );
     }
 
     #[test]

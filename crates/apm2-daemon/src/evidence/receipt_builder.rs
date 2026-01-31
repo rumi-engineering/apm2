@@ -30,6 +30,8 @@
 //! - CTR-1205: Builder validates ALL inputs
 //! - CTR-2603: Builder completeness
 
+use apm2_core::htf::TimeEnvelopeRef;
+
 use super::receipt::{
     CanonicalizerId, Hash, MAX_EVIDENCE_REFS, ReceiptError, ReceiptKind, Signature, SignerIdentity,
     ToolExecutionDetails, ToolReceipt,
@@ -74,6 +76,7 @@ pub struct ReceiptBuilder {
     evidence_refs: Vec<Hash>,
     timestamp_ns: Option<u64>,
     tool_execution_details: Option<ToolExecutionDetails>,
+    time_envelope_ref: Option<TimeEnvelopeRef>,
 }
 
 impl ReceiptBuilder {
@@ -89,6 +92,7 @@ impl ReceiptBuilder {
             evidence_refs: Vec::new(),
             timestamp_ns: None,
             tool_execution_details: None,
+            time_envelope_ref: None,
         }
     }
 
@@ -231,6 +235,20 @@ impl ReceiptBuilder {
         self
     }
 
+    /// Sets the time envelope reference (RFC-0016 HTF).
+    ///
+    /// # Arguments
+    ///
+    /// * `envelope_ref` - Reference to the `TimeEnvelope` for temporal ordering
+    ///
+    /// Per TCK-00240, tool receipts should include a time envelope reference
+    /// for temporal ordering and causality tracking.
+    #[must_use]
+    pub const fn with_time_envelope_ref(mut self, envelope_ref: TimeEnvelopeRef) -> Self {
+        self.time_envelope_ref = Some(envelope_ref);
+        self
+    }
+
     /// Builds the unsigned receipt.
     ///
     /// This validates all inputs and computes the `unsigned_bytes_hash`.
@@ -290,6 +308,7 @@ impl ReceiptBuilder {
             timestamp_ns,
             unsigned_bytes_hash: [0; 32], // Will be computed below
             tool_execution_details: self.tool_execution_details,
+            time_envelope_ref: self.time_envelope_ref,
             signature: None,
             signer_identity: None,
         };
