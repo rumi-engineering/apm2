@@ -71,6 +71,8 @@
     clippy::derive_partial_eq_without_eq,
     clippy::doc_markdown,
     clippy::match_single_binding,
+    clippy::missing_const_for_fn,
+    clippy::must_use_candidate,
     clippy::redundant_closure,
     clippy::struct_field_names,
     missing_docs

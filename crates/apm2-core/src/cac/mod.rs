@@ -175,6 +175,7 @@ pub mod compiler;
 pub mod conformance;
 pub mod dcp_index;
 pub mod export;
+pub mod freeze_check;
 pub mod manifest;
 pub mod pack_spec;
 pub mod patch_engine;
@@ -209,6 +210,10 @@ pub use export::{
     ContentResolver, DEFAULT_EXPORTER_VERSION, ExportConfig, ExportError, ExportManifest,
     ExportOutput, ExportPipeline, ExportPipelineBuilder, MAX_RENDERED_CONTENT_BYTES,
     MemoryContentResolver, Provenance,
+};
+// Freeze check exports
+pub use freeze_check::{
+    FreezeCheck, FreezeCheckError, MAX_FREEZE_ID_LENGTH, MAX_REASON_LENGTH, NoOpFreezeCheck,
 };
 // Manifest exports
 pub use manifest::{

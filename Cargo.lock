@@ -235,6 +235,7 @@ version = "0.3.0"
 dependencies = [
  "blake3",
  "chrono",
+ "hex",
  "proptest",
  "serde",
  "serde_bytes",

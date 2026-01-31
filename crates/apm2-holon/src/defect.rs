@@ -201,6 +201,10 @@ pub enum SignalType {
     /// A required capability is unavailable.
     #[serde(rename = "CAPABILITY_UNAVAILABLE")]
     CapabilityUnavailable,
+
+    /// Projection divergence detected between ledger and external trunk.
+    #[serde(rename = "PROJECTION_DIVERGENCE")]
+    ProjectionDivergence,
 }
 
 impl SignalType {
@@ -215,6 +219,7 @@ impl SignalType {
             Self::ExportDrift => "EXPORT_DRIFT",
             Self::AatFail => "AAT_FAIL",
             Self::CapabilityUnavailable => "CAPABILITY_UNAVAILABLE",
+            Self::ProjectionDivergence => "PROJECTION_DIVERGENCE",
         }
     }
 }
@@ -482,6 +487,47 @@ impl DefectRecord {
             )
             .add_remediation("Add missing artifact to context pack manifest")
             .add_remediation("Verify artifact stable ID is correct")
+            .build()
+    }
+
+    /// Creates a defect record for projection divergence.
+    ///
+    /// This is a convenience constructor for emitting a defect when the
+    /// ledger's `MergeReceipt` trunk HEAD diverges from the external trunk
+    /// HEAD. This triggers an intervention freeze per RFC-0015.
+    ///
+    /// # Arguments
+    ///
+    /// * `defect_id` - Unique identifier for this defect
+    /// * `work_id` - The work ID (or repo ID) this defect is associated with
+    /// * `expected_head` - The expected trunk HEAD from the `MergeReceipt`
+    /// * `actual_head` - The actual trunk HEAD observed externally
+    /// * `timestamp_ns` - When the divergence was detected (Unix nanoseconds)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DefectError` if any input exceeds validation limits.
+    pub fn projection_divergence(
+        defect_id: impl Into<String>,
+        work_id: impl Into<String>,
+        expected_head: [u8; 32],
+        actual_head: [u8; 32],
+        timestamp_ns: u64,
+    ) -> Result<Self, DefectError> {
+        let expected_hex = hex::encode(expected_head);
+        let actual_hex = hex::encode(actual_head);
+        Self::builder(defect_id, "PROJECTION_DIVERGENCE")
+            .severity(DefectSeverity::S0) // Critical - immediate intervention required
+            .work_id(work_id)
+            .detected_at(timestamp_ns)
+            .signal(DefectSignal::new(
+                SignalType::ProjectionDivergence,
+                format!(
+                    "trunk HEAD divergence detected: expected {expected_hex}, actual {actual_hex}"
+                ),
+            ))
+            .add_remediation("Investigate the external modification to the trunk")
+            .add_remediation("Initiate adjudication process for unfreeze")
             .build()
     }
 
@@ -938,6 +984,45 @@ mod tests {
 
         let deserialized: SignalType = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, SignalType::CapabilityUnavailable);
+    }
+
+    #[test]
+    fn test_defect_record_projection_divergence() {
+        let defect = DefectRecord::projection_divergence(
+            "DEF-003",
+            "test-repo",
+            [0x42; 32],
+            [0x99; 32],
+            1_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(defect.defect_id(), "DEF-003");
+        assert_eq!(defect.defect_class(), "PROJECTION_DIVERGENCE");
+        assert_eq!(defect.severity(), DefectSeverity::S0); // Critical severity
+        assert_eq!(defect.work_id(), "test-repo");
+        assert_eq!(
+            defect.signal().signal_type(),
+            SignalType::ProjectionDivergence
+        );
+        assert!(defect.signal().details().contains("divergence detected"));
+        assert!(defect.signal().details().contains("4242424242")); // Hex of expected
+        assert!(defect.signal().details().contains("9999999999")); // Hex of actual
+        assert!(!defect.suggested_remediations().is_empty());
+    }
+
+    #[test]
+    fn test_signal_type_projection_divergence() {
+        assert_eq!(
+            SignalType::ProjectionDivergence.as_str(),
+            "PROJECTION_DIVERGENCE"
+        );
+
+        let json = serde_json::to_string(&SignalType::ProjectionDivergence).unwrap();
+        assert_eq!(json, "\"PROJECTION_DIVERGENCE\"");
+
+        let deserialized: SignalType = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, SignalType::ProjectionDivergence);
     }
 
     #[test]

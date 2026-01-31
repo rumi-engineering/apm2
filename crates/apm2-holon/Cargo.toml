@@ -30,6 +30,7 @@ chrono.workspace = true
 
 # Utilities
 uuid.workspace = true
+hex.workspace = true
 
 # Cryptography
 blake3.workspace = true
