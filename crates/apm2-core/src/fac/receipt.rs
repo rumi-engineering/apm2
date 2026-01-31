@@ -687,6 +687,9 @@ impl From<GateReceipt> for GateReceiptProto {
             payload_hash: receipt.payload_hash.to_vec(),
             evidence_bundle_hash: receipt.evidence_bundle_hash.to_vec(),
             receipt_signature: receipt.receipt_signature.to_vec(),
+            // HTF time envelope reference (RFC-0016): not yet populated by this conversion.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
         }
     }
 }
@@ -1031,6 +1034,8 @@ pub mod tests {
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
             receipt_signature: vec![0u8; 64],
+            // HTF time envelope reference (RFC-0016): not yet populated.
+            time_envelope_ref: None,
         };
 
         let result = GateReceipt::try_from(proto);
@@ -1051,6 +1056,8 @@ pub mod tests {
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
             receipt_signature: vec![0u8; 32], // Wrong length - should be 64
+            // HTF time envelope reference (RFC-0016): not yet populated.
+            time_envelope_ref: None,
         };
 
         let result = GateReceipt::try_from(proto);
@@ -1096,6 +1103,8 @@ pub mod tests {
             payload_hash: vec![0xAB; 32],
             evidence_bundle_hash: vec![0xCD; 32],
             receipt_signature: vec![0u8; 64],
+            // HTF time envelope reference (RFC-0016): not yet populated.
+            time_envelope_ref: None,
         };
 
         let result = GateReceipt::try_from(proto);

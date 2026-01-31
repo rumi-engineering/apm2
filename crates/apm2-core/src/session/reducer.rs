@@ -504,6 +504,9 @@ pub mod helpers {
             entropy_budget,
             resume_cursor,
             restart_attempt,
+            // HTF time envelope reference (RFC-0016): not yet populated by this helper.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Started(started)),
@@ -544,6 +547,9 @@ pub mod helpers {
             exit_classification: exit_classification.to_string(),
             rationale_code: rationale_code.to_string(),
             final_entropy,
+            // HTF time envelope reference (RFC-0016): not yet populated by this helper.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Terminated(terminated)),

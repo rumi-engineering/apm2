@@ -63,7 +63,7 @@ use apm2_core::crypto::{Signer, VerifyingKey};
 use apm2_core::events::{
     InterventionFreeze as ProtoInterventionFreeze,
     InterventionResolutionType as ProtoResolutionType, InterventionScope as ProtoScope,
-    InterventionUnfreeze as ProtoInterventionUnfreeze,
+    InterventionUnfreeze as ProtoInterventionUnfreeze, TimeEnvelopeRef,
 };
 use apm2_core::fac::{
     INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, sign_with_domain, verify_with_domain,
@@ -629,6 +629,17 @@ impl TryFrom<i32> for ResolutionType {
 
 impl From<&InterventionFreeze> for ProtoInterventionFreeze {
     fn from(freeze: &InterventionFreeze) -> Self {
+        // Convert domain time_envelope_ref (hex String) to proto TimeEnvelopeRef
+        // Empty string maps to None; non-empty hex string maps to Some(TimeEnvelopeRef)
+        let time_envelope_ref = if freeze.time_envelope_ref.is_empty() {
+            None
+        } else {
+            // Best-effort decode; if invalid hex, produce empty hash (will fail validation
+            // later)
+            let hash = hex::decode(&freeze.time_envelope_ref).unwrap_or_default();
+            Some(TimeEnvelopeRef { hash })
+        };
+
         Self {
             freeze_id: freeze.freeze_id.clone(),
             scope: i32::from(freeze.scope),
@@ -639,7 +650,7 @@ impl From<&InterventionFreeze> for ProtoInterventionFreeze {
             actual_trunk_head: freeze.actual_trunk_head.to_vec(),
             gate_actor_id: freeze.gate_actor_id.clone(),
             gate_signature: freeze.gate_signature.to_vec(),
-            time_envelope_ref: freeze.time_envelope_ref.clone(),
+            time_envelope_ref,
         }
     }
 }
@@ -683,6 +694,15 @@ impl TryFrom<&ProtoInterventionFreeze> for InterventionFreeze {
                 ))
             })?;
 
+        // Convert proto time_envelope_ref (Option<TimeEnvelopeRef>) to domain (hex
+        // String) None maps to empty string; Some(TimeEnvelopeRef) maps to
+        // hex-encoded hash
+        let time_envelope_ref = proto
+            .time_envelope_ref
+            .as_ref()
+            .map(|ter| hex::encode(&ter.hash))
+            .unwrap_or_default();
+
         Ok(Self {
             freeze_id: proto.freeze_id.clone(),
             scope,
@@ -693,7 +713,7 @@ impl TryFrom<&ProtoInterventionFreeze> for InterventionFreeze {
             actual_trunk_head,
             gate_actor_id: proto.gate_actor_id.clone(),
             gate_signature,
-            time_envelope_ref: proto.time_envelope_ref.clone(),
+            time_envelope_ref,
         })
     }
 }
@@ -708,6 +728,17 @@ impl TryFrom<ProtoInterventionFreeze> for InterventionFreeze {
 
 impl From<&InterventionUnfreeze> for ProtoInterventionUnfreeze {
     fn from(unfreeze: &InterventionUnfreeze) -> Self {
+        // Convert domain time_envelope_ref (hex String) to proto TimeEnvelopeRef
+        // Empty string maps to None; non-empty hex string maps to Some(TimeEnvelopeRef)
+        let time_envelope_ref = if unfreeze.time_envelope_ref.is_empty() {
+            None
+        } else {
+            // Best-effort decode; if invalid hex, produce empty hash (will fail validation
+            // later)
+            let hash = hex::decode(&unfreeze.time_envelope_ref).unwrap_or_default();
+            Some(TimeEnvelopeRef { hash })
+        };
+
         Self {
             freeze_id: unfreeze.freeze_id.clone(),
             resolution_type: i32::from(unfreeze.resolution_type),
@@ -716,7 +747,7 @@ impl From<&InterventionUnfreeze> for ProtoInterventionUnfreeze {
             unfrozen_at: unfreeze.unfrozen_at,
             gate_actor_id: unfreeze.gate_actor_id.clone(),
             gate_signature: unfreeze.gate_signature.to_vec(),
-            time_envelope_ref: unfreeze.time_envelope_ref.clone(),
+            time_envelope_ref,
         }
     }
 }
@@ -748,6 +779,15 @@ impl TryFrom<&ProtoInterventionUnfreeze> for InterventionUnfreeze {
             Some(proto.adjudication_id.clone())
         };
 
+        // Convert proto time_envelope_ref (Option<TimeEnvelopeRef>) to domain (hex
+        // String) None maps to empty string; Some(TimeEnvelopeRef) maps to
+        // hex-encoded hash
+        let time_envelope_ref = proto
+            .time_envelope_ref
+            .as_ref()
+            .map(|ter| hex::encode(&ter.hash))
+            .unwrap_or_default();
+
         Ok(Self {
             freeze_id: proto.freeze_id.clone(),
             resolution_type,
@@ -755,7 +795,7 @@ impl TryFrom<&ProtoInterventionUnfreeze> for InterventionUnfreeze {
             unfrozen_at: proto.unfrozen_at,
             gate_actor_id: proto.gate_actor_id.clone(),
             gate_signature,
-            time_envelope_ref: proto.time_envelope_ref.clone(),
+            time_envelope_ref,
         })
     }
 }
@@ -2544,6 +2584,8 @@ pub mod tests {
     #[test]
     fn test_intervention_freeze_proto_conversion() {
         let signer = Signer::generate();
+        // Use a valid 64-character hex string (32 bytes) for time_envelope_ref
+        let time_envelope_hash = hex::encode([0xab; 32]);
         let freeze = InterventionFreezeBuilder::new("freeze-001")
             .scope(FreezeScope::Repository)
             .scope_value("test-repo")
@@ -2552,7 +2594,7 @@ pub mod tests {
             .expected_trunk_head([0x42; 32])
             .actual_trunk_head([0x99; 32])
             .gate_actor_id("watchdog-001")
-            .time_envelope_ref("htf:tick:12345")
+            .time_envelope_ref(&time_envelope_hash)
             .build_and_sign(&signer);
 
         // Manual -> Proto
@@ -2569,7 +2611,13 @@ pub mod tests {
         assert_eq!(proto.actual_trunk_head, freeze.actual_trunk_head.to_vec());
         assert_eq!(proto.gate_actor_id, freeze.gate_actor_id);
         assert_eq!(proto.gate_signature, freeze.gate_signature.to_vec());
-        assert_eq!(proto.time_envelope_ref, freeze.time_envelope_ref);
+        // Compare time_envelope_ref by converting proto back to hex string
+        let proto_time_envelope_ref = proto
+            .time_envelope_ref
+            .as_ref()
+            .map(|ter| hex::encode(&ter.hash))
+            .unwrap_or_default();
+        assert_eq!(proto_time_envelope_ref, freeze.time_envelope_ref);
 
         // Proto -> Manual roundtrip
         let recovered = InterventionFreeze::try_from(proto).unwrap();
@@ -2579,12 +2627,14 @@ pub mod tests {
     #[test]
     fn test_intervention_unfreeze_proto_conversion() {
         let signer = Signer::generate();
+        // Use a valid 64-character hex string (32 bytes) for time_envelope_ref
+        let time_envelope_hash = hex::encode([0xcd; 32]);
         let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
             .resolution_type(ResolutionType::Adjudication)
             .adjudication_id("adj-001")
             .unfrozen_at(2_000_000_000)
             .gate_actor_id("operator-001")
-            .time_envelope_ref("htf:tick:12345")
+            .time_envelope_ref(&time_envelope_hash)
             .build_and_sign(&signer);
 
         // Manual -> Proto
@@ -2595,7 +2645,13 @@ pub mod tests {
         assert_eq!(proto.unfrozen_at, unfreeze.unfrozen_at);
         assert_eq!(proto.gate_actor_id, unfreeze.gate_actor_id);
         assert_eq!(proto.gate_signature, unfreeze.gate_signature.to_vec());
-        assert_eq!(proto.time_envelope_ref, unfreeze.time_envelope_ref);
+        // Compare time_envelope_ref by converting proto back to hex string
+        let proto_time_envelope_ref = proto
+            .time_envelope_ref
+            .as_ref()
+            .map(|ter| hex::encode(&ter.hash))
+            .unwrap_or_default();
+        assert_eq!(proto_time_envelope_ref, unfreeze.time_envelope_ref);
 
         // Proto -> Manual roundtrip
         let recovered = InterventionUnfreeze::try_from(proto).unwrap();
@@ -2605,11 +2661,13 @@ pub mod tests {
     #[test]
     fn test_intervention_unfreeze_proto_conversion_none_adjudication() {
         let signer = Signer::generate();
+        // Use a valid 64-character hex string (32 bytes) for time_envelope_ref
+        let time_envelope_hash = hex::encode([0xef; 32]);
         let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
             .resolution_type(ResolutionType::Manual)
             .unfrozen_at(2_000_000_000)
             .gate_actor_id("operator-001")
-            .time_envelope_ref("htf:tick:12345")
+            .time_envelope_ref(&time_envelope_hash)
             .build_and_sign(&signer);
 
         // Manual -> Proto (None -> empty string)

@@ -338,6 +338,9 @@ impl FirewallDecision {
             policy_hash: policy_hash.to_vec(),
             rationale_code: rationale_with_path,
             budget_consumed,
+            // HTF time envelope reference (RFC-0016): not yet populated by this method.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
         }
     }
 }

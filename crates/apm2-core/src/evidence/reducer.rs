@@ -379,6 +379,9 @@ pub mod helpers {
             classification: classification.to_string(),
             artifact_size,
             metadata,
+            // HTF time envelope reference (RFC-0016): not yet populated.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
         };
         let event = EvidenceEvent {
             event: Some(evidence_event::Event::Published(published)),

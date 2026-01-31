@@ -1,5 +1,14 @@
 // APM2 Kernel Event Schema
-// Version: 0.2.0
+// Version: 0.3.0
+//
+// CHANGELOG (0.3.0):
+// - Added TimeEnvelopeRef message type for HTF time authority (RFC-0016)
+// - Added optional time_envelope_ref field to critical events:
+//   SessionStarted, SessionTerminated, ToolDecided, ToolExecuted,
+//   LeaseIssued, LeaseReleased, AdjudicationResolved, EvidencePublished,
+//   GateReceipt, MergeReceipt, InterventionFreeze, InterventionUnfreeze,
+//   RunnerPoolQuarantined, AATSpecQuarantined, QuarantineCleared
+// - Marked legacy timestamp fields as OBSERVATIONAL (not for protocol authority)
 //
 // This file defines the core event types for the APM2 kernel.
 // All events are stored in the ledger and form a hash chain.
@@ -19,6 +28,26 @@ syntax = "proto3";
 package apm2.kernel.v1;
 
 import "google/protobuf/timestamp.proto";
+
+// ============================================================
+// HTF TIME ENVELOPE REFERENCE (RFC-0016)
+// ============================================================
+//
+// TimeEnvelopeRef provides a content-addressed reference to a full
+// TimeEnvelopeV1 stored in CAS. Critical events include this reference
+// to bind HTF time authority to protocol decisions.
+//
+// Security: The 32-byte hash provides integrity verification and enables
+// independent retrieval/validation of the full time envelope.
+
+// Content hash reference to a TimeEnvelopeV1 artifact in CAS.
+// Used by critical events to bind HTF time authority without embedding
+// the full envelope in hot-path messages.
+message TimeEnvelopeRef {
+  // Content hash (SHA-256) of the TimeEnvelopeV1 artifact (32 bytes).
+  // The referenced envelope can be retrieved from CAS for verification.
+  bytes hash = 1;
+}
 
 // Common envelope for all kernel events
 message KernelEvent {
@@ -110,6 +139,9 @@ message SessionStarted {
   uint64 resume_cursor = 7;
   // For restarted sessions: restart attempt number (0 = first start)
   uint32 restart_attempt = 8;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds this event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 9;
 }
 
 message SessionProgress {
@@ -124,6 +156,9 @@ message SessionTerminated {
   string exit_classification = 2;  // SUCCESS, FAILURE, TIMEOUT, ENTROPY_EXCEEDED
   string rationale_code = 3;
   uint64 final_entropy = 4;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds this event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 5;
 }
 
 message SessionQuarantined {
@@ -214,13 +249,22 @@ message ToolDecided {
   bytes policy_hash = 4;
   string rationale_code = 5;
   uint64 budget_consumed = 6;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the decision receipt to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 7;
 }
 
 message ToolExecuted {
   string request_id = 1;
   string outcome = 2;  // SUCCESS, FAILURE, TIMEOUT
   bytes result_hash = 3;  // Hash of result (full result stored in CAS)
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  // Duration is recorded for observational purposes only; authoritative
+  // timing uses HTF tick deltas from the time_envelope_ref.
   uint64 duration_ms = 4;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the execution receipt to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 5;
 }
 
 // ============================================================
@@ -240,9 +284,18 @@ message LeaseIssued {
   string lease_id = 1;
   string work_id = 2;
   string actor_id = 3;
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  // Retained for display/audit purposes; authoritative timing uses
+  // tick-based expiry from the time_envelope_ref.
   uint64 issued_at = 4;
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  // Retained for display/audit purposes; authoritative expiry uses
+  // tick-based checks from the time_envelope_ref.
   uint64 expires_at = 5;
   bytes registrar_signature = 6;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the lease issuance to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 7;
 }
 
 message LeaseRenewed {
@@ -254,6 +307,9 @@ message LeaseRenewed {
 message LeaseReleased {
   string lease_id = 1;
   string release_reason = 2;  // COMPLETED, ABORTED, VOLUNTARY
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the lease release to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 3;
 }
 
 message LeaseExpired {
@@ -332,6 +388,9 @@ message AdjudicationResolved {
   uint64 votes_for = 3;
   uint64 votes_against = 4;
   bytes quorum_signature = 5;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the adjudication decision to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 6;
 }
 
 message AdjudicationTimeout {
@@ -361,6 +420,9 @@ message EvidencePublished {
   uint64 artifact_size = 7;
   // Metadata key-value pairs as "key=value" strings
   repeated string metadata = 8;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the evidence submission to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 9;
 }
 
 message GateReceiptGenerated {
@@ -691,6 +753,9 @@ message GateReceipt {
   bytes evidence_bundle_hash = 10;
   // Ed25519 signature over canonical bytes with GATE_RECEIPT: domain (64 bytes)
   bytes receipt_signature = 11;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the gate receipt to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 12;
 }
 
 // ============================================================
@@ -912,7 +977,9 @@ message InterventionFreeze {
   string scope_value = 3;
   // ID of the DefectRecord that triggered this freeze.
   string trigger_defect_id = 4;
-  // Timestamp when the freeze was applied (Unix nanoseconds).
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  // Retained for display/audit purposes; authoritative timing uses
+  // HTF time from the time_envelope_ref.
   uint64 frozen_at = 5;
   // Expected trunk HEAD from the latest MergeReceipt.
   bytes expected_trunk_head = 6;
@@ -922,8 +989,9 @@ message InterventionFreeze {
   string gate_actor_id = 8;
   // Ed25519 signature over canonical bytes with INTERVENTION_FREEZE: domain (64 bytes).
   bytes gate_signature = 9;
-  // Reference to the time envelope for temporal authority.
-  string time_envelope_ref = 10;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the freeze event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 10;
 }
 
 // Emitted when a frozen scope is unfrozen after adjudication.
@@ -938,14 +1006,17 @@ message InterventionUnfreeze {
   InterventionResolutionType resolution_type = 2;
   // ID of the adjudication that resolved the freeze.
   string adjudication_id = 3;
-  // Timestamp when the unfreeze was applied (Unix nanoseconds).
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  // Retained for display/audit purposes; authoritative timing uses
+  // HTF time from the time_envelope_ref.
   uint64 unfrozen_at = 4;
   // Actor who issued the unfreeze (must be authorized).
   string gate_actor_id = 5;
   // Ed25519 signature over canonical bytes with INTERVENTION_UNFREEZE: domain (64 bytes).
   bytes gate_signature = 6;
-  // Reference to the time envelope for temporal authority.
-  string time_envelope_ref = 7;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the unfreeze event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 7;
 }
 
 // ============================================================
@@ -1175,8 +1246,9 @@ message RunnerPoolQuarantined {
   string reason = 3;
   // References to evidence supporting the quarantine decision.
   repeated string evidence_refs = 4;
-  // Reference to the time envelope for temporal authority.
-  string time_envelope_ref = 5;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the quarantine event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 5;
   // Actor who issued the quarantine.
   string issuer_actor_id = 6;
   // Ed25519 signature over canonical bytes with QUARANTINE_EVENT: domain (64 bytes).
@@ -1200,8 +1272,9 @@ message AATSpecQuarantined {
   string reason = 3;
   // References to evidence supporting the quarantine decision.
   repeated string evidence_refs = 4;
-  // Reference to the time envelope for temporal authority.
-  string time_envelope_ref = 5;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the quarantine event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 5;
   // Actor who issued the quarantine.
   string issuer_actor_id = 6;
   // Ed25519 signature over canonical bytes with QUARANTINE_EVENT: domain (64 bytes).
@@ -1220,12 +1293,17 @@ message QuarantineCleared {
   string quarantine_id = 1;
   // ID of the target being cleared (pool_id or spec_id).
   string target_id = 2;
-  // Timestamp when the quarantine was cleared (Unix nanoseconds).
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  // Retained for display/audit purposes; authoritative timing uses
+  // HTF time from the time_envelope_ref.
   uint64 cleared_at = 3;
   // Actor who cleared the quarantine.
   string issuer_actor_id = 4;
   // Ed25519 signature over canonical bytes with QUARANTINE_EVENT: domain (64 bytes).
   bytes issuer_signature = 5;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the quarantine clearing event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 6;
 }
 
 // ============================================================
@@ -1248,10 +1326,15 @@ message MergeReceipt {
   bytes policy_hash = 4;
   // Observed result selector (e.g., new commit SHA)
   string result_selector = 5;
-  // Timestamp when the merge occurred (Unix nanos)
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  // Retained for display/audit purposes; authoritative timing uses
+  // HTF time from the time_envelope_ref.
   uint64 merged_at = 6;
   // Actor who performed the merge
   string gate_actor_id = 7;
   // Ed25519 signature over canonical bytes with MERGE_RECEIPT: domain (64 bytes)
   bytes gate_signature = 8;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the merge receipt to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 9;
 }

@@ -17,6 +17,8 @@ fn test_session_started_roundtrip() {
         entropy_budget: 10_000,
         resume_cursor: 0,
         restart_attempt: 0,
+        // HTF time envelope reference (RFC-0016): not yet populated.
+        time_envelope_ref: None,
     };
 
     let session_event = SessionEvent {
@@ -142,6 +144,8 @@ fn test_lease_issued_roundtrip() {
         issued_at: 1_700_000_000,
         expires_at: 1_700_003_600,
         registrar_signature: vec![0xde; 64],
+        // HTF time envelope reference (RFC-0016): not yet populated.
+        time_envelope_ref: None,
     };
 
     let lease_event = LeaseEvent {
@@ -251,6 +255,8 @@ fn test_evidence_published_roundtrip() {
         classification: "INTERNAL".to_string(),
         artifact_size: 1024,
         metadata: vec!["key=value".to_string()],
+        // HTF time envelope reference (RFC-0016): not yet populated.
+        time_envelope_ref: None,
     };
 
     let evidence_event = EvidenceEvent {

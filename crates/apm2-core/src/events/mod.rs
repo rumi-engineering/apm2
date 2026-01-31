@@ -46,6 +46,8 @@
 //!     entropy_budget: 1000,
 //!     resume_cursor: 0,
 //!     restart_attempt: 0,
+//!     // HTF time envelope reference (RFC-0016): not yet populated.
+//!     time_envelope_ref: None,
 //! };
 //!
 //! let session_event = SessionEvent {

@@ -556,6 +556,9 @@ pub mod helpers {
             issued_at,
             expires_at,
             registrar_signature,
+            // HTF time envelope reference (RFC-0016): not yet populated by this helper.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
         };
         let event = LeaseEvent {
             event: Some(lease_event::Event::Issued(issued)),
@@ -587,6 +590,9 @@ pub mod helpers {
         let released = LeaseReleased {
             lease_id: lease_id.to_string(),
             release_reason: release_reason.to_string(),
+            // HTF time envelope reference (RFC-0016): not yet populated by this helper.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
         };
         let event = LeaseEvent {
             event: Some(lease_event::Event::Released(released)),

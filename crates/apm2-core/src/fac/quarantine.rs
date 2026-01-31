@@ -52,7 +52,7 @@
 //!     pool_id: "pool-flaky".to_string(),
 //!     reason: "Timing flakiness detected".to_string(),
 //!     evidence_refs: vec!["evidence-001".to_string()],
-//!     time_envelope_ref: "htf:tick:12345".to_string(),
+//!     time_envelope_ref: None,
 //!     issuer_actor_id: "gate-001".to_string(),
 //!     issuer_signature: [0u8; 64],
 //! };
@@ -70,6 +70,8 @@
 //!     cleared_at: 1704067200000,
 //!     issuer_actor_id: "gate-001".to_string(),
 //!     issuer_signature: [0u8; 64],
+//!     // HTF time envelope reference (RFC-0016): not yet populated.
+//!     time_envelope_ref: None,
 //! };
 //! projection
 //!     .apply(QuarantineEvent::Cleared(clear_event))
@@ -163,6 +165,55 @@ pub enum QuarantineError {
 }
 
 // =============================================================================
+// Serde Helpers for TimeEnvelopeRef
+// =============================================================================
+
+/// Serializes a proto `TimeEnvelopeRef` to hex-encoded string.
+///
+/// Note: Serde requires `&Option<T>` signature for field-level serialization.
+#[allow(clippy::ref_option)]
+fn serialize_time_envelope_ref<S>(
+    value: &Option<crate::events::TimeEnvelopeRef>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(envelope_ref) => {
+            let hex = hex::encode(&envelope_ref.hash);
+            serializer.serialize_some(&hex)
+        },
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Deserializes a hex-encoded string to a proto `TimeEnvelopeRef`.
+fn deserialize_time_envelope_ref<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::events::TimeEnvelopeRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(hex_str) => {
+            let bytes = hex::decode(&hex_str).map_err(serde::de::Error::custom)?;
+            if bytes.len() != 32 {
+                return Err(serde::de::Error::custom(format!(
+                    "time_envelope_ref hash must be 32 bytes, got {}",
+                    bytes.len()
+                )));
+            }
+            Ok(Some(crate::events::TimeEnvelopeRef { hash: bytes }))
+        },
+        None => Ok(None),
+    }
+}
+
+// =============================================================================
 // Domain Types
 // =============================================================================
 
@@ -181,8 +232,16 @@ pub struct RunnerPoolQuarantined {
     /// References to evidence supporting the quarantine decision.
     pub evidence_refs: Vec<String>,
 
-    /// Reference to the time envelope for temporal authority.
-    pub time_envelope_ref: String,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the quarantine event to verifiable HTF time.
+    /// Stored as proto type for direct conversion; serde uses hex encoding.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_time_envelope_ref",
+        deserialize_with = "deserialize_time_envelope_ref",
+        default
+    )]
+    pub time_envelope_ref: Option<crate::events::TimeEnvelopeRef>,
 
     /// Actor who issued the quarantine.
     pub issuer_actor_id: String,
@@ -201,7 +260,7 @@ impl RunnerPoolQuarantined {
     /// - `pool_id` (length-prefixed)
     /// - `reason` (length-prefixed)
     /// - `evidence_refs` count + each ref (length-prefixed, sorted)
-    /// - `time_envelope_ref` (length-prefixed)
+    /// - `time_envelope_ref` (optional: present flag + 32 byte hash)
     /// - `issuer_actor_id` (length-prefixed)
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH < u32::MAX
@@ -229,9 +288,13 @@ impl RunnerPoolQuarantined {
             bytes.extend_from_slice(r.as_bytes());
         }
 
-        // time_envelope_ref (length-prefixed)
-        bytes.extend_from_slice(&(self.time_envelope_ref.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(self.time_envelope_ref.as_bytes());
+        // time_envelope_ref (optional: 1 byte present flag + 32 byte hash if present)
+        if let Some(ref envelope_ref) = self.time_envelope_ref {
+            bytes.push(1); // Present flag
+            bytes.extend_from_slice(&envelope_ref.hash);
+        } else {
+            bytes.push(0); // Absent flag
+        }
 
         // issuer_actor_id (length-prefixed)
         bytes.extend_from_slice(&(self.issuer_actor_id.len() as u32).to_be_bytes());
@@ -280,8 +343,16 @@ pub struct AATSpecQuarantined {
     /// References to evidence supporting the quarantine decision.
     pub evidence_refs: Vec<String>,
 
-    /// Reference to the time envelope for temporal authority.
-    pub time_envelope_ref: String,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the quarantine event to verifiable HTF time.
+    /// Stored as proto type for direct conversion; serde uses hex encoding.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_time_envelope_ref",
+        deserialize_with = "deserialize_time_envelope_ref",
+        default
+    )]
+    pub time_envelope_ref: Option<crate::events::TimeEnvelopeRef>,
 
     /// Actor who issued the quarantine.
     pub issuer_actor_id: String,
@@ -300,7 +371,7 @@ impl AATSpecQuarantined {
     /// - `spec_id` (length-prefixed)
     /// - `reason` (length-prefixed)
     /// - `evidence_refs` count + each ref (length-prefixed, sorted)
-    /// - `time_envelope_ref` (length-prefixed)
+    /// - `time_envelope_ref` (optional: present flag + 32 byte hash)
     /// - `issuer_actor_id` (length-prefixed)
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH < u32::MAX
@@ -328,9 +399,13 @@ impl AATSpecQuarantined {
             bytes.extend_from_slice(r.as_bytes());
         }
 
-        // time_envelope_ref (length-prefixed)
-        bytes.extend_from_slice(&(self.time_envelope_ref.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(self.time_envelope_ref.as_bytes());
+        // time_envelope_ref (optional: 1 byte present flag + 32 byte hash if present)
+        if let Some(ref envelope_ref) = self.time_envelope_ref {
+            bytes.push(1); // Present flag
+            bytes.extend_from_slice(&envelope_ref.hash);
+        } else {
+            bytes.push(0); // Absent flag
+        }
 
         // issuer_actor_id (length-prefixed)
         bytes.extend_from_slice(&(self.issuer_actor_id.len() as u32).to_be_bytes());
@@ -373,6 +448,7 @@ pub struct QuarantineCleared {
     /// ID of the target being cleared (`pool_id` or `spec_id`).
     pub target_id: String,
 
+    /// OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
     /// Timestamp when the quarantine was cleared (Unix nanoseconds).
     pub cleared_at: u64,
 
@@ -382,6 +458,17 @@ pub struct QuarantineCleared {
     /// Ed25519 signature over canonical bytes.
     #[serde(with = "serde_bytes")]
     pub issuer_signature: [u8; 64],
+
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the quarantine clearing event to verifiable HTF time.
+    /// Stored as proto type for direct conversion; serde uses hex encoding.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_time_envelope_ref",
+        deserialize_with = "deserialize_time_envelope_ref",
+        default
+    )]
+    pub time_envelope_ref: Option<crate::events::TimeEnvelopeRef>,
 }
 
 impl QuarantineCleared {
@@ -393,6 +480,7 @@ impl QuarantineCleared {
     /// - `target_id` (length-prefixed)
     /// - `cleared_at` (8 bytes big-endian)
     /// - `issuer_actor_id` (length-prefixed)
+    /// - `time_envelope_ref` (optional: present flag + 32 byte hash)
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH < u32::MAX
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -412,6 +500,14 @@ impl QuarantineCleared {
         // issuer_actor_id (length-prefixed)
         bytes.extend_from_slice(&(self.issuer_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.issuer_actor_id.as_bytes());
+
+        // time_envelope_ref (optional: 1 byte present flag + 32 byte hash if present)
+        if let Some(ref envelope_ref) = self.time_envelope_ref {
+            bytes.push(1); // Present flag
+            bytes.extend_from_slice(&envelope_ref.hash);
+        } else {
+            bytes.push(0); // Absent flag
+        }
 
         bytes
     }
@@ -513,7 +609,7 @@ impl QuarantineProjection {
     ///     pool_id: "pool-001".to_string(),
     ///     reason: "Flaky".to_string(),
     ///     evidence_refs: vec![],
-    ///     time_envelope_ref: "htf:tick:1".to_string(),
+    ///     time_envelope_ref: None,
     ///     issuer_actor_id: "gate".to_string(),
     ///     issuer_signature: [0u8; 64],
     /// };
@@ -642,7 +738,7 @@ fn validate_pool_quarantined(event: &RunnerPoolQuarantined) -> Result<(), Quaran
     validate_string_length("quarantine_id", &event.quarantine_id)?;
     validate_string_length("pool_id", &event.pool_id)?;
     validate_string_length("reason", &event.reason)?;
-    validate_string_length("time_envelope_ref", &event.time_envelope_ref)?;
+    validate_time_envelope_ref(event.time_envelope_ref.as_ref())?;
     validate_string_length("issuer_actor_id", &event.issuer_actor_id)?;
     validate_evidence_refs(&event.evidence_refs)?;
     Ok(())
@@ -653,7 +749,7 @@ fn validate_spec_quarantined(event: &AATSpecQuarantined) -> Result<(), Quarantin
     validate_string_length("quarantine_id", &event.quarantine_id)?;
     validate_string_length("spec_id", &event.spec_id)?;
     validate_string_length("reason", &event.reason)?;
-    validate_string_length("time_envelope_ref", &event.time_envelope_ref)?;
+    validate_time_envelope_ref(event.time_envelope_ref.as_ref())?;
     validate_string_length("issuer_actor_id", &event.issuer_actor_id)?;
     validate_evidence_refs(&event.evidence_refs)?;
     Ok(())
@@ -675,6 +771,23 @@ const fn validate_string_length(field: &'static str, value: &str) -> Result<(), 
             len: value.len(),
             max: MAX_STRING_LENGTH,
         });
+    }
+    Ok(())
+}
+
+/// Validates a time envelope reference.
+///
+/// If present, the hash must be exactly 32 bytes (SHA-256).
+fn validate_time_envelope_ref(
+    envelope_ref: Option<&crate::events::TimeEnvelopeRef>,
+) -> Result<(), QuarantineError> {
+    if let Some(envelope) = envelope_ref {
+        if envelope.hash.len() != 32 {
+            return Err(QuarantineError::InvalidData(format!(
+                "time_envelope_ref hash must be 32 bytes, got {}",
+                envelope.hash.len()
+            )));
+        }
     }
     Ok(())
 }
@@ -796,6 +909,7 @@ impl TryFrom<QuarantineClearedProto> for QuarantineCleared {
             cleared_at: proto.cleared_at,
             issuer_actor_id: proto.issuer_actor_id,
             issuer_signature,
+            time_envelope_ref: proto.time_envelope_ref,
         };
 
         validate_cleared(&event)?;
@@ -811,6 +925,7 @@ impl From<QuarantineCleared> for QuarantineClearedProto {
             cleared_at: domain.cleared_at,
             issuer_actor_id: domain.issuer_actor_id,
             issuer_signature: domain.issuer_signature.to_vec(),
+            time_envelope_ref: domain.time_envelope_ref,
         }
     }
 }
@@ -865,7 +980,9 @@ pub mod tests {
             pool_id: pool_id.to_string(),
             reason: "Test flakiness".to_string(),
             evidence_refs: vec!["evidence-001".to_string()],
-            time_envelope_ref: "htf:tick:12345".to_string(),
+            time_envelope_ref: Some(crate::events::TimeEnvelopeRef {
+                hash: [0x42u8; 32].to_vec(),
+            }),
             issuer_actor_id: "gate-001".to_string(),
             issuer_signature: [0u8; 64],
         }
@@ -877,7 +994,9 @@ pub mod tests {
             spec_id: spec_id.to_string(),
             reason: "Non-deterministic output".to_string(),
             evidence_refs: vec!["evidence-002".to_string()],
-            time_envelope_ref: "htf:tick:12346".to_string(),
+            time_envelope_ref: Some(crate::events::TimeEnvelopeRef {
+                hash: [0x43u8; 32].to_vec(),
+            }),
             issuer_actor_id: "gate-002".to_string(),
             issuer_signature: [0u8; 64],
         }
@@ -890,6 +1009,9 @@ pub mod tests {
             cleared_at: 1_704_067_200_000,
             issuer_actor_id: "gate-001".to_string(),
             issuer_signature: [0u8; 64],
+            time_envelope_ref: Some(crate::events::TimeEnvelopeRef {
+                hash: [0x44u8; 32].to_vec(),
+            }),
         }
     }
 
@@ -1144,7 +1266,8 @@ pub mod tests {
             pool_id: "pool-001".to_string(),
             reason: "test".to_string(),
             evidence_refs: vec![],
-            time_envelope_ref: "htf:tick:1".to_string(),
+            // HTF time envelope reference (RFC-0016): using None for test.
+            time_envelope_ref: None,
             issuer_actor_id: "gate".to_string(),
             issuer_signature: vec![0u8; 32], // Wrong length!
         };
@@ -1168,7 +1291,8 @@ pub mod tests {
             pool_id: "pool".to_string(),
             reason: "test".to_string(),
             evidence_refs: vec![],
-            time_envelope_ref: "htf:tick:1".to_string(),
+            // HTF time envelope reference (RFC-0016): using None for test.
+            time_envelope_ref: None,
             issuer_actor_id: "gate".to_string(),
             issuer_signature: vec![0u8; 64],
         };
@@ -1191,7 +1315,7 @@ pub mod tests {
             pool_id: long_string,
             reason: "test".to_string(),
             evidence_refs: vec![],
-            time_envelope_ref: "htf:tick:1".to_string(),
+            time_envelope_ref: None,
             issuer_actor_id: "gate".to_string(),
             issuer_signature: vec![0u8; 64],
         };
@@ -1217,7 +1341,7 @@ pub mod tests {
             pool_id: "pool".to_string(),
             reason: "test".to_string(),
             evidence_refs: many_refs,
-            time_envelope_ref: "htf:tick:1".to_string(),
+            time_envelope_ref: None,
             issuer_actor_id: "gate".to_string(),
             issuer_signature: vec![0u8; 64],
         };
@@ -1237,7 +1361,7 @@ pub mod tests {
             pool_id: "pool".to_string(),
             reason: "test".to_string(),
             evidence_refs: vec![long_ref],
-            time_envelope_ref: "htf:tick:1".to_string(),
+            time_envelope_ref: None,
             issuer_actor_id: "gate".to_string(),
             issuer_signature: vec![0u8; 64],
         };
@@ -1477,6 +1601,8 @@ pub mod tests {
             merged_at: 1_234_567_890,
             gate_actor_id: "gate-001".to_string(),
             gate_signature: vec![0u8; 64],
+            // HTF time envelope reference (RFC-0016): not yet populated.
+            time_envelope_ref: None,
         });
 
         let result: Result<QuarantineEvent, _> = payload.try_into();
@@ -1498,7 +1624,7 @@ pub mod tests {
             pool_id: pool_id.to_string(),
             reason: "Test flakiness".to_string(),
             evidence_refs: vec!["evidence-001".to_string()],
-            time_envelope_ref: "htf:tick:12345".to_string(),
+            time_envelope_ref: None,
             issuer_actor_id: "gate-001".to_string(),
             issuer_signature: [0u8; 64],
         };
@@ -1517,7 +1643,7 @@ pub mod tests {
             spec_id: spec_id.to_string(),
             reason: "Non-deterministic output".to_string(),
             evidence_refs: vec!["evidence-002".to_string()],
-            time_envelope_ref: "htf:tick:12346".to_string(),
+            time_envelope_ref: None,
             issuer_actor_id: "gate-002".to_string(),
             issuer_signature: [0u8; 64],
         };
@@ -1537,6 +1663,8 @@ pub mod tests {
             cleared_at: 1_704_067_200_000,
             issuer_actor_id: "gate-001".to_string(),
             issuer_signature: [0u8; 64],
+            // HTF time envelope reference (RFC-0016): using None for test.
+            time_envelope_ref: None,
         };
 
         let canonical = event.canonical_bytes();
@@ -1679,7 +1807,7 @@ pub mod tests {
             pool_id: oversized_pool_id,
             reason: "test".to_string(),
             evidence_refs: vec![],
-            time_envelope_ref: "htf:tick:1".to_string(),
+            time_envelope_ref: None,
             issuer_actor_id: "gate".to_string(),
             issuer_signature: [0u8; 64],
         };
@@ -1705,7 +1833,7 @@ pub mod tests {
             spec_id: oversized_spec_id,
             reason: "test".to_string(),
             evidence_refs: vec![],
-            time_envelope_ref: "htf:tick:1".to_string(),
+            time_envelope_ref: None,
             issuer_actor_id: "gate".to_string(),
             issuer_signature: [0u8; 64],
         };
@@ -1732,6 +1860,8 @@ pub mod tests {
             cleared_at: 1_704_067_200_000,
             issuer_actor_id: "gate".to_string(),
             issuer_signature: [0u8; 64],
+            // HTF time envelope reference (RFC-0016): using None for test.
+            time_envelope_ref: None,
         };
 
         let result = projection.apply(QuarantineEvent::Cleared(event));
@@ -1758,7 +1888,7 @@ pub mod tests {
             pool_id: "pool-001".to_string(),
             reason: "test".to_string(),
             evidence_refs: many_refs,
-            time_envelope_ref: "htf:tick:1".to_string(),
+            time_envelope_ref: None,
             issuer_actor_id: "gate".to_string(),
             issuer_signature: [0u8; 64],
         };

@@ -228,6 +228,9 @@ mod tests {
             classification: "INTERNAL".to_string(),
             artifact_size: 100,
             metadata: vec!["key=value".to_string()],
+            // HTF time envelope reference (RFC-0016): not yet populated.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
         };
 
         published.canonicalize();

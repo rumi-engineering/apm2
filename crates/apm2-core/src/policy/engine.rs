@@ -728,6 +728,9 @@ impl EvaluationResult {
             policy_hash: self.policy_hash.to_vec(),
             rationale_code: self.rationale_code.clone(),
             budget_consumed: self.budget_consumed,
+            // HTF time envelope reference (RFC-0016): not yet populated by this method.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
         }
     }
 
