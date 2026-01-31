@@ -315,15 +315,32 @@ impl LeaseReducer {
             });
         }
 
-        // Create the lease
-        let lease = Lease::new(
-            lease_id.clone(),
-            work_id.clone(),
-            event.actor_id,
-            event.issued_at,
-            event.expires_at,
-            event.registrar_signature,
-        );
+        // Create the lease with tick-based timing if available (RFC-0016 HTF).
+        // If tick_rate_hz > 0, use tick-based constructor for SEC-CTRL-FAC-0015
+        // compliance.
+        let lease = if event.tick_rate_hz > 0 {
+            Lease::new_with_ticks(
+                lease_id.clone(),
+                work_id.clone(),
+                event.actor_id,
+                event.issued_at,
+                event.expires_at,
+                HtfTick::new(event.issued_at_tick, event.tick_rate_hz),
+                HtfTick::new(event.expires_at_tick, event.tick_rate_hz),
+                event.registrar_signature,
+            )
+        } else {
+            // Legacy path: no tick data available. SEC-CTRL-FAC-0015 fail-closed
+            // will treat this lease as expired when checked with tick-based logic.
+            Lease::new(
+                lease_id.clone(),
+                work_id.clone(),
+                event.actor_id,
+                event.issued_at,
+                event.expires_at,
+                event.registrar_signature,
+            )
+        };
 
         // Insert lease and track active lease for work
         self.state.leases.insert(lease_id.clone(), lease);
@@ -392,6 +409,13 @@ impl LeaseReducer {
         lease.last_renewed_at = Some(timestamp);
         // Update signature to the latest
         lease.registrar_signature = event.registrar_signature;
+
+        // Update tick-based expiry if tick data is present (RFC-0016 HTF).
+        // This ensures that renewed leases maintain tick-based expiry tracking.
+        if event.tick_rate_hz > 0 {
+            lease.expires_at_tick =
+                Some(HtfTick::new(event.new_expires_at_tick, event.tick_rate_hz));
+        }
 
         Ok(())
     }
@@ -566,9 +590,56 @@ pub mod helpers {
         LeaseConflict, LeaseEvent, LeaseExpired, LeaseIssued, LeaseReleased, LeaseRenewed,
         lease_event,
     };
+    use crate::htf::HtfTick;
 
-    /// Creates a `LeaseIssued` event payload.
+    /// Creates a `LeaseIssued` event payload with tick-based timing (RFC-0016
+    /// HTF).
+    ///
+    /// This is the preferred function for creating lease issued events as it
+    /// includes tick-based timing data required for SEC-CTRL-FAC-0015
+    /// compliance.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn lease_issued_payload_with_ticks(
+        lease_id: &str,
+        work_id: &str,
+        actor_id: &str,
+        issued_at: u64,
+        expires_at: u64,
+        issued_at_tick: &HtfTick,
+        expires_at_tick: &HtfTick,
+        registrar_signature: Vec<u8>,
+    ) -> Vec<u8> {
+        let issued = LeaseIssued {
+            lease_id: lease_id.to_string(),
+            work_id: work_id.to_string(),
+            actor_id: actor_id.to_string(),
+            issued_at,
+            expires_at,
+            registrar_signature,
+            // HTF time envelope reference (RFC-0016): not yet populated by this helper.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
+            issued_at_tick: issued_at_tick.value(),
+            expires_at_tick: expires_at_tick.value(),
+            tick_rate_hz: issued_at_tick.tick_rate_hz(),
+        };
+        let event = LeaseEvent {
+            event: Some(lease_event::Event::Issued(issued)),
+        };
+        event.encode_to_vec()
+    }
+
+    /// Creates a `LeaseIssued` event payload without tick-based timing.
+    ///
+    /// **DEPRECATED**: This function creates events without tick-based timing,
+    /// which will cause leases to be treated as expired per SEC-CTRL-FAC-0015
+    /// fail-closed policy. Use [`lease_issued_payload_with_ticks`] instead.
+    #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "use lease_issued_payload_with_ticks for RFC-0016 HTF compliance"
+    )]
     pub fn lease_issued_payload(
         lease_id: &str,
         work_id: &str,
@@ -587,6 +658,10 @@ pub mod helpers {
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
             // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
+            // Legacy: tick fields set to 0 (fail-closed per SEC-CTRL-FAC-0015)
+            issued_at_tick: 0,
+            expires_at_tick: 0,
+            tick_rate_hz: 0,
         };
         let event = LeaseEvent {
             event: Some(lease_event::Event::Issued(issued)),
@@ -594,8 +669,45 @@ pub mod helpers {
         event.encode_to_vec()
     }
 
-    /// Creates a `LeaseRenewed` event payload.
+    /// Creates a `LeaseRenewed` event payload with tick-based timing (RFC-0016
+    /// HTF).
+    ///
+    /// This is the preferred function for creating lease renewed events as it
+    /// includes tick-based timing data required for SEC-CTRL-FAC-0015
+    /// compliance.
     #[must_use]
+    pub fn lease_renewed_payload_with_ticks(
+        lease_id: &str,
+        new_expires_at: u64,
+        new_expires_at_tick: &HtfTick,
+        registrar_signature: Vec<u8>,
+    ) -> Vec<u8> {
+        let renewed = LeaseRenewed {
+            lease_id: lease_id.to_string(),
+            new_expires_at,
+            registrar_signature,
+            // HTF time envelope reference (RFC-0016): not yet populated by this helper.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
+            new_expires_at_tick: new_expires_at_tick.value(),
+            tick_rate_hz: new_expires_at_tick.tick_rate_hz(),
+        };
+        let event = LeaseEvent {
+            event: Some(lease_event::Event::Renewed(renewed)),
+        };
+        event.encode_to_vec()
+    }
+
+    /// Creates a `LeaseRenewed` event payload without tick-based timing.
+    ///
+    /// **DEPRECATED**: This function creates events without tick-based timing,
+    /// which will NOT update the tick-based expiry. Use
+    /// [`lease_renewed_payload_with_ticks`] instead.
+    #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "use lease_renewed_payload_with_ticks for RFC-0016 HTF compliance"
+    )]
     pub fn lease_renewed_payload(
         lease_id: &str,
         new_expires_at: u64,
@@ -605,6 +717,11 @@ pub mod helpers {
             lease_id: lease_id.to_string(),
             new_expires_at,
             registrar_signature,
+            // HTF time envelope reference (RFC-0016): not yet populated by this helper.
+            time_envelope_ref: None,
+            // Legacy: tick fields set to 0 (no tick update)
+            new_expires_at_tick: 0,
+            tick_rate_hz: 0,
         };
         let event = LeaseEvent {
             event: Some(lease_event::Event::Renewed(renewed)),

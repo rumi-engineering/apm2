@@ -1,4 +1,11 @@
 //! Tests for the lease module.
+//!
+//! Note: Tests use the legacy `lease_issued_payload` and
+//! `lease_renewed_payload` functions to verify backwards compatibility with
+//! events that lack tick data. This tests the SEC-CTRL-FAC-0015 fail-closed
+//! behavior.
+
+#![allow(deprecated)]
 
 use super::error::LeaseError;
 use super::reducer::{LeaseReducer, helpers};
