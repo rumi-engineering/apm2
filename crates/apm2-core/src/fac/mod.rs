@@ -74,6 +74,7 @@ mod ci_attestation;
 mod ci_import;
 pub mod determinism;
 mod domain_separator;
+pub mod echo_trap;
 pub mod flake_class;
 pub mod harness_sandbox;
 mod key_policy;
@@ -138,6 +139,12 @@ pub use domain_separator::{
     INTERVENTION_UNFREEZE_PREFIX, LEASE_REVOKED_PREFIX, MERGE_RECEIPT_PREFIX,
     POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX, QUARANTINE_EVENT_PREFIX, sign_with_domain,
     verify_with_domain,
+};
+// Re-export echo-trap detection types
+pub use echo_trap::{
+    ECHO_TRAP_THRESHOLD, EchoTrapDetector, EchoTrapError, EchoTrapEvent, FindingSignature,
+    MAX_SIGNATURE_LENGTH, MAX_SIGNATURES as MAX_ECHO_TRAP_SIGNATURES, SessionTermination,
+    TerminationRationale,
 };
 // Re-export flake classification routing types
 pub use flake_class::FlakeRouting;
