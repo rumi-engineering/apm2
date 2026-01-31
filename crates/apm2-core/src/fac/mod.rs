@@ -123,7 +123,7 @@ pub use receipt::{
 // Re-export terminal verifier types
 pub use terminal_verifier::{
     CheckResult, MAX_ALLOWED_VERIFIER_KINDS, MAX_OUTPUT_VALUES, MAX_PREDICATE_DEPTH,
-    MAX_REQUIRED_OUTPUTS, Predicate, PredicateOp, TerminalVerifier, VerifierError, VerifierKind,
-    VerifierOutput, VerifierOutputBuilder, VerifierPolicy, VerifierPolicyBuilder,
-    evaluate_predicate,
+    MAX_PREDICATE_NODES, MAX_REQUIRED_OUTPUTS, Predicate, PredicateOp, TerminalVerifier,
+    VerifierError, VerifierKind, VerifierOutput, VerifierOutputBuilder, VerifierPolicy,
+    VerifierPolicyBuilder, evaluate_predicate,
 };

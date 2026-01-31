@@ -85,6 +85,13 @@ pub const MAX_OUTPUT_VALUES: usize = 256;
 /// Maximum depth of nested predicates to prevent stack overflow.
 pub const MAX_PREDICATE_DEPTH: usize = 32;
 
+/// Maximum total number of nodes in a predicate tree to prevent
+/// denial-of-service.
+///
+/// A full binary tree of depth 32 could have ~4.29 billion nodes, causing OOM.
+/// This limit ensures predicate trees remain tractable for validation.
+pub const MAX_PREDICATE_NODES: usize = 256;
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -133,6 +140,24 @@ pub enum VerifierError {
         /// Actual depth.
         depth: usize,
         /// Maximum allowed depth.
+        max: usize,
+    },
+
+    /// Predicate node count exceeded.
+    #[error("predicate node count exceeded: {count} > {max}")]
+    PredicateNodeCountExceeded {
+        /// Actual node count.
+        count: usize,
+        /// Maximum allowed node count.
+        max: usize,
+    },
+
+    /// Variable name in predicate exceeds maximum string length.
+    #[error("predicate variable name too long: {actual} > {max}")]
+    PredicateVariableTooLong {
+        /// Actual length of the variable name.
+        actual: usize,
+        /// Maximum allowed length.
         max: usize,
     },
 
@@ -478,6 +503,85 @@ impl Predicate {
             });
         }
         Ok(())
+    }
+
+    /// Counts the total number of nodes in the predicate tree.
+    ///
+    /// This counts all nodes including `Literal`, `Variable`, `Compare`,
+    /// `And`, `Or`, and `Not` nodes recursively.
+    #[must_use]
+    pub fn count_nodes(&self) -> usize {
+        match self {
+            Self::Literal(_) | Self::Variable(_) => 1,
+            Self::Compare { left, right, .. } => 1 + left.count_nodes() + right.count_nodes(),
+            Self::And { left, right } | Self::Or { left, right } => {
+                1 + left.count_nodes() + right.count_nodes()
+            },
+            Self::Not { inner } => 1 + inner.count_nodes(),
+        }
+    }
+
+    /// Validates the predicate node count against the maximum limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifierError::PredicateNodeCountExceeded`] if the total node
+    /// count exceeds [`MAX_PREDICATE_NODES`].
+    pub fn validate_node_count(&self) -> Result<(), VerifierError> {
+        let count = self.count_nodes();
+        if count > MAX_PREDICATE_NODES {
+            return Err(VerifierError::PredicateNodeCountExceeded {
+                count,
+                max: MAX_PREDICATE_NODES,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates all variable names in the predicate tree against the maximum
+    /// string length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifierError::PredicateVariableTooLong`] if any variable name
+    /// exceeds [`MAX_STRING_LENGTH`].
+    pub fn validate_string_lengths(&self) -> Result<(), VerifierError> {
+        match self {
+            Self::Literal(_) => Ok(()),
+            Self::Variable(name) => {
+                if name.len() > MAX_STRING_LENGTH {
+                    Err(VerifierError::PredicateVariableTooLong {
+                        actual: name.len(),
+                        max: MAX_STRING_LENGTH,
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            Self::Compare { left, right, .. }
+            | Self::And { left, right }
+            | Self::Or { left, right } => {
+                left.validate_string_lengths()?;
+                right.validate_string_lengths()
+            },
+            Self::Not { inner } => inner.validate_string_lengths(),
+        }
+    }
+
+    /// Performs complete validation of the predicate tree.
+    ///
+    /// This validates:
+    /// - Predicate depth does not exceed [`MAX_PREDICATE_DEPTH`]
+    /// - Total node count does not exceed [`MAX_PREDICATE_NODES`]
+    /// - All variable names do not exceed [`MAX_STRING_LENGTH`]
+    ///
+    /// # Errors
+    ///
+    /// Returns an appropriate [`VerifierError`] if any validation fails.
+    pub fn validate(&self) -> Result<(), VerifierError> {
+        self.validate_depth()?;
+        self.validate_node_count()?;
+        self.validate_string_lengths()
     }
 
     /// Evaluates this predicate with the given variable bindings.
@@ -1014,8 +1118,8 @@ impl VerifierPolicyBuilder {
             }
         }
 
-        // Validate predicate depth
-        machine_predicate.validate_depth()?;
+        // Validate predicate (depth, node count, and string lengths)
+        machine_predicate.validate()?;
 
         // Compute policy hash
         let policy_hash = compute_policy_hash(
@@ -1042,6 +1146,16 @@ impl VerifierPolicyBuilder {
 }
 
 /// Computes the policy hash from all policy fields.
+///
+/// # Determinism Warning
+///
+/// **CRITICAL**: This function relies on `serde_json::to_string` for
+/// serializing the `machine_predicate`. The current `Predicate` enum uses only
+/// deterministic types (i64, String, Box<Predicate>). **DO NOT** add `HashMap`,
+/// `HashSet`, or any other non-deterministic iteration order types to
+/// `Predicate` without updating this function to use a sorted/canonical
+/// serialization approach. Failure to maintain determinism will cause policy
+/// hash mismatches and break verification.
 #[allow(clippy::cast_possible_truncation)]
 fn compute_policy_hash(
     policy_id: &str,
@@ -1079,6 +1193,7 @@ fn compute_policy_hash(
     }
 
     // machine_predicate (serialize to JSON for hashing)
+    // NOTE: See function doc comment about determinism requirements.
     let predicate_json = serde_json::to_string(machine_predicate).unwrap_or_default();
     hasher.update(&(predicate_json.len() as u32).to_be_bytes());
     hasher.update(predicate_json.as_bytes());
@@ -2007,5 +2122,284 @@ pub mod tests {
             .unwrap();
 
         assert!(!policy.validate_output(&output).unwrap());
+    }
+
+    // =========================================================================
+    // Predicate Node Count Tests (DoS prevention)
+    // =========================================================================
+
+    #[test]
+    fn test_predicate_count_nodes_simple() {
+        // Single literal node
+        assert_eq!(Predicate::literal(1).count_nodes(), 1);
+
+        // Single variable node
+        assert_eq!(Predicate::variable("x").count_nodes(), 1);
+
+        // Compare: 1 (compare) + 1 (left var) + 1 (right literal) = 3
+        let compare = Predicate::compare(
+            Predicate::variable("x"),
+            PredicateOp::Eq,
+            Predicate::literal(0),
+        );
+        assert_eq!(compare.count_nodes(), 3);
+
+        // And: 1 (and) + 1 (left) + 1 (right) = 3
+        let and = Predicate::and(Predicate::literal(1), Predicate::literal(1));
+        assert_eq!(and.count_nodes(), 3);
+
+        // Not: 1 (not) + 1 (inner) = 2
+        let not = Predicate::negate(Predicate::literal(1));
+        assert_eq!(not.count_nodes(), 2);
+    }
+
+    #[test]
+    fn test_predicate_count_nodes_nested() {
+        // ((a == 0) AND (b == 0)) OR (c != 0)
+        // Structure:
+        // OR (1)
+        //   AND (1)
+        //     Compare (1) + Var (1) + Lit (1) = 3
+        //     Compare (1) + Var (1) + Lit (1) = 3
+        //   Compare (1) + Var (1) + Lit (1) = 3
+        // Total: 1 + 1 + 3 + 3 + 3 = 11
+        let pred = Predicate::or(
+            Predicate::and(
+                Predicate::compare(
+                    Predicate::variable("a"),
+                    PredicateOp::Eq,
+                    Predicate::literal(0),
+                ),
+                Predicate::compare(
+                    Predicate::variable("b"),
+                    PredicateOp::Eq,
+                    Predicate::literal(0),
+                ),
+            ),
+            Predicate::compare(
+                Predicate::variable("c"),
+                PredicateOp::Ne,
+                Predicate::literal(0),
+            ),
+        );
+        assert_eq!(pred.count_nodes(), 11);
+    }
+
+    #[test]
+    fn test_predicate_validate_node_count_within_limit() {
+        // A simple predicate well within the limit
+        let pred = Predicate::compare(
+            Predicate::variable("x"),
+            PredicateOp::Eq,
+            Predicate::literal(0),
+        );
+        assert!(pred.validate_node_count().is_ok());
+        assert!(pred.validate().is_ok());
+    }
+
+    #[test]
+    fn test_predicate_validate_node_count_exceeds_limit() {
+        // Build a balanced tree that exceeds MAX_PREDICATE_NODES (256) but stays
+        // within MAX_PREDICATE_DEPTH (32).
+        // A balanced binary tree of depth d has 2^(d+1) - 1 nodes.
+        // With depth 8 we get 2^9 - 1 = 511 nodes > 256, but depth is only 9 < 32.
+        fn build_balanced_tree(depth: usize) -> Predicate {
+            if depth == 0 {
+                Predicate::literal(1)
+            } else {
+                Predicate::and(
+                    build_balanced_tree(depth - 1),
+                    build_balanced_tree(depth - 1),
+                )
+            }
+        }
+
+        let large_pred = build_balanced_tree(8);
+        assert!(large_pred.count_nodes() > MAX_PREDICATE_NODES);
+        assert!(large_pred.depth() <= MAX_PREDICATE_DEPTH);
+
+        let result = large_pred.validate_node_count();
+        assert!(matches!(
+            result,
+            Err(VerifierError::PredicateNodeCountExceeded { .. })
+        ));
+
+        // Also verify it fails full validate()
+        let result = large_pred.validate();
+        assert!(matches!(
+            result,
+            Err(VerifierError::PredicateNodeCountExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn test_predicate_node_count_at_boundary() {
+        // Test at exactly MAX_PREDICATE_NODES (256)
+        // A balanced binary tree of depth d has 2^(d+1) - 1 nodes.
+        // Depth 7 gives 2^8 - 1 = 255 nodes (just under limit)
+        // Depth 8 gives 2^9 - 1 = 511 nodes (over limit)
+        fn build_balanced_tree(depth: usize) -> Predicate {
+            if depth == 0 {
+                Predicate::literal(1)
+            } else {
+                Predicate::and(
+                    build_balanced_tree(depth - 1),
+                    build_balanced_tree(depth - 1),
+                )
+            }
+        }
+
+        // 255 nodes is under the limit of 256
+        let at_limit_minus_one = build_balanced_tree(7);
+        assert_eq!(at_limit_minus_one.count_nodes(), 255);
+        assert!(at_limit_minus_one.validate_node_count().is_ok());
+
+        // 511 nodes exceeds the limit of 256
+        let exceeds_limit = build_balanced_tree(8);
+        assert_eq!(exceeds_limit.count_nodes(), 511);
+        assert!(exceeds_limit.validate_node_count().is_err());
+    }
+
+    // =========================================================================
+    // Predicate Variable String Length Tests
+    // =========================================================================
+
+    #[test]
+    fn test_predicate_validate_string_lengths_valid() {
+        let pred = Predicate::compare(
+            Predicate::variable("exit_code"),
+            PredicateOp::Eq,
+            Predicate::literal(0),
+        );
+        assert!(pred.validate_string_lengths().is_ok());
+        assert!(pred.validate().is_ok());
+    }
+
+    #[test]
+    fn test_predicate_validate_string_lengths_too_long() {
+        let long_name = "x".repeat(MAX_STRING_LENGTH + 1);
+        let pred = Predicate::variable(long_name);
+
+        let result = pred.validate_string_lengths();
+        assert!(matches!(
+            result,
+            Err(VerifierError::PredicateVariableTooLong { .. })
+        ));
+
+        // Also fails full validate()
+        let result = pred.validate();
+        assert!(matches!(
+            result,
+            Err(VerifierError::PredicateVariableTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_predicate_validate_string_lengths_nested() {
+        // Long variable buried in a nested predicate tree
+        let long_name = "x".repeat(MAX_STRING_LENGTH + 1);
+        let pred = Predicate::and(
+            Predicate::compare(
+                Predicate::variable("a"),
+                PredicateOp::Eq,
+                Predicate::literal(0),
+            ),
+            Predicate::or(
+                Predicate::literal(1),
+                Predicate::variable(long_name), // Long name buried deep
+            ),
+        );
+
+        let result = pred.validate_string_lengths();
+        assert!(matches!(
+            result,
+            Err(VerifierError::PredicateVariableTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_predicate_validate_string_at_max_length() {
+        // Exactly at the limit should succeed
+        let max_name = "x".repeat(MAX_STRING_LENGTH);
+        let pred = Predicate::variable(max_name);
+        assert!(pred.validate_string_lengths().is_ok());
+    }
+
+    // =========================================================================
+    // Policy Builder Integration with New Validations
+    // =========================================================================
+
+    #[test]
+    fn test_policy_builder_rejects_predicate_too_many_nodes() {
+        // Build a wide tree that stays within depth limit but exceeds node limit.
+        // A balanced binary tree of depth d has 2^(d+1) - 1 nodes.
+        // With depth 8 we get 2^9 - 1 = 511 nodes > 256, but depth is only 8 < 32.
+        fn build_balanced_tree(depth: usize) -> Predicate {
+            if depth == 0 {
+                Predicate::literal(1)
+            } else {
+                Predicate::and(
+                    build_balanced_tree(depth - 1),
+                    build_balanced_tree(depth - 1),
+                )
+            }
+        }
+
+        // Depth 8 gives us 511 nodes > 256, but depth 8 < 32
+        let large_pred = build_balanced_tree(8);
+        assert_eq!(large_pred.depth(), 9); // depth of tree is levels + 1
+        assert!(large_pred.count_nodes() > MAX_PREDICATE_NODES);
+
+        let result = VerifierPolicyBuilder::new("policy-001")
+            .scenario_type("build")
+            .add_allowed_verifier_kind(VerifierKind::ExitCode)
+            .machine_predicate(large_pred)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(VerifierError::PredicateNodeCountExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn test_policy_builder_rejects_predicate_variable_too_long() {
+        let long_name = "x".repeat(MAX_STRING_LENGTH + 1);
+        let pred = Predicate::compare(
+            Predicate::variable(long_name),
+            PredicateOp::Eq,
+            Predicate::literal(0),
+        );
+
+        let result = VerifierPolicyBuilder::new("policy-001")
+            .scenario_type("build")
+            .add_allowed_verifier_kind(VerifierKind::ExitCode)
+            .machine_predicate(pred)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(VerifierError::PredicateVariableTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_predicate_full_validate_checks_all() {
+        // Test that validate() catches depth issues
+        fn build_deep(depth: usize) -> Predicate {
+            if depth == 0 {
+                Predicate::literal(1)
+            } else {
+                Predicate::negate(build_deep(depth - 1))
+            }
+        }
+
+        // Depth of 33 exceeds MAX_PREDICATE_DEPTH (32)
+        let deep_pred = build_deep(33);
+        let result = deep_pred.validate();
+        assert!(matches!(
+            result,
+            Err(VerifierError::PredicateDepthExceeded { .. })
+        ));
     }
 }
