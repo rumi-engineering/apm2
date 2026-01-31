@@ -66,6 +66,7 @@
 //! ```
 
 mod aat_receipt;
+pub mod anti_downgrade;
 mod artifact_manifest;
 mod ci_attestation;
 mod ci_import;
