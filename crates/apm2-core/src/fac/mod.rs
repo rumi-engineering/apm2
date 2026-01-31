@@ -67,6 +67,7 @@
 
 mod aat_receipt;
 pub mod aat_reuse;
+mod aat_spec;
 pub mod anti_downgrade;
 mod artifact_manifest;
 mod ci_attestation;
@@ -95,6 +96,11 @@ pub use aat_receipt::{
 pub use aat_reuse::{
     AATResultReused, AATResultReusedProto, AatProvenanceTuple, AatProvenanceTupleProto, ReuseError,
     can_reuse_aat_result,
+};
+// Re-export AAT spec types
+pub use aat_spec::{
+    AatSpec, AatSpecBuilder, AatSpecError, AatStep, AatStepBuilder, Invariant, InvariantBuilder,
+    MAX_ACTION_LENGTH, MAX_INVARIANTS, MAX_STATEMENT_LENGTH, MAX_STEPS,
 };
 // Re-export artifact manifest types
 pub use artifact_manifest::{
