@@ -81,6 +81,7 @@ mod lease;
 pub mod merge_receipt;
 mod policy_resolution;
 mod receipt;
+pub mod retry_manager;
 pub mod risk_tier;
 pub mod selection_policy;
 mod terminal_verifier;
@@ -172,6 +173,10 @@ pub use policy_resolution::{
 pub use receipt::{
     GateReceipt, GateReceiptBuilder, GateReceiptProto, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
     SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
+};
+// Re-export retry manager types
+pub use retry_manager::{
+    MAX_GATE_ATTEMPTS, MAX_GLOBAL_EPISODES, MAX_TRACKED_GATES, RetryError, RetryManager,
 };
 // Re-export risk tier classification types
 pub use risk_tier::{
