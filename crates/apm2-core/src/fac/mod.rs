@@ -80,6 +80,7 @@ mod key_policy;
 mod lease;
 pub mod merge_receipt;
 mod policy_resolution;
+pub mod quarantine;
 mod receipt;
 pub mod retry_manager;
 pub mod risk_tier;
@@ -168,6 +169,13 @@ pub use policy_resolution::{
     DeterminismClass, MAX_RCP_PROFILES, MAX_STRING_LENGTH, MAX_VERIFIER_POLICIES,
     PolicyResolutionError, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
     PolicyResolvedForChangeSetProto, RiskTier,
+};
+// Re-export quarantine types
+pub use quarantine::{
+    AATSpecQuarantined, AATSpecQuarantinedProto, MAX_EVIDENCE_REFS, MAX_QUARANTINED_ITEMS,
+    MAX_STRING_LENGTH as MAX_QUARANTINE_STRING_LENGTH, QuarantineCleared, QuarantineClearedProto,
+    QuarantineError, QuarantineEvent, QuarantineProjection, RunnerPoolQuarantined,
+    RunnerPoolQuarantinedProto,
 };
 // Re-export receipt types
 pub use receipt::{

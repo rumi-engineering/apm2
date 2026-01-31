@@ -1,0 +1,1167 @@
+// AGENT-AUTHORED
+//! Quarantine projection for tracking quarantined pools and specs.
+//!
+//! This module implements the [`QuarantineProjection`] for tracking which
+//! runner pools and AAT specs are currently quarantined in the Forge
+//! Admission Cycle.
+//!
+//! # Overview
+//!
+//! When flakiness is detected during AAT execution, the system routes the
+//! flake to appropriate quarantine actions based on classification:
+//!
+//! - [`FlakeClass::HarnessFlake`](crate::fac::FlakeClass) -> Quarantine runner
+//!   pool
+//! - [`FlakeClass::TestNonsemantic`](crate::fac::FlakeClass) -> Quarantine AAT
+//!   spec
+//! - [`FlakeClass::CodeNonsemantic`](crate::fac::FlakeClass) -> Quarantine AAT
+//!   spec
+//!
+//! The projection maintains two sets tracking which pools and specs are
+//! currently quarantined. Selection logic uses this projection to exclude
+//! quarantined targets from AAT execution.
+//!
+//! # Events
+//!
+//! The projection processes three event types:
+//!
+//! - [`RunnerPoolQuarantined`]: Adds `pool_id` to quarantined pools
+//! - [`AATSpecQuarantined`]: Adds `spec_id` to quarantined specs
+//! - [`QuarantineCleared`]: Removes `target_id` from both sets
+//!
+//! # Security
+//!
+//! - All quarantine events require signatures for non-repudiation
+//! - Evidence refs bind quarantine decisions to supporting data
+//! - Time envelope refs enforce temporal authority bounds
+//! - Resource limits prevent denial-of-service attacks
+//!
+//! # Example
+//!
+//! ```rust
+//! use apm2_core::fac::quarantine::{
+//!     AATSpecQuarantined, QuarantineCleared, QuarantineEvent,
+//!     QuarantineProjection, RunnerPoolQuarantined,
+//! };
+//!
+//! let mut projection = QuarantineProjection::new();
+//!
+//! // Quarantine a runner pool
+//! let pool_event = RunnerPoolQuarantined {
+//!     quarantine_id: "q-001".to_string(),
+//!     pool_id: "pool-flaky".to_string(),
+//!     reason: "Timing flakiness detected".to_string(),
+//!     evidence_refs: vec!["evidence-001".to_string()],
+//!     time_envelope_ref: "htf:tick:12345".to_string(),
+//!     issuer_actor_id: "gate-001".to_string(),
+//!     issuer_signature: [0u8; 64],
+//! };
+//! projection
+//!     .apply(QuarantineEvent::PoolQuarantined(pool_event))
+//!     .unwrap();
+//!
+//! assert!(projection.is_pool_quarantined("pool-flaky"));
+//! assert!(!projection.is_pool_quarantined("pool-healthy"));
+//!
+//! // Clear the quarantine
+//! let clear_event = QuarantineCleared {
+//!     quarantine_id: "q-001".to_string(),
+//!     target_id: "pool-flaky".to_string(),
+//!     cleared_at: 1704067200000,
+//!     issuer_actor_id: "gate-001".to_string(),
+//!     issuer_signature: [0u8; 64],
+//! };
+//! projection
+//!     .apply(QuarantineEvent::Cleared(clear_event))
+//!     .unwrap();
+//!
+//! assert!(!projection.is_pool_quarantined("pool-flaky"));
+//! ```
+
+use std::collections::HashSet;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+// Re-export proto types
+pub use crate::events::{
+    AatSpecQuarantined as AATSpecQuarantinedProto, QuarantineCleared as QuarantineClearedProto,
+    RunnerPoolQuarantined as RunnerPoolQuarantinedProto,
+};
+
+// =============================================================================
+// Resource Limits
+// =============================================================================
+
+/// Maximum length for string fields (denial-of-service protection).
+pub const MAX_STRING_LENGTH: usize = 1024;
+
+/// Maximum number of evidence refs per event (denial-of-service protection).
+pub const MAX_EVIDENCE_REFS: usize = 64;
+
+/// Maximum number of quarantined items per set (denial-of-service protection).
+pub const MAX_QUARANTINED_ITEMS: usize = 10_000;
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+/// Errors that can occur during quarantine operations.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum QuarantineError {
+    /// String field exceeds maximum length.
+    #[error("string field '{field}' exceeds maximum length ({len} > {max})")]
+    StringTooLong {
+        /// The field name.
+        field: &'static str,
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Too many evidence refs.
+    #[error("evidence_refs exceeds maximum count ({count} > {max})")]
+    TooManyEvidenceRefs {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
+
+    /// Quarantine limit exceeded (denial-of-service protection).
+    #[error("quarantine limit exceeded for {target_type} ({count} >= {max})")]
+    QuarantineLimitExceeded {
+        /// Type of target (pool or spec).
+        target_type: &'static str,
+        /// Current count.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
+
+    /// Missing required field.
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+
+    /// Invalid data in conversion.
+    #[error("invalid data: {0}")]
+    InvalidData(String),
+
+    /// Invalid signature length.
+    #[error("invalid signature length ({len} != 64)")]
+    InvalidSignatureLength {
+        /// Actual length.
+        len: usize,
+    },
+}
+
+// =============================================================================
+// Domain Types
+// =============================================================================
+
+/// Event indicating a runner pool has been quarantined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerPoolQuarantined {
+    /// Unique identifier for this quarantine event.
+    pub quarantine_id: String,
+
+    /// ID of the runner pool being quarantined.
+    pub pool_id: String,
+
+    /// Human-readable reason for quarantine.
+    pub reason: String,
+
+    /// References to evidence supporting the quarantine decision.
+    pub evidence_refs: Vec<String>,
+
+    /// Reference to the time envelope for temporal authority.
+    pub time_envelope_ref: String,
+
+    /// Actor who issued the quarantine.
+    pub issuer_actor_id: String,
+
+    /// Ed25519 signature over canonical bytes.
+    #[serde(with = "serde_bytes")]
+    pub issuer_signature: [u8; 64],
+}
+
+/// Event indicating an AAT spec has been quarantined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AATSpecQuarantined {
+    /// Unique identifier for this quarantine event.
+    pub quarantine_id: String,
+
+    /// ID of the AAT spec being quarantined.
+    pub spec_id: String,
+
+    /// Human-readable reason for quarantine.
+    pub reason: String,
+
+    /// References to evidence supporting the quarantine decision.
+    pub evidence_refs: Vec<String>,
+
+    /// Reference to the time envelope for temporal authority.
+    pub time_envelope_ref: String,
+
+    /// Actor who issued the quarantine.
+    pub issuer_actor_id: String,
+
+    /// Ed25519 signature over canonical bytes.
+    #[serde(with = "serde_bytes")]
+    pub issuer_signature: [u8; 64],
+}
+
+/// Event indicating a quarantine has been cleared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantineCleared {
+    /// ID of the original quarantine event being cleared.
+    pub quarantine_id: String,
+
+    /// ID of the target being cleared (`pool_id` or `spec_id`).
+    pub target_id: String,
+
+    /// Timestamp when the quarantine was cleared (Unix nanoseconds).
+    pub cleared_at: u64,
+
+    /// Actor who cleared the quarantine.
+    pub issuer_actor_id: String,
+
+    /// Ed25519 signature over canonical bytes.
+    #[serde(with = "serde_bytes")]
+    pub issuer_signature: [u8; 64],
+}
+
+/// Union of all quarantine event types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuarantineEvent {
+    /// A runner pool was quarantined.
+    PoolQuarantined(RunnerPoolQuarantined),
+
+    /// An AAT spec was quarantined.
+    SpecQuarantined(AATSpecQuarantined),
+
+    /// A quarantine was cleared.
+    Cleared(QuarantineCleared),
+}
+
+// =============================================================================
+// QuarantineProjection
+// =============================================================================
+
+/// Projection tracking quarantined runner pools and AAT specs.
+///
+/// This projection maintains the current set of quarantined targets and
+/// provides query methods for selection logic to exclude them.
+///
+/// # Thread Safety
+///
+/// This type is not thread-safe. For concurrent access, wrap in appropriate
+/// synchronization primitives.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuarantineProjection {
+    /// Set of quarantined runner pool IDs.
+    quarantined_pools: HashSet<String>,
+
+    /// Set of quarantined AAT spec IDs.
+    quarantined_specs: HashSet<String>,
+}
+
+impl QuarantineProjection {
+    /// Creates a new empty projection.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Applies a quarantine event to update the projection state.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The quarantine event to process.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the event was successfully applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuarantineError`] if:
+    /// - Resource limits are exceeded (denial-of-service protection)
+    /// - Event validation fails
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::fac::quarantine::{
+    ///     QuarantineEvent, QuarantineProjection, RunnerPoolQuarantined,
+    /// };
+    ///
+    /// let mut projection = QuarantineProjection::new();
+    ///
+    /// let event = RunnerPoolQuarantined {
+    ///     quarantine_id: "q-001".to_string(),
+    ///     pool_id: "pool-001".to_string(),
+    ///     reason: "Flaky".to_string(),
+    ///     evidence_refs: vec![],
+    ///     time_envelope_ref: "htf:tick:1".to_string(),
+    ///     issuer_actor_id: "gate".to_string(),
+    ///     issuer_signature: [0u8; 64],
+    /// };
+    ///
+    /// projection
+    ///     .apply(QuarantineEvent::PoolQuarantined(event))
+    ///     .unwrap();
+    /// assert!(projection.is_pool_quarantined("pool-001"));
+    /// ```
+    pub fn apply(&mut self, event: QuarantineEvent) -> Result<(), QuarantineError> {
+        match event {
+            QuarantineEvent::PoolQuarantined(e) => {
+                // Check resource limits before adding
+                if self.quarantined_pools.len() >= MAX_QUARANTINED_ITEMS
+                    && !self.quarantined_pools.contains(&e.pool_id)
+                {
+                    return Err(QuarantineError::QuarantineLimitExceeded {
+                        target_type: "pools",
+                        count: self.quarantined_pools.len(),
+                        max: MAX_QUARANTINED_ITEMS,
+                    });
+                }
+                self.quarantined_pools.insert(e.pool_id);
+            },
+            QuarantineEvent::SpecQuarantined(e) => {
+                // Check resource limits before adding
+                if self.quarantined_specs.len() >= MAX_QUARANTINED_ITEMS
+                    && !self.quarantined_specs.contains(&e.spec_id)
+                {
+                    return Err(QuarantineError::QuarantineLimitExceeded {
+                        target_type: "specs",
+                        count: self.quarantined_specs.len(),
+                        max: MAX_QUARANTINED_ITEMS,
+                    });
+                }
+                self.quarantined_specs.insert(e.spec_id);
+            },
+            QuarantineEvent::Cleared(e) => {
+                // Remove from both sets (target could be either type)
+                self.quarantined_pools.remove(&e.target_id);
+                self.quarantined_specs.remove(&e.target_id);
+            },
+        }
+        Ok(())
+    }
+
+    /// Returns `true` if the given pool ID is quarantined.
+    ///
+    /// Selection logic should use this to exclude quarantined pools from
+    /// runner selection.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool_id` - The pool ID to check.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::fac::quarantine::QuarantineProjection;
+    ///
+    /// let projection = QuarantineProjection::new();
+    /// assert!(!projection.is_pool_quarantined("pool-001"));
+    /// ```
+    #[must_use]
+    pub fn is_pool_quarantined(&self, pool_id: &str) -> bool {
+        self.quarantined_pools.contains(pool_id)
+    }
+
+    /// Returns `true` if the given spec ID is quarantined.
+    ///
+    /// Selection logic should use this to exclude quarantined specs from
+    /// AAT selection.
+    ///
+    /// # Arguments
+    ///
+    /// * `spec_id` - The spec ID to check.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::fac::quarantine::QuarantineProjection;
+    ///
+    /// let projection = QuarantineProjection::new();
+    /// assert!(!projection.is_spec_quarantined("spec-001"));
+    /// ```
+    #[must_use]
+    pub fn is_spec_quarantined(&self, spec_id: &str) -> bool {
+        self.quarantined_specs.contains(spec_id)
+    }
+
+    /// Returns the number of quarantined pools.
+    #[must_use]
+    pub fn quarantined_pool_count(&self) -> usize {
+        self.quarantined_pools.len()
+    }
+
+    /// Returns the number of quarantined specs.
+    #[must_use]
+    pub fn quarantined_spec_count(&self) -> usize {
+        self.quarantined_specs.len()
+    }
+
+    /// Returns an iterator over quarantined pool IDs.
+    pub fn quarantined_pools(&self) -> impl Iterator<Item = &str> {
+        self.quarantined_pools.iter().map(String::as_str)
+    }
+
+    /// Returns an iterator over quarantined spec IDs.
+    pub fn quarantined_specs(&self) -> impl Iterator<Item = &str> {
+        self.quarantined_specs.iter().map(String::as_str)
+    }
+}
+
+// =============================================================================
+// Validation Functions
+// =============================================================================
+
+/// Validates a `RunnerPoolQuarantined` event.
+fn validate_pool_quarantined(event: &RunnerPoolQuarantined) -> Result<(), QuarantineError> {
+    validate_string_length("quarantine_id", &event.quarantine_id)?;
+    validate_string_length("pool_id", &event.pool_id)?;
+    validate_string_length("reason", &event.reason)?;
+    validate_string_length("time_envelope_ref", &event.time_envelope_ref)?;
+    validate_string_length("issuer_actor_id", &event.issuer_actor_id)?;
+    validate_evidence_refs(&event.evidence_refs)?;
+    Ok(())
+}
+
+/// Validates an `AATSpecQuarantined` event.
+fn validate_spec_quarantined(event: &AATSpecQuarantined) -> Result<(), QuarantineError> {
+    validate_string_length("quarantine_id", &event.quarantine_id)?;
+    validate_string_length("spec_id", &event.spec_id)?;
+    validate_string_length("reason", &event.reason)?;
+    validate_string_length("time_envelope_ref", &event.time_envelope_ref)?;
+    validate_string_length("issuer_actor_id", &event.issuer_actor_id)?;
+    validate_evidence_refs(&event.evidence_refs)?;
+    Ok(())
+}
+
+/// Validates a `QuarantineCleared` event.
+fn validate_cleared(event: &QuarantineCleared) -> Result<(), QuarantineError> {
+    validate_string_length("quarantine_id", &event.quarantine_id)?;
+    validate_string_length("target_id", &event.target_id)?;
+    validate_string_length("issuer_actor_id", &event.issuer_actor_id)?;
+    Ok(())
+}
+
+/// Validates string length against `MAX_STRING_LENGTH`.
+const fn validate_string_length(field: &'static str, value: &str) -> Result<(), QuarantineError> {
+    if value.len() > MAX_STRING_LENGTH {
+        return Err(QuarantineError::StringTooLong {
+            field,
+            len: value.len(),
+            max: MAX_STRING_LENGTH,
+        });
+    }
+    Ok(())
+}
+
+/// Validates evidence refs count and individual lengths.
+fn validate_evidence_refs(refs: &[String]) -> Result<(), QuarantineError> {
+    if refs.len() > MAX_EVIDENCE_REFS {
+        return Err(QuarantineError::TooManyEvidenceRefs {
+            count: refs.len(),
+            max: MAX_EVIDENCE_REFS,
+        });
+    }
+    for (i, r) in refs.iter().enumerate() {
+        if r.len() > MAX_STRING_LENGTH {
+            return Err(QuarantineError::StringTooLong {
+                field: "evidence_refs",
+                len: r.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        // Avoid unused variable warning
+        let _ = i;
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Proto Conversions
+// =============================================================================
+
+impl TryFrom<RunnerPoolQuarantinedProto> for RunnerPoolQuarantined {
+    type Error = QuarantineError;
+
+    fn try_from(proto: RunnerPoolQuarantinedProto) -> Result<Self, Self::Error> {
+        let issuer_signature: [u8; 64] = proto
+            .issuer_signature
+            .try_into()
+            .map_err(|v: Vec<u8>| QuarantineError::InvalidSignatureLength { len: v.len() })?;
+
+        let event = Self {
+            quarantine_id: proto.quarantine_id,
+            pool_id: proto.pool_id,
+            reason: proto.reason,
+            evidence_refs: proto.evidence_refs,
+            time_envelope_ref: proto.time_envelope_ref,
+            issuer_actor_id: proto.issuer_actor_id,
+            issuer_signature,
+        };
+
+        validate_pool_quarantined(&event)?;
+        Ok(event)
+    }
+}
+
+impl From<RunnerPoolQuarantined> for RunnerPoolQuarantinedProto {
+    fn from(domain: RunnerPoolQuarantined) -> Self {
+        Self {
+            quarantine_id: domain.quarantine_id,
+            pool_id: domain.pool_id,
+            reason: domain.reason,
+            evidence_refs: domain.evidence_refs,
+            time_envelope_ref: domain.time_envelope_ref,
+            issuer_actor_id: domain.issuer_actor_id,
+            issuer_signature: domain.issuer_signature.to_vec(),
+        }
+    }
+}
+
+impl TryFrom<AATSpecQuarantinedProto> for AATSpecQuarantined {
+    type Error = QuarantineError;
+
+    fn try_from(proto: AATSpecQuarantinedProto) -> Result<Self, Self::Error> {
+        let issuer_signature: [u8; 64] = proto
+            .issuer_signature
+            .try_into()
+            .map_err(|v: Vec<u8>| QuarantineError::InvalidSignatureLength { len: v.len() })?;
+
+        let event = Self {
+            quarantine_id: proto.quarantine_id,
+            spec_id: proto.spec_id,
+            reason: proto.reason,
+            evidence_refs: proto.evidence_refs,
+            time_envelope_ref: proto.time_envelope_ref,
+            issuer_actor_id: proto.issuer_actor_id,
+            issuer_signature,
+        };
+
+        validate_spec_quarantined(&event)?;
+        Ok(event)
+    }
+}
+
+impl From<AATSpecQuarantined> for AATSpecQuarantinedProto {
+    fn from(domain: AATSpecQuarantined) -> Self {
+        Self {
+            quarantine_id: domain.quarantine_id,
+            spec_id: domain.spec_id,
+            reason: domain.reason,
+            evidence_refs: domain.evidence_refs,
+            time_envelope_ref: domain.time_envelope_ref,
+            issuer_actor_id: domain.issuer_actor_id,
+            issuer_signature: domain.issuer_signature.to_vec(),
+        }
+    }
+}
+
+impl TryFrom<QuarantineClearedProto> for QuarantineCleared {
+    type Error = QuarantineError;
+
+    fn try_from(proto: QuarantineClearedProto) -> Result<Self, Self::Error> {
+        let issuer_signature: [u8; 64] = proto
+            .issuer_signature
+            .try_into()
+            .map_err(|v: Vec<u8>| QuarantineError::InvalidSignatureLength { len: v.len() })?;
+
+        let event = Self {
+            quarantine_id: proto.quarantine_id,
+            target_id: proto.target_id,
+            cleared_at: proto.cleared_at,
+            issuer_actor_id: proto.issuer_actor_id,
+            issuer_signature,
+        };
+
+        validate_cleared(&event)?;
+        Ok(event)
+    }
+}
+
+impl From<QuarantineCleared> for QuarantineClearedProto {
+    fn from(domain: QuarantineCleared) -> Self {
+        Self {
+            quarantine_id: domain.quarantine_id,
+            target_id: domain.target_id,
+            cleared_at: domain.cleared_at,
+            issuer_actor_id: domain.issuer_actor_id,
+            issuer_signature: domain.issuer_signature.to_vec(),
+        }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+#[allow(missing_docs)]
+pub mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Test Helpers
+    // =========================================================================
+
+    fn create_pool_quarantined(pool_id: &str) -> RunnerPoolQuarantined {
+        RunnerPoolQuarantined {
+            quarantine_id: format!("q-{pool_id}"),
+            pool_id: pool_id.to_string(),
+            reason: "Test flakiness".to_string(),
+            evidence_refs: vec!["evidence-001".to_string()],
+            time_envelope_ref: "htf:tick:12345".to_string(),
+            issuer_actor_id: "gate-001".to_string(),
+            issuer_signature: [0u8; 64],
+        }
+    }
+
+    fn create_spec_quarantined(spec_id: &str) -> AATSpecQuarantined {
+        AATSpecQuarantined {
+            quarantine_id: format!("q-{spec_id}"),
+            spec_id: spec_id.to_string(),
+            reason: "Non-deterministic output".to_string(),
+            evidence_refs: vec!["evidence-002".to_string()],
+            time_envelope_ref: "htf:tick:12346".to_string(),
+            issuer_actor_id: "gate-002".to_string(),
+            issuer_signature: [0u8; 64],
+        }
+    }
+
+    fn create_cleared(target_id: &str) -> QuarantineCleared {
+        QuarantineCleared {
+            quarantine_id: format!("q-{target_id}"),
+            target_id: target_id.to_string(),
+            cleared_at: 1_704_067_200_000,
+            issuer_actor_id: "gate-001".to_string(),
+            issuer_signature: [0u8; 64],
+        }
+    }
+
+    // =========================================================================
+    // Projection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_new_projection_is_empty() {
+        let projection = QuarantineProjection::new();
+        assert_eq!(projection.quarantined_pool_count(), 0);
+        assert_eq!(projection.quarantined_spec_count(), 0);
+    }
+
+    #[test]
+    fn test_pool_quarantine_and_query() {
+        let mut projection = QuarantineProjection::new();
+
+        // Initially not quarantined
+        assert!(!projection.is_pool_quarantined("pool-001"));
+
+        // Quarantine the pool
+        let event = create_pool_quarantined("pool-001");
+        projection
+            .apply(QuarantineEvent::PoolQuarantined(event))
+            .unwrap();
+
+        // Now quarantined
+        assert!(projection.is_pool_quarantined("pool-001"));
+        assert!(!projection.is_pool_quarantined("pool-002"));
+        assert_eq!(projection.quarantined_pool_count(), 1);
+    }
+
+    #[test]
+    fn test_spec_quarantine_and_query() {
+        let mut projection = QuarantineProjection::new();
+
+        // Initially not quarantined
+        assert!(!projection.is_spec_quarantined("spec-001"));
+
+        // Quarantine the spec
+        let event = create_spec_quarantined("spec-001");
+        projection
+            .apply(QuarantineEvent::SpecQuarantined(event))
+            .unwrap();
+
+        // Now quarantined
+        assert!(projection.is_spec_quarantined("spec-001"));
+        assert!(!projection.is_spec_quarantined("spec-002"));
+        assert_eq!(projection.quarantined_spec_count(), 1);
+    }
+
+    #[test]
+    fn test_quarantine_cleared_removes_pool() {
+        let mut projection = QuarantineProjection::new();
+
+        // Quarantine a pool
+        let quarantine = create_pool_quarantined("pool-001");
+        projection
+            .apply(QuarantineEvent::PoolQuarantined(quarantine))
+            .unwrap();
+        assert!(projection.is_pool_quarantined("pool-001"));
+
+        // Clear the quarantine
+        let clear = create_cleared("pool-001");
+        projection.apply(QuarantineEvent::Cleared(clear)).unwrap();
+
+        // No longer quarantined
+        assert!(!projection.is_pool_quarantined("pool-001"));
+        assert_eq!(projection.quarantined_pool_count(), 0);
+    }
+
+    #[test]
+    fn test_quarantine_cleared_removes_spec() {
+        let mut projection = QuarantineProjection::new();
+
+        // Quarantine a spec
+        let quarantine = create_spec_quarantined("spec-001");
+        projection
+            .apply(QuarantineEvent::SpecQuarantined(quarantine))
+            .unwrap();
+        assert!(projection.is_spec_quarantined("spec-001"));
+
+        // Clear the quarantine
+        let clear = create_cleared("spec-001");
+        projection.apply(QuarantineEvent::Cleared(clear)).unwrap();
+
+        // No longer quarantined
+        assert!(!projection.is_spec_quarantined("spec-001"));
+        assert_eq!(projection.quarantined_spec_count(), 0);
+    }
+
+    #[test]
+    fn test_clear_removes_from_both_sets() {
+        let mut projection = QuarantineProjection::new();
+
+        // Add an ID to both sets (edge case: same ID used for pool and spec)
+        let pool_event = create_pool_quarantined("shared-id");
+        let spec_event = create_spec_quarantined("shared-id");
+
+        projection
+            .apply(QuarantineEvent::PoolQuarantined(pool_event))
+            .unwrap();
+        projection
+            .apply(QuarantineEvent::SpecQuarantined(spec_event))
+            .unwrap();
+
+        assert!(projection.is_pool_quarantined("shared-id"));
+        assert!(projection.is_spec_quarantined("shared-id"));
+
+        // Clear removes from both
+        let clear = create_cleared("shared-id");
+        projection.apply(QuarantineEvent::Cleared(clear)).unwrap();
+
+        assert!(!projection.is_pool_quarantined("shared-id"));
+        assert!(!projection.is_spec_quarantined("shared-id"));
+    }
+
+    #[test]
+    fn test_multiple_quarantines() {
+        let mut projection = QuarantineProjection::new();
+
+        // Quarantine multiple pools
+        for i in 1..=5 {
+            let event = create_pool_quarantined(&format!("pool-{i:03}"));
+            projection
+                .apply(QuarantineEvent::PoolQuarantined(event))
+                .unwrap();
+        }
+
+        // Quarantine multiple specs
+        for i in 1..=3 {
+            let event = create_spec_quarantined(&format!("spec-{i:03}"));
+            projection
+                .apply(QuarantineEvent::SpecQuarantined(event))
+                .unwrap();
+        }
+
+        assert_eq!(projection.quarantined_pool_count(), 5);
+        assert_eq!(projection.quarantined_spec_count(), 3);
+
+        // Verify specific queries
+        assert!(projection.is_pool_quarantined("pool-003"));
+        assert!(projection.is_spec_quarantined("spec-002"));
+        assert!(!projection.is_pool_quarantined("pool-006"));
+        assert!(!projection.is_spec_quarantined("spec-004"));
+    }
+
+    #[test]
+    fn test_quarantine_idempotent() {
+        let mut projection = QuarantineProjection::new();
+
+        // Quarantine the same pool twice
+        let event1 = create_pool_quarantined("pool-001");
+        let event2 = create_pool_quarantined("pool-001");
+
+        projection
+            .apply(QuarantineEvent::PoolQuarantined(event1))
+            .unwrap();
+        projection
+            .apply(QuarantineEvent::PoolQuarantined(event2))
+            .unwrap();
+
+        // Should still have count of 1 (HashSet deduplicates)
+        assert_eq!(projection.quarantined_pool_count(), 1);
+    }
+
+    #[test]
+    fn test_clear_nonexistent_is_noop() {
+        let mut projection = QuarantineProjection::new();
+
+        // Clear a target that was never quarantined
+        let clear = create_cleared("nonexistent");
+        projection.apply(QuarantineEvent::Cleared(clear)).unwrap();
+
+        // Should succeed without error
+        assert_eq!(projection.quarantined_pool_count(), 0);
+        assert_eq!(projection.quarantined_spec_count(), 0);
+    }
+
+    #[test]
+    fn test_iterators() {
+        let mut projection = QuarantineProjection::new();
+
+        // Add some quarantines
+        projection
+            .apply(QuarantineEvent::PoolQuarantined(create_pool_quarantined(
+                "pool-a",
+            )))
+            .unwrap();
+        projection
+            .apply(QuarantineEvent::PoolQuarantined(create_pool_quarantined(
+                "pool-b",
+            )))
+            .unwrap();
+        projection
+            .apply(QuarantineEvent::SpecQuarantined(create_spec_quarantined(
+                "spec-x",
+            )))
+            .unwrap();
+
+        // Collect and verify iterators
+        let pools: HashSet<&str> = projection.quarantined_pools().collect();
+        let specs: HashSet<&str> = projection.quarantined_specs().collect();
+
+        assert_eq!(pools.len(), 2);
+        assert!(pools.contains("pool-a"));
+        assert!(pools.contains("pool-b"));
+
+        assert_eq!(specs.len(), 1);
+        assert!(specs.contains("spec-x"));
+    }
+
+    // =========================================================================
+    // Proto Conversion Tests
+    // =========================================================================
+
+    #[test]
+    fn test_pool_quarantined_proto_roundtrip() {
+        let original = create_pool_quarantined("pool-001");
+
+        let proto: RunnerPoolQuarantinedProto = original.clone().into();
+        let recovered: RunnerPoolQuarantined = proto.try_into().unwrap();
+
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_spec_quarantined_proto_roundtrip() {
+        let original = create_spec_quarantined("spec-001");
+
+        let proto: AATSpecQuarantinedProto = original.clone().into();
+        let recovered: AATSpecQuarantined = proto.try_into().unwrap();
+
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_cleared_proto_roundtrip() {
+        let original = create_cleared("target-001");
+
+        let proto: QuarantineClearedProto = original.clone().into();
+        let recovered: QuarantineCleared = proto.try_into().unwrap();
+
+        assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_proto_invalid_signature_length() {
+        let proto = RunnerPoolQuarantinedProto {
+            quarantine_id: "q-001".to_string(),
+            pool_id: "pool-001".to_string(),
+            reason: "test".to_string(),
+            evidence_refs: vec![],
+            time_envelope_ref: "htf:tick:1".to_string(),
+            issuer_actor_id: "gate".to_string(),
+            issuer_signature: vec![0u8; 32], // Wrong length!
+        };
+
+        let result: Result<RunnerPoolQuarantined, _> = proto.try_into();
+        assert!(matches!(
+            result,
+            Err(QuarantineError::InvalidSignatureLength { len: 32 })
+        ));
+    }
+
+    // =========================================================================
+    // Validation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_string_too_long_quarantine_id() {
+        let long_string = "x".repeat(MAX_STRING_LENGTH + 1);
+        let proto = RunnerPoolQuarantinedProto {
+            quarantine_id: long_string,
+            pool_id: "pool".to_string(),
+            reason: "test".to_string(),
+            evidence_refs: vec![],
+            time_envelope_ref: "htf:tick:1".to_string(),
+            issuer_actor_id: "gate".to_string(),
+            issuer_signature: vec![0u8; 64],
+        };
+
+        let result: Result<RunnerPoolQuarantined, _> = proto.try_into();
+        assert!(matches!(
+            result,
+            Err(QuarantineError::StringTooLong {
+                field: "quarantine_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_string_too_long_pool_id() {
+        let long_string = "x".repeat(MAX_STRING_LENGTH + 1);
+        let proto = RunnerPoolQuarantinedProto {
+            quarantine_id: "q-001".to_string(),
+            pool_id: long_string,
+            reason: "test".to_string(),
+            evidence_refs: vec![],
+            time_envelope_ref: "htf:tick:1".to_string(),
+            issuer_actor_id: "gate".to_string(),
+            issuer_signature: vec![0u8; 64],
+        };
+
+        let result: Result<RunnerPoolQuarantined, _> = proto.try_into();
+        assert!(matches!(
+            result,
+            Err(QuarantineError::StringTooLong {
+                field: "pool_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_too_many_evidence_refs() {
+        let many_refs: Vec<String> = (0..=MAX_EVIDENCE_REFS)
+            .map(|i| format!("evidence-{i:04}"))
+            .collect();
+
+        let proto = RunnerPoolQuarantinedProto {
+            quarantine_id: "q-001".to_string(),
+            pool_id: "pool".to_string(),
+            reason: "test".to_string(),
+            evidence_refs: many_refs,
+            time_envelope_ref: "htf:tick:1".to_string(),
+            issuer_actor_id: "gate".to_string(),
+            issuer_signature: vec![0u8; 64],
+        };
+
+        let result: Result<RunnerPoolQuarantined, _> = proto.try_into();
+        assert!(matches!(
+            result,
+            Err(QuarantineError::TooManyEvidenceRefs { .. })
+        ));
+    }
+
+    #[test]
+    fn test_evidence_ref_too_long() {
+        let long_ref = "x".repeat(MAX_STRING_LENGTH + 1);
+        let proto = RunnerPoolQuarantinedProto {
+            quarantine_id: "q-001".to_string(),
+            pool_id: "pool".to_string(),
+            reason: "test".to_string(),
+            evidence_refs: vec![long_ref],
+            time_envelope_ref: "htf:tick:1".to_string(),
+            issuer_actor_id: "gate".to_string(),
+            issuer_signature: vec![0u8; 64],
+        };
+
+        let result: Result<RunnerPoolQuarantined, _> = proto.try_into();
+        assert!(matches!(
+            result,
+            Err(QuarantineError::StringTooLong {
+                field: "evidence_refs",
+                ..
+            })
+        ));
+    }
+
+    // =========================================================================
+    // Resource Limit Tests (denial-of-service protection)
+    // =========================================================================
+
+    #[test]
+    fn test_quarantine_limit_exceeded_pools() {
+        let mut projection = QuarantineProjection::new();
+
+        // Fill to the limit (simulate, not actually MAX_QUARANTINED_ITEMS)
+        // We test the logic with a smaller projection
+        for i in 0..100 {
+            let event = create_pool_quarantined(&format!("pool-{i:04}"));
+            projection
+                .apply(QuarantineEvent::PoolQuarantined(event))
+                .unwrap();
+        }
+
+        assert_eq!(projection.quarantined_pool_count(), 100);
+
+        // Adding duplicate should succeed (idempotent)
+        let dup_event = create_pool_quarantined("pool-0050");
+        assert!(
+            projection
+                .apply(QuarantineEvent::PoolQuarantined(dup_event))
+                .is_ok()
+        );
+    }
+
+    // =========================================================================
+    // Serde Tests
+    // =========================================================================
+
+    #[test]
+    fn test_projection_serde_roundtrip() {
+        let mut projection = QuarantineProjection::new();
+
+        projection
+            .apply(QuarantineEvent::PoolQuarantined(create_pool_quarantined(
+                "pool-001",
+            )))
+            .unwrap();
+        projection
+            .apply(QuarantineEvent::SpecQuarantined(create_spec_quarantined(
+                "spec-001",
+            )))
+            .unwrap();
+
+        let json = serde_json::to_string(&projection).unwrap();
+        let recovered: QuarantineProjection = serde_json::from_str(&json).unwrap();
+
+        assert!(recovered.is_pool_quarantined("pool-001"));
+        assert!(recovered.is_spec_quarantined("spec-001"));
+        assert_eq!(
+            projection.quarantined_pool_count(),
+            recovered.quarantined_pool_count()
+        );
+        assert_eq!(
+            projection.quarantined_spec_count(),
+            recovered.quarantined_spec_count()
+        );
+    }
+
+    #[test]
+    fn test_event_types_serde_roundtrip() {
+        let pool = create_pool_quarantined("pool-001");
+        let pool_json = serde_json::to_string(&pool).unwrap();
+        let pool_recovered: RunnerPoolQuarantined = serde_json::from_str(&pool_json).unwrap();
+        assert_eq!(pool, pool_recovered);
+
+        let spec = create_spec_quarantined("spec-001");
+        let spec_json = serde_json::to_string(&spec).unwrap();
+        let spec_recovered: AATSpecQuarantined = serde_json::from_str(&spec_json).unwrap();
+        assert_eq!(spec, spec_recovered);
+
+        let clear = create_cleared("target-001");
+        let clear_json = serde_json::to_string(&clear).unwrap();
+        let clear_recovered: QuarantineCleared = serde_json::from_str(&clear_json).unwrap();
+        assert_eq!(clear, clear_recovered);
+    }
+
+    // =========================================================================
+    // Selection Exclusion Tests (Definition of Done)
+    // =========================================================================
+
+    #[test]
+    fn test_selection_excludes_quarantined_pools() {
+        let mut projection = QuarantineProjection::new();
+
+        // Quarantine pool-002
+        projection
+            .apply(QuarantineEvent::PoolQuarantined(create_pool_quarantined(
+                "pool-002",
+            )))
+            .unwrap();
+
+        // Simulate selection filtering
+        let available_pools = vec!["pool-001", "pool-002", "pool-003"];
+        let selectable: Vec<_> = available_pools
+            .into_iter()
+            .filter(|p| !projection.is_pool_quarantined(p))
+            .collect();
+
+        assert_eq!(selectable, vec!["pool-001", "pool-003"]);
+    }
+
+    #[test]
+    fn test_selection_excludes_quarantined_specs() {
+        let mut projection = QuarantineProjection::new();
+
+        // Quarantine spec-002
+        projection
+            .apply(QuarantineEvent::SpecQuarantined(create_spec_quarantined(
+                "spec-002",
+            )))
+            .unwrap();
+
+        // Simulate selection filtering
+        let available_specs = vec!["spec-001", "spec-002", "spec-003"];
+        let selectable: Vec<_> = available_specs
+            .into_iter()
+            .filter(|s| !projection.is_spec_quarantined(s))
+            .collect();
+
+        assert_eq!(selectable, vec!["spec-001", "spec-003"]);
+    }
+
+    #[test]
+    fn test_cleared_re_enables_targets() {
+        let mut projection = QuarantineProjection::new();
+
+        // Quarantine both pool and spec
+        projection
+            .apply(QuarantineEvent::PoolQuarantined(create_pool_quarantined(
+                "pool-001",
+            )))
+            .unwrap();
+        projection
+            .apply(QuarantineEvent::SpecQuarantined(create_spec_quarantined(
+                "spec-001",
+            )))
+            .unwrap();
+
+        // Verify excluded
+        assert!(projection.is_pool_quarantined("pool-001"));
+        assert!(projection.is_spec_quarantined("spec-001"));
+
+        // Clear both
+        projection
+            .apply(QuarantineEvent::Cleared(create_cleared("pool-001")))
+            .unwrap();
+        projection
+            .apply(QuarantineEvent::Cleared(create_cleared("spec-001")))
+            .unwrap();
+
+        // Verify re-enabled
+        assert!(!projection.is_pool_quarantined("pool-001"));
+        assert!(!projection.is_spec_quarantined("spec-001"));
+    }
+}

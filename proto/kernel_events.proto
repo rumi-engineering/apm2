@@ -1141,6 +1141,91 @@ message NetworkPolicyProfile {
 }
 
 // ============================================================
+// QUARANTINE EVENTS (TCK-00235)
+// ============================================================
+//
+// Quarantine events implement the pool and spec quarantine mechanism for the
+// Forge Admission Cycle. When flakiness is detected and classified, the
+// system quarantines either the runner pool (infrastructure issues) or the
+// AAT spec (test/code issues) to prevent repeated failures.
+//
+// Key security properties:
+// - Quarantined pools/specs are excluded from selection
+// - Quarantine requires evidence binding (evidence_refs, time_envelope_ref)
+// - All quarantine events are signed for non-repudiation
+// - QuarantineCleared re-enables targets after investigation
+
+// Emitted when a runner pool is quarantined due to infrastructure flakiness.
+//
+// This event is triggered when FlakeClass::HarnessFlake routing determines
+// that flakiness is attributed to runner/infrastructure issues (timing,
+// resource contention, runner-specific bugs).
+//
+// Security: Quarantined pools are excluded from future AAT runner selection
+// until the issue is investigated and QuarantineCleared is emitted.
+message RunnerPoolQuarantined {
+  // Unique identifier for this quarantine event.
+  string quarantine_id = 1;
+  // ID of the runner pool being quarantined.
+  string pool_id = 2;
+  // Human-readable reason for quarantine.
+  string reason = 3;
+  // References to evidence supporting the quarantine decision.
+  repeated string evidence_refs = 4;
+  // Reference to the time envelope for temporal authority.
+  string time_envelope_ref = 5;
+  // Actor who issued the quarantine.
+  string issuer_actor_id = 6;
+  // Ed25519 signature over canonical bytes with QUARANTINE_EVENT: domain (64 bytes).
+  bytes issuer_signature = 7;
+}
+
+// Emitted when an AAT spec is quarantined due to test/code flakiness.
+//
+// This event is triggered when FlakeClass::TestNonsemantic or
+// FlakeClass::CodeNonsemantic routing determines that flakiness is in the
+// test specification itself (output format changes, timestamps, random IDs).
+//
+// Security: Quarantined specs are excluded from AAT selection until the
+// non-determinism is resolved and QuarantineCleared is emitted.
+message AATSpecQuarantined {
+  // Unique identifier for this quarantine event.
+  string quarantine_id = 1;
+  // ID of the AAT spec being quarantined.
+  string spec_id = 2;
+  // Human-readable reason for quarantine.
+  string reason = 3;
+  // References to evidence supporting the quarantine decision.
+  repeated string evidence_refs = 4;
+  // Reference to the time envelope for temporal authority.
+  string time_envelope_ref = 5;
+  // Actor who issued the quarantine.
+  string issuer_actor_id = 6;
+  // Ed25519 signature over canonical bytes with QUARANTINE_EVENT: domain (64 bytes).
+  bytes issuer_signature = 7;
+}
+
+// Emitted when a quarantine is cleared after investigation.
+//
+// This event re-enables the previously quarantined pool or spec for selection.
+// The target_id must match either a pool_id from RunnerPoolQuarantined or a
+// spec_id from AATSpecQuarantined.
+//
+// Security: Clearing requires investigation and is audited via signature.
+message QuarantineCleared {
+  // ID of the original quarantine event being cleared.
+  string quarantine_id = 1;
+  // ID of the target being cleared (pool_id or spec_id).
+  string target_id = 2;
+  // Timestamp when the quarantine was cleared (Unix nanoseconds).
+  uint64 cleared_at = 3;
+  // Actor who cleared the quarantine.
+  string issuer_actor_id = 4;
+  // Ed25519 signature over canonical bytes with QUARANTINE_EVENT: domain (64 bytes).
+  bytes issuer_signature = 5;
+}
+
+// ============================================================
 // MERGE EVENTS
 // ============================================================
 
