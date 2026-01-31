@@ -8,7 +8,7 @@
 //! # Risk Tiers
 //!
 //! - **High**: Maximum scrutiny required. Triggered by changes to critical
-//!   modules (auth, crypto, ledger, tool, kernel) or sensitive patterns
+//!   modules (auth, crypto, ledger, tool, kernel, fac) or sensitive patterns
 //!   (secret, credentials, policy).
 //! - **Med**: Elevated scrutiny required. Triggered by large changesets (lines
 //!   > 500, files > 10, dependency fanout > 20).
@@ -20,8 +20,8 @@
 //! Classification uses a two-tier signal hierarchy:
 //!
 //! 1. **Primary Signals** (-> HIGH):
-//!    - `touches_critical_module`: Changes to auth, crypto, ledger, tool, or
-//!      kernel modules
+//!    - `touches_critical_module`: Changes to auth, crypto, ledger, tool,
+//!      kernel, or fac modules
 //!    - `matches_sensitive_pattern`: Changes containing "secret",
 //!      "credentials", or "policy"
 //!
@@ -34,9 +34,12 @@
 //!
 //! # Security Model
 //!
-//! The classification model is fail-closed: unknown or ambiguous signals
-//! escalate to higher risk tiers rather than lower ones. This ensures that
-//! edge cases receive appropriate scrutiny.
+//! The classification model is permissive by default: when no risk signals
+//! are detected, the changeset receives the LOW tier. Known risk signals
+//! (critical modules, sensitive patterns, size thresholds) escalate to
+//! higher tiers. This "fail-open" approach prioritizes developer velocity
+//! for routine changes while ensuring elevated scrutiny for known risk
+//! indicators.
 //!
 //! # Example
 //!
@@ -86,7 +89,8 @@ use serde::{Deserialize, Serialize};
 /// - `ledger`: Audit trail and immutable records
 /// - `tool`: External tool execution and sandboxing
 /// - `kernel`: Core system primitives and trust boundaries
-pub const CRITICAL_MODULES: &[&str] = &["auth", "crypto", "ledger", "tool", "kernel"];
+/// - `fac`: Forge Admission Cycle - security-critical evidence and attestation
+pub const CRITICAL_MODULES: &[&str] = &["auth", "crypto", "ledger", "tool", "kernel", "fac"];
 
 /// Sensitive patterns in file paths or content that trigger HIGH risk tier.
 ///
@@ -142,7 +146,7 @@ pub enum RiskTierClass {
     /// Highest risk tier. Maximum scrutiny required.
     ///
     /// Triggered by:
-    /// - Changes to critical modules (auth, crypto, ledger, tool, kernel)
+    /// - Changes to critical modules (auth, crypto, ledger, tool, kernel, fac)
     /// - Matches to sensitive patterns (secret, credentials, policy)
     High,
 
@@ -349,22 +353,65 @@ pub fn classify_risk(changeset: &ChangeSet) -> RiskTierClass {
     RiskTierClass::Low
 }
 
+/// Maximum file path length to process for risk classification.
+///
+/// Paths longer than this are truncated to prevent denial-of-service via
+/// unbounded memory allocation. 4096 bytes is a reasonable limit that covers
+/// all practical file paths.
+const MAX_PATH_LEN: usize = 4096;
+
+/// Pre-computed patterns for critical module matching.
+///
+/// These are computed at compile time to avoid runtime allocations.
+/// Each module has patterns for: /module/, /module., module/, module.
+const CRITICAL_MODULE_PATTERNS: &[(&str, &str, &str, &str)] = &[
+    ("/auth/", "/auth.", "auth/", "auth."),
+    ("/crypto/", "/crypto.", "crypto/", "crypto."),
+    ("/ledger/", "/ledger.", "ledger/", "ledger."),
+    ("/tool/", "/tool.", "tool/", "tool."),
+    ("/kernel/", "/kernel.", "kernel/", "kernel."),
+    ("/fac/", "/fac.", "fac/", "fac."),
+];
+
 /// Checks if the changeset touches a critical module.
 ///
 /// A critical module is touched if any file path contains one of the
 /// critical module names as a path component (case-insensitive).
+///
+/// Uses pre-allocated pattern buffers to avoid denial-of-service via unbounded
+/// allocations.
 fn touches_critical_module(changeset: &ChangeSet) -> bool {
+    // Pre-allocate a single buffer for lowercase conversion
+    let mut lower_buf = String::with_capacity(MAX_PATH_LEN);
+
     for file_path in &changeset.files_changed {
-        let lower_path = file_path.to_lowercase();
-        for module in CRITICAL_MODULES {
-            // Check if the module name appears as a path component
-            // by looking for /module/ or /module. patterns
-            if lower_path.contains(&format!("/{module}/"))
-                || lower_path.contains(&format!("/{module}."))
-                || lower_path.starts_with(&format!("{module}/"))
-                || lower_path.starts_with(&format!("{module}."))
-                || lower_path == *module
+        lower_buf.clear();
+
+        // Truncate path to prevent denial-of-service via unbounded allocation
+        let path_slice = if file_path.len() > MAX_PATH_LEN {
+            &file_path[..MAX_PATH_LEN]
+        } else {
+            file_path.as_str()
+        };
+
+        // Reuse buffer for lowercase conversion
+        lower_buf.extend(path_slice.chars().map(|c| c.to_ascii_lowercase()));
+
+        for (slash_module_slash, slash_module_dot, module_slash, module_dot) in
+            CRITICAL_MODULE_PATTERNS
+        {
+            if lower_buf.contains(slash_module_slash)
+                || lower_buf.contains(slash_module_dot)
+                || lower_buf.starts_with(module_slash)
+                || lower_buf.starts_with(module_dot)
             {
+                return true;
+            }
+        }
+
+        // Also check exact match with module names
+        for module in CRITICAL_MODULES {
+            if lower_buf == *module {
                 return true;
             }
         }
@@ -376,11 +423,28 @@ fn touches_critical_module(changeset: &ChangeSet) -> bool {
 ///
 /// A sensitive pattern is matched if any file path contains one of the
 /// sensitive pattern strings (case-insensitive).
+///
+/// Uses pre-allocated buffer to avoid denial-of-service via unbounded
+/// allocations.
 fn matches_sensitive_pattern(changeset: &ChangeSet) -> bool {
+    // Pre-allocate a single buffer for lowercase conversion
+    let mut lower_buf = String::with_capacity(MAX_PATH_LEN);
+
     for file_path in &changeset.files_changed {
-        let lower_path = file_path.to_lowercase();
+        lower_buf.clear();
+
+        // Truncate path to prevent denial-of-service via unbounded allocation
+        let path_slice = if file_path.len() > MAX_PATH_LEN {
+            &file_path[..MAX_PATH_LEN]
+        } else {
+            file_path.as_str()
+        };
+
+        // Reuse buffer for lowercase conversion
+        lower_buf.extend(path_slice.chars().map(|c| c.to_ascii_lowercase()));
+
         for pattern in SENSITIVE_PATTERNS {
-            if lower_path.contains(pattern) {
+            if lower_buf.contains(pattern) {
                 return true;
             }
         }
@@ -516,6 +580,16 @@ pub mod tests {
     fn test_classify_critical_module_kernel() {
         let changeset = ChangeSet {
             files_changed: vec!["kernel/main.rs".to_string()],
+            lines_changed: 10,
+            dependency_fanout: 1,
+        };
+        assert_eq!(classify_risk(&changeset), RiskTierClass::High);
+    }
+
+    #[test]
+    fn test_classify_critical_module_fac() {
+        let changeset = ChangeSet {
+            files_changed: vec!["crates/apm2-core/src/fac/risk_tier.rs".to_string()],
             lines_changed: 10,
             dependency_fanout: 1,
         };
