@@ -6,6 +6,7 @@
 //!
 //! # Components
 //!
+//! - **CI Attestation**: Types representing CI evidence trustworthiness levels
 //! - **Domain Separators**: Cryptographic prefixes preventing signature replay
 //! - **Gate Leases**: Authorization tokens binding executors to changesets
 //! - **Policy Resolution**: Anchor events locking policy decisions for
@@ -63,12 +64,18 @@
 //! assert!(resolution.verify_lease_match(&lease).is_ok());
 //! ```
 
+mod ci_attestation;
 mod domain_separator;
 mod key_policy;
 mod lease;
 mod policy_resolution;
 mod receipt;
 
+// Re-export CI attestation types
+pub use ci_attestation::{
+    CiAttestation, CiAttestationBuilder, CiAttestationError, CiAttestationLevel,
+    MAX_DOWNLOADED_ARTIFACT_HASHES, MAX_STRING_LENGTH as MAX_CI_ATTESTATION_STRING_LENGTH,
+};
 // Re-export domain separator constants and functions
 pub use domain_separator::{
     AAT_RESULT_REUSED_PREFIX, CI_IMPORT_ATTESTATION_PREFIX, GATE_LEASE_ISSUED_PREFIX,
