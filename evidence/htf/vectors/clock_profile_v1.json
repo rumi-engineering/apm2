@@ -1,0 +1,16 @@
+[
+  {
+    "description": "Basic ClockProfile v1",
+    "input": {
+      "profile_policy_id": "test-policy",
+      "tick_rate_hz": 1000000,
+      "monotonic_source": "CLOCK_MONOTONIC",
+      "hlc_enabled": true,
+      "wall_time_source": "BEST_EFFORT_NTP",
+      "max_wall_uncertainty_ns": 500000,
+      "build_fingerprint": "v1.0.0"
+    },
+    "canonical_json": "{\"build_fingerprint\":\"v1.0.0\",\"hlc_enabled\":true,\"max_wall_uncertainty_ns\":500000,\"monotonic_source\":\"CLOCK_MONOTONIC\",\"profile_policy_id\":\"test-policy\",\"tick_rate_hz\":1000000,\"wall_time_source\":\"BEST_EFFORT_NTP\"}",
+    "canonical_hash_hex": "f95fbe6008837f1a49d9f12371af2117ca9005e872d16247992a306463992169"
+  }
+]

@@ -16,7 +16,9 @@
 
 use std::cmp::Ordering;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 use thiserror::Error;
 
 // =============================================================================
@@ -26,6 +28,108 @@ use thiserror::Error;
 /// Maximum length of any string field in HTF types.
 /// This prevents denial-of-service attacks via oversized strings.
 pub const MAX_STRING_LENGTH: usize = 4096;
+
+/// Maximum number of observation records in a `TimeSyncObservation`.
+///
+/// This prevents denial-of-service attacks via unbounded arrays.
+/// SEC-HTF-001: Denial-of-service protection for unbounded
+/// `Vec<ObservationRecord>`.
+pub const MAX_OBSERVATIONS: usize = 1000;
+
+/// Maximum serialized size in bytes for attestation data in `ClockProfile`.
+///
+/// This prevents denial-of-service attacks via oversized JSON values.
+/// SEC-HTF-002: Denial-of-service protection for unbounded `serde_json::Value`.
+pub const MAX_ATTESTATION_SIZE: usize = 65536;
+
+// =============================================================================
+// Deserialization Helpers
+// =============================================================================
+
+fn deserialize_bounded_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    if s.len() > MAX_STRING_LENGTH {
+        return Err(de::Error::custom(format!(
+            "string exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+            s.len()
+        )));
+    }
+    Ok(s)
+}
+
+fn deserialize_bounded_option_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Deserialize::deserialize(deserializer)?;
+    if let Some(ref s) = opt {
+        if s.len() > MAX_STRING_LENGTH {
+            return Err(de::Error::custom(format!(
+                "string exceeds maximum length: {} > {MAX_STRING_LENGTH}",
+                s.len()
+            )));
+        }
+    }
+    Ok(opt)
+}
+
+fn deserialize_attestation<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw: Option<Box<RawValue>> = Deserialize::deserialize(deserializer)?;
+    match raw {
+        Some(r) => {
+            if r.get().len() > MAX_ATTESTATION_SIZE {
+                return Err(de::Error::custom(format!(
+                    "attestation exceeds maximum size: {} bytes > {MAX_ATTESTATION_SIZE} bytes",
+                    r.get().len()
+                )));
+            }
+            serde_json::from_str(r.get())
+                .map(Some)
+                .map_err(de::Error::custom)
+        },
+        None => Ok(None),
+    }
+}
+
+fn deserialize_observations<'de, D>(deserializer: D) -> Result<Vec<ObservationRecord>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ObservationsVisitor;
+
+    impl<'de> Visitor<'de> for ObservationsVisitor {
+        type Value = Vec<ObservationRecord>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a sequence of observation records")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while let Some(elem) = seq.next_element()? {
+                if vec.len() >= MAX_OBSERVATIONS {
+                    return Err(de::Error::custom(format!(
+                        "observations exceeds maximum count: {} > {MAX_OBSERVATIONS}",
+                        vec.len() + 1
+                    )));
+                }
+                vec.push(elem);
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_seq(ObservationsVisitor)
+}
 
 // =============================================================================
 // LedgerTime
@@ -71,9 +175,11 @@ pub const MAX_STRING_LENGTH: usize = 4096;
 /// // Different ledgers: compare by ledger_id
 /// assert!(t3 < t4);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LedgerTime {
     /// Stable identifier for a ledger namespace.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
     ledger_id: String,
 
     /// Epoch number, increments on authority/configuration changes.
@@ -248,38 +354,6 @@ impl Ord for LedgerTime {
 impl std::fmt::Display for LedgerTime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}:{}", self.ledger_id, self.epoch, self.seq)
-    }
-}
-
-/// Custom deserialization that enforces resource limits.
-impl<'de> Deserialize<'de> for LedgerTime {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
-
-        #[derive(Deserialize)]
-        struct LedgerTimeHelper {
-            ledger_id: String,
-            epoch: u64,
-            seq: u64,
-        }
-
-        let helper = LedgerTimeHelper::deserialize(deserializer)?;
-
-        if helper.ledger_id.len() > MAX_STRING_LENGTH {
-            return Err(D::Error::custom(format!(
-                "ledger_id exceeds maximum length: {} > {MAX_STRING_LENGTH}",
-                helper.ledger_id.len(),
-            )));
-        }
-
-        Ok(Self {
-            ledger_id: helper.ledger_id,
-            epoch: helper.epoch,
-            seq: helper.seq,
-        })
     }
 }
 
@@ -1030,10 +1104,12 @@ impl<'de> Deserialize<'de> for BoundedWallInterval {
         use serde::de::Error;
 
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct BoundedWallIntervalHelper {
             t_min_utc_ns: u64,
             t_max_utc_ns: u64,
             source: WallTimeSource,
+            #[serde(deserialize_with = "deserialize_bounded_string")]
             confidence: String,
         }
 
@@ -1043,13 +1119,6 @@ impl<'de> Deserialize<'de> for BoundedWallInterval {
             return Err(D::Error::custom(format!(
                 "invalid interval: t_max ({}) < t_min ({})",
                 helper.t_max_utc_ns, helper.t_min_utc_ns,
-            )));
-        }
-
-        if helper.confidence.len() > MAX_STRING_LENGTH {
-            return Err(D::Error::custom(format!(
-                "confidence exceeds maximum length: {} > {MAX_STRING_LENGTH}",
-                helper.confidence.len(),
             )));
         }
 
@@ -1083,6 +1152,156 @@ pub enum BoundedWallIntervalError {
         /// The maximum allowed length.
         max: usize,
     },
+}
+
+// =============================================================================
+// ClockProfile
+// =============================================================================
+
+/// Configuration for a node's clock behavior.
+///
+/// `ClockProfile` defines the parameters for monotonic and wall time sources,
+/// tick rates, and uncertainty bounds. It is a CAC artifact that must be
+/// canonicalized and signed.
+///
+/// # Security
+///
+/// The `attestation` field is bounded by [`MAX_ATTESTATION_SIZE`] bytes when
+/// serialized to prevent denial-of-service attacks via oversized JSON values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClockProfile {
+    /// Optional attestation data (Phase 2+).
+    /// SEC-HTF-002: Limited to `MAX_ATTESTATION_SIZE` bytes when serialized.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_attestation")]
+    pub attestation: Option<serde_json::Value>,
+
+    /// Daemon version + platform hash.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
+    pub build_fingerprint: String,
+
+    /// Whether hybrid logical clock is enabled.
+    pub hlc_enabled: bool,
+
+    /// Maximum wall time uncertainty in nanoseconds.
+    pub max_wall_uncertainty_ns: u64,
+
+    /// Source of monotonic clock.
+    pub monotonic_source: MonotonicSource,
+
+    /// Stable identifier for policy grouping.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
+    pub profile_policy_id: String,
+
+    /// Tick rate in Hz (must match envelopes).
+    pub tick_rate_hz: u64,
+
+    /// Source of wall time synchronization.
+    pub wall_time_source: WallTimeSource,
+}
+
+// =============================================================================
+// TimeEnvelope
+// =============================================================================
+
+/// A verifiable time assertion envelope.
+///
+/// `TimeEnvelope` binds a monotonic tick reading, wall time bounds, and
+/// logical clock state to a specific ledger anchor and clock profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeEnvelope {
+    /// Content hash of the `ClockProfileV1`.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
+    pub clock_profile_hash: String,
+
+    /// Hybrid logical clock timestamp.
+    pub hlc: Hlc,
+
+    /// Reference to ledger position.
+    pub ledger_anchor: LedgerTime,
+
+    /// Monotonic clock reading.
+    pub mono: MonotonicReading,
+
+    /// Optional notes about the time envelope.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_bounded_option_string")]
+    pub notes: Option<String>,
+
+    /// Wall clock time bounds.
+    pub wall: BoundedWallInterval,
+}
+
+/// Hybrid Logical Clock timestamp components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Hlc {
+    /// Logical counter component.
+    pub logical: u64,
+
+    /// Wall time in nanoseconds.
+    pub wall_ns: u64,
+}
+
+/// Monotonic clock reading components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MonotonicReading {
+    /// End tick (must be >= `start_tick` when present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_tick: Option<u64>,
+
+    /// Monotonic clock source.
+    pub source: MonotonicSource,
+
+    /// Start tick value.
+    pub start_tick: u64,
+
+    /// Tick rate in Hz.
+    pub tick_rate_hz: u64,
+}
+
+// =============================================================================
+// TimeSyncObservation
+// =============================================================================
+
+/// A record of time synchronization observations.
+///
+/// # Security
+///
+/// The `observations` array is bounded by [`MAX_OBSERVATIONS`] to prevent
+/// denial-of-service attacks via unbounded arrays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimeSyncObservation {
+    /// Array of time sync observation records.
+    /// SEC-HTF-001: Limited to `MAX_OBSERVATIONS` entries.
+    #[serde(deserialize_with = "deserialize_observations")]
+    pub observations: Vec<ObservationRecord>,
+
+    /// `TimeEnvelopeRef` hash reference.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
+    pub observed_at_envelope_ref: String,
+}
+
+/// Individual observation record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationRecord {
+    /// Monotonic tick at observation time.
+    pub observed_at_mono_tick: u64,
+
+    /// Observed clock offset in nanoseconds.
+    pub observed_offset_ns: i64,
+
+    /// Source of the observation.
+    #[serde(deserialize_with = "deserialize_bounded_string")]
+    pub source: String,
+
+    /// Uncertainty of the observation in nanoseconds.
+    pub uncertainty_ns: u64,
 }
 
 // =============================================================================
@@ -1221,7 +1440,7 @@ mod tests {
             let result: Result<LedgerTime, _> = serde_json::from_str(&json);
             assert!(result.is_err());
             let err_msg = result.unwrap_err().to_string();
-            assert!(err_msg.contains("ledger_id exceeds maximum length"));
+            assert!(err_msg.contains("string exceeds maximum length"));
         }
 
         #[test]
@@ -1712,7 +1931,7 @@ mod tests {
             let result: Result<BoundedWallInterval, _> = serde_json::from_str(&json);
             assert!(result.is_err());
             let err_msg = result.unwrap_err().to_string();
-            assert!(err_msg.contains("confidence exceeds maximum length"));
+            assert!(err_msg.contains("string exceeds maximum length"));
         }
 
         #[test]
@@ -1735,6 +1954,153 @@ mod tests {
                 let deserialized: BoundedWallInterval = serde_json::from_str(&json).unwrap();
                 assert_eq!(wall.source(), deserialized.source());
             }
+        }
+    }
+
+    // =========================================================================
+    // Security Limit Tests (SEC-HTF-001 and SEC-HTF-002)
+    // =========================================================================
+
+    mod security_limits {
+        use super::*;
+
+        /// SEC-HTF-001: Test that observations array is bounded
+        #[test]
+        fn test_time_sync_observation_max_observations() {
+            // Create observations at the limit
+            let observations: Vec<ObservationRecord> = (0..MAX_OBSERVATIONS)
+                .map(|i| ObservationRecord {
+                    observed_at_mono_tick: i as u64,
+                    observed_offset_ns: 0,
+                    source: "test".to_string(),
+                    uncertainty_ns: 100,
+                })
+                .collect();
+
+            let valid_json = serde_json::json!({
+                "observations": observations.iter().map(|o| serde_json::json!({
+                    "observed_at_mono_tick": o.observed_at_mono_tick,
+                    "observed_offset_ns": o.observed_offset_ns,
+                    "source": o.source,
+                    "uncertainty_ns": o.uncertainty_ns,
+                })).collect::<Vec<_>>(),
+                "observed_at_envelope_ref": "test-ref"
+            });
+
+            // Should succeed at the limit
+            let result: Result<TimeSyncObservation, _> = serde_json::from_value(valid_json.clone());
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().observations.len(), MAX_OBSERVATIONS);
+
+            // Create one over the limit
+            let mut over_limit = valid_json;
+            let obs_array = over_limit
+                .get_mut("observations")
+                .unwrap()
+                .as_array_mut()
+                .unwrap();
+            obs_array.push(serde_json::json!({
+                "observed_at_mono_tick": MAX_OBSERVATIONS as u64,
+                "observed_offset_ns": 0,
+                "source": "test",
+                "uncertainty_ns": 100,
+            }));
+
+            let result: Result<TimeSyncObservation, _> = serde_json::from_value(over_limit);
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(err_msg.contains("observations exceeds maximum count"));
+        }
+
+        /// SEC-HTF-002: Test that attestation size is bounded
+        #[test]
+        fn test_clock_profile_max_attestation_size() {
+            // Create a valid ClockProfile with small attestation
+            let small_attestation = serde_json::json!({
+                "key": "value"
+            });
+
+            let valid_json = serde_json::json!({
+                "attestation": small_attestation,
+                "build_fingerprint": "test-build",
+                "hlc_enabled": true,
+                "max_wall_uncertainty_ns": 1_000_000,
+                "monotonic_source": "CLOCK_MONOTONIC_RAW",
+                "profile_policy_id": "test-policy",
+                "tick_rate_hz": 1_000_000_000,
+                "wall_time_source": "BEST_EFFORT_NTP"
+            });
+
+            // Should succeed with small attestation
+            let result: Result<ClockProfile, _> = serde_json::from_value(valid_json);
+            assert!(result.is_ok());
+
+            // Create attestation that exceeds the limit
+            let large_data = "x".repeat(MAX_ATTESTATION_SIZE + 1);
+            let large_attestation = serde_json::json!({
+                "large_field": large_data
+            });
+
+            let invalid_json = serde_json::json!({
+                "attestation": large_attestation,
+                "build_fingerprint": "test-build",
+                "hlc_enabled": true,
+                "max_wall_uncertainty_ns": 1_000_000,
+                "monotonic_source": "CLOCK_MONOTONIC_RAW",
+                "profile_policy_id": "test-policy",
+                "tick_rate_hz": 1_000_000_000,
+                "wall_time_source": "BEST_EFFORT_NTP"
+            });
+
+            let result: Result<ClockProfile, _> = serde_json::from_value(invalid_json);
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(err_msg.contains("attestation exceeds maximum size"));
+        }
+
+        /// SEC-HTF-002: Test that null attestation is allowed
+        #[test]
+        fn test_clock_profile_null_attestation() {
+            let json = serde_json::json!({
+                "attestation": null,
+                "build_fingerprint": "test-build",
+                "hlc_enabled": true,
+                "max_wall_uncertainty_ns": 1_000_000,
+                "monotonic_source": "CLOCK_MONOTONIC_RAW",
+                "profile_policy_id": "test-policy",
+                "tick_rate_hz": 1_000_000_000,
+                "wall_time_source": "BEST_EFFORT_NTP"
+            });
+
+            let result: Result<ClockProfile, _> = serde_json::from_value(json);
+            assert!(result.is_ok());
+            assert!(result.unwrap().attestation.is_none());
+        }
+
+        /// SEC-HTF-002: Test attestation at exactly the limit
+        #[test]
+        fn test_clock_profile_attestation_at_limit() {
+            // Create attestation that is just under the limit
+            // Account for JSON overhead ({"key":""} is ~10 chars)
+            let data_size = MAX_ATTESTATION_SIZE - 15;
+            let at_limit_data = "x".repeat(data_size);
+            let at_limit_attestation = serde_json::json!({
+                "key": at_limit_data
+            });
+
+            let json = serde_json::json!({
+                "attestation": at_limit_attestation,
+                "build_fingerprint": "test-build",
+                "hlc_enabled": true,
+                "max_wall_uncertainty_ns": 1_000_000,
+                "monotonic_source": "CLOCK_MONOTONIC_RAW",
+                "profile_policy_id": "test-policy",
+                "tick_rate_hz": 1_000_000_000,
+                "wall_time_source": "BEST_EFFORT_NTP"
+            });
+
+            let result: Result<ClockProfile, _> = serde_json::from_value(json);
+            assert!(result.is_ok());
         }
     }
 }
