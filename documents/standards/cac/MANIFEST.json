@@ -406,6 +406,21 @@
         "bytes": 2179,
         "path": "schemas/cac.bundle_manifest.v1.schema.json",
         "sha256": "9ab11bc0b7840bf3c3b6d52887a6234f3b45d3659b49291f3838a567f42a500c"
+      },
+      {
+        "bytes": 2462,
+        "path": "schemas/cac.clock_profile.v1.schema.json",
+        "sha256": "1f3e7e2edf5c2e5efb3bc2ee40a623fcbfe2a0782ad449661522296d883b7bbd"
+      },
+      {
+        "bytes": 4967,
+        "path": "schemas/cac.time_envelope.v1.schema.json",
+        "sha256": "110b7f433150e23ff5ef0133c1cab21e00a9b25698e6d39de94dbfb6fbc0073f"
+      },
+      {
+        "bytes": 2089,
+        "path": "schemas/cac.time_sync_observation.v1.schema.json",
+        "sha256": "95f1d6b2cefe801f5994843678e7f52e8089e5175d3d17af1646fdf7c6961467"
       }
     ],
     "parallel_designs": [
@@ -434,7 +449,10 @@
       "schemas/cac.instruction_spec.v1.schema.json",
       "schemas/cac.vendor_profile.v1.schema.json",
       "schemas/cac.target_profile.v1.schema.json",
+      "schemas/cac.time_envelope.v1.schema.json",
+      "schemas/cac.time_sync_observation.v1.schema.json",
       "schemas/cac.changeset_report.v1.schema.json",
+      "schemas/cac.clock_profile.v1.schema.json",
       "schemas/cac.bundle_manifest.v1.schema.json",
       "schemas/cac.run_receipt.v1.schema.json",
       "schemas/cac.canonicalizer_vectors.v1.schema.json"

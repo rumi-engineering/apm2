@@ -1,0 +1,68 @@
+{
+  "$id": "cac.time_sync_observation.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "time.sync_observation"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "observations": {
+              "description": "Array of time sync observation records",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "observed_offset_ns": {
+                    "description": "Observed clock offset in nanoseconds",
+                    "type": "integer"
+                  },
+                  "observed_at_mono_tick": {
+                    "description": "Monotonic tick at observation time",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "source": {
+                    "description": "Source of the observation",
+                    "type": "string"
+                  },
+                  "uncertainty_ns": {
+                    "description": "Uncertainty of the observation in nanoseconds",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "observed_at_mono_tick",
+                  "observed_offset_ns",
+                  "source"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "observed_at_envelope_ref": {
+              "description": "TimeEnvelopeRef hash reference",
+              "type": "string"
+            }
+          },
+          "required": [
+            "observed_at_envelope_ref",
+            "observations"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.time_sync_observation.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC TimeSyncObservation v1"
+}

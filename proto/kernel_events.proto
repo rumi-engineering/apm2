@@ -1232,7 +1232,7 @@ message QuarantineCleared {
 // MERGE EVENTS
 // ============================================================
 
-// Emitted when a merge is executed atomically after observing the result.
+// Emitted when a merge is executed atomically after observing the result_selector.
 //
 // This receipt binds the inputs (base, changeset, policy, receipts) to the
 // observed outcome (result_selector), ensuring that the merge cannot be

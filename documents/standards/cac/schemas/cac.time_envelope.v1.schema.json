@@ -1,0 +1,160 @@
+{
+  "$id": "cac.time_envelope.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "time.envelope"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "clock_profile_hash": {
+              "description": "Content hash of the ClockProfileV1",
+              "type": "string"
+            },
+            "hlc": {
+              "additionalProperties": false,
+              "description": "Hybrid logical clock timestamp",
+              "properties": {
+                "logical": {
+                  "description": "Logical counter component",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "wall_ns": {
+                  "description": "Wall time in nanoseconds",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "wall_ns",
+                "logical"
+              ],
+              "type": "object"
+            },
+            "ledger_anchor": {
+              "additionalProperties": false,
+              "description": "Reference to ledger position",
+              "properties": {
+                "epoch": {
+                  "description": "Ledger epoch number",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "ledger_id": {
+                  "description": "Identifier of the ledger",
+                  "type": "string"
+                },
+                "seq": {
+                  "description": "Sequence number within epoch",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "ledger_id",
+                "epoch",
+                "seq"
+              ],
+              "type": "object"
+            },
+            "mono": {
+              "additionalProperties": false,
+              "description": "Monotonic clock reading",
+              "properties": {
+                "end_tick": {
+                  "description": "End tick (must be >= start_tick when present)",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "source": {
+                  "description": "Monotonic clock source",
+                  "enum": [
+                    "CLOCK_MONOTONIC_RAW",
+                    "CLOCK_MONOTONIC",
+                    "OTHER"
+                  ],
+                  "type": "string"
+                },
+                "start_tick": {
+                  "description": "Start tick value",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tick_rate_hz": {
+                  "description": "Tick rate in Hz (must match ClockProfile)",
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "start_tick",
+                "tick_rate_hz",
+                "source"
+              ],
+              "type": "object"
+            },
+            "notes": {
+              "description": "Optional notes about the time envelope",
+              "type": "string"
+            },
+            "wall": {
+              "additionalProperties": false,
+              "description": "Wall clock time bounds",
+              "properties": {
+                "confidence": {
+                  "description": "Confidence level of the wall time",
+                  "type": "string"
+                },
+                "source": {
+                  "description": "Wall time source",
+                  "enum": [
+                    "NONE",
+                    "BEST_EFFORT_NTP",
+                    "AUTHENTICATED_NTS",
+                    "ROUGHTIME",
+                    "CLOUD_BOUNDED",
+                    "MANUAL_OPERATOR"
+                  ],
+                  "type": "string"
+                },
+                "t_max_utc_ns": {
+                  "description": "Maximum UTC time in nanoseconds",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "t_min_utc_ns": {
+                  "description": "Minimum UTC time in nanoseconds",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "t_min_utc_ns",
+                "t_max_utc_ns",
+                "source"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "clock_profile_hash",
+            "ledger_anchor",
+            "mono"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.time_envelope.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC TimeEnvelope v1"
+}

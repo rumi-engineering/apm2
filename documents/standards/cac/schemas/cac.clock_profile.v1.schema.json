@@ -1,0 +1,83 @@
+{
+  "$id": "cac.clock_profile.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "clock.profile"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "attestation": {
+              "additionalProperties": false,
+              "description": "Optional attestation data (Phase 2+)",
+              "type": "object"
+            },
+            "build_fingerprint": {
+              "description": "Daemon version + platform hash",
+              "type": "string"
+            },
+            "hlc_enabled": {
+              "description": "Whether hybrid logical clock is enabled",
+              "type": "boolean"
+            },
+            "max_wall_uncertainty_ns": {
+              "description": "Maximum wall time uncertainty in nanoseconds",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "monotonic_source": {
+              "description": "Source of monotonic clock",
+              "enum": [
+                "CLOCK_MONOTONIC_RAW",
+                "CLOCK_MONOTONIC",
+                "OTHER"
+              ],
+              "type": "string"
+            },
+            "profile_policy_id": {
+              "description": "Stable identifier for policy grouping",
+              "type": "string"
+            },
+            "tick_rate_hz": {
+              "description": "Tick rate in Hz (must match envelopes)",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "wall_time_source": {
+              "description": "Source of wall time synchronization",
+              "enum": [
+                "NONE",
+                "BEST_EFFORT_NTP",
+                "AUTHENTICATED_NTS",
+                "ROUGHTIME",
+                "CLOUD_BOUNDED",
+                "MANUAL_OPERATOR"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "profile_policy_id",
+            "tick_rate_hz",
+            "monotonic_source",
+            "hlc_enabled",
+            "wall_time_source",
+            "max_wall_uncertainty_ns",
+            "build_fingerprint"
+          ],
+          "type": "object"
+        },
+        "schema": {
+          "const": "cac.clock_profile.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC ClockProfile v1"
+}

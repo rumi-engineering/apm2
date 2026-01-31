@@ -43,7 +43,7 @@ pub const MAX_GATE_RECEIPTS: usize = 64;
 // Error Types
 // =============================================================================
 
-/// Errors that can occur during [`MergeReceipt`] operations.
+/// Errors that can occur during `MergeReceipt` operations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum MergeReceiptError {
     /// Missing required field.
@@ -134,10 +134,6 @@ impl MergeReceipt {
     /// * `merged_at` - Timestamp of merge
     /// * `gate_actor_id` - ID of the actor performing the merge
     /// * `signer` - Signer to authorize the receipt
-    ///
-    /// # Returns
-    ///
-    /// A signed `MergeReceipt` or error if validation fails.
     ///
     /// # Errors
     ///

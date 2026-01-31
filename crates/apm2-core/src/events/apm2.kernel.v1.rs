@@ -1489,7 +1489,7 @@ pub struct QuarantineCleared {
     #[prost(bytes = "vec", tag = "5")]
     pub issuer_signature: ::prost::alloc::vec::Vec<u8>,
 }
-/// Emitted when a merge is executed atomically after observing the result.
+/// Emitted when a merge is executed atomically after observing the result_selector.
 ///
 /// This receipt binds the inputs (base, changeset, policy, receipts) to the
 /// observed outcome (result_selector), ensuring that the merge cannot be
