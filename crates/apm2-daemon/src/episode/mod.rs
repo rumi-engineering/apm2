@@ -199,7 +199,8 @@ pub use registry::AdapterRegistry;
 pub use ring_buffer::{RingBuffer, tier_defaults};
 pub use runtime::{
     EpisodeEvent, EpisodeRuntime, EpisodeRuntimeConfig, Hash, MAX_CONCURRENT_EPISODES,
-    MAX_EVENTS_BUFFER_SIZE, new_shared_runtime,
+    MAX_EVENTS_BUFFER_SIZE, new_shared_runtime, new_shared_runtime_with_clock,
+    new_shared_runtime_with_clock_initialized,
 };
 pub use scope::{
     CapabilityScope, CapabilityScopeBuilder, MAX_ALLOWED_PATTERNS, MAX_NETWORK_HOSTS,

@@ -146,6 +146,18 @@ pub enum ClockError {
     /// Canonicalization failed.
     #[error("canonicalization failed: {0}")]
     Canonicalization(#[from] CanonicalizationError),
+
+    /// Monotonic source not supported on this platform.
+    ///
+    /// Rust's `std::time::Instant` uses the platform's default monotonic clock
+    /// (e.g., `CLOCK_MONOTONIC` on Linux). Alternative sources like
+    /// `CLOCK_MONOTONIC_RAW` require platform-specific APIs and are not
+    /// currently supported.
+    #[error("monotonic source {requested:?} not supported on this platform; use ClockMonotonic")]
+    UnsupportedMonotonicSource {
+        /// The requested monotonic source.
+        requested: MonotonicSource,
+    },
 }
 
 /// Record of a clock regression event for defect reporting.
@@ -446,10 +458,30 @@ impl HolonicClock {
     ///
     /// Returns [`ClockError::Canonicalization`] if the clock profile cannot be
     /// canonicalized for hashing.
+    ///
+    /// Returns [`ClockError::UnsupportedMonotonicSource`] if the configured
+    /// monotonic source is not supported on this platform. Currently, only
+    /// [`MonotonicSource::ClockMonotonic`] is supported because Rust's
+    /// `std::time::Instant` uses the platform's default monotonic clock.
     pub fn new(
         config: ClockConfig,
         ledger: Option<Arc<dyn LedgerBackend>>,
     ) -> Result<Self, ClockError> {
+        // Validate monotonic source (TCK-00240).
+        //
+        // Rust's `std::time::Instant` uses the platform's default monotonic clock,
+        // which is typically `CLOCK_MONOTONIC` on Linux. Alternative sources like
+        // `CLOCK_MONOTONIC_RAW` require platform-specific APIs (libc::clock_gettime)
+        // and are not currently supported.
+        //
+        // This validation ensures fail-closed behavior per SEC-CTRL-FAC-0015:
+        // we reject unsupported configurations rather than silently ignoring them.
+        if config.monotonic_source != MonotonicSource::ClockMonotonic {
+            return Err(ClockError::UnsupportedMonotonicSource {
+                requested: config.monotonic_source,
+            });
+        }
+
         let clock_profile = ClockProfile {
             attestation: None,
             build_fingerprint: config.build_fingerprint.clone(),
@@ -517,10 +549,29 @@ impl HolonicClock {
     /// This indicates a serious system issue (e.g., VM time travel).
     #[allow(clippy::cast_possible_truncation)]
     pub fn now_mono_tick(&self) -> Result<HtfTick, ClockError> {
-        // The cast from u128 to u64 is safe: elapsed time from Instant::now()
-        // won't exceed u64::MAX nanoseconds (584 years).
+        // Get elapsed nanoseconds from the monotonic epoch.
         let elapsed = self.epoch_instant.elapsed();
-        let current_tick = elapsed.as_nanos() as u64;
+        let elapsed_ns = elapsed.as_nanos();
+
+        // Scale nanoseconds to configured tick rate.
+        //
+        // Formula: ticks = elapsed_ns * tick_rate_hz / 1_000_000_000
+        //
+        // At DEFAULT_TICK_RATE_HZ (1 GHz), this is identity: 1 tick = 1 nanosecond.
+        // At 1 MHz tick rate, this produces: 1 tick = 1 microsecond.
+        // At 1 kHz tick rate, this produces: 1 tick = 1 millisecond.
+        //
+        // We perform the multiplication in u128 to avoid overflow:
+        // - elapsed_ns can be up to u64::MAX (584 years)
+        // - tick_rate_hz can be up to u64::MAX
+        // - The product fits in u128
+        //
+        // The final cast to u64 is safe because the result is bounded by
+        // elapsed_ns (since tick_rate_hz <= 1_000_000_000 for typical configs,
+        // and even at u64::MAX tick_rate_hz, we're dividing by 1 GHz which
+        // reduces the value by ~10^9).
+        let tick_rate = u128::from(self.config.tick_rate_hz);
+        let current_tick = (elapsed_ns * tick_rate / 1_000_000_000) as u64;
 
         // Atomically update and check for regression (INV-HC001).
         // Using fetch_max ensures thread-safe updates without race conditions
@@ -1050,6 +1101,49 @@ mod tests {
     }
 
     #[test]
+    fn test_tick_rate_scaling() {
+        // Test at 1 MHz (microsecond resolution)
+        let config = ClockConfigBuilder::new().tick_rate_hz(1_000_000).build();
+        let clock = HolonicClock::new(config, None).unwrap();
+
+        let tick1 = clock.now_mono_tick().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let tick2 = clock.now_mono_tick().unwrap();
+
+        // At 1 MHz, 10ms = 10,000 microseconds = ~10,000 ticks.
+        // Allow some tolerance for scheduling variance.
+        let elapsed_ticks = tick2.value() - tick1.value();
+        assert!(
+            (9_000..=15_000).contains(&elapsed_ticks),
+            "Expected ~10,000 ticks at 1 MHz for 10ms sleep, got {elapsed_ticks}"
+        );
+
+        // Verify the tick rate is correctly propagated
+        assert_eq!(tick1.tick_rate_hz(), 1_000_000);
+        assert_eq!(tick2.tick_rate_hz(), 1_000_000);
+    }
+
+    #[test]
+    fn test_tick_rate_scaling_default() {
+        // At default 1 GHz, 1 tick = 1 nanosecond
+        let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
+
+        let tick1 = clock.now_mono_tick().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let tick2 = clock.now_mono_tick().unwrap();
+
+        // At 1 GHz, 1ms = 1,000,000 nanoseconds = ~1,000,000 ticks.
+        // Allow tolerance for scheduling variance.
+        let elapsed_ticks = tick2.value() - tick1.value();
+        assert!(
+            (900_000..=10_000_000).contains(&elapsed_ticks),
+            "Expected ~1,000,000 ticks at 1 GHz for 1ms sleep, got {elapsed_ticks}"
+        );
+
+        assert_eq!(tick1.tick_rate_hz(), DEFAULT_TICK_RATE_HZ);
+    }
+
+    #[test]
     fn test_holonic_clock_hlc() {
         let clock = HolonicClock::new(ClockConfig::default(), None).unwrap();
 
@@ -1070,6 +1164,33 @@ mod tests {
 
         let result = clock.now_hlc();
         assert!(matches!(result, Err(ClockError::HlcNotEnabled)));
+    }
+
+    #[test]
+    fn test_unsupported_monotonic_source() {
+        // ClockMonotonicRaw is not supported (requires platform-specific APIs)
+        let config = ClockConfigBuilder::new()
+            .monotonic_source(MonotonicSource::ClockMonotonicRaw)
+            .build();
+        let result = HolonicClock::new(config, None);
+        assert!(
+            matches!(result, Err(ClockError::UnsupportedMonotonicSource { requested }) if requested == MonotonicSource::ClockMonotonicRaw)
+        );
+
+        // MonotonicSource::Other is not supported
+        let config2 = ClockConfigBuilder::new()
+            .monotonic_source(MonotonicSource::Other)
+            .build();
+        let result2 = HolonicClock::new(config2, None);
+        assert!(
+            matches!(result2, Err(ClockError::UnsupportedMonotonicSource { requested }) if requested == MonotonicSource::Other)
+        );
+
+        // ClockMonotonic is the only supported source
+        let config3 = ClockConfigBuilder::new()
+            .monotonic_source(MonotonicSource::ClockMonotonic)
+            .build();
+        assert!(HolonicClock::new(config3, None).is_ok());
     }
 
     #[test]

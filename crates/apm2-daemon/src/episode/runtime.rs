@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use apm2_core::htf::{TimeEnvelope, TimeEnvelopeRef};
+use apm2_core::htf::{ClockProfile, TimeEnvelope, TimeEnvelopeRef};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
@@ -53,7 +53,17 @@ pub const MAX_CONCURRENT_EPISODES: usize = 10_000;
 ///
 /// This prevents unbounded memory growth per CTR-1303. When this limit
 /// is reached, new events will evict the oldest events.
-pub const MAX_EVENTS_BUFFER_SIZE: usize = 100_000;
+///
+/// # Memory Budget
+///
+/// Each `EpisodeEvent` can contain a `TimeEnvelope` with multiple string
+/// fields (notes, `profile_hash`, `ledger_id`) up to `MAX_STRING_LENGTH` (4KB).
+/// At 10,000 events with worst-case sizing, heap usage is bounded to ~150MB,
+/// which is acceptable for daemon processes.
+///
+/// The previous value of 100,000 could result in ~1.5GB heap usage, which
+/// risks OOM on resource-constrained nodes (TCK-00240 review feedback).
+pub const MAX_EVENTS_BUFFER_SIZE: usize = 10_000;
 
 /// Hash type (BLAKE3-256).
 pub type Hash = [u8; 32];
@@ -127,17 +137,45 @@ pub enum EpisodeEvent {
         /// The full `TimeEnvelope` preimage for verification.
         time_envelope: Option<TimeEnvelope>,
     },
+    /// Clock profile was published (TCK-00240).
+    ///
+    /// This event is emitted when the runtime is initialized with a
+    /// `HolonicClock`. It publishes the `ClockProfile` to the ledger so that
+    /// auditors can resolve `clock_profile_hash` references in `TimeEnvelope`s.
+    ///
+    /// # Verification
+    ///
+    /// Auditors should verify that:
+    /// - `profile_hash == hex(blake3(canonical_bytes(clock_profile)))`
+    /// - All `TimeEnvelope.clock_profile_hash` fields in subsequent events
+    ///   match this published profile
+    ClockProfilePublished {
+        /// BLAKE3 hash of the canonical clock profile.
+        profile_hash: String,
+        /// The full `ClockProfile` for verification.
+        clock_profile: ClockProfile,
+        /// Timestamp when published (nanoseconds since epoch).
+        published_at_ns: u64,
+        /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
+        time_envelope_ref: Option<TimeEnvelopeRef>,
+        /// The full `TimeEnvelope` preimage for verification.
+        time_envelope: Option<TimeEnvelope>,
+    },
 }
 
 impl EpisodeEvent {
-    /// Returns the episode ID for this event.
+    /// Returns the episode ID for this event, if applicable.
+    ///
+    /// Runtime-level events like [`EpisodeEvent::ClockProfilePublished`] do not
+    /// have an associated episode and return `None`.
     #[must_use]
-    pub const fn episode_id(&self) -> &EpisodeId {
+    pub const fn episode_id(&self) -> Option<&EpisodeId> {
         match self {
             Self::Created { episode_id, .. }
             | Self::Started { episode_id, .. }
             | Self::Stopped { episode_id, .. }
-            | Self::Quarantined { episode_id, .. } => episode_id,
+            | Self::Quarantined { episode_id, .. } => Some(episode_id),
+            Self::ClockProfilePublished { .. } => None,
         }
     }
 
@@ -149,6 +187,7 @@ impl EpisodeEvent {
             Self::Started { .. } => "episode.started",
             Self::Stopped { .. } => "episode.stopped",
             Self::Quarantined { .. } => "episode.quarantined",
+            Self::ClockProfilePublished { .. } => "clock.profile_published",
         }
     }
 
@@ -167,6 +206,9 @@ impl EpisodeEvent {
             }
             | Self::Quarantined {
                 time_envelope_ref, ..
+            }
+            | Self::ClockProfilePublished {
+                time_envelope_ref, ..
             } => time_envelope_ref.as_ref(),
         }
     }
@@ -181,7 +223,8 @@ impl EpisodeEvent {
             Self::Created { time_envelope, .. }
             | Self::Started { time_envelope, .. }
             | Self::Stopped { time_envelope, .. }
-            | Self::Quarantined { time_envelope, .. } => time_envelope.as_ref(),
+            | Self::Quarantined { time_envelope, .. }
+            | Self::ClockProfilePublished { time_envelope, .. } => time_envelope.as_ref(),
         }
     }
 }
@@ -301,6 +344,12 @@ impl EpisodeRuntime {
     /// When a `HolonicClock` is provided, all episode events will be stamped
     /// with a `TimeEnvelopeRef` for temporal ordering and causality tracking
     /// per RFC-0016 (HTF).
+    ///
+    /// # Note
+    ///
+    /// This constructor does not emit the `ClockProfilePublished` event.
+    /// Use [`Self::with_clock_initialized`] for production code to ensure
+    /// the clock profile is published to the ledger for auditor resolution.
     #[must_use]
     pub fn with_clock(config: EpisodeRuntimeConfig, clock: Arc<HolonicClock>) -> Self {
         Self {
@@ -311,6 +360,78 @@ impl EpisodeRuntime {
             episode_seq: AtomicU64::new(1),
             clock: Some(clock),
         }
+    }
+
+    /// Creates a new episode runtime with clock and emits
+    /// `ClockProfilePublished`.
+    ///
+    /// This is the preferred factory for production code. It:
+    /// 1. Creates the runtime with the provided clock
+    /// 2. Emits a `ClockProfilePublished` event so auditors can resolve
+    ///    `clock_profile_hash` references in subsequent `TimeEnvelope`s
+    ///
+    /// # Returns
+    ///
+    /// Returns `Err` if clock stamping fails during event emission.
+    ///
+    /// # Security (SEC-CTRL-FAC-0015 Fail-Closed)
+    ///
+    /// If the clock fails to stamp the profile publication event, the runtime
+    /// is not created. This ensures temporal authority is established from
+    /// the start.
+    pub async fn with_clock_initialized(
+        config: EpisodeRuntimeConfig,
+        clock: Arc<HolonicClock>,
+    ) -> Result<Self, EpisodeError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let runtime = Self::with_clock(config, clock);
+
+        // Get current timestamp.
+        // The cast from u128 to u64 is safe: nanoseconds since UNIX epoch
+        // won't exceed u64::MAX until the year 2554.
+        #[allow(clippy::cast_possible_truncation)]
+        let published_at_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        // Get clock profile from the clock (safe: we just set it in with_clock)
+        let clock_ref = runtime.clock().ok_or_else(|| EpisodeError::ClockFailure {
+            message: "clock not available after with_clock()".to_string(),
+        })?;
+
+        // Stamp the event with the clock (fail-closed: propagate errors)
+        // Since we verified clock exists, stamp_envelope will return Some
+        let (time_envelope, time_envelope_ref) = runtime
+            .stamp_envelope(Some(format!(
+                "clock.profile_published:{}",
+                clock_ref.profile_hash()
+            )))
+            .await?
+            .ok_or_else(|| EpisodeError::ClockFailure {
+                message: "stamp_envelope returned None despite clock being configured".to_string(),
+            })?;
+
+        // Emit the ClockProfilePublished event
+        if runtime.config.emit_events {
+            runtime
+                .emit_event(EpisodeEvent::ClockProfilePublished {
+                    profile_hash: clock_ref.profile_hash().to_string(),
+                    clock_profile: clock_ref.clock_profile().clone(),
+                    published_at_ns,
+                    time_envelope_ref: Some(time_envelope_ref),
+                    time_envelope: Some(time_envelope),
+                })
+                .await;
+
+            info!(
+                profile_hash = %clock_ref.profile_hash(),
+                "clock profile published"
+            );
+        }
+
+        Ok(runtime)
     }
 
     /// Creates a new episode runtime with default configuration.
@@ -949,6 +1070,11 @@ pub fn new_shared_runtime(config: EpisodeRuntimeConfig) -> Arc<EpisodeRuntime> {
 /// When a clock is provided, all episode events will be stamped with a
 /// `TimeEnvelopeRef` for temporal ordering and causality tracking per
 /// RFC-0016 (HTF).
+///
+/// # Note
+///
+/// This function does not emit the `ClockProfilePublished` event.
+/// Use [`new_shared_runtime_with_clock_initialized`] for production code.
 #[must_use]
 #[allow(dead_code)] // Public API for future use
 pub fn new_shared_runtime_with_clock(
@@ -956,6 +1082,27 @@ pub fn new_shared_runtime_with_clock(
     clock: Arc<HolonicClock>,
 ) -> Arc<EpisodeRuntime> {
     Arc::new(EpisodeRuntime::with_clock(config, clock))
+}
+
+/// Creates a new `Arc<EpisodeRuntime>` with initialized clock profile
+/// publication.
+///
+/// This is the preferred factory for production code. It:
+/// 1. Creates the runtime with the provided clock
+/// 2. Emits a `ClockProfilePublished` event so auditors can resolve
+///    `clock_profile_hash` references in subsequent `TimeEnvelope`s
+///
+/// # Returns
+///
+/// Returns `Err` if clock stamping fails during event emission.
+#[allow(dead_code)] // Public API for future use
+pub async fn new_shared_runtime_with_clock_initialized(
+    config: EpisodeRuntimeConfig,
+    clock: Arc<HolonicClock>,
+) -> Result<Arc<EpisodeRuntime>, EpisodeError> {
+    EpisodeRuntime::with_clock_initialized(config, clock)
+        .await
+        .map(Arc::new)
 }
 
 #[cfg(test)]
@@ -1668,6 +1815,76 @@ mod tests {
         assert!(
             events[0].time_envelope_ref().is_none(),
             "Event should have no time_envelope_ref without clock"
+        );
+    }
+
+    /// TCK-00240: Verify that `ClockProfilePublished` event is emitted when
+    /// using `with_clock_initialized`.
+    #[tokio::test]
+    async fn tck_00240_clock_profile_published_event() {
+        use crate::htf::{ClockConfig, HolonicClock};
+
+        let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None).unwrap());
+        let expected_hash = clock.profile_hash().to_string();
+
+        // Create runtime with initialized clock - this should emit
+        // ClockProfilePublished
+        let runtime = EpisodeRuntime::with_clock_initialized(test_config(), clock)
+            .await
+            .expect("should succeed");
+
+        let events = runtime.drain_events().await;
+        assert_eq!(
+            events.len(),
+            1,
+            "Should have exactly one event (ClockProfilePublished)"
+        );
+
+        // Verify the event is ClockProfilePublished
+        match &events[0] {
+            EpisodeEvent::ClockProfilePublished {
+                profile_hash,
+                clock_profile,
+                time_envelope_ref,
+                time_envelope,
+                ..
+            } => {
+                assert_eq!(profile_hash, &expected_hash);
+                assert!(time_envelope_ref.is_some(), "Should have time_envelope_ref");
+                assert!(
+                    time_envelope.is_some(),
+                    "Should have time_envelope preimage"
+                );
+
+                // Verify the clock profile fields
+                assert!(clock_profile.hlc_enabled);
+                assert_eq!(clock_profile.tick_rate_hz, 1_000_000_000); // Default 1 GHz
+            },
+            other => panic!(
+                "Expected ClockProfilePublished event, got {:?}",
+                other.event_type()
+            ),
+        }
+    }
+
+    /// TCK-00240: Verify that `ClockProfilePublished` has `episode_id() ==
+    /// None`.
+    #[tokio::test]
+    async fn tck_00240_clock_profile_published_has_no_episode_id() {
+        use crate::htf::{ClockConfig, HolonicClock};
+
+        let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None).unwrap());
+        let runtime = EpisodeRuntime::with_clock_initialized(test_config(), clock)
+            .await
+            .expect("should succeed");
+
+        let events = runtime.drain_events().await;
+        assert_eq!(events.len(), 1);
+
+        // ClockProfilePublished is a runtime-level event, not an episode event
+        assert!(
+            events[0].episode_id().is_none(),
+            "ClockProfilePublished should not have an episode_id"
         );
     }
 }

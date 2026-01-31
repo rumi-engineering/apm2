@@ -47,6 +47,7 @@ use super::error::EpisodeId;
 use super::runtime::Hash;
 use super::tool_class::ToolClass;
 use super::tool_handler::{MAX_HANDLERS, ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
+use crate::htf::{ClockError, HolonicClock};
 
 // =============================================================================
 // ExecutorError
@@ -108,6 +109,16 @@ pub enum ExecutorError {
         message: String,
     },
 
+    /// Clock failure.
+    ///
+    /// Per SEC-CTRL-FAC-0015, clock failures cause fail-closed behavior.
+    /// If a clock is configured, it MUST be authoritative for time stamping.
+    #[error("clock failure: {message}")]
+    ClockFailure {
+        /// Error message.
+        message: String,
+    },
+
     /// Internal error.
     #[error("internal executor error: {message}")]
     Internal {
@@ -129,6 +140,7 @@ impl ExecutorError {
             Self::ToolClassMismatch { .. } => "tool_class_mismatch",
             Self::ExecutionFailed { .. } => "execution_failed",
             Self::StorageFailed { .. } => "storage_failed",
+            Self::ClockFailure { .. } => "clock_failure",
             Self::Internal { .. } => "internal",
         }
     }
@@ -140,6 +152,14 @@ impl ExecutorError {
             self,
             Self::ExecutionFailed { .. } | Self::StorageFailed { .. }
         )
+    }
+}
+
+impl From<ClockError> for ExecutorError {
+    fn from(err: ClockError) -> Self {
+        Self::ClockFailure {
+            message: err.to_string(),
+        }
     }
 }
 
@@ -217,14 +237,17 @@ impl ExecutionContext {
 /// Tool executor with budget enforcement and CAS storage.
 ///
 /// The executor manages tool handler registration, budget charging,
-/// execution dispatch, and result storage.
+/// execution dispatch, and result storage. Per RFC-0016 (HTF) and
+/// TCK-00240, tool executions are stamped with `TimeEnvelope` references
+/// for temporal ordering and causality tracking.
 ///
 /// # Lifecycle
 ///
 /// 1. Create executor with budget tracker and CAS
-/// 2. Register tool handlers via `register_handler()`
-/// 3. Execute tools via `execute()`
-/// 4. Results are automatically stored in CAS
+/// 2. Optionally set clock via `with_clock()` for time envelope stamping
+/// 3. Register tool handlers via `register_handler()`
+/// 4. Execute tools via `execute()`
+/// 5. Results are automatically stored in CAS with time envelope refs
 ///
 /// # Example
 ///
@@ -235,14 +258,16 @@ impl ExecutionContext {
 /// let budget = EpisodeBudget::builder().tool_calls(100).build();
 /// let tracker = Arc::new(BudgetTracker::from_envelope(budget));
 /// let cas = Arc::new(StubContentAddressedStore::new());
+/// let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None)?);
 ///
-/// let mut executor = ToolExecutor::new(tracker, cas);
+/// let mut executor = ToolExecutor::new(tracker, cas).with_clock(clock);
 /// executor.register_handler(Box::new(ReadFileHandler))?;
 ///
 /// let args = ToolArgs::Read(ReadArgs { path: "/workspace/file.rs".into(), ... });
 /// let ctx = ExecutionContext::new(episode_id, "req-1", timestamp_ns);
 ///
 /// let result = executor.execute(&ctx, &args).await?;
+/// // result.time_envelope_ref is populated if clock is configured
 /// ```
 pub struct ToolExecutor {
     /// Budget tracker for this episode.
@@ -253,6 +278,12 @@ pub struct ToolExecutor {
 
     /// Registered tool handlers by class.
     handlers: HashMap<ToolClass, Box<dyn ToolHandler>>,
+
+    /// Holonic clock for time envelope stamping (RFC-0016 HTF).
+    ///
+    /// When present, tool executions are stamped with a `TimeEnvelopeRef`
+    /// for temporal ordering and causality tracking.
+    clock: Option<Arc<HolonicClock>>,
 }
 
 impl ToolExecutor {
@@ -268,7 +299,31 @@ impl ToolExecutor {
             budget_tracker,
             cas,
             handlers: HashMap::new(),
+            clock: None,
         }
+    }
+
+    /// Sets the holonic clock for time envelope stamping.
+    ///
+    /// When a clock is configured, all tool executions will be stamped with
+    /// a `TimeEnvelopeRef` for temporal ordering and causality tracking per
+    /// RFC-0016 (HTF) and TCK-00240.
+    ///
+    /// # Security (SEC-CTRL-FAC-0015 Fail-Closed)
+    ///
+    /// If a clock is configured but fails during stamping, the execution
+    /// will fail rather than proceeding without a timestamp. This ensures
+    /// temporal authority is maintained.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<HolonicClock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Returns a reference to the holonic clock, if configured.
+    #[must_use]
+    pub const fn clock(&self) -> Option<&Arc<HolonicClock>> {
+        self.clock.as_ref()
     }
 
     /// Registers a tool handler.
@@ -326,7 +381,8 @@ impl ToolExecutor {
     /// 3. Charges estimated budget
     /// 4. Executes the handler
     /// 5. Stores the result in CAS
-    /// 6. Returns the result with actual resource consumption
+    /// 6. Stamps time envelope (if clock is configured)
+    /// 7. Returns the result with actual resource consumption
     ///
     /// # Arguments
     ///
@@ -340,6 +396,13 @@ impl ToolExecutor {
     /// - Arguments fail validation
     /// - Budget is insufficient
     /// - Execution fails
+    /// - Clock fails to stamp time envelope (when configured)
+    ///
+    /// # Security (SEC-CTRL-FAC-0015 Fail-Closed)
+    ///
+    /// If a clock is configured but fails during stamping, the execution
+    /// returns an error rather than proceeding without a timestamp. This
+    /// ensures temporal authority is maintained per RFC-0016.
     #[instrument(skip(self, args), fields(
         episode_id = %ctx.episode_id,
         request_id = %ctx.request_id,
@@ -379,12 +442,14 @@ impl ToolExecutor {
                 warn!(error = %err, "handler execution failed");
                 // Return failure result with consumed budget (no reconciliation needed
                 // since we charged the estimate and execution failed)
-                return Ok(self.build_failure_result(
-                    ctx,
-                    err.to_string(),
-                    estimated_delta,
-                    start_time.elapsed(),
-                ));
+                return self
+                    .build_failure_result_with_stamp(
+                        ctx,
+                        err.to_string(),
+                        estimated_delta,
+                        start_time.elapsed(),
+                    )
+                    .await;
             },
         };
 
@@ -417,20 +482,34 @@ impl ToolExecutor {
         let result_hash = self.store_result_data(&result_data)?;
         debug!(result_hash = %hex::encode(&result_hash[..8]), "result stored in CAS");
 
-        // Step 7: Build and return result
+        // Step 7: Build result
         let duration = start_time.elapsed();
         // Safe truncation: durations > 585 years would overflow, which is impractical
         #[allow(clippy::cast_possible_truncation)]
         let duration_ns = duration.as_nanos() as u64;
         let completed_at_ns = ctx.started_at_ns.saturating_add(duration_ns);
 
-        Ok(ToolResult::success(
+        let mut result = ToolResult::success(
             &ctx.request_id,
             result_data.output,
             result_data.budget_consumed,
             duration,
             completed_at_ns,
-        ))
+        );
+
+        // Step 8: Stamp time envelope (RFC-0016 HTF, TCK-00240)
+        // Per SEC-CTRL-FAC-0015, if clock is configured, stamping must succeed
+        if let Some(ref clock) = self.clock {
+            let notes = format!("tool.executed:{}", ctx.request_id);
+            let (envelope, envelope_ref) = clock.stamp_envelope(Some(notes)).await?;
+            result = result.with_time_envelope(envelope, envelope_ref);
+            debug!(
+                time_envelope_ref = %envelope_ref,
+                "stamped tool result with time envelope"
+            );
+        }
+
+        Ok(result)
     }
 
     /// Validates arguments without executing.
@@ -488,26 +567,44 @@ impl ToolExecutor {
         Ok(self.cas.store(&serialized))
     }
 
-    #[allow(clippy::unused_self)] // May use self in future for CAS storage
-    fn build_failure_result(
+    /// Builds a failure result with optional time envelope stamping.
+    ///
+    /// Per SEC-CTRL-FAC-0015, if clock is configured, stamping must succeed
+    /// even for failure results. This ensures all tool executions have
+    /// temporal authority when a clock is available.
+    async fn build_failure_result_with_stamp(
         &self,
         ctx: &ExecutionContext,
         error_message: String,
         budget_consumed: BudgetDelta,
         duration: Duration,
-    ) -> ToolResult {
+    ) -> Result<ToolResult, ExecutorError> {
         // Safe truncation: durations > 585 years would overflow, which is impractical
         #[allow(clippy::cast_possible_truncation)]
         let duration_ns = duration.as_nanos() as u64;
         let completed_at_ns = ctx.started_at_ns.saturating_add(duration_ns);
-        ToolResult::failure(
+        let mut result = ToolResult::failure(
             &ctx.request_id,
             error_message,
             None,
             budget_consumed,
             duration,
             completed_at_ns,
-        )
+        );
+
+        // Stamp time envelope (RFC-0016 HTF, TCK-00240)
+        // Per SEC-CTRL-FAC-0015, if clock is configured, stamping must succeed
+        if let Some(ref clock) = self.clock {
+            let notes = format!("tool.failed:{}", ctx.request_id);
+            let (envelope, envelope_ref) = clock.stamp_envelope(Some(notes)).await?;
+            result = result.with_time_envelope(envelope, envelope_ref);
+            debug!(
+                time_envelope_ref = %envelope_ref,
+                "stamped failure result with time envelope"
+            );
+        }
+
+        Ok(result)
     }
 }
 

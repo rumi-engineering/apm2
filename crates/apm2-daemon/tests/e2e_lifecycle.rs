@@ -795,7 +795,10 @@ async fn test_event_episode_created() {
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0], EpisodeEvent::Created { .. }));
     assert_eq!(events[0].event_type(), "episode.created");
-    assert_eq!(events[0].episode_id().as_str(), episode_id.as_str());
+    assert_eq!(
+        events[0].episode_id().unwrap().as_str(),
+        episode_id.as_str()
+    );
 }
 
 /// Test episode.started event.
@@ -875,7 +878,7 @@ async fn test_full_lifecycle_event_sequence() {
 
     // All events should reference the same episode
     for event in &events {
-        assert_eq!(event.episode_id().as_str(), episode_id.as_str());
+        assert_eq!(event.episode_id().unwrap().as_str(), episode_id.as_str());
     }
 }
 

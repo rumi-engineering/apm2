@@ -42,6 +42,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use apm2_core::htf::{TimeEnvelope, TimeEnvelopeRef};
 use prost::Message;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -700,10 +701,20 @@ impl BudgetDelta {
 /// This captures the output, timing, and resource usage of a completed tool
 /// invocation. Results are stored in the dedupe cache for idempotent replay.
 ///
+/// Per RFC-0016 (HTF) and TCK-00240, tool results include an optional
+/// `time_envelope_ref` for temporal ordering and causality tracking.
+///
 /// # Security
 ///
 /// Uses `deny_unknown_fields` to prevent field injection attacks when
 /// deserializing from untrusted input.
+///
+/// # Time Envelope Preimage Preservation
+///
+/// The `time_envelope` field contains the full `TimeEnvelope` preimage
+/// alongside the `time_envelope_ref` hash. This ensures the envelope data
+/// (monotonic ticks, wall bounds, ledger anchor) is persisted and verifiable.
+/// Without the preimage, the hash reference would be unresolvable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolResult {
@@ -735,6 +746,21 @@ pub struct ToolResult {
 
     /// Timestamp when execution completed (nanoseconds since epoch).
     pub completed_at_ns: u64,
+
+    /// Reference to the `TimeEnvelope` for this result (RFC-0016 HTF).
+    ///
+    /// Per TCK-00240, tool results include a time envelope reference for
+    /// temporal ordering and causality tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_envelope_ref: Option<TimeEnvelopeRef>,
+
+    /// The full `TimeEnvelope` preimage for verification.
+    ///
+    /// Per security review, the preimage is stored alongside the reference
+    /// to ensure the temporal data is persisted and verifiable. Without this,
+    /// the hash reference would be unresolvable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_envelope: Option<TimeEnvelope>,
 }
 
 impl ToolResult {
@@ -764,6 +790,8 @@ impl ToolResult {
             budget_consumed,
             duration,
             completed_at_ns,
+            time_envelope_ref: None,
+            time_envelope: None,
         }
     }
 
@@ -792,13 +820,43 @@ impl ToolResult {
             budget_consumed,
             duration,
             completed_at_ns,
+            time_envelope_ref: None,
+            time_envelope: None,
         }
+    }
+
+    /// Sets the time envelope for this result (RFC-0016 HTF).
+    ///
+    /// Per TCK-00240, tool results include a time envelope reference for
+    /// temporal ordering and causality tracking. Both the preimage and
+    /// reference are stored for verifiability.
+    #[must_use]
+    pub fn with_time_envelope(
+        mut self,
+        envelope: TimeEnvelope,
+        envelope_ref: TimeEnvelopeRef,
+    ) -> Self {
+        self.time_envelope = Some(envelope);
+        self.time_envelope_ref = Some(envelope_ref);
+        self
     }
 
     /// Returns the output as a string if valid UTF-8.
     #[must_use]
     pub fn output_str(&self) -> Option<&str> {
         std::str::from_utf8(&self.output).ok()
+    }
+
+    /// Returns the time envelope reference for this result (RFC-0016 HTF).
+    #[must_use]
+    pub const fn time_envelope_ref(&self) -> Option<&TimeEnvelopeRef> {
+        self.time_envelope_ref.as_ref()
+    }
+
+    /// Returns the time envelope preimage for this result (RFC-0016 HTF).
+    #[must_use]
+    pub const fn time_envelope(&self) -> Option<&TimeEnvelope> {
+        self.time_envelope.as_ref()
     }
 }
 
@@ -821,6 +879,9 @@ struct ToolResultProto {
     duration_ns: Option<u64>,
     #[prost(uint64, optional, tag = "8")]
     completed_at_ns: Option<u64>,
+    // Tag 9: time_envelope_ref - INCLUDED for temporal ordering (RFC-0016 HTF)
+    #[prost(bytes = "vec", optional, tag = "9")]
+    time_envelope_ref: Option<Vec<u8>>,
 }
 
 impl ToolResult {
@@ -855,6 +916,11 @@ impl ToolResult {
             #[allow(clippy::cast_possible_truncation)]
             duration_ns: Some(self.duration.as_nanos().min(u128::from(u64::MAX)) as u64),
             completed_at_ns: Some(self.completed_at_ns),
+            // Include time_envelope_ref for temporal ordering (RFC-0016 HTF)
+            time_envelope_ref: self
+                .time_envelope_ref
+                .as_ref()
+                .map(|r| r.as_bytes().to_vec()),
         };
         proto.encode_to_vec()
     }
