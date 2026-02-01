@@ -159,8 +159,7 @@ pub use capability::{
     CapabilityManifestBuilder, CapabilityValidator, CustodyDomainError, CustodyDomainId,
     DenyReason, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES, MAX_CAPABILITY_ID_LEN,
     MAX_CUSTODY_DOMAINS_PER_REQUEST, MAX_MANIFEST_ID_LEN, MAX_SHELL_ALLOWLIST,
-    MAX_SHELL_PATTERN_LEN, MAX_WRITE_ALLOWLIST, ToolRequest, extract_custody_domains,
-    validate_custody_domain_overlap,
+    MAX_SHELL_PATTERN_LEN, MAX_WRITE_ALLOWLIST, ToolRequest, validate_custody_domain_overlap,
 };
 // Re-export Claude Code adapter types (TCK-00173)
 pub use claude_code::{

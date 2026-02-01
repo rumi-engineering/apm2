@@ -3248,12 +3248,9 @@ pub fn validate_custody_domain_overlap(
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use std::collections::HashMap;
-///
-/// use apm2_daemon::episode::capability::{
-///     CustodyDomainId, extract_custody_domains,
-/// };
+/// use apm2_daemon::episode::capability::CustodyDomainId;
 ///
 /// // Mock resolver: maps actor_id -> domains
 /// let domain_map: HashMap<&str, Vec<&str>> =
@@ -3277,7 +3274,11 @@ pub fn validate_custody_domain_overlap(
 /// let domains = extract_custody_domains(&actors, resolver);
 /// assert_eq!(domains.len(), 2);
 /// ```
-pub fn extract_custody_domains<F>(actor_ids: &[String], resolver: F) -> Vec<CustodyDomainId>
+// TCK-00258: Function is not currently used in dispatch.rs but kept for future
+// use when a proper CustodyDomainResolver is implemented. Tests validate its
+// correctness.
+#[allow(dead_code)]
+pub(crate) fn extract_custody_domains<F>(actor_ids: &[String], resolver: F) -> Vec<CustodyDomainId>
 where
     F: Fn(&str) -> Vec<CustodyDomainId>,
 {
