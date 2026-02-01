@@ -384,15 +384,18 @@ impl ServerHandshake {
         }
 
         // Validate peer credentials (TCK-00248)
+        // SEC-DCP-001: Error message must not leak internal state (UIDs)
+        // SEC-DCP-002: Use constant-time comparison to prevent timing attacks
         if let Some(creds) = &self.peer_credentials {
             let current_uid = getuid().as_raw();
-            if creds.uid != current_uid {
+            // Constant-time comparison: XOR and check if zero
+            // This prevents timing attacks that could leak information about the expected
+            // UID
+            let uid_match = (creds.uid ^ current_uid) == 0;
+            if !uid_match {
                 self.state = HandshakeState::Failed;
-                return Ok(HelloNack::rejected(format!(
-                    "unauthorized user: expected uid {}, got {}",
-                    current_uid, creds.uid
-                ))
-                .into());
+                // Generic error message - do not leak UIDs to unauthorized peers
+                return Ok(HelloNack::rejected("permission denied").into());
             }
         }
 
@@ -790,5 +793,84 @@ mod tests {
         // Verify it can be parsed back
         let parsed = parse_handshake_message(&bytes).unwrap();
         assert!(matches!(parsed, HandshakeMessage::Hello(_)));
+    }
+
+    /// Test that UID mismatch results in rejection (TCK-00248).
+    ///
+    /// This exercises the `if creds.uid != current_uid` rejection path
+    /// which was previously untested.
+    #[test]
+    fn test_server_handshake_uid_mismatch_rejection() {
+        use super::super::credentials::PeerCredentials;
+
+        // Create credentials with a different UID than the current process
+        let current_uid = getuid().as_raw();
+        let mismatched_uid = if current_uid == 0 {
+            1000
+        } else {
+            current_uid + 1
+        };
+
+        let fake_credentials = PeerCredentials {
+            uid: mismatched_uid,
+            gid: 1000,
+            pid: Some(12345),
+        };
+
+        let mut server = ServerHandshake::new("daemon/1.0", Some(fake_credentials));
+        let hello = Hello::new("cli/1.0");
+
+        let response = server.process_hello(&hello).unwrap();
+
+        // Should receive HelloNack with rejection
+        match response {
+            HandshakeMessage::HelloNack(nack) => {
+                assert_eq!(nack.error_code, HandshakeErrorCode::Rejected);
+                // SEC-DCP-001: Error message must NOT leak UIDs
+                assert!(
+                    !nack.message.contains(&current_uid.to_string()),
+                    "Error message should not leak server UID"
+                );
+                assert!(
+                    !nack.message.contains(&mismatched_uid.to_string()),
+                    "Error message should not leak client UID"
+                );
+                // Should be a generic "permission denied" message
+                assert_eq!(nack.message, "permission denied");
+            },
+            other => panic!("Expected HelloNack, got: {other:?}"),
+        }
+
+        // Server should be in failed state
+        assert_eq!(server.state(), HandshakeState::Failed);
+    }
+
+    /// Test that matching UID allows handshake to proceed (TCK-00248).
+    #[test]
+    fn test_server_handshake_uid_match_allowed() {
+        use super::super::credentials::PeerCredentials;
+
+        // Create credentials with the same UID as the current process
+        let current_uid = getuid().as_raw();
+
+        let valid_credentials = PeerCredentials {
+            uid: current_uid,
+            gid: 1000,
+            pid: Some(12345),
+        };
+
+        let mut server = ServerHandshake::new("daemon/1.0", Some(valid_credentials));
+        let hello = Hello::new("cli/1.0");
+
+        let response = server.process_hello(&hello).unwrap();
+
+        // Should receive HelloAck
+        assert!(
+            matches!(response, HandshakeMessage::HelloAck(_)),
+            "Expected HelloAck for matching UID"
+        );
+
+        // Server should be in completed state
+        assert!(server.is_completed());
     }
 }
