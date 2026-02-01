@@ -106,7 +106,7 @@ This skill handles the complete workflow for getting documentation updates revie
 - `Read` - Read files to understand changes
 - `Glob` - Find modified files
 - `Grep` - Search contents
-- `Bash` - Git operations, cargo-husky, gh cli
+- `Bash` - Git operations, gh cli
 
 ## Success Criteria
 

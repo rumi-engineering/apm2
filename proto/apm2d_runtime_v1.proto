@@ -247,3 +247,137 @@ enum RetentionHint {
   STANDARD = 2;
   ARCHIVAL = 3;
 }
+
+// =============================================================================
+// CTR-PROTO-007: Privileged Endpoints (RFC-0017)
+// =============================================================================
+// These endpoints require operator credentials (connection on operator.sock).
+// Session connections receive PERMISSION_DENIED for all privileged requests.
+
+// Role enumeration for work claiming and episode spawning.
+enum WorkRole {
+  WORK_ROLE_UNSPECIFIED = 0;
+  IMPLEMENTER = 1;
+  GATE_EXECUTOR = 2;
+  REVIEWER = 3;
+  COORDINATOR = 4;
+}
+
+// IPC-PRIV-001: ClaimWork
+// Request work assignment with policy-resolved capabilities.
+// Per DD-001: actor_id is a display hint; authoritative actor_id derived from credential.
+message ClaimWorkRequest {
+  // Display-only hint for actor name. Authoritative actor_id derived from credential.
+  string actor_id = 1;
+  // Role for work assignment.
+  WorkRole role = 2;
+  // Ed25519 signature over (actor_id || role || nonce) using operator key.
+  bytes credential_signature = 3;
+  // Nonce to prevent replay attacks.
+  bytes nonce = 4;
+}
+
+message ClaimWorkResponse {
+  // Assigned work identifier.
+  string work_id = 1;
+  // Lease identifier for this work claim.
+  string lease_id = 2;
+  // Blake3 hash of the capability manifest.
+  bytes capability_manifest_hash = 3;
+  // Reference to the PolicyResolvedForChangeSet event.
+  string policy_resolved_ref = 4;
+  // Blake3 hash of the sealed context pack.
+  bytes context_pack_hash = 5;
+}
+
+// IPC-PRIV-002: SpawnEpisode
+// Spawn execution episode with FAC preconditions.
+message SpawnEpisodeRequest {
+  // Work identifier from a prior ClaimWork.
+  string work_id = 1;
+  // Role for this episode (IMPLEMENTER, GATE_EXECUTOR, REVIEWER).
+  WorkRole role = 2;
+  // Required for GATE_EXECUTOR role; must reference valid GateLeaseIssued.
+  optional string lease_id = 3;
+}
+
+message SpawnEpisodeResponse {
+  // Session identifier for IPC communication.
+  string session_id = 1;
+  // Blake3 hash of the capability manifest governing this session.
+  bytes capability_manifest_hash = 2;
+  // Whether the context pack is sealed.
+  bool context_pack_sealed = 3;
+  // Ephemeral handle for session identification (not a credential).
+  string ephemeral_handle = 4;
+}
+
+// IPC-PRIV-003: IssueCapability
+// Issue additional capability to an existing session.
+message IssueCapabilityRequest {
+  // Target session identifier.
+  string session_id = 1;
+  // Capability request details.
+  CapabilityRequest capability_request = 2;
+}
+
+message CapabilityRequest {
+  // Tool class to grant access to.
+  string tool_class = 1;
+  // Path patterns for read access (optional).
+  repeated string read_patterns = 2;
+  // Path patterns for write access (optional).
+  repeated string write_patterns = 3;
+  // Duration in seconds for the capability grant.
+  uint64 duration_secs = 4;
+}
+
+message IssueCapabilityResponse {
+  // Unique identifier for this capability grant.
+  string capability_id = 1;
+  // Unix timestamp when capability was granted.
+  uint64 granted_at = 2;
+  // Unix timestamp when capability expires.
+  uint64 expires_at = 3;
+}
+
+// IPC-PRIV-004: Shutdown
+// Gracefully shutdown the daemon.
+message ShutdownRequest {
+  // Optional reason for shutdown (for logging/audit).
+  optional string reason = 1;
+}
+
+message ShutdownResponse {
+  // Acknowledgment message.
+  string message = 1;
+}
+
+// =============================================================================
+// Error Codes for Privileged Endpoints
+// =============================================================================
+enum PrivilegedErrorCode {
+  PRIVILEGED_ERROR_UNSPECIFIED = 0;
+  // Caller lacks operator credential (not on operator.sock).
+  PERMISSION_DENIED = 1;
+  // Invalid parameter in request.
+  CAPABILITY_REQUEST_REJECTED = 2;
+  // Governance policy resolution failed.
+  POLICY_RESOLUTION_FAILED = 3;
+  // Required policy resolution missing for spawn.
+  POLICY_RESOLUTION_MISSING = 4;
+  // GATE_EXECUTOR spawn requires valid lease.
+  GATE_LEASE_MISSING = 5;
+  // Custody domain overlap detected (separation of duties violation).
+  SOD_VIOLATION = 6;
+  // Referenced session not found.
+  SESSION_NOT_FOUND = 7;
+  // Capability grant denied by policy.
+  CAPABILITY_DENIED = 8;
+}
+
+// Generic error response for privileged endpoints.
+message PrivilegedError {
+  PrivilegedErrorCode code = 1;
+  string message = 2;
+}

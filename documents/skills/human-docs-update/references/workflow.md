@@ -34,13 +34,12 @@ decision_tree:
     - id: RUN_LOCAL_CHECKS
       purpose: "Run formatting and linting checks before committing."
       steps[2]:
-        - id: RUN_GIT_HOOKS
+        - id: RUN_LOCAL_CHECKS
           action: |
-            Run git hooks manually if needed, or rely on commit trigger:
+            Run local checks before committing:
             ```bash
-            .cargo-husky/hooks/pre-commit
+            cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
             ```
-            Note: Hooks may auto-fix some issues (trailing whitespace, etc.)
 
         - id: CHECK_YAML_VALID
           action: |

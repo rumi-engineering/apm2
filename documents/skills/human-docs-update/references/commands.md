@@ -13,9 +13,9 @@ commands[13]:
     command: "git checkout -b <branch-name>"
     purpose: "Create and switch to a new feature branch."
 
-  - name: run-local-hooks
-    command: ".cargo-husky/hooks/pre-commit"
-    purpose: "Run all local pre-commit hooks (formatting, linting, etc.)."
+  - name: run-local-checks
+    command: "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings"
+    purpose: "Run formatting and linting checks locally."
 
   - name: stage-files
     command: "git add <file1> <file2> ..."
@@ -68,7 +68,7 @@ git branch --show-current
 git checkout -b docs/update-readme
 
 # 3. Run local checks
-.cargo-husky/hooks/pre-commit
+cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 
 # 4. Stage and commit
 git add documents/README.md

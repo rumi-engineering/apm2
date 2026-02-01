@@ -309,6 +309,16 @@ impl_bounded_decode_simple!(
     EvidencePinned,
     EvidenceTtlExpired,
     PromoteTrigger,
+    // CTR-PROTO-007: Privileged Endpoints (RFC-0017)
+    ClaimWorkRequest,
+    ClaimWorkResponse,
+    SpawnEpisodeRequest,
+    SpawnEpisodeResponse,
+    IssueCapabilityRequest,
+    IssueCapabilityResponse,
+    ShutdownRequest,
+    ShutdownResponse,
+    PrivilegedError,
 );
 
 // Implement BoundedDecode for messages with repeated fields
@@ -318,6 +328,8 @@ impl_bounded_decode_with_repeated!(EpisodeQuarantined, evidence_pinned);
 impl_bounded_decode_with_repeated!(Receipt, evidence_refs);
 impl_bounded_decode_with_repeated!(CompactionCompleted, tombstoned_hashes);
 impl_bounded_decode_with_repeated!(TelemetryPolicy, promote_triggers);
+// CTR-PROTO-007: Privileged Endpoints (RFC-0017)
+impl_bounded_decode_with_repeated!(CapabilityRequest, read_patterns, write_patterns);
 
 /// Trait for canonicalizing messages before signing.
 ///

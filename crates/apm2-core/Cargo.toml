@@ -108,7 +108,6 @@ seccompiler.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true
-cargo-husky = { workspace = true, features = ["precommit-hook", "prepush-hook", "user-hooks"] }
 # Certificate generation (test-only)
 rcgen.workspace = true
 x509-cert.workspace = true

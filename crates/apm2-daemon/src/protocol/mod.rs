@@ -87,6 +87,8 @@
 
 /// Peer credentials extraction from Unix sockets via `SO_PEERCRED`.
 pub mod credentials;
+/// Privileged endpoint dispatcher for RFC-0017 control-plane IPC.
+pub mod dispatch;
 pub mod error;
 pub mod framing;
 pub mod golden_vectors;
@@ -96,6 +98,11 @@ pub mod server;
 
 // Re-export commonly used types at module level
 pub use credentials::PeerCredentials;
+pub use dispatch::{
+    ConnectionContext, PrivilegedDispatcher, PrivilegedMessageType, PrivilegedResponse,
+    encode_claim_work_request, encode_issue_capability_request, encode_shutdown_request,
+    encode_spawn_episode_request,
+};
 pub use error::{
     MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ProtocolResult,
 };
@@ -105,8 +112,26 @@ pub use handshake::{
     HelloNack, ServerHandshake, parse_handshake_message, parse_hello, serialize_handshake_message,
 };
 pub use messages::{
-    BoundedDecode, CanonicalBytes, Canonicalize, DEFAULT_MAX_MESSAGE_SIZE,
-    DEFAULT_MAX_REPEATED_FIELD_COUNT, DecodeConfig, DecodeError,
+    BoundedDecode,
+    CanonicalBytes,
+    Canonicalize,
+    // CTR-PROTO-007: Privileged Endpoints (RFC-0017)
+    CapabilityRequest,
+    ClaimWorkRequest,
+    ClaimWorkResponse,
+    DEFAULT_MAX_MESSAGE_SIZE,
+    DEFAULT_MAX_REPEATED_FIELD_COUNT,
+    DecodeConfig,
+    DecodeError,
+    IssueCapabilityRequest,
+    IssueCapabilityResponse,
+    PrivilegedError,
+    PrivilegedErrorCode,
+    ShutdownRequest,
+    ShutdownResponse,
+    SpawnEpisodeRequest,
+    SpawnEpisodeResponse,
+    WorkRole,
 };
 pub use server::{
     Connection, ConnectionPermit, ProtocolServer, ServerConfig, connect, default_socket_path,

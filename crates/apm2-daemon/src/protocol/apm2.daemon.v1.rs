@@ -277,6 +277,131 @@ pub struct CompactionCompleted {
     #[prost(bytes = "vec", repeated, tag = "2")]
     pub tombstoned_hashes: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
+/// IPC-PRIV-001: ClaimWork
+/// Request work assignment with policy-resolved capabilities.
+/// Per DD-001: actor_id is a display hint; authoritative actor_id derived from credential.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClaimWorkRequest {
+    /// Display-only hint for actor name. Authoritative actor_id derived from credential.
+    #[prost(string, tag = "1")]
+    pub actor_id: ::prost::alloc::string::String,
+    /// Role for work assignment.
+    #[prost(enumeration = "WorkRole", tag = "2")]
+    pub role: i32,
+    /// Ed25519 signature over (actor_id || role || nonce) using operator key.
+    #[prost(bytes = "vec", tag = "3")]
+    pub credential_signature: ::prost::alloc::vec::Vec<u8>,
+    /// Nonce to prevent replay attacks.
+    #[prost(bytes = "vec", tag = "4")]
+    pub nonce: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClaimWorkResponse {
+    /// Assigned work identifier.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Lease identifier for this work claim.
+    #[prost(string, tag = "2")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Blake3 hash of the capability manifest.
+    #[prost(bytes = "vec", tag = "3")]
+    pub capability_manifest_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Reference to the PolicyResolvedForChangeSet event.
+    #[prost(string, tag = "4")]
+    pub policy_resolved_ref: ::prost::alloc::string::String,
+    /// Blake3 hash of the sealed context pack.
+    #[prost(bytes = "vec", tag = "5")]
+    pub context_pack_hash: ::prost::alloc::vec::Vec<u8>,
+}
+/// IPC-PRIV-002: SpawnEpisode
+/// Spawn execution episode with FAC preconditions.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpawnEpisodeRequest {
+    /// Work identifier from a prior ClaimWork.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Role for this episode (IMPLEMENTER, GATE_EXECUTOR, REVIEWER).
+    #[prost(enumeration = "WorkRole", tag = "2")]
+    pub role: i32,
+    /// Required for GATE_EXECUTOR role; must reference valid GateLeaseIssued.
+    #[prost(string, optional, tag = "3")]
+    pub lease_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SpawnEpisodeResponse {
+    /// Session identifier for IPC communication.
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// Blake3 hash of the capability manifest governing this session.
+    #[prost(bytes = "vec", tag = "2")]
+    pub capability_manifest_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Whether the context pack is sealed.
+    #[prost(bool, tag = "3")]
+    pub context_pack_sealed: bool,
+    /// Ephemeral handle for session identification (not a credential).
+    #[prost(string, tag = "4")]
+    pub ephemeral_handle: ::prost::alloc::string::String,
+}
+/// IPC-PRIV-003: IssueCapability
+/// Issue additional capability to an existing session.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IssueCapabilityRequest {
+    /// Target session identifier.
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// Capability request details.
+    #[prost(message, optional, tag = "2")]
+    pub capability_request: ::core::option::Option<CapabilityRequest>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CapabilityRequest {
+    /// Tool class to grant access to.
+    #[prost(string, tag = "1")]
+    pub tool_class: ::prost::alloc::string::String,
+    /// Path patterns for read access (optional).
+    #[prost(string, repeated, tag = "2")]
+    pub read_patterns: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Path patterns for write access (optional).
+    #[prost(string, repeated, tag = "3")]
+    pub write_patterns: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Duration in seconds for the capability grant.
+    #[prost(uint64, tag = "4")]
+    pub duration_secs: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IssueCapabilityResponse {
+    /// Unique identifier for this capability grant.
+    #[prost(string, tag = "1")]
+    pub capability_id: ::prost::alloc::string::String,
+    /// Unix timestamp when capability was granted.
+    #[prost(uint64, tag = "2")]
+    pub granted_at: u64,
+    /// Unix timestamp when capability expires.
+    #[prost(uint64, tag = "3")]
+    pub expires_at: u64,
+}
+/// IPC-PRIV-004: Shutdown
+/// Gracefully shutdown the daemon.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShutdownRequest {
+    /// Optional reason for shutdown (for logging/audit).
+    #[prost(string, optional, tag = "1")]
+    pub reason: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShutdownResponse {
+    /// Acknowledgment message.
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+}
+/// Generic error response for privileged endpoints.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PrivilegedError {
+    #[prost(enumeration = "PrivilegedErrorCode", tag = "1")]
+    pub code: i32,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -544,6 +669,100 @@ impl RetentionHint {
             "EPHEMERAL" => Some(Self::Ephemeral),
             "STANDARD" => Some(Self::Standard),
             "ARCHIVAL" => Some(Self::Archival),
+            _ => None,
+        }
+    }
+}
+/// Role enumeration for work claiming and episode spawning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WorkRole {
+    Unspecified = 0,
+    Implementer = 1,
+    GateExecutor = 2,
+    Reviewer = 3,
+    Coordinator = 4,
+}
+impl WorkRole {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WORK_ROLE_UNSPECIFIED",
+            Self::Implementer => "IMPLEMENTER",
+            Self::GateExecutor => "GATE_EXECUTOR",
+            Self::Reviewer => "REVIEWER",
+            Self::Coordinator => "COORDINATOR",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WORK_ROLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "IMPLEMENTER" => Some(Self::Implementer),
+            "GATE_EXECUTOR" => Some(Self::GateExecutor),
+            "REVIEWER" => Some(Self::Reviewer),
+            "COORDINATOR" => Some(Self::Coordinator),
+            _ => None,
+        }
+    }
+}
+/// =============================================================================
+/// Error Codes for Privileged Endpoints
+/// =============================================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PrivilegedErrorCode {
+    PrivilegedErrorUnspecified = 0,
+    /// Caller lacks operator credential (not on operator.sock).
+    PermissionDenied = 1,
+    /// Invalid parameter in request.
+    CapabilityRequestRejected = 2,
+    /// Governance policy resolution failed.
+    PolicyResolutionFailed = 3,
+    /// Required policy resolution missing for spawn.
+    PolicyResolutionMissing = 4,
+    /// GATE_EXECUTOR spawn requires valid lease.
+    GateLeaseMissing = 5,
+    /// Custody domain overlap detected (separation of duties violation).
+    SodViolation = 6,
+    /// Referenced session not found.
+    SessionNotFound = 7,
+    /// Capability grant denied by policy.
+    CapabilityDenied = 8,
+}
+impl PrivilegedErrorCode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::PrivilegedErrorUnspecified => "PRIVILEGED_ERROR_UNSPECIFIED",
+            Self::PermissionDenied => "PERMISSION_DENIED",
+            Self::CapabilityRequestRejected => "CAPABILITY_REQUEST_REJECTED",
+            Self::PolicyResolutionFailed => "POLICY_RESOLUTION_FAILED",
+            Self::PolicyResolutionMissing => "POLICY_RESOLUTION_MISSING",
+            Self::GateLeaseMissing => "GATE_LEASE_MISSING",
+            Self::SodViolation => "SOD_VIOLATION",
+            Self::SessionNotFound => "SESSION_NOT_FOUND",
+            Self::CapabilityDenied => "CAPABILITY_DENIED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PRIVILEGED_ERROR_UNSPECIFIED" => Some(Self::PrivilegedErrorUnspecified),
+            "PERMISSION_DENIED" => Some(Self::PermissionDenied),
+            "CAPABILITY_REQUEST_REJECTED" => Some(Self::CapabilityRequestRejected),
+            "POLICY_RESOLUTION_FAILED" => Some(Self::PolicyResolutionFailed),
+            "POLICY_RESOLUTION_MISSING" => Some(Self::PolicyResolutionMissing),
+            "GATE_LEASE_MISSING" => Some(Self::GateLeaseMissing),
+            "SOD_VIOLATION" => Some(Self::SodViolation),
+            "SESSION_NOT_FOUND" => Some(Self::SessionNotFound),
+            "CAPABILITY_DENIED" => Some(Self::CapabilityDenied),
             _ => None,
         }
     }

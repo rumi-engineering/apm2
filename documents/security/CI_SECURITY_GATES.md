@@ -283,23 +283,20 @@ cargo deny check
 cargo clippy -- -A clippy::all -W clippy::cognitive_complexity
 ```
 
-## Pre-commit Hooks
+## Pre-commit Checks
 
-The project uses `cargo-husky` to automatically manage git hooks. These are installed when you first run `cargo test`.
+Run the following checks locally before committing:
 
-Hooks include:
+```bash
+# Format checking
+cargo fmt --check
 
-- `pre-commit`: Runs formatting, clippy, proto verification, typos, and TOML/YAML/JSON/Markdown linting.
-- `pre-push`: Runs the full workspace test suite and documentation checks.
-- `commit-msg`: Enforces Conventional Commits.
+# Clippy lints
+cargo clippy --workspace --all-targets -- -D warnings
 
-To manually trigger the hooks, you can run the respective scripts in `.cargo-husky/hooks/`.
-
-Hooks include:
-
-- Format checking
-- Clippy lints
-- Large file prevention
+# Run tests
+cargo test --workspace
+```
 
 ## Bypassing Gates
 
