@@ -1,7 +1,14 @@
 //! IPC server for daemon communication.
 //!
-//! Provides a Unix socket server that accepts client connections
-//! and dispatches requests to handlers.
+//! **DEPRECATED (TCK-00249):** This module is superseded by the dual-socket
+//! `SocketManager` topology in `protocol/socket_manager.rs`. The legacy single-
+//! socket JSON IPC has been replaced with privilege-separated operator/session
+//! sockets per RFC-0017.
+//!
+//! This module is retained for backwards compatibility during the transition
+//! period.
+
+#![allow(dead_code)] // Legacy module - replaced by protocol::socket_manager
 
 use std::path::Path;
 

@@ -45,8 +45,27 @@ impl EcosystemConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error if the TOML is invalid.
+    /// Returns an error if:
+    /// - The TOML is invalid
+    /// - The legacy `socket` key is present in `[daemon]` section (DD-009)
     pub fn from_toml(content: &str) -> Result<Self, ConfigError> {
+        // First, check for legacy `socket` key in daemon config (DD-009 fail-closed
+        // validation) Parse as raw TOML value to detect if `daemon.socket` was
+        // explicitly set
+        if let Ok(raw) = content.parse::<toml::Table>() {
+            if let Some(daemon) = raw.get("daemon") {
+                if let Some(daemon_table) = daemon.as_table() {
+                    if daemon_table.contains_key("socket") {
+                        return Err(ConfigError::Validation(
+                            "DD-009: legacy 'socket' key is no longer supported in [daemon] section. \
+                             Use 'operator_socket' and 'session_socket' instead for dual-socket \
+                             privilege separation."
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
         toml::from_str(content).map_err(ConfigError::Parse)
     }
 
@@ -67,9 +86,25 @@ pub struct DaemonConfig {
     #[serde(default = "default_pid_file")]
     pub pid_file: PathBuf,
 
-    /// Path to the Unix socket.
+    /// Path to the Unix socket (legacy, deprecated).
+    ///
+    /// **Deprecated (DD-009):** Use `operator_socket` and `session_socket`
+    /// instead. This field is kept for migration purposes but will be
+    /// rejected in future versions.
     #[serde(default = "default_socket")]
     pub socket: PathBuf,
+
+    /// Path to the operator socket (mode 0600, privileged operations).
+    ///
+    /// Added in TCK-00249 for dual-socket privilege separation.
+    #[serde(default = "default_operator_socket")]
+    pub operator_socket: PathBuf,
+
+    /// Path to the session socket (mode 0660, session-scoped operations).
+    ///
+    /// Added in TCK-00249 for dual-socket privilege separation.
+    #[serde(default = "default_session_socket")]
+    pub session_socket: PathBuf,
 
     /// Log directory.
     #[serde(default = "default_log_dir")]
@@ -89,6 +124,8 @@ impl Default for DaemonConfig {
         Self {
             pid_file: default_pid_file(),
             socket: default_socket(),
+            operator_socket: default_operator_socket(),
+            session_socket: default_session_socket(),
             log_dir: default_log_dir(),
             state_file: default_state_file(),
             audit: AuditConfig::default(),
@@ -132,9 +169,33 @@ fn default_pid_file() -> PathBuf {
 fn default_socket() -> PathBuf {
     // Per RFC-0013 AD-DAEMON-002: ${XDG_RUNTIME_DIR}/apm2/apm2d.sock
     // Falls back to /tmp/apm2/apm2d.sock if XDG_RUNTIME_DIR is not set
+    //
+    // **Deprecated (DD-009):** Use operator_socket and session_socket instead.
     std::env::var("XDG_RUNTIME_DIR").map_or_else(
         |_| PathBuf::from("/tmp/apm2/apm2d.sock"),
         |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("apm2d.sock"),
+    )
+}
+
+fn default_operator_socket() -> PathBuf {
+    // Per TCK-00249: ${XDG_RUNTIME_DIR}/apm2/operator.sock
+    // Falls back to /tmp/apm2/operator.sock if XDG_RUNTIME_DIR is not set
+    std::env::var("XDG_RUNTIME_DIR").map_or_else(
+        |_| PathBuf::from("/tmp/apm2/operator.sock"),
+        |runtime_dir| {
+            PathBuf::from(runtime_dir)
+                .join("apm2")
+                .join("operator.sock")
+        },
+    )
+}
+
+fn default_session_socket() -> PathBuf {
+    // Per TCK-00249: ${XDG_RUNTIME_DIR}/apm2/session.sock
+    // Falls back to /tmp/apm2/session.sock if XDG_RUNTIME_DIR is not set
+    std::env::var("XDG_RUNTIME_DIR").map_or_else(
+        |_| PathBuf::from("/tmp/apm2/session.sock"),
+        |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("session.sock"),
     )
 }
 
@@ -256,7 +317,8 @@ mod tests {
         let toml = r#"
             [daemon]
             pid_file = "/tmp/apm2.pid"
-            socket = "/tmp/apm2.sock"
+            operator_socket = "/tmp/apm2/operator.sock"
+            session_socket = "/tmp/apm2/session.sock"
 
             [daemon.audit]
             retention_days = 90
@@ -283,9 +345,64 @@ mod tests {
 
         let config = EcosystemConfig::from_toml(toml).unwrap();
         assert_eq!(config.daemon.pid_file, PathBuf::from("/tmp/apm2.pid"));
+        assert_eq!(
+            config.daemon.operator_socket,
+            PathBuf::from("/tmp/apm2/operator.sock")
+        );
+        assert_eq!(
+            config.daemon.session_socket,
+            PathBuf::from("/tmp/apm2/session.sock")
+        );
         assert_eq!(config.daemon.audit.retention_days, 90);
         assert_eq!(config.daemon.audit.max_size_bytes, 536_870_912);
         assert_eq!(config.credentials.len(), 1);
         assert_eq!(config.processes[0].instances, 2);
+    }
+
+    /// Test that DD-009 rejects legacy socket configuration (fail-closed).
+    #[test]
+    fn test_dd009_rejects_legacy_socket_key() {
+        let toml = r#"
+            [daemon]
+            pid_file = "/tmp/apm2.pid"
+            socket = "/tmp/apm2.sock"
+
+            [[processes]]
+            name = "test"
+            command = "echo"
+        "#;
+
+        let result = EcosystemConfig::from_toml(toml);
+        assert!(result.is_err(), "Should reject legacy socket key");
+
+        let err = result.unwrap_err();
+        match err {
+            ConfigError::Validation(msg) => {
+                assert!(msg.contains("DD-009"), "Error should mention DD-009: {msg}");
+                assert!(
+                    msg.contains("socket"),
+                    "Error should mention legacy socket: {msg}"
+                );
+            },
+            _ => panic!("Expected ConfigError::Validation, got {err:?}"),
+        }
+    }
+
+    /// Test that configs without daemon.socket are accepted.
+    #[test]
+    fn test_config_without_legacy_socket_accepted() {
+        let toml = r#"
+            [daemon]
+            pid_file = "/tmp/apm2.pid"
+            operator_socket = "/tmp/apm2/operator.sock"
+            session_socket = "/tmp/apm2/session.sock"
+
+            [[processes]]
+            name = "test"
+            command = "echo"
+        "#;
+
+        let config = EcosystemConfig::from_toml(toml).unwrap();
+        assert_eq!(config.processes.len(), 1);
     }
 }

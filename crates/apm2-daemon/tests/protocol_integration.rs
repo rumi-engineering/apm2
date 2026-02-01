@@ -6,6 +6,7 @@
 //! - Handshake protocol completion
 //! - Connection lifecycle management
 //! - UID-based authentication at accept time (TCK-00248)
+//! - Dual-socket privilege separation (TCK-00249)
 //!
 //! # Security Note (TCK-00248)
 //!
@@ -13,12 +14,22 @@
 //! Since both client and server run as the same user in tests, integration
 //! tests verify the authorization succeeds. Unit tests in `server.rs` verify
 //! that the constant-time comparison and error handling work correctly.
+//!
+//! # Dual-Socket Topology (TCK-00249)
+//!
+//! The socket manager creates two sockets with different permissions:
+//! - `operator.sock` (mode 0600): Privileged operations only
+//! - `session.sock` (mode 0660): Session-scoped operations only
+//!
+//! Connections are routed based on which socket they connect to, and the
+//! socket type determines which handlers are accessible.
 
 use std::time::Duration;
 
 use apm2_daemon::protocol::{
     ClientHandshake, HandshakeMessage, Hello, PROTOCOL_VERSION, ProtocolServer, ServerConfig,
-    ServerHandshake, connect, parse_handshake_message, parse_hello, serialize_handshake_message,
+    ServerHandshake, SocketManager, SocketManagerConfig, SocketType, connect,
+    parse_handshake_message, parse_hello, serialize_handshake_message,
 };
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
@@ -449,4 +460,293 @@ async fn test_handshake_after_uid_validation() {
         .expect("server timed out")
         .expect("server task panicked");
     assert_eq!(server_version, Some(PROTOCOL_VERSION));
+}
+
+// ============================================================================
+// Dual-Socket Routing Tests (TCK-00249)
+// ============================================================================
+
+/// Test that `SocketManager` creates two sockets with correct permissions.
+///
+/// Verifies acceptance criterion: "Two sockets created with correct
+/// permissions"
+/// - operator.sock: mode 0600 (owner read/write only)
+/// - session.sock: mode 0660 (owner + group read/write)
+#[tokio::test]
+async fn test_dual_socket_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let operator_path = tmp.path().join("operator.sock");
+    let session_path = tmp.path().join("session.sock");
+
+    let config = SocketManagerConfig::new(&operator_path, &session_path);
+    let _manager = SocketManager::bind(config).unwrap();
+
+    // Verify operator socket has mode 0600
+    let operator_meta = std::fs::metadata(&operator_path).unwrap();
+    let operator_mode = operator_meta.permissions().mode() & 0o777;
+    assert_eq!(
+        operator_mode, 0o600,
+        "operator socket should have mode 0600, got {operator_mode:04o}"
+    );
+
+    // Verify session socket has mode 0660
+    let session_meta = std::fs::metadata(&session_path).unwrap();
+    let session_mode = session_meta.permissions().mode() & 0o777;
+    assert_eq!(
+        session_mode, 0o660,
+        "session socket should have mode 0660, got {session_mode:04o}"
+    );
+}
+
+/// Test that connections to operator socket are marked as privileged.
+///
+/// Verifies acceptance criterion: "Connections routed based on socket path"
+#[tokio::test]
+async fn test_operator_socket_is_privileged() {
+    use tokio::net::UnixStream;
+
+    let tmp = TempDir::new().unwrap();
+    let operator_path = tmp.path().join("operator.sock");
+    let session_path = tmp.path().join("session.sock");
+
+    let config = SocketManagerConfig::new(&operator_path, &session_path);
+    let manager = std::sync::Arc::new(SocketManager::bind(config).unwrap());
+
+    // Spawn accept task
+    let manager_clone = manager.clone();
+    let accept_handle = tokio::spawn(async move {
+        let (_conn, _permit, socket_type) = manager_clone.accept().await.unwrap();
+        socket_type
+    });
+
+    // Connect to operator socket
+    let _client = UnixStream::connect(&operator_path).await.unwrap();
+
+    // Verify socket type is Operator (privileged)
+    let socket_type = timeout(Duration::from_secs(1), accept_handle)
+        .await
+        .expect("accept timed out")
+        .expect("accept task failed");
+
+    assert_eq!(socket_type, SocketType::Operator);
+    assert!(
+        socket_type.is_privileged(),
+        "Operator socket should be privileged"
+    );
+}
+
+/// Test that connections to session socket are NOT privileged.
+///
+/// Verifies acceptance criterion: "Connections routed based on socket path"
+#[tokio::test]
+async fn test_session_socket_is_not_privileged() {
+    use tokio::net::UnixStream;
+
+    let tmp = TempDir::new().unwrap();
+    let operator_path = tmp.path().join("operator.sock");
+    let session_path = tmp.path().join("session.sock");
+
+    let config = SocketManagerConfig::new(&operator_path, &session_path);
+    let manager = std::sync::Arc::new(SocketManager::bind(config).unwrap());
+
+    // Spawn accept task
+    let manager_clone = manager.clone();
+    let accept_handle = tokio::spawn(async move {
+        let (_conn, _permit, socket_type) = manager_clone.accept().await.unwrap();
+        socket_type
+    });
+
+    // Connect to session socket
+    let _client = UnixStream::connect(&session_path).await.unwrap();
+
+    // Verify socket type is Session (unprivileged)
+    let socket_type = timeout(Duration::from_secs(1), accept_handle)
+        .await
+        .expect("accept timed out")
+        .expect("accept task failed");
+
+    assert_eq!(socket_type, SocketType::Session);
+    assert!(
+        !socket_type.is_privileged(),
+        "Session socket should NOT be privileged"
+    );
+}
+
+/// Test that socket manager correctly routes multiple connections.
+///
+/// This test verifies that:
+/// 1. Connections to operator socket are routed as Operator type
+/// 2. Connections to session socket are routed as Session type
+/// 3. The routing is determined by which socket the connection arrives on
+#[tokio::test]
+async fn test_dual_socket_routing() {
+    use tokio::net::UnixStream;
+
+    let tmp = TempDir::new().unwrap();
+    let operator_path = tmp.path().join("operator.sock");
+    let session_path = tmp.path().join("session.sock");
+
+    let config = SocketManagerConfig::new(&operator_path, &session_path);
+    let manager = std::sync::Arc::new(SocketManager::bind(config).unwrap());
+
+    // Test multiple connections in sequence, alternating sockets
+    let socket_types: Vec<(&std::path::PathBuf, SocketType)> = vec![
+        (&operator_path, SocketType::Operator),
+        (&session_path, SocketType::Session),
+        (&operator_path, SocketType::Operator),
+        (&session_path, SocketType::Session),
+    ];
+
+    for (socket_path, expected_type) in socket_types {
+        let manager_clone = manager.clone();
+        let accept_handle = tokio::spawn(async move {
+            let (_conn, _permit, socket_type) = manager_clone.accept().await.unwrap();
+            socket_type
+        });
+
+        let _client = UnixStream::connect(socket_path).await.unwrap();
+
+        let socket_type = timeout(Duration::from_secs(1), accept_handle)
+            .await
+            .expect("accept timed out")
+            .expect("accept task failed");
+
+        assert_eq!(
+            socket_type,
+            expected_type,
+            "Connection to {} should be {:?}",
+            socket_path.display(),
+            expected_type
+        );
+    }
+}
+
+/// Test that socket manager cleans up both sockets on drop.
+#[tokio::test]
+async fn test_dual_socket_cleanup() {
+    let tmp = TempDir::new().unwrap();
+    let operator_path = tmp.path().join("operator.sock");
+    let session_path = tmp.path().join("session.sock");
+
+    {
+        let config = SocketManagerConfig::new(&operator_path, &session_path);
+        let _manager = SocketManager::bind(config).unwrap();
+
+        assert!(operator_path.exists());
+        assert!(session_path.exists());
+    }
+
+    // Both sockets should be removed when manager is dropped
+    assert!(!operator_path.exists());
+    assert!(!session_path.exists());
+}
+
+/// Test that handshake works on operator socket.
+#[tokio::test]
+async fn test_operator_socket_handshake() {
+    use tokio::net::UnixStream;
+
+    let tmp = TempDir::new().unwrap();
+    let operator_path = tmp.path().join("operator.sock");
+    let session_path = tmp.path().join("session.sock");
+
+    let config = SocketManagerConfig::new(&operator_path, &session_path);
+    let manager = std::sync::Arc::new(SocketManager::bind(config).unwrap());
+
+    // Spawn server that handles handshake on operator socket
+    let manager_clone = manager.clone();
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _permit, socket_type) = manager_clone.accept().await.unwrap();
+        assert_eq!(socket_type, SocketType::Operator);
+
+        let mut handshake = ServerHandshake::new("test-daemon/1.0");
+
+        let frame = conn.framed().next().await.unwrap().unwrap();
+        let hello = parse_hello(&frame).expect("failed to parse Hello");
+
+        let response = handshake.process_hello(&hello).unwrap();
+        let response_bytes = serialize_handshake_message(&response).unwrap();
+        conn.framed().send(response_bytes).await.unwrap();
+
+        assert!(handshake.is_completed());
+        socket_type
+    });
+
+    // Connect to operator socket using low-level UnixStream
+    let stream = UnixStream::connect(&operator_path).await.unwrap();
+    let mut client_conn = apm2_daemon::protocol::Connection::new_with_credentials(stream, None);
+    let mut client_handshake = ClientHandshake::new("test-cli/1.0");
+
+    let hello = client_handshake.create_hello();
+    let hello_msg = HandshakeMessage::Hello(hello);
+    let hello_bytes = serialize_handshake_message(&hello_msg).unwrap();
+    client_conn.framed().send(hello_bytes).await.unwrap();
+
+    let response_frame = client_conn.framed().next().await.unwrap().unwrap();
+    let response = parse_handshake_message(&response_frame).expect("failed to parse response");
+    client_handshake.process_response(response).unwrap();
+
+    assert!(client_handshake.is_completed());
+
+    let socket_type = timeout(Duration::from_secs(1), server_handle)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked");
+    assert_eq!(socket_type, SocketType::Operator);
+}
+
+/// Test that handshake works on session socket.
+#[tokio::test]
+async fn test_session_socket_handshake() {
+    use tokio::net::UnixStream;
+
+    let tmp = TempDir::new().unwrap();
+    let operator_path = tmp.path().join("operator.sock");
+    let session_path = tmp.path().join("session.sock");
+
+    let config = SocketManagerConfig::new(&operator_path, &session_path);
+    let manager = std::sync::Arc::new(SocketManager::bind(config).unwrap());
+
+    // Spawn server that handles handshake on session socket
+    let manager_clone = manager.clone();
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _permit, socket_type) = manager_clone.accept().await.unwrap();
+        assert_eq!(socket_type, SocketType::Session);
+
+        let mut handshake = ServerHandshake::new("test-daemon/1.0");
+
+        let frame = conn.framed().next().await.unwrap().unwrap();
+        let hello = parse_hello(&frame).expect("failed to parse Hello");
+
+        let response = handshake.process_hello(&hello).unwrap();
+        let response_bytes = serialize_handshake_message(&response).unwrap();
+        conn.framed().send(response_bytes).await.unwrap();
+
+        assert!(handshake.is_completed());
+        socket_type
+    });
+
+    // Connect to session socket using low-level UnixStream
+    let stream = UnixStream::connect(&session_path).await.unwrap();
+    let mut client_conn = apm2_daemon::protocol::Connection::new_with_credentials(stream, None);
+    let mut client_handshake = ClientHandshake::new("test-cli/1.0");
+
+    let hello = client_handshake.create_hello();
+    let hello_msg = HandshakeMessage::Hello(hello);
+    let hello_bytes = serialize_handshake_message(&hello_msg).unwrap();
+    client_conn.framed().send(hello_bytes).await.unwrap();
+
+    let response_frame = client_conn.framed().next().await.unwrap().unwrap();
+    let response = parse_handshake_message(&response_frame).expect("failed to parse response");
+    client_handshake.process_response(response).unwrap();
+
+    assert!(client_handshake.is_completed());
+
+    let socket_type = timeout(Duration::from_secs(1), server_handle)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked");
+    assert_eq!(socket_type, SocketType::Session);
 }

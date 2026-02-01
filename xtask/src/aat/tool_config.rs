@@ -112,11 +112,18 @@ impl AatToolConfig {
 }
 
 // Allow unsafe in tests for environment variable manipulation.
-// SAFETY: Tests must be run with `--test-threads=1` to prevent data races.
+// SAFETY: Tests use a mutex to serialize access to environment variables,
+// preventing data races even when running tests in parallel.
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// Mutex to serialize tests that modify the `AAT_AI_TOOL` environment
+    /// variable. This prevents race conditions when tests run in parallel.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_ai_tool_default_is_gemini() {
@@ -164,12 +171,13 @@ mod tests {
     }
 
     // Note: The following tests modify environment variables, which requires unsafe
-    // in Rust 2024 edition. They use `-- --test-threads=1` for safety.
-    // SAFETY: Tests are run single-threaded to prevent data races on env vars.
+    // in Rust 2024 edition. They use a mutex to serialize access.
+    // SAFETY: Mutex ensures exclusive access to AAT_AI_TOOL env var.
 
     #[test]
     fn test_aat_tool_config_from_env_unset() {
-        // SAFETY: Single-threaded test execution prevents data races.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::remove_var("AAT_AI_TOOL");
         }
@@ -179,13 +187,14 @@ mod tests {
 
     #[test]
     fn test_aat_tool_config_from_env_gemini() {
-        // SAFETY: Single-threaded test execution prevents data races.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::set_var("AAT_AI_TOOL", "gemini");
         }
         let config = AatToolConfig::from_env();
         assert_eq!(config.ai_tool, AiTool::Gemini);
-        // SAFETY: Single-threaded test execution prevents data races.
+        // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::remove_var("AAT_AI_TOOL");
         }
@@ -193,13 +202,14 @@ mod tests {
 
     #[test]
     fn test_aat_tool_config_from_env_claude_code() {
-        // SAFETY: Single-threaded test execution prevents data races.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::set_var("AAT_AI_TOOL", "claude-code");
         }
         let config = AatToolConfig::from_env();
         assert_eq!(config.ai_tool, AiTool::ClaudeCode);
-        // SAFETY: Single-threaded test execution prevents data races.
+        // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::remove_var("AAT_AI_TOOL");
         }
@@ -207,13 +217,14 @@ mod tests {
 
     #[test]
     fn test_aat_tool_config_from_env_invalid_falls_back_to_default() {
-        // SAFETY: Single-threaded test execution prevents data races.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::set_var("AAT_AI_TOOL", "invalid-tool");
         }
         let config = AatToolConfig::from_env();
         assert_eq!(config.ai_tool, AiTool::Gemini);
-        // SAFETY: Single-threaded test execution prevents data races.
+        // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::remove_var("AAT_AI_TOOL");
         }
@@ -233,13 +244,14 @@ mod tests {
 
     #[test]
     fn test_aat_tool_config_override_takes_precedence_over_env() {
-        // SAFETY: Single-threaded test execution prevents data races.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::set_var("AAT_AI_TOOL", "gemini");
         }
         let config = AatToolConfig::from_env().with_override(Some(AiTool::ClaudeCode));
         assert_eq!(config.ai_tool, AiTool::ClaudeCode);
-        // SAFETY: Single-threaded test execution prevents data races.
+        // SAFETY: Mutex held, exclusive access to env var.
         unsafe {
             std::env::remove_var("AAT_AI_TOOL");
         }

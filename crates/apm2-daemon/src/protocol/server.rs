@@ -39,6 +39,7 @@ use tracing::{debug, info, warn};
 use super::credentials::PeerCredentials;
 use super::error::{MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, ProtocolError, ProtocolResult};
 use super::framing::FrameCodec;
+use super::socket_manager::SocketType;
 
 /// Default socket filename.
 const DEFAULT_SOCKET_NAME: &str = "apm2d.sock";
@@ -214,39 +215,67 @@ impl ProtocolServer {
 
     /// Ensure a directory exists with appropriate permissions.
     ///
-    /// # Security
+    /// # Security (SEC-FS-001)
     ///
-    /// This function enforces directory permissions unconditionally
-    /// (fail-closed). Even if the directory already exists with loose
-    /// permissions (e.g., 0777), we correct them to 0700 to prevent local
-    /// manipulation of the socket.
+    /// Does **not** modify permissions of existing directories to avoid
+    /// clobbering system paths (e.g., `/tmp`) if configured incorrectly.
+    /// Only enforces 0700 on directories created by this call.
+    ///
+    /// # Symlink Protection (RSK-2617)
+    ///
+    /// Uses `symlink_metadata` to verify path type before any operations.
+    /// Rejects symlinks to prevent symlink-based attacks.
     fn ensure_directory(path: &Path) -> ProtocolResult<()> {
-        // Create directory if it doesn't exist
-        if !path.exists() {
-            std::fs::create_dir_all(path).map_err(|e| {
-                ProtocolError::Io(io::Error::new(
-                    e.kind(),
-                    format!("failed to create directory {}: {e}", path.display()),
-                ))
-            })?;
-        }
+        // Check if path exists using symlink_metadata to detect symlinks (RSK-2617)
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                // Path exists - verify it's a directory, not a symlink
+                if metadata.file_type().is_symlink() {
+                    return Err(ProtocolError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "security: {} is a symlink, refusing to use as socket directory",
+                            path.display()
+                        ),
+                    )));
+                }
+                if !metadata.is_dir() {
+                    return Err(ProtocolError::Io(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} exists but is not a directory", path.display()),
+                    )));
+                }
+                // Directory exists, do NOT modify its permissions (SEC-FS-001)
+                Ok(())
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Path doesn't exist, create it
+                std::fs::create_dir_all(path).map_err(|e| {
+                    ProtocolError::Io(io::Error::new(
+                        e.kind(),
+                        format!("failed to create directory {}: {e}", path.display()),
+                    ))
+                })?;
 
-        // Always enforce directory permissions to 0700 (owner only)
-        // This is critical even for pre-existing directories to prevent
-        // attackers from pre-creating directories with loose permissions.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(path, perms).map_err(|e| {
-                ProtocolError::Io(io::Error::new(
-                    e.kind(),
-                    format!("failed to set permissions on {}: {e}", path.display()),
-                ))
-            })?;
+                // Only enforce permissions if we created the directory
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o700);
+                    std::fs::set_permissions(path, perms).map_err(|e| {
+                        ProtocolError::Io(io::Error::new(
+                            e.kind(),
+                            format!("failed to set permissions on {}: {e}", path.display()),
+                        ))
+                    })?;
+                }
+                Ok(())
+            },
+            Err(e) => Err(ProtocolError::Io(io::Error::new(
+                e.kind(),
+                format!("failed to stat {}: {e}", path.display()),
+            ))),
         }
-
-        Ok(())
     }
 
     /// Remove a stale socket file if it exists.
@@ -398,6 +427,19 @@ pub struct ConnectionPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+impl ConnectionPermit {
+    /// Create a new connection permit.
+    ///
+    /// This is used by [`SocketManager`] to create permits for connections
+    /// accepted from the dual-socket topology.
+    ///
+    /// [`SocketManager`]: super::socket_manager::SocketManager
+    #[must_use]
+    pub const fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self { _permit: permit }
+    }
+}
+
 /// A framed connection to a client.
 ///
 /// Wraps a Unix stream with the frame codec for length-prefixed messaging.
@@ -413,12 +455,16 @@ pub struct Connection {
     framed: Framed<UnixStream, FrameCodec>,
     /// Peer credentials (UID/GID/PID) extracted from the socket.
     peer_credentials: Option<PeerCredentials>,
+    /// Socket type (Operator or Session) this connection originated from.
+    /// `None` for legacy single-socket server connections.
+    socket_type: Option<SocketType>,
 }
 
 impl Connection {
     /// Create a new connection from a Unix stream.
     ///
     /// Initializes with [`MAX_HANDSHAKE_FRAME_SIZE`] limit.
+    /// Sets `socket_type` to `None` for legacy single-socket connections.
     fn new(stream: UnixStream, peer_credentials: Option<PeerCredentials>) -> Self {
         Self {
             framed: Framed::new(
@@ -427,6 +473,49 @@ impl Connection {
                     .expect("MAX_HANDSHAKE_FRAME_SIZE must be within protocol limits"),
             ),
             peer_credentials,
+            socket_type: None, // Legacy single-socket connection
+        }
+    }
+
+    /// Create a new connection from a Unix stream with credentials and socket
+    /// type.
+    ///
+    /// This is used by [`SocketManager`] to create connections for the
+    /// dual-socket topology after credentials have been validated.
+    ///
+    /// Initializes with [`MAX_HANDSHAKE_FRAME_SIZE`] limit.
+    ///
+    /// [`SocketManager`]: super::socket_manager::SocketManager
+    #[must_use]
+    pub fn new_with_credentials(
+        stream: UnixStream,
+        peer_credentials: Option<PeerCredentials>,
+    ) -> Self {
+        Self::new(stream, peer_credentials)
+    }
+
+    /// Create a new connection with full context (credentials + socket type).
+    ///
+    /// This is used by [`SocketManager`] to create connections for the
+    /// dual-socket topology after credentials have been validated.
+    ///
+    /// Initializes with [`MAX_HANDSHAKE_FRAME_SIZE`] limit.
+    ///
+    /// [`SocketManager`]: super::socket_manager::SocketManager
+    #[must_use]
+    pub fn new_with_socket_type(
+        stream: UnixStream,
+        peer_credentials: Option<PeerCredentials>,
+        socket_type: SocketType,
+    ) -> Self {
+        Self {
+            framed: Framed::new(
+                stream,
+                FrameCodec::with_max_size(MAX_HANDSHAKE_FRAME_SIZE)
+                    .expect("MAX_HANDSHAKE_FRAME_SIZE must be within protocol limits"),
+            ),
+            peer_credentials,
+            socket_type: Some(socket_type),
         }
     }
 
@@ -434,6 +523,32 @@ impl Connection {
     #[must_use]
     pub const fn peer_credentials(&self) -> Option<&PeerCredentials> {
         self.peer_credentials.as_ref()
+    }
+
+    /// Returns the socket type this connection originated from.
+    ///
+    /// Returns `None` for legacy single-socket server connections,
+    /// or `Some(SocketType)` for dual-socket connections created by
+    /// [`SocketManager`].
+    ///
+    /// [`SocketManager`]: super::socket_manager::SocketManager
+    #[must_use]
+    pub const fn socket_type(&self) -> Option<SocketType> {
+        self.socket_type
+    }
+
+    /// Returns `true` if this is a privileged (operator) connection.
+    ///
+    /// For dual-socket connections, this checks if the connection came from
+    /// the operator socket. For legacy single-socket connections, this returns
+    /// `true` (maintaining backwards compatibility).
+    #[must_use]
+    pub const fn is_privileged(&self) -> bool {
+        match self.socket_type {
+            Some(SocketType::Session) => false,
+            Some(SocketType::Operator) | None => true, /* Legacy connections are treated as
+                                                        * privileged */
+        }
     }
 
     /// Upgrades the connection to the full protocol frame size.
@@ -746,41 +861,112 @@ mod tests {
         );
     }
 
-    /// Test that pre-existing directories with loose permissions are corrected.
+    /// Test that pre-existing directories have their permissions preserved
+    /// (SEC-FS-001).
     ///
-    /// This test verifies the fail-closed security behavior: if an attacker
-    /// pre-creates the socket directory with loose permissions (0777), the
-    /// server must correct them to 0700 to prevent local manipulation.
+    /// This test verifies the SEC-FS-001 pattern: existing directories are NOT
+    /// modified to avoid clobbering system paths (e.g., /tmp) if configured
+    /// incorrectly. Only directories created by this function get 0700.
     #[tokio::test]
     #[cfg(unix)]
-    async fn test_directory_permissions_corrected() {
+    async fn test_directory_permissions_preserved() {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = TempDir::new().unwrap();
         let socket_dir = tmp.path().join("apm2_test_dir");
         let socket_path = socket_dir.join("test.sock");
 
-        // Pre-create directory with loose permissions (simulating attacker)
+        // Pre-create directory with custom permissions
         std::fs::create_dir_all(&socket_dir).unwrap();
-        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o750)).unwrap();
 
-        // Verify the directory has loose permissions
+        // Verify the directory has the expected permissions
         let initial_mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            initial_mode, 0o777,
-            "Pre-condition: directory should be 0777"
+            initial_mode, 0o750,
+            "Pre-condition: directory should be 0750"
         );
 
-        // Bind server - should correct directory permissions
+        // Bind server - should NOT modify existing directory permissions (SEC-FS-001)
         let config = ServerConfig::new(&socket_path);
         let _server = ProtocolServer::bind(config).unwrap();
 
-        // Verify directory permissions were corrected to 0700
-        let corrected_mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
+        // Verify directory permissions were preserved (not modified)
+        let preserved_mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            corrected_mode, 0o700,
-            "Directory permissions should be corrected to 0700, got {corrected_mode:04o}"
+            preserved_mode, 0o750,
+            "Directory permissions should be preserved at 0750, got {preserved_mode:04o}"
         );
+    }
+
+    /// Test that newly created directories get 0700 permissions.
+    ///
+    /// This test verifies that when the socket directory does not exist,
+    /// it is created with 0700 permissions for proper security.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_new_directory_permissions_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let socket_dir = tmp.path().join("apm2_new_dir");
+        let socket_path = socket_dir.join("test.sock");
+
+        // Verify directory does not exist
+        assert!(
+            !socket_dir.exists(),
+            "Pre-condition: directory should not exist"
+        );
+
+        // Bind server - should create directory with 0700
+        let config = ServerConfig::new(&socket_path);
+        let _server = ProtocolServer::bind(config).unwrap();
+
+        // Verify directory was created with 0700 permissions
+        let created_mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            created_mode, 0o700,
+            "Newly created directory should have 0700 permissions, got {created_mode:04o}"
+        );
+    }
+
+    /// Test that symlink directories are rejected (RSK-2617).
+    ///
+    /// This test verifies that the server refuses to use a symlink as the
+    /// socket directory, preventing symlink-based attacks.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_symlink_directory_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let real_dir = tmp.path().join("real_dir");
+        let symlink_dir = tmp.path().join("symlink_dir");
+        let socket_path = symlink_dir.join("test.sock");
+
+        // Create real directory and symlink to it
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
+
+        // Verify symlink exists
+        assert!(
+            std::fs::symlink_metadata(&symlink_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "Pre-condition: path should be a symlink"
+        );
+
+        // Bind server - should reject symlink directory
+        let config = ServerConfig::new(&socket_path);
+        let result = ProtocolServer::bind(config);
+
+        assert!(result.is_err(), "Server should reject symlink directory");
+        match result {
+            Err(ProtocolError::Io(ref e)) if e.kind() == io::ErrorKind::InvalidInput => {
+                // Expected: symlink rejection returns InvalidInput
+            },
+            Err(e) => panic!("Expected InvalidInput error for symlink rejection, got: {e}"),
+            Ok(_) => panic!("Server should reject symlink directory"),
+        }
     }
 
     /// Test that UID validation uses constant-time comparison (TCK-00248,

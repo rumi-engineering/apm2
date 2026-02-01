@@ -100,10 +100,12 @@ http-body-util.workspace = true
 # Database (persistent idempotency cache)
 rusqlite.workspace = true
 
+# Futures traits (for framed streams)
+futures = "0.3"
+
 [dev-dependencies]
 # Testing utilities
 tempfile.workspace = true
-futures = "0.3"
 
 [build-dependencies]
 prost-build.workspace = true

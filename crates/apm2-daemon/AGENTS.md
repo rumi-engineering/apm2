@@ -113,6 +113,44 @@ control-plane path.
 - [CTR-D008] Each connection is handled in a separate spawned task.
 - [CTR-D009] Handshake completes before any control-plane message exchange.
 
+### `SocketManager` (TCK-00249)
+
+```rust
+pub fn bind(config: SocketManagerConfig) -> ProtocolResult<SocketManager>
+pub async fn accept(&self) -> ProtocolResult<(Connection, ConnectionPermit, SocketType)>
+```
+
+Dual-socket manager for privilege separation. Creates two Unix sockets:
+
+- **`operator.sock`** (mode 0600): Privileged operations (ClaimWork, SpawnEpisode, etc.)
+- **`session.sock`** (mode 0660): Session-scoped operations (RequestTool, EmitEvent, etc.)
+
+**Invariants (SocketManager):**
+- [INV-SM-001] Operator socket always has mode 0600.
+- [INV-SM-002] Session socket always has mode 0660.
+- [INV-SM-003] `is_privileged` is determined solely by which socket accepted the connection.
+- [INV-SM-004] Both sockets share the same parent directory (mode 0700).
+
+**Contracts (SocketManager):**
+- [CTR-SM-001] Removes stale socket files before binding.
+- [CTR-SM-002] Creates parent directory with mode 0700.
+- [CTR-SM-003] Sets socket permissions after binding (0600 for operator, 0660 for session).
+- [CTR-SM-004] Cleans up both socket files on shutdown.
+- [CTR-SM-005] Connection type (`SocketType::Operator` or `SocketType::Session`) is routed
+  based on which listener accepted the connection.
+
+### `SocketType`
+
+```rust
+pub enum SocketType {
+    Operator,  // is_privileged() = true
+    Session,   // is_privileged() = false
+}
+```
+
+Represents the type of socket a connection arrived on. Used to determine
+which handler namespaces are accessible.
+
 ### Wire Protocol
 
 Uses length-prefixed binary framing with Hello/HelloAck handshake. JSON framing
