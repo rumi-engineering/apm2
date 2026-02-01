@@ -829,7 +829,7 @@ mod tests {
                 assert!(!resp.lease_id.is_empty());
             },
             PrivilegedResponse::Error(err) => {
-                panic!("Unexpected error: {:?}", err);
+                panic!("Unexpected error: {err:?}");
             },
             _ => panic!("Expected ClaimWork response"),
         }
@@ -855,7 +855,7 @@ mod tests {
                 assert!(!resp.ephemeral_handle.is_empty());
             },
             PrivilegedResponse::Error(err) => {
-                panic!("Unexpected error: {:?}", err);
+                panic!("Unexpected error: {err:?}");
             },
             _ => panic!("Expected SpawnEpisode response"),
         }
@@ -885,7 +885,7 @@ mod tests {
                 assert!(resp.expires_at > resp.granted_at);
             },
             PrivilegedResponse::Error(err) => {
-                panic!("Unexpected error: {:?}", err);
+                panic!("Unexpected error: {err:?}");
             },
             _ => panic!("Expected IssueCapability response"),
         }
@@ -908,7 +908,7 @@ mod tests {
                 assert!(!resp.message.is_empty());
             },
             PrivilegedResponse::Error(err) => {
-                panic!("Unexpected error: {:?}", err);
+                panic!("Unexpected error: {err:?}");
             },
             _ => panic!("Expected Shutdown response"),
         }
@@ -924,7 +924,7 @@ mod tests {
 
         // Test missing actor_id
         let request = ClaimWorkRequest {
-            actor_id: "".to_string(),
+            actor_id: String::new(),
             role: WorkRole::Implementer.into(),
             credential_signature: vec![],
             nonce: vec![],
@@ -1006,7 +1006,7 @@ mod tests {
                 // Success
             },
             PrivilegedResponse::Error(err) => {
-                panic!("Unexpected error: {:?}", err);
+                panic!("Unexpected error: {err:?}");
             },
             _ => panic!("Expected SpawnEpisode response"),
         }
@@ -1096,7 +1096,7 @@ mod tests {
             work_id: "W-001".to_string(),
             lease_id: "L-001".to_string(),
             capability_manifest_hash: vec![],
-            policy_resolved_ref: "".to_string(),
+            policy_resolved_ref: String::new(),
             context_pack_hash: vec![],
         });
         let encoded = claim_resp.encode();
