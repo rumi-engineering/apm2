@@ -436,6 +436,13 @@ pub trait PolicyResolver: Send + Sync {
 ///
 /// Returns deterministic stub data. In production, this will be replaced
 /// with a real governance holon integration.
+///
+/// # TCK-00255: Context Pack Sealing
+///
+/// This stub demonstrates the sealing pattern required by RFC-0017:
+/// 1. Create a `ContextPackManifest` with work-specific entries
+/// 2. Call `seal()` to get the deterministic content hash
+/// 3. Return the seal hash in the `PolicyResolution.context_pack_hash`
 #[derive(Debug, Clone, Default)]
 pub struct StubPolicyResolver;
 
@@ -446,16 +453,46 @@ impl PolicyResolver for StubPolicyResolver {
         _role: WorkRole,
         actor_id: &str,
     ) -> Result<PolicyResolution, PolicyResolutionError> {
-        // Generate deterministic hashes based on input for testing
+        use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
+
+        // Generate deterministic hashes for policy and capability manifest
         let policy_hash = blake3::hash(format!("policy:{work_id}:{actor_id}").as_bytes());
         let manifest_hash = blake3::hash(format!("manifest:{work_id}:{actor_id}").as_bytes());
-        let context_hash = blake3::hash(format!("context:{work_id}:{actor_id}").as_bytes());
+
+        // TCK-00255: Create and seal a context pack manifest
+        // In production, this would be populated with actual file entries from
+        // the work definition. For the stub, we create a deterministic manifest
+        // based on work_id and actor_id.
+        let content_hash = blake3::hash(format!("content:{work_id}:{actor_id}").as_bytes());
+        let context_pack = ContextPackManifestBuilder::new(
+            format!("manifest:{work_id}"),
+            format!("profile:{actor_id}"),
+        )
+        .add_entry(
+            ManifestEntryBuilder::new(
+                format!("/work/{work_id}/context.yaml"),
+                *content_hash.as_bytes(),
+            )
+            .stable_id("work-context")
+            .access_level(AccessLevel::Read)
+            .build(),
+        )
+        .build();
+
+        // TCK-00255: Call seal() to get the context pack hash
+        // This ensures the hash is deterministic and verifiable.
+        let context_pack_hash =
+            context_pack
+                .seal()
+                .map_err(|e| PolicyResolutionError::GovernanceFailed {
+                    message: format!("context pack sealing failed: {e}"),
+                })?;
 
         Ok(PolicyResolution {
             policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
             resolved_policy_hash: *policy_hash.as_bytes(),
             capability_manifest_hash: *manifest_hash.as_bytes(),
-            context_pack_hash: *context_hash.as_bytes(),
+            context_pack_hash,
         })
     }
 }

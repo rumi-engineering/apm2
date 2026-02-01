@@ -856,6 +856,126 @@ impl ContextPackManifest {
         Ok(())
     }
 
+    /// Seals the context pack and returns the content hash.
+    ///
+    /// Sealing is the explicit action that finalizes the manifest and produces
+    /// a cryptographic hash for verification. This hash:
+    ///
+    /// 1. Is deterministic: same entries always produce the same hash
+    /// 2. Is tamper-evident: any modification to the manifest will change the
+    ///    hash
+    /// 3. Includes all manifest content: `manifest_id`, `profile_id`, and all
+    ///    entries
+    ///
+    /// The seal hash is computed at build time and stored in `manifest_hash`.
+    /// This method returns the pre-computed hash and verifies self-consistency.
+    ///
+    /// # Use in Work Claim Flow
+    ///
+    /// Per RFC-0017 DD-003, the Work Orchestrator calls `seal()` on the context
+    /// pack before returning the `WorkAssignment`. The returned hash is
+    /// included in the `ClaimWorkResponse.context_pack_hash` field.
+    ///
+    /// # Returns
+    ///
+    /// The 32-byte BLAKE3 hash of the manifest content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::InvalidData`] if the manifest has been tampered
+    /// with (hash mismatch).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::context::{
+    ///     AccessLevel, ContextPackManifest, ContextPackManifestBuilder,
+    ///     ManifestEntryBuilder,
+    /// };
+    ///
+    /// let manifest =
+    ///     ContextPackManifestBuilder::new("manifest-001", "profile-001")
+    ///         .add_entry(
+    ///             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+    ///                 .access_level(AccessLevel::Read)
+    ///                 .build(),
+    ///         )
+    ///         .build();
+    ///
+    /// // Seal returns the content hash
+    /// let seal_hash = manifest.seal().unwrap();
+    /// assert_eq!(seal_hash, manifest.manifest_hash());
+    ///
+    /// // Same entries always produce the same hash
+    /// let manifest2 =
+    ///     ContextPackManifestBuilder::new("manifest-001", "profile-001")
+    ///         .add_entry(
+    ///             ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+    ///                 .access_level(AccessLevel::Read)
+    ///                 .build(),
+    ///         )
+    ///         .build();
+    ///
+    /// assert_eq!(manifest.seal().unwrap(), manifest2.seal().unwrap());
+    /// ```
+    pub fn seal(&self) -> Result<[u8; 32], ManifestError> {
+        // Verify self-consistency to detect tampering
+        self.verify_self_consistency()?;
+
+        Ok(self.manifest_hash)
+    }
+
+    /// Verifies the seal of a context pack.
+    ///
+    /// This method recomputes the content hash and verifies it matches the
+    /// stored `manifest_hash`. Use this after deserializing a manifest to
+    /// ensure it has not been modified.
+    ///
+    /// # Tamper Detection
+    ///
+    /// If the manifest has been modified after construction (e.g., via JSON
+    /// manipulation), this method will detect the tampering and return an
+    /// error.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the seal is valid (hash matches).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::InvalidData`] if the seal is invalid (hash
+    /// mismatch).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::context::{
+    ///     ContextPackManifestBuilder, ManifestEntryBuilder,
+    /// };
+    ///
+    /// let manifest =
+    ///     ContextPackManifestBuilder::new("manifest-001", "profile-001")
+    ///         .add_entry(
+    ///             ManifestEntryBuilder::new("/file.rs", [0x42; 32]).build(),
+    ///         )
+    ///         .build();
+    ///
+    /// // Fresh manifest passes verification
+    /// assert!(manifest.verify_seal().is_ok());
+    ///
+    /// // Serialize and deserialize
+    /// let json = serde_json::to_string(&manifest).unwrap();
+    /// let mut recovered: apm2_core::context::ContextPackManifest =
+    ///     serde_json::from_str(&json).unwrap();
+    /// recovered.rebuild_index();
+    ///
+    /// // Deserialized manifest still passes verification
+    /// assert!(recovered.verify_seal().is_ok());
+    /// ```
+    pub fn verify_seal(&self) -> Result<(), ManifestError> {
+        self.verify_self_consistency()
+    }
+
     /// Rebuilds the path index after deserialization.
     ///
     /// This is called automatically when needed, but can be called explicitly
@@ -1015,6 +1135,12 @@ impl ContextPackManifestBuilder {
                 }
             }
         }
+
+        // TCK-00255: Sort entries by path for deterministic hashing.
+        // This ensures that the same set of entries produces the same hash
+        // regardless of insertion order, which is required for reliable seal
+        // verification.
+        self.entries.sort_by(|a, b| a.path.cmp(&b.path));
 
         // Build path index for O(1) lookups
         let path_index = ContextPackManifest::build_path_index(&self.entries);
@@ -1970,5 +2096,278 @@ pub mod tests {
             .try_build();
 
         assert!(matches!(result, Err(ManifestError::InvalidPath { .. })));
+    }
+
+    // =========================================================================
+    // TCK-00255: Sealing Tests
+    // =========================================================================
+
+    /// TCK-00255: Verify seal returns the manifest hash.
+    #[test]
+    fn tck_00255_seal_returns_manifest_hash() {
+        let manifest = create_test_manifest();
+
+        let seal_hash = manifest.seal().unwrap();
+        assert_eq!(seal_hash, manifest.manifest_hash());
+    }
+
+    /// TCK-00255: Verify seal hash is deterministic (same entries produce same
+    /// hash).
+    #[test]
+    fn tck_00255_seal_hash_is_deterministic() {
+        // Build two manifests with identical content
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+                    .stable_id("src-main")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/project/README.md", [0xAB; 32])
+                    .stable_id("readme")
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
+            .build();
+
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+                    .stable_id("src-main")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/project/README.md", [0xAB; 32])
+                    .stable_id("readme")
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
+            .build();
+
+        // Same entries produce same hash
+        assert_eq!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
+    }
+
+    /// TCK-00255: Verify modification after sealing is detected (hash mismatch
+    /// causes rejection).
+    #[test]
+    fn tck_00255_modification_after_sealing_detected() {
+        // Create a manifest with manually corrupted hash via JSON
+        let json = r#"{"manifest_id":"manifest-001","manifest_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"profile_id":"profile-001","entries":[]}"#;
+        let mut manifest: ContextPackManifest = serde_json::from_str(json).unwrap();
+        manifest.rebuild_index();
+
+        // seal() should detect the tampering
+        let result = manifest.seal();
+        assert!(
+            matches!(result, Err(ManifestError::InvalidData(_))),
+            "Expected seal to detect tampered manifest, got {result:?}"
+        );
+
+        // verify_seal() should also detect the tampering
+        let result = manifest.verify_seal();
+        assert!(
+            matches!(result, Err(ManifestError::InvalidData(_))),
+            "Expected verify_seal to detect tampered manifest, got {result:?}"
+        );
+    }
+
+    /// TCK-00255: Verify seal works after deserialization roundtrip.
+    #[test]
+    fn tck_00255_seal_after_deserialization() {
+        let original = create_test_manifest();
+        let original_seal = original.seal().unwrap();
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&original).unwrap();
+        let mut recovered: ContextPackManifest = serde_json::from_str(&json).unwrap();
+        recovered.rebuild_index();
+
+        // Seal should produce the same hash
+        let recovered_seal = recovered.seal().unwrap();
+        assert_eq!(original_seal, recovered_seal);
+
+        // verify_seal should pass
+        assert!(recovered.verify_seal().is_ok());
+    }
+
+    /// TCK-00255: Verify different entries produce different seal hashes.
+    #[test]
+    fn tck_00255_different_entries_different_seal() {
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/file1.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/file2.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        // Different entries produce different hashes
+        assert_ne!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
+    }
+
+    /// TCK-00255: Verify different content hashes produce different seal.
+    #[test]
+    fn tck_00255_different_content_hash_different_seal() {
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/file.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/file.rs", [0xFF; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        // Different content hashes produce different seal hashes
+        assert_ne!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
+    }
+
+    /// TCK-00255: Verify different access levels produce different seal.
+    #[test]
+    fn tck_00255_different_access_level_different_seal() {
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/file.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/file.rs", [0x42; 32])
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
+            .build();
+
+        // Different access levels produce different seal hashes
+        assert_ne!(manifest1.seal().unwrap(), manifest2.seal().unwrap());
+    }
+
+    /// TCK-00255: Verify seal on empty manifest works.
+    #[test]
+    fn tck_00255_seal_empty_manifest() {
+        let manifest = ContextPackManifestBuilder::new("empty-manifest", "profile-001").build();
+
+        // Empty manifest should seal successfully
+        let seal = manifest.seal().unwrap();
+        assert_ne!(seal, [0u8; 32]); // Hash should be non-zero
+
+        // verify_seal should pass
+        assert!(manifest.verify_seal().is_ok());
+    }
+
+    /// TCK-00255: Verify different insertion orders produce the same seal hash.
+    ///
+    /// This is the critical test for deterministic hashing: entries are sorted
+    /// by path before hashing, so insertion order should not affect the result.
+    #[test]
+    fn tck_00255_insertion_order_independence() {
+        // Add entries in order: A, B, C
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/aaa/file.rs", [0x11; 32])
+                    .stable_id("file-a")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/bbb/file.rs", [0x22; 32])
+                    .stable_id("file-b")
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/ccc/file.rs", [0x33; 32])
+                    .stable_id("file-c")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        // Add entries in order: C, A, B (different order, same entries)
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/ccc/file.rs", [0x33; 32])
+                    .stable_id("file-c")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/aaa/file.rs", [0x11; 32])
+                    .stable_id("file-a")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/bbb/file.rs", [0x22; 32])
+                    .stable_id("file-b")
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
+            .build();
+
+        // Add entries in order: B, C, A (yet another order)
+        let manifest3 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/bbb/file.rs", [0x22; 32])
+                    .stable_id("file-b")
+                    .access_level(AccessLevel::ReadWithZoom)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/ccc/file.rs", [0x33; 32])
+                    .stable_id("file-c")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .add_entry(
+                ManifestEntryBuilder::new("/aaa/file.rs", [0x11; 32])
+                    .stable_id("file-a")
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        // All three manifests should produce the same seal hash
+        let seal1 = manifest1.seal().unwrap();
+        let seal2 = manifest2.seal().unwrap();
+        let seal3 = manifest3.seal().unwrap();
+
+        assert_eq!(
+            seal1, seal2,
+            "Different insertion order produced different hash"
+        );
+        assert_eq!(
+            seal2, seal3,
+            "Different insertion order produced different hash"
+        );
+        assert_eq!(
+            seal1, seal3,
+            "Different insertion order produced different hash"
+        );
+
+        // Verify entries are stored in sorted order
+        assert_eq!(manifest1.entries()[0].path(), "/aaa/file.rs");
+        assert_eq!(manifest1.entries()[1].path(), "/bbb/file.rs");
+        assert_eq!(manifest1.entries()[2].path(), "/ccc/file.rs");
     }
 }

@@ -16,6 +16,18 @@
 //! - [`firewall::FirewallMode`]: Enforcement mode (Warn, `SoftFail`,
 //!   `HardFail`)
 //!
+//! # Sealing (TCK-00255)
+//!
+//! Context packs are sealed after construction to ensure integrity. The seal
+//! is a BLAKE3 hash over all manifest content that:
+//!
+//! - Is deterministic: same entries always produce the same hash
+//! - Is tamper-evident: any modification changes the hash
+//! - Is verifiable: [`ContextPackManifest::verify_seal`] detects tampering
+//!
+//! Use [`ContextPackManifest::seal`] in the Work Claim flow to get the content
+//! hash for the `ClaimWorkResponse.context_pack_hash` field.
+//!
 //! # Security Model
 //!
 //! The context firewall uses manifests as allowlists:
