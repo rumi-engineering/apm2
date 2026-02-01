@@ -1076,10 +1076,14 @@ pub enum LeaseValidationError {
         lease_id: String,
     },
     /// Lease exists but `work_id` does not match.
+    ///
+    /// # Security Note (SEC-HYG-001)
+    ///
+    /// The expected `work_id` is intentionally omitted from this error to
+    /// prevent information leakage. Revealing the expected value could
+    /// allow an attacker to enumerate valid work IDs.
     WorkIdMismatch {
-        /// The expected `work_id` from the lease.
-        expected: String,
-        /// The actual `work_id` from the request.
+        /// The actual `work_id` from the request (not the expected one).
         actual: String,
     },
     /// Lease has expired.
@@ -1100,8 +1104,8 @@ impl std::fmt::Display for LeaseValidationError {
             Self::LeaseNotFound { lease_id } => {
                 write!(f, "lease not found: {lease_id}")
             },
-            Self::WorkIdMismatch { expected, actual } => {
-                write!(f, "work_id mismatch: expected {expected}, got {actual}")
+            Self::WorkIdMismatch { actual } => {
+                write!(f, "work_id mismatch for provided value: {actual}")
             },
             Self::LeaseExpired { lease_id } => {
                 write!(f, "lease expired: {lease_id}")
@@ -1177,13 +1181,25 @@ struct LeaseEntry {
 ///
 /// # Capacity Limits (CTR-1303)
 ///
-/// This validator enforces a maximum of [`MAX_LEASE_ENTRIES`] entries to
-/// prevent memory exhaustion. When the limit is reached, the oldest entry (by
-/// insertion order) is evicted to make room for the new lease.
+/// This validator enforces a maximum of 10,000 entries to prevent memory
+/// exhaustion. When the limit is reached, the oldest entry (by insertion order)
+/// is evicted to make room for the new lease.
+///
+/// # Security Notes
+///
+/// - **SEC-DoS-001**: Duplicate lease IDs are handled by updating in place
+///   rather than adding a new entry, preventing unbounded memory growth.
+/// - **SEC-DoS-002**: Uses `VecDeque` for O(1) eviction from the front,
+///   consistent with the O(1) eviction pattern established in PR 329.
 #[derive(Debug, Default)]
 pub struct StubLeaseValidator {
-    /// Leases stored with insertion order for LRU eviction.
-    leases: std::sync::RwLock<(Vec<String>, std::collections::HashMap<String, LeaseEntry>)>,
+    /// Leases stored with insertion order for O(1) LRU eviction.
+    ///
+    /// Uses `VecDeque` (SEC-DoS-002) for efficient front removal.
+    leases: std::sync::RwLock<(
+        std::collections::VecDeque<String>,
+        std::collections::HashMap<String, LeaseEntry>,
+    )>,
 }
 
 impl StubLeaseValidator {
@@ -1191,7 +1207,10 @@ impl StubLeaseValidator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            leases: std::sync::RwLock::new((Vec::new(), std::collections::HashMap::new())),
+            leases: std::sync::RwLock::new((
+                std::collections::VecDeque::new(),
+                std::collections::HashMap::new(),
+            )),
         }
     }
 }
@@ -1216,7 +1235,6 @@ impl LeaseValidator for StubLeaseValidator {
                     Ok(())
                 } else {
                     Err(LeaseValidationError::WorkIdMismatch {
-                        expected: entry.work_id.clone(),
                         actual: work_id.to_string(),
                     })
                 }
@@ -1228,17 +1246,30 @@ impl LeaseValidator for StubLeaseValidator {
         let mut guard = self.leases.write().expect("lock poisoned");
         let (order, leases) = &mut *guard;
 
+        // SEC-DoS-001: Check for duplicate lease_id and update in place
+        if leases.contains_key(lease_id) {
+            // Update existing entry without adding to order (already tracked)
+            leases.insert(
+                lease_id.to_string(),
+                LeaseEntry {
+                    work_id: work_id.to_string(),
+                    gate_id: gate_id.to_string(),
+                },
+            );
+            return;
+        }
+
         // CTR-1303: Evict oldest entry if at capacity
+        // SEC-DoS-002: Use pop_front() for O(1) eviction
         while leases.len() >= MAX_LEASE_ENTRIES {
-            if let Some(oldest_key) = order.first().cloned() {
-                order.remove(0);
+            if let Some(oldest_key) = order.pop_front() {
                 leases.remove(&oldest_key);
             } else {
                 break;
             }
         }
 
-        order.push(lease_id.to_string());
+        order.push_back(lease_id.to_string());
         leases.insert(
             lease_id.to_string(),
             LeaseEntry {
