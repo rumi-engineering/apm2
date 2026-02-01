@@ -23,11 +23,24 @@
 //! - Same major version
 //! - Client minor version <= server minor version (backward compatible)
 //!
+//! # Session Authentication (TCK-00250)
+//!
+//! After handshake, session-scoped connections require a [`SessionToken`]
+//! for authentication. Tokens are minted when an episode is spawned via
+//! the `SpawnEpisode` privileged endpoint and bind the session to its
+//! authorization context.
+//!
+//! The token is validated on each session-scoped request using HMAC-SHA256
+//! with constant-time comparison. See [`super::session_token`] for details.
+//!
+//! [`SessionToken`]: super::session_token::SessionToken
+//!
 //! # Security Considerations
 //!
 //! - Handshake must complete before any other messages
 //! - Invalid handshake terminates the connection
 //! - Version mismatch provides diagnostic info without leaking internals
+//! - Session tokens use constant-time MAC verification (CTR-WH001)
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
