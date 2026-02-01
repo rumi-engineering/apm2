@@ -1060,6 +1060,228 @@ impl SessionRegistry for StubSessionRegistry {
     }
 }
 
+// ============================================================================
+// TCK-00257: Gate Lease Validation
+// ============================================================================
+
+/// Maximum number of lease entries to store (CTR-1303: bounded capacity).
+const MAX_LEASE_ENTRIES: usize = 10_000;
+
+/// Error returned when lease validation fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseValidationError {
+    /// Lease ID was not found in the ledger.
+    LeaseNotFound {
+        /// The lease ID that was not found.
+        lease_id: String,
+    },
+    /// Lease exists but `work_id` does not match.
+    ///
+    /// # Security Note (SEC-HYG-001)
+    ///
+    /// The expected `work_id` is intentionally omitted from this error to
+    /// prevent information leakage. Revealing the expected value could
+    /// allow an attacker to enumerate valid work IDs.
+    WorkIdMismatch {
+        /// The actual `work_id` from the request (not the expected one).
+        actual: String,
+    },
+    /// Lease has expired.
+    LeaseExpired {
+        /// The expired lease ID.
+        lease_id: String,
+    },
+    /// Failed to query the ledger.
+    LedgerQueryFailed {
+        /// The error message from the ledger.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for LeaseValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LeaseNotFound { lease_id } => {
+                write!(f, "lease not found: {lease_id}")
+            },
+            Self::WorkIdMismatch { actual } => {
+                write!(f, "work_id mismatch for provided value: {actual}")
+            },
+            Self::LeaseExpired { lease_id } => {
+                write!(f, "lease expired: {lease_id}")
+            },
+            Self::LedgerQueryFailed { message } => {
+                write!(f, "ledger query failed: {message}")
+            },
+        }
+    }
+}
+
+impl std::error::Error for LeaseValidationError {}
+
+/// Trait for validating gate leases.
+///
+/// Per RFC-0017 IPC-PRIV-002, `GATE_EXECUTOR` role requires a valid
+/// `GateLeaseIssued` event to exist in the ledger for the specified
+/// `lease_id` and `work_id`.
+///
+/// # Security Contract
+///
+/// - `GATE_EXECUTOR` spawn MUST be rejected if lease validation fails
+/// - Lease validation verifies the lease exists and matches the `work_id`
+/// - This is a fail-closed check: validation errors reject the spawn
+///
+/// # Implementers
+///
+/// - `StubLeaseValidator`: In-memory storage for testing
+/// - `LedgerLeaseValidator`: Ledger-backed validation (future)
+pub trait LeaseValidator: Send + Sync {
+    /// Validates that a gate lease exists and matches the `work_id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `lease_id` - The lease ID to validate
+    /// * `work_id` - The work ID that must match the lease
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the lease is valid and matches the `work_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LeaseValidationError` if:
+    /// - The lease does not exist (`LeaseNotFound`)
+    /// - The lease exists but the `work_id` doesn't match (`WorkIdMismatch`)
+    /// - The lease has expired (`LeaseExpired`)
+    /// - The ledger query failed (`LedgerQueryFailed`)
+    fn validate_gate_lease(
+        &self,
+        lease_id: &str,
+        work_id: &str,
+    ) -> Result<(), LeaseValidationError>;
+
+    /// Registers a gate lease for testing purposes.
+    ///
+    /// In production, leases are issued through a separate governance flow.
+    /// This method exists to support test fixtures.
+    fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str);
+}
+
+/// Entry for a registered lease.
+#[derive(Debug, Clone)]
+struct LeaseEntry {
+    work_id: String,
+    #[allow(dead_code)]
+    gate_id: String,
+}
+
+/// Stub implementation of [`LeaseValidator`] for testing.
+///
+/// Stores leases in memory with no persistence.
+///
+/// # Capacity Limits (CTR-1303)
+///
+/// This validator enforces a maximum of 10,000 entries to prevent memory
+/// exhaustion. When the limit is reached, the oldest entry (by insertion order)
+/// is evicted to make room for the new lease.
+///
+/// # Security Notes
+///
+/// - **SEC-DoS-001**: Duplicate lease IDs are handled by updating in place
+///   rather than adding a new entry, preventing unbounded memory growth.
+/// - **SEC-DoS-002**: Uses `VecDeque` for O(1) eviction from the front,
+///   consistent with the O(1) eviction pattern established in PR 329.
+#[derive(Debug, Default)]
+pub struct StubLeaseValidator {
+    /// Leases stored with insertion order for O(1) LRU eviction.
+    ///
+    /// Uses `VecDeque` (SEC-DoS-002) for efficient front removal.
+    leases: std::sync::RwLock<(
+        std::collections::VecDeque<String>,
+        std::collections::HashMap<String, LeaseEntry>,
+    )>,
+}
+
+impl StubLeaseValidator {
+    /// Creates a new empty lease validator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            leases: std::sync::RwLock::new((
+                std::collections::VecDeque::new(),
+                std::collections::HashMap::new(),
+            )),
+        }
+    }
+}
+
+impl LeaseValidator for StubLeaseValidator {
+    fn validate_gate_lease(
+        &self,
+        lease_id: &str,
+        work_id: &str,
+    ) -> Result<(), LeaseValidationError> {
+        let guard = self.leases.read().expect("lock poisoned");
+        let (_, leases) = &*guard;
+
+        leases.get(lease_id).map_or_else(
+            || {
+                Err(LeaseValidationError::LeaseNotFound {
+                    lease_id: lease_id.to_string(),
+                })
+            },
+            |entry| {
+                let work_id_matches = entry.work_id.len() == work_id.len()
+                    && bool::from(entry.work_id.as_bytes().ct_eq(work_id.as_bytes()));
+                if work_id_matches {
+                    Ok(())
+                } else {
+                    Err(LeaseValidationError::WorkIdMismatch {
+                        actual: work_id.to_string(),
+                    })
+                }
+            },
+        )
+    }
+
+    fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str) {
+        let mut guard = self.leases.write().expect("lock poisoned");
+        let (order, leases) = &mut *guard;
+
+        // SEC-DoS-001: Check for duplicate lease_id and update in place
+        if leases.contains_key(lease_id) {
+            // Update existing entry without adding to order (already tracked)
+            leases.insert(
+                lease_id.to_string(),
+                LeaseEntry {
+                    work_id: work_id.to_string(),
+                    gate_id: gate_id.to_string(),
+                },
+            );
+            return;
+        }
+
+        // CTR-1303: Evict oldest entry if at capacity
+        // SEC-DoS-002: Use pop_front() for O(1) eviction
+        while leases.len() >= MAX_LEASE_ENTRIES {
+            if let Some(oldest_key) = order.pop_front() {
+                leases.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+
+        order.push_back(lease_id.to_string());
+        leases.insert(
+            lease_id.to_string(),
+            LeaseEntry {
+                work_id: work_id.to_string(),
+                gate_id: gate_id.to_string(),
+            },
+        );
+    }
+}
+
 /// Privileged endpoint dispatcher.
 ///
 /// Routes incoming messages to the appropriate handler based on message type.
@@ -1085,6 +1307,10 @@ impl SessionRegistry for StubSessionRegistry {
 ///
 /// - Episode runtime for lifecycle management
 /// - Session registry for session state persistence
+///
+/// # TCK-00257 Additions
+///
+/// - Lease validator for `GATE_EXECUTOR` spawn validation
 pub struct PrivilegedDispatcher {
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
@@ -1103,6 +1329,9 @@ pub struct PrivilegedDispatcher {
 
     /// Session registry for session state persistence (TCK-00256).
     session_registry: Arc<dyn SessionRegistry>,
+
+    /// Lease validator for `GATE_EXECUTOR` spawn validation (TCK-00257).
+    lease_validator: Arc<dyn LeaseValidator>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -1115,7 +1344,7 @@ impl PrivilegedDispatcher {
     /// Creates a new dispatcher with default decode configuration.
     ///
     /// Uses stub implementations for policy resolver, work registry, event
-    /// emitter, and session registry.
+    /// emitter, session registry, and lease validator.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1125,13 +1354,14 @@ impl PrivilegedDispatcher {
             event_emitter: Arc::new(StubLedgerEventEmitter::new()),
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(StubSessionRegistry::default()),
+            lease_validator: Arc::new(StubLeaseValidator::new()),
         }
     }
 
     /// Creates a new dispatcher with custom decode configuration.
     ///
     /// Uses stub implementations for policy resolver, work registry, event
-    /// emitter, and session registry.
+    /// emitter, session registry, and lease validator.
     #[must_use]
     pub fn with_decode_config(decode_config: DecodeConfig) -> Self {
         Self {
@@ -1141,6 +1371,7 @@ impl PrivilegedDispatcher {
             event_emitter: Arc::new(StubLedgerEventEmitter::new()),
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(StubSessionRegistry::default()),
+            lease_validator: Arc::new(StubLeaseValidator::new()),
         }
     }
 
@@ -1155,6 +1386,7 @@ impl PrivilegedDispatcher {
         event_emitter: Arc<dyn LedgerEventEmitter>,
         episode_runtime: Arc<EpisodeRuntime>,
         session_registry: Arc<dyn SessionRegistry>,
+        lease_validator: Arc<dyn LeaseValidator>,
     ) -> Self {
         Self {
             decode_config,
@@ -1163,6 +1395,7 @@ impl PrivilegedDispatcher {
             event_emitter,
             episode_runtime,
             session_registry,
+            lease_validator,
         }
     }
 
@@ -1188,6 +1421,14 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn session_registry(&self) -> &Arc<dyn SessionRegistry> {
         &self.session_registry
+    }
+
+    /// Returns a reference to the lease validator.
+    ///
+    /// Primarily for testing purposes to pre-register leases.
+    #[must_use]
+    pub fn lease_validator(&self) -> &Arc<dyn LeaseValidator> {
+        &self.lease_validator
     }
 
     /// Dispatches a privileged request to the appropriate handler.
@@ -1401,6 +1642,14 @@ impl PrivilegedDispatcher {
 
     /// Handles `SpawnEpisode` requests (IPC-PRIV-002).
     ///
+    /// # Security Contract (TCK-00257)
+    ///
+    /// - `GATE_EXECUTOR` role requires a valid `lease_id` that references a
+    ///   `GateLeaseIssued` event in the ledger
+    /// - The lease must match the `work_id` in the request
+    /// - Non-`GATE_EXECUTOR` roles (`IMPLEMENTER`, `REVIEWER`) do not require
+    ///   ledger lease validation (they use claim-based validation)
+    ///
     /// # TCK-00256 Implementation
     ///
     /// This handler implements the episode spawn flow per DD-001 and DD-002:
@@ -1491,6 +1740,31 @@ impl PrivilegedDispatcher {
                 PrivilegedErrorCode::GateLeaseMissing,
                 "lease_id is required for GATE_EXECUTOR role",
             ));
+        }
+
+        // TCK-00257: GATE_EXECUTOR requires valid lease in ledger
+        // Per RFC-0017 IPC-PRIV-002, the lease must exist as a GateLeaseIssued event
+        // and the work_id must match. This is a fail-closed check.
+        if request.role == WorkRole::GateExecutor as i32 {
+            let lease_id = request
+                .lease_id
+                .as_ref()
+                .expect("lease_id presence checked above");
+
+            if let Err(e) = self
+                .lease_validator
+                .validate_gate_lease(lease_id, &request.work_id)
+            {
+                warn!(
+                    work_id = %request.work_id,
+                    error = %e,
+                    "SpawnEpisode rejected: gate lease validation failed"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::GateLeaseMissing,
+                    format!("gate lease validation failed: {e}"),
+                ));
+            }
         }
 
         // TCK-00256: Query work registry for PolicyResolvedForChangeSet
@@ -2624,6 +2898,11 @@ mod tests {
             _ => panic!("Expected ClaimWork response"),
         };
 
+        // TCK-00257: Register the lease for validation
+        dispatcher
+            .lease_validator()
+            .register_lease(&lease_id, &work_id, "gate-build");
+
         // Now spawn with the claimed work_id and correct lease_id
         let request = SpawnEpisodeRequest {
             work_id,
@@ -2685,18 +2964,20 @@ mod tests {
 
         match response {
             PrivilegedResponse::Error(err) => {
+                // TCK-00257: With lease validation, wrong lease_id fails at
+                // lease validation (GATE_LEASE_MISSING) before claim validation
                 assert_eq!(
                     err.code,
-                    PrivilegedErrorCode::CapabilityRequestRejected as i32,
-                    "Should return CapabilityRequestRejected for lease_id mismatch"
+                    PrivilegedErrorCode::GateLeaseMissing as i32,
+                    "Should return GateLeaseMissing for unknown lease_id"
                 );
                 assert!(
-                    err.message.contains("lease_id"),
-                    "Error message should mention lease_id: {}",
+                    err.message.contains("lease"),
+                    "Error message should mention lease: {}",
                     err.message
                 );
             },
-            _ => panic!("Expected lease_id mismatch error, got: {response:?}"),
+            _ => panic!("Expected lease validation error, got: {response:?}"),
         }
     }
 
@@ -2847,6 +3128,135 @@ mod tests {
             "Session should be queryable by handle"
         );
         assert_eq!(session_by_handle.unwrap().session_id, session_id);
+    }
+
+    // ========================================================================
+    // TCK-00257: ADV-004 Gate Lease Validation Tests
+    // ========================================================================
+
+    /// ADV-004: `GATE_EXECUTOR` spawn with unknown/unregistered `lease_id`
+    /// fails.
+    ///
+    /// This test verifies that the ledger is queried for a valid
+    /// `GateLeaseIssued` event. If the lease is not found, the spawn is
+    /// rejected with `GATE_LEASE_MISSING`.
+    #[test]
+    fn test_adv_004_gate_executor_unknown_lease_fails() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // DO NOT register any lease - this simulates an unknown/invalid lease
+
+        let request = SpawnEpisodeRequest {
+            work_id: "W-001".to_string(),
+            role: WorkRole::GateExecutor.into(),
+            lease_id: Some("L-UNKNOWN".to_string()), // Not registered
+        };
+        let frame = encode_spawn_episode_request(&request);
+
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        match response {
+            PrivilegedResponse::Error(err) => {
+                assert_eq!(
+                    err.code,
+                    PrivilegedErrorCode::GateLeaseMissing as i32,
+                    "Should fail with GATE_LEASE_MISSING for unknown lease"
+                );
+                assert!(
+                    err.message.contains("lease not found"),
+                    "Error message should indicate lease not found: {}",
+                    err.message
+                );
+            },
+            _ => panic!("Expected GATE_LEASE_MISSING error for unknown lease"),
+        }
+    }
+
+    /// ADV-004: `GATE_EXECUTOR` spawn with mismatched `work_id` fails.
+    ///
+    /// This test verifies that the lease's `work_id` must match the request's
+    /// `work_id`. A lease for work W-001 cannot be used for spawn on W-002.
+    #[test]
+    fn test_adv_004_gate_executor_work_id_mismatch_fails() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // Register lease for W-001
+        dispatcher
+            .lease_validator()
+            .register_lease("L-001", "W-001", "gate-build");
+
+        // Try to use that lease for W-002 (different work_id)
+        let request = SpawnEpisodeRequest {
+            work_id: "W-002".to_string(), // Mismatched work_id
+            role: WorkRole::GateExecutor.into(),
+            lease_id: Some("L-001".to_string()),
+        };
+        let frame = encode_spawn_episode_request(&request);
+
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        match response {
+            PrivilegedResponse::Error(err) => {
+                assert_eq!(
+                    err.code,
+                    PrivilegedErrorCode::GateLeaseMissing as i32,
+                    "Should fail with GATE_LEASE_MISSING for work_id mismatch"
+                );
+                assert!(
+                    err.message.contains("mismatch"),
+                    "Error message should indicate work_id mismatch: {}",
+                    err.message
+                );
+            },
+            _ => panic!("Expected GATE_LEASE_MISSING error for work_id mismatch"),
+        }
+    }
+
+    /// ADV-004: `GATE_EXECUTOR` spawn with valid registered lease succeeds
+    /// (at the lease validation stage).
+    ///
+    /// This test verifies that a properly registered lease that matches
+    /// the `work_id` passes the lease validation. Note: The spawn may still
+    /// fail at the claim validation stage if `ClaimWork` wasn't called first.
+    #[test]
+    fn test_adv_004_gate_executor_valid_lease_passes_validation() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // Register the lease for the correct work_id
+        dispatcher
+            .lease_validator()
+            .register_lease("L-VALID", "W-VALID", "gate-aat");
+
+        let request = SpawnEpisodeRequest {
+            work_id: "W-VALID".to_string(),
+            role: WorkRole::GateExecutor.into(),
+            lease_id: Some("L-VALID".to_string()),
+        };
+        let frame = encode_spawn_episode_request(&request);
+
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        // The response should NOT be GATE_LEASE_MISSING - the lease validation
+        // passed. It may fail for other reasons (policy resolution missing),
+        // but not lease validation.
+        if let PrivilegedResponse::Error(err) = &response {
+            assert_ne!(
+                err.code,
+                PrivilegedErrorCode::GateLeaseMissing as i32,
+                "Should NOT fail with GATE_LEASE_MISSING - lease is valid"
+            );
+            // Expected to fail with PolicyResolutionMissing since we didn't
+            // call ClaimWork
+            assert_eq!(
+                err.code,
+                PrivilegedErrorCode::PolicyResolutionMissing as i32,
+                "Should fail with PolicyResolutionMissing (no ClaimWork)"
+            );
+        }
+        // If it somehow succeeded, that's also fine for this test
     }
 
     // ========================================================================
