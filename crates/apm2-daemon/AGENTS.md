@@ -93,57 +93,35 @@ Composite key for process runners: (`ProcessId`, instance index).
 **Invariants:**
 - [INV-D006] Instance index is always `< spec.instances` for the corresponding process.
 
-## IPC Server
+## IPC Server (ProtocolServer-only, DD-009)
 
-### `ipc_server::run`
+### `ProtocolServer::bind` + `accept`
 
 ```rust
-pub async fn run(socket_path: &Path, state: SharedState) -> Result<()>
+pub fn bind(config: ServerConfig) -> ProtocolResult<ProtocolServer>
+pub async fn accept(&self) -> ProtocolResult<(Connection, ConnectionPermit)>
 ```
 
-Main server loop that listens on a Unix domain socket and spawns connection handlers.
+Control-plane IPC uses the ProtocolServer stack only (DD-009). Legacy JSON IPC
+(`apm2_core::ipc` + `ipc_server.rs`) is forbidden and must not be used for any
+control-plane path.
 
-**Contracts:**
+**Contracts (ProtocolServer):**
 - [CTR-D005] Removes stale socket file before binding.
-- [CTR-D006] Creates parent directory if needed.
+- [CTR-D006] Creates parent directory with restrictive permissions.
 - [CTR-D007] Cleans up socket file on shutdown.
 - [CTR-D008] Each connection is handled in a separate spawned task.
+- [CTR-D009] Handshake completes before any control-plane message exchange.
 
 ### Wire Protocol
 
-Uses length-prefixed JSON framing (see `apm2_core::ipc`):
-
-```
-+----------------------------+------------------+
-| Length (4 bytes, big-endian) | JSON payload     |
-+----------------------------+------------------+
-```
+Uses length-prefixed binary framing with Hello/HelloAck handshake. JSON framing
+is explicitly forbidden by DD-009.
 
 **Invariants:**
-- [INV-D007] Maximum message size is 16 MiB (`MAX_MESSAGE_SIZE`).
+- [INV-D007] Maximum frame size enforced before allocation.
 - [INV-D008] Connection closes on any framing or parse error.
-
-## Handlers
-
-The `handlers::dispatch` function routes `IpcRequest` variants to typed handlers:
-
-| Request | Handler | Response |
-|---------|---------|----------|
-| `Ping` | `handle_ping` | `Pong { version, uptime_secs }` |
-| `Status` | `handle_status` | `Status { version, pid, uptime_secs, process_count, running_instances }` |
-| `ListProcesses` | `handle_list` | `ProcessList { processes }` |
-| `GetProcess { name }` | `handle_get_process` | `ProcessDetails { process }` or `Error` |
-| `StartProcess { name }` | `handle_start` | `Ok` or `Error` |
-| `StopProcess { name }` | `handle_stop` | `Ok` or `Error` |
-| `RestartProcess { name }` | `handle_restart` | `Ok` or `Error` |
-| `Shutdown` | `handle_shutdown` | `Ok` |
-
-**Contracts:**
-- [CTR-D009] All handlers return exactly one `IpcResponse`.
-- [CTR-D010] `Error` responses include both `ErrorCode` and human-readable message.
-- [CTR-D011] `handle_start` fails with `ProcessAlreadyRunning` if any instance is running.
-- [CTR-D012] `handle_stop` fails with `ProcessNotRunning` if no instances are running.
-- [CTR-D013] `handle_restart` tolerates `ProcessNotRunning` during stop phase.
+- [INV-D009] Legacy JSON IPC listeners/adapters are prohibited in default builds.
 
 ## Daemonization
 
@@ -209,47 +187,14 @@ apm2-daemon --config ecosystem.toml
 
 # Start in foreground
 apm2-daemon --config ecosystem.toml --no-daemon
-
-# Custom socket path
-apm2-daemon --socket /tmp/apm2.sock --no-daemon
 ```
 
-### Handling a Start Request
-
-```rust
-async fn handle_start(state: &SharedState, name: &str) -> IpcResponse {
-    let mut inner = state.write().await;
-
-    let Some(spec) = inner.supervisor.get_spec(name).cloned() else {
-        return IpcResponse::Error {
-            code: ErrorCode::ProcessNotFound,
-            message: format!("Process '{name}' not found"),
-        };
-    };
-
-    // Check if already running
-    let handles = inner.supervisor.get_handles(name);
-    if handles.iter().any(|h| h.state.is_running()) {
-        return IpcResponse::Error {
-            code: ErrorCode::ProcessAlreadyRunning,
-            message: format!("Process '{name}' is already running"),
-        };
-    }
-
-    // Start instances...
-    for i in 0..spec.instances {
-        let mut runner = ProcessRunner::new(spec.clone(), i);
-        runner.start()?;
-        inner.insert_runner(spec.id, i, runner);
-    }
-
-    IpcResponse::Ok { message: Some(format!("Process '{name}' started")) }
-}
-```
+Socket paths are configured via `[daemon].operator_socket` and
+`[daemon].session_socket` in `ecosystem.toml`. Single-socket CLI flags/keys are
+forbidden by DD-009.
 
 ## Related Modules
 
-- [`apm2_core::ipc`](../apm2-core/src/ipc/AGENTS.md) - Wire protocol types (`IpcRequest`, `IpcResponse`)
 - [`apm2_core::process`](../apm2-core/src/process/AGENTS.md) - `ProcessSpec`, `ProcessState`, `ProcessRunner`
 - [`apm2_core::supervisor`](../apm2-core/src/supervisor/AGENTS.md) - Process collection management
 - [`apm2_core::config`](../apm2-core/src/config/AGENTS.md) - `EcosystemConfig` for daemon configuration

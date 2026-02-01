@@ -8,19 +8,19 @@ rfc_risks_and_open_questions:
 
   risks:
     - id: RISK-RFC-0017-001
-      name: "Migration surface larger than expected"
-      category: ADOPTION
+      name: "xtask bypass surfaces violate projection-only posture"
+      category: SECURITY
       description: |
-        xtask deprecation assumes limited direct usage. If migration surface is
-        larger (undocumented xtask behaviors, external scripts depending on xtask),
-        removal may cause unexpected breakage.
+        xtask can perform authority-affecting actions (e.g., external status
+        writes) outside the daemon control plane. This creates a bypass path
+        that violates projection-only GitHub and allows ungoverned writes.
       likelihood: MEDIUM
       impact: HIGH
       mitigation:
-        - "Telemetry gate: removal blocked until <5% direct xtask usage"
-        - "Extended deprecation period if telemetry shows high usage"
-        - "Deprecation warnings with migration guidance"
-      owner: "Implementation team"
+        - "Disable or hard-fail authority-affecting xtask operations (REQ-0014)"
+        - "CI guardrails reject direct external status writes"
+        - "Route projections through daemon-only mechanisms"
+      owner: "Security review"
       status: OPEN
 
     - id: RISK-RFC-0017-002
@@ -85,6 +85,22 @@ rfc_risks_and_open_questions:
       owner: "Architecture team"
       status: OPEN
 
+    - id: RISK-RFC-0017-006
+      name: "Legacy IPC downgrade/bypass"
+      category: SECURITY
+      description: |
+        If any legacy JSON IPC listener or adapter remains, attackers can
+        downgrade to the weaker path and bypass ProtocolServer controls.
+      likelihood: MEDIUM
+      impact: CRITICAL
+      mitigation:
+        - "DD-009 hard cutover: ProtocolServer-only IPC"
+        - "Fail-closed rejection of legacy socket keys"
+        - "ADV-012 verifies no legacy listener or downgrade path"
+        - "CI guardrails block legacy IPC symbols"
+      owner: "Security review"
+      status: OPEN
+
   open_questions:
     # Known Unknowns requiring codebase investigation in EXPLORE phase
 
@@ -129,7 +145,7 @@ rfc_risks_and_open_questions:
       resolved_date: "2026-01-30"
       resolved_by: "Human (operator)"
       council_finding: FND-RFC-0017-001
-      decision_ref: "02_design_decisions.yaml#DD-008"
+      decision_ref: "02_design_decisions.yaml#DD-009"
       evidence_ref: "evidence/rfc/RFC-0017/reviews/rfc_review_20260130T120000.yaml"
       resolution: |
         DECISION: OPTION A - Adopt Protobuf Runtime Protocol
@@ -141,12 +157,14 @@ rfc_risks_and_open_questions:
         - Canonical encoding for signing (AD-DAEMON-003)
         - Golden test vectors (AD-VERIFY-001)
 
+        Amendment A-001 (DD-009) supersedes DD-008 migration language:
+        - No JSON IPC listener ships or runs.
+        - No JSON→protobuf adapter exists or is supported.
+        - Dual-socket topology (operator.sock + session.sock) is mandatory.
+
         Implementation adds:
         - SO_PEERCRED authentication to ProtocolServer::accept()
         - Control-plane messages to apm2d_runtime_v1.proto
-        - Thin JSON-to-protobuf CLI adapter for backward compatibility
-
-        JSON IPC (apm2_core::ipc) remains for legacy CLI during migration.
 
     # =========================================================================
     # OQ-002: RESOLVED by RFC Council EXPLORE phase 2026-01-30
@@ -747,8 +765,8 @@ rfc_risks_and_open_questions:
     exploration_summary: |
       KEY FINDINGS FROM v0->v2 EXPLORATION:
 
-      1. **Protocol Decision (OQ-001/OQ-001a)**: Protobuf Runtime Protocol adopted.
-         Two existing stacks found; protobuf chosen for handshake, canonical encoding.
+      1. **Protocol Decision (OQ-001/OQ-001a)**: Protobuf Runtime Protocol adopted
+         with DD-009 hard cutover (no legacy JSON IPC or adapters).
 
       2. **Capability Structures (OQ-003)**: 5 existing structures found - NO NEW
          ABSTRACTIONS NEEDED. Extend ContextPackManifest and CapabilityScope.

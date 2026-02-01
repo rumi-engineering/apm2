@@ -1,0 +1,30 @@
+requirement:
+  id: REQ-DCP-0006
+  title: "SoD Custody Domain Enforcement"
+  status: ACTIVE
+
+  statement: |
+    Gate executor spawn MUST enforce Separation of Duties (SoD) by rejecting
+    custody-domain overlap between authoring and reviewing roles.
+
+  rationale: |
+    SoD prevents a single actor from both authoring and approving changes,
+    reducing the risk of insider manipulation.
+
+  acceptance_criteria:
+    - id: AC-DCP-0006-001
+      description: "Overlapping custody domain is rejected."
+      verification: "ADV-006 returns LeaseIssueDenied with SOD_VIOLATION."
+    - id: AC-DCP-0006-002
+      description: "Custody domain extraction and overlap detection are correct."
+      verification: "UT-SPAWN-003 validates domain overlap logic."
+
+  design_references:
+    - "06_ticket_decomposition.yaml#GRP-003"
+
+  test_references:
+    - "07_test_and_evidence.yaml#ADV-006"
+    - "07_test_and_evidence.yaml#UT-SPAWN-003"
+
+  law_refs:
+    - LAW-05

@@ -15,7 +15,10 @@ implementation:
       path: ".cargo/config.toml"
   implementation_steps: []
   summary: ""
-notes: "Phase: PHASE-5\nGenerated from RFC RFC-0017 ticket decomposition on 2026-01-30."
+notes: |
+  Phase: PHASE-5
+  Generated from RFC RFC-0017 ticket decomposition on 2026-01-30.
+  CANCELLED (REQ-0014 amended / DD-009): telemetry-gated deprecation removed; bypass closure handled by TCK-00284.
 schema_version: "2026-01-26"
 template_version: "2026-01-26"
 test_requirements:
@@ -30,5 +33,5 @@ ticket:
   id: TCK-00277
   requirement_ids: []
   rfc_id: RFC-0017
-  status: READY
+  status: CANCELLED
   title: Remove xtask crate after telemetry gate

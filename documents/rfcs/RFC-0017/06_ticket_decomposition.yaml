@@ -7,6 +7,9 @@ rfc_ticket_decomposition:
     RFC v4 (Standard phase) ticket decomposition completed via rfc-council DECOMPOSE mode.
     27 tickets generated across 9 groups following the planned_ticket_structure.
     All tickets trace to PRD-0010 requirements and leverage existing CCP components.
+    Amendment A-001 (DD-009) cancels CLI migration + telemetry-gated xtask deprecation
+    tickets (TCK-00270..TCK-00277) and adds a new Amendment Follow-ups group
+    (TCK-00279..TCK-00284) focused on hard cutover enforcement.
 
   planned_ticket_structure:
     groups:
@@ -109,6 +112,8 @@ rfc_ticket_decomposition:
       - group_id: GRP-008
         name: "CLI Migration"
         phase: PHASE-4
+        status: CANCELLED
+        amendment_note: "Cancelled under DD-009 hard cutover (no CLI migration path)."
         requirements_covered: []
         estimated_tickets:
           - title: "Implement apm2 work claim command"
@@ -123,6 +128,8 @@ rfc_ticket_decomposition:
       - group_id: GRP-009
         name: "xtask Deprecation"
         phase: PHASE-5
+        status: CANCELLED
+        amendment_note: "Cancelled under DD-009 hard cutover (telemetry gate removed)."
         requirements_covered: []
         estimated_tickets:
           - title: "Add deprecation warnings to xtask commands"
@@ -134,16 +141,35 @@ rfc_ticket_decomposition:
           - title: "Remove xtask crate"
             scope: "Crate deletion, Cargo.toml cleanup"
 
+      - group_id: GRP-010
+        name: "Amendment Follow-ups (DD-009 Hard Cutover)"
+        phase: PHASE-1
+        requirements_covered:
+          - REQ-DCP-0001
+          - REQ-DCP-0008
+        estimated_tickets:
+          - title: "ProtocolServer-only daemon entrypoint"
+            scope: "Remove legacy ipc_server startup; dual sockets only"
+          - title: "Config schema cutover (dual sockets only)"
+            scope: "Reject legacy single-socket keys; update defaults"
+          - title: "Delete legacy JSON IPC modules"
+            scope: "Remove ipc_server.rs + JSON handler surface"
+          - title: "CI guardrails for legacy IPC reintroduction"
+            scope: "Fail builds on legacy IPC symbols/paths"
+          - title: "ADV-012 legacy IPC bypass test"
+            scope: "Adversarial downgrade test and evidence"
+          - title: "xtask bypass closure"
+            scope: "Remove direct external projection writes or hard-fail"
+
   dependencies_overview:
     critical_path:
       - "GRP-001 (IPC Foundation) -> GRP-002 (Work Orchestration)"
       - "GRP-001 -> GRP-005 (Event Signing)"
+      - "GRP-001 -> GRP-010 (Hard Cutover Enforcement)"
       - "GRP-002 -> GRP-003 (Episode Spawn)"
       - "GRP-003 -> GRP-004 (Tool Mediation)"
       - "GRP-003 -> GRP-006 (Session Lifecycle)"
       - "GRP-004 -> GRP-007 (Metrics)"
-      - "GRP-007 -> GRP-008 (CLI Migration)"
-      - "GRP-008 -> GRP-009 (xtask Deprecation)"
 
     parallelizable:
       - "GRP-005 (Event Signing) can proceed in parallel with GRP-002, GRP-003"
@@ -1603,3 +1629,200 @@ rfc_ticket_decomposition:
           verification: "cargo xtask returns command not found"
       adversarial_tests:
         - ADV-008
+
+    # ==========================================================================
+    # GRP-010: Amendment Follow-ups (DD-009 Hard Cutover)
+    # ==========================================================================
+    - ticket_id: TCK-00279
+      title: "ProtocolServer-only daemon entrypoint"
+      group_id: GRP-010
+      phase: PHASE-1
+      requirement_ids:
+        - REQ-DCP-0001
+        - REQ-DCP-0008
+      depends_on:
+        - TCK-00248
+        - TCK-00249
+      files_to_modify:
+        - path: "crates/apm2-daemon/src/main.rs"
+          changes: |
+            Start ProtocolServer listeners (operator.sock + session.sock).
+            Remove ipc_server::run from default startup path.
+      files_to_create: []
+      implementation_steps:
+        - step: 1
+          action: "Wire ProtocolServer into main entrypoint"
+          details: "Bind operator/session sockets and accept connections."
+        - step: 2
+          action: "Remove legacy IPC startup"
+          details: "Delete ipc_server::run spawn and legacy socket usage."
+      acceptance_criteria:
+        - criterion: "Daemon starts ProtocolServer-only control plane"
+          verification: "Runtime logs + integration test show only operator/session sockets"
+        - criterion: "Legacy JSON IPC listener is not started"
+          verification: "ADV-012 cannot connect to legacy socket"
+      test_requirements:
+        - test_id: INT-IPC-010
+          description: "ProtocolServer-only startup"
+          verification_command: "cargo test -p apm2-daemon protocol_only_startup"
+
+    - ticket_id: TCK-00280
+      title: "Config schema cutover: dual sockets only"
+      group_id: GRP-010
+      phase: PHASE-1
+      requirement_ids:
+        - REQ-DCP-0001
+        - REQ-DCP-0008
+      depends_on: []
+      files_to_modify:
+        - path: "crates/apm2-core/src/config/mod.rs"
+          changes: |
+            Replace daemon.socket with operator_socket + session_socket.
+            Reject legacy single-socket keys (fail-closed).
+        - path: "ecosystem.example.toml"
+          changes: |
+            Use operator_socket + session_socket keys.
+      files_to_create: []
+      implementation_steps:
+        - step: 1
+          action: "Define dual socket config keys"
+          details: "Add operator_socket + session_socket fields."
+        - step: 2
+          action: "Fail-closed on legacy key"
+          details: "Reject [daemon].socket if present."
+      acceptance_criteria:
+        - criterion: "Legacy single-socket config rejected"
+          verification: "Unit test fails parsing with [daemon].socket"
+        - criterion: "Dual sockets are required"
+          verification: "Config validation fails without both operator/session sockets"
+      test_requirements:
+        - test_id: UT-CONFIG-010
+          description: "Legacy socket key rejection"
+          verification_command: "cargo test -p apm2-core config_reject_legacy_socket"
+
+    - ticket_id: TCK-00281
+      title: "Delete legacy JSON IPC modules"
+      group_id: GRP-010
+      phase: PHASE-1
+      requirement_ids:
+        - REQ-DCP-0001
+        - REQ-DCP-0008
+      depends_on:
+        - TCK-00279
+      files_to_modify:
+        - path: "crates/apm2-daemon/src/ipc_server.rs"
+          changes: "Remove legacy JSON IPC server module."
+        - path: "crates/apm2-daemon/src/handlers.rs"
+          changes: "Remove or port legacy JSON handler surface."
+        - path: "crates/apm2-core/src/ipc/mod.rs"
+          changes: "Remove JSON IPC protocol types once unused."
+      files_to_create: []
+      implementation_steps:
+        - step: 1
+          action: "Remove legacy ipc_server module"
+          details: "Delete JSON framing and dispatch loop."
+        - step: 2
+          action: "Remove legacy JSON protocol types"
+          details: "Delete apm2_core::ipc once no call sites remain."
+      acceptance_criteria:
+        - criterion: "No legacy JSON IPC modules remain in default build"
+          verification: "CI guardrails + build succeed without legacy symbols"
+      test_requirements:
+        - test_id: CI-LEGACY-IPC-001
+          description: "Build fails if legacy IPC symbols remain"
+          verification_command: "ci/legacy_ipc_guard.sh"
+
+    - ticket_id: TCK-00282
+      title: "CI guardrails: forbid legacy IPC reintroduction"
+      group_id: GRP-010
+      phase: PHASE-1
+      requirement_ids:
+        - REQ-DCP-0008
+      depends_on:
+        - TCK-00281
+      files_to_modify:
+        - path: "scripts/ci/legacy_ipc_guard.sh"
+          changes: |
+            Add guard that fails on ipc_server, apm2_core::ipc, daemon.socket keys.
+        - path: ".github/workflows/*"
+          changes: "Wire guard into CI pipeline."
+      files_to_create:
+        - path: "scripts/ci/legacy_ipc_guard.sh"
+          purpose: "Fail build on legacy IPC symbols/paths/config keys"
+      implementation_steps:
+        - step: 1
+          action: "Implement guard script"
+          details: "rg checks for legacy IPC symbols and legacy config keys."
+        - step: 2
+          action: "Wire guard into CI"
+          details: "Fail builds that reintroduce legacy IPC."
+      acceptance_criteria:
+        - criterion: "CI fails on legacy IPC reintroduction"
+          verification: "Guard script fails on forbidden symbols"
+      test_requirements:
+        - test_id: CI-LEGACY-IPC-002
+          description: "Guard runs in CI"
+          verification_command: "scripts/ci/legacy_ipc_guard.sh"
+
+    - ticket_id: TCK-00283
+      title: "ADV-012 legacy IPC bypass test"
+      group_id: GRP-010
+      phase: PHASE-1
+      requirement_ids:
+        - REQ-DCP-0001
+        - REQ-DCP-0008
+      depends_on:
+        - TCK-00279
+        - TCK-00281
+      files_to_modify:
+        - path: "crates/apm2-daemon/tests/adv_012_legacy_ipc.rs"
+          changes: "Add ADV-012 adversarial test."
+      files_to_create:
+        - path: "crates/apm2-daemon/tests/adv_012_legacy_ipc.rs"
+          purpose: "Legacy JSON IPC bypass + downgrade attempt"
+      implementation_steps:
+        - step: 1
+          action: "Add ADV-012 test harness"
+          details: "Probe legacy socket and send JSON frames to ProtocolServer sockets."
+        - step: 2
+          action: "Record evidence"
+          details: "Emit evidence artifacts per PRD-0010 evidence standards."
+      acceptance_criteria:
+        - criterion: "Legacy socket path absent/refuses connection"
+          verification: "ADV-012 fails to connect to legacy socket"
+        - criterion: "ProtocolServer rejects JSON frames before handlers"
+          verification: "ADV-012 fails downgrade attempts"
+      test_requirements:
+        - test_id: ADV-012
+          description: "Legacy JSON IPC bypass + downgrade attempt"
+          verification_command: "cargo test -p apm2-daemon adv_012_legacy_ipc"
+
+    - ticket_id: TCK-00284
+      title: "xtask bypass closure for external projections"
+      group_id: GRP-010
+      phase: PHASE-1
+      requirement_ids:
+        - REQ-0014
+      depends_on: []
+      files_to_modify:
+        - path: "xtask/src/tasks/review.rs"
+          changes: "Remove or hard-fail direct GitHub status writes."
+        - path: "xtask/src/tasks/aat.rs"
+          changes: "Remove or hard-fail direct GitHub status writes."
+      files_to_create: []
+      implementation_steps:
+        - step: 1
+          action: "Disable direct status writes"
+          details: "Replace gh api status calls with hard-fail or daemon-mediated path."
+        - step: 2
+          action: "Add guardrails"
+          details: "Ensure xtask cannot write external projections."
+      acceptance_criteria:
+        - criterion: "No direct external status writes from xtask"
+          verification: "Code inspection + CI guard confirms removal"
+        - criterion: "Authority-affecting xtask ops fail-closed"
+          verification: "Attempted status write errors explicitly"
+      test_requirements:
+        - test_id: UT-XTASK-014
+          description: "xtask external write paths removed"
+          verification_command: "cargo test -p xtask"

@@ -1,0 +1,31 @@
+requirement:
+  id: REQ-DCP-0013
+  title: "Daemon Crash Recovery"
+  status: ACTIVE
+
+  statement: |
+    On daemon restart, active sessions MUST be revoked and recovered in a
+    fail-closed manner within 5 seconds.
+
+  rationale: |
+    Daemon recovery ensures sessions cannot continue operating without control
+    plane mediation and prevents orphaned execution.
+
+  acceptance_criteria:
+    - id: AC-DCP-0013-001
+      description: "Session registry persists across daemon restart."
+      verification: "UT-SESS-001 validates registry persistence."
+    - id: AC-DCP-0013-002
+      description: "LEASE_REVOKED is delivered within timeout."
+      verification: "UT-SESS-002 validates signal delivery."
+    - id: AC-DCP-0013-003
+      description: "End-to-end crash recovery flow succeeds."
+      verification: "INT-005 demonstrates recovery behavior."
+
+  design_references:
+    - "02_design_decisions.yaml#DD-005"
+
+  test_references:
+    - "07_test_and_evidence.yaml#UT-SESS-001"
+    - "07_test_and_evidence.yaml#UT-SESS-002"
+    - "07_test_and_evidence.yaml#INT-005"

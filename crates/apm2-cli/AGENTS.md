@@ -84,7 +84,7 @@ Primary command enum with subcommands for all daemon operations.
 
 **Contracts:**
 - [CTR-CLI-001] `Daemon` spawns `apm2-daemon` binary, does not implement daemon logic directly.
-- [CTR-CLI-002] `Kill` sends `IpcRequest::Shutdown` to daemon.
+- [CTR-CLI-002] `Kill` issues a shutdown request via ProtocolServer; legacy JSON IPC is forbidden.
 - [CTR-CLI-003] Process commands require daemon to be running.
 
 ### `CredsCommands`
@@ -119,62 +119,42 @@ Credential management subcommands.
 
 ### Process Management
 
-| Command | Description | IPC Request |
-|---------|-------------|-------------|
-| `apm2 start <name>` | Start a process | `StartProcess { name }` |
-| `apm2 stop <name>` | Stop a process | `StopProcess { name }` |
-| `apm2 restart <name>` | Restart a process | `RestartProcess { name }` |
-| `apm2 reload <name>` | Rolling restart | `ReloadProcess { name }` |
-| `apm2 list` (alias: `ls`) | List all processes | `ListProcesses` |
-| `apm2 status <name>` | Show process details | `GetProcess { name }` |
-| `apm2 logs <name>` | Tail process logs | `TailLogs { name, lines, follow }` |
+| Command | Description |
+|---------|-------------|
+| `apm2 start <name>` | Start a process |
+| `apm2 stop <name>` | Stop a process |
+| `apm2 restart <name>` | Restart a process |
+| `apm2 reload <name>` | Rolling restart |
+| `apm2 list` (alias: `ls`) | List all processes |
+| `apm2 status <name>` | Show process details |
+| `apm2 logs <name>` | Tail process logs |
 
 ### Credential Management
 
-| Command | Description | IPC Request |
-|---------|-------------|-------------|
-| `apm2 creds list` | List credential profiles | `ListCredentials` |
-| `apm2 creds add` | Add credential profile | `AddCredential { ... }` |
-| `apm2 creds remove` | Remove credential profile | `RemoveCredential { profile_id }` |
-| `apm2 creds refresh` | Force refresh credentials | `RefreshCredential { profile_id }` |
-| `apm2 creds switch` | Switch process credentials | `SwitchCredential { ... }` |
-| `apm2 creds login` | Interactive login (client-side) | N/A |
+| Command | Description |
+|---------|-------------|
+| `apm2 creds list` | List credential profiles |
+| `apm2 creds add` | Add credential profile |
+| `apm2 creds remove` | Remove credential profile |
+| `apm2 creds refresh` | Force refresh credentials |
+| `apm2 creds switch` | Switch process credentials |
+| `apm2 creds login` | Interactive login (client-side) |
 
-## IPC Client
+## IPC Client (ProtocolServer-only, DD-009)
 
-Each command module implements `send_request` for daemon communication:
-
-```rust
-fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcResponse> {
-    // 1. Connect to Unix socket
-    let mut stream = UnixStream::connect(socket_path)?;
-
-    // 2. Serialize and frame request
-    let json = serde_json::to_vec(&request)?;
-    let framed = frame_message(&json);
-    stream.write_all(&framed)?;
-
-    // 3. Read response length prefix
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    // 4. Read and parse response
-    let mut response_buf = vec![0u8; len];
-    stream.read_exact(&mut response_buf)?;
-    let response: IpcResponse = serde_json::from_slice(&response_buf)?;
-
-    Ok(response)
-}
-```
+CLI control-plane IPC must use ProtocolServer handshake + binary framing only.
+Legacy JSON IPC (`apm2_core::ipc`) is forbidden by DD-009 and must not be used.
+Until ProtocolServer wiring is complete, CLI control-plane usage is de-scoped and
+must not be treated as an authority surface.
 
 **Invariants:**
-- [INV-CLI-003] Uses length-prefixed JSON framing per `apm2_core::ipc` protocol.
+- [INV-CLI-003] Uses ProtocolServer framing and handshake; JSON framing is prohibited.
 - [INV-CLI-004] Connection is closed after each request-response cycle (stateless).
+- [INV-CLI-005] Operator vs session sockets are distinct; privileged calls use operator.sock only.
 
 **Contracts:**
 - [CTR-CLI-101] Returns `Error` with context if socket connection fails.
-- [CTR-CLI-102] Returns `Error` if daemon returns `IpcResponse::Error`.
+- [CTR-CLI-102] Returns `Error` if daemon returns protocol error status.
 - [CTR-CLI-103] Exits with non-zero status on any error.
 
 ## Output Formatting
@@ -271,27 +251,14 @@ Next steps:
 
 ## Error Handling
 
-Commands handle daemon responses uniformly:
-
-```rust
-match send_request(socket_path, &request)? {
-    IpcResponse::Ok { message } => {
-        println!("Success{}", message.map(|m| format!(": {m}")).unwrap_or_default());
-    }
-    IpcResponse::Error { code, message } => {
-        bail!("Failed: {message} ({code:?})");
-    }
-    _ => bail!("Unexpected response"),
-}
-```
+Commands surface daemon errors and exit non-zero on failure.
 
 **Contracts:**
-- [CTR-CLI-106] All error messages include the `ErrorCode` for debugging.
+- [CTR-CLI-106] All error messages include a structured error code when available.
 - [CTR-CLI-107] Connection errors suggest checking if daemon is running.
 
 ## Related Modules
 
-- [`apm2_core::ipc`](../apm2-core/src/ipc/AGENTS.md) - Wire protocol types and framing functions
 - [`apm2_core::config`](../apm2-core/src/config/AGENTS.md) - `EcosystemConfig` for socket path resolution
 - [`apm2_daemon`](../apm2-daemon/AGENTS.md) - Server-side implementation
 

@@ -117,6 +117,21 @@ rfc_test_and_evidence:
             invariant_tested: INV-0002
             added_by: "RFC Council FINALIZE - FND-RFC-0017-SA3-006"
 
+          - test_id: ADV-012
+            name: "Legacy JSON IPC bypass + downgrade attempt"
+            description: |
+              Attempt to connect to the legacy single-socket path (daemon.sock)
+              and send a length-prefixed JSON IpcRequest::Ping. Also attempt to
+              send JSON frames to operator.sock and session.sock to force a
+              protocol downgrade.
+            expected: |
+              1. Legacy single-socket path does not exist or refuses connection.
+              2. ProtocolServer sockets reject JSON frames before handler logic.
+              3. No control-plane operation executes via legacy framing.
+            requirement_ids: [REQ-DCP-0001, REQ-DCP-0008]
+            threat_coverage: [TH-002]
+            added_by: "Amendment A-001 (DD-009)"
+
       - category: UNIT
         description: "Isolated unit tests for individual components"
         tests:

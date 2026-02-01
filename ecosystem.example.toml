@@ -3,7 +3,8 @@
 
 [daemon]
 pid_file = "/var/run/apm2/apm2.pid"
-socket = "/var/run/apm2/apm2.sock"
+operator_socket = "/var/run/apm2/operator.sock"
+session_socket = "/var/run/apm2/session.sock"
 log_dir = "/var/log/apm2"
 state_file = "/var/lib/apm2/state.json"
 

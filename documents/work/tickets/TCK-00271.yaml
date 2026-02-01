@@ -11,7 +11,10 @@ implementation:
       path: crates/apm2-cli/src/client/daemon.rs
   implementation_steps: []
   summary: ""
-notes: "Phase: PHASE-4\nGenerated from RFC RFC-0017 ticket decomposition on 2026-01-30."
+notes: |
+  Phase: PHASE-4
+  Generated from RFC RFC-0017 ticket decomposition on 2026-01-30.
+  CANCELLED (DD-009 hard cutover): CLI migration de-scoped; no legacy adapter path.
 schema_version: "2026-01-26"
 template_version: "2026-01-26"
 test_requirements:
@@ -26,5 +29,5 @@ ticket:
   id: TCK-00271
   requirement_ids: []
   rfc_id: RFC-0017
-  status: READY
+  status: CANCELLED
   title: Implement apm2 episode spawn command

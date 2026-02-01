@@ -1,0 +1,43 @@
+requirement:
+  id: REQ-DCP-0008
+  title: "IPC Authentication"
+  status: ACTIVE
+
+  statement: |
+    ProtocolServer control-plane IPC MUST authenticate clients via SO_PEERCRED
+    and per-connection capability tokens. Legacy JSON IPC and single-socket
+    configurations are forbidden (DD-009).
+
+  rationale: |
+    Peer credentials establish locality/identity while tokens bind sessions.
+    Eliminating legacy IPC prevents downgrade and bypass paths.
+
+  acceptance_criteria:
+    - id: AC-DCP-0008-001
+      description: "SO_PEERCRED extraction is enforced on operator.sock and session.sock."
+      verification: "UT-IPC-001 demonstrates peer credential extraction."
+    - id: AC-DCP-0008-002
+      description: "Per-connection capability tokens are issued and validated."
+      verification: "UT-IPC-002 validates token issuance/verification."
+    - id: AC-DCP-0008-003
+      description: "Legacy JSON IPC listener is absent; legacy socket keys rejected."
+      verification: "ADV-012 + config-parse tests prove fail-closed behavior."
+    - id: AC-DCP-0008-004
+      description: "JSON downgrade attempts are rejected before handler logic."
+      verification: "ADV-012 rejects JSON frames on ProtocolServer sockets."
+    - id: AC-DCP-0008-005
+      description: "UID remapping risk is explicitly tested."
+      verification: "ADV-009 validates container UID remapping behavior."
+
+  design_references:
+    - "02_design_decisions.yaml#DD-001"
+    - "02_design_decisions.yaml#DD-009"
+
+  test_references:
+    - "07_test_and_evidence.yaml#UT-IPC-001"
+    - "07_test_and_evidence.yaml#UT-IPC-002"
+    - "07_test_and_evidence.yaml#ADV-009"
+    - "07_test_and_evidence.yaml#ADV-012"
+
+  law_refs:
+    - LAW-05

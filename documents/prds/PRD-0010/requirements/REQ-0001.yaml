@@ -7,12 +7,14 @@ prd_requirement:
   title: "IPC Privilege Separation"
   statement: |
     apm2-daemon MUST separate IPC endpoints into privileged (operator-only) and
-    session-scoped (bound to session_id) categories; agents MUST NOT be able to
-    call privileged endpoints directly.
+    session-scoped (bound to session_id) categories using the dual-socket
+    topology (operator.sock + session.sock) mandated by DD-009; legacy JSON IPC
+    listeners or adapters are forbidden.
   acceptance_criteria:
-    - "Privileged endpoints (ClaimWork, SpawnEpisode, IssueCapability, Shutdown) require operator credential. Verified by: ADV-001 test shows agent call to ClaimWork returns PERMISSION_DENIED."
-    - "Session-scoped endpoints (RequestTool, EmitEvent, PublishEvidence, StreamTelemetry) bound to authenticated session_id. Verified by: Test shows session-scoped call without valid session_id is rejected."
-    - "Denied privilege escalation returns generic PERMISSION_DENIED without endpoint enumeration. Verified by: Error message inspection shows no endpoint names leaked."
+    - "Privileged endpoints (ClaimWork, SpawnEpisode, IssueCapability, Shutdown) are reachable only via operator.sock with operator credentials. Verified by: ADV-001/ADV-002 show PERMISSION_DENIED from session scope."
+    - "Session-scoped endpoints (RequestTool, EmitEvent, PublishEvidence, StreamTelemetry) are reachable only via session.sock with authenticated session_token. Verified by: session-scoped call without valid session_token is rejected."
+    - "Legacy JSON IPC listener is absent and single-socket configs are rejected (DD-009). Verified by: ADV-012 and config-parse tests."
+    - "JSON frames sent to ProtocolServer sockets are rejected before handler logic. Verified by: ADV-012."
   evidence:
     evidence_ids:
       - EVID-0001

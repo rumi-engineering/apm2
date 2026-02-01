@@ -29,14 +29,14 @@ prd_evidence_artifact:
           - "Test process runs without operator credentials"
       - id: "CMD-0002"
         shell: "bash"
-        command: "stat -c '%U:%G %a' /run/apm2/daemon.sock"
+        command: "stat -c '%U:%G %a' /run/apm2/operator.sock"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 5
         network_access: "DISALLOWED"
         allowlist_hosts: []
         constraints:
-          - "Socket path matches configured path"
+          - "Operator socket path matches configured path"
   assertions:
     - "All privileged endpoints (ClaimWork, SpawnEpisode, IssueCapability, Shutdown) reject unprivileged caller"
     - "Error response is generic PERMISSION_DENIED without endpoint enumeration"

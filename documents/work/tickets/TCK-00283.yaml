@@ -1,0 +1,37 @@
+acceptance_criteria:
+  - criterion: Legacy socket path absent or refused
+    verification: ADV-012 cannot connect to daemon.sock
+  - criterion: JSON downgrade attempts fail
+    verification: ADV-012 shows JSON frames rejected before handlers
+implementation:
+  code_examples: []
+  files_to_create:
+    - path: crates/apm2-daemon/tests/adv_012_legacy_ipc.rs
+      purpose: Adversarial test for legacy IPC bypass + downgrade attempt
+  files_to_modify:
+    - changes: "Add ADV-012 adversarial test and evidence capture."
+      path: crates/apm2-daemon/tests/adv_012_legacy_ipc.rs
+  implementation_steps:
+    - "Implement ADV-012 test harness"
+    - "Capture evidence artifacts per PRD-0010 standards"
+  summary: "Implement ADV-012 legacy IPC bypass test."
+notes: |
+  Phase: PHASE-1
+  Added by Amendment A-001 (DD-009 hard cutover).
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+test_requirements:
+  - description: ADV-012 passes
+    test_id: ADV-012
+    verification_command: cargo test -p apm2-daemon adv_012_legacy_ipc
+ticket:
+  depends_on:
+    - TCK-00279
+    - TCK-00281
+  id: TCK-00283
+  requirement_ids:
+    - REQ-DCP-0001
+    - REQ-DCP-0008
+  rfc_id: RFC-0017
+  status: READY
+  title: ADV-012 legacy IPC bypass test

@@ -50,33 +50,27 @@ rfc_rollout_and_ops:
           - "Context firewall bypass"
 
       - id: PHASE-4
-        name: "CLI Migration"
-        description: "New apm2 CLI commands using daemon IPC"
+        name: "CLI Migration (Cancelled by DD-009)"
+        description: "De-scoped under hard cutover; no legacy adapter path"
         deliverables:
-          - "apm2 work claim"
-          - "apm2 episode spawn"
-          - "apm2 fac ingest"
-          - "apm2 work status"
+          - "Cancelled: CLI migration is out of scope for DD-009"
         gates:
-          - "All commands functional via daemon IPC"
-          - "Help text documents migration from xtask"
+          - "N/A (cancelled)"
         rollback_criteria:
-          - "CLI commands fail to connect to daemon"
-          - "Functionality regression vs xtask"
+          - "N/A (cancelled)"
 
       - id: PHASE-5
-        name: "xtask Deprecation"
-        description: "Deprecate and remove xtask commands"
+        name: "xtask Bypass Closure"
+        description: "Disable authority-affecting xtask operations (fail-closed)"
         deliverables:
-          - "Deprecation warnings on xtask commands"
-          - "--allow-deprecated gate"
-          - "xtask crate removal after telemetry gate"
+          - "Authority-affecting xtask ops hard-fail or route via daemon projection"
+          - "Direct external status writes removed"
         gates:
-          - "Telemetry shows <5% xtask direct usage"
-          - "Adversarial test ADV-008 passes"
+          - "CI guardrails block legacy IPC + external writes"
+          - "Adversarial test ADV-012 passes"
         rollback_criteria:
-          - "Telemetry shows sustained high xtask usage"
-          - "Critical workflow breakage reported"
+          - "Bypass path discovered"
+          - "Projection-only enforcement regression"
 
   operational_considerations:
     monitoring:
@@ -175,27 +169,26 @@ rfc_rollout_and_ops:
         - "Mount Unix socket directory with appropriate permissions"
         - "Daemon process runs as non-root user with capability to bind socket"
       socket_location:
-        default: "$XDG_RUNTIME_DIR/apm2/daemon.sock"
-        fallback: "/tmp/apm2-$USER/daemon.sock"
+        operator_default: "$XDG_RUNTIME_DIR/apm2/operator.sock"
+        operator_fallback: "/tmp/apm2-$USER/operator.sock"
+        session_default: "$XDG_RUNTIME_DIR/apm2/session.sock"
+        session_fallback: "/tmp/apm2-$USER/session.sock"
       permissions:
-        socket: "0600 (owner only)"
+        operator_socket: "0600 (owner only)"
+        session_socket: "0660 (owner + group)"
         socket_dir: "0700 (owner only)"
 
   deprecation_timeline:
     milestones:
       - milestone: "Phase 5 start"
-        action: "Add deprecation warnings to all xtask commands"
+        action: "Disable authority-affecting xtask operations (hard-fail or route via daemon projection)"
         duration_estimate: "1 release cycle"
-
-      - milestone: "Phase 5 midpoint"
-        action: "Require --allow-deprecated flag"
-        gate: "Telemetry shows decreasing trend"
 
       - milestone: "Phase 5 complete"
         action: "Remove xtask crate"
-        gate: "Telemetry shows <5% direct usage"
+        gate: "Replacement workflows validated; no telemetry gate"
 
     divergence_policy: |
-      During deprecation period, divergence from xtask direct writes emits
-      WARNING but does NOT trigger freeze. Full freeze enforcement for
-      unauthorized mutations starts after Phase 5 (xtask removal).
+      Authority-affecting xtask operations are fail-closed immediately under
+      DD-009. Divergence from projection-only paths triggers hard failure and
+      is treated as a security defect, not a warning.
