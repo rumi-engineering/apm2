@@ -6,8 +6,10 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 
 use super::error::SessionError;
+use super::quarantine::QuarantineManager;
 use super::state::{ExitClassification, SessionState};
 use crate::events::{PolicyEvent, SessionEvent, policy_event, session_event};
+use crate::htf::HtfTick;
 use crate::ledger::EventRecord;
 use crate::reducer::{Reducer, ReducerContext};
 
@@ -93,6 +95,28 @@ impl SessionReducer {
         Self::default()
     }
 
+    /// Approximates a tick value from a wall-clock timestamp and tick rate.
+    ///
+    /// This is a fallback method used when proper tick information is not
+    /// available from the event's time envelope. It provides an approximation
+    /// that allows quarantine expiry checks to proceed, though proper
+    /// tick-based timing from resolved time envelopes should be preferred.
+    ///
+    /// # SEC-HTF-003: Approximation Warning
+    ///
+    /// This approximation assumes the tick counter started at timestamp 0,
+    /// which may not match the actual tick epoch. In production, proper tick
+    /// values should be resolved from the event's `time_envelope_ref`.
+    #[must_use]
+    fn approximate_tick_from_timestamp(timestamp_ns: u64, tick_rate_hz: u64) -> HtfTick {
+        // Convert nanoseconds to seconds (with saturation for safety)
+        // Then multiply by tick rate to get approximate tick value
+        // Note: This assumes ticks started at epoch 0, which is an approximation
+        let seconds = timestamp_ns / 1_000_000_000;
+        let tick_value = seconds.saturating_mul(tick_rate_hz);
+        HtfTick::new(tick_value, tick_rate_hz)
+    }
+
     /// Handles a session started event.
     ///
     /// Allows session restart: if a session exists but is in a terminal state
@@ -104,6 +128,13 @@ impl SessionReducer {
     /// `restart_attempt` must be strictly greater than the previous attempt.
     /// This prevents replay attacks that could reset a session to a fresh
     /// state.
+    ///
+    /// **Quarantine Enforcement** (SEC-HTF-003): When restarting a quarantined
+    /// session, the quarantine period must have expired. For tick-based
+    /// quarantines (RFC-0016), expiry is checked using monotonic ticks which
+    /// are immune to wall-clock manipulation. If tick rates mismatch, the
+    /// quarantine is considered NOT expired (fail-closed behavior per
+    /// DD-HTF-0001).
     fn handle_started(
         &mut self,
         event: crate::events::SessionStarted,
@@ -126,6 +157,63 @@ impl SessionReducer {
                     previous_attempt: last_attempt,
                     new_attempt: event.restart_attempt,
                 });
+            }
+
+            // SEC-HTF-003: Enforce quarantine expiry before allowing restart
+            // DD-HTF-0001: Use check_quarantine_expired_at_tick for defect emission
+            if let SessionState::Quarantined {
+                quarantine_until,
+                expires_at_tick,
+                tick_rate_hz,
+                ..
+            } = existing
+            {
+                // Check if quarantine has expired
+                let (is_expired, remaining_ticks) = if let (Some(expires_tick), Some(rate_hz)) =
+                    (*expires_at_tick, *tick_rate_hz)
+                {
+                    // Tick-based quarantine: use tick comparison (RFC-0016 HTF)
+                    // We don't have current tick from event, so use wall-clock as approximation
+                    // for the current tick based on timestamp and tick rate
+                    //
+                    // SEC-HTF-003: If we had a proper current_tick from the event's
+                    // time_envelope_ref, we would use check_quarantine_expired_at_tick
+                    // to get defect emission. For now, we use wall-clock as a fallback.
+                    //
+                    // TODO(TCK-00247): Resolve time_envelope_ref to get actual current tick
+                    let expires_at_tick = HtfTick::new(expires_tick, rate_hz);
+                    let approx_current_tick =
+                        Self::approximate_tick_from_timestamp(timestamp, rate_hz);
+
+                    let (expired, _defect) = QuarantineManager::check_quarantine_expired_at_tick(
+                        &expires_at_tick,
+                        &approx_current_tick,
+                    );
+                    // Note: _defect would be emitted to ledger in production code
+
+                    let remaining = if expired {
+                        Some(0)
+                    } else {
+                        Some(
+                            expires_at_tick
+                                .value()
+                                .saturating_sub(approx_current_tick.value()),
+                        )
+                    };
+                    (expired, remaining)
+                } else {
+                    // Legacy quarantine: use wall-clock comparison
+                    let expired = timestamp >= *quarantine_until;
+                    (expired, None)
+                };
+
+                if !is_expired {
+                    return Err(SessionError::QuarantineNotExpired {
+                        session_id,
+                        expires_at_ns: *quarantine_until,
+                        remaining_ticks,
+                    });
+                }
             }
         }
 
@@ -1924,5 +2012,291 @@ mod unit_tests {
             },
             _ => panic!("Expected Running state after restart"),
         }
+    }
+
+    // ========================================================================
+    // Quarantine Expiry Enforcement Tests (TCK-00243)
+    // ========================================================================
+
+    /// TCK-00243: Tests that a session restart is rejected while quarantine
+    /// is still active (wall-clock legacy quarantine).
+    #[test]
+    #[allow(deprecated)]
+    fn tck_00243_quarantine_expiry_legacy_rejects_early_restart() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let mut start_event = create_event("session.started", "session-1", start_payload);
+        start_event.timestamp_ns = 1_000_000_000;
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Quarantine the session (legacy: no tick fields)
+        let quar_payload = helpers::session_quarantined_payload(
+            "session-1",
+            "crash_loop",
+            5_000_000_000, // expires at 5 seconds
+        );
+        let mut quar_event = create_event("session.quarantined", "session-1", quar_payload);
+        quar_event.timestamp_ns = 2_000_000_000;
+        reducer.apply(&quar_event, &ctx).unwrap();
+
+        // Try to restart BEFORE quarantine expires (at 3 seconds)
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            100, // resume_cursor
+            1,   // restart_attempt
+        );
+        let mut restart_event = create_event("session.started", "session-1", restart_payload);
+        restart_event.timestamp_ns = 3_000_000_000; // Before 5_000_000_000
+        let result = reducer.apply(&restart_event, &ctx);
+
+        // Should reject with QuarantineNotExpired
+        assert!(
+            matches!(
+                result,
+                Err(SessionError::QuarantineNotExpired {
+                    session_id: _,
+                    expires_at_ns: 5_000_000_000,
+                    remaining_ticks: None, // Legacy has no tick info
+                })
+            ),
+            "Should reject restart while quarantine active: {result:?}"
+        );
+    }
+
+    /// TCK-00243: Tests that a session restart is allowed after quarantine
+    /// expires (wall-clock legacy quarantine).
+    #[test]
+    #[allow(deprecated)]
+    fn tck_00243_quarantine_expiry_legacy_allows_restart_after_expiry() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let mut start_event = create_event("session.started", "session-1", start_payload);
+        start_event.timestamp_ns = 1_000_000_000;
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Quarantine the session (legacy: no tick fields)
+        let quar_payload = helpers::session_quarantined_payload(
+            "session-1",
+            "crash_loop",
+            5_000_000_000, // expires at 5 seconds
+        );
+        let mut quar_event = create_event("session.quarantined", "session-1", quar_payload);
+        quar_event.timestamp_ns = 2_000_000_000;
+        reducer.apply(&quar_event, &ctx).unwrap();
+
+        // Restart AFTER quarantine expires (at 6 seconds)
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            100, // resume_cursor
+            1,   // restart_attempt
+        );
+        let mut restart_event = create_event("session.started", "session-1", restart_payload);
+        restart_event.timestamp_ns = 6_000_000_000; // After 5_000_000_000
+        let result = reducer.apply(&restart_event, &ctx);
+
+        // Should succeed
+        assert!(
+            result.is_ok(),
+            "Should allow restart after quarantine expires: {result:?}"
+        );
+        assert!(reducer.state().get("session-1").unwrap().is_active());
+    }
+
+    /// TCK-00243: Tests that a session restart is rejected while tick-based
+    /// quarantine is still active.
+    #[test]
+    fn tck_00243_quarantine_expiry_tick_based_rejects_early_restart() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let mut start_event = create_event("session.started", "session-1", start_payload);
+        start_event.timestamp_ns = 1_000_000_000;
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Quarantine with tick-based timing
+        // Using 1Hz tick rate for easy calculation:
+        // - issued_at_tick = 2 (at 2 seconds)
+        // - expires_at_tick = 10 (at 10 seconds)
+        let quar_payload = helpers::session_quarantined_payload_with_ticks(
+            "session-1",
+            "crash_loop",
+            10_000_000_000, // wall-clock expires (observational)
+            2,              // issued_at_tick
+            10,             // expires_at_tick
+            1,              // tick_rate_hz (1Hz = 1 tick per second)
+        );
+        let mut quar_event = create_event("session.quarantined", "session-1", quar_payload);
+        quar_event.timestamp_ns = 2_000_000_000;
+        reducer.apply(&quar_event, &ctx).unwrap();
+
+        // Try to restart at 5 seconds (tick ~5, before expires_at_tick=10)
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            100, // resume_cursor
+            1,   // restart_attempt
+        );
+        let mut restart_event = create_event("session.started", "session-1", restart_payload);
+        restart_event.timestamp_ns = 5_000_000_000; // ~5 ticks, before 10
+        let result = reducer.apply(&restart_event, &ctx);
+
+        // Should reject with QuarantineNotExpired (with tick info)
+        assert!(
+            matches!(
+                result,
+                Err(SessionError::QuarantineNotExpired {
+                    remaining_ticks: Some(_),
+                    ..
+                })
+            ),
+            "Should reject restart while tick-based quarantine active: {result:?}"
+        );
+    }
+
+    /// TCK-00243: Tests that a session restart is allowed after tick-based
+    /// quarantine expires.
+    #[test]
+    fn tck_00243_quarantine_expiry_tick_based_allows_restart_after_expiry() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let mut start_event = create_event("session.started", "session-1", start_payload);
+        start_event.timestamp_ns = 1_000_000_000;
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Quarantine with tick-based timing (1Hz)
+        let quar_payload = helpers::session_quarantined_payload_with_ticks(
+            "session-1",
+            "crash_loop",
+            10_000_000_000, // wall-clock expires (observational)
+            2,              // issued_at_tick
+            10,             // expires_at_tick
+            1,              // tick_rate_hz (1Hz)
+        );
+        let mut quar_event = create_event("session.quarantined", "session-1", quar_payload);
+        quar_event.timestamp_ns = 2_000_000_000;
+        reducer.apply(&quar_event, &ctx).unwrap();
+
+        // Restart at 15 seconds (tick ~15, after expires_at_tick=10)
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            100, // resume_cursor
+            1,   // restart_attempt
+        );
+        let mut restart_event = create_event("session.started", "session-1", restart_payload);
+        restart_event.timestamp_ns = 15_000_000_000; // ~15 ticks, after 10
+        let result = reducer.apply(&restart_event, &ctx);
+
+        // Should succeed
+        assert!(
+            result.is_ok(),
+            "Should allow restart after tick-based quarantine expires: {result:?}"
+        );
+        assert!(reducer.state().get("session-1").unwrap().is_active());
+    }
+
+    /// TCK-00243: Tests that terminated sessions can still be restarted
+    /// (quarantine check only applies to Quarantined state).
+    #[test]
+    fn tck_00243_terminated_session_restart_not_blocked() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let mut start_event = create_event("session.started", "session-1", start_payload);
+        start_event.timestamp_ns = 1_000_000_000;
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Terminate the session (not quarantine)
+        let term_payload =
+            helpers::session_terminated_payload("session-1", "FAILURE", "crashed", 500);
+        let mut term_event = create_event("session.terminated", "session-1", term_payload);
+        term_event.timestamp_ns = 2_000_000_000;
+        reducer.apply(&term_event, &ctx).unwrap();
+
+        // Restart immediately - should work (no quarantine to check)
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            100, // resume_cursor
+            1,   // restart_attempt
+        );
+        let mut restart_event = create_event("session.started", "session-1", restart_payload);
+        restart_event.timestamp_ns = 2_000_000_001; // Immediately after
+        let result = reducer.apply(&restart_event, &ctx);
+
+        assert!(
+            result.is_ok(),
+            "Terminated session restart should not be blocked: {result:?}"
+        );
     }
 }

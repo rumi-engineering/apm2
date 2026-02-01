@@ -510,8 +510,9 @@ impl RestartCoordinator {
             };
         }
 
-        // Fall back to regular restart decision
-        self.should_restart(crash_event, entropy_summary)
+        // Fall back to regular restart decision using tick-based method
+        // SEC-HTF-003: Use tick-based restart decision to avoid mixed clock domains
+        self.should_restart_at_tick(crash_event, entropy_summary, current_tick)
     }
 }
 

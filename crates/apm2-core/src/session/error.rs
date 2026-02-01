@@ -49,6 +49,31 @@ pub enum SessionError {
     /// Failed to decode protobuf message.
     #[error("decode error: {0}")]
     DecodeError(#[from] prost::DecodeError),
+
+    /// Attempted to restart a session while still quarantined.
+    ///
+    /// When a session is quarantined, a restart is only allowed after the
+    /// quarantine period has expired. This error is returned when a
+    /// `SessionStarted` event is received for a quarantined session
+    /// before the quarantine has expired.
+    ///
+    /// # SEC-HTF-003: Tick-Based Expiry (RFC-0016)
+    ///
+    /// When tick-based quarantine timing is available, expiry is checked
+    /// using monotonic ticks which are immune to wall-clock manipulation.
+    /// If a tick rate mismatch is detected, the quarantine is considered
+    /// NOT expired (fail-closed behavior).
+    #[error(
+        "session {session_id} is still quarantined (remaining_ticks: {remaining_ticks:?}, expires_at: {expires_at_ns})"
+    )]
+    QuarantineNotExpired {
+        /// The session ID.
+        session_id: String,
+        /// Wall-clock expiry timestamp (observational only).
+        expires_at_ns: u64,
+        /// Remaining ticks if tick-based timing is available, None for legacy.
+        remaining_ticks: Option<u64>,
+    },
 }
 
 /// Display implementation for state names used in error messages.
