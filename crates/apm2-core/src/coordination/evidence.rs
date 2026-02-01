@@ -361,7 +361,8 @@ impl CoordinationReceipt {
         let mut buf = Vec::with_capacity(1024);
 
         // Magic bytes for versioning (allows future format changes)
-        buf.extend_from_slice(b"CRv1");
+        // CRv2: TCK-00242 - replaced elapsed_ms/max_duration_ms with tick-based fields
+        buf.extend_from_slice(b"CRv2");
 
         // Coordination ID
         write_length_prefixed_string(&mut buf, &self.coordination_id);
@@ -374,14 +375,16 @@ impl CoordinationReceipt {
             wo.write_canonical(&mut buf);
         }
 
-        // Budget usage
+        // Budget usage (TCK-00242: tick-based elapsed time)
         write_u32(&mut buf, self.budget_usage.consumed_episodes);
-        write_u64(&mut buf, self.budget_usage.elapsed_ms);
+        write_u64(&mut buf, self.budget_usage.elapsed_ticks);
+        write_u64(&mut buf, self.budget_usage.tick_rate_hz);
         write_u64(&mut buf, self.budget_usage.consumed_tokens);
 
-        // Budget ceiling
+        // Budget ceiling (TCK-00242: tick-based duration)
         write_u32(&mut buf, self.budget_ceiling.max_episodes);
-        write_u64(&mut buf, self.budget_ceiling.max_duration_ms);
+        write_u64(&mut buf, self.budget_ceiling.max_duration_ticks);
+        write_u64(&mut buf, self.budget_ceiling.tick_rate_hz);
         // Optional max_tokens: write 0 for None, otherwise write the value
         write_u64(&mut buf, self.budget_ceiling.max_tokens.unwrap_or(0));
         // Discriminator for Option
@@ -792,6 +795,9 @@ mod tests {
     use super::*;
     use crate::evidence::MemoryCas;
 
+    /// Test tick rate: 1MHz (1 tick = 1 microsecond)
+    const TEST_TICK_RATE_HZ: u64 = 1_000_000;
+
     // ========================================================================
     // WorkOutcome Tests
     // ========================================================================
@@ -898,10 +904,17 @@ mod tests {
             ],
             budget_usage: BudgetUsage {
                 consumed_episodes: 3,
-                elapsed_ms: 5000,
+                elapsed_ticks: 5_000_000,
+                tick_rate_hz: TEST_TICK_RATE_HZ,
                 consumed_tokens: 10000,
             },
-            budget_ceiling: CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap(),
+            budget_ceiling: CoordinationBudget::new(
+                10,
+                60_000_000,
+                TEST_TICK_RATE_HZ,
+                Some(100_000),
+            )
+            .unwrap(),
             stop_condition: StopCondition::WorkCompleted,
             started_at: 1_000_000_000,
             completed_at: 1_005_000_000,
@@ -960,7 +973,8 @@ mod tests {
                 WorkOutcome::new("c".to_string(), 1, SessionOutcome::Success, vec![]).unwrap(),
             ],
             budget_usage: BudgetUsage::new(),
-            budget_ceiling: CoordinationBudget::new(10, 60_000, None).unwrap(),
+            budget_ceiling: CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None)
+                .unwrap(),
             stop_condition: StopCondition::WorkCompleted,
             started_at: 0,
             completed_at: 0,
@@ -976,7 +990,8 @@ mod tests {
                 WorkOutcome::new("b|c".to_string(), 1, SessionOutcome::Success, vec![]).unwrap(),
             ],
             budget_usage: BudgetUsage::new(),
-            budget_ceiling: CoordinationBudget::new(10, 60_000, None).unwrap(),
+            budget_ceiling: CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None)
+                .unwrap(),
             stop_condition: StopCondition::WorkCompleted,
             started_at: 0,
             completed_at: 0,
@@ -1085,8 +1100,8 @@ mod tests {
         let json = serde_json::json!({
             "coordination_id": "coord-1",
             "work_outcomes": work_outcomes,
-            "budget_usage": {"consumed_episodes": 0, "elapsed_ms": 0, "consumed_tokens": 0},
-            "budget_ceiling": {"max_episodes": 10, "max_duration_ms": 60000, "max_tokens": null},
+            "budget_usage": {"consumed_episodes": 0, "elapsed_ticks": 0, "tick_rate_hz": 1_000_000, "consumed_tokens": 0},
+            "budget_ceiling": {"max_episodes": 10, "max_duration_ticks": 60_000_000, "tick_rate_hz": 1_000_000, "max_tokens": null},
             "stop_condition": "WorkCompleted",
             "started_at": 0,
             "completed_at": 0,
@@ -1105,8 +1120,8 @@ mod tests {
         let json = serde_json::json!({
             "coordination_id": "coord-1",
             "work_outcomes": [],
-            "budget_usage": {"consumed_episodes": 0, "elapsed_ms": 0, "consumed_tokens": 0},
-            "budget_ceiling": {"max_episodes": 10, "max_duration_ms": 60000, "max_tokens": null},
+            "budget_usage": {"consumed_episodes": 0, "elapsed_ticks": 0, "tick_rate_hz": 1_000_000, "consumed_tokens": 0},
+            "budget_ceiling": {"max_episodes": 10, "max_duration_ticks": 60_000_000, "tick_rate_hz": 1_000_000, "max_tokens": null},
             "stop_condition": "WorkCompleted",
             "started_at": 0,
             "completed_at": 0,
@@ -1127,7 +1142,7 @@ mod tests {
 
     #[test]
     fn tck_00154_builder_new() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let builder = ReceiptBuilder::new("coord-123".to_string(), budget, 1_000_000_000);
 
         assert_eq!(builder.work_outcomes_count(), 0);
@@ -1138,7 +1153,7 @@ mod tests {
 
     #[test]
     fn tck_00154_builder_record_work_outcome() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let mut builder = ReceiptBuilder::new("coord-123".to_string(), budget, 1_000_000_000);
 
         let outcome = WorkOutcome::new(
@@ -1156,7 +1171,7 @@ mod tests {
 
     #[test]
     fn tck_00154_builder_rejects_outcome_with_too_many_sessions() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let mut builder = ReceiptBuilder::new("coord-123".to_string(), budget, 1_000_000_000);
 
         // Create outcome with too many session IDs by direct construction
@@ -1180,7 +1195,7 @@ mod tests {
 
     #[test]
     fn tck_00154_builder_record_session() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let mut builder = ReceiptBuilder::new("coord-123".to_string(), budget, 1_000_000_000);
 
         builder.record_session(SessionOutcome::Success);
@@ -1194,7 +1209,8 @@ mod tests {
 
     #[test]
     fn tck_00154_builder_build() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         let mut builder =
             ReceiptBuilder::new("coord-123".to_string(), budget.clone(), 1_000_000_000);
 
@@ -1216,7 +1232,8 @@ mod tests {
         // Build receipt
         let usage = BudgetUsage {
             consumed_episodes: 1,
-            elapsed_ms: 1000,
+            elapsed_ticks: 1_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 5000,
         };
         let receipt = builder.build(StopCondition::WorkCompleted, usage.clone(), 1_001_000_000);
@@ -1239,7 +1256,7 @@ mod tests {
     #[test]
     fn tck_00154_builder_build_and_store() {
         let cas = MemoryCas::new();
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let mut builder = ReceiptBuilder::new("coord-123".to_string(), budget, 1_000_000_000);
 
         builder
@@ -1271,7 +1288,7 @@ mod tests {
 
     #[test]
     fn tck_00154_builder_too_many_outcomes() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let mut builder = ReceiptBuilder::new("coord-123".to_string(), budget, 1_000_000_000);
 
         // Fill to capacity
@@ -1308,7 +1325,8 @@ mod tests {
     #[test]
     fn tck_00154_full_coordination_workflow() {
         let cas = MemoryCas::new();
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
 
         // Start building receipt
         let mut builder = ReceiptBuilder::new("coord-full".to_string(), budget, 1_000_000_000);
@@ -1348,7 +1366,8 @@ mod tests {
         // Complete coordination
         let usage = BudgetUsage {
             consumed_episodes: 3,
-            elapsed_ms: 5000,
+            elapsed_ticks: 5_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 15000,
         };
 
@@ -1411,7 +1430,7 @@ mod tests {
 
     #[test]
     fn tck_00154_receipt_all_stop_conditions() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
 
         let stop_conditions = vec![
             StopCondition::WorkCompleted,
@@ -1445,7 +1464,7 @@ mod tests {
     #[test]
     fn tck_00154_stop_condition_uses_stable_encoding() {
         // Verify that BudgetType uses as_str() for stable encoding
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
 
         let receipt_duration = {
             let builder = ReceiptBuilder::new("coord-1".to_string(), budget.clone(), 1_000);

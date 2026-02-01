@@ -41,6 +41,15 @@ use apm2_core::coordination::{
     SpawnError, StopCondition, WorkOutcome,
 };
 use apm2_core::evidence::MemoryCas;
+use apm2_core::htf::HtfTick;
+
+/// Test tick rate: 1MHz (1 tick = 1 microsecond)
+const TEST_TICK_RATE_HZ: u64 = 1_000_000;
+
+/// Creates an `HtfTick` for testing with the standard test tick rate.
+const fn tick(value: u64) -> HtfTick {
+    HtfTick::new(value, TEST_TICK_RATE_HZ)
+}
 
 // ============================================================================
 // MockSessionSpawner Implementation
@@ -249,7 +258,7 @@ impl SessionSpawner for MockSessionSpawner {
 
 /// Creates a standard test budget.
 fn create_test_budget() -> CoordinationBudget {
-    CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap()
+    CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap()
 }
 
 /// Creates a test configuration with the given work IDs.
@@ -272,18 +281,21 @@ fn run_coordination(
     spawner: &MockSessionSpawner,
 ) -> Vec<CoordinationEvent> {
     let timestamp_ns = 1_000_000_000u64;
+    let mut current_tick = tick(0);
 
     // Start coordination
     let _coord_id = controller
-        .start(timestamp_ns)
+        .start(current_tick, timestamp_ns)
         .expect("start should succeed");
 
     // Process work items
     while !controller.is_work_queue_exhausted() {
+        current_tick = tick(current_tick.value() + 1_000);
+
         if let Some(stop) = controller.check_stop_condition() {
             // Complete with stop condition
             let _completed_event = controller
-                .complete(stop, timestamp_ns + 1_000_000)
+                .complete(stop, current_tick, timestamp_ns + 1_000_000)
                 .expect("complete should succeed");
             return controller.emitted_events().to_vec();
         }
@@ -313,12 +325,14 @@ fn run_coordination(
 
         if spawn_outcome.is_err() {
             // Record spawn failure
+            current_tick = tick(current_tick.value() + 1_000);
             controller
                 .record_session_termination(
                     &spawn_result.session_id,
                     &work_id,
                     SessionOutcome::Failure,
                     0,
+                    current_tick,
                     timestamp_ns,
                 )
                 .expect("record_session_termination should succeed");
@@ -331,20 +345,27 @@ fn run_coordination(
             .expect("observe_termination should succeed");
 
         // Record termination
+        current_tick = tick(current_tick.value() + 1_000);
         controller
             .record_session_termination(
                 &spawn_result.session_id,
                 &work_id,
                 termination.outcome,
                 termination.tokens_consumed,
+                current_tick,
                 timestamp_ns,
             )
             .expect("record_session_termination should succeed");
     }
 
     // All work completed
+    current_tick = tick(current_tick.value() + 1_000);
     let _completed_event = controller
-        .complete(StopCondition::WorkCompleted, timestamp_ns + 1_000_000)
+        .complete(
+            StopCondition::WorkCompleted,
+            current_tick,
+            timestamp_ns + 1_000_000,
+        )
         .expect("complete should succeed");
 
     controller.emitted_events().to_vec()
@@ -409,7 +430,7 @@ fn tck_00155_cas_at_commit_ordering_session_bound_before_spawn() {
 
     // Start coordination
     let _coord_id = controller
-        .start(timestamp_ns)
+        .start(tick(0), timestamp_ns)
         .expect("start should succeed");
 
     // Get current event count BEFORE prepare_session_spawn
@@ -635,7 +656,8 @@ fn tck_00155_receipt_cas_storage() {
 
     let usage = apm2_core::coordination::BudgetUsage {
         consumed_episodes: 1,
-        elapsed_ms: 1000,
+        elapsed_ticks: 1_000_000,
+        tick_rate_hz: TEST_TICK_RATE_HZ,
         consumed_tokens: 1000,
     };
 
@@ -829,7 +851,7 @@ fn tck_00155_session_bound_includes_expected_transition_count() {
 /// it indicates a breaking change to the canonical encoding format.
 #[test]
 fn tck_00155_receipt_canonical_encoding_golden_vector() {
-    let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+    let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
 
     let receipt = CoordinationReceipt {
         coordination_id: "coord-golden".to_string(),
@@ -844,7 +866,8 @@ fn tck_00155_receipt_canonical_encoding_golden_vector() {
         ],
         budget_usage: apm2_core::coordination::BudgetUsage {
             consumed_episodes: 1,
-            elapsed_ms: 1000,
+            elapsed_ticks: 1_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 5000,
         },
         budget_ceiling: budget,
@@ -859,7 +882,7 @@ fn tck_00155_receipt_canonical_encoding_golden_vector() {
     let canonical = receipt.canonical_bytes();
 
     // Verify magic bytes (versioning)
-    assert_eq!(&canonical[0..4], b"CRv1", "Magic bytes should be CRv1");
+    assert_eq!(&canonical[0..4], b"CRv2", "Magic bytes should be CRv2");
 
     // Verify determinism: same receipt always produces same bytes
     let canonical2 = receipt.canonical_bytes();

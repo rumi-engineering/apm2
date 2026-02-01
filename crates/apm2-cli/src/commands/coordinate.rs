@@ -29,8 +29,15 @@ use apm2_core::coordination::{
     CoordinationBudget, CoordinationConfig, CoordinationController, DEFAULT_MAX_ATTEMPTS_PER_WORK,
     MAX_WORK_QUEUE_SIZE,
 };
+use apm2_core::htf::HtfTick;
 use clap::Args;
 use serde::{Deserialize, Serialize};
+
+/// Default tick rate: 1MHz (1 tick = 1 microsecond).
+///
+/// This provides reasonable precision for coordination budget tracking
+/// while keeping tick values manageable.
+const DEFAULT_TICK_RATE_HZ: u64 = 1_000_000;
 
 /// Maximum file size for work query input (1MB).
 ///
@@ -272,9 +279,18 @@ fn run_coordinate_inner(args: &CoordinateArgs) -> Result<CoordinationReceipt, Co
         )));
     }
 
+    // Convert ms to ticks at 1MHz (1 tick = 1 microsecond)
+    // This maintains precision while using the tick-based API.
+    let max_duration_ticks = args.max_duration_ms.saturating_mul(1000); // ms -> us at 1MHz
+
     // Create budget
-    let budget = CoordinationBudget::new(args.max_episodes, args.max_duration_ms, args.max_tokens)
-        .map_err(|e| CoordinateCliError::InvalidArgs(e.to_string()))?;
+    let budget = CoordinationBudget::new(
+        args.max_episodes,
+        max_duration_ticks,
+        DEFAULT_TICK_RATE_HZ,
+        args.max_tokens,
+    )
+    .map_err(|e| CoordinateCliError::InvalidArgs(e.to_string()))?;
 
     // Create configuration
     let config = CoordinationConfig::with_max_queue_size(
@@ -297,18 +313,23 @@ fn run_coordinate_inner(args: &CoordinateArgs) -> Result<CoordinationReceipt, Co
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
 
+    // Create initial tick for coordination start
+    let start_tick = HtfTick::new(0, DEFAULT_TICK_RATE_HZ);
+
     // Start coordination
     let coordination_id = controller
-        .start(started_at)
+        .start(start_tick, started_at)
         .map_err(|e| CoordinateCliError::CoordinationError(e.to_string()))?;
 
     if !args.quiet {
         eprintln!("Coordination started: {coordination_id}");
         eprintln!("Work items: {}", config.work_ids.len());
+        // Convert ticks back to ms for display (ticks / 1000 at 1MHz)
+        let max_duration_ms = config.budget.max_duration_ticks / 1000;
         eprintln!(
             "Budget: {} episodes, {} ms, {} tokens",
             config.budget.max_episodes,
-            config.budget.max_duration_ms,
+            max_duration_ms,
             config
                 .budget
                 .max_tokens
@@ -343,8 +364,12 @@ fn run_coordinate_inner(args: &CoordinateArgs) -> Result<CoordinationReceipt, Co
         message: "coordination requires daemon connection (not yet implemented)".to_string(),
     };
 
+    // Calculate elapsed time in ticks for abort
+    // Since we're aborting immediately, elapsed is roughly 0
+    let abort_tick = HtfTick::new(0, DEFAULT_TICK_RATE_HZ);
+
     controller
-        .abort(abort_reason, completed_at)
+        .abort(abort_reason, abort_tick, completed_at)
         .map_err(|e| CoordinateCliError::CoordinationError(e.to_string()))?;
 
     // Build receipt from controller state
@@ -507,17 +532,21 @@ fn build_receipt(
     let (total_sessions, successful_sessions, failed_sessions) =
         count_sessions_from_events(controller.emitted_events());
 
+    // Convert ticks to ms for output (at 1MHz: ticks / 1000)
+    let elapsed_ms = budget_usage.elapsed_ticks / 1000;
+    let max_duration_ms = config.budget.max_duration_ticks / 1000;
+
     CoordinationReceipt {
         coordination_id: coordination_id.to_string(),
         work_outcomes,
         budget_usage: BudgetUsageOutput {
             consumed_episodes: budget_usage.consumed_episodes,
-            elapsed_ms: budget_usage.elapsed_ms,
+            elapsed_ms,
             consumed_tokens: budget_usage.consumed_tokens,
         },
         budget_ceiling: BudgetCeilingOutput {
             max_episodes: config.budget.max_episodes,
-            max_duration_ms: config.budget.max_duration_ms,
+            max_duration_ms,
             max_tokens: config.budget.max_tokens,
         },
         stop_condition: stop_condition.to_string(),

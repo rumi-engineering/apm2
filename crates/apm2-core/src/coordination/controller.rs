@@ -103,13 +103,13 @@
 //! # References
 //!
 //! - TCK-00150: Implement `CoordinationController` serial execution loop
+//! - TCK-00242: Convert coordination timeouts to tick-based tracking
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
+//! - RFC-0016: HTF Time Model (tick-based duration tracking)
 //! - AD-COORD-002: Serial execution, one session at a time
 //! - AD-COORD-003: Binding events bracket session lifecycle
 //! - AD-COORD-006: Work freshness validation
 //! - AD-COORD-007: Session ID generation before binding event
-
-use std::time::Instant;
 
 use super::error::{ControllerError, ControllerResult};
 use super::events::{
@@ -118,11 +118,12 @@ use super::events::{
 };
 use super::evidence::{ReceiptBuilder, WorkOutcome};
 use super::state::{
-    AbortReason, BudgetUsage, CoordinationBudget, CoordinationStatus, MAX_WORK_QUEUE_SIZE,
-    SessionOutcome, StopCondition, WorkItemOutcome,
+    AbortReason, BudgetUsage, CoordinationBudget, CoordinationError, CoordinationStatus,
+    MAX_WORK_QUEUE_SIZE, SessionOutcome, StopCondition, WorkItemOutcome,
 };
 use crate::crypto::Hash;
 use crate::evidence::ContentAddressedStore;
+use crate::htf::HtfTick;
 
 /// Maximum number of attempts per work item (default).
 pub const DEFAULT_MAX_ATTEMPTS_PER_WORK: u32 = 3;
@@ -359,10 +360,12 @@ pub struct CoordinationController {
     /// Failed sessions count.
     failed_sessions: u32,
 
-    /// Start time for duration tracking.
-    started_at: Option<Instant>,
+    /// Start tick for duration tracking (TCK-00242).
+    ///
+    /// Uses `HtfTick` instead of `Instant` for replay-stable duration tracking.
+    started_at_tick: Option<HtfTick>,
 
-    /// Start timestamp in nanoseconds (for receipt).
+    /// Start timestamp in nanoseconds (for receipt, observational only).
     started_at_ns: u64,
 
     /// Current status.
@@ -392,18 +395,21 @@ impl CoordinationController {
             .map(|id| WorkItemState::new(id.clone()))
             .collect();
 
+        // Extract tick rate before moving config
+        let tick_rate_hz = config.budget.tick_rate_hz;
+
         Self {
             coordination_id: None,
             config,
             work_index: 0,
             work_tracking,
             active_session: None,
-            budget_usage: BudgetUsage::new(),
+            budget_usage: BudgetUsage::with_tick_rate(tick_rate_hz),
             consecutive_failures: 0,
             total_sessions: 0,
             successful_sessions: 0,
             failed_sessions: 0,
-            started_at: None,
+            started_at_tick: None,
             started_at_ns: 0,
             status: CoordinationStatus::Initializing,
             emitted_events: Vec::new(),
@@ -475,12 +481,45 @@ impl CoordinationController {
     }
 
     // =========================================================================
+    // Private Helper Methods
+    // =========================================================================
+
+    /// Validates that the provided tick's rate matches the configured budget
+    /// tick rate.
+    ///
+    /// Per TCK-00242: All tick values within a coordination must use the same
+    /// tick rate as the budget to ensure replay-stable duration calculations.
+    /// Using ticks with different rates would cause temporal confusion where
+    /// elapsed time is computed incorrectly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidTickRate`] if the tick rate doesn't
+    /// match the budget's `tick_rate_hz`.
+    const fn validate_tick_rate(&self, tick: &HtfTick) -> ControllerResult<()> {
+        let expected_hz = self.config.budget.tick_rate_hz;
+        let actual_hz = tick.tick_rate_hz();
+        if actual_hz != expected_hz {
+            return Err(ControllerError::InvalidTickRate {
+                expected_hz,
+                actual_hz,
+            });
+        }
+        Ok(())
+    }
+
+    // =========================================================================
     // Lifecycle Methods
     // =========================================================================
 
     /// Starts the coordination and emits the started event.
     ///
     /// Generates a coordination ID (UUID v4) and emits `coordination.started`.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_tick` - The current monotonic tick (TCK-00242)
+    /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
     ///
@@ -490,7 +529,12 @@ impl CoordinationController {
     ///
     /// Returns [`ControllerError::CoordinationAlreadyExists`] if already
     /// started.
-    pub fn start(&mut self, timestamp_ns: u64) -> ControllerResult<String> {
+    /// Returns [`ControllerError::InvalidTickRate`] if tick rate doesn't match
+    /// budget.
+    pub fn start(&mut self, current_tick: HtfTick, timestamp_ns: u64) -> ControllerResult<String> {
+        // Validate tick rate matches budget (TCK-00242)
+        self.validate_tick_rate(&current_tick)?;
+
         if self.coordination_id.is_some() {
             return Err(ControllerError::CoordinationAlreadyExists {
                 coordination_id: self.coordination_id.clone().unwrap_or_default(),
@@ -500,8 +544,8 @@ impl CoordinationController {
         // Generate coordination ID (UUID v4 format)
         let coordination_id = generate_uuid();
 
-        // Record start time
-        self.started_at = Some(Instant::now());
+        // Record start tick (TCK-00242: tick-based duration tracking)
+        self.started_at_tick = Some(current_tick);
         self.started_at_ns = timestamp_ns;
         self.coordination_id = Some(coordination_id.clone());
         self.status = CoordinationStatus::Running;
@@ -741,7 +785,8 @@ impl CoordinationController {
     /// * `work_id` - The work item that was processed
     /// * `outcome` - The session outcome (Success or Failure)
     /// * `tokens_consumed` - Tokens consumed by the session
-    /// * `timestamp_ns` - Current timestamp in nanoseconds
+    /// * `current_tick` - Current monotonic tick for elapsed time (TCK-00242)
+    /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
     ///
@@ -749,8 +794,8 @@ impl CoordinationController {
     ///
     /// # Errors
     ///
-    /// Returns an error if the coordination is not running or `session_id`
-    /// doesn't match the active session.
+    /// Returns an error if the coordination is not running, `session_id`
+    /// doesn't match the active session, or tick rate doesn't match budget.
     #[allow(clippy::too_many_lines)]
     pub fn record_session_termination(
         &mut self,
@@ -758,8 +803,12 @@ impl CoordinationController {
         work_id: &str,
         outcome: SessionOutcome,
         tokens_consumed: u64,
+        current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<TerminationResult> {
+        // Validate tick rate matches budget (TCK-00242)
+        self.validate_tick_rate(&current_tick)?;
+
         let coordination_id =
             self.coordination_id
                 .clone()
@@ -802,12 +851,42 @@ impl CoordinationController {
             .consumed_tokens
             .saturating_add(tokens_consumed);
 
-        // Update elapsed time
-        // Note: truncation is safe - u64 can hold ~584 million years in milliseconds
-        if let Some(started_at) = self.started_at {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                self.budget_usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+        // Update elapsed time using tick-based tracking (TCK-00242)
+        if let Some(started_at_tick) = self.started_at_tick {
+            if let Err(e) = self.budget_usage.update_elapsed_ticks(
+                started_at_tick.value(),
+                current_tick.value(),
+                current_tick.tick_rate_hz(),
+            ) {
+                // Auto-abort on clock regression (TCK-00242: fail-closed)
+                // The controller must not remain in Running state after a clock anomaly
+                let controller_error = match e {
+                    CoordinationError::TickRateMismatch { expected, actual } => {
+                        ControllerError::InvalidTickRate {
+                            expected_hz: expected,
+                            actual_hz: actual,
+                        }
+                    },
+                    CoordinationError::ClockRegression {
+                        start_tick,
+                        current_tick: curr_tick,
+                    } => {
+                        // Transition to Aborted state before returning error
+                        self.status = CoordinationStatus::Aborted(AbortReason::Error {
+                            message: format!(
+                                "clock regression detected: current_tick ({curr_tick}) < start_tick ({start_tick})"
+                            ),
+                        });
+                        ControllerError::ClockRegression {
+                            start_tick,
+                            current_tick: curr_tick,
+                        }
+                    },
+                    _ => ControllerError::Internal {
+                        message: format!("unexpected error updating elapsed ticks: {e}"),
+                    },
+                };
+                return Err(controller_error);
             }
         }
 
@@ -948,6 +1027,12 @@ impl CoordinationController {
     /// # Returns
     ///
     /// `Some(StopCondition)` if a stop condition is met, `None` otherwise.
+    ///
+    /// # Note (TCK-00242)
+    ///
+    /// Duration checking uses the `elapsed_ticks` stored in `budget_usage`,
+    /// which must be updated via `record_session_termination()` before calling
+    /// this method for accurate duration budget enforcement.
     #[must_use]
     pub fn check_stop_condition(&self) -> Option<StopCondition> {
         // Check circuit breaker (highest priority)
@@ -957,8 +1042,8 @@ impl CoordinationController {
             });
         }
 
-        // Check duration budget
-        if self.budget_usage.elapsed_ms >= self.config.budget.max_duration_ms {
+        // Check duration budget (TCK-00242: tick-based)
+        if self.budget_usage.elapsed_ticks >= self.config.budget.max_duration_ticks {
             return Some(StopCondition::BudgetExhausted(
                 super::state::BudgetType::Duration,
             ));
@@ -995,7 +1080,9 @@ impl CoordinationController {
     /// # Arguments
     ///
     /// * `stop_condition` - The stop condition that caused completion
-    /// * `timestamp_ns` - Current timestamp in nanoseconds
+    /// * `current_tick` - Current monotonic tick for final elapsed time
+    ///   (TCK-00242)
+    /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
     ///
@@ -1003,12 +1090,17 @@ impl CoordinationController {
     ///
     /// # Errors
     ///
-    /// Returns an error if already in terminal state.
+    /// Returns an error if already in terminal state or tick rate doesn't match
+    /// budget.
     pub fn complete(
         &mut self,
         stop_condition: StopCondition,
+        current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<CoordinationCompleted> {
+        // Validate tick rate matches budget (TCK-00242)
+        self.validate_tick_rate(&current_tick)?;
+
         if self.status.is_terminal() {
             return Err(ControllerError::CoordinationTerminal {
                 coordination_id: self.coordination_id.clone().unwrap_or_default(),
@@ -1022,12 +1114,40 @@ impl CoordinationController {
                     message: "coordination not started".to_string(),
                 })?;
 
-        // Update elapsed time
-        // Note: truncation is safe - u64 can hold ~584 million years in milliseconds
-        if let Some(started_at) = self.started_at {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                self.budget_usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+        // Update elapsed time using tick-based tracking (TCK-00242)
+        if let Some(started_at_tick) = self.started_at_tick {
+            if let Err(e) = self.budget_usage.update_elapsed_ticks(
+                started_at_tick.value(),
+                current_tick.value(),
+                current_tick.tick_rate_hz(),
+            ) {
+                // Auto-abort on clock regression (TCK-00242: fail-closed)
+                let controller_error = match e {
+                    CoordinationError::TickRateMismatch { expected, actual } => {
+                        ControllerError::InvalidTickRate {
+                            expected_hz: expected,
+                            actual_hz: actual,
+                        }
+                    },
+                    CoordinationError::ClockRegression {
+                        start_tick,
+                        current_tick: curr_tick,
+                    } => {
+                        self.status = CoordinationStatus::Aborted(AbortReason::Error {
+                            message: format!(
+                                "clock regression detected: current_tick ({curr_tick}) < start_tick ({start_tick})"
+                            ),
+                        });
+                        ControllerError::ClockRegression {
+                            start_tick,
+                            current_tick: curr_tick,
+                        }
+                    },
+                    _ => ControllerError::Internal {
+                        message: format!("unexpected error updating elapsed ticks: {e}"),
+                    },
+                };
+                return Err(controller_error);
             }
         }
 
@@ -1062,7 +1182,9 @@ impl CoordinationController {
     ///
     /// * `cas` - Content-addressed store for receipt storage
     /// * `stop_condition` - The stop condition that caused completion
-    /// * `timestamp_ns` - Current timestamp in nanoseconds
+    /// * `current_tick` - Current monotonic tick for final elapsed time
+    ///   (TCK-00242)
+    /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
     ///
@@ -1072,13 +1194,18 @@ impl CoordinationController {
     ///
     /// # Errors
     ///
-    /// Returns an error if already in terminal state or receipt storage fails.
+    /// Returns an error if already in terminal state, tick rate doesn't match
+    /// budget, or receipt storage fails.
     pub fn complete_with_cas<C: ContentAddressedStore>(
         &mut self,
         cas: &C,
         stop_condition: StopCondition,
+        current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<(CoordinationCompleted, Hash, Hash)> {
+        // Validate tick rate matches budget (TCK-00242)
+        self.validate_tick_rate(&current_tick)?;
+
         if self.status.is_terminal() {
             return Err(ControllerError::CoordinationTerminal {
                 coordination_id: self.coordination_id.clone().unwrap_or_default(),
@@ -1092,11 +1219,40 @@ impl CoordinationController {
                     message: "coordination not started".to_string(),
                 })?;
 
-        // Update elapsed time
-        if let Some(started_at) = self.started_at {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                self.budget_usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+        // Update elapsed time using tick-based tracking (TCK-00242)
+        if let Some(started_at_tick) = self.started_at_tick {
+            if let Err(e) = self.budget_usage.update_elapsed_ticks(
+                started_at_tick.value(),
+                current_tick.value(),
+                current_tick.tick_rate_hz(),
+            ) {
+                // Auto-abort on clock regression (TCK-00242: fail-closed)
+                let controller_error = match e {
+                    CoordinationError::TickRateMismatch { expected, actual } => {
+                        ControllerError::InvalidTickRate {
+                            expected_hz: expected,
+                            actual_hz: actual,
+                        }
+                    },
+                    CoordinationError::ClockRegression {
+                        start_tick,
+                        current_tick: curr_tick,
+                    } => {
+                        self.status = CoordinationStatus::Aborted(AbortReason::Error {
+                            message: format!(
+                                "clock regression detected: current_tick ({curr_tick}) < start_tick ({start_tick})"
+                            ),
+                        });
+                        ControllerError::ClockRegression {
+                            start_tick,
+                            current_tick: curr_tick,
+                        }
+                    },
+                    _ => ControllerError::Internal {
+                        message: format!("unexpected error updating elapsed ticks: {e}"),
+                    },
+                };
+                return Err(controller_error);
             }
         }
 
@@ -1145,7 +1301,9 @@ impl CoordinationController {
     /// # Arguments
     ///
     /// * `reason` - The reason for abortion
-    /// * `timestamp_ns` - Current timestamp in nanoseconds
+    /// * `current_tick` - Current monotonic tick for final elapsed time
+    ///   (TCK-00242)
+    /// * `timestamp_ns` - Current timestamp in nanoseconds (observational)
     ///
     /// # Returns
     ///
@@ -1153,12 +1311,17 @@ impl CoordinationController {
     ///
     /// # Errors
     ///
-    /// Returns an error if already in terminal state.
+    /// Returns an error if already in terminal state or tick rate doesn't match
+    /// budget.
     pub fn abort(
         &mut self,
         reason: AbortReason,
+        current_tick: HtfTick,
         timestamp_ns: u64,
     ) -> ControllerResult<CoordinationAborted> {
+        // Validate tick rate matches budget (TCK-00242)
+        self.validate_tick_rate(&current_tick)?;
+
         if self.status.is_terminal() {
             return Err(ControllerError::CoordinationTerminal {
                 coordination_id: self.coordination_id.clone().unwrap_or_default(),
@@ -1172,12 +1335,42 @@ impl CoordinationController {
                     message: "coordination not started".to_string(),
                 })?;
 
-        // Update elapsed time
-        // Note: truncation is safe - u64 can hold ~584 million years in milliseconds
-        if let Some(started_at) = self.started_at {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                self.budget_usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
+        // Update elapsed time using tick-based tracking (TCK-00242)
+        // Note: For abort(), we don't auto-abort on clock regression since we're
+        // already transitioning to Aborted state. Just map the error.
+        if let Some(started_at_tick) = self.started_at_tick {
+            if let Err(e) = self.budget_usage.update_elapsed_ticks(
+                started_at_tick.value(),
+                current_tick.value(),
+                current_tick.tick_rate_hz(),
+            ) {
+                let controller_error = match e {
+                    CoordinationError::TickRateMismatch { expected, actual } => {
+                        ControllerError::InvalidTickRate {
+                            expected_hz: expected,
+                            actual_hz: actual,
+                        }
+                    },
+                    CoordinationError::ClockRegression {
+                        start_tick,
+                        current_tick: curr_tick,
+                    } => {
+                        // Even during abort, set the status to Aborted with clock regression reason
+                        self.status = CoordinationStatus::Aborted(AbortReason::Error {
+                            message: format!(
+                                "clock regression detected: current_tick ({curr_tick}) < start_tick ({start_tick})"
+                            ),
+                        });
+                        ControllerError::ClockRegression {
+                            start_tick,
+                            current_tick: curr_tick,
+                        }
+                    },
+                    _ => ControllerError::Internal {
+                        message: format!("unexpected error updating elapsed ticks: {e}"),
+                    },
+                };
+                return Err(controller_error);
             }
         }
 
@@ -1208,8 +1401,17 @@ fn generate_uuid() -> String {
 mod tests {
     use super::*;
 
+    /// Default tick rate for tests: 1MHz (1 tick = 1 microsecond)
+    const TEST_TICK_RATE_HZ: u64 = 1_000_000;
+
+    /// Create a test tick at the given value
+    fn tick(value: u64) -> HtfTick {
+        HtfTick::new(value, TEST_TICK_RATE_HZ)
+    }
+
     fn test_budget() -> CoordinationBudget {
-        CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap()
+        // 10 episodes, 60_000_000 ticks (60 seconds at 1MHz), 100_000 tokens
+        CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap()
     }
 
     fn test_config(work_ids: Vec<String>) -> CoordinationConfig {
@@ -1270,7 +1472,7 @@ mod tests {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
 
-        let coord_id = controller.start(1_000_000_000).unwrap();
+        let coord_id = controller.start(tick(1000), 1_000_000_000).unwrap();
 
         assert!(controller.coordination_id().is_some());
         assert_eq!(controller.coordination_id().unwrap(), coord_id);
@@ -1287,8 +1489,8 @@ mod tests {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
 
-        controller.start(1_000_000_000).unwrap();
-        let result = controller.start(2_000_000_000);
+        controller.start(tick(1000), 1_000_000_000).unwrap();
+        let result = controller.start(tick(2000), 2_000_000_000);
 
         assert!(matches!(
             result,
@@ -1304,7 +1506,7 @@ mod tests {
     fn tck_00150_session_id_generated_before_binding() {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         let result = controller
             .prepare_session_spawn("work-1", 100, 2_000_000_000)
@@ -1334,7 +1536,7 @@ mod tests {
     fn tck_00150_binding_bracket_ordering() {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Prepare spawn (emits session_bound)
         let spawn_result = controller
@@ -1351,6 +1553,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Success,
                 1000,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -1394,7 +1597,7 @@ mod tests {
     fn tck_00150_skip_stale_work() {
         let config = test_config(vec!["work-1".to_string(), "work-2".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Skip work-1 due to freshness violation
         controller.skip_work_item("work-1").unwrap();
@@ -1412,7 +1615,7 @@ mod tests {
     fn tck_00150_skip_mismatch_fails() {
         let config = test_config(vec!["work-1".to_string(), "work-2".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Try to skip work-2 when current is work-1
         let result = controller.skip_work_item("work-2");
@@ -1431,7 +1634,7 @@ mod tests {
     fn tck_00150_serial_execution_consecutive_spawn_fails() {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // First spawn succeeds
         let spawn1 = controller
@@ -1452,6 +1655,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Failure,
                 100,
+                tick(3000),
                 4_000_000_000,
             )
             .unwrap();
@@ -1469,7 +1673,7 @@ mod tests {
     fn tck_00150_work_id_mismatch_on_termination() {
         let config = test_config(vec!["work-1".to_string(), "work-2".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Spawn session for work-1
         let spawn = controller
@@ -1482,6 +1686,7 @@ mod tests {
             "work-2", // Wrong work_id
             SessionOutcome::Success,
             1000,
+            tick(2000),
             3_000_000_000,
         );
 
@@ -1501,7 +1706,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Work A: fail 2 times (exhaust retries) -> consecutive_failures = 1
         for i in 0u64..2 {
@@ -1514,6 +1719,7 @@ mod tests {
                     "A",
                     SessionOutcome::Failure,
                     100,
+                    tick(2000 + i * 1000),
                     3_000_000_000 + i * 1_000_000_000,
                 )
                 .unwrap();
@@ -1532,6 +1738,7 @@ mod tests {
                     "B",
                     SessionOutcome::Failure,
                     100,
+                    tick(10000 + i * 1000),
                     11_000_000_000 + i * 1_000_000_000,
                 )
                 .unwrap();
@@ -1549,6 +1756,7 @@ mod tests {
                 "C",
                 SessionOutcome::Success,
                 100,
+                tick(20000),
                 21_000_000_000,
             )
             .unwrap();
@@ -1565,7 +1773,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Process first "A" (index 0)
         let spawn_a1 = controller
@@ -1577,6 +1785,7 @@ mod tests {
                 "A",
                 SessionOutcome::Success,
                 100,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -1598,6 +1807,7 @@ mod tests {
                 "B",
                 SessionOutcome::Success,
                 200,
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -1612,6 +1822,7 @@ mod tests {
                 "A",
                 SessionOutcome::Success,
                 300,
+                tick(6000),
                 7_000_000_000,
             )
             .unwrap();
@@ -1631,7 +1842,7 @@ mod tests {
     fn tck_00150_serial_execution_one_session_at_time() {
         let config = test_config(vec!["work-1".to_string(), "work-2".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Process work-1
         let spawn1 = controller
@@ -1648,6 +1859,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Success,
                 1000,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -1670,6 +1882,7 @@ mod tests {
                 "work-2",
                 SessionOutcome::Success,
                 2000,
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -1688,7 +1901,7 @@ mod tests {
     fn tck_00150_stop_condition_work_completed() {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Process work-1
         let spawn = controller
@@ -1700,6 +1913,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Success,
                 1000,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -1727,7 +1941,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Work A fails (exhausts 1 retry) -> consecutive_failures = 1
         let spawn_a = controller
@@ -1739,6 +1953,7 @@ mod tests {
                 "A",
                 SessionOutcome::Failure,
                 100,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -1754,6 +1969,7 @@ mod tests {
                 "B",
                 SessionOutcome::Failure,
                 100,
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -1769,6 +1985,7 @@ mod tests {
                 "C",
                 SessionOutcome::Failure,
                 100,
+                tick(6000),
                 7_000_000_000,
             )
             .unwrap();
@@ -1787,10 +2004,10 @@ mod tests {
     #[test]
     fn tck_00150_stop_condition_episode_budget() {
         // Create config with max 2 episodes
-        let budget = CoordinationBudget::new(2, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(2, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 5).unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Use up 2 episodes
         for i in 0u64..2 {
@@ -1803,6 +2020,7 @@ mod tests {
                     "work-1",
                     SessionOutcome::Failure,
                     100,
+                    tick(2000 + i * 1000),
                     3_000_000_000 + i * 1_000_000_000,
                 )
                 .unwrap();
@@ -1825,7 +2043,7 @@ mod tests {
     fn tck_00150_complete_coordination() {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         let spawn = controller
             .prepare_session_spawn("work-1", 100, 2_000_000_000)
@@ -1836,12 +2054,13 @@ mod tests {
                 "work-1",
                 SessionOutcome::Success,
                 1000,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
 
         let completed = controller
-            .complete(StopCondition::WorkCompleted, 4_000_000_000)
+            .complete(StopCondition::WorkCompleted, tick(3000), 4_000_000_000)
             .unwrap();
 
         assert!(controller.is_terminal());
@@ -1854,10 +2073,10 @@ mod tests {
     fn tck_00150_abort_coordination() {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         let aborted = controller
-            .abort(AbortReason::NoEligibleWork, 2_000_000_000)
+            .abort(AbortReason::NoEligibleWork, tick(2000), 2_000_000_000)
             .unwrap();
 
         assert!(controller.is_terminal());
@@ -1872,7 +2091,7 @@ mod tests {
     fn tck_00150_retry_on_failure() {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // First attempt - failure
         let spawn1 = controller
@@ -1884,6 +2103,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Failure,
                 100,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -1904,6 +2124,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Success,
                 200,
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -1917,7 +2138,7 @@ mod tests {
     fn tck_00150_max_attempts_exhausted() {
         let config = test_config(vec!["work-1".to_string(), "work-2".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Exhaust 3 attempts for work-1
         for i in 0u64..3 {
@@ -1930,6 +2151,7 @@ mod tests {
                     "work-1",
                     SessionOutcome::Failure,
                     100,
+                    tick(2000 + i * 1000),
                     3_000_000_000 + i * 1_000_000_000,
                 )
                 .unwrap();
@@ -1998,7 +2220,7 @@ mod tests {
         let mut controller = CoordinationController::new(config);
 
         // Start coordination
-        let coord_id = controller.start(1_000_000_000).unwrap();
+        let coord_id = controller.start(tick(1000), 1_000_000_000).unwrap();
         assert!(!coord_id.is_empty());
 
         // Process work-1 (success)
@@ -2011,6 +2233,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Success,
                 1000,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -2025,6 +2248,7 @@ mod tests {
                 "work-2",
                 SessionOutcome::Failure,
                 500,
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -2038,6 +2262,7 @@ mod tests {
                 "work-2",
                 SessionOutcome::Success,
                 800,
+                tick(6000),
                 7_000_000_000,
             )
             .unwrap();
@@ -2052,6 +2277,7 @@ mod tests {
                 "work-3",
                 SessionOutcome::Success,
                 1200,
+                tick(8000),
                 9_000_000_000,
             )
             .unwrap();
@@ -2062,7 +2288,7 @@ mod tests {
 
         // Complete coordination
         let completed = controller
-            .complete(StopCondition::WorkCompleted, 10_000_000_000)
+            .complete(StopCondition::WorkCompleted, tick(9000), 10_000_000_000)
             .unwrap();
 
         assert!(controller.is_terminal());
@@ -2090,7 +2316,7 @@ mod tests {
     #[test]
     fn tck_00151_episode_budget_enforced() {
         // Create config with max 3 episodes
-        let budget = CoordinationBudget::new(3, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(3, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(
             vec!["work-1".to_string()], // Only one work item but 5 retries available
             budget,
@@ -2098,7 +2324,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Consume 3 episodes with failures (still retrying same work)
         for i in 0u64..3 {
@@ -2111,6 +2337,7 @@ mod tests {
                     "work-1",
                     SessionOutcome::Failure,
                     100,
+                    tick(2000 + i * 1000),
                     3_000_000_000 + i * 1_000_000_000,
                 )
                 .unwrap();
@@ -2130,27 +2357,23 @@ mod tests {
     }
 
     /// TCK-00151: Duration budget enforced - coordination stops at
-    /// `max_duration_ms`.
+    /// `max_duration_ticks`.
     ///
     /// Acceptance Criteria 2: Duration budget enforced.
     #[test]
     fn tck_00151_duration_budget_enforced() {
-        // Create config with max 1ms duration (will be exceeded immediately)
-        let budget = CoordinationBudget::new(100, 1, None).unwrap();
+        // Create config with max 1000 ticks (1ms at 1MHz)
+        let budget = CoordinationBudget::new(100, 1_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 3).unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
-        // Wait for real time to elapse (the controller tracks wall clock time)
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        // Update budget usage elapsed time (simulate what happens in the run loop)
-        if let Some(started_at) = controller.started_at {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                controller.budget_usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
-            }
-        }
+        // Advance time by injecting a tick that exceeds the budget
+        // Budget is 1000 ticks, started at tick 1000, so tick 2001 exceeds it
+        controller
+            .budget_usage
+            .update_elapsed_ticks(1000, 2001, TEST_TICK_RATE_HZ)
+            .unwrap();
 
         // Check stop condition - should return BudgetExhausted(Duration)
         let stop = controller.check_stop_condition();
@@ -2168,10 +2391,11 @@ mod tests {
     #[test]
     fn tck_00151_token_budget_enforced() {
         // Create config with max 1000 tokens
-        let budget = CoordinationBudget::new(100, 60_000, Some(1000)).unwrap();
+        let budget =
+            CoordinationBudget::new(100, 60_000_000, TEST_TICK_RATE_HZ, Some(1000)).unwrap();
         let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 10).unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Consume 1000 tokens across multiple sessions
         let spawn1 = controller
@@ -2183,6 +2407,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Failure,
                 400,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -2196,6 +2421,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Failure,
                 600, // Total: 400 + 600 = 1000
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -2217,10 +2443,10 @@ mod tests {
     #[test]
     fn tck_00151_token_budget_not_set() {
         // Create config WITHOUT token budget
-        let budget = CoordinationBudget::new(100, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(100, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 10).unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Consume many tokens
         let spawn1 = controller
@@ -2232,6 +2458,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Failure,
                 1_000_000, // Large token consumption
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -2255,7 +2482,7 @@ mod tests {
             "work-3".to_string(),
         ]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Session 1: 1000 tokens
         let spawn1 = controller
@@ -2267,6 +2494,7 @@ mod tests {
                 "work-1",
                 SessionOutcome::Success,
                 1000,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -2282,6 +2510,7 @@ mod tests {
                 "work-2",
                 SessionOutcome::Success,
                 2500,
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -2297,6 +2526,7 @@ mod tests {
                 "work-3",
                 SessionOutcome::Failure,
                 500,
+                tick(6000),
                 7_000_000_000,
             )
             .unwrap();
@@ -2304,7 +2534,7 @@ mod tests {
 
         // Complete and verify final budget usage
         controller
-            .complete(StopCondition::WorkCompleted, 8_000_000_000)
+            .complete(StopCondition::WorkCompleted, tick(7000), 8_000_000_000)
             .unwrap();
         assert_eq!(controller.budget_usage.consumed_tokens, 4000);
     }
@@ -2316,10 +2546,10 @@ mod tests {
     #[test]
     fn tck_00151_budget_priority_ordering() {
         // Create config with all budget types set to low values
-        let budget = CoordinationBudget::new(1, 1, Some(1)).unwrap();
+        let budget = CoordinationBudget::new(1, 1_000, TEST_TICK_RATE_HZ, Some(1)).unwrap();
         let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 3).unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Consume 1 episode and 1 token
         let spawn = controller
@@ -2331,18 +2561,17 @@ mod tests {
                 "work-1",
                 SessionOutcome::Success,
                 1,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
 
-        // Wait for duration to be exhausted
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        if let Some(started_at) = controller.started_at {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                controller.budget_usage.elapsed_ms = started_at.elapsed().as_millis() as u64;
-            }
-        }
+        // Simulate duration exceeding budget by injecting tick that exceeds budget
+        // Budget is 1000 ticks, started at tick 1000, so tick 2001 exceeds it
+        controller
+            .budget_usage
+            .update_elapsed_ticks(1000, 2001, TEST_TICK_RATE_HZ)
+            .unwrap();
 
         // All three budgets are now exhausted, check priority
         // Duration should take priority
@@ -2358,10 +2587,11 @@ mod tests {
     /// TCK-00151: Verify budget usage is included in completed event.
     #[test]
     fn tck_00151_budget_usage_in_completed_event() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 3).unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Process one session
         let spawn = controller
@@ -2373,29 +2603,31 @@ mod tests {
                 "work-1",
                 SessionOutcome::Success,
                 5000,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
 
         // Complete and check budget usage in event
         let completed = controller
-            .complete(StopCondition::WorkCompleted, 4_000_000_000)
+            .complete(StopCondition::WorkCompleted, tick(3000), 4_000_000_000)
             .unwrap();
 
         assert_eq!(completed.budget_usage.consumed_episodes, 1);
         assert_eq!(completed.budget_usage.consumed_tokens, 5000);
-        // elapsed_ms is set from real time tracking
+        // elapsed_ticks is set from tick-based tracking
         // Just verify the field is accessible and has a value
-        let _ = completed.budget_usage.elapsed_ms;
+        let _ = completed.budget_usage.elapsed_ticks;
     }
 
     /// TCK-00151: Verify budget usage is included in aborted event.
     #[test]
     fn tck_00151_budget_usage_in_aborted_event() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         let config = CoordinationConfig::new(vec!["work-1".to_string()], budget, 3).unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Process one session
         let spawn = controller
@@ -2407,13 +2639,14 @@ mod tests {
                 "work-1",
                 SessionOutcome::Failure,
                 3000,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
 
         // Abort and check budget usage in event
         let aborted = controller
-            .abort(AbortReason::NoEligibleWork, 4_000_000_000)
+            .abort(AbortReason::NoEligibleWork, tick(3000), 4_000_000_000)
             .unwrap();
 
         assert_eq!(aborted.budget_usage.consumed_episodes, 1);
@@ -2425,7 +2658,7 @@ mod tests {
     fn tck_00151_episode_increment_monotonic() {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         let mut prev_episodes = 0;
 
@@ -2439,6 +2672,7 @@ mod tests {
                     "work-1",
                     SessionOutcome::Failure,
                     100,
+                    tick(2000 + i * 1000),
                     3_000_000_000 + i * 1_000_000_000,
                 )
                 .unwrap();
@@ -2465,7 +2699,7 @@ mod tests {
             "work-3".to_string(),
         ]);
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         let work_ids = ["work-1", "work-2", "work-3"];
         let mut prev_tokens = 0;
@@ -2480,6 +2714,7 @@ mod tests {
                     work_id,
                     SessionOutcome::Success,
                     (i as u64 + 1) * 100, // 100, 200, 300 tokens
+                    tick(2000 + (i as u64) * 1000),
                     3_000_000_000,
                 )
                 .unwrap();
@@ -2511,7 +2746,7 @@ mod tests {
     fn tck_00152_circuit_breaker_triggers_on_3_consecutive_failures() {
         // Use max_attempts = 1 so each failure exhausts retries immediately,
         // causing the work item to be marked as permanently failed.
-        let budget = CoordinationBudget::new(100, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(100, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(
             vec![
                 "A".to_string(),
@@ -2524,7 +2759,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Work A fails (exhausts 1 retry) -> consecutive_failures = 1
         let spawn_a = controller
@@ -2536,6 +2771,7 @@ mod tests {
                 "A",
                 SessionOutcome::Failure,
                 100,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -2552,6 +2788,7 @@ mod tests {
                 "B",
                 SessionOutcome::Failure,
                 100,
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -2568,6 +2805,7 @@ mod tests {
                 "C",
                 SessionOutcome::Failure,
                 100,
+                tick(6000),
                 7_000_000_000,
             )
             .unwrap();
@@ -2591,7 +2829,7 @@ mod tests {
     #[test]
     fn tck_00152_circuit_breaker_resets_on_success() {
         // Use max_attempts = 1 so each failure exhausts retries immediately
-        let budget = CoordinationBudget::new(100, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(100, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(
             vec![
                 "A".to_string(),
@@ -2604,7 +2842,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Work A fails -> consecutive_failures = 1
         let spawn_a = controller
@@ -2616,6 +2854,7 @@ mod tests {
                 "A",
                 SessionOutcome::Failure,
                 100,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -2631,6 +2870,7 @@ mod tests {
                 "B",
                 SessionOutcome::Failure,
                 100,
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -2646,6 +2886,7 @@ mod tests {
                 "C",
                 SessionOutcome::Success,
                 100,
+                tick(6000),
                 7_000_000_000,
             )
             .unwrap();
@@ -2669,7 +2910,7 @@ mod tests {
     #[test]
     fn tck_00152_retry_exhaustion_does_not_trigger_circuit_breaker_alone() {
         // Use max_attempts = 3 (3 retries per work item)
-        let budget = CoordinationBudget::new(100, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(100, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(
             vec!["A".to_string(), "B".to_string()],
             budget,
@@ -2677,7 +2918,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Work A: Fail 3 times (exhaust all retries)
         // Each session failure within retries should NOT increment consecutive_failures
@@ -2691,6 +2932,7 @@ mod tests {
                     "A",
                     SessionOutcome::Failure,
                     100,
+                    tick(2000 + i * 1000),
                     3_000_000_000 + i * 1_000_000_000,
                 )
                 .unwrap();
@@ -2712,6 +2954,7 @@ mod tests {
                 "A",
                 SessionOutcome::Failure,
                 100,
+                tick(5000),
                 6_000_000_000,
             )
             .unwrap();
@@ -2738,7 +2981,7 @@ mod tests {
     fn tck_00152_stop_condition_priority_ordering() {
         // Create a scenario where both circuit breaker and episode budget are
         // exhausted
-        let budget = CoordinationBudget::new(3, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(3, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(
             vec![
                 "A".to_string(),
@@ -2751,7 +2994,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Fail 3 work items (triggers both circuit breaker AND exhausts episode budget)
         for (i, work_id) in ["A", "B", "C"].iter().enumerate() {
@@ -2764,6 +3007,7 @@ mod tests {
                     work_id,
                     SessionOutcome::Failure,
                     100,
+                    tick(2000 + (i as u64) * 1000),
                     3_000_000_000,
                 )
                 .unwrap();
@@ -2793,7 +3037,7 @@ mod tests {
     /// IT-COORD-STOP-001: Circuit breaker trigger test.
     #[test]
     fn tck_00152_integration_circuit_breaker_trigger() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(
             vec![
                 "W1".to_string(),
@@ -2806,7 +3050,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Simulate 3 consecutive work item failures
         let work_ids = ["W1", "W2", "W3"];
@@ -2820,6 +3064,7 @@ mod tests {
                     work_id,
                     SessionOutcome::Failure,
                     100,
+                    tick(2000 + (i as u64) * 1000),
                     3_000_000_000,
                 )
                 .unwrap();
@@ -2832,7 +3077,9 @@ mod tests {
             StopCondition::CircuitBreakerTriggered { .. }
         ));
 
-        let completed = controller.complete(stop, 10_000_000_000).unwrap();
+        let completed = controller
+            .complete(stop, tick(9000), 10_000_000_000)
+            .unwrap();
         assert!(matches!(
             completed.stop_condition,
             StopCondition::CircuitBreakerTriggered {
@@ -2846,7 +3093,7 @@ mod tests {
     /// IT-COORD-STOP-002: Circuit breaker reset on success.
     #[test]
     fn tck_00152_integration_circuit_breaker_reset() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(
             vec![
                 "W1".to_string(),
@@ -2860,7 +3107,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Fail W1
         let spawn_w1 = controller
@@ -2872,6 +3119,7 @@ mod tests {
                 "W1",
                 SessionOutcome::Failure,
                 100,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -2887,6 +3135,7 @@ mod tests {
                 "W2",
                 SessionOutcome::Failure,
                 100,
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -2902,6 +3151,7 @@ mod tests {
                 "W3",
                 SessionOutcome::Success,
                 100,
+                tick(6000),
                 7_000_000_000,
             )
             .unwrap();
@@ -2917,6 +3167,7 @@ mod tests {
                 "W4",
                 SessionOutcome::Failure,
                 100,
+                tick(8000),
                 9_000_000_000,
             )
             .unwrap();
@@ -2931,6 +3182,7 @@ mod tests {
                 "W5",
                 SessionOutcome::Failure,
                 100,
+                tick(10000),
                 11_000_000_000,
             )
             .unwrap();
@@ -2949,11 +3201,11 @@ mod tests {
     /// IT-COORD-STOP-003: Retry exhaustion behavior.
     #[test]
     fn tck_00152_integration_retry_exhaustion() {
-        let budget = CoordinationBudget::new(20, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(20, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config =
             CoordinationConfig::new(vec!["W1".to_string(), "W2".to_string()], budget, 3).unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // W1: Fail, fail, then succeed (uses 3 sessions)
         let spawn_w1_1 = controller
@@ -2965,6 +3217,7 @@ mod tests {
                 "W1",
                 SessionOutcome::Failure,
                 100,
+                tick(2000),
                 3_000_000_000,
             )
             .unwrap();
@@ -2984,6 +3237,7 @@ mod tests {
                 "W1",
                 SessionOutcome::Failure,
                 100,
+                tick(4000),
                 5_000_000_000,
             )
             .unwrap();
@@ -2999,6 +3253,7 @@ mod tests {
                 "W1",
                 SessionOutcome::Success,
                 100,
+                tick(6000),
                 7_000_000_000,
             )
             .unwrap();
@@ -3015,6 +3270,7 @@ mod tests {
                 "W2",
                 SessionOutcome::Success,
                 100,
+                tick(8000),
                 9_000_000_000,
             )
             .unwrap();
@@ -3040,7 +3296,7 @@ mod tests {
     /// event.
     #[test]
     fn tck_00152_property_binding_completeness() {
-        let budget = CoordinationBudget::new(20, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(20, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let config = CoordinationConfig::new(
             vec![
                 "A".to_string(),
@@ -3053,7 +3309,7 @@ mod tests {
         )
         .unwrap();
         let mut controller = CoordinationController::new(config);
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Run a complex sequence of successes, failures, and retries
         let outcomes = [
@@ -3075,6 +3331,7 @@ mod tests {
                     work_id,
                     *outcome,
                     100,
+                    tick(2000 + (i as u64) * 1000),
                     3_000_000_000 + i as u64 * 1_000_000_000,
                 )
                 .unwrap();
@@ -3143,7 +3400,7 @@ mod tests {
         let mut controller = CoordinationController::new(config);
 
         // Start coordination
-        let _coord_id = controller.start(1_000_000_000).unwrap();
+        let _coord_id = controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Process work-1: success on first attempt
         let work_id = controller.current_work_id().unwrap().to_string();
@@ -3156,6 +3413,7 @@ mod tests {
                 &work_id,
                 SessionOutcome::Success,
                 5000,
+                tick(2000),
                 1_002_000_000,
             )
             .unwrap();
@@ -3171,6 +3429,7 @@ mod tests {
                 &work_id,
                 SessionOutcome::Success,
                 3000,
+                tick(3000),
                 1_004_000_000,
             )
             .unwrap();
@@ -3181,7 +3440,7 @@ mod tests {
 
         // Complete with CAS storage
         let (completed_event, canonical_hash, cas_hash) = controller
-            .complete_with_cas(&cas, stop, 1_005_000_000)
+            .complete_with_cas(&cas, stop, tick(4000), 1_005_000_000)
             .unwrap();
 
         // Verify receipt was stored
@@ -3222,7 +3481,7 @@ mod tests {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
 
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Work-1: fail first attempt, succeed second
         let work_id = controller.current_work_id().unwrap().to_string();
@@ -3237,6 +3496,7 @@ mod tests {
                 &work_id,
                 SessionOutcome::Failure,
                 2000,
+                tick(2000),
                 1_002_000_000,
             )
             .unwrap();
@@ -3251,6 +3511,7 @@ mod tests {
                 &work_id,
                 SessionOutcome::Success,
                 3000,
+                tick(3000),
                 1_004_000_000,
             )
             .unwrap();
@@ -3258,7 +3519,7 @@ mod tests {
         // Complete
         let stop = controller.check_stop_condition().unwrap();
         let (_, canonical_hash, cas_hash) = controller
-            .complete_with_cas(&cas, stop, 1_005_000_000)
+            .complete_with_cas(&cas, stop, tick(4000), 1_005_000_000)
             .unwrap();
 
         // Load and verify
@@ -3283,7 +3544,7 @@ mod tests {
         let config = test_config(vec!["work-1".to_string()]);
         let mut controller = CoordinationController::new(config);
 
-        controller.start(1_000_000_000).unwrap();
+        controller.start(tick(1000), 1_000_000_000).unwrap();
 
         // Complete one work item
         let work_id = controller.current_work_id().unwrap().to_string();
@@ -3296,6 +3557,7 @@ mod tests {
                 &work_id,
                 SessionOutcome::Success,
                 5000,
+                tick(2000),
                 1_002_000_000,
             )
             .unwrap();
@@ -3303,7 +3565,7 @@ mod tests {
         // Complete and get hash
         let stop = controller.check_stop_condition().unwrap();
         let (completed_event, canonical_hash, _cas_hash) = controller
-            .complete_with_cas(&cas, stop, 1_005_000_000)
+            .complete_with_cas(&cas, stop, tick(4000), 1_005_000_000)
             .unwrap();
 
         // The completion event should contain the canonical hash (non-zero)
@@ -3315,5 +3577,247 @@ mod tests {
             completed_event.receipt_hash, canonical_hash,
             "Completion event hash should match returned canonical hash"
         );
+    }
+
+    // =========================================================================
+    // TCK-00242: Tick Rate Validation Tests
+    // =========================================================================
+
+    /// TCK-00242: Start rejects tick with mismatched rate.
+    ///
+    /// Validates that `start()` returns `InvalidTickRate` when the provided
+    /// tick has a different rate than the budget configuration.
+    #[test]
+    fn tck_00242_start_rejects_mismatched_tick_rate() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        // Use a different tick rate (1GHz instead of 1MHz)
+        let wrong_rate_tick = HtfTick::new(1000, 1_000_000_000);
+
+        let result = controller.start(wrong_rate_tick, 1_000_000_000);
+
+        assert!(matches!(
+            result,
+            Err(ControllerError::InvalidTickRate {
+                expected_hz: 1_000_000,
+                actual_hz: 1_000_000_000,
+            })
+        ));
+    }
+
+    /// TCK-00242: Complete rejects tick with mismatched rate.
+    ///
+    /// Validates that `complete()` returns `InvalidTickRate` when the provided
+    /// tick has a different rate than the budget configuration.
+    #[test]
+    fn tck_00242_complete_rejects_mismatched_tick_rate() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(tick(1000), 1_000_000_000).unwrap();
+
+        // Process one session to make WorkCompleted valid
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn.session_id,
+                "work-1",
+                SessionOutcome::Success,
+                1000,
+                tick(2000),
+                3_000_000_000,
+            )
+            .unwrap();
+
+        // Use a different tick rate for complete
+        let wrong_rate_tick = HtfTick::new(3000, 1_000_000_000);
+
+        let result =
+            controller.complete(StopCondition::WorkCompleted, wrong_rate_tick, 4_000_000_000);
+
+        assert!(matches!(
+            result,
+            Err(ControllerError::InvalidTickRate {
+                expected_hz: 1_000_000,
+                actual_hz: 1_000_000_000,
+            })
+        ));
+    }
+
+    /// TCK-00242: Abort rejects tick with mismatched rate.
+    ///
+    /// Validates that `abort()` returns `InvalidTickRate` when the provided
+    /// tick has a different rate than the budget configuration.
+    #[test]
+    fn tck_00242_abort_rejects_mismatched_tick_rate() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(tick(1000), 1_000_000_000).unwrap();
+
+        // Use a different tick rate for abort
+        let wrong_rate_tick = HtfTick::new(2000, 1_000_000_000);
+
+        let result = controller.abort(AbortReason::NoEligibleWork, wrong_rate_tick, 2_000_000_000);
+
+        assert!(matches!(
+            result,
+            Err(ControllerError::InvalidTickRate {
+                expected_hz: 1_000_000,
+                actual_hz: 1_000_000_000,
+            })
+        ));
+    }
+
+    /// TCK-00242: `record_session_termination` rejects tick with mismatched
+    /// rate.
+    ///
+    /// Validates that `record_session_termination()` returns `InvalidTickRate`
+    /// when the provided tick has a different rate than the budget.
+    #[test]
+    fn tck_00242_record_session_termination_rejects_mismatched_tick_rate() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(tick(1000), 1_000_000_000).unwrap();
+
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+
+        // Use a different tick rate for termination
+        let wrong_rate_tick = HtfTick::new(2000, 1_000_000_000);
+
+        let result = controller.record_session_termination(
+            &spawn.session_id,
+            "work-1",
+            SessionOutcome::Success,
+            1000,
+            wrong_rate_tick,
+            3_000_000_000,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ControllerError::InvalidTickRate {
+                expected_hz: 1_000_000,
+                actual_hz: 1_000_000_000,
+            })
+        ));
+    }
+
+    /// TCK-00242: Correct tick rate is accepted throughout coordination.
+    ///
+    /// Validates that all methods accept ticks with the correct rate.
+    #[test]
+    fn tck_00242_correct_tick_rate_accepted() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        // All operations should succeed with correct tick rate
+        controller.start(tick(1000), 1_000_000_000).unwrap();
+
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+
+        controller
+            .record_session_termination(
+                &spawn.session_id,
+                "work-1",
+                SessionOutcome::Success,
+                1000,
+                tick(2000),
+                3_000_000_000,
+            )
+            .unwrap();
+
+        controller
+            .complete(StopCondition::WorkCompleted, tick(3000), 4_000_000_000)
+            .unwrap();
+
+        assert!(controller.is_terminal());
+    }
+
+    /// TCK-00242: Controller auto-aborts on clock regression.
+    ///
+    /// When `update_elapsed_ticks` detects a clock regression (`current_tick` <
+    /// `start_tick`), the controller must automatically transition to Aborted
+    /// state (fail-closed).
+    #[test]
+    fn tck_00242_auto_abort_on_clock_regression() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        // Start at tick 2000
+        controller.start(tick(2000), 1_000_000_000).unwrap();
+
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+
+        // Try to record termination with a tick BEFORE the start tick (regression)
+        let regressed_tick = tick(1000); // 1000 < 2000
+
+        let result = controller.record_session_termination(
+            &spawn.session_id,
+            "work-1",
+            SessionOutcome::Success,
+            1000,
+            regressed_tick,
+            3_000_000_000,
+        );
+
+        // Should return ClockRegression error
+        assert!(matches!(
+            result,
+            Err(ControllerError::ClockRegression {
+                start_tick: 2000,
+                current_tick: 1000,
+            })
+        ));
+
+        // Controller should now be in terminal (Aborted) state
+        assert!(controller.is_terminal());
+        assert!(matches!(
+            controller.status(),
+            CoordinationStatus::Aborted(AbortReason::Error { .. })
+        ));
+    }
+
+    /// TCK-00242: Controller auto-aborts on clock regression during
+    /// `complete()`.
+    ///
+    /// The fail-closed behavior applies to all methods that call
+    /// `update_elapsed_ticks`.
+    #[test]
+    fn tck_00242_auto_abort_on_clock_regression_during_complete() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        // Start at tick 2000
+        controller.start(tick(2000), 1_000_000_000).unwrap();
+
+        // Try to complete with a tick BEFORE the start tick (regression)
+        let regressed_tick = tick(1500); // 1500 < 2000
+
+        let result =
+            controller.complete(StopCondition::WorkCompleted, regressed_tick, 2_000_000_000);
+
+        // Should return ClockRegression error
+        assert!(matches!(
+            result,
+            Err(ControllerError::ClockRegression {
+                start_tick: 2000,
+                current_tick: 1500,
+            })
+        ));
+
+        // Controller should now be in terminal (Aborted) state
+        assert!(controller.is_terminal());
+        assert!(matches!(
+            controller.status(),
+            CoordinationStatus::Aborted(AbortReason::Error { .. })
+        ));
     }
 }

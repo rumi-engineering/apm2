@@ -350,6 +350,9 @@ mod unit_tests {
     use crate::coordination::events::BLAKE3_HASH_SIZE;
     use crate::coordination::state::{AbortReason, BudgetUsage, CoordinationBudget, StopCondition};
 
+    /// Test tick rate: 1MHz (1 tick = 1 microsecond)
+    const TEST_TICK_RATE_HZ: u64 = 1_000_000;
+
     /// Helper to create an event record with a JSON payload.
     fn create_event(event_type: &str, payload: &[u8]) -> EventRecord {
         EventRecord::with_timestamp(
@@ -363,7 +366,7 @@ mod unit_tests {
 
     /// Helper to create a started event payload.
     fn started_payload(coordination_id: &str, work_ids: Vec<String>) -> Vec<u8> {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let event = CoordinationStarted::new(
             coordination_id.to_string(),
             work_ids,
@@ -419,7 +422,8 @@ mod unit_tests {
             stop_condition,
             BudgetUsage {
                 consumed_episodes: 2,
-                elapsed_ms: 5000,
+                elapsed_ticks: 5_000_000,
+                tick_rate_hz: TEST_TICK_RATE_HZ,
                 consumed_tokens: 10000,
             },
             2,

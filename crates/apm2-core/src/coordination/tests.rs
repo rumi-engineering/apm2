@@ -66,15 +66,18 @@ fn arb_work_ids() -> impl Strategy<Value = Vec<String>> {
     prop::collection::vec(arb_work_id(), 1..=5)
 }
 
-/// Generates a valid coordination budget.
+/// Test tick rate: 1MHz (1 tick = 1 microsecond)
+const TEST_TICK_RATE_HZ: u64 = 1_000_000;
+
+/// Generates a valid coordination budget (TCK-00242: tick-based).
 fn arb_budget() -> impl Strategy<Value = CoordinationBudget> {
     (
         1u32..100,
-        1000u64..100_000,
+        1_000_000u64..100_000_000, // Ticks at 1MHz
         prop::option::of(1000u64..100_000),
     )
-        .prop_map(|(episodes, duration, tokens)| {
-            CoordinationBudget::new(episodes, duration, tokens).unwrap()
+        .prop_map(|(episodes, duration_ticks, tokens)| {
+            CoordinationBudget::new(episodes, duration_ticks, TEST_TICK_RATE_HZ, tokens).unwrap()
         })
 }
 
@@ -155,14 +158,20 @@ fn arb_stop_condition() -> impl Strategy<Value = StopCondition> {
 /// Generates a `CoordinationCompleted` event.
 #[allow(dead_code)]
 fn arb_completed_event(coord_id: String) -> impl Strategy<Value = CoordinationCompleted> {
-    (arb_stop_condition(), 0u32..10, 0u64..60_000, 0u64..100_000).prop_map(
-        move |(stop, episodes, elapsed, tokens)| {
+    (
+        arb_stop_condition(),
+        0u32..10,
+        0u64..60_000_000,
+        0u64..100_000,
+    )
+        .prop_map(move |(stop, episodes, elapsed_ticks, tokens)| {
             CoordinationCompleted::new(
                 coord_id.clone(),
                 stop,
                 BudgetUsage {
                     consumed_episodes: episodes,
-                    elapsed_ms: elapsed,
+                    elapsed_ticks,
+                    tick_rate_hz: TEST_TICK_RATE_HZ,
                     consumed_tokens: tokens,
                 },
                 episodes,
@@ -171,8 +180,7 @@ fn arb_completed_event(coord_id: String) -> impl Strategy<Value = CoordinationCo
                 [0u8; BLAKE3_HASH_SIZE],
                 4_000_000_000,
             )
-        },
-    )
+        })
 }
 
 /// Generates an abort reason.
@@ -506,7 +514,7 @@ fn tck_00149_determinism_complex_sequence() {
     let mut reducer2 = CoordinationReducer::new();
     let ctx = ReducerContext::new(1);
 
-    let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+    let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
 
     // Build event sequence
     let events: Vec<EventRecord> = vec![
@@ -581,7 +589,8 @@ fn tck_00149_determinism_complex_sequence() {
             StopCondition::WorkCompleted,
             BudgetUsage {
                 consumed_episodes: 3,
-                elapsed_ms: 6000,
+                elapsed_ticks: 6_000_000,
+                tick_rate_hz: TEST_TICK_RATE_HZ,
                 consumed_tokens: 4500,
             },
             3,
@@ -616,7 +625,7 @@ fn tck_00149_determinism_complex_sequence() {
 #[test]
 fn tck_00149_checkpoint_replay_equals_genesis_replay() {
     let ctx = ReducerContext::new(1);
-    let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+    let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
 
     // Build event sequence (split into two parts)
     let events_part1: Vec<EventRecord> = vec![
@@ -654,7 +663,8 @@ fn tck_00149_checkpoint_replay_equals_genesis_replay() {
             StopCondition::WorkCompleted,
             BudgetUsage {
                 consumed_episodes: 1,
-                elapsed_ms: 2000,
+                elapsed_ticks: 2_000_000,
+                tick_rate_hz: TEST_TICK_RATE_HZ,
                 consumed_tokens: 1000,
             },
             1,
@@ -742,7 +752,7 @@ fn tck_00148_types_are_send_sync() {
 #[test]
 fn tck_00148_types_derive_required_traits() {
     // Test Debug (via format!)
-    let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+    let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
     let _ = format!("{budget:?}");
 
     let usage = BudgetUsage::new();
@@ -765,7 +775,7 @@ fn tck_00148_types_derive_required_traits() {
     let _ = format!("{state:?}");
 
     // Test Clone (via clone() and then use it)
-    let budget2 = CoordinationBudget::new(10, 60_000, None).unwrap();
+    let budget2 = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
     let budget_clone = budget2.clone();
     assert_eq!(budget2, budget_clone);
 
@@ -788,7 +798,7 @@ fn tck_00148_types_derive_required_traits() {
     let session2 = CoordinationSession::new(
         "c".to_string(),
         vec!["w".to_string()],
-        CoordinationBudget::new(10, 60_000, None).unwrap(),
+        CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap(),
         3,
         1000,
     )
@@ -827,7 +837,7 @@ fn tck_00148_types_derive_required_traits() {
 #[test]
 fn tck_00148_json_roundtrip_comprehensive() {
     // Build a complete CoordinationState with all nested types
-    let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+    let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
     let mut session = CoordinationSession::new(
         "coord-123".to_string(),
         vec!["work-1".to_string(), "work-2".to_string()],
@@ -839,7 +849,8 @@ fn tck_00148_json_roundtrip_comprehensive() {
     session.status = CoordinationStatus::Running;
     session.budget_usage = BudgetUsage {
         consumed_episodes: 2,
-        elapsed_ms: 15_000,
+        elapsed_ticks: 15_000_000,
+        tick_rate_hz: TEST_TICK_RATE_HZ,
         consumed_tokens: 25_000,
     };
     session.consecutive_failures = 1;

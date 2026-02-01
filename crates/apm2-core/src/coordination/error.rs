@@ -147,6 +147,36 @@ pub enum ControllerError {
         /// Description of the error.
         message: String,
     },
+
+    /// Tick rate mismatch.
+    ///
+    /// The provided `HtfTick` has a different tick rate than the configured
+    /// budget. This would cause temporal confusion where duration calculations
+    /// produce incorrect results.
+    ///
+    /// Per TCK-00242: All tick values within a coordination must use the same
+    /// tick rate as the budget for replay-stable duration tracking.
+    InvalidTickRate {
+        /// The expected tick rate from the budget configuration.
+        expected_hz: u64,
+        /// The actual tick rate from the provided `HtfTick`.
+        actual_hz: u64,
+    },
+
+    /// Clock regression detected.
+    ///
+    /// The current tick value is less than the start tick, indicating a
+    /// clock regression or discontinuity. Per fail-closed policy, this
+    /// error must be handled rather than silently ignored.
+    ///
+    /// Per TCK-00242: Clock regressions are detected and reported as errors
+    /// to prevent coordination from continuing indefinitely.
+    ClockRegression {
+        /// The tick value when coordination started.
+        start_tick: u64,
+        /// The current tick value that is less than start.
+        current_tick: u64,
+    },
 }
 
 impl fmt::Display for ControllerError {
@@ -211,6 +241,24 @@ impl fmt::Display for ControllerError {
             Self::Internal { message } => {
                 write!(f, "internal error: {message}")
             },
+            Self::InvalidTickRate {
+                expected_hz,
+                actual_hz,
+            } => {
+                write!(
+                    f,
+                    "tick rate mismatch: expected {expected_hz} Hz, got {actual_hz} Hz"
+                )
+            },
+            Self::ClockRegression {
+                start_tick,
+                current_tick,
+            } => {
+                write!(
+                    f,
+                    "clock regression detected: current tick {current_tick} < start tick {start_tick}"
+                )
+            },
         }
     }
 }
@@ -225,6 +273,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn tck_00150_error_display() {
         let errors = vec![
             (ControllerError::EmptyWorkQueue, "work queue is empty"),
@@ -311,6 +360,20 @@ mod tests {
                     message: "unexpected state".to_string(),
                 },
                 "internal error: unexpected state",
+            ),
+            (
+                ControllerError::InvalidTickRate {
+                    expected_hz: 1_000_000,
+                    actual_hz: 1_000_000_000,
+                },
+                "tick rate mismatch: expected 1000000 Hz, got 1000000000 Hz",
+            ),
+            (
+                ControllerError::ClockRegression {
+                    start_tick: 1000,
+                    current_tick: 500,
+                },
+                "clock regression detected: current tick 500 < start tick 1000",
             ),
         ];
 

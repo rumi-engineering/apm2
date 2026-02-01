@@ -797,13 +797,17 @@ mod tests {
     use super::*;
     use crate::coordination::state::BudgetType;
 
+    /// Test tick rate: 1MHz (1 tick = 1 microsecond)
+    const TEST_TICK_RATE_HZ: u64 = 1_000_000;
+
     // ========================================================================
     // CoordinationStarted Tests
     // ========================================================================
 
     #[test]
     fn test_coordination_started_new() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         let event = CoordinationStarted::new(
             "coord-123".to_string(),
             vec!["work-1".to_string(), "work-2".to_string()],
@@ -821,7 +825,8 @@ mod tests {
 
     #[test]
     fn test_coordination_started_serde_roundtrip() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         let event = CoordinationStarted::new(
             "coord-123".to_string(),
             vec!["work-1".to_string()],
@@ -947,7 +952,8 @@ mod tests {
     fn test_coordination_completed_new() {
         let budget_usage = BudgetUsage {
             consumed_episodes: 5,
-            elapsed_ms: 30_000,
+            elapsed_ticks: 30_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 50_000,
         };
         let receipt_hash = test_hash();
@@ -975,7 +981,8 @@ mod tests {
     fn test_coordination_completed_serde_roundtrip() {
         let budget_usage = BudgetUsage {
             consumed_episodes: 5,
-            elapsed_ms: 30_000,
+            elapsed_ticks: 30_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 50_000,
         };
         let event = CoordinationCompleted::new(
@@ -999,6 +1006,7 @@ mod tests {
     /// TCK-00148: Test that invalid hash length is rejected during
     /// deserialization.
     #[test]
+    #[allow(clippy::unreadable_literal)] // Raw JSON string - underscores not valid in JSON
     fn test_completed_event_invalid_hash() {
         // This test documents that the type system prevents invalid hash lengths
         // at compile time. The receipt_hash field is now [u8; 32], not Vec<u8>.
@@ -1007,7 +1015,7 @@ mod tests {
         let json_with_short_hash = r#"{
             "coordination_id": "coord-123",
             "stop_condition": "WorkCompleted",
-            "budget_usage": {"consumed_episodes": 0, "elapsed_ms": 0, "consumed_tokens": 0},
+            "budget_usage": {"consumed_episodes": 0, "elapsed_ticks": 0, "tick_rate_hz": 1000000, "consumed_tokens": 0},
             "total_sessions": 1,
             "successful_sessions": 1,
             "failed_sessions": 0,
@@ -1047,7 +1055,8 @@ mod tests {
     fn test_coordination_aborted_serde_roundtrip() {
         let budget_usage = BudgetUsage {
             consumed_episodes: 2,
-            elapsed_ms: 10_000,
+            elapsed_ticks: 10_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 5000,
         };
         let event = CoordinationAborted::new(
@@ -1074,7 +1083,7 @@ mod tests {
             CoordinationStarted::new(
                 "c".to_string(),
                 vec![],
-                CoordinationBudget::new(10, 60_000, None).unwrap(),
+                CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap(),
                 3,
                 1000,
             )
@@ -1125,7 +1134,7 @@ mod tests {
 
     #[test]
     fn test_coordination_event_coordination_id() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let event = CoordinationEvent::Started(
             CoordinationStarted::new("coord-test".to_string(), vec![], budget, 3, 1000).unwrap(),
         );
@@ -1139,7 +1148,8 @@ mod tests {
                 CoordinationStarted::new(
                     "c".to_string(),
                     vec!["w1".to_string(), "w2".to_string()],
-                    CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap(),
+                    CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000))
+                        .unwrap(),
                     3,
                     1000,
                 )
@@ -1166,7 +1176,8 @@ mod tests {
                 StopCondition::WorkCompleted,
                 BudgetUsage {
                     consumed_episodes: 2,
-                    elapsed_ms: 5000,
+                    elapsed_ticks: 5_000_000,
+                    tick_rate_hz: TEST_TICK_RATE_HZ,
                     consumed_tokens: 1000,
                 },
                 2,
@@ -1203,7 +1214,7 @@ mod tests {
         let started = CoordinationStarted::new(
             "coord-1".to_string(),
             vec!["work-1".to_string()],
-            CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap(),
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap(),
             3,
             1000,
         )
@@ -1251,7 +1262,8 @@ mod tests {
                 stop,
                 BudgetUsage {
                     consumed_episodes: 5,
-                    elapsed_ms: 30_000,
+                    elapsed_ticks: 30_000_000,
+                    tick_rate_hz: TEST_TICK_RATE_HZ,
                     consumed_tokens: 50_000,
                 },
                 5,
@@ -1294,7 +1306,7 @@ mod tests {
     /// `CoordinationStarted`.
     #[test]
     fn test_coordination_started_queue_limit() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
 
         // Create a work_ids list that exceeds the limit
         let oversized_work_ids: Vec<String> = (0..=MAX_WORK_QUEUE_SIZE)
@@ -1352,7 +1364,8 @@ mod tests {
             "work_ids": oversized_work_ids,
             "budget": {
                 "max_episodes": 10,
-                "max_duration_ms": 60000,
+                "max_duration_ticks": 60000,
+                "tick_rate_hz": 1_000_000,
                 "max_tokens": null
             },
             "max_attempts_per_work": 3,
@@ -1381,7 +1394,7 @@ mod tests {
                 CoordinationStarted::new(
                     "c".to_string(),
                     vec!["w1".to_string()],
-                    CoordinationBudget::new(10, 60_000, None).unwrap(),
+                    CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap(),
                     3,
                     1000,
                 )
