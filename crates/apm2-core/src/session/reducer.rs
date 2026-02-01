@@ -108,7 +108,7 @@ impl SessionReducer {
     /// which may not match the actual tick epoch. In production, proper tick
     /// values should be resolved from the event's `time_envelope_ref`.
     #[must_use]
-    fn approximate_tick_from_timestamp(timestamp_ns: u64, tick_rate_hz: u64) -> HtfTick {
+    const fn approximate_tick_from_timestamp(timestamp_ns: u64, tick_rate_hz: u64) -> HtfTick {
         // Convert nanoseconds to seconds (with saturation for safety)
         // Then multiply by tick rate to get approximate tick value
         // Note: This assumes ticks started at epoch 0, which is an approximation
