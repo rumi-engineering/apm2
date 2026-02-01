@@ -41,16 +41,18 @@
 //! - **No wall-time authority**: Budget exhaustion, stop conditions, and all
 //!   coordination decisions are based on tick deltas, not wall clock readings.
 
+use std::fmt;
 use std::fs::File;
 use std::io::Read as IoRead;
 
 use apm2_core::coordination::{
     CoordinationBudget, CoordinationConfig, CoordinationController, DEFAULT_MAX_ATTEMPTS_PER_WORK,
-    MAX_WORK_QUEUE_SIZE,
+    MAX_SESSION_IDS_PER_OUTCOME, MAX_WORK_OUTCOMES, MAX_WORK_QUEUE_SIZE,
 };
 use apm2_core::htf::HtfTick;
 use clap::Args;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Default tick rate: 1MHz (1 tick = 1 microsecond).
 ///
@@ -63,6 +65,110 @@ const DEFAULT_TICK_RATE_HZ: u64 = 1_000_000;
 /// This limit prevents denial-of-service attacks via memory exhaustion from
 /// large file inputs.
 const MAX_WORK_QUERY_FILE_SIZE: u64 = 1024 * 1024;
+
+// ============================================================================
+// Bounded Deserializers (SEC-FAC-001: DoS/OOM Protection)
+// ============================================================================
+
+/// Custom deserializer for `session_ids` that enforces
+/// [`MAX_SESSION_IDS_PER_OUTCOME`].
+///
+/// This uses a streaming visitor pattern that enforces limits DURING
+/// deserialization, preventing OOM attacks by rejecting oversized arrays
+/// before full allocation occurs.
+fn deserialize_bounded_session_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedVecVisitor;
+
+    impl<'de> Visitor<'de> for BoundedVecVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_SESSION_IDS_PER_OUTCOME} strings"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Use size hint but cap at MAX_SESSION_IDS_PER_OUTCOME to prevent
+            // pre-allocation attacks
+            let capacity = seq
+                .size_hint()
+                .unwrap_or(0)
+                .min(MAX_SESSION_IDS_PER_OUTCOME);
+            let mut items = Vec::with_capacity(capacity);
+
+            while let Some(item) = seq.next_element()? {
+                if items.len() >= MAX_SESSION_IDS_PER_OUTCOME {
+                    return Err(de::Error::custom(format!(
+                        "session_ids exceeds maximum size: {} > {}",
+                        items.len() + 1,
+                        MAX_SESSION_IDS_PER_OUTCOME
+                    )));
+                }
+                items.push(item);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor)
+}
+
+/// Custom deserializer for `work_outcomes` that enforces [`MAX_WORK_OUTCOMES`].
+///
+/// This uses a streaming visitor pattern that enforces limits DURING
+/// deserialization, preventing OOM attacks by rejecting oversized arrays
+/// before full allocation occurs.
+fn deserialize_bounded_work_outcomes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<WorkOutcomeEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedVecVisitor;
+
+    impl<'de> Visitor<'de> for BoundedVecVisitor {
+        type Value = Vec<WorkOutcomeEntry>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_WORK_OUTCOMES} work outcomes"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Use size hint but cap at MAX_WORK_OUTCOMES to prevent pre-allocation
+            // attacks
+            let capacity = seq.size_hint().unwrap_or(0).min(MAX_WORK_OUTCOMES);
+            let mut items = Vec::with_capacity(capacity);
+
+            while let Some(item) = seq.next_element()? {
+                if items.len() >= MAX_WORK_OUTCOMES {
+                    return Err(de::Error::custom(format!(
+                        "work_outcomes exceeds maximum size: {} > {}",
+                        items.len() + 1,
+                        MAX_WORK_OUTCOMES
+                    )));
+                }
+                items.push(item);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor)
+}
 
 /// Exit codes for coordinate commands per CTR-COORD-007.
 pub mod exit_codes {
@@ -148,11 +254,27 @@ pub struct CoordinateArgs {
 /// Coordination receipt output structure.
 ///
 /// Per CTR-COORD-006: Evidence artifact proving coordination execution.
+///
+/// # Security Notes (SEC-FAC-001, SEC-FAC-002, SEC-FAC-003)
+///
+/// - **Bounded deserialization**: `work_outcomes` is bounded by
+///   [`MAX_WORK_OUTCOMES`] to prevent memory exhaustion attacks.
+/// - **Strict parsing**: `deny_unknown_fields` prevents injection of unexpected
+///   fields.
+/// - **Canonicalization**: This CLI struct is for output/display purposes only
+///   and does not implement `Canonicalizable`. For cryptographic operations
+///   requiring tamper-evidence, use
+///   [`apm2_core::coordination::CoordinationReceipt`] which provides
+///   `canonical_bytes()` and `compute_hash()`.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoordinationReceipt {
     /// Coordination ID.
     pub coordination_id: String,
     /// Work outcomes for each processed item.
+    ///
+    /// Limited to [`MAX_WORK_OUTCOMES`] entries during deserialization.
+    #[serde(deserialize_with = "deserialize_bounded_work_outcomes")]
     pub work_outcomes: Vec<WorkOutcomeEntry>,
     /// Budget usage at completion.
     pub budget_usage: BudgetUsageOutput,
@@ -173,7 +295,15 @@ pub struct CoordinationReceipt {
 }
 
 /// Work outcome entry in the receipt.
+///
+/// # Security Notes (SEC-FAC-001, SEC-FAC-002)
+///
+/// - **Bounded deserialization**: `session_ids` is bounded by
+///   [`MAX_SESSION_IDS_PER_OUTCOME`] to prevent memory exhaustion attacks.
+/// - **Strict parsing**: `deny_unknown_fields` prevents injection of unexpected
+///   fields.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkOutcomeEntry {
     /// Work item ID.
     pub work_id: String,
@@ -182,11 +312,21 @@ pub struct WorkOutcomeEntry {
     /// Final outcome (SUCCEEDED, FAILED, SKIPPED).
     pub final_outcome: String,
     /// Session IDs used for this work item.
+    ///
+    /// Limited to [`MAX_SESSION_IDS_PER_OUTCOME`] entries during
+    /// deserialization.
+    #[serde(deserialize_with = "deserialize_bounded_session_ids")]
     pub session_ids: Vec<String>,
 }
 
 /// Budget usage output in the receipt.
+///
+/// # Security Notes (SEC-FAC-002)
+///
+/// - **Strict parsing**: `deny_unknown_fields` prevents injection of unexpected
+///   fields.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetUsageOutput {
     /// Episodes consumed.
     pub consumed_episodes: u32,
@@ -201,7 +341,13 @@ pub struct BudgetUsageOutput {
 /// Budget ceiling output in the receipt.
 ///
 /// Field names match the `CoordinationBudget` schema for consistency.
+///
+/// # Security Notes (SEC-FAC-002)
+///
+/// - **Strict parsing**: `deny_unknown_fields` prevents injection of unexpected
+///   fields.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_field_names)]
 pub struct BudgetCeilingOutput {
     /// Maximum episodes configured.
@@ -1218,5 +1364,298 @@ mod tests {
         let one_second_ms = 1000u64;
         let expected_ticks = one_second_ms * 1000; // ms to us
         assert_eq!(expected_ticks, DEFAULT_TICK_RATE_HZ);
+    }
+
+    // =========================================================================
+    // Security Tests (SEC-FAC-001, SEC-FAC-002, SEC-FAC-003)
+    // =========================================================================
+
+    /// SEC-FAC-001: Verify bounded deserialization rejects oversized
+    /// work_outcomes.
+    ///
+    /// Attackers may craft malicious JSON with excessive array sizes to
+    /// cause memory exhaustion. The bounded deserializer MUST reject
+    /// arrays exceeding `MAX_WORK_OUTCOMES`.
+    #[test]
+    fn sec_fac_001_bounded_deser_rejects_oversized_work_outcomes() {
+        use apm2_core::coordination::MAX_WORK_OUTCOMES;
+
+        // Build JSON with too many work outcomes
+        let work_outcomes: Vec<serde_json::Value> = (0..=MAX_WORK_OUTCOMES)
+            .map(|i| {
+                serde_json::json!({
+                    "work_id": format!("work-{i}"),
+                    "attempts": 1,
+                    "final_outcome": "SUCCEEDED",
+                    "session_ids": [],
+                })
+            })
+            .collect();
+
+        let json = serde_json::json!({
+            "coordination_id": "coord-1",
+            "work_outcomes": work_outcomes,
+            "budget_usage": {
+                "consumed_episodes": 0,
+                "elapsed_ticks": 0,
+                "elapsed_ms": 0,
+                "consumed_tokens": 0
+            },
+            "budget_ceiling": {
+                "max_episodes": 10,
+                "max_duration_ticks": 60_000_000,
+                "max_duration_ms": 60_000,
+                "max_tokens": null
+            },
+            "stop_condition": "WORK_COMPLETED",
+            "started_at": 0,
+            "completed_at": 0,
+            "total_sessions": 0,
+            "successful_sessions": 0,
+            "failed_sessions": 0,
+        });
+
+        let result: Result<CoordinationReceipt, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("exceeds maximum"),
+            "Expected bounded deserializer to reject oversized array"
+        );
+    }
+
+    /// SEC-FAC-001: Verify bounded deserialization rejects oversized
+    /// session_ids.
+    ///
+    /// Attackers may craft malicious JSON with excessive session_ids to
+    /// cause memory exhaustion. The bounded deserializer MUST reject
+    /// arrays exceeding `MAX_SESSION_IDS_PER_OUTCOME`.
+    #[test]
+    fn sec_fac_001_bounded_deser_rejects_oversized_session_ids() {
+        use apm2_core::coordination::MAX_SESSION_IDS_PER_OUTCOME;
+
+        // Build JSON with too many session IDs
+        let session_ids: Vec<String> = (0..=MAX_SESSION_IDS_PER_OUTCOME)
+            .map(|i| format!("session-{i}"))
+            .collect();
+
+        let json = serde_json::json!({
+            "work_id": "work-1",
+            "attempts": 1,
+            "final_outcome": "SUCCEEDED",
+            "session_ids": session_ids,
+        });
+
+        let result: Result<WorkOutcomeEntry, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("exceeds maximum"),
+            "Expected bounded deserializer to reject oversized session_ids"
+        );
+    }
+
+    /// SEC-FAC-002: Verify deny_unknown_fields rejects unexpected fields
+    /// in CoordinationReceipt.
+    ///
+    /// Attackers may inject unexpected fields to probe for vulnerabilities
+    /// or exploit lenient parsing. The `deny_unknown_fields` attribute
+    /// MUST cause deserialization to fail.
+    #[test]
+    fn sec_fac_002_deny_unknown_fields_receipt() {
+        let json = serde_json::json!({
+            "coordination_id": "coord-1",
+            "work_outcomes": [],
+            "budget_usage": {
+                "consumed_episodes": 0,
+                "elapsed_ticks": 0,
+                "elapsed_ms": 0,
+                "consumed_tokens": 0
+            },
+            "budget_ceiling": {
+                "max_episodes": 10,
+                "max_duration_ticks": 60_000_000,
+                "max_duration_ms": 60_000,
+                "max_tokens": null
+            },
+            "stop_condition": "WORK_COMPLETED",
+            "started_at": 0,
+            "completed_at": 0,
+            "total_sessions": 0,
+            "successful_sessions": 0,
+            "failed_sessions": 0,
+            "malicious_field": "injected_payload",
+        });
+
+        let result: Result<CoordinationReceipt, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("unknown field"),
+            "Expected deny_unknown_fields to reject extra field"
+        );
+    }
+
+    /// SEC-FAC-002: Verify deny_unknown_fields rejects unexpected fields
+    /// in WorkOutcomeEntry.
+    #[test]
+    fn sec_fac_002_deny_unknown_fields_work_outcome() {
+        let json = serde_json::json!({
+            "work_id": "work-1",
+            "attempts": 1,
+            "final_outcome": "SUCCEEDED",
+            "session_ids": [],
+            "extra": "malicious",
+        });
+
+        let result: Result<WorkOutcomeEntry, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("unknown field"),
+            "Expected deny_unknown_fields to reject extra field in WorkOutcomeEntry"
+        );
+    }
+
+    /// SEC-FAC-002: Verify deny_unknown_fields rejects unexpected fields
+    /// in BudgetUsageOutput.
+    #[test]
+    fn sec_fac_002_deny_unknown_fields_budget_usage() {
+        let json = serde_json::json!({
+            "consumed_episodes": 0,
+            "elapsed_ticks": 0,
+            "elapsed_ms": 0,
+            "consumed_tokens": 0,
+            "hidden_budget": 999999,
+        });
+
+        let result: Result<BudgetUsageOutput, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("unknown field"),
+            "Expected deny_unknown_fields to reject extra field in BudgetUsageOutput"
+        );
+    }
+
+    /// SEC-FAC-002: Verify deny_unknown_fields rejects unexpected fields
+    /// in BudgetCeilingOutput.
+    #[test]
+    fn sec_fac_002_deny_unknown_fields_budget_ceiling() {
+        let json = serde_json::json!({
+            "max_episodes": 10,
+            "max_duration_ticks": 60_000_000,
+            "max_duration_ms": 60_000,
+            "max_tokens": null,
+            "secret_limit": 0,
+        });
+
+        let result: Result<BudgetCeilingOutput, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("unknown field"),
+            "Expected deny_unknown_fields to reject extra field in BudgetCeilingOutput"
+        );
+    }
+
+    /// SEC-FAC-001: Verify valid receipts with bounded arrays still parse.
+    ///
+    /// Ensure that legitimate use cases still work after adding bounded
+    /// deserialization.
+    #[test]
+    fn sec_fac_001_valid_bounded_receipt_parses() {
+        let json = serde_json::json!({
+            "coordination_id": "coord-test",
+            "work_outcomes": [
+                {
+                    "work_id": "work-1",
+                    "attempts": 2,
+                    "final_outcome": "SUCCEEDED",
+                    "session_ids": ["sess-1", "sess-2"],
+                }
+            ],
+            "budget_usage": {
+                "consumed_episodes": 2,
+                "elapsed_ticks": 5_000_000,
+                "elapsed_ms": 5000,
+                "consumed_tokens": 1000
+            },
+            "budget_ceiling": {
+                "max_episodes": 10,
+                "max_duration_ticks": 60_000_000,
+                "max_duration_ms": 60_000,
+                "max_tokens": null
+            },
+            "stop_condition": "WORK_COMPLETED",
+            "started_at": 1704067200000000000_u64,
+            "completed_at": 1704067205000000000_u64,
+            "total_sessions": 2,
+            "successful_sessions": 2,
+            "failed_sessions": 0,
+        });
+
+        let result: Result<CoordinationReceipt, _> = serde_json::from_value(json);
+        assert!(result.is_ok(), "Valid receipt should parse successfully");
+
+        let receipt = result.unwrap();
+        assert_eq!(receipt.coordination_id, "coord-test");
+        assert_eq!(receipt.work_outcomes.len(), 1);
+        assert_eq!(receipt.work_outcomes[0].session_ids.len(), 2);
+    }
+
+    /// SEC-FAC-001/002: Verify serde roundtrip preserves data integrity.
+    ///
+    /// Ensure that serialization followed by deserialization produces
+    /// equivalent data.
+    #[test]
+    fn sec_fac_serde_roundtrip() {
+        let receipt = CoordinationReceipt {
+            coordination_id: "coord-roundtrip".to_string(),
+            work_outcomes: vec![WorkOutcomeEntry {
+                work_id: "work-1".to_string(),
+                attempts: 3,
+                final_outcome: "SUCCEEDED".to_string(),
+                session_ids: vec!["sess-a".to_string(), "sess-b".to_string()],
+            }],
+            budget_usage: BudgetUsageOutput {
+                consumed_episodes: 3,
+                elapsed_ticks: 10_000_000,
+                elapsed_ms: 10_000,
+                consumed_tokens: 5000,
+            },
+            budget_ceiling: BudgetCeilingOutput {
+                max_episodes: 10,
+                max_duration_ticks: 60_000_000,
+                max_duration_ms: 60_000,
+                max_tokens: Some(100_000),
+            },
+            stop_condition: "WORK_COMPLETED".to_string(),
+            started_at: 1_000_000_000,
+            completed_at: 1_010_000_000,
+            total_sessions: 3,
+            successful_sessions: 3,
+            failed_sessions: 0,
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&receipt).unwrap();
+
+        // Deserialize back
+        let restored: CoordinationReceipt = serde_json::from_str(&json).unwrap();
+
+        // Verify all fields
+        assert_eq!(restored.coordination_id, receipt.coordination_id);
+        assert_eq!(restored.work_outcomes.len(), receipt.work_outcomes.len());
+        assert_eq!(
+            restored.work_outcomes[0].work_id,
+            receipt.work_outcomes[0].work_id
+        );
+        assert_eq!(
+            restored.work_outcomes[0].session_ids.len(),
+            receipt.work_outcomes[0].session_ids.len()
+        );
+        assert_eq!(
+            restored.budget_usage.elapsed_ticks,
+            receipt.budget_usage.elapsed_ticks
+        );
+        assert_eq!(
+            restored.budget_ceiling.max_tokens,
+            receipt.budget_ceiling.max_tokens
+        );
     }
 }
