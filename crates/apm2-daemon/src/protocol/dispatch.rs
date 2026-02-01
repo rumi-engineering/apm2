@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use prost::Message;
+use subtle::ConstantTimeEq;
 use tracing::{debug, info, warn};
 
 use super::credentials::PeerCredentials;
@@ -139,6 +140,12 @@ pub trait LedgerEventEmitter: Send + Sync {
 ///
 /// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
 pub const WORK_CLAIMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_claimed:";
+
+/// Maximum length for ID fields (`work_id`, `lease_id`, etc.).
+///
+/// Per SEC-SCP-FAC-0020: Unbounded input processing can lead to denial-of-service via OOM.
+/// This limit prevents attackers from supplying multi-GB ID strings.
+pub const MAX_ID_LENGTH: usize = 256;
 
 /// Maximum number of events stored in `StubLedgerEventEmitter`.
 ///
@@ -984,6 +991,18 @@ impl std::error::Error for SessionRegistryError {}
 /// This registry enforces a maximum of [`MAX_SESSIONS`] entries to prevent
 /// memory exhaustion. When the limit is reached, the oldest entry (by insertion
 /// order) is evicted to make room for the new session.
+///
+/// # Async Blocking Trade-off
+///
+/// This implementation uses `std::sync::RwLock` rather than
+/// `tokio::sync::RwLock`. This is acceptable because:
+/// - Critical sections are extremely short (`HashMap` lookup/insert)
+/// - This is a test stub, not production code
+/// - Converting to async would require `async_trait` throughout the trait
+///   hierarchy
+///
+/// For production use, consider using `tokio::sync::RwLock` or a concurrent
+/// `HashMap` implementation like `dashmap`.
 #[derive(Debug, Default)]
 pub struct StubSessionRegistry {
     /// Sessions stored with insertion order for LRU eviction.
@@ -1430,6 +1449,34 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // SEC-SCP-FAC-0020: Enforce maximum length on work_id to prevent DoS via OOM
+        if request.work_id.len() > MAX_ID_LENGTH {
+            warn!(
+                work_id_len = request.work_id.len(),
+                max_len = MAX_ID_LENGTH,
+                "SpawnEpisode rejected: work_id exceeds maximum length"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        // SEC-SCP-FAC-0020: Enforce maximum length on lease_id to prevent DoS via OOM
+        if let Some(ref lease_id) = request.lease_id {
+            if lease_id.len() > MAX_ID_LENGTH {
+                warn!(
+                    lease_id_len = lease_id.len(),
+                    max_len = MAX_ID_LENGTH,
+                    "SpawnEpisode rejected: lease_id exceeds maximum length"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+                ));
+            }
+        }
+
         if request.role == WorkRole::Unspecified as i32 {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -1484,8 +1531,16 @@ impl PrivilegedDispatcher {
         // SEC-SCP-FAC-0020: Validate lease_id matches the claimed lease_id
         // This prevents authorization bypass where a caller provides an arbitrary
         // lease_id. All roles must provide the correct lease_id from ClaimWork.
+        // NOTE: Uses constant-time comparison to prevent timing side-channel attacks
+        // that could leak information about valid lease_id values.
         let provided_lease_id = request.lease_id.as_deref().unwrap_or("");
-        if provided_lease_id != claim.lease_id {
+        let lease_id_matches = provided_lease_id.len() == claim.lease_id.len()
+            && bool::from(
+                provided_lease_id
+                    .as_bytes()
+                    .ct_eq(claim.lease_id.as_bytes()),
+            );
+        if !lease_id_matches {
             warn!(
                 work_id = %request.work_id,
                 "SpawnEpisode rejected: lease_id mismatch"
@@ -1498,9 +1553,12 @@ impl PrivilegedDispatcher {
 
         // For GateExecutor, the lease_id is required and must match
         // (Redundant but explicit check preserved for clarity per logic)
+        // NOTE: Uses constant-time comparison to prevent timing side-channel attacks.
         if request.role == WorkRole::GateExecutor as i32 {
             if let Some(ref lease_id) = request.lease_id {
-                if lease_id != &claim.lease_id {
+                let gate_lease_matches = lease_id.len() == claim.lease_id.len()
+                    && bool::from(lease_id.as_bytes().ct_eq(claim.lease_id.as_bytes()));
+                if !gate_lease_matches {
                     warn!(
                         work_id = %request.work_id,
                         "SpawnEpisode rejected: GateExecutor lease_id mismatch"
