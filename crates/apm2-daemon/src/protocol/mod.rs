@@ -91,6 +91,7 @@ pub mod golden_vectors;
 pub mod handshake;
 pub mod messages;
 pub mod server;
+pub mod credentials;
 
 // Re-export commonly used types at module level
 pub use error::{
@@ -108,3 +109,4 @@ pub use messages::{
 pub use server::{
     Connection, ConnectionPermit, ProtocolServer, ServerConfig, connect, default_socket_path,
 };
+pub use credentials::PeerCredentials;

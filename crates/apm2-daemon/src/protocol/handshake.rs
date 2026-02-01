@@ -31,7 +31,9 @@
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use nix::unistd::getuid;
 
+use super::credentials::PeerCredentials;
 use super::error::{MAX_HANDSHAKE_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ProtocolResult};
 
 /// Hello message sent by client to initiate handshake.
@@ -341,17 +343,21 @@ pub struct ServerHandshake {
 
     /// Negotiated protocol version (after successful handshake).
     negotiated_version: Option<u32>,
+
+    /// Peer credentials for authentication (TCK-00248).
+    peer_credentials: Option<PeerCredentials>,
 }
 
 impl ServerHandshake {
     /// Create a new server handshake handler.
     #[must_use]
-    pub fn new(server_info: impl Into<String>) -> Self {
+    pub fn new(server_info: impl Into<String>, peer_credentials: Option<PeerCredentials>) -> Self {
         Self {
             server_info: server_info.into(),
             policy_hash: None,
             state: HandshakeState::AwaitingHello,
             negotiated_version: None,
+            peer_credentials,
         }
     }
 
@@ -375,6 +381,19 @@ impl ServerHandshake {
             return Err(ProtocolError::handshake_failed(
                 "unexpected Hello message (already handshaked)",
             ));
+        }
+
+        // Validate peer credentials (TCK-00248)
+        if let Some(creds) = &self.peer_credentials {
+            let current_uid = getuid().as_raw();
+            if creds.uid != current_uid {
+                self.state = HandshakeState::Failed;
+                return Ok(HelloNack::rejected(format!(
+                    "unauthorized user: expected uid {}, got {}",
+                    current_uid, creds.uid
+                ))
+                .into());
+            }
         }
 
         // Validate protocol version
@@ -569,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_server_handshake_success() {
-        let mut server = ServerHandshake::new("daemon/1.0");
+        let mut server = ServerHandshake::new("daemon/1.0", None);
         assert_eq!(server.state(), HandshakeState::AwaitingHello);
 
         let hello = Hello::new("cli/1.0");
@@ -582,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_server_handshake_version_mismatch() {
-        let mut server = ServerHandshake::new("daemon/1.0");
+        let mut server = ServerHandshake::new("daemon/1.0", None);
 
         let hello = Hello::with_version(99, "cli/1.0");
         let response = server.process_hello(&hello).unwrap();
@@ -593,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_server_handshake_duplicate_hello() {
-        let mut server = ServerHandshake::new("daemon/1.0");
+        let mut server = ServerHandshake::new("daemon/1.0", None);
 
         // First hello succeeds
         let hello1 = Hello::new("cli/1.0");
@@ -633,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_server_with_policy_hash() {
-        let mut server = ServerHandshake::new("daemon/1.0").with_policy_hash("policy123");
+        let mut server = ServerHandshake::new("daemon/1.0", None).with_policy_hash("policy123");
 
         let hello = Hello::new("cli/1.0");
         let response = server.process_hello(&hello).unwrap();

@@ -65,7 +65,7 @@ async fn test_full_handshake_protocol() {
     // Spawn server that handles handshake
     let server_handle = tokio::spawn(async move {
         let (mut conn, _permit) = server.accept().await.unwrap();
-        let mut handshake = ServerHandshake::new("test-daemon/1.0");
+        let mut handshake = ServerHandshake::new("test-daemon/1.0", None);
 
         // Receive Hello from client using secure parsing (enforces 64KB limit)
         let frame = conn.framed().next().await.unwrap().unwrap();
@@ -128,7 +128,7 @@ async fn test_handshake_version_mismatch() {
     // Spawn server
     let server_handle = tokio::spawn(async move {
         let (mut conn, _permit) = server.accept().await.unwrap();
-        let mut handshake = ServerHandshake::new("test-daemon/1.0");
+        let mut handshake = ServerHandshake::new("test-daemon/1.0", None);
 
         // Use secure parsing (enforces 64KB limit)
         let frame = conn.framed().next().await.unwrap().unwrap();

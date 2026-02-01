@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 
 use super::error::{MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, ProtocolError, ProtocolResult};
 use super::framing::FrameCodec;
+use super::credentials::PeerCredentials;
 
 /// Default socket filename.
 const DEFAULT_SOCKET_NAME: &str = "apm2d.sock";
@@ -309,9 +310,18 @@ impl ProtocolServer {
         // Accept connection
         let (stream, _addr) = self.listener.accept().await?;
 
-        debug!("Accepted new connection");
+        // Extract peer credentials (TCK-00248)
+        // Connections without valid credentials are rejected (fail-closed)
+        let creds = PeerCredentials::from_stream(&stream).map_err(|e| {
+            ProtocolError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("failed to extract peer credentials: {e}"),
+            ))
+        })?;
 
-        let connection = Connection::new(stream);
+        debug!(uid = creds.uid, gid = creds.gid, pid = ?creds.pid, "Accepted new connection");
+
+        let connection = Connection::new(stream, Some(creds));
         let connection_permit = ConnectionPermit { _permit: permit };
 
         Ok((connection, connection_permit))
@@ -383,20 +393,29 @@ pub struct ConnectionPermit {
 pub struct Connection {
     /// The framed stream.
     framed: Framed<UnixStream, FrameCodec>,
+    /// Peer credentials (UID/GID/PID) extracted from the socket.
+    peer_credentials: Option<PeerCredentials>,
 }
 
 impl Connection {
     /// Create a new connection from a Unix stream.
     ///
     /// Initializes with [`MAX_HANDSHAKE_FRAME_SIZE`] limit.
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: UnixStream, peer_credentials: Option<PeerCredentials>) -> Self {
         Self {
             framed: Framed::new(
                 stream,
                 FrameCodec::with_max_size(MAX_HANDSHAKE_FRAME_SIZE)
                     .expect("MAX_HANDSHAKE_FRAME_SIZE must be within protocol limits"),
             ),
+            peer_credentials,
         }
+    }
+
+    /// Returns the peer credentials associated with this connection.
+    #[must_use]
+    pub fn peer_credentials(&self) -> Option<&PeerCredentials> {
+        self.peer_credentials.as_ref()
     }
 
     /// Upgrades the connection to the full protocol frame size.
@@ -479,7 +498,7 @@ pub async fn connect(socket_path: impl AsRef<Path>) -> ProtocolResult<Connection
 
     debug!(socket_path = %path.display(), "Connected to server");
 
-    Ok(Connection::new(stream))
+    Ok(Connection::new(stream, None))
 }
 
 #[cfg(test)]
