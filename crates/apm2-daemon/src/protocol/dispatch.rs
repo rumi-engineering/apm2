@@ -890,16 +890,18 @@ impl PrivilegedDispatcher {
         }
 
         // STUB: Return placeholder response
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // RFC-0016 HTF compliance: Use UUID-derived identifier instead of
+        // SystemTime::now() The actual timestamps will be populated by proper
+        // HTF clock when implemented
+        let stub_id = uuid::Uuid::new_v4();
 
         Ok(PrivilegedResponse::IssueCapability(
             IssueCapabilityResponse {
-                capability_id: "C-STUB-001".to_string(),
-                granted_at: now,
-                expires_at: now + 3600, // 1 hour
+                capability_id: format!("C-{stub_id}"),
+                // STUB: Use placeholder timestamps (0) until HTF clock is available
+                // Per RFC-0016, real timestamps must come from HTF-compliant clock source
+                granted_at: 0,
+                expires_at: 3600, // Relative offset for stub
             },
         ))
     }
@@ -1304,7 +1306,10 @@ mod tests {
         match response {
             PrivilegedResponse::IssueCapability(resp) => {
                 assert!(!resp.capability_id.is_empty());
-                assert!(resp.expires_at > resp.granted_at);
+                assert!(resp.capability_id.starts_with("C-")); // UUID-based ID
+                // STUB uses placeholder timestamps (granted_at=0, expires_at=3600)
+                assert_eq!(resp.granted_at, 0);
+                assert_eq!(resp.expires_at, 3600);
             },
             PrivilegedResponse::Error(err) => {
                 panic!("Unexpected error: {err:?}");
@@ -1458,7 +1463,8 @@ mod tests {
             );
         }
 
-        /// Same credential always produces the same `actor_id` (stable identity).
+        /// Same credential always produces the same `actor_id` (stable
+        /// identity).
         ///
         /// This is the inverse test of what was previously tested - we now
         /// verify that nonces do NOT produce different `actor_ids` (which
