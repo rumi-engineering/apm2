@@ -381,3 +381,119 @@ message PrivilegedError {
   PrivilegedErrorCode code = 1;
   string message = 2;
 }
+
+// =============================================================================
+// CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, TCK-00252)
+// =============================================================================
+// These endpoints require a valid session_token (connection on session.sock).
+// Invalid or expired tokens receive SESSION_INVALID error.
+// Operator socket connections receive PERMISSION_DENIED for session requests.
+
+// IPC-SESS-001: RequestTool
+// Request tool execution within session capability bounds.
+message RequestToolRequest {
+  // Session token for authentication (validated via HMAC-SHA256).
+  string session_token = 1;
+  // Tool identifier (e.g., "file_read", "shell_exec").
+  string tool_id = 2;
+  // Serialized tool arguments (JSON or binary).
+  bytes arguments = 3;
+  // Deduplication key for idempotent requests.
+  string dedupe_key = 4;
+}
+
+message RequestToolResponse {
+  // Request identifier for tracking.
+  string request_id = 1;
+  // Tool decision (ALLOW, DENY, DEDUPE_HIT).
+  DecisionType decision = 2;
+  // Rule that matched (if DENY).
+  optional string rule_id = 3;
+  // Policy hash at decision time.
+  bytes policy_hash = 4;
+}
+
+// IPC-SESS-002: EmitEvent
+// Emit a signed event to the ledger.
+message EmitEventRequest {
+  // Session token for authentication.
+  string session_token = 1;
+  // Event type identifier.
+  string event_type = 2;
+  // Event payload (JSON or binary).
+  bytes payload = 3;
+  // Correlation ID for event tracing.
+  string correlation_id = 4;
+}
+
+message EmitEventResponse {
+  // Event identifier in the ledger.
+  string event_id = 1;
+  // Sequence number in the session.
+  uint64 seq = 2;
+  // Timestamp when event was recorded (nanoseconds since epoch).
+  uint64 timestamp_ns = 3;
+}
+
+// IPC-SESS-003: PublishEvidence
+// Publish evidence artifact to content-addressed storage.
+message PublishEvidenceRequest {
+  // Session token for authentication.
+  string session_token = 1;
+  // Artifact content (binary).
+  bytes artifact = 2;
+  // Evidence kind for categorization.
+  EvidenceKind kind = 3;
+  // Retention hint for storage policy.
+  RetentionHint retention_hint = 4;
+}
+
+message PublishEvidenceResponse {
+  // Blake3 hash of the artifact (content address).
+  bytes artifact_hash = 1;
+  // Storage location hint.
+  string storage_path = 2;
+  // TTL in seconds (0 = permanent).
+  uint64 ttl_secs = 3;
+}
+
+// IPC-SESS-004: StreamTelemetry
+// Stream telemetry frames for observability.
+message StreamTelemetryRequest {
+  // Session token for authentication.
+  string session_token = 1;
+  // Telemetry frame to stream.
+  TelemetryFrame frame = 2;
+}
+
+message StreamTelemetryResponse {
+  // Acknowledgment sequence number.
+  uint64 ack_seq = 1;
+  // Whether frame was promoted to persistent storage.
+  bool promoted = 2;
+}
+
+// =============================================================================
+// Error Codes for Session-Scoped Endpoints
+// =============================================================================
+enum SessionErrorCode {
+  SESSION_ERROR_UNSPECIFIED = 0;
+  // Session token is invalid (expired, tampered, or missing).
+  SESSION_ERROR_INVALID = 1;
+  // Session has been terminated.
+  SESSION_ERROR_TERMINATED = 2;
+  // Tool not allowed by capability manifest.
+  SESSION_ERROR_TOOL_NOT_ALLOWED = 3;
+  // Budget exhausted for this session.
+  SESSION_ERROR_BUDGET_EXHAUSTED = 4;
+  // Context firewall violation (deny + terminate).
+  SESSION_ERROR_CONTEXT_FIREWALL = 5;
+  // Caller is on operator socket (session endpoints require session.sock).
+  SESSION_ERROR_PERMISSION_DENIED = 6;
+}
+
+// Generic error response for session-scoped endpoints.
+message SessionError {
+  SessionErrorCode code = 1;
+  string message = 2;
+}

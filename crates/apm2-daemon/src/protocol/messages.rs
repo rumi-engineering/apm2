@@ -319,6 +319,16 @@ impl_bounded_decode_simple!(
     ShutdownRequest,
     ShutdownResponse,
     PrivilegedError,
+    // CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, TCK-00252)
+    RequestToolRequest,
+    RequestToolResponse,
+    EmitEventRequest,
+    EmitEventResponse,
+    PublishEvidenceRequest,
+    PublishEvidenceResponse,
+    StreamTelemetryRequest,
+    StreamTelemetryResponse,
+    SessionError,
 );
 
 // Implement BoundedDecode for messages with repeated fields

@@ -97,6 +97,8 @@ pub mod golden_vectors;
 pub mod handshake;
 pub mod messages;
 pub mod server;
+/// Session-scoped endpoint dispatcher for RFC-0017 IPC (TCK-00252).
+pub mod session_dispatch;
 pub mod session_token;
 /// Dual-socket manager for privilege separation (TCK-00249).
 pub mod socket_manager;
@@ -136,19 +138,35 @@ pub use messages::{
     DEFAULT_MAX_REPEATED_FIELD_COUNT,
     DecodeConfig,
     DecodeError,
+    // CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, TCK-00252)
+    EmitEventRequest,
+    EmitEventResponse,
     IssueCapabilityRequest,
     IssueCapabilityResponse,
     PrivilegedError,
     PrivilegedErrorCode,
+    PublishEvidenceRequest,
+    PublishEvidenceResponse,
+    RequestToolRequest,
+    RequestToolResponse,
+    SessionError,
+    SessionErrorCode,
     ShutdownRequest,
     ShutdownResponse,
     SpawnEpisodeRequest,
     SpawnEpisodeResponse,
+    StreamTelemetryRequest,
+    StreamTelemetryResponse,
     WorkRole,
 };
 #[allow(unused_imports)]
 pub use server::{
     Connection, ConnectionPermit, ProtocolServer, ServerConfig, connect, default_socket_path,
+};
+#[allow(unused_imports)]
+pub use session_dispatch::{
+    SessionDispatcher, SessionMessageType, SessionResponse, encode_emit_event_request,
+    encode_publish_evidence_request, encode_request_tool_request, encode_stream_telemetry_request,
 };
 #[allow(unused_imports)]
 pub use session_token::{SessionToken, SessionTokenError, TokenMinter};

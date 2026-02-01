@@ -402,6 +402,124 @@ pub struct PrivilegedError {
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
 }
+/// IPC-SESS-001: RequestTool
+/// Request tool execution within session capability bounds.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RequestToolRequest {
+    /// Session token for authentication (validated via HMAC-SHA256).
+    #[prost(string, tag = "1")]
+    pub session_token: ::prost::alloc::string::String,
+    /// Tool identifier (e.g., "file_read", "shell_exec").
+    #[prost(string, tag = "2")]
+    pub tool_id: ::prost::alloc::string::String,
+    /// Serialized tool arguments (JSON or binary).
+    #[prost(bytes = "vec", tag = "3")]
+    pub arguments: ::prost::alloc::vec::Vec<u8>,
+    /// Deduplication key for idempotent requests.
+    #[prost(string, tag = "4")]
+    pub dedupe_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RequestToolResponse {
+    /// Request identifier for tracking.
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// Tool decision (ALLOW, DENY, DEDUPE_HIT).
+    #[prost(enumeration = "DecisionType", tag = "2")]
+    pub decision: i32,
+    /// Rule that matched (if DENY).
+    #[prost(string, optional, tag = "3")]
+    pub rule_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Policy hash at decision time.
+    #[prost(bytes = "vec", tag = "4")]
+    pub policy_hash: ::prost::alloc::vec::Vec<u8>,
+}
+/// IPC-SESS-002: EmitEvent
+/// Emit a signed event to the ledger.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EmitEventRequest {
+    /// Session token for authentication.
+    #[prost(string, tag = "1")]
+    pub session_token: ::prost::alloc::string::String,
+    /// Event type identifier.
+    #[prost(string, tag = "2")]
+    pub event_type: ::prost::alloc::string::String,
+    /// Event payload (JSON or binary).
+    #[prost(bytes = "vec", tag = "3")]
+    pub payload: ::prost::alloc::vec::Vec<u8>,
+    /// Correlation ID for event tracing.
+    #[prost(string, tag = "4")]
+    pub correlation_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EmitEventResponse {
+    /// Event identifier in the ledger.
+    #[prost(string, tag = "1")]
+    pub event_id: ::prost::alloc::string::String,
+    /// Sequence number in the session.
+    #[prost(uint64, tag = "2")]
+    pub seq: u64,
+    /// Timestamp when event was recorded (nanoseconds since epoch).
+    #[prost(uint64, tag = "3")]
+    pub timestamp_ns: u64,
+}
+/// IPC-SESS-003: PublishEvidence
+/// Publish evidence artifact to content-addressed storage.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishEvidenceRequest {
+    /// Session token for authentication.
+    #[prost(string, tag = "1")]
+    pub session_token: ::prost::alloc::string::String,
+    /// Artifact content (binary).
+    #[prost(bytes = "vec", tag = "2")]
+    pub artifact: ::prost::alloc::vec::Vec<u8>,
+    /// Evidence kind for categorization.
+    #[prost(enumeration = "EvidenceKind", tag = "3")]
+    pub kind: i32,
+    /// Retention hint for storage policy.
+    #[prost(enumeration = "RetentionHint", tag = "4")]
+    pub retention_hint: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PublishEvidenceResponse {
+    /// Blake3 hash of the artifact (content address).
+    #[prost(bytes = "vec", tag = "1")]
+    pub artifact_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Storage location hint.
+    #[prost(string, tag = "2")]
+    pub storage_path: ::prost::alloc::string::String,
+    /// TTL in seconds (0 = permanent).
+    #[prost(uint64, tag = "3")]
+    pub ttl_secs: u64,
+}
+/// IPC-SESS-004: StreamTelemetry
+/// Stream telemetry frames for observability.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StreamTelemetryRequest {
+    /// Session token for authentication.
+    #[prost(string, tag = "1")]
+    pub session_token: ::prost::alloc::string::String,
+    /// Telemetry frame to stream.
+    #[prost(message, optional, tag = "2")]
+    pub frame: ::core::option::Option<TelemetryFrame>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct StreamTelemetryResponse {
+    /// Acknowledgment sequence number.
+    #[prost(uint64, tag = "1")]
+    pub ack_seq: u64,
+    /// Whether frame was promoted to persistent storage.
+    #[prost(bool, tag = "2")]
+    pub promoted: bool,
+}
+/// Generic error response for session-scoped endpoints.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionError {
+    #[prost(enumeration = "SessionErrorCode", tag = "1")]
+    pub code: i32,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -763,6 +881,56 @@ impl PrivilegedErrorCode {
             "SOD_VIOLATION" => Some(Self::SodViolation),
             "SESSION_NOT_FOUND" => Some(Self::SessionNotFound),
             "CAPABILITY_DENIED" => Some(Self::CapabilityDenied),
+            _ => None,
+        }
+    }
+}
+/// =============================================================================
+/// Error Codes for Session-Scoped Endpoints
+/// =============================================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SessionErrorCode {
+    SessionErrorUnspecified = 0,
+    /// Session token is invalid (expired, tampered, or missing).
+    SessionErrorInvalid = 1,
+    /// Session has been terminated.
+    SessionErrorTerminated = 2,
+    /// Tool not allowed by capability manifest.
+    SessionErrorToolNotAllowed = 3,
+    /// Budget exhausted for this session.
+    SessionErrorBudgetExhausted = 4,
+    /// Context firewall violation (deny + terminate).
+    SessionErrorContextFirewall = 5,
+    /// Caller is on operator socket (session endpoints require session.sock).
+    SessionErrorPermissionDenied = 6,
+}
+impl SessionErrorCode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::SessionErrorUnspecified => "SESSION_ERROR_UNSPECIFIED",
+            Self::SessionErrorInvalid => "SESSION_ERROR_INVALID",
+            Self::SessionErrorTerminated => "SESSION_ERROR_TERMINATED",
+            Self::SessionErrorToolNotAllowed => "SESSION_ERROR_TOOL_NOT_ALLOWED",
+            Self::SessionErrorBudgetExhausted => "SESSION_ERROR_BUDGET_EXHAUSTED",
+            Self::SessionErrorContextFirewall => "SESSION_ERROR_CONTEXT_FIREWALL",
+            Self::SessionErrorPermissionDenied => "SESSION_ERROR_PERMISSION_DENIED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SESSION_ERROR_UNSPECIFIED" => Some(Self::SessionErrorUnspecified),
+            "SESSION_ERROR_INVALID" => Some(Self::SessionErrorInvalid),
+            "SESSION_ERROR_TERMINATED" => Some(Self::SessionErrorTerminated),
+            "SESSION_ERROR_TOOL_NOT_ALLOWED" => Some(Self::SessionErrorToolNotAllowed),
+            "SESSION_ERROR_BUDGET_EXHAUSTED" => Some(Self::SessionErrorBudgetExhausted),
+            "SESSION_ERROR_CONTEXT_FIREWALL" => Some(Self::SessionErrorContextFirewall),
+            "SESSION_ERROR_PERMISSION_DENIED" => Some(Self::SessionErrorPermissionDenied),
             _ => None,
         }
     }

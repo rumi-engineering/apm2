@@ -122,8 +122,8 @@ pub async fn accept(&self) -> ProtocolResult<(Connection, ConnectionPermit, Sock
 
 Dual-socket manager for privilege separation. Creates two Unix sockets:
 
-- **`operator.sock`** (mode 0600): Privileged operations (ClaimWork, SpawnEpisode, etc.)
-- **`session.sock`** (mode 0660): Session-scoped operations (RequestTool, EmitEvent, etc.)
+- **`operator.sock`** (mode 0600): Privileged operations (ClaimWork, SpawnEpisode, IssueCapability, Shutdown)
+- **`session.sock`** (mode 0660): Session-scoped operations (RequestTool, EmitEvent, PublishEvidence, StreamTelemetry)
 
 **Invariants (SocketManager):**
 - [INV-SM-001] Operator socket always has mode 0600.
@@ -150,6 +150,33 @@ pub enum SocketType {
 
 Represents the type of socket a connection arrived on. Used to determine
 which handler namespaces are accessible.
+
+### `SessionDispatcher` (TCK-00252)
+
+```rust
+pub struct SessionDispatcher { ... }
+pub fn dispatch(&self, frame: &Bytes, ctx: &ConnectionContext) -> ProtocolResult<SessionResponse>
+```
+
+Session-scoped endpoint dispatcher for RFC-0017. Routes session requests to the
+appropriate handler after validating the session token.
+
+**Session Endpoints (CTR-PROTO-008):**
+- `RequestTool`: Request tool execution within capability bounds
+- `EmitEvent`: Emit signed event to ledger
+- `PublishEvidence`: Publish evidence artifact to content-addressed storage
+- `StreamTelemetry`: Stream telemetry frames for observability
+
+**Invariants (SessionDispatcher):**
+- [INV-SESS-001] Session endpoints require valid `session_token`.
+- [INV-SESS-002] Invalid/expired tokens return `SESSION_ERROR_INVALID`.
+- [INV-SESS-003] Operator connections receive `SESSION_ERROR_PERMISSION_DENIED`.
+- [INV-SESS-004] Token validation uses constant-time HMAC comparison (CTR-WH001).
+
+**Contracts (SessionDispatcher):**
+- [CTR-SD-001] Token is validated BEFORE any handler logic executes.
+- [CTR-SD-002] Messages use bounded decoding (CTR-1603).
+- [CTR-SD-003] Session ID from token is used for authorization, not user input.
 
 ### Wire Protocol
 
