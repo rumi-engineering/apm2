@@ -4,14 +4,17 @@ prd_success_metrics:
   metrics:
   - id: MET-0001
     name: End-to-end cycle time (spec to merge)
-    description: Wall-clock time from factory command invocation to merged change
-      for a bounded-scope work item.
+    description: Ledger-window span from factory command invocation to merged change
+      for a bounded-scope work item. Primary axis is (ledger_id, epoch, seq) delta
+      between WORK.OPENED and WORK.COMPLETED events.
     baseline: Manual engineering baseline varies; for comparison record current median
-      human cycle time for similar changes.
+      human cycle time for similar changes (wall time, observational only).
     target: Reduce median cycle time by ≥10x for bounded changes while maintaining
-      evidence completeness and no safety regressions.
+      evidence completeness and no safety regressions. Measured in ledger sequence
+      delta; wall-time overlay is bounded and non-authoritative.
     measurement_method: 'Compute from ledger events: WORK.OPENED to WORK.COMPLETED
-      plus merge event; export to dashboard.'
+      plus merge event; primary index by (ledger_id, epoch, seq) windows. Wall-time
+      overlay derived from TimeEnvelope bounded intervals (observational).'
     evidence_ids:
     - EVID-0011
     - EVID-0018
@@ -51,14 +54,14 @@ prd_success_metrics:
     - EVID-0003
     - EVID-0011
   - id: MET-0005
-    name: Mean time to detect and remediate stall
-    description: Time from last progress signal to remediation action (restart/quarantine/failover)
-      for stalled sessions.
-    baseline: Manual detection; hours to days.
-    target: Detect stalls within configured threshold (e.g., 5 minutes) and remediate
-      within 1 minute thereafter.
-    measurement_method: Compute from session heartbeat/progress events and supervisor
-      remediation events.
+    name: Mean tick delta to detect and remediate stall
+    description: Tick delta from last progress signal to remediation action (restart/quarantine/failover)
+      for stalled sessions. Primary axis is MonotonicTicks (M) delta.
+    baseline: Manual detection baseline measured in wall time (observational only).
+    target: Detect stalls within configured tick threshold and remediate within
+      bounded tick delta thereafter. Wall-time overlay is observational only.
+    measurement_method: Compute tick delta from session heartbeat/progress events and supervisor
+      remediation events. Primary index by tick deltas; wall-time overlay is bounded.
     evidence_ids:
     - EVID-0006
     - EVID-0011
@@ -95,7 +98,8 @@ prd_success_metrics:
   - id: GRD-0003
     name: Bounded resource burn
     threshold: Budgets must prevent unbounded loops; no single work item may exceed
-      configured max wall time or token budgets without explicit governance action.
+      configured max tick budget or token budgets without explicit governance action.
+      Tick budgets are authoritative; wall-time budgets are observational only.
     response_plan: Terminate stalled sessions, release leases, open adjudication work
       if repeated, tighten policy.
     evidence_ids:
