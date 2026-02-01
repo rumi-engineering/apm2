@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::crash::{CrashEvent, CrashType};
 use super::entropy::EntropyTrackerSummary;
 use super::quarantine::{QuarantineEvaluation, QuarantineManager};
+use crate::htf::HtfTick;
 use crate::restart::{BackoffConfig, RestartConfig, RestartManager};
 
 /// Coordinates restart decisions for a session.
@@ -179,8 +180,11 @@ impl RestartCoordinator {
     /// Determines whether a crashed session should be restarted, with
     /// quarantine support.
     ///
-    /// This is the preferred method for making restart decisions as it
-    /// integrates with the quarantine system.
+    /// **DEPRECATED**: Use [`RestartCoordinator::should_restart_with_quarantine_tick`]
+    /// for RFC-0016 HTF compliant quarantine timing.
+    ///
+    /// This method uses wall-clock timestamps which can be manipulated.
+    /// The tick-based variant is immune to wall-clock manipulation.
     ///
     /// Takes into account:
     /// - The crash type (some crashes shouldn't trigger restart)
@@ -196,10 +200,11 @@ impl RestartCoordinator {
     ///   duration)
     /// * `previous_quarantines` - How many times this session has been
     ///   quarantined
-    // TODO(TCK-00243): Migrate to tick-based quarantine timing.
-    // This function currently uses wall-clock timestamps. The full migration to
-    // tick-based timing is tracked as a follow-up to the initial HTF integration.
     #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "use should_restart_with_quarantine_tick for tick-based timing (RFC-0016 HTF)"
+    )]
     #[allow(deprecated)]
     pub fn should_restart_with_quarantine(
         &self,
@@ -237,6 +242,106 @@ impl RestartCoordinator {
             return RestartDecision::Quarantine {
                 reason: reason.to_string(),
                 until,
+                until_tick: None,
+            };
+        }
+
+        // Fall back to regular restart decision
+        self.should_restart(crash_event, entropy_summary)
+    }
+
+    /// Determines whether a crashed session should be restarted, with
+    /// quarantine support using tick-based timing (RFC-0016 HTF compliant).
+    ///
+    /// This is the preferred method for making restart decisions as it
+    /// integrates with the quarantine system and uses monotonic ticks
+    /// that are immune to wall-clock manipulation.
+    ///
+    /// Takes into account:
+    /// - The crash type (some crashes shouldn't trigger restart)
+    /// - The entropy budget (exhausted budget means no restart)
+    /// - The restart manager's circuit breaker and limits
+    /// - Quarantine thresholds (excessive violations, crash loops, etc.)
+    ///
+    /// # Arguments
+    /// * `crash_event` - The crash event details
+    /// * `entropy_summary` - Optional entropy tracker summary
+    /// * `quarantine_manager` - The quarantine manager to evaluate thresholds
+    /// * `current_tick` - Current monotonic tick
+    /// * `current_time_ns` - Current wall-clock timestamp (observational only)
+    /// * `previous_quarantines` - How many times this session has been
+    ///   quarantined
+    ///
+    /// # Returns
+    ///
+    /// A [`RestartDecision`] with tick-based quarantine timing when applicable.
+    /// For quarantine decisions, both `until` (wall-clock, observational) and
+    /// `until_tick` (authoritative) are populated.
+    #[must_use]
+    #[allow(deprecated)]
+    pub fn should_restart_with_quarantine_tick(
+        &self,
+        crash_event: &CrashEvent,
+        entropy_summary: Option<&EntropyTrackerSummary>,
+        quarantine_manager: &QuarantineManager,
+        current_tick: &HtfTick,
+        current_time_ns: u64,
+        previous_quarantines: u32,
+    ) -> RestartDecision {
+        // Build quarantine evaluation from available state
+        let mut eval = QuarantineEvaluation::new(&crash_event.session_id)
+            .with_restarts(crash_event.restart_count);
+
+        if let Some(summary) = entropy_summary {
+            eval = eval
+                .with_entropy(summary.budget, summary.consumed)
+                .with_violations(summary.violation_count);
+        }
+
+        // Check for non-restartable signal
+        if let CrashType::Signal {
+            signal,
+            signal_name,
+        } = &crash_event.crash_type
+        {
+            if !super::crash::is_signal_restartable(*signal) {
+                eval = eval.with_non_restartable_signal(*signal, signal_name);
+            }
+        }
+
+        // Check if session should be quarantined
+        if let Some(reason) = quarantine_manager.should_quarantine(&eval) {
+            // Calculate tick-based duration if config supports it, otherwise fall back
+            let (until, until_tick) = quarantine_manager
+                .calculate_duration_ticks(previous_quarantines)
+                .map_or_else(
+                    || {
+                        // Legacy: wall-clock only
+                        let duration =
+                            quarantine_manager.calculate_duration(previous_quarantines);
+                        let until =
+                            QuarantineManager::quarantine_until(current_time_ns, duration);
+                        (until, None)
+                    },
+                    |duration_ticks| {
+                        // Tick-based: authoritative
+                        let until_tick = QuarantineManager::quarantine_until_tick(
+                            current_tick,
+                            duration_ticks,
+                        );
+                        // Wall-clock: observational only
+                        let duration =
+                            quarantine_manager.calculate_duration(previous_quarantines);
+                        let until =
+                            QuarantineManager::quarantine_until(current_time_ns, duration);
+                        (until, Some(until_tick))
+                    },
+                );
+
+            return RestartDecision::Quarantine {
+                reason: reason.to_string(),
+                until,
+                until_tick,
             };
         }
 
@@ -266,8 +371,14 @@ pub enum RestartDecision {
     Quarantine {
         /// Reason for quarantine.
         reason: String,
+        /// OBSERVATIONAL - see RFC-0016 HTF; not authoritative for expiry.
         /// Unix timestamp (nanoseconds) until when quarantined.
+        /// Retained for backwards compatibility and display purposes.
         until: u64,
+        /// HTF: Monotonic tick until when quarantined (RFC-0016).
+        /// Authoritative for expiry checks when present.
+        /// If `None`, use wall-clock `until` for legacy quarantines.
+        until_tick: Option<HtfTick>,
     },
 }
 
@@ -644,6 +755,7 @@ mod tests {
         let quarantine = RestartDecision::Quarantine {
             reason: "test".to_string(),
             until: 1000,
+            until_tick: None,
         };
         assert!(!quarantine.is_restart());
         assert!(!quarantine.is_terminate());
@@ -675,6 +787,7 @@ mod tests {
     // ========================================================================
 
     #[test]
+    #[allow(deprecated)]
     fn test_should_restart_with_quarantine_healthy_session() {
         let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
         let quarantine_manager = QuarantineManager::with_defaults();
@@ -694,6 +807,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_should_restart_with_quarantine_excessive_violations() {
         let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
         let quarantine_manager = QuarantineManager::with_defaults();
@@ -722,13 +836,14 @@ mod tests {
 
         // Should quarantine due to excessive violations
         assert!(decision.is_quarantine());
-        if let RestartDecision::Quarantine { reason, until } = decision {
+        if let RestartDecision::Quarantine { reason, until, .. } = decision {
             assert!(reason.contains("violation"));
             assert!(until > 1_000_000_000);
         }
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_should_restart_with_quarantine_crash_loop() {
         let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
         let quarantine_manager = QuarantineManager::with_defaults();
@@ -752,6 +867,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_should_restart_with_quarantine_non_restartable_signal() {
         let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
         let quarantine_manager = QuarantineManager::with_defaults();
@@ -779,6 +895,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_should_restart_with_quarantine_entropy_exceeded() {
         let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
         let quarantine_manager = QuarantineManager::with_defaults();
@@ -801,6 +918,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_quarantine_duration_escalates() {
         let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
         let quarantine_manager = QuarantineManager::with_defaults();
@@ -839,6 +957,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_quarantine_disabled_for_entropy() {
         use super::super::quarantine::QuarantineConfig;
 
@@ -868,6 +987,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_quarantine_clean_exit_not_quarantined() {
         let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
         let quarantine_manager = QuarantineManager::with_defaults();
@@ -886,5 +1006,217 @@ mod tests {
         if let RestartDecision::Terminate { reason } = decision {
             assert_eq!(reason, TerminateReason::CleanExit);
         }
+    }
+
+    // ========================================================================
+    // Tick-based Quarantine Tests (TCK-00243)
+    // ========================================================================
+
+    #[test]
+    fn tck_00243_tick_based_quarantine_returns_until_tick() {
+        use super::super::quarantine::QuarantineConfig;
+
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        // Create quarantine manager with tick-based config
+        // with_ticks(base_duration_ticks, max_duration_ticks, tick_rate_hz, multiplier)
+        let config = QuarantineConfig::with_ticks(
+            60,   // base_duration_ticks
+            3600, // max_duration_ticks
+            1,    // tick_rate_hz (1 Hz for easy calculation)
+            2.0,  // backoff_multiplier
+        );
+        let quarantine_manager = QuarantineManager::new(config);
+        // Crash with 5 restarts to trigger crash loop quarantine
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 5);
+        let entropy = make_entropy_summary(false);
+        // HtfTick::new(value, tick_rate_hz)
+        let current_tick = HtfTick::new(1000, 1);
+        let current_time = 1_000_000_000_000_000_000u64;
+
+        let decision = coordinator.should_restart_with_quarantine_tick(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            &current_tick,
+            current_time,
+            0,
+        );
+
+        // Should quarantine with tick-based until
+        assert!(decision.is_quarantine());
+        if let RestartDecision::Quarantine {
+            reason,
+            until,
+            until_tick,
+        } = decision
+        {
+            assert!(reason.contains("crash loop"));
+            // Wall-clock until should be populated (observational)
+            assert!(until > current_time);
+            // Tick-based until should be populated (authoritative)
+            assert!(until_tick.is_some());
+            let tick = until_tick.unwrap();
+            // Should be current_tick + base_duration_ticks (60)
+            assert_eq!(tick.value(), 1000 + 60);
+        }
+    }
+
+    #[test]
+    fn tck_00243_tick_based_quarantine_escalates() {
+        use super::super::quarantine::QuarantineConfig;
+
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let config = QuarantineConfig::with_ticks(
+            60,   // base_duration_ticks
+            3600, // max_duration_ticks
+            1,    // tick_rate_hz
+            2.0,  // backoff_multiplier
+        );
+        let quarantine_manager = QuarantineManager::new(config);
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 5);
+        let entropy = make_entropy_summary(false);
+        let current_tick = HtfTick::new(1000, 1);
+        let current_time = 1_000_000_000_000_000_000u64;
+
+        // First quarantine (previous_quarantines = 0)
+        let decision1 = coordinator.should_restart_with_quarantine_tick(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            &current_tick,
+            current_time,
+            0,
+        );
+        let RestartDecision::Quarantine {
+            until_tick: until_tick1,
+            ..
+        } = decision1
+        else {
+            panic!("Expected quarantine");
+        };
+        let tick1 = until_tick1.expect("Expected until_tick");
+        // Duration should be base (60 ticks)
+        assert_eq!(tick1.value() - current_tick.value(), 60);
+
+        // Second quarantine (previous_quarantines = 1)
+        let decision2 = coordinator.should_restart_with_quarantine_tick(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            &current_tick,
+            current_time,
+            1,
+        );
+        let RestartDecision::Quarantine {
+            until_tick: until_tick2,
+            ..
+        } = decision2
+        else {
+            panic!("Expected quarantine");
+        };
+        let tick2 = until_tick2.expect("Expected until_tick");
+        // Duration should be doubled (120 ticks)
+        assert_eq!(tick2.value() - current_tick.value(), 120);
+
+        // Third quarantine (previous_quarantines = 2)
+        let decision3 = coordinator.should_restart_with_quarantine_tick(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            &current_tick,
+            current_time,
+            2,
+        );
+        let RestartDecision::Quarantine {
+            until_tick: until_tick3,
+            ..
+        } = decision3
+        else {
+            panic!("Expected quarantine");
+        };
+        let tick3 = until_tick3.expect("Expected until_tick");
+        // Duration should be quadrupled (240 ticks)
+        assert_eq!(tick3.value() - current_tick.value(), 240);
+    }
+
+    #[test]
+    fn tck_00243_legacy_config_returns_none_until_tick() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        // Default quarantine manager has no tick config
+        let quarantine_manager = QuarantineManager::with_defaults();
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 5);
+        let entropy = make_entropy_summary(false);
+        let current_tick = HtfTick::new(1000, 1);
+        let current_time = 1_000_000_000_000_000_000u64;
+
+        let decision = coordinator.should_restart_with_quarantine_tick(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            &current_tick,
+            current_time,
+            0,
+        );
+
+        // Should quarantine but with no tick (legacy mode)
+        assert!(decision.is_quarantine());
+        if let RestartDecision::Quarantine { until_tick, .. } = decision {
+            // Legacy config has no tick-based duration
+            assert!(until_tick.is_none());
+        }
+    }
+
+    #[test]
+    fn tck_00243_tick_quarantine_no_wall_time_dependence() {
+        use super::super::quarantine::QuarantineConfig;
+
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let config = QuarantineConfig::with_ticks(
+            60,   // base_duration_ticks
+            3600, // max_duration_ticks
+            1,    // tick_rate_hz
+            2.0,  // backoff_multiplier
+        );
+        let quarantine_manager = QuarantineManager::new(config);
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 5);
+        let entropy = make_entropy_summary(false);
+        let current_tick = HtfTick::new(1000, 1);
+
+        // Call with different wall clock times
+        let decision1 = coordinator.should_restart_with_quarantine_tick(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            &current_tick,
+            1_000_000_000_000_000_000u64, // Time A
+            0,
+        );
+
+        let decision2 = coordinator.should_restart_with_quarantine_tick(
+            &crash,
+            Some(&entropy),
+            &quarantine_manager,
+            &current_tick,
+            9_000_000_000_000_000_000u64, // Time B (very different)
+            0,
+        );
+
+        // Both should have the same until_tick (tick-based is deterministic)
+        let RestartDecision::Quarantine {
+            until_tick: tick1, ..
+        } = decision1
+        else {
+            panic!("Expected quarantine");
+        };
+        let RestartDecision::Quarantine {
+            until_tick: tick2, ..
+        } = decision2
+        else {
+            panic!("Expected quarantine");
+        };
+
+        // Tick values should be identical regardless of wall time
+        assert_eq!(tick1, tick2);
+        assert_eq!(tick1.unwrap().value(), 1060); // current_tick + 60
     }
 }

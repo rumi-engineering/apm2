@@ -260,11 +260,25 @@ impl SessionReducer {
         };
 
         // Transition to Quarantined state (preserving restart_attempt for monotonicity)
+        // HTF tick fields (RFC-0016): authoritative for expiry when present
+        let (issued_at_tick, expires_at_tick, tick_rate_hz) = if event.tick_rate_hz > 0 {
+            (
+                Some(event.issued_at_tick),
+                Some(event.expires_at_tick),
+                Some(event.tick_rate_hz),
+            )
+        } else {
+            (None, None, None)
+        };
+
         let new_state = SessionState::Quarantined {
             started_at,
             quarantined_at: timestamp,
             reason: event.reason,
             quarantine_until: event.quarantine_until,
+            issued_at_tick,
+            expires_at_tick,
+            tick_rate_hz,
             last_restart_attempt: restart_attempt,
         };
 
@@ -557,8 +571,15 @@ pub mod helpers {
         event.encode_to_vec()
     }
 
-    /// Creates a `SessionQuarantined` event payload.
+    /// Creates a `SessionQuarantined` event payload (legacy, wall-clock only).
+    ///
+    /// **DEPRECATED**: Use [`session_quarantined_payload_with_ticks`] for RFC-0016 HTF
+    /// compliant quarantine events with tick-based timing.
     #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "use session_quarantined_payload_with_ticks for tick-based timing (RFC-0016 HTF)"
+    )]
     pub fn session_quarantined_payload(
         session_id: &str,
         reason: &str,
@@ -568,6 +589,41 @@ pub mod helpers {
             session_id: session_id.to_string(),
             reason: reason.to_string(),
             quarantine_until,
+            // HTF fields (RFC-0016): not populated in legacy helper
+            time_envelope_ref: None,
+            issued_at_tick: 0,
+            expires_at_tick: 0,
+            tick_rate_hz: 0,
+        };
+        let event = SessionEvent {
+            event: Some(session_event::Event::Quarantined(quarantined)),
+        };
+        event.encode_to_vec()
+    }
+
+    /// Creates a `SessionQuarantined` event payload with tick-based timing (RFC-0016 HTF).
+    ///
+    /// This is the preferred method for creating quarantine events as it uses
+    /// monotonic ticks that are immune to wall-clock manipulation.
+    #[must_use]
+    pub fn session_quarantined_payload_with_ticks(
+        session_id: &str,
+        reason: &str,
+        quarantine_until: u64,
+        issued_at_tick: u64,
+        expires_at_tick: u64,
+        tick_rate_hz: u64,
+    ) -> Vec<u8> {
+        let quarantined = SessionQuarantined {
+            session_id: session_id.to_string(),
+            reason: reason.to_string(),
+            quarantine_until,
+            // HTF time envelope reference (RFC-0016): not yet populated by this helper.
+            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
+            time_envelope_ref: None,
+            issued_at_tick,
+            expires_at_tick,
+            tick_rate_hz,
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Quarantined(quarantined)),

@@ -119,9 +119,19 @@ pub enum SessionState {
         quarantined_at: u64,
         /// Reason for quarantine.
         reason: String,
+        /// OBSERVATIONAL - see RFC-0016 HTF; not authoritative for expiry.
         /// Timestamp until which the session is quarantined (nanoseconds since
-        /// epoch).
+        /// epoch). Retained for backwards compatibility and display purposes.
         quarantine_until: u64,
+        /// HTF: Monotonic tick when quarantine was issued (RFC-0016).
+        /// Authoritative for timing decisions when present.
+        issued_at_tick: Option<u64>,
+        /// HTF: Monotonic tick until when quarantined (RFC-0016).
+        /// Authoritative for expiry checks when present.
+        expires_at_tick: Option<u64>,
+        /// Tick rate in Hz for `issued_at_tick` and `expires_at_tick`.
+        /// Required for interpreting tick values as durations.
+        tick_rate_hz: Option<u64>,
         /// Last restart attempt number (for monotonicity enforcement on
         /// restart).
         last_restart_attempt: u32,
@@ -335,6 +345,9 @@ mod unit_tests {
             quarantined_at: 2000,
             reason: "policy violation".to_string(),
             quarantine_until: 3000,
+            issued_at_tick: None,
+            expires_at_tick: None,
+            tick_rate_hz: None,
             last_restart_attempt: 0,
         };
         assert!(!quarantined.is_active());
@@ -360,6 +373,9 @@ mod unit_tests {
             quarantined_at: 2000,
             reason: "policy violation".to_string(),
             quarantine_until: 3000,
+            issued_at_tick: None,
+            expires_at_tick: None,
+            tick_rate_hz: None,
             last_restart_attempt: 0,
         };
         assert!(quarantined.is_terminal());
@@ -385,6 +401,9 @@ mod unit_tests {
             quarantined_at: 2000,
             reason: "policy violation".to_string(),
             quarantine_until: 3000,
+            issued_at_tick: None,
+            expires_at_tick: None,
+            tick_rate_hz: None,
             last_restart_attempt: 0,
         };
         assert_eq!(quarantined.state_name(), StateName::Quarantined);
