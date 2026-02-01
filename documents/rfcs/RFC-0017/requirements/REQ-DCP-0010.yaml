@@ -1,0 +1,23 @@
+requirement:
+  id: REQ-DCP-0010
+  title: "Session Ready Latency"
+  status: ACTIVE
+
+  statement: |
+    SpawnEpisode MUST complete session readiness (pack sealed, policy checked,
+    sandbox ready) within <2s p99 on a local Unix socket (warm daemon).
+
+  rationale: |
+    Session readiness latency bounds ensure predictable orchestration and
+    bounded operator wait time.
+
+  acceptance_criteria:
+    - id: AC-DCP-0010-001
+      description: "Session readiness p99 <2s."
+      verification: "BENCH-002 results meet target."
+
+  design_references:
+    - "05_rollout_and_ops.yaml#PHASE-2"
+
+  test_references:
+    - "07_test_and_evidence.yaml#BENCH-002"

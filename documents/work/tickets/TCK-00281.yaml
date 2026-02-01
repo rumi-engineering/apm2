@@ -1,0 +1,39 @@
+acceptance_criteria:
+  - criterion: Legacy JSON IPC server module removed
+    verification: ipc_server.rs no longer exists in daemon crate
+  - criterion: Legacy JSON IPC handler surface removed or ported
+    verification: handlers.rs no longer exposes apm2_core::ipc dispatch
+implementation:
+  code_examples: []
+  files_to_create: []
+  files_to_modify:
+    - changes: "Remove legacy JSON IPC server module."
+      path: crates/apm2-daemon/src/ipc_server.rs
+    - changes: "Remove or port legacy JSON handlers to ProtocolServer."
+      path: crates/apm2-daemon/src/handlers.rs
+    - changes: "Remove apm2_core::ipc module once no call sites remain."
+      path: crates/apm2-core/src/ipc/mod.rs
+  implementation_steps:
+    - "Delete legacy ipc_server module"
+    - "Port any required handler logic into ProtocolServer handlers"
+    - "Remove apm2_core::ipc types after call sites are removed"
+  summary: "Delete legacy JSON IPC modules (DD-009)."
+notes: |
+  Phase: PHASE-1
+  Added by Amendment A-001 (DD-009 hard cutover).
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+test_requirements:
+  - description: Build succeeds without legacy IPC symbols
+    test_id: CI-00281-01
+    verification_command: cargo build --workspace
+ticket:
+  depends_on:
+    - TCK-00279
+  id: TCK-00281
+  requirement_ids:
+    - REQ-DCP-0001
+    - REQ-DCP-0008
+  rfc_id: RFC-0017
+  status: READY
+  title: Delete legacy JSON IPC modules

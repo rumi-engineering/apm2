@@ -1,0 +1,30 @@
+requirement:
+  id: REQ-DCP-0004
+  title: "Zero Credentials in Sessions"
+  status: ACTIVE
+
+  statement: |
+    Session processes MUST NOT have direct access to credentials. The daemon
+    mediates authenticated operations and retains credentials in daemon scope.
+
+  rationale: |
+    Keeping credentials out of session scope prevents exfiltration and ensures
+    all privileged actions are brokered and auditable.
+
+  acceptance_criteria:
+    - id: AC-DCP-0004-001
+      description: "Credential probes from session are denied."
+      verification: "ADV-011 confirms environment and file access are blocked."
+    - id: AC-DCP-0004-002
+      description: "Credential mediation occurs only in daemon scope."
+      verification: "Integration tests show broker-held tokens only."
+
+  design_references:
+    - "02_design_decisions.yaml#DD-004"
+
+  test_references:
+    - "07_test_and_evidence.yaml#ADV-011"
+    - "07_test_and_evidence.yaml#INT-003"
+
+  law_refs:
+    - LAW-05

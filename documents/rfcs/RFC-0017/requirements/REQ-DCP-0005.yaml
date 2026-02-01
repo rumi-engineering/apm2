@@ -1,0 +1,31 @@
+requirement:
+  id: REQ-DCP-0005
+  title: "Context Firewall Enforcement"
+  status: ACTIVE
+
+  statement: |
+    Tool requests MUST be validated against the ContextPack allowlist. Reads
+    outside the allowlist MUST be denied and the session terminated.
+
+  rationale: |
+    Context firewall enforcement prevents unauthorized data access and ensures
+    deterministic, auditable execution.
+
+  acceptance_criteria:
+    - id: AC-DCP-0005-001
+      description: "Reads outside ContextPack allowlist are denied."
+      verification: "ADV-003 returns ToolDecided=DENY and session termination."
+    - id: AC-DCP-0005-002
+      description: "Post-deny requests are blocked."
+      verification: "ADV-010 validates deny-terminate atomicity."
+
+  design_references:
+    - "02_design_decisions.yaml#DD-004"
+
+  test_references:
+    - "07_test_and_evidence.yaml#ADV-003"
+    - "07_test_and_evidence.yaml#ADV-010"
+    - "07_test_and_evidence.yaml#UT-TOOL-002"
+
+  law_refs:
+    - LAW-05

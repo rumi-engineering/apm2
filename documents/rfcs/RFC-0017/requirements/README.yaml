@@ -24,6 +24,6 @@ requirements_readme:
     - REQ-DCP-0013  # Daemon Crash Recovery
 
   notes: |
-    Individual requirement YAML files will be created during v4 (Standard) phase
-    when tickets are decomposed. For v0 (Discovery), requirements are documented
-    in 01_problem_and_imports.yaml.
+    Individual requirement YAML files now exist in this directory and are the
+    authoritative RFC-0017 requirement set. They refine PRD-0010 for implementation
+    and include DD-009 hard cutover constraints where applicable.

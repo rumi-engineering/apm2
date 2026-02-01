@@ -2,16 +2,25 @@
 
 > Unix socket-based inter-process communication between CLI client and daemon using length-prefixed JSON frames.
 
+**Legacy notice:** This module defines the legacy JSON IPC surface. RFC-0017
+DD-009 forbids JSON IPC in default builds; ProtocolServer is the only supported
+control-plane IPC. This module is retained temporarily for removal under
+TCK-00281 and must not be used for new development.
+
 ## Overview
 
-The `apm2_core::ipc` module defines the wire protocol for CLI-to-daemon communication in APM2. It provides:
+The `apm2_core::ipc` module defines the legacy wire protocol for CLI-to-daemon
+communication in APM2. It provides:
 
 - Request/response enums for all daemon operations
 - Length-prefixed framing for message boundaries over stream sockets
 - Typed error codes for structured error handling
 - DTOs for process and credential information
 
-This module establishes the contract boundary between `apm2-cli` (client) and `apm2-daemon` (server). The daemon listens on a Unix domain socket; the CLI serializes `IpcRequest` variants to JSON, frames them with a 4-byte length prefix, and awaits `IpcResponse` frames.
+This module historically established the contract boundary between `apm2-cli`
+(client) and `apm2-daemon` (server). Under DD-009, default builds must not
+expose this JSON IPC surface, and any JSON framing sent to ProtocolServer
+sockets must be rejected before handler logic.
 
 ## Key Types
 
@@ -245,6 +254,7 @@ let request = IpcRequest::Status;
 let json = serde_json::to_vec(&request)?;
 let framed = frame_message(&json);
 
+// Legacy JSON IPC socket (unsupported in default builds).
 let mut stream = UnixStream::connect("/run/apm2/daemon.sock")?;
 stream.write_all(&framed)?;
 ```
@@ -309,7 +319,7 @@ fn handle_request(request: IpcRequest) -> IpcResponse {
 
 ### Socket Location
 
-The daemon socket is typically located at:
+Legacy JSON IPC socket paths (unsupported in default builds) were typically:
 - Linux: `/run/apm2/daemon.sock` or `$XDG_RUNTIME_DIR/apm2/daemon.sock`
 - macOS: `$HOME/.apm2/daemon.sock`
 
@@ -330,5 +340,5 @@ For `TailLogs` with `follow: true`, the connection remains open and the daemon s
 
 - [`apm2_core::process`](../process/AGENTS.md) - Provides `ProcessId` and `ProcessState` types used in responses
 - [`apm2_core::credentials`](../credentials/AGENTS.md) - Provides `CredentialProfileMetadata` for credential operations
-- [`apm2_daemon`](../../../../apm2-daemon/AGENTS.md) - Implements the server-side socket handler
-- [`apm2_cli`](../../../../apm2-cli/AGENTS.md) - Implements the client-side request logic
+- [`apm2_daemon`](../../../../apm2-daemon/AGENTS.md) - Legacy server implementation (disabled by DD-009)
+- [`apm2_cli`](../../../../apm2-cli/AGENTS.md) - Legacy client implementation (de-scoped under DD-009)

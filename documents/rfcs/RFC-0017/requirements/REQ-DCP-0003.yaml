@@ -1,0 +1,30 @@
+requirement:
+  id: REQ-DCP-0003
+  title: "GateLeaseIssued Precondition"
+  status: ACTIVE
+
+  statement: |
+    Gate executor spawn and gate outcomes MUST require a valid GateLeaseIssued
+    event bound to the intended custody domain and change set.
+
+  rationale: |
+    Lease gating prevents unauthorized gate execution and enforces custody
+    separation between authoring and reviewing roles.
+
+  acceptance_criteria:
+    - id: AC-DCP-0003-001
+      description: "GateOutcome without a valid lease is rejected."
+      verification: "ADV-004 returns GATE_LEASE_MISSING."
+    - id: AC-DCP-0003-002
+      description: "Gate executor spawn validates lease binding."
+      verification: "UT-SPAWN-002 validates lease binding semantics."
+
+  design_references:
+    - "06_ticket_decomposition.yaml#GRP-003"
+
+  test_references:
+    - "07_test_and_evidence.yaml#ADV-004"
+    - "07_test_and_evidence.yaml#UT-SPAWN-002"
+
+  law_refs:
+    - LAW-05

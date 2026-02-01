@@ -532,22 +532,19 @@ rfc_design_decisions:
         1. Add SO_PEERCRED to ProtocolServer::accept() for authentication
         2. Add control-plane messages to apm2d_runtime_v1.proto
         3. Implement handlers in ProtocolServer for new endpoints
-        4. Create thin JSON-to-protobuf CLI adapter for backward compatibility
-        5. Deprecate JSON IPC for control-plane operations (keep for legacy CLI)
+        4. SUPERSEDED BY DD-009: No JSON→protobuf adapter is permitted
+        5. SUPERSEDED BY DD-009: JSON IPC is removed, not retained
 
-        The existing JSON IPC (apm2_core::ipc) remains available for:
-        - Human CLI commands during migration (via adapter)
-        - Legacy tooling compatibility
-        - Eventually deprecated once CLI migration complete
+        SUPERSEDED BY DD-009: Legacy JSON IPC (apm2_core::ipc) is forbidden in
+        default builds and has no supported migration path.
 
       cutover_topology:
         pattern: A
         pattern_name: "Protobuf-only control plane"
         description: |
           Daemon listens only with ProtocolServer for control-plane operations.
-          - CLI migrates to protobuf (or uses CLI-side adapter)
-          - JSON IPC (ipc_server.rs) is retired for control-plane; kept only for
-            backward-compatible legacy tooling during transition
+          - CLI migration is out of scope for DD-009; no adapter path is supported
+          - JSON IPC (ipc_server.rs) is removed; no legacy tooling retention
           - All new control-plane endpoints are ONLY in protobuf handlers
 
         invariant: |
@@ -559,7 +556,7 @@ rfc_design_decisions:
         implementation_constraint: |
           Ticket acceptance criteria must verify:
           - New handler logic is NOT duplicated in ipc_server.rs
-          - ipc_server.rs either delegates to shared handler or is not called
+          - ipc_server.rs is not present or not referenced in default build
           - Unit tests cover protobuf handlers directly
 
       alternatives_considered:
@@ -629,6 +626,40 @@ rfc_design_decisions:
           resolved_date: "2026-01-30"
           resolution: "OPTION A (Protobuf Runtime Protocol) adopted. See DD-008.decision above."
 
+    # =========================================================================
+    # DD-009: HARD CUTOVER (Added by Amendment A-001 2026-02-01)
+    # =========================================================================
+    - id: DD-009
+      title: "Hard Cutover: ProtocolServer-Only Control Plane"
+      status: DECIDED
+      decided_date: "2026-02-01"
+      decided_by: "Human (operator)"
+      supersedes:
+        - "DD-008 decision lines 531-539 (JSON-to-protobuf adapter + legacy JSON IPC retention)"
+        - "DD-008 cutover_topology description lines 545-548 (legacy JSON tooling retention)"
+      decision: |
+        ProtocolServer (apm2_daemon::protocol) is the ONLY control-plane IPC in
+        default builds. Legacy JSON IPC (apm2_core::ipc + ipc_server.rs) MUST NOT
+        be started, shipped, or referenced as a supported control-plane path.
+        No JSON→protobuf adapter exists or is supported.
+
+        Control-plane topology is dual-socket only:
+        - operator.sock for privileged endpoints
+        - session.sock for session-scoped endpoints
+        Any legacy single-socket configuration is rejected fail-closed at startup.
+      allowed_surfaces:
+        - "ProtocolServer on operator.sock"
+        - "ProtocolServer on session.sock"
+      forbidden_surfaces:
+        - "ipc_server::run legacy JSON listener"
+        - "apm2_core::ipc JSON request/response framing"
+        - "JSON→protobuf CLI adapter"
+        - "Any single-socket control-plane configuration"
+      enforcement:
+        - "Config parser rejects legacy [daemon].socket key"
+        - "CI guardrails fail builds referencing legacy IPC symbols"
+        - "ADV-012 demonstrates legacy JSON bypass is impossible"
+
   architecture_overview:
     # IMPORTANT: Locations are ACTUAL CCP paths. Do NOT create new directories.
     # Anti-cousin principle: extend existing modules, do not create parallel hierarchies.
@@ -636,7 +667,7 @@ rfc_design_decisions:
       - name: "Daemon IPC Handler"
         responsibility: "Authenticate clients, route to privileged/session handlers"
         location: "crates/apm2-daemon/src/protocol/"
-        extension_note: "Extend ProtocolServer; wrap/retire ipc_server.rs. Do NOT create src/ipc/"
+        extension_note: "Extend ProtocolServer; remove ipc_server.rs. Do NOT create src/ipc/"
 
       - name: "Work Orchestrator"
         responsibility: "Handle ClaimWork, query governance, mint capabilities"

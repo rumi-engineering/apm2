@@ -2,9 +2,9 @@ requirements_readme:
   schema_version: "2026-01-23"
   template_version: "2026-01-23"
   prd_id: PRD-0010
-  total_requirements: 13
+  total_requirements: 18
   requirements_by_type:
-    SECURITY: 8
+    SECURITY: 11
     FUNCTIONAL: 3
     PERFORMANCE: 3
     RELIABILITY: 1
@@ -48,3 +48,18 @@ requirements_readme:
     - id: REQ-0013
       type: RELIABILITY
       title: "Daemon Crash Recovery"
+    - id: REQ-0014
+      type: FUNCTIONAL
+      title: "xtask Deprecation with Migration Path"
+    - id: REQ-0015
+      type: SECURITY
+      title: "Operator Credential Definition"
+    - id: REQ-0016
+      type: SECURITY
+      title: "Capability Terminology Separation"
+    - id: REQ-0017
+      type: FUNCTIONAL
+      title: "RFC-0015 Dependency Contract"
+    - id: REQ-0018
+      type: SECURITY
+      title: "SSH Key Mediation Specification"

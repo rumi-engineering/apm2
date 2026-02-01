@@ -1,0 +1,32 @@
+requirement:
+  id: REQ-DCP-0002
+  title: "PolicyResolvedForChangeSet Precondition"
+  status: ACTIVE
+
+  statement: |
+    SpawnEpisode and work orchestration MUST verify that a
+    PolicyResolvedForChangeSet event exists for the target change set before
+    issuing capabilities or spawning execution.
+
+  rationale: |
+    Governance policy resolution is the authoritative gate for work execution.
+    Enforcing this precondition prevents unauthorized or policy-divergent work.
+
+  acceptance_criteria:
+    - id: AC-DCP-0002-001
+      description: "SpawnEpisode requires PolicyResolvedForChangeSet."
+      verification: "UT-SPAWN-001 + INT-002 validate rejection without policy resolution."
+    - id: AC-DCP-0002-002
+      description: "ClaimWork issues capabilities only after policy resolution."
+      verification: "INT-001 validates capability minting after governance decision."
+
+  design_references:
+    - "02_design_decisions.yaml#DD-002"
+
+  test_references:
+    - "07_test_and_evidence.yaml#UT-SPAWN-001"
+    - "07_test_and_evidence.yaml#INT-001"
+    - "07_test_and_evidence.yaml#INT-002"
+
+  law_refs:
+    - LAW-01
