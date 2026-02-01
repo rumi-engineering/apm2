@@ -314,30 +314,68 @@ impl SocketManager {
     }
 
     /// Ensure a directory exists with appropriate permissions (0700).
+    ///
+    /// # Safety
+    ///
+    /// Does **not** modify permissions of existing directories to avoid
+    /// clobbering system paths (e.g., `/tmp`) if configured incorrectly.
+    /// Only enforces 0700 on directories created by this call.
+    ///
+    /// # Symlink Protection (RSK-2617)
+    ///
+    /// Uses `symlink_metadata` to verify path type before any operations.
+    /// Rejects symlinks to prevent symlink-based attacks.
     fn ensure_directory(path: &Path) -> ProtocolResult<()> {
-        if !path.exists() {
-            std::fs::create_dir_all(path).map_err(|e| {
-                ProtocolError::Io(io::Error::new(
-                    e.kind(),
-                    format!("failed to create directory {}: {e}", path.display()),
-                ))
-            })?;
-        }
+        // Check if path exists using symlink_metadata to detect symlinks (RSK-2617)
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                // Path exists - verify it's a directory, not a symlink
+                if metadata.file_type().is_symlink() {
+                    return Err(ProtocolError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "security: {} is a symlink, refusing to use as socket directory",
+                            path.display()
+                        ),
+                    )));
+                }
+                if !metadata.is_dir() {
+                    return Err(ProtocolError::Io(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{} exists but is not a directory", path.display()),
+                    )));
+                }
+                // Directory exists, do NOT modify its permissions (SEC-FS-001)
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Path doesn't exist, create it
+                std::fs::create_dir_all(path).map_err(|e| {
+                    ProtocolError::Io(io::Error::new(
+                        e.kind(),
+                        format!("failed to create directory {}: {e}", path.display()),
+                    ))
+                })?;
 
-        // Always enforce directory permissions to 0700 (owner only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(DIRECTORY_MODE);
-            std::fs::set_permissions(path, perms).map_err(|e| {
-                ProtocolError::Io(io::Error::new(
-                    e.kind(),
-                    format!("failed to set permissions on {}: {e}", path.display()),
-                ))
-            })?;
+                // Only enforce permissions if we created the directory
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(DIRECTORY_MODE);
+                    std::fs::set_permissions(path, perms).map_err(|e| {
+                        ProtocolError::Io(io::Error::new(
+                            e.kind(),
+                            format!("failed to set permissions on {}: {e}", path.display()),
+                        ))
+                    })?;
+                }
+                Ok(())
+            }
+            Err(e) => Err(ProtocolError::Io(io::Error::new(
+                e.kind(),
+                format!("failed to stat {}: {e}", path.display()),
+            ))),
         }
-
-        Ok(())
     }
 
     /// Set socket file permissions.
@@ -491,7 +529,7 @@ impl SocketManager {
         permit: tokio::sync::OwnedSemaphorePermit,
         socket_type: SocketType,
     ) -> ProtocolResult<(Connection, ConnectionPermit)> {
-        use nix::unistd::getuid;
+        use nix::unistd::{getgid, getuid};
         use subtle::ConstantTimeEq;
 
         // Extract peer credentials (TCK-00248)
@@ -502,13 +540,29 @@ impl SocketManager {
             ))
         })?;
 
-        // Validate UID before handshake (TCK-00248, SEC-DCP-001/002)
+        // Validate UID/GID based on socket type
+        // TCK-00249: Privilege Separation Logic
+        // - Operator: Strict UID match (Owner only)
+        // - Session: UID match (Owner) OR GID match (Group)
         let current_uid = getuid().as_raw();
-        let uid_bytes = creds.uid.to_ne_bytes();
-        let expected_bytes = current_uid.to_ne_bytes();
-        let uid_match = uid_bytes.ct_eq(&expected_bytes);
+        let current_gid = getgid().as_raw();
 
-        if uid_match.unwrap_u8() != 1 {
+        let uid_bytes = creds.uid.to_ne_bytes();
+        let expected_uid_bytes = current_uid.to_ne_bytes();
+        let uid_match = uid_bytes.ct_eq(&expected_uid_bytes).unwrap_u8() == 1;
+
+        let authorized = match socket_type {
+            SocketType::Operator => uid_match,
+            SocketType::Session => {
+                let gid_bytes = creds.gid.to_ne_bytes();
+                let expected_gid_bytes = current_gid.to_ne_bytes();
+                let gid_match = gid_bytes.ct_eq(&expected_gid_bytes).unwrap_u8() == 1;
+
+                uid_match || gid_match
+            }
+        };
+
+        if !authorized {
             return Err(ProtocolError::Io(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "permission denied",
@@ -731,13 +785,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_directory_permissions_corrected() {
+    async fn test_directory_permissions_preserved_if_existing() {
         let tmp = TempDir::new().unwrap();
         let socket_dir = tmp.path().join("apm2_test_dir");
         let operator_path = socket_dir.join("operator.sock");
         let session_path = socket_dir.join("session.sock");
 
-        // Pre-create directory with loose permissions (simulating attacker)
+        // Pre-create directory with loose permissions (simulating existing system dir)
         std::fs::create_dir_all(&socket_dir).unwrap();
         std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
 
@@ -748,15 +802,15 @@ mod tests {
             "Pre-condition: directory should be 0777"
         );
 
-        // Bind manager - should correct directory permissions
+        // Bind manager - should NOT modify directory permissions
         let config = SocketManagerConfig::new(&operator_path, &session_path);
         let _manager = SocketManager::bind(config).unwrap();
 
-        // Verify directory permissions were corrected to 0700
-        let corrected_mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
+        // Verify directory permissions were preserved (NOT corrected to 0700)
+        let preserved_mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            corrected_mode, DIRECTORY_MODE,
-            "Directory permissions should be corrected to 0700, got {corrected_mode:04o}"
+            preserved_mode, 0o777,
+            "Directory permissions should be preserved, got {preserved_mode:04o}"
         );
     }
 
