@@ -143,8 +143,9 @@ pub const WORK_CLAIMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_claimed:";
 
 /// Maximum length for ID fields (`work_id`, `lease_id`, etc.).
 ///
-/// Per SEC-SCP-FAC-0020: Unbounded input processing can lead to denial-of-service via OOM.
-/// This limit prevents attackers from supplying multi-GB ID strings.
+/// Per SEC-SCP-FAC-0020: Unbounded input processing can lead to
+/// denial-of-service via OOM. This limit prevents attackers from supplying
+/// multi-GB ID strings.
 pub const MAX_ID_LENGTH: usize = 256;
 
 /// Maximum number of events stored in `StubLedgerEventEmitter`.
