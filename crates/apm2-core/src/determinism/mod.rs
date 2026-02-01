@@ -20,6 +20,19 @@
 //!    files
 //! 3. **Determinism**: Output depends only on input content, not environment
 //!
+//! # Time Model (RFC-0016 HTF Compliance Review)
+//!
+//! **TCK-00243 Review**: This module was reviewed for wall-clock time usage as
+//! part of RFC-0016 HTF compliance. **No wall-clock timing is used** in this
+//! module. All operations are purely deterministic transformations:
+//!
+//! - Canonicalization: Key sorting, string formatting
+//! - Atomic writes: File system operations (rename, fsync)
+//! - Diff classification: String comparison
+//!
+//! None of these operations depend on wall-clock time, so no changes are
+//! required for HTF compliance.
+//!
 //! # Example
 //!
 //! ```

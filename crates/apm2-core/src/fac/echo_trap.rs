@@ -356,9 +356,43 @@ impl EchoTrapDetector {
     /// Returns `EchoTrapError::SignatureTooLong` if the signature exceeds
     /// `MAX_SIGNATURE_LENGTH`. Returns `EchoTrapError::TooManySignatures` if
     /// recording this signature would exceed `MAX_SIGNATURES`.
+    ///
+    /// # Note
+    ///
+    /// The `detected_at` timestamp in the returned event is a placeholder (0).
+    /// For deterministic timing, use `record_finding_at_tick` instead.
     pub fn record_finding(
         &mut self,
         signature: FindingSignature,
+    ) -> Result<Option<EchoTrapEvent>, EchoTrapError> {
+        self.record_finding_at_tick(signature, current_timestamp_ns())
+    }
+
+    /// Records a finding signature with explicit tick timestamp (RFC-0016 HTF).
+    ///
+    /// This is the preferred method for production use. The tick value provides
+    /// deterministic, wall-clock-immune timestamps for echo trap detection.
+    ///
+    /// # Arguments
+    ///
+    /// * `signature` - The finding signature to record
+    /// * `tick_ns` - Tick value in nanoseconds (from HTF monotonic clock)
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(None)` if the signature was recorded but threshold not reached
+    /// - `Ok(Some(EchoTrapEvent))` if threshold was reached (echo trap
+    ///   detected)
+    ///
+    /// # Errors
+    ///
+    /// Returns `EchoTrapError::SignatureTooLong` if the signature exceeds
+    /// `MAX_SIGNATURE_LENGTH`. Returns `EchoTrapError::TooManySignatures` if
+    /// recording this signature would exceed `MAX_SIGNATURES`.
+    pub fn record_finding_at_tick(
+        &mut self,
+        signature: FindingSignature,
+        tick_ns: u64,
     ) -> Result<Option<EchoTrapEvent>, EchoTrapError> {
         // Validate signature
         signature.validate()?;
@@ -383,7 +417,7 @@ impl EchoTrapDetector {
 
         // Check threshold
         if count >= ECHO_TRAP_THRESHOLD {
-            let event = EchoTrapEvent::new(signature, count, current_timestamp_ns());
+            let event = EchoTrapEvent::new(signature, count, tick_ns);
             Ok(Some(event))
         } else {
             Ok(None)
@@ -454,15 +488,20 @@ impl EchoTrapDetector {
     }
 }
 
-/// Returns the current timestamp in nanoseconds since epoch.
-fn current_timestamp_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[allow(clippy::cast_possible_truncation)]
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+/// Returns a placeholder timestamp for echo trap events.
+///
+/// # RFC-0016 HTF Migration Note
+///
+/// This function returns 0 as a placeholder. In production, callers should
+/// provide an explicit tick value via
+/// `EchoTrapDetector::record_finding_at_tick` for deterministic timing that is
+/// immune to wall-clock manipulation.
+///
+/// The timestamp field in `EchoTrapEvent` is observational only and not used
+/// for any security-critical decisions.
+const fn current_timestamp_ns() -> u64 {
+    // Return 0 as placeholder; callers should use tick-based methods
+    0
 }
 
 // =============================================================================

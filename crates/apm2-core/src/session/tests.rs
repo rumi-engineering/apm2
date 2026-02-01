@@ -135,10 +135,13 @@ impl SessionEventType {
                 session_id,
                 actor_id,
             } => {
-                let payload = helpers::session_quarantined_payload(
+                let payload = helpers::session_quarantined_payload_with_ticks(
                     session_id,
                     "violation",
                     timestamp + 1_000_000_000,
+                    timestamp / 1_000_000, // issued_at_tick (ns to ms)
+                    (timestamp + 1_000_000_000) / 1_000_000, // expires_at_tick
+                    1000,                  // tick_rate_hz
                 );
                 EventRecord::with_timestamp(
                     "session.quarantined",
@@ -501,8 +504,14 @@ fn test_multiple_concurrent_sessions() {
     reducer.apply(&term_event2, &ctx).unwrap();
 
     // Quarantine session-3
-    let quar_payload =
-        helpers::session_quarantined_payload("session-3", "policy violation", 3_000_000_000);
+    let quar_payload = helpers::session_quarantined_payload_with_ticks(
+        "session-3",
+        "policy violation",
+        3_000_000_000,
+        2000, // issued_at_tick
+        3000, // expires_at_tick
+        1000, // tick_rate_hz
+    );
     let quar_event = EventRecord::with_timestamp(
         "session.quarantined",
         "session-3",
