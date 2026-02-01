@@ -1292,8 +1292,8 @@ static HTF_TIME_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // Numeric time units: "5 minutes", "24 hours", "30 days", etc.
         Regex::new(r"(?i)\b\d+\s*(seconds?|minutes?|hours?|days?|weeks?|months?|years?)\b")
             .unwrap(),
-        // Business time codes
-        Regex::new(r"\b(ASAP|EOD|EOW|EOY)\b").unwrap(),
+        // Business time codes (case-insensitive)
+        Regex::new(r"(?i)\b(ASAP|EOD|EOW|EOY)\b").unwrap(),
         // Relative time phrases
         Regex::new(r"(?i)\bnext\s+(week|month|quarter|year)\b").unwrap(),
     ]
@@ -1378,9 +1378,9 @@ fn check_htf_file(path: &Path, findings: &mut Vec<LintFinding>) -> Result<()> {
             continue;
         }
 
-        // Check each pattern
+        // Check each pattern - use find_iter to capture all matches per line
         for pattern in HTF_TIME_PATTERNS.iter() {
-            if let Some(mat) = pattern.find(line) {
+            for mat in pattern.find_iter(line) {
                 let matched_text = mat.as_str();
 
                 // Additional check: skip if this looks like a schema version (e.g.,
@@ -1409,37 +1409,43 @@ fn check_htf_file(path: &Path, findings: &mut Vec<LintFinding>) -> Result<()> {
     Ok(())
 }
 
+/// Regex pattern for YAML keys that indicate version/schema/date fields.
+/// Used to avoid false positives on lines like `schema_version: "2026-01-30"`.
+static VERSION_KEY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^\s*(schema_version|template_version|version|created_date|last_updated_date|date)\s*:").unwrap()
+});
+
+/// Regex pattern for ISO date formats (YYYY-MM-DD).
+static DATE_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").unwrap());
+
+/// Regex pattern for YAML keys ending in _id or named id.
+static ID_KEY_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*(\w+_id|id)\s*:").unwrap());
+
 /// Check if matched text is likely a version number or ID rather than a time
 /// reference.
 ///
 /// This helps avoid false positives for patterns like:
 /// - Schema versions: "2026-01-30" (matches "30 days" pattern without context)
-/// - Response times: "24h" in timing contexts that are actually tick-based
+/// - ID fields: "REQ-0001" where numbers might match time patterns
 fn is_likely_version_or_id(matched_text: &str, line: &str) -> bool {
-    // If the line contains "version" or "schema", it's likely a version reference
-    let line_lower = line.to_lowercase();
-    if line_lower.contains("version") || line_lower.contains("schema") {
+    // Check if the line starts with a version/schema/date YAML key
+    if VERSION_KEY_PATTERN.is_match(line) {
+        return true;
+    }
+
+    // Check if the line starts with an ID YAML key
+    if ID_KEY_PATTERN.is_match(line) {
         return true;
     }
 
     // If the matched text is part of a date pattern (YYYY-MM-DD), skip it
-    // Check for surrounding date context
     if line.contains('-') {
-        // Look for date patterns around the match
-        let date_pattern = Regex::new(r"\d{4}-\d{2}-\d{2}").unwrap();
-        if date_pattern.is_match(line) {
-            // Check if the matched text is part of this date
-            if let Some(date_match) = date_pattern.find(line) {
-                if date_match.as_str().contains(matched_text) {
-                    return true;
-                }
+        if let Some(date_match) = DATE_PATTERN.find(line) {
+            if date_match.as_str().contains(matched_text) {
+                return true;
             }
         }
-    }
-
-    // Skip if this is in an ID field context
-    if line_lower.contains("_id") || line_lower.contains("id:") {
-        return true;
     }
 
     false
@@ -2145,7 +2151,7 @@ pub fn init() {}
             }
 
             for pattern in HTF_TIME_PATTERNS.iter() {
-                if let Some(mat) = pattern.find(line) {
+                for mat in pattern.find_iter(line) {
                     let matched_text = mat.as_str();
                     if is_likely_version_or_id(matched_text, line) {
                         continue;
@@ -2398,19 +2404,77 @@ one_year: 1 year
 
     #[test]
     fn test_is_likely_version_or_id() {
-        // Version lines should be skipped
+        // Version lines should be skipped (YAML key starts with version-related key)
         assert!(is_likely_version_or_id("30", "schema_version: 2026-01-30"));
         assert!(is_likely_version_or_id(
             "26",
             "template_version: 2026-01-26"
         ));
+        assert!(is_likely_version_or_id("30", "version: 1.2.30"));
+        assert!(is_likely_version_or_id("30", "created_date: 2026-01-30"));
 
-        // ID lines should be skipped
+        // ID lines should be skipped (YAML key ends with _id or is "id:")
         assert!(is_likely_version_or_id("1", "requirement_id: REQ-0001"));
         assert!(is_likely_version_or_id("5", "ticket_id: TCK-00005"));
+        assert!(is_likely_version_or_id("1", "id: 1"));
 
-        // Regular content should not be skipped
+        // Regular content should NOT be skipped
         assert!(!is_likely_version_or_id("5 minutes", "timeout: 5 minutes"));
         assert!(!is_likely_version_or_id("ASAP", "deadline: ASAP"));
+
+        // Lines with "version" in the VALUE (not the key) should NOT be skipped
+        assert!(!is_likely_version_or_id(
+            "30 days",
+            "description: The system version 2.0 will be ready in 30 days"
+        ));
+
+        // Lines with "id" in the VALUE (not the key) should NOT be skipped
+        assert!(!is_likely_version_or_id(
+            "5 minutes",
+            "note: The user id lookup takes 5 minutes"
+        ));
+    }
+
+    #[test]
+    fn test_htf_detects_multiple_violations_per_line() {
+        let content = r"
+statement: Processing takes 5 minutes and retries every 30 seconds.
+";
+        let findings = check_htf_content(content, "documents/rfcs/RFC-0001/test.yaml");
+
+        // Should detect both "5 minutes" and "30 seconds" on the same line
+        assert_eq!(
+            findings.len(),
+            2,
+            "Should detect 2 violations on same line, got {}",
+            findings.len()
+        );
+
+        let patterns: Vec<_> = findings.iter().map(|f| f.pattern.as_str()).collect();
+        assert!(
+            patterns.iter().any(|p| p.contains("5 minutes")),
+            "Should detect '5 minutes'"
+        );
+        assert!(
+            patterns.iter().any(|p| p.contains("30 seconds")),
+            "Should detect '30 seconds'"
+        );
+    }
+
+    #[test]
+    fn test_htf_does_not_skip_version_in_value() {
+        let content = r"
+description: The system version 2.0 will be ready in 30 days and reviewed within 48 hours.
+";
+        let findings = check_htf_content(content, "documents/rfcs/RFC-0001/test.yaml");
+
+        // Should detect both "30 days" and "48 hours" - not skipped because "version"
+        // is in value
+        assert_eq!(
+            findings.len(),
+            2,
+            "Should detect 2 violations, got {}",
+            findings.len()
+        );
     }
 }
