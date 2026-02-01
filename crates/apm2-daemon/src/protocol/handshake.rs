@@ -787,6 +787,11 @@ mod tests {
 
     // NOTE: UID authorization tests have been moved to server.rs tests
     // since UID validation now occurs at accept() time, before handshake.
-    // See `test_accept_uid_mismatch_rejection` and
-    // `test_accept_uid_match_success` in the server module tests.
+    // See `test_uid_constant_time_comparison` (verifies rejection logic) and
+    // `test_accept_extracts_and_validates_credentials` (verifies success path)
+    // in the server module tests.
+    //
+    // Integration-level UID rejection tests are not feasible because both
+    // client and server run as the same process UID, and SO_PEERCRED cannot
+    // be spoofed.
 }
