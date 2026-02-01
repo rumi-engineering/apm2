@@ -221,8 +221,26 @@ pub struct SessionQuarantined {
     pub session_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub reason: ::prost::alloc::string::String,
+    /// OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+    /// Retained for backwards compatibility and display purposes.
     #[prost(uint64, tag = "3")]
     pub quarantine_until: u64,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the quarantine event to verifiable HTF time.
+    #[prost(message, optional, tag = "4")]
+    pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Monotonic tick when the quarantine was issued (RFC-0016 HTF).
+    /// Authoritative for timing decisions; immune to wall-clock manipulation.
+    #[prost(uint64, tag = "5")]
+    pub issued_at_tick: u64,
+    /// Monotonic tick when the quarantine expires (RFC-0016 HTF).
+    /// Authoritative for expiry checks; immune to wall-clock manipulation.
+    #[prost(uint64, tag = "6")]
+    pub expires_at_tick: u64,
+    /// Tick rate in Hz for issued_at_tick and expires_at_tick.
+    /// Required for interpreting tick values as durations.
+    #[prost(uint64, tag = "7")]
+    pub tick_rate_hz: u64,
 }
 /// ============================================================
 /// WORK EVENTS

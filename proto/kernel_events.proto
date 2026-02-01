@@ -164,7 +164,21 @@ message SessionTerminated {
 message SessionQuarantined {
   string session_id = 1;
   string reason = 2;
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  // Retained for backwards compatibility and display purposes.
   uint64 quarantine_until = 3;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the quarantine event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 4;
+  // Monotonic tick when the quarantine was issued (RFC-0016 HTF).
+  // Authoritative for timing decisions; immune to wall-clock manipulation.
+  uint64 issued_at_tick = 5;
+  // Monotonic tick when the quarantine expires (RFC-0016 HTF).
+  // Authoritative for expiry checks; immune to wall-clock manipulation.
+  uint64 expires_at_tick = 6;
+  // Tick rate in Hz for issued_at_tick and expires_at_tick.
+  // Required for interpreting tick values as durations.
+  uint64 tick_rate_hz = 7;
 }
 
 // ============================================================

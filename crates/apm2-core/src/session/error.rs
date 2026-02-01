@@ -49,6 +49,72 @@ pub enum SessionError {
     /// Failed to decode protobuf message.
     #[error("decode error: {0}")]
     DecodeError(#[from] prost::DecodeError),
+
+    /// Attempted to restart a session while still quarantined.
+    ///
+    /// When a session is quarantined, a restart is only allowed after the
+    /// quarantine period has expired. This error is returned when a
+    /// `SessionStarted` event is received for a quarantined session
+    /// before the quarantine has expired.
+    ///
+    /// # SEC-HTF-003: Tick-Based Expiry (RFC-0016)
+    ///
+    /// When tick-based quarantine timing is available, expiry is checked
+    /// using monotonic ticks which are immune to wall-clock manipulation.
+    /// If a tick rate mismatch is detected, the quarantine is considered
+    /// NOT expired (fail-closed behavior).
+    #[error(
+        "session {session_id} is still quarantined (remaining_ticks: {remaining_ticks:?}, expires_at: {expires_at_ns})"
+    )]
+    QuarantineNotExpired {
+        /// The session ID.
+        session_id: String,
+        /// Wall-clock expiry timestamp (observational only).
+        expires_at_ns: u64,
+        /// Remaining ticks if tick-based timing is available, None for legacy.
+        remaining_ticks: Option<u64>,
+    },
+
+    /// Attempted to restart a tick-based quarantined session without a valid
+    /// time envelope reference.
+    ///
+    /// # SEC-HTF-003: Fail-Closed Behavior (RFC-0016)
+    ///
+    /// When a session has a tick-based quarantine, the restart event MUST
+    /// include a `time_envelope_ref` to provide the authoritative current tick.
+    /// Without this reference, we cannot securely verify quarantine expiry
+    /// and must deny the restart (fail-closed behavior).
+    ///
+    /// This prevents attackers from bypassing quarantine by omitting time
+    /// envelope data from restart events.
+    #[error(
+        "session {session_id} restart denied: tick-based quarantine requires time_envelope_ref (SEC-HTF-003)"
+    )]
+    MissingTimeEnvelopeRef {
+        /// The session ID.
+        session_id: String,
+    },
+
+    /// Clock regression detected during quarantine expiry check.
+    ///
+    /// # DD-HTF-0001: Defect Emission (RFC-0016)
+    ///
+    /// When tick rates mismatch during quarantine expiry checks, a clock
+    /// regression defect is emitted. This indicates a potential security
+    /// issue where ticks from different clock domains are being compared.
+    ///
+    /// The restart is denied with fail-closed behavior.
+    #[error(
+        "session {session_id} restart denied: clock regression detected (current_rate={current_tick_rate_hz}Hz, expected_rate={expected_tick_rate_hz}Hz)"
+    )]
+    ClockRegressionDetected {
+        /// The session ID.
+        session_id: String,
+        /// Current tick rate in Hz.
+        current_tick_rate_hz: u64,
+        /// Expected tick rate in Hz.
+        expected_tick_rate_hz: u64,
+    },
 }
 
 /// Display implementation for state names used in error messages.
