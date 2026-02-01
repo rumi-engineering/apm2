@@ -47,10 +47,37 @@ fn test_args_hash() -> [u8; 32] {
 }
 
 /// Creates a capability manifest with the specified capabilities.
+///
+/// Per TCK-00254, the `tool_allowlist` is automatically populated from the
+/// capabilities' tool classes, and `write_allowlist` is populated for
+/// Write capabilities.
 fn create_manifest_with_capabilities(caps: Vec<Capability>) -> CapabilityManifest {
+    use std::path::PathBuf;
+
+    // Collect unique tool classes from capabilities for the allowlist
+    let tool_classes: Vec<ToolClass> = caps.iter().map(|c| c.tool_class).collect();
+
+    // Collect write paths from Write capabilities for the write_allowlist
+    let write_paths: Vec<PathBuf> = caps
+        .iter()
+        .filter(|c| c.tool_class == ToolClass::Write)
+        .flat_map(|c| c.scope.root_paths.clone())
+        .collect();
+
+    // If Execute is present, add a default shell_allowlist pattern
+    // (for testing purposes - allows all commands)
+    let shell_patterns: Vec<String> = if tool_classes.contains(&ToolClass::Execute) {
+        vec!["*".to_string()] // Allow all shell commands for testing
+    } else {
+        Vec::new()
+    };
+
     CapabilityManifest::builder("test-manifest")
         .delegator("test-actor")
         .capabilities(caps)
+        .tool_allowlist(tool_classes)
+        .write_allowlist(write_paths)
+        .shell_allowlist(shell_patterns)
         .build()
         .expect("valid manifest")
 }
@@ -218,7 +245,8 @@ async fn test_allow_multiple_tool_classes() {
         ToolClass::Execute,
         "key-exec",
         RiskTier::Tier0,
-    );
+    )
+    .with_shell_command("ls"); // Shell command required for Execute requests
     let decision = broker
         .request(&exec_request, current_timestamp_ns())
         .await

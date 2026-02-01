@@ -54,8 +54,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use apm2_core::context::ContextPackManifest;
 use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
+use apm2_core::context::{ContextPackManifest, ToolClass};
 use apm2_core::coordination::{ContextRefinementRequest, CoordinationEvent};
 use apm2_core::tool::{ToolRequest, tool_request};
 
@@ -105,6 +105,45 @@ pub enum ConsumeSessionError {
     InvalidManifest {
         /// Error description.
         message: String,
+    },
+
+    /// Tool class not allowed in manifest.
+    ///
+    /// Per TCK-00254, tool requests are validated against the manifest's
+    /// `tool_allowlist`. This error is returned when the requested tool class
+    /// is not in the allowlist (fail-closed semantics).
+    #[error("tool class '{tool_class}' not in manifest allowlist for '{manifest_id}'")]
+    ToolNotAllowed {
+        /// The tool class that was denied.
+        tool_class: String,
+        /// The manifest ID.
+        manifest_id: String,
+    },
+
+    /// Write path not allowed in manifest.
+    ///
+    /// Per TCK-00254, write operations are validated against the manifest's
+    /// `write_allowlist`. This error is returned when the write path is not
+    /// in the allowlist (fail-closed semantics).
+    #[error("write path '{path}' not in manifest allowlist for '{manifest_id}'")]
+    WritePathNotAllowed {
+        /// The path that was denied.
+        path: String,
+        /// The manifest ID.
+        manifest_id: String,
+    },
+
+    /// Shell command not allowed in manifest.
+    ///
+    /// Per TCK-00254, shell execution requests are validated against the
+    /// manifest's `shell_allowlist`. This error is returned when the command
+    /// does not match any allowed pattern (fail-closed semantics).
+    #[error("shell command '{command}' not in manifest allowlist for '{manifest_id}'")]
+    ShellCommandNotAllowed {
+        /// The command that was denied.
+        command: String,
+        /// The manifest ID.
+        manifest_id: String,
     },
 }
 
@@ -413,6 +452,8 @@ impl SessionTerminationInfo {
 /// `Ok(())` if the request is allowed or not a `FileRead`.
 /// `Err(ConsumeSessionError::ContextMiss)` if the path is not in the manifest.
 /// `Err(ConsumeSessionError::NotConsumeMode)` if not in consumption mode.
+/// `Err(ConsumeSessionError::ToolNotAllowed)` if the tool class is not in the
+/// manifest's `tool_allowlist`.
 pub fn validate_tool_request(
     request: &ToolRequest,
     manifest: &ContextPackManifest,
@@ -427,24 +468,90 @@ pub fn validate_tool_request(
         return Ok(()); // No tool, nothing to validate
     };
 
-    // Extract path from FileRead
-    let path = match tool {
-        tool_request::Tool::FileRead(read) => &read.path,
-        _ => return Ok(()), // Not a FileRead, skip validation
-    };
+    // TCK-00254: Check tool allowlist (fail-closed semantics)
+    // Map the tool variant to a ToolClass and check against the allowlist.
+    let tool_class = tool_to_tool_class(tool);
+    if !manifest.tool_allowlist.contains(&tool_class) {
+        return Err(ConsumeSessionError::ToolNotAllowed {
+            tool_class: tool_class.to_string(),
+            manifest_id: manifest.manifest_id.clone(),
+        });
+    }
 
-    // Create firewall and validate
-    let firewall = DefaultContextFirewall::new(manifest, mode);
-    match firewall.validate_read(path, None) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            // SECURITY: Truncate path BEFORE creating the error to prevent
-            // local DoS via oversized paths in error variants.
-            Err(ConsumeSessionError::ContextMiss {
-                path: ContextRefinementRequest::truncate_path_str(path),
-                manifest_id: manifest.manifest_id.clone(),
-                reason: e.to_string(),
-            })
+    // Validate based on tool type
+    match tool {
+        tool_request::Tool::FileRead(read) => {
+            // Validate path against manifest entries
+            let firewall = DefaultContextFirewall::new(manifest, mode);
+            match firewall.validate_read(&read.path, None) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    // SECURITY: Truncate path BEFORE creating the error to prevent
+                    // local DoS via oversized paths in error variants.
+                    Err(ConsumeSessionError::ContextMiss {
+                        path: ContextRefinementRequest::truncate_path_str(&read.path),
+                        manifest_id: manifest.manifest_id.clone(),
+                        reason: e.to_string(),
+                    })
+                },
+            }
+        },
+        tool_request::Tool::FileWrite(write) => {
+            // TCK-00254: Validate write path against write_allowlist (fail-closed)
+            let path = std::path::Path::new(&write.path);
+            if !manifest.is_write_path_allowed(path) {
+                return Err(ConsumeSessionError::WritePathNotAllowed {
+                    path: ContextRefinementRequest::truncate_path_str(&write.path),
+                    manifest_id: manifest.manifest_id.clone(),
+                });
+            }
+            Ok(())
+        },
+        tool_request::Tool::FileEdit(edit) => {
+            // TCK-00254: Validate edit path against write_allowlist (fail-closed)
+            let path = std::path::Path::new(&edit.path);
+            if !manifest.is_write_path_allowed(path) {
+                return Err(ConsumeSessionError::WritePathNotAllowed {
+                    path: ContextRefinementRequest::truncate_path_str(&edit.path),
+                    manifest_id: manifest.manifest_id.clone(),
+                });
+            }
+            Ok(())
+        },
+        tool_request::Tool::ShellExec(exec) => {
+            // TCK-00254: Validate shell command against shell_allowlist (fail-closed)
+            if !manifest.is_shell_command_allowed(&exec.command) {
+                // SECURITY: Truncate command to prevent oversized error variants
+                let truncated_command = if exec.command.len() > 256 {
+                    format!("{}...", &exec.command[..256])
+                } else {
+                    exec.command.clone()
+                };
+                return Err(ConsumeSessionError::ShellCommandNotAllowed {
+                    command: truncated_command,
+                    manifest_id: manifest.manifest_id.clone(),
+                });
+            }
+            Ok(())
+        },
+        // Other tool types don't require additional path/command validation
+        _ => Ok(()),
+    }
+}
+
+/// Maps a `tool_request::Tool` variant to its corresponding `ToolClass`.
+///
+/// This helper function enables tool allowlist validation in CONSUME mode
+/// per TCK-00254.
+const fn tool_to_tool_class(tool: &tool_request::Tool) -> ToolClass {
+    match tool {
+        tool_request::Tool::FileRead(_) => ToolClass::Read,
+        tool_request::Tool::FileWrite(_) | tool_request::Tool::FileEdit(_) => ToolClass::Write,
+        tool_request::Tool::ShellExec(_) => ToolClass::Execute,
+        tool_request::Tool::GitOp(_) => ToolClass::Git,
+        tool_request::Tool::Inference(_) => ToolClass::Inference,
+        tool_request::Tool::ArtifactPublish(_) | tool_request::Tool::ArtifactFetch(_) => {
+            ToolClass::Artifact
         },
     }
 }
@@ -473,6 +580,10 @@ mod tests {
                     .access_level(AccessLevel::Read)
                     .build(),
             )
+            // TCK-00254: Include allowlists for test compatibility
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Execute])
+            // Allow "ls" command for shell execution tests
+            .shell_allowlist(vec!["ls".to_string()])
             .build()
     }
 
@@ -706,9 +817,77 @@ mod tests {
             })),
         };
 
-        // Non-FileRead requests pass through (they're handled by other rules)
+        // Non-FileRead requests pass through path validation (tool allowlist passes)
         let result = validate_tool_request(&request, &manifest, FirewallMode::HardFail);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_tool_request_tool_not_allowed() {
+        // Create manifest with only Read allowed (no Write)
+        let manifest = ContextPackManifestBuilder::new("test-manifest-002", "test-profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .tool_allowlist(vec![ToolClass::Read]) // Only Read allowed
+            .build();
+
+        // Try to write - should be denied
+        let request = ToolRequest {
+            consumption_mode: true,
+            request_id: "req-001".to_string(),
+            session_token: "token".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::FileWrite(apm2_core::tool::FileWrite {
+                path: "/project/src/main.rs".to_string(),
+                content: vec![],
+                create_only: false,
+                append: false,
+            })),
+        };
+
+        let result = validate_tool_request(&request, &manifest, FirewallMode::HardFail);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ConsumeSessionError::ToolNotAllowed { tool_class, manifest_id }
+            if tool_class == "Write" && manifest_id == "test-manifest-002")
+        );
+    }
+
+    #[test]
+    fn test_validate_tool_request_empty_allowlist_denies_all() {
+        // Create manifest with empty tool_allowlist (fail-closed)
+        let manifest = ContextPackManifestBuilder::new("test-manifest-003", "test-profile-001")
+            .add_entry(
+                ManifestEntryBuilder::new("/project/src/main.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            // No tool_allowlist means empty, which denies all tools
+            .build();
+
+        let request = ToolRequest {
+            consumption_mode: true,
+            request_id: "req-001".to_string(),
+            session_token: "token".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::FileRead(apm2_core::tool::FileRead {
+                path: "/project/src/main.rs".to_string(),
+                offset: 0,
+                limit: 0,
+            })),
+        };
+
+        // Even FileRead should be denied with empty allowlist
+        let result = validate_tool_request(&request, &manifest, FirewallMode::HardFail);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, ConsumeSessionError::ToolNotAllowed { .. }));
     }
 
     // =========================================================================

@@ -48,7 +48,7 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::budget::EpisodeBudget;
-use super::capability::DenyReason;
+use super::capability::{DenyReason, MAX_SHELL_PATTERN_LEN};
 use super::envelope::RiskTier;
 use super::error::EpisodeId;
 use super::runtime::Hash;
@@ -134,6 +134,13 @@ pub struct BrokerToolRequest {
     /// Optional network target (host, port).
     pub network: Option<(String, u16)>,
 
+    /// Optional shell command for Execute operations.
+    ///
+    /// Per TCK-00254, when the tool class is Execute and the manifest has
+    /// a `shell_allowlist` configured, this field MUST be present for
+    /// validation.
+    pub shell_command: Option<String>,
+
     /// The risk tier of the current episode.
     pub risk_tier: RiskTier,
 }
@@ -183,6 +190,14 @@ pub enum RequestValidationError {
         /// Maximum allowed length.
         max: usize,
     },
+
+    /// Shell command exceeds maximum length.
+    ShellCommandTooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for RequestValidationError {
@@ -203,6 +218,9 @@ impl std::fmt::Display for RequestValidationError {
             },
             Self::HostTooLong { len, max } => {
                 write!(f, "network host too long: {len} bytes (max {max})")
+            },
+            Self::ShellCommandTooLong { len, max } => {
+                write!(f, "shell command too long: {len} bytes (max {max})")
             },
         }
     }
@@ -240,6 +258,7 @@ impl BrokerToolRequest {
             path: None,
             size: None,
             network: None,
+            shell_command: None,
             risk_tier,
         }
     }
@@ -269,6 +288,17 @@ impl BrokerToolRequest {
     #[must_use]
     pub fn with_network(mut self, host: impl Into<String>, port: u16) -> Self {
         self.network = Some((host.into(), port));
+        self
+    }
+
+    /// Sets the shell command for Execute operations.
+    ///
+    /// Per TCK-00254, when the tool class is Execute and `shell_allowlist` is
+    /// configured, this field is required for validation (fail-closed
+    /// semantics).
+    #[must_use]
+    pub fn with_shell_command(mut self, command: impl Into<String>) -> Self {
+        self.shell_command = Some(command.into());
         self
     }
 
@@ -320,6 +350,15 @@ impl BrokerToolRequest {
                 });
             }
         }
+        // Validate shell command length (TCK-00254: boundedness check)
+        if let Some(ref command) = self.shell_command {
+            if command.len() > MAX_SHELL_PATTERN_LEN {
+                return Err(RequestValidationError::ShellCommandTooLong {
+                    len: command.len(),
+                    max: MAX_SHELL_PATTERN_LEN,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -335,6 +374,10 @@ impl BrokerToolRequest {
         }
         if let Some((ref host, port)) = self.network {
             req = req.with_network(host.clone(), port);
+        }
+        // TCK-00254: Include shell_command for Execute operations
+        if let Some(ref command) = self.shell_command {
+            req = req.with_shell_command(command.clone());
         }
         req
     }

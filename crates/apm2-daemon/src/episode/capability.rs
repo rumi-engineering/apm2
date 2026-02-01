@@ -37,7 +37,7 @@
 //! - CTR-1303: Bounded collections with MAX_* constants
 //! - HOLONIC-BOUNDARY-001: Deterministic time via clock injection
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
@@ -45,7 +45,17 @@ use serde::{Deserialize, Serialize};
 
 use super::envelope::RiskTier;
 use super::scope::{CapabilityScope, ScopeError};
-use super::tool_class::ToolClass;
+// =============================================================================
+// Allowlist Resource Limits (TCK-00254)
+//
+// Per CTR-1303, all Vec fields must have bounded sizes to prevent DoS.
+// All MAX_*_ALLOWLIST constants are defined in apm2-core and re-exported via
+// tool_class to eliminate duplication (Code Quality Review [MAJOR]).
+// =============================================================================
+pub use super::tool_class::{
+    MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN, MAX_TOOL_ALLOWLIST, MAX_WRITE_ALLOWLIST, ToolClass,
+    shell_pattern_matches,
+};
 
 // =============================================================================
 // Clock Abstraction
@@ -168,6 +178,64 @@ pub enum CapabilityError {
         /// Name of the empty field.
         field: &'static str,
     },
+
+    /// Tool allowlist exceeds maximum size.
+    TooManyToolAllowlistEntries {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Write allowlist exceeds maximum size.
+    TooManyWriteAllowlistEntries {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Shell allowlist exceeds maximum size.
+    TooManyShellAllowlistEntries {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Shell pattern exceeds maximum length.
+    ShellPatternTooLong {
+        /// Actual length in bytes.
+        len: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Path in write allowlist exceeds maximum length.
+    WriteAllowlistPathTooLong {
+        /// Actual length in bytes.
+        len: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Path in write allowlist is not absolute.
+    ///
+    /// Per CTR-1503, all write paths must be absolute to prevent
+    /// path resolution attacks.
+    WriteAllowlistPathNotAbsolute {
+        /// The path that is not absolute.
+        path: String,
+    },
+
+    /// Path in write allowlist contains path traversal.
+    ///
+    /// Per CTR-1503 and CTR-2609, paths must not contain `..` components
+    /// to prevent directory escape attacks.
+    WriteAllowlistPathTraversal {
+        /// The path that contains traversal.
+        path: String,
+    },
 }
 
 impl std::fmt::Display for CapabilityError {
@@ -196,6 +264,27 @@ impl std::fmt::Display for CapabilityError {
             },
             Self::EmptyField { field } => {
                 write!(f, "required field is empty: {field}")
+            },
+            Self::TooManyToolAllowlistEntries { count, max } => {
+                write!(f, "too many tool allowlist entries: {count} (max {max})")
+            },
+            Self::TooManyWriteAllowlistEntries { count, max } => {
+                write!(f, "too many write allowlist entries: {count} (max {max})")
+            },
+            Self::TooManyShellAllowlistEntries { count, max } => {
+                write!(f, "too many shell allowlist entries: {count} (max {max})")
+            },
+            Self::ShellPatternTooLong { len, max } => {
+                write!(f, "shell pattern too long: {len} bytes (max {max})")
+            },
+            Self::WriteAllowlistPathTooLong { len, max } => {
+                write!(f, "write allowlist path too long: {len} bytes (max {max})")
+            },
+            Self::WriteAllowlistPathNotAbsolute { path } => {
+                write!(f, "write allowlist path is not absolute: {path}")
+            },
+            Self::WriteAllowlistPathTraversal { path } => {
+                write!(f, "write allowlist path contains traversal (..): {path}")
             },
         }
     }
@@ -297,6 +386,47 @@ pub enum DenyReason {
         /// Human-readable reason for the denial.
         reason: String,
     },
+
+    /// Tool class is not in the manifest's tool allowlist.
+    ///
+    /// Per TCK-00254, tools must be explicitly allowed in the manifest.
+    /// Empty `tool_allowlist` means no tools allowed (fail-closed).
+    ToolNotInAllowlist {
+        /// The tool class that was denied.
+        tool_class: ToolClass,
+    },
+
+    /// Write path is not in the manifest's write allowlist.
+    ///
+    /// Per TCK-00254, write operations must target paths in the allowlist.
+    /// Empty `write_allowlist` means no writes allowed (fail-closed).
+    WritePathNotInAllowlist {
+        /// The path that was denied.
+        path: String,
+    },
+
+    /// Shell command is not in the manifest's shell allowlist.
+    ///
+    /// Per TCK-00254, shell commands must match patterns in the allowlist.
+    /// Empty `shell_allowlist` means no shell commands allowed (fail-closed).
+    ShellCommandNotInAllowlist {
+        /// The shell command that was denied.
+        command: String,
+    },
+
+    /// Write path is required but not provided.
+    ///
+    /// Per TCK-00254, when `write_allowlist` is configured, the request MUST
+    /// include a path for validation. Fail-closed semantics: missing field =
+    /// deny.
+    WritePathRequired,
+
+    /// Shell command is required but not provided.
+    ///
+    /// Per TCK-00254, when `shell_allowlist` is configured, the request MUST
+    /// include a shell command for validation. Fail-closed semantics: missing
+    /// field = deny.
+    ShellCommandRequired,
 }
 
 impl std::fmt::Display for DenyReason {
@@ -325,6 +455,24 @@ impl std::fmt::Display for DenyReason {
             },
             Self::PolicyDenied { rule_id, reason } => {
                 write!(f, "policy denied by rule {rule_id}: {reason}")
+            },
+            Self::ToolNotInAllowlist { tool_class } => {
+                write!(f, "tool class not in allowlist: {tool_class}")
+            },
+            Self::WritePathNotInAllowlist { path } => {
+                write!(f, "write path not in allowlist: {path}")
+            },
+            Self::ShellCommandNotInAllowlist { command } => {
+                write!(f, "shell command not in allowlist: {command}")
+            },
+            Self::WritePathRequired => {
+                write!(f, "write path required when write_allowlist is configured")
+            },
+            Self::ShellCommandRequired => {
+                write!(
+                    f,
+                    "shell command required when shell_allowlist is configured"
+                )
             },
         }
     }
@@ -502,6 +650,13 @@ impl CapabilityBuilder {
 /// - Is referenced by hash in the episode envelope
 /// - Expires at a specified time (optional)
 ///
+/// # TCK-00254 Extensions
+///
+/// Per RFC-0017, the manifest includes allowlists for tool mediation:
+/// - `tool_allowlist`: Allowed tool classes
+/// - `write_allowlist`: Allowed filesystem write paths
+/// - `shell_allowlist`: Allowed shell command patterns
+///
 /// # Security
 ///
 /// Uses `deny_unknown_fields` to prevent field injection attacks when
@@ -524,6 +679,27 @@ pub struct CapabilityManifest {
     /// When this manifest expires (Unix timestamp in seconds).
     /// Zero means no expiration.
     pub expires_at: u64,
+
+    /// Allowlist of tool classes that can be invoked.
+    ///
+    /// Per REQ-DCP-0002, tool requests are validated against this allowlist
+    /// at the daemon layer. Empty means no tools allowed (fail-closed).
+    #[serde(default)]
+    pub tool_allowlist: Vec<ToolClass>,
+
+    /// Allowlist of filesystem paths that can be written to.
+    ///
+    /// Per REQ-DCP-0002, write operations are validated against this allowlist.
+    /// Paths should be absolute and normalized. Empty means no writes allowed.
+    #[serde(default)]
+    pub write_allowlist: Vec<PathBuf>,
+
+    /// Allowlist of shell command patterns that can be executed.
+    ///
+    /// Per REQ-DCP-0002, shell execution requests are validated against this
+    /// allowlist. Patterns may use glob syntax. Empty means no shell allowed.
+    #[serde(default)]
+    pub shell_allowlist: Vec<String>,
 }
 
 impl CapabilityManifest {
@@ -578,6 +754,66 @@ impl CapabilityManifest {
             if !seen_ids.insert(&cap.capability_id) {
                 return Err(CapabilityError::DuplicateCapabilityId {
                     id: cap.capability_id.clone(),
+                });
+            }
+        }
+
+        // Validate allowlists (TCK-00254: CTR-1303 bounded collections)
+        if self.tool_allowlist.len() > MAX_TOOL_ALLOWLIST {
+            return Err(CapabilityError::TooManyToolAllowlistEntries {
+                count: self.tool_allowlist.len(),
+                max: MAX_TOOL_ALLOWLIST,
+            });
+        }
+
+        if self.write_allowlist.len() > MAX_WRITE_ALLOWLIST {
+            return Err(CapabilityError::TooManyWriteAllowlistEntries {
+                count: self.write_allowlist.len(),
+                max: MAX_WRITE_ALLOWLIST,
+            });
+        }
+
+        // Validate write allowlist paths (TCK-00254: CTR-1503, CTR-2609)
+        for path in &self.write_allowlist {
+            let path_len = path.as_os_str().len();
+            if path_len > super::scope::MAX_PATH_LEN {
+                return Err(CapabilityError::WriteAllowlistPathTooLong {
+                    len: path_len,
+                    max: super::scope::MAX_PATH_LEN,
+                });
+            }
+
+            // Per CTR-1503: Paths must be absolute
+            if !path.is_absolute() {
+                return Err(CapabilityError::WriteAllowlistPathNotAbsolute {
+                    path: path.to_string_lossy().to_string(),
+                });
+            }
+
+            // Per CTR-2609: Reject path traversal (..) to prevent directory escape
+            // We check the path string representation for ".." components
+            for component in path.components() {
+                if matches!(component, std::path::Component::ParentDir) {
+                    return Err(CapabilityError::WriteAllowlistPathTraversal {
+                        path: path.to_string_lossy().to_string(),
+                    });
+                }
+            }
+        }
+
+        if self.shell_allowlist.len() > MAX_SHELL_ALLOWLIST {
+            return Err(CapabilityError::TooManyShellAllowlistEntries {
+                count: self.shell_allowlist.len(),
+                max: MAX_SHELL_ALLOWLIST,
+            });
+        }
+
+        // Validate shell pattern lengths
+        for pattern in &self.shell_allowlist {
+            if pattern.len() > MAX_SHELL_PATTERN_LEN {
+                return Err(CapabilityError::ShellPatternTooLong {
+                    len: pattern.len(),
+                    max: MAX_SHELL_PATTERN_LEN,
                 });
             }
         }
@@ -644,15 +880,78 @@ impl CapabilityManifest {
             .filter(move |c| c.tool_class == tool_class)
     }
 
+    // =========================================================================
+    // TCK-00254: Allowlist Enforcement Methods
+    // =========================================================================
+
+    /// Returns a reference to the tool allowlist.
+    #[must_use]
+    pub fn tool_allowlist(&self) -> &[ToolClass] {
+        &self.tool_allowlist
+    }
+
+    /// Checks if the given tool class is in the tool allowlist.
+    ///
+    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    #[must_use]
+    pub fn is_tool_allowed(&self, tool_class: ToolClass) -> bool {
+        if self.tool_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+        self.tool_allowlist.contains(&tool_class)
+    }
+
+    /// Checks if the given path is in the write allowlist.
+    ///
+    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// The path must be a prefix match: `/workspace` allows `/workspace/foo`.
+    #[must_use]
+    pub fn is_write_path_allowed(&self, path: &Path) -> bool {
+        if self.write_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+
+        // Check if the path starts with any allowed path
+        self.write_allowlist.iter().any(|allowed| {
+            // Use starts_with for prefix matching
+            path.starts_with(allowed)
+        })
+    }
+
+    /// Checks if the given shell command matches a pattern in the shell
+    /// allowlist.
+    ///
+    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// Patterns use simple glob matching with `*` as wildcard.
+    #[must_use]
+    pub fn is_shell_command_allowed(&self, command: &str) -> bool {
+        if self.shell_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+
+        // Check if the command matches any allowed pattern.
+        // Uses the shared shell_pattern_matches function from apm2-core to
+        // eliminate code duplication (Code Quality Review [MAJOR]).
+        self.shell_allowlist
+            .iter()
+            .any(|pattern| shell_pattern_matches(pattern, command))
+    }
+
     /// Validates a tool request against this manifest.
     ///
     /// This is the main entry point for capability validation. It checks:
     /// 1. Manifest expiration
-    /// 2. Matching tool class
-    /// 3. Path containment (for filesystem operations)
-    /// 4. Size limits
-    /// 5. Network policy (for network operations)
-    /// 6. Risk tier requirements
+    /// 2. TCK-00254: Tool allowlist enforcement
+    /// 3. TCK-00254: Write allowlist enforcement (for Write operations)
+    /// 4. TCK-00254: Shell allowlist enforcement (for Execute operations)
+    /// 5. Matching tool class
+    /// 6. Path containment (for filesystem operations)
+    /// 7. Size limits
+    /// 8. Network policy (for network operations)
+    /// 9. Risk tier requirements
     ///
     /// # Arguments
     ///
@@ -670,90 +969,8 @@ impl CapabilityManifest {
             };
         }
 
-        // Find capabilities matching the tool class
-        let matching: Vec<_> = self.find_by_tool_class(request.tool_class).collect();
-
-        if matching.is_empty() {
-            return CapabilityDecision::Deny {
-                reason: DenyReason::NoMatchingCapability {
-                    tool_class: request.tool_class,
-                },
-            };
-        }
-
-        // Try each matching capability
-        for cap in matching {
-            // Check risk tier
-            if !cap.risk_tier_sufficient(request.risk_tier) {
-                continue;
-            }
-
-            // Check path if applicable
-            if let Some(ref path) = request.path {
-                if !cap.allows_path(path) {
-                    continue;
-                }
-            }
-
-            // Check size limits if applicable
-            if let Some(size) = request.size {
-                let size_allowed = match request.tool_class {
-                    ToolClass::Read => cap.allows_read_size(size),
-                    ToolClass::Write => cap.allows_write_size(size),
-                    _ => true,
-                };
-                if !size_allowed {
-                    continue;
-                }
-            }
-
-            // Check network access if applicable
-            if let Some((ref host, port)) = request.network {
-                if !cap.allows_network(host, port) {
-                    continue;
-                }
-            }
-
-            // All checks passed
-            return CapabilityDecision::Allow {
-                capability_id: cap.capability_id.clone(),
-            };
-        }
-
-        // No capability matched - determine best reason
-        // This provides the most specific denial reason
-        if let Some(ref path) = request.path {
-            return CapabilityDecision::Deny {
-                reason: DenyReason::PathNotAllowed {
-                    path: path.to_string_lossy().to_string(),
-                },
-            };
-        }
-
-        if let Some((ref host, port)) = request.network {
-            return CapabilityDecision::Deny {
-                reason: DenyReason::NetworkNotAllowed {
-                    host: host.clone(),
-                    port,
-                },
-            };
-        }
-
-        // Fall back to risk tier reason
-        if let Some(cap) = self.find_by_tool_class(request.tool_class).next() {
-            return CapabilityDecision::Deny {
-                reason: DenyReason::InsufficientRiskTier {
-                    required: cap.risk_tier_required,
-                    actual: request.risk_tier,
-                },
-            };
-        }
-
-        CapabilityDecision::Deny {
-            reason: DenyReason::NoMatchingCapability {
-                tool_class: request.tool_class,
-            },
-        }
+        // Delegate to the internal validation logic
+        self.validate_request_internal(request)
     }
 
     /// Validates a tool request with a custom clock for expiration checks.
@@ -778,6 +995,63 @@ impl CapabilityManifest {
 
     /// Internal validation logic without expiration check.
     fn validate_request_internal(&self, request: &ToolRequest) -> CapabilityDecision {
+        // TCK-00254: Check tool allowlist (fail-closed)
+        if !self.is_tool_allowed(request.tool_class) {
+            return CapabilityDecision::Deny {
+                reason: DenyReason::ToolNotInAllowlist {
+                    tool_class: request.tool_class,
+                },
+            };
+        }
+
+        // TCK-00254: Check write allowlist for Write operations (fail-closed)
+        // SECURITY (SEC-SCP-FAC-0020): Always enforce write allowlist check for Write
+        // operations. If the allowlist is empty, is_write_path_allowed returns false,
+        // correctly implementing fail-closed semantics per DD-004.
+        if request.tool_class == ToolClass::Write {
+            match &request.path {
+                Some(path) => {
+                    if !self.is_write_path_allowed(path) {
+                        return CapabilityDecision::Deny {
+                            reason: DenyReason::WritePathNotInAllowlist {
+                                path: path.to_string_lossy().to_string(),
+                            },
+                        };
+                    }
+                },
+                None => {
+                    // SECURITY: Fail-closed - Write requests must provide a path
+                    return CapabilityDecision::Deny {
+                        reason: DenyReason::WritePathRequired,
+                    };
+                },
+            }
+        }
+
+        // TCK-00254: Check shell allowlist for Execute operations (fail-closed)
+        // SECURITY (SEC-SCP-FAC-0020): Always enforce shell allowlist check for Execute
+        // operations. If the allowlist is empty, is_shell_command_allowed returns
+        // false, correctly implementing fail-closed semantics per DD-004.
+        if request.tool_class == ToolClass::Execute {
+            match &request.shell_command {
+                Some(command) => {
+                    if !self.is_shell_command_allowed(command) {
+                        return CapabilityDecision::Deny {
+                            reason: DenyReason::ShellCommandNotInAllowlist {
+                                command: command.clone(),
+                            },
+                        };
+                    }
+                },
+                None => {
+                    // SECURITY: Fail-closed - Execute requests must provide a shell_command
+                    return CapabilityDecision::Deny {
+                        reason: DenyReason::ShellCommandRequired,
+                    };
+                },
+            }
+        }
+
         // Find capabilities matching the tool class
         let matching: Vec<_> = self.find_by_tool_class(request.tool_class).collect();
 
@@ -884,17 +1158,47 @@ struct CapabilityManifestProto {
     created_at: Option<u64>,
     #[prost(uint64, optional, tag = "5")]
     expires_at: Option<u64>,
+    /// Sorted tool class values for deterministic serialization.
+    #[prost(uint32, repeated, tag = "6")]
+    tool_allowlist: Vec<u32>,
+    /// Sorted write paths for deterministic serialization.
+    #[prost(string, repeated, tag = "7")]
+    write_allowlist: Vec<String>,
+    /// Sorted shell patterns for deterministic serialization.
+    #[prost(string, repeated, tag = "8")]
+    shell_allowlist: Vec<String>,
 }
 
 impl CapabilityManifest {
     /// Returns the canonical bytes for this manifest.
     ///
-    /// Per AD-VERIFY-001, capabilities are sorted by ID for determinism.
+    /// Per AD-VERIFY-001, capabilities and allowlists are sorted for
+    /// determinism.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         // Sort capabilities by ID for deterministic ordering
         let mut sorted_caps: Vec<_> = self.capabilities.iter().collect();
         sorted_caps.sort_by(|a, b| a.capability_id.cmp(&b.capability_id));
+
+        // Sort tool allowlist by value for determinism
+        let mut sorted_tools: Vec<u32> = self
+            .tool_allowlist
+            .iter()
+            .map(|t| u32::from(t.value()))
+            .collect();
+        sorted_tools.sort_unstable();
+
+        // Sort write allowlist paths for determinism
+        let mut sorted_write_paths: Vec<String> = self
+            .write_allowlist
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        sorted_write_paths.sort_unstable();
+
+        // Sort shell allowlist for determinism
+        let mut sorted_shell_patterns: Vec<String> = self.shell_allowlist.clone();
+        sorted_shell_patterns.sort_unstable();
 
         let proto = CapabilityManifestProto {
             manifest_id: self.manifest_id.clone(),
@@ -902,6 +1206,9 @@ impl CapabilityManifest {
             delegator_id: self.delegator_id.clone(),
             created_at: Some(self.created_at),
             expires_at: Some(self.expires_at),
+            tool_allowlist: sorted_tools,
+            write_allowlist: sorted_write_paths,
+            shell_allowlist: sorted_shell_patterns,
         };
         proto.encode_to_vec()
     }
@@ -915,6 +1222,9 @@ pub struct CapabilityManifestBuilder {
     delegator_id: String,
     created_at: u64,
     expires_at: u64,
+    tool_allowlist: Vec<ToolClass>,
+    write_allowlist: Vec<PathBuf>,
+    shell_allowlist: Vec<String>,
 }
 
 impl CapabilityManifestBuilder {
@@ -932,6 +1242,9 @@ impl CapabilityManifestBuilder {
             delegator_id: String::new(),
             created_at: now,
             expires_at: 0,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         }
     }
 
@@ -981,18 +1294,82 @@ impl CapabilityManifestBuilder {
         self
     }
 
+    /// Sets the tool allowlist.
+    ///
+    /// Per REQ-DCP-0002, only tools in this allowlist can be invoked.
+    #[must_use]
+    pub fn tool_allowlist(mut self, tools: Vec<ToolClass>) -> Self {
+        self.tool_allowlist = tools;
+        self
+    }
+
+    /// Adds a tool class to the allowlist.
+    #[must_use]
+    pub fn allow_tool(mut self, tool: ToolClass) -> Self {
+        self.tool_allowlist.push(tool);
+        self
+    }
+
+    /// Sets the write path allowlist.
+    ///
+    /// Per REQ-DCP-0002, only paths in this allowlist can be written to.
+    #[must_use]
+    pub fn write_allowlist(mut self, paths: Vec<PathBuf>) -> Self {
+        self.write_allowlist = paths;
+        self
+    }
+
+    /// Adds a path to the write allowlist.
+    #[must_use]
+    pub fn allow_write_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.write_allowlist.push(path.into());
+        self
+    }
+
+    /// Sets the shell pattern allowlist.
+    ///
+    /// Per REQ-DCP-0002, only commands matching patterns in this allowlist
+    /// can be executed.
+    #[must_use]
+    pub fn shell_allowlist(mut self, patterns: Vec<String>) -> Self {
+        self.shell_allowlist = patterns;
+        self
+    }
+
+    /// Adds a shell pattern to the allowlist.
+    #[must_use]
+    pub fn allow_shell_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.shell_allowlist.push(pattern.into());
+        self
+    }
+
     /// Builds the manifest.
     ///
     /// # Errors
     ///
     /// Returns an error if validation fails.
-    pub fn build(self) -> Result<CapabilityManifest, CapabilityError> {
+    ///
+    /// # Implementation
+    ///
+    /// Allowlists are sorted during construction to ensure `PartialEq`
+    /// consistency with `canonical_bytes()`. This prevents bugs in caching
+    /// or deduplication where logically identical manifests would compare
+    /// as different due to insertion order.
+    pub fn build(mut self) -> Result<CapabilityManifest, CapabilityError> {
+        // Sort allowlists for PartialEq consistency with canonical_bytes()
+        self.tool_allowlist.sort_by_key(ToolClass::value);
+        self.write_allowlist.sort();
+        self.shell_allowlist.sort();
+
         let manifest = CapabilityManifest {
             manifest_id: self.manifest_id,
             capabilities: self.capabilities,
             delegator_id: self.delegator_id,
             created_at: self.created_at,
             expires_at: self.expires_at,
+            tool_allowlist: self.tool_allowlist,
+            write_allowlist: self.write_allowlist,
+            shell_allowlist: self.shell_allowlist,
         };
         manifest.validate()?;
         Ok(manifest)
@@ -1018,6 +1395,13 @@ pub struct ToolRequest {
     /// Optional network target (host, port).
     pub network: Option<(String, u16)>,
 
+    /// Optional shell command for Execute operations.
+    ///
+    /// Per TCK-00254, this enables shell allowlist matching.
+    /// When `tool_class` is Execute and `shell_allowlist` is configured,
+    /// this command must match one of the allowed patterns.
+    pub shell_command: Option<String>,
+
     /// The risk tier of the current episode.
     pub risk_tier: RiskTier,
 }
@@ -1031,6 +1415,7 @@ impl ToolRequest {
             path: None,
             size: None,
             network: None,
+            shell_command: None,
             risk_tier,
         }
     }
@@ -1053,6 +1438,16 @@ impl ToolRequest {
     #[must_use]
     pub fn with_network(mut self, host: impl Into<String>, port: u16) -> Self {
         self.network = Some((host.into(), port));
+        self
+    }
+
+    /// Sets the shell command for Execute operations.
+    ///
+    /// Per TCK-00254, when `tool_class` is Execute, this command will be
+    /// validated against the manifest's `shell_allowlist`.
+    #[must_use]
+    pub fn with_shell_command(mut self, command: impl Into<String>) -> Self {
+        self.shell_command = Some(command.into());
         self
     }
 }
@@ -1470,9 +1865,12 @@ mod tests {
     }
 
     fn make_manifest(caps: Vec<Capability>) -> CapabilityManifest {
+        // Collect tool classes from capabilities for the allowlist
+        let tool_classes: Vec<ToolClass> = caps.iter().map(|c| c.tool_class).collect();
         CapabilityManifest::builder("test-manifest")
             .delegator("test-delegator")
             .capabilities(caps)
+            .tool_allowlist(tool_classes)
             .build()
             .unwrap()
     }
@@ -1551,10 +1949,18 @@ mod tests {
 
     #[test]
     fn test_validate_request_denied_no_capability() {
-        let manifest = make_manifest(vec![make_read_capability(
-            "cap-1",
-            vec![PathBuf::from("/workspace")],
-        )]);
+        // Create manifest with Write in tool_allowlist but no Write capability
+        // This tests the capability matching logic (not the tool allowlist)
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_read_capability(
+                "cap-1",
+                vec![PathBuf::from("/workspace")],
+            )])
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .build()
+            .unwrap();
 
         let request =
             ToolRequest::new(ToolClass::Write, RiskTier::Tier0).with_path("/workspace/file.rs");
@@ -1593,6 +1999,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 0,
             expires_at: 1, // Expired in 1970
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         let request = ToolRequest::new(ToolClass::Read, RiskTier::Tier0);
@@ -1615,6 +2024,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         let manifest2 = CapabilityManifest {
@@ -1626,6 +2038,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Different order should produce same canonical bytes
@@ -1658,20 +2073,31 @@ mod tests {
             scope: CapabilityScope::allow_all(),
             risk_tier_required: RiskTier::Tier3,
         };
-        let manifest = make_manifest(vec![cap]);
 
-        // Tier 1 should be denied
-        let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier1);
+        // Create manifest with shell_allowlist to allow the test command
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capability(cap)
+            .tool_allowlist(vec![ToolClass::Execute])
+            .shell_allowlist(vec!["test-cmd".to_string()])
+            .build()
+            .unwrap();
+
+        // Tier 1 should be denied (insufficient risk tier)
+        let request =
+            ToolRequest::new(ToolClass::Execute, RiskTier::Tier1).with_shell_command("test-cmd");
         let decision = manifest.validate_request(&request);
         assert!(decision.is_denied());
 
         // Tier 3 should be allowed
-        let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier3);
+        let request =
+            ToolRequest::new(ToolClass::Execute, RiskTier::Tier3).with_shell_command("test-cmd");
         let decision = manifest.validate_request(&request);
         assert!(decision.is_allowed());
 
         // Tier 4 should also be allowed (higher than required)
-        let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier4);
+        let request =
+            ToolRequest::new(ToolClass::Execute, RiskTier::Tier4).with_shell_command("test-cmd");
         let decision = manifest.validate_request(&request);
         assert!(decision.is_allowed());
     }
@@ -1736,6 +2162,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000, // Expires at timestamp 2000
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Clock is before expiration
@@ -1757,6 +2186,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000, // Expires at timestamp 2000
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Clock is after expiration
@@ -1778,6 +2210,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 0, // No expiration
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Should never expire regardless of clock
@@ -1799,6 +2234,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Should succeed with clock before expiration
@@ -1829,6 +2267,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000,
+            tool_allowlist: vec![ToolClass::Read],
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         let request = ToolRequest::new(ToolClass::Read, RiskTier::Tier0)
@@ -1874,6 +2315,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 0,
             expires_at: 1000,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Verify behavior is deterministic with fixed clock
@@ -1905,5 +2349,688 @@ mod tests {
             assert!(!manifest.is_expired_with_clock(&at_expiry));
             assert!(manifest.is_expired_with_clock(&after_expiry));
         }
+    }
+
+    // ==========================================================================
+    // TCK-00254: Allowlist Tests
+    //
+    // Per REQ-DCP-0002, these tests verify the tool, write, and shell
+    // allowlists for capability manifests.
+    // ==========================================================================
+
+    #[test]
+    fn test_manifest_with_tool_allowlist() {
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .build()
+            .unwrap();
+
+        assert_eq!(manifest.tool_allowlist.len(), 2);
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Read));
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Write));
+    }
+
+    #[test]
+    fn test_manifest_with_write_allowlist() {
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .write_allowlist(vec![
+                PathBuf::from("/workspace/src"),
+                PathBuf::from("/workspace/target"),
+            ])
+            .build()
+            .unwrap();
+
+        assert_eq!(manifest.write_allowlist.len(), 2);
+        assert!(
+            manifest
+                .write_allowlist
+                .contains(&PathBuf::from("/workspace/src"))
+        );
+    }
+
+    #[test]
+    fn test_manifest_with_shell_allowlist() {
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .shell_allowlist(vec!["cargo *".to_string(), "git status".to_string()])
+            .build()
+            .unwrap();
+
+        assert_eq!(manifest.shell_allowlist.len(), 2);
+        assert!(manifest.shell_allowlist.contains(&"cargo *".to_string()));
+    }
+
+    #[test]
+    fn test_manifest_builder_allow_methods() {
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .allow_tool(ToolClass::Read)
+            .allow_tool(ToolClass::Execute)
+            .allow_write_path("/workspace")
+            .allow_shell_pattern("npm *")
+            .build()
+            .unwrap();
+
+        assert_eq!(manifest.tool_allowlist.len(), 2);
+        assert_eq!(manifest.write_allowlist.len(), 1);
+        assert_eq!(manifest.shell_allowlist.len(), 1);
+    }
+
+    #[test]
+    fn test_manifest_tool_allowlist_too_large() {
+        let tools: Vec<ToolClass> = (0..=MAX_TOOL_ALLOWLIST).map(|_| ToolClass::Read).collect();
+
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(tools)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::TooManyToolAllowlistEntries { count, max })
+            if count == MAX_TOOL_ALLOWLIST + 1 && max == MAX_TOOL_ALLOWLIST
+        ));
+    }
+
+    #[test]
+    fn test_manifest_write_allowlist_too_large() {
+        let paths: Vec<PathBuf> = (0..=MAX_WRITE_ALLOWLIST)
+            .map(|i| PathBuf::from(format!("/path/{i}")))
+            .collect();
+
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .write_allowlist(paths)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::TooManyWriteAllowlistEntries { count, max })
+            if count == MAX_WRITE_ALLOWLIST + 1 && max == MAX_WRITE_ALLOWLIST
+        ));
+    }
+
+    #[test]
+    fn test_manifest_shell_allowlist_too_large() {
+        let patterns: Vec<String> = (0..=MAX_SHELL_ALLOWLIST)
+            .map(|i| format!("cmd{i}"))
+            .collect();
+
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .shell_allowlist(patterns)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::TooManyShellAllowlistEntries { count, max })
+            if count == MAX_SHELL_ALLOWLIST + 1 && max == MAX_SHELL_ALLOWLIST
+        ));
+    }
+
+    #[test]
+    fn test_manifest_shell_pattern_too_long() {
+        let long_pattern = "x".repeat(MAX_SHELL_PATTERN_LEN + 1);
+
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .shell_allowlist(vec![long_pattern])
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::ShellPatternTooLong { len, max })
+            if len == MAX_SHELL_PATTERN_LEN + 1 && max == MAX_SHELL_PATTERN_LEN
+        ));
+    }
+
+    #[test]
+    fn test_manifest_write_path_too_long() {
+        let long_path =
+            PathBuf::from("/".to_string() + &"x".repeat(super::super::scope::MAX_PATH_LEN));
+
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .write_allowlist(vec![long_path])
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::WriteAllowlistPathTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_canonical_bytes_includes_allowlists() {
+        let manifest1 = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read])
+            .build()
+            .unwrap();
+
+        let manifest2 = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Write])
+            .build()
+            .unwrap();
+
+        // Different tool allowlists should produce different hashes
+        assert_ne!(manifest1.canonical_bytes(), manifest2.canonical_bytes());
+        assert_ne!(manifest1.digest(), manifest2.digest());
+    }
+
+    #[test]
+    fn test_canonical_bytes_allowlist_order_determinism() {
+        // Same allowlist items in different orders should produce same hash
+        let manifest1 = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute])
+            .write_allowlist(vec![
+                PathBuf::from("/b"),
+                PathBuf::from("/a"),
+                PathBuf::from("/c"),
+            ])
+            .shell_allowlist(vec!["z".to_string(), "a".to_string(), "m".to_string()])
+            .build()
+            .unwrap();
+
+        let manifest2 = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Execute, ToolClass::Read, ToolClass::Write])
+            .write_allowlist(vec![
+                PathBuf::from("/c"),
+                PathBuf::from("/b"),
+                PathBuf::from("/a"),
+            ])
+            .shell_allowlist(vec!["m".to_string(), "z".to_string(), "a".to_string()])
+            .build()
+            .unwrap();
+
+        // Same content in different order should produce same hash (sorted before
+        // hashing)
+        assert_eq!(
+            manifest1.canonical_bytes(),
+            manifest2.canonical_bytes(),
+            "canonical bytes should be deterministic regardless of allowlist order"
+        );
+        assert_eq!(
+            manifest1.digest(),
+            manifest2.digest(),
+            "digest should be deterministic regardless of allowlist order"
+        );
+    }
+
+    #[test]
+    fn test_manifest_with_empty_allowlists_valid() {
+        // Empty allowlists should be valid (fail-closed semantics)
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .build()
+            .unwrap();
+
+        assert!(manifest.tool_allowlist.is_empty());
+        assert!(manifest.write_allowlist.is_empty());
+        assert!(manifest.shell_allowlist.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_serde_roundtrip_with_allowlists() {
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .shell_allowlist(vec!["cargo *".to_string()])
+            .build()
+            .unwrap();
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&manifest).unwrap();
+
+        // Deserialize back
+        let recovered: CapabilityManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(manifest.tool_allowlist, recovered.tool_allowlist);
+        assert_eq!(manifest.write_allowlist, recovered.write_allowlist);
+        assert_eq!(manifest.shell_allowlist, recovered.shell_allowlist);
+        assert_eq!(manifest.digest(), recovered.digest());
+    }
+
+    // ==========================================================================
+    // TCK-00254: Allowlist Enforcement Tests
+    //
+    // Per Security Review, these tests verify the enforcement of
+    // tool_allowlist, write_allowlist, and shell_allowlist.
+    // ==========================================================================
+
+    #[test]
+    fn test_tool_allowlist_enforcement_allowed() {
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .capability(make_read_capability(
+                "cap-1",
+                vec![PathBuf::from("/workspace")],
+            ))
+            .allow_write_path("/workspace")
+            .build()
+            .unwrap();
+
+        // Read is in the allowlist
+        assert!(manifest.is_tool_allowed(ToolClass::Read));
+        assert!(manifest.is_tool_allowed(ToolClass::Write));
+
+        // Execute is not in the allowlist
+        assert!(!manifest.is_tool_allowed(ToolClass::Execute));
+    }
+
+    #[test]
+    fn test_tool_allowlist_enforcement_empty_is_fail_closed() {
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            // No tool_allowlist set - empty
+            .capability(make_read_capability("cap-1", vec![PathBuf::from("/workspace")]))
+            .build()
+            .unwrap();
+
+        // Empty allowlist means nothing is allowed (fail-closed)
+        assert!(!manifest.is_tool_allowed(ToolClass::Read));
+        assert!(!manifest.is_tool_allowed(ToolClass::Write));
+        assert!(!manifest.is_tool_allowed(ToolClass::Execute));
+    }
+
+    #[test]
+    fn test_tool_allowlist_enforcement_in_validate_request() {
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Read])
+            .capability(make_read_capability(
+                "cap-1",
+                vec![PathBuf::from("/workspace")],
+            ))
+            .build()
+            .unwrap();
+
+        // Read is allowed
+        let request =
+            ToolRequest::new(ToolClass::Read, RiskTier::Tier0).with_path("/workspace/file.rs");
+        let decision = manifest.validate_request(&request);
+        assert!(decision.is_allowed());
+
+        // Write is not in tool_allowlist
+        let request =
+            ToolRequest::new(ToolClass::Write, RiskTier::Tier0).with_path("/workspace/file.rs");
+        let decision = manifest.validate_request(&request);
+        assert!(decision.is_denied());
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(matches!(reason, DenyReason::ToolNotInAllowlist { .. }));
+        }
+    }
+
+    #[test]
+    fn test_write_allowlist_enforcement_allowed() {
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .write_allowlist(vec![
+                PathBuf::from("/workspace"),
+                PathBuf::from("/tmp/build"),
+            ])
+            .build()
+            .unwrap();
+
+        // Exact match
+        assert!(manifest.is_write_path_allowed(Path::new("/workspace")));
+        // Subdirectory is allowed (prefix match)
+        assert!(manifest.is_write_path_allowed(Path::new("/workspace/src/main.rs")));
+        assert!(manifest.is_write_path_allowed(Path::new("/tmp/build/output.o")));
+
+        // Outside allowed paths
+        assert!(!manifest.is_write_path_allowed(Path::new("/etc/passwd")));
+        assert!(!manifest.is_write_path_allowed(Path::new("/home/user")));
+    }
+
+    #[test]
+    fn test_write_allowlist_enforcement_empty_is_fail_closed() {
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            // No write_allowlist set - empty
+            .build()
+            .unwrap();
+
+        // Empty allowlist means nothing is allowed
+        assert!(!manifest.is_write_path_allowed(Path::new("/workspace")));
+        assert!(!manifest.is_write_path_allowed(Path::new("/tmp")));
+    }
+
+    #[test]
+    fn test_write_allowlist_enforcement_in_validate_request() {
+        // Create write capability
+        let write_cap = Capability {
+            capability_id: "write-cap".to_string(),
+            tool_class: ToolClass::Write,
+            scope: CapabilityScope {
+                root_paths: vec![PathBuf::from("/workspace")],
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        };
+
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Write])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .capability(write_cap)
+            .build()
+            .unwrap();
+
+        // Write to allowed path
+        let request =
+            ToolRequest::new(ToolClass::Write, RiskTier::Tier0).with_path("/workspace/file.rs");
+        let decision = manifest.validate_request(&request);
+        assert!(decision.is_allowed());
+
+        // Write to disallowed path
+        let request = ToolRequest::new(ToolClass::Write, RiskTier::Tier0).with_path("/etc/passwd");
+        let decision = manifest.validate_request(&request);
+        assert!(decision.is_denied());
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(matches!(reason, DenyReason::WritePathNotInAllowlist { .. }));
+        }
+    }
+
+    #[test]
+    fn test_shell_allowlist_enforcement_allowed() {
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .shell_allowlist(vec![
+                "cargo *".to_string(),
+                "git status".to_string(),
+                "npm run *".to_string(),
+            ])
+            .build()
+            .unwrap();
+
+        // Wildcard matching
+        assert!(manifest.is_shell_command_allowed("cargo build"));
+        assert!(manifest.is_shell_command_allowed("cargo test --release"));
+        // Exact match
+        assert!(manifest.is_shell_command_allowed("git status"));
+        // Wildcard at end
+        assert!(manifest.is_shell_command_allowed("npm run test"));
+
+        // Not allowed
+        assert!(!manifest.is_shell_command_allowed("rm -rf /"));
+        assert!(!manifest.is_shell_command_allowed("git push"));
+    }
+
+    #[test]
+    fn test_shell_allowlist_enforcement_empty_is_fail_closed() {
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            // No shell_allowlist set - empty
+            .build()
+            .unwrap();
+
+        // Empty allowlist means nothing is allowed
+        assert!(!manifest.is_shell_command_allowed("ls"));
+        assert!(!manifest.is_shell_command_allowed("cargo build"));
+    }
+
+    #[test]
+    fn test_shell_allowlist_enforcement_in_validate_request() {
+        // Create execute capability
+        let exec_cap = Capability {
+            capability_id: "exec-cap".to_string(),
+            tool_class: ToolClass::Execute,
+            scope: CapabilityScope::allow_all(),
+            risk_tier_required: RiskTier::Tier0,
+        };
+
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Execute])
+            .shell_allowlist(vec!["cargo *".to_string()])
+            .capability(exec_cap)
+            .build()
+            .unwrap();
+
+        // Allowed shell command
+        let request =
+            ToolRequest::new(ToolClass::Execute, RiskTier::Tier0).with_shell_command("cargo build");
+        let decision = manifest.validate_request(&request);
+        assert!(decision.is_allowed());
+
+        // Disallowed shell command
+        let request =
+            ToolRequest::new(ToolClass::Execute, RiskTier::Tier0).with_shell_command("rm -rf /");
+        let decision = manifest.validate_request(&request);
+        assert!(decision.is_denied());
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(matches!(
+                reason,
+                DenyReason::ShellCommandNotInAllowlist { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_shell_pattern_matching_various_patterns() {
+        // Exact match
+        assert!(shell_pattern_matches("ls", "ls"));
+        assert!(!shell_pattern_matches("ls", "ls -la"));
+
+        // Wildcard at end
+        assert!(shell_pattern_matches("cargo *", "cargo build"));
+        assert!(shell_pattern_matches("cargo *", "cargo test --release"));
+        assert!(!shell_pattern_matches("cargo *", "npm run"));
+
+        // Wildcard at start
+        assert!(shell_pattern_matches("* --version", "cargo --version"));
+        assert!(shell_pattern_matches("* --version", "node --version"));
+
+        // Wildcard in middle
+        assert!(shell_pattern_matches("git * --amend", "git commit --amend"));
+
+        // Multiple wildcards
+        assert!(shell_pattern_matches("*cargo*", "run cargo build"));
+        assert!(shell_pattern_matches(
+            "git * * -m *",
+            "git commit -a -m test"
+        ));
+    }
+
+    #[test]
+    fn test_write_allowlist_path_validation_not_absolute() {
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .write_allowlist(vec![PathBuf::from("relative/path")])
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::WriteAllowlistPathNotAbsolute { .. })
+        ));
+    }
+
+    #[test]
+    fn test_write_allowlist_path_validation_traversal() {
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .write_allowlist(vec![PathBuf::from("/workspace/../etc")])
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::WriteAllowlistPathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn test_write_allowlist_path_validation_traversal_middle() {
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .write_allowlist(vec![PathBuf::from("/workspace/foo/../bar")])
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::WriteAllowlistPathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tool_request_with_shell_command() {
+        let request =
+            ToolRequest::new(ToolClass::Execute, RiskTier::Tier0).with_shell_command("cargo build");
+
+        assert_eq!(request.shell_command, Some("cargo build".to_string()));
+        assert_eq!(request.tool_class, ToolClass::Execute);
+    }
+
+    // =========================================================================
+    // TCK-00254: Fail-Closed Semantics Tests
+    // =========================================================================
+
+    #[test]
+    fn test_execute_without_shell_command_when_allowlist_configured_is_denied() {
+        // Create execute capability with shell_allowlist configured
+        let exec_cap = Capability {
+            capability_id: "exec-cap".to_string(),
+            tool_class: ToolClass::Execute,
+            scope: CapabilityScope::allow_all(),
+            risk_tier_required: RiskTier::Tier0,
+        };
+
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Execute])
+            .shell_allowlist(vec!["cargo *".to_string()])
+            .capability(exec_cap)
+            .build()
+            .unwrap();
+
+        // Execute request WITHOUT shell_command should be DENIED
+        // (fail-closed: missing required field when allowlist is configured)
+        let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier0);
+        let decision = manifest.validate_request(&request);
+
+        assert!(decision.is_denied());
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(
+                matches!(reason, DenyReason::ShellCommandRequired),
+                "expected ShellCommandRequired, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_execute_without_shell_command_when_no_allowlist_is_denied() {
+        // SEC-SCP-FAC-0020: Empty shell_allowlist means fail-closed
+        // Create execute capability WITHOUT shell_allowlist
+        let exec_cap = Capability {
+            capability_id: "exec-cap".to_string(),
+            tool_class: ToolClass::Execute,
+            scope: CapabilityScope::allow_all(),
+            risk_tier_required: RiskTier::Tier0,
+        };
+
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Execute])
+            // No shell_allowlist configured - empty means fail-closed
+            .capability(exec_cap)
+            .build()
+            .unwrap();
+
+        // Execute request WITHOUT shell_command should be DENIED
+        // (empty allowlist means nothing is allowed - fail-closed per DD-004)
+        let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier0);
+        let decision = manifest.validate_request(&request);
+
+        assert!(decision.is_denied());
+        assert!(matches!(
+            decision,
+            CapabilityDecision::Deny {
+                reason: DenyReason::ShellCommandRequired
+            }
+        ));
+    }
+
+    #[test]
+    fn test_write_without_path_when_allowlist_configured_is_denied() {
+        // Create write capability with write_allowlist configured
+        let write_cap = Capability {
+            capability_id: "write-cap".to_string(),
+            tool_class: ToolClass::Write,
+            scope: CapabilityScope::allow_all(),
+            risk_tier_required: RiskTier::Tier0,
+        };
+
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Write])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .capability(write_cap)
+            .build()
+            .unwrap();
+
+        // Write request WITHOUT path should be DENIED
+        // (fail-closed: missing required field when allowlist is configured)
+        let request = ToolRequest::new(ToolClass::Write, RiskTier::Tier0);
+        let decision = manifest.validate_request(&request);
+
+        assert!(decision.is_denied());
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(
+                matches!(reason, DenyReason::WritePathRequired),
+                "expected WritePathRequired, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_without_path_when_no_allowlist_is_denied() {
+        // SEC-SCP-FAC-0020: Empty write_allowlist means fail-closed
+        // Create write capability WITHOUT write_allowlist
+        let write_cap = Capability {
+            capability_id: "write-cap".to_string(),
+            tool_class: ToolClass::Write,
+            scope: CapabilityScope::allow_all(),
+            risk_tier_required: RiskTier::Tier0,
+        };
+
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(vec![ToolClass::Write])
+            // No write_allowlist configured - empty means fail-closed
+            .capability(write_cap)
+            .build()
+            .unwrap();
+
+        // Write request WITHOUT path should be DENIED
+        // (empty allowlist means nothing is allowed - fail-closed per DD-004)
+        let request = ToolRequest::new(ToolClass::Write, RiskTier::Tier0);
+        let decision = manifest.validate_request(&request);
+
+        assert!(decision.is_denied());
+        assert!(matches!(
+            decision,
+            CapabilityDecision::Deny {
+                reason: DenyReason::WritePathRequired
+            }
+        ));
     }
 }

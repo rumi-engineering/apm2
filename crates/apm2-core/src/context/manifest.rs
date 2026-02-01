@@ -97,6 +97,324 @@ pub const MAX_PATH_LENGTH: usize = 4096;
 /// Prevents Vec allocation spikes from paths with many segments.
 pub const MAX_PATH_COMPONENTS: usize = 256;
 
+/// Maximum number of tool classes in the tool allowlist.
+/// Per CTR-1303, bounded collections prevent `DoS`.
+pub const MAX_TOOL_ALLOWLIST: usize = 100;
+
+/// Maximum number of paths in the write allowlist.
+/// Per CTR-1303, bounded collections prevent `DoS`.
+pub const MAX_WRITE_ALLOWLIST: usize = 1000;
+
+/// Maximum number of patterns in the shell allowlist.
+/// Per CTR-1303, bounded collections prevent `DoS`.
+pub const MAX_SHELL_ALLOWLIST: usize = 500;
+
+/// Maximum length of a shell pattern.
+/// Per CTR-1303, bounded inputs prevent memory exhaustion.
+pub const MAX_SHELL_PATTERN_LEN: usize = 1024;
+
+/// Maximum string length for tool class names during parsing.
+pub const MAX_TOOL_CLASS_NAME_LEN: usize = 64;
+
+// =============================================================================
+// Tool Class Enum (TCK-00254)
+//
+// Per REQ-DCP-0002, the context pack manifest includes a tool allowlist.
+// This is the canonical definition; apm2-daemon re-exports from here.
+// =============================================================================
+
+/// Tool class for capability categorization.
+///
+/// Per AD-TOOL-002, tool classes define the coarse-grained category of
+/// operations a capability allows. Fine-grained restrictions are applied
+/// via `CapabilityScope`.
+///
+/// # Discriminant Stability
+///
+/// Explicit discriminant values maintain semver compatibility. New variants
+/// must use new values; existing values must not change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum ToolClass {
+    /// Read operations: file reads, directory listings, git status.
+    #[default]
+    Read      = 0,
+
+    /// Write operations: file writes, file edits, file deletions.
+    Write     = 1,
+
+    /// Execute operations: shell commands, process spawning.
+    Execute   = 2,
+
+    /// Network operations: HTTP requests, socket connections.
+    Network   = 3,
+
+    /// Git operations: commits, pushes, branch operations.
+    Git       = 4,
+
+    /// Inference operations: LLM API calls.
+    Inference = 5,
+
+    /// Artifact operations: CAS publish/fetch.
+    Artifact  = 6,
+}
+
+impl ToolClass {
+    /// Returns the numeric value of this tool class.
+    #[must_use]
+    pub const fn value(&self) -> u8 {
+        *self as u8
+    }
+
+    /// Parses a tool class from a u8 value.
+    ///
+    /// # Returns
+    ///
+    /// `None` if the value does not correspond to a known tool class.
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Read),
+            1 => Some(Self::Write),
+            2 => Some(Self::Execute),
+            3 => Some(Self::Network),
+            4 => Some(Self::Git),
+            5 => Some(Self::Inference),
+            6 => Some(Self::Artifact),
+            _ => None,
+        }
+    }
+
+    /// Parses a tool class from a u32 value.
+    ///
+    /// # Security
+    ///
+    /// This method validates the full u32 range to prevent truncation attacks.
+    /// Casting to u8 first would truncate values like 256 to 0, potentially
+    /// granting unintended capabilities.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Read),
+            1 => Some(Self::Write),
+            2 => Some(Self::Execute),
+            3 => Some(Self::Network),
+            4 => Some(Self::Git),
+            5 => Some(Self::Inference),
+            6 => Some(Self::Artifact),
+            _ => None,
+        }
+    }
+
+    /// Parses a tool class from a string name.
+    ///
+    /// # Security
+    ///
+    /// Rejects names longer than `MAX_TOOL_CLASS_NAME_LEN` to prevent
+    /// memory exhaustion attacks.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        if s.len() > MAX_TOOL_CLASS_NAME_LEN {
+            return None;
+        }
+        match s.to_lowercase().as_str() {
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            "execute" | "exec" => Some(Self::Execute),
+            "network" | "net" => Some(Self::Network),
+            "git" => Some(Self::Git),
+            "inference" | "llm" => Some(Self::Inference),
+            "artifact" | "cas" => Some(Self::Artifact),
+            _ => None,
+        }
+    }
+
+    /// Returns the canonical name of this tool class.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Read => "Read",
+            Self::Write => "Write",
+            Self::Execute => "Execute",
+            Self::Network => "Network",
+            Self::Git => "Git",
+            Self::Inference => "Inference",
+            Self::Artifact => "Artifact",
+        }
+    }
+
+    /// Returns `true` if this tool class represents read-only operations.
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        matches!(self, Self::Read)
+    }
+
+    /// Returns `true` if this tool class can modify state.
+    #[must_use]
+    pub const fn can_mutate(&self) -> bool {
+        matches!(
+            self,
+            Self::Write | Self::Execute | Self::Git | Self::Artifact
+        )
+    }
+
+    /// Returns `true` if this tool class involves network access.
+    #[must_use]
+    pub const fn involves_network(&self) -> bool {
+        matches!(self, Self::Network | Self::Inference)
+    }
+
+    /// Returns all known tool classes.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::Read,
+            Self::Write,
+            Self::Execute,
+            Self::Network,
+            Self::Git,
+            Self::Inference,
+            Self::Artifact,
+        ]
+    }
+}
+
+impl std::fmt::Display for ToolClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+// =============================================================================
+// ToolClassExt - Canonical Serialization
+// =============================================================================
+
+/// Internal protobuf representation for `ToolClass`.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ToolClassProto {
+    #[prost(uint32, optional, tag = "1")]
+    value: Option<u32>,
+}
+
+/// Extension trait for `ToolClass` to provide canonical serialization.
+///
+/// Per AD-VERIFY-001, this provides deterministic serialization
+/// for use in digests and signatures.
+pub trait ToolClassExt {
+    /// Returns the canonical bytes for this tool class.
+    fn canonical_bytes(&self) -> Vec<u8>;
+}
+
+impl ToolClassExt for ToolClass {
+    fn canonical_bytes(&self) -> Vec<u8> {
+        use prost::Message;
+        let proto = ToolClassProto {
+            value: Some(u32::from(self.value())),
+        };
+        proto.encode_to_vec()
+    }
+}
+
+// =============================================================================
+// Shell Pattern Matching (TCK-00254)
+//
+// Per Code Quality Review [MAJOR], this function is shared between
+// ContextPackManifest and CapabilityManifest to eliminate duplication.
+// =============================================================================
+
+/// Matches a shell command against a pattern with simple glob support.
+///
+/// Supports `*` as a wildcard that matches any sequence of characters.
+/// Patterns without wildcards require exact match.
+///
+/// # Implementation
+///
+/// Uses streaming iteration over pattern parts to avoid heap allocations
+/// in the hot path (SEC-DOS-MDL-0001). This is critical since this method
+/// is called for every tool request against every pattern in the shell
+/// allowlist (up to `MAX_SHELL_ALLOWLIST` patterns).
+///
+/// # Examples
+///
+/// ```
+/// use apm2_core::context::shell_pattern_matches;
+///
+/// // Exact match (no wildcards)
+/// assert!(shell_pattern_matches("cargo build", "cargo build"));
+/// assert!(!shell_pattern_matches("cargo build", "cargo test"));
+///
+/// // Prefix match
+/// assert!(shell_pattern_matches("cargo *", "cargo build"));
+/// assert!(shell_pattern_matches("cargo *", "cargo test --release"));
+///
+/// // Suffix match
+/// assert!(shell_pattern_matches(
+///     "* --release",
+///     "cargo build --release"
+/// ));
+///
+/// // Contains match
+/// assert!(shell_pattern_matches("*build*", "cargo build --release"));
+/// ```
+#[must_use]
+pub fn shell_pattern_matches(pattern: &str, command: &str) -> bool {
+    // Check for wildcards first - if none, exact match required
+    if !pattern.contains('*') {
+        return pattern == command;
+    }
+
+    // Streaming iterator over pattern parts (zero allocations)
+    let mut parts = pattern.split('*');
+    let mut remaining = command;
+
+    // Handle first part: must be at start unless pattern starts with '*'
+    if let Some(first) = parts.next() {
+        if !first.is_empty() {
+            // Pattern doesn't start with '*', so first part must be prefix
+            if let Some(stripped) = remaining.strip_prefix(first) {
+                remaining = stripped;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    // Handle middle and last parts
+    // We peek ahead to distinguish middle parts from the last part
+    let mut prev_part: Option<&str> = None;
+    for part in parts {
+        // Process the previous part as a middle part (can be anywhere)
+        if let Some(p) = prev_part {
+            if !p.is_empty() {
+                if let Some(pos) = remaining.find(p) {
+                    remaining = &remaining[pos + p.len()..];
+                } else {
+                    return false;
+                }
+            }
+        }
+        prev_part = Some(part);
+    }
+
+    // Process the last part: must be at end unless pattern ends with '*'
+    if let Some(last_part) = prev_part {
+        if !pattern.ends_with('*') && !last_part.is_empty() {
+            // Pattern doesn't end with '*', so last part must be suffix
+            if !remaining.ends_with(last_part) {
+                return false;
+            }
+        } else if !last_part.is_empty() {
+            // Pattern ends with '*', so last part just needs to exist
+            if !remaining.contains(last_part) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -193,6 +511,26 @@ pub enum ManifestError {
     InvalidPath {
         /// The reason the path is invalid.
         reason: String,
+    },
+
+    /// Write allowlist path is not absolute.
+    ///
+    /// Per CTR-1503, all write paths must be absolute to prevent
+    /// path resolution attacks.
+    #[error("write allowlist path is not absolute: {path}")]
+    WriteAllowlistPathNotAbsolute {
+        /// The path that is not absolute.
+        path: String,
+    },
+
+    /// Write allowlist path contains path traversal.
+    ///
+    /// Per CTR-1503 and CTR-2609, paths must not contain `..` components
+    /// to prevent directory escape attacks.
+    #[error("write allowlist path contains traversal (..): {path}")]
+    WriteAllowlistPathTraversal {
+        /// The path that contains traversal.
+        path: String,
     },
 }
 
@@ -459,6 +797,7 @@ impl ManifestEntryBuilder {
 ///   time)
 /// - `profile_id`: Profile that generated this manifest
 /// - `entries`: List of allowed file entries
+/// - `tool_allowlist`: List of allowed tool classes (TCK-00254)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextPackManifest {
@@ -475,6 +814,29 @@ pub struct ContextPackManifest {
     /// List of allowed file entries.
     entries: Vec<ManifestEntry>,
 
+    /// Allowlist of tool classes that can be invoked.
+    ///
+    /// Per TCK-00254 and REQ-DCP-0002, tool requests are validated against
+    /// this allowlist. Empty means no tools allowed (fail-closed).
+    #[serde(default)]
+    pub tool_allowlist: Vec<ToolClass>,
+
+    /// Allowlist of filesystem paths that can be written to.
+    ///
+    /// Per TCK-00254 and REQ-DCP-0002, write operations are validated against
+    /// this allowlist. Paths should be absolute and normalized. Empty means
+    /// no writes allowed (fail-closed).
+    #[serde(default)]
+    pub write_allowlist: Vec<std::path::PathBuf>,
+
+    /// Allowlist of shell command patterns that can be executed.
+    ///
+    /// Per TCK-00254 and REQ-DCP-0002, shell execution requests are validated
+    /// against this allowlist. Patterns may use glob syntax. Empty means no
+    /// shell allowed (fail-closed).
+    #[serde(default)]
+    pub shell_allowlist: Vec<String>,
+
     /// Index for O(1) path lookups.
     /// Maps normalized path to index in entries vector.
     #[serde(skip)]
@@ -488,6 +850,9 @@ impl PartialEq for ContextPackManifest {
             && self.manifest_hash == other.manifest_hash
             && self.profile_id == other.profile_id
             && self.entries == other.entries
+            && self.tool_allowlist == other.tool_allowlist
+            && self.write_allowlist == other.write_allowlist
+            && self.shell_allowlist == other.shell_allowlist
     }
 }
 
@@ -506,16 +871,56 @@ impl ContextPackManifest {
         &self.entries
     }
 
+    /// Checks if the given path is in the write allowlist.
+    ///
+    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// The path must be a prefix match: `/workspace` allows `/workspace/foo`.
+    #[must_use]
+    pub fn is_write_path_allowed(&self, path: &std::path::Path) -> bool {
+        if self.write_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+
+        // Check if the path starts with any allowed path
+        self.write_allowlist
+            .iter()
+            .any(|allowed| path.starts_with(allowed))
+    }
+
+    /// Checks if the given shell command matches a pattern in the shell
+    /// allowlist.
+    ///
+    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// Patterns use simple glob matching with `*` as wildcard.
+    #[must_use]
+    pub fn is_shell_command_allowed(&self, command: &str) -> bool {
+        if self.shell_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+
+        // Check if the command matches any allowed pattern
+        // Uses the module-level shell_pattern_matches function to avoid duplication
+        self.shell_allowlist
+            .iter()
+            .any(|pattern| shell_pattern_matches(pattern, command))
+    }
+
     /// Computes the manifest hash from the manifest fields.
     ///
     /// The hash is computed over the canonical representation of all fields
-    /// except the hash itself.
+    /// except the hash itself. Per TCK-00254, all allowlists are sorted for
+    /// deterministic ordering.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     fn compute_manifest_hash(
         manifest_id: &str,
         profile_id: &str,
         entries: &[ManifestEntry],
+        tool_allowlist: &[ToolClass],
+        write_allowlist: &[std::path::PathBuf],
+        shell_allowlist: &[String],
     ) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
 
@@ -548,6 +953,36 @@ impl ContextPackManifest {
 
             // access_level
             hasher.update(&[entry.access_level as u8]);
+        }
+
+        // Tool allowlist (TCK-00254) - sorted for determinism
+        let mut sorted_tools: Vec<u8> = tool_allowlist.iter().map(ToolClass::value).collect();
+        sorted_tools.sort_unstable();
+        hasher.update(&(sorted_tools.len() as u32).to_be_bytes());
+        for tool_value in &sorted_tools {
+            hasher.update(&[*tool_value]);
+        }
+
+        // Write allowlist (TCK-00254) - sorted for determinism
+        let mut sorted_write_paths: Vec<String> = write_allowlist
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        sorted_write_paths.sort_unstable();
+        hasher.update(&(sorted_write_paths.len() as u32).to_be_bytes());
+        for path in &sorted_write_paths {
+            hasher.update(&(path.len() as u32).to_be_bytes());
+            hasher.update(path.as_bytes());
+        }
+
+        // Shell allowlist (TCK-00254) - sorted for determinism
+        let mut sorted_shell_patterns: Vec<&str> =
+            shell_allowlist.iter().map(String::as_str).collect();
+        sorted_shell_patterns.sort_unstable();
+        hasher.update(&(sorted_shell_patterns.len() as u32).to_be_bytes());
+        for pattern in &sorted_shell_patterns {
+            hasher.update(&(pattern.len() as u32).to_be_bytes());
+            hasher.update(pattern.as_bytes());
         }
 
         *hasher.finalize().as_bytes()
@@ -841,8 +1276,14 @@ impl ContextPackManifest {
     /// Returns [`ManifestError::InvalidData`] if the computed hash does not
     /// match the stored hash.
     pub fn verify_self_consistency(&self) -> Result<(), ManifestError> {
-        let computed_hash =
-            Self::compute_manifest_hash(&self.manifest_id, &self.profile_id, &self.entries);
+        let computed_hash = Self::compute_manifest_hash(
+            &self.manifest_id,
+            &self.profile_id,
+            &self.entries,
+            &self.tool_allowlist,
+            &self.write_allowlist,
+            &self.shell_allowlist,
+        );
 
         // Use constant-time comparison for security
         if !bool::from(computed_hash.ct_eq(&self.manifest_hash)) {
@@ -1006,6 +1447,9 @@ pub struct ContextPackManifestBuilder {
     manifest_id: String,
     profile_id: String,
     entries: Vec<ManifestEntry>,
+    tool_allowlist: Vec<ToolClass>,
+    write_allowlist: Vec<std::path::PathBuf>,
+    shell_allowlist: Vec<String>,
 }
 
 impl ContextPackManifestBuilder {
@@ -1016,6 +1460,9 @@ impl ContextPackManifestBuilder {
             manifest_id: manifest_id.into(),
             profile_id: profile_id.into(),
             entries: Vec::new(),
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         }
     }
 
@@ -1030,6 +1477,55 @@ impl ContextPackManifestBuilder {
     #[must_use]
     pub fn entries(mut self, entries: Vec<ManifestEntry>) -> Self {
         self.entries = entries;
+        self
+    }
+
+    /// Sets the tool allowlist.
+    ///
+    /// Per TCK-00254, only tools in this allowlist can be invoked.
+    #[must_use]
+    pub fn tool_allowlist(mut self, tools: Vec<ToolClass>) -> Self {
+        self.tool_allowlist = tools;
+        self
+    }
+
+    /// Adds a tool class to the allowlist.
+    #[must_use]
+    pub fn allow_tool(mut self, tool: ToolClass) -> Self {
+        self.tool_allowlist.push(tool);
+        self
+    }
+
+    /// Sets the write allowlist.
+    ///
+    /// Per TCK-00254, only writes to paths in this allowlist are permitted.
+    #[must_use]
+    pub fn write_allowlist(mut self, paths: Vec<std::path::PathBuf>) -> Self {
+        self.write_allowlist = paths;
+        self
+    }
+
+    /// Adds a path to the write allowlist.
+    #[must_use]
+    pub fn allow_write_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.write_allowlist.push(path.into());
+        self
+    }
+
+    /// Sets the shell allowlist.
+    ///
+    /// Per TCK-00254, only shell commands matching patterns in this allowlist
+    /// can be executed.
+    #[must_use]
+    pub fn shell_allowlist(mut self, patterns: Vec<String>) -> Self {
+        self.shell_allowlist = patterns;
+        self
+    }
+
+    /// Adds a shell pattern to the allowlist.
+    #[must_use]
+    pub fn allow_shell_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.shell_allowlist.push(pattern.into());
         self
     }
 
@@ -1058,6 +1554,7 @@ impl ContextPackManifestBuilder {
     /// are found.
     /// Returns [`ManifestError::InvalidPath`] if any path contains traversal
     /// or null bytes.
+    #[allow(clippy::too_many_lines)]
     pub fn try_build(mut self) -> Result<ContextPackManifest, ManifestError> {
         use std::collections::HashSet;
 
@@ -1077,7 +1574,7 @@ impl ContextPackManifestBuilder {
             });
         }
 
-        // Validate collection size
+        // Validate collection sizes (CTR-1303: bounded collections)
         if self.entries.len() > MAX_ENTRIES {
             return Err(ManifestError::CollectionTooLarge {
                 field: "entries",
@@ -1085,6 +1582,68 @@ impl ContextPackManifestBuilder {
                 max: MAX_ENTRIES,
             });
         }
+
+        // Validate tool_allowlist size (TCK-00254)
+        if self.tool_allowlist.len() > MAX_TOOL_ALLOWLIST {
+            return Err(ManifestError::CollectionTooLarge {
+                field: "tool_allowlist",
+                actual: self.tool_allowlist.len(),
+                max: MAX_TOOL_ALLOWLIST,
+            });
+        }
+
+        // Validate write_allowlist size (TCK-00254)
+        if self.write_allowlist.len() > MAX_WRITE_ALLOWLIST {
+            return Err(ManifestError::CollectionTooLarge {
+                field: "write_allowlist",
+                actual: self.write_allowlist.len(),
+                max: MAX_WRITE_ALLOWLIST,
+            });
+        }
+
+        // Validate write_allowlist paths (TCK-00254: CTR-1503, CTR-2609)
+        // This ensures consistency with CapabilityManifest::validate()
+        for path in &self.write_allowlist {
+            let path_len = path.as_os_str().len();
+            if path_len > MAX_PATH_LENGTH {
+                return Err(ManifestError::PathTooLong {
+                    actual: path_len,
+                    max: MAX_PATH_LENGTH,
+                });
+            }
+
+            // Per CTR-1503: Paths must be absolute
+            if !path.is_absolute() {
+                return Err(ManifestError::WriteAllowlistPathNotAbsolute {
+                    path: path.to_string_lossy().to_string(),
+                });
+            }
+
+            // Per CTR-2609: Reject path traversal (..) to prevent directory escape
+            for component in path.components() {
+                if matches!(component, std::path::Component::ParentDir) {
+                    return Err(ManifestError::WriteAllowlistPathTraversal {
+                        path: path.to_string_lossy().to_string(),
+                    });
+                }
+            }
+        }
+
+        // Validate shell_allowlist size (TCK-00254)
+        if self.shell_allowlist.len() > MAX_SHELL_ALLOWLIST {
+            return Err(ManifestError::CollectionTooLarge {
+                field: "shell_allowlist",
+                actual: self.shell_allowlist.len(),
+                max: MAX_SHELL_ALLOWLIST,
+            });
+        }
+
+        // Sort allowlists for PartialEq consistency with compute_manifest_hash()
+        // This ensures logically identical manifests compare equal regardless of
+        // insertion order, preventing bugs in caching or deduplication.
+        self.tool_allowlist.sort_by_key(ToolClass::value);
+        self.write_allowlist.sort();
+        self.shell_allowlist.sort();
 
         // Track paths and stable_ids for duplicate detection using HashSet for O(N)
         let mut seen_paths: HashSet<String> = HashSet::with_capacity(self.entries.len());
@@ -1145,11 +1704,14 @@ impl ContextPackManifestBuilder {
         // Build path index for O(1) lookups
         let path_index = ContextPackManifest::build_path_index(&self.entries);
 
-        // Compute manifest hash
+        // Compute manifest hash (includes all allowlists per TCK-00254)
         let manifest_hash = ContextPackManifest::compute_manifest_hash(
             &self.manifest_id,
             &self.profile_id,
             &self.entries,
+            &self.tool_allowlist,
+            &self.write_allowlist,
+            &self.shell_allowlist,
         );
 
         Ok(ContextPackManifest {
@@ -1157,6 +1719,9 @@ impl ContextPackManifestBuilder {
             manifest_hash,
             profile_id: self.profile_id,
             entries: self.entries,
+            tool_allowlist: self.tool_allowlist,
+            write_allowlist: self.write_allowlist,
+            shell_allowlist: self.shell_allowlist,
             path_index,
         })
     }
@@ -2099,6 +2664,144 @@ pub mod tests {
     }
 
     // =========================================================================
+    // TCK-00254: Tool Allowlist Tests
+    // =========================================================================
+
+    #[test]
+    fn test_manifest_with_tool_allowlist() {
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .build();
+
+        assert_eq!(manifest.tool_allowlist.len(), 2);
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Read));
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Write));
+    }
+
+    #[test]
+    fn test_manifest_builder_allow_tool() {
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .allow_tool(ToolClass::Read)
+            .allow_tool(ToolClass::Execute)
+            .build();
+
+        assert_eq!(manifest.tool_allowlist.len(), 2);
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Read));
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Execute));
+    }
+
+    #[test]
+    fn test_manifest_tool_allowlist_too_large() {
+        let tools: Vec<ToolClass> = (0..=MAX_TOOL_ALLOWLIST).map(|_| ToolClass::Read).collect();
+
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(tools)
+            .try_build();
+
+        assert!(matches!(
+            result,
+            Err(ManifestError::CollectionTooLarge { field, actual, max })
+            if field == "tool_allowlist" && actual == MAX_TOOL_ALLOWLIST + 1 && max == MAX_TOOL_ALLOWLIST
+        ));
+    }
+
+    #[test]
+    fn test_manifest_hash_includes_tool_allowlist() {
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read])
+            .build();
+
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Write])
+            .build();
+
+        // Different tool allowlists should produce different hashes
+        assert_ne!(manifest1.manifest_hash(), manifest2.manifest_hash());
+    }
+
+    #[test]
+    fn test_manifest_hash_tool_allowlist_order_determinism() {
+        // Same tools in different order should produce same hash (sorted before
+        // hashing)
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute])
+            .build();
+
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Execute, ToolClass::Read, ToolClass::Write])
+            .build();
+
+        assert_eq!(
+            manifest1.manifest_hash(),
+            manifest2.manifest_hash(),
+            "manifest hash should be deterministic regardless of tool_allowlist order"
+        );
+    }
+
+    #[test]
+    fn test_manifest_empty_tool_allowlist_valid() {
+        // Empty tool_allowlist should be valid (fail-closed semantics)
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001").build();
+
+        assert!(manifest.tool_allowlist.is_empty());
+        assert!(manifest.verify_self_consistency().is_ok());
+    }
+
+    #[test]
+    fn test_manifest_serde_roundtrip_with_tool_allowlist() {
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&manifest).unwrap();
+
+        // Deserialize back
+        let mut recovered: ContextPackManifest = serde_json::from_str(&json).unwrap();
+        recovered.rebuild_index();
+
+        assert_eq!(manifest.tool_allowlist, recovered.tool_allowlist);
+        assert_eq!(manifest.manifest_hash(), recovered.manifest_hash());
+        assert!(recovered.verify_self_consistency().is_ok());
+    }
+
+    #[test]
+    fn test_tool_class_from_u8() {
+        assert_eq!(ToolClass::from_u8(0), Some(ToolClass::Read));
+        assert_eq!(ToolClass::from_u8(1), Some(ToolClass::Write));
+        assert_eq!(ToolClass::from_u8(2), Some(ToolClass::Execute));
+        assert_eq!(ToolClass::from_u8(3), Some(ToolClass::Network));
+        assert_eq!(ToolClass::from_u8(4), Some(ToolClass::Git));
+        assert_eq!(ToolClass::from_u8(5), Some(ToolClass::Inference));
+        assert_eq!(ToolClass::from_u8(6), Some(ToolClass::Artifact));
+        assert_eq!(ToolClass::from_u8(7), None);
+        assert_eq!(ToolClass::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_tool_class_value() {
+        assert_eq!(ToolClass::Read.value(), 0);
+        assert_eq!(ToolClass::Write.value(), 1);
+        assert_eq!(ToolClass::Execute.value(), 2);
+        assert_eq!(ToolClass::Network.value(), 3);
+        assert_eq!(ToolClass::Git.value(), 4);
+        assert_eq!(ToolClass::Inference.value(), 5);
+        assert_eq!(ToolClass::Artifact.value(), 6);
+    }
+
+    #[test]
+    fn test_tool_class_display() {
+        assert_eq!(format!("{}", ToolClass::Read), "Read");
+        assert_eq!(format!("{}", ToolClass::Write), "Write");
+        assert_eq!(format!("{}", ToolClass::Execute), "Execute");
+    }
+
+    // =========================================================================
     // TCK-00255: Sealing Tests
     // =========================================================================
 
@@ -2369,5 +3072,88 @@ pub mod tests {
         assert_eq!(manifest1.entries()[0].path(), "/aaa/file.rs");
         assert_eq!(manifest1.entries()[1].path(), "/bbb/file.rs");
         assert_eq!(manifest1.entries()[2].path(), "/ccc/file.rs");
+    }
+
+    // =========================================================================
+    // TCK-00254: Write Allowlist Path Validation Tests
+    //
+    // Per Code Quality Review [MAJOR], ContextPackManifestBuilder must validate
+    // write_allowlist paths for absolute paths and traversal, consistent with
+    // CapabilityManifest::validate().
+    // =========================================================================
+
+    #[test]
+    fn tck_00254_write_allowlist_path_not_absolute() {
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .write_allowlist(vec![std::path::PathBuf::from("relative/path")])
+            .try_build();
+
+        assert!(
+            matches!(
+                result,
+                Err(ManifestError::WriteAllowlistPathNotAbsolute { ref path })
+                if path == "relative/path"
+            ),
+            "Expected WriteAllowlistPathNotAbsolute, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00254_write_allowlist_path_traversal() {
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .write_allowlist(vec![std::path::PathBuf::from("/workspace/../etc")])
+            .try_build();
+
+        assert!(
+            matches!(
+                result,
+                Err(ManifestError::WriteAllowlistPathTraversal { ref path })
+                if path == "/workspace/../etc"
+            ),
+            "Expected WriteAllowlistPathTraversal, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00254_write_allowlist_path_traversal_nested() {
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .write_allowlist(vec![std::path::PathBuf::from("/workspace/foo/../../etc")])
+            .try_build();
+
+        assert!(
+            matches!(
+                result,
+                Err(ManifestError::WriteAllowlistPathTraversal { .. })
+            ),
+            "Expected WriteAllowlistPathTraversal, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn tck_00254_write_allowlist_valid_absolute_paths() {
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .write_allowlist(vec![
+                std::path::PathBuf::from("/workspace"),
+                std::path::PathBuf::from("/home/user/project"),
+            ])
+            .try_build();
+
+        assert!(result.is_ok(), "Expected Ok, got {result:?}");
+        let manifest = result.unwrap();
+        assert_eq!(manifest.write_allowlist.len(), 2);
+    }
+
+    #[test]
+    fn tck_00254_write_allowlist_path_too_long() {
+        let long_path = std::path::PathBuf::from("/".to_string() + &"x".repeat(MAX_PATH_LENGTH));
+
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .write_allowlist(vec![long_path])
+            .try_build();
+
+        assert!(
+            matches!(result, Err(ManifestError::PathTooLong { .. })),
+            "Expected PathTooLong, got {result:?}"
+        );
     }
 }
