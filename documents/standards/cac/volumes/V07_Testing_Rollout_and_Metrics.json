@@ -17,22 +17,26 @@
           },
           "required_aat_suites": [
             {
-              "max_duration_ms": 60000,
+              "max_duration_ticks": "configured per environment",
+              "max_duration_ms_observational": 60000,
               "purpose": "Validate bootstrap trust root, CAC admission pipeline, canonicalization metadata, schema validation, and replay protection.",
               "suite_id": "AAT-CAC-CORE"
             },
             {
-              "max_duration_ms": 60000,
+              "max_duration_ticks": "configured per environment",
+              "max_duration_ms_observational": 60000,
               "purpose": "Validate ArtifactFetch/DcpResolve determinism and consumption-mode enforcement.",
               "suite_id": "AAT-CAC-FETCH"
             },
             {
-              "max_duration_ms": 60000,
+              "max_duration_ticks": "configured per environment",
+              "max_duration_ms_observational": 60000,
               "purpose": "Validate target delivery determinism and conformance.",
               "suite_id": "AAT-CAC-EXPORT"
             },
             {
-              "max_duration_ms": 60000,
+              "max_duration_ticks": "configured per environment",
+              "max_duration_ms_observational": 60000,
               "purpose": "Truth capabilities manifest against actual CLI behavior.",
               "suite_id": "AAT-CAC-CAP"
             }
@@ -139,18 +143,19 @@
           }
         ],
         "metrics": {
+          "htf_indexing_note": "All metrics use ledger sequence windows and tick deltas as primary axes. Wall-time overlays are bounded and non-authoritative.",
           "lagging": [
             {
-              "definition": "Median time from work opened to work completed + merged.",
+              "definition": "Median ledger sequence delta from work opened to work completed + merged. Wall-time overlay is observational only.",
               "id": "CAC-M-LAG-0001",
-              "name": "PR cycle time",
+              "name": "PR cycle time (ledger windows)",
               "target": "improve after CAC adoption"
             },
             {
               "definition": "Repeat incidence of UNPLANNED_CONTEXT_READ defects on similar work types.",
               "id": "CAC-M-LAG-0002",
               "name": "Defect recurrence rate (missing-context class)",
-              "target": "decrease month-over-month"
+              "target": "decrease over ledger sequence windows"
             }
           ],
           "leading": [
@@ -187,28 +192,29 @@
           ]
         },
         "rollout_plan": {
+          "htf_note": "Phase durations in days are for external coordination and human planning only. Internal phase transitions are gated by ledger sequence and success criteria, not wall time.",
           "phases": [
             {
               "ci_behavior": "warnings only",
-              "duration_days": 7,
+              "duration_days_external": 7,
               "name": "Warn-only linting + bootstrap schemas",
               "phase_id": "CAC-R-01"
             },
             {
               "ci_behavior": "fail on admission violations for new artifacts",
-              "duration_days": 14,
+              "duration_days_external": 14,
               "name": "Admission pipeline enabled + receipts",
               "phase_id": "CAC-R-02"
             },
             {
               "ci_behavior": "fail on discretionary reads; file defects automatically",
-              "duration_days": 14,
+              "duration_days_external": 14,
               "name": "Hermetic consumption + run receipt gating",
               "phase_id": "CAC-R-03"
             },
             {
               "ci_behavior": "fail on export drift; require passing AATReceipt for cutover",
-              "duration_days": 14,
+              "duration_days_external": 14,
               "name": "Target delivery + capabilities gating for CLI cutover",
               "phase_id": "CAC-R-04"
             }

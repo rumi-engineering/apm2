@@ -31,8 +31,8 @@ prd_success_metrics:
       description: |
         Percentage of consumption-mode reads that are properly allowlisted via
         ContextPackManifest. Measures OCAP containment effectiveness.
-      baseline: "Baseline established from initial HTF window (TIME_TBD); expected >20% denial rate initially."
-      target: "<5% denial rate within HTF window (TIME_TBD); <1% within extended HTF window (TIME_TBD)"
+      baseline: "Baseline established from initial ledger window; expected >20% denial rate initially."
+      target: "<5% denial rate within configured ledger window; <1% within extended ledger window"
       measurement_method: |
         Aggregate ToolDecided=DENY events with rule_id CTX-ALLOWLIST-001. Compute rate
         per 1000 gate runs with Wilson score interval.
@@ -43,8 +43,8 @@ prd_success_metrics:
       description: |
         Fraction of gate runs completed without CONTEXT_MISS termination,
         indicating RCP compilation quality.
-      baseline: "Baseline established from initial HTF window (TIME_TBD); expected <70% initially."
-      target: ">95% within HTF window (TIME_TBD); >99% within extended HTF window (TIME_TBD)"
+      baseline: "Baseline established from initial ledger window; expected <70% initially."
+      target: ">95% within configured ledger window; >99% within extended ledger window"
       measurement_method: |
         RunReceipt analysis for context_pack_sufficiency=true. Track SessionTerminated
         events with rationale=CONTEXT_MISS.
@@ -55,11 +55,11 @@ prd_success_metrics:
       description: |
         Time between external trunk divergence and PROJECTION_DIVERGENCE defect
         emission plus admission freeze.
-      baseline: "No detection mechanism pre-FAC (infinite latency)."
-      target: "Detection latency <= HTF threshold (TIME_TBD); freeze within HTF threshold (TIME_TBD)"
+      baseline: "No detection mechanism pre-FAC (infinite latency measured in tick deltas)."
+      target: "Detection latency <= configured tick threshold; freeze within configured tick threshold"
       measurement_method: |
-        Compare divergence watchdog poll HTF ticks to InterventionFreeze HTF ticks.
-        Track poll_interval_htf_ticks compliance (TIME_TBD).
+        Compare divergence watchdog poll ticks to InterventionFreeze ticks.
+        Track poll_interval_ticks compliance. Primary index by tick deltas.
       evidence_ids:
         - EVID-0005
     - id: MET-0006
@@ -91,7 +91,7 @@ prd_success_metrics:
       description: |
         Percentage of reasoning degeneration episodes detected and terminated
         before exceeding threshold.
-      baseline: "Baseline established from initial HTF window (TIME_TBD)."
+      baseline: "Baseline established from initial ledger window."
       target: "100% detection when FindingSignature repeats 3+ times without delta"
       measurement_method: |
         Track SessionTerminated events with rationale=REASONING_DEGENERATION and
@@ -116,7 +116,7 @@ prd_success_metrics:
         Percentage of gate policy drift detected through holdout audits and
         outcome sampling.
       baseline: "Baseline established after Phase 2 holdout suite deployment."
-      target: ">95% detection of false-negative rate exceeding threshold; quarantine within HTF window (TIME_TBD)"
+      target: ">95% detection of false-negative rate exceeding threshold; quarantine within configured tick window"
       measurement_method: |
         Track FAC-90-HOLDOUT_AUDIT results. Compare false_negative_rate to threshold.
         Verify EVALUATOR_DRIFT emission and policy quarantine timing.
@@ -177,10 +177,10 @@ prd_success_metrics:
         Post-merge defects tagged as "should have been caught by AAT" per holdout and
         production incident review.
       baseline: "Baseline established after Phase 2 holdouts."
-      target: "<1% escape rate; trending down quarter-over-quarter"
+      target: "<1% escape rate; trending down over ledger sequence windows"
       measurement_method: |
         Track defect taxonomy tags AAT_FALSE_NEGATIVE / HOLDOUT_FALSE_NEGATIVE and
-        correlate with changeset risk tier.
+        correlate with changeset risk tier. Index by ledger windows; wall-time trends are observational only.
       evidence_ids:
         - EVID-0010
     - id: MET-0016
@@ -189,29 +189,33 @@ prd_success_metrics:
         Distribution of AAT mismatches by flake_class values:
         HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN.
       baseline: "Baseline established after flake classification rollout."
-      target: "UNKNOWN <5%; HARNESS_FLAKE + ENVIRONMENT_DRIFT trending down"
+      target: "UNKNOWN <5%; HARNESS_FLAKE + ENVIRONMENT_DRIFT trending down over ledger windows"
       measurement_method: |
         Aggregate GateReceipt flake_class across AAT mismatches/failures and correlate with quarantine events.
+        Index by ledger sequence windows; wall-time aggregation is observational only.
       evidence_ids:
         - EVID-0025
     - id: MET-0017
       name: AAT signal density
       description: |
-        Defects per AAT run or per HTF tick window to ensure AAT yields actionable signal.
+        Defects per AAT run or per tick window to ensure AAT yields actionable signal.
       baseline: "Baseline established after AAT rollout."
-      target: "Signal density increases quarter-over-quarter"
+      target: "Signal density increases over ledger sequence windows"
       measurement_method: |
-        Compute defects linked to AAT evidence bundles divided by total AAT runtime (HTF window; observational wall time only).
+        Compute defects linked to AAT evidence bundles divided by total AAT runtime in tick deltas.
+        Index by ledger windows; wall-time overlay is observational only.
       evidence_ids:
         - EVID-0024
     - id: MET-0018
-      name: Median time-to-actionable AAT output
+      name: Median tick-delta-to-actionable AAT output
       description: |
-        Median HTF tick delta from AAT failure to actionable fix (measured via defect closure).
+        Median tick delta from AAT failure to actionable fix (measured via defect closure).
+        Primary axis is MonotonicTicks (M) delta.
       baseline: "Baseline established after AAT rollout."
-      target: "<1 HTF window (TIME_TBD) for HIGH-risk tier"
+      target: "<1 configured tick window for HIGH-risk tier"
       measurement_method: |
-        Track HTF tick delta between AAT defect creation and linked fix merge, stratified by risk tier.
+        Track tick delta between AAT defect creation and linked fix merge, stratified by risk tier.
+        Index by tick deltas; wall-time overlay is bounded and non-authoritative.
       evidence_ids:
         - EVID-0027
     - id: MET-0019
@@ -283,7 +287,7 @@ prd_success_metrics:
         - EVID-0002
     - id: GRD-0004
       name: Projection divergence freeze
-      threshold: "External trunk divergence MUST trigger InterventionFreeze within HTF window (TIME_TBD)."
+      threshold: "External trunk divergence MUST trigger InterventionFreeze within configured tick window."
       response_plan: |
         PROJECTION_DIVERGENCE defect emitted. New FAC admissions blocked for repo.
         Unfreeze requires AdjudicationResolved or emergency_override ceremony.
