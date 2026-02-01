@@ -258,10 +258,25 @@ Returns `true` if the entropy budget has been exceeded.
 Evaluates whether a session should be quarantined based on its state.
 
 #### `QuarantineManager::calculate_duration(previous_quarantines) -> Duration`
-Calculates quarantine duration using exponential backoff.
+Calculates quarantine duration using exponential backoff (wall clock).
 
-#### `QuarantineManager::is_quarantine_expired(quarantine_until, current_time_ns) -> bool`
-Checks if a quarantine has expired.
+#### `QuarantineManager::calculate_duration_ticks(previous_quarantines) -> Option<u64>`
+Calculates quarantine duration in ticks using exponential backoff (RFC-0016 HTF).
+
+#### `QuarantineManager::is_quarantine_expired_at_tick(quarantine_until_tick, current_tick) -> bool`
+Checks if a quarantine has expired based on ticks (RFC-0016 HTF). Fails closed on tick rate mismatch.
+
+#### `QuarantineManager::quarantine_until_tick(current_tick, duration_ticks) -> HtfTick`
+Calculates the quarantine expiry tick (RFC-0016 HTF).
+
+#### `QuarantineInfo::is_expired_at_tick(current_tick) -> bool`
+Checks if a quarantine has expired based on ticks (RFC-0016 HTF).
+
+#### `QuarantineInfo::is_expired_at_tick_or_wall(current_tick, current_wall_ns) -> bool`
+Checks if a quarantine has expired with wall-clock fallback for legacy quarantines.
+
+#### `QuarantineInfo::ticks_remaining(current_tick) -> u64`
+Returns remaining ticks until quarantine expires (RFC-0016 HTF).
 
 ### Crash Detection
 
