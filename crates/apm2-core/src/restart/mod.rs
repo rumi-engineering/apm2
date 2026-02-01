@@ -809,8 +809,8 @@ mod tck_00243 {
         let _ = RestartManager::with_ticks(config, 1000, 0);
     }
 
-    /// SEC-FIX-001: Legacy `record_restart` prunes old entries to prevent session
-    /// lockout.
+    /// SEC-FIX-001: Legacy `record_restart` prunes old entries to prevent
+    /// session lockout.
     #[test]
     #[allow(deprecated)]
     fn legacy_record_restart_prunes_history() {
