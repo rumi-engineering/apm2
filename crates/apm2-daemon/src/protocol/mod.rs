@@ -115,6 +115,7 @@ pub use dispatch::{
     // TCK-00253: Ledger event emitter types
     LedgerEventEmitter,
     LedgerEventError,
+    MAX_LEDGER_EVENTS,
     MAX_WORK_CLAIMS,
     // TCK-00253: Policy resolution and work claim types
     PolicyResolution,

@@ -138,14 +138,31 @@ pub trait LedgerEventEmitter: Send + Sync {
 /// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
 pub const WORK_CLAIMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_claimed:";
 
+/// Maximum number of events stored in `StubLedgerEventEmitter`.
+///
+/// Per CTR-1303: In-memory stores must have `max_entries` limit with O(1)
+/// eviction. This prevents denial-of-service via memory exhaustion from
+/// unbounded event emission.
+pub const MAX_LEDGER_EVENTS: usize = 10_000;
+
 /// Stub ledger event emitter for testing.
 ///
 /// Stores events in memory with Ed25519 signatures using a test signing key.
 /// In production, this will be replaced with `SqliteLedgerEventEmitter`.
+///
+/// # Capacity Limits (CTR-1303)
+///
+/// This emitter enforces a maximum of [`MAX_LEDGER_EVENTS`] entries to prevent
+/// memory exhaustion. When the limit is reached, the oldest entry (by insertion
+/// order) is evicted to make room for the new event.
 #[derive(Debug)]
 pub struct StubLedgerEventEmitter {
-    /// Events stored by event ID.
-    events: std::sync::RwLock<std::collections::HashMap<String, SignedLedgerEvent>>,
+    /// Events stored with insertion order for LRU eviction.
+    /// The `Vec` maintains insertion order; oldest entries are at the front.
+    events: std::sync::RwLock<(
+        Vec<String>,
+        std::collections::HashMap<String, SignedLedgerEvent>,
+    )>,
     /// Events indexed by work ID for efficient querying.
     events_by_work_id: std::sync::RwLock<std::collections::HashMap<String, Vec<String>>>,
     /// Signing key for event signatures (test key).
@@ -164,7 +181,10 @@ impl StubLedgerEventEmitter {
     pub fn new() -> Self {
         use rand::rngs::OsRng;
         Self {
-            events: std::sync::RwLock::new(std::collections::HashMap::new()),
+            events: std::sync::RwLock::new((
+                Vec::with_capacity(MAX_LEDGER_EVENTS.min(1000)), // Pre-allocate reasonably
+                std::collections::HashMap::with_capacity(MAX_LEDGER_EVENTS.min(1000)),
+            )),
             events_by_work_id: std::sync::RwLock::new(std::collections::HashMap::new()),
             signing_key: ed25519_dalek::SigningKey::generate(&mut OsRng),
         }
@@ -174,7 +194,10 @@ impl StubLedgerEventEmitter {
     #[must_use]
     pub fn with_signing_key(signing_key: ed25519_dalek::SigningKey) -> Self {
         Self {
-            events: std::sync::RwLock::new(std::collections::HashMap::new()),
+            events: std::sync::RwLock::new((
+                Vec::with_capacity(MAX_LEDGER_EVENTS.min(1000)), // Pre-allocate reasonably
+                std::collections::HashMap::with_capacity(MAX_LEDGER_EVENTS.min(1000)),
+            )),
             events_by_work_id: std::sync::RwLock::new(std::collections::HashMap::new()),
             signing_key,
         }
@@ -220,14 +243,12 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Sign the canonical bytes
         let signature = self.signing_key.sign(&canonical_bytes);
 
-        // Get timestamp (using UUID-based approach for HTF compliance)
-        // In production, this would use an HTF-compliant clock
-        // Note: u128 -> u64 truncation is safe for timestamps until year 2554
-        #[allow(clippy::cast_possible_truncation)]
-        let timestamp_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        // RFC-0016 HTF compliance: Use placeholder timestamp (0) for stub
+        // implementation. In production, this would use an HTF-compliant clock
+        // source that provides monotonic, causally-ordered timestamps. The stub
+        // uses 0 to make tests deterministic and avoid the forbidden
+        // SystemTime::now() call.
+        let timestamp_ns = 0u64;
 
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
@@ -239,9 +260,26 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             timestamp_ns,
         };
 
-        // Persist to in-memory store
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
         {
-            let mut events = self.events.write().expect("lock poisoned");
+            let mut guard = self.events.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    events.remove(&oldest_key);
+                    debug!(
+                        evicted_event_id = %oldest_key,
+                        "Evicted oldest ledger event to maintain capacity limit"
+                    );
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
             events.insert(event_id.clone(), signed_event.clone());
         }
         {
@@ -263,20 +301,20 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     }
 
     fn get_event(&self, event_id: &str) -> Option<SignedLedgerEvent> {
-        let events = self.events.read().expect("lock poisoned");
-        events.get(event_id).cloned()
+        let guard = self.events.read().expect("lock poisoned");
+        guard.1.get(event_id).cloned()
     }
 
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
         let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
-        let events = self.events.read().expect("lock poisoned");
+        let guard = self.events.read().expect("lock poisoned");
 
         events_by_work
             .get(work_id)
             .map(|event_ids| {
                 event_ids
                     .iter()
-                    .filter_map(|id| events.get(id).cloned())
+                    .filter_map(|id| guard.1.get(id).cloned())
                     .collect()
             })
             .unwrap_or_default()
@@ -1038,15 +1076,21 @@ impl PrivilegedDispatcher {
 
         // TCK-00253: Query governance for policy resolution
         // Per DD-002: "Daemon calls HOLON-KERNEL-GOVERNANCE for policy resolution"
-        let policy_resolution = self
+        let policy_resolution = match self
             .policy_resolver
             .resolve_for_claim(&work_id, role, &actor_id)
-            .map_err(|e| {
+        {
+            Ok(resolution) => resolution,
+            Err(e) => {
                 warn!(error = %e, "Policy resolution failed");
-                ProtocolError::Serialization {
-                    reason: format!("policy resolution failed: {e}"),
-                }
-            })?;
+                // Return application-level error, not protocol error
+                // Policy resolution failures are logic errors, not serialization errors
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::PolicyResolutionFailed,
+                    format!("policy resolution failed: {e}"),
+                ));
+            },
+        };
 
         info!(
             work_id = %work_id,
@@ -1065,12 +1109,18 @@ impl PrivilegedDispatcher {
             policy_resolution: policy_resolution.clone(),
         };
 
-        let claim = self.work_registry.register_claim(claim).map_err(|e| {
-            warn!(error = %e, "Work registration failed");
-            ProtocolError::Serialization {
-                reason: format!("work registration failed: {e}"),
-            }
-        })?;
+        let claim = match self.work_registry.register_claim(claim) {
+            Ok(claim) => claim,
+            Err(e) => {
+                warn!(error = %e, "Work registration failed");
+                // Return application-level error, not protocol error
+                // Registration failures are logic errors, not serialization errors
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("work registration failed: {e}"),
+                ));
+            },
+        };
 
         // TCK-00253: Emit signed WorkClaimed event to ledger.
         // Per acceptance criteria: "`WorkClaimed` event signed and persisted"
@@ -1078,12 +1128,18 @@ impl PrivilegedDispatcher {
         // - Signed with the daemon's signing key (Ed25519)
         // - Includes work_id, lease_id, actor_id, role, and policy_resolved_ref
         // - Persisted to the append-only ledger for audit trail
-        let signed_event = self.event_emitter.emit_work_claimed(&claim).map_err(|e| {
-            warn!(error = %e, "WorkClaimed event emission failed");
-            ProtocolError::Serialization {
-                reason: format!("event emission failed: {e}"),
-            }
-        })?;
+        let signed_event = match self.event_emitter.emit_work_claimed(&claim) {
+            Ok(event) => event,
+            Err(e) => {
+                warn!(error = %e, "WorkClaimed event emission failed");
+                // Return application-level error, not protocol error
+                // Event emission failures are logic errors, not serialization errors
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("event emission failed: {e}"),
+                ));
+            },
+        };
 
         debug!(
             event_id = %signed_event.event_id,
@@ -2030,7 +2086,12 @@ mod tests {
                 event.event_id.starts_with("EVT-"),
                 "Event ID should have EVT- prefix"
             );
-            assert!(event.timestamp_ns > 0, "Timestamp should be set");
+            // RFC-0016 HTF compliance: Stub uses placeholder timestamp (0)
+            // In production, HTF-compliant clock will provide real timestamps
+            assert_eq!(
+                event.timestamp_ns, 0,
+                "Stub timestamp should be 0 (HTF placeholder)"
+            );
 
             // Verify payload contains expected fields
             let payload: serde_json::Value =
