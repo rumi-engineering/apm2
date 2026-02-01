@@ -39,7 +39,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -61,15 +62,172 @@ const DOMAIN_PREFIX: &[u8] = b"apm2.session_token.v1:";
 
 /// Maximum length for `session_id` to prevent denial-of-service via oversized
 /// tokens (CTR-1303).
-const MAX_SESSION_ID_LENGTH: usize = 256;
+pub const MAX_SESSION_ID_LENGTH: usize = 256;
 
 /// Maximum length for `lease_id` to prevent denial-of-service via oversized
 /// tokens (CTR-1303).
-const MAX_LEASE_ID_LENGTH: usize = 256;
+pub const MAX_LEASE_ID_LENGTH: usize = 256;
 
 /// Expected length of the hex-encoded MAC string.
 /// HMAC-SHA256 produces 32 bytes = 64 hex characters.
-const EXPECTED_MAC_HEX_LENGTH: usize = MAC_LENGTH * 2;
+pub const EXPECTED_MAC_HEX_LENGTH: usize = MAC_LENGTH * 2;
+
+// =============================================================================
+// Bounded Deserialization Helpers
+// =============================================================================
+
+/// Deserializes a string with bounded length enforcement during
+/// deserialization.
+///
+/// This prevents denial-of-service attacks where an attacker sends a very large
+/// string field that causes memory allocation before validation can occur. The
+/// check happens during deserialization itself, not after.
+///
+/// # Security (SEC-CTRL-FAC-001)
+///
+/// Length is checked DURING deserialization, before the full string is
+/// allocated.
+fn deserialize_bounded_session_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedSessionIdVisitor;
+
+    impl Visitor<'_> for BoundedSessionIdVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a string with at most {MAX_SESSION_ID_LENGTH} bytes"
+            )
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let len = v.len();
+            if len > MAX_SESSION_ID_LENGTH {
+                return Err(E::custom(format!(
+                    "session_id exceeds maximum length: {len} > {MAX_SESSION_ID_LENGTH}"
+                )));
+            }
+            Ok(v.to_owned())
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let len = v.len();
+            if len > MAX_SESSION_ID_LENGTH {
+                return Err(E::custom(format!(
+                    "session_id exceeds maximum length: {len} > {MAX_SESSION_ID_LENGTH}"
+                )));
+            }
+            Ok(v)
+        }
+    }
+
+    deserializer.deserialize_string(BoundedSessionIdVisitor)
+}
+
+/// Deserializes a `lease_id` string with bounded length enforcement.
+fn deserialize_bounded_lease_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedLeaseIdVisitor;
+
+    impl Visitor<'_> for BoundedLeaseIdVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a string with at most {MAX_LEASE_ID_LENGTH} bytes"
+            )
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let len = v.len();
+            if len > MAX_LEASE_ID_LENGTH {
+                return Err(E::custom(format!(
+                    "lease_id exceeds maximum length: {len} > {MAX_LEASE_ID_LENGTH}"
+                )));
+            }
+            Ok(v.to_owned())
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let len = v.len();
+            if len > MAX_LEASE_ID_LENGTH {
+                return Err(E::custom(format!(
+                    "lease_id exceeds maximum length: {len} > {MAX_LEASE_ID_LENGTH}"
+                )));
+            }
+            Ok(v)
+        }
+    }
+
+    deserializer.deserialize_string(BoundedLeaseIdVisitor)
+}
+
+/// Deserializes a MAC hex string with bounded length enforcement.
+///
+/// The MAC must be exactly `EXPECTED_MAC_HEX_LENGTH` (64) characters.
+fn deserialize_bounded_mac<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedMacVisitor;
+
+    impl Visitor<'_> for BoundedMacVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a hex string of exactly {EXPECTED_MAC_HEX_LENGTH} characters"
+            )
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let len = v.len();
+            if len != EXPECTED_MAC_HEX_LENGTH {
+                return Err(E::custom(format!(
+                    "mac hex length invalid: {len} chars, expected {EXPECTED_MAC_HEX_LENGTH} chars"
+                )));
+            }
+            Ok(v.to_owned())
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let len = v.len();
+            if len != EXPECTED_MAC_HEX_LENGTH {
+                return Err(E::custom(format!(
+                    "mac hex length invalid: {len} chars, expected {EXPECTED_MAC_HEX_LENGTH} chars"
+                )));
+            }
+            Ok(v)
+        }
+    }
+
+    deserializer.deserialize_string(BoundedMacVisitor)
+}
 
 // =============================================================================
 // Helper Functions
@@ -163,12 +321,29 @@ pub enum SessionTokenError {
 /// - [INV-TOKEN-001] MAC computed over domain-separated data prevents replay
 /// - [INV-TOKEN-002] Expiration enforced before any authorization check
 /// - [INV-TOKEN-003] MAC verification uses constant-time comparison
+/// - [INV-TOKEN-004] Bounded deserialization prevents denial-of-service
+///   (SEC-CTRL-FAC-001)
+///
+/// # Protocol Hygiene (SEC-PROTO-001)
+///
+/// - `#[serde(deny_unknown_fields)]` prevents field injection attacks
+///   (CTR-1604)
+/// - Bounded deserialization enforces length limits during parsing, not after
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SessionToken {
     /// Unique session identifier.
+    ///
+    /// Bounded by `MAX_SESSION_ID_LENGTH` during deserialization
+    /// (SEC-CTRL-FAC-001).
+    #[serde(deserialize_with = "deserialize_bounded_session_id")]
     pub session_id: String,
 
     /// Lease authorizing this session.
+    ///
+    /// Bounded by `MAX_LEASE_ID_LENGTH` during deserialization
+    /// (SEC-CTRL-FAC-001).
+    #[serde(deserialize_with = "deserialize_bounded_lease_id")]
     pub lease_id: String,
 
     /// Spawn timestamp in nanoseconds since Unix epoch.
@@ -180,7 +355,9 @@ pub struct SessionToken {
     /// HMAC-SHA256 over the token data (domain prefix, `session_id`,
     /// `lease_id`, `spawn_time_ns`, `expires_at_ns`).
     ///
-    /// Hex-encoded for JSON serialization.
+    /// Hex-encoded for JSON serialization. Must be exactly 64 hex characters.
+    /// Bounded during deserialization (SEC-CTRL-FAC-001).
+    #[serde(deserialize_with = "deserialize_bounded_mac")]
     pub mac: String,
 }
 
@@ -939,5 +1116,168 @@ mod tests {
         let result = minter.validate(&token, now);
 
         assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Bounded Deserialization Tests (SEC-CTRL-FAC-001)
+    // These tests verify that deserialization rejects oversized inputs BEFORE
+    // allocating memory for the full string. This is the critical fix for
+    // the unbounded deserialization DoS vulnerability.
+    // =========================================================================
+
+    /// SEC-CTRL-FAC-001: Verify deserialization rejects oversized `session_id`
+    /// during parsing.
+    ///
+    /// Attack vector: Attacker sends JSON with massive `session_id` (16MB).
+    /// Expected: Rejected by serde during deserialization, before full
+    /// allocation.
+    #[test]
+    fn test_deserialize_rejects_oversized_session_id() {
+        let oversized_session_id = "x".repeat(MAX_SESSION_ID_LENGTH + 1);
+        let json = format!(
+            r#"{{"session_id":"{}","lease_id":"lease-001","spawn_time_ns":1700000000000000000,"expires_at_ns":1700003600000000000,"mac":"{}"}}"#,
+            oversized_session_id,
+            "a".repeat(EXPECTED_MAC_HEX_LENGTH)
+        );
+
+        let result: Result<SessionToken, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("session_id exceeds maximum length"),
+            "Expected session_id length error, got: {err_msg}"
+        );
+    }
+
+    /// SEC-CTRL-FAC-001: Verify deserialization rejects oversized `lease_id`
+    /// during parsing.
+    #[test]
+    fn test_deserialize_rejects_oversized_lease_id() {
+        let oversized_lease_id = "x".repeat(MAX_LEASE_ID_LENGTH + 1);
+        let json = format!(
+            r#"{{"session_id":"session-001","lease_id":"{}","spawn_time_ns":1700000000000000000,"expires_at_ns":1700003600000000000,"mac":"{}"}}"#,
+            oversized_lease_id,
+            "a".repeat(EXPECTED_MAC_HEX_LENGTH)
+        );
+
+        let result: Result<SessionToken, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("lease_id exceeds maximum length"),
+            "Expected lease_id length error, got: {err_msg}"
+        );
+    }
+
+    /// SEC-CTRL-FAC-001: Verify deserialization rejects oversized `mac` during
+    /// parsing.
+    #[test]
+    fn test_deserialize_rejects_oversized_mac() {
+        let oversized_mac = "a".repeat(65536);
+        let json = format!(
+            r#"{{"session_id":"session-001","lease_id":"lease-001","spawn_time_ns":1700000000000000000,"expires_at_ns":1700003600000000000,"mac":"{oversized_mac}"}}"#
+        );
+
+        let result: Result<SessionToken, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("mac hex length invalid"),
+            "Expected mac length error, got: {err_msg}"
+        );
+    }
+
+    /// SEC-CTRL-FAC-001: Verify deserialization rejects short `mac` during
+    /// parsing.
+    #[test]
+    fn test_deserialize_rejects_short_mac() {
+        let short_mac = "a".repeat(16);
+        let json = format!(
+            r#"{{"session_id":"session-001","lease_id":"lease-001","spawn_time_ns":1700000000000000000,"expires_at_ns":1700003600000000000,"mac":"{short_mac}"}}"#
+        );
+
+        let result: Result<SessionToken, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("mac hex length invalid"),
+            "Expected mac length error, got: {err_msg}"
+        );
+    }
+
+    /// SEC-PROTO-001: Verify deserialization rejects unknown fields.
+    ///
+    /// Attack vector: Attacker sends token with extra fields to probe for
+    /// injection vulnerabilities.
+    #[test]
+    fn test_deserialize_rejects_unknown_fields() {
+        let json = format!(
+            r#"{{"session_id":"session-001","lease_id":"lease-001","spawn_time_ns":1700000000000000000,"expires_at_ns":1700003600000000000,"mac":"{}","extra_field":"malicious"}}"#,
+            "a".repeat(EXPECTED_MAC_HEX_LENGTH)
+        );
+
+        let result: Result<SessionToken, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unknown field"),
+            "Expected unknown field error, got: {err_msg}"
+        );
+    }
+
+    /// Boundary test: deserialization accepts `session_id` at exactly
+    /// `MAX_SESSION_ID_LENGTH`.
+    #[test]
+    fn test_deserialize_accepts_max_length_session_id() {
+        let max_session_id = "x".repeat(MAX_SESSION_ID_LENGTH);
+        let json = format!(
+            r#"{{"session_id":"{}","lease_id":"lease-001","spawn_time_ns":1700000000000000000,"expires_at_ns":1700003600000000000,"mac":"{}"}}"#,
+            max_session_id,
+            "a".repeat(EXPECTED_MAC_HEX_LENGTH)
+        );
+
+        let result: Result<SessionToken, _> = serde_json::from_str(&json);
+        assert!(result.is_ok());
+        let token = result.unwrap();
+        assert_eq!(token.session_id.len(), MAX_SESSION_ID_LENGTH);
+    }
+
+    /// Boundary test: deserialization accepts `lease_id` at exactly
+    /// `MAX_LEASE_ID_LENGTH`.
+    #[test]
+    fn test_deserialize_accepts_max_length_lease_id() {
+        let max_lease_id = "x".repeat(MAX_LEASE_ID_LENGTH);
+        let json = format!(
+            r#"{{"session_id":"session-001","lease_id":"{}","spawn_time_ns":1700000000000000000,"expires_at_ns":1700003600000000000,"mac":"{}"}}"#,
+            max_lease_id,
+            "a".repeat(EXPECTED_MAC_HEX_LENGTH)
+        );
+
+        let result: Result<SessionToken, _> = serde_json::from_str(&json);
+        assert!(result.is_ok());
+        let token = result.unwrap();
+        assert_eq!(token.lease_id.len(), MAX_LEASE_ID_LENGTH);
+    }
+
+    /// Verify valid token still serializes and deserializes correctly after
+    /// adding bounded deserialization.
+    #[test]
+    fn test_bounded_deserialization_roundtrip() {
+        let minter = test_minter();
+        let token = minter
+            .mint("session-001", "lease-001", test_spawn_time(), test_ttl())
+            .unwrap();
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&token).unwrap();
+
+        // Deserialize back (now with bounded deserialization)
+        let parsed: SessionToken = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(token, parsed);
+
+        // Validate the deserialized token still works
+        let now = test_spawn_time() + Duration::from_secs(1800);
+        assert!(minter.validate(&parsed, now).is_ok());
     }
 }
