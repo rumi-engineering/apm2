@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Canary comparison mode for A/B testing routing configurations.
 //!
 //! This module provides:

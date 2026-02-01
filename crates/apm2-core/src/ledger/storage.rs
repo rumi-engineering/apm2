@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! `SQLite`-backed ledger storage implementation.
 //!
 //! This module uses `SQLite` with WAL mode for the underlying storage.

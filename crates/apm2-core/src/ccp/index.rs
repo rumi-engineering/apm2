@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! CCP Index generation for unified, content-addressed codebase artifacts.
 //!
 //! This module combines the component atlas and crate graph into a unified

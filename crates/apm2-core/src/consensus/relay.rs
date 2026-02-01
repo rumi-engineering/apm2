@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Relay Holon for routing messages to workers behind NAT.
 //!
 //! This module implements the Relay Holon, which maintains a registry of

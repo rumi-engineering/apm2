@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Crate graph generation for CCP.
 //!
 //! This module invokes `cargo metadata` to build a deterministic dependency

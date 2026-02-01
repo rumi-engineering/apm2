@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Process management module.
 //!
 //! This module provides types and functions for spawning, monitoring,

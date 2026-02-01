@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 // AGENT-AUTHORED
 //! Echo-trap detection and escalation for the Forge Admission Cycle.
 //!

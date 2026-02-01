@@ -279,12 +279,13 @@ impl CiTransitionBuilder {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
 
     use super::*;
     use crate::events::ci::CIWorkflowPayload;
 
     fn sample_ci_event(conclusion: CIConclusion, pr_numbers: Vec<u64>) -> CIWorkflowCompleted {
+        let fixed_time = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
         CIWorkflowCompleted::with_timestamp(
             CIWorkflowPayload {
                 pr_numbers,
@@ -296,7 +297,7 @@ mod tests {
             },
             true,
             "delivery-123".to_string(),
-            Utc::now(),
+            fixed_time,
         )
     }
 

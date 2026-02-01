@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Supervision module.
 //!
 //! Provides the core supervision logic for managing process lifecycles.

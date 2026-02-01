@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Token refresh functionality.
 //!
 //! Handles automatic refresh of OAuth tokens and session tokens before expiry.

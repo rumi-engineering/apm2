@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Component atlas generation for CCP.
 //!
 //! This module discovers AGENTS.md files in crate directories, parses

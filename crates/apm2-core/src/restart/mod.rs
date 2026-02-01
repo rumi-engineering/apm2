@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Restart policy module.
 //!
 //! Defines restart behavior including backoff strategies and circuit breakers.

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! State persistence module.
 //!
 //! Handles saving and restoring process manager state for recovery after

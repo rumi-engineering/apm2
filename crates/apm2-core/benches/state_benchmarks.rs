@@ -12,7 +12,7 @@ use std::sync::RwLock;
 
 use apm2_core::process::{ProcessId, ProcessState};
 use apm2_core::state::{PersistedProcessInstance, PersistedState};
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use common::create_process_spec;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
@@ -57,9 +57,9 @@ fn bench_state_serialization(c: &mut Criterion) {
                 instance_index: 0,
                 state: ProcessState::Running,
                 pid: Some(10000 + i),
-                started_at: Some(Utc::now()),
+                started_at: Some(Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap()),
                 restart_count: 2,
-                last_restart: Some(Utc::now()),
+                last_restart: Some(Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap()),
                 credential_profile: Some("claude-prod".to_string()),
             });
         }
@@ -93,9 +93,9 @@ fn bench_state_deserialization(c: &mut Criterion) {
                 instance_index: 0,
                 state: ProcessState::Running,
                 pid: Some(10000 + i),
-                started_at: Some(Utc::now()),
+                started_at: Some(Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap()),
                 restart_count: 2,
-                last_restart: Some(Utc::now()),
+                last_restart: Some(Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap()),
                 credential_profile: Some("claude-prod".to_string()),
             });
         }
@@ -144,7 +144,7 @@ fn bench_instance_update(c: &mut Criterion) {
                             instance_index: 0,
                             state: ProcessState::Running,
                             pid: Some(12345),
-                            started_at: Some(Utc::now()),
+                            started_at: Some(Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap()),
                             restart_count: 1,
                             last_restart: None,
                             credential_profile: None,
