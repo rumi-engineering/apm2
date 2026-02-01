@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Core ticket emission logic from RFC decomposition.
 //!
 //! This module provides:

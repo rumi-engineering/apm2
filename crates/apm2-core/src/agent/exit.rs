@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Agent exit signal protocol.
 //!
 //! This module defines the structured exit protocol that agents use to signal

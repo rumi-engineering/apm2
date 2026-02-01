@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Token provider for GitHub App authentication.
 //!
 //! This module provides the infrastructure for minting GitHub installation

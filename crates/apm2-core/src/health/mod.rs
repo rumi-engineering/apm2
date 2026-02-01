@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Health check module.
 //!
 //! Provides health check mechanisms for monitoring process health.

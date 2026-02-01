@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Run manifest data structures and builder.
 //!
 //! This module defines the [`RunManifest`] struct that captures a complete

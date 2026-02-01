@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! CI workflow ledger events.
 //!
 //! This module defines ledger event types for CI workflow completions,

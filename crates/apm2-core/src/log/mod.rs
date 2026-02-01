@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Log management module.
 //!
 //! Handles log collection, rotation, and streaming for managed processes.

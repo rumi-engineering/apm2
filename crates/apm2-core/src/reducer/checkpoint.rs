@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Checkpoint storage for reducer state persistence.
 //!
 //! Checkpoints allow reducers to save their state at a specific ledger

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 // AGENT-AUTHORED
 //! Byzantine equivocation detection for the consensus layer.
 //!

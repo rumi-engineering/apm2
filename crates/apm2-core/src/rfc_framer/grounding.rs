@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! CCP grounding section generation and path validation.
 //!
 //! This module provides:

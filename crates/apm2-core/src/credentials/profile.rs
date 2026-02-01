@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Credential profile definitions.
 
 use std::path::PathBuf;

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Claude Code instrumented adapter.
 //!
 //! This adapter integrates with Claude Code's native hook system to receive

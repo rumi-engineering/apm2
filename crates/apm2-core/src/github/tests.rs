@@ -312,11 +312,9 @@ mod integration_tests {
         assert_eq!(response.token_hash.len(), 32);
 
         // 4. Create a lease from the token response
-        #[allow(clippy::cast_possible_truncation)]
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        // Use a fixed timestamp: 2026-01-15 12:00:00 UTC in nanoseconds since
+        // UNIX_EPOCH 2026-01-15 12:00:00 UTC = 1768478400 seconds since epoch
+        let now_nanos: u64 = 1_768_478_400_000_000_000;
 
         #[allow(clippy::cast_possible_truncation)]
         let expires_at_nanos = (u128::from(response.expires_at) * 1_000_000_000) as u64;

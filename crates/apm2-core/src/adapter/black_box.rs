@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Black-box adapter for observation-based agent monitoring.
 //!
 //! This adapter wraps an agent process and derives events from side effects

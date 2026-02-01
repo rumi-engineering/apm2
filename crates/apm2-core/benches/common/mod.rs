@@ -11,7 +11,7 @@ use apm2_core::ipc::{
     ErrorCode, InstanceInfo, IpcRequest, IpcResponse, LogEntry, ProcessInfo, ProcessSummary,
 };
 use apm2_core::process::{ProcessId, ProcessSpec, ProcessState};
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 
 /// Create a process spec with a configurable number of environment variables.
 pub fn create_process_spec(name: &str, env_count: usize) -> ProcessSpec {
@@ -183,7 +183,7 @@ pub fn create_process_info() -> ProcessInfo {
 pub fn create_log_entries(count: usize) -> Vec<LogEntry> {
     (0..count)
         .map(|i| LogEntry {
-            timestamp: Utc::now(),
+            timestamp: Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap(),
             process_name: "my-process".to_string(),
             instance: (i % 3) as u32,
             stream: if i % 2 == 0 { "stdout" } else { "stderr" }.to_string(),

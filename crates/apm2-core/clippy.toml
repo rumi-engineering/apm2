@@ -1,0 +1,12 @@
+[[disallowed-methods]]
+path = "std::time::SystemTime::now"
+reason = "Wall-clock time is non-deterministic and can regress. Use HtfTick for coordination or explicit time injection."
+
+[[disallowed-methods]]
+path = "chrono::Utc::now"
+reason = "Wall-clock time is non-deterministic. Use HtfTick or explicit time injection."
+
+[[disallowed-methods]]
+path = "chrono::Local::now"
+reason = "Wall-clock time is non-deterministic. Use HtfTick or explicit time injection."
+

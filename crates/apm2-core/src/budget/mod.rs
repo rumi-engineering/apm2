@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Budget enforcement for session resource limits.
 //!
 //! This module implements budget tracking and enforcement for the APM2 kernel.

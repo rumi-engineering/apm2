@@ -1031,6 +1031,8 @@ impl ContextPackSpecBuilder {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+
     use super::*;
 
     // =========================================================================
@@ -1258,9 +1260,9 @@ mod tests {
 
     #[test]
     fn test_dependency_review_with_timestamp() {
-        let now = Utc::now();
-        let review = DependencyReview::with_timestamp("org:doc:readme", "a".repeat(64), now);
-        assert_eq!(review.reviewed_at, Some(now));
+        let fixed_time = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        let review = DependencyReview::with_timestamp("org:doc:readme", "a".repeat(64), fixed_time);
+        assert_eq!(review.reviewed_at, Some(fixed_time));
     }
 
     #[test]

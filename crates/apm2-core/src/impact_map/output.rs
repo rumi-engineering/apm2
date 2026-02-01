@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Deterministic YAML output generation for impact maps.
 //!
 //! This module provides:

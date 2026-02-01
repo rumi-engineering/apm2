@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 // AGENT-AUTHORED
 //! HLC-Based CRDT Merge Operators for distributed event reconciliation.
 //!

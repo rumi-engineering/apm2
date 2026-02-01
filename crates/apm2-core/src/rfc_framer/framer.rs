@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Core RFC generation logic from Impact Map and CCP.
 //!
 //! This module provides:

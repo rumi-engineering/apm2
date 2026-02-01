@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! CAC Admission Pipeline and Receipts.
 //!
 //! This module implements the admission gate that validates, canonicalizes,

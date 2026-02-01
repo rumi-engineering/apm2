@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // Metadata/observability usage or adapter.
 //! Reverse-TLS tunnel management for NAT traversal.
 //!
 //! This module implements reverse-TLS tunnels that allow workers behind NAT
