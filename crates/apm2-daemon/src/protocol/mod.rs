@@ -101,21 +101,29 @@ pub mod session_token;
 /// Dual-socket manager for privilege separation (TCK-00249).
 pub mod socket_manager;
 
-// Re-export commonly used types at module level
+// Re-export commonly used types at module level.
+// These re-exports form the public API of this module and may not be used
+// within the crate itself.
+#[allow(unused_imports)]
 pub use credentials::PeerCredentials;
+#[allow(unused_imports)]
 pub use dispatch::{
     ConnectionContext, PrivilegedDispatcher, PrivilegedMessageType, PrivilegedResponse,
     encode_claim_work_request, encode_issue_capability_request, encode_shutdown_request,
     encode_spawn_episode_request,
 };
+#[allow(unused_imports)]
 pub use error::{
     MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ProtocolResult,
 };
+#[allow(unused_imports)]
 pub use framing::FrameCodec;
+#[allow(unused_imports)]
 pub use handshake::{
     ClientHandshake, HandshakeErrorCode, HandshakeMessage, HandshakeState, Hello, HelloAck,
     HelloNack, ServerHandshake, parse_handshake_message, parse_hello, serialize_handshake_message,
 };
+#[allow(unused_imports)]
 pub use messages::{
     BoundedDecode,
     CanonicalBytes,
@@ -138,10 +146,13 @@ pub use messages::{
     SpawnEpisodeResponse,
     WorkRole,
 };
+#[allow(unused_imports)]
 pub use server::{
     Connection, ConnectionPermit, ProtocolServer, ServerConfig, connect, default_socket_path,
 };
+#[allow(unused_imports)]
 pub use session_token::{SessionToken, SessionTokenError, TokenMinter};
+#[allow(unused_imports)]
 pub use socket_manager::{
     SocketManager, SocketManagerConfig, SocketType, default_operator_socket_path,
     default_session_socket_path,

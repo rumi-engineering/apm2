@@ -1,9 +1,18 @@
 //! apm2-daemon - AI CLI Process Manager Daemon
 //!
 //! This is the main daemon binary that manages AI CLI processes.
+//!
+//! # Dual-Socket Topology (TCK-00249)
+//!
+//! The daemon uses a dual-socket architecture for privilege separation:
+//! - **Operator socket** (`operator.sock`, mode 0600): Privileged operations
+//! - **Session socket** (`session.sock`, mode 0660): Session-scoped operations
+//!
+//! See RFC-0017 for architecture details.
 
 mod handlers;
 mod ipc_server;
+// mod protocol; // Use library crate instead to avoid dead code warnings
 mod state;
 
 use std::path::PathBuf;
@@ -16,6 +25,8 @@ use apm2_core::config::EcosystemConfig;
 use apm2_core::process::ProcessState;
 use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
+use apm2_daemon::protocol; // Import from library
+use apm2_daemon::protocol::socket_manager::{SocketManager, SocketManagerConfig};
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
@@ -42,9 +53,13 @@ struct Args {
     #[arg(long)]
     pid_file: Option<PathBuf>,
 
-    /// Path to Unix socket
+    /// Path to operator Unix socket (mode 0600, privileged operations)
     #[arg(long)]
-    socket: Option<PathBuf>,
+    operator_socket: Option<PathBuf>,
+
+    /// Path to session Unix socket (mode 0660, session-scoped operations)
+    #[arg(long)]
+    session_socket: Option<PathBuf>,
 
     /// Path to state file (reserved; not wired up yet)
     #[arg(long)]
@@ -62,7 +77,8 @@ struct Args {
 /// Daemon configuration derived from args and config file.
 struct DaemonConfig {
     config: EcosystemConfig,
-    socket_path: PathBuf,
+    operator_socket_path: PathBuf,
+    session_socket_path: PathBuf,
     pid_path: PathBuf,
 }
 
@@ -77,10 +93,14 @@ impl DaemonConfig {
         };
 
         // Determine paths (CLI args override config file)
-        let socket_path = args
-            .socket
+        let operator_socket_path = args
+            .operator_socket
             .clone()
-            .unwrap_or_else(|| config.daemon.socket.clone());
+            .unwrap_or_else(|| config.daemon.operator_socket.clone());
+        let session_socket_path = args
+            .session_socket
+            .clone()
+            .unwrap_or_else(|| config.daemon.session_socket.clone());
         let pid_path = args
             .pid_file
             .clone()
@@ -88,7 +108,8 @@ impl DaemonConfig {
 
         Ok(Self {
             config,
-            socket_path,
+            operator_socket_path,
+            session_socket_path,
             pid_path,
         })
     }
@@ -316,10 +337,19 @@ async fn main() -> Result<()> {
     // Write PID file
     write_pid_file(&daemon_config.pid_path)?;
 
+    // Initialize dual-socket manager (TCK-00249)
+    let socket_manager_config = SocketManagerConfig::new(
+        &daemon_config.operator_socket_path,
+        &daemon_config.session_socket_path,
+    );
+    let socket_manager = SocketManager::bind(socket_manager_config)
+        .context("failed to initialize dual-socket manager")?;
+
     info!(
-        "apm2 daemon started (pid: {}, socket: {:?})",
+        "apm2 daemon started (pid: {}, operator_socket: {:?}, session_socket: {:?})",
         std::process::id(),
-        daemon_config.socket_path
+        daemon_config.operator_socket_path,
+        daemon_config.session_socket_path
     );
 
     {
@@ -327,11 +357,13 @@ async fn main() -> Result<()> {
         info!("Managing {} processes", inner.supervisor.process_count());
     }
 
-    // Start IPC server
-    let socket_path = daemon_config.socket_path.clone();
+    // Start dual-socket IPC server (TCK-00249)
+    // This replaces the legacy single-socket JSON IPC
+    let socket_manager = Arc::new(socket_manager);
     let ipc_state = state.clone();
+    let ipc_socket_manager = Arc::clone(&socket_manager);
     let ipc_task = tokio::spawn(async move {
-        if let Err(e) = ipc_server::run(&socket_path, ipc_state).await {
+        if let Err(e) = run_socket_manager_server(ipc_socket_manager, ipc_state).await {
             error!("IPC server error: {}", e);
         }
     });
@@ -368,12 +400,155 @@ async fn main() -> Result<()> {
     info!("Shutting down daemon...");
     shutdown_all_processes(&state).await;
 
-    // Cleanup
-    if daemon_config.socket_path.exists() {
-        let _ = std::fs::remove_file(&daemon_config.socket_path);
+    // Cleanup sockets (SocketManager handles this in Drop, but explicit cleanup is
+    // safer)
+    if let Err(e) = socket_manager.cleanup() {
+        warn!("Failed to cleanup sockets: {e}");
     }
     remove_pid_file(&daemon_config.pid_path);
 
     info!("Daemon shutdown complete");
     Ok(())
+}
+
+/// Run the dual-socket IPC server using `SocketManager` (TCK-00249).
+///
+/// This replaces the legacy single-socket JSON IPC with the new
+/// privilege-separated dual-socket topology defined in RFC-0017.
+async fn run_socket_manager_server(
+    socket_manager: Arc<SocketManager>,
+    state: SharedState,
+) -> Result<()> {
+    info!("Dual-socket IPC server started");
+
+    loop {
+        // Check for shutdown
+        if state.is_shutdown_requested() {
+            info!("Dual-socket IPC server shutting down");
+            break;
+        }
+
+        // Accept connection with timeout to allow shutdown checks
+        let accept_result =
+            tokio::time::timeout(Duration::from_millis(100), socket_manager.accept()).await;
+
+        match accept_result {
+            Ok(Ok((connection, _permit, socket_type))) => {
+                let conn_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        handle_dual_socket_connection(connection, socket_type, conn_state).await
+                    {
+                        warn!("Connection handler error: {e}");
+                    }
+                });
+            },
+            Ok(Err(e)) => {
+                error!("Failed to accept connection: {e}");
+            },
+            Err(_) => {
+                // Timeout, continue to check shutdown
+            },
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle a connection from the dual-socket manager.
+///
+/// Routes requests based on socket type (privilege level).
+async fn handle_dual_socket_connection(
+    mut connection: protocol::server::Connection,
+    socket_type: protocol::socket_manager::SocketType,
+    state: SharedState,
+) -> Result<()> {
+    use apm2_core::ipc::{IpcRequest, IpcResponse};
+    use futures::{SinkExt, StreamExt};
+
+    info!(
+        socket_type = %socket_type,
+        privileged = connection.is_privileged(),
+        "New dual-socket connection"
+    );
+
+    // Upgrade to full frame size after connection is established
+    connection.upgrade_to_full_frame_size()?;
+
+    // Process messages
+    while let Some(frame_result) = connection.framed().next().await {
+        match frame_result {
+            Ok(frame) => {
+                if frame.is_empty() {
+                    // Empty frame signals connection close
+                    break;
+                }
+
+                // Parse the request
+                let request: IpcRequest = match serde_json::from_slice(&frame) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        warn!("Failed to parse request: {e}");
+                        continue;
+                    },
+                };
+
+                // Check privilege level for privileged operations
+                if requires_privilege(&request) && !connection.is_privileged() {
+                    warn!(
+                        "Unprivileged client attempted privileged operation: {:?}",
+                        request
+                    );
+                    let response = IpcResponse::Error {
+                        code: apm2_core::ipc::ErrorCode::InvalidRequest,
+                        message: "operation requires privileged (operator) connection".to_string(),
+                    };
+                    let json: bytes::Bytes = serde_json::to_vec(&response)?.into();
+                    connection.framed().send(json).await?;
+                    continue;
+                }
+
+                // Dispatch to handler
+                let response = handlers::dispatch(request, &state).await;
+
+                // Send response
+                let json: bytes::Bytes = serde_json::to_vec(&response)?.into();
+                connection.framed().send(json).await?;
+            },
+            Err(e) => {
+                warn!("Frame error: {e}");
+                break;
+            },
+        }
+    }
+
+    info!(socket_type = %socket_type, "Connection closed");
+    Ok(())
+}
+
+/// Check if a request requires privileged (operator) access.
+///
+/// TCK-00249: Privileged operations can only be invoked via the operator
+/// socket. Session socket connections are limited to session-scoped operations.
+const fn requires_privilege(request: &apm2_core::ipc::IpcRequest) -> bool {
+    use apm2_core::ipc::IpcRequest;
+    matches!(
+        request,
+        // Process control operations (privileged)
+        IpcRequest::StartProcess { .. }
+            | IpcRequest::StopProcess { .. }
+            | IpcRequest::RestartProcess { .. }
+            | IpcRequest::ReloadProcess { .. }
+            // Credential management (privileged)
+            | IpcRequest::AddCredential { .. }
+            | IpcRequest::RemoveCredential { .. }
+            | IpcRequest::RefreshCredential { .. }
+            | IpcRequest::SwitchCredential { .. }
+            // Episode management (privileged)
+            | IpcRequest::CreateEpisode { .. }
+            | IpcRequest::StartEpisode { .. }
+            | IpcRequest::StopEpisode { .. }
+            // Daemon control (privileged)
+            | IpcRequest::Shutdown
+    )
 }

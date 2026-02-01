@@ -39,6 +39,7 @@ use tracing::{debug, info, warn};
 use super::credentials::PeerCredentials;
 use super::error::{MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, ProtocolError, ProtocolResult};
 use super::framing::FrameCodec;
+use super::socket_manager::SocketType;
 
 /// Default socket filename.
 const DEFAULT_SOCKET_NAME: &str = "apm2d.sock";
@@ -426,12 +427,16 @@ pub struct Connection {
     framed: Framed<UnixStream, FrameCodec>,
     /// Peer credentials (UID/GID/PID) extracted from the socket.
     peer_credentials: Option<PeerCredentials>,
+    /// Socket type (Operator or Session) this connection originated from.
+    /// `None` for legacy single-socket server connections.
+    socket_type: Option<SocketType>,
 }
 
 impl Connection {
     /// Create a new connection from a Unix stream.
     ///
     /// Initializes with [`MAX_HANDSHAKE_FRAME_SIZE`] limit.
+    /// Sets `socket_type` to `None` for legacy single-socket connections.
     fn new(stream: UnixStream, peer_credentials: Option<PeerCredentials>) -> Self {
         Self {
             framed: Framed::new(
@@ -440,10 +445,12 @@ impl Connection {
                     .expect("MAX_HANDSHAKE_FRAME_SIZE must be within protocol limits"),
             ),
             peer_credentials,
+            socket_type: None, // Legacy single-socket connection
         }
     }
 
-    /// Create a new connection from a Unix stream with credentials.
+    /// Create a new connection from a Unix stream with credentials and socket
+    /// type.
     ///
     /// This is used by [`SocketManager`] to create connections for the
     /// dual-socket topology after credentials have been validated.
@@ -459,10 +466,61 @@ impl Connection {
         Self::new(stream, peer_credentials)
     }
 
+    /// Create a new connection with full context (credentials + socket type).
+    ///
+    /// This is used by [`SocketManager`] to create connections for the
+    /// dual-socket topology after credentials have been validated.
+    ///
+    /// Initializes with [`MAX_HANDSHAKE_FRAME_SIZE`] limit.
+    ///
+    /// [`SocketManager`]: super::socket_manager::SocketManager
+    #[must_use]
+    pub fn new_with_socket_type(
+        stream: UnixStream,
+        peer_credentials: Option<PeerCredentials>,
+        socket_type: SocketType,
+    ) -> Self {
+        Self {
+            framed: Framed::new(
+                stream,
+                FrameCodec::with_max_size(MAX_HANDSHAKE_FRAME_SIZE)
+                    .expect("MAX_HANDSHAKE_FRAME_SIZE must be within protocol limits"),
+            ),
+            peer_credentials,
+            socket_type: Some(socket_type),
+        }
+    }
+
     /// Returns the peer credentials associated with this connection.
     #[must_use]
     pub const fn peer_credentials(&self) -> Option<&PeerCredentials> {
         self.peer_credentials.as_ref()
+    }
+
+    /// Returns the socket type this connection originated from.
+    ///
+    /// Returns `None` for legacy single-socket server connections,
+    /// or `Some(SocketType)` for dual-socket connections created by
+    /// [`SocketManager`].
+    ///
+    /// [`SocketManager`]: super::socket_manager::SocketManager
+    #[must_use]
+    pub const fn socket_type(&self) -> Option<SocketType> {
+        self.socket_type
+    }
+
+    /// Returns `true` if this is a privileged (operator) connection.
+    ///
+    /// For dual-socket connections, this checks if the connection came from
+    /// the operator socket. For legacy single-socket connections, this returns
+    /// `true` (maintaining backwards compatibility).
+    #[must_use]
+    pub const fn is_privileged(&self) -> bool {
+        match self.socket_type {
+            Some(SocketType::Session) => false,
+            Some(SocketType::Operator) | None => true, /* Legacy connections are treated as
+                                                        * privileged */
+        }
     }
 
     /// Upgrades the connection to the full protocol frame size.

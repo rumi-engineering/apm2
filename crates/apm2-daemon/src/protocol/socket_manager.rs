@@ -224,6 +224,7 @@ impl SocketManagerConfig {
 /// - [INV-SM-002] Session socket always has mode 0660
 /// - [INV-SM-003] `is_privileged` is determined solely by which socket accepted
 /// - [INV-SM-004] Both sockets share the same parent directory (mode 0700)
+#[derive(Debug)]
 pub struct SocketManager {
     /// Manager configuration.
     config: SocketManagerConfig,
@@ -347,7 +348,7 @@ impl SocketManager {
                 }
                 // Directory exists, do NOT modify its permissions (SEC-FS-001)
                 Ok(())
-            }
+            },
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // Path doesn't exist, create it
                 std::fs::create_dir_all(path).map_err(|e| {
@@ -370,7 +371,7 @@ impl SocketManager {
                     })?;
                 }
                 Ok(())
-            }
+            },
             Err(e) => Err(ProtocolError::Io(io::Error::new(
                 e.kind(),
                 format!("failed to stat {}: {e}", path.display()),
@@ -544,22 +545,22 @@ impl SocketManager {
         // TCK-00249: Privilege Separation Logic
         // - Operator: Strict UID match (Owner only)
         // - Session: UID match (Owner) OR GID match (Group)
-        let current_uid = getuid().as_raw();
-        let current_gid = getgid().as_raw();
+        let owner_uid = getuid().as_raw();
+        let group_gid = getgid().as_raw();
 
         let uid_bytes = creds.uid.to_ne_bytes();
-        let expected_uid_bytes = current_uid.to_ne_bytes();
-        let uid_match = uid_bytes.ct_eq(&expected_uid_bytes).unwrap_u8() == 1;
+        let owner_bytes = owner_uid.to_ne_bytes();
+        let uid_match = uid_bytes.ct_eq(&owner_bytes).unwrap_u8() == 1;
 
         let authorized = match socket_type {
             SocketType::Operator => uid_match,
             SocketType::Session => {
                 let gid_bytes = creds.gid.to_ne_bytes();
-                let expected_gid_bytes = current_gid.to_ne_bytes();
-                let gid_match = gid_bytes.ct_eq(&expected_gid_bytes).unwrap_u8() == 1;
+                let group_bytes = group_gid.to_ne_bytes();
+                let gid_match = gid_bytes.ct_eq(&group_bytes).unwrap_u8() == 1;
 
                 uid_match || gid_match
-            }
+            },
         };
 
         if !authorized {
@@ -577,7 +578,7 @@ impl SocketManager {
             "Accepted new connection"
         );
 
-        let connection = Connection::new_with_credentials(stream, Some(creds));
+        let connection = Connection::new_with_socket_type(stream, Some(creds), socket_type);
         let connection_permit = ConnectionPermit::new(permit);
 
         Ok((connection, connection_permit))
@@ -811,6 +812,55 @@ mod tests {
         assert_eq!(
             preserved_mode, 0o777,
             "Directory permissions should be preserved, got {preserved_mode:04o}"
+        );
+    }
+
+    /// Test that symlinks are rejected as socket directories (RSK-2617).
+    #[tokio::test]
+    async fn test_symlink_directory_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let real_dir = tmp.path().join("real_dir");
+        let symlink_dir = tmp.path().join("symlink_dir");
+
+        // Create real directory and symlink to it
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
+
+        let operator_path = symlink_dir.join("operator.sock");
+        let session_path = symlink_dir.join("session.sock");
+
+        // Attempt to bind should fail due to symlink
+        let config = SocketManagerConfig::new(&operator_path, &session_path);
+        let result = SocketManager::bind(config);
+
+        assert!(result.is_err(), "Should reject symlink directories");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("symlink"),
+            "Error should mention symlink: {err}"
+        );
+    }
+
+    /// Test that new directories are created with 0700 permissions.
+    #[tokio::test]
+    async fn test_new_directory_permissions_0700() {
+        let tmp = TempDir::new().unwrap();
+        let socket_dir = tmp.path().join("new_apm2_dir");
+        let operator_path = socket_dir.join("operator.sock");
+        let session_path = socket_dir.join("session.sock");
+
+        // Directory should not exist
+        assert!(!socket_dir.exists());
+
+        // Bind manager - should create directory with 0700
+        let config = SocketManagerConfig::new(&operator_path, &session_path);
+        let _manager = SocketManager::bind(config).unwrap();
+
+        // Verify directory was created with 0700
+        let mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, DIRECTORY_MODE,
+            "New directory should have 0700 permissions, got {mode:04o}"
         );
     }
 
