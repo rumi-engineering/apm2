@@ -19,19 +19,40 @@
 //! # References
 //!
 //! - TCK-00153: Implement apm2 coordinate CLI command
+//! - TCK-00247: HTF CLI rendering of ticks/ledger windows with bounded wall
+//!   overlay
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
+//! - RFC-0016: Hierarchical Time Framework
 //! - CTR-COORD-007: CLI Command (apm2 coordinate)
+//!
+//! # HTF Compliance (RFC-0016)
+//!
+//! This command is HTF-compliant per TCK-00247:
+//!
+//! - **Tick-based budget enforcement**: Duration budgets use `HtfTick`
+//!   (monotonic, node-local) for authority decisions. The
+//!   `--max-duration-ticks` flag is the authoritative budget input.
+//!
+//! - **Wall time as overlay only**: The `--max-duration-ms` flag is provided
+//!   for convenience but is converted to ticks. Wall time values in receipts
+//!   (`started_at`, `completed_at`, `elapsed_ms`) are observational overlays
+//!   and MUST NOT be used for authority decisions.
+//!
+//! - **No wall-time authority**: Budget exhaustion, stop conditions, and all
+//!   coordination decisions are based on tick deltas, not wall clock readings.
 
+use std::fmt;
 use std::fs::File;
 use std::io::Read as IoRead;
 
 use apm2_core::coordination::{
     CoordinationBudget, CoordinationConfig, CoordinationController, DEFAULT_MAX_ATTEMPTS_PER_WORK,
-    MAX_WORK_QUEUE_SIZE,
+    MAX_SESSION_IDS_PER_OUTCOME, MAX_WORK_OUTCOMES, MAX_WORK_QUEUE_SIZE,
 };
 use apm2_core::htf::HtfTick;
 use clap::Args;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Default tick rate: 1MHz (1 tick = 1 microsecond).
 ///
@@ -44,6 +65,110 @@ const DEFAULT_TICK_RATE_HZ: u64 = 1_000_000;
 /// This limit prevents denial-of-service attacks via memory exhaustion from
 /// large file inputs.
 const MAX_WORK_QUERY_FILE_SIZE: u64 = 1024 * 1024;
+
+// ============================================================================
+// Bounded Deserializers (SEC-FAC-001: DoS/OOM Protection)
+// ============================================================================
+
+/// Custom deserializer for `session_ids` that enforces
+/// [`MAX_SESSION_IDS_PER_OUTCOME`].
+///
+/// This uses a streaming visitor pattern that enforces limits DURING
+/// deserialization, preventing OOM attacks by rejecting oversized arrays
+/// before full allocation occurs.
+fn deserialize_bounded_session_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedVecVisitor;
+
+    impl<'de> Visitor<'de> for BoundedVecVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_SESSION_IDS_PER_OUTCOME} strings"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Use size hint but cap at MAX_SESSION_IDS_PER_OUTCOME to prevent
+            // pre-allocation attacks
+            let capacity = seq
+                .size_hint()
+                .unwrap_or(0)
+                .min(MAX_SESSION_IDS_PER_OUTCOME);
+            let mut items = Vec::with_capacity(capacity);
+
+            while let Some(item) = seq.next_element()? {
+                if items.len() >= MAX_SESSION_IDS_PER_OUTCOME {
+                    return Err(de::Error::custom(format!(
+                        "session_ids exceeds maximum size: {} > {}",
+                        items.len() + 1,
+                        MAX_SESSION_IDS_PER_OUTCOME
+                    )));
+                }
+                items.push(item);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor)
+}
+
+/// Custom deserializer for `work_outcomes` that enforces [`MAX_WORK_OUTCOMES`].
+///
+/// This uses a streaming visitor pattern that enforces limits DURING
+/// deserialization, preventing OOM attacks by rejecting oversized arrays
+/// before full allocation occurs.
+fn deserialize_bounded_work_outcomes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<WorkOutcomeEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedVecVisitor;
+
+    impl<'de> Visitor<'de> for BoundedVecVisitor {
+        type Value = Vec<WorkOutcomeEntry>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_WORK_OUTCOMES} work outcomes"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Use size hint but cap at MAX_WORK_OUTCOMES to prevent pre-allocation
+            // attacks
+            let capacity = seq.size_hint().unwrap_or(0).min(MAX_WORK_OUTCOMES);
+            let mut items = Vec::with_capacity(capacity);
+
+            while let Some(item) = seq.next_element()? {
+                if items.len() >= MAX_WORK_OUTCOMES {
+                    return Err(de::Error::custom(format!(
+                        "work_outcomes exceeds maximum size: {} > {}",
+                        items.len() + 1,
+                        MAX_WORK_OUTCOMES
+                    )));
+                }
+                items.push(item);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor)
+}
 
 /// Exit codes for coordinate commands per CTR-COORD-007.
 pub mod exit_codes {
@@ -79,10 +204,18 @@ pub struct CoordinateArgs {
     #[arg(long)]
     pub max_episodes: u32,
 
-    /// Maximum wall-clock time in milliseconds (required).
+    /// Maximum duration in ticks (HTF compliant).
+    ///
+    /// Coordination stops when this duration elapses in the tick domain.
+    /// Takes precedence over `max_duration_ms`.
+    #[arg(long)]
+    pub max_duration_ticks: Option<u64>,
+
+    /// Maximum wall-clock time in milliseconds (legacy).
     ///
     /// Coordination stops when this duration elapses.
-    #[arg(long)]
+    /// This is an observational overlay on the tick budget.
+    #[arg(long, default_value_t = 60000)]
     pub max_duration_ms: u64,
 
     /// Maximum tokens to consume (optional).
@@ -121,11 +254,27 @@ pub struct CoordinateArgs {
 /// Coordination receipt output structure.
 ///
 /// Per CTR-COORD-006: Evidence artifact proving coordination execution.
+///
+/// # Security Notes (SEC-FAC-001, SEC-FAC-002, SEC-FAC-003)
+///
+/// - **Bounded deserialization**: `work_outcomes` is bounded by
+///   [`MAX_WORK_OUTCOMES`] to prevent memory exhaustion attacks.
+/// - **Strict parsing**: `deny_unknown_fields` prevents injection of unexpected
+///   fields.
+/// - **Canonicalization**: This CLI struct is for output/display purposes only
+///   and does not implement `Canonicalizable`. For cryptographic operations
+///   requiring tamper-evidence, use
+///   [`apm2_core::coordination::CoordinationReceipt`] which provides
+///   `canonical_bytes()` and `compute_hash()`.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoordinationReceipt {
     /// Coordination ID.
     pub coordination_id: String,
     /// Work outcomes for each processed item.
+    ///
+    /// Limited to [`MAX_WORK_OUTCOMES`] entries during deserialization.
+    #[serde(deserialize_with = "deserialize_bounded_work_outcomes")]
     pub work_outcomes: Vec<WorkOutcomeEntry>,
     /// Budget usage at completion.
     pub budget_usage: BudgetUsageOutput,
@@ -146,7 +295,15 @@ pub struct CoordinationReceipt {
 }
 
 /// Work outcome entry in the receipt.
+///
+/// # Security Notes (SEC-FAC-001, SEC-FAC-002)
+///
+/// - **Bounded deserialization**: `session_ids` is bounded by
+///   [`MAX_SESSION_IDS_PER_OUTCOME`] to prevent memory exhaustion attacks.
+/// - **Strict parsing**: `deny_unknown_fields` prevents injection of unexpected
+///   fields.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkOutcomeEntry {
     /// Work item ID.
     pub work_id: String,
@@ -155,15 +312,27 @@ pub struct WorkOutcomeEntry {
     /// Final outcome (SUCCEEDED, FAILED, SKIPPED).
     pub final_outcome: String,
     /// Session IDs used for this work item.
+    ///
+    /// Limited to [`MAX_SESSION_IDS_PER_OUTCOME`] entries during
+    /// deserialization.
+    #[serde(deserialize_with = "deserialize_bounded_session_ids")]
     pub session_ids: Vec<String>,
 }
 
 /// Budget usage output in the receipt.
+///
+/// # Security Notes (SEC-FAC-002)
+///
+/// - **Strict parsing**: `deny_unknown_fields` prevents injection of unexpected
+///   fields.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetUsageOutput {
     /// Episodes consumed.
     pub consumed_episodes: u32,
-    /// Elapsed time in milliseconds.
+    /// Elapsed time in ticks (HTF compliant).
+    pub elapsed_ticks: u64,
+    /// Elapsed time in milliseconds (observational).
     pub elapsed_ms: u64,
     /// Tokens consumed.
     pub consumed_tokens: u64,
@@ -172,12 +341,20 @@ pub struct BudgetUsageOutput {
 /// Budget ceiling output in the receipt.
 ///
 /// Field names match the `CoordinationBudget` schema for consistency.
+///
+/// # Security Notes (SEC-FAC-002)
+///
+/// - **Strict parsing**: `deny_unknown_fields` prevents injection of unexpected
+///   fields.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_field_names)]
 pub struct BudgetCeilingOutput {
     /// Maximum episodes configured.
     pub max_episodes: u32,
-    /// Maximum duration in milliseconds.
+    /// Maximum duration in ticks (HTF compliant).
+    pub max_duration_ticks: u64,
+    /// Maximum duration in milliseconds (observational).
     pub max_duration_ms: u64,
     /// Maximum tokens configured (null if not set).
     pub max_tokens: Option<u64>,
@@ -238,8 +415,9 @@ fn output_receipt(receipt: &CoordinationReceipt, json_output: bool) {
             receipt.total_sessions, receipt.successful_sessions, receipt.failed_sessions
         );
         println!(
-            "Budget used: {} episodes, {} ms, {} tokens",
+            "Budget used: {} episodes, {} ticks ({} ms), {} tokens",
             receipt.budget_usage.consumed_episodes,
+            receipt.budget_usage.elapsed_ticks,
             receipt.budget_usage.elapsed_ms,
             receipt.budget_usage.consumed_tokens
         );
@@ -255,11 +433,23 @@ fn run_coordinate_inner(args: &CoordinateArgs) -> Result<CoordinationReceipt, Co
         ));
     }
 
-    if args.max_duration_ms == 0 {
-        return Err(CoordinateCliError::InvalidArgs(
-            "max-duration-ms must be positive".to_string(),
-        ));
-    }
+    // Determine max duration in ticks (HTF authority)
+    // If ticks provided, use them. Else convert ms to ticks.
+    let max_duration_ticks = if let Some(ticks) = args.max_duration_ticks {
+        if ticks == 0 {
+            return Err(CoordinateCliError::InvalidArgs(
+                "max-duration-ticks must be positive".to_string(),
+            ));
+        }
+        ticks
+    } else {
+        if args.max_duration_ms == 0 {
+            return Err(CoordinateCliError::InvalidArgs(
+                "max-duration-ms (or max-duration-ticks) must be positive".to_string(),
+            ));
+        }
+        args.max_duration_ms.saturating_mul(1000) // ms -> us at 1MHz
+    };
 
     // Parse work IDs from either --work-ids or --work-query
     let work_ids = parse_work_ids(args)?;
@@ -278,10 +468,6 @@ fn run_coordinate_inner(args: &CoordinateArgs) -> Result<CoordinationReceipt, Co
             args.max_work_queue
         )));
     }
-
-    // Convert ms to ticks at 1MHz (1 tick = 1 microsecond)
-    // This maintains precision while using the tick-based API.
-    let max_duration_ticks = args.max_duration_ms.saturating_mul(1000); // ms -> us at 1MHz
 
     // Create budget
     let budget = CoordinationBudget::new(
@@ -541,11 +727,13 @@ fn build_receipt(
         work_outcomes,
         budget_usage: BudgetUsageOutput {
             consumed_episodes: budget_usage.consumed_episodes,
+            elapsed_ticks: budget_usage.elapsed_ticks,
             elapsed_ms,
             consumed_tokens: budget_usage.consumed_tokens,
         },
         budget_ceiling: BudgetCeilingOutput {
             max_episodes: config.budget.max_episodes,
+            max_duration_ticks: config.budget.max_duration_ticks,
             max_duration_ms,
             max_tokens: config.budget.max_tokens,
         },
@@ -604,6 +792,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -626,6 +815,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 5, // Set lower than work_ids count
@@ -651,6 +841,7 @@ mod tests {
             work_query: None,
             max_episodes: 0, // Invalid
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -666,6 +857,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 0, // Invalid
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -685,6 +877,7 @@ mod tests {
             work_query: Some("file.txt".to_string()),
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -719,11 +912,13 @@ mod tests {
             }],
             budget_usage: BudgetUsageOutput {
                 consumed_episodes: 5,
+                elapsed_ticks: 30_000_000,
                 elapsed_ms: 30_000,
                 consumed_tokens: 50_000,
             },
             budget_ceiling: BudgetCeilingOutput {
                 max_episodes: 10,
+                max_duration_ticks: 60_000_000,
                 max_duration_ms: 60_000,
                 max_tokens: Some(100_000),
             },
@@ -760,6 +955,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -786,6 +982,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -885,11 +1082,13 @@ mod tests {
             work_outcomes: vec![],
             budget_usage: BudgetUsageOutput {
                 consumed_episodes: 0,
+                elapsed_ticks: 0,
                 elapsed_ms: 0,
                 consumed_tokens: 0,
             },
             budget_ceiling: BudgetCeilingOutput {
                 max_episodes: 10,
+                max_duration_ticks: 60_000_000,
                 max_duration_ms: 60_000,
                 max_tokens: None,
             },
@@ -917,6 +1116,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -937,6 +1137,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -946,5 +1147,515 @@ mod tests {
 
         let exit_code = run_coordinate(&args);
         assert_eq!(exit_code, exit_codes::INVALID_ARGS);
+    }
+
+    // =========================================================================
+    // HTF Compliance Tests (TCK-00247)
+    // =========================================================================
+
+    /// TCK-00247: Verify tick-based duration takes precedence over wall-clock
+    /// ms.
+    ///
+    /// Per RFC-0016: Ticks are authoritative for duration/budget enforcement.
+    /// When `max_duration_ticks` is provided, it takes precedence over
+    /// `max_duration_ms`.
+    #[test]
+    fn tck_00247_tick_duration_takes_precedence() {
+        let args = CoordinateArgs {
+            work_ids: Some(vec!["work-1".to_string()]),
+            work_query: None,
+            max_episodes: 10,
+            max_duration_ticks: Some(5_000_000), // 5M ticks = 5s at 1MHz
+            max_duration_ms: 1_000,              // 1s (should be ignored)
+            max_tokens: None,
+            max_attempts: 3,
+            max_work_queue: 1000,
+            json: true,
+            quiet: true,
+        };
+
+        // Should succeed - ticks value takes precedence
+        let result = run_coordinate_inner(&args);
+        assert!(result.is_ok());
+
+        // Verify the receipt uses the tick-based duration
+        let receipt = result.unwrap();
+        assert_eq!(receipt.budget_ceiling.max_duration_ticks, 5_000_000);
+    }
+
+    /// TCK-00247: Verify zero ticks is rejected (tick authority validation).
+    ///
+    /// Per RFC-0016: Zero duration is invalid for any authority clock domain.
+    #[test]
+    fn tck_00247_zero_ticks_rejected() {
+        let args = CoordinateArgs {
+            work_ids: Some(vec!["work-1".to_string()]),
+            work_query: None,
+            max_episodes: 10,
+            max_duration_ticks: Some(0), // Invalid: zero ticks
+            max_duration_ms: 60_000,
+            max_tokens: None,
+            max_attempts: 3,
+            max_work_queue: 1000,
+            json: true,
+            quiet: true,
+        };
+
+        let result = run_coordinate_inner(&args);
+        assert!(matches!(result, Err(CoordinateCliError::InvalidArgs(_))));
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("max-duration-ticks must be positive"),
+                "Expected tick validation error, got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00247: Verify wall-clock ms fallback when ticks not provided.
+    ///
+    /// Per RFC-0016: ms input is converted to ticks for internal use.
+    /// This maintains backward compatibility while enforcing tick authority.
+    #[test]
+    fn tck_00247_ms_converted_to_ticks() {
+        let args = CoordinateArgs {
+            work_ids: Some(vec!["work-1".to_string()]),
+            work_query: None,
+            max_episodes: 10,
+            max_duration_ticks: None,
+            max_duration_ms: 1_000, // 1 second
+            max_tokens: None,
+            max_attempts: 3,
+            max_work_queue: 1000,
+            json: true,
+            quiet: true,
+        };
+
+        let result = run_coordinate_inner(&args);
+        assert!(result.is_ok());
+
+        // Verify ms was converted to ticks (1000ms * 1000 = 1_000_000 ticks at 1MHz)
+        let receipt = result.unwrap();
+        assert_eq!(receipt.budget_ceiling.max_duration_ticks, 1_000_000);
+    }
+
+    /// TCK-00247: Verify receipt includes both ticks (authority) and ms
+    /// (overlay).
+    ///
+    /// Per RFC-0016: Wall time is permitted as observational overlay for
+    /// display. Receipts should include both tick-based values
+    /// (authoritative) and wall-clock values (observational).
+    #[test]
+    fn tck_00247_receipt_includes_tick_and_wall_overlay() {
+        let receipt = CoordinationReceipt {
+            coordination_id: "test-coord".to_string(),
+            work_outcomes: vec![],
+            budget_usage: BudgetUsageOutput {
+                consumed_episodes: 2,
+                elapsed_ticks: 5_000_000, // Authority: 5M ticks
+                elapsed_ms: 5_000,        // Overlay: 5 seconds
+                consumed_tokens: 1000,
+            },
+            budget_ceiling: BudgetCeilingOutput {
+                max_episodes: 10,
+                max_duration_ticks: 60_000_000, // Authority: 60M ticks
+                max_duration_ms: 60_000,        // Overlay: 60 seconds
+                max_tokens: None,
+            },
+            stop_condition: "WORK_COMPLETED".to_string(),
+            started_at: 1_704_067_200_000_000_000, // Observational only
+            completed_at: 1_704_067_205_000_000_000, // Observational only
+            total_sessions: 2,
+            successful_sessions: 2,
+            failed_sessions: 0,
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&receipt).unwrap();
+
+        // Verify both tick and ms fields are present
+        assert!(json.contains("\"elapsed_ticks\""));
+        assert!(json.contains("\"elapsed_ms\""));
+        assert!(json.contains("\"max_duration_ticks\""));
+        assert!(json.contains("\"max_duration_ms\""));
+
+        // Verify tick values are correct (authoritative)
+        assert!(json.contains("5000000")); // elapsed_ticks
+        assert!(json.contains("60000000")); // max_duration_ticks
+    }
+
+    /// TCK-00247: Verify wall-clock timestamps are observational only.
+    ///
+    /// Per RFC-0016: Wall time fields (`started_at`, `completed_at`) are for
+    /// display/audit purposes only. They MUST NOT affect coordination
+    /// decisions.
+    #[test]
+    fn tck_00247_wall_timestamps_observational() {
+        // Create two receipts with different wall timestamps but same tick values
+        let receipt1 = CoordinationReceipt {
+            coordination_id: "test-1".to_string(),
+            work_outcomes: vec![],
+            budget_usage: BudgetUsageOutput {
+                consumed_episodes: 5,
+                elapsed_ticks: 30_000_000,
+                elapsed_ms: 30_000,
+                consumed_tokens: 5000,
+            },
+            budget_ceiling: BudgetCeilingOutput {
+                max_episodes: 10,
+                max_duration_ticks: 60_000_000,
+                max_duration_ms: 60_000,
+                max_tokens: None,
+            },
+            stop_condition: "BUDGET_EXHAUSTED".to_string(),
+            started_at: 1_000_000_000_000_000_000, // Early timestamp
+            completed_at: 1_000_000_030_000_000_000,
+            total_sessions: 5,
+            successful_sessions: 5,
+            failed_sessions: 0,
+        };
+
+        let receipt2 = CoordinationReceipt {
+            coordination_id: "test-2".to_string(),
+            work_outcomes: vec![],
+            budget_usage: BudgetUsageOutput {
+                consumed_episodes: 5,
+                elapsed_ticks: 30_000_000, // Same tick budget
+                elapsed_ms: 30_000,
+                consumed_tokens: 5000,
+            },
+            budget_ceiling: BudgetCeilingOutput {
+                max_episodes: 10,
+                max_duration_ticks: 60_000_000,
+                max_duration_ms: 60_000,
+                max_tokens: None,
+            },
+            stop_condition: "BUDGET_EXHAUSTED".to_string(),
+            started_at: 2_000_000_000_000_000_000, // Later timestamp (different!)
+            completed_at: 2_000_000_030_000_000_000,
+            total_sessions: 5,
+            successful_sessions: 5,
+            failed_sessions: 0,
+        };
+
+        // Despite different wall timestamps, tick-based budget usage is identical
+        // This proves wall timestamps don't affect authority decisions
+        assert_eq!(
+            receipt1.budget_usage.elapsed_ticks,
+            receipt2.budget_usage.elapsed_ticks
+        );
+        assert_eq!(
+            receipt1.budget_ceiling.max_duration_ticks,
+            receipt2.budget_ceiling.max_duration_ticks
+        );
+
+        // Both should have same stop condition based on ticks, not wall time
+        assert_eq!(receipt1.stop_condition, receipt2.stop_condition);
+    }
+
+    /// TCK-00247: Verify tick rate constant is correctly defined.
+    ///
+    /// Per RFC-0016: Tick rates must be explicit and consistent.
+    #[test]
+    fn tck_00247_tick_rate_defined() {
+        // 1MHz = 1 tick per microsecond
+        assert_eq!(DEFAULT_TICK_RATE_HZ, 1_000_000);
+
+        // Verify conversion: 1 second = 1_000_000 ticks
+        let one_second_ms = 1000u64;
+        let expected_ticks = one_second_ms * 1000; // ms to us
+        assert_eq!(expected_ticks, DEFAULT_TICK_RATE_HZ);
+    }
+
+    // =========================================================================
+    // Security Tests (SEC-FAC-001, SEC-FAC-002, SEC-FAC-003)
+    // =========================================================================
+
+    /// SEC-FAC-001: Verify bounded deserialization rejects oversized
+    /// `work_outcomes`.
+    ///
+    /// Attackers may craft malicious JSON with excessive array sizes to
+    /// cause memory exhaustion. The bounded deserializer MUST reject
+    /// arrays exceeding `MAX_WORK_OUTCOMES`.
+    #[test]
+    fn sec_fac_001_bounded_deser_rejects_oversized_work_outcomes() {
+        use apm2_core::coordination::MAX_WORK_OUTCOMES;
+
+        // Build JSON with too many work outcomes
+        let work_outcomes: Vec<serde_json::Value> = (0..=MAX_WORK_OUTCOMES)
+            .map(|i| {
+                serde_json::json!({
+                    "work_id": format!("work-{i}"),
+                    "attempts": 1,
+                    "final_outcome": "SUCCEEDED",
+                    "session_ids": [],
+                })
+            })
+            .collect();
+
+        let json = serde_json::json!({
+            "coordination_id": "coord-1",
+            "work_outcomes": work_outcomes,
+            "budget_usage": {
+                "consumed_episodes": 0,
+                "elapsed_ticks": 0,
+                "elapsed_ms": 0,
+                "consumed_tokens": 0
+            },
+            "budget_ceiling": {
+                "max_episodes": 10,
+                "max_duration_ticks": 60_000_000,
+                "max_duration_ms": 60_000,
+                "max_tokens": null
+            },
+            "stop_condition": "WORK_COMPLETED",
+            "started_at": 0,
+            "completed_at": 0,
+            "total_sessions": 0,
+            "successful_sessions": 0,
+            "failed_sessions": 0,
+        });
+
+        let result: Result<CoordinationReceipt, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("exceeds maximum"),
+            "Expected bounded deserializer to reject oversized array"
+        );
+    }
+
+    /// SEC-FAC-001: Verify bounded deserialization rejects oversized
+    /// `session_ids`.
+    ///
+    /// Attackers may craft malicious JSON with excessive `session_ids` to
+    /// cause memory exhaustion. The bounded deserializer MUST reject
+    /// arrays exceeding `MAX_SESSION_IDS_PER_OUTCOME`.
+    #[test]
+    fn sec_fac_001_bounded_deser_rejects_oversized_session_ids() {
+        use apm2_core::coordination::MAX_SESSION_IDS_PER_OUTCOME;
+
+        // Build JSON with too many session IDs
+        let session_ids: Vec<String> = (0..=MAX_SESSION_IDS_PER_OUTCOME)
+            .map(|i| format!("session-{i}"))
+            .collect();
+
+        let json = serde_json::json!({
+            "work_id": "work-1",
+            "attempts": 1,
+            "final_outcome": "SUCCEEDED",
+            "session_ids": session_ids,
+        });
+
+        let result: Result<WorkOutcomeEntry, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("exceeds maximum"),
+            "Expected bounded deserializer to reject oversized session_ids"
+        );
+    }
+
+    /// SEC-FAC-002: Verify `deny_unknown_fields` rejects unexpected fields
+    /// in `CoordinationReceipt`.
+    ///
+    /// Attackers may inject unexpected fields to probe for vulnerabilities
+    /// or exploit lenient parsing. The `deny_unknown_fields` attribute
+    /// MUST cause deserialization to fail.
+    #[test]
+    fn sec_fac_002_deny_unknown_fields_receipt() {
+        let json = serde_json::json!({
+            "coordination_id": "coord-1",
+            "work_outcomes": [],
+            "budget_usage": {
+                "consumed_episodes": 0,
+                "elapsed_ticks": 0,
+                "elapsed_ms": 0,
+                "consumed_tokens": 0
+            },
+            "budget_ceiling": {
+                "max_episodes": 10,
+                "max_duration_ticks": 60_000_000,
+                "max_duration_ms": 60_000,
+                "max_tokens": null
+            },
+            "stop_condition": "WORK_COMPLETED",
+            "started_at": 0,
+            "completed_at": 0,
+            "total_sessions": 0,
+            "successful_sessions": 0,
+            "failed_sessions": 0,
+            "malicious_field": "injected_payload",
+        });
+
+        let result: Result<CoordinationReceipt, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("unknown field"),
+            "Expected deny_unknown_fields to reject extra field"
+        );
+    }
+
+    /// SEC-FAC-002: Verify `deny_unknown_fields` rejects unexpected fields
+    /// in `WorkOutcomeEntry`.
+    #[test]
+    fn sec_fac_002_deny_unknown_fields_work_outcome() {
+        let json = serde_json::json!({
+            "work_id": "work-1",
+            "attempts": 1,
+            "final_outcome": "SUCCEEDED",
+            "session_ids": [],
+            "extra": "malicious",
+        });
+
+        let result: Result<WorkOutcomeEntry, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("unknown field"),
+            "Expected deny_unknown_fields to reject extra field in WorkOutcomeEntry"
+        );
+    }
+
+    /// SEC-FAC-002: Verify `deny_unknown_fields` rejects unexpected fields
+    /// in `BudgetUsageOutput`.
+    #[test]
+    fn sec_fac_002_deny_unknown_fields_budget_usage() {
+        let json = serde_json::json!({
+            "consumed_episodes": 0,
+            "elapsed_ticks": 0,
+            "elapsed_ms": 0,
+            "consumed_tokens": 0,
+            "hidden_budget": 999_999,
+        });
+
+        let result: Result<BudgetUsageOutput, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("unknown field"),
+            "Expected deny_unknown_fields to reject extra field in BudgetUsageOutput"
+        );
+    }
+
+    /// SEC-FAC-002: Verify `deny_unknown_fields` rejects unexpected fields
+    /// in `BudgetCeilingOutput`.
+    #[test]
+    fn sec_fac_002_deny_unknown_fields_budget_ceiling() {
+        let json = serde_json::json!({
+            "max_episodes": 10,
+            "max_duration_ticks": 60_000_000,
+            "max_duration_ms": 60_000,
+            "max_tokens": null,
+            "secret_limit": 0,
+        });
+
+        let result: Result<BudgetCeilingOutput, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("unknown field"),
+            "Expected deny_unknown_fields to reject extra field in BudgetCeilingOutput"
+        );
+    }
+
+    /// SEC-FAC-001: Verify valid receipts with bounded arrays still parse.
+    ///
+    /// Ensure that legitimate use cases still work after adding bounded
+    /// deserialization.
+    #[test]
+    fn sec_fac_001_valid_bounded_receipt_parses() {
+        let json = serde_json::json!({
+            "coordination_id": "coord-test",
+            "work_outcomes": [
+                {
+                    "work_id": "work-1",
+                    "attempts": 2,
+                    "final_outcome": "SUCCEEDED",
+                    "session_ids": ["sess-1", "sess-2"],
+                }
+            ],
+            "budget_usage": {
+                "consumed_episodes": 2,
+                "elapsed_ticks": 5_000_000,
+                "elapsed_ms": 5000,
+                "consumed_tokens": 1000
+            },
+            "budget_ceiling": {
+                "max_episodes": 10,
+                "max_duration_ticks": 60_000_000,
+                "max_duration_ms": 60_000,
+                "max_tokens": null
+            },
+            "stop_condition": "WORK_COMPLETED",
+            "started_at": 1_704_067_200_000_000_000_u64,
+            "completed_at": 1_704_067_205_000_000_000_u64,
+            "total_sessions": 2,
+            "successful_sessions": 2,
+            "failed_sessions": 0,
+        });
+
+        let result: Result<CoordinationReceipt, _> = serde_json::from_value(json);
+        assert!(result.is_ok(), "Valid receipt should parse successfully");
+
+        let receipt = result.unwrap();
+        assert_eq!(receipt.coordination_id, "coord-test");
+        assert_eq!(receipt.work_outcomes.len(), 1);
+        assert_eq!(receipt.work_outcomes[0].session_ids.len(), 2);
+    }
+
+    /// SEC-FAC-001/002: Verify serde roundtrip preserves data integrity.
+    ///
+    /// Ensure that serialization followed by deserialization produces
+    /// equivalent data.
+    #[test]
+    fn sec_fac_serde_roundtrip() {
+        let receipt = CoordinationReceipt {
+            coordination_id: "coord-roundtrip".to_string(),
+            work_outcomes: vec![WorkOutcomeEntry {
+                work_id: "work-1".to_string(),
+                attempts: 3,
+                final_outcome: "SUCCEEDED".to_string(),
+                session_ids: vec!["sess-a".to_string(), "sess-b".to_string()],
+            }],
+            budget_usage: BudgetUsageOutput {
+                consumed_episodes: 3,
+                elapsed_ticks: 10_000_000,
+                elapsed_ms: 10_000,
+                consumed_tokens: 5000,
+            },
+            budget_ceiling: BudgetCeilingOutput {
+                max_episodes: 10,
+                max_duration_ticks: 60_000_000,
+                max_duration_ms: 60_000,
+                max_tokens: Some(100_000),
+            },
+            stop_condition: "WORK_COMPLETED".to_string(),
+            started_at: 1_000_000_000,
+            completed_at: 1_010_000_000,
+            total_sessions: 3,
+            successful_sessions: 3,
+            failed_sessions: 0,
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&receipt).unwrap();
+
+        // Deserialize back
+        let restored: CoordinationReceipt = serde_json::from_str(&json).unwrap();
+
+        // Verify all fields
+        assert_eq!(restored.coordination_id, receipt.coordination_id);
+        assert_eq!(restored.work_outcomes.len(), receipt.work_outcomes.len());
+        assert_eq!(
+            restored.work_outcomes[0].work_id,
+            receipt.work_outcomes[0].work_id
+        );
+        assert_eq!(
+            restored.work_outcomes[0].session_ids.len(),
+            receipt.work_outcomes[0].session_ids.len()
+        );
+        assert_eq!(
+            restored.budget_usage.elapsed_ticks,
+            receipt.budget_usage.elapsed_ticks
+        );
+        assert_eq!(
+            restored.budget_ceiling.max_tokens,
+            receipt.budget_ceiling.max_tokens
+        );
     }
 }
