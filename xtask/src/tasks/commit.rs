@@ -181,6 +181,7 @@ fn run_doc_lint_check() -> Result<()> {
     let lint_args = LintArgs {
         fix: false,
         include_docs: true,
+        include_htf: false,
     };
 
     // Use the shared scan_workspace function to get findings
