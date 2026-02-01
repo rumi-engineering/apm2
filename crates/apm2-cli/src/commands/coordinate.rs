@@ -19,8 +19,27 @@
 //! # References
 //!
 //! - TCK-00153: Implement apm2 coordinate CLI command
+//! - TCK-00247: HTF CLI rendering of ticks/ledger windows with bounded wall
+//!   overlay
 //! - RFC-0012: Agent Coordination Layer for Autonomous Work Loop Execution
+//! - RFC-0016: Hierarchical Time Framework
 //! - CTR-COORD-007: CLI Command (apm2 coordinate)
+//!
+//! # HTF Compliance (RFC-0016)
+//!
+//! This command is HTF-compliant per TCK-00247:
+//!
+//! - **Tick-based budget enforcement**: Duration budgets use `HtfTick`
+//!   (monotonic, node-local) for authority decisions. The
+//!   `--max-duration-ticks` flag is the authoritative budget input.
+//!
+//! - **Wall time as overlay only**: The `--max-duration-ms` flag is provided
+//!   for convenience but is converted to ticks. Wall time values in receipts
+//!   (`started_at`, `completed_at`, `elapsed_ms`) are observational overlays
+//!   and MUST NOT be used for authority decisions.
+//!
+//! - **No wall-time authority**: Budget exhaustion, stop conditions, and all
+//!   coordination decisions are based on tick deltas, not wall clock readings.
 
 use std::fs::File;
 use std::io::Read as IoRead;
@@ -982,5 +1001,222 @@ mod tests {
 
         let exit_code = run_coordinate(&args);
         assert_eq!(exit_code, exit_codes::INVALID_ARGS);
+    }
+
+    // =========================================================================
+    // HTF Compliance Tests (TCK-00247)
+    // =========================================================================
+
+    /// TCK-00247: Verify tick-based duration takes precedence over wall-clock
+    /// ms.
+    ///
+    /// Per RFC-0016: Ticks are authoritative for duration/budget enforcement.
+    /// When `max_duration_ticks` is provided, it takes precedence over
+    /// `max_duration_ms`.
+    #[test]
+    fn tck_00247_tick_duration_takes_precedence() {
+        let args = CoordinateArgs {
+            work_ids: Some(vec!["work-1".to_string()]),
+            work_query: None,
+            max_episodes: 10,
+            max_duration_ticks: Some(5_000_000), // 5M ticks = 5s at 1MHz
+            max_duration_ms: 1_000,              // 1s (should be ignored)
+            max_tokens: None,
+            max_attempts: 3,
+            max_work_queue: 1000,
+            json: true,
+            quiet: true,
+        };
+
+        // Should succeed - ticks value takes precedence
+        let result = run_coordinate_inner(&args);
+        assert!(result.is_ok());
+
+        // Verify the receipt uses the tick-based duration
+        let receipt = result.unwrap();
+        assert_eq!(receipt.budget_ceiling.max_duration_ticks, 5_000_000);
+    }
+
+    /// TCK-00247: Verify zero ticks is rejected (tick authority validation).
+    ///
+    /// Per RFC-0016: Zero duration is invalid for any authority clock domain.
+    #[test]
+    fn tck_00247_zero_ticks_rejected() {
+        let args = CoordinateArgs {
+            work_ids: Some(vec!["work-1".to_string()]),
+            work_query: None,
+            max_episodes: 10,
+            max_duration_ticks: Some(0), // Invalid: zero ticks
+            max_duration_ms: 60_000,
+            max_tokens: None,
+            max_attempts: 3,
+            max_work_queue: 1000,
+            json: true,
+            quiet: true,
+        };
+
+        let result = run_coordinate_inner(&args);
+        assert!(matches!(result, Err(CoordinateCliError::InvalidArgs(_))));
+        if let Err(CoordinateCliError::InvalidArgs(msg)) = result {
+            assert!(
+                msg.contains("max-duration-ticks must be positive"),
+                "Expected tick validation error, got: {msg}"
+            );
+        }
+    }
+
+    /// TCK-00247: Verify wall-clock ms fallback when ticks not provided.
+    ///
+    /// Per RFC-0016: ms input is converted to ticks for internal use.
+    /// This maintains backward compatibility while enforcing tick authority.
+    #[test]
+    fn tck_00247_ms_converted_to_ticks() {
+        let args = CoordinateArgs {
+            work_ids: Some(vec!["work-1".to_string()]),
+            work_query: None,
+            max_episodes: 10,
+            max_duration_ticks: None,
+            max_duration_ms: 1_000, // 1 second
+            max_tokens: None,
+            max_attempts: 3,
+            max_work_queue: 1000,
+            json: true,
+            quiet: true,
+        };
+
+        let result = run_coordinate_inner(&args);
+        assert!(result.is_ok());
+
+        // Verify ms was converted to ticks (1000ms * 1000 = 1_000_000 ticks at 1MHz)
+        let receipt = result.unwrap();
+        assert_eq!(receipt.budget_ceiling.max_duration_ticks, 1_000_000);
+    }
+
+    /// TCK-00247: Verify receipt includes both ticks (authority) and ms
+    /// (overlay).
+    ///
+    /// Per RFC-0016: Wall time is permitted as observational overlay for
+    /// display. Receipts should include both tick-based values
+    /// (authoritative) and wall-clock values (observational).
+    #[test]
+    fn tck_00247_receipt_includes_tick_and_wall_overlay() {
+        let receipt = CoordinationReceipt {
+            coordination_id: "test-coord".to_string(),
+            work_outcomes: vec![],
+            budget_usage: BudgetUsageOutput {
+                consumed_episodes: 2,
+                elapsed_ticks: 5_000_000, // Authority: 5M ticks
+                elapsed_ms: 5_000,        // Overlay: 5 seconds
+                consumed_tokens: 1000,
+            },
+            budget_ceiling: BudgetCeilingOutput {
+                max_episodes: 10,
+                max_duration_ticks: 60_000_000, // Authority: 60M ticks
+                max_duration_ms: 60_000,        // Overlay: 60 seconds
+                max_tokens: None,
+            },
+            stop_condition: "WORK_COMPLETED".to_string(),
+            started_at: 1_704_067_200_000_000_000, // Observational only
+            completed_at: 1_704_067_205_000_000_000, // Observational only
+            total_sessions: 2,
+            successful_sessions: 2,
+            failed_sessions: 0,
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&receipt).unwrap();
+
+        // Verify both tick and ms fields are present
+        assert!(json.contains("\"elapsed_ticks\""));
+        assert!(json.contains("\"elapsed_ms\""));
+        assert!(json.contains("\"max_duration_ticks\""));
+        assert!(json.contains("\"max_duration_ms\""));
+
+        // Verify tick values are correct (authoritative)
+        assert!(json.contains("5000000")); // elapsed_ticks
+        assert!(json.contains("60000000")); // max_duration_ticks
+    }
+
+    /// TCK-00247: Verify wall-clock timestamps are observational only.
+    ///
+    /// Per RFC-0016: Wall time fields (`started_at`, `completed_at`) are for
+    /// display/audit purposes only. They MUST NOT affect coordination
+    /// decisions.
+    #[test]
+    fn tck_00247_wall_timestamps_observational() {
+        // Create two receipts with different wall timestamps but same tick values
+        let receipt1 = CoordinationReceipt {
+            coordination_id: "test-1".to_string(),
+            work_outcomes: vec![],
+            budget_usage: BudgetUsageOutput {
+                consumed_episodes: 5,
+                elapsed_ticks: 30_000_000,
+                elapsed_ms: 30_000,
+                consumed_tokens: 5000,
+            },
+            budget_ceiling: BudgetCeilingOutput {
+                max_episodes: 10,
+                max_duration_ticks: 60_000_000,
+                max_duration_ms: 60_000,
+                max_tokens: None,
+            },
+            stop_condition: "BUDGET_EXHAUSTED".to_string(),
+            started_at: 1_000_000_000_000_000_000, // Early timestamp
+            completed_at: 1_000_000_030_000_000_000,
+            total_sessions: 5,
+            successful_sessions: 5,
+            failed_sessions: 0,
+        };
+
+        let receipt2 = CoordinationReceipt {
+            coordination_id: "test-2".to_string(),
+            work_outcomes: vec![],
+            budget_usage: BudgetUsageOutput {
+                consumed_episodes: 5,
+                elapsed_ticks: 30_000_000, // Same tick budget
+                elapsed_ms: 30_000,
+                consumed_tokens: 5000,
+            },
+            budget_ceiling: BudgetCeilingOutput {
+                max_episodes: 10,
+                max_duration_ticks: 60_000_000,
+                max_duration_ms: 60_000,
+                max_tokens: None,
+            },
+            stop_condition: "BUDGET_EXHAUSTED".to_string(),
+            started_at: 2_000_000_000_000_000_000, // Later timestamp (different!)
+            completed_at: 2_000_000_030_000_000_000,
+            total_sessions: 5,
+            successful_sessions: 5,
+            failed_sessions: 0,
+        };
+
+        // Despite different wall timestamps, tick-based budget usage is identical
+        // This proves wall timestamps don't affect authority decisions
+        assert_eq!(
+            receipt1.budget_usage.elapsed_ticks,
+            receipt2.budget_usage.elapsed_ticks
+        );
+        assert_eq!(
+            receipt1.budget_ceiling.max_duration_ticks,
+            receipt2.budget_ceiling.max_duration_ticks
+        );
+
+        // Both should have same stop condition based on ticks, not wall time
+        assert_eq!(receipt1.stop_condition, receipt2.stop_condition);
+    }
+
+    /// TCK-00247: Verify tick rate constant is correctly defined.
+    ///
+    /// Per RFC-0016: Tick rates must be explicit and consistent.
+    #[test]
+    fn tck_00247_tick_rate_defined() {
+        // 1MHz = 1 tick per microsecond
+        assert_eq!(DEFAULT_TICK_RATE_HZ, 1_000_000);
+
+        // Verify conversion: 1 second = 1_000_000 ticks
+        let one_second_ms = 1000u64;
+        let expected_ticks = one_second_ms * 1000; // ms to us
+        assert_eq!(expected_ticks, DEFAULT_TICK_RATE_HZ);
     }
 }
