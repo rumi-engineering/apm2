@@ -573,8 +573,8 @@ pub mod helpers {
 
     /// Creates a `SessionQuarantined` event payload (legacy, wall-clock only).
     ///
-    /// **DEPRECATED**: Use [`session_quarantined_payload_with_ticks`] for RFC-0016 HTF
-    /// compliant quarantine events with tick-based timing.
+    /// **DEPRECATED**: Use [`session_quarantined_payload_with_ticks`] for
+    /// RFC-0016 HTF compliant quarantine events with tick-based timing.
     #[must_use]
     #[deprecated(
         since = "0.4.0",
@@ -601,7 +601,8 @@ pub mod helpers {
         event.encode_to_vec()
     }
 
-    /// Creates a `SessionQuarantined` event payload with tick-based timing (RFC-0016 HTF).
+    /// Creates a `SessionQuarantined` event payload with tick-based timing
+    /// (RFC-0016 HTF).
     ///
     /// This is the preferred method for creating quarantine events as it uses
     /// monotonic ticks that are immune to wall-clock manipulation.
@@ -898,8 +899,14 @@ mod unit_tests {
         reducer.apply(&start_event, &ctx).unwrap();
 
         // Quarantine session
-        let quar_payload =
-            helpers::session_quarantined_payload("session-1", "policy violation", 3_000_000_000);
+        let quar_payload = helpers::session_quarantined_payload_with_ticks(
+            "session-1",
+            "policy violation",
+            3_000_000_000,
+            2000, // issued_at_tick
+            3000, // expires_at_tick (1 second at 1000 Hz)
+            1000, // tick_rate_hz
+        );
         let mut quar_event = create_event("session.quarantined", "session-1", quar_payload);
         quar_event.timestamp_ns = 2_000_000_000;
         reducer.apply(&quar_event, &ctx).unwrap();
@@ -1227,8 +1234,14 @@ mod unit_tests {
         reducer.apply(&term_event, &ctx).unwrap();
 
         // Quarantine session-2
-        let quar_payload =
-            helpers::session_quarantined_payload("session-2", "violation", 9_000_000_000);
+        let quar_payload = helpers::session_quarantined_payload_with_ticks(
+            "session-2",
+            "violation",
+            9_000_000_000,
+            5000, // issued_at_tick
+            8000, // expires_at_tick (3 seconds at 1000 Hz)
+            1000, // tick_rate_hz
+        );
         let quar_event = create_event("session.quarantined", "session-2", quar_payload);
         reducer.apply(&quar_event, &ctx).unwrap();
 
@@ -1824,10 +1837,13 @@ mod unit_tests {
         reducer.apply(&start_event, &ctx).unwrap();
 
         // Quarantine the session
-        let quar_payload = helpers::session_quarantined_payload(
+        let quar_payload = helpers::session_quarantined_payload_with_ticks(
             "session-1",
             "excessive_policy_violations",
             5_000_000_000,
+            0,    // issued_at_tick
+            5000, // expires_at_tick (5 seconds at 1000 Hz)
+            1000, // tick_rate_hz
         );
         let quar_event = create_event("session.quarantined", "session-1", quar_payload);
         reducer.apply(&quar_event, &ctx).unwrap();

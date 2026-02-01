@@ -180,7 +180,8 @@ impl RestartCoordinator {
     /// Determines whether a crashed session should be restarted, with
     /// quarantine support.
     ///
-    /// **DEPRECATED**: Use [`RestartCoordinator::should_restart_with_quarantine_tick`]
+    /// **DEPRECATED**: Use
+    /// [`RestartCoordinator::should_restart_with_quarantine_tick`]
     /// for RFC-0016 HTF compliant quarantine timing.
     ///
     /// This method uses wall-clock timestamps which can be manipulated.
@@ -317,23 +318,17 @@ impl RestartCoordinator {
                 .map_or_else(
                     || {
                         // Legacy: wall-clock only
-                        let duration =
-                            quarantine_manager.calculate_duration(previous_quarantines);
-                        let until =
-                            QuarantineManager::quarantine_until(current_time_ns, duration);
+                        let duration = quarantine_manager.calculate_duration(previous_quarantines);
+                        let until = QuarantineManager::quarantine_until(current_time_ns, duration);
                         (until, None)
                     },
                     |duration_ticks| {
                         // Tick-based: authoritative
-                        let until_tick = QuarantineManager::quarantine_until_tick(
-                            current_tick,
-                            duration_ticks,
-                        );
+                        let until_tick =
+                            QuarantineManager::quarantine_until_tick(current_tick, duration_ticks);
                         // Wall-clock: observational only
-                        let duration =
-                            quarantine_manager.calculate_duration(previous_quarantines);
-                        let until =
-                            QuarantineManager::quarantine_until(current_time_ns, duration);
+                        let duration = quarantine_manager.calculate_duration(previous_quarantines);
+                        let until = QuarantineManager::quarantine_until(current_time_ns, duration);
                         (until, Some(until_tick))
                     },
                 );

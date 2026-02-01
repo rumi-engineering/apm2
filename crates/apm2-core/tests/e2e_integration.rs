@@ -776,10 +776,13 @@ fn test_session_lifecycle_quarantine() {
     assert!(reducer.state().get("session-quar-001").unwrap().is_active());
 
     // Quarantine the session
-    let quar_payload = helpers::session_quarantined_payload(
+    let quar_payload = helpers::session_quarantined_payload_with_ticks(
         "session-quar-001",
         "policy violation detected",
         3_000_000_000, // release_after_ns
+        2000,          // issued_at_tick
+        3000,          // expires_at_tick
+        1000,          // tick_rate_hz
     );
     let quar_event = EventRecord::with_timestamp(
         "session.quarantined",
@@ -945,8 +948,14 @@ fn test_multiple_concurrent_sessions() {
     reducer.apply(&term_event, &ctx).expect("terminate");
 
     // Quarantine session-3
-    let quar_payload =
-        helpers::session_quarantined_payload("session-3", "policy violation", 3_000_000_000);
+    let quar_payload = helpers::session_quarantined_payload_with_ticks(
+        "session-3",
+        "policy violation",
+        3_000_000_000,
+        2000, // issued_at_tick
+        3000, // expires_at_tick
+        1000, // tick_rate_hz
+    );
     let quar_event = EventRecord::with_timestamp(
         "session.quarantined",
         "session-3",
