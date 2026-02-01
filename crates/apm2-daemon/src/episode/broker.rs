@@ -696,9 +696,12 @@ mod tests {
     }
 
     fn make_manifest(caps: Vec<Capability>) -> CapabilityManifest {
+        // Collect tool classes from capabilities for the allowlist
+        let tool_classes: Vec<ToolClass> = caps.iter().map(|c| c.tool_class).collect();
         CapabilityManifest::builder("test-manifest")
             .delegator("test-delegator")
             .capabilities(caps)
+            .tool_allowlist(tool_classes)
             .build()
             .unwrap()
     }

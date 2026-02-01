@@ -101,17 +101,21 @@ pub const MAX_PATH_COMPONENTS: usize = 256;
 /// Per CTR-1303, bounded collections prevent `DoS`.
 pub const MAX_TOOL_ALLOWLIST: usize = 100;
 
+/// Maximum string length for tool class names during parsing.
+pub const MAX_TOOL_CLASS_NAME_LEN: usize = 64;
+
 // =============================================================================
 // Tool Class Enum (TCK-00254)
 //
 // Per REQ-DCP-0002, the context pack manifest includes a tool allowlist.
-// This enum mirrors the one in apm2-daemon for consistency.
+// This is the canonical definition; apm2-daemon re-exports from here.
 // =============================================================================
 
-/// Tool class for capability categorization in context pack manifests.
+/// Tool class for capability categorization.
 ///
-/// Per TCK-00254, this defines the coarse-grained categories of tool
-/// operations that can be allowed in a context pack.
+/// Per AD-TOOL-002, tool classes define the coarse-grained category of
+/// operations a capability allows. Fine-grained restrictions are applied
+/// via `CapabilityScope`.
 ///
 /// # Discriminant Stability
 ///
@@ -169,11 +173,55 @@ impl ToolClass {
             _ => None,
         }
     }
-}
 
-impl std::fmt::Display for ToolClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
+    /// Parses a tool class from a u32 value.
+    ///
+    /// # Security
+    ///
+    /// This method validates the full u32 range to prevent truncation attacks.
+    /// Casting to u8 first would truncate values like 256 to 0, potentially
+    /// granting unintended capabilities.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Read),
+            1 => Some(Self::Write),
+            2 => Some(Self::Execute),
+            3 => Some(Self::Network),
+            4 => Some(Self::Git),
+            5 => Some(Self::Inference),
+            6 => Some(Self::Artifact),
+            _ => None,
+        }
+    }
+
+    /// Parses a tool class from a string name.
+    ///
+    /// # Security
+    ///
+    /// Rejects names longer than `MAX_TOOL_CLASS_NAME_LEN` to prevent
+    /// memory exhaustion attacks.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        if s.len() > MAX_TOOL_CLASS_NAME_LEN {
+            return None;
+        }
+        match s.to_lowercase().as_str() {
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            "execute" | "exec" => Some(Self::Execute),
+            "network" | "net" => Some(Self::Network),
+            "git" => Some(Self::Git),
+            "inference" | "llm" => Some(Self::Inference),
+            "artifact" | "cas" => Some(Self::Artifact),
+            _ => None,
+        }
+    }
+
+    /// Returns the canonical name of this tool class.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
             Self::Read => "Read",
             Self::Write => "Write",
             Self::Execute => "Execute",
@@ -181,8 +229,48 @@ impl std::fmt::Display for ToolClass {
             Self::Git => "Git",
             Self::Inference => "Inference",
             Self::Artifact => "Artifact",
-        };
-        write!(f, "{name}")
+        }
+    }
+
+    /// Returns `true` if this tool class represents read-only operations.
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        matches!(self, Self::Read)
+    }
+
+    /// Returns `true` if this tool class can modify state.
+    #[must_use]
+    pub const fn can_mutate(&self) -> bool {
+        matches!(
+            self,
+            Self::Write | Self::Execute | Self::Git | Self::Artifact
+        )
+    }
+
+    /// Returns `true` if this tool class involves network access.
+    #[must_use]
+    pub const fn involves_network(&self) -> bool {
+        matches!(self, Self::Network | Self::Inference)
+    }
+
+    /// Returns all known tool classes.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::Read,
+            Self::Write,
+            Self::Execute,
+            Self::Network,
+            Self::Git,
+            Self::Inference,
+            Self::Artifact,
+        ]
+    }
+}
+
+impl std::fmt::Display for ToolClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
     }
 }
 

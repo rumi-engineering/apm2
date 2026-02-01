@@ -47,10 +47,28 @@ fn test_args_hash() -> [u8; 32] {
 }
 
 /// Creates a capability manifest with the specified capabilities.
+///
+/// Per TCK-00254, the `tool_allowlist` is automatically populated from the
+/// capabilities' tool classes, and `write_allowlist` is populated for
+/// Write capabilities.
 fn create_manifest_with_capabilities(caps: Vec<Capability>) -> CapabilityManifest {
+    use std::path::PathBuf;
+
+    // Collect unique tool classes from capabilities for the allowlist
+    let tool_classes: Vec<ToolClass> = caps.iter().map(|c| c.tool_class).collect();
+
+    // Collect write paths from Write capabilities for the write_allowlist
+    let write_paths: Vec<PathBuf> = caps
+        .iter()
+        .filter(|c| c.tool_class == ToolClass::Write)
+        .flat_map(|c| c.scope.root_paths.clone())
+        .collect();
+
     CapabilityManifest::builder("test-manifest")
         .delegator("test-actor")
         .capabilities(caps)
+        .tool_allowlist(tool_classes)
+        .write_allowlist(write_paths)
         .build()
         .expect("valid manifest")
 }

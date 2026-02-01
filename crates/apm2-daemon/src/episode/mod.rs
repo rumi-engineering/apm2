@@ -158,7 +158,7 @@ pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
     CapabilityManifestBuilder, CapabilityValidator, DenyReason, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES,
     MAX_CAPABILITY_ID_LEN, MAX_MANIFEST_ID_LEN, MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN,
-    MAX_TOOL_ALLOWLIST, MAX_WRITE_ALLOWLIST, ToolRequest,
+    MAX_WRITE_ALLOWLIST, ToolRequest,
 };
 // Re-export Claude Code adapter types (TCK-00173)
 pub use claude_code::{
@@ -210,7 +210,7 @@ pub use scope::{
 };
 pub use snapshot::{PinnedSnapshot, PinnedSnapshotBuilder};
 pub use state::{EpisodeState, QuarantineReason, TerminationClass, validate_transition};
-pub use tool_class::{MAX_TOOL_CLASS_NAME_LEN, ToolClass};
+pub use tool_class::{MAX_TOOL_ALLOWLIST, MAX_TOOL_CLASS_NAME_LEN, ToolClass, ToolClassExt};
 pub use tool_handler::{
     ExecuteArgs, GitArgs, InferenceArgs, MAX_HANDLERS, MAX_RESULT_MESSAGE_LEN, MAX_TOOL_ARGS_SIZE,
     NetworkArgs, RawArgs, ReadArgs, ResultMetadata, ToolArgs, ToolHandler, ToolHandlerError,
