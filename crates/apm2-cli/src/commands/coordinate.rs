@@ -79,10 +79,18 @@ pub struct CoordinateArgs {
     #[arg(long)]
     pub max_episodes: u32,
 
-    /// Maximum wall-clock time in milliseconds (required).
+    /// Maximum duration in ticks (HTF compliant).
+    ///
+    /// Coordination stops when this duration elapses in the tick domain.
+    /// Takes precedence over `max_duration_ms`.
+    #[arg(long)]
+    pub max_duration_ticks: Option<u64>,
+
+    /// Maximum wall-clock time in milliseconds (legacy).
     ///
     /// Coordination stops when this duration elapses.
-    #[arg(long)]
+    /// This is an observational overlay on the tick budget.
+    #[arg(long, default_value_t = 60000)]
     pub max_duration_ms: u64,
 
     /// Maximum tokens to consume (optional).
@@ -163,7 +171,9 @@ pub struct WorkOutcomeEntry {
 pub struct BudgetUsageOutput {
     /// Episodes consumed.
     pub consumed_episodes: u32,
-    /// Elapsed time in milliseconds.
+    /// Elapsed time in ticks (HTF compliant).
+    pub elapsed_ticks: u64,
+    /// Elapsed time in milliseconds (observational).
     pub elapsed_ms: u64,
     /// Tokens consumed.
     pub consumed_tokens: u64,
@@ -177,7 +187,9 @@ pub struct BudgetUsageOutput {
 pub struct BudgetCeilingOutput {
     /// Maximum episodes configured.
     pub max_episodes: u32,
-    /// Maximum duration in milliseconds.
+    /// Maximum duration in ticks (HTF compliant).
+    pub max_duration_ticks: u64,
+    /// Maximum duration in milliseconds (observational).
     pub max_duration_ms: u64,
     /// Maximum tokens configured (null if not set).
     pub max_tokens: Option<u64>,
@@ -238,8 +250,9 @@ fn output_receipt(receipt: &CoordinationReceipt, json_output: bool) {
             receipt.total_sessions, receipt.successful_sessions, receipt.failed_sessions
         );
         println!(
-            "Budget used: {} episodes, {} ms, {} tokens",
+            "Budget used: {} episodes, {} ticks ({} ms), {} tokens",
             receipt.budget_usage.consumed_episodes,
+            receipt.budget_usage.elapsed_ticks,
             receipt.budget_usage.elapsed_ms,
             receipt.budget_usage.consumed_tokens
         );
@@ -255,11 +268,23 @@ fn run_coordinate_inner(args: &CoordinateArgs) -> Result<CoordinationReceipt, Co
         ));
     }
 
-    if args.max_duration_ms == 0 {
-        return Err(CoordinateCliError::InvalidArgs(
-            "max-duration-ms must be positive".to_string(),
-        ));
-    }
+    // Determine max duration in ticks (HTF authority)
+    // If ticks provided, use them. Else convert ms to ticks.
+    let max_duration_ticks = if let Some(ticks) = args.max_duration_ticks {
+        if ticks == 0 {
+            return Err(CoordinateCliError::InvalidArgs(
+                "max-duration-ticks must be positive".to_string(),
+            ));
+        }
+        ticks
+    } else {
+        if args.max_duration_ms == 0 {
+            return Err(CoordinateCliError::InvalidArgs(
+                "max-duration-ms (or max-duration-ticks) must be positive".to_string(),
+            ));
+        }
+        args.max_duration_ms.saturating_mul(1000) // ms -> us at 1MHz
+    };
 
     // Parse work IDs from either --work-ids or --work-query
     let work_ids = parse_work_ids(args)?;
@@ -278,10 +303,6 @@ fn run_coordinate_inner(args: &CoordinateArgs) -> Result<CoordinationReceipt, Co
             args.max_work_queue
         )));
     }
-
-    // Convert ms to ticks at 1MHz (1 tick = 1 microsecond)
-    // This maintains precision while using the tick-based API.
-    let max_duration_ticks = args.max_duration_ms.saturating_mul(1000); // ms -> us at 1MHz
 
     // Create budget
     let budget = CoordinationBudget::new(
@@ -541,11 +562,13 @@ fn build_receipt(
         work_outcomes,
         budget_usage: BudgetUsageOutput {
             consumed_episodes: budget_usage.consumed_episodes,
+            elapsed_ticks: budget_usage.elapsed_ticks,
             elapsed_ms,
             consumed_tokens: budget_usage.consumed_tokens,
         },
         budget_ceiling: BudgetCeilingOutput {
             max_episodes: config.budget.max_episodes,
+            max_duration_ticks: config.budget.max_duration_ticks,
             max_duration_ms,
             max_tokens: config.budget.max_tokens,
         },
@@ -604,6 +627,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -626,6 +650,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 5, // Set lower than work_ids count
@@ -651,6 +676,7 @@ mod tests {
             work_query: None,
             max_episodes: 0, // Invalid
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -666,6 +692,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 0, // Invalid
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -685,6 +712,7 @@ mod tests {
             work_query: Some("file.txt".to_string()),
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -719,11 +747,13 @@ mod tests {
             }],
             budget_usage: BudgetUsageOutput {
                 consumed_episodes: 5,
+                elapsed_ticks: 30_000_000,
                 elapsed_ms: 30_000,
                 consumed_tokens: 50_000,
             },
             budget_ceiling: BudgetCeilingOutput {
                 max_episodes: 10,
+                max_duration_ticks: 60_000_000,
                 max_duration_ms: 60_000,
                 max_tokens: Some(100_000),
             },
@@ -760,6 +790,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -786,6 +817,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -885,11 +917,13 @@ mod tests {
             work_outcomes: vec![],
             budget_usage: BudgetUsageOutput {
                 consumed_episodes: 0,
+                elapsed_ticks: 0,
                 elapsed_ms: 0,
                 consumed_tokens: 0,
             },
             budget_ceiling: BudgetCeilingOutput {
                 max_episodes: 10,
+                max_duration_ticks: 60_000_000,
                 max_duration_ms: 60_000,
                 max_tokens: None,
             },
@@ -917,6 +951,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
@@ -937,6 +972,7 @@ mod tests {
             work_query: None,
             max_episodes: 10,
             max_duration_ms: 60_000,
+            max_duration_ticks: None,
             max_tokens: None,
             max_attempts: 3,
             max_work_queue: 1000,
