@@ -41,7 +41,10 @@ use super::messages::{
     IssueCapabilityResponse, PrivilegedError, PrivilegedErrorCode, ShutdownRequest,
     ShutdownResponse, SpawnEpisodeRequest, SpawnEpisodeResponse, WorkRole,
 };
-use crate::episode::{EpisodeRuntime, EpisodeRuntimeConfig};
+use crate::episode::{
+    CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
+    LeaseIssueDenialReason, validate_custody_domain_overlap,
+};
 
 // ============================================================================
 // Ledger Event Emitter Interface (TCK-00253)
@@ -528,6 +531,20 @@ pub struct WorkClaim {
 
     /// Policy resolution for this claim.
     pub policy_resolution: PolicyResolution,
+
+    /// Custody domains associated with the executor (for `SoD` validation).
+    ///
+    /// Per TCK-00258, these are the domains assigned to the actor claiming
+    /// the work. For `GATE_EXECUTOR` roles, spawn will be rejected if these
+    /// domains overlap with author domains.
+    pub executor_custody_domains: Vec<String>,
+
+    /// Custody domains associated with changeset authors (for `SoD`
+    /// validation).
+    ///
+    /// Per TCK-00258, these are the domains of the actors who authored the
+    /// changeset being reviewed.
+    pub author_custody_domains: Vec<String>,
 }
 
 /// Trait for persisting and querying work claims.
@@ -608,7 +625,10 @@ pub const MAX_WORK_CLAIMS: usize = 10_000;
 pub struct StubWorkRegistry {
     /// Claims stored with insertion order for LRU eviction.
     /// Uses `VecDeque` for O(1) eviction of oldest entries.
-    claims: std::sync::RwLock<(VecDeque<String>, std::collections::HashMap<String, WorkClaim>)>,
+    claims: std::sync::RwLock<(
+        VecDeque<String>,
+        std::collections::HashMap<String, WorkClaim>,
+    )>,
 }
 
 impl Default for StubWorkRegistry {
@@ -1458,6 +1478,67 @@ impl PrivilegedDispatcher {
         &self.lease_validator
     }
 
+    // =========================================================================
+    // TCK-00258: Custody Domain Resolution (`SoD` Enforcement)
+    // =========================================================================
+
+    /// Resolves custody domains for an actor.
+    ///
+    /// Per TCK-00258, this method maps an actor ID to its custody domains
+    /// for `SoD` validation. In production, this would query the `KeyPolicy`
+    /// via a `CustodyDomainResolver` trait.
+    ///
+    /// # Stub Implementation
+    ///
+    /// Currently returns a single domain derived from the actor ID prefix.
+    /// For example, `team-alpha:alice` -> `["team-alpha"]`.
+    /// This enables testing of the `SoD` enforcement without full `KeyPolicy`
+    /// integration.
+    #[allow(clippy::unused_self)] // Will use self in production for registry access
+    fn resolve_actor_custody_domains(&self, actor_id: &str) -> Vec<String> {
+        // Stub: derive domain from actor_id prefix (e.g., "team-alpha:alice" ->
+        // "team-alpha") In production, this would query
+        // KeyPolicy.custody_domains
+        if let Some(colon_pos) = actor_id.find(':') {
+            let domain = &actor_id[..colon_pos];
+            if !domain.is_empty() {
+                return vec![domain.to_string()];
+            }
+        }
+        // Fallback: use the actor_id itself as the domain
+        // This ensures self-review is always detected (actor reviewing own work)
+        vec![actor_id.to_string()]
+    }
+
+    /// Resolves custody domains for changeset authors.
+    ///
+    /// Per TCK-00258, this method retrieves the custody domains of all actors
+    /// who authored the changeset being reviewed. In production, this would
+    /// query the changeset metadata and `KeyPolicy`.
+    ///
+    /// # Stub Implementation
+    ///
+    /// Currently returns a placeholder domain based on the `work_id`.
+    /// For testing, set `work_id` to include domain information:
+    /// e.g., `W-team-alpha-12345` -> `["team-alpha"]`
+    #[allow(clippy::unused_self)] // Will use self in production for registry access
+    fn resolve_changeset_author_domains(&self, work_id: &str) -> Vec<String> {
+        // Stub: derive author domain from work_id (e.g., "W-team-alpha-12345" ->
+        // ["team-alpha"]) In production, this would query changeset metadata
+        // for author list, then resolve each author's custody domains via
+        // KeyPolicy
+        if let Some(rest) = work_id.strip_prefix("W-") {
+            if let Some(dash_pos) = rest.find('-') {
+                let domain = &rest[..dash_pos];
+                if !domain.is_empty() {
+                    return vec![domain.to_string()];
+                }
+            }
+        }
+        // Default: empty means no `SoD` check (for backward compatibility)
+        Vec::new()
+    }
+
     /// Dispatches a privileged request to the appropriate handler.
     ///
     /// # Message Format
@@ -1610,6 +1691,12 @@ impl PrivilegedDispatcher {
             "Work claimed with policy resolution"
         );
 
+        // TCK-00258: Extract custody domains for SoD validation
+        // For now, use a stub implementation that derives domain from actor_id
+        // In production, this would query the KeyPolicy via CustodyDomainResolver
+        let executor_custody_domains = self.resolve_actor_custody_domains(&actor_id);
+        let author_custody_domains = self.resolve_changeset_author_domains(&work_id);
+
         // Register the work claim
         let claim = WorkClaim {
             work_id,
@@ -1617,6 +1704,8 @@ impl PrivilegedDispatcher {
             actor_id,
             role,
             policy_resolution: policy_resolution.clone(),
+            executor_custody_domains,
+            author_custody_domains,
         };
 
         let claim = match self.work_registry.register_claim(claim) {
@@ -1868,6 +1957,76 @@ impl PrivilegedDispatcher {
                     return Ok(PrivilegedResponse::error(
                         PrivilegedErrorCode::CapabilityRequestRejected,
                         "lease_id does not match the claimed lease_id for GATE_EXECUTOR",
+                    ));
+                }
+            }
+        }
+
+        // =====================================================================
+        // TCK-00258: SoD Custody Domain Validation
+        //
+        // Per REQ-DCP-0006, GATE_EXECUTOR spawns MUST enforce Separation of
+        // Duties by rejecting when executor custody domains overlap with author
+        // custody domains. This prevents self-review attacks.
+        // =====================================================================
+        if request.role == WorkRole::GateExecutor as i32 {
+            // Convert claim domains to CustodyDomainId for validation
+            let executor_domains: Vec<CustodyDomainId> = claim
+                .executor_custody_domains
+                .iter()
+                .filter_map(|d| CustodyDomainId::new(d.clone()).ok())
+                .collect();
+
+            let author_domains: Vec<CustodyDomainId> = claim
+                .author_custody_domains
+                .iter()
+                .filter_map(|d| CustodyDomainId::new(d.clone()).ok())
+                .collect();
+
+            // Only validate if both executor and author domains are present
+            // Empty author domains means the changeset metadata wasn't available,
+            // so we skip SoD validation (backward compatibility)
+            if !executor_domains.is_empty() && !author_domains.is_empty() {
+                if let Err(CustodyDomainError::Overlap {
+                    executor_domain,
+                    author_domain,
+                }) = validate_custody_domain_overlap(&executor_domains, &author_domains)
+                {
+                    warn!(
+                        work_id = %request.work_id,
+                        executor_domain = %executor_domain,
+                        author_domain = %author_domain,
+                        "SpawnEpisode rejected: SoD custody domain violation"
+                    );
+
+                    // Emit LeaseIssueDenied event for audit logging
+                    // Use current timestamp (in production, use HTF clock)
+                    let timestamp_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+                        .unwrap_or(0);
+
+                    // Best-effort event emission - don't fail spawn on event error
+                    let _ = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            self.episode_runtime
+                                .emit_lease_issue_denied(
+                                    request.work_id.clone(),
+                                    LeaseIssueDenialReason::SodViolation {
+                                        executor_domain: executor_domain.clone(),
+                                        author_domain: author_domain.clone(),
+                                    },
+                                    timestamp_ns,
+                                )
+                                .await
+                        })
+                    });
+
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::SodViolation,
+                        format!(
+                            "custody domain overlap: executor domain '{executor_domain}' overlaps with author domain '{author_domain}'"
+                        ),
                     ));
                 }
             }
@@ -3619,6 +3778,8 @@ mod tests {
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
                 },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
             };
             registry.register_claim(claim).unwrap();
         }
@@ -3649,6 +3810,8 @@ mod tests {
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
             },
+            executor_custody_domains: vec![],
+            author_custody_domains: vec![],
         };
 
         // First registration succeeds

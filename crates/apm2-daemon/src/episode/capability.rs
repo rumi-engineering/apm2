@@ -3034,3 +3034,427 @@ mod tests {
         ));
     }
 }
+
+// =============================================================================
+// TCK-00258: Custody Domain Validation (SoD Enforcement)
+// =============================================================================
+
+/// Maximum number of custody domains per validation request.
+///
+/// Per `CTR-1303`, we bound the number of domains to prevent `DoS` via resource
+/// exhaustion.
+pub const MAX_CUSTODY_DOMAINS_PER_REQUEST: usize = 256;
+
+/// A custody domain identifier.
+///
+/// Custody domains represent organizational boundaries for key management
+/// and conflict-of-interest detection. Keys within the same custody domain
+/// share a COI group identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CustodyDomainId(String);
+
+impl CustodyDomainId {
+    /// Creates a new custody domain ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The domain identifier string
+    ///
+    /// # Validation
+    ///
+    /// The ID must not be empty and must not exceed 256 characters.
+    pub fn new(id: impl Into<String>) -> Result<Self, CapabilityError> {
+        let id = id.into();
+        if id.is_empty() {
+            return Err(CapabilityError::EmptyField {
+                field: "custody_domain_id",
+            });
+        }
+        if id.len() > MAX_ACTOR_ID_LEN {
+            return Err(CapabilityError::ActorIdTooLong {
+                len: id.len(),
+                max: MAX_ACTOR_ID_LEN,
+            });
+        }
+        Ok(Self(id))
+    }
+
+    /// Returns the domain ID as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CustodyDomainId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for CustodyDomainId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Error type for custody domain validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyDomainError {
+    /// Custody domain overlap detected (`SoD` violation).
+    Overlap {
+        /// The executor's custody domain.
+        executor_domain: String,
+        /// The author's custody domain that overlaps.
+        author_domain: String,
+    },
+
+    /// Too many custody domains provided.
+    TooManyDomains {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Invalid custody domain ID.
+    InvalidDomainId {
+        /// The invalid domain ID.
+        domain_id: String,
+        /// Reason for rejection.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for CustodyDomainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Overlap {
+                executor_domain,
+                author_domain,
+            } => write!(
+                f,
+                "custody domain overlap: executor '{executor_domain}' overlaps with author '{author_domain}'"
+            ),
+            Self::TooManyDomains { count, max } => {
+                write!(f, "too many custody domains: {count} (max {max})")
+            },
+            Self::InvalidDomainId { domain_id, reason } => {
+                write!(f, "invalid custody domain ID '{domain_id}': {reason}")
+            },
+        }
+    }
+}
+
+impl std::error::Error for CustodyDomainError {}
+
+/// Validates that executor custody domains do not overlap with author custody
+/// domains.
+///
+/// Per REQ-DCP-0006, this function enforces Separation of Duties (`SoD`) by
+/// rejecting spawn requests where the executor could be reviewing their own
+/// work (self-review attack prevention).
+///
+/// # Arguments
+///
+/// * `executor_domains` - Custody domains associated with the executor
+/// * `author_domains` - Custody domains associated with the changeset authors
+///
+/// # Returns
+///
+/// `Ok(())` if there is no overlap (spawn allowed), or
+/// `Err(CustodyDomainError::Overlap)` if overlap is detected.
+///
+/// # Security
+///
+/// - Uses constant-time comparison to prevent timing side-channel attacks
+/// - Bounds input sizes to prevent `DoS` via resource exhaustion
+/// - Checks ALL domain combinations (not early-exit on first mismatch)
+///
+/// # Example
+///
+/// ```rust
+/// use apm2_daemon::episode::capability::{
+///     CustodyDomainId, validate_custody_domain_overlap,
+/// };
+///
+/// let executor = vec![CustodyDomainId::new("team-review").unwrap()];
+/// let authors = vec![CustodyDomainId::new("team-dev").unwrap()];
+///
+/// // Non-overlapping domains: allowed
+/// assert!(validate_custody_domain_overlap(&executor, &authors).is_ok());
+///
+/// let executor = vec![CustodyDomainId::new("team-alpha").unwrap()];
+/// let authors = vec![CustodyDomainId::new("team-alpha").unwrap()];
+///
+/// // Overlapping domains: denied
+/// assert!(validate_custody_domain_overlap(&executor, &authors).is_err());
+/// ```
+pub fn validate_custody_domain_overlap(
+    executor_domains: &[CustodyDomainId],
+    author_domains: &[CustodyDomainId],
+) -> Result<(), CustodyDomainError> {
+    use subtle::ConstantTimeEq;
+
+    // CTR-1303: Bound input sizes to prevent DoS
+    if executor_domains.len() > MAX_CUSTODY_DOMAINS_PER_REQUEST {
+        return Err(CustodyDomainError::TooManyDomains {
+            count: executor_domains.len(),
+            max: MAX_CUSTODY_DOMAINS_PER_REQUEST,
+        });
+    }
+    if author_domains.len() > MAX_CUSTODY_DOMAINS_PER_REQUEST {
+        return Err(CustodyDomainError::TooManyDomains {
+            count: author_domains.len(),
+            max: MAX_CUSTODY_DOMAINS_PER_REQUEST,
+        });
+    }
+
+    // Check for any overlap between executor and author domains
+    // Uses constant-time comparison to prevent timing attacks (RSK-1909)
+    for executor_domain in executor_domains {
+        for author_domain in author_domains {
+            let exec_bytes = executor_domain.as_str().as_bytes();
+            let author_bytes = author_domain.as_str().as_bytes();
+
+            // For constant-time comparison, we need equal-length inputs
+            // If lengths differ, they can't be equal
+            if exec_bytes.len() == author_bytes.len() && bool::from(exec_bytes.ct_eq(author_bytes))
+            {
+                return Err(CustodyDomainError::Overlap {
+                    executor_domain: executor_domain.as_str().to_string(),
+                    author_domain: author_domain.as_str().to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Extracts custody domains from a list of actor IDs using a domain resolver.
+///
+/// Per REQ-DCP-0006, this helper function maps actor IDs to their associated
+/// custody domains for `SoD` validation.
+///
+/// # Arguments
+///
+/// * `actor_ids` - List of actor identifiers to resolve
+/// * `resolver` - Function that maps an actor ID to its custody domains
+///
+/// # Returns
+///
+/// A deduplicated list of custody domains associated with the actors.
+///
+/// # Example
+///
+/// ```rust
+/// use std::collections::HashMap;
+///
+/// use apm2_daemon::episode::capability::{
+///     CustodyDomainId, extract_custody_domains,
+/// };
+///
+/// // Mock resolver: maps actor_id -> domains
+/// let domain_map: HashMap<&str, Vec<&str>> =
+///     [("alice", vec!["team-alpha"]), ("bob", vec!["team-beta"])]
+///         .into_iter()
+///         .collect();
+///
+/// let resolver = |actor_id: &str| -> Vec<CustodyDomainId> {
+///     domain_map
+///         .get(actor_id)
+///         .map(|domains| {
+///             domains
+///                 .iter()
+///                 .filter_map(|d| CustodyDomainId::new(*d).ok())
+///                 .collect()
+///         })
+///         .unwrap_or_default()
+/// };
+///
+/// let actors = vec!["alice".to_string(), "bob".to_string()];
+/// let domains = extract_custody_domains(&actors, resolver);
+/// assert_eq!(domains.len(), 2);
+/// ```
+pub fn extract_custody_domains<F>(actor_ids: &[String], resolver: F) -> Vec<CustodyDomainId>
+where
+    F: Fn(&str) -> Vec<CustodyDomainId>,
+{
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    let mut domains = Vec::new();
+
+    for actor_id in actor_ids {
+        for domain in resolver(actor_id) {
+            // Deduplicate by domain ID string
+            if seen.insert(domain.as_str().to_string()) {
+                domains.push(domain);
+            }
+        }
+    }
+
+    domains
+}
+
+#[cfg(test)]
+mod custody_domain_tests {
+    use super::*;
+
+    #[test]
+    fn test_custody_domain_id_valid() {
+        let domain = CustodyDomainId::new("team-alpha").unwrap();
+        assert_eq!(domain.as_str(), "team-alpha");
+        assert_eq!(format!("{domain}"), "team-alpha");
+    }
+
+    #[test]
+    fn test_custody_domain_id_empty_rejected() {
+        let result = CustodyDomainId::new("");
+        assert!(matches!(result, Err(CapabilityError::EmptyField { .. })));
+    }
+
+    #[test]
+    fn test_custody_domain_id_too_long_rejected() {
+        let long_id = "x".repeat(MAX_ACTOR_ID_LEN + 1);
+        let result = CustodyDomainId::new(long_id);
+        assert!(matches!(
+            result,
+            Err(CapabilityError::ActorIdTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_non_overlapping_domains() {
+        let executor = vec![CustodyDomainId::new("team-review").unwrap()];
+        let authors = vec![CustodyDomainId::new("team-dev").unwrap()];
+
+        let result = validate_custody_domain_overlap(&executor, &authors);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_overlapping_domains() {
+        let executor = vec![CustodyDomainId::new("team-alpha").unwrap()];
+        let authors = vec![CustodyDomainId::new("team-alpha").unwrap()];
+
+        let result = validate_custody_domain_overlap(&executor, &authors);
+        assert!(matches!(result, Err(CustodyDomainError::Overlap { .. })));
+
+        if let Err(CustodyDomainError::Overlap {
+            executor_domain,
+            author_domain,
+        }) = result
+        {
+            assert_eq!(executor_domain, "team-alpha");
+            assert_eq!(author_domain, "team-alpha");
+        }
+    }
+
+    #[test]
+    fn test_validate_multiple_domains_with_overlap() {
+        // Executor has multiple domains, one overlaps with author
+        let executor = vec![
+            CustodyDomainId::new("team-review").unwrap(),
+            CustodyDomainId::new("team-alpha").unwrap(),
+        ];
+        let authors = vec![
+            CustodyDomainId::new("team-alpha").unwrap(),
+            CustodyDomainId::new("team-beta").unwrap(),
+        ];
+
+        let result = validate_custody_domain_overlap(&executor, &authors);
+        assert!(matches!(
+            result,
+            Err(CustodyDomainError::Overlap {
+                executor_domain,
+                author_domain,
+            }) if executor_domain == "team-alpha" && author_domain == "team-alpha"
+        ));
+    }
+
+    #[test]
+    fn test_validate_multiple_domains_no_overlap() {
+        let executor = vec![
+            CustodyDomainId::new("team-review").unwrap(),
+            CustodyDomainId::new("team-ops").unwrap(),
+        ];
+        let authors = vec![
+            CustodyDomainId::new("team-dev").unwrap(),
+            CustodyDomainId::new("team-qa").unwrap(),
+        ];
+
+        let result = validate_custody_domain_overlap(&executor, &authors);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_executor_domains() {
+        // Empty executor domains should pass (no overlap possible)
+        let executor: Vec<CustodyDomainId> = vec![];
+        let authors = vec![CustodyDomainId::new("team-alpha").unwrap()];
+
+        let result = validate_custody_domain_overlap(&executor, &authors);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_author_domains() {
+        // Empty author domains should pass (no overlap possible)
+        let executor = vec![CustodyDomainId::new("team-alpha").unwrap()];
+        let authors: Vec<CustodyDomainId> = vec![];
+
+        let result = validate_custody_domain_overlap(&executor, &authors);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_extract_custody_domains() {
+        use std::collections::HashMap;
+
+        let domain_map: HashMap<&str, Vec<&str>> = [
+            ("alice", vec!["team-alpha", "team-shared"]),
+            ("bob", vec!["team-beta"]),
+            ("charlie", vec!["team-alpha"]), // Same as alice
+        ]
+        .into_iter()
+        .collect();
+
+        let resolver = |actor_id: &str| -> Vec<CustodyDomainId> {
+            domain_map
+                .get(actor_id)
+                .map(|domains| {
+                    domains
+                        .iter()
+                        .filter_map(|d| CustodyDomainId::new(*d).ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let actors = vec![
+            "alice".to_string(),
+            "bob".to_string(),
+            "charlie".to_string(),
+        ];
+        let domains = extract_custody_domains(&actors, resolver);
+
+        // Should have 3 unique domains: team-alpha, team-shared, team-beta
+        assert_eq!(domains.len(), 3);
+        let domain_strs: Vec<&str> = domains.iter().map(CustodyDomainId::as_str).collect();
+        assert!(domain_strs.contains(&"team-alpha"));
+        assert!(domain_strs.contains(&"team-shared"));
+        assert!(domain_strs.contains(&"team-beta"));
+    }
+
+    #[test]
+    fn test_extract_custody_domains_unknown_actor() {
+        let resolver = |_actor_id: &str| -> Vec<CustodyDomainId> { vec![] };
+
+        let actors = vec!["unknown".to_string()];
+        let domains = extract_custody_domains(&actors, resolver);
+
+        assert!(domains.is_empty());
+    }
+}

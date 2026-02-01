@@ -153,12 +153,14 @@ pub use broker::{
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 // Re-export tool execution types (TCK-00165)
 pub use budget_tracker::{BudgetExhaustedError, BudgetSnapshot, BudgetTracker};
-// Re-export capability types (TCK-00163, TCK-00254)
+// Re-export capability types (TCK-00163, TCK-00254, TCK-00258)
 pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
-    CapabilityManifestBuilder, CapabilityValidator, DenyReason, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES,
-    MAX_CAPABILITY_ID_LEN, MAX_MANIFEST_ID_LEN, MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN,
-    MAX_WRITE_ALLOWLIST, ToolRequest,
+    CapabilityManifestBuilder, CapabilityValidator, CustodyDomainError, CustodyDomainId,
+    DenyReason, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES, MAX_CAPABILITY_ID_LEN,
+    MAX_CUSTODY_DOMAINS_PER_REQUEST, MAX_MANIFEST_ID_LEN, MAX_SHELL_ALLOWLIST,
+    MAX_SHELL_PATTERN_LEN, MAX_WRITE_ALLOWLIST, ToolRequest, extract_custody_domains,
+    validate_custody_domain_overlap,
 };
 // Re-export Claude Code adapter types (TCK-00173)
 pub use claude_code::{
@@ -199,9 +201,9 @@ pub use raw_adapter::{
 pub use registry::AdapterRegistry;
 pub use ring_buffer::{RingBuffer, tier_defaults};
 pub use runtime::{
-    EpisodeEvent, EpisodeRuntime, EpisodeRuntimeConfig, Hash, MAX_CONCURRENT_EPISODES,
-    MAX_EVENTS_BUFFER_SIZE, new_shared_runtime, new_shared_runtime_with_clock,
-    new_shared_runtime_with_clock_initialized,
+    EpisodeEvent, EpisodeRuntime, EpisodeRuntimeConfig, Hash, LeaseIssueDenialReason,
+    MAX_CONCURRENT_EPISODES, MAX_EVENTS_BUFFER_SIZE, new_shared_runtime,
+    new_shared_runtime_with_clock, new_shared_runtime_with_clock_initialized,
 };
 pub use scope::{
     CapabilityScope, CapabilityScopeBuilder, MAX_ALLOWED_PATTERNS, MAX_NETWORK_HOSTS,
