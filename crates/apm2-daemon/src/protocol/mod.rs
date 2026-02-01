@@ -110,9 +110,37 @@ pub mod socket_manager;
 pub use credentials::PeerCredentials;
 #[allow(unused_imports)]
 pub use dispatch::{
-    ConnectionContext, PrivilegedDispatcher, PrivilegedMessageType, PrivilegedResponse,
-    encode_claim_work_request, encode_issue_capability_request, encode_shutdown_request,
+    // Core dispatcher types
+    ConnectionContext,
+    // TCK-00253: Ledger event emitter types
+    LedgerEventEmitter,
+    LedgerEventError,
+    MAX_LEDGER_EVENTS,
+    MAX_WORK_CLAIMS,
+    // TCK-00253: Policy resolution and work claim types
+    PolicyResolution,
+    PolicyResolutionError,
+    PolicyResolver,
+    PrivilegedDispatcher,
+    PrivilegedMessageType,
+    PrivilegedResponse,
+    SignedLedgerEvent,
+    StubLedgerEventEmitter,
+    StubPolicyResolver,
+    StubWorkRegistry,
+    WORK_CLAIMED_DOMAIN_PREFIX,
+    WorkClaim,
+    WorkRegistry,
+    WorkRegistryError,
+    // TCK-00253: Actor ID derivation
+    derive_actor_id,
+    // Request encoding helpers
+    encode_claim_work_request,
+    encode_issue_capability_request,
+    encode_shutdown_request,
     encode_spawn_episode_request,
+    generate_lease_id,
+    generate_work_id,
 };
 #[allow(unused_imports)]
 pub use error::{

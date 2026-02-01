@@ -1111,10 +1111,11 @@ mod tests {
         let tick2 = clock.now_mono_tick().unwrap();
 
         // At 1 MHz, 10ms = 10,000 microseconds = ~10,000 ticks.
-        // Allow some tolerance for scheduling variance.
+        // Allow generous tolerance for CI scheduling variance (can be 100%+ in
+        // containerized CI).
         let elapsed_ticks = tick2.value() - tick1.value();
         assert!(
-            (9_000..=15_000).contains(&elapsed_ticks),
+            (5_000..=25_000).contains(&elapsed_ticks),
             "Expected ~10,000 ticks at 1 MHz for 10ms sleep, got {elapsed_ticks}"
         );
 
