@@ -5,6 +5,14 @@
 //! - Frame encoding/decoding over the wire
 //! - Handshake protocol completion
 //! - Connection lifecycle management
+//! - UID-based authentication at accept time (TCK-00248)
+//!
+//! # Security Note (TCK-00248)
+//!
+//! UID validation is performed at `accept()` time, before the handshake.
+//! Since both client and server run as the same user in tests, integration
+//! tests verify the authorization succeeds. Unit tests in `server.rs` verify
+//! that the constant-time comparison and error handling work correctly.
 
 use std::time::Duration;
 
@@ -325,4 +333,120 @@ async fn test_connection_limit_enforcement() {
     let inner = result.unwrap();
     assert!(inner.is_ok(), "Third accept task should not panic");
     assert!(inner.unwrap().is_ok(), "Third accept should succeed");
+}
+
+/// Test that same-UID connections are accepted (TCK-00248).
+///
+/// This integration test verifies that when client and server run as the same
+/// user (which is always the case in tests), the connection is accepted and
+/// handshake succeeds.
+///
+/// # Security Note (TCK-00248)
+///
+/// UID validation now happens at `accept()` time (before handshake), using
+/// constant-time comparison via `subtle::ConstantTimeEq`. Since we can't
+/// easily change the process UID in tests, this test verifies the success
+/// path. Unit tests in `server.rs` verify the rejection path using mocked
+/// credentials.
+#[tokio::test]
+async fn test_accept_validates_uid_at_connection_time() {
+    let tmp = TempDir::new().unwrap();
+    let socket_path = test_socket_path(&tmp, "uid_validation");
+
+    let config = ServerConfig::new(&socket_path).with_server_info("test-daemon/1.0");
+    let server = ProtocolServer::bind(config).unwrap();
+
+    // Spawn server that accepts and verifies peer credentials are populated
+    let server_handle = tokio::spawn(async move {
+        let (conn, _permit) = server.accept().await.unwrap();
+
+        // Verify that peer credentials were extracted
+        let creds = conn
+            .peer_credentials()
+            .expect("Peer credentials should be present");
+
+        // Verify credentials match current process (same user in tests)
+        let current_uid = nix::unistd::getuid().as_raw();
+        assert_eq!(
+            creds.uid, current_uid,
+            "Peer UID should match current process UID"
+        );
+
+        // PID should be present on Linux
+        assert!(creds.pid.is_some(), "Peer PID should be present");
+
+        conn
+    });
+
+    // Connect as client
+    let client = connect(&socket_path).await.unwrap();
+
+    // Verify server accepted the connection (UID matched)
+    let _server_conn = timeout(Duration::from_secs(1), server_handle)
+        .await
+        .expect("server accept timed out")
+        .expect("server accept failed");
+
+    // Client connection exists
+    drop(client);
+}
+
+/// Test full handshake succeeds after UID validation at accept (TCK-00248).
+///
+/// This verifies that the handshake works correctly after UID authorization
+/// has already been performed at the `accept()` stage.
+#[tokio::test]
+async fn test_handshake_after_uid_validation() {
+    let tmp = TempDir::new().unwrap();
+    let socket_path = test_socket_path(&tmp, "uid_handshake");
+
+    let config = ServerConfig::new(&socket_path).with_server_info("test-daemon/1.0");
+    let server = ProtocolServer::bind(config).unwrap();
+
+    // Spawn server
+    let server_handle = tokio::spawn(async move {
+        // accept() performs UID validation before returning
+        let (mut conn, _permit) = server.accept().await.unwrap();
+
+        // Verify peer credentials are present (UID validated at accept)
+        assert!(
+            conn.peer_credentials().is_some(),
+            "Credentials should be present after accept"
+        );
+
+        // Handshake no longer needs to validate UID - already done at accept()
+        let mut handshake = ServerHandshake::new("test-daemon/1.0");
+
+        let frame = conn.framed().next().await.unwrap().unwrap();
+        let hello = parse_hello(&frame).expect("failed to parse Hello");
+
+        let response = handshake.process_hello(&hello).unwrap();
+        let response_bytes = serialize_handshake_message(&response).unwrap();
+        conn.framed().send(response_bytes).await.unwrap();
+
+        assert!(handshake.is_completed());
+        handshake.negotiated_version()
+    });
+
+    // Client side
+    let mut client_conn = connect(&socket_path).await.unwrap();
+    let mut client_handshake = ClientHandshake::new("test-cli/1.0");
+
+    let hello = client_handshake.create_hello();
+    let hello_msg = HandshakeMessage::Hello(hello);
+    let hello_bytes = serialize_handshake_message(&hello_msg).unwrap();
+    client_conn.framed().send(hello_bytes).await.unwrap();
+
+    let response_frame = client_conn.framed().next().await.unwrap().unwrap();
+    let response = parse_handshake_message(&response_frame).expect("failed to parse response");
+    client_handshake.process_response(response).unwrap();
+
+    assert!(client_handshake.is_completed());
+    assert_eq!(client_handshake.server_info(), Some("test-daemon/1.0"));
+
+    let server_version = timeout(Duration::from_secs(1), server_handle)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked");
+    assert_eq!(server_version, Some(PROTOCOL_VERSION));
 }

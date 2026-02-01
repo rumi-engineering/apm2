@@ -85,6 +85,8 @@
 //! - Handshake required before message exchange
 //! - Version mismatch terminates connection
 
+/// Peer credentials extraction from Unix sockets via `SO_PEERCRED`.
+pub mod credentials;
 pub mod error;
 pub mod framing;
 pub mod golden_vectors;
@@ -93,6 +95,7 @@ pub mod messages;
 pub mod server;
 
 // Re-export commonly used types at module level
+pub use credentials::PeerCredentials;
 pub use error::{
     MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ProtocolResult,
 };

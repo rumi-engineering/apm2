@@ -29,11 +29,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use nix::unistd::getuid;
+use subtle::ConstantTimeEq;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
+use super::credentials::PeerCredentials;
 use super::error::{MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, ProtocolError, ProtocolResult};
 use super::framing::FrameCodec;
 
@@ -309,9 +312,34 @@ impl ProtocolServer {
         // Accept connection
         let (stream, _addr) = self.listener.accept().await?;
 
-        debug!("Accepted new connection");
+        // Extract peer credentials (TCK-00248)
+        // Connections without valid credentials are rejected (fail-closed)
+        let creds = PeerCredentials::from_stream(&stream).map_err(|e| {
+            ProtocolError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("failed to extract peer credentials: {e}"),
+            ))
+        })?;
 
-        let connection = Connection::new(stream);
+        // Validate UID before handshake (TCK-00248, SEC-DCP-001/002)
+        // This rejects unauthorized peers BEFORE they can send any frames.
+        // Uses constant-time comparison to prevent timing attacks.
+        let current_uid = getuid().as_raw();
+        let uid_bytes = creds.uid.to_ne_bytes();
+        let expected_bytes = current_uid.to_ne_bytes();
+        let uid_match = uid_bytes.ct_eq(&expected_bytes);
+
+        if uid_match.unwrap_u8() != 1 {
+            // Generic error message - do not leak UIDs to unauthorized peers
+            return Err(ProtocolError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "permission denied",
+            )));
+        }
+
+        debug!(uid = creds.uid, gid = creds.gid, pid = ?creds.pid, "Accepted new connection");
+
+        let connection = Connection::new(stream, Some(creds));
         let connection_permit = ConnectionPermit { _permit: permit };
 
         Ok((connection, connection_permit))
@@ -383,20 +411,29 @@ pub struct ConnectionPermit {
 pub struct Connection {
     /// The framed stream.
     framed: Framed<UnixStream, FrameCodec>,
+    /// Peer credentials (UID/GID/PID) extracted from the socket.
+    peer_credentials: Option<PeerCredentials>,
 }
 
 impl Connection {
     /// Create a new connection from a Unix stream.
     ///
     /// Initializes with [`MAX_HANDSHAKE_FRAME_SIZE`] limit.
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: UnixStream, peer_credentials: Option<PeerCredentials>) -> Self {
         Self {
             framed: Framed::new(
                 stream,
                 FrameCodec::with_max_size(MAX_HANDSHAKE_FRAME_SIZE)
                     .expect("MAX_HANDSHAKE_FRAME_SIZE must be within protocol limits"),
             ),
+            peer_credentials,
         }
+    }
+
+    /// Returns the peer credentials associated with this connection.
+    #[must_use]
+    pub const fn peer_credentials(&self) -> Option<&PeerCredentials> {
+        self.peer_credentials.as_ref()
     }
 
     /// Upgrades the connection to the full protocol frame size.
@@ -479,7 +516,7 @@ pub async fn connect(socket_path: impl AsRef<Path>) -> ProtocolResult<Connection
 
     debug!(socket_path = %path.display(), "Connected to server");
 
-    Ok(Connection::new(stream))
+    Ok(Connection::new(stream, None))
 }
 
 #[cfg(test)]
@@ -744,5 +781,88 @@ mod tests {
             corrected_mode, 0o700,
             "Directory permissions should be corrected to 0700, got {corrected_mode:04o}"
         );
+    }
+
+    /// Test that UID validation uses constant-time comparison (TCK-00248,
+    /// SEC-DCP-002).
+    ///
+    /// This unit test verifies the constant-time comparison logic by testing
+    /// that the XOR-based byte comparison works correctly for matching and
+    /// non-matching UIDs.
+    #[test]
+    fn test_uid_constant_time_comparison() {
+        use subtle::ConstantTimeEq;
+
+        // Test matching UIDs
+        let uid1: u32 = 1000;
+        let uid2: u32 = 1000;
+        let bytes1 = uid1.to_ne_bytes();
+        let bytes2 = uid2.to_ne_bytes();
+        let result = bytes1.ct_eq(&bytes2);
+        assert_eq!(result.unwrap_u8(), 1, "Matching UIDs should return 1");
+
+        // Test non-matching UIDs
+        let uid3: u32 = 1000;
+        let uid4: u32 = 1001;
+        let bytes3 = uid3.to_ne_bytes();
+        let bytes4 = uid4.to_ne_bytes();
+        let result = bytes3.ct_eq(&bytes4);
+        assert_eq!(result.unwrap_u8(), 0, "Non-matching UIDs should return 0");
+
+        // Test boundary case: UID 0 vs non-zero
+        let uid_root: u32 = 0;
+        let uid_user: u32 = 1000;
+        let bytes_root = uid_root.to_ne_bytes();
+        let bytes_user = uid_user.to_ne_bytes();
+        let result = bytes_root.ct_eq(&bytes_user);
+        assert_eq!(result.unwrap_u8(), 0, "Root vs user should return 0");
+
+        // Test UID 0 matching itself
+        let result = bytes_root.ct_eq(&bytes_root);
+        assert_eq!(result.unwrap_u8(), 1, "Root vs root should return 1");
+    }
+
+    /// Test that `accept()` extracts and validates peer credentials
+    /// (TCK-00248).
+    ///
+    /// Since we can't easily simulate a UID mismatch in tests (both ends
+    /// of the socket are this process), this test verifies:
+    /// 1. Credentials are extracted successfully
+    /// 2. Credentials match the current process (so accept succeeds)
+    /// 3. The Connection has the credentials populated
+    #[tokio::test]
+    async fn test_accept_extracts_and_validates_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let socket_path = test_socket_path(&tmp);
+
+        let config = ServerConfig::new(&socket_path);
+        let server = ProtocolServer::bind(config).unwrap();
+
+        // Spawn accept task
+        let server_handle = tokio::spawn(async move {
+            let (conn, _permit) = server.accept().await.unwrap();
+
+            // Verify credentials were extracted
+            let creds = conn
+                .peer_credentials()
+                .expect("Credentials should be present");
+
+            // Verify UID matches current process
+            let current_uid = getuid().as_raw();
+            assert_eq!(creds.uid, current_uid, "UID should match current process");
+
+            // GID is always present in PeerCredentials struct
+
+            // Verify PID is populated (on Linux)
+            assert!(creds.pid.is_some(), "PID should be present");
+
+            conn
+        });
+
+        // Connect as client
+        let _client = connect(&socket_path).await.unwrap();
+
+        // Verify accept succeeded
+        let _conn = server_handle.await.unwrap();
     }
 }

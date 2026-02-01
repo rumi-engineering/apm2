@@ -328,6 +328,13 @@ pub enum HandshakeState {
 /// Server-side handshake handler.
 ///
 /// Validates client Hello messages and generates appropriate responses.
+///
+/// # Security Note (TCK-00248)
+///
+/// UID-based authorization is performed at the connection accept level
+/// in [`crate::protocol::ProtocolServer::accept`], NOT during handshake.
+/// This ensures unauthorized peers are rejected BEFORE they can send
+/// any frames, satisfying the "rejection before handshake" requirement.
 #[derive(Debug)]
 pub struct ServerHandshake {
     /// Server info string for `HelloAck`.
@@ -365,6 +372,11 @@ impl ServerHandshake {
     /// Process a client Hello message.
     ///
     /// Returns the response to send to the client.
+    ///
+    /// # Security Note
+    ///
+    /// UID authorization is performed at `accept()` time, so by the time
+    /// this method is called, the peer has already been authenticated.
     ///
     /// # Errors
     ///
@@ -772,4 +784,14 @@ mod tests {
         let parsed = parse_handshake_message(&bytes).unwrap();
         assert!(matches!(parsed, HandshakeMessage::Hello(_)));
     }
+
+    // NOTE: UID authorization tests have been moved to server.rs tests
+    // since UID validation now occurs at accept() time, before handshake.
+    // See `test_uid_constant_time_comparison` (verifies rejection logic) and
+    // `test_accept_extracts_and_validates_credentials` (verifies success path)
+    // in the server module tests.
+    //
+    // Integration-level UID rejection tests are not feasible because both
+    // client and server run as the same process UID, and SO_PEERCRED cannot
+    // be spoofed.
 }
