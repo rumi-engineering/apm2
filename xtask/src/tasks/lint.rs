@@ -8,6 +8,7 @@
 //! - LINT-0013: New modules without RFC justification
 //! - LINT-0014: Cousin abstractions (similar struct/trait definitions)
 //! - LINT-0015: New pub items without deletion/migration plans
+//! - LINT-0016: HTF human-time units in normative documents
 //!
 //! When `--include-docs` is passed, also scans markdown files for code blocks
 //! and checks them for the same anti-patterns.
@@ -15,10 +16,12 @@
 //! Findings are reported as warnings (not errors) to allow gradual adoption.
 
 use std::path::Path;
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use pulldown_cmark::{CodeBlockKind, Event, Parser as MdParser, Tag, TagEnd};
+use regex::Regex;
 use serde::Deserialize;
 
 // =============================================================================
@@ -93,6 +96,14 @@ pub struct LintArgs {
     /// anti-patterns.
     #[arg(long)]
     pub include_docs: bool,
+
+    /// Run HTF (Holonic Time Fabric) human-time lint on normative documents.
+    ///
+    /// When enabled, scans normative documents (PRDs, RFCs, skills, laws) for
+    /// human-time units (minutes, hours, days, etc.) that violate HTF policy.
+    /// Human-time units are only allowed with explicit `EXTERNAL_TIME:` prefix.
+    #[arg(long)]
+    pub include_htf: bool,
 }
 
 /// Severity level for lint findings.
@@ -239,6 +250,11 @@ pub fn scan_workspace(args: LintArgs) -> Result<Vec<LintFinding>> {
     check_no_new_module_without_justification(&mut findings)?;
     check_cousin_abstractions(&mut findings)?;
     check_deletion_plan_required(&mut findings)?;
+
+    // Run HTF human-time lint on normative documents (LINT-0016)
+    if args.include_htf {
+        check_htf_human_time_units(&mut findings)?;
+    }
 
     Ok(findings)
 }
@@ -1261,6 +1277,174 @@ fn check_pub_items_for_deletion_plan(
     }
 }
 
+// =============================================================================
+// LINT-0016: HTF human-time units in normative documents
+// =============================================================================
+
+/// Regex patterns for detecting human time units that violate HTF policy.
+///
+/// These patterns match:
+/// - Numeric durations: "5 minutes", "24 hours", "30 days", etc.
+/// - Business time codes: "ASAP", "EOD", "EOW", "EOY"
+/// - Relative time phrases: "next week", "next month", "next quarter"
+static HTF_TIME_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    vec![
+        // Numeric time units: "5 minutes", "24 hours", "30 days", etc.
+        Regex::new(r"(?i)\b\d+\s*(seconds?|minutes?|hours?|days?|weeks?|months?|years?)\b")
+            .unwrap(),
+        // Business time codes
+        Regex::new(r"\b(ASAP|EOD|EOW|EOY)\b").unwrap(),
+        // Relative time phrases
+        Regex::new(r"(?i)\bnext\s+(week|month|quarter|year)\b").unwrap(),
+    ]
+});
+
+/// Directories containing normative documents subject to HTF human-time lint.
+const HTF_SCOPED_PATHS: &[&str] = &[
+    "documents/prds/",
+    "documents/rfcs/",
+    "documents/skills/",
+    "documents/laws/",
+];
+
+/// Escape hatch prefix for explicitly external-facing time references.
+const HTF_ESCAPE_PREFIX: &str = "EXTERNAL_TIME:";
+
+/// Check for human time units in normative documents (LINT-0016).
+///
+/// Scans normative documents (PRDs, RFCs, skills, laws) for human-time units
+/// that violate HTF (Holonic Time Fabric) policy. Human-time units are only
+/// allowed with explicit `EXTERNAL_TIME:` prefix to indicate external-facing
+/// contexts (user notifications, SLAs, display formatting).
+fn check_htf_human_time_units(findings: &mut Vec<LintFinding>) -> Result<()> {
+    // Scan YAML and Markdown files in scoped directories
+    let file_patterns = [
+        "documents/prds/**/*.yaml",
+        "documents/prds/**/*.md",
+        "documents/rfcs/**/*.yaml",
+        "documents/rfcs/**/*.md",
+        "documents/skills/**/*.yaml",
+        "documents/skills/**/*.md",
+        "documents/laws/**/*.yaml",
+        "documents/laws/**/*.md",
+    ];
+
+    for pattern in file_patterns {
+        let glob_pattern = glob::glob(pattern).context("Invalid HTF glob pattern")?;
+
+        for entry in glob_pattern {
+            let path = entry.context("Failed to read HTF glob entry")?;
+            if !path.is_file() {
+                continue;
+            }
+            check_htf_file(&path, findings)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Check a single file for HTF human-time violations.
+fn check_htf_file(path: &Path, findings: &mut Vec<LintFinding>) -> Result<()> {
+    let file_path = path.display().to_string();
+
+    // Skip template files (they may contain examples with human time)
+    if file_path.contains("/template/") {
+        return Ok(());
+    }
+
+    // Verify this file is in a scoped directory
+    if !HTF_SCOPED_PATHS
+        .iter()
+        .any(|scope| file_path.starts_with(scope))
+    {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read file for HTF lint: {file_path}"))?;
+
+    for (line_idx, line) in content.lines().enumerate() {
+        let line_number = line_idx + 1;
+
+        // Skip lines with the escape hatch prefix
+        if line.contains(HTF_ESCAPE_PREFIX) {
+            continue;
+        }
+
+        // Skip YAML comments (starting with #)
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Check each pattern
+        for pattern in HTF_TIME_PATTERNS.iter() {
+            if let Some(mat) = pattern.find(line) {
+                let matched_text = mat.as_str();
+
+                // Additional check: skip if this looks like a schema version (e.g.,
+                // "2026-01-30") or an ID pattern (e.g., "REQ-0001")
+                if is_likely_version_or_id(matched_text, line) {
+                    continue;
+                }
+
+                findings.push(LintFinding {
+                    file_path: file_path.clone(),
+                    line_number,
+                    pattern: matched_text.to_string(),
+                    message: format!(
+                        "Human time unit '{matched_text}' in normative document violates HTF policy (REQ-HTF-0006)"
+                    ),
+                    suggestion: format!(
+                        "Use tick-based or ledger-based time instead. For external-facing contexts, prefix with '{HTF_ESCAPE_PREFIX}'"
+                    ),
+                    severity: LintSeverity::Error,
+                    lint_id: Some("LINT-0016".to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if matched text is likely a version number or ID rather than a time
+/// reference.
+///
+/// This helps avoid false positives for patterns like:
+/// - Schema versions: "2026-01-30" (matches "30 days" pattern without context)
+/// - Response times: "24h" in timing contexts that are actually tick-based
+fn is_likely_version_or_id(matched_text: &str, line: &str) -> bool {
+    // If the line contains "version" or "schema", it's likely a version reference
+    let line_lower = line.to_lowercase();
+    if line_lower.contains("version") || line_lower.contains("schema") {
+        return true;
+    }
+
+    // If the matched text is part of a date pattern (YYYY-MM-DD), skip it
+    // Check for surrounding date context
+    if line.contains('-') {
+        // Look for date patterns around the match
+        let date_pattern = Regex::new(r"\d{4}-\d{2}-\d{2}").unwrap();
+        if date_pattern.is_match(line) {
+            // Check if the matched text is part of this date
+            if let Some(date_match) = date_pattern.find(line) {
+                if date_match.as_str().contains(matched_text) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Skip if this is in an ID field context
+    if line_lower.contains("_id") || line_lower.contains("id:") {
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,9 +1454,11 @@ mod tests {
         let args = LintArgs {
             fix: false,
             include_docs: false,
+            include_htf: false,
         };
         assert!(!args.fix);
         assert!(!args.include_docs);
+        assert!(!args.include_htf);
     }
 
     #[test]
@@ -1280,6 +1466,7 @@ mod tests {
         let args = LintArgs {
             fix: true,
             include_docs: false,
+            include_htf: false,
         };
         assert!(args.fix);
     }
@@ -1289,8 +1476,19 @@ mod tests {
         let args = LintArgs {
             fix: false,
             include_docs: true,
+            include_htf: false,
         };
         assert!(args.include_docs);
+    }
+
+    #[test]
+    fn test_lint_args_with_include_htf() {
+        let args = LintArgs {
+            fix: false,
+            include_docs: false,
+            include_htf: true,
+        };
+        assert!(args.include_htf);
     }
 
     #[test]
@@ -1489,6 +1687,7 @@ mod tests {
         let args = LintArgs {
             fix: true,
             include_docs: false,
+            include_htf: false,
         };
         // The run() function should print a note but not fail
         // (We don't actually call run() in unit tests to avoid file I/O)
@@ -1922,5 +2121,296 @@ pub fn init() {}
             deletion_plan_matches(&plan, "other", "crates/foo/src/lib.rs"),
             None
         );
+    }
+
+    // =========================================================================
+    // Tests for LINT-0016: HTF human-time units
+    // =========================================================================
+
+    /// Helper function to check HTF violations in a content string.
+    fn check_htf_content(content: &str, file_path: &str) -> Vec<LintFinding> {
+        let mut findings = Vec::new();
+        for (line_idx, line) in content.lines().enumerate() {
+            let line_number = line_idx + 1;
+
+            // Skip lines with the escape hatch prefix
+            if line.contains(HTF_ESCAPE_PREFIX) {
+                continue;
+            }
+
+            // Skip YAML comments
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+
+            for pattern in HTF_TIME_PATTERNS.iter() {
+                if let Some(mat) = pattern.find(line) {
+                    let matched_text = mat.as_str();
+                    if is_likely_version_or_id(matched_text, line) {
+                        continue;
+                    }
+                    findings.push(LintFinding {
+                        file_path: file_path.to_string(),
+                        line_number,
+                        pattern: matched_text.to_string(),
+                        message: format!("Human time unit '{matched_text}' in normative document"),
+                        suggestion: "Use tick-based time".to_string(),
+                        severity: LintSeverity::Error,
+                        lint_id: Some("LINT-0016".to_string()),
+                    });
+                }
+            }
+        }
+        findings
+    }
+
+    #[test]
+    fn test_htf_detects_numeric_time_units() {
+        let content = r"
+statement: |
+  The timeout is set to 5 minutes for initial connection.
+  Retries happen every 30 seconds.
+  Leases expire after 24 hours.
+  Cleanup runs every 7 days.
+";
+        let findings = check_htf_content(content, "documents/rfcs/RFC-0001/test.yaml");
+        assert!(
+            findings.len() >= 4,
+            "Expected at least 4 findings, got {}",
+            findings.len()
+        );
+
+        // Check that we found the expected patterns
+        let patterns: Vec<_> = findings.iter().map(|f| f.pattern.as_str()).collect();
+        assert!(
+            patterns.iter().any(|p| p.contains("minutes")),
+            "Should detect '5 minutes'"
+        );
+        assert!(
+            patterns.iter().any(|p| p.contains("seconds")),
+            "Should detect '30 seconds'"
+        );
+        assert!(
+            patterns.iter().any(|p| p.contains("hours")),
+            "Should detect '24 hours'"
+        );
+        assert!(
+            patterns.iter().any(|p| p.contains("days")),
+            "Should detect '7 days'"
+        );
+    }
+
+    #[test]
+    fn test_htf_detects_business_time_codes() {
+        let content = r"
+deadline: ASAP
+completion: EOD
+review: EOW
+delivery: EOY
+";
+        let findings = check_htf_content(content, "documents/prds/PRD-0001/test.yaml");
+        assert_eq!(findings.len(), 4, "Should detect all 4 business time codes");
+
+        let patterns: Vec<_> = findings.iter().map(|f| f.pattern.as_str()).collect();
+        assert!(patterns.contains(&"ASAP"));
+        assert!(patterns.contains(&"EOD"));
+        assert!(patterns.contains(&"EOW"));
+        assert!(patterns.contains(&"EOY"));
+    }
+
+    #[test]
+    fn test_htf_detects_relative_time_phrases() {
+        let content = r"
+planning: We will address this next week.
+roadmap: Implementation scheduled for next month.
+goals: Complete by next quarter.
+";
+        let findings = check_htf_content(content, "documents/skills/test/test.md");
+        assert_eq!(
+            findings.len(),
+            3,
+            "Should detect all 3 relative time phrases"
+        );
+
+        let patterns: Vec<_> = findings.iter().map(|f| f.pattern.as_str()).collect();
+        assert!(
+            patterns.iter().any(|p| p.contains("next week")),
+            "Should detect 'next week'"
+        );
+        assert!(
+            patterns.iter().any(|p| p.contains("next month")),
+            "Should detect 'next month'"
+        );
+        assert!(
+            patterns.iter().any(|p| p.contains("next quarter")),
+            "Should detect 'next quarter'"
+        );
+    }
+
+    #[test]
+    fn test_htf_escape_hatch_works() {
+        let content = r"
+external_notification: |
+  EXTERNAL_TIME: Users will receive a reminder 24 hours before the deadline.
+  EXTERNAL_TIME: The SLA guarantees response within 4 hours.
+normal_statement: |
+  Internal processing takes 5 minutes.
+";
+        let findings = check_htf_content(content, "documents/rfcs/RFC-0001/test.yaml");
+
+        // Should only detect the internal "5 minutes", not the EXTERNAL_TIME prefixed
+        // ones
+        assert_eq!(
+            findings.len(),
+            1,
+            "Should only detect 1 violation (not escaped)"
+        );
+        assert!(findings[0].pattern.contains("5 minutes"));
+    }
+
+    #[test]
+    fn test_htf_skips_yaml_comments() {
+        let content = r"
+# This comment mentions 5 minutes but should be skipped
+  # Indented comment: 30 seconds
+statement: This is the actual content with 10 hours timeout.
+";
+        let findings = check_htf_content(content, "documents/prds/PRD-0001/test.yaml");
+
+        // Should only detect "10 hours" from the non-comment line
+        assert_eq!(
+            findings.len(),
+            1,
+            "Should only detect 1 violation (not in comments)"
+        );
+        assert!(findings[0].pattern.contains("10 hours"));
+    }
+
+    #[test]
+    fn test_htf_skips_version_and_schema_lines() {
+        let content = r#"
+schema_version: "2026-01-30"
+template_version: "2026-01-26"
+created_date: "2026-01-30"
+"#;
+        let findings = check_htf_content(content, "documents/rfcs/RFC-0001/00_meta.yaml");
+
+        // Should not flag version/schema lines even if they contain date-like patterns
+        assert_eq!(
+            findings.len(),
+            0,
+            "Should not flag version/schema/date lines"
+        );
+    }
+
+    #[test]
+    fn test_htf_lint_finding_format() {
+        let finding = LintFinding {
+            file_path: "documents/rfcs/RFC-0016/02_design.yaml".to_string(),
+            line_number: 42,
+            pattern: "5 minutes".to_string(),
+            message: "Human time unit '5 minutes' in normative document violates HTF policy (REQ-HTF-0006)"
+                .to_string(),
+            suggestion: "Use tick-based time instead. For external-facing contexts, prefix with 'EXTERNAL_TIME:'"
+                .to_string(),
+            severity: LintSeverity::Error,
+            lint_id: Some("LINT-0016".to_string()),
+        };
+
+        let output = finding.to_string();
+        assert!(output.contains("error [LINT-0016]"));
+        assert!(output.contains("documents/rfcs/RFC-0016/02_design.yaml:42"));
+        assert!(output.contains("5 minutes"));
+    }
+
+    #[test]
+    fn test_htf_case_insensitive_time_units() {
+        let content = r"
+timeout: 5 MINUTES
+delay: 30 Seconds
+expiry: 24 Hours
+";
+        let findings = check_htf_content(content, "documents/rfcs/RFC-0001/test.yaml");
+        assert_eq!(
+            findings.len(),
+            3,
+            "Should detect time units regardless of case"
+        );
+    }
+
+    #[test]
+    fn test_htf_singular_and_plural_forms() {
+        let content = r"
+one_second: 1 second
+one_minute: 1 minute
+one_hour: 1 hour
+one_day: 1 day
+one_week: 1 week
+one_month: 1 month
+one_year: 1 year
+";
+        let findings = check_htf_content(content, "documents/prds/PRD-0001/test.yaml");
+        assert_eq!(
+            findings.len(),
+            7,
+            "Should detect both singular and plural forms"
+        );
+    }
+
+    #[test]
+    fn test_htf_patterns_compiled() {
+        // Verify patterns compile and can match
+        assert!(!HTF_TIME_PATTERNS.is_empty(), "Should have HTF patterns");
+
+        for pattern in HTF_TIME_PATTERNS.iter() {
+            // Each pattern should be valid regex
+            assert!(
+                pattern.is_match("test 5 minutes test")
+                    || pattern.is_match("ASAP")
+                    || pattern.is_match("next week"),
+                "Pattern should match at least one expected string"
+            );
+        }
+    }
+
+    #[test]
+    fn test_htf_scoped_paths() {
+        // Verify scoped paths are configured
+        assert!(!HTF_SCOPED_PATHS.is_empty(), "Should have scoped paths");
+        assert!(
+            HTF_SCOPED_PATHS.contains(&"documents/prds/"),
+            "Should include PRDs"
+        );
+        assert!(
+            HTF_SCOPED_PATHS.contains(&"documents/rfcs/"),
+            "Should include RFCs"
+        );
+        assert!(
+            HTF_SCOPED_PATHS.contains(&"documents/skills/"),
+            "Should include skills"
+        );
+        assert!(
+            HTF_SCOPED_PATHS.contains(&"documents/laws/"),
+            "Should include laws"
+        );
+    }
+
+    #[test]
+    fn test_is_likely_version_or_id() {
+        // Version lines should be skipped
+        assert!(is_likely_version_or_id("30", "schema_version: 2026-01-30"));
+        assert!(is_likely_version_or_id(
+            "26",
+            "template_version: 2026-01-26"
+        ));
+
+        // ID lines should be skipped
+        assert!(is_likely_version_or_id("1", "requirement_id: REQ-0001"));
+        assert!(is_likely_version_or_id("5", "ticket_id: TCK-00005"));
+
+        // Regular content should not be skipped
+        assert!(!is_likely_version_or_id("5 minutes", "timeout: 5 minutes"));
+        assert!(!is_likely_version_or_id("ASAP", "deadline: ASAP"));
     }
 }

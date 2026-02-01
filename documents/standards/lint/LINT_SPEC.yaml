@@ -105,3 +105,22 @@ lint_spec:
       description: "New pub items (fn, struct, trait, mod) MUST have a deletion/migration plan in the associated RFC."
       severity: "ERROR"
       rationale: "Forces consideration of API surface lifetime to prevent permanent clutter accumulation."
+  htf_time_rules:
+    - id: "LINT-0016"
+      scope: "NORMATIVE_DOCS"
+      description: "Human time units (minutes, hours, days, weeks, months, years, ASAP, EOD, EOW, EOY, next week/month/quarter) are forbidden in normative documents unless explicitly marked external."
+      severity: "ERROR"
+      rationale: "Enforces HTF (Holonic Time Fabric) requirement REQ-HTF-0006: normative artifacts MUST use tick-based or ledger-based time, not human wall-time units."
+      scoped_paths:
+        - "documents/prds/**"
+        - "documents/rfcs/**"
+        - "documents/skills/**"
+        - "documents/laws/**"
+      reject_patterns:
+        - "\\b\\d+\\s*(seconds?|minutes?|hours?|days?|weeks?|months?|years?)\\b"
+        - "\\b(ASAP|EOD|EOW|EOY)\\b"
+        - "\\bnext\\s+(week|month|quarter|year)\\b"
+      escape_hatch:
+        prefix: "EXTERNAL_TIME:"
+        metadata_key: "external_time"
+        rationale: "Explicit escape for external-facing contexts (user notifications, SLAs, display formatting)."
