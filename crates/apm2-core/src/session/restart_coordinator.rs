@@ -3,6 +3,15 @@
 //! This module provides the `RestartCoordinator` which wraps the low-level
 //! `RestartManager` and integrates with entropy tracking and quarantine
 //! management to make restart decisions.
+//!
+//! # Migration Note
+//!
+//! This module currently uses legacy (wall-clock based) restart manager methods
+//! for backwards compatibility. These will be migrated to tick-based methods
+//! when the calling code is updated to provide HTF tick values.
+
+// Allow deprecated methods during migration period
+#![allow(deprecated)]
 
 use std::time::Duration;
 

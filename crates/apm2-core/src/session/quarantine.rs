@@ -24,12 +24,112 @@
 //! Quarantine duration uses exponential backoff based on how many times
 //! the session has been quarantined. This prevents sessions from constantly
 //! cycling through quarantine and retry.
+//!
+//! # Defect Emission (DD-HTF-0001)
+//!
+//! Per RFC-0016, tick rate mismatches during quarantine expiry checks emit
+//! a `CLOCK_REGRESSION` defect. This module provides `ClockRegressionDefect`
+//! for callers to emit as a defect record.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::htf::HtfTick;
+
+/// Defect code for clock regression events.
+pub const CLOCK_REGRESSION_CODE: &str = "CLOCK_REGRESSION";
+
+/// Context string for quarantine expiry check.
+pub const CONTEXT_QUARANTINE_EXPIRY: &str = "quarantine_expiry_check";
+
+/// Context string for ticks remaining calculation.
+pub const CONTEXT_TICKS_REMAINING: &str = "ticks_remaining_calculation";
+
+/// Defect record for clock regression events (DD-HTF-0001).
+///
+/// This defect is emitted when a tick rate mismatch is detected during
+/// quarantine or lease expiry checks. Per RFC-0016, this indicates a
+/// potential security issue where ticks from different clock domains
+/// are being compared.
+///
+/// # Response
+///
+/// Per `03_trust_boundaries.yaml`, the default response to `CLOCK_REGRESSION` is:
+/// - Fail-closed for high-risk operations
+/// - Quarantine the affected node
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClockRegressionDefect {
+    /// Defect code (always `CLOCK_REGRESSION`).
+    pub code: String,
+
+    /// Tick rate of the current tick (Hz).
+    pub current_tick_rate_hz: u64,
+
+    /// Tick rate of the expected tick (Hz).
+    pub expected_tick_rate_hz: u64,
+
+    /// Current tick value.
+    pub current_tick_value: u64,
+
+    /// Expected tick value (e.g., quarantine expiry tick).
+    pub expected_tick_value: u64,
+
+    /// Context where the mismatch was detected.
+    pub context: String,
+
+    /// Whether fail-closed behavior was applied.
+    pub fail_closed_applied: bool,
+}
+
+impl ClockRegressionDefect {
+    /// Creates a new clock regression defect for quarantine expiry check.
+    #[must_use]
+    pub fn quarantine_expiry_mismatch(
+        current_tick: &HtfTick,
+        quarantine_until_tick: &HtfTick,
+    ) -> Self {
+        Self {
+            code: CLOCK_REGRESSION_CODE.to_string(),
+            current_tick_rate_hz: current_tick.tick_rate_hz(),
+            expected_tick_rate_hz: quarantine_until_tick.tick_rate_hz(),
+            current_tick_value: current_tick.value(),
+            expected_tick_value: quarantine_until_tick.value(),
+            context: CONTEXT_QUARANTINE_EXPIRY.to_string(),
+            fail_closed_applied: true,
+        }
+    }
+
+    /// Creates a new clock regression defect for ticks remaining calculation.
+    #[must_use]
+    pub fn ticks_remaining_mismatch(
+        current_tick: &HtfTick,
+        quarantine_until_tick: &HtfTick,
+    ) -> Self {
+        Self {
+            code: CLOCK_REGRESSION_CODE.to_string(),
+            current_tick_rate_hz: current_tick.tick_rate_hz(),
+            expected_tick_rate_hz: quarantine_until_tick.tick_rate_hz(),
+            current_tick_value: current_tick.value(),
+            expected_tick_value: quarantine_until_tick.value(),
+            context: CONTEXT_TICKS_REMAINING.to_string(),
+            fail_closed_applied: true,
+        }
+    }
+}
+
+impl std::fmt::Display for ClockRegressionDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CLOCK_REGRESSION in {}: tick rate mismatch (current={}Hz, expected={}Hz)",
+            self.context, self.current_tick_rate_hz, self.expected_tick_rate_hz
+        )
+    }
+}
+
+impl std::error::Error for ClockRegressionDefect {}
 
 /// Configuration for quarantine behavior.
 ///
@@ -544,6 +644,12 @@ impl QuarantineManager {
     /// we cannot reliably determine expiry. This differs from leases
     /// where `expired = true` correctly removes privilege.
     ///
+    /// # DD-HTF-0001: Defect Emission
+    ///
+    /// This method silently fails closed. Use
+    /// [`QuarantineManager::check_quarantine_expired_at_tick`] if you need
+    /// to emit a `CLOCK_REGRESSION` defect on tick rate mismatch.
+    ///
     /// # Arguments
     /// * `quarantine_until_tick` - Tick when quarantine expires
     /// * `current_tick` - Current tick
@@ -558,6 +664,42 @@ impl QuarantineManager {
             return false; // Fail-closed: keep quarantine active (NOT expired)
         }
         current_tick.value() >= quarantine_until_tick.value()
+    }
+
+    /// Checks if a quarantine has expired, returning a defect on tick rate
+    /// mismatch (RFC-0016 HTF, DD-HTF-0001).
+    ///
+    /// This is the preferred method when defect emission is required. It
+    /// returns both the expiry result and an optional defect to emit.
+    ///
+    /// # SEC-HTF-003: Tick Rate Validation (FAIL-CLOSED)
+    ///
+    /// If tick rates differ, returns `(false, Some(defect))` where:
+    /// - `false` = quarantine NOT expired (fail-closed behavior)
+    /// - `defect` = `ClockRegressionDefect` for emission
+    ///
+    /// # Arguments
+    /// * `quarantine_until_tick` - Tick when quarantine expires
+    /// * `current_tick` - Current tick
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(is_expired, Option<ClockRegressionDefect>)`.
+    #[must_use]
+    pub fn check_quarantine_expired_at_tick(
+        quarantine_until_tick: &HtfTick,
+        current_tick: &HtfTick,
+    ) -> (bool, Option<ClockRegressionDefect>) {
+        // SEC-HTF-003: Enforce tick rate equality.
+        if current_tick.tick_rate_hz() != quarantine_until_tick.tick_rate_hz() {
+            // DD-HTF-0001: Emit CLOCK_REGRESSION defect
+            let defect = ClockRegressionDefect::quarantine_expiry_mismatch(
+                current_tick,
+                quarantine_until_tick,
+            );
+            return (false, Some(defect)); // Fail-closed with defect
+        }
+        (current_tick.value() >= quarantine_until_tick.value(), None)
     }
 
     /// Calculates the `quarantine_until` timestamp.
@@ -833,6 +975,23 @@ impl QuarantineInfo {
 
     /// Checks if this quarantine has expired, using tick-based comparison with
     /// wall-clock fallback for legacy quarantines.
+    ///
+    /// # RSK-2503: Mixed Clock Domain Hazard - TEMPORARY MIGRATION SHIM
+    ///
+    /// **WARNING**: This method consults two authority sources (tick and wall
+    /// clock), introducing a mixed clock domain hazard. This is intentional
+    /// as a migration shim for backwards compatibility with legacy quarantines
+    /// that lack tick data.
+    ///
+    /// **Migration Plan**:
+    /// 1. During transition: This method provides fallback for legacy data
+    /// 2. After full migration: Deprecate this method in favor of
+    ///    `is_expired_at_tick` 3. Target removal: When all quarantines have
+    ///    tick data (estimated: 2 release cycles after HTF deployment)
+    ///
+    /// **Security Note**: The wall-clock fallback is ONLY used for legacy
+    /// quarantines. New quarantines with tick data always use tick comparison,
+    /// which is immune to wall-clock manipulation.
     ///
     /// # SEC-CTRL-FAC-0015: Migration Path for Legacy Quarantines
     ///
@@ -1951,5 +2110,72 @@ mod tck_00243 {
         let result: Result<QuarantineInfo, _> = serde_json::from_str(invalid_json);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown field"));
+    }
+
+    /// TCK-00243: DD-HTF-0001 `CLOCK_REGRESSION` defect emission on tick rate
+    /// mismatch.
+    ///
+    /// When tick rates differ, `check_quarantine_expired_at_tick` should return
+    /// a `ClockRegressionDefect` for emission to the defect log.
+    #[test]
+    fn clock_regression_defect_on_tick_rate_mismatch() {
+        let quarantine_until = HtfTick::new(2000, 1_000_000); // 1MHz
+        let current_tick = HtfTick::new(1500, 10_000_000); // 10MHz (mismatch!)
+
+        let (is_expired, defect) =
+            QuarantineManager::check_quarantine_expired_at_tick(&quarantine_until, &current_tick);
+
+        // Fail-closed: quarantine should NOT be expired
+        assert!(!is_expired);
+
+        // Defect should be present
+        assert!(defect.is_some());
+        let defect = defect.unwrap();
+
+        // Verify defect fields
+        assert_eq!(defect.code, CLOCK_REGRESSION_CODE);
+        assert_eq!(defect.current_tick_rate_hz, 10_000_000);
+        assert_eq!(defect.expected_tick_rate_hz, 1_000_000);
+        assert_eq!(defect.current_tick_value, 1500);
+        assert_eq!(defect.expected_tick_value, 2000);
+        assert_eq!(defect.context, CONTEXT_QUARANTINE_EXPIRY);
+        assert!(defect.fail_closed_applied);
+
+        // Display should be informative
+        let display = defect.to_string();
+        assert!(display.contains("CLOCK_REGRESSION"));
+        assert!(display.contains("quarantine_expiry_check"));
+        assert!(display.contains("10000000Hz"));
+        assert!(display.contains("1000000Hz"));
+    }
+
+    /// TCK-00243: No defect when tick rates match.
+    #[test]
+    fn no_defect_when_tick_rates_match() {
+        let quarantine_until = HtfTick::new(2000, 1_000_000);
+        let current_tick = HtfTick::new(1500, 1_000_000); // Same rate
+
+        let (is_expired, defect) =
+            QuarantineManager::check_quarantine_expired_at_tick(&quarantine_until, &current_tick);
+
+        // Should not be expired (1500 < 2000)
+        assert!(!is_expired);
+
+        // No defect when rates match
+        assert!(defect.is_none());
+    }
+
+    /// TCK-00243: `ClockRegressionDefect` serde roundtrip.
+    #[test]
+    fn clock_regression_defect_serde_roundtrip() {
+        let defect = ClockRegressionDefect::quarantine_expiry_mismatch(
+            &HtfTick::new(1500, 10_000_000),
+            &HtfTick::new(2000, 1_000_000),
+        );
+
+        let json = serde_json::to_string(&defect).unwrap();
+        let deserialized: ClockRegressionDefect = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(defect, deserialized);
     }
 }

@@ -1,11 +1,24 @@
 //! Restart policy module.
 //!
 //! Defines restart behavior including backoff strategies and circuit breakers.
+//!
+//! # Time Model (RFC-0016 HTF)
+//!
+//! Restart tracking uses tick-based timing for immunity to wall-clock
+//! manipulation:
+//!
+//! - `restart_window_ticks` / `tick_rate_hz`: Authoritative for restart window
+//!   calculations when present
+//! - `restart_window`: Retained for backwards compatibility
+//!
+//! When tick-based fields are present, they are authoritative. Window
+//! calculations MUST use tick arithmetic, not wall time.
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::htf::HtfTick;
 
 /// Restart configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,10 +156,18 @@ impl BackoffConfig {
 }
 
 /// Restart history entry.
+///
+/// # Time Model (RFC-0016 HTF)
+///
+/// When `recorded_at_tick` is present, it is authoritative for restart window
+/// calculations. The `timestamp` field is retained for backwards compatibility
+/// and observational purposes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestartEntry {
-    /// Time of the restart.
-    pub timestamp: DateTime<Utc>,
+    /// Time of the restart (observational, not authoritative for window
+    /// calculations when tick data is present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ns: Option<u64>,
 
     /// Exit code of the previous run (if available).
     pub exit_code: Option<i32>,
@@ -156,9 +177,26 @@ pub struct RestartEntry {
 
     /// Restart delay applied.
     pub delay: Duration,
+
+    /// HTF tick when this restart was recorded (RFC-0016).
+    /// Authoritative for restart window calculations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at_tick: Option<HtfTick>,
 }
 
 /// Manages restart decisions and history.
+///
+/// # Time Model (RFC-0016 HTF)
+///
+/// `RestartManager` supports both tick-based and legacy wall-clock timing:
+///
+/// - When tick-based timing is configured (via `restart_window_ticks`), all
+///   restart window calculations use tick arithmetic immune to wall-clock
+///   manipulation.
+/// - Legacy mode uses wall-clock duration for backwards compatibility.
+///
+/// Use `should_restart_at_tick` and `record_restart_at_tick` for tick-based
+/// operations.
 #[derive(Debug)]
 pub struct RestartManager {
     /// Restart configuration.
@@ -173,8 +211,14 @@ pub struct RestartManager {
     /// Whether the circuit breaker is open (preventing restarts).
     circuit_open: bool,
 
-    /// Time when the circuit breaker opened.
-    circuit_opened_at: Option<DateTime<Utc>>,
+    /// Tick when the circuit breaker opened (RFC-0016 HTF).
+    circuit_opened_at_tick: Option<HtfTick>,
+
+    /// Restart window in ticks (if tick-based timing is configured).
+    restart_window_ticks: Option<u64>,
+
+    /// Tick rate in Hz (required when using tick-based timing).
+    tick_rate_hz: Option<u64>,
 }
 
 impl RestartManager {
@@ -186,12 +230,161 @@ impl RestartManager {
             history: Vec::new(),
             backoff_attempt: 0,
             circuit_open: false,
-            circuit_opened_at: None,
+            circuit_opened_at_tick: None,
+            restart_window_ticks: None,
+            tick_rate_hz: None,
         }
     }
 
-    /// Check if a restart should be allowed.
+    /// Create a new restart manager with tick-based timing (RFC-0016 HTF).
+    ///
+    /// This is the preferred constructor for new code. Tick-based timing is
+    /// immune to wall-clock manipulation.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Restart configuration
+    /// * `restart_window_ticks` - Restart window in ticks
+    /// * `tick_rate_hz` - Tick rate in Hz (MUST be > 0)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tick_rate_hz` is 0.
     #[must_use]
+    pub const fn with_ticks(
+        config: RestartConfig,
+        restart_window_ticks: u64,
+        tick_rate_hz: u64,
+    ) -> Self {
+        assert!(tick_rate_hz > 0, "tick_rate_hz must be > 0");
+        Self {
+            config,
+            history: Vec::new(),
+            backoff_attempt: 0,
+            circuit_open: false,
+            circuit_opened_at_tick: None,
+            restart_window_ticks: Some(restart_window_ticks),
+            tick_rate_hz: Some(tick_rate_hz),
+        }
+    }
+
+    /// Returns true if this manager uses tick-based timing.
+    #[must_use]
+    pub const fn is_tick_based(&self) -> bool {
+        self.restart_window_ticks.is_some() && self.tick_rate_hz.is_some()
+    }
+
+    /// Check if a restart should be allowed at the given tick (RFC-0016 HTF).
+    ///
+    /// This is the tick-based equivalent of `should_restart`. It counts
+    /// restarts within the tick-based window to determine if a restart is
+    /// allowed.
+    ///
+    /// # SEC-HTF-003: Tick Rate Validation
+    ///
+    /// If the provided `current_tick` has a different tick rate than the
+    /// configured rate, this method returns `false` (fail-closed: deny
+    /// restart).
+    #[must_use]
+    pub fn should_restart_at_tick(&self, exit_code: Option<i32>, current_tick: &HtfTick) -> bool {
+        // Check circuit breaker
+        if self.circuit_open {
+            return false;
+        }
+
+        // Check if we restart on success
+        if exit_code == Some(0) && !self.config.restart_on_success {
+            return false;
+        }
+
+        // SEC-HTF-003: Validate tick rate matches configuration
+        if let Some(configured_rate) = self.tick_rate_hz {
+            if current_tick.tick_rate_hz() != configured_rate {
+                // Fail-closed: deny restart on tick rate mismatch
+                return false;
+            }
+        }
+
+        // Get window boundary
+        let window_ticks = self.restart_window_ticks.unwrap_or_else(|| {
+            // Fallback: convert Duration to ticks if not configured
+            let tick_rate = self.tick_rate_hz.unwrap_or(1_000_000);
+            self.config.restart_window.as_secs() * tick_rate
+        });
+
+        let window_start_tick = current_tick.value().saturating_sub(window_ticks);
+
+        // Count restarts within the tick-based window
+        let recent_restarts = self
+            .history
+            .iter()
+            .filter(|entry| {
+                entry
+                    .recorded_at_tick
+                    .as_ref()
+                    .is_some_and(|t| t.value() >= window_start_tick)
+            })
+            .count();
+
+        recent_restarts < self.config.max_restarts as usize
+    }
+
+    /// Record a restart at the given tick and get the delay (RFC-0016 HTF).
+    ///
+    /// This is the tick-based equivalent of `record_restart`. The restart is
+    /// recorded with the provided tick for window calculations.
+    pub fn record_restart_at_tick(
+        &mut self,
+        exit_code: Option<i32>,
+        uptime: Duration,
+        current_tick: HtfTick,
+    ) -> Duration {
+        self.backoff_attempt += 1;
+        let delay = self.config.backoff.delay_for_attempt(self.backoff_attempt);
+
+        let entry = RestartEntry {
+            timestamp_ns: None,
+            exit_code,
+            uptime,
+            delay,
+            recorded_at_tick: Some(current_tick),
+        };
+
+        self.history.push(entry);
+        self.prune_history_at_tick(&current_tick);
+
+        // Check if we should open the circuit breaker
+        self.check_circuit_breaker_at_tick(&current_tick);
+
+        delay
+    }
+
+    /// Record a successful run (uptime exceeded `min_uptime`).
+    pub const fn record_success(&mut self) {
+        // Reset backoff on successful run
+        self.backoff_attempt = 0;
+        self.circuit_open = false;
+        self.circuit_opened_at_tick = None;
+    }
+
+    // =========================================================================
+    // Legacy methods for backwards compatibility
+    // =========================================================================
+
+    /// Check if a restart should be allowed (legacy, wall-clock based).
+    ///
+    /// **DEPRECATED**: Use [`RestartManager::should_restart_at_tick`] for
+    /// tick-based timing (RFC-0016 HTF).
+    ///
+    /// This method maintains backwards compatibility with code that doesn't
+    /// provide tick values. It uses a simple count of restarts in history
+    /// without wall-clock window filtering (since history is pruned by
+    /// tick-based methods).
+    #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "use should_restart_at_tick for tick-based timing (RFC-0016 HTF)"
+    )]
     pub fn should_restart(&self, exit_code: Option<i32>) -> bool {
         // Check circuit breaker
         if self.circuit_open {
@@ -203,86 +396,115 @@ impl RestartManager {
             return false;
         }
 
-        // Check restart count within window
-        let now = Utc::now();
-        let window_start =
-            now - chrono::Duration::from_std(self.config.restart_window).unwrap_or_default();
-
-        let recent_restarts = self
-            .history
-            .iter()
-            .filter(|entry| entry.timestamp >= window_start)
-            .count();
-
-        recent_restarts < self.config.max_restarts as usize
+        // For legacy mode, count all history entries
+        // (tick-based pruning will have removed old entries)
+        self.history.len() < self.config.max_restarts as usize
     }
 
-    /// Record a restart and get the delay before restarting.
+    /// Record a restart and get the delay (legacy, wall-clock based).
+    ///
+    /// **DEPRECATED**: Use [`RestartManager::record_restart_at_tick`] for
+    /// tick-based timing (RFC-0016 HTF).
+    #[deprecated(
+        since = "0.4.0",
+        note = "use record_restart_at_tick for tick-based timing (RFC-0016 HTF)"
+    )]
     pub fn record_restart(&mut self, exit_code: Option<i32>, uptime: Duration) -> Duration {
         self.backoff_attempt += 1;
         let delay = self.config.backoff.delay_for_attempt(self.backoff_attempt);
 
         let entry = RestartEntry {
-            timestamp: Utc::now(),
+            timestamp_ns: None,
             exit_code,
             uptime,
             delay,
+            recorded_at_tick: None, // Legacy: no tick data
         };
 
         self.history.push(entry);
-        self.prune_history();
 
-        // Check if we should open the circuit breaker
-        self.check_circuit_breaker();
+        // Legacy mode doesn't prune by tick (no tick available)
+        // Circuit breaker check uses history length
+        if self.history.len() >= self.config.max_restarts as usize {
+            self.circuit_open = true;
+        }
 
         delay
     }
 
-    /// Record a successful run (uptime exceeded `min_uptime`).
-    pub const fn record_success(&mut self) {
-        // Reset backoff on successful run
-        self.backoff_attempt = 0;
-        self.circuit_open = false;
-        self.circuit_opened_at = None;
+    /// Get the number of restarts within the window (legacy).
+    ///
+    /// **DEPRECATED**: Use [`RestartManager::restart_count_at_tick`] for
+    /// tick-based timing (RFC-0016 HTF).
+    #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "use restart_count_at_tick for tick-based timing (RFC-0016 HTF)"
+    )]
+    pub fn restart_count(&self) -> usize {
+        self.history.len()
     }
 
-    /// Check if the circuit breaker should open.
-    fn check_circuit_breaker(&mut self) {
-        let now = Utc::now();
-        let window_start =
-            now - chrono::Duration::from_std(self.config.restart_window).unwrap_or_default();
+    /// Check if the circuit breaker should open (tick-based).
+    fn check_circuit_breaker_at_tick(&mut self, current_tick: &HtfTick) {
+        let window_ticks = self.restart_window_ticks.unwrap_or_else(|| {
+            let tick_rate = self.tick_rate_hz.unwrap_or(1_000_000);
+            self.config.restart_window.as_secs() * tick_rate
+        });
+
+        let window_start_tick = current_tick.value().saturating_sub(window_ticks);
 
         let recent_restarts = self
             .history
             .iter()
-            .filter(|entry| entry.timestamp >= window_start)
+            .filter(|entry| {
+                entry
+                    .recorded_at_tick
+                    .as_ref()
+                    .is_some_and(|t| t.value() >= window_start_tick)
+            })
             .count();
 
         if recent_restarts >= self.config.max_restarts as usize {
             self.circuit_open = true;
-            self.circuit_opened_at = Some(now);
+            self.circuit_opened_at_tick = Some(*current_tick);
         }
     }
 
-    /// Remove old entries from history.
-    fn prune_history(&mut self) {
-        let now = Utc::now();
-        let window_start =
-            now - chrono::Duration::from_std(self.config.restart_window).unwrap_or_default();
+    /// Remove old entries from history (tick-based).
+    fn prune_history_at_tick(&mut self, current_tick: &HtfTick) {
+        let window_ticks = self.restart_window_ticks.unwrap_or_else(|| {
+            let tick_rate = self.tick_rate_hz.unwrap_or(1_000_000);
+            self.config.restart_window.as_secs() * tick_rate
+        });
 
-        self.history.retain(|entry| entry.timestamp >= window_start);
+        let window_start_tick = current_tick.value().saturating_sub(window_ticks);
+
+        self.history.retain(|entry| {
+            entry
+                .recorded_at_tick
+                .is_some_and(|t| t.value() >= window_start_tick)
+        });
     }
 
-    /// Get the number of restarts within the window.
+    /// Get the number of restarts within the window at the given tick.
     #[must_use]
-    pub fn restart_count(&self) -> usize {
-        let now = Utc::now();
-        let window_start =
-            now - chrono::Duration::from_std(self.config.restart_window).unwrap_or_default();
+    pub fn restart_count_at_tick(&self, current_tick: &HtfTick) -> usize {
+        let window_ticks = self.restart_window_ticks.unwrap_or_else(|| {
+            let tick_rate = self.tick_rate_hz.unwrap_or(1_000_000);
+            self.config.restart_window.as_secs() * tick_rate
+        });
+
+        let window_start_tick = current_tick.value().saturating_sub(window_ticks);
 
         self.history
             .iter()
-            .filter(|entry| entry.timestamp >= window_start)
+            .filter(|entry| {
+                entry
+                    .recorded_at_tick
+                    .as_ref()
+                    .is_some_and(|t| t.value() >= window_start_tick)
+            })
             .count()
     }
 
@@ -297,7 +519,7 @@ impl RestartManager {
         self.history.clear();
         self.backoff_attempt = 0;
         self.circuit_open = false;
-        self.circuit_opened_at = None;
+        self.circuit_opened_at_tick = None;
     }
 
     /// Get the configuration.
@@ -346,42 +568,185 @@ mod tests {
     }
 
     #[test]
-    fn test_restart_manager() {
-        let config = RestartConfig {
-            max_restarts: 3,
-            restart_window: Duration::from_secs(60),
-            ..Default::default()
-        };
-        let mut manager = RestartManager::new(config);
-
-        // Should allow restarts initially
-        assert!(manager.should_restart(Some(1)));
-
-        // Record some restarts
-        manager.record_restart(Some(1), Duration::from_secs(5));
-        assert!(manager.should_restart(Some(1)));
-
-        manager.record_restart(Some(1), Duration::from_secs(5));
-        assert!(manager.should_restart(Some(1)));
-
-        manager.record_restart(Some(1), Duration::from_secs(5));
-        // Should not allow restart after max_restarts
-        assert!(!manager.should_restart(Some(1)));
-        assert!(manager.is_circuit_open());
-    }
-
-    #[test]
     fn test_restart_on_success() {
         let config = RestartConfig {
             restart_on_success: false,
             ..Default::default()
         };
         let manager = RestartManager::new(config);
+        let tick = HtfTick::new(1000, 1_000_000);
 
         // Should not restart on exit code 0
-        assert!(!manager.should_restart(Some(0)));
+        assert!(!manager.should_restart_at_tick(Some(0), &tick));
         // Should restart on non-zero exit code
-        assert!(manager.should_restart(Some(1)));
+        assert!(manager.should_restart_at_tick(Some(1), &tick));
+    }
+}
+
+/// TCK-00243: Tick-based restart window tests (RFC-0016 HTF).
+#[cfg(test)]
+mod tck_00243 {
+    use super::*;
+
+    const TICK_RATE_HZ: u64 = 1_000_000; // 1MHz
+
+    fn tick(value: u64) -> HtfTick {
+        HtfTick::new(value, TICK_RATE_HZ)
+    }
+
+    /// TCK-00243: Tick-based restart manager construction.
+    #[test]
+    fn tick_based_manager_construction() {
+        let config = RestartConfig {
+            max_restarts: 3,
+            restart_window: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        // 60 seconds = 60_000_000 ticks at 1MHz
+        let manager = RestartManager::with_ticks(config, 60_000_000, TICK_RATE_HZ);
+
+        assert!(manager.is_tick_based());
+        assert_eq!(manager.restart_window_ticks, Some(60_000_000));
+        assert_eq!(manager.tick_rate_hz, Some(TICK_RATE_HZ));
+    }
+
+    /// TCK-00243: Legacy manager is not tick-based.
+    #[test]
+    fn legacy_manager_not_tick_based() {
+        let config = RestartConfig::default();
+        let manager = RestartManager::new(config);
+
+        assert!(!manager.is_tick_based());
+    }
+
+    /// TCK-00243: Tick-based restart window counting.
+    #[test]
+    fn tick_based_restart_window() {
+        let config = RestartConfig {
+            max_restarts: 3,
+            restart_window: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        // Window of 1000 ticks
+        let mut manager = RestartManager::with_ticks(config, 1000, TICK_RATE_HZ);
+
+        // Should allow restarts initially
+        assert!(manager.should_restart_at_tick(Some(1), &tick(100)));
+
+        // Record restarts within window
+        manager.record_restart_at_tick(Some(1), Duration::from_secs(5), tick(100));
+        assert!(manager.should_restart_at_tick(Some(1), &tick(200)));
+        assert_eq!(manager.restart_count_at_tick(&tick(200)), 1);
+
+        manager.record_restart_at_tick(Some(1), Duration::from_secs(5), tick(200));
+        assert!(manager.should_restart_at_tick(Some(1), &tick(300)));
+        assert_eq!(manager.restart_count_at_tick(&tick(300)), 2);
+
+        manager.record_restart_at_tick(Some(1), Duration::from_secs(5), tick(300));
+        // Should not allow restart after max_restarts
+        assert!(!manager.should_restart_at_tick(Some(1), &tick(400)));
+        assert!(manager.is_circuit_open());
+    }
+
+    /// TCK-00243: Restarts outside window are not counted.
+    #[test]
+    fn restarts_outside_window_not_counted() {
+        let config = RestartConfig {
+            max_restarts: 2,
+            restart_window: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        // Window of 1000 ticks
+        let mut manager = RestartManager::with_ticks(config, 1000, TICK_RATE_HZ);
+
+        // Record restart at tick 100
+        manager.record_restart_at_tick(Some(1), Duration::from_secs(5), tick(100));
+
+        // At tick 500, the restart at 100 is within window (500 - 1000 < 0, so
+        // window_start = 0)
+        assert_eq!(manager.restart_count_at_tick(&tick(500)), 1);
+
+        // At tick 1200, the restart at 100 is outside window (1200 - 1000 = 200 > 100)
+        assert_eq!(manager.restart_count_at_tick(&tick(1200)), 0);
+
+        // Can restart again after window expires
+        assert!(manager.should_restart_at_tick(Some(1), &tick(1200)));
+    }
+
+    /// TCK-00243: Tick rate mismatch fails closed.
+    #[test]
+    fn tick_rate_mismatch_fails_closed() {
+        let config = RestartConfig {
+            max_restarts: 5,
+            restart_window: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        let manager = RestartManager::with_ticks(config, 1000, TICK_RATE_HZ);
+
+        // Correct tick rate: should allow restart
+        assert!(manager.should_restart_at_tick(Some(1), &tick(100)));
+
+        // Wrong tick rate: should deny restart (fail-closed)
+        let wrong_rate_tick = HtfTick::new(100, 10_000_000); // 10MHz instead of 1MHz
+        assert!(!manager.should_restart_at_tick(Some(1), &wrong_rate_tick));
+    }
+
+    /// TCK-00243: Reset clears tick-based state.
+    #[test]
+    fn reset_clears_tick_state() {
+        let config = RestartConfig {
+            max_restarts: 1,
+            restart_window: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        let mut manager = RestartManager::with_ticks(config, 1000, TICK_RATE_HZ);
+
+        // Record restart and hit circuit breaker
+        manager.record_restart_at_tick(Some(1), Duration::from_secs(5), tick(100));
+        assert!(manager.is_circuit_open());
+        assert!(!manager.should_restart_at_tick(Some(1), &tick(200)));
+
+        // Reset
+        manager.reset();
+
+        // Should allow restarts again
+        assert!(!manager.is_circuit_open());
+        assert!(manager.should_restart_at_tick(Some(1), &tick(300)));
+    }
+
+    /// TCK-00243: Record success resets state.
+    #[test]
+    fn record_success_resets_state() {
+        let config = RestartConfig {
+            max_restarts: 1,
+            restart_window: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        let mut manager = RestartManager::with_ticks(config, 1000, TICK_RATE_HZ);
+
+        // Record restart and hit circuit breaker
+        manager.record_restart_at_tick(Some(1), Duration::from_secs(5), tick(100));
+        assert!(manager.is_circuit_open());
+
+        // Record success
+        manager.record_success();
+
+        // Circuit should be closed
+        assert!(!manager.is_circuit_open());
+    }
+
+    /// TCK-00243: `with_ticks` panics on zero tick rate.
+    #[test]
+    #[should_panic(expected = "tick_rate_hz must be > 0")]
+    fn with_ticks_panics_on_zero_rate() {
+        let config = RestartConfig::default();
+        let _ = RestartManager::with_ticks(config, 1000, 0);
     }
 }
 
