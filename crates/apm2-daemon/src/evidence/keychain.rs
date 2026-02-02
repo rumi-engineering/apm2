@@ -63,8 +63,24 @@ use super::signer::{KeyId, ReceiptSigner, SignerError};
 /// Service name for keychain entries.
 pub const KEYCHAIN_SERVICE_NAME: &str = "apm2-receipt-signing";
 
+/// Service name for GitHub tokens (TCK-00262).
+///
+/// Uses a dedicated service name to avoid collisions with signing keys.
+pub const GITHUB_KEYCHAIN_SERVICE: &str = "apm2-github-tokens";
+
 /// Maximum number of keys to store (CTR-1303).
 pub const MAX_STORED_KEYS: usize = 100;
+
+/// Maximum number of GitHub tokens to store (CTR-1303, TCK-00262).
+///
+/// This bounds the in-memory token store to prevent memory exhaustion attacks.
+pub const MAX_STORED_TOKENS: usize = 100;
+
+/// Maximum size for a single GitHub token in bytes (CTR-1303, TCK-00262).
+///
+/// GitHub tokens are typically under 100 bytes. 4KB is generous while
+/// preventing unbounded allocation from malicious input.
+pub const MAX_TOKEN_SIZE: usize = 4096;
 
 /// Key data version for serialization compatibility.
 const KEY_DATA_VERSION: u8 = 1;
@@ -143,6 +159,22 @@ pub enum KeychainError {
     /// Home directory not found.
     #[error("could not determine home directory")]
     NoHomeDirectory,
+
+    /// Token exceeds maximum size (CTR-1303, TCK-00262).
+    #[error("token too large: {size} bytes (max {max})")]
+    TokenTooLarge {
+        /// Actual size.
+        size: usize,
+        /// Maximum allowed size.
+        max: usize,
+    },
+
+    /// Token store is full (CTR-1303, TCK-00262).
+    #[error("token store full: maximum {max} tokens")]
+    StoreFull {
+        /// Maximum number of tokens.
+        max: usize,
+    },
 }
 
 // =============================================================================
@@ -245,6 +277,61 @@ pub trait SigningKeyStore: Send + Sync {
     ///
     /// Returns an error if the key doesn't exist or the operation fails.
     fn update_version(&self, key_id: &KeyId, new_version: u32) -> Result<(), KeychainError>;
+}
+
+// =============================================================================
+// GitHubCredentialStore Trait (TCK-00262)
+// =============================================================================
+
+/// Trait for GitHub credential storage backends.
+///
+/// This trait abstracts the storage of GitHub installation access tokens
+/// to allow for OS keychain storage in production and in-memory storage
+/// for testing. Per RFC-0017 TB-003, credentials are held by the daemon
+/// only and never exposed to session processes.
+///
+/// # Security
+///
+/// - Tokens are stored in the OS keychain, protected at rest
+/// - Sessions never see raw credentials (broker-mediated access)
+/// - Uses a dedicated service name (`GITHUB_KEYCHAIN_SERVICE`) to avoid
+///   collisions with signing keys
+pub trait GitHubCredentialStore: Send + Sync {
+    /// Stores a GitHub token for an installation.
+    ///
+    /// # Arguments
+    ///
+    /// * `installation_id` - GitHub installation ID (unique identifier)
+    /// * `token` - The access token to store
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the keychain operation fails.
+    fn store_token(&self, installation_id: &str, token: &str) -> Result<(), KeychainError>;
+
+    /// Retrieves a GitHub token for an installation.
+    ///
+    /// # Arguments
+    ///
+    /// * `installation_id` - GitHub installation ID
+    ///
+    /// # Errors
+    ///
+    /// Returns `KeychainError::NotFound` if the token is not found,
+    /// or another error if the operation fails.
+    fn get_token(&self, installation_id: &str) -> Result<String, KeychainError>;
+
+    /// Deletes a GitHub token.
+    ///
+    /// # Arguments
+    ///
+    /// * `installation_id` - GitHub installation ID
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the keychain operation fails.
+    /// Returns `Ok(())` if the token doesn't exist (idempotent delete).
+    fn delete_token(&self, installation_id: &str) -> Result<(), KeychainError>;
 }
 
 // =============================================================================
@@ -674,6 +761,44 @@ impl SigningKeyStore for OsKeychain {
     }
 }
 
+impl GitHubCredentialStore for OsKeychain {
+    fn store_token(&self, installation_id: &str, token: &str) -> Result<(), KeychainError> {
+        // Use a dedicated service name for GitHub tokens to avoid collision
+        // with signing keys
+        let entry = keyring::Entry::new(GITHUB_KEYCHAIN_SERVICE, installation_id)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        entry
+            .set_password(token)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        Ok(())
+    }
+
+    fn get_token(&self, installation_id: &str) -> Result<String, KeychainError> {
+        let entry = keyring::Entry::new(GITHUB_KEYCHAIN_SERVICE, installation_id)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        entry.get_password().map_err(|e| match e {
+            keyring::Error::NoEntry => KeychainError::NotFound {
+                key_id: installation_id.to_string(),
+            },
+            _ => KeychainError::Keychain(e.to_string()),
+        })
+    }
+
+    fn delete_token(&self, installation_id: &str) -> Result<(), KeychainError> {
+        let entry = keyring::Entry::new(GITHUB_KEYCHAIN_SERVICE, installation_id)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        // Idempotent delete: ignore NotFound errors
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(KeychainError::Keychain(e.to_string())),
+        }
+    }
+}
+
 // =============================================================================
 // InMemoryKeyStore
 // =============================================================================
@@ -783,6 +908,106 @@ impl SigningKeyStore for InMemoryKeyStore {
             })?;
 
         info.version = new_version;
+        Ok(())
+    }
+}
+
+// =============================================================================
+// InMemoryGitHubCredentialStore (TCK-00262)
+//
+// NOTE: This is a TEST-ONLY implementation (marked with #[cfg(test)]).
+// Per TCK-00262 security review, in-memory credential stores must not be
+// available in production builds. Production code MUST use OsKeychain.
+// =============================================================================
+
+/// In-memory GitHub credential store for testing.
+///
+/// This implementation does not persist tokens and is intended for unit tests
+/// that should not interact with the real OS keychain.
+///
+/// # Security
+///
+/// This is a **test-only** implementation, enforced via `#[cfg(test)]`.
+/// Production code should use `OsKeychain` which stores credentials in the
+/// OS-native keychain. The `#[cfg(test)]` attribute ensures this type cannot
+/// be accidentally used in production builds.
+///
+/// Per CTR-1303, this store enforces:
+/// - Maximum token size (`MAX_TOKEN_SIZE` = 4096 bytes)
+/// - Maximum store capacity (`MAX_STORED_TOKENS` = 100 entries)
+#[cfg(test)]
+pub struct InMemoryGitHubCredentialStore {
+    /// Storage for tokens (`installation_id` -> token).
+    tokens: RwLock<HashMap<String, String>>,
+}
+
+#[cfg(test)]
+impl InMemoryGitHubCredentialStore {
+    /// Creates a new in-memory GitHub credential store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tokens: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for InMemoryGitHubCredentialStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl GitHubCredentialStore for InMemoryGitHubCredentialStore {
+    fn store_token(&self, installation_id: &str, token: &str) -> Result<(), KeychainError> {
+        // CTR-1303, TCK-00262: Enforce token size limit to prevent DoS
+        if token.len() > MAX_TOKEN_SIZE {
+            return Err(KeychainError::TokenTooLarge {
+                size: token.len(),
+                max: MAX_TOKEN_SIZE,
+            });
+        }
+
+        let mut tokens = self
+            .tokens
+            .write()
+            .map_err(|_| KeychainError::LockPoisoned)?;
+
+        // CTR-1303, TCK-00262: Enforce store capacity limit to prevent memory
+        // exhaustion Note: We check if the key already exists to allow
+        // overwrites without counting against the limit (common pattern for
+        // token refresh)
+        if !tokens.contains_key(installation_id) && tokens.len() >= MAX_STORED_TOKENS {
+            return Err(KeychainError::StoreFull {
+                max: MAX_STORED_TOKENS,
+            });
+        }
+
+        tokens.insert(installation_id.to_string(), token.to_string());
+        Ok(())
+    }
+
+    fn get_token(&self, installation_id: &str) -> Result<String, KeychainError> {
+        let tokens = self
+            .tokens
+            .read()
+            .map_err(|_| KeychainError::LockPoisoned)?;
+        tokens
+            .get(installation_id)
+            .cloned()
+            .ok_or_else(|| KeychainError::NotFound {
+                key_id: installation_id.to_string(),
+            })
+    }
+
+    fn delete_token(&self, installation_id: &str) -> Result<(), KeychainError> {
+        let mut tokens = self
+            .tokens
+            .write()
+            .map_err(|_| KeychainError::LockPoisoned)?;
+        tokens.remove(installation_id);
         Ok(())
     }
 }
@@ -1077,5 +1302,131 @@ mod tests {
         let ts = current_timestamp().unwrap();
         // Timestamp should be after 2024-01-01 (1704067200)
         assert!(ts > 1_704_067_200);
+    }
+
+    // =========================================================================
+    // InMemoryGitHubCredentialStore Tests (TCK-00262)
+    // =========================================================================
+
+    #[test]
+    fn test_in_memory_github_store_roundtrip() {
+        let store = InMemoryGitHubCredentialStore::new();
+        let installation_id = "123456";
+        let token = "ghs_test_token_value";
+
+        // Store token
+        store.store_token(installation_id, token).unwrap();
+
+        // Retrieve token
+        let retrieved = store.get_token(installation_id).unwrap();
+        assert_eq!(retrieved, token);
+    }
+
+    #[test]
+    fn test_in_memory_github_store_not_found() {
+        let store = InMemoryGitHubCredentialStore::new();
+
+        let result = store.get_token("nonexistent");
+        assert!(matches!(result, Err(KeychainError::NotFound { .. })));
+    }
+
+    #[test]
+    fn test_in_memory_github_store_delete() {
+        let store = InMemoryGitHubCredentialStore::new();
+        let installation_id = "123456";
+
+        // Store and then delete
+        store.store_token(installation_id, "token").unwrap();
+        store.delete_token(installation_id).unwrap();
+
+        // Should not be found
+        let result = store.get_token(installation_id);
+        assert!(matches!(result, Err(KeychainError::NotFound { .. })));
+    }
+
+    #[test]
+    fn test_in_memory_github_store_delete_idempotent() {
+        let store = InMemoryGitHubCredentialStore::new();
+
+        // Delete nonexistent token should succeed (idempotent)
+        assert!(store.delete_token("nonexistent").is_ok());
+    }
+
+    #[test]
+    fn test_in_memory_github_store_overwrite() {
+        let store = InMemoryGitHubCredentialStore::new();
+        let installation_id = "123456";
+
+        // Store and overwrite
+        store.store_token(installation_id, "token1").unwrap();
+        store.store_token(installation_id, "token2").unwrap();
+
+        // Should get latest token
+        let retrieved = store.get_token(installation_id).unwrap();
+        assert_eq!(retrieved, "token2");
+    }
+
+    // =========================================================================
+    // Security Bounds Tests (TCK-00262)
+    // =========================================================================
+
+    #[test]
+    fn test_in_memory_github_store_token_too_large() {
+        let store = InMemoryGitHubCredentialStore::new();
+        let large_token = "x".repeat(MAX_TOKEN_SIZE + 1);
+
+        let result = store.store_token("installation-1", &large_token);
+        assert!(matches!(
+            result,
+            Err(KeychainError::TokenTooLarge { size, max })
+            if size == MAX_TOKEN_SIZE + 1 && max == MAX_TOKEN_SIZE
+        ));
+    }
+
+    #[test]
+    fn test_in_memory_github_store_token_at_limit() {
+        let store = InMemoryGitHubCredentialStore::new();
+        let max_token = "x".repeat(MAX_TOKEN_SIZE);
+
+        // Should succeed at exactly the limit
+        store.store_token("installation-1", &max_token).unwrap();
+        let retrieved = store.get_token("installation-1").unwrap();
+        assert_eq!(retrieved.len(), MAX_TOKEN_SIZE);
+    }
+
+    #[test]
+    fn test_in_memory_github_store_capacity_limit() {
+        let store = InMemoryGitHubCredentialStore::new();
+
+        // Fill up to the limit
+        for i in 0..MAX_STORED_TOKENS {
+            store
+                .store_token(&format!("installation-{i}"), "token")
+                .unwrap();
+        }
+
+        // One more should fail
+        let result = store.store_token("installation-overflow", "token");
+        assert!(matches!(
+            result,
+            Err(KeychainError::StoreFull { max }) if max == MAX_STORED_TOKENS
+        ));
+    }
+
+    #[test]
+    fn test_in_memory_github_store_overwrite_at_capacity() {
+        let store = InMemoryGitHubCredentialStore::new();
+
+        // Fill up to the limit
+        for i in 0..MAX_STORED_TOKENS {
+            store
+                .store_token(&format!("installation-{i}"), "token-v1")
+                .unwrap();
+        }
+
+        // Overwriting an existing key should still work
+        store.store_token("installation-0", "token-v2").unwrap();
+        let retrieved = store.get_token("installation-0").unwrap();
+        assert_eq!(retrieved, "token-v2");
     }
 }
