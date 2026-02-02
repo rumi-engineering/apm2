@@ -222,7 +222,7 @@ decision_tree:
       comment_content:
         structure:
           - section: "Verdict Banner"
-            format: "## Verdict: PASS | FAIL"
+            format: "## Security Review: PASS | FAIL"
             content: "Clear verdict with SCP determination and severity summary"
           - section: "Summary"
             content: "1-2 paragraph overview of security scope and key conclusions"

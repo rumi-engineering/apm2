@@ -179,7 +179,7 @@ decision_tree:
       comment_content:
         structure:
           - section: "Verdict Banner"
-            format: "## Verdict: PASS | FAIL"
+            format: "## Code Quality Review: PASS | FAIL"
             content: "Clear verdict with overall severity summary"
           - section: "Summary"
             content: "1-2 paragraph overview of what was reviewed and key conclusions"
