@@ -951,43 +951,23 @@ async fn test_legacy_protocol_server_path_not_used_by_daemon() {
 // Connection Handler Tests (TCK-00279 Fix)
 // ============================================================================
 
-/// INT-00279-02: Mandatory handshake in production connection handler.
+/// INT-00279-02: Mandatory handshake via `perform_handshake`.
 ///
-/// This test verifies that the production connection handler (now in the
+/// This test verifies that the `perform_handshake` function (now in the
 /// library at `apm2_daemon::protocol::connection_handler`) properly implements
 /// the mandatory Hello/HelloAck handshake as specified in DD-001/DD-008.
 ///
-/// Prior to this fix, the production handler in `main.rs` skipped the
-/// handshake, causing protocol-compliant clients to hang.
+/// # TCK-00281: Legacy JSON IPC Removed
 ///
-/// This test exercises the ACTUAL production code path via the library module.
-/// Helper struct for test state.
-struct IntTestState;
-
-/// Helper dispatcher for integration test.
-fn int_test_dispatcher(
-    req: apm2_core::ipc::IpcRequest,
-    _state: &std::sync::Arc<IntTestState>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = apm2_core::ipc::IpcResponse> + Send + '_>> {
-    Box::pin(async move {
-        match req {
-            apm2_core::ipc::IpcRequest::Ping => apm2_core::ipc::IpcResponse::Pong {
-                version: "test".to_string(),
-                uptime_secs: 42,
-            },
-            _ => apm2_core::ipc::IpcResponse::Error {
-                code: apm2_core::ipc::ErrorCode::NotSupported,
-                message: "not implemented".to_string(),
-            },
-        }
-    })
-}
-
+/// Per DD-009, legacy JSON IPC dispatch has been removed. This test now
+/// only verifies the handshake functionality, not JSON request/response
+/// handling. The full request dispatch will be re-implemented using
+/// protobuf in a subsequent ticket.
 #[tokio::test]
-async fn test_production_handler_performs_handshake() {
+async fn test_perform_handshake_integration() {
     use std::sync::Arc;
 
-    use apm2_daemon::protocol::connection_handler::handle_connection;
+    use apm2_daemon::protocol::connection_handler::{HandshakeResult, perform_handshake};
     use apm2_daemon::protocol::{
         ClientHandshake, Connection, HandshakeMessage, SocketManagerConfig,
         parse_handshake_message, serialize_handshake_message,
@@ -1001,15 +981,13 @@ async fn test_production_handler_performs_handshake() {
     let config = SocketManagerConfig::new(&operator_path, &session_path);
     let manager = Arc::new(apm2_daemon::protocol::SocketManager::bind(config).unwrap());
 
-    let state = Arc::new(IntTestState);
-
-    // Spawn server using the PRODUCTION handler from the library
+    // Spawn server using perform_handshake from the library
     let manager_clone = manager.clone();
-    let state_clone = Arc::clone(&state);
     let server_handle = tokio::spawn(async move {
-        let (conn, _permit, socket_type) = manager_clone.accept().await.unwrap();
-        // This is the ACTUAL production code path being tested
-        handle_connection(conn, socket_type, &state_clone, int_test_dispatcher).await
+        let (mut conn, _permit, socket_type) = manager_clone.accept().await.unwrap();
+        // Test the handshake function directly
+        let result = perform_handshake(&mut conn).await.unwrap();
+        (result, socket_type)
     });
 
     // Connect as client
@@ -1017,17 +995,16 @@ async fn test_production_handler_performs_handshake() {
     let mut client_conn = Connection::new_with_credentials(stream, None);
     let mut client_handshake = ClientHandshake::new("integration-test/1.0");
 
-    // Perform handshake - this should succeed now that production handler does
-    // handshake
+    // Perform handshake
     let hello = client_handshake.create_hello();
     let hello_msg = HandshakeMessage::Hello(hello);
     let hello_bytes = serialize_handshake_message(&hello_msg).unwrap();
     client_conn.framed().send(hello_bytes).await.unwrap();
 
-    // Receive HelloAck - this would have hung before the fix
+    // Receive HelloAck
     let response_frame = timeout(Duration::from_secs(2), client_conn.framed().next())
         .await
-        .expect("handshake response timed out - production handler may not be performing handshake")
+        .expect("handshake response timed out")
         .expect("stream ended unexpectedly")
         .expect("failed to receive response");
 
@@ -1043,67 +1020,34 @@ async fn test_production_handler_performs_handshake() {
         "Client handshake should complete"
     );
 
-    // Upgrade frame size after handshake
-    client_conn.upgrade_to_full_frame_size().unwrap();
-
-    // Now send a Ping request
-    let ping_request = apm2_core::ipc::IpcRequest::Ping;
-    let request_bytes = serde_json::to_vec(&ping_request).unwrap();
-    client_conn
-        .framed()
-        .send(bytes::Bytes::from(request_bytes))
-        .await
-        .unwrap();
-
-    // Receive Pong response
-    let pong_frame = client_conn.framed().next().await.unwrap().unwrap();
-    let pong_response: apm2_core::ipc::IpcResponse = serde_json::from_slice(&pong_frame).unwrap();
-
-    match pong_response {
-        apm2_core::ipc::IpcResponse::Pong {
-            version,
-            uptime_secs,
-        } => {
-            assert_eq!(version, "test");
-            assert_eq!(uptime_secs, 42);
-        },
-        other => panic!("Expected Pong, got {other:?}"),
-    }
-
-    // Close connection
-    client_conn
-        .framed()
-        .send(bytes::Bytes::new())
-        .await
-        .unwrap();
-
     // Wait for server to finish
-    let result = timeout(Duration::from_secs(1), server_handle)
+    let (result, socket_type) = timeout(Duration::from_secs(1), server_handle)
         .await
         .expect("server timed out")
         .expect("server task panicked");
 
-    assert!(result.is_ok(), "Server should complete without error");
+    assert!(
+        matches!(result, HandshakeResult::Success),
+        "Handshake should succeed"
+    );
+    assert_eq!(socket_type, SocketType::Operator);
 }
 
-/// INT-00279-03: Production handler is now in testable library module.
+/// INT-00279-03: Handshake handler is in testable library module.
 ///
-/// This test verifies that the connection handler logic is no longer trapped
-/// in the binary (main.rs) but is instead in the library crate where it can
-/// be properly unit tested.
+/// This test verifies that the connection handler logic is in the library
+/// crate where it can be properly unit tested.
 ///
 /// Per LAW-05 (testability principle), core security logic should be in
 /// testable library modules, not in the binary.
+///
+/// # TCK-00281: Legacy JSON IPC Removed
+///
+/// Per DD-009, the `requires_privilege` function and JSON dispatch have been
+/// removed. Only handshake-related types remain in the library.
 #[test]
-fn test_connection_handler_is_in_library() {
-    use apm2_daemon::protocol::connection_handler::{HandshakeResult, requires_privilege};
-
-    // These types and functions should be accessible from the library
-    // If this test compiles, the code has been properly extracted from main.rs
-
-    // Verify requires_privilege function is accessible and works
-    assert!(!requires_privilege(&apm2_core::ipc::IpcRequest::Ping));
-    assert!(requires_privilege(&apm2_core::ipc::IpcRequest::Status));
+fn test_handshake_types_are_in_library() {
+    use apm2_daemon::protocol::connection_handler::HandshakeResult;
 
     // Verify HandshakeResult enum variants are accessible
     // Simply constructing each variant proves they exist and are public
@@ -1116,5 +1060,5 @@ fn test_connection_handler_is_in_library() {
     assert!(matches!(failed, HandshakeResult::Failed));
     assert!(matches!(closed, HandshakeResult::ConnectionClosed));
 
-    // This test passing means the connection handler is properly in the library
+    // This test passing means the handshake handler is properly in the library
 }

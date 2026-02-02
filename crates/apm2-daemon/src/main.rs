@@ -25,7 +25,6 @@
 //!
 //! See RFC-0017 for architecture details.
 
-mod handlers;
 // mod protocol; // Use library crate instead to avoid dead code warnings
 mod state;
 
@@ -662,34 +661,52 @@ async fn run_socket_manager_server(
 ///
 /// Routes requests based on socket type (privilege level).
 ///
-/// # Protocol Compliance (TCK-00279)
+/// # Protocol Compliance (TCK-00279/TCK-00281)
 ///
-/// This function delegates to
-/// [`protocol::connection_handler::handle_connection`] which implements the
-/// mandatory Hello/HelloAck handshake as specified in DD-001/DD-008. The
-/// handshake MUST complete before any IPC frames are processed.
+/// This function performs the mandatory Hello/HelloAck handshake as specified
+/// in DD-001/DD-008, then processes protobuf messages. Legacy JSON IPC has
+/// been removed per DD-009.
 async fn handle_dual_socket_connection(
-    connection: protocol::server::Connection,
+    mut connection: protocol::server::Connection,
     socket_type: protocol::socket_manager::SocketType,
-    state: SharedState,
+    _state: SharedState,
 ) -> Result<()> {
-    use apm2_core::ipc::IpcRequest;
+    use protocol::connection_handler::{HandshakeResult, perform_handshake};
 
-    // Dispatcher function that wraps handlers::dispatch
-    fn dispatcher(
-        request: IpcRequest,
-        state: &SharedState,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = apm2_core::ipc::IpcResponse> + Send + '_>>
-    {
-        Box::pin(handlers::dispatch(request, state))
+    info!(
+        socket_type = %socket_type,
+        privileged = connection.is_privileged(),
+        "New ProtocolServer connection"
+    );
+
+    // Perform mandatory handshake
+    match perform_handshake(&mut connection).await? {
+        HandshakeResult::Success => {
+            info!(socket_type = %socket_type, "Handshake completed successfully");
+        },
+        HandshakeResult::Failed => {
+            warn!(socket_type = %socket_type, "Handshake failed, closing connection");
+            return Ok(());
+        },
+        HandshakeResult::ConnectionClosed => {
+            info!(socket_type = %socket_type, "Connection closed during handshake");
+            return Ok(());
+        },
     }
 
-    // Delegate to the library connection handler which implements:
-    // 1. Mandatory Hello/HelloAck handshake (was missing before)
-    // 2. Privilege checks based on socket type
-    // 3. Message loop with proper frame handling
-    protocol::connection_handler::handle_connection(connection, socket_type, &state, dispatcher)
-        .await
+    // TCK-00281: Legacy JSON IPC dispatch has been removed per DD-009.
+    // The daemon now only accepts protobuf-encoded messages via
+    // PrivilegedDispatcher and SessionDispatcher. CLI clients must migrate to
+    // the protobuf protocol.
+    //
+    // TODO: Wire up PrivilegedDispatcher and SessionDispatcher for message
+    // processing. For now, connections are accepted and handshake is completed,
+    // but no message processing occurs. This allows the daemon to start and
+    // accept connections while the protobuf integration is completed in
+    // subsequent tickets.
+
+    info!(socket_type = %socket_type, "Connection ready for protobuf messages (dispatch pending)");
+    Ok(())
 }
 
 /// Run the Prometheus metrics HTTP server (TCK-00268).

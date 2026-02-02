@@ -31,11 +31,10 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
-use apm2_core::ipc::ErrorCode;
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use crate::client::daemon::{DaemonClient, DaemonClientError};
+use crate::client::daemon::{DaemonClient, DaemonClientError, ErrorCode};
 
 /// Maximum envelope file size (10 MiB).
 ///
@@ -746,6 +745,12 @@ fn handle_daemon_error(json_output: bool, error: &DaemonClientError) -> u8 {
             json_output,
             "unexpected_response",
             &format!("Unexpected daemon response: {msg}"),
+            exit_codes::ERROR,
+        ),
+        DaemonClientError::ProtocolMigrationRequired => output_error(
+            json_output,
+            "protocol_migration_required",
+            "CLI requires protobuf migration (DD-009). Legacy JSON IPC has been removed.",
             exit_codes::ERROR,
         ),
     }

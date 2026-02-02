@@ -46,6 +46,7 @@ pub struct DaemonStateHandle {
     session_registry: Arc<dyn SessionRegistry>,
     /// Metrics registry for daemon health observability (TCK-00268).
     /// Used by handlers to record IPC request metrics per REQ-DCP-0012.
+    #[allow(dead_code)] // Will be used when RFC-0017 protobuf IPC is fully wired up
     metrics_registry: Option<SharedMetricsRegistry>,
 }
 
@@ -141,6 +142,7 @@ impl DaemonStateHandle {
     /// Returns the metrics registry for daemon health observability.
     /// Used by handlers to record IPC request metrics per REQ-DCP-0012.
     #[must_use]
+    #[allow(dead_code)] // Will be used when RFC-0017 protobuf IPC is fully wired up
     pub const fn metrics_registry(&self) -> Option<&SharedMetricsRegistry> {
         self.metrics_registry.as_ref()
     }
@@ -175,6 +177,7 @@ impl DaemonStateHandle {
 
     /// Get daemon uptime in seconds.
     #[must_use]
+    #[allow(dead_code)] // Will be used when RFC-0017 protobuf IPC is fully wired up
     #[allow(clippy::cast_sign_loss)] // max(0) ensures non-negative
     pub fn uptime_secs(&self) -> u64 {
         let now = Utc::now();
