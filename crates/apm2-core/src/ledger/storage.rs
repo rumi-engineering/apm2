@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use super::backend::LedgerBackend;
@@ -77,9 +78,25 @@ pub enum LedgerError {
         details: String,
     },
 
+    /// Event is unsigned but signature is required.
+    #[error("unsigned event rejected: {details}")]
+    UnsignedEvent {
+        /// Details about why the event was rejected.
+        details: String,
+    },
+
     /// Crypto operation failed.
     #[error("crypto error: {0}")]
     Crypto(String),
+
+    /// Chain integrity violation: `prev_hash` doesn't match ledger tip.
+    #[error("chain integrity violation: prev_hash does not match ledger tip")]
+    ChainIntegrityViolation {
+        /// The `prev_hash` provided in the event.
+        provided_prev_hash: Vec<u8>,
+        /// The actual hash of the last event in the ledger.
+        expected_prev_hash: Vec<u8>,
+    },
 }
 
 /// Current record version for the event schema.
@@ -886,6 +903,252 @@ impl SqliteLedgerBackend {
 
         // Append the event
         self.append(&event)
+    }
+
+    /// Maximum payload size for `append_verified` to prevent denial-of-service
+    /// via unbounded memory allocation. 16 MiB is generous for event payloads
+    /// while preventing abuse.
+    pub const MAX_VERIFIED_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
+
+    /// Appends an event to the ledger after verifying its signature.
+    ///
+    /// This method provides signature verification on ingestion per RFC-0017
+    /// DD-006. It rejects:
+    /// 1. Unsigned events (signature field is None or empty)
+    /// 2. Events with invalid signatures
+    /// 3. Events where `actor_id` does not match the `verifying_key`
+    /// 4. Events with payloads exceeding `MAX_VERIFIED_PAYLOAD_SIZE`
+    /// 5. Events where `prev_hash` doesn't match the current ledger tip
+    ///
+    /// # Security Properties
+    ///
+    /// - **RFC-0017 DD-006 Compliance**: Uses type-specific domain prefixes
+    ///   (e.g., `apm2.event.tool_decided:`) based on `event_type`. This
+    ///   prevents cross-type signature replay attacks.
+    /// - **Payload-based signatures**: The signature is verified over the
+    ///   domain-prefixed canonicalized payload, consistent with
+    ///   `DomainSeparatedCanonical` in `canonical.rs`.
+    /// - **Chain integrity**: Verifies that `prev_hash` matches the actual
+    ///   ledger tip, preventing orphaned links.
+    /// - **Actor binding**: The `actor_id` must match the hex-encoded public
+    ///   key of the `verifying_key`, binding identity to the cryptographic key.
+    ///   Uses constant-time comparison (SEC-CTRL-FAC-0012).
+    /// - **Denial-of-service protection**: Payload size is limited to prevent
+    ///   memory exhaustion.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The event to append (must have `signature` and `payload`
+    ///   fields populated; `prev_hash` and `event_hash` will be computed)
+    /// * `verifying_key` - The public key to verify the signature against
+    ///
+    /// # Returns
+    ///
+    /// The sequence ID assigned to the event.
+    ///
+    /// # Errors
+    ///
+    /// - `UnsignedEvent` if the event has no signature
+    /// - `SignatureInvalid` if the signature verification fails, `actor_id`
+    ///   mismatch, or unknown event type
+    /// - `ChainIntegrityViolation` if `prev_hash` doesn't match ledger tip
+    /// - Other `LedgerError` variants for storage errors
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use apm2_core::crypto::Signer;
+    /// use apm2_core::events::{TOOL_DECIDED_DOMAIN_PREFIX, ToolDecided};
+    /// use apm2_core::fac::sign_with_domain;
+    /// use apm2_core::ledger::{EventRecord, Ledger};
+    /// use prost::Message;
+    ///
+    /// let ledger = Ledger::in_memory().unwrap();
+    /// let signer = Signer::generate();
+    ///
+    /// // Compute actor_id from verifying key
+    /// let actor_id = hex::encode(signer.verifying_key().as_bytes());
+    ///
+    /// // Create the event payload
+    /// let tool_decided = ToolDecided {
+    ///     request_id: "req-1".to_string(),
+    ///     decision: "ALLOW".to_string(),
+    ///     rule_id: "rule-1".to_string(),
+    ///     policy_hash: vec![0u8; 32],
+    ///     rationale_code: "APPROVED".to_string(),
+    ///     budget_consumed: 100,
+    ///     time_envelope_ref: None,
+    /// };
+    /// let payload = tool_decided.encode_to_vec();
+    ///
+    /// // Sign the domain-prefixed payload (as DomainSeparatedCanonical does)
+    /// let mut signing_bytes = TOOL_DECIDED_DOMAIN_PREFIX.to_vec();
+    /// signing_bytes.extend_from_slice(&payload);
+    /// let signature =
+    ///     sign_with_domain(&signer, TOOL_DECIDED_DOMAIN_PREFIX, &payload);
+    ///
+    /// let mut event =
+    ///     EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    /// event.signature = Some(signature.to_bytes().to_vec());
+    ///
+    /// // Append with signature verification
+    /// let seq_id = ledger
+    ///     .append_verified(&event, &signer.verifying_key())
+    ///     .unwrap();
+    /// ```
+    pub fn append_verified(
+        &self,
+        event: &EventRecord,
+        verifying_key: &crate::crypto::VerifyingKey,
+    ) -> Result<u64, LedgerError> {
+        // DoS protection: reject oversized payloads
+        if event.payload.len() > Self::MAX_VERIFIED_PAYLOAD_SIZE {
+            return Err(LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: format!(
+                    "payload size {} exceeds maximum {} bytes",
+                    event.payload.len(),
+                    Self::MAX_VERIFIED_PAYLOAD_SIZE
+                ),
+            });
+        }
+
+        // SEC-CTRL-FAC-0012: Constant-time comparison for actor_id (identity binding)
+        let expected_actor_id = hex::encode(verifying_key.as_bytes());
+        let actor_id_matches = bool::from(
+            event
+                .actor_id
+                .as_bytes()
+                .ct_eq(expected_actor_id.as_bytes()),
+        );
+        if !actor_id_matches {
+            return Err(LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: format!(
+                    "actor_id mismatch: expected {} (from verifying_key), got {}",
+                    expected_actor_id, event.actor_id
+                ),
+            });
+        }
+
+        // Check for unsigned event
+        let signature_bytes =
+            event
+                .signature
+                .as_ref()
+                .ok_or_else(|| LedgerError::UnsignedEvent {
+                    details: "event signature is missing".to_string(),
+                })?;
+
+        if signature_bytes.is_empty() {
+            return Err(LedgerError::UnsignedEvent {
+                details: "event signature is empty".to_string(),
+            });
+        }
+
+        // Chain integrity check: verify prev_hash matches current ledger tip
+        let ledger_tip = self.last_event_hash()?;
+        let provided_prev_hash = event.prev_hash.clone().unwrap_or_else(|| vec![0u8; 32]);
+
+        if provided_prev_hash.len() != 32 {
+            return Err(LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: format!(
+                    "prev_hash must be 32 bytes, got {}",
+                    provided_prev_hash.len()
+                ),
+            });
+        }
+
+        if provided_prev_hash != ledger_tip {
+            return Err(LedgerError::ChainIntegrityViolation {
+                provided_prev_hash,
+                expected_prev_hash: ledger_tip,
+            });
+        }
+
+        // Get the type-specific domain prefix per RFC-0017 DD-006
+        let domain_prefix = Self::get_domain_prefix_for_event_type(&event.event_type)?;
+
+        // Parse the signature
+        let signature = crate::crypto::parse_signature(signature_bytes).map_err(|e| {
+            LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: format!("failed to parse signature: {e}"),
+            }
+        })?;
+
+        // Verify the signature using domain separation over the payload
+        // This aligns with DomainSeparatedCanonical::canonical_bytes_with_domain()
+        // which signs over domain_prefix || protobuf_encoded_payload
+        crate::fac::verify_with_domain(verifying_key, domain_prefix, &event.payload, &signature)
+            .map_err(|_| LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: "signature verification failed".to_string(),
+            })?;
+
+        // Compute event_hash for chain linking (if not already set)
+        let prev_hash_array: [u8; 32] = provided_prev_hash
+            .try_into()
+            .expect("prev_hash length already validated");
+        let computed_hash =
+            crate::crypto::EventHasher::hash_event(&event.payload, &prev_hash_array);
+
+        // If event_hash is provided, verify it matches; otherwise we'll set it
+        if let Some(provided_hash) = &event.event_hash {
+            if provided_hash.as_slice() != computed_hash.as_slice() {
+                return Err(LedgerError::SignatureInvalid {
+                    seq_id: 0,
+                    details: "event_hash does not match computed hash".to_string(),
+                });
+            }
+        }
+
+        // Signature is valid, append the event with computed event_hash if needed
+        let mut event_to_store = event.clone();
+        if event_to_store.event_hash.is_none() {
+            event_to_store.event_hash = Some(computed_hash.to_vec());
+        }
+
+        self.append(&event_to_store)
+    }
+
+    /// Returns the domain prefix for a given event type per RFC-0017 DD-006.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_type` - The event type string (e.g., `tool_decided`,
+    ///   `tool_executed`)
+    ///
+    /// # Returns
+    ///
+    /// The domain prefix bytes for the event type.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SignatureInvalid` if the event type is not recognized.
+    fn get_domain_prefix_for_event_type(event_type: &str) -> Result<&'static [u8], LedgerError> {
+        // Map event_type strings to their domain prefixes from canonical.rs
+        // These prefixes are defined per RFC-0017 DD-006
+        match event_type {
+            "tool_decided" => Ok(crate::events::TOOL_DECIDED_DOMAIN_PREFIX),
+            "tool_executed" => Ok(crate::events::TOOL_EXECUTED_DOMAIN_PREFIX),
+            "session_terminated" => Ok(crate::events::SESSION_TERMINATED_DOMAIN_PREFIX),
+            "work_claimed" => Ok(crate::events::WORK_CLAIMED_DOMAIN_PREFIX),
+            "episode_spawned" => Ok(crate::events::EPISODE_SPAWNED_DOMAIN_PREFIX),
+            "merge_receipt" => Ok(crate::events::MERGE_RECEIPT_DOMAIN_PREFIX),
+            "runner_pool_quarantined" => Ok(crate::events::RUNNER_POOL_QUARANTINED_DOMAIN_PREFIX),
+            "aat_spec_quarantined" => Ok(crate::events::AAT_SPEC_QUARANTINED_DOMAIN_PREFIX),
+            // CAS payloads (not kernel events, but may be stored in ledger)
+            "aat_gate_receipt" => Ok(crate::events::AAT_GATE_RECEIPT_DOMAIN_PREFIX),
+            "artifact_manifest" => Ok(crate::events::ARTIFACT_MANIFEST_DOMAIN_PREFIX),
+            _ => Err(LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: format!(
+                    "unknown event type '{event_type}': no domain prefix defined per RFC-0017 DD-006"
+                ),
+            }),
+        }
     }
 
     /// Verifies a single event's hash and signature.

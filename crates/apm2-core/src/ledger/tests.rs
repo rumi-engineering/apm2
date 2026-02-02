@@ -810,3 +810,508 @@ fn tck_00182_reader_includes_consensus_fields() {
     let event = reader.read_one(seq_id).unwrap();
     assert_eq!(event.quorum_cert, Some(vec![0x01, 0x02, 0x03]));
 }
+
+// =============================================================================
+// TCK-00265: Signature Verification on Ledger Ingestion
+// =============================================================================
+
+/// Helper to create a properly signed event for testing.
+///
+/// This implements the correct signing approach per RFC-0017 DD-006:
+/// 1. Derive `actor_id` from verifying key
+/// 2. Sign the domain-prefixed payload (consistent with
+///    `DomainSeparatedCanonical`)
+/// 3. Set `prev_hash` to the current ledger tip
+fn create_signed_event(
+    ledger: &Ledger,
+    signer: &crate::crypto::Signer,
+    event_type: &str,
+    session_id: &str,
+    payload: Vec<u8>,
+) -> EventRecord {
+    // Derive actor_id from verifying key (identity binding)
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+
+    // Get the previous hash for chain linking
+    let prev_hash = ledger.last_event_hash().unwrap();
+
+    // Get the domain prefix for the event type
+    let domain_prefix = get_test_domain_prefix(event_type);
+
+    // Sign the payload with domain separation (consistent with
+    // DomainSeparatedCanonical)
+    let signature = crate::fac::sign_with_domain(signer, domain_prefix, &payload);
+
+    let mut event = EventRecord::new(event_type, session_id, &actor_id, payload);
+    event.prev_hash = Some(prev_hash);
+    event.signature = Some(signature.to_bytes().to_vec());
+    // event_hash will be computed by append_verified
+    event
+}
+
+/// Helper to get domain prefix for test event types.
+fn get_test_domain_prefix(event_type: &str) -> &'static [u8] {
+    match event_type {
+        "tool_decided" => crate::events::TOOL_DECIDED_DOMAIN_PREFIX,
+        "tool_executed" => crate::events::TOOL_EXECUTED_DOMAIN_PREFIX,
+        "session_terminated" => crate::events::SESSION_TERMINATED_DOMAIN_PREFIX,
+        "work_claimed" => crate::events::WORK_CLAIMED_DOMAIN_PREFIX,
+        "episode_spawned" => crate::events::EPISODE_SPAWNED_DOMAIN_PREFIX,
+        "merge_receipt" => crate::events::MERGE_RECEIPT_DOMAIN_PREFIX,
+        _ => panic!("Unknown event type in test: {event_type}"),
+    }
+}
+
+/// Test that unsigned events are rejected (ADV-007).
+#[test]
+fn tck_00265_unsigned_event_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Derive actor_id from verifying key
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+
+    // Create an event without a signature
+    let prev_hash = ledger.last_event_hash().unwrap();
+    let payload = b"payload".to_vec();
+
+    let mut event = EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    event.prev_hash = Some(prev_hash);
+    // No signature
+
+    // Attempt to append with verification should fail
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::UnsignedEvent { .. })));
+}
+
+/// Test that events with empty signature are rejected.
+#[test]
+fn tck_00265_empty_signature_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Derive actor_id from verifying key
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+
+    // Create an event with an empty signature
+    let prev_hash = ledger.last_event_hash().unwrap();
+    let payload = b"payload".to_vec();
+
+    let mut event = EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    event.prev_hash = Some(prev_hash);
+    event.signature = Some(vec![]); // Empty signature
+
+    // Attempt to append with verification should fail
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::UnsignedEvent { .. })));
+}
+
+/// Test that events with invalid signatures are rejected.
+#[test]
+fn tck_00265_invalid_signature_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+    let wrong_signer = Signer::generate();
+
+    // Derive actor_id from signer (the one we'll verify with)
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+
+    // Create event with correct actor_id but sign with wrong key
+    let prev_hash = ledger.last_event_hash().unwrap();
+    let payload = b"payload".to_vec();
+
+    // Sign with wrong_signer but use signer's actor_id
+    let signature = crate::fac::sign_with_domain(
+        &wrong_signer,
+        crate::events::TOOL_DECIDED_DOMAIN_PREFIX,
+        &payload,
+    );
+
+    let mut event = EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    event.prev_hash = Some(prev_hash);
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    // Attempt to append with verification should fail (wrong key)
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::SignatureInvalid { .. })));
+}
+
+/// Test that events with tampered payload are rejected.
+#[test]
+fn tck_00265_tampered_event_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Derive actor_id from verifying key
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+
+    // Create and sign an event with original payload
+    let prev_hash = ledger.last_event_hash().unwrap();
+    let original_payload = b"original payload".to_vec();
+
+    // Sign the original payload
+    let signature = crate::fac::sign_with_domain(
+        &signer,
+        crate::events::TOOL_DECIDED_DOMAIN_PREFIX,
+        &original_payload,
+    );
+
+    // Create event with tampered payload but original signature
+    let tampered_payload = b"tampered payload".to_vec();
+    let mut event = EventRecord::new("tool_decided", "session-1", &actor_id, tampered_payload);
+    event.prev_hash = Some(prev_hash);
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    // Attempt to append with verification should fail (signature won't match
+    // tampered payload)
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::SignatureInvalid { .. })));
+}
+
+/// Test that properly signed events are accepted.
+#[test]
+fn tck_00265_valid_signature_accepted() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Create and properly sign an event using the helper
+    let event = create_signed_event(
+        &ledger,
+        &signer,
+        "tool_decided",
+        "session-1",
+        b"payload".to_vec(),
+    );
+
+    // Append with verification should succeed
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_ok());
+    let seq_id = result.unwrap();
+    assert_eq!(seq_id, 1);
+
+    // Verify the event was stored
+    let stored_event = ledger.read_one(seq_id).unwrap();
+    assert_eq!(stored_event.payload, b"payload");
+    assert!(stored_event.signature.is_some());
+    assert!(stored_event.event_hash.is_some());
+}
+
+/// Test that malformed signatures are rejected.
+#[test]
+fn tck_00265_malformed_signature_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Derive actor_id from verifying key
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+
+    // Create event with correct fields but malformed signature
+    let prev_hash = ledger.last_event_hash().unwrap();
+    let payload = b"payload".to_vec();
+
+    let mut event = EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    event.prev_hash = Some(prev_hash);
+    event.signature = Some(vec![0x42; 32]); // Wrong length (should be 64)
+
+    // Attempt to append with verification should fail
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::SignatureInvalid { .. })));
+}
+
+/// Test that signatures with wrong domain prefix are rejected.
+#[test]
+fn tck_00265_wrong_domain_prefix_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Derive actor_id from verifying key
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+
+    // Create event with correct fields
+    let prev_hash = ledger.last_event_hash().unwrap();
+    let payload = b"payload".to_vec();
+
+    // Sign with a different domain prefix than the event_type requires
+    let signature = crate::fac::sign_with_domain(
+        &signer,
+        crate::events::TOOL_EXECUTED_DOMAIN_PREFIX, // Wrong prefix for tool_decided!
+        &payload,
+    );
+
+    let mut event = EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    event.prev_hash = Some(prev_hash);
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    // Attempt to append with verification should fail (wrong domain)
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::SignatureInvalid { .. })));
+}
+
+/// Test multiple valid signed events can be appended with chain linking.
+#[test]
+fn tck_00265_multiple_signed_events() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Append multiple properly signed events
+    for i in 0u64..5 {
+        let payload = format!("payload-{i}").into_bytes();
+        let event = create_signed_event(&ledger, &signer, "tool_decided", "session-1", payload);
+
+        let result = ledger.append_verified(&event, &signer.verifying_key());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), i + 1);
+    }
+
+    // Verify all events were stored
+    let stats = ledger.stats().unwrap();
+    assert_eq!(stats.event_count, 5);
+}
+
+/// Test that `actor_id` mismatch is rejected (identity binding).
+#[test]
+fn tck_00265_actor_id_mismatch_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Create event with wrong actor_id (not derived from verifying key)
+    let prev_hash = ledger.last_event_hash().unwrap();
+    let payload = b"payload".to_vec();
+
+    // Sign correctly but use wrong actor_id
+    let signature =
+        crate::fac::sign_with_domain(&signer, crate::events::TOOL_DECIDED_DOMAIN_PREFIX, &payload);
+
+    let mut event = EventRecord::new(
+        "tool_decided",
+        "session-1",
+        "wrong-actor-id", // Not derived from verifying key
+        payload,
+    );
+    event.prev_hash = Some(prev_hash);
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    // Attempt to append with verification should fail (actor_id mismatch)
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::SignatureInvalid { .. })));
+}
+
+/// Test that missing `event_hash` is computed and stored (not rejected).
+#[test]
+fn tck_00265_missing_event_hash_computed() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Derive actor_id from verifying key
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+
+    // Create event without event_hash
+    let prev_hash = ledger.last_event_hash().unwrap();
+    let payload = b"payload".to_vec();
+
+    // Sign the payload with domain prefix
+    let signature =
+        crate::fac::sign_with_domain(&signer, crate::events::TOOL_DECIDED_DOMAIN_PREFIX, &payload);
+
+    let mut event = EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    event.prev_hash = Some(prev_hash);
+    // No event_hash set - append_verified will compute it
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    // Attempt to append with verification should succeed (event_hash is computed)
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_ok());
+    let seq_id = result.unwrap();
+
+    // Verify the event was stored with computed event_hash
+    let stored_event = ledger.read_one(seq_id).unwrap();
+    assert!(stored_event.event_hash.is_some());
+    assert_eq!(stored_event.event_hash.as_ref().unwrap().len(), 32);
+}
+
+/// Test that oversized payload is rejected (denial-of-service protection).
+#[test]
+fn tck_00265_oversized_payload_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Derive actor_id from verifying key
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+
+    // Create an oversized payload
+    let payload = vec![0u8; Ledger::MAX_VERIFIED_PAYLOAD_SIZE + 1];
+
+    let mut event = EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    event.signature = Some(vec![0u8; 64]); // Dummy signature
+
+    // Attempt to append with verification should fail (payload too large)
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::SignatureInvalid { .. })));
+}
+
+/// Test that chain verification works with events appended via
+/// `append_verified`.
+#[test]
+fn tck_00265_chain_verification_consistency() {
+    use crate::crypto::{EventHasher, Signer};
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Append multiple events using append_verified
+    for i in 0u64..3 {
+        let payload = format!("payload-{i}").into_bytes();
+        let event = create_signed_event(&ledger, &signer, "tool_decided", "session-1", payload);
+        ledger
+            .append_verified(&event, &signer.verifying_key())
+            .unwrap();
+    }
+
+    // Now verify the chain using verify_chain
+    // Note: verify_chain verifies the hash chain (prev_hash linkage), but signature
+    // verification is over the payload with domain prefix (not event_hash).
+    // This test verifies that the hash chain is correctly maintained.
+    let verify_result = ledger.verify_chain(
+        |payload, prev_hash| {
+            let prev: [u8; 32] = prev_hash.try_into().unwrap();
+            EventHasher::hash_event(payload, &prev).to_vec()
+        },
+        |_event_hash, signature_bytes| {
+            // Signature verification would need to be over the payload, not event_hash.
+            // For this test, we just verify the signature parses correctly.
+            crate::crypto::parse_signature(signature_bytes).is_ok()
+        },
+    );
+
+    assert!(
+        verify_result.is_ok(),
+        "Chain verification should succeed for events appended via append_verified"
+    );
+}
+
+/// Test that unknown event types are rejected per RFC-0017 DD-006.
+#[test]
+fn tck_00265_unknown_event_type_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Derive actor_id from verifying key
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+
+    let prev_hash = ledger.last_event_hash().unwrap();
+    let payload = b"payload".to_vec();
+
+    // Sign with some arbitrary prefix (doesn't matter, will fail on event type
+    // lookup)
+    let signature =
+        crate::fac::sign_with_domain(&signer, crate::events::TOOL_DECIDED_DOMAIN_PREFIX, &payload);
+
+    let mut event = EventRecord::new(
+        "unknown.event.type", // Unknown event type
+        "session-1",
+        &actor_id,
+        payload,
+    );
+    event.prev_hash = Some(prev_hash);
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    // Attempt to append with verification should fail (unknown event type)
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    match result {
+        Err(LedgerError::SignatureInvalid { details, .. }) => {
+            assert!(
+                details.contains("unknown event type"),
+                "Error should mention unknown event type: {details}"
+            );
+        },
+        other => panic!("Expected SignatureInvalid, got {other:?}"),
+    }
+}
+
+/// Test that chain integrity violation is detected (`prev_hash` mismatch).
+#[test]
+fn tck_00265_chain_integrity_violation_detected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // First, append a valid event to establish a ledger tip
+    let event1 = create_signed_event(
+        &ledger,
+        &signer,
+        "tool_decided",
+        "session-1",
+        b"first payload".to_vec(),
+    );
+    ledger
+        .append_verified(&event1, &signer.verifying_key())
+        .unwrap();
+
+    // Now try to append an event with wrong prev_hash (pointing to genesis instead
+    // of tip)
+    let actor_id = hex::encode(signer.verifying_key().as_bytes());
+    let payload = b"second payload".to_vec();
+
+    // Sign the payload correctly
+    let signature =
+        crate::fac::sign_with_domain(&signer, crate::events::TOOL_DECIDED_DOMAIN_PREFIX, &payload);
+
+    let mut event2 = EventRecord::new("tool_decided", "session-1", &actor_id, payload);
+    // Use genesis hash instead of the actual tip
+    event2.prev_hash = Some(vec![0u8; 32]);
+    event2.signature = Some(signature.to_bytes().to_vec());
+
+    // Attempt to append should fail with chain integrity violation
+    let result = ledger.append_verified(&event2, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(LedgerError::ChainIntegrityViolation { .. })),
+        "Expected ChainIntegrityViolation, got {result:?}"
+    );
+}

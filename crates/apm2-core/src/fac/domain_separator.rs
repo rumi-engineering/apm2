@@ -114,6 +114,13 @@ pub const INTERVENTION_FREEZE_PREFIX: &[u8] = b"INTERVENTION_FREEZE:";
 /// Used when signing/verifying adjudication-resolved unfreeze events.
 pub const INTERVENTION_UNFREEZE_PREFIX: &[u8] = b"INTERVENTION_UNFREEZE:";
 
+/// Domain prefix for ledger event records.
+///
+/// Used when signing/verifying events on ledger ingestion.
+/// This ensures event signatures are bound to the ledger context
+/// and cannot be replayed in other contexts.
+pub const LEDGER_EVENT_PREFIX: &[u8] = b"LEDGER_EVENT:";
+
 // =============================================================================
 // Domain-Separated Signing
 // =============================================================================
@@ -355,6 +362,12 @@ pub mod tests {
         for prefix in &prefixes {
             assert!(unique.insert(prefix), "Prefix should be unique");
         }
+    }
+
+    #[test]
+    fn test_ledger_event_prefix() {
+        // Verify the LEDGER_EVENT_PREFIX matches the expected value
+        assert_eq!(LEDGER_EVENT_PREFIX, b"LEDGER_EVENT:" as &[u8]);
     }
 
     #[test]
