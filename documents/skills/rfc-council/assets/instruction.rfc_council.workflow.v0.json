@@ -33,14 +33,14 @@
     "lex": {
       "W1": "Validate input ID format (PRD-XXXX or RFC-XXXX); map to PRD/RFC roots + tickets by rfc_id.",
       "W2": "If RFC target, load latest evidence bundle (rfc_review_*.yaml) to resume unresolved gates.",
-      "W3": "Auto-select mode from RFC version: v0->EXPLORE, v2->FINALIZE, v4->DECOMPOSE unless tickets exist => REVIEW.",
+      "W3": "Select mode: 'remediate' -> REMEDIATE; else auto-select from RFC version (v0->EXPLORE, v2->FINALIZE, v4->DECOMPOSE) or tickets -> REVIEW.",
       "W4": "Compute review depth from ticket count, cross-crate, net-new; COUNCIL if any high or explicit flag.",
       "W5": "Gate order (9): SCHEMA, DEP-ACYCLICITY, SCOPE-COVERAGE, CCP-MAPPING, ATOMICITY, IMPLEMENTABILITY, SECURITY-INTEGRITY, REQUIREMENT-FIDELITY, ANTI-COUSIN."
     },
     "dir": [
       ["D1", 3, "@W1", ["inputs"], []],
       ["D2", 3, "@W2", ["evidence"], []],
-      ["D3", 3, "@W3", ["mode"], []],
+      ["D3", 3, "@W3", ["mode", "dcp://apm2.local/instructions/rfc_council/remediate_mode@v0"], []],
       ["D4", 3, "@W4", ["depth"], []],
       ["D5", 3, "@W5", ["gates"], []]
     ],

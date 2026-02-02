@@ -38,7 +38,7 @@
       "C3": "Dialectical Convergence (Mode 59): On disagreement, trigger Thesis vs Antithesis -> v4 Synthesis.",
       "C4": "Cycle 1: structural gates; Cycle 2: feasibility gates; Cycle 3: quorum resolve.",
       "C5": "Quorum: 2/3 vote resolves contested findings; deadlock => NEEDS_ADJUDICATION.",
-      "C6": "Council outputs evidence bundle with council_metadata and gate results.",
+      "C6": "Council outputs evidence bundle to `evidence/rfc/{RFC_ID}/reviews/rfc_review_{timestamp}.yaml` with council_metadata and gate results.",
       "C7": "Budget/episode/stall abort => ABORTED with partial findings; subagent failure => adjust quorum."
     },
     "dir": [

@@ -37,7 +37,7 @@
       "F2": "Run council for v2->v4 (SA roles + Anchored Stochastic Modes).",
       "F3": "Forced convergence: answer or defer remaining questions; replace placeholders.",
       "F4": "Assurance Case (Mode 36): Replace gate list with GSN-style Argument Tree; link every claim to evidence artifact.",
-      "F5": "Emit v4: set version v4 + status APPROVED; write governance summary.",
+      "F5": "Emit v4 bundle to `evidence/rfc/{RFC_ID}/reviews/rfc_review_{timestamp}.yaml`; set version v4 + status APPROVED; write governance summary.",
       "F6": "Confidence Certification: All branches of Assurance Case must reach HIGH confidence."
     },
     "dir": [

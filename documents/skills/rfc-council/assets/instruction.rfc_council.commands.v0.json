@@ -31,9 +31,9 @@
       "documents/skills/rfc-council/references/commands.md"
     ],
     "lex": {
-      "C1": "Commands: create, evolve, explore, finalize, review, review-council, implicit-review.",
+      "C1": "Commands: create, evolve, explore, finalize, review, review-council, implicit-review, remediate.",
       "C2": "Options: --council, --depth STANDARD|COUNCIL, --dry-run.",
-      "C3": "Outputs: create => RFC+tickets; review => evidence bundle path.",
+      "C3": "Outputs: create => RFC+tickets; review => evidence bundle path; remediate => updated bundle + fixes.",
       "C4": "Exit codes: 0=success, 1=rejected, 2=needs human, 3=aborted."
     },
     "dir": [

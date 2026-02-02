@@ -39,7 +39,7 @@
       "R3": "Remediation (Mode 59): If gate fails BLOCKER/MAJOR, synthesize Thesis (Req) vs Antithesis (Constraint); re-run gate once.",
       "R4": "Compute review depth from ticket count/cross-crate/net-new; COUNCIL if high impact.",
       "R5": "If COUNCIL depth, invoke council protocol.",
-      "R6": "Emit new evidence bundle with gates, findings, verdict, council_metadata (if any).",
+      "R6": "Emit new evidence bundle to `evidence/rfc/{RFC_ID}/reviews/rfc_review_{timestamp}.yaml` with gates, findings, verdict, council_metadata.",
       "R7": "Verdict: REJECTED if blockers or >3 majors; APPROVED_WITH_REMEDIATION if 1-3 majors; else APPROVED."
     },
     "dir": [
