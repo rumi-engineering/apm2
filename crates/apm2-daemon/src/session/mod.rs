@@ -14,11 +14,13 @@ pub mod consume;
 // Re-export main types
 pub use consume::{
     ConsumeSessionContext, ConsumeSessionError, ConsumeSessionHandler,
-    EXIT_CLASSIFICATION_CONTEXT_MISS, MAX_REFINEMENT_ATTEMPTS, SessionTerminationInfo,
-    TERMINATION_RATIONALE_CONTEXT_MISS, validate_tool_request,
+    EXIT_CLASSIFICATION_CONTEXT_MISS, MAX_REFINEMENT_ATTEMPTS, TERMINATION_RATIONALE_CONTEXT_MISS,
+    validate_tool_request,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+pub use crate::episode::decision::SessionTerminationInfo;
 
 /// Ephemeral session handle for IPC authentication.
 ///
