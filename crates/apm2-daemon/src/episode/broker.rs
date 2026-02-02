@@ -47,12 +47,14 @@ use super::capability::{
     ManifestLoadError, ManifestLoader,
 };
 use super::decision::{
-    BrokerToolRequest, BudgetDelta, DedupeKey, RequestValidationError, SessionTerminationInfo,
-    ToolDecision, ToolResult,
+    BrokerToolRequest, BudgetDelta, Credential, DedupeKey, RequestValidationError,
+    SessionTerminationInfo, ToolDecision, ToolResult,
 };
 use super::dedupe::{DedupeCache, DedupeCacheConfig, SharedDedupeCache};
 use super::error::EpisodeId;
 use super::runtime::Hash;
+use super::tool_class::ToolClass;
+use crate::evidence::keychain::GitHubCredentialStore;
 
 // =============================================================================
 // BrokerError
@@ -343,6 +345,20 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
 
     /// Context pack manifest for firewall enforcement (TCK-00261).
     context_manifest: tokio::sync::RwLock<Option<Arc<ContextPackManifest>>>,
+
+    /// GitHub credential store for broker-mediated access (TCK-00262).
+    ///
+    /// Per RFC-0017 TB-003, credentials are held by the daemon and never
+    /// exposed to session processes. The broker fetches credentials from
+    /// this store when processing Git/Network tool requests.
+    github_store: Option<Arc<dyn GitHubCredentialStore>>,
+
+    /// GitHub installation ID for the current session (TCK-00262).
+    ///
+    /// This is set by the daemon when a session is initialized with a
+    /// GitHub App installation. Tool requests for Git/Network operations
+    /// will use this installation ID to fetch credentials from the store.
+    github_installation_id: tokio::sync::RwLock<Option<String>>,
 }
 
 impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
@@ -359,6 +375,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: None,
             context_manifest: tokio::sync::RwLock::new(None),
+            github_store: None,
+            github_installation_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -375,6 +393,105 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: Some(loader),
             context_manifest: tokio::sync::RwLock::new(None),
+            github_store: None,
+            github_installation_id: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    /// Creates a new tool broker with a GitHub credential store.
+    ///
+    /// Per RFC-0017 TB-003, credentials are held by the daemon only. This
+    /// constructor enables credential mediation for Git/Network operations.
+    #[must_use]
+    pub fn with_github_store(
+        config: ToolBrokerConfig,
+        github_store: Arc<dyn GitHubCredentialStore>,
+    ) -> Self {
+        let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+
+        Self {
+            config,
+            validator: tokio::sync::RwLock::new(None),
+            dedupe_cache,
+            policy: StubPolicyEngine::new(),
+            cas: Arc::new(StubContentAddressedStore::new()),
+            loader: None,
+            context_manifest: tokio::sync::RwLock::new(None),
+            github_store: Some(github_store),
+            github_installation_id: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    /// Returns `true` if a GitHub credential store is configured.
+    #[must_use]
+    pub fn has_github_store(&self) -> bool {
+        self.github_store.is_some()
+    }
+
+    /// Sets the GitHub installation ID for credential lookups.
+    ///
+    /// This should be called when a session is initialized with a GitHub
+    /// App installation. Subsequent Git/Network tool requests will use this
+    /// installation ID to fetch credentials from the store.
+    pub async fn set_github_installation_id(&self, installation_id: String) {
+        let mut guard = self.github_installation_id.write().await;
+        *guard = Some(installation_id);
+        debug!("GitHub installation ID set for credential mediation");
+    }
+
+    /// Clears the GitHub installation ID.
+    ///
+    /// This should be called when a session ends or the GitHub installation
+    /// is revoked.
+    pub async fn clear_github_installation_id(&self) {
+        let mut guard = self.github_installation_id.write().await;
+        *guard = None;
+        debug!("GitHub installation ID cleared");
+    }
+
+    /// Fetches a credential for a tool request if applicable.
+    ///
+    /// Per RFC-0017 TB-003 (Credential Isolation Boundary), credentials are
+    /// held by the daemon and never exposed to session processes. This method
+    /// fetches credentials for Git/Network tool classes when:
+    /// 1. A GitHub credential store is configured
+    /// 2. A GitHub installation ID is set for the session
+    ///
+    /// # Returns
+    ///
+    /// `Some(Credential)` if credentials were successfully fetched,
+    /// `None` if no credential store is configured or no installation ID is
+    /// set.
+    async fn fetch_credential_for_request(&self, tool_class: ToolClass) -> Option<Credential> {
+        // Only fetch credentials for Git and Network tool classes
+        if !matches!(tool_class, ToolClass::Git | ToolClass::Network) {
+            return None;
+        }
+
+        // Check if we have a credential store configured
+        let store = self.github_store.as_ref()?;
+
+        // Check if we have an installation ID
+        let installation_id = self.github_installation_id.read().await;
+        let installation_id = installation_id.as_ref()?;
+
+        // Fetch the token from the store
+        match store.get_token(installation_id) {
+            Ok(token) => {
+                debug!(
+                    tool_class = ?tool_class,
+                    "credential fetched for tool request"
+                );
+                Some(Credential::new(token))
+            },
+            Err(e) => {
+                warn!(
+                    tool_class = ?tool_class,
+                    error = %e,
+                    "failed to fetch credential for tool request"
+                );
+                None
+            },
         }
     }
 
@@ -638,7 +755,12 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         }
 
         // Request is authorized - return Allow decision
-        debug!(capability_id = %capability_id, "request allowed");
+        // Step 6: Fetch credentials for Git/Network tools (TCK-00262)
+        // Per RFC-0017 TB-003, credentials are attached by the broker, never
+        // exposed to session processes directly.
+        let credential = self.fetch_credential_for_request(request.tool_class).await;
+
+        debug!(capability_id = %capability_id, has_credential = credential.is_some(), "request allowed");
         Ok(ToolDecision::Allow {
             request_id: request.request_id.clone(),
             capability_id,
@@ -653,6 +775,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             },
             policy_hash: self.policy.policy_hash(),
             budget_delta: BudgetDelta::single_call(),
+            credential,
         })
     }
 
@@ -1908,6 +2031,368 @@ mod tests {
         assert!(
             exec_decision.is_allowed(),
             "execute should be allowed when context shell_allowlist is empty, got: {exec_decision:?}"
+        );
+    }
+
+    // =========================================================================
+    // Credential Broker Tests (TCK-00262)
+    //
+    // These tests verify the credential broker functionality per RFC-0017 TB-003
+    // (Credential Isolation Boundary). Credentials are held by the daemon and
+    // mediated to tool requests for Git/Network operations.
+    // =========================================================================
+
+    /// Helper to make a Git capability.
+    fn make_git_capability(id: &str, paths: Vec<PathBuf>) -> Capability {
+        Capability {
+            capability_id: id.to_string(),
+            tool_class: ToolClass::Git,
+            scope: CapabilityScope {
+                root_paths: paths,
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        }
+    }
+
+    /// Helper to make a Network capability.
+    fn make_network_capability(id: &str) -> Capability {
+        Capability {
+            capability_id: id.to_string(),
+            tool_class: ToolClass::Network,
+            scope: CapabilityScope {
+                root_paths: Vec::new(),
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_credential_broker_has_github_store() {
+        // TCK-00262: Test has_github_store() method
+        use crate::evidence::keychain::InMemoryGitHubCredentialStore;
+
+        // Without store
+        let broker_no_store: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default());
+        assert!(!broker_no_store.has_github_store());
+
+        // With store
+        let store = Arc::new(InMemoryGitHubCredentialStore::new());
+        let broker_with_store: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+        assert!(broker_with_store.has_github_store());
+    }
+
+    #[tokio::test]
+    async fn test_credential_broker_set_installation_id() {
+        // TCK-00262: Test set/clear installation ID
+        use crate::evidence::keychain::InMemoryGitHubCredentialStore;
+
+        let store = Arc::new(InMemoryGitHubCredentialStore::new());
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+
+        // Initially no installation ID
+        {
+            let guard = broker.github_installation_id.read().await;
+            assert!(guard.is_none());
+        }
+
+        // Set installation ID
+        broker
+            .set_github_installation_id("install-123".to_string())
+            .await;
+        {
+            let guard = broker.github_installation_id.read().await;
+            assert_eq!(guard.as_ref().unwrap(), "install-123");
+        }
+
+        // Clear installation ID
+        broker.clear_github_installation_id().await;
+        {
+            let guard = broker.github_installation_id.read().await;
+            assert!(guard.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_credential_broker_attaches_credential_for_git() {
+        // TCK-00262: Git tool requests should have credentials attached
+        use crate::evidence::keychain::InMemoryGitHubCredentialStore;
+
+        let store = Arc::new(InMemoryGitHubCredentialStore::new());
+        // Store a token for our installation
+        store
+            .store_token("install-456", "ghp_test_token_12345")
+            .unwrap();
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+
+        // Set up manifest with Git capability
+        let manifest = make_manifest(vec![make_git_capability(
+            "cap-git",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set installation ID
+        broker
+            .set_github_installation_id("install-456".to_string())
+            .await;
+
+        // Make Git request
+        let request = BrokerToolRequest::new(
+            "req-git-1",
+            test_episode_id(),
+            ToolClass::Git,
+            test_dedupe_key("git-1"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/repo");
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_some(),
+                "Git request should have credential attached"
+            );
+            assert_eq!(credential.unwrap().expose_secret(), "ghp_test_token_12345");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_credential_broker_attaches_credential_for_network() {
+        // TCK-00262: Network tool requests should have credentials attached
+        use crate::evidence::keychain::InMemoryGitHubCredentialStore;
+
+        let store = Arc::new(InMemoryGitHubCredentialStore::new());
+        store
+            .store_token("install-789", "ghp_network_token")
+            .unwrap();
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+
+        // Set up manifest with Network capability
+        let tool_classes = vec![ToolClass::Network];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_network_capability("cap-network")])
+            .tool_allowlist(tool_classes)
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set installation ID
+        broker
+            .set_github_installation_id("install-789".to_string())
+            .await;
+
+        // Make Network request
+        let request = BrokerToolRequest::new(
+            "req-network-1",
+            test_episode_id(),
+            ToolClass::Network,
+            test_dedupe_key("network-1"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        );
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_some(),
+                "Network request should have credential attached"
+            );
+            assert_eq!(credential.unwrap().expose_secret(), "ghp_network_token");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_credential_broker_no_credential_for_read() {
+        // TCK-00262: Read tool requests should NOT have credentials attached
+        use crate::evidence::keychain::InMemoryGitHubCredentialStore;
+
+        let store = Arc::new(InMemoryGitHubCredentialStore::new());
+        store.store_token("install-abc", "ghp_token").unwrap();
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+
+        // Set up manifest with Read capability
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set installation ID
+        broker
+            .set_github_installation_id("install-abc".to_string())
+            .await;
+
+        // Make Read request
+        let request = make_request("req-read", ToolClass::Read, Some("/workspace/file.rs"));
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_none(),
+                "Read request should NOT have credential attached"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_credential_broker_no_credential_without_store() {
+        // TCK-00262: Without a credential store, Git requests have no credential
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up manifest with Git capability
+        let manifest = make_manifest(vec![make_git_capability(
+            "cap-git",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Make Git request (no store configured)
+        let request = BrokerToolRequest::new(
+            "req-git-no-store",
+            test_episode_id(),
+            ToolClass::Git,
+            test_dedupe_key("git-no-store"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/repo");
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_none(),
+                "Git request without store should have no credential"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_credential_broker_no_credential_without_installation_id() {
+        // TCK-00262: With store but no installation ID, Git requests have no credential
+        use crate::evidence::keychain::InMemoryGitHubCredentialStore;
+
+        let store = Arc::new(InMemoryGitHubCredentialStore::new());
+        store.store_token("install-xyz", "ghp_token").unwrap();
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+
+        // Set up manifest with Git capability
+        let manifest = make_manifest(vec![make_git_capability(
+            "cap-git",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Do NOT set installation ID
+
+        // Make Git request
+        let request = BrokerToolRequest::new(
+            "req-git-no-id",
+            test_episode_id(),
+            ToolClass::Git,
+            test_dedupe_key("git-no-id"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/repo");
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_none(),
+                "Git request without installation ID should have no credential"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_credential_broker_missing_token_returns_none() {
+        // TCK-00262: If token lookup fails, request still succeeds but without
+        // credential
+        use crate::evidence::keychain::InMemoryGitHubCredentialStore;
+
+        let store = Arc::new(InMemoryGitHubCredentialStore::new());
+        // Do NOT store any tokens
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+
+        // Set up manifest with Git capability
+        let manifest = make_manifest(vec![make_git_capability(
+            "cap-git",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set installation ID (but no token stored for this ID)
+        broker
+            .set_github_installation_id("install-missing".to_string())
+            .await;
+
+        // Make Git request
+        let request = BrokerToolRequest::new(
+            "req-git-missing",
+            test_episode_id(),
+            ToolClass::Git,
+            test_dedupe_key("git-missing"),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/repo");
+
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        // Request should still be allowed, just without credential
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(
+                credential.is_none(),
+                "Git request with missing token should have no credential"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_credential_is_redacted_in_debug() {
+        // TCK-00262: Verify Credential debug output is redacted
+        let credential = Credential::new("super_secret_token");
+        let debug_output = format!("{:?}", credential);
+
+        assert!(
+            !debug_output.contains("super_secret_token"),
+            "Credential should not expose secret in debug output"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Credential debug should show [REDACTED]"
         );
     }
 }

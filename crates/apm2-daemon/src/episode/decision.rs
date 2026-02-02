@@ -44,6 +44,7 @@ use std::time::Duration;
 
 use apm2_core::htf::{TimeEnvelope, TimeEnvelopeRef};
 use prost::Message;
+use secrecy::{ExposeSecret, SecretString};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -608,6 +609,78 @@ impl SessionTerminationInfo {
 }
 
 // =============================================================================
+// Credential (TCK-00262)
+// =============================================================================
+
+/// Opaque credential wrapper for secure handling in broker decisions.
+///
+/// Per RFC-0017 TB-003 (Credential Isolation Boundary), credentials are held
+/// by the daemon only and never exposed to session processes. This wrapper:
+///
+/// - Uses `SecretString` to protect the secret in memory
+/// - Implements redacted `Debug` to prevent accidental logging
+/// - Provides explicit `expose_secret()` for controlled access
+///
+/// # Security
+///
+/// - The underlying secret is protected with `secrecy::SecretString`
+/// - Debug output shows `[REDACTED]` instead of the actual value
+/// - Credentials are only attached to `ToolDecision::Allow` for authenticated
+///   tool execution; they are never serialized back to the session
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use secrecy::SecretString;
+/// use apm2_daemon::episode::decision::Credential;
+///
+/// let cred = Credential::new(SecretString::new("ghs_token".into()));
+///
+/// // Debug doesn't reveal the secret
+/// assert_eq!(format!("{:?}", cred), "[REDACTED]");
+///
+/// // Explicit access required
+/// let token = cred.expose_secret();
+/// ```
+#[derive(Clone)]
+pub struct Credential(SecretString);
+
+impl Credential {
+    /// Creates a new credential from a secret string.
+    pub fn new(secret: impl Into<SecretString>) -> Self {
+        Self(secret.into())
+    }
+
+    /// Exposes the underlying secret value.
+    ///
+    /// # Security
+    ///
+    /// Use with caution. This method is intended for passing the credential
+    /// to tool execution (e.g., setting environment variables for git).
+    /// The secret should never be logged or returned to the session.
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[REDACTED]")
+    }
+}
+
+impl PartialEq for Credential {
+    fn eq(&self, other: &Self) -> bool {
+        // Note: This comparison is not constant-time, but credentials
+        // are only compared in test/debug contexts, not in security-critical
+        // paths. For cryptographic secret comparison, use `subtle::ConstantTimeEq`.
+        self.0.expose_secret() == other.0.expose_secret()
+    }
+}
+
+impl Eq for Credential {}
+
+// =============================================================================
 // ToolDecision
 // =============================================================================
 
@@ -637,6 +710,14 @@ pub enum ToolDecision {
 
         /// Resource budget to charge for this operation.
         budget_delta: BudgetDelta,
+
+        /// Optional credential for authenticated operations (TCK-00262).
+        ///
+        /// Per RFC-0017 TB-003, credentials are held by the daemon and
+        /// mediated through the broker. When present, this credential
+        /// should be used for tool execution (e.g., setting `GITHUB_TOKEN`
+        /// for git operations) but NEVER returned to the session.
+        credential: Option<Credential>,
     },
 
     /// Request is denied.
@@ -1175,6 +1256,7 @@ mod tests {
             rule_id: Some("rule-1".to_string()),
             policy_hash: [0u8; 32],
             budget_delta: BudgetDelta::single_call(),
+            credential: None,
         };
 
         assert!(decision.is_allowed());
@@ -1580,5 +1662,63 @@ mod tests {
         assert!(msg.contains("host"));
         assert!(msg.contains("300"));
         assert!(msg.contains("255"));
+    }
+
+    // =========================================================================
+    // Credential Tests (TCK-00262)
+    // =========================================================================
+
+    #[test]
+    fn test_credential_expose_secret() {
+        let secret = "ghs_test_token_12345";
+        let cred = Credential::new(SecretString::new(secret.into()));
+
+        assert_eq!(cred.expose_secret(), secret);
+    }
+
+    #[test]
+    fn test_credential_debug_is_redacted() {
+        let cred = Credential::new(SecretString::new("sensitive_token".into()));
+
+        let debug_output = format!("{cred:?}");
+        assert_eq!(debug_output, "[REDACTED]");
+        assert!(!debug_output.contains("sensitive_token"));
+    }
+
+    #[test]
+    fn test_credential_equality() {
+        let cred1 = Credential::new(SecretString::new("token_a".into()));
+        let cred2 = Credential::new(SecretString::new("token_a".into()));
+        let cred3 = Credential::new(SecretString::new("token_b".into()));
+
+        assert_eq!(cred1, cred2);
+        assert_ne!(cred1, cred3);
+    }
+
+    #[test]
+    fn test_credential_clone() {
+        let cred1 = Credential::new(SecretString::new("cloned_token".into()));
+        let cred2 = cred1.clone();
+
+        assert_eq!(cred1.expose_secret(), cred2.expose_secret());
+    }
+
+    #[test]
+    fn test_tool_decision_allow_with_credential() {
+        let cred = Credential::new(SecretString::new("ghs_token".into()));
+        let decision = ToolDecision::Allow {
+            request_id: "req-001".to_string(),
+            capability_id: "cap-git".to_string(),
+            rule_id: None,
+            policy_hash: [0u8; 32],
+            budget_delta: BudgetDelta::single_call(),
+            credential: Some(cred),
+        };
+
+        assert!(decision.is_allowed());
+        if let ToolDecision::Allow { credential, .. } = decision {
+            assert!(credential.is_some());
+            assert_eq!(credential.unwrap().expose_secret(), "ghs_token");
+        }
     }
 }
