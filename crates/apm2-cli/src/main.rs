@@ -250,14 +250,17 @@ fn main() -> Result<()> {
         // Try to load from config, or use default
         if cli.config.exists() {
             if let Ok(config) = apm2_core::config::EcosystemConfig::from_file(&cli.config) {
-                return config.daemon.socket;
+                return config.daemon.operator_socket;
             }
         }
-        // Per RFC-0013 AD-DAEMON-002: ${XDG_RUNTIME_DIR}/apm2/apm2d.sock
-        // Falls back to /tmp/apm2/apm2d.sock if XDG_RUNTIME_DIR is not set
+        // Fallback: ${XDG_RUNTIME_DIR}/apm2/operator.sock or /tmp/apm2/operator.sock
         std::env::var("XDG_RUNTIME_DIR").map_or_else(
-            |_| PathBuf::from("/tmp/apm2/apm2d.sock"),
-            |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("apm2d.sock"),
+            |_| PathBuf::from("/tmp/apm2/operator.sock"),
+            |runtime_dir| {
+                PathBuf::from(runtime_dir)
+                    .join("apm2")
+                    .join("operator.sock")
+            },
         )
     });
 

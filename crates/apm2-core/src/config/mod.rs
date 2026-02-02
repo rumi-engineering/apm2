@@ -48,6 +48,8 @@ impl EcosystemConfig {
     /// Returns an error if:
     /// - The TOML is invalid
     /// - The legacy `socket` key is present in `[daemon]` section (DD-009)
+    /// - The `operator_socket` or `session_socket` fields are missing
+    ///   (TCK-00280)
     pub fn from_toml(content: &str) -> Result<Self, ConfigError> {
         // First, check for legacy `socket` key in daemon config (DD-009 fail-closed
         // validation) Parse as raw TOML value to detect if `daemon.socket` was
@@ -66,6 +68,8 @@ impl EcosystemConfig {
                 }
             }
         }
+        // Parse the config - operator_socket and session_socket are now required fields
+        // and serde will fail if they are missing when [daemon] section is present
         toml::from_str(content).map_err(ConfigError::Parse)
     }
 
@@ -86,24 +90,16 @@ pub struct DaemonConfig {
     #[serde(default = "default_pid_file")]
     pub pid_file: PathBuf,
 
-    /// Path to the Unix socket (legacy, deprecated).
-    ///
-    /// **Deprecated (DD-009):** Use `operator_socket` and `session_socket`
-    /// instead. This field is kept for migration purposes but will be
-    /// rejected in future versions.
-    #[serde(default = "default_socket")]
-    pub socket: PathBuf,
-
     /// Path to the operator socket (mode 0600, privileged operations).
     ///
     /// Added in TCK-00249 for dual-socket privilege separation.
-    #[serde(default = "default_operator_socket")]
+    /// Required field - config validation fails if not provided.
     pub operator_socket: PathBuf,
 
     /// Path to the session socket (mode 0660, session-scoped operations).
     ///
     /// Added in TCK-00249 for dual-socket privilege separation.
-    #[serde(default = "default_session_socket")]
+    /// Required field - config validation fails if not provided.
     pub session_socket: PathBuf,
 
     /// Log directory.
@@ -123,7 +119,6 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             pid_file: default_pid_file(),
-            socket: default_socket(),
             operator_socket: default_operator_socket(),
             session_socket: default_session_socket(),
             log_dir: default_log_dir(),
@@ -164,17 +159,6 @@ const fn default_audit_max_size_bytes() -> u64 {
 
 fn default_pid_file() -> PathBuf {
     PathBuf::from("/var/run/apm2/apm2.pid")
-}
-
-fn default_socket() -> PathBuf {
-    // Per RFC-0013 AD-DAEMON-002: ${XDG_RUNTIME_DIR}/apm2/apm2d.sock
-    // Falls back to /tmp/apm2/apm2d.sock if XDG_RUNTIME_DIR is not set
-    //
-    // **Deprecated (DD-009):** Use operator_socket and session_socket instead.
-    std::env::var("XDG_RUNTIME_DIR").map_or_else(
-        |_| PathBuf::from("/tmp/apm2/apm2d.sock"),
-        |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("apm2d.sock"),
-    )
 }
 
 fn default_operator_socket() -> PathBuf {
@@ -359,9 +343,10 @@ mod tests {
         assert_eq!(config.processes[0].instances, 2);
     }
 
-    /// Test that DD-009 rejects legacy socket configuration (fail-closed).
+    /// UT-00280-01: Test that DD-009 rejects legacy socket configuration
+    /// (fail-closed).
     #[test]
-    fn test_dd009_rejects_legacy_socket_key() {
+    fn config_reject_legacy_socket() {
         let toml = r#"
             [daemon]
             pid_file = "/tmp/apm2.pid"
@@ -404,5 +389,67 @@ mod tests {
 
         let config = EcosystemConfig::from_toml(toml).unwrap();
         assert_eq!(config.processes.len(), 1);
+    }
+
+    /// UT-00280-02: Test that daemon config requires `operator_socket`
+    /// (TCK-00280).
+    #[test]
+    fn config_requires_operator_socket() {
+        let toml = r#"
+            [daemon]
+            pid_file = "/tmp/apm2.pid"
+            session_socket = "/tmp/apm2/session.sock"
+
+            [[processes]]
+            name = "test"
+            command = "echo"
+        "#;
+
+        let result = EcosystemConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "Should require operator_socket when daemon section present"
+        );
+    }
+
+    /// UT-00280-03: Test that daemon config requires `session_socket`
+    /// (TCK-00280).
+    #[test]
+    fn config_requires_session_socket() {
+        let toml = r#"
+            [daemon]
+            pid_file = "/tmp/apm2.pid"
+            operator_socket = "/tmp/apm2/operator.sock"
+
+            [[processes]]
+            name = "test"
+            command = "echo"
+        "#;
+
+        let result = EcosystemConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "Should require session_socket when daemon section present"
+        );
+    }
+
+    /// UT-00280-04: Test that both sockets are required when daemon section is
+    /// present.
+    #[test]
+    fn config_requires_both_sockets() {
+        let toml = r#"
+            [daemon]
+            pid_file = "/tmp/apm2.pid"
+
+            [[processes]]
+            name = "test"
+            command = "echo"
+        "#;
+
+        let result = EcosystemConfig::from_toml(toml);
+        assert!(
+            result.is_err(),
+            "Should require both sockets when daemon section present"
+        );
     }
 }
