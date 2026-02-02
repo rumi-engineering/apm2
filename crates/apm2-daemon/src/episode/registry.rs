@@ -517,6 +517,7 @@ mod session_registry_tests {
             ephemeral_handle: handle.to_string(),
             lease_id: format!("lease-{id}"),
             policy_resolved_ref: "policy-ref".to_string(),
+            capability_manifest_hash: vec![],
             episode_id: None,
         }
     }
@@ -754,16 +755,5 @@ mod session_registry_tests {
 
         // Handle index for evicted session should be cleaned up
         assert!(registry.get_session_by_handle("handle-0").is_none());
-=======
-        let guard = self.sessions.read().expect("lock poisoned");
-        guard.1.get(session_id).cloned()
-    }
-
-    fn get_session_by_handle(&self, handle: &str) -> Option<SessionState> {
-        let handles = self.sessions_by_handle.read().expect("lock poisoned");
-        let session_id = handles.get(handle)?;
-        let guard = self.sessions.read().expect("lock poisoned");
-        guard.1.get(session_id).cloned()
->>>>>>> 2964356 (feat(TCK-00259): Implement ephemeral session handle generation)
     }
 }
