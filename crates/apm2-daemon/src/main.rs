@@ -661,101 +661,35 @@ async fn run_socket_manager_server(
 /// Handle a connection from the dual-socket manager.
 ///
 /// Routes requests based on socket type (privilege level).
+///
+/// # Protocol Compliance (TCK-00279)
+///
+/// This function delegates to
+/// [`protocol::connection_handler::handle_connection`] which implements the
+/// mandatory Hello/HelloAck handshake as specified in DD-001/DD-008. The
+/// handshake MUST complete before any IPC frames are processed.
 async fn handle_dual_socket_connection(
-    mut connection: protocol::server::Connection,
+    connection: protocol::server::Connection,
     socket_type: protocol::socket_manager::SocketType,
     state: SharedState,
 ) -> Result<()> {
-    use apm2_core::ipc::{IpcRequest, IpcResponse};
-    use futures::{SinkExt, StreamExt};
+    use apm2_core::ipc::IpcRequest;
 
-    info!(
-        socket_type = %socket_type,
-        privileged = connection.is_privileged(),
-        "New ProtocolServer connection"
-    );
-
-    // Upgrade to full frame size after connection is established
-    connection.upgrade_to_full_frame_size()?;
-
-    // Process messages
-    while let Some(frame_result) = connection.framed().next().await {
-        match frame_result {
-            Ok(frame) => {
-                if frame.is_empty() {
-                    // Empty frame signals connection close
-                    break;
-                }
-
-                // Parse the request
-                let request: IpcRequest = match serde_json::from_slice(&frame) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        warn!("Failed to parse request: {e}");
-                        continue;
-                    },
-                };
-
-                // Check privilege level for privileged operations
-                if requires_privilege(&request) && !connection.is_privileged() {
-                    warn!(
-                        "Unprivileged client attempted privileged operation: {:?}",
-                        request
-                    );
-                    let response = IpcResponse::Error {
-                        code: apm2_core::ipc::ErrorCode::InvalidRequest,
-                        message: "operation requires privileged (operator) connection".to_string(),
-                    };
-                    let json: bytes::Bytes = serde_json::to_vec(&response)?.into();
-                    connection.framed().send(json).await?;
-                    continue;
-                }
-
-                // Dispatch to handler
-                let response = handlers::dispatch(request, &state).await;
-
-                // Send response
-                let json: bytes::Bytes = serde_json::to_vec(&response)?.into();
-                connection.framed().send(json).await?;
-            },
-            Err(e) => {
-                warn!("Frame error: {e}");
-                break;
-            },
-        }
+    // Dispatcher function that wraps handlers::dispatch
+    fn dispatcher(
+        request: IpcRequest,
+        state: &SharedState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = apm2_core::ipc::IpcResponse> + Send + '_>>
+    {
+        Box::pin(handlers::dispatch(request, state))
     }
 
-    info!(socket_type = %socket_type, "Connection closed");
-    Ok(())
-}
-
-/// Check if a request requires privileged (operator) access.
-///
-/// TCK-00249: Uses default-deny model. Session socket connections are only
-/// allowed to perform a small whitelist of safe operations. All other
-/// operations require privileged (operator) connection.
-///
-/// # Security (Holonic Seclusion)
-///
-/// Session socket (mode 0660) is accessible to group users. To maintain
-/// seclusion, we only allow `Ping` which cannot leak information about
-/// processes, credentials, logs, or other sensitive data.
-///
-/// Operations that would violate seclusion if allowed on session socket:
-/// - `TailLogs`: Would expose logs from ALL processes to any group user
-/// - `ListProcesses`/`GetProcess`: Would expose process args (may contain
-///   secrets)
-/// - `ListCredentials`/`GetCredential`: Would expose credential metadata
-/// - `Status`: Would expose daemon configuration details
-/// - `*Episode*`: Episode state contains sensitive context
-const fn requires_privilege(request: &apm2_core::ipc::IpcRequest) -> bool {
-    use apm2_core::ipc::IpcRequest;
-    // Default-deny: only explicitly whitelisted operations are unprivileged
-    !matches!(
-        request,
-        // Session-safe operations (do not leak sensitive information)
-        IpcRequest::Ping
-    )
+    // Delegate to the library connection handler which implements:
+    // 1. Mandatory Hello/HelloAck handshake (was missing before)
+    // 2. Privilege checks based on socket type
+    // 3. Message loop with proper frame handling
+    protocol::connection_handler::handle_connection(connection, socket_type, &state, dispatcher)
+        .await
 }
 
 /// Run the Prometheus metrics HTTP server (TCK-00268).
