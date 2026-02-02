@@ -783,17 +783,29 @@ async fn run_socket_manager_server(
 ///
 /// Routes requests based on socket type (privilege level).
 ///
-/// # Protocol Compliance (TCK-00279/TCK-00281)
+/// # Protocol Compliance (TCK-00279/TCK-00281/TCK-00287)
 ///
 /// This function performs the mandatory Hello/HelloAck handshake as specified
-/// in DD-001/DD-008, then processes protobuf messages. Legacy JSON IPC has
-/// been removed per DD-009.
+/// in DD-001/DD-008, then processes protobuf messages via tag-based
+/// dispatchers. Legacy JSON IPC has been removed per DD-009.
+///
+/// # JSON Downgrade Rejection (DD-009)
+///
+/// Per TCK-00287 and DD-009, JSON frames are rejected before reaching handlers.
+/// The tag-based routing validates that the first byte is a valid message type
+/// tag (1-4 for privileged, 1-4 for session). JSON frames starting with `{`
+/// (0x7B = 123) are rejected as unknown message types.
 async fn handle_dual_socket_connection(
     mut connection: protocol::server::Connection,
     socket_type: protocol::socket_manager::SocketType,
     _state: SharedState,
 ) -> Result<()> {
+    use bytes::Bytes;
+    use futures::StreamExt;
     use protocol::connection_handler::{HandshakeResult, perform_handshake};
+    use protocol::dispatch::{ConnectionContext, PrivilegedDispatcher};
+    use protocol::session_dispatch::SessionDispatcher;
+    use protocol::session_token::TokenMinter;
 
     info!(
         socket_type = %socket_type,
@@ -816,19 +828,107 @@ async fn handle_dual_socket_connection(
         },
     }
 
-    // TCK-00281: Legacy JSON IPC dispatch has been removed per DD-009.
-    // The daemon now only accepts protobuf-encoded messages via
-    // PrivilegedDispatcher and SessionDispatcher. CLI clients must migrate to
-    // the protobuf protocol.
-    //
-    // TODO: Wire up PrivilegedDispatcher and SessionDispatcher for message
-    // processing. For now, connections are accepted and handshake is completed,
-    // but no message processing occurs. This allows the daemon to start and
-    // accept connections while the protobuf integration is completed in
-    // subsequent tickets.
+    // TCK-00287: Wire up tag-based ProtocolServer dispatchers
+    // Create connection context based on socket type
+    let ctx = match socket_type {
+        protocol::socket_manager::SocketType::Operator => {
+            ConnectionContext::privileged(connection.peer_credentials().cloned())
+        },
+        protocol::socket_manager::SocketType::Session => {
+            ConnectionContext::session(connection.peer_credentials().cloned(), None)
+        },
+    };
 
-    info!(socket_type = %socket_type, "Connection ready for protobuf messages (dispatch pending)");
+    // Create dispatchers
+    // Note: Using stub implementations for now. Production would use shared
+    // instances with proper registries, metrics, etc.
+    let privileged_dispatcher = PrivilegedDispatcher::new();
+    let session_dispatcher =
+        SessionDispatcher::new(TokenMinter::new(TokenMinter::generate_secret()));
+
+    // TCK-00287: Message dispatch loop
+    // Process incoming frames until connection closes or error
+    info!(socket_type = %socket_type, "Entering message dispatch loop");
+
+    while let Some(frame_result) = connection.framed().next().await {
+        let frame = match frame_result {
+            Ok(frame) => frame,
+            Err(e) => {
+                warn!(socket_type = %socket_type, error = %e, "Frame read error");
+                break;
+            },
+        };
+
+        // TCK-00287: JSON downgrade rejection (DD-009 fail-closed)
+        // Validate frame before dispatch. JSON frames start with '{' (0x7B = 123)
+        // or '[' (0x5B = 91) which are not valid message type tags.
+        // The dispatcher's tag validation will reject these, but we add an
+        // explicit check here for clearer error messaging.
+        if !frame.is_empty() && is_json_frame(&frame) {
+            warn!(
+                socket_type = %socket_type,
+                first_byte = frame[0],
+                "JSON downgrade attempt rejected - protocol requires tag-based binary frames"
+            );
+            // Per DD-009: fail-closed, no JSON processing allowed
+            continue;
+        }
+
+        // Route to appropriate dispatcher based on socket type
+        // Each dispatcher returns its own response type, so we handle them separately
+        let frame_bytes = Bytes::from(frame.to_vec());
+        match socket_type {
+            protocol::socket_manager::SocketType::Operator => {
+                match privileged_dispatcher.dispatch(&frame_bytes, &ctx) {
+                    Ok(response) => {
+                        info!(socket_type = %socket_type, "Privileged request dispatched successfully");
+                        // TODO: Send response back to client when bidirectional IPC is needed
+                        drop(response);
+                    },
+                    Err(e) => {
+                        warn!(socket_type = %socket_type, error = %e, "Privileged dispatch error");
+                    },
+                }
+            },
+            protocol::socket_manager::SocketType::Session => {
+                match session_dispatcher.dispatch(&frame_bytes, &ctx) {
+                    Ok(response) => {
+                        info!(socket_type = %socket_type, "Session request dispatched successfully");
+                        // TODO: Send response back to client when bidirectional IPC is needed
+                        drop(response);
+                    },
+                    Err(e) => {
+                        warn!(socket_type = %socket_type, error = %e, "Session dispatch error");
+                    },
+                }
+            },
+        }
+    }
+
+    info!(socket_type = %socket_type, "Connection closed");
     Ok(())
+}
+
+/// Checks if a frame appears to be a JSON payload (downgrade attempt).
+///
+/// JSON payloads typically start with `{` (object) or `[` (array).
+/// The protocol requires tag-based binary frames where the first byte
+/// is a message type tag (1-4 for privileged, 1-4 for session).
+///
+/// # DD-009 Compliance
+///
+/// Per DD-009, JSON IPC is a downgrade/bypass surface and must be fail-closed
+/// by default. This function helps identify and reject JSON frames before
+/// they reach any handler.
+#[inline]
+fn is_json_frame(frame: &[u8]) -> bool {
+    if frame.is_empty() {
+        return false;
+    }
+    // JSON typically starts with '{', '[', or whitespace followed by these
+    // Valid protocol tags are 1-4 (privileged) or 1-4 (session)
+    // ASCII '{' = 123 (0x7B), '[' = 91 (0x5B)
+    matches!(frame[0], b'{' | b'[')
 }
 
 /// Run the Prometheus metrics HTTP server (TCK-00268).
