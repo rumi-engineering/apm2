@@ -284,20 +284,21 @@ rfc_ticket_decomposition:
         - "TCK-00297"
       risk_tier: "T2"
       summary: |
-        Disable direct gh api /statuses writes for FAC-adjacent signals in xtask,
-        or route them through daemon projection-only logic. This ticket MUST
-        begin with a repo search for direct GitHub status writes and update the
-        touched file set accordingly. Phase 1 must fail-closed (disable direct
-        writes) until projection routing exists.
+        Add USE_HEF_PROJECTION feature flag to gate routing of FAC-adjacent
+        GitHub status writes. Flag defaults to false (xtask unchanged). When
+        enabled, routes writes through daemon projection-only logic. This ticket
+        MUST begin with a repo search for direct GitHub status writes. Removal
+        of xtask writes is DEFERRED until HEF projection is validated in production.
       files_to_modify:
-        - "xtask/src/tasks/aat.rs (remove or gate direct status writes)"
-        - "xtask/src/tasks/push.rs (remove or gate direct status writes)"
-        - "xtask/src/tasks/review.rs (remove or gate direct status writes)"
-        - "xtask/src/tasks/security_review_exec.rs (remove or gate direct status writes)"
+        - "xtask/src/tasks/aat.rs (wrap status writes in feature flag check)"
+        - "xtask/src/tasks/push.rs (wrap status writes in feature flag check)"
+        - "xtask/src/tasks/review.rs (wrap status writes in feature flag check)"
+        - "xtask/src/tasks/security_review_exec.rs (wrap status writes in feature flag check)"
       files_to_create: []
       acceptance_criteria:
-        - "Direct GitHub status writes for FAC-adjacent signals are disabled by default."
-        - "If daemon projection routing exists, all status writes are routed through it."
+        - "USE_HEF_PROJECTION feature flag exists and defaults to false (xtask unchanged)."
+        - "When USE_HEF_PROJECTION=true, status writes route through daemon projection."
+        - "Existing xtask functionality preserved when flag is disabled."
       evidence_ids:
         - "EVID-HEF-0001"
 

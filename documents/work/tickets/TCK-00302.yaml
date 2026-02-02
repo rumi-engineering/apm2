@@ -1,0 +1,63 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: "TCK-00302"
+    title: "HEF: Subscription registry + ACL enforcement"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0003"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0003.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0002"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0002.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_PROTOCOL"
+      - "DOMAIN_SECURITY"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00287"
+        reason: "Requires base protocol infrastructure"
+      - ticket_id: "TCK-00300"
+        reason: "Requires PulseEnvelope + Subscribe/Unsubscribe proto definitions"
+      - ticket_id: "TCK-00301"
+        reason: "Requires topic grammar + wildcard matcher for subscription patterns"
+  scope:
+    in_scope:
+      - "Add subscription handling to ProtocolServer dispatchers for session and operator sockets"
+      - "Implement operator/session default-deny ACL enforcement"
+      - "Enforce capability-manifest restrictions on session subscriptions"
+      - "Ensure sessions never publish pulses"
+      - "Implement ACL evaluation logic in dedicated module"
+      - "Reject session wildcard patterns in Phase 1"
+    out_of_scope:
+      - "Wildcard subscription support for session.sock (Phase 1 limitation)"
+      - "Subscription persistence across daemon restarts"
+      - "Resource governance and backpressure (covered by TCK-00303)"
+      - "Pulse publishing and outbox (covered by TCK-00304)"
+  plan:
+    steps:
+      - "Read existing session_dispatch.rs and dispatch.rs to understand current message handling"
+      - "Create pulse_acl.rs module with ACL evaluation logic (default-deny, capability checks)"
+      - "Add Subscribe/Unsubscribe handling to session_dispatch.rs with capability-manifest enforcement"
+      - "Add Subscribe/Unsubscribe handling to dispatch.rs for operator sockets with full taxonomy access"
+      - "Implement session wildcard pattern rejection for Phase 1"
+      - "Add unit tests for ACL evaluation (allowlist hits, denials, wildcard rejection)"
+      - "Add integration tests verifying session vs operator subscription permissions"
+      - "Verify session publish attempts are rejected"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0002"
+    criteria:
+      - "Session subscriptions are deny-by-default; only capability-manifest allowlisted topics are accepted."
+      - "Session wildcard patterns are rejected in Phase 1."
+      - "Operator subscriptions can access full topic taxonomy."
+  notes:
+    security: "default-deny, least privilege, fail-closed"
+    verification: "ACL enforcement must be tested with both positive (allowed) and negative (denied) subscription attempts"
+    general: "Phase 1 restricts session.sock to exact topic subscriptions only; wildcards reserved for operator.sock"

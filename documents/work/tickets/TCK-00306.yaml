@@ -1,0 +1,66 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: "TCK-00306"
+    title: "HEF NEW WORK REQUIRED: Episode lifecycle/tool/io truth-plane events"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0001"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0001.yaml#requirement"
+      - requirement_id: "REQ-HEF-0008"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0008.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0006"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0006.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_PROTOCOL"
+      - "DOMAIN_DAEMON"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00287"
+        reason: "HEF foundation ticket must be completed first"
+      - ticket_id: "TCK-00300"
+        reason: "PulseEnvelope proto definitions required for episode events"
+  scope:
+    in_scope:
+      - "Add optional episode_id field to Session kernel events (SessionStarted, SessionProgress, SessionTerminated, SessionQuarantined)"
+      - "Add optional episode_id field to Tool kernel events (ToolRequested, ToolDecided, ToolExecuted)"
+      - "Add IO artifact reference event for episode.<episode_id>.io topic derivation"
+      - "Update proto/kernel_events.proto with episode_id fields"
+      - "Populate episode_id from episode context when emitting ledger events in daemon"
+      - "Emit ledger events from daemon episode runtime"
+      - "Ensure backward compatibility with existing ledger event replay"
+    out_of_scope:
+      - "Episode creation or lifecycle management logic"
+      - "Pulse subscription handling (covered by other tickets)"
+      - "Topic ACL enforcement (covered by TCK-00302)"
+      - "Non-episode session event modifications"
+  plan:
+    steps:
+      - "Review existing kernel_events.proto Session and Tool event definitions"
+      - "Add optional episode_id string field to SessionStarted, SessionProgress, SessionTerminated, SessionQuarantined"
+      - "Add optional episode_id string field to ToolRequested, ToolDecided, ToolExecuted"
+      - "Define new IO artifact reference event type in kernel_events.proto"
+      - "Update daemon episode runtime to populate episode_id when emitting events"
+      - "Add migration/compatibility handling for empty episode_id on replay"
+      - "Implement topic derivation logic for episode.*.{lifecycle,tool,io} topics"
+      - "Add unit tests for event serialization with episode_id"
+      - "Add integration tests for ledger replay with old events (empty episode_id)"
+      - "Verify topic derivation extracts episode_id correctly from event fields"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0006"
+    criteria:
+      - "Episode pulses are derived from ledger events, not IPC-only messages."
+      - "Session/Tool events include optional episode_id field (empty for non-episode sessions)."
+      - "Existing ledger events replay correctly (episode_id defaults to empty string)."
+      - "Topic derivation extracts episode_id from event fields for episode.*.{lifecycle,tool,io} topics."
+  notes:
+    security: "default-deny, least privilege, fail-closed"
+    preconditions: "Q-HEF-0001 resolved: Option A selected (add episode_id field to existing events)"

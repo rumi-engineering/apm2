@@ -1,0 +1,90 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: "TCK-00313"
+    title: "FAC v0: End-to-end autonomous run harness"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0009"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0009.yaml#requirement"
+      - requirement_id: "REQ-HEF-0010"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0010.yaml#requirement"
+      - requirement_id: "REQ-HEF-0011"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0011.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0012"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0012.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_DAEMON"
+      - "DOMAIN_EVIDENCE"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00287"
+        reason: "Protocol server infrastructure required"
+      - ticket_id: "TCK-00288"
+        reason: "Episode runtime infrastructure required"
+      - ticket_id: "TCK-00290"
+        reason: "Tool broker infrastructure required"
+      - ticket_id: "TCK-00293"
+        reason: "CAS storage infrastructure required"
+      - ticket_id: "TCK-00310"
+        reason: "ChangeSetBundleV1 and ChangeSetPublished event required as harness entry point"
+      - ticket_id: "TCK-00311"
+        reason: "Workspace snapshot/apply and ReviewBlocked required for reviewer episodes"
+      - ticket_id: "TCK-00312"
+        reason: "ReviewReceipt artifacts required for review completion"
+      - ticket_id: "TCK-00315"
+        reason: "Reviewer navigation tools required for file access during review"
+      - ticket_id: "TCK-00256"
+        reason: "RFC-0017: Episode lifecycle management required"
+      - ticket_id: "TCK-00260"
+        reason: "RFC-0017: Tool execution context required"
+      - ticket_id: "TCK-00252"
+        reason: "RFC-0017: Session management infrastructure required"
+  scope:
+    in_scope:
+      - "Build end-to-end FAC v0 integration test harness"
+      - "Drive ChangeSetPublished -> reviewer episodes flow"
+      - "Drive reviewer episodes -> ReviewReceipt flow"
+      - "Drive ReviewReceipt -> GateReceipt flow"
+      - "Drive GateReceipt -> projection flow"
+      - "Verify no GitHub reads for truth (ledger-only)"
+      - "Create hef_fac_v0_e2e.rs test file"
+      - "Produce EVID-HEF-0012 evidence artifact"
+      - "Validate GATE-HEF-FAC-V0 passes"
+    out_of_scope:
+      - "Implementation of individual FAC components (covered by TCK-00310, TCK-00311, TCK-00312)"
+      - "HEF pulse infrastructure (covered by TCK-00300 through TCK-00308)"
+      - "GitHub webhook integration"
+      - "Production deployment configuration"
+      - "Performance optimization beyond correctness"
+  plan:
+    steps:
+      - "Review existing integration test patterns in crates/apm2-daemon/tests/"
+      - "Design end-to-end test scenario covering full FAC v0 flow"
+      - "Create crates/apm2-daemon/tests/hef_fac_v0_e2e.rs test file"
+      - "Implement test fixture for ChangeSetBundleV1 creation"
+      - "Implement test fixture for ChangeSetPublished event emission"
+      - "Implement test fixture for reviewer episode spawning"
+      - "Wire test harness to drive workspace apply and review execution"
+      - "Wire test harness to verify ReviewReceipt emission"
+      - "Wire test harness to verify GateReceipt emission"
+      - "Wire test harness to verify projection update"
+      - "Add assertion that no GitHub API calls occur during test"
+      - "Generate EVID-HEF-0012 evidence artifact on test pass"
+      - "Verify GATE-HEF-FAC-V0 gate passes"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0012"
+    criteria:
+      - "EVID-HEF-0012 produced; GATE-HEF-FAC-V0 passes."
+  notes:
+    security: "default-deny, least privilege, fail-closed"
+    verification: "Harness must assert ledger-only truth source with zero GitHub reads"
+    general: "Part of FAC v0 Preconditions group; this is the integration validation for the entire FAC v0 pipeline"

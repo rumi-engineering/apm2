@@ -1,0 +1,69 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: "TCK-00310"
+    title: "FAC v0 NEW WORK REQUIRED: ChangeSetBundleV1 + ChangeSetPublished event"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0009"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0009.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0009"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0009.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_KERNEL"
+      - "DOMAIN_PROTOCOL"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00286"
+        reason: "Depends on prerequisite kernel infrastructure"
+      - ticket_id: "TCK-00287"
+        reason: "Depends on base ProtocolServer infrastructure"
+      - ticket_id: "TCK-00288"
+        reason: "Depends on prerequisite infrastructure changes"
+      - ticket_id: "TCK-00290"
+        reason: "Depends on prerequisite infrastructure changes"
+      - ticket_id: "TCK-00293"
+        reason: "Depends on prerequisite infrastructure changes"
+  scope:
+    in_scope:
+      - "Define ChangeSetBundleV1 CAS schema in schemas/apm2/changeset_bundle_v1.yaml"
+      - "Implement bundle canonicalization in crates/apm2-core/src/fac/changeset_bundle.rs"
+      - "Add ChangeSetPublished event type to proto/kernel_events.proto"
+      - "Emit ChangeSetPublished ledger event from crates/apm2-core/src/ledger/"
+      - "Anchor changeset_digest and CAS hash before any review begins"
+      - "Implement deterministic digest computation (same inputs -> same digest)"
+      - "Ensure hash input omits the changeset_digest field"
+    out_of_scope:
+      - "Workspace snapshot/apply semantics (covered by TCK-00311)"
+      - "ReviewReceipt artifacts (covered by TCK-00312)"
+      - "End-to-end FAC harness (covered by TCK-00313)"
+      - "Reviewer navigation tools (covered by TCK-00315)"
+  plan:
+    steps:
+      - "Design ChangeSetBundleV1 schema with required fields (diff content, metadata, timestamps)"
+      - "Create schemas/apm2/changeset_bundle_v1.yaml with field definitions and constraints"
+      - "Implement canonicalization algorithm in changeset_bundle.rs (field ordering, normalization)"
+      - "Implement deterministic digest computation (SHA-256 over canonicalized bundle)"
+      - "Ensure changeset_digest field is excluded from hash input to prevent circular dependency"
+      - "Add ChangeSetPublished message to proto/kernel_events.proto"
+      - "Wire ledger event emission in apm2-core/src/ledger/"
+      - "Add unit tests for canonicalization determinism"
+      - "Add integration test for ChangeSetPublished event emission"
+      - "Verify same bundle inputs produce identical changeset_digest across runs"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0009"
+    criteria:
+      - "ChangeSetBundleV1 canonicalization is defined and deterministic."
+      - "Deterministic digest test exists (same bundle inputs -> same changeset_digest), and hash input omits the changeset_digest field."
+      - "Ledger event ChangeSetPublished references changeset_digest + CAS hash."
+  notes:
+    security: "default-deny, least privilege, fail-closed"
+    verification: "Deterministic digest unit test, ledger event emission integration test"
