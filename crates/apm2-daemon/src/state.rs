@@ -15,6 +15,7 @@ use apm2_core::supervisor::Supervisor;
 use apm2_daemon::episode::{
     InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
 };
+use apm2_daemon::metrics::SharedMetricsRegistry;
 use apm2_daemon::session::SessionRegistry;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
@@ -43,6 +44,9 @@ pub struct DaemonStateHandle {
     /// wired up.
     #[allow(dead_code)]
     session_registry: Arc<dyn SessionRegistry>,
+    /// Metrics registry for daemon health observability (TCK-00268).
+    /// Used by handlers to record IPC request metrics per REQ-DCP-0012.
+    metrics_registry: Option<SharedMetricsRegistry>,
 }
 
 impl DaemonStateHandle {
@@ -57,6 +61,7 @@ impl DaemonStateHandle {
         config: EcosystemConfig,
         supervisor: Supervisor,
         schema_registry: InMemorySchemaRegistry,
+        metrics_registry: Option<SharedMetricsRegistry>,
     ) -> Self {
         Self {
             inner: RwLock::new(DaemonState {
@@ -68,6 +73,7 @@ impl DaemonStateHandle {
             started_at: Utc::now(),
             schema_registry,
             session_registry: Arc::new(InMemorySessionRegistry::new()),
+            metrics_registry,
         }
     }
 
@@ -88,6 +94,7 @@ impl DaemonStateHandle {
         supervisor: Supervisor,
         schema_registry: InMemorySchemaRegistry,
         state_file_path: impl AsRef<Path>,
+        metrics_registry: Option<SharedMetricsRegistry>,
     ) -> Result<Self, PersistentRegistryError> {
         let session_registry =
             Arc::new(PersistentSessionRegistry::load_from_file(state_file_path)?);
@@ -102,6 +109,7 @@ impl DaemonStateHandle {
             started_at: Utc::now(),
             schema_registry,
             session_registry,
+            metrics_registry,
         })
     }
 
@@ -124,6 +132,17 @@ impl DaemonStateHandle {
     #[allow(dead_code)] // Will be used when RFC-0017 protobuf IPC is fully wired up
     pub fn session_registry(&self) -> &Arc<dyn SessionRegistry> {
         &self.session_registry
+    }
+
+    /// Get a reference to the metrics registry.
+    ///
+    /// # TCK-00268
+    ///
+    /// Returns the metrics registry for daemon health observability.
+    /// Used by handlers to record IPC request metrics per REQ-DCP-0012.
+    #[must_use]
+    pub const fn metrics_registry(&self) -> Option<&SharedMetricsRegistry> {
+        self.metrics_registry.as_ref()
     }
 
     /// Get read access to the inner state.

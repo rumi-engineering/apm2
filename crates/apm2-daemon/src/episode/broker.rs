@@ -55,6 +55,7 @@ use super::error::EpisodeId;
 use super::runtime::Hash;
 use super::tool_class::ToolClass;
 use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
+use crate::metrics::SharedMetricsRegistry;
 
 // =============================================================================
 // BrokerError
@@ -359,6 +360,27 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// daemon and never exposed to session processes. The broker uses this
     /// store to provide SSH agent access for Git SSH operations.
     ssh_store: Option<Arc<dyn SshCredentialStore>>,
+
+    /// Prometheus metrics registry for daemon health observability (TCK-00268).
+    ///
+    /// When present, the broker emits metrics for:
+    /// - `tool_mediation_latency`: After each tool mediation decision
+    /// - `context_firewall_denial`: When context firewall denies a request
+    /// - `session_terminated`: When context firewall triggers termination
+    ///
+    /// # Integration Status
+    ///
+    /// **NOTE**: The `ToolBroker` is not currently instantiated in `main.rs`.
+    /// It is used by the `PrivilegedDispatcher` binary protocol path which is
+    /// not yet wired into the daemon's connection handling.
+    ///
+    /// These metrics will become active when the binary protocol and tool
+    /// mediation flows are integrated into the daemon. Until then, they are
+    /// exercised only in unit tests.
+    ///
+    /// TODO(TCK-FUTURE): Wire `ToolBroker` into `main.rs` via
+    /// `PrivilegedDispatcher` to enable tool mediation metrics.
+    metrics: Option<SharedMetricsRegistry>,
 }
 
 impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
@@ -377,6 +399,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: None,
             ssh_store: None,
+            metrics: None,
         }
     }
 
@@ -395,6 +418,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: None,
             ssh_store: None,
+            metrics: None,
         }
     }
 
@@ -419,6 +443,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: Some(github_store),
             ssh_store: None,
+            metrics: None,
         }
     }
 
@@ -444,6 +469,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: None,
             ssh_store: Some(ssh_store),
+            metrics: None,
         }
     }
 
@@ -470,7 +496,26 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             context_manifest: tokio::sync::RwLock::new(None),
             github_store: Some(github_store),
             ssh_store: Some(ssh_store),
+            metrics: None,
         }
+    }
+
+    /// Adds a metrics registry to the broker (TCK-00268).
+    ///
+    /// When set, the broker will emit metrics for:
+    /// - `tool_mediation_latency`: After each tool mediation decision
+    /// - `context_firewall_denial`: When context firewall denies a request
+    /// - `session_terminated`: When context firewall triggers termination
+    ///
+    /// # Integration Status
+    ///
+    /// **NOTE**: This method is currently only exercised in tests. The
+    /// `ToolBroker` is not yet wired into `main.rs`. See the `metrics`
+    /// field documentation for details.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: SharedMetricsRegistry) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Returns `true` if a GitHub credential store is configured.
@@ -833,6 +878,9 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         timestamp_ns: u64,
         session_context: Option<&super::decision::SessionContext>,
     ) -> Result<ToolDecision, BrokerError> {
+        // TCK-00268: Record start time for latency metrics
+        let start_time = std::time::Instant::now();
+
         // Step 1: Validate request structure
         request.validate()?;
 
@@ -848,20 +896,46 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // NOTE: DefaultContextFirewall::new() is instantiated per-request. This is
         // acceptable overhead since the struct is lightweight (borrows manifest
         // reference) and avoids storing additional state in the broker.
+        // TCK-00268: Helper for tool class label
+        let tool_id = match request.tool_class {
+            super::tool_class::ToolClass::Read => "read",
+            super::tool_class::ToolClass::Write => "write",
+            super::tool_class::ToolClass::Execute => "execute",
+            super::tool_class::ToolClass::Network => "network",
+            super::tool_class::ToolClass::Git => "git",
+            super::tool_class::ToolClass::Inference => "inference",
+            super::tool_class::ToolClass::Artifact => "artifact",
+            _ => "unknown",
+        };
+
         if let Some(context_manifest) = self.context_manifest.read().await.as_ref() {
-            // Helper to create termination decision
+            // Helper to create termination decision and emit metrics
             // NOTE: We use episode_id as session_id here because the broker operates
             // at the episode layer. Session-level identifiers are not available at
             // this point in the call stack. The episode_id provides sufficient
             // traceability for audit purposes.
-            let make_terminate = |rationale: &str| ToolDecision::Terminate {
-                request_id: request.request_id.clone(),
-                termination_info: Box::new(SessionTerminationInfo::new(
-                    request.episode_id.to_string(),
-                    rationale,
-                    "FAILURE",
-                )),
-                refinement_event: None,
+            let make_terminate = |rationale: &str| {
+                // TCK-00268: Emit context firewall denial, session termination, and tool
+                // mediation metrics
+                if let Some(ref metrics) = self.metrics {
+                    let latency = start_time.elapsed().as_secs_f64();
+                    metrics.daemon_metrics().context_firewall_denied(rationale);
+                    metrics.daemon_metrics().session_terminated(rationale);
+                    metrics.daemon_metrics().record_tool_mediation_latency(
+                        tool_id,
+                        "terminate",
+                        latency,
+                    );
+                }
+                ToolDecision::Terminate {
+                    request_id: request.request_id.clone(),
+                    termination_info: Box::new(SessionTerminationInfo::new(
+                        request.episode_id.to_string(),
+                        rationale,
+                        "FAILURE",
+                    )),
+                    refinement_event: None,
+                }
             };
 
             match request.tool_class {
@@ -945,6 +1019,13 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             CapabilityDecision::Allow { capability_id } => capability_id,
             CapabilityDecision::Deny { reason } => {
                 debug!(reason = %reason, "capability denied");
+                // TCK-00268: Emit tool mediation latency metric for deny
+                if let Some(ref metrics) = self.metrics {
+                    let latency = start_time.elapsed().as_secs_f64();
+                    metrics
+                        .daemon_metrics()
+                        .record_tool_mediation_latency(tool_id, "deny", latency);
+                }
                 return Ok(ToolDecision::Deny {
                     request_id: request.request_id.clone(),
                     reason,
@@ -959,6 +1040,13 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         if self.config.check_policy {
             if let PolicyDecision::Deny { rule_id, reason } = self.policy.evaluate(request) {
                 warn!(rule_id = %rule_id, reason = %reason, "policy denied");
+                // TCK-00268: Emit tool mediation latency metric for policy deny
+                if let Some(ref metrics) = self.metrics {
+                    let latency = start_time.elapsed().as_secs_f64();
+                    metrics
+                        .daemon_metrics()
+                        .record_tool_mediation_latency(tool_id, "deny", latency);
+                }
                 return Ok(ToolDecision::Deny {
                     request_id: request.request_id.clone(),
                     // F02: Use PolicyDenied reason instead of misleading NoMatchingCapability
@@ -980,6 +1068,15 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 .await
             {
                 debug!(dedupe_key = %request.dedupe_key, "dedupe cache hit");
+                // TCK-00268: Emit tool mediation latency metric for cache hit
+                if let Some(ref metrics) = self.metrics {
+                    let latency = start_time.elapsed().as_secs_f64();
+                    metrics.daemon_metrics().record_tool_mediation_latency(
+                        tool_id,
+                        "cache_hit",
+                        latency,
+                    );
+                }
                 return Ok(ToolDecision::DedupeCacheHit {
                     request_id: request.request_id.clone(),
                     result: Box::new(cached),
@@ -997,6 +1094,15 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             .await;
 
         debug!(capability_id = %capability_id, has_credential = credential.is_some(), "request allowed");
+
+        // TCK-00268: Emit tool mediation latency metric for allow
+        if let Some(ref metrics) = self.metrics {
+            let latency = start_time.elapsed().as_secs_f64();
+            metrics
+                .daemon_metrics()
+                .record_tool_mediation_latency(tool_id, "allow", latency);
+        }
+
         Ok(ToolDecision::Allow {
             request_id: request.request_id.clone(),
             capability_id,
