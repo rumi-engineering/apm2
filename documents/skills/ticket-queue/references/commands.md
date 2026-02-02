@@ -42,28 +42,52 @@ commands[22]:
     purpose: "Reviewer log mtime."
   - name: pid-inspect
     command: "ps -p <PID> -o pid=,etime=,cmd="
-    purpose: "Inspect process status."
+    purpose: "Inspect process status (legacy; prefer TaskOutput for subagents)."
   - name: find-ai-pids
     command: "pgrep -fa \"(gemini|codex|claude)\" || true"
-    purpose: "Find AI PIDs."
+    purpose: "Find AI PIDs (legacy; prefer task_id tracking)."
+  - name: check-subagent-status
+    tool: TaskOutput
+    parameters:
+      task_id: "<TASK_ID>"
+      block: false
+      timeout: 5000
+    purpose: "Check subagent status without blocking. Returns current output and status."
+  - name: wait-subagent-completion
+    tool: TaskOutput
+    parameters:
+      task_id: "<TASK_ID>"
+      block: true
+      timeout: 30000
+    purpose: "Wait for subagent completion (up to 30s)."
+  - name: stop-subagent
+    tool: TaskStop
+    parameters:
+      task_id: "<TASK_ID>"
+    purpose: "Terminate a running subagent by task_id."
   - name: log-tail-tool-ish-lines
     command: "tail -n 300 <LOG_FILE> | rg -n \"tool|Tool|Bash\(|Read\(|Edit\(|Write\(|exec|command\" || true"
     purpose: "Extract tool lines from log."
-  - name: implementer-log-mtime
-    command: "stat -c \"%y %n\" <IMPLEMENTER_LOG_FILE>"
-    purpose: "Implementer log mtime."
-  - name: implementer-log-tail
-    command: "tail -n 200 <IMPLEMENTER_LOG_FILE>"
-    purpose: "Tail implementer log."
+  - name: subagent-output-mtime
+    command: "stat -c \"%y %n\" <OUTPUT_FILE>"
+    purpose: "Subagent output_file mtime (use path from Task tool response)."
+  - name: subagent-output-tail
+    command: "tail -n 200 <OUTPUT_FILE>"
+    purpose: "Tail subagent output_file (use path from Task tool response)."
   - name: safe-kill-pid
     command: "bash -lc 'set -euo pipefail; ps -p <PID> -o pid=,cmd=; kill -TERM <PID>; sleep 5; kill -KILL <PID> 2>/dev/null || true'"
-    purpose: "Terminate PID."
+    purpose: "Terminate PID (legacy; prefer TaskStop for subagents)."
   - name: claude-history-tail
     command: "tail -n 200 \"$HOME/.claude/history.jsonl\""
     purpose: "Tail Claude history."
-  - name: start-claude-implementer-with-log
-    command: "bash -lc 'set -euo pipefail; mkdir -p \"$HOME/.apm2/ticket-queue/logs\"; log=\"$HOME/.apm2/ticket-queue/logs/<TICKET_ID>.implementer.log\"; script -q \"$log\" -c \"claude --agent rust-developer --verbose \\\"Follow ticket skill for <TICKET_ID>\\\"\" & echo \"PID=$! LOG=$log\"'"
-    purpose: "Spawn Claude implementer. Execute /ticket."
+  - name: start-ticket-subagent
+    tool: Task
+    parameters:
+      subagent_type: "general-purpose"
+      description: "Implement <TICKET_ID>"
+      prompt: "/ticket <TICKET_ID>"
+      run_in_background: true
+    purpose: "Spawn ticket implementer subagent via Task tool. Returns task_id and output_file for monitoring."
   - name: check-ticket-unblocked
     command: |
       deps=$(rg "tickets:" -A 10 "documents/work/tickets/<TICKET_ID>.yaml" | grep -o "TCK-[0-9]{5}")

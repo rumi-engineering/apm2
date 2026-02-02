@@ -7,7 +7,7 @@ decision_tree:
       purpose: "Ensure AI reviews update status within 15m."
       steps[12]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "Replace <TICKET_ID>, <BRANCH_NAME>, <PR_URL>, <SEC_PID>, <QUAL_PID>, <SEC_LOG>, <QUAL_LOG>, <headRefOid>."
+          action: "Replace <TICKET_ID>, <BRANCH_NAME>, <PR_URL>, <SEC_TASK_ID>, <QUAL_TASK_ID>, <headRefOid>."
         - id: GET_PR_METADATA
           action: command
           run: "gh pr view <BRANCH_NAME> --json url,headRefOid"
@@ -20,20 +20,23 @@ decision_tree:
           action: command
           run: "python3 - <<'PY'\nimport json, os, time\nfrom pathlib import Path\np = Path.home() / '.apm2' / 'reviewer_state.json'\nif p.exists():\n    data = json.loads(p.read_text())\n    for k,v in (data.get('reviewers') or {}).items():\n        print(f\"{k}\tpid={v.get('pid')}\tstarted_at={v.get('started_at')}\tlog_file={v.get('log_file')}\tpr_url={v.get('pr_url')}\")\nPY"
           capture_as: reviewer_state_summary
-        - id: IDENTIFY_PIDS_AND_LOGS
-          action: "Set <SEC_PID>, <SEC_LOG>, <QUAL_PID>, <QUAL_LOG> from summary."
-        - id: INSPECT_REVIEWER_PROCESSES
-          action: command
-          run: "bash -lc 'set -euo pipefail; ps -p <SEC_PID> -o pid=,etime=,cmd= || true; ps -p <QUAL_PID> -o pid=,etime=,cmd= || true'"
-          capture_as: reviewer_ps
-        - id: CHECK_LOG_ACTIVITY
-          action: command
-          run: "bash -lc 'set -euo pipefail; stat -c \"%y %n\" <SEC_LOG> || true; stat -c \"%y %n\" <QUAL_LOG> || true'"
-          capture_as: reviewer_log_mtime
-        - id: TAIL_LOGS
-          action: command
-          run: "bash -lc 'set -euo pipefail; tail -n 80 <SEC_LOG> || true; tail -n 80 <QUAL_LOG> || true'"
-          capture_as: reviewer_log_tail
+        - id: IDENTIFY_TASK_IDS
+          action: "Identify reviewer task_ids from reviewer_state or previous dispatch records."
+        - id: INSPECT_REVIEWER_STATUS
+          action: |
+            Use TaskOutput to check reviewer subagent status (if managed via Task tool):
+              TaskOutput(task_id=<SEC_TASK_ID>, block=false, timeout=5000)
+              TaskOutput(task_id=<QUAL_TASK_ID>, block=false, timeout=5000)
+            Note: xtask reviews may run as direct processes; check reviewer_state for details.
+          capture_as: reviewer_status
+        - id: CHECK_REVIEWER_ACTIVITY
+          action: |
+            Review reviewer_state_summary for activity timestamps.
+            If reviewers managed via Task tool, read output_files for recent activity.
+          capture_as: reviewer_activity
+        - id: TAIL_OUTPUTS
+          action: "If output_files available, read last 80 lines for progress indicators."
+          capture_as: reviewer_output_tail
         - id: ENFORCE_15M_DEADLINE
           action: "Verify `now - started_at < 900s`. If breach (per `ai_status`), restart reviews."
         - id: RESTART_IF_UNHEALTHY
