@@ -26,7 +26,7 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -41,10 +41,12 @@ use super::messages::{
     IssueCapabilityResponse, PrivilegedError, PrivilegedErrorCode, ShutdownRequest,
     ShutdownResponse, SpawnEpisodeRequest, SpawnEpisodeResponse, WorkRole,
 };
+use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
     CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
     LeaseIssueDenialReason, validate_custody_domain_overlap,
 };
+use crate::session::{EphemeralHandle, SessionRegistry, SessionState};
 
 // ============================================================================
 // Ledger Event Emitter Interface (TCK-00253)
@@ -935,178 +937,6 @@ impl PrivilegedResponse {
 // Dispatcher
 // ============================================================================
 
-/// Maximum number of sessions tracked in the session registry.
-///
-/// Per CTR-1303: In-memory stores must have `max_entries` limit to prevent
-/// denial-of-service via memory exhaustion.
-pub const MAX_SESSIONS: usize = 10_000;
-
-/// Session state for a spawned episode.
-///
-/// Per TCK-00256, the session state is persisted when `SpawnEpisode` succeeds
-/// to enable subsequent session-scoped IPC calls.
-///
-/// # Security Note
-///
-/// The `Debug` impl manually redacts `lease_id` to prevent accidental leakage
-/// in debug logs. The `lease_id` is a security-sensitive credential that should
-/// not appear in logs or error messages.
-#[derive(Clone)]
-pub struct SessionState {
-    /// Unique session identifier.
-    pub session_id: String,
-    /// Work ID this session is associated with.
-    pub work_id: String,
-    /// Role claimed for this session.
-    pub role: WorkRole,
-    /// Ephemeral handle for IPC communication.
-    pub ephemeral_handle: String,
-    /// Lease ID authorizing this session.
-    ///
-    /// **SECURITY**: This field is redacted in Debug output to prevent
-    /// credential leakage in logs.
-    pub lease_id: String,
-    /// Policy resolution reference.
-    pub policy_resolved_ref: String,
-    /// Episode ID in the runtime (if created).
-    pub episode_id: Option<String>,
-}
-
-impl std::fmt::Debug for SessionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionState")
-            .field("session_id", &self.session_id)
-            .field("work_id", &self.work_id)
-            .field("role", &self.role)
-            .field("ephemeral_handle", &self.ephemeral_handle)
-            .field("lease_id", &"[REDACTED]")
-            .field("policy_resolved_ref", &self.policy_resolved_ref)
-            .field("episode_id", &self.episode_id)
-            .finish()
-    }
-}
-
-/// Trait for persisting and querying session state.
-///
-/// Per TCK-00256, sessions must be persisted to enable subsequent
-/// session-scoped IPC calls.
-pub trait SessionRegistry: Send + Sync {
-    /// Registers a new session.
-    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError>;
-
-    /// Queries a session by session ID.
-    fn get_session(&self, session_id: &str) -> Option<SessionState>;
-
-    /// Queries a session by ephemeral handle.
-    fn get_session_by_handle(&self, handle: &str) -> Option<SessionState>;
-}
-
-/// Error type for session registry operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionRegistryError {
-    /// Session ID already exists.
-    DuplicateSessionId {
-        /// The duplicate session ID.
-        session_id: String,
-    },
-
-    /// Registration failed.
-    RegistrationFailed {
-        /// Error message.
-        message: String,
-    },
-}
-
-impl std::fmt::Display for SessionRegistryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DuplicateSessionId { session_id } => {
-                write!(f, "duplicate session_id: {session_id}")
-            },
-            Self::RegistrationFailed { message } => {
-                write!(f, "session registration failed: {message}")
-            },
-        }
-    }
-}
-
-impl std::error::Error for SessionRegistryError {}
-
-/// In-memory stub session registry for testing.
-///
-/// # Capacity Limits (CTR-1303)
-///
-/// This registry enforces a maximum of [`MAX_SESSIONS`] entries to prevent
-/// memory exhaustion. When the limit is reached, the oldest entry (by insertion
-/// order) is evicted to make room for the new session.
-///
-/// # Async Blocking Trade-off
-///
-/// This implementation uses `std::sync::RwLock` rather than
-/// `tokio::sync::RwLock`. This is acceptable because:
-/// - Critical sections are extremely short (`HashMap` lookup/insert)
-/// - This is a test stub, not production code
-/// - Converting to async would require `async_trait` throughout the trait
-///   hierarchy
-///
-/// For production use, consider using `tokio::sync::RwLock` or a concurrent
-/// `HashMap` implementation like `dashmap`.
-#[derive(Debug, Default)]
-pub struct StubSessionRegistry {
-    /// Sessions stored with insertion order for LRU eviction.
-    sessions: std::sync::RwLock<(VecDeque<String>, HashMap<String, SessionState>)>,
-    /// Sessions indexed by ephemeral handle for efficient lookup.
-    sessions_by_handle: std::sync::RwLock<HashMap<String, String>>,
-}
-
-impl SessionRegistry for StubSessionRegistry {
-    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError> {
-        let mut guard = self.sessions.write().expect("lock poisoned");
-        let mut handles = self.sessions_by_handle.write().expect("lock poisoned");
-        let (order, sessions) = &mut *guard;
-
-        if sessions.contains_key(&session.session_id) {
-            return Err(SessionRegistryError::DuplicateSessionId {
-                session_id: session.session_id,
-            });
-        }
-
-        // CTR-1303: Evict oldest entry if at capacity
-        while sessions.len() >= MAX_SESSIONS {
-            if let Some(oldest_key) = order.pop_front() {
-                if let Some(evicted) = sessions.remove(&oldest_key) {
-                    handles.remove(&evicted.ephemeral_handle);
-                }
-                debug!(
-                    evicted_session_id = %oldest_key,
-                    "Evicted oldest session to maintain capacity limit"
-                );
-            } else {
-                break;
-            }
-        }
-
-        let session_id = session.session_id.clone();
-        let handle = session.ephemeral_handle.clone();
-        order.push_back(session_id.clone());
-        handles.insert(handle, session_id.clone());
-        sessions.insert(session_id, session);
-        Ok(())
-    }
-
-    fn get_session(&self, session_id: &str) -> Option<SessionState> {
-        let guard = self.sessions.read().expect("lock poisoned");
-        guard.1.get(session_id).cloned()
-    }
-
-    fn get_session_by_handle(&self, handle: &str) -> Option<SessionState> {
-        let handles = self.sessions_by_handle.read().expect("lock poisoned");
-        let session_id = handles.get(handle)?;
-        let guard = self.sessions.read().expect("lock poisoned");
-        guard.1.get(session_id).cloned()
-    }
-}
-
 // ============================================================================
 // TCK-00257: Gate Lease Validation
 // ============================================================================
@@ -1400,7 +1230,7 @@ impl PrivilegedDispatcher {
             work_registry: Arc::new(StubWorkRegistry::default()),
             event_emitter: Arc::new(StubLedgerEventEmitter::new()),
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
-            session_registry: Arc::new(StubSessionRegistry::default()),
+            session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
         }
     }
@@ -1417,7 +1247,7 @@ impl PrivilegedDispatcher {
             work_registry: Arc::new(StubWorkRegistry::default()),
             event_emitter: Arc::new(StubLedgerEventEmitter::new()),
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
-            session_registry: Arc::new(StubSessionRegistry::default()),
+            session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
         }
     }
@@ -2099,7 +1929,7 @@ impl PrivilegedDispatcher {
 
         // Generate session ID and ephemeral handle
         let session_id = format!("S-{}", uuid::Uuid::new_v4());
-        let ephemeral_handle = format!("H-{}", uuid::Uuid::new_v4());
+        let ephemeral_handle = EphemeralHandle::generate();
 
         // TCK-00256: Persist session state for subsequent IPC calls
         // The episode_runtime can create/start episodes asynchronously when needed.
@@ -2108,8 +1938,8 @@ impl PrivilegedDispatcher {
         let session_state = SessionState {
             session_id: session_id.clone(),
             work_id: request.work_id.clone(),
-            role: request_role,
-            ephemeral_handle: ephemeral_handle.clone(),
+            role: request_role.into(),
+            ephemeral_handle: ephemeral_handle.to_string(),
             lease_id: claim.lease_id.clone(),
             policy_resolved_ref: claim.policy_resolution.policy_resolved_ref.clone(),
             episode_id: None, // Will be set when episode starts in async context
@@ -2125,15 +1955,15 @@ impl PrivilegedDispatcher {
 
         debug!(
             session_id = %session_id,
-            work_id = %request.work_id,
-            "Session state persisted successfully"
+            ephemeral_handle = %ephemeral_handle,
+            "Session persisted"
         );
 
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
             session_id,
+            ephemeral_handle: ephemeral_handle.to_string(),
             capability_manifest_hash: claim.policy_resolution.capability_manifest_hash.to_vec(),
             context_pack_sealed: true,
-            ephemeral_handle,
         }))
     }
 
@@ -3361,7 +3191,7 @@ mod tests {
         let session = session.unwrap();
         assert_eq!(session.session_id, session_id);
         assert_eq!(session.work_id, work_id);
-        assert_eq!(session.role, WorkRole::Implementer);
+        assert_eq!(session.role, i32::from(WorkRole::Implementer));
         assert_eq!(session.ephemeral_handle, ephemeral_handle);
 
         // Also verify we can query by ephemeral handle
