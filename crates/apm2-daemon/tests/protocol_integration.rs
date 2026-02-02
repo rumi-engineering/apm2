@@ -750,3 +750,199 @@ async fn test_session_socket_handshake() {
         .expect("server task panicked");
     assert_eq!(socket_type, SocketType::Session);
 }
+
+// ============================================================================
+// ProtocolServer-Only Startup Tests (TCK-00279)
+// ============================================================================
+
+/// INT-00279-01: `ProtocolServer`-only startup.
+///
+/// This test verifies the acceptance criteria for TCK-00279:
+///
+/// 1. **`ProtocolServer` is the only daemon control-plane listener**
+///    - Verification: `SocketManager` binds operator.sock + session.sock
+///
+/// 2. **Legacy JSON IPC startup removed**
+///    - Verification: No `ipc_server` module exists in the daemon binary source
+///    - (This is verified by code inspection and compilation - the module
+///      import was removed)
+///
+/// 3. **Legacy socket path is absent**
+///    - Verification: Default paths use operator.sock and session.sock, not
+///      apm2d.sock
+///
+/// Per DD-009 (RFC-0017), the daemon ONLY uses `ProtocolServer` for
+/// control-plane IPC. The legacy JSON IPC (`ipc_server.rs`) has been removed.
+#[tokio::test]
+async fn test_protocol_only_startup() {
+    let tmp = TempDir::new().unwrap();
+
+    // Define the dual-socket paths per DD-009
+    let operator_path = tmp.path().join("operator.sock");
+    let session_path = tmp.path().join("session.sock");
+
+    // Legacy single-socket path that should NOT be used
+    let legacy_path = tmp.path().join("apm2d.sock");
+
+    // 1. Verify SocketManager creates ONLY operator.sock and session.sock
+    let config = SocketManagerConfig::new(&operator_path, &session_path);
+    let manager = SocketManager::bind(config).unwrap();
+
+    // Verify the dual sockets exist
+    assert!(
+        operator_path.exists(),
+        "operator.sock should exist for ProtocolServer"
+    );
+    assert!(
+        session_path.exists(),
+        "session.sock should exist for ProtocolServer"
+    );
+
+    // Verify legacy single-socket path does NOT exist
+    // (We never created it, and SocketManager shouldn't either)
+    assert!(
+        !legacy_path.exists(),
+        "Legacy apm2d.sock should NOT exist - ProtocolServer uses dual sockets only"
+    );
+
+    // 2. Verify SocketManager paths match what we configured
+    assert_eq!(
+        manager.operator_socket_path(),
+        &operator_path,
+        "SocketManager should bind to configured operator path"
+    );
+    assert_eq!(
+        manager.session_socket_path(),
+        &session_path,
+        "SocketManager should bind to configured session path"
+    );
+
+    // 3. Verify socket permissions match DD-009 requirements
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let operator_mode = std::fs::metadata(&operator_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            operator_mode, 0o600,
+            "operator.sock should have mode 0600 (owner only)"
+        );
+
+        let session_mode = std::fs::metadata(&session_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            session_mode, 0o660,
+            "session.sock should have mode 0660 (owner + group)"
+        );
+    }
+
+    // 4. Verify default paths from EcosystemConfig use dual-socket topology
+    // The default config should point to operator.sock and session.sock,
+    // not the legacy apm2d.sock
+    let default_config = apm2_core::config::EcosystemConfig::default();
+
+    // Get filenames from paths
+    let default_operator_name = default_config
+        .daemon
+        .operator_socket
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let default_session_name = default_config
+        .daemon
+        .session_socket
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    assert_eq!(
+        default_operator_name, "operator.sock",
+        "Default operator socket should be operator.sock"
+    );
+    assert_eq!(
+        default_session_name, "session.sock",
+        "Default session socket should be session.sock"
+    );
+
+    // Cleanup happens automatically when manager is dropped
+    drop(manager);
+
+    // Verify cleanup removed the sockets
+    assert!(
+        !operator_path.exists(),
+        "operator.sock should be cleaned up on drop"
+    );
+    assert!(
+        !session_path.exists(),
+        "session.sock should be cleaned up on drop"
+    );
+}
+
+/// Test that legacy single-socket server config points to the legacy path.
+///
+/// This verifies that `ProtocolServer::default_socket_path()` still returns
+/// the legacy `apm2d.sock` path (for backwards compatibility in the
+/// `ProtocolServer` API), but the daemon uses `SocketManager` with dual sockets
+/// instead.
+///
+/// This test documents the distinction:
+/// - `ProtocolServer` (single-socket): Uses `apm2d.sock` - NOT used by daemon
+/// - `SocketManager` (dual-socket): Uses `operator.sock` + `session.sock` -
+///   USED by daemon
+#[tokio::test]
+async fn test_legacy_protocol_server_path_not_used_by_daemon() {
+    use apm2_daemon::protocol::server::default_socket_path;
+
+    // The legacy ProtocolServer default path
+    let legacy_default = default_socket_path();
+    let legacy_name = legacy_default
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // ProtocolServer's default is apm2d.sock (for API compatibility)
+    assert_eq!(
+        legacy_name, "apm2d.sock",
+        "ProtocolServer default should be apm2d.sock"
+    );
+
+    // But the daemon uses SocketManager with dual sockets instead
+    let default_config = apm2_core::config::EcosystemConfig::default();
+    let daemon_operator = default_config
+        .daemon
+        .operator_socket
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let daemon_session = default_config
+        .daemon
+        .session_socket
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // Daemon config uses dual-socket paths, NOT the legacy single socket
+    assert_ne!(
+        daemon_operator, "apm2d.sock",
+        "Daemon should NOT use legacy apm2d.sock for operator"
+    );
+    assert_ne!(
+        daemon_session, "apm2d.sock",
+        "Daemon should NOT use legacy apm2d.sock for session"
+    );
+    assert_eq!(
+        daemon_operator, "operator.sock",
+        "Daemon should use operator.sock"
+    );
+    assert_eq!(
+        daemon_session, "session.sock",
+        "Daemon should use session.sock"
+    );
+}
