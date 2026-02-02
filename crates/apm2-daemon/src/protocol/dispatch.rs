@@ -46,6 +46,7 @@ use crate::episode::{
     CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
     LeaseIssueDenialReason, validate_custody_domain_overlap,
 };
+use crate::metrics::SharedMetricsRegistry;
 use crate::session::{EphemeralHandle, SessionRegistry, SessionState};
 
 // ============================================================================
@@ -1209,6 +1210,14 @@ pub struct PrivilegedDispatcher {
 
     /// Lease validator for `GATE_EXECUTOR` spawn validation (TCK-00257).
     lease_validator: Arc<dyn LeaseValidator>,
+
+    /// Prometheus metrics registry for daemon health observability (TCK-00268).
+    ///
+    /// When present, the dispatcher emits metrics for:
+    /// - `session_spawned`: When `SpawnEpisode` succeeds
+    /// - `ipc_request_completed`: For each dispatched request
+    /// - `capability_granted`: When `IssueCapability` succeeds
+    metrics: Option<SharedMetricsRegistry>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -1221,7 +1230,7 @@ impl PrivilegedDispatcher {
     /// Creates a new dispatcher with default decode configuration.
     ///
     /// Uses stub implementations for policy resolver, work registry, event
-    /// emitter, session registry, and lease validator.
+    /// emitter, session registry, and lease validator. No metrics are emitted.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1232,13 +1241,14 @@ impl PrivilegedDispatcher {
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
+            metrics: None,
         }
     }
 
     /// Creates a new dispatcher with custom decode configuration.
     ///
     /// Uses stub implementations for policy resolver, work registry, event
-    /// emitter, session registry, and lease validator.
+    /// emitter, session registry, and lease validator. No metrics are emitted.
     #[must_use]
     pub fn with_decode_config(decode_config: DecodeConfig) -> Self {
         Self {
@@ -1249,12 +1259,14 @@ impl PrivilegedDispatcher {
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
+            metrics: None,
         }
     }
 
     /// Creates a new dispatcher with custom dependencies.
     ///
     /// This is the production constructor for real governance integration.
+    /// Does not include metrics; use `with_metrics` to add them.
     #[must_use]
     pub fn with_dependencies(
         decode_config: DecodeConfig,
@@ -1273,7 +1285,20 @@ impl PrivilegedDispatcher {
             episode_runtime,
             session_registry,
             lease_validator,
+            metrics: None,
         }
+    }
+
+    /// Adds a metrics registry to the dispatcher (TCK-00268).
+    ///
+    /// When set, the dispatcher will emit metrics for:
+    /// - `session_spawned`: When `SpawnEpisode` succeeds
+    /// - `ipc_request_completed`: For each dispatched request
+    /// - `capability_granted`: When `IssueCapability` succeeds
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: SharedMetricsRegistry) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Returns a reference to the event emitter.
@@ -1438,12 +1463,32 @@ impl PrivilegedDispatcher {
                 reason: format!("unknown privileged message type: {tag}"),
             })?;
 
-        match msg_type {
+        let result = match msg_type {
             PrivilegedMessageType::ClaimWork => self.handle_claim_work(payload, ctx),
             PrivilegedMessageType::SpawnEpisode => self.handle_spawn_episode(payload, ctx),
             PrivilegedMessageType::IssueCapability => self.handle_issue_capability(payload, ctx),
             PrivilegedMessageType::Shutdown => self.handle_shutdown(payload, ctx),
+        };
+
+        // TCK-00268: Emit IPC request completion metrics
+        if let Some(ref metrics) = self.metrics {
+            let endpoint = match msg_type {
+                PrivilegedMessageType::ClaimWork => "ClaimWork",
+                PrivilegedMessageType::SpawnEpisode => "SpawnEpisode",
+                PrivilegedMessageType::IssueCapability => "IssueCapability",
+                PrivilegedMessageType::Shutdown => "Shutdown",
+            };
+            let status = match &result {
+                Ok(PrivilegedResponse::Error(_)) => "error",
+                Ok(_) => "success",
+                Err(_) => "protocol_error",
+            };
+            metrics
+                .daemon_metrics()
+                .ipc_request_completed(endpoint, status);
         }
+
+        result
     }
 
     /// Handles `ClaimWork` requests (IPC-PRIV-001).
@@ -1960,6 +2005,18 @@ impl PrivilegedDispatcher {
             "Session persisted"
         );
 
+        // TCK-00268: Emit session_spawned metric
+        if let Some(ref metrics) = self.metrics {
+            let role_str = match request_role {
+                WorkRole::Implementer => "implementer",
+                WorkRole::Reviewer => "reviewer",
+                WorkRole::GateExecutor => "gate_executor",
+                WorkRole::Coordinator => "coordinator",
+                WorkRole::Unspecified => "unspecified",
+            };
+            metrics.daemon_metrics().session_spawned(role_str);
+        }
+
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
             session_id,
             ephemeral_handle: ephemeral_handle.to_string(),
@@ -2011,6 +2068,34 @@ impl PrivilegedDispatcher {
         // SystemTime::now() The actual timestamps will be populated by proper
         // HTF clock when implemented
         let stub_id = uuid::Uuid::new_v4();
+
+        // TCK-00268: Emit capability_granted metric
+        // Extract role from session state for the metric label
+        if let Some(ref metrics) = self.metrics {
+            // Try to get the session to determine role
+            let role = self
+                .session_registry
+                .get_session(&request.session_id)
+                .map_or("unknown", |s| {
+                    match WorkRole::try_from(s.role).unwrap_or(WorkRole::Unspecified) {
+                        WorkRole::Implementer => "implementer",
+                        WorkRole::Reviewer => "reviewer",
+                        WorkRole::GateExecutor => "gate_executor",
+                        WorkRole::Coordinator => "coordinator",
+                        WorkRole::Unspecified => "unspecified",
+                    }
+                });
+
+            // Extract capability type from request
+            let capability_type = request
+                .capability_request
+                .as_ref()
+                .map_or("unknown", |c| c.tool_class.as_str());
+
+            metrics
+                .daemon_metrics()
+                .capability_granted(role, capability_type);
+        }
 
         Ok(PrivilegedResponse::IssueCapability(
             IssueCapabilityResponse {
