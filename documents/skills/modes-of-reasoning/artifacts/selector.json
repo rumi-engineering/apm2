@@ -1,0 +1,166 @@
+{
+  "schema": "cac.reasoning_selector.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.selector",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/selector@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "version": "1.0.0",
+    "mode_count": 81,
+    "cats": {
+      "formal": [1, 2, 3, 4, 5, 6, 7, 8, 64, 66],
+      "probabilistic": [10, 11, 12, 20, 23, 24],
+      "uncertain": [21, 22, 25, 26, 27],
+      "ampliative": [9, 13, 14, 15, 16, 17, 18, 19, 28],
+      "nonmonotonic": [30, 31, 32, 33, 34],
+      "causal": [29, 37, 38, 39, 40, 41, 42, 43],
+      "decision": [44, 45, 46, 47, 48, 49, 50, 51, 52],
+      "search": [53, 54],
+      "strategic": [55, 56, 57, 58],
+      "argumentation": [35, 36, 59, 60, 62],
+      "domain": [61, 63, 65, 67, 68, 69, 70, 71, 72, 73, 74],
+      "meta": [75, 76, 77, 78, 79, 80, 81]
+    },
+    "axes": {
+      "certainty_vs_exploration": {
+        "certainty": [1, 2, 3, 6, 7, 8, 36],
+        "exploration": [9, 11, 13, 14, 15, 17]
+      },
+      "cooperative_vs_adversarial": {
+        "cooperative": [45, 47, 57],
+        "adversarial": [55, 58, 79, 49]
+      },
+      "belief_vs_action": {
+        "belief": [11, 13, 33, 37, 38],
+        "action": [45, 47, 48, 51, 58, 81]
+      },
+      "facts_vs_values": {
+        "facts": [37, 38, 40, 10, 11],
+        "values": [65, 72, 35, 60]
+      },
+      "monotonic_vs_nonmonotonic": {
+        "monotonic": [1, 2, 3, 4, 5],
+        "nonmonotonic": [30, 31, 32, 33, 34, 81]
+      },
+      "single_vs_multi_agent": {
+        "single": [45, 47, 48, 51],
+        "multi": [55, 56, 57, 58]
+      },
+      "precision_vs_velocity": {
+        "precision": [2, 7, 8, 36, 48, 70],
+        "velocity": [51, 53, 19, 15, 74]
+      }
+    },
+    "patterns": {
+      "science_experimentation": [13, 1, 69, 10, 33, 76],
+      "incident_response": [74, 13, 40, 52, 39],
+      "policy_governance": [37, 45, 72, 35, 60, 36],
+      "engineering_safety": [6, 8, 49, 79, 36, 76],
+      "strategy_uncertainty": [18, 42, 50, 55, 63],
+      "architectural_discovery": [78, 44, 63, 13],
+      "codebase_grounding": [61, 40, 14, 6],
+      "evidence_synthesis": [36, 76, 80, 77],
+      "strategic_protocol_design": [64, 7, 55, 58]
+    },
+    "heuristics": [
+      {
+        "if": {"need": "certainty"},
+        "then": [1, 2, 6, 7, 36],
+        "avoid": [53, 13]
+      },
+      {
+        "if": {"need": "exploration"},
+        "then": [9, 11, 13, 14],
+        "avoid": [1, 2]
+      },
+      {
+        "if": {"environment": "adversarial"},
+        "then": [55, 79, 49, 58],
+        "avoid": [45]
+      },
+      {
+        "if": {"environment": "cooperative"},
+        "then": [45, 47, 57],
+        "avoid": [79]
+      },
+      {
+        "if": {"subject": "facts"},
+        "then": [37, 38, 40, 10, 11],
+        "avoid": [65, 72]
+      },
+      {
+        "if": {"subject": "values"},
+        "then": [65, 72, 35, 60],
+        "avoid": [10, 11]
+      },
+      {
+        "if": {"need": "buy-in"},
+        "then": [60, 57, 35],
+        "avoid": [1, 2]
+      },
+      {
+        "if": {"constraint": "time-pressure"},
+        "then": [51, 53, 19],
+        "avoid": [48, 46]
+      },
+      {
+        "if": {"uncertainty": "deep"},
+        "then": [21, 49, 50],
+        "avoid": [11, 48]
+      },
+      {
+        "if": {"uncertainty": "moderate"},
+        "then": [11, 33, 52],
+        "avoid": [1, 2]
+      },
+      {
+        "if": {"task": "diagnosis"},
+        "then": [13, 40, 41, 52],
+        "avoid": [48, 58]
+      },
+      {
+        "if": {"task": "design"},
+        "then": [70, 6, 46, 36],
+        "avoid": [13, 41]
+      },
+      {
+        "if": {"task": "prediction"},
+        "then": [11, 18, 42, 10],
+        "avoid": [65, 72]
+      },
+      {
+        "if": {"task": "verification"},
+        "then": [1, 2, 6, 7, 8],
+        "avoid": [53, 51]
+      },
+      {
+        "if": {"task": "system-maintenance"},
+        "then": [81, 43, 75, 78],
+        "avoid": [48, 51]
+      },
+      {
+        "if": {"task": "decomposition"},
+        "then": [47, 51, 70],
+        "avoid": [13, 14]
+      },
+      {
+        "if": {"status": "blocked"},
+        "then": [59, 75, 77],
+        "avoid": [1, 2]
+      },
+      {
+        "if": {"subject": "legacy_code"},
+        "then": [61, 40, 73],
+        "avoid": [7, 8]
+      },
+      {
+        "if": {"risk": "high"},
+        "then": [79, 49, 36],
+        "avoid": [53, 51]
+      }
+    ]
+  }
+}

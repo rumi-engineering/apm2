@@ -1,44 +1,19 @@
 title: RFC CREATE Mode
 
-# Execution Context
-#
-# This file serves two modes with conditional execution:
-# - CREATE mode: Executes PHASE_1 -> PHASE_2 -> PHASE_4 -> PHASE_5 (skips PHASE_3)
-# - DECOMPOSE mode: Jumps directly to PHASE_3 only (ticket generation)
-#
-# The `condition` field on each step indicates which mode(s) execute it.
-# Steps without a condition are executed by all modes.
-
 decision_tree:
   entrypoint: CREATE_FLOW
   nodes[1]:
     - id: CREATE_FLOW
-      purpose: "Generate RFC and tickets from PRD. Also handles DECOMPOSE mode for ticket generation."
+      purpose: "Generate RFC and tickets from PRD."
       steps[6]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <PRD_ID> and <RFC_ID> placeholders before running commands."
         - id: PHASE_1_GENESIS_CREATION
           action: |
-            Create RFC directory and 9 YAML files for v0 (Discovery):
-
-            1. Create directory: documents/rfcs/RFC-XXXX/
-
-            2. Generate 9 files from PRD content:
-               - 00_meta.yaml: Set version: v0. metadata, status (DRAFT).
-               - 01_problem_and_imports.yaml: Problem statement, requirements (from PRD).
-               - 02_design_decisions.yaml: Initial design hypotheses.
-               - 03_trust_boundaries.yaml: Identified security surface area.
-               - 04_contracts_and_versioning.yaml: Tentative interface definitions.
-               - 05_rollout_and_ops.yaml: High-level rollout strategy.
-               - 06_ticket_decomposition.yaml: Placeholder for future decomposition.
-               - 07_test_and_evidence.yaml: Test strategy hypotheses.
-               - 08_risks_and_open_questions.yaml: CRITICAL: List all "Known Unknowns" and codebase discovery needs.
-               - 09_governance_and_gates.yaml: Initial gate configuration.
-
-            3. Link to PRD:
-               binds_to_prd:
-                 prd_id: PRD-XXXX
-                 rationale: "Initiates RFC v0 discovery for PRD requirements"
+            Initialize RFC v0 (Discovery):
+            1. Create `documents/rfcs/RFC-XXXX/`
+            2. Populate 00-09 YAML files from PRD content.
+            3. Set `binds_to_prd` metadata.
 
         - id: PHASE_2_DISCOVERY_COUNCIL
           action: |
@@ -47,73 +22,24 @@ decision_tree:
             - SA-2: Identify implementability risks and missing codebase knowledge.
             - SA-3: Identify trust boundary gaps and security unknowns.
 
-            Constraint: Each SA selects **5 strictly random reasoning modes** from modes-of-reasoning
-            (see COUNCIL_PROTOCOL.md Step 3: Stochastic Mode Selection for algorithm).
+            Constraint: Each SA selects **2 Anchor + 3 Random** modes.
+
+        - id: PHASE_2_5_TRANSCENDENTAL_ANCHOR
+          action: |
+            Perform **Mode 78 (Transcendental)** analysis on core PRD requirements:
+            1. ANCHOR: State the requirement as an "Accepted Fact" (e.g., "The system must support X").
+            2. QUESTION: Ask "What must be true in the existing architecture for X to be possible?"
+            3. DERIVE: Infer non-negotiable preconditions.
+            4. VALIDATE: If a precondition is missing in the current system, log it as a BLOCKER in 08_risks_and_open_questions.yaml.
 
         - id: PHASE_3_TICKET_CREATION
           condition: "mode is DECOMPOSE"
           action: |
-            Generate engineering tickets from approved RFC v4:
-            (DECOMPOSE mode jumps directly to this step via rfc-council-workflow.md)
-
-            Prerequisites:
-            - RFC is at version v4 (Standard phase)
-            - 06_ticket_decomposition.yaml has planned_ticket_structure
-
-            ## Step 1: Populate Ticket Decomposition
-
-            Transform `planned_ticket_structure` into full `tickets` array in 06_ticket_decomposition.yaml:
-
-            For each ticket group in planned_ticket_structure:
-            1. Generate stable ticket ID (TCK-XXXXX where XXXXX is sequential)
-            2. Extract implementation details from RFC design decisions (02_design_decisions.yaml)
-            3. Map requirements from the group to the ticket
-            4. Define file paths (files_to_create, files_to_modify) from CCP analysis
-            5. Write acceptance criteria from test strategy (07_test_and_evidence.yaml)
-            6. Set depends_on based on logical ordering (types before reducer before controller)
-
-            Update 06_ticket_decomposition.yaml:
-            ```yaml
-            status: POPULATED
-            tickets:
-              - ticket_id: TCK-XXXXX
-                title: "..."
-                requirement_ids: [REQ-...]
-                depends_on: []
-                files_to_create: [...]
-                files_to_modify: [...]
-                implementation_steps: [...]
-                acceptance_criteria: [...]
-                test_requirements: [...]
-            ```
-
-            ## Step 2: Validate Gates
-
-            Before emission, verify:
-            - GATE-TCK-ATOMICITY: Each ticket is single-PR completable
-            - GATE-TCK-IMPLEMENTABILITY: Agent can implement without ambiguity
-            - GATE-TCK-ANTI-COUSIN: No duplicate patterns introduced
-
-            ## Step 3: Emit Tickets via CLI
-
-            Delegate file generation to the CLI:
-            ```bash
-            apm2 factory tickets emit --rfc RFC-XXXX --prd PRD-XXXX
-            ```
-
-            This reads the populated 06_ticket_decomposition.yaml and generates
-            individual ticket files to documents/work/tickets/TCK-*.yaml.
-
-            ## Step 4: Commit
-
-            Stage and commit all changes:
-            ```bash
-            git add documents/rfcs/RFC-XXXX/06_ticket_decomposition.yaml
-            git add documents/work/tickets/TCK-*.yaml
-            git commit -m "docs(RFC-XXXX): Generate engineering tickets from v4"
-            ```
-
-            Return to caller (do not proceed to PHASE_4/PHASE_5).
+            1. Transform `planned_ticket_structure` into `tickets` array in 06_ticket_decomposition.yaml.
+            2. Map requirements, file paths, and acceptance criteria.
+            3. Verify gates: ATOMICITY, IMPLEMENTABILITY, ANTI-COUSIN.
+            4. Emit: `apm2 factory tickets emit --rfc RFC-XXXX --prd PRD-XXXX`.
+            5. Commit changes.
 
         - id: PHASE_4_SELF_REVIEW
           condition: "mode is CREATE"

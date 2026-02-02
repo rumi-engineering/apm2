@@ -1,0 +1,120 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/fermi-order-of-magnitude@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 19,
+    "name": "fermi-order-of-magnitude",
+    "cat": "ampliative",
+    "core": "Rough quantitative estimates via decomposition and bounding; aims for scale correctness (within 10x) rather than precision. Primary tool when data is unavailable but decision requires numeric grounding.",
+    "out": [
+      {"n": "point_estimate", "d": "central value with explicit order-of-magnitude (e.g., ~10^6)"},
+      {"n": "bounds", "d": "lower/upper limits spanning uncertainty (e.g., 10^5 to 10^7)"},
+      {"n": "sensitivity_drivers", "d": "which 1-2 components dominate total uncertainty"},
+      {"n": "unit_chain", "d": "dimensional analysis showing units cancel correctly"},
+      {"n": "sanity_anchor", "d": "known reference point confirming plausibility"}
+    ],
+    "proc": [
+      "state target quantity with explicit units (e.g., 'annual piano tunings in Chicago')",
+      "decompose into 3-7 estimable factors; prefer multiplicative chains where factors are independent",
+      "for each factor: estimate low/mid/high values; use powers of 10 or simple fractions",
+      "propagate bounds: multiply lows for lower bound, highs for upper bound",
+      "verify units cancel to target units; if not, identify missing/extra factor",
+      "identify dominant term: which factor's uncertainty range contributes most to total spread?",
+      "sanity-check: compare result to at least one known reference point within 10x",
+      "if bounds span >3 orders of magnitude, refine largest-uncertainty factor first"
+    ],
+    "check": [
+      "units cancel correctly to target units?",
+      "each factor estimable from common knowledge or stated assumption?",
+      "low/high bounds for each factor span at most 1 order of magnitude?",
+      "result compared to at least one external anchor?",
+      "dominant sensitivity driver identified and flagged?",
+      "implicit assumptions (e.g., uniform distribution, independence) stated explicitly?"
+    ],
+    "quick_checklist": [
+      "PRE: target quantity has explicit units",
+      "PRE: decomposition has 3-7 factors (fewer too coarse, more error-prone)",
+      "DURING: each factor has low/mid/high estimate",
+      "DURING: units tracked at each step",
+      "POST: total bounds span <3 orders of magnitude (else refine)",
+      "POST: sanity anchor identified and result within 10x of it"
+    ],
+    "diff": {
+      "vs_qualitative_29": "produces numeric estimates (10^N), not just 'large' or 'increasing'",
+      "vs_reference_class_18": "decomposes from first principles; reference-class anchors on historical base rates of similar cases. Fermi when no reference class exists; reference-class when past cases available",
+      "vs_statistical_10": "no sample data required; no confidence intervals or hypothesis tests. Fermi for early estimation; statistical after data collection",
+      "vs_simulation_42": "one-shot calculation, not model execution over time/parameters. Fermi for quick bounds; simulation for dynamic behavior and distributions",
+      "vs_bayesian_11": "no prior distribution or updating; single-pass estimate. Fermi provides rough prior for Bayesian refinement"
+    },
+    "confusions": [
+      {
+        "pair": "fermi vs reference-class (18)",
+        "symptom": "using decomposition when historical base rates are available",
+        "resolution": "if 10+ similar past cases exist with known outcomes, use reference-class; if novel or no data, use Fermi"
+      },
+      {
+        "pair": "fermi vs statistical (10)",
+        "symptom": "treating Fermi bounds as confidence intervals",
+        "resolution": "Fermi bounds are uncertainty ranges from factor estimates, not statistical CIs from sampling. Do not report Fermi bounds as '95% CI'"
+      }
+    ],
+    "fail": {
+      "mode": "hidden unit/assumption errors",
+      "desc": "unit mistakes or implicit assumptions left untested; errors in component estimates compound multiplicatively, potentially yielding results off by 100x or more",
+      "signals": [
+        "units not tracked or verified",
+        "result not compared to any sanity anchor",
+        "implicit assumptions (e.g., 'everyone uses it') not stated",
+        "single point estimate without bounds",
+        "factor count exceeds 7 (error accumulation)"
+      ],
+      "mitigations": [
+        "write units at every step; verify final units match target before concluding",
+        "identify and state at least 2 implicit assumptions (e.g., 'assumes uniform distribution across city')",
+        "compare result to at least one independent reference point; if off by >10x, revisit factors",
+        "if bounds span >1000x, stop and refine the most uncertain factor before proceeding",
+        "limit chain to 7 factors max; each multiplication adds ~0.5 orders of magnitude uncertainty"
+      ]
+    },
+    "use": [
+      "early feasibility assessment when data unavailable",
+      "sanity checks on detailed calculations or vendor quotes",
+      "identifying dominant cost, risk, or capacity terms",
+      "quick prioritization decisions under time pressure",
+      "interview estimation problems (classic Fermi questions)",
+      "bounding resource requirements before detailed planning"
+    ],
+    "rel": [
+      {"id": 29, "name": "qualitative", "link": "even coarser; directional only, no numeric estimate"},
+      {"id": 18, "name": "reference-class-outside-view", "link": "anchored to base rates; use when past cases available"},
+      {"id": 51, "name": "satisficing", "link": "good-enough decision making; Fermi provides numeric threshold"},
+      {"id": 42, "name": "model-based-simulation", "link": "dynamic execution; Fermi for static one-shot bounds"},
+      {"id": 76, "name": "calibration-epistemic-humility", "link": "track Fermi accuracy over time to improve estimates"}
+    ],
+    "micro_example": {
+      "target": "annual piano tunings in Chicago",
+      "units": "tunings/year",
+      "decomposition": [
+        {"factor": "Chicago population", "low": "2M", "mid": "3M", "high": "4M", "units": "people"},
+        {"factor": "people per household", "low": "2", "mid": "2.5", "high": "3", "units": "people/household"},
+        {"factor": "fraction of households with piano", "low": "0.02", "mid": "0.05", "high": "0.10", "units": "dimensionless"},
+        {"factor": "tunings per piano per year", "low": "1", "mid": "1.5", "high": "2", "units": "tunings/piano/year"}
+      ],
+      "calculation": {
+        "mid": "(3M people / 2.5 people/hh) * 0.05 * 1.5 = 1.2M hh * 0.05 * 1.5 = 90,000 tunings/year",
+        "low": "(2M / 3) * 0.02 * 1 = 667K hh * 0.02 = 13,300 tunings/year",
+        "high": "(4M / 2) * 0.10 * 2 = 2M hh * 0.10 * 2 = 400,000 tunings/year"
+      },
+      "units_check": "people / (people/hh) * (tunings/piano/year) = hh * tunings/piano/year -- missing pianos/hh, which is the fraction factor. Correct chain: (people) / (people/hh) * (pianos/hh) * (tunings/piano/year) = tunings/year. CHECK.",
+      "dominant_driver": "fraction of households with piano (5x range: 0.02-0.10) dominates uncertainty",
+      "sanity_anchor": "Chicago Yellow Pages lists ~100 piano tuners; if each does 2-3 tunings/day, 250 days/year = 50-75k tunings. Mid estimate (90k) within 2x. PLAUSIBLE.",
+      "result": "~10^5 tunings/year (range: 10^4 to 4*10^5)"
+    }
+  }
+}

@@ -1,0 +1,256 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/meta-reasoning@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z",
+    "updated_at": "2026-02-02T00:00:00Z"
+  },
+  "payload": {
+    "id": 75,
+    "name": "meta-reasoning",
+    "cat": "meta",
+    "core": "Second-order reasoning that selects, monitors, and adjusts first-order reasoning processes. Determines which mode to apply, effort allocation, stopping criteria, and quality monitoring. The operating system for all other reasoning modes. Key constraint: meta-reasoning must consume <5% of total analysis budget.",
+
+    "out": [
+      {"name": "problem_characterization", "desc": "5-axis classification: belief/action, cooperative/adversarial, certainty/exploration, time pressure (H/M/L), stakes (H/M/L)"},
+      {"name": "mode_selection_rationale", "desc": "2-3 candidate modes with 1-sentence fit reason each; primary mode marked"},
+      {"name": "effort_budget", "desc": "Total time cap + per-checkpoint allocation (e.g., '45m total: 15m/15m/15m')"},
+      {"name": "stopping_rule", "desc": "Testable condition: confidence threshold, alternatives exhausted, or diminishing returns hit"},
+      {"name": "checkpoint_schedule", "desc": "Timestamps or intervals for progress assessment (e.g., 'every 15m' or '10:15, 10:30, 10:45')"},
+      {"name": "mode_switch_trigger", "desc": "Specific signal: '2 checkpoints with no hypothesis eliminated' or 'problem recharacterization forced'"},
+      {"name": "retrospective_note", "desc": "1-sentence post-hoc record: 'mode X worked/failed because Y'"}
+    ],
+
+    "proc": [
+      {
+        "step": 1,
+        "name": "Characterize problem",
+        "action": "Classify on 5 axes: belief vs action, cooperative vs adversarial, certainty vs exploration, time pressure (H/M/L), stakes (H/M/L).",
+        "test": "Can you fill in all 5 axes with single-word answers?",
+        "example": "Incident diagnosis: belief, cooperative, exploration, time=H, stakes=H."
+      },
+      {
+        "step": 2,
+        "name": "Select candidate modes",
+        "action": "List 2-3 candidate modes from taxonomy. For each, write 1 sentence: why it fits this problem's axes.",
+        "test": "Each mode's rationale references at least 1 axis value.",
+        "example": "Diagnostic (fits high time pressure + belief), Mechanistic (fits exploration), Abductive (fits belief + no obvious cause)."
+      },
+      {
+        "step": 3,
+        "name": "Set effort budget",
+        "action": "Set total time proportional to stakes. Divide into 2-4 checkpoint intervals. Meta-reasoning itself must take <5% of total.",
+        "test": "Budget is a number, not 'reasonable amount'. Checkpoints are scheduled.",
+        "example": "45m total. Checkpoints at 15m, 30m, 40m. Meta-reasoning: 2m max."
+      },
+      {
+        "step": 4,
+        "name": "Define stopping rule",
+        "action": "Specify testable end condition: confidence threshold reached, N alternatives evaluated, or marginal value of continued analysis below threshold.",
+        "test": "Rule is falsifiable: you could observe it being met.",
+        "example": "Stop when: root cause identified with >80% confidence OR top 3 hypotheses ranked and tested."
+      },
+      {
+        "step": 5,
+        "name": "Define mode-switch triggers",
+        "action": "Specify signals that force abandoning current mode: no progress after N checkpoints, problem recharacterization, time budget exhausted.",
+        "test": "Trigger is observable, not subjective ('feels stuck').",
+        "example": "Switch if: 2 checkpoints with no hypothesis eliminated OR realize problem is actually action not belief."
+      },
+      {
+        "step": 6,
+        "name": "Execute with checkpoints",
+        "action": "Run primary mode. At each checkpoint: assess progress against stopping rule, check for switch triggers.",
+        "test": "Checkpoint produces 1-sentence status update.",
+        "example": "15m checkpoint: 2 of 4 hypotheses eliminated. On track."
+      },
+      {
+        "step": 7,
+        "name": "Close loop",
+        "action": "Write 1-sentence retrospective: did mode selection work? What would you do differently?",
+        "test": "Retrospective is specific, not 'it went fine'.",
+        "example": "Diagnostic mode worked; should have started with log analysis not user interviews."
+      }
+    ],
+
+    "quick_checklist": [
+      "5 axes filled in? (belief/action, coop/adv, cert/expl, time, stakes)",
+      "2-3 modes listed with fit rationale?",
+      "Total budget set as number, not vague?",
+      "Checkpoints scheduled?",
+      "Stopping rule testable?",
+      "Switch trigger observable?",
+      "Meta-reasoning <5% of total budget?"
+    ],
+
+    "check": [
+      "problem characterized on all 5 axes (belief/action, cooperative/adversarial, certainty/exploration, time pressure, stakes)",
+      ">=2 candidate modes identified with 1-sentence fit rationale each",
+      "time budget set as concrete number proportional to stakes",
+      "stopping rule is testable (could verify when met)",
+      "mode-switch trigger is observable (not 'feels stuck')",
+      "checkpoint schedule established with specific times/intervals",
+      "meta-reasoning consumed <5% of total analysis budget",
+      "retrospective note written at completion"
+    ],
+
+    "diff": {
+      "sensemaking": {
+        "boundary": "Sensemaking establishes what problem is (frame selection); meta-reasoning selects how to reason about the framed problem.",
+        "test": "Are you naming the situation type (sensemaking) or choosing a reasoning approach (meta-reasoning)?"
+      },
+      "calibration": {
+        "boundary": "Calibration tracks accuracy retrospectively across many judgments; meta-reasoning selects mode prospectively for one problem.",
+        "test": "Are you scoring past predictions (calibration) or choosing an approach now (meta-reasoning)?"
+      },
+      "debiasing": {
+        "boundary": "Debiasing audits outputs for cognitive errors; meta-reasoning selects which process produces those outputs.",
+        "test": "Are you checking an answer for bias (debiasing) or deciding how to generate the answer (meta-reasoning)?"
+      },
+      "reflective-equilibrium": {
+        "boundary": "Reflective equilibrium iterates between principles and cases to achieve coherence; meta-reasoning selects reasoning mode, not content.",
+        "test": "Are you adjusting beliefs to match principles (reflective-eq) or choosing which mode to use (meta-reasoning)?"
+      },
+      "adversarial-red-team": {
+        "boundary": "Red-team attacks a system/plan from adversary perspective; meta-reasoning orchestrates which modes to apply, including red-team.",
+        "test": "Are you actively attacking (red-team) or deciding whether/when to attack (meta-reasoning)?"
+      },
+      "value-of-information": {
+        "boundary": "VoI decides whether to gather more data before acting; meta-reasoning decides how to reason with current data.",
+        "test": "Are you computing value of getting more info (VoI) or choosing a reasoning approach (meta-reasoning)?"
+      },
+      "heuristic": {
+        "boundary": "Heuristics are a specific fast-and-frugal mode; meta-reasoning decides when heuristics are appropriate vs. slower modes.",
+        "test": "Are you applying a rule-of-thumb (heuristic) or deciding whether to use rules-of-thumb (meta-reasoning)?"
+      },
+      "planning": {
+        "boundary": "Planning constructs action sequences in the world; meta-reasoning constructs reasoning step sequences in the mind.",
+        "test": "Are you planning what to do (planning) or planning how to think (meta-reasoning)?"
+      }
+    },
+
+    "common_confusions": [
+      {
+        "confusion": "Meta-reasoning vs Sensemaking: both happen early",
+        "resolution": "Sensemaking answers 'what kind of situation is this?' (frame). Meta-reasoning answers 'how should I reason about this framed situation?' (mode). Sensemaking precedes meta-reasoning.",
+        "example": "Sensemaking: 'This is a competitive threat, not an execution failure.' Meta-reasoning: 'For competitive threats, use game-theoretic + scenario analysis.'"
+      },
+      {
+        "confusion": "Meta-reasoning vs Reflective Equilibrium: both involve self-reflection",
+        "resolution": "Meta-reasoning selects reasoning mode (process choice). Reflective equilibrium adjusts beliefs and principles until coherent (content revision). Meta-reasoning is about how to think; reflective equilibrium is about what to believe.",
+        "example": "Meta-reasoning: 'Use causal inference for this policy question.' Reflective equilibrium: 'My principle conflicts with this case; revise the principle.'"
+      },
+      {
+        "confusion": "Meta-reasoning vs Debiasing: both are 'meta' category",
+        "resolution": "Meta-reasoning runs before analysis (selects mode). Debiasing runs after analysis (audits output). Meta-reasoning is prospective orchestration; debiasing is retrospective quality control.",
+        "example": "Meta-reasoning: 'Choose diagnostic mode for this incident.' Debiasing: 'Check if my root-cause conclusion is anchoring-biased.'"
+      }
+    ],
+
+    "fail": {
+      "name": "meta-infinite regress",
+      "description": "Spending more time selecting how to reason than actually reasoning. The 'analysis paralysis' of mode selection.",
+      "signals": [
+        "mode selection consumes >10% of analysis budget",
+        ">5 candidate modes considered without committing to one",
+        "researching reasoning frameworks instead of applying a reasonable mode",
+        "second-guessing mode choice at every checkpoint",
+        "recursive questions: 'how should I decide how to decide how to reason?'"
+      ],
+      "mitigations": [
+        {
+          "mitigation": "Hard time-box: 5% of total budget max for mode selection",
+          "test": "Set timer. If timer expires, use whatever mode you have.",
+          "example": "45m problem budget -> 2m max for meta-reasoning. At 2m, commit."
+        },
+        {
+          "mitigation": "Default mode ladder: domain default -> satisficing + reference-class -> ask expert",
+          "test": "Can you name your domain's default mode? If not, use satisficing.",
+          "example": "Software incident -> diagnostic. Unknown domain -> satisficing + outside-view."
+        },
+        {
+          "mitigation": "Apply satisficing to mode selection itself: first adequate mode wins",
+          "test": "Stop searching modes when one is 'good enough', not optimal.",
+          "example": "Diagnostic mode fits. Stop considering. Don't research whether mechanistic is better."
+        },
+        {
+          "mitigation": "Only switch modes if current mode is failing, not merely suboptimal",
+          "test": "Switch trigger: 'zero progress in 2 checkpoints', not 'another mode might be 10% better'.",
+          "example": "Diagnostic yielded 2 hypotheses eliminated. Working. Don't switch to mechanistic."
+        },
+        {
+          "mitigation": "Banned phrase: never ask 'how should I decide how to reason?'",
+          "test": "If you hear this question, immediately use default mode ladder.",
+          "example": "Catch yourself spiraling. Apply: domain default or satisficing. Move on."
+        },
+        {
+          "mitigation": "One-shot mode selection: choose once, revisit only if failing",
+          "test": "Mode selection happens once at start, not continuously.",
+          "example": "Selected diagnostic at t=0. At t=15m, check progress, not mode optimality."
+        }
+      ]
+    },
+
+    "use": [
+      "high-stakes decisions where mode mismatch is costly (wrong analysis approach wastes time or yields wrong answer)",
+      "novel problems with no obvious default mode (cross-domain, unprecedented)",
+      "multi-phase analysis requiring different modes per stage (e.g., sensemaking -> causal -> decision)",
+      "team reasoning alignment: agreeing on approach before diving into substance",
+      "resource-constrained decisions: limited time/people requires deliberate mode choice",
+      "post-failure analysis: diagnosing whether reasoning approach (not just content) was wrong"
+    ],
+
+    "rel": [
+      {"id": 63, "name": "sensemaking", "role": "upstream: establishes frame before mode selection"},
+      {"id": 52, "name": "value-of-information", "role": "input: informs stopping rules and data-gathering decisions"},
+      {"id": 76, "name": "calibration", "role": "downstream: tracks long-run reasoning quality across problems"},
+      {"id": 80, "name": "debiasing", "role": "downstream: audits mode outputs for cognitive bias"},
+      {"id": 51, "name": "satisficing", "role": "technique: apply to mode selection to avoid regress"},
+      {"id": 53, "name": "heuristic", "role": "option: fast mode selected under time pressure"},
+      {"id": 47, "name": "planning", "role": "parallel: action planning vs reasoning planning"},
+      {"id": 77, "name": "reflective-equilibrium", "role": "distinct: content coherence vs process selection"},
+      {"id": 79, "name": "adversarial-red-team", "role": "option: mode to select when adversarial context identified"}
+    ],
+
+    "ex": {
+      "situation": "Customer reports intermittent login failures, 1 hour to diagnose before exec escalation.",
+      "characterization": {
+        "belief_or_action": "belief (need explanation)",
+        "cooperative_or_adversarial": "cooperative (customer wants fix, not attacking)",
+        "certainty_or_exploration": "exploration (no obvious cause)",
+        "time_pressure": "H (1 hour hard deadline)",
+        "stakes": "H (exec visibility, customer trust)"
+      },
+      "candidate_modes": [
+        {"mode": "diagnostic", "rationale": "structured triage fits high time pressure + belief problem"},
+        {"mode": "mechanistic", "rationale": "trace system components fits exploration"},
+        {"mode": "abductive", "rationale": "generate hypotheses from symptoms fits no obvious cause"}
+      ],
+      "selected_mode": "diagnostic (primary), with abductive hypothesis generation as sub-step",
+      "budget": "45m analysis + 15m buffer. Checkpoints: 15m, 30m, 40m. Meta-reasoning: 2m.",
+      "stopping_rule": "Root cause identified with >80% confidence OR top 3 hypotheses ranked with test plan",
+      "switch_trigger": "30m with no hypothesis eliminated -> switch to mechanistic (full trace)",
+      "execution": [
+        "15m checkpoint: 4 hypotheses generated, 1 eliminated (not network - latency normal). On track.",
+        "30m checkpoint: 2 more eliminated (not DB, not auth service). 1 remaining: session cookie handling.",
+        "35m: root cause confirmed (race condition in session cookie refresh)."
+      ],
+      "retrospective": "Diagnostic mode worked. Would start with session trace earlier next time."
+    },
+
+    "micro_example": {
+      "situation": "Choose reasoning approach for 'should we expand to new market?' (2 hours available)",
+      "meta_reasoning_output": {
+        "characterization": "action, cooperative, exploration, time=M, stakes=H",
+        "modes": ["decision-theoretic (fits action + stakes)", "reference-class (fits exploration + high stakes)"],
+        "budget": "90m analysis, 20m synthesis, 10m buffer. Meta: 4m.",
+        "stopping": "Decision recommendation with confidence interval and top 3 risks",
+        "switch_trigger": "45m with no clear framework -> add game-theoretic (competitor response)"
+      },
+      "total_meta_time": "3 minutes (3.3% of budget)"
+    }
+  }
+}

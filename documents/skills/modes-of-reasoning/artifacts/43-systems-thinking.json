@@ -1,0 +1,194 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/systems-thinking@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 43,
+    "name": "systems-thinking",
+    "cat": "causal",
+    "core": "Reason about interacting components whose behavior over time cannot be predicted from parts alone. Core primitives: reinforcing loops (R), balancing loops (B), delays, stocks (accumulations), flows (rates), and emergence from loop dominance shifts.",
+    "out": [
+      "causal_loop_diagram",
+      "leverage_points",
+      "dynamic_hypothesis",
+      "boundary_chart",
+      "stock_flow_map"
+    ],
+    "proc": [
+      "Define problem dynamically: state undesired behavior pattern over time (growth, oscillation, collapse, stagnation)",
+      "Draw reference mode: sketch expected trajectory vs actual trajectory on time axis",
+      "Identify 5-15 key variables; classify each as stock (accumulates) or auxiliary (computed)",
+      "For each stock, name at least one inflow and one outflow with units",
+      "Draw influence arrows with +/- signs; + means same direction, - means opposite",
+      "Trace loops back to origin; count sign flips: even = R (reinforcing), odd = B (balancing)",
+      "Label each loop with descriptive name capturing its behavioral role",
+      "Insert delays where effect lags cause by > 1 time unit; note order of magnitude",
+      "Identify boundary: list exogenous variables and justify exclusion of others",
+      "Locate leverage points using Meadows hierarchy: paradigm > goals > structure > feedback > parameters",
+      "Write dynamic hypothesis: [problem pattern] occurs because [loop name] dominates when [condition], leading to [consequence]",
+      "Derive testable prediction: if [intervention], then [measurable outcome] by [timeframe]",
+      "Validate: compare prediction to historical data, simulation, or natural experiment"
+    ],
+    "quick_check": [
+      "Can you point to at least one stock with explicit units?",
+      "Is every loop closed (path returns to starting variable)?",
+      "Is at least one delay quantified with order-of-magnitude estimate?",
+      "Does dynamic hypothesis name a specific loop and condition?",
+      "Is prediction falsifiable with named metric and timeframe?"
+    ],
+    "check": [
+      "Every loop labeled R/B with descriptive name reflecting behavioral role",
+      "At least one stock with inflow/outflow pair, all with consistent units",
+      "Delays marked where lag > 1 time unit; magnitude estimated",
+      "Boundary explicit: exogenous vars identified and inclusion criteria stated",
+      "Dynamic hypothesis specifies loop, condition for dominance, and observable consequence",
+      "Reference mode drawn showing expected vs actual behavior over time",
+      "Leverage points ranked; at least one structural intervention identified"
+    ],
+    "diff": {
+      "mechanistic": {
+        "contrast": "Mechanistic = how component works inside; Systems = how components interact over time for emergent patterns",
+        "boundary": "Use mechanistic first to understand each component, then systems to understand their interaction",
+        "test": "If problem is 'why does X fail?' use mechanistic. If problem is 'why does behavior persist despite intervention?' use systems"
+      },
+      "model-based-simulation": {
+        "contrast": "Simulation runs quantitative models forward in time; Systems builds qualitative structure (loops, delays) first",
+        "boundary": "Systems provides the causal structure; simulation tests parameter sensitivity and timing",
+        "test": "If you lack loop structure, systems first. If you have structure and need trajectories, simulate"
+      },
+      "qualitative": {
+        "contrast": "Qualitative = directional sign propagation through chains; Systems adds loop closure, delay analysis, and stock-flow distinction",
+        "boundary": "Use qualitative for quick impact tracing; escalate to systems when oscillation or counterintuitive behavior appears",
+        "test": "If behavior is monotonic and predictable, qualitative suffices. If behavior oscillates or reverses, use systems"
+      },
+      "counterfactual": {
+        "contrast": "Counterfactual asks 'what if X had been different?'; Systems asks 'what structure causes this behavior pattern?'",
+        "boundary": "Systems provides the model; counterfactual queries alternate parameter settings on that model",
+        "test": "If explaining past event, counterfactual. If explaining recurring pattern, systems"
+      },
+      "causal-inference": {
+        "contrast": "Causal inference estimates effect size of intervention; Systems maps feedback structure that may nullify or amplify intervention",
+        "boundary": "Causal inference assumes stable structure; systems reveals when structure changes or feedback undermines intervention",
+        "test": "If system is at equilibrium and you need effect size, causal inference. If system is dynamic with feedback, systems first"
+      }
+    },
+    "confusions": [
+      {
+        "confused_with": "qualitative (mode 29)",
+        "symptom": "Drawing influence diagrams without closing loops or distinguishing stocks from flows",
+        "resolution": "Qualitative is open-chain sign propagation. Systems requires: (1) closed loops, (2) explicit stocks, (3) delay analysis. If your diagram has no loops, you are doing qualitative, not systems thinking."
+      },
+      {
+        "confused_with": "mechanistic (mode 40)",
+        "symptom": "Explaining how each component works but missing emergent behavior from interactions",
+        "resolution": "Mechanistic decomposes into parts and explains each. Systems asks: what happens when these parts interact over time? Look for: feedback, delays, accumulation. If parts operate independently, mechanistic suffices."
+      },
+      {
+        "confused_with": "model-based-simulation (mode 42)",
+        "symptom": "Jumping to simulation without articulating loop structure or testing qualitative predictions first",
+        "resolution": "Simulation is quantitative execution. Systems is qualitative structure. Correct sequence: systems thinking produces CLD and dynamic hypothesis, simulation tests sensitivity. Skipping systems makes simulation a black box."
+      }
+    ],
+    "fail": {
+      "mode": "Vague loop stories without measurable hypotheses",
+      "signal": "Cannot name stocks with units, cannot specify which loop dominates under what condition, cannot state falsifiable prediction with metric and timeframe",
+      "mit": [
+        {
+          "id": "MIT-1",
+          "name": "Stock discipline",
+          "rule": "Every stock must have name, unit, and at least one inflow and outflow identified",
+          "test": "Can you write: 'Stock [X] measured in [units] increases via [inflow] and decreases via [outflow]'?",
+          "example": "Stock 'technical debt' measured in 'hours-to-fix' increases via 'shortcuts taken' and decreases via 'refactoring effort'"
+        },
+        {
+          "id": "MIT-2",
+          "name": "Loop dominance specificity",
+          "rule": "Dynamic hypothesis must name which loop dominates under which measurable condition",
+          "test": "Can you write: 'Loop [R/B name] dominates when [variable] exceeds [threshold]'?",
+          "example": "Loop R1-Burnout-Spiral dominates when on-call-load exceeds 10 pages/person/week"
+        },
+        {
+          "id": "MIT-3",
+          "name": "Delay quantification",
+          "rule": "Every marked delay must have order-of-magnitude estimate with basis",
+          "test": "Can you write: 'Delay of [N] [time-units] based on [evidence]'?",
+          "example": "Delay of 3 months based on historical new-hire ramp-up data"
+        },
+        {
+          "id": "MIT-4",
+          "name": "Falsifiable prediction",
+          "rule": "Prediction must specify intervention, metric, direction, and timeframe",
+          "test": "Can you write: 'If [intervention], then [metric] will [direction] by [amount] within [timeframe]'?",
+          "example": "If we reduce ramp-up to 1 month, attrition rate will drop by 30% within 6 months"
+        },
+        {
+          "id": "MIT-5",
+          "name": "Boundary justification",
+          "rule": "Exogenous variables must be listed with reason for exclusion from feedback",
+          "test": "Can you write: 'Variable [X] is exogenous because [reason it does not respond to system variables]'?",
+          "example": "Market salary rate is exogenous because our hiring volume does not affect regional tech salaries"
+        }
+      ]
+    },
+    "use": [
+      "Org design: hiring velocity, onboarding capacity, incentive structures, knowledge transfer",
+      "Markets: supply/demand dynamics, network effects, platform ecosystems, adoption curves",
+      "Reliability engineering: alert fatigue, incident cascades, capacity planning, on-call sustainability",
+      "Long-term planning: policy resistance, unintended consequences, goal erosion, shifting-the-burden",
+      "Technical debt: quality-speed tradeoffs, defect accumulation, refactoring thresholds"
+    ],
+    "rel": [
+      {"id": 40, "name": "mechanistic", "note": "use before systems to understand how each component works"},
+      {"id": 42, "name": "model-based-simulation", "note": "use after systems to run quantitative scenarios on loop structure"},
+      {"id": 29, "name": "qualitative", "note": "simpler mode for open-chain reasoning without loop closure"},
+      {"id": 39, "name": "counterfactual", "note": "queries alternate histories using systems model as substrate"},
+      {"id": 37, "name": "causal-inference", "note": "estimates effect sizes; systems reveals when feedback undermines estimates"}
+    ],
+    "micro_ex": {
+      "problem": "Why does code quality degrade despite code review mandates?",
+      "stock": "Technical debt (hours-to-fix)",
+      "loops": {
+        "R1": "Debt-Burden: debt -> slow delivery -> pressure -> shortcuts -> more debt",
+        "B1": "Review-Gate: shortcuts -> review rejection -> forced fixes -> less debt"
+      },
+      "delay": "Review feedback delay ~2 days; debt visibility delay ~1 sprint",
+      "hypothesis": "R1 dominates when review backlog > 3 days, causing shortcuts to bypass stale reviews",
+      "prediction": "Reducing review latency to < 1 day shifts dominance to B1, reducing debt accumulation by 40% in 2 sprints"
+    },
+    "ex": {
+      "problem": "Why does on-call team burn out despite hiring?",
+      "reference_mode": "Expected: load/person stable after hiring surge. Actual: load/person spikes 2-3 months post-hire, then attrition wave",
+      "vars": [
+        {"name": "on-call load", "type": "stock", "unit": "pages/person/week", "inflow": "new alerts", "outflow": "resolved alerts"},
+        {"name": "team size", "type": "stock", "unit": "headcount", "inflow": "hiring rate", "outflow": "attrition rate"},
+        {"name": "burnout rate", "type": "flow", "unit": "people/month"},
+        {"name": "hiring rate", "type": "flow", "unit": "people/month"},
+        {"name": "effective capacity", "type": "auxiliary", "formula": "team size * (1 - fraction in ramp-up)"}
+      ],
+      "loops": [
+        {"name": "R1", "label": "Burnout spiral", "path": "high load -> burnout -> attrition -> fewer people -> higher load", "polarity": "reinforcing"},
+        {"name": "B1", "label": "Hiring response", "path": "high load -> visible pain -> hiring approved -> new hires -> lower load", "polarity": "balancing"}
+      ],
+      "delays": [
+        {"location": "hiring approval", "magnitude": "1-2 months", "basis": "budget cycle"},
+        {"location": "new hire ramp-up", "magnitude": "3 months", "basis": "historical onboarding data"}
+      ],
+      "boundary": {
+        "exogenous": ["market salary rates", "alert volume from external users"],
+        "justification": "Our team size does not affect market rates; user base grows independently of ops staffing"
+      },
+      "hypothesis": "R1 dominates when ramp-up delay > 2 months, causing attrition to outpace net capacity gain from hiring",
+      "prediction": "If ramp-up cut to 1 month via improved onboarding, attrition rate drops by 30% within 6 months",
+      "leverage_points": [
+        {"level": "structure", "intervention": "Pair new hires with dedicated mentor (reduces ramp-up delay)"},
+        {"level": "feedback", "intervention": "Make burnout visible earlier via weekly load dashboards"},
+        {"level": "parameter", "intervention": "Increase hiring budget (weakest leverage; does not change delay structure)"}
+      ]
+    }
+  }
+}

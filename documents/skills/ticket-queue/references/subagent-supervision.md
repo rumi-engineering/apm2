@@ -26,10 +26,23 @@ decision_tree:
             - If reviews pending: expect `cargo xtask check` polling and reviewer log inspection (not random refactors).
             - If no PR: expect `cargo xtask push` (not more local-only edits).
         - id: STUCK_DEFINITION
-          action: "Define STUCK as: (a) no log mtime change for >=5 minutes OR (b) repeated tool errors / API 4xx/5xx loops OR (c) repeated identical actions without new evidence."
+          action: |
+            Define STUCK as:
+            (a) no log mtime change for >=5 minutes
+            (b) repeated tool errors / API 4xx/5xx loops
+            (c) repeated identical actions without new evidence
+            (d) MAX_RUNTIME_EXCEEDED: agent has worked continuously for >=15 minutes.
+        - id: MAX_RUNTIME_EXCEEDED_RESPONSE
+          action: |
+            If MAX_RUNTIME_EXCEEDED (15 minutes):
+            Context rot leads to subagents introducing problems rather than fixes. You MUST:
+            1) Terminate the old subagent (TERM then KILL).
+            2) Start a NEW subagent with a WARM HANDOFF.
+            3) Even if the git status is DIRTY, provide the new subagent with the `ticket` skill instructions and the specific <TICKET_ID>/<WORKTREE_PATH>.
+            4) The handoff prompt must include the latest `cargo xtask check` output and the explicit next goal.
         - id: STUCK_RESPONSE
           action: |
-            If STUCK:
+            If STUCK (a, b, or c):
             1) Verify PID is really the subagent (ps cmdline contains `claude` or `codex`).
             2) Terminate it (TERM then KILL) and restart with a fresh, shorter prompt that includes:
                - the current `cargo xtask check` output snippet

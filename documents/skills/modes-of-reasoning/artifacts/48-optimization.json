@@ -1,0 +1,198 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/optimization@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 48,
+    "name": "optimization",
+    "cat": "search",
+    "core": "Choose the best solution relative to an objective function subject to constraints. Moves beyond feasibility to optimality: given f(x) and constraints g(x) <= 0, find x* such that f(x*) >= f(x) for all feasible x.",
+    "out": [
+      {"id": "optimal_solution", "form": "x* with objective value f(x*)", "test": "no feasible x yields better f(x); optimality conditions (KKT, integer cuts) verified"},
+      {"id": "near_optimal_solution", "form": "x with gap bound: f(x) >= (1-epsilon)*f(x*)", "test": "gap certified by dual bound, branch-and-bound, or approximation proof"},
+      {"id": "tradeoff_curves", "form": "Pareto frontier or parametric sweep {(param, f(x*))})", "test": "each point on curve is optimal for its parameter value"},
+      {"id": "shadow_prices", "form": "marginal value per constraint: df/db_i", "test": "small relaxation of constraint i improves objective by approximately shadow_price * delta"},
+      {"id": "sensitivity_report", "form": "parameter ranges where current solution remains optimal", "test": "re-solve at range boundaries confirms solution change"}
+    ],
+    "proc": [
+      {"step": 1, "do": "define objective function: what to maximize/minimize, in what units", "out": "f(x) with explicit formula or oracle", "test": "objective can be evaluated for any candidate solution; units stated"},
+      {"step": 2, "do": "enumerate decision variables: what can be controlled", "out": "variable list with domains (continuous, integer, binary)", "test": "every controllable choice appears exactly once; domains correct"},
+      {"step": 3, "do": "enumerate constraints: hard limits, resource bounds, logical requirements", "out": "constraint set g_i(x) <= 0 with traceability to requirements", "test": "each business requirement maps to >= 1 constraint; no orphan requirements"},
+      {"step": 4, "do": "classify problem type: LP, IP, MIP, QP, convex, nonconvex, combinatorial", "out": "problem class with rationale", "test": "classification matches variable domains and function forms"},
+      {"step": 5, "do": "select solver: simplex, interior-point, branch-and-bound, metaheuristic, custom", "out": "solver choice with convergence guarantees", "test": "solver handles problem class; termination criteria specified"},
+      {"step": 6, "do": "solve and extract solution", "out": "x*, f(x*), solver status, gap (if applicable)", "test": "solver returns optimal/feasible; solution substitutes into constraints without violation"},
+      {"step": 7, "do": "compute shadow prices and reduced costs", "out": "dual values for binding constraints", "test": "shadow prices consistent with small constraint perturbations"},
+      {"step": 8, "do": "perform sensitivity analysis on objective coefficients and constraint bounds", "out": "stability ranges for parameters", "test": "solution remains optimal within stated ranges; re-solve confirms"},
+      {"step": 9, "do": "validate against unmodeled constraints and stakeholder expectations", "out": "validation checklist with sign-offs", "test": "domain expert confirms solution does not violate unstated rules; stakeholders accept result"}
+    ],
+    "check": [
+      "objective function explicitly stated with units and direction (min/max)",
+      "all decision variables enumerated with correct domains",
+      "every business requirement traced to >= 1 constraint (no orphans)",
+      "implicit constraints surfaced: capacity, physics, mutual exclusion, sequencing",
+      "problem class correctly identified (convexity, integrality)",
+      "solver appropriate for problem class with termination guarantee",
+      "solution verified feasible by substitution into original constraints",
+      "optimality conditions checked (dual feasibility, complementary slackness, or gap < epsilon)",
+      "shadow prices computed and interpreted for key constraints",
+      "sensitivity analysis completed for uncertain parameters",
+      "unmodeled constraints and stakeholder expectations validated post-solve"
+    ],
+    "quick_checklist": [
+      "Can I state f(x) in one sentence with units? (no -> step 1 incomplete)",
+      "Did I list every decision variable? (no -> step 2 incomplete)",
+      "Does each requirement have a constraint? (no -> step 3 incomplete)",
+      "Do I know if the problem is convex? (no -> step 4 incomplete)",
+      "Did I validate the solution with a domain expert? (no -> step 9 incomplete)",
+      "Can I explain what happens if constraint X relaxes by 10%? (no -> step 7-8 incomplete)"
+    ],
+    "diff": {
+      "06-constraint-satisfiability": {
+        "boundary": "feasibility vs optimality",
+        "use_optimization_when": "you need the best solution, not just any valid solution",
+        "use_other_when": "you only need to know if a solution exists, or you need UNSAT proof",
+        "example": "optimization: 'minimize delivery cost subject to time windows' vs constraint-sat: 'is there any schedule that meets all time windows?'"
+      },
+      "45-decision-theoretic": {
+        "boundary": "certainty vs uncertainty",
+        "use_optimization_when": "outcomes of decisions are known with certainty (deterministic model)",
+        "use_other_when": "outcomes depend on uncertain states; need expected utility over probability distribution",
+        "example": "optimization: 'minimize cost given fixed demand' vs decision-theoretic: 'maximize expected profit under demand uncertainty'"
+      },
+      "46-multi-criteria-decision-analysis": {
+        "boundary": "single objective vs multiple conflicting objectives",
+        "use_optimization_when": "objectives can be collapsed into a single scalar function",
+        "use_other_when": "stakeholders have incommensurable values; need to surface Pareto frontier or elicit weights transparently",
+        "example": "optimization: 'minimize cost' vs mcda: 'balance cost, quality, and delivery time with stakeholder-elicited weights'"
+      },
+      "49-robust-worst-case": {
+        "boundary": "nominal vs adversarial parameters",
+        "use_optimization_when": "parameters are known or have small uncertainty; nominal solution acceptable",
+        "use_other_when": "parameters may be adversarially chosen or have deep uncertainty; need guaranteed worst-case performance",
+        "example": "optimization: 'minimize cost at expected demand' vs robust: 'minimize cost such that we meet SLA even at worst-case demand'"
+      },
+      "53-heuristic": {
+        "boundary": "optimal solution vs fast approximation",
+        "use_optimization_when": "solution quality matters more than speed; solver time acceptable",
+        "use_other_when": "time-critical; good-enough answer in seconds beats optimal answer in hours",
+        "example": "optimization: 'run MIP solver overnight for production plan' vs heuristic: 'apply greedy assignment rule for real-time dispatch'"
+      },
+      "54-search-based-algorithmic": {
+        "boundary": "continuous landscape vs discrete exploration",
+        "use_optimization_when": "objective and constraints define a mathematical program (LP, QP, etc.)",
+        "use_other_when": "problem is discrete search with branching (games, puzzles, state-space traversal)",
+        "example": "optimization: 'solve linear program for blending' vs search: 'explore game tree for best move'"
+      }
+    },
+    "confused": [
+      {
+        "with": "06-constraint-satisfiability",
+        "symptom": "declaring an objective but stopping at feasibility check",
+        "distinguish": "Ask: Do I need 'a' solution or 'the best' solution? If just feasibility, use constraint-sat (faster, simpler). If you want to rank solutions, you need optimization."
+      },
+      {
+        "with": "45-decision-theoretic",
+        "symptom": "treating uncertain parameters as fixed constants to avoid probability modeling",
+        "distinguish": "Ask: Are my parameters known with certainty? If not, optimization on expected values may hide tail risks; use decision-theoretic with explicit probability distributions."
+      },
+      {
+        "with": "46-multi-criteria-decision-analysis",
+        "symptom": "collapsing multiple objectives into a weighted sum without stakeholder buy-in on weights",
+        "distinguish": "Ask: Did stakeholders agree on the weights? If weights are contested or objectives are incommensurable, use MCDA to surface tradeoffs rather than hiding them in the objective."
+      },
+      {
+        "with": "53-heuristic",
+        "symptom": "spending hours on exact optimization when a greedy heuristic would suffice for the decision",
+        "distinguish": "Ask: What is the cost of suboptimality vs the cost of solver time? If 5% suboptimality is acceptable and you need answers in seconds, use heuristics."
+      }
+    ],
+    "fail": {
+      "name": "wrong_objective",
+      "desc": "The objective function fails to capture what stakeholders actually value, leading to solutions that are 'optimal' but rejected in practice.",
+      "detect": [
+        "optimal solution 'feels wrong' to domain experts",
+        "stakeholders reject mathematically optimal recommendation",
+        "solution exploits loophole or games the metric",
+        "important factor discovered only after seeing solution",
+        "solution violates unstated but obvious constraint"
+      ],
+      "mit": [
+        {
+          "do": "objective elicitation workshop with stakeholders before modeling",
+          "test": "stakeholders sign off on objective function in writing",
+          "concrete": "meeting notes with explicit 'this is what we minimize' statement and stakeholder signatures"
+        },
+        {
+          "do": "list unmodeled factors and explain why each is excluded",
+          "test": "document reviewed by domain expert who confirms exclusions are acceptable",
+          "concrete": "table: factor | reason_excluded | expert_sign_off"
+        },
+        {
+          "do": "run premortem on optimal solution before presenting",
+          "test": "generate >= 3 scenarios where optimal solution fails; check if failures indicate missing constraints",
+          "concrete": "premortem document: 'if we implement this solution, it could fail because...'"
+        },
+        {
+          "do": "test for gaming: if agents optimize this metric, what bad behavior emerges?",
+          "test": "identify >= 1 perverse incentive; add constraint or modify objective to block it",
+          "concrete": "adversarial review: 'a rational agent would game this by...; we prevent via...'"
+        },
+        {
+          "do": "validate solution against unmodeled constraints with domain expert walk-through",
+          "test": "expert confirms solution does not violate any unstated rules or norms",
+          "concrete": "sign-off checklist: 'does this solution violate any rule not in the model? Y/N'"
+        },
+        {
+          "do": "consider multi-objective reformulation if single objective is contested",
+          "test": "present Pareto frontier to stakeholders; let them choose operating point",
+          "concrete": "Pareto plot with labeled points; stakeholder picks preferred tradeoff"
+        }
+      ]
+    },
+    "use": [
+      "resource allocation: assign limited resources (budget, personnel, machines) to maximize output or minimize cost",
+      "routing and logistics: vehicle routing, shortest path, network flow to minimize distance/time/cost",
+      "scheduling: job-shop, workforce, appointment scheduling to minimize makespan or maximize utilization",
+      "design tradeoffs: parameter tuning, topology selection to optimize performance metrics",
+      "pricing and revenue: dynamic pricing, markdown optimization to maximize revenue or margin",
+      "supply chain planning: inventory levels, production quantities, supplier selection to minimize total cost",
+      "portfolio optimization: asset allocation to maximize return for given risk or minimize risk for given return"
+    ],
+    "rel": [
+      "06-constraint-satisfiability",
+      "45-decision-theoretic",
+      "46-multi-criteria-decision-analysis",
+      "49-robust-worst-case",
+      "47-planning-policy",
+      "53-heuristic",
+      "54-search-based-algorithmic"
+    ],
+    "ex": {
+      "prob": "Warehouse assigns 5 vehicles to 40 delivery stops to minimize total driving distance while respecting vehicle capacity and customer time windows.",
+      "steps": [
+        "objective: minimize sum of route distances (km)",
+        "variables: assignment of stops to vehicles, sequence within each route",
+        "constraints: each stop visited once, vehicle capacity <= 1000 kg, time windows [9am, 5pm]",
+        "classify: capacitated vehicle routing problem with time windows (CVRPTW), NP-hard",
+        "solver: MIP solver with branch-and-cut (e.g., OR-Tools, Gurobi)",
+        "result: optimal routes found in 120s; total distance 340 km",
+        "shadow price: adding 1 vehicle reduces distance by 52 km (15%); relaxing time window by 1 hour saves 28 km",
+        "sensitivity: solution stable for demand +/- 10%; re-solve needed if stops exceed 45",
+        "validation: operations manager confirms routes avoid known road closures (unmodeled); drivers accept schedules"
+      ],
+      "result": "5 routes covering 40 stops in 340 km; shadow prices guide fleet expansion decision"
+    },
+    "micro_example": {
+      "prob": "Allocate $100 budget to ads (A) and content (C) to maximize leads. Each $1 in A yields 2 leads; each $1 in C yields 3 leads. Constraint: A >= 20 (brand minimum).",
+      "model": "max 2A + 3C s.t. A + C <= 100, A >= 20, A,C >= 0",
+      "solve": "optimal: A=20, C=80, leads=40+240=280",
+      "shadow_price": "relaxing A >= 20 by $1 gains 1 lead (shadow price = 1)",
+      "validation": "marketing confirms: brand constraint makes sense; no other unstated rules"
+    }
+  }
+}

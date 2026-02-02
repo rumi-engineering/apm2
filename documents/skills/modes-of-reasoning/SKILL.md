@@ -7,12 +7,18 @@ argument-hint: "[<mode-number> | <keyword> | recommend <problem-type> | empty]"
 
 # Modes of Reasoning
 
-A practical taxonomy of reasoning modes. For background on how these modes relate and when to combine them, see [introduction](references/introduction.md).
+A practical taxonomy of 81 reasoning modes stored as CAC artifacts. For background on how these modes relate and when to combine them, see `artifacts/selector.json`.
+
+## Artifact References
+
+- **Mode artifacts**: `artifacts/{NN}-{name}.json` (e.g., `artifacts/58-mechanism-design.json`)
+- **Selector artifact**: `artifacts/selector.json` - contains axes, patterns, and heuristics for mode selection
+- **Stable IDs**: `dcp://apm2.agents/mor/mode/{name}@1`
 
 ## Invocation
 
 ```
-/modes-of-reasoning                     # Browse full table
+/modes-of-reasoning                     # Browse mode selector
 /modes-of-reasoning 13                  # Look up mode #13 (abductive)
 /modes-of-reasoning bayesian            # Search by keyword
 /modes-of-reasoning recommend diagnosis # Get recommendations for a problem type
@@ -22,96 +28,113 @@ A practical taxonomy of reasoning modes. For background on how these modes relat
 
 Parse `$ARGUMENTS`:
 
-- **Empty or omitted** → Display the quick reference table below
-- **Number (1-80)** → Read and return the corresponding reference file
-- **`recommend <problem-type>`** → Suggest relevant modes for the problem type (e.g., forecasting, debugging, governance, strategy)
-- **Keyword** → Search mode names/descriptions and return matching entries
+- **Empty or omitted** → Load `artifacts/selector.json` and display quick reference table
+- **Number (1-80)** → Read and return the corresponding mode artifact
+- **`recommend <problem-type>`** → Use selector heuristics and patterns to suggest relevant modes
+- **Keyword** → Search mode names/cores and return matching entries
 
 ## Quick Reference Table
 
-| # | Mode | Category | Reference |
-|---|------|----------|-----------|
-| 1 | Deductive reasoning | Formal | [deductive-reasoning.md](references/01-deductive-reasoning.md) |
-| 2 | Mathematical / proof-theoretic reasoning | Formal | [mathematical-proof-theoretic.md](references/02-mathematical-proof-theoretic.md) |
-| 3 | Constructive (intuitionistic) reasoning | Formal | [constructive-intuitionistic.md](references/03-constructive-intuitionistic.md) |
-| 4 | Equational / algebraic reasoning | Formal | [equational-algebraic.md](references/04-equational-algebraic.md) |
-| 5 | Model-theoretic / semantic reasoning | Formal | [model-theoretic-semantic.md](references/05-model-theoretic-semantic.md) |
-| 6 | Constraint / satisfiability reasoning | Formal | [constraint-satisfiability.md](references/06-constraint-satisfiability.md) |
-| 7 | Type-theoretic reasoning | Formal | [type-theoretic.md](references/07-type-theoretic.md) |
-| 8 | Counterexample-guided reasoning | Formal | [counterexample-guided.md](references/08-counterexample-guided.md) |
-| 9 | Inductive reasoning | Ampliative | [inductive.md](references/09-inductive.md) |
-| 10 | Statistical reasoning (frequentist) | Ampliative | [statistical-frequentist.md](references/10-statistical-frequentist.md) |
-| 11 | Bayesian probabilistic reasoning | Ampliative | [bayesian-probabilistic.md](references/11-bayesian-probabilistic.md) |
-| 12 | Likelihood-based reasoning | Ampliative | [likelihood-based.md](references/12-likelihood-based.md) |
-| 13 | Abductive reasoning | Ampliative | [abductive.md](references/13-abductive.md) |
-| 14 | Analogical reasoning | Ampliative | [analogical.md](references/14-analogical.md) |
-| 15 | Case-based reasoning | Ampliative | [case-based.md](references/15-case-based.md) |
-| 16 | Explanation-based learning | Ampliative | [explanation-based-learning.md](references/16-explanation-based-learning.md) |
-| 17 | Simplicity / compression reasoning | Ampliative | [simplicity-compression.md](references/17-simplicity-compression.md) |
-| 18 | Reference-class / outside view reasoning | Ampliative | [reference-class-outside-view.md](references/18-reference-class-outside-view.md) |
-| 19 | Fermi / order-of-magnitude reasoning | Ampliative | [fermi-order-of-magnitude.md](references/19-fermi-order-of-magnitude.md) |
-| 20 | Probabilistic logic | Uncertainty | [probabilistic-logic.md](references/20-probabilistic-logic.md) |
-| 21 | Imprecise probability / interval probability | Uncertainty | [imprecise-probability.md](references/21-imprecise-probability.md) |
-| 22 | Evidential reasoning (Dempster-Shafer) | Uncertainty | [evidential-dempster-shafer.md](references/22-evidential-dempster-shafer.md) |
-| 23 | Maximum-entropy reasoning | Uncertainty | [maximum-entropy.md](references/23-maximum-entropy.md) |
-| 24 | Qualitative probability / ranking-function | Uncertainty | [qualitative-probability.md](references/24-qualitative-probability.md) |
-| 25 | Fuzzy reasoning / fuzzy logic | Vagueness | [fuzzy-logic.md](references/25-fuzzy-logic.md) |
-| 26 | Many-valued and partial logics | Vagueness | [many-valued-partial-logics.md](references/26-many-valued-partial-logics.md) |
-| 27 | Rough set reasoning | Vagueness | [rough-set.md](references/27-rough-set.md) |
-| 28 | Prototype / similarity-based category reasoning | Vagueness | [prototype-similarity-based.md](references/28-prototype-similarity-based.md) |
-| 29 | Qualitative reasoning | Vagueness | [qualitative.md](references/29-qualitative.md) |
-| 30 | Non-monotonic reasoning | Inconsistency & Defaults | [non-monotonic.md](references/30-non-monotonic.md) |
-| 31 | Default / typicality reasoning | Inconsistency & Defaults | [default-typicality.md](references/31-default-typicality.md) |
-| 32 | Defeasible reasoning | Inconsistency & Defaults | [defeasible.md](references/32-defeasible.md) |
-| 33 | Belief revision and belief update | Inconsistency & Defaults | [belief-revision.md](references/33-belief-revision.md) |
-| 34 | Paraconsistent reasoning | Inconsistency & Defaults | [paraconsistent.md](references/34-paraconsistent.md) |
-| 35 | Argumentation theory | Inconsistency & Defaults | [argumentation-theory.md](references/35-argumentation-theory.md) |
-| 36 | Assurance-case / safety-case reasoning | Inconsistency & Defaults | [assurance-case.md](references/36-assurance-case.md) |
-| 37 | Causal inference | Causal & Explanatory | [causal-inference.md](references/37-causal-inference.md) |
-| 38 | Causal discovery | Causal & Explanatory | [causal-discovery.md](references/38-causal-discovery.md) |
-| 39 | Counterfactual reasoning | Causal & Explanatory | [counterfactual.md](references/39-counterfactual.md) |
-| 40 | Mechanistic reasoning | Causal & Explanatory | [mechanistic.md](references/40-mechanistic.md) |
-| 41 | Diagnostic reasoning | Causal & Explanatory | [diagnostic.md](references/41-diagnostic.md) |
-| 42 | Model-based / simulation reasoning | Causal & Explanatory | [model-based-simulation.md](references/42-model-based-simulation.md) |
-| 43 | Systems thinking | Causal & Explanatory | [systems-thinking.md](references/43-systems-thinking.md) |
-| 44 | Means-end / instrumental reasoning | Practical | [means-end-instrumental.md](references/44-means-end-instrumental.md) |
-| 45 | Decision-theoretic reasoning | Practical | [decision-theoretic.md](references/45-decision-theoretic.md) |
-| 46 | Multi-criteria decision analysis (MCDA) | Practical | [multi-criteria-decision-analysis.md](references/46-multi-criteria-decision-analysis.md) |
-| 47 | Planning / policy reasoning | Practical | [planning-policy.md](references/47-planning-policy.md) |
-| 48 | Optimization reasoning | Practical | [optimization.md](references/48-optimization.md) |
-| 49 | Robust / worst-case reasoning | Practical | [robust-worst-case.md](references/49-robust-worst-case.md) |
-| 50 | Minimax regret reasoning | Practical | [minimax-regret.md](references/50-minimax-regret.md) |
-| 51 | Satisficing | Practical | [satisficing.md](references/51-satisficing.md) |
-| 52 | Value-of-information reasoning | Practical | [value-of-information.md](references/52-value-of-information.md) |
-| 53 | Heuristic reasoning | Practical | [heuristic.md](references/53-heuristic.md) |
-| 54 | Search-based / algorithmic reasoning | Practical | [search-based-algorithmic.md](references/54-search-based-algorithmic.md) |
-| 55 | Game-theoretic / strategic reasoning | Strategic & Social | [game-theoretic-strategic.md](references/55-game-theoretic-strategic.md) |
-| 56 | Theory-of-mind / mental-state reasoning | Strategic & Social | [theory-of-mind.md](references/56-theory-of-mind.md) |
-| 57 | Negotiation and coalition reasoning | Strategic & Social | [negotiation-coalition.md](references/57-negotiation-coalition.md) |
-| 58 | Mechanism design / incentive engineering | Strategic & Social | [mechanism-design.md](references/58-mechanism-design.md) |
-| 59 | Dialectical reasoning | Dialectical & Rhetorical | [dialectical.md](references/59-dialectical.md) |
-| 60 | Rhetorical reasoning | Dialectical & Rhetorical | [rhetorical.md](references/60-rhetorical.md) |
-| 61 | Hermeneutic / interpretive reasoning | Dialectical & Rhetorical | [hermeneutic-interpretive.md](references/61-hermeneutic-interpretive.md) |
-| 62 | Narrative reasoning / causal storytelling | Dialectical & Rhetorical | [narrative-causal-storytelling.md](references/62-narrative-causal-storytelling.md) |
-| 63 | Sensemaking / frame-building reasoning | Dialectical & Rhetorical | [sensemaking-frame-building.md](references/63-sensemaking-frame-building.md) |
-| 64 | Modal reasoning | Modal & Temporal | [modal.md](references/64-modal.md) |
-| 65 | Deontic reasoning | Modal & Temporal | [deontic.md](references/65-deontic.md) |
-| 66 | Temporal reasoning | Modal & Temporal | [temporal.md](references/66-temporal.md) |
-| 67 | Spatial and diagrammatic reasoning | Modal & Temporal | [spatial-diagrammatic.md](references/67-spatial-diagrammatic.md) |
-| 68 | Scientific reasoning | Domain-Specific | [scientific.md](references/68-scientific.md) |
-| 69 | Experimental design reasoning | Domain-Specific | [experimental-design.md](references/69-experimental-design.md) |
-| 70 | Engineering design reasoning | Domain-Specific | [engineering-design.md](references/70-engineering-design.md) |
-| 71 | Legal reasoning | Domain-Specific | [legal.md](references/71-legal.md) |
-| 72 | Moral / ethical reasoning | Domain-Specific | [moral-ethical.md](references/72-moral-ethical.md) |
-| 73 | Historical / investigative reasoning | Domain-Specific | [historical-investigative.md](references/73-historical-investigative.md) |
-| 74 | Clinical / operational troubleshooting | Domain-Specific | [clinical-operational-troubleshooting.md](references/74-clinical-operational-troubleshooting.md) |
-| 75 | Meta-reasoning | Meta-Level | [meta-reasoning.md](references/75-meta-reasoning.md) |
-| 76 | Calibration and epistemic humility | Meta-Level | [calibration-epistemic-humility.md](references/76-calibration-epistemic-humility.md) |
-| 77 | Reflective equilibrium | Meta-Level | [reflective-equilibrium.md](references/77-reflective-equilibrium.md) |
-| 78 | Transcendental reasoning | Meta-Level | [transcendental.md](references/78-transcendental.md) |
-| 79 | Adversarial / red-team reasoning | Meta-Level | [adversarial-red-team.md](references/79-adversarial-red-team.md) |
-| 80 | Debiasing / epistemic hygiene reasoning | Meta-Level | [debiasing-epistemic-hygiene.md](references/80-debiasing-epistemic-hygiene.md) |
+| # | Mode | Category | Artifact |
+|---|------|----------|----------|
+| 1 | Deductive reasoning | formal | `01-deductive-reasoning.json` |
+| 2 | Mathematical / proof-theoretic | formal | `02-mathematical-proof-theoretic.json` |
+| 3 | Constructive (intuitionistic) | formal | `03-constructive-intuitionistic.json` |
+| 4 | Equational / algebraic | formal | `04-equational-algebraic.json` |
+| 5 | Model-theoretic / semantic | formal | `05-model-theoretic-semantic.json` |
+| 6 | Constraint / satisfiability | formal | `06-constraint-satisfiability.json` |
+| 7 | Type-theoretic | formal | `07-type-theoretic.json` |
+| 8 | Counterexample-guided | formal | `08-counterexample-guided.json` |
+| 9 | Inductive | ampliative | `09-inductive.json` |
+| 10 | Statistical (frequentist) | probabilistic | `10-statistical-frequentist.json` |
+| 11 | Bayesian probabilistic | probabilistic | `11-bayesian-probabilistic.json` |
+| 12 | Likelihood-based | probabilistic | `12-likelihood-based.json` |
+| 13 | Abductive | ampliative | `13-abductive.json` |
+| 14 | Analogical | ampliative | `14-analogical.json` |
+| 15 | Case-based | ampliative | `15-case-based.json` |
+| 16 | Explanation-based learning | ampliative | `16-explanation-based-learning.json` |
+| 17 | Simplicity / compression | ampliative | `17-simplicity-compression.json` |
+| 18 | Reference-class / outside view | ampliative | `18-reference-class-outside-view.json` |
+| 19 | Fermi / order-of-magnitude | ampliative | `19-fermi-order-of-magnitude.json` |
+| 20 | Probabilistic logic | probabilistic | `20-probabilistic-logic.json` |
+| 21 | Imprecise probability | uncertain | `21-imprecise-probability.json` |
+| 22 | Evidential (Dempster-Shafer) | uncertain | `22-evidential-dempster-shafer.json` |
+| 23 | Maximum-entropy | probabilistic | `23-maximum-entropy.json` |
+| 24 | Qualitative probability | probabilistic | `24-qualitative-probability.json` |
+| 25 | Fuzzy logic | uncertain | `25-fuzzy-logic.json` |
+| 26 | Many-valued / partial logics | uncertain | `26-many-valued-partial-logics.json` |
+| 27 | Rough set | uncertain | `27-rough-set.json` |
+| 28 | Prototype / similarity-based | ampliative | `28-prototype-similarity-based.json` |
+| 29 | Qualitative | causal | `29-qualitative.json` |
+| 30 | Non-monotonic | nonmonotonic | `30-non-monotonic.json` |
+| 31 | Default / typicality | nonmonotonic | `31-default-typicality.json` |
+| 32 | Defeasible | nonmonotonic | `32-defeasible.json` |
+| 33 | Belief revision | nonmonotonic | `33-belief-revision.json` |
+| 34 | Paraconsistent | nonmonotonic | `34-paraconsistent.json` |
+| 35 | Argumentation theory | argumentation | `35-argumentation-theory.json` |
+| 36 | Assurance-case / safety-case | argumentation | `36-assurance-case.json` |
+| 37 | Causal inference | causal | `37-causal-inference.json` |
+| 38 | Causal discovery | causal | `38-causal-discovery.json` |
+| 39 | Counterfactual | causal | `39-counterfactual.json` |
+| 40 | Mechanistic | causal | `40-mechanistic.json` |
+| 41 | Diagnostic | causal | `41-diagnostic.json` |
+| 42 | Model-based / simulation | causal | `42-model-based-simulation.json` |
+| 43 | Systems thinking | causal | `43-systems-thinking.json` |
+| 44 | Means-end / instrumental | decision | `44-means-end-instrumental.json` |
+| 45 | Decision-theoretic | decision | `45-decision-theoretic.json` |
+| 46 | Multi-criteria decision analysis | decision | `46-multi-criteria-decision-analysis.json` |
+| 47 | Planning / policy | decision | `47-planning-policy.json` |
+| 48 | Optimization | search | `48-optimization.json` |
+| 49 | Robust / worst-case | decision | `49-robust-worst-case.json` |
+| 50 | Minimax regret | decision | `50-minimax-regret.json` |
+| 51 | Satisficing | decision | `51-satisficing.json` |
+| 52 | Value-of-information | decision | `52-value-of-information.json` |
+| 53 | Heuristic | search | `53-heuristic.json` |
+| 54 | Search-based / algorithmic | search | `54-search-based-algorithmic.json` |
+| 55 | Game-theoretic / strategic | strategic | `55-game-theoretic-strategic.json` |
+| 56 | Theory-of-mind | strategic | `56-theory-of-mind.json` |
+| 57 | Negotiation / coalition | strategic | `57-negotiation-coalition.json` |
+| 58 | Mechanism design | strategic | `58-mechanism-design.json` |
+| 59 | Dialectical | argumentation | `59-dialectical.json` |
+| 60 | Rhetorical | argumentation | `60-rhetorical.json` |
+| 61 | Hermeneutic / interpretive | domain | `61-hermeneutic-interpretive.json` |
+| 62 | Narrative / causal storytelling | argumentation | `62-narrative-causal-storytelling.json` |
+| 63 | Sensemaking / frame-building | domain | `63-sensemaking-frame-building.json` |
+| 64 | Modal | formal | `64-modal.json` |
+| 65 | Deontic | domain | `65-deontic.json` |
+| 66 | Temporal | formal | `66-temporal.json` |
+| 67 | Spatial / diagrammatic | domain | `67-spatial-diagrammatic.json` |
+| 68 | Scientific | domain | `68-scientific.json` |
+| 69 | Experimental design | domain | `69-experimental-design.json` |
+| 70 | Engineering design | domain | `70-engineering-design.json` |
+| 71 | Legal | domain | `71-legal.json` |
+| 72 | Moral / ethical | domain | `72-moral-ethical.json` |
+| 73 | Historical / investigative | domain | `73-historical-investigative.json` |
+| 74 | Clinical / operational troubleshooting | domain | `74-clinical-operational-troubleshooting.json` |
+| 75 | Meta-reasoning | meta | `75-meta-reasoning.json` |
+| 76 | Calibration / epistemic humility | meta | `76-calibration-epistemic-humility.json` |
+| 77 | Reflective equilibrium | meta | `77-reflective-equilibrium.json` |
+| 78 | Transcendental | meta | `78-transcendental.json` |
+| 79 | Adversarial / red-team | meta | `79-adversarial-red-team.json` |
+| 80 | Debiasing / epistemic hygiene | meta | `80-debiasing-epistemic-hygiene.json` |
+| 81 | Autopoietic / recursive self-maintenance | meta | `81-autopoietic-recursive.json` |
 
 ## Hybrid Reasoning Patterns
 
-For common composites and "wiring diagrams" showing how to combine modes, see [hybrid-patterns.md](references/hybrid-patterns.md).
+The selector artifact contains common patterns for combining modes:
+
+- **science_experimentation**: [13, 1, 69, 10, 33, 76] - abduction → deduction → experimental design → stats → belief revision → calibration
+- **incident_response**: [74, 13, 40, 52, 39] - clinical + abduction + mechanistic + VoI + counterfactual
+- **policy_governance**: [37, 45, 72, 35, 60, 36] - causal + decision + moral + argumentation + rhetoric + assurance
+- **engineering_safety**: [6, 8, 49, 79, 36, 76] - constraints + counterexample + robust + red-team + assurance + calibration
+- **strategy_uncertainty**: [18, 42, 50, 55, 63] - reference-class + simulation + minimax-regret + game-theory + sensemaking
+
+## Mode Selection Heuristics
+
+Use the selector's heuristics to choose modes based on:
+
+- **Certainty vs exploration** - formal modes for certainty, ampliative for exploration
+- **Cooperative vs adversarial** - decision theory vs game theory + red-team
+- **Facts vs values** - causal/statistical vs deontic/moral + argumentation
+- **Time pressure** - satisficing + heuristics vs optimization + thorough analysis
+- **Uncertainty depth** - imprecise probability + robust vs Bayesian

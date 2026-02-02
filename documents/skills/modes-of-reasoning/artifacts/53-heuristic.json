@@ -1,0 +1,178 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/heuristic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z",
+    "updated_at": "2026-02-02T00:00:00Z"
+  },
+  "payload": {
+    "id": 53,
+    "name": "heuristic",
+    "cat": "search",
+    "core": "Apply simple rules of thumb that often work to make fast decisions. Trade accuracy for speed when speed matters more than precision. Heuristics skip evaluation steps; they are cached decision rules, not threshold-based stopping.",
+
+    "out": [
+      {"n": "heuristic_statement", "d": "explicit rule in form 'if <pattern> then <action/judgment>' with stated domain scope"},
+      {"n": "applicability_check", "d": "evidence that current situation matches the heuristic's domain (surface feature match)"},
+      {"n": "candidate_answer", "d": "the quick decision or inference produced by rule application"},
+      {"n": "stake_classification", "d": "low/medium/high classification with criteria (reversibility, cost of error, time pressure)"},
+      {"n": "fallback_trigger", "d": "conditions under which heuristic should be abandoned for deeper analysis"}
+    ],
+
+    "proc": [
+      "classify stake level: low (reversible, <$1K impact, no safety), medium (semi-reversible, <$10K), high (irreversible, >$10K or safety-critical)",
+      "recognize situation type from 2-3 surface features (not deep investigation)",
+      "retrieve applicable heuristic: state it explicitly as 'if <pattern> then <action>'",
+      "verify domain match: does current situation fall within heuristic's known-valid scope?",
+      "apply heuristic to generate candidate answer without further evaluation",
+      "check for red-flag exceptions: known failure conditions that override the heuristic",
+      "if low-stakes: accept result and document heuristic used",
+      "if medium-stakes: accept but schedule post-hoc validation sample",
+      "if high-stakes: flag for deeper analysis, do not rely on heuristic alone"
+    ],
+
+    "quick_checklist": [
+      "PRE: stake level classified before applying heuristic",
+      "PRE: heuristic stated explicitly (not implicit reasoning)",
+      "DURING: domain scope verified (situation matches heuristic's valid range)",
+      "DURING: red-flag exceptions checked",
+      "POST: result accepted only if stakes justify shortcut",
+      "POST: sample of heuristic decisions scheduled for validation (medium stakes)",
+      "POST: heuristic logged for failure-rate tracking"
+    ],
+
+    "check": [
+      "heuristic explicitly stated in 'if-then' form, not implicit?",
+      "domain applicability verified against known scope boundaries?",
+      "time or resource constraint documented that justifies shortcut?",
+      "stake level classified and appropriate for heuristic use?",
+      "fallback to deeper analysis identified for high-stakes cases?",
+      "red-flag exceptions enumerated and checked?"
+    ],
+
+    "diff": {
+      "satisficing": {
+        "boundary": "satisficing evaluates candidates against a threshold; heuristic skips evaluation entirely by applying a cached rule",
+        "test": "Did you evaluate options against a threshold (satisficing) or apply a rule without evaluation (heuristic)?"
+      },
+      "fermi": {
+        "boundary": "Fermi decomposes into 3-7 estimable factors with bounds; heuristic applies a single cached rule without decomposition",
+        "test": "Did you decompose into factors (Fermi) or apply one rule directly (heuristic)?"
+      },
+      "default-typicality": {
+        "boundary": "default-typicality reasons about category membership and exception blocking; heuristic is action-oriented (do X when Y)",
+        "test": "Are you inferring properties from categories (default) or deciding actions from patterns (heuristic)?"
+      },
+      "search-based": {
+        "boundary": "search-based explores solution space systematically, possibly guided by heuristics; heuristic mode skips search entirely",
+        "test": "Are you exploring a space (search) or short-circuiting directly to an answer (heuristic)?"
+      },
+      "debiasing": {
+        "boundary": "debiasing audits and corrects reasoning; heuristic embraces speed over correction",
+        "test": "Are you checking for errors (debiasing) or accepting speed tradeoffs (heuristic)?"
+      }
+    },
+
+    "confusions": [
+      {
+        "pair": "heuristic vs satisficing (51)",
+        "symptom": "saying 'good enough' when actually using a rule, or vice versa",
+        "resolution": "satisficing requires defining a threshold and evaluating candidates until one passes; heuristic applies a rule with no candidate evaluation. If you evaluated multiple options, it was satisficing."
+      },
+      {
+        "pair": "heuristic vs default-typicality (31)",
+        "symptom": "treating 'birds typically fly' as a heuristic",
+        "resolution": "defaults reason about category membership (Tweety is a bird → Tweety flies unless exception); heuristics are action rules (if crash bug → prioritize over cosmetic). Defaults can be blocked by specificity; heuristics have red-flag overrides."
+      },
+      {
+        "pair": "heuristic vs search-based (54)",
+        "symptom": "using heuristic to guide search and calling the whole process 'heuristic reasoning'",
+        "resolution": "heuristics can guide search (A* uses admissible heuristics), but heuristic-as-mode means skipping search entirely. If you explored a solution space, you did search; if you jumped to an answer, you did heuristic."
+      }
+    ],
+
+    "fail": {
+      "name": "heuristics become doctrine",
+      "desc": "Rules of thumb ossify into unquestionable laws; original context and failure rate forgotten; exceptions dismissed rather than integrated.",
+      "signals": [
+        "rules of thumb treated as universal laws (no stated domain bounds)",
+        "no exceptions permitted despite changed context",
+        "heuristic origin and rationale forgotten, only rule remembered",
+        "resistance to evidence contradicting the rule",
+        "zero heuristics retired or revised in past year",
+        "no validation sample taken for medium-stakes decisions"
+      ],
+      "mitigations": [
+        {
+          "mitigation": "label each heuristic with explicit domain bounds",
+          "test": "can you state 3 situations where this heuristic should NOT apply?"
+        },
+        {
+          "mitigation": "track failure rate per heuristic with quarterly review",
+          "test": "is there a log showing heuristic X failed Y% of spot-checks in Q4?"
+        },
+        {
+          "mitigation": "require retirement or revision if failure rate >15%",
+          "test": "has any heuristic been retired or revised in the past year?"
+        },
+        {
+          "mitigation": "document heuristic origin and rationale when created",
+          "test": "can you explain why this heuristic was adopted and from what evidence?"
+        },
+        {
+          "mitigation": "schedule post-hoc validation sample for medium-stakes batches",
+          "test": "for the last 100 heuristic decisions, how many were spot-checked and what was the error rate?"
+        },
+        {
+          "mitigation": "pair with debiasing (mode 80) for any high-stakes decision",
+          "test": "did you run the 7-step debiasing checklist before accepting the heuristic answer for high stakes?"
+        }
+      ]
+    },
+
+    "use": [
+      "triage and initial screening (support tickets, CVEs, job applications)",
+      "first-draft generation under deadline",
+      "guiding search in large spaces (pruning, prioritization)",
+      "high-frequency low-stakes decisions (code review focus, meeting scheduling)",
+      "alert prioritization in monitoring systems",
+      "rapid incident response initial actions"
+    ],
+
+    "rel": [
+      {"id": 51, "name": "satisficing", "role": "threshold-based stopping; heuristic skips evaluation entirely"},
+      {"id": 19, "name": "fermi-order-of-magnitude", "role": "decomposition into factors; heuristic applies single cached rule"},
+      {"id": 31, "name": "default-typicality", "role": "category inference with exceptions; heuristic is action-oriented"},
+      {"id": 54, "name": "search-based-algorithmic", "role": "explores solution space; heuristic short-circuits to answer"},
+      {"id": 80, "name": "debiasing-epistemic-hygiene", "role": "audits heuristic outputs; pair for high-stakes decisions"},
+      {"id": 76, "name": "calibration-epistemic-humility", "role": "tracks heuristic accuracy over time"}
+    ],
+
+    "ex": {
+      "scenario": "Bug triage: 200 tickets, 2 hours to prioritize. Heuristic: 'customer-reported > internal, crash > cosmetic, recent > old'.",
+      "steps": [
+        "stake classification: medium (affects sprint planning, reversible, no safety impact)",
+        "state heuristic explicitly: 'if customer-reported AND crash AND <7 days old → P1; else → backlog'",
+        "domain check: heuristic valid for product bugs; not valid for security issues (different triage)",
+        "red-flag check: any ticket mentioning 'data loss' or 'security' → escalate regardless of heuristic",
+        "apply: top 20 tickets flagged P1, remaining 180 to backlog",
+        "post-hoc validation: spot-check 5 random backlog tickets for heuristic failures",
+        "log result: heuristic applied to 200 tickets, 1/5 spot-check was misclassified (should have been P1)"
+      ]
+    },
+
+    "micro_example": {
+      "situation": "Code review queue: 15 PRs, 30 minutes before standup.",
+      "heuristic_statement": "if PR <50 lines AND no API changes → quick approve; else → defer to post-standup",
+      "domain_scope": "internal tooling repo, no production traffic, all authors are trusted team members",
+      "red_flags": "changes to auth, config, or external integrations → always defer regardless of size",
+      "stake_classification": "low (internal tools, all changes reversible, no customer impact)",
+      "application": "8 PRs match quick-approve criteria, 7 deferred. Total time: 12 minutes.",
+      "validation": "post-standup review of 2 quick-approved PRs: both appropriate, no issues",
+      "logged_for_tracking": "heuristic 'small-PR-quick-approve' used 8 times, 0 failures this week"
+    }
+  }
+}

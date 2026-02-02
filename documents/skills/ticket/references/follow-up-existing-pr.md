@@ -31,7 +31,7 @@ decision_tree:
               description: "Re-verify security controls, especially for feedback-driven changes."
               items:
                 - "List ALL SCP boundaries touched (original + feedback-driven)"
-                - "For each boundary: cite required textbook controls with CTR-XXXX references"
+                - "For each boundary: cite required Rust Standards controls with CTR-XXXX references"
                 - "List ALL new Vec/HashMap/HashSet with their MAX_* constants and enforcement points"
                 - "Verify streaming deserializers for any new untrusted input paths"
             negative_tests:
@@ -57,13 +57,15 @@ decision_tree:
           action: command
           run: "gh pr diff <PR_URL>"
           capture_as: diff_content
+        - id: CONSULT_RUST_STANDARDS
+          action: "Read relevant sections of the `documents/skills/rust-standards/` documents based on the feedback and planned changes."
         - id: IMPLEMENT_AND_TEST
-          action: "Address the latest feedback and improve correctness. Apply relevant Rust Textbook frameworks (Ownership, Async, Errors, etc.)."
+          action: "Address the latest feedback and improve correctness. Follow Rust Standards quality guidelines."
         - id: UPDATE_DOCS_AND_AGENTS
           action: "Update documentation and AGENTS.md files to reflect changes and new invariants."
-        - id: FIX_FORMATTING
+        - id: FIX_FORMATTING_AND_LINT
           action: command
-          run: "cargo fmt"
+          run: "cargo fmt --all && cargo clippy --fix --allow-dirty --all-targets --all-features -- -D warnings && cargo fmt --all --check"
         - id: VERIFY_AND_COMMIT
           action: command
           run: "cargo xtask commit \"Addressing review feedback and improving implementation\""

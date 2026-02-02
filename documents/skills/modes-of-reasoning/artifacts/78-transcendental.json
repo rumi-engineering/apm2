@@ -1,0 +1,145 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/transcendental@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 78,
+    "name": "transcendental",
+    "cat": "meta",
+    "core": "Start from an accepted fact and infer what must be true for it to be possible (Kantian style). Reasons backward from actuality to necessary enabling conditions. Key move: if X is actual, then its preconditions are not optional—they must already obtain. Produces hard constraints, not preferences. Terminates with validated necessity claims, each testable by 'if this were absent, would X be impossible?'",
+    "out": [
+      {"n": "starting_fact", "d": "the accepted actuality or demonstrated possibility from which reasoning proceeds; must be uncontroversial or independently verified"},
+      {"n": "enabling_question", "d": "explicit formulation: 'What must be true for X to be possible?'"},
+      {"n": "necessity_claims", "d": "list of conditions each proven necessary via impossibility-without test; each tagged logical|empirical|conceptual"},
+      {"n": "sufficiency_boundary", "d": "explicit statement of what conditions together would be sufficient, kept separate from necessity claims"},
+      {"n": "presupposition_inventory", "d": "implicit framework assumptions the argument depends on; surfaced for scrutiny"},
+      {"n": "alternative_structures", "d": "at least 1 alternative enabling structure considered and ruled out or acknowledged"}
+    ],
+    "proc": [
+      "ANCHOR: state the accepted fact X that is actual or demonstrably possible; verify X is uncontested before proceeding",
+      "QUESTION: pose the enabling question explicitly: 'What must be true for X to be possible?'",
+      "DERIVE: for each candidate condition C, apply the impossibility-without test: 'If C were absent, could X still obtain?' If yes, C is not necessary; discard. If no, C is necessary; keep.",
+      "CLASSIFY: tag each necessity claim as logical (true in all possible worlds), empirical (true given physical laws), or conceptual (true given definitions)",
+      "SEPARATE: explicitly state sufficiency boundary—what combination would be enough; do not conflate with necessity",
+      "SURFACE: inventory presuppositions—what framework assumptions does this derivation rest on? List at least 2.",
+      "ALTERNATIVES: generate at least 1 alternative enabling structure; test whether it satisfies X without requiring the same conditions; if it does, the condition is not truly necessary",
+      "VALIDATE: confirm each derived condition matches the actual world; if a 'necessary' condition is absent in reality, the derivation contains an error"
+    ],
+    "check": [
+      "starting fact stated and accepted without controversy",
+      "enabling question posed verbatim before derivation",
+      "each precondition tested via impossibility-without; test result documented",
+      "necessity claims tagged logical|empirical|conceptual",
+      "necessary vs sufficient explicitly separated; no conflation",
+      "at least 2 framework presuppositions surfaced",
+      "at least 1 alternative enabling structure considered",
+      "derived conditions validated against observed reality",
+      "output framed as necessity claims, not design preferences"
+    ],
+    "diff": {
+      "deductive-1": "deductive derives conclusions from premises; transcendental derives premises from conclusions. Direction: deductive moves forward from axioms, transcendental moves backward from actuality.",
+      "constructive-3": "constructive builds existence proofs by construction; transcendental uncovers existence requirements by necessity analysis. Constructive asks 'how can we build X?'; transcendental asks 'what must already be true for X to exist?'",
+      "abductive-13": "abductive generates candidate explanations for surprising observations; transcendental derives necessary conditions for accepted facts. Abductive is generative and ampliative; transcendental is analytic and constraining.",
+      "counterfactual-39": "counterfactual asks 'what would have happened if X were different?' given a causal model; transcendental asks 'what must be true for X to be possible at all?' Counterfactual evaluates alternatives within a possibility space; transcendental defines the boundaries of that space.",
+      "reflective-equilibrium-77": "reflective equilibrium adjusts principles and cases iteratively until coherent; transcendental derives fixed preconditions that cannot be adjusted away. Reflective equilibrium tolerates revision; transcendental identifies the non-negotiable.",
+      "meta-reasoning-75": "meta-reasoning selects which reasoning mode to apply; transcendental analyzes what makes any reasoning mode applicable. Meta-reasoning is mode selection; transcendental is mode enablement analysis."
+    },
+    "confusions": [
+      {
+        "trap": "conflating transcendental with abductive",
+        "symptom": "generating multiple candidate preconditions and ranking them by plausibility",
+        "correction": "transcendental does not generate hypotheses to rank; it derives conditions that must hold. If you're weighing alternatives, you're doing abduction. Transcendental applies the impossibility-without test: either X is impossible without C, or C is not necessary."
+      },
+      {
+        "trap": "confusing necessary conditions with design preferences",
+        "symptom": "listing conditions that are desirable or common rather than strictly required",
+        "correction": "for each condition, ask: 'Could X exist without this?' If yes, it's not a transcendental finding—it's a design choice. Only conditions that pass the impossibility-without test are transcendental outputs."
+      },
+      {
+        "trap": "treating one enabling structure as the only enabling structure",
+        "symptom": "deriving 'necessary' conditions that only apply to your current model/implementation",
+        "correction": "always generate at least 1 alternative enabling structure. If the alternative achieves X without condition C, then C is not truly necessary—it's implementation-specific."
+      }
+    ],
+    "fail": {
+      "mode": "framework_projection",
+      "desc": "Mistaking model requirements for reality requirements; deriving 'necessary' conditions that alternative structures could satisfy differently",
+      "signals": [
+        "treating implementation constraints as logical necessities",
+        "deriving 'necessary' conditions that alternatives could satisfy",
+        "confusing conceptual necessity with empirical necessity",
+        "assuming only one possible enabling structure exists",
+        "no alternative structures considered",
+        "impossibility-without test not applied or documented",
+        "framework presuppositions hidden rather than surfaced"
+      ],
+      "mitigations": [
+        {"m": "apply impossibility-without test to every claimed necessity", "test": "for each necessity_claim: impossibility_without_test.result == 'X impossible' documented"},
+        {"m": "tag each necessity claim as logical, empirical, or conceptual", "test": "necessity_claims.every(c => c.type in ['logical', 'empirical', 'conceptual'])"},
+        {"m": "generate at least 1 alternative enabling structure", "test": "alternative_structures.length >= 1"},
+        {"m": "surface at least 2 framework presuppositions", "test": "presupposition_inventory.length >= 2"},
+        {"m": "separate necessity claims from sufficiency claims explicitly", "test": "sufficiency_boundary exists AND sufficiency_boundary != necessity_claims"},
+        {"m": "validate derived conditions against observed reality", "test": "for each necessity_claim: reality_check.status == 'confirmed'"},
+        {"m": "ask 'necessary for my model or necessary in reality?' for each condition", "test": "each claim annotated with scope: 'model-specific' or 'reality-level'"}
+      ]
+    },
+    "use": [
+      "foundational architecture: deriving hard constraints before design begins",
+      "protocol design: identifying what any valid protocol must provide",
+      "conceptual audits: surfacing hidden assumptions in existing systems",
+      "first-principles requirements: distinguishing must-haves from nice-to-haves",
+      "impossibility proofs: showing what cannot be achieved without certain conditions",
+      "API contract design: deriving what any implementation must guarantee",
+      "security requirements: identifying conditions without which security properties cannot hold"
+    ],
+    "rel": [
+      {"id": 1, "n": "deductive", "r": "forward derivation from premises; transcendental inverts this direction"},
+      {"id": 3, "n": "constructive", "r": "builds existence proofs; use after transcendental to show sufficiency"},
+      {"id": 13, "n": "abductive", "r": "generates hypotheses; transcendental is analytic not generative"},
+      {"id": 39, "n": "counterfactual", "r": "evaluates within possibility space; transcendental defines that space"},
+      {"id": 75, "n": "meta-reasoning", "r": "selects modes; transcendental analyzes mode enablement"},
+      {"id": 77, "n": "reflective-equilibrium", "r": "tolerates revision; transcendental identifies non-negotiables"}
+    ],
+    "ex": {
+      "sit": "Designing a distributed consensus system",
+      "anchor": "Byzantine fault-tolerant consensus is achieved in production systems (e.g., PBFT, Tendermint)",
+      "question": "What must be true for BFT consensus to be possible?",
+      "derivation": [
+        {"condition": "n >= 3f + 1 nodes", "test": "Can BFT work with n = 3f? No—impossible to distinguish faulty from honest with only 2f+1 honest nodes", "type": "logical"},
+        {"condition": "authenticated communication", "test": "Can BFT work without authentication? No—faulty nodes could impersonate honest ones", "type": "logical"},
+        {"condition": "partial synchrony or synchrony", "test": "Can BFT work in pure asynchrony? No—FLP impossibility proves this", "type": "logical"},
+        {"condition": "deterministic state machine", "test": "Can BFT work with nondeterminism? No—replicas would diverge on same input", "type": "logical"}
+      ],
+      "alternative": "Considered Nakamoto consensus: achieves consensus with different assumptions (probabilistic finality, economic security); proves some BFT conditions are implementation-specific, but core conditions (authenticated comm, bounded asynchrony) remain necessary",
+      "presuppositions": ["computation is discrete/digital", "Byzantine faults are worst-case adversarial"],
+      "outcome": "Architecture requirements derived from impossibility analysis, not ad-hoc preferences"
+    },
+    "micro_ex": {
+      "sit": "Designing an authentication system",
+      "anchor": "Secure user authentication is possible in web applications",
+      "question": "What must be true for secure authentication to be possible?",
+      "derivation": [
+        {"condition": "secret not transmitted in cleartext", "test": "impossible without—attacker intercepts", "type": "empirical"},
+        {"condition": "server can verify without storing cleartext secret", "test": "hashing enables this; plaintext storage violates", "type": "conceptual"},
+        {"condition": "binding between identity and secret", "test": "without binding, authentication meaningless", "type": "logical"}
+      ],
+      "alternative": "Passwordless (FIDO2): different enabling structure, but core condition (binding between identity and proof) remains necessary",
+      "outcome": "Password hashing is implementation; identity-proof binding is transcendental requirement"
+    },
+    "quick_check": [
+      "Did I state an accepted fact, not a hypothesis?",
+      "Did I pose 'What must be true for X to be possible?' explicitly?",
+      "For each condition, did I test: 'Is X impossible without this?'",
+      "Did I tag each necessity as logical, empirical, or conceptual?",
+      "Did I separate necessary conditions from sufficient conditions?",
+      "Did I consider at least 1 alternative enabling structure?",
+      "Did I surface at least 2 framework presuppositions?",
+      "Do my 'necessary' conditions actually exist in reality?"
+    ]
+  }
+}

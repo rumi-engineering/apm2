@@ -18,8 +18,8 @@
     "stable_id": "dcp://apm2.local/instructions/rfc_council/create_mode@v0"
   },
   "payload": {
-    "i": "CREATE/DECOMPOSE mode flow (RFC v0 creation + ticket generation).",
-    "pb": "Provide CAC-native steps for RFC genesis and ticket decomposition.",
+    "i": "RFC CREATE/DECOMPOSE (Genesis + Ticket emission).",
+    "pb": "Initialize RFC v0 and generate engineering tickets.",
     "t": {
       "sys": "APM2",
       "repo": "/home/ubuntu/Projects/apm2-rfc-consensus",
@@ -28,28 +28,31 @@
       ]
     },
     "ctx": [
-      "documents/skills/rfc-council/references/create-mode.md"
+      "documents/skills/rfc-council/references/create-mode.md",
+      "documents/skills/modes-of-reasoning/artifacts/selector.json"
     ],
     "lex": {
       "C1": "Create RFC v0: directory + 9 YAML files (00-09) from PRD; binds_to_prd set.",
-      "C2": "Run council for v0 discovery (SA roles + random reasoning modes).",
-      "C3": "DECOMPOSE: populate 06_ticket_decomposition.yaml tickets from planned structure (IDs, reqs, files, acceptance, depends_on).",
-      "C4": "DECOMPOSE: verify ATOMICITY + IMPLEMENTABILITY + ANTI-COUSIN before emit.",
-      "C5": "Emit tickets via apm2 factory tickets emit --rfc --prd; commit changes.",
-      "C6": "CREATE: self-review v0 focusing on SCHEMA + SCOPE-COVERAGE; allow ATOMICITY/IMPLEMENTABILITY failures if logged in open questions; commit v0.",
-      "C7": "Ticket template includes implementation steps, code examples, acceptance criteria, test requirements."
+      "C2": "Transcendental (Mode 78): Infer non-negotiable preconditions for core PRD requirements; log blockers in 08_risks if missing in component_atlas.",
+      "C3": "Means-End Chain (Mode 44): Verify every 02_design_decision traces to a 01_requirement; mark orphans as Speculative Scope.",
+      "C4": "Run council for v0 discovery (SA roles + Anchored Stochastic Modes).",
+      "C5": "DECOMPOSE: populate 06_ticket_decomposition.yaml from planned structure.",
+      "C6": "DECOMPOSE Gates: verify ATOMICITY + IMPLEMENTABILITY + ANTI-COUSIN.",
+      "C7": "Emit tickets via apm2 factory; commit changes.",
+      "C8": "Self-review v0 (SCHEMA + SCOPE-COVERAGE); accept known-unknowns."
     },
     "dir": [
       ["D1", 3, "@C1", ["create"], []],
-      ["D2", 3, "@C2", ["council"], []],
-      ["D3", 3, "@C3", ["decompose"], []],
-      ["D4", 3, "@C4", ["gates"], []],
-      ["D5", 3, "@C5", ["emit"], []],
-      ["D6", 3, "@C6", ["review"], []],
-      ["D7", 2, "@C7", ["template"], []]
+      ["D2", 3, "@C2", ["transcendental", "dcp://apm2.agents/mor/mode/transcendental@1"], []],
+      ["D3", 3, "@C3", ["means_end", "dcp://apm2.agents/mor/mode/means-end-instrumental@1"], []],
+      ["D4", 3, "@C4", ["council"], []],
+      ["D5", 3, "@C5", ["decompose"], []],
+      ["D6", 3, "@C6", ["gates"], []],
+      ["D7", 3, "@C7", ["emit"], []],
+      ["D8", 3, "@C8", ["review"], []]
     ],
     "g": [
-      ["G-SOURCE", "D", 1, ["@C1", "@C2", "@C3", "@C4", "@C5", "@C6", "@C7"], ["E1"], "FAIL_IF_MISSING"]
+      ["G-SOURCE", "D", 1, ["@C1", "@C2", "@C3", "@C4", "@C5", "@C6", "@C7", "@C8"], ["E1"], "FAIL_IF_MISSING"]
     ],
     "ev": [
       ["E1", "source_doc", true, "md", ["documents/skills/rfc-council/references/create-mode.md"], []]
@@ -60,9 +63,7 @@
     "r": {
       "depth": "M",
       "modes": [
-        47,
-        36,
-        79
+        "architectural_discovery"
       ],
       "ob": [
         "A",

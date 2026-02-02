@@ -1,0 +1,134 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/value-of-information@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 52,
+    "name": "value-of-information",
+    "cat": "decision",
+    "core": "Decide which measurements/experiments reduce uncertainty most per cost to improve decisions. Core question: If I learned X, would I act differently? VOI = 0 when no feasible outcome changes the chosen action.",
+    "terms": {
+      "EVPI": "Expected Value of Perfect Information: max gain if uncertainty fully resolved before deciding",
+      "EVSI": "Expected Value of Sample Information: expected gain from a specific imperfect inquiry",
+      "pivotal_uncertainty": "variable whose resolution could flip the optimal action",
+      "decision_sensitivity": "range of variable values over which optimal action changes"
+    },
+    "out": [
+      "prioritized inquiry list ranked by (EVSI - cost) / cost",
+      "EVPI numeric bound per pivotal uncertainty",
+      "EVSI estimate per feasible inquiry with confidence range",
+      "decision-sensitivity table: variable → threshold → action flip",
+      "stop-learning threshold: minimum net EVSI to proceed",
+      "instrumentation spec: what to measure, precision needed, sample size"
+    ],
+    "proc": [
+      "1. Frame decision: enumerate action set A = {a1, a2, ...}, define outcome metric V(a, θ)",
+      "2. Identify uncertainties θ that appear in V; list only those where different θ values yield different optimal a*",
+      "3. Assess current beliefs P(θ) with explicit distributions or bounds",
+      "4. Compute baseline EV: E[V(a*, θ)] under current best action a*",
+      "5. For each pivotal θ: compute EVPI = E[max_a V(a, θ)] - E[V(a*, θ)]; skip if EVPI < minimum threshold",
+      "6. For feasible inquiries I: estimate EVSI(I) = expected posterior gain - inquiry cost c(I)",
+      "7. Rank inquiries by net EVSI / c(I); break ties by speed-to-insight",
+      "8. Execute top inquiry if net EVSI > 0 and within budget; else act on current best",
+      "9. After inquiry: update P(θ), re-rank remaining inquiries, loop to step 5"
+    ],
+    "quick_checklist": [
+      "Is there a concrete decision with at least 2 distinct actions?",
+      "Is there at least one uncertainty that could flip the optimal action?",
+      "Is there a feasible inquiry whose cost < EVPI for some pivotal uncertainty?",
+      "Is there time/budget to act on inquiry results before decision deadline?",
+      "If all answers yes → VOI analysis warranted; else act now or reframe"
+    ],
+    "check": [
+      "decision clearly stated with explicit action alternatives (not just 'learn more')",
+      "at least one uncertainty identified that could flip decision at credible probability",
+      "EVPI computed or bounded for each pivotal uncertainty (not just listed)",
+      "inquiry cost estimated in same units as outcome metric (time, money, opportunity)",
+      "stopping condition defined: net EVSI threshold, budget cap, or deadline",
+      "no inquiry pursued has EVSI < cost",
+      "sensitivity table shows threshold values, not just 'sensitive'"
+    ],
+    "diff": {
+      "decision-theoretic (45)": "decision-theoretic chooses among actions given beliefs; VOI chooses among inquiries to improve beliefs before acting",
+      "experimental-design (69)": "experimental design answers how to measure X reliably; VOI answers whether to measure X or Y first based on decision impact",
+      "diagnostic (41)": "diagnostic aims to identify root cause; VOI aims to improve decision—if cause doesn't change action, VOI = 0",
+      "bayesian-probabilistic (11)": "Bayesian updates beliefs given evidence; VOI decides which evidence to seek based on decision value, not just belief precision",
+      "satisficing (51)": "satisficing stops at 'good enough' action; VOI stops at 'enough information'—they combine when stopping threshold is satisficing",
+      "optimization (48)": "optimization maximizes outcome in fixed model; VOI maximizes expected outcome including option to improve model"
+    },
+    "common_confusions": [
+      {
+        "confusion": "More data is always valuable",
+        "correction": "Data has zero value if it cannot change your action. A survey with 99% confidence on a non-pivotal variable wastes resources."
+      },
+      {
+        "confusion": "VOI means delaying decisions to gather information",
+        "correction": "VOI often recommends acting immediately when inquiry cost > EVPI or when deadline is imminent. Delay is justified only when net EVSI > 0."
+      },
+      {
+        "confusion": "High uncertainty = high VOI",
+        "correction": "VOI depends on decision sensitivity, not uncertainty magnitude. A variable can be highly uncertain but not affect which action is optimal."
+      }
+    ],
+    "fail": {
+      "name": "measuring easy over decision-relevant",
+      "signals": [
+        "inquiry backlog ranked by ease or habit, not by EVSI / cost",
+        "no articulated decision the data informs—data collected 'in case it's useful'",
+        "reports produced but never cited in action choices",
+        "high precision pursued on non-decision-sensitive variables",
+        "inquiry continues past point where action is determined",
+        "cost accounting omits opportunity cost of delayed action"
+      ],
+      "mitigations": [
+        "decision-linkage test: before any inquiry, require written statement of which decision it informs and which action flips if result differs",
+        "sensitivity audit: verify that 2x or 10x improvement in variable estimate actually crosses a decision threshold",
+        "opportunity-cost gate: compute expected gain from inquiry vs. acting now; require positive margin with 80% confidence",
+        "retrospective decision trace: quarterly audit of which gathered data actually appeared in decision rationale",
+        "pre-registration: before inquiry, state the decision rule mapping results to actions; flag if rule not followed",
+        "time-box enforcement: set hard deadline for inquiry phase; escalate if approaching deadline with no action plan",
+        "inquiry budget cap: allocate fixed % of decision stakes to information gathering; require justification to exceed"
+      ]
+    },
+    "use": [
+      "R&D project prioritization: which experiments unlock most business value?",
+      "analytics roadmaps: which dashboards/models to build first?",
+      "incident investigation: when to stop diagnosing and start remediating?",
+      "test design go/no-go: is another test cycle worth the delay?",
+      "due diligence: which risks to investigate deeply vs. accept?",
+      "hiring: when is another interview round worth the delay?",
+      "market research: survey vs. launch MVP vs. act on priors?"
+    ],
+    "rel": [
+      "45-decision-theoretic",
+      "69-experimental-design",
+      "41-diagnostic",
+      "11-bayesian-probabilistic",
+      "48-optimization",
+      "51-satisficing",
+      "19-fermi-order-of-magnitude"
+    ],
+    "ex": {
+      "scenario": "Launch Feature A (+$50K expected) or B (+$30K). Uncertainty: A adoption rate 20-40%. Survey cost: $2K, takes 1 week. Launch deadline in 2 weeks.",
+      "steps": [
+        "frame: actions = {launch A, launch B}; metric = expected revenue",
+        "baseline: E[A] = $50K, E[B] = $30K; current best = A",
+        "sensitivity: if adoption <25%, B wins; P(adoption <25%) = 30%",
+        "EVPI: 0.30 × ($50K - $30K) = $6K (value of perfect adoption knowledge)",
+        "EVSI for survey: 50% uncertainty reduction → ~$3K expected gain",
+        "net value: $3K - $2K = +$1K; time available = yes",
+        "decision: run survey; if adoption estimate <25%, launch B; else launch A"
+      ]
+    },
+    "micro_ex_negative": {
+      "scenario": "Choose vendor X ($100K) or Y ($95K). Uncertainty: X has 60-80% reliability. Both meet minimum 50% threshold.",
+      "analysis": "Reliability range [60%, 80%] never drops below 50% threshold. No outcome flips vendor choice.",
+      "conclusion": "EVPI = 0. Do not investigate reliability further; choose Y (lower cost) immediately."
+    }
+  }
+}

@@ -1,0 +1,106 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/likelihood-based@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 12,
+    "name": "likelihood-based",
+    "cat": "probabilistic",
+    "core": "Compare how well hypotheses predict observed data via likelihoods P(E|H), without committing to priors. Answers 'what does the evidence say?' not 'what should I believe?' Useful when priors are contentious, unavailable, or you want to report evidential weight separately from belief.",
+    "out": [
+      {"n": "hypothesis_set", "d": ">=2 competing hypotheses with clear parameterization"},
+      {"n": "likelihood_values", "d": "P(E|H) computed for each hypothesis"},
+      {"n": "likelihood_ratios", "d": "LR = P(E|H1)/P(E|H2) for each pair; LR>10 strong, LR>100 very strong"},
+      {"n": "support_ranking", "d": "hypotheses ordered by evidential support with LR magnitudes"},
+      {"n": "decision_caveat", "d": "explicit statement: LR measures evidence strength, not posterior probability"}
+    ],
+    "proc": [
+      "enumerate hypotheses: specify >=2 competing hypotheses with enough precision to compute P(E|H)",
+      "define evidence: list observations that will be compared across hypotheses",
+      "compute likelihoods: calculate P(E|H) for each hypothesis; use models, rates, or conditional probabilities",
+      "calculate likelihood ratios: LR(H1 vs H2) = P(E|H1)/P(E|H2); interpret LR>10 as strong, LR>100 as very strong",
+      "rank by support: order hypotheses by how much evidence favors each; note if multiple are close",
+      "state decision boundary: if action required, explicitly note that LR alone is insufficient without priors",
+      "flag prior-sensitivity: identify if base rates would flip the ranking (e.g., LR=20 but prior odds 1:1000)"
+    ],
+    "check": [
+      "likelihoods computed correctly for each hypothesis?",
+      "hypotheses mutually exclusive and cover comparison space?",
+      "likelihood ratios calculated and interpreted (10/100 thresholds)?",
+      "evidence defined before computing likelihoods (no peeking)?",
+      "decision context assessed: is LR sufficient or are priors needed?",
+      "base rate impact flagged if LR could be swamped by prior odds?",
+      "support ranking explicit with magnitudes, not just ordinal?"
+    ],
+    "diff": {
+      "bayesian": "reports P(E|H) comparison vs P(H|E) posterior; Bayesian multiplies LR by prior odds to get posterior odds",
+      "frequentist": "compares evidence for hypotheses vs tests null with p-values; LR is not a p-value",
+      "abductive": "quantitative LR scoring vs qualitative best-explanation criteria (scope, simplicity, coherence)",
+      "reference_class": "uses evidence to compare hypotheses vs provides base rates as prior input",
+      "decision_theoretic": "produces evidential ranking vs consumes posteriors and utilities for action choice"
+    },
+    "fail": {
+      "mode": "prior-neglect",
+      "desc": "treating likelihood ratio as posterior odds; concluding H1 is more probable because LR favors it, ignoring that rare hypotheses remain rare despite strong evidence",
+      "signals": [
+        "LR stated as probability (e.g., '20x more likely to be true')",
+        "action recommended based on LR alone without base rate check",
+        "no mention of prior odds when stakes are high",
+        "LR<100 treated as decisive for rare hypothesis"
+      ],
+      "mitigations": [
+        "always state: 'LR measures evidence strength, not probability'",
+        "compute posterior odds = LR * prior odds; note if prior odds unknown",
+        "flag when prior odds <1:100 and LR <100 (posterior may still favor alternative)",
+        "for high-stakes decisions, require Bayesian mode (mode 11) after LR computation",
+        "separate 'evidence report' from 'decision recommendation'"
+      ]
+    },
+    "confusions": [
+      {
+        "pair": "likelihood-based vs bayesian-probabilistic",
+        "distinction": "Likelihood-based stops at LR; Bayesian multiplies by prior to get posterior. Use likelihood-based when reporting evidence strength without asserting beliefs; use Bayesian when you need decision-ready probabilities.",
+        "test": "Are you reporting 'how strongly evidence supports H' (likelihood) or 'how probable H is' (Bayesian)?"
+      },
+      {
+        "pair": "likelihood-based vs frequentist",
+        "distinction": "Likelihood ratio compares hypotheses; p-value tests one null. LR=20 for H1 vs H0 is not p=0.05. LR is symmetric (can favor either), p-value is one-directional.",
+        "test": "Are you comparing two models (likelihood) or testing one null (frequentist)?"
+      }
+    ],
+    "use": [
+      "forensic evidence reporting (DNA match LR)",
+      "scientific model comparison (AIC/BIC based)",
+      "medical diagnostic evidence before Bayesian synthesis",
+      "hypothesis triage: which warrant prior elicitation?",
+      "contested domains: report evidence without imposing priors",
+      "meta-analysis: combine LRs across studies before applying priors"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "adds priors to convert LR to posterior odds"},
+      {"id": 10, "n": "statistical-frequentist", "r": "alternative: tests nulls vs compares hypotheses"},
+      {"id": 13, "n": "abductive", "r": "qualitative hypothesis ranking; often precedes LR computation"},
+      {"id": 18, "n": "reference-class", "r": "provides base rates that LR lacks"},
+      {"id": 45, "n": "decision-theoretic", "r": "consumes posteriors derived from LR + priors"},
+      {"id": 76, "n": "calibration", "r": "tracks whether LR-based rankings are well-calibrated"}
+    ],
+    "ex": {
+      "sit": "Security alert: unusual login pattern. H1: account compromise, H2: legitimate user on new device.",
+      "steps": [
+        "evidence: login from new IP, new device fingerprint, 3AM local time, successful on first attempt",
+        "P(E|H1 compromise): new IP (0.9), new device (0.9), 3AM (0.6), first-attempt (0.8) = 0.39",
+        "P(E|H2 legitimate): new IP (0.2), new device (0.3), 3AM (0.05), first-attempt (0.95) = 0.003",
+        "LR = 0.39 / 0.003 = 130, very strong evidence for compromise",
+        "caveat: if only 1 in 10,000 logins are compromises, prior odds = 1:10000",
+        "posterior odds = 130 * (1/10000) = 130:10000 = 1:77, still more likely legitimate",
+        "decision: LR is strong but prior swamps it; escalate to MFA challenge, not lockout"
+      ],
+      "insight": "LR=130 sounds decisive but rare base rate means most alerts are false positives; separate evidence strength from action threshold"
+    }
+  }
+}

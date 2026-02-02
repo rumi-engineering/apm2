@@ -24,7 +24,8 @@ pub const REQUIRED_READING: &[&str] = &[
     "documents/security/THREAT_MODEL.md",
     "documents/security/SECRETS_MANAGEMENT.md",
     "documents/skills/rust-standards/SKILL.md",
-    "documents/skills/laws-of-holonic-agent-systems/references/agent-native-software/SKILL.md",
+    "documents/skills/glossary/SKILL.md",
+    "documents/skills/laws-of-holonic-agent-systems/SKILL.md",
 ];
 
 const STATUS_CONTEXT: &str = "ai-review/security";
@@ -256,13 +257,32 @@ pub fn approve(ticket_id: Option<&str>, dry_run: bool) -> Result<()> {
 pub fn deny(ticket_id: Option<&str>, reason: &str, dry_run: bool) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
 
+    // If reason is "-", read from stdin [SECURITY: CTR-2616 - Safe Piping]
+    let actual_reason = if reason == "-" {
+        use std::io::Read;
+        println!("Reading denial reason from stdin...");
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .context("Failed to read reason from stdin")?;
+        buffer
+    } else {
+        reason.to_string()
+    };
+
     println!("Security Review: DENY");
     if let Some(id) = ticket_id {
         println!("  Ticket: {id}");
     } else {
         println!("  Using current branch");
     }
-    println!("  Reason: {reason}");
+
+    if reason == "-" {
+        println!("  Reason: (read from stdin)");
+    } else {
+        println!("  Reason: {actual_reason}");
+    }
+
     if dry_run {
         println!("  Mode: DRY RUN (no API calls will be made)");
     }
@@ -295,7 +315,7 @@ pub fn deny(ticket_id: Option<&str>, reason: &str, dry_run: bool) -> Result<()> 
         println!("\n[4/4] Posting denial...");
 
         // Post denial comment
-        let comment = denial_comment(reason);
+        let comment = denial_comment(&actual_reason);
         let pr_url = &pr.pr_url;
         cmd!(sh, "gh pr comment {pr_url} --body {comment}")
             .run()

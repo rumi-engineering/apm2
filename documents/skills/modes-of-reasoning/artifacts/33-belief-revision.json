@@ -1,0 +1,154 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/belief-revision@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 33,
+    "name": "belief-revision",
+    "cat": "nonmonotonic",
+    "core": "Formal framework for modifying beliefs when new information conflicts. AGM postulates define expansion (+A when consistent), contraction (-A for removal), and revision (*A = contract then expand). Key constraint: minimal change--drop as little as possible to restore consistency. Operates on propositions (in/out), not credences (probability degrees).",
+    "out": [
+      {"n": "belief_inventory", "d": "explicit list of accepted propositions with source tags (observation, inference, assumption, axiom)"},
+      {"n": "conflict_diagnosis", "d": "specific propositions contradicting new information, with derivation chain showing how conflict arises"},
+      {"n": "entrenchment_ranking", "d": "ordered tiers from foundational (never drop) to peripheral (drop first); each tier has membership criteria"},
+      {"n": "contraction_candidates", "d": "enumerated minimal subsets whose removal restores consistency; scored by total entrenchment cost"},
+      {"n": "revised_belief_set", "d": "final consistent set after contraction + expansion; diff from original showing drops and adds"},
+      {"n": "revision_justification", "d": "for each dropped belief: why this one, not alternative; links to entrenchment tier and cost comparison"},
+      {"n": "revision_log", "d": "timestamped history of past revisions with dropped beliefs and triggering information"}
+    ],
+    "proc": [
+      "STEP 1 - Enumerate K: list all accepted propositions; tag each with source (observation, inference, assumption, axiom) -> produces belief_inventory",
+      "STEP 2 - State A: express new information as proposition(s); identify direct logical conflicts with K -> produces conflict_diagnosis",
+      "STEP 3 - Rank entrenchment: assign beliefs to ordered tiers (axiom > direct-observation > inference > assumption > hypothesis); document tier criteria -> produces entrenchment_ranking",
+      "STEP 4 - Generate contraction options: enumerate minimal subsets of K that, if dropped, would restore K+A consistency; compute entrenchment cost for each -> produces contraction_candidates",
+      "STEP 5 - Select contraction: choose lowest-cost option; if tied, prefer specificity (drop specific over general) -> updates contraction_candidates with selection",
+      "STEP 6 - Execute revision: apply contraction, add A to K, verify consistency; document all changes -> produces revised_belief_set",
+      "STEP 7 - Justify and log: for each dropped belief, record why it lost to alternatives; append to revision history -> produces revision_justification and revision_log"
+    ],
+    "quick_check": [
+      "Beliefs enumerated BEFORE revision attempted? (prevents implicit assumptions)",
+      "Conflict stated at propositional level? (not vague 'inconsistent')",
+      "Entrenchment ranking written BEFORE selecting what to drop? (prevents motivated reasoning)",
+      "Multiple contraction options generated? (minimum 2 if possible)",
+      "Selected contraction is minimal? (no unnecessary drops)",
+      "Post-revision consistency verified? (no remaining contradictions)",
+      "Revision logged with timestamp? (enables pattern detection)"
+    ],
+    "check": [
+      "belief_inventory exists with source tags for each proposition",
+      "new information stated as explicit proposition(s), not paraphrase",
+      "conflict derivation shows logical steps from K + A to contradiction",
+      "entrenchment tiers documented with membership criteria before revision",
+      "at least 2 contraction candidates enumerated (or justified why only 1 exists)",
+      "selected contraction has lowest entrenchment cost (or tie-break documented)",
+      "revised_belief_set is provably consistent",
+      "revision_justification references entrenchment costs, not post-hoc rationalization",
+      "revision_log updated with this revision"
+    ],
+    "diff": {
+      "bayesian": {
+        "boundary": "belief-revision decides accept/reject (binary); Bayesian assigns credence (0-1 probability)",
+        "when_belief_revision": "discrete commitments required, no probability model, qualitative reasoning",
+        "when_other": "degrees of belief matter, have likelihood model, quantitative uncertainty needed"
+      },
+      "non-monotonic": {
+        "boundary": "belief-revision restructures entire belief set when conflict arises; non-monotonic handles exceptions at inference time via defaults",
+        "when_belief_revision": "committed belief contradicted, need to update accepted set",
+        "when_other": "reasoning with defaults and exceptions, tentative conclusions"
+      },
+      "defeasible": {
+        "boundary": "belief-revision operates on propositions (what to believe); defeasible operates on rules (which rule wins)",
+        "when_belief_revision": "updating accepted propositions given new evidence",
+        "when_other": "resolving conflicts between competing rules or arguments"
+      },
+      "paraconsistent": {
+        "boundary": "belief-revision eliminates contradictions; paraconsistent tolerates them without explosion",
+        "when_belief_revision": "consistency required, willing to drop beliefs",
+        "when_other": "must preserve contradictory information, aggregating conflicting sources"
+      },
+      "counterexample-guided": {
+        "boundary": "belief-revision updates beliefs given conflict; counterexample-guided generates test cases to find conflicts",
+        "when_belief_revision": "conflict already identified, need to resolve it",
+        "when_other": "proactively searching for flaws before conflict manifests"
+      }
+    },
+    "confusions": [
+      {
+        "pair": ["belief-revision", "bayesian-probabilistic"],
+        "confusion": "Both update beliefs with evidence, but Bayesian adjusts credence (0.7 -> 0.3) while belief-revision toggles acceptance (in -> out)",
+        "resolution": "Ask: do I need probability degrees or binary accept/reject? If tracking uncertainty quantitatively, use Bayesian. If maintaining consistent commitment set, use belief-revision."
+      },
+      {
+        "pair": ["belief-revision", "defeasible"],
+        "confusion": "Both handle conflicts, but defeasible resolves which RULE wins; belief-revision resolves which PROPOSITION to drop",
+        "resolution": "Ask: is the conflict between rules (use defeasible) or between a new fact and existing beliefs (use belief-revision)?"
+      },
+      {
+        "pair": ["belief-revision", "non-monotonic"],
+        "confusion": "Both allow retraction, but non-monotonic retracts CONCLUSIONS when exceptions trigger; belief-revision retracts BELIEFS when contradictions arise",
+        "resolution": "Ask: am I reasoning with defaults that may have exceptions (non-monotonic) or updating my committed belief set given new evidence (belief-revision)?"
+      }
+    ],
+    "fail": {
+      "mode": "entrenchment_inertia",
+      "signals": [
+        "same beliefs always survive revision regardless of evidence",
+        "entrenchment rankings never change despite repeated challenges",
+        "peripheral drops fail to restore consistency but core beliefs remain untouchable",
+        "new information consistently rejected as 'must be wrong'",
+        "protecting favored beliefs rather than truth-seeking",
+        "no revision log or history shows same pattern repeating"
+      ],
+      "mitigations": [
+        {"m": "entrenchment review trigger", "test": "if same belief survives 3+ revisions in same domain, entrenchment tier must be re-justified", "threshold": "100% of frequent survivors"},
+        {"m": "contraction diversity check", "test": "over 10 revisions, no single belief should be in dropped set >70% OR <10% (unless axiom)", "threshold": "flag statistical anomalies"},
+        {"m": "devil's advocate contraction", "test": "for each revision, document what would happen if highest-entrenchment belief in conflict were dropped instead", "threshold": "100% of revisions"},
+        {"m": "external entrenchment audit", "test": "entrenchment rankings reviewed by independent party annually or after 20 revisions", "threshold": "all long-running belief bases"},
+        {"m": "evidence-based entrenchment", "test": "tier assignments cite empirical track record (prediction accuracy, consistency with other sources)", "threshold": "all non-axiom beliefs"},
+        {"m": "revision velocity monitoring", "test": "if revision rate drops >50% while new information rate stays constant, investigate entrenchment rigidity", "threshold": "flag for review"}
+      ]
+    },
+    "use": [
+      "requirements evolution under changing stakeholder input",
+      "knowledge base maintenance with contradictory sources",
+      "source reconciliation across conflicting authorities",
+      "scientific theory revision given anomalous data",
+      "configuration management with incompatible constraints",
+      "policy updates when new regulations conflict with existing rules",
+      "ontology maintenance when new entities violate existing taxonomies",
+      "legal reasoning when precedents conflict with new statutes"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian", "r": "degree-based updating; use when probability needed, not binary acceptance"},
+      {"id": 30, "n": "non-monotonic", "r": "exception handling at inference; use for default reasoning"},
+      {"id": 32, "n": "defeasible", "r": "defeat relations between rules; use for rule conflict resolution"},
+      {"id": 34, "n": "paraconsistent", "r": "contradiction tolerance; use when must preserve inconsistent information"},
+      {"id": 8, "n": "counterexample-guided", "r": "proactive conflict discovery; use before belief-revision to find problems"},
+      {"id": 75, "n": "meta-reasoning", "r": "deciding when to revise vs hold; use for revision strategy selection"},
+      {"id": 76, "n": "calibration", "r": "tracking revision accuracy over time; essential feedback loop"}
+    ],
+    "ex": {
+      "sit": "Software requirements: R1='system shall support 1000 concurrent users' (from sales), R2='response time < 100ms' (from UX), R3='run on single server' (from ops). New constraint A='budget allows only $5K/month hosting'.",
+      "steps": [
+        "K = {R1: 1000 users [sales], R2: <100ms [UX], R3: single server [ops]}",
+        "A = $5K budget [finance], conflicts: single server + 1000 users + <100ms exceeds $5K",
+        "entrenchment: R2 (user experience core) > R1 (sales target) > R3 (ops preference)",
+        "contractions: {drop R3} cost=low, {drop R1} cost=medium, {drop R2} cost=high, {drop R1+R3} cost=medium",
+        "select: drop R3 (lowest cost), allows multi-server within $5K budget",
+        "revised K' = {R1, R2, A, R3': 'run on distributed infrastructure within $5K'}",
+        "justify: R3 dropped because ops preference, not user-facing; R3' added as replacement"
+      ],
+      "insight": "entrenchment reflects stakeholder priority and user impact, not source seniority"
+    },
+    "micro_ex": {
+      "sit": "Debug belief: 'cache is always consistent'. Log shows stale read. New info: 'read returned value from 5 minutes ago'.",
+      "steps": "K={cache consistent}, A={stale read observed}. Conflict: consistent cache cannot return stale value. Entrenchment: observation > assumption. Drop 'cache consistent', add A. Revised K'={cache may be inconsistent, stale read observed}.",
+      "insight": "direct observation defeats untested assumption; now investigate cache invalidation"
+    }
+  }
+}

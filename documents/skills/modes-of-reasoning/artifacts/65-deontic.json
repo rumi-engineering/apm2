@@ -1,0 +1,151 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/deontic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 65,
+    "name": "deontic",
+    "cat": "domain",
+    "core": "Derive what is permitted (P), obligatory (O), or forbidden (F) from given norms using deontic operators. Resolve norm conflicts via priority rules: lex specialis (specific defeats general), lex superior (higher authority defeats lower), lex posterior (later defeats earlier). Key distinction from ethics: deontic takes norms as given and derives consequences; it does not evaluate whether norms are just.",
+    "out": [
+      {"type": "norm_inventory", "form": "table: norm-id | source | trigger-condition | operator(O/P/F) | action | exceptions", "test": "every norm has exactly one operator; trigger is boolean predicate; no implied exceptions"},
+      {"type": "conflict_matrix", "form": "N x N grid; cell (i,j) populated iff norm-i and norm-j yield contradictory operators for same action", "test": "every non-empty cell has resolution rule or explicit 'unresolved' flag"},
+      {"type": "priority_ordering", "form": "DAG or total order over norms with edge labels (specialis/superior/posterior)", "test": "no unlabeled edges; incomparable pairs explicitly marked"},
+      {"type": "compliance_verdict", "form": "action -> PERMITTED|REQUIRED|FORBIDDEN with citation chain", "test": "verdict traces to surviving norm(s); all defeated norms listed with defeat reason"}
+    ],
+    "proc": [
+      "inventory norms: for each norm, extract (source, trigger-condition, operator, action, exceptions); reject norms with ambiguous operators",
+      "normalize triggers: convert trigger conditions to boolean predicates; flag vague triggers (e.g., 'reasonable') for clarification",
+      "detect conflicts: for each action, check if multiple norms apply with different operators under current facts; log as conflict pair",
+      "build priority graph: for each conflict pair, determine priority edge using specialis > superior > posterior; document which lex principle applies",
+      "resolve conflicts: traverse priority graph; surviving operator is from highest-priority applicable norm; defeated norms recorded with defeat reason",
+      "derive verdicts: output deontic status for each action; cite surviving norm(s); list defeated alternatives",
+      "document residuals: flag unresolved conflicts (no priority determinable) as normative gaps requiring escalation or policy decision"
+    ],
+    "quick_check": [
+      "Have I listed ALL applicable norms, including implicit organizational policies?",
+      "Does every norm have exactly one operator (O/P/F), not a mix?",
+      "Are trigger conditions testable predicates, not vague standards?",
+      "Did I declare priority rules BEFORE analyzing conflicts (not post-hoc)?",
+      "For each conflict, can I name which lex principle resolves it?",
+      "Are unresolved conflicts explicitly flagged, not silently dropped?",
+      "Does my verdict cite the surviving norm, not just state the conclusion?"
+    ],
+    "check": [
+      "every norm has explicit, testable trigger conditions (not 'as appropriate')",
+      "O/P/F operator is unambiguous per norm; mixed operators split into separate norms",
+      "exceptions enumerated explicitly; 'unless otherwise specified' replaced with concrete conditions",
+      "priority scheme (specialis/superior/posterior) declared before conflict analysis",
+      "verdicts cite justifying norm(s) with full derivation chain",
+      "defeated norms listed with defeat reason (which lex principle, which competing norm)",
+      "residual conflicts flagged with escalation path, not dropped or hidden"
+    ],
+    "diff": {
+      "modal": "modal: asks 'is X possible/necessary?' (alethic truth across worlds); deontic: asks 'is X permitted/required?' (normative status). Modal possibility != deontic permission. Test: if reasoning about what could happen vs what should happen, modal vs deontic.",
+      "legal": "legal: applies deontic logic within institutional constraints (jurisdiction, precedent, procedure, burden of proof); deontic: the underlying formal logic of O/P/F operators. Legal adds enforcement mechanisms and procedural rules that pure deontic lacks. Test: if jurisdiction or burden of proof matters, use legal mode.",
+      "moral-ethical": "moral: evaluates which norms SHOULD exist (meta-normative); deontic: derives consequences from norms that ARE given (object-level). Deontic is norm-consuming; moral is norm-producing. Test: if questioning whether a norm is just, use moral mode; if deriving what follows from accepted norms, use deontic.",
+      "defeasible": "defeasible: generic mechanism for resolving rule conflicts via priority graphs (any domain); deontic: specialized for normative conflicts with O/P/F operators. Deontic uses defeasible-style resolution but adds norm-specific semantics (permission closure, obligation propagation). Test: if rules have O/P/F operators, use deontic; if rules are factual/causal, use defeasible.",
+      "argumentation-theory": "argumentation: computes acceptable extensions without necessarily picking a winner; deontic: must produce a verdict for compliance purposes. Deontic forces resolution; argumentation may leave conflicts as 'undecided extensions'. Test: if you need a definitive compliance answer, use deontic."
+    },
+    "confusions": [
+      {
+        "vs": "moral-ethical",
+        "wrong": "using deontic mode to decide whether a policy is ethical",
+        "right": "deontic derives from given norms; moral evaluates whether those norms should exist",
+        "test": "if your conclusion is 'this norm is unjust', you left deontic and entered moral reasoning"
+      },
+      {
+        "vs": "legal",
+        "wrong": "treating deontic analysis as sufficient for legal compliance",
+        "right": "legal adds jurisdiction, precedent hierarchy, procedural requirements, and enforcement mechanisms that deontic ignores",
+        "test": "if you need to cite case law or allocate burden of proof, switch to legal mode"
+      },
+      {
+        "vs": "defeasible",
+        "wrong": "using defeasible mode when norms have explicit O/P/F operators",
+        "right": "deontic handles normative operators with their special semantics (permission as absence of prohibition, obligation implying permission)",
+        "test": "if your rules use 'must/may/must-not', you likely need deontic; if rules are causal or factual, use defeasible"
+      }
+    ],
+    "fail": {
+      "mode": "norm_soup",
+      "desc": "Norms accumulated without conflict detection; contradictory operators coexist; verdicts cherry-pick convenient norms while ignoring inconvenient ones.",
+      "signals": [
+        "O(X) and F(X) both 'apply' without documented resolution",
+        "verdict cites one norm while ignoring applicable conflicting norm",
+        "priority rules invented post-hoc to justify preferred outcome",
+        "exceptions added implicitly ('obviously this doesn't apply here')",
+        "trigger conditions so vague they match everything ('when appropriate')"
+      ],
+      "mit": [
+        {
+          "m": "pre-declare priority scheme",
+          "how": "state lex specialis/superior/posterior ordering before analyzing any conflicts",
+          "test": "priority scheme documented before conflict matrix; no conflicts resolved without citing pre-declared rule"
+        },
+        {
+          "m": "exhaustive conflict matrix",
+          "how": "build N x N matrix of all norm pairs; explicitly mark each cell as compatible, conflicting+resolved, or conflicting+unresolved",
+          "test": "matrix has N^2 entries; no blank cells; every 'conflicting' cell has resolution or escalation flag"
+        },
+        {
+          "m": "trigger precision requirement",
+          "how": "reject norms with non-boolean triggers; replace 'reasonable' with measurable threshold",
+          "test": "every trigger can be evaluated to true/false given facts; no 'judgment calls' in trigger evaluation"
+        },
+        {
+          "m": "citation chain mandate",
+          "how": "every verdict includes: surviving norm ID, defeated norm IDs, lex principle used for each defeat",
+          "test": "verdict can be audited by following citations back to source norms"
+        },
+        {
+          "m": "residual escalation protocol",
+          "how": "unresolved conflicts route to named decision authority with deadline",
+          "test": "every 'unresolved' flag has escalation owner and SLA; no conflicts silently dropped"
+        },
+        {
+          "m": "norm source provenance",
+          "how": "track who created each norm, when, under what authority",
+          "test": "every norm has source attribution; lex superior disputes resolvable by checking authority hierarchy"
+        }
+      ]
+    },
+    "use": [
+      "compliance analysis: determine if action satisfies regulatory norms",
+      "access control design: derive permissions from RBAC/ABAC policy norms",
+      "governance frameworks: resolve conflicts between organizational policies",
+      "contract interpretation: extract O/P/F from contractual clauses",
+      "automated policy engines: implement norm-based decision systems",
+      "audit preparation: document which norms govern which actions"
+    ],
+    "rel": [
+      {"id": 64, "name": "modal", "why": "deontic logic is a modal logic with O/P/F operators instead of box/diamond"},
+      {"id": 71, "name": "legal", "why": "legal reasoning applies deontic logic within institutional context"},
+      {"id": 72, "name": "moral-ethical", "why": "moral evaluates norms deontic takes as given"},
+      {"id": 32, "name": "defeasible", "why": "deontic uses defeasible-style priority resolution for norm conflicts"},
+      {"id": 35, "name": "argumentation-theory", "why": "argumentation provides alternative extension-based conflict handling"}
+    ],
+    "ex": {
+      "ctx": "Access control policy: N1 O(authenticate) if access-data [source: security policy]; N2 P(skip-auth) if emergency-responder [source: ops handbook]; N3 F(access-without-auth) if data-is-PII [source: privacy regulation]",
+      "analysis": [
+        "inventory: 3 norms with triggers (access-data, emergency-responder, data-is-PII)",
+        "conflict detection: N2 permits skip-auth, N3 forbids access-without-auth -> conflict when emergency-responder + PII",
+        "priority: N3 (privacy regulation) lex superior to N2 (ops handbook) - regulation outranks handbook",
+        "verdict: F(access-without-auth) for PII even for emergency responders; N2 defeated by N3 via lex superior",
+        "residual: emergency responders needing PII access flagged as normative gap -> escalate to legal/compliance for policy revision"
+      ]
+    },
+    "micro_ex": {
+      "contrast": "deontic vs moral-ethical",
+      "scenario": "Policy says 'employees must report suspicious activity' (O(report)). Employee sees coworker taking office supplies home.",
+      "deontic_analysis": "Norm N1: O(report) if suspicious-activity. Taking supplies = suspicious? If yes, O(report) applies. Deontic verdict: REQUIRED to report (given the norm).",
+      "moral_analysis": "Is the norm itself just? Consequentialist: reporting minor theft damages trust, net harm. Virtue: proportionality suggests discretion. Moral verdict: norm may be overbroad; consider whether it SHOULD require reporting minor infractions.",
+      "key_diff": "Deontic took the norm as given and derived the obligation. Moral questioned whether the norm should exist in this form. Deontic = norm-consuming; Moral = norm-evaluating."
+    }
+  }
+}

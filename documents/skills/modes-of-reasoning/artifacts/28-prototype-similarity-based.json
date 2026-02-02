@@ -1,0 +1,106 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/prototype-similarity-based@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 28,
+    "name": "prototype-similarity-based",
+    "cat": "ampliative",
+    "core": "Categorize items by measured similarity to stored prototypes/exemplars rather than necessary-and-sufficient definitions. Produces graded membership where typicality = proximity to prototype in feature space. Central insight: categories have internal structure with central members and fuzzy boundaries.",
+    "out": [
+      {"n": "typicality_scores", "d": "numeric similarity values for each item-prototype pair"},
+      {"n": "graded_memberships", "d": "category assignments with confidence/typicality degrees"},
+      {"n": "prototype_definitions", "d": "documented exemplars defining each category center"},
+      {"n": "boundary_classifications", "d": "items near category edges with multi-category scores"},
+      {"n": "similarity_matrices", "d": "pairwise distances between items and all prototypes"}
+    ],
+    "proc": [
+      "define feature space: select attributes relevant to categorization task",
+      "curate prototypes: identify 1-3 central exemplars per category (most typical, least controversial)",
+      "specify similarity metric: choose distance function matching domain semantics (cosine, Euclidean, weighted features)",
+      "compute similarity: measure distance from item to each prototype in feature space",
+      "assign graded membership: typicality = inverse distance or similarity score",
+      "resolve multi-category: item may belong partially to multiple categories; report all scores above threshold",
+      "flag boundary cases: items equidistant from multiple prototypes require human review or multi-label",
+      "validate: spot-check assignments against domain expert intuitions"
+    ],
+    "check": [
+      "prototypes selected by domain experts, not arbitrary examples?",
+      "prototype set covers category diversity (not just one subtype)?",
+      "similarity metric validated against human similarity judgments?",
+      "feature weights reflect domain importance, not data prevalence?",
+      "boundary items explicitly flagged rather than force-assigned?",
+      "prototype drift monitored over time?",
+      "bias audit: prototypes not skewed toward majority subgroup?"
+    ],
+    "diff": {
+      "vs_fuzzy_logic_25": "prototype uses distance to exemplars; fuzzy uses membership functions without stored examples. Fuzzy asks 'how much does X satisfy predicate P?' Prototype asks 'how similar is X to exemplar E?'",
+      "vs_case_based_15": "prototype classifies only; case-based retrieves cases then adapts solutions. Prototype stops at 'this ticket is type-A'; case-based continues to 'here is how we solved similar type-A tickets'",
+      "vs_analogical_14": "prototype measures similarity for category membership; analogical transfers relational structure for inference. Prototype: 'robin is bird-like'. Analogical: 'heart is pump-like, therefore has valves'",
+      "vs_rough_set_27": "prototype uses distance in feature space; rough-set uses equivalence classes from indiscernibility. Prototype yields continuous typicality; rough-set yields lower/upper bounds",
+      "vs_default_typicality_31": "prototype computes similarity scores; default/typicality uses logical defaults that can be overridden. Prototype: 'penguin is 0.4 typical bird'. Default: 'birds fly unless exception'"
+    },
+    "confusions": [
+      {
+        "error": "treating typicality as probability",
+        "example": "'0.8 typicality' interpreted as '80% chance of membership'",
+        "fix": "typicality is similarity to central example, not likelihood of category membership"
+      },
+      {
+        "error": "using prototype reasoning when definitions exist",
+        "example": "classifying 'is this a prime number?' by similarity to example primes",
+        "fix": "use deductive reasoning for well-defined categories; prototype is for family-resemblance concepts"
+      }
+    ],
+    "fail": {
+      "mode": "prototype-bias",
+      "desc": "hidden bias in prototypes propagates to all classifications; category drift over time; minority subtypes systematically misclassified",
+      "signals": [
+        "prototypes selected by convenience rather than domain expertise",
+        "single prototype per category ignores within-category diversity",
+        "similarity metric not validated against human judgments",
+        "boundary items force-assigned without flagging uncertainty",
+        "no periodic review of prototype relevance as domain evolves"
+      ],
+      "mitigations": [
+        "audit prototype selection: document why each exemplar chosen; require domain expert sign-off",
+        "use multiple prototypes per category: minimum 2-3 exemplars covering major subtypes",
+        "validate similarity metric: test against human similarity ratings on held-out pairs",
+        "flag boundary items: items within 10% of decision boundary require human review",
+        "scheduled prototype review: quarterly assessment of prototype relevance and drift",
+        "stratified testing: verify classification accuracy across demographic/domain subgroups"
+      ]
+    },
+    "use": [
+      "UX taxonomies where categories lack crisp definitions",
+      "product categorization with family-resemblance structure",
+      "support ticket routing by similarity to exemplar tickets",
+      "content moderation with graded severity scores",
+      "cognitive modeling of human categorization",
+      "search result clustering around topic exemplars"
+    ],
+    "rel": [
+      {"id": 25, "name": "fuzzy-logic", "link": "degree membership without prototypes; both handle vagueness differently"},
+      {"id": 15, "name": "case-based", "link": "uses exemplars for problem-solving, not just classification"},
+      {"id": 14, "name": "analogical", "link": "similarity for inference transfer, not category membership"},
+      {"id": 27, "name": "rough-set", "link": "bounds from feature indiscernibility vs distance from exemplars"},
+      {"id": 31, "name": "default-typicality", "link": "logical defaults vs computed similarity scores"}
+    ],
+    "ex": {
+      "scenario": "categorizing support tickets by similarity to prototype ticket types",
+      "steps": [
+        "define prototypes: select 3 exemplar tickets per category (billing, technical, account) from resolved high-confidence cases",
+        "choose metric: TF-IDF cosine similarity on ticket text plus weighted categorical features (product, urgency)",
+        "compute: new ticket similarity = [0.82 billing, 0.31 technical, 0.15 account]",
+        "assign: primary=billing (0.82), flag if second-highest > 0.6 for multi-category review",
+        "validate: sample 50 assignments weekly, compare to human labels, adjust prototypes if drift detected"
+      ],
+      "insight": "ticket is 'billing-like' with degree 0.82, not '82% probability of being billing'"
+    }
+  }
+}

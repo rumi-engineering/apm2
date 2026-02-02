@@ -14,8 +14,11 @@ commands[13]:
     command: "cargo xtask start-ticket [target] --print-path"
     purpose: "Output only worktree path (use for cd)."
   - name: format
-    command: "cargo fmt"
-    purpose: "Fix formatting issues before committing."
+    command: "cargo fmt --all --check"
+    purpose: "Verify formatting across all workspace members before committing."
+  - name: lint
+    command: "cargo clippy --fix --allow-dirty --all-targets --all-features -- -D warnings"
+    purpose: "Fix linting issues and enforce quality standards before committing."
   - name: commit
     command: "cargo xtask commit \"<message>\""
     purpose: "Verify, sync with main, and commit."

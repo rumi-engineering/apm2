@@ -1,0 +1,132 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/qualitative@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 29,
+    "name": "qualitative",
+    "cat": "causal",
+    "core": "Reason with qualitative states (increasing, decreasing, positive/negative influence) instead of exact numbers. Use sign algebra (+, -, 0, ?) and monotone constraints for directional predictions when quantitative data is unavailable. Output is direction of change, not magnitude.",
+    "out": [
+      {"n": "directional_predictions", "d": "claims of form 'X increasing causes Y to increase/decrease'"},
+      {"n": "influence_graph", "d": "directed graph with signed edges (+/-) between variables"},
+      {"n": "ambiguity_flags", "d": "paths where conflicting signs prevent definite prediction"},
+      {"n": "validity_bounds", "d": "stated ranges where monotonicity assumptions hold"},
+      {"n": "sanity_verdicts", "d": "pass/fail checks on whether proposed changes have sensible direction"}
+    ],
+    "proc": [
+      "1. List variables: name each quantity of interest with units or role",
+      "2. Assign qualitative states: mark current direction as + (increasing), - (decreasing), 0 (steady), ? (unknown)",
+      "3. Draw influence graph: for each pair (X, Y), ask 'if X increases, does Y increase (+) or decrease (-)?'",
+      "4. Propagate signs: multiply signs along paths (+ * + = +, + * - = -, - * - = +)",
+      "5. Detect ambiguity: if two paths from X to Y yield opposite signs, mark result as ?",
+      "6. State prediction: 'Increasing X will [increase/decrease/?] Y'",
+      "7. Bound validity: specify range or conditions where monotonicity holds",
+      "8. Check reversal points: identify where nonlinearity invalidates sign (e.g., saturation, U-curves)"
+    ],
+    "quick_check": [
+      "Every variable has a defined sign (+, -, 0, ?)",
+      "Every influence edge has a justified sign with domain reason",
+      "Ambiguous paths (conflicting signs) explicitly marked ?",
+      "Prediction is directional, NOT a magnitude claim",
+      "Validity range stated: 'holds when X in [low, high]'",
+      "At least one reversal/threshold identified or 'none expected' stated"
+    ],
+    "decision_steps": [
+      {"step": "Need numeric answer?", "yes": "Use Fermi or quantitative model", "no": "Continue"},
+      {"step": "Loops or delays matter?", "yes": "Use systems-thinking", "no": "Continue"},
+      {"step": "Rigorous causal effect needed?", "yes": "Use causal-inference", "no": "Continue"},
+      {"step": "Only care about direction of change?", "yes": "Qualitative applies", "no": "Reconsider mode"}
+    ],
+    "diff": {
+      "fermi": "Fermi produces order-of-magnitude numbers; Qualitative produces direction only (+/-/?)",
+      "systems-thinking": "Systems-thinking adds loops (R/B), delays, and stocks; Qualitative is single-pass sign propagation without feedback",
+      "causal-inference": "Causal-inference quantifies P(Y|do(X)) with data; Qualitative asserts direction without magnitude",
+      "qualitative-probability": "Qualitative-probability ranks hypotheses by plausibility; Qualitative reasons about variable directions",
+      "fuzzy-logic": "Fuzzy assigns graded membership (0-1) to vague predicates; Qualitative uses discrete signs (+/-/0/?)"
+    },
+    "confusions": [
+      {
+        "pair": ["qualitative", "qualitative-probability"],
+        "error": "Both have 'qualitative' in name, so they must be similar",
+        "fix": "Qualitative = directional change of variables (X up -> Y down); Qualitative-probability = ranking hypotheses by plausibility without numeric probabilities"
+      },
+      {
+        "pair": ["qualitative", "fuzzy-logic"],
+        "error": "Both avoid exact numbers, so they're interchangeable",
+        "fix": "Qualitative uses discrete signs (+/-) for causal direction; Fuzzy uses continuous [0,1] for degree of membership in vague categories"
+      },
+      {
+        "pair": ["qualitative", "systems-thinking"],
+        "error": "Both draw influence diagrams with +/- signs",
+        "fix": "Qualitative is one-shot propagation; Systems-thinking traces loops, identifies R/B dominance, models delays and stocks"
+      }
+    ],
+    "fail": {
+      "mode": "Missing nonlinear thresholds where sign reasoning breaks down",
+      "signals": [
+        "Prediction fails outside narrow range",
+        "'More X means more Y' only true conditionally (U-curve, saturation)",
+        "Magnitude matters for decision but only direction provided",
+        "Conflicting paths not flagged as ambiguous",
+        "Sign claimed without domain justification"
+      ],
+      "mit": [
+        "State validity range explicitly: 'holds for X in [a, b]'",
+        "Identify saturation points: 'beyond X=c, Y stops increasing'",
+        "Identify reversal points: 'at X=d, relationship flips to negative'",
+        "Use Fermi to bound regime: estimate order-of-magnitude boundaries",
+        "Mark ambiguous paths as ? and explain conflicting influences",
+        "Require domain citation for each influence sign"
+      ]
+    },
+    "anti_patterns": [
+      {"name": "Magnitude smuggling", "desc": "Claiming 'X strongly increases Y' when only direction is justified", "fix": "Report '+' only; use Fermi for magnitude"},
+      {"name": "Threshold blindness", "desc": "Assuming monotonicity holds everywhere", "fix": "Actively ask: where does this relationship saturate or reverse?"},
+      {"name": "Unjustified signs", "desc": "Assigning + or - without domain reasoning", "fix": "Each edge needs a one-sentence domain justification"}
+    ],
+    "use": [
+      "Early architecture decisions when numbers unavailable",
+      "Feedback sanity check: does this influence direction make sense?",
+      "Trend validation before quantitative modeling",
+      "Quick impact assessment: will this change help or hurt?",
+      "System dynamics exploration without full stock-flow model",
+      "Cross-checking numeric models: do signs match expectations?"
+    ],
+    "rel": [
+      {"id": 19, "name": "fermi", "note": "upgrade to Fermi when order-of-magnitude estimate needed"},
+      {"id": 43, "name": "systems-thinking", "note": "upgrade when feedback loops or delays matter"},
+      {"id": 37, "name": "causal-inference", "note": "upgrade when rigorous quantified causal effects needed"},
+      {"id": 24, "name": "qualitative-probability", "note": "different purpose: ranks hypotheses, not variable directions"},
+      {"id": 25, "name": "fuzzy-logic", "note": "different purpose: graded membership in vague categories"}
+    ],
+    "micro_ex": {
+      "setup": "Will hiring more engineers reduce bug count?",
+      "graph": "engineers(+) --[+]--> capacity --[-]--> backlog --[+]--> bugs",
+      "calc": "+ * + * - * + = -",
+      "answer": "More engineers -> fewer bugs (directional claim only)",
+      "bound": "Holds until communication overhead dominates (Brooks's Law threshold)"
+    },
+    "ex": {
+      "problem": "Will adding a cache improve latency?",
+      "variables": [
+        {"name": "cache_size", "state": "+", "unit": "MB"},
+        {"name": "hit_rate", "state": "+", "unit": "fraction"},
+        {"name": "latency", "state": "-", "unit": "ms"}
+      ],
+      "influences": [
+        {"from": "cache_size", "to": "hit_rate", "sign": "+", "reason": "larger cache holds more hot data"},
+        {"from": "hit_rate", "to": "latency", "sign": "-", "reason": "hits avoid slow backend calls"}
+      ],
+      "propagation": "+ * - = -",
+      "prediction": "Increasing cache size decreases latency",
+      "validity_bound": "Holds until cache exceeds working set size (~500MB for this workload)",
+      "reversal": "Beyond working set, hit_rate saturates at ~0.95; further cache increase yields no latency benefit"
+    }
+  }
+}

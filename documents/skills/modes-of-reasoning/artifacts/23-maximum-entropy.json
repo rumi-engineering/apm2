@@ -1,0 +1,146 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/maximum-entropy@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 23,
+    "name": "maximum-entropy",
+    "cat": "probabilistic",
+    "core": "Choose probability distributions that satisfy known constraints while assuming as little else as possible by maximizing entropy. Principled method for constructing least-committal priors and baselines. Does not claim the world is maximally random, only that we should not assume more structure than evidence warrants. Key insight: entropy measures information content; maximizing it means injecting minimum information beyond constraints.",
+    "decision_procedure": [
+      "IF constraints are precise numeric expectations (mean, variance, marginals) → apply MaxEnt directly",
+      "IF constraints are inequalities or bounds only → consider imprecise probability (mode 21) for honest uncertainty",
+      "IF strong domain knowledge exists about distribution shape → use informative Bayesian prior instead",
+      "IF multiple constraint formulations are plausible → run sensitivity analysis across formulations before committing",
+      "IF problem involves belief combination from multiple sources → consider Dempster-Shafer (mode 22) instead"
+    ],
+    "out": [
+      {"n": "constraint_set", "d": "explicit list of known constraints with sources and confidence levels", "from_step": 1},
+      {"n": "max_entropy_distribution", "d": "distribution maximizing entropy subject to constraints; includes functional form and parameters", "from_step": 3},
+      {"n": "entropy_value", "d": "computed entropy H in bits or nats; interpretable as missing information", "from_step": 3},
+      {"n": "baseline_model", "d": "objective default for comparison; documents what 'no additional assumptions' means", "from_step": 5},
+      {"n": "sensitivity_report", "d": "how distribution changes under constraint perturbation", "from_step": 4}
+    ],
+    "proc": [
+      "enumerate constraints: list expectations E[f_k(X)] = c_k, domain bounds, known marginals; tag each with source",
+      "validate constraint consistency: check constraints are mutually satisfiable; contradictions → no solution exists",
+      "formulate Lagrangian: L = H(p) + sum(λ_k(E[f_k] - c_k)) where H = -sum(p log p)",
+      "solve for distribution: exponential family form p(x) ∝ exp(sum(λ_k f_k(x))); use iterative scaling if closed form unavailable",
+      "verify all constraints: compute E[f_k] from solution; confirm |E[f_k] - c_k| < tolerance for each k",
+      "sensitivity check: perturb each constraint by ±10%; flag if distribution shape changes qualitatively",
+      "document scope: state what constraints capture, what structure is assumed absent, when to revisit"
+    ],
+    "check": [
+      "all known constraints explicitly listed with provenance",
+      "no constraints omitted that domain experts would expect",
+      "entropy maximization solved correctly (Lagrange conditions satisfied)",
+      "resulting distribution integrates/sums to 1 and satisfies all constraints within tolerance",
+      "interpretation does not overstate objectivity: 'least-committal given constraints' not 'objectively correct'",
+      "sensitivity analysis performed; distribution stable under reasonable perturbations",
+      "omitted structure explicitly acknowledged in documentation"
+    ],
+    "diff": {
+      "bayesian-probabilistic": "MaxEnt constructs priors from constraints; Bayesian updates priors with likelihood. MaxEnt is prior-generation step, Bayesian is full inference cycle.",
+      "simplicity-compression": "Both invoke Occam; MaxEnt maximizes distributional entropy, compression minimizes description length. MaxEnt applies to probability assignments, compression to data/models.",
+      "imprecise-probability": "MaxEnt yields single distribution; imprecise probability yields credal set (all distributions consistent with constraints). Use imprecise when constraints too weak to justify point estimate.",
+      "frequentist": "MaxEnt is epistemic (represents knowledge state); frequentist is aleatory (long-run frequencies). MaxEnt gives principled prior absent frequency data.",
+      "qualitative-probability": "MaxEnt requires numeric constraint values; qualitative probability uses ordinal comparisons only. Use qualitative when you know A > B but not by how much.",
+      "evidential-dempster-shafer": "MaxEnt assumes single probability function; Dempster-Shafer represents belief and plausibility separately. Use D-S when evidence is incomplete/conflicting from multiple sources."
+    },
+    "common_confusions": [
+      {
+        "confusion": "MaxEnt always yields uniform distribution",
+        "correction": "Uniform only when sole constraint is normalization. Adding mean constraint yields exponential family; adding mean+variance yields Gaussian. The distribution follows from constraints, not a preference for uniformity."
+      },
+      {
+        "confusion": "MaxEnt is objective and assumption-free",
+        "correction": "MaxEnt is principled but not assumption-free. The choice of which constraints to include is subjective. Different analysts including different constraints get different MaxEnt distributions. MaxEnt is 'least additional assumptions given stated constraints.'"
+      },
+      {
+        "confusion": "MaxEnt prior is always the right Bayesian prior",
+        "correction": "MaxEnt provides a default prior when you lack informative domain knowledge. If you have genuine prior knowledge (e.g., expert elicitation, past studies), encode it directly rather than forcing it through constraint form."
+      }
+    ],
+    "fail": {
+      "mode": "constraint_underspecification",
+      "signals": [
+        "constraints omit known structure that domain experts would include",
+        "output treated as objectively true rather than conditional on constraints",
+        "sensitivity to constraint formulation not tested",
+        "MaxEnt used when strong prior knowledge exists but was not encoded",
+        "constraints specified incorrectly (wrong expectation operator, wrong support)"
+      ],
+      "mitigations": [
+        {
+          "m": "constraint audit with domain expert",
+          "test": "expert reviews constraint list; confirms no known constraints omitted; signs off or adds missing constraints"
+        },
+        {
+          "m": "sensitivity analysis under perturbation",
+          "test": "perturb each constraint ±10%; if distribution shape changes qualitatively (e.g., unimodal→bimodal), flag constraint as critical"
+        },
+        {
+          "m": "alternative formulation comparison",
+          "test": "try at least 2 reasonable constraint formulations; if results diverge significantly, report uncertainty rather than picking one"
+        },
+        {
+          "m": "explicit scope statement",
+          "test": "documentation includes sentence: 'This MaxEnt distribution assumes no structure beyond [list constraints]; revisit if [list conditions] arise'"
+        },
+        {
+          "m": "escalate to imprecise probability",
+          "test": "if fewer than 2 constraints or constraints are inequalities only, use credal set (mode 21) instead of point MaxEnt"
+        }
+      ]
+    },
+    "quick_checklist": [
+      "Constraints listed with sources? □",
+      "Constraints mutually consistent? □",
+      "Entropy maximization solved (not assumed uniform)? □",
+      "All constraints verified in solution? □",
+      "Sensitivity tested (±10% perturbation)? □",
+      "Scope and limitations documented? □",
+      "Not overclaiming objectivity? □"
+    ],
+    "use": [
+      "constructing Bayesian priors when only moments or marginals known (e.g., prior for sensor noise given mean and variance)",
+      "null/baseline model for hypothesis testing: 'does data deviate from MaxEnt expectation?'",
+      "feature selection in NLP: MaxEnt classifiers select features that satisfy observed frequency constraints",
+      "statistical mechanics: Boltzmann distribution is MaxEnt given energy constraint",
+      "filling in missing cells in contingency tables given known marginals",
+      "calibrating probability forecasts when only partial information available"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "MaxEnt generates priors; Bayesian updates them"},
+      {"id": 17, "n": "simplicity-compression", "r": "both invoke parsimony; MaxEnt for distributions, compression for descriptions"},
+      {"id": 21, "n": "imprecise-probability", "r": "use when constraints too weak for point MaxEnt"},
+      {"id": 22, "n": "evidential-dempster-shafer", "r": "alternative when evidence is conflicting/incomplete"},
+      {"id": 24, "n": "qualitative-probability", "r": "use when constraints are ordinal not numeric"}
+    ],
+    "ex": {
+      "sit": "Need prior for dice outcome when only known constraint is mean equals 3.5 (fair die expectation).",
+      "steps": [
+        "constraint: E[X] = 3.5 over outcomes {1,2,3,4,5,6}; source: assumption of fair die",
+        "validate: constraint is consistent with support (3.5 is achievable as expectation over {1..6})",
+        "formulate: L = -sum(p_i log p_i) + λ_0(sum p_i - 1) + λ_1(sum i·p_i - 3.5)",
+        "solve: p(x) ∝ exp(λ_1 · x); λ_1 = 0 satisfies constraint → p_i = 1/6 uniform",
+        "verify: E[X] = (1+2+3+4+5+6)/6 = 3.5 ✓; sum p_i = 1 ✓",
+        "sensitivity: if E[X] = 4.0 instead, distribution shifts toward higher values (no longer uniform)",
+        "document: 'Uniform prior assumes only mean=3.5; if variance or mode known, revisit'"
+      ],
+      "insight": "MaxEnt yields uniform when only mean is constrained to the natural center; adding variance constraint would yield different shape"
+    },
+    "micro_example": {
+      "title": "Constraint choice changes everything",
+      "scenario": "Two analysts model wait time X ≥ 0 with E[X] = 5 minutes.",
+      "analyst_A": "Constraint: E[X] = 5. MaxEnt → Exponential(λ=0.2). Heavy right tail.",
+      "analyst_B": "Constraints: E[X] = 5, Var[X] = 4. MaxEnt → Gamma(shape=6.25, rate=1.25). Lighter tail, peaked.",
+      "lesson": "Same mean, different distributions. The variance constraint injects information that changes shape. Neither is 'wrong'; they encode different knowledge states."
+    }
+  }
+}

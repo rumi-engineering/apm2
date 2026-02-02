@@ -1,0 +1,116 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/counterexample-guided@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 8,
+    "name": "counterexample-guided",
+    "cat": "formal",
+    "core": "Refinement loop: propose coarse abstraction, check property, if spurious counterexample found refine abstraction to eliminate it, repeat until property proven or real counterexample found. Key insight: abstractions that are 'too coarse' produce spurious counterexamples (paths valid in abstraction but infeasible concretely); refinement eliminates exactly those spurious behaviors.",
+    "out": [
+      {"id": "proof_certificate", "form": "formal proof object or solver output", "test": "independently verifiable; replays without abstraction"},
+      {"id": "concrete_counterexample", "form": "executable trace with inputs/states/outputs", "test": "trace reproduces on concrete system; violates stated property"},
+      {"id": "refinement_log", "form": "sequence of (iteration, counterexample, refinement_predicate, state_count)", "test": "each entry shows monotonic progress; no repeated predicates"},
+      {"id": "abstraction_mapping", "form": "function from concrete states to abstract states", "test": "mapping is surjective; abstract transitions overapproximate concrete"},
+      {"id": "residual_abstraction", "form": "final abstraction if timeout", "test": "documents unchecked regions; can resume from this point"}
+    ],
+    "proc": [
+      {"step": 1, "do": "define property P as temporal/safety/liveness formula", "out": "machine-checkable property spec", "test": "property parses in checker; covers intended behavior", "decide": "if property not formalizable, use red-team (79) instead"},
+      {"step": 2, "do": "choose initial abstraction A0 (collapse related states, ignore irrelevant variables)", "out": "abstraction function + abstract state space", "test": "abstract space < 10% of concrete; preserves property-relevant distinctions", "decide": "if no cheap abstraction exists, use constraint-sat (06) directly"},
+      {"step": 3, "do": "model-check P on abstraction Ai", "out": "PASS or counterexample path CEi", "test": "checker terminates; result is deterministic"},
+      {"step": 4, "do": "simulate CEi on concrete system", "out": "REAL (reproduces) or SPURIOUS (blocked at step k)", "test": "simulation reaches final state or identifies first infeasible transition"},
+      {"step": 5, "do": "if SPURIOUS: compute refinement predicate from infeasibility (interpolant, predicate, split)", "out": "predicate p that distinguishes spurious from real", "test": "p eliminates CEi from abstraction; p is minimal"},
+      {"step": 6, "do": "refine abstraction: Ai+1 = split(Ai, p)", "out": "new abstraction with |states(Ai+1)| > |states(Ai)|", "test": "CEi not reproducible in Ai+1; no previously-eliminated CEs reappear"},
+      {"step": 7, "do": "check termination: i < max_iterations AND |Ai| < state_budget", "out": "CONTINUE or TIMEOUT", "test": "if TIMEOUT, emit residual_abstraction and partial result", "decide": "on TIMEOUT, escalate to manual review or bounded model checking"}
+    ],
+    "check": [
+      "property P is machine-checkable (LTL/CTL/safety automaton)",
+      "initial abstraction A0 reduces state space by >= 50%",
+      "refinement heuristic documented (interpolants, predicate abstraction, CEGAR variant)",
+      "iteration cap defined (typically 20-50 for CEGAR loops)",
+      "state budget defined (max abstract states before timeout)",
+      "each refinement strictly increases abstraction power (state count grows)",
+      "no predicate added twice (indicates refinement bug)",
+      "spurious counterexample diagnosis includes concrete step where path fails"
+    ],
+    "quick_checklist": {
+      "entry": [
+        "property is formalizable as temporal/safety spec",
+        "concrete system too large for direct model checking (>10^6 states)",
+        "abstraction strategy identified (data abstraction, predicate abstraction, symmetry)"
+      ],
+      "exit_success": [
+        "proof certificate validates property holds",
+        "OR concrete counterexample reproduces violation"
+      ],
+      "exit_timeout": [
+        "residual abstraction documented",
+        "unchecked regions enumerated",
+        "partial confidence statement issued"
+      ]
+    },
+    "diff": {
+      "05-model-theoretic": "CEGAR builds sequence of increasingly precise abstractions; model-theoretic constructs single interpretation. CEGAR iterates toward proof; model-theoretic finds one (counter)model.",
+      "06-constraint-sat": "CEGAR iteratively refines encoding based on spurious counterexamples; constraint-sat encodes once and solves. Use constraint-sat when encoding is straightforward; use CEGAR when state space requires abstraction.",
+      "33-belief-revision": "CEGAR refines state-space partitions to eliminate spurious paths; belief-revision revises propositional beliefs on contradiction. Both iterate, but CEGAR operates on program semantics while belief-revision operates on knowledge.",
+      "79-adversarial-red-team": "CEGAR finds counterexamples formally via exhaustive search on abstraction; red-team finds counterexamples empirically via attacker intuition. CEGAR guarantees completeness (if terminates); red-team has no completeness guarantee but finds 'creative' attacks.",
+      "fuzz-test": "CEGAR systematically refines based on why counterexample failed; fuzzing randomly explores hoping to hit violations. CEGAR is complete; fuzzing is heuristic but cheaper."
+    },
+    "common_confusions": [
+      {"pair": ["CEGAR", "iterative deepening"], "distinction": "CEGAR refines state-space partition (adds predicates); iterative deepening increases search depth bound. CEGAR abstraction changes what states exist; depth bound changes how far you look."},
+      {"pair": ["CEGAR", "SAT-based BMC"], "distinction": "CEGAR uses abstraction + refinement loop; BMC unrolls concrete transitions to fixed depth. BMC finds bugs quickly; CEGAR can prove absence of bugs."},
+      {"pair": ["spurious counterexample", "real bug"], "distinction": "Spurious: path exists in abstraction but is infeasible concretely (abstraction too coarse). Real: path exists and reproduces on concrete system (actual violation)."}
+    ],
+    "fail": {
+      "mode": "endless_refinement_loops",
+      "desc": "Abstraction grows without bound; each refinement adds predicates but spurious counterexamples keep appearing; never converges to proof or real counterexample.",
+      "signals": [
+        "iteration count exceeds 10x initial estimate",
+        "same abstract states re-split with different predicates",
+        "state space grows faster than linear per iteration (exponential blowup)",
+        "interpolant computation times out repeatedly",
+        "refinement predicates become increasingly complex (>5 conjuncts)"
+      ],
+      "mitigations": [
+        {"name": "predicate_budget", "action": "cap predicates at 50; on budget exhaustion emit partial result", "test": "count(predicates) checked each iteration; hard stop at limit"},
+        {"name": "refinement_size_test", "action": "if |Ai+1| > 2 * |Ai|, flag potential blowup and consider coarser split", "test": "growth factor computed and logged; alert if > 2x"},
+        {"name": "interpolant_quality_check", "action": "require interpolant to eliminate >= 10 spurious paths, not just current CE", "test": "re-run CE enumeration after refinement; count eliminated"},
+        {"name": "timeout_with_partial_result", "action": "after N iterations, emit residual abstraction + checked/unchecked regions", "test": "partial result includes coverage metric (% of abstract states verified)"},
+        {"name": "abstraction_restart", "action": "if stuck, restart with different initial abstraction strategy", "test": "track whether restart improves convergence rate"}
+      ]
+    },
+    "use": [
+      "hardware/software verification with state spaces > 10^6 (device drivers, protocols, controllers)",
+      "security property checking (information flow, access control invariants)",
+      "protocol verification with unbounded queues or recursion",
+      "hybrid systems verification (continuous + discrete dynamics)",
+      "cases where cheap abstraction check + expensive concrete simulation is viable"
+    ],
+    "rel": [
+      {"id": 5, "name": "model-theoretic-semantic", "role": "CEGAR builds abstractions; model-theoretic interprets them"},
+      {"id": 6, "name": "constraint-satisfiability", "role": "CEGAR may use SAT/SMT as abstraction checker"},
+      {"id": 33, "name": "belief-revision", "role": "both iterate on contradictions; different domains"},
+      {"id": 79, "name": "adversarial-red-team", "role": "formal vs empirical counterexample discovery"},
+      {"id": 49, "name": "robust-worst-case", "role": "CEGAR finds violations; robust designs margins against them"}
+    ],
+    "ex": {
+      "goal": "Verify mutual exclusion: lock never acquired twice without intervening release",
+      "property": "AG (acquired -> A[!acquired U released])",
+      "concrete_system": "Multi-threaded lock with 3 threads, each with local counter 0-100 (state space: 2 * 100^3 = 2M states)",
+      "steps": [
+        {"iter": 0, "action": "abstract to lock_held: {true, false} ignoring counters", "result": "abstract space = 2 states"},
+        {"iter": 1, "action": "check property on abstraction", "result": "counterexample: acquire -> acquire (no release)"},
+        {"iter": 2, "action": "simulate on concrete", "result": "spurious: second acquire blocked by guard (counter[tid] > 0)"},
+        {"iter": 3, "action": "compute interpolant: counter[tid] > 0", "result": "refine: split states on counter[tid] > 0 vs = 0"},
+        {"iter": 4, "action": "check refined abstraction (6 states)", "result": "no counterexample found"},
+        {"iter": 5, "action": "emit proof certificate", "result": "property verified; certificate size: 12 proof obligations"}
+      ],
+      "insight": "Initial 2-state abstraction was too coarse (allowed spurious double-acquire). Single predicate refinement (counter > 0) sufficed to prove property without exploring full 2M state space."
+    }
+  }
+}

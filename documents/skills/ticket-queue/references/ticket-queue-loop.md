@@ -5,9 +5,13 @@ decision_tree:
   nodes[1]:
     - id: SNAPSHOT_AND_CLASSIFY
       purpose: "Compute ticket state (completed/in-progress/incomplete), pick exactly one ticket to process next, and dispatch work."
-      steps[7]:
+      steps[8]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <START_TARGET_OPTIONAL> with $1 (or empty). Replace <TICKET_ID>/<WORKTREE_PATH>/<BRANCH_NAME> when routed."
+        - id: VERIFY_CWD_IS_MAIN_REPO
+          action: |
+            Periodically check your current directory. If you are inside a worktree (e.g., `documents/work/worktrees/`), you MUST `cd` back to the main repository root before listing tickets or running `gh` commands.
+            Command: `pwd && [ -f Cargo.toml ] || cd ../../../..` (adjust depth as needed to reach root).
         - id: LIST_ALL_TICKETS
           action: command
           run: "ls documents/work/tickets/TCK-*.yaml | rg -o \"TCK-[0-9]{5}\" | sort -u"

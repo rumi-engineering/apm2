@@ -1,0 +1,126 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/reflective-equilibrium@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 77,
+    "name": "reflective-equilibrium",
+    "cat": "meta",
+    "core": "Iteratively adjust both abstract principles and concrete case judgments until they cohere. Neither theory nor intuition has automatic priority; both evolve together through mutual revision. Equilibrium is dynamic: new cases can destabilize it, requiring fresh iteration.",
+    "out": [
+      "principle_set: numbered list of general rules with version history showing revisions",
+      "case_inventory: table mapping cases to (judgment, governing_principle, confidence)",
+      "tension_log: record of conflicts found and how each was resolved (principle_revised | judgment_revised | exception_carved | tension_accepted)",
+      "revision_trace: ordered list of (old_state, trigger_case, new_state, justification)",
+      "equilibrium_certificate: final coherence claim with coverage metrics (cases_tested, principles_stable, residual_tensions)"
+    ],
+    "proc": [
+      "1. SEED: write down 3-7 candidate principles; list 10+ concrete cases with intuitive judgments before seeing principles",
+      "2. MAP: for each case, identify which principle(s) apply; mark conflicts where principle implies X but intuition says not-X",
+      "3. WEIGH: for each conflict, score (a) principle strength (generality, prior success) vs (b) intuition strength (clarity, stability under reflection)",
+      "4. REVISE: if intuition dominates, narrow/qualify the principle; if principle dominates, update the judgment and note why intuition was unreliable",
+      "5. PROPAGATE: after any revision, re-test all prior cases against updated principle set; log new conflicts",
+      "6. ITERATE: repeat steps 2-5 until a full pass produces zero new conflicts or only tensions you explicitly accept",
+      "7. STRESS-TEST: generate 3 adversarial cases designed to break equilibrium; if any succeeds, return to step 3",
+      "8. CERTIFY: produce equilibrium_certificate listing coverage, residual tensions, and conditions that would reopen review"
+    ],
+    "check": [
+      "principle_set has version >= 2 (at least one revision occurred)",
+      "case_inventory covers >= 10 cases including >= 3 marked 'hard' at outset",
+      "tension_log shows >= 1 principle revision AND >= 1 judgment revision (bidirectional adjustment)",
+      "no case removed from inventory without explicit 'excluded because...' entry",
+      "equilibrium_certificate states residual tensions (0 is suspicious; usually 1-3 accepted)",
+      "revision_trace is non-empty and each entry has a justification"
+    ],
+    "quick_checklist": [
+      "Did I revise at least one principle? (if no, may have privileged theory)",
+      "Did I revise at least one judgment? (if no, may have privileged intuition)",
+      "Did I test adversarial cases I didn't author? (if no, confirmation bias risk)",
+      "Can I state residual tensions explicitly? (if vague, equilibrium is shallow)",
+      "Would a skeptic find my revision_trace persuasive? (if not, justifications are weak)"
+    ],
+    "diff": {
+      "deductive": "deduction derives conclusions from fixed axioms; reflective equilibrium treats axioms as revisable inputs",
+      "moral-ethical": "moral reasoning applies normative content; reflective equilibrium is the method for refining that content iteratively",
+      "dialectical": "dialectic synthesizes thesis+antithesis into new thesis; reflective equilibrium iterates case-by-case, not argument-by-argument",
+      "belief-revision": "belief revision updates beliefs given new evidence; reflective equilibrium revises principles given judgments AND judgments given principles (bidirectional)",
+      "calibration-epistemic-humility": "calibration adjusts confidence in claims; reflective equilibrium adjusts the claims themselves, not just confidence",
+      "meta-reasoning": "meta-reasoning selects which mode to use; reflective equilibrium is one such mode, not the selector"
+    },
+    "common_confusions": [
+      {
+        "confused_with": "76-calibration-epistemic-humility",
+        "why_confused": "both involve self-correction and iterative refinement",
+        "distinction": "calibration adjusts credences/confidence; reflective equilibrium adjusts the content of principles and judgments, not just certainty levels"
+      },
+      {
+        "confused_with": "33-belief-revision",
+        "why_confused": "both update beliefs when conflicts arise",
+        "distinction": "belief revision is unidirectional (evidence -> belief); reflective equilibrium is bidirectional (principles <-> judgments)"
+      },
+      {
+        "confused_with": "59-dialectical",
+        "why_confused": "both seek coherence through iteration",
+        "distinction": "dialectic works on abstract arguments (thesis vs antithesis); reflective equilibrium works on principles vs concrete cases"
+      }
+    ],
+    "fail": {
+      "mode": "coherence by case-dropping",
+      "signals": [
+        "case_inventory shrinks between iterations without 'excluded because' entries",
+        "only 'easy' cases remain; all marked-hard cases were dropped or reclassified",
+        "revision_trace shows only judgment changes, never principle changes (one-way deference)",
+        "equilibrium reached in < 3 iterations on a novel domain",
+        "no adversarial cases in stress-test step; only author-generated cases tested"
+      ],
+      "mitigations": [
+        "HARD-CASE LOCK: flag 3+ cases as 'must-address' at step 1; equilibrium invalid if any are absent from final inventory",
+        "BIDIRECTION GATE: require >= 1 principle revision AND >= 1 judgment revision before certifying equilibrium",
+        "EXTERNAL STRESS: solicit 3 adversarial cases from a critic or red-team before step 8; document each and resolution",
+        "ITERATION FLOOR: for novel domains, require >= 4 full passes through steps 2-5 before stress-test",
+        "EXCLUSION AUDIT: any case removed requires a written justification citing which principle made it out-of-scope and why that scoping is principled",
+        "RESIDUAL DISCLOSURE: final certificate must list 1-3 residual tensions with explicit 'accepted because...' rationale"
+      ]
+    },
+    "use": [
+      "policy design: balancing general rules with edge cases while documenting exceptions",
+      "governance frameworks: building stakeholder buy-in by showing both sides adjusted",
+      "ethics development: refining moral principles through test cases, not just intuition-pumps",
+      "standard setting: harmonizing competing requirements with traceable trade-offs",
+      "value-laden decisions: producing principled justifications that survive adversarial scrutiny"
+    ],
+    "rel": [
+      "72-moral-ethical",
+      "59-dialectical",
+      "33-belief-revision",
+      "75-meta-reasoning",
+      "76-calibration-epistemic-humility"
+    ],
+    "ex": {
+      "situation": "organization developing data privacy policy",
+      "steps": [
+        "SEED: principles = [P1: minimize data collection, P2: enable fraud detection, P3: respect user consent]. Cases = [C1: marketing analytics, C2: security logging, C3: behavioral fraud signals, C4: third-party sharing for ads]",
+        "MAP: C1 conflicts P1 (analytics wants more data). C3 conflicts P1 (fraud needs behavioral data). C4 conflicts P3 (users didn't consent to ad partners)",
+        "WEIGH: P1 vs C3 intuition: fraud detection is a legitimate service purpose, intuition strong. P1 vs C1: marketing is nice-to-have, intuition weak",
+        "REVISE: narrow P1 to 'minimize data not required for stated service purpose'; C3 now passes. C1 still fails (marketing not stated purpose). Log revision",
+        "PROPAGATE: re-test C2 (security logging): passes under revised P1. Re-test C4: still fails P3 regardless of P1 change",
+        "ITERATE: second pass finds no new conflicts for C1-C4. Add adversarial C5: 'retain data for legal hold'; P1 tension. Revise P1 to 'minimize... except for legal/regulatory holds'. Third pass stable",
+        "STRESS-TEST: red-team proposes C6: 'sell anonymized data'. P1 silent, P3 arguable (consent unclear). Accept as residual tension",
+        "CERTIFY: equilibrium on 6 cases, 3 principles (each revised once), 1 residual tension (C6) documented with 'requires explicit consent language in future revision'"
+      ]
+    },
+    "micro_example": {
+      "context": "deciding whether exceptions to a 'no meeting Fridays' policy should exist",
+      "principle_v1": "No meetings on Fridays",
+      "case": "Critical incident requires cross-team sync on Friday",
+      "tension": "Principle forbids; intuition says incident response trumps productivity norm",
+      "resolution": "Principle revised to 'No routine meetings on Fridays; exceptions for P1 incidents with VP approval'",
+      "test": "Checked 5 prior Fridays; 3 would have passed (incidents), 2 would have failed (could wait). Equilibrium stable"
+    }
+  }
+}

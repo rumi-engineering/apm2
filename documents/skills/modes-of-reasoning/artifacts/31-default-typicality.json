@@ -1,0 +1,169 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/default-typicality@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 31,
+    "name": "default-typicality",
+    "cat": "nonmonotonic",
+    "core": "Apply 'normally/typically X implies Y' rules that hold unless overridden by more specific information. Binary outcome: default fires or is blocked. No probability calculus - specificity alone resolves conflicts.",
+    "when_to_use": [
+      "domain has known typical cases with known exceptions (not novel unknowns)",
+      "binary categorization suffices; graded membership not required",
+      "specificity hierarchy is clear (subclass, role, context)",
+      "speed matters more than calibrated uncertainty",
+      "rules originate from domain expertise, not statistical sampling"
+    ],
+    "when_not_to_use": [
+      "exceptions are frequent (>30% of cases) - defaults add noise",
+      "specificity ordering is contested or ambiguous",
+      "need calibrated probabilities for downstream decisions",
+      "novel entities where typicality assumptions may fail",
+      "multiple conflicting defaults with no clear specificity winner"
+    ],
+    "out": [
+      {"n": "default_rules", "d": "table: [rule_id, antecedent, consequent, source, specificity_rank]"},
+      {"n": "typical_conclusions", "d": "list of inferences with firing default cited"},
+      {"n": "exception_triggers", "d": "map: {exception_condition -> [blocked_default_ids]}"},
+      {"n": "specificity_ordering", "d": "partial order DAG: rule_id -> [more_specific_rule_ids]"},
+      {"n": "default_assumptions", "d": "explicit list: 'Assuming D7 (users have email) - no contrary evidence'"}
+    ],
+    "proc": [
+      "1. ENUMERATE defaults: list all 'typically X->Y' rules applicable to entity; cite source for each",
+      "2. CLASSIFY entity: determine all categories/roles entity belongs to (e.g., bird AND penguin)",
+      "3. BUILD specificity DAG: for each rule pair, determine if one is more specific (subclass, narrower context); record partial order",
+      "4. DETECT conflicts: find rules with contradictory consequents for same entity",
+      "5. RESOLVE via specificity: most-specific unblocked rule fires; if tie, flag for manual resolution or use recency/authority",
+      "6. FIRE unblocked defaults: derive conclusions; annotate each with source default",
+      "7. DOCUMENT assumptions: for each fired default, state 'Assuming Dx because no evidence of exception Ey'"
+    ],
+    "quick_checklist": [
+      "[ ] Every default has 'typically' qualifier, never stated as universal fact",
+      "[ ] Each default cites provenance (policy doc, domain expert, observed pattern)",
+      "[ ] Specificity DAG covers all rule pairs that could conflict",
+      "[ ] Conclusions traceable to firing default ID",
+      "[ ] Assumptions section lists all active defaults with 'no contrary evidence' note",
+      "[ ] Edge cases (entities in multiple categories) explicitly handled"
+    ],
+    "diff": {
+      "non-monotonic": {
+        "boundary": "default-typicality is ONE mechanism within non-monotonic; non-monotonic is umbrella covering defaults, circumscription, autoepistemic logic",
+        "choose_this_when": "you have explicit 'typically' rules with specificity ordering",
+        "choose_other_when": "you need general framework or want to model closed-world assumptions"
+      },
+      "defeasible": {
+        "boundary": "default-typicality uses specificity alone; defeasible tracks explicit attack/defeat relations between arguments",
+        "choose_this_when": "conflicts resolve by 'more specific wins' without complex argument chains",
+        "choose_other_when": "rules have explicit 'R1 defeats R2' annotations or multi-step defeat propagation"
+      },
+      "bayesian": {
+        "boundary": "default-typicality is binary fires/blocked; Bayesian gives calibrated P(conclusion|evidence)",
+        "choose_this_when": "speed matters, specificity is clear, binary output acceptable",
+        "choose_other_when": "need numeric confidence, evidence is quantitative, downstream uses probabilities"
+      },
+      "prototype-similarity": {
+        "boundary": "default-typicality is rule-based categorical; prototype uses similarity to exemplars with graded membership",
+        "choose_this_when": "categories have crisp boundaries with known exceptions",
+        "choose_other_when": "category membership is inherently graded, no clear rules, similarity metric available"
+      },
+      "belief-revision": {
+        "boundary": "default-typicality blocks at inference time; belief-revision restructures stored beliefs on contradiction",
+        "choose_this_when": "beliefs stable, reasoning about new entity under existing rules",
+        "choose_other_when": "learning new info that should permanently change belief set"
+      }
+    },
+    "common_confusions": [
+      {
+        "confusion": "Using default-typicality when exceptions are frequent",
+        "symptom": ">30% of cases require exception handling; constant 'but in this case...' overrides",
+        "resolution": "Switch to Bayesian (#11) for calibrated uncertainty or belief-revision (#33) if domain knowledge evolving"
+      },
+      {
+        "confusion": "Conflating defaults with prototype similarity",
+        "symptom": "saying 'typically X' when you mean 'X is similar to prototype'; no discrete exception list",
+        "resolution": "If categories are graded by similarity, use prototype-similarity (#28); reserve defaults for rule-based exceptions"
+      },
+      {
+        "confusion": "Treating defaults as facts in downstream reasoning",
+        "symptom": "conclusions from defaults used as premises for deductive steps without defeasibility marker",
+        "resolution": "Tag all default-derived conclusions with 'defeasible:true'; downstream deduction must propagate uncertainty"
+      }
+    ],
+    "fail": {
+      "mode": "default_ossification",
+      "signals": [
+        "defaults stated as 'X is Y' rather than 'X typically is Y'",
+        "no exception_triggers documented for any default",
+        "provenance unknown: cannot answer 'why is this a default?'",
+        "same defaults used for 3+ years without audit",
+        "specificity_ordering missing or implicit in code comments"
+      ],
+      "mitigations": [
+        {
+          "name": "mandatory_qualifier",
+          "action": "lint rule: every default must contain 'typically', 'normally', or 'by default' keyword",
+          "test": "grep default_rules for qualifier; fail if any lack qualifier"
+        },
+        {
+          "name": "provenance_field_required",
+          "action": "schema enforces 'source' field on each default (policy_doc_id, expert_name, or data_sample_id)",
+          "test": "JSON schema validation rejects defaults without 'source'"
+        },
+        {
+          "name": "exception_rate_monitoring",
+          "action": "log when defaults are blocked; alert if exception_rate > 0.3 for any default over 30-day window",
+          "test": "dashboard shows per-default exception rate; threshold alert configured"
+        },
+        {
+          "name": "quarterly_default_audit",
+          "action": "calendar reminder: review all defaults every 90 days; mark 'reviewed_at' timestamp",
+          "test": "report lists defaults where reviewed_at > 90 days ago"
+        },
+        {
+          "name": "specificity_dag_visualization",
+          "action": "generate DOT graph of specificity ordering; review for missing edges",
+          "test": "graph covers all rule pairs; no orphan nodes except top-level defaults"
+        }
+      ]
+    },
+    "use": [
+      "ontology design: defining typical properties with carve-outs",
+      "rule engine configuration: encoding business rules with exceptions",
+      "SOPs with override clauses: 'normally do X unless condition Y'",
+      "configuration management: default settings with environment-specific overrides",
+      "policy frameworks: standard procedures with role-based exceptions",
+      "diagnostic reasoning: typical symptoms with known atypical presentations"
+    ],
+    "rel": [
+      {"id": 30, "n": "non-monotonic", "r": "parent framework; defaults are one non-monotonic mechanism"},
+      {"id": 32, "n": "defeasible", "r": "models explicit defeat relations vs specificity-only"},
+      {"id": 11, "n": "bayesian", "r": "probabilistic alternative when calibrated uncertainty needed"},
+      {"id": 33, "n": "belief-revision", "r": "restructures beliefs vs inference-time blocking"},
+      {"id": 28, "n": "prototype-similarity", "r": "graded similarity vs categorical defaults"}
+    ],
+    "micro_example": {
+      "pattern": "config_override",
+      "setup": "app.defaults.timeout=30s; env.prod.timeout=60s; service.payment.timeout=120s",
+      "resolution": "service.payment is most specific -> timeout=120s for payment service in prod",
+      "key_insight": "specificity (service > env > app) determines winner; no probability needed"
+    },
+    "ex": {
+      "sit": "Rules: (D1) birds typically fly; (D2) penguins typically do not fly; (D3) baby penguins typically cannot swim. Entity: Tweety is a bird, penguin, and baby.",
+      "steps": [
+        "1. ENUMERATE: D1(bird->fly), D2(penguin->not-fly), D3(baby-penguin->not-swim)",
+        "2. CLASSIFY: Tweety is {bird, penguin, baby-penguin}",
+        "3. SPECIFICITY: penguin < bird (subclass), baby-penguin < penguin (subclass)",
+        "4. CONFLICTS: D1 vs D2 on flying (contradict); D3 orthogonal (swimming)",
+        "5. RESOLVE: D2 more specific than D1 for Tweety -> D2 fires, D1 blocked",
+        "6. CONCLUSIONS: Tweety typically does not fly (D2), Tweety typically cannot swim (D3)",
+        "7. ASSUMPTIONS: 'Assuming D2 (no evidence Tweety is a flying penguin subspecies)'"
+      ],
+      "insight": "specificity resolves fly/not-fly without probability; orthogonal defaults (swim) fire independently"
+    }
+  }
+}

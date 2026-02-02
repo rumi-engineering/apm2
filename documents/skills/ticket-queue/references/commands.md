@@ -1,12 +1,15 @@
 title: Ticket Queue — Command Reference
 
-commands[24]:
+commands[27]:
   - name: xtask-help
     command: "cargo xtask --help"
     purpose: "List all available xtask commands and their descriptions. Use this for command discovery before running ticket workflow commands."
   - name: xtask-start-ticket-help
     command: "cargo xtask start-ticket --help"
     purpose: "Show detailed help for the start-ticket command, including --dry-run and --print-path flags."
+  - name: list-recent-prs
+    command: "gh pr list --state all --limit 20 --json number,title,headRefName,updatedAt,state --jq 'map(select(.state == \"MERGED\" or .state == \"OPEN\")) | sort_by(.updatedAt) | reverse | .[0:10] | .[] | \"\\(.updatedAt) \\(.state) \\(.headRefName) \\(.title)\"'"
+    purpose: "List the 10 most recently modified OPEN or MERGED PRs. Use this to derive the logical next TCK-XXXXX by observing the latest activity."
   - name: list-ticket-ids
     command: "ls documents/work/tickets/TCK-*.yaml | rg -o \"TCK-[0-9]{5}\" | sort -u"
     purpose: "List all ticket IDs that MUST be merged."
@@ -22,12 +25,12 @@ commands[24]:
   - name: start-next-ticket
     command: "cargo xtask start-ticket $1"
     purpose: "Create a worktree + branch for the next unblocked ticket (or a specific RFC/ticket if $1 provided). SIDE EFFECTS: creates/updates worktrees and local branches."
-  - name: check-status-on-ticket-branch
-    command: "timeout 30s cargo xtask check"
-    purpose: "Show status for the current ticket branch (CI + review + reviewer health)."
-  - name: check-status-watch
-    command: "timeout 200s cargo xtask check --watch"
-    purpose: "Poll status for ~3 minutes (internal watch timeout is 180s)."
+  - name: check-pr-status
+    command: "timeout 30s gh pr view <BRANCH_NAME> --json state,reviewDecision,statusCheckRollup,headRefOid,url"
+    purpose: "Show PR state, review decision, and CI status rollup without requiring a worktree. Includes latest commit SHA (headRefOid)."
+  - name: trigger-reviews
+    command: "cargo xtask review security <PR_URL> & cargo xtask review quality <PR_URL> &"
+    purpose: "Manually trigger/re-trigger AI reviews for a PR URL. Use this if reviews are missing or stuck after a direct push."
   - name: finish-after-merge
     command: "cargo xtask finish"
     purpose: "Cleanup worktree/branch after PR merges. SIDE EFFECTS: git worktree remove and local branch delete."
@@ -61,15 +64,13 @@ commands[24]:
   - name: safe-kill-pid
     command: "bash -lc 'set -euo pipefail; ps -p <PID> -o pid=,cmd=; kill -TERM <PID>; sleep 5; kill -KILL <PID> 2>/dev/null || true'"
     purpose: "Terminate a stuck subagent/reviewer PID after verifying it is the expected process. SIDE EFFECTS: sends signals to a process."
-  - name: codex-history-tail
-    command: "tail -n 200 \"$HOME/.codex/history.jsonl\""
-    purpose: "Out-of-band inspection of most recent Codex tool/event logs (fallback)."
   - name: claude-history-tail
     command: "tail -n 200 \"$HOME/.claude/history.jsonl\""
     purpose: "Out-of-band inspection of most recent Claude Code logs (fallback)."
   - name: start-claude-implementer-with-log
     command: "bash -lc 'set -euo pipefail; mkdir -p \"$HOME/.apm2/ticket-queue/logs\"; log=\"$HOME/.apm2/ticket-queue/logs/<TICKET_ID>.implementer.claude.log\"; script -q \"$log\" -c \"cd <WORKTREE_PATH> && claude --agent rust-developer --verbose \\\"<PASTE_IMPLEMENTER_TASK>\\\"\" & echo \"PID=$! LOG=$log\"'"
     purpose: "Spawn a Claude Code implementer session with a durable log file (run in a separate terminal/tab; you can background it and capture PID)."
-  - name: start-codex-implementer-with-json-log
-    command: "bash -lc 'set -euo pipefail; mkdir -p \"$HOME/.apm2/ticket-queue/logs\"; log=\"$HOME/.apm2/ticket-queue/logs/<TICKET_ID>.implementer.codex.jsonl\"; cd <WORKTREE_PATH>; codex exec --json --full-auto -p \"<PASTE_IMPLEMENTER_TASK>\" | tee \"$log\"'"
-    purpose: "Run a Codex implementer subagent with JSONL event output captured to a log (out-of-band tool call visibility)."
+  - name: list-workflow-runs
+    command: "gh api \"repos/{owner}/{repo}/actions/runs\" --jq '.workflow_runs | map(select(.head_branch == \"<BRANCH_NAME>\" and .event == \"pull_request\")) | .[0:3] | .[] | \"\\(.id) \\(.status) \\(.head_sha[0:7]) \\(.created_at)\"' 2>/dev/null"
+    purpose: "List the 3 most recent GitHub Actions runs for a specific branch. Useful for verifying CI state without polling full status. replace {owner}/{repo} with current repository and <BRANCH_NAME> with ticket branch."
+

@@ -5,9 +5,11 @@ decision_tree:
   nodes[1]:
     - id: START
       purpose: "Start the next unblocked ticket (creates worktree + branch), then delegate to implementer subagent and monitor until merged."
-      steps[7]:
+      steps[8]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "Replace <START_TARGET_OPTIONAL> with $1 (or empty). This controls the initial selection only; you MUST continue until all tickets are merged."
+        - id: DERIVE_NEXT_TICKET
+          action: "If <START_TARGET_OPTIONAL> is empty, use `gh pr list` from `references/commands.md` (`list-recent-prs`) to observe the last 5-10 merged or open PRs. Derive the logical next TCK-XXXXX by identifying the highest numeric ticket ID currently in flight or recently merged, then selecting its immediate numeric successor from `documents/work/tickets/`."
         - id: START_TICKET
           action: command
           run: "cargo xtask start-ticket <START_TARGET_OPTIONAL>"

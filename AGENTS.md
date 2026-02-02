@@ -98,7 +98,6 @@
     "tool_protocol": "proto/tool_protocol.proto"
   },
   "doc_refs": {
-    "root_onboarding": "ROOT_ONBOARDING.cac.md",
     "documents_index": "documents/README.md",
     "skills_root": "documents/skills/",
     "glossary_root": "documents/skills/glossary/",

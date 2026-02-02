@@ -56,9 +56,7 @@
     "r": {
       "depth": "M",
       "modes": [
-        47,
-        36,
-        79
+        "policy_governance"
       ],
       "ob": [
         "A",

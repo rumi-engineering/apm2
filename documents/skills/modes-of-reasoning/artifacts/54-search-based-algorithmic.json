@@ -1,0 +1,233 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/search-based-algorithmic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 54,
+    "name": "search-based-algorithmic",
+    "cat": "search",
+    "core": "Systematically explore discrete solution space via tree/graph traversal or dynamic programming. Use when: (a) solutions are combinatorial configurations, (b) goal is reachable via state transitions, (c) exhaustive enumeration is infeasible without structure exploitation.",
+    "out": [
+      {
+        "id": "solution_path",
+        "form": "sequence of states/actions from initial to goal",
+        "test": "each transition valid; final state satisfies goal predicate"
+      },
+      {
+        "id": "best_found_solution",
+        "form": "solution with associated cost/score",
+        "test": "no explored alternative has better score; optimality certificate if complete search"
+      },
+      {
+        "id": "explored_space_summary",
+        "form": "nodes expanded, nodes pruned, max depth reached, branches cut",
+        "test": "counts consistent with algorithm invariants"
+      },
+      {
+        "id": "no_solution_proof",
+        "form": "exhaustive enumeration certificate or UNSAT core",
+        "test": "all reachable states checked; none satisfy goal"
+      }
+    ],
+    "proc": [
+      {
+        "step": 1,
+        "do": "define state representation: what constitutes a configuration",
+        "decision": "minimize state size while capturing all decision-relevant info",
+        "out": "state schema with fields and domains",
+        "test": "two states are equal iff they lead to identical futures"
+      },
+      {
+        "step": 2,
+        "do": "specify goal test: predicate that returns true for solution states",
+        "decision": "goal test must be O(1) or O(state_size), not search within goal check",
+        "out": "goal_test(state) -> bool",
+        "test": "known solution states return true; known non-solutions return false"
+      },
+      {
+        "step": 3,
+        "do": "enumerate successor function: given state, produce all valid next states",
+        "decision": "generate successors lazily if branching factor large; prune invalid early",
+        "out": "successors(state) -> list of (action, next_state, cost)",
+        "test": "no valid successor omitted; no invalid successor included"
+      },
+      {
+        "step": 4,
+        "do": "select search strategy based on problem characteristics",
+        "decision": "BFS if uniform cost + shallow solution; DFS if deep + memory constrained; A* if admissible heuristic available; IDA* if memory critical; beam search if approximate OK",
+        "out": "algorithm choice with rationale",
+        "test": "choice matches memory/optimality/completeness requirements"
+      },
+      {
+        "step": 5,
+        "do": "design heuristic function h(state) estimating cost-to-goal",
+        "decision": "admissible (never overestimates) if optimal solution required; consistent (h(n) <= c(n,n') + h(n')) for efficiency",
+        "out": "h(state) -> numeric estimate",
+        "test": "h(goal) = 0; h(s) <= actual cost from s to goal for all sampled s"
+      },
+      {
+        "step": 6,
+        "do": "implement pruning rules to cut branches that cannot lead to better solutions",
+        "decision": "bound-based (branch-and-bound), dominance (state A dominates B), symmetry (equivalent states), constraint propagation",
+        "out": "prune(state, bound) -> bool",
+        "test": "pruned branches verified to contain no optimal solutions on small instances"
+      },
+      {
+        "step": 7,
+        "do": "track explored states to avoid revisiting",
+        "decision": "hash table for random access; bloom filter if memory tight (accept false positives); transposition table for game trees",
+        "out": "visited set or equivalent structure",
+        "test": "no state expanded twice; memory usage within budget"
+      },
+      {
+        "step": 8,
+        "do": "run search with resource bounds; extract solution path on success",
+        "decision": "set time/memory/node limits; decide restart vs continue policy",
+        "out": "solution path or best-so-far with search statistics",
+        "test": "path reconstructable; statistics match algorithm behavior"
+      }
+    ],
+    "check": [
+      "state space finite or search bounded by depth/cost limit",
+      "successor function complete: all legal moves generated",
+      "heuristic admissible if optimality required (h(s) <= h*(s) for all s)",
+      "heuristic consistent if using graph search (h(n) <= c(n,n') + h(n'))",
+      "pruning sound: no optimal solution in pruned branches",
+      "duplicate detection covers all revisit scenarios",
+      "termination guaranteed: finite space, or depth/cost bound, or iterative deepening",
+      "resource bounds specified: max nodes, max time, max memory"
+    ],
+    "quick_checklist": [
+      "Can I enumerate all successors of any state? (no -> successor function incomplete)",
+      "Is my goal test O(1)? (no -> risk of hidden search in goal check)",
+      "Is branching factor < 10? (no -> need strong heuristic or pruning)",
+      "Is solution depth < 20? (no -> consider iterative deepening or IDA*)",
+      "Do I need optimal solution? (no -> beam search or greedy may suffice)",
+      "Is heuristic admissible? (unknown -> test on known instances)",
+      "Did I enable duplicate detection? (no -> exponential blowup on graphs)"
+    ],
+    "diff": {
+      "47-planning-policy": {
+        "boundary": "method vs problem type",
+        "use_search_when": "you need to implement the state-space exploration that finds a plan",
+        "use_other_when": "you are defining what constitutes a valid plan (goals, actions, preconditions)",
+        "example": "planning: 'robot must reach goal avoiding obstacles'; search: 'A* over grid states with Manhattan heuristic'"
+      },
+      "48-optimization": {
+        "boundary": "discrete structure vs continuous objective",
+        "use_search_when": "solutions are discrete configurations reachable via transitions; objective emerges from path cost",
+        "use_other_when": "solution is continuous parameter vector; use gradient/convex methods",
+        "example": "search: 'shortest path in graph'; optimization: 'minimize f(x) where x in R^n'"
+      },
+      "06-constraint-satisfiability": {
+        "boundary": "exploration vs assignment",
+        "use_search_when": "solution is a path or sequence; state transitions matter",
+        "use_other_when": "solution is a single assignment; no notion of path/transitions",
+        "example": "search: 'sequence of moves to solve puzzle'; constraint-sat: 'assign values to variables satisfying all constraints'"
+      },
+      "53-heuristic": {
+        "boundary": "systematic algorithm vs rule of thumb",
+        "use_search_when": "you need guaranteed coverage of solution space with completeness/optimality properties",
+        "use_other_when": "you need fast approximate answer without systematic exploration",
+        "example": "search: 'A* guarantees shortest path'; heuristic: 'always turn toward goal' (may miss optimal)"
+      }
+    },
+    "confused": [
+      {
+        "with": "47-planning-policy",
+        "symptom": "mixing 'what plan to find' with 'how to find it'",
+        "distinguish": "Planning defines the problem (states, actions, goals). Search is one method to solve it. You can solve planning problems with search, constraint-sat, or other methods.",
+        "resolution": "Separate specification (planning) from implementation (search algorithm choice)."
+      },
+      {
+        "with": "53-heuristic",
+        "symptom": "confusing heuristic function h(s) with heuristic reasoning mode",
+        "distinguish": "In search, h(s) is a numeric estimate guiding exploration. Heuristic reasoning mode uses rules-of-thumb to skip systematic analysis entirely.",
+        "resolution": "Search uses heuristics as guidance within systematic exploration; heuristic mode replaces systematic exploration."
+      },
+      {
+        "with": "48-optimization",
+        "symptom": "applying gradient descent to discrete combinatorial problems",
+        "distinguish": "Search handles discrete spaces with explicit transitions. Optimization typically handles continuous spaces with calculus-based methods.",
+        "resolution": "If solution space is discrete/combinatorial and transitions are explicit, use search. If continuous, use optimization."
+      }
+    ],
+    "fail": {
+      "mode": "combinatorial_explosion_without_structure",
+      "desc": "exponential blowup defeats naive enumeration; search exhausts resources before finding solution",
+      "signals": [
+        "nodes expanded grows exponentially with depth",
+        "search runs for hours without progress",
+        "memory exhausted by open/closed lists",
+        "same states revisited repeatedly",
+        "heuristic provides no guidance (h(s) = 0 everywhere)"
+      ],
+      "mit": [
+        {
+          "do": "design admissible heuristic specific to domain",
+          "test": "verify h(s) <= actual_cost on 100+ random states; measure node reduction vs blind search",
+          "concrete": "for 15-puzzle: Manhattan distance reduces nodes from 10^12 to 10^6"
+        },
+        {
+          "do": "add domain-specific pruning via dominance or symmetry",
+          "test": "pruned branches verified to contain no optimal solution on small instances",
+          "concrete": "for TSP: never revisit city; prune paths longer than best-so-far"
+        },
+        {
+          "do": "use iterative deepening to bound memory",
+          "test": "memory usage constant regardless of solution depth; time overhead < 2x",
+          "concrete": "IDA* for 15-puzzle uses O(d) memory vs O(b^d) for A*"
+        },
+        {
+          "do": "enable duplicate detection with appropriate data structure",
+          "test": "no state expanded more than once; hash table lookups O(1)",
+          "concrete": "transposition table for game trees; Zobrist hashing for board states"
+        },
+        {
+          "do": "decompose problem into independent subproblems if possible",
+          "test": "subproblem solutions combine correctly; total time < undecomposed time",
+          "concrete": "pattern databases for sliding puzzles: solve 6-tile subsets independently"
+        },
+        {
+          "do": "set resource bounds and implement anytime behavior",
+          "test": "search returns best-so-far when budget exhausted; quality improves monotonically with time",
+          "concrete": "beam search with increasing width; return best path found when time limit hit"
+        }
+      ]
+    },
+    "use": [
+      "game AI: minimax/alpha-beta for adversarial games; MCTS for large branching factor",
+      "pathfinding: A*/Dijkstra for navigation; jump point search for grids",
+      "puzzle solving: IDA* for sliding puzzles; BFS for Rubik's cube subgroups",
+      "theorem proving: proof search with heuristic guidance",
+      "code generation: program synthesis via search over program space",
+      "scheduling: branch-and-bound for job-shop; beam search for makespan"
+    ],
+    "rel": [
+      "47-planning-policy",
+      "48-optimization",
+      "06-constraint-satisfiability",
+      "53-heuristic",
+      "08-counterexample-guided"
+    ],
+    "ex": {
+      "prob": "Find shortest path in 8-puzzle from scrambled state to goal state [[1,2,3],[4,5,6],[7,8,_]]",
+      "steps": [
+        "state: 3x3 array of tiles + blank position; 9!/2 reachable states",
+        "goal test: state == [[1,2,3],[4,5,6],[7,8,0]]",
+        "successors: slide tile into blank; 2-4 moves per state",
+        "strategy: A* (need optimal); IDA* if memory constrained",
+        "heuristic: Manhattan distance (sum of tile distances to goal positions); admissible and consistent",
+        "pruning: don't undo previous move (slide back)",
+        "duplicate detection: hash table keyed by state tuple",
+        "run: expand ~2000 nodes; find 23-move optimal solution"
+      ],
+      "result": "optimal 23-move solution path; search expanded 2,143 nodes vs 181,440 for BFS"
+    }
+  }
+}

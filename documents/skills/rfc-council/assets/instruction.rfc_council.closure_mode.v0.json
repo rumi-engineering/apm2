@@ -18,8 +18,8 @@
     "stable_id": "dcp://apm2.local/instructions/rfc_council/closure_mode@v0"
   },
   "payload": {
-    "i": "FINALIZE mode flow (v2 -> v4 convergence).",
-    "pb": "Provide CAC-native closure steps to finalize RFC and pass all gates.",
+    "i": "RFC FINALIZE (v2 -> v4 + Mode 36 Assurance Case).",
+    "pb": "Finalize RFC and synthesize Confidence Certificate.",
     "t": {
       "sys": "APM2",
       "repo": "/home/ubuntu/Projects/apm2-rfc-consensus",
@@ -29,21 +29,22 @@
     },
     "ctx": [
       "documents/skills/rfc-council/references/closure-mode.md",
-      "documents/skills/rfc-council/references/REVIEW_RUBRIC.md"
+      "documents/skills/rfc-council/references/REVIEW_RUBRIC.md",
+      "documents/skills/modes-of-reasoning/artifacts/selector.json"
     ],
     "lex": {
-      "F1": "Load v2 context; verify open questions mostly answered.",
-      "F2": "Run council for v2->v4 (SA roles + random modes).",
-      "F3": "Forced convergence: answer or explicitly defer all remaining open questions; replace placeholders.",
-      "F4": "Execute all 9 gates from REVIEW_RUBRIC; BLOCKER findings block v4 transition.",
-      "F5": "Emit v4: set version v4 + status APPROVED; write governance summary; commit.",
-      "F6": "All gate results must be APPROVED or APPROVED_WITH_REMEDIATION for v4."
+      "F1": "Load v2 context; verify open questions resolved.",
+      "F2": "Run council for v2->v4 (SA roles + Anchored Stochastic Modes).",
+      "F3": "Forced convergence: answer or defer remaining questions; replace placeholders.",
+      "F4": "Assurance Case (Mode 36): Replace gate list with GSN-style Argument Tree; link every claim to evidence artifact.",
+      "F5": "Emit v4 bundle to `evidence/rfc/{RFC_ID}/reviews/rfc_review_{timestamp}.yaml`; set version v4 + status APPROVED; write governance summary.",
+      "F6": "Confidence Certification: All branches of Assurance Case must reach HIGH confidence."
     },
     "dir": [
       ["D1", 3, "@F1", ["inputs"], []],
       ["D2", 3, "@F2", ["council"], []],
       ["D3", 3, "@F3", ["convergence"], []],
-      ["D4", 3, "@F4", ["gates"], []],
+      ["D4", 3, "@F4", ["assurance", "dcp://apm2.agents/mor/mode/assurance-case@1"], []],
       ["D5", 3, "@F5", ["emit"], []],
       ["D6", 3, "@F6", ["verdict"], []]
     ],
@@ -59,9 +60,8 @@
     "r": {
       "depth": "M",
       "modes": [
-        47,
-        36,
-        79
+        "evidence_synthesis",
+        "assurance-case"
       ],
       "ob": [
         "A",

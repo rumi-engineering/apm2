@@ -1,0 +1,152 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/rhetorical@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 60,
+    "name": "rhetorical",
+    "cat": "argumentation",
+    "core": "Reasoning aimed at belief-change and coordinated action through audience-aware communication. Applies the classical triad: ethos (speaker credibility), pathos (emotional resonance), logos (logical structure). Key constraint: adoption-oriented but truth-anchored; persuasion must not compromise accuracy.",
+    "out": [
+      {"n": "persuasive_arguments", "d": "claims sequenced for audience acceptance; format: claim + warrant + evidence + call-to-action"},
+      {"n": "framing_document", "d": "explicit mapping of issue to audience values; format: value | connection | message angle"},
+      {"n": "appeal_balance_rationale", "d": "documented weighting of ethos/pathos/logos with justification for context"},
+      {"n": "objection_response_matrix", "d": "anticipated objections with pre-crafted responses; columns: objection | source | response | evidence"},
+      {"n": "communication_plan", "d": "channel, timing, messenger selection; includes feedback loops"}
+    ],
+    "proc": [
+      "1. profile audience: list stakeholders, their values (ranked), concerns, prior beliefs, trust level with speaker",
+      "2. truth-anchor: enumerate factual claims to be made; verify each independently before proceeding",
+      "3. select framing: choose 2-3 candidate frames; score each on (a) audience resonance, (b) accuracy preservation, (c) action clarity",
+      "4. calibrate appeal mix: if audience skeptical of speaker -> emphasize logos + third-party ethos; if audience analytically oriented -> lead with logos; if audience faces decision fatigue -> simplify to single clear ask with pathos hook",
+      "5. construct argument arc: opening hook (pathos or ethos) -> problem framing -> evidence (logos) -> vision (pathos) -> ask (logos)",
+      "6. objection mapping: list top 3 objections by likelihood; prepare response for each with evidence",
+      "7. integrity check: would you deliver this message if the audience had full context? if no, revise",
+      "8. channel-fit: match message length/complexity to medium (email < deck < whitepaper < conversation)"
+    ],
+    "quick_checklist": {
+      "pre_delivery": [
+        "all factual claims verified with citations",
+        "framing does not omit material counter-evidence",
+        "audience profile based on evidence, not assumption",
+        "ask is specific and actionable",
+        "fallback position prepared if primary ask rejected"
+      ],
+      "post_delivery": [
+        "collect audience feedback on perceived honesty",
+        "track whether commitments made during persuasion are kept",
+        "note which appeals landed vs fell flat for iteration"
+      ]
+    },
+    "check": [
+      "audience profile includes evidence sources (not just intuition)",
+      "every emotional appeal paired with factual grounding",
+      "framing passes reversal test: would opponent call it fair?",
+      "no claims that require hiding contrary evidence",
+      "message unchanged if delivered to hostile fact-checker",
+      "long-term relationship value exceeds short-term win value"
+    ],
+    "diff": {
+      "argumentation-theory": "rhetoric optimizes for adoption; argumentation optimizes for logical defensibility regardless of audience",
+      "theory-of-mind": "ToM builds mental model of audience; rhetoric applies that model to craft persuasive message",
+      "narrative": "narrative explains causally (what happened and why); rhetoric persuades (what to believe or do)",
+      "dialectical": "dialectic seeks synthesis through opposition; rhetoric seeks adoption of a position",
+      "negotiation": "negotiation trades value between parties; rhetoric changes beliefs without exchange",
+      "deductive": "deduction preserves truth through inference; rhetoric preserves truth while optimizing uptake"
+    },
+    "common_confusions": [
+      {
+        "pair": ["rhetorical", "dialectical"],
+        "confusion": "both involve argumentation, so seem similar",
+        "distinction": "dialectic progresses thesis->antithesis->synthesis seeking truth; rhetoric advocates for a position seeking adoption. Dialectic welcomes opposition; rhetoric anticipates and neutralizes it."
+      },
+      {
+        "pair": ["rhetorical", "narrative"],
+        "confusion": "both use storytelling",
+        "distinction": "narrative mode constructs causal explanations (postmortems, strategy rationales); rhetorical mode uses story elements instrumentally for persuasion. Narrative asks 'what happened?'; rhetoric asks 'how do I get them to act?'"
+      },
+      {
+        "pair": ["rhetorical", "negotiation"],
+        "confusion": "both aim to change outcomes with others",
+        "distinction": "negotiation involves mutual concession and value exchange; rhetoric is unilateral belief/action change. Negotiation requires something to trade; rhetoric requires only communication."
+      }
+    ],
+    "fail": {
+      "mode": "manipulative_persuasion",
+      "signals": [
+        "factual claims not independently verified before use",
+        "counter-evidence known but omitted from framing",
+        "emotional appeals disconnected from factual basis",
+        "audience modeled as marks rather than partners",
+        "message would change if audience had full context"
+      ],
+      "mitigations": [
+        {
+          "signal": "unverified claims",
+          "test": "can you cite source for each factual claim?",
+          "action": "add citation or mark as uncertain; do not present uncertain claims as fact"
+        },
+        {
+          "signal": "omitted counter-evidence",
+          "test": "list 3 strongest objections; is any based on evidence you're hiding?",
+          "action": "if yes, either address the evidence explicitly or revise the claim"
+        },
+        {
+          "signal": "ungrounded emotional appeal",
+          "test": "remove pathos from argument; does logos still support the ask?",
+          "action": "if logos alone is insufficient, strengthen evidence before adding pathos back"
+        },
+        {
+          "signal": "exploitative framing",
+          "test": "would you publish this framing in a transparency report?",
+          "action": "if no, reframe to pass the transparency test"
+        },
+        {
+          "signal": "context-dependent message",
+          "test": "would the message hold if delivered to a skeptical journalist?",
+          "action": "if no, revise until it passes adversarial review"
+        }
+      ]
+    },
+    "use": [
+      "change management: building buy-in for organizational shifts",
+      "stakeholder alignment: creating shared understanding across groups",
+      "executive communication: presenting recommendations to decision-makers",
+      "policy advocacy: influencing policy through structured argument",
+      "product positioning: framing offerings relative to alternatives",
+      "crisis communication: maintaining trust while delivering difficult news"
+    ],
+    "rel": [
+      {"id": 35, "n": "argumentation-theory", "r": "provides logical structure that rhetoric makes persuasive"},
+      {"id": 56, "n": "theory-of-mind", "r": "supplies audience model that rhetoric operationalizes"},
+      {"id": 62, "n": "narrative", "r": "provides causal stories that rhetoric employs for persuasion"},
+      {"id": 59, "n": "dialectical", "r": "opposition mode; use dialectic to refine position, then rhetoric to advocate"},
+      {"id": 57, "n": "negotiation", "r": "when belief-change insufficient, escalate to value exchange"}
+    ],
+    "ex": {
+      "sit": "Engineering team must convince leadership to invest in technical debt reduction. Leadership values speed and features.",
+      "steps": [
+        "1. audience profile: CFO (ROI-focused, skeptical of eng requests), CTO (understands debt, politically constrained), CEO (speed-obsessed, trusts metrics)",
+        "2. truth-anchor: verify claims - defect rate up 40% YoY, feature velocity down 25%, competitor shipped 2x features",
+        "3. framing candidates: (a) 'cleanup' - low resonance, sounds like housekeeping; (b) 'velocity tax' - moderate, implies ongoing cost; (c) 'competitive catch-up' - high resonance, connects to CEO priority",
+        "4. appeal mix: CEO is metrics-oriented -> lead with logos (velocity data), add pathos (competitive threat vision)",
+        "5. argument arc: hook (competitor momentum) -> problem (velocity declining) -> evidence (metrics) -> vision (Q3 parity) -> ask (6-week sprint)",
+        "6. objection matrix: 'delays roadmap' -> show roadmap acceleration post-investment; 'unproven ROI' -> cite prior debt sprint results",
+        "7. integrity check: message holds under full disclosure; not hiding positive competitor factors",
+        "8. channel: 30-min exec briefing with 5-slide deck; pre-wire CTO for support"
+      ],
+      "insight": "reframing technical debt as competitive velocity unlocked exec sponsorship by connecting engineering need to business priority"
+    },
+    "micro_ex": {
+      "sit": "Convince team to adopt code review checklist",
+      "appeal_mix": "ethos (senior engineer endorsement) + logos (defect data from pilot) + pathos (pride in quality)",
+      "message": "Our pilot cut review-found bugs by 30%. Senior devs already use it. Let's make quality our signature.",
+      "why_it_works": "combines credibility (senior endorsement), evidence (30% reduction), and identity appeal (quality as team identity)"
+    }
+  }
+}

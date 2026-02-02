@@ -1,0 +1,143 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/diagnostic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 41,
+    "name": "diagnostic",
+    "cat": "causal",
+    "core": "Infer hidden faults from observed symptoms using structured fault models. Requires: (1) known fault taxonomy or causal model, (2) observable symptoms mapped to candidate causes, (3) discriminating tests that differentiate hypotheses. Terminates with ranked causes + confidence bounds, not certainty.",
+    "out": [
+      {"n": "symptom_inventory", "d": "timestamped observations with severity; what is abnormal vs baseline"},
+      {"n": "hypothesis_list", "d": ">=3 candidate causes from fault model with prior probability estimates"},
+      {"n": "evidence_matrix", "d": "for each hypothesis: supporting evidence, refuting evidence, missing evidence"},
+      {"n": "test_plan", "d": "ordered discriminating tests ranked by information gain / cost"},
+      {"n": "diagnosis", "d": "top cause(s) with confidence level (low/medium/high) and explicit ruled-out alternatives"},
+      {"n": "escalation_trigger", "d": "conditions under which to escalate (time elapsed, confidence below threshold, severity increase)"}
+    ],
+    "proc": [
+      "SYMPTOM CAPTURE: list all anomalies with timestamps; note what is normal (baseline) vs abnormal; quantify severity (P1-P4 or numeric)",
+      "HYPOTHESIS GENERATION: enumerate >=3 causes from fault model; include (a) most common cause, (b) most severe cause, (c) recently-changed component",
+      "PRIOR ASSIGNMENT: estimate P(cause) from base rates (historical incident data, known failure frequencies); if no data, use uniform",
+      "EVIDENCE MAPPING: for each hypothesis, list observations that support (+), refute (-), or are neutral; flag missing evidence",
+      "TEST SELECTION: choose test that maximally discriminates top 2 hypotheses; prefer fast/cheap/safe tests; use VoI if costs differ significantly",
+      "BELIEF UPDATE: after each test, update hypothesis probabilities; if leading hypothesis P>0.8 and runner-up P<0.1, consider converging",
+      "CONVERGENCE GATE: declare diagnosis when (a) one hypothesis dominates (P>0.8), (b) >=1 discriminating test confirms, (c) no contradicting evidence unexplained",
+      "ESCALATE: if no hypothesis reaches P>0.5 after 3 tests, or time budget exceeded, or severity increases, escalate with current state"
+    ],
+    "check": [
+      ">=3 hypotheses generated before any deep investigation",
+      "each hypothesis has explicit +/- evidence columns filled",
+      "at least one discriminating test run before declaring root cause",
+      "confidence level stated with numeric threshold rationale (e.g., P>0.8)",
+      "ruled-out alternatives documented with specific refuting evidence",
+      "escalation criteria defined before starting (time, confidence, severity)",
+      "diagnosis labeled 'probable cause' not 'confirmed' unless intervention validates"
+    ],
+    "diff": {
+      "abductive-13": "diagnostic: structured fault model with known failure modes; abductive: novel problems requiring hypothesis invention. Use diagnostic when fault taxonomy exists (e.g., network errors, OOM, deadlock); use abductive for unprecedented anomalies",
+      "mechanistic-40": "diagnostic: consumes mechanistic models to localize faults; mechanistic: builds/explains the model itself. Diagnostic asks 'which component failed?'; mechanistic asks 'how does this component work?'",
+      "value-of-information-52": "VoI: decides whether to gather more info vs act now; diagnostic: uses that guidance to select tests. Invoke VoI when test costs vary significantly or time pressure forces choice",
+      "counterfactual-39": "diagnostic: identifies what actually caused the symptom; counterfactual: asks what would have happened otherwise. Use counterfactual in postmortem after diagnostic identifies cause",
+      "clinical-operational-troubleshooting-74": "clinical/ops: time-critical hybrid blending pattern-matching + intervention under pressure; diagnostic: methodical fault-tree traversal when time permits. Use clinical when 'stop the bleeding' matters; diagnostic when accuracy matters more than speed"
+    },
+    "confusions": [
+      {
+        "trap": "using diagnostic when abductive is needed",
+        "symptom": "no fault model exists; inventing causes ad-hoc rather than drawing from known taxonomy",
+        "correction": "if failure mode is unprecedented (no historical pattern, no fault tree), switch to abductive to generate hypothesis set first, then return to diagnostic to test them"
+      },
+      {
+        "trap": "conflating diagnostic with clinical-operational-troubleshooting",
+        "symptom": "rushing to intervention before systematic hypothesis testing; 'trying things' instead of discriminating tests",
+        "correction": "clinical mode allows parallel fix+diagnose under time pressure; pure diagnostic requires hypothesis testing before action. Choose based on severity and reversibility of interventions"
+      },
+      {
+        "trap": "skipping mechanistic understanding",
+        "symptom": "correlating symptoms to causes without understanding why; pattern-matching without mechanism",
+        "correction": "if you cannot explain why a cause produces the symptom, invoke mechanistic mode to validate the causal chain before declaring diagnosis"
+      }
+    ],
+    "fail": {
+      "mode": "premature closure",
+      "desc": "Locking onto first plausible cause; ignoring disconfirming evidence; skipping differential diagnosis",
+      "signals": [
+        "only one hypothesis considered",
+        "contradicting evidence dismissed without explanation",
+        "no discriminating test run; diagnosis based on pattern-match alone",
+        "confidence stated without evidence ratio",
+        "ruled-out alternatives not documented"
+      ],
+      "mitigations": [
+        {"m": "force >=3 hypotheses before investigation", "test": "hypothesis_list.length >= 3"},
+        {"m": "require evidence matrix with +/- columns for each hypothesis", "test": "all hypotheses have non-empty supporting and refuting fields"},
+        {"m": "run at least one discriminating test before declaring cause", "test": "test_results.length >= 1 before diagnosis finalized"},
+        {"m": "state confidence with numeric threshold", "test": "diagnosis includes P>X statement"},
+        {"m": "document ruled-out alternatives with specific refuting evidence", "test": "ruled_out list non-empty with evidence per entry"},
+        {"m": "set time-box with mandatory escalation", "test": "escalation_trigger defined with time or iteration limit"},
+        {"m": "ask 'what evidence would change my mind?' for leading hypothesis", "test": "revision_triggers field populated"}
+      ]
+    },
+    "use": [
+      "incident response: identify root cause of production outages",
+      "technical troubleshooting: debug software/hardware failures with known failure modes",
+      "quality defect analysis: trace manufacturing or process defects to source",
+      "medical diagnosis: differential diagnosis from symptoms (when fault model = disease taxonomy)",
+      "customer support escalation: triage issues to appropriate team based on symptom-cause mapping"
+    ],
+    "rel": [
+      {"id": 13, "n": "abductive", "r": "generates hypotheses for novel problems; use before diagnostic if no fault model"},
+      {"id": 40, "n": "mechanistic", "r": "explains how components work; use to validate causal chain"},
+      {"id": 52, "n": "value-of-information", "r": "prioritizes tests by decision impact; use when test costs vary"},
+      {"id": 74, "n": "clinical-operational-troubleshooting", "r": "time-critical hybrid; use when speed > accuracy"},
+      {"id": 39, "n": "counterfactual", "r": "postmortem analysis; use after diagnostic to understand prevention"}
+    ],
+    "ex": {
+      "task": "API latency spike in production",
+      "symptom_inventory": [
+        "P99 latency 5x normal (500ms -> 2500ms) starting 14:30",
+        "error rate stable (0.1%)",
+        "CPU utilization normal (40%)",
+        "memory utilization normal (60%)",
+        "recent deploy: schema migration at 14:00"
+      ],
+      "hypotheses": [
+        {"cause": "database slow queries", "prior": "0.4 (common cause, recent migration)"},
+        {"cause": "network congestion", "prior": "0.2 (baseline rate)"},
+        {"cause": "upstream dependency degraded", "prior": "0.2 (baseline rate)"},
+        {"cause": "GC pauses", "prior": "0.1 (memory normal argues against)"},
+        {"cause": "connection pool exhaustion", "prior": "0.1 (error rate stable argues against)"}
+      ],
+      "evidence_matrix": {
+        "db_slow_queries": {"+": "recent migration, latency pattern", "-": "none yet", "missing": "slow query log"},
+        "network": {"+": "none", "-": "traces show DB wait not network", "missing": "none"},
+        "gc_pauses": {"+": "none", "-": "no pause spikes in metrics", "missing": "none"}
+      },
+      "test_plan": ["1. check DB slow query log (fast, high info)", "2. trace sample requests (medium)", "3. review dependency dashboards (fast)"],
+      "test_results": "DB slow query log shows 3s queries on user_accounts table; execution plan shows full table scan",
+      "diagnosis": "Missing index on user_accounts table causing full table scans (P=0.9). Ruled out: network (traces show DB wait), GC (no pause spikes), connection pool (error rate stable).",
+      "validation": "Added index; latency returned to baseline within 5 minutes"
+    },
+    "micro_ex": {
+      "sit": "Build failing intermittently on CI; passes locally",
+      "symptoms": "fails 30% of runs; timeout on integration tests; no code changes in 2 days",
+      "hyp": ["flaky test (race condition)", "CI resource contention", "external service instability"],
+      "test": "check CI resource metrics during failures vs successes",
+      "result": "failures correlate with parallel job count > 8; CPU throttling visible",
+      "diag": "CI resource contention (P=0.85); reduce parallelism or increase resources"
+    },
+    "quick_check": [
+      "Did I list >=3 hypotheses from a fault model before investigating?",
+      "Does each hypothesis have explicit supporting and refuting evidence?",
+      "Did I run at least one discriminating test before declaring the cause?",
+      "Is my confidence stated with a numeric threshold (e.g., P>0.8)?",
+      "Did I document what I ruled out and why?",
+      "Do I have escalation criteria defined?"
+    ]
+  }
+}

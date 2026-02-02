@@ -11,22 +11,13 @@ decision_tree:
 
 ## Overview
 
-The COUNCIL protocol is a multi-agent deliberation process designed to prevent "cognitive entropy collapse" (premature convergence on suboptimal designs). It achieves this by:
+The COUNCIL protocol is a multi-agent deliberation process for RFC ticket validation.
 
-1. **Lifecycle-Adaptive Subagents**: Spawns 3 subagents with specialized roles that shift focus based on RFC version (v0/v2/v4).
-2. **Maximum Entropy Reasoning**: Each subagent selects **5 strictly random reasoning modes** from `modes-of-reasoning/SKILL.md`. By removing fixed "specialized" modes, the council is forced to synthesize new perspectives for every session, preventing model-mode entrenchment.
-3. **Agent-Native Principles**: Subagents apply Stochastic Cognition and Tool-Loop patterns to their analysis, treating all assessments as probabilistic.
-4. **Structured Deliberation**: 3 review cycles with inter-cycle onboarding notes enable progressive refinement.
+1. **Lifecycle-Adaptive Subagents**: 3 subagents with roles focused on RFC version (v0/v2/v4).
+2. **Anchored Stochastic Reasoning**: Each subagent uses **2 fixed Anchor Modes** and selects **3 strictly random modes** from `modes-of-reasoning/artifacts/selector.json`.
+3. **Agent-Native Principles**: Assess via Stochastic Cognition and Tool-Loop patterns.
+4. **Structured Deliberation**: 3 review cycles with inter-cycle convergence triggers.
 5. **Quorum Consensus**: Findings converge through 2/3 voting (2 of 3 agents must agree).
-
-### Why Maximum Entropy?
-
-Traditional council designs assign fixed reasoning specializations to each agent (e.g., "SA-1 always uses deductive reasoning"). This creates predictable blind spots and model-mode entrenchment. Maximum entropy selection forces:
-
-- **Perspective diversity**: Same agent applies different lenses each session
-- **Cross-pollination**: Structural rigorists must sometimes think heuristically
-- **Emergent insights**: Random mode combinations reveal unexpected connections
-- **Anti-confirmation bias**: Harder to find only what you're looking for
 
 ---
 
@@ -52,47 +43,32 @@ Spawn 3 subagents. Their specific focus shifts based on the RFC version:
 | SA-2  | Risk identification, knowledge gaps | Mock implementation runs | Execution efficiency & atomicity |
 | SA-3  | Trust boundary discovery | Extension point security | Final security assurance (CAE Tree) |
 
-### Step 3: Stochastic Mode Selection
+### Step 3: Anchored Stochastic Mode Selection
 
-Each subagent selects **5 strictly random modes** from `documents/skills/modes-of-reasoning/SKILL.md`.
+Each subagent uses **2 fixed Anchor Modes** based on their lifecycle role and selects **3 strictly random modes** from `documents/skills/modes-of-reasoning/artifacts/selector.json`.
+
+**Role-Based Anchors:**
+- **SA-1 (Rigorist):** [70] Engineering Design, [44] Means-End Instrumental.
+- **SA-2 (Feasibility):** [40] Mechanistic, [51] Satisficing.
+- **SA-3 (Guardian):** [79] Adversarial Red-Team, [36] Assurance-Case.
 
 **Selection Algorithm:**
 ```python
 import random
 
-def select_random_modes(agent_id: str, session_seed: int) -> list[int]:
+def select_council_modes(agent_id: str, anchors: list[int], session_seed: int) -> list[int]:
     """
-    Select 5 strictly random reasoning modes for a subagent.
-
-    Uses session seed + agent_id for reproducibility (same session = same modes).
-    Ensures distribution across multiple categories.
+    Select 2 fixed anchors + 3 strictly random reasoning modes.
     """
     random.seed(f"{session_seed}-{agent_id}")
-
-    # All 80 modes from modes-of-reasoning
-    all_modes = list(range(1, 81))
-
-    # Select 5 without replacement
-    selected = random.sample(all_modes, 5)
-
-    return sorted(selected)
+    all_modes = [m for m in range(1, 82) if m not in anchors]
+    random_slots = random.sample(all_modes, 3)
+    return sorted(anchors + random_slots)
 ```
 
-**Constraint:** Subagents must explain how their 5 random modes interact to challenge their primary lifecycle focus. For example, SA-1 (Structural Rigorist) might be forced to use Mode 53 (Heuristic) or Mode 62 (Narrative), "disturbing" their usual deductive patterns.
+**Constraint:** Subagents must explain how their 3 random modes "disturb" or "amplify" their 2 anchor modes. For example, SA-1 might be forced to use Mode 62 (Narrative) to explain an Engineering Design (70) choice.
 
-**Category Distribution Check:** After selection, verify at least 2 different categories are represented:
-- Formal (1-8)
-- Ampliative (9-19)
-- Uncertainty (20-24)
-- Vagueness (25-29)
-- Inconsistency & Defaults (30-36)
-- Causal & Explanatory (37-43)
-- Practical (44-54)
-- Strategic & Social (55-58)
-- Dialectical & Rhetorical (59-63)
-- Modal & Temporal (64-67)
-- Domain-Specific (68-74)
-- Meta-Level (75-80)
+**Category Distribution Check:** After selection, verify at least 3 different categories are represented across the 5 modes.
 
 Despite the randomness of the reasoning *lens*, subagents must still produce their assigned artifacts by applying their random modes to the task:
 

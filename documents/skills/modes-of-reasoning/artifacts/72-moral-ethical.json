@@ -1,0 +1,110 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/moral-ethical@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 72,
+    "name": "moral-ethical",
+    "cat": "domain",
+    "core": "Reason about right/wrong and value tradeoffs using ethical frameworks (consequentialist, deontological, virtue, contractualist, care ethics); evaluate normative claims that cannot be reduced to facts alone. Key distinction: ethics asks 'what ought to be' independent of what is desired, legal, or optimal.",
+    "out": [
+      {"type": "value_constraints", "form": "bounded permissible actions with framework citation", "test": "each constraint names framework (e.g., 'deontological: autonomy requires...') and derives from principle not preference"},
+      {"type": "ethical_justification", "form": "premise → principle → conclusion chain", "test": "can identify: (1) factual premises, (2) normative principle invoked, (3) how conclusion follows"},
+      {"type": "tradeoff_statement", "form": "value A vs value B with resolution rationale", "test": "both values named explicitly, weights justified by principle not intuition, losers acknowledged"},
+      {"type": "normative_principles", "form": "ought-statements with scope and exceptions", "test": "scope bounded ('applies when X'), exceptions enumerated ('except if Y'), principle not derived from is-facts alone"},
+      {"type": "stakeholder_impact_map", "form": "affected parties × values × harm/benefit", "test": "no stakeholder omitted for convenience, vulnerable parties explicitly identified"}
+    ],
+    "proc": [
+      "1. MAP STAKEHOLDERS: list all affected parties including non-obvious (future persons, non-humans, indirect effects); flag power asymmetries",
+      "2. INVENTORY VALUES: enumerate values at stake per stakeholder (autonomy, welfare, dignity, fairness, care, virtue); no 'general good' abstractions",
+      "3. SELECT FRAMEWORK(S): choose lens(es)—consequentialist (outcomes), deontological (duties/rights), virtue (character), contractualist (reasonable agreement), care (relationships); state why chosen",
+      "4. APPLY FRAMEWORK: derive ought-claims from framework; if multiple frameworks, run each independently before synthesis",
+      "5. SURFACE TENSIONS: identify where frameworks conflict or values trade off; make tradeoffs explicit not implicit",
+      "6. RESOLVE WITH CONSTRAINTS: justify resolution citing principled constraints; if constraint is 'minimize harm', specify to whom and measured how",
+      "7. VALIDATE: check for values laundering, hidden preferences, omitted stakeholders; invert conclusion and test if reasoning still holds"
+    ],
+    "check": [
+      "is/ought separation: no normative conclusion derived purely from descriptive facts",
+      "framework explicit: ethical framework named, not just 'ethics requires'",
+      "stakeholder coverage: affected parties enumerated, not 'users' or 'people' generically",
+      "tradeoff visibility: value tensions surfaced before resolution, not hidden in framing",
+      "principled constraints: justification traces to ethical principle, not 'we decided' or 'stakeholders prefer'",
+      "values laundering test: could someone with opposite preferences reach same conclusion using same reasoning?",
+      "vulnerable party check: those with least power explicitly considered, not aggregated away"
+    ],
+    "quick_checklist": [
+      "[ ] Can I name the ethical framework(s) used?",
+      "[ ] Did I list stakeholders beyond the obvious requester?",
+      "[ ] Are tradeoffs explicit or buried in framing?",
+      "[ ] Would this reasoning survive if I wanted the opposite outcome?",
+      "[ ] Did I distinguish 'is legal/desired/optimal' from 'is right'?"
+    ],
+    "diff": {
+      "deontic": "deontic derives conclusions from given norms using formal logic (if norm N, then obligation O); moral-ethical evaluates which norms should exist and why—deontic is downstream of moral-ethical",
+      "legal": "legal applies institutional norms as given (statute says X); moral-ethical asks whether X is just—use legal for compliance, moral-ethical for policy critique or novel situations without precedent",
+      "reflective-equilibrium": "reflective equilibrium is a coherence method (adjust principles and judgments until consistent); moral-ethical is the broader evaluative enterprise that may use reflective equilibrium as one tool",
+      "decision-theoretic": "decision-theoretic optimizes expected value given preferences; moral-ethical evaluates whether those preferences are ethically permissible—decision theory takes values as input, ethics interrogates them",
+      "argumentation-theory": "argumentation structures claims/rebuttals formally; moral-ethical provides the normative content—argumentation is the vehicle, ethics is the cargo",
+      "game-theoretic": "game theory models strategic interaction given payoffs; moral-ethical asks if those payoffs reflect morally relevant values—game theory is descriptive/predictive, ethics is normative/prescriptive"
+    },
+    "common_confusions": [
+      {"confusion": "Using decision-theoretic optimization as ethical reasoning", "symptom": "Conclusion is 'maximizes stakeholder value' without asking if that value distribution is just", "fix": "Ask: 'Is maximizing this value the right thing to do?' before optimizing"},
+      {"confusion": "Treating legal compliance as ethical sufficiency", "symptom": "'It's legal therefore it's ethical' or 'policy permits it'", "fix": "Legal sets floor not ceiling; ask 'should this be legal?' and 'what would a just policy require?'"},
+      {"confusion": "Values laundering via stakeholder aggregation", "symptom": "'Most stakeholders benefit' hides harm concentration on vulnerable minority", "fix": "Disaggregate impacts; check if Rawlsian 'worst-off party' test passes"}
+    ],
+    "fail": {
+      "mode": "values laundering: dressing preferences as ethics without principled constraints",
+      "signals": [
+        "ethical claim derived from goal-alignment without independent normative justification",
+        "framework named but not actually applied (decoration ethics)",
+        "tradeoffs resolved by fiat ('we balanced...') without stating weights or principles",
+        "stakeholder analysis omits parties whose inclusion would complicate preferred conclusion",
+        "conclusion matches pre-existing preference suspiciously well across all frameworks"
+      ],
+      "mit": [
+        "FRAMEWORK REQUIREMENT: name specific ethical framework and show derivation chain; reject 'ethics requires X' without framework",
+        "ADVERSARIAL TEST: articulate strongest ethical argument for opposite conclusion; if none exists, scrutinize harder",
+        "STAKEHOLDER AUDIT: list stakeholders before knowing conclusion; add anyone whose omission would be convenient",
+        "MULTI-FRAMEWORK CHECK: apply ≥2 frameworks independently; if all agree, check for hidden shared assumption",
+        "PREFERENCE INVERSION: state analyst's prior preference; if conclusion matches, require extra justification",
+        "VULNERABLE PARTY VETO: identify least-powerful affected party; ensure their interests are not merely 'weighed' but given principled protection"
+      ]
+    },
+    "use": [
+      "AI governance: model capability restrictions, deployment boundaries",
+      "product harm assessment: feature impact on vulnerable users",
+      "trust and safety policy: content moderation principles",
+      "people policy: hiring, compensation, termination ethics",
+      "organizational values: mission alignment, culture decisions",
+      "research ethics: experiment design, publication decisions"
+    ],
+    "rel": [
+      {"id": 65, "name": "deontic", "why": "formal normative logic; use when norms are settled, derive obligations"},
+      {"id": 71, "name": "legal", "why": "institutional norms; use for compliance, combine with ethical for policy design"},
+      {"id": 77, "name": "reflective-equilibrium", "why": "coherence method; use to resolve tensions between principles and intuitions"},
+      {"id": 45, "name": "decision-theoretic", "why": "value optimization; ethical mode validates which values to optimize"},
+      {"id": 35, "name": "argumentation-theory", "why": "structured reasoning; ethical mode provides normative content for arguments"}
+    ],
+    "ex": {
+      "ctx": "Product feature may increase engagement but risks addictive patterns in vulnerable users",
+      "analysis": "Consequentialist: weigh user welfare against business value—net harm if addiction outweighs engagement benefit. Deontological: respect for autonomy requires informed consent and ability to disengage; manipulation violates this regardless of outcome. Care ethics: duty to vulnerable populations (minors, addiction-prone) supersedes aggregate benefit. Virtue: what would a trustworthy company do? Resolution: implement with safeguards (time limits, transparency, opt-out) as principled constraint derived from autonomy and care, not engagement maximization. Tradeoff made explicit: accepting lower engagement to honor duty of care."
+    },
+    "micro_example": {
+      "bad": {
+        "label": "Values laundering",
+        "reasoning": "'Stakeholders prefer feature X. Feature X increases engagement. Therefore, launching X is ethical.'",
+        "flaw": "Preferences treated as ethical justification; no framework; 'stakeholders' undefined; engagement conflated with welfare"
+      },
+      "good": {
+        "label": "Principled ethical reasoning",
+        "reasoning": "'Feature X increases engagement but may reduce user autonomy (deontological concern). Affected parties: active users (benefit), vulnerable users (harm risk), non-users (neutral). Applying care ethics: duty to vulnerable population requires safeguards. Applying autonomy principle: informed consent needed. Resolution: launch with usage transparency, time-limit options, and parental controls. Tradeoff: lower engagement ceiling accepted to honor autonomy and care duties.'",
+        "strength": "Framework explicit, stakeholders enumerated, tradeoff visible, constraint principled"
+      }
+    }
+  }
+}

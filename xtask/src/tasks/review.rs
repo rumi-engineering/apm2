@@ -560,4 +560,27 @@ mod tests {
         assert_eq!(ReviewType::Quality.ai_tool(), Some("gemini"));
         assert_eq!(ReviewType::Uat.ai_tool(), None);
     }
+
+    #[test]
+    fn test_prompts_contain_placeholders() {
+        let repo_root = std::env::var("CARGO_MANIFEST_DIR")
+            .map(|p| std::path::Path::new(&p).parent().unwrap().to_path_buf())
+            .unwrap();
+
+        for review_type in [ReviewType::Security, ReviewType::Quality] {
+            let prompt_path = review_type.prompt_path().unwrap();
+            let full_path = repo_root.join(prompt_path);
+            let content = std::fs::read_to_string(&full_path)
+                .unwrap_or_else(|_| panic!("Failed to read prompt: {prompt_path}"));
+
+            assert!(
+                content.contains("$PR_URL"),
+                "Prompt {prompt_path} missing $PR_URL placeholder"
+            );
+            assert!(
+                content.contains("$HEAD_SHA"),
+                "Prompt {prompt_path} missing $HEAD_SHA placeholder"
+            );
+        }
+    }
 }

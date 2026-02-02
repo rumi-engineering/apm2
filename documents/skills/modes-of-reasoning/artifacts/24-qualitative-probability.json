@@ -1,0 +1,185 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/qualitative-probability@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 24,
+    "name": "qualitative-probability",
+    "cat": "probabilistic",
+    "core": "Replace numeric probabilities with ordinal 'degree of disbelief' ranks (Spohn-style ranking functions). Update beliefs by shifting ranks rather than computing precise probabilities. Useful when only ordering of plausibility is defensible, not magnitudes.",
+    "when_to_use": [
+      "No reliable base rates or frequency data exist",
+      "Experts can rank but not quantify relative likelihood",
+      "Early triage: identify leading hypotheses before full analysis",
+      "Comparison suffices: need 'A more plausible than B', not 'P(A)=0.7'",
+      "Numeric probabilities would imply false precision"
+    ],
+    "when_not_to_use": [
+      "Decision requires distinguishing P=0.01 from P=0.10 (use Bayesian)",
+      "Regulatory thresholds exist (e.g., 95% confidence required)",
+      "Expected value calculations needed (use Bayesian + decision-theoretic)",
+      "Combining evidence across domains with different scales (use intervals)",
+      "Stakes high enough to justify eliciting numeric priors"
+    ],
+    "out": [
+      {"n": "plausibility_ranking", "d": "ordered list of hypotheses from most to least plausible with rank values"},
+      {"n": "rank_assignments", "d": "ordinal disbelief ranks: 0=fully believed, higher=less plausible"},
+      {"n": "belief_dynamics_log", "d": "evidence items and their rank-shift effects"},
+      {"n": "comparative_judgments", "d": "'A more plausible than B by k ranks' statements"},
+      {"n": "magnitude_flags", "d": "notes where ordinal ranking may lose decision-relevant info"}
+    ],
+    "proc": [
+      "ENTRY: confirm numeric probabilities unjustified or unavailable; if P(H) estimable, consider Bayesian",
+      "ENUMERATE hypotheses: list mutually exclusive candidates (or note overlap)",
+      "ASSIGN initial ranks: 0=fully believed, 1+=degrees of disbelief; justify each assignment",
+      "VALIDATE scale: ensure rank 0 assigned to something (or explain universal skepticism)",
+      "FOR each evidence item: (a) state direction of impact, (b) identify affected hypotheses",
+      "CONDITIONALIZE: set observed evidence to rank 0; shift others proportionally by impact strength",
+      "CHECK consistency: no proposition and its negation both rank 0",
+      "DERIVE ordering: sort hypotheses by final rank; ties are meaningful (equal plausibility)",
+      "FLAG magnitude needs: note if 'slightly more plausible' vs 'vastly more plausible' matters for decision",
+      "OUTPUT: ranked list + comparative statements + magnitude flags"
+    ],
+    "quick_checklist": {
+      "before": [
+        "Numeric probabilities truly unavailable/unjustified?",
+        "Hypotheses mutually exclusive or overlap documented?",
+        "Initial rank assignments have explicit rationale?"
+      ],
+      "during": [
+        "Each evidence shift has stated direction and magnitude category (small/medium/large)?",
+        "Rank 0 is assigned to at least one proposition (or global skepticism documented)?",
+        "No contradiction: ~H and H cannot both be rank 0?"
+      ],
+      "after": [
+        "Ordering answers the decision question?",
+        "Magnitude-sensitive decisions flagged for escalation?",
+        "Lost precision explicitly documented?"
+      ]
+    },
+    "check": [
+      "Ranks interpreted ordinally: rank 2 is not 'twice as disbelieved' as rank 1",
+      "Every rank assignment justified by evidence or background knowledge",
+      "Rank updates follow conditionalization: observed evidence becomes rank 0",
+      "No false precision: 'more plausible' not 'P=0.73'",
+      "Magnitude gaps noted: distinguish 'slightly ahead' from 'vastly ahead' when decision-relevant",
+      "Comparative statements cite rank differences: 'A is 2 ranks more plausible than B'"
+    ],
+    "common_confusions": [
+      {
+        "vs": "bayesian-probabilistic",
+        "confusion": "Treating ranks like probability ratios or multiplying ranks",
+        "distinction": "Ranks are ordinal only; Bayesian uses numeric P(H|E) via Bayes' rule. Ranks shift additively (rank +=2), not multiplicatively (P *= 0.5)",
+        "when_switch": "Switch to Bayesian when base rates exist, expected value needed, or stakes justify numeric elicitation"
+      },
+      {
+        "vs": "imprecise-probability",
+        "confusion": "Using ranks when intervals would capture uncertainty better",
+        "distinction": "Ranks give ordering without magnitude; intervals give bounds on magnitude. If you need 'P is between 0.1 and 0.3', use intervals not ranks",
+        "when_switch": "Switch to imprecise-probability when bounds on probability are estimable even if point estimates aren't"
+      },
+      {
+        "vs": "belief-revision",
+        "confusion": "Confusing rank entrenchment with AGM entrenchment ordering",
+        "distinction": "Qualitative probability: ranks express plausibility of hypotheses. Belief revision: entrenchment ranks beliefs for retention under conflict. Different purposes: hypothesis comparison vs consistency maintenance",
+        "when_switch": "Switch to belief-revision when the problem is resolving contradictions in accepted beliefs, not ranking hypotheses"
+      },
+      {
+        "vs": "default-typicality",
+        "confusion": "Using ranks where categorical defaults suffice",
+        "distinction": "Defaults: 'typically X unless exception'; ranks: 'X is 2 ranks more plausible than Y'. Defaults are binary (applies/blocked); ranks are graded",
+        "when_switch": "Use defaults when you have 'normally/typically' rules and just need to check exceptions; use ranks when you need to compare plausibility of multiple hypotheses"
+      }
+    ],
+    "diff": {
+      "bayesian": "ordinal ranks vs numeric P(H|E); additive shifts vs multiplicative Bayes' rule; no expected value calculation",
+      "default-typicality": "graded ranks (0,1,2,3...) vs binary applies/blocked; continuous plausibility vs categorical default",
+      "imprecise-probability": "pure ordering vs interval-valued [P_low, P_high]; no magnitude bounds vs explicit bounds",
+      "belief-revision": "ranks for hypothesis plausibility vs entrenchment for belief retention; comparison vs consistency"
+    },
+    "fail": {
+      "mode": "magnitude_loss",
+      "desc": "Ordinal ranking loses magnitude information that may be decision-critical",
+      "signals": [
+        "Decision requires distinguishing P=0.01 vs P=0.10 (10x difference matters)",
+        "Combining evidence from different domains needs numeric weighting",
+        "Rank differences treated as meaningful magnitudes ('rank 4 is twice as unlikely as rank 2')",
+        "Critical thresholds exist (e.g., regulatory 95% cutoff, safety margin)",
+        "Expected value calculation needed: EV = sum(P_i * V_i)"
+      ],
+      "mitigations": [
+        {
+          "name": "magnitude_flag_protocol",
+          "test": "For each rank gap >= 2, document: 'Is this gap decision-relevant?' If yes, flag for escalation",
+          "action": "Add magnitude_flags output listing decisions sensitive to gap size"
+        },
+        {
+          "name": "escalation_threshold",
+          "test": "Before finalizing: 'Would different gap sizes change the recommended action?' If yes, escalate",
+          "action": "Escalate to Bayesian with elicited priors or imprecise-probability with bounds"
+        },
+        {
+          "name": "precision_loss_ledger",
+          "test": "Create explicit log: 'Information lost by using ranks: [list]'",
+          "action": "Review ledger before decision; if any item affects choice, switch modes"
+        },
+        {
+          "name": "qualitative_magnitude_markers",
+          "test": "Annotate gaps as 'small' (1 rank), 'medium' (2-3), 'large' (4+)",
+          "action": "Use markers in comparative statements: 'A is LARGELY more plausible than B'"
+        },
+        {
+          "name": "threshold_scan",
+          "test": "Ask: 'Are there numeric thresholds (regulatory, contractual, safety)?' If yes, ranks insufficient",
+          "action": "Document threshold requirement; switch to mode with numeric output"
+        }
+      ]
+    },
+    "use": [
+      "Early-stage hypothesis ranking before data collection",
+      "Domains lacking base rates: novel situations, unique events",
+      "Expert elicitation when ranking is easier than quantification",
+      "Qualitative risk comparison: 'threat A > threat B > threat C'",
+      "Preliminary triage: which hypotheses merit full Bayesian analysis",
+      "Communication: ranks often clearer than probabilities to non-statisticians"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "upgrade path: use when numeric probabilities justified"},
+      {"id": 31, "n": "default-typicality", "r": "alternative: use for binary typical/atypical when grading unnecessary"},
+      {"id": 21, "n": "imprecise-probability", "r": "upgrade path: use when magnitude bounds estimable"},
+      {"id": 33, "n": "belief-revision", "r": "different purpose: use for consistency restoration, not hypothesis comparison"},
+      {"id": 52, "n": "value-of-information", "r": "companion: assess whether getting numeric probabilities is worth the cost"}
+    ],
+    "ex": {
+      "sit": "Three competing explanations for system failure: hardware fault, software bug, user error. No failure rate data available.",
+      "steps": [
+        "ENTRY: no base rates → qualitative probability appropriate",
+        "hypotheses: H1=hardware, H2=software, H3=user (mutually exclusive)",
+        "initial ranks: H1=2, H2=1, H3=1 (software/user more common historically)",
+        "evidence E1: logs show no user activity before failure",
+        "update: H3 rank shifts +2 → H3=3 (large shift: directly contradicts hypothesis)",
+        "evidence E2: hardware diagnostics pass",
+        "update: H1 rank shifts +1 → H1=3 (medium shift: indirect evidence)",
+        "CHECK: rank 0 not assigned → implies residual uncertainty on all; acceptable",
+        "DERIVE ordering: H2=1 < H1=3 = H3=3 (software most plausible)",
+        "FLAG: 'Are rank gaps decision-relevant?' Gap of 2 between H2 and others; if action is 'investigate one first', ordering suffices"
+      ],
+      "insight": "Reached actionable conclusion (investigate software first) without needing P(bug)=0.73. Magnitude flag confirmed ordering sufficient for triage decision."
+    },
+    "micro_ex": {
+      "sit": "Two job candidates, no quantifiable metrics.",
+      "steps": [
+        "A: strong references (rank 1), B: weak references (rank 3)",
+        "evidence: B aces technical test",
+        "update: B rank -2 → B=1 (now tied with A)",
+        "flag: tie means need tiebreaker; ranks alone insufficient"
+      ],
+      "insight": "Ranks surfaced tie condition, prompting further evaluation rather than false precision."
+    }
+  }
+}

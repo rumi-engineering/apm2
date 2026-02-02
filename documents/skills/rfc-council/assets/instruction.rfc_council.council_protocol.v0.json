@@ -18,8 +18,8 @@
     "stable_id": "dcp://apm2.local/instructions/rfc_council/council_protocol@v0"
   },
   "payload": {
-    "i": "Council protocol (multi-agent deliberation, cycles, quorum, outputs).",
-    "pb": "Define CAC-native council orchestration for rigorous ticket review.",
+    "i": "COUNCIL Protocol (Deliberation, Quorum, Output).",
+    "pb": "Orchestrate multi-agent council for ticket review.",
     "t": {
       "sys": "APM2",
       "repo": "/home/ubuntu/Projects/apm2-rfc-consensus",
@@ -29,26 +29,29 @@
     },
     "ctx": [
       "documents/skills/rfc-council/references/COUNCIL_PROTOCOL.md",
-      "documents/skills/modes-of-reasoning/SKILL.md"
+      "documents/skills/modes-of-reasoning/SKILL.md",
+      "documents/skills/modes-of-reasoning/artifacts/selector.json"
     ],
     "lex": {
-      "C1": "Spawn 3 subagents with lifecycle-aware roles (v0/v2/v4 focus).",
-      "C2": "Each subagent selects 5 random reasoning modes; validate category coverage + overlap bounds.",
-      "C3": "Cycle 1: structural gates; Cycle 2: feasibility gates; Cycle 3: quorum resolve.",
-      "C4": "Quorum: 2/3 vote resolves contested findings; deadlock => NEEDS_ADJUDICATION.",
-      "C5": "Council outputs evidence bundle with council_metadata and gate results.",
-      "C6": "Budget/episode/stall abort => ABORTED with partial findings; subagent failure => adjust quorum."
+      "C1": "Spawn 3 subagents with Anchor Roles: SA-1 (Rigorist: 70+44), SA-2 (Feasibility: 40+51), SA-3 (Guardian: 79+36).",
+      "C2": "Stochastic Interference: Each agent selects 3 random modes from selector.json (excluding anchors); enforce category diversity.",
+      "C3": "Dialectical Convergence (Mode 59): On disagreement, trigger Thesis vs Antithesis -> v4 Synthesis.",
+      "C4": "Cycle 1: structural gates; Cycle 2: feasibility gates; Cycle 3: quorum resolve.",
+      "C5": "Quorum: 2/3 vote resolves contested findings; deadlock => NEEDS_ADJUDICATION.",
+      "C6": "Council outputs evidence bundle to `evidence/rfc/{RFC_ID}/reviews/rfc_review_{timestamp}.yaml` with council_metadata and gate results.",
+      "C7": "Budget/episode/stall abort => ABORTED with partial findings; subagent failure => adjust quorum."
     },
     "dir": [
       ["D1", 3, "@C1", ["agents"], []],
       ["D2", 3, "@C2", ["modes"], []],
-      ["D3", 3, "@C3", ["cycles"], []],
-      ["D4", 3, "@C4", ["quorum"], []],
-      ["D5", 3, "@C5", ["output"], []],
-      ["D6", 3, "@C6", ["limits"], []]
+      ["D3", 3, "@C3", ["dialectical", "dcp://apm2.agents/mor/mode/dialectical@1"], []],
+      ["D4", 3, "@C4", ["cycles"], []],
+      ["D5", 3, "@C5", ["quorum"], []],
+      ["D6", 3, "@C6", ["output"], []],
+      ["D7", 3, "@C7", ["limits"], []]
     ],
     "g": [
-      ["G-SOURCE", "D", 1, ["@C1", "@C2", "@C3", "@C4", "@C5", "@C6"], ["E1"], "FAIL_IF_MISSING"]
+      ["G-SOURCE", "D", 1, ["@C1", "@C2", "@C3", "@C4", "@C5", "@C6", "@C7"], ["E1"], "FAIL_IF_MISSING"]
     ],
     "ev": [
       ["E1", "source_doc", true, "md", ["documents/skills/rfc-council/references/COUNCIL_PROTOCOL.md"], []]
@@ -59,9 +62,9 @@
     "r": {
       "depth": "M",
       "modes": [
-        47,
-        36,
-        79
+        "strategic_protocol_design",
+        "mechanism_design",
+        "dialectical"
       ],
       "ob": [
         "A",

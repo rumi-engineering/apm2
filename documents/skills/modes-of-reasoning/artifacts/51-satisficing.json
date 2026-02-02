@@ -1,0 +1,126 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/satisficing@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 51,
+    "name": "satisficing",
+    "cat": "decision",
+    "core": "Accept first solution meeting predefined threshold; stop search immediately. Rational when search cost exceeds marginal gain from finding optimal. Key insight: 'good enough' must be defined before search, not discovered during it.",
+    "out": [
+      "threshold spec: measurable criteria defining 'good enough' (pre-committed)",
+      "stopping rule: condition that triggers immediate search halt",
+      "constraint budget: time/compute/info limits with hard cutoffs",
+      "accepted solution: first candidate meeting threshold + timestamp",
+      "threshold justification: why this level is appropriate for stakes",
+      "search log: candidates evaluated before acceptance (for audit)"
+    ],
+    "proc": [
+      "1. Set threshold BEFORE generating any candidates (pre-commitment)",
+      "2. Define hard constraint budget (hours, queries, dollars)",
+      "3. Specify stopping rule: 'accept first meeting X; if budget exhausts, take best-so-far'",
+      "4. Generate candidates sequentially (not in parallel batches)",
+      "5. Evaluate each candidate immediately against threshold",
+      "6. On first threshold-meeting candidate: STOP, accept, document",
+      "7. If budget exhausts without threshold-match: accept best-so-far OR relax threshold explicitly",
+      "8. Record: candidate accepted, candidates skipped, time remaining"
+    ],
+    "check": [
+      "threshold written down before first candidate generated",
+      "threshold is falsifiable (can determine if met in finite time)",
+      "stopping rule unambiguous (no 'maybe keep looking' clauses)",
+      "constraint budget has hard limit, not 'as time permits'",
+      "solution actually meets stated threshold (verified, not assumed)",
+      "threshold neither trivially low (any candidate passes) nor disguised optimization (no candidate passes)",
+      "no post-hoc threshold adjustment to justify chosen solution"
+    ],
+    "diff": {
+      "optimization_48": "optimization: exhaustive search for global best, accepts only max/min. satisficing: sequential search, accepts first above threshold. Use optimization when stakes justify search cost; satisficing when they don't.",
+      "heuristic_53": "heuristic: rule-of-thumb that approximates good solutions (e.g., 'pick familiar vendor'). satisficing: deliberate threshold + stopping rule. Heuristics skip evaluation; satisficing evaluates but stops early.",
+      "value-of-information_52": "VOI: decides when to stop gathering information before deciding. satisficing: decides when to stop searching for solutions. VOI gates information; satisficing gates alternatives.",
+      "minimax-regret_50": "minimax-regret: minimize worst-case disappointment across scenarios. satisficing: accept first adequate solution regardless of regret. Use minimax-regret when wrong choice has lasting consequences; satisficing when reversible.",
+      "multi-criteria_46": "MCDA: weights multiple criteria, ranks all alternatives. satisficing: pass/fail threshold on each criterion, stops at first pass. Use MCDA when trade-offs matter; satisficing when must-haves dominate.",
+      "robust-worst-case_49": "robust: optimize for worst-case scenario. satisficing: accept good-enough for expected case. Use robust when tail risk is catastrophic; satisficing when average case dominates."
+    },
+    "fail": {
+      "name": "threshold miscalibration",
+      "signals": [
+        "consistently accepting poor outcomes (threshold too low)",
+        "search never terminates (threshold too high = disguised optimization)",
+        "threshold invented post-hoc to justify already-chosen solution",
+        "stopping rule has escape clauses ('unless something better appears')",
+        "threshold set without reference to historical baselines",
+        "different thresholds applied to different candidates mid-search"
+      ],
+      "mitigations": [
+        "pre-registration: write threshold in shared doc before search starts; no edits allowed",
+        "baseline anchoring: threshold must reference ≥3 historical 'acceptable' outcomes",
+        "time-box forcing: set wall-clock deadline; accept best-so-far when timer fires",
+        "third-party threshold: have someone uninvolved in search set the threshold",
+        "threshold audit trail: log any threshold changes with justification + approver",
+        "regret check: 'if I later find 20% better, would I reverse?' — if yes, maybe optimize instead"
+      ]
+    },
+    "anti_patterns": [
+      {
+        "name": "satisficing theater",
+        "desc": "setting threshold, then continuing search 'just to see what else is out there'",
+        "fix": "enforce hard stop on threshold-match; log any continued search as optimization"
+      },
+      {
+        "name": "threshold gaming",
+        "desc": "adjusting threshold downward as search drags on until current best passes",
+        "fix": "lock threshold at search start; if relaxation needed, document as explicit scope change"
+      },
+      {
+        "name": "false urgency",
+        "desc": "claiming time pressure to justify low threshold when stakes actually warrant optimization",
+        "fix": "require explicit stakes assessment: 'consequence of suboptimal choice is X'"
+      }
+    ],
+    "use": [
+      "real-time operations: incident response, trading, live troubleshooting",
+      "high-frequency decisions: hiring screens, triage, queue prioritization",
+      "reversible choices: vendor selection, tool picks, early prototypes",
+      "resource-constrained search: limited budget, tight deadline, scarce expertise",
+      "diminishing returns: when first 80% of value comes from first 20% of search"
+    ],
+    "not_use": [
+      "irreversible high-stakes: architecture, contracts, safety-critical",
+      "when search cost is negligible relative to decision value",
+      "when threshold cannot be specified in advance",
+      "when all stakeholders demand optimality (political constraint)"
+    ],
+    "rel": [
+      "48-optimization",
+      "53-heuristic",
+      "52-value-of-information",
+      "50-minimax-regret",
+      "46-multi-criteria-decision-analysis",
+      "49-robust-worst-case"
+    ],
+    "ex": {
+      "scenario": "Select SaaS vendor for internal wiki. Budget: 2 hours. Threshold: 5 must-have features, <$50/seat, ≥4-star reviews.",
+      "steps": [
+        "pre-commit threshold in Slack before search: '5 features, <$50, 4+ stars'",
+        "set timer: 2 hours, hard stop",
+        "evaluate vendors sequentially from top search results",
+        "vendor 1: 4 features — REJECT",
+        "vendor 2: 5 features, $60/seat — REJECT",
+        "vendor 3: 5 features, $40/seat, 4.2 stars — ACCEPT",
+        "stop search at 45 min; document: 'threshold met, 1:15 returned to backlog'"
+      ]
+    },
+    "micro_ex": {
+      "name": "threshold calibration failure",
+      "bad": "team sets threshold 'must be best-in-class' — search continues for 3 weeks, never terminates",
+      "good": "team sets threshold 'must handle 1000 users, integrate with SSO, cost <$5k/yr' — accepts first match in 2 hours",
+      "lesson": "thresholds must be falsifiable and achievable, not aspirational"
+    }
+  }
+}

@@ -1,0 +1,152 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/counterfactual@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 39,
+    "name": "counterfactual",
+    "cat": "causal",
+    "core": "Evaluate alternate histories given a causal model: fix an intervention variable to a value that did not occur, propagate effects through causal structure, compare factual vs counterfactual outcomes. Answers 'what would have happened if X had been different?' Requires explicit causal DAG; outputs are conditional on model validity.",
+    "out": [
+      {"n": "causal_model", "d": "explicit DAG with variables, edges, and functional relationships"},
+      {"n": "intervention_spec", "d": "variable changed, factual value, counterfactual value, time of change"},
+      {"n": "counterfactual_outcome", "d": "predicted outcome under intervention with uncertainty bounds"},
+      {"n": "factual_outcome", "d": "observed/predicted outcome under actual conditions"},
+      {"n": "causal_attribution", "d": "credit/blame assignment with magnitude (outcome difference attributable to intervention)"},
+      {"n": "sensitivity_report", "d": "how conclusions change under alternative model assumptions"},
+      {"n": "model_limitations", "d": "stated assumptions, untested regions, known simplifications"}
+    ],
+    "proc": [
+      "SPECIFY MODEL: draw explicit causal DAG; name all variables, directional edges, and functional forms; state exogenous variables and their assumed distributions",
+      "VALIDATE MODEL: check model against observed data; verify it reproduces known factual outcomes; document fit quality and discrepancies",
+      "DEFINE INTERVENTION: state (a) which variable to change, (b) its factual value, (c) its counterfactual value, (d) whether change is surgical (do-operator) or parametric",
+      "FREEZE UPSTREAM: hold all variables upstream of intervention at their factual values; only downstream variables may change",
+      "PROPAGATE: compute counterfactual values for all downstream variables using structural equations; if stochastic, report distribution or bounds",
+      "COMPARE: calculate difference between factual and counterfactual outcomes; this difference is the causal attribution",
+      "SENSITIVITY: vary key assumptions (edge coefficients, functional forms, omitted confounders) and report how attribution changes",
+      "BOUND CLAIMS: state conclusions as 'according to this model' with explicit uncertainty; identify what model errors would invalidate conclusion"
+    ],
+    "check": [
+      "causal DAG drawn explicitly with all relevant variables",
+      "model validated against at least one observed intervention or outcome",
+      "intervention precisely specified (variable, factual value, counterfactual value)",
+      "upstream variables frozen at factual values during propagation",
+      "downstream effects computed, not assumed",
+      "factual vs counterfactual comparison quantified with magnitude",
+      "sensitivity analysis performed on at least 2 key assumptions",
+      "conclusions hedged with 'model predicts' or 'given this structure'",
+      "model limitations documented (omitted variables, untested regions)",
+      "output labeled as counterfactual claim, not observed fact"
+    ],
+    "diff": {
+      "causal-inference-37": "counterfactual asks 'what would have happened' (past, specific case); causal-inference asks 'what happens if we do' (future, population average). Counterfactual requires full structural model; causal-inference may use identification without full specification.",
+      "model-based-simulation-42": "counterfactual fixes intervention and traces backward attribution; simulation runs forward from conditions to predict future states. Counterfactual answers 'why did this happen?'; simulation answers 'what will happen?'",
+      "diagnostic-41": "diagnostic identifies actual cause from symptoms; counterfactual evaluates whether a hypothesized cause would have changed the outcome. Diagnostic answers 'what caused this?'; counterfactual answers 'would outcome differ if cause absent?'",
+      "abductive-13": "abductive generates candidate explanations for surprising observations; counterfactual tests a specific causal claim by hypothetical removal. Abductive is generative; counterfactual is evaluative.",
+      "historical-investigative-73": "historical reconstructs what actually happened from evidence; counterfactual explores what would have happened under different choices. Historical is factual; counterfactual is hypothetical.",
+      "decision-theoretic-45": "decision-theoretic evaluates future choices under uncertainty; counterfactual evaluates past choices retrospectively. Decision looks forward; counterfactual looks backward."
+    },
+    "confusions": [
+      {
+        "trap": "conflating counterfactual with prediction",
+        "symptom": "asking 'what will happen if we do X?' and calling it counterfactual",
+        "correction": "prediction/simulation reasons about future interventions; counterfactual reasons about past alternatives. If the event hasn't happened yet, use decision-theoretic or simulation, not counterfactual."
+      },
+      {
+        "trap": "counterfactual without causal model",
+        "symptom": "claiming 'if X hadn't happened, Y wouldn't have occurred' based on correlation or intuition",
+        "correction": "counterfactuals require explicit causal structure. Correlational data cannot support counterfactual claims. Draw the DAG first; if you can't, you can't do valid counterfactual reasoning."
+      },
+      {
+        "trap": "treating counterfactual as diagnosis",
+        "symptom": "using counterfactual to identify the cause when cause is unknown",
+        "correction": "counterfactual evaluates a hypothesized cause; it doesn't discover causes. Use diagnostic or abductive to identify candidate causes first, then counterfactual to evaluate their causal necessity."
+      },
+      {
+        "trap": "ignoring model uncertainty in attribution",
+        "symptom": "stating 'X caused Y' definitively based on single counterfactual run",
+        "correction": "counterfactual conclusions are conditional on model correctness. Always report sensitivity to key assumptions; if model uncertain, attribution is uncertain."
+      }
+    ],
+    "fail": {
+      "mode": "confident_counterfactuals_from_weak_models",
+      "desc": "Asserting what would have happened without valid causal model, or treating model outputs as ground truth",
+      "signals": [
+        "no explicit causal DAG",
+        "model not validated against any observed outcomes",
+        "confounders acknowledged but not modeled",
+        "single scenario without sensitivity analysis",
+        "conclusions stated as fact rather than model prediction",
+        "intervention not precisely defined (ambiguous what changed)",
+        "upstream variables not frozen during propagation"
+      ],
+      "mitigations": [
+        {"m": "require explicit causal DAG before any counterfactual claim", "test": "causal_model.edges.length > 0 AND causal_model.variables.length > 0"},
+        {"m": "validate model reproduces at least one observed outcome", "test": "validation.observed_vs_predicted.error < threshold"},
+        {"m": "perform sensitivity analysis on top 3 uncertain parameters", "test": "sensitivity_report.parameters.length >= 3"},
+        {"m": "bound uncertainty in counterfactual outcomes", "test": "counterfactual_outcome.confidence_interval exists OR counterfactual_outcome.bounds exists"},
+        {"m": "state all conclusions with 'model predicts' or 'given this structure'", "test": "conclusion.text.contains('model') OR conclusion.text.contains('given')"},
+        {"m": "document at least 2 model limitations or untested assumptions", "test": "model_limitations.length >= 2"},
+        {"m": "verify intervention is well-defined with factual and counterfactual values stated", "test": "intervention_spec.factual != null AND intervention_spec.counterfactual != null"}
+      ]
+    },
+    "use": [
+      "postmortem root-cause attribution (would faster detection have prevented outage?)",
+      "accountability and blame analysis (was this decision the cause of failure?)",
+      "individual case explanation (why did this patient respond differently?)",
+      "policy evaluation (would different policy have changed outcome?)",
+      "legal causation (but-for test: would harm have occurred without defendant's action?)",
+      "personalized decision support (for this user, would alternative have been better?)",
+      "historical analysis (would different strategy have won the battle?)"
+    ],
+    "rel": [
+      {"id": 37, "n": "causal-inference", "r": "provides causal model; counterfactual uses model for retrospective what-if"},
+      {"id": 42, "n": "model-based-simulation", "r": "forward prediction; counterfactual is backward attribution"},
+      {"id": 41, "n": "diagnostic", "r": "identifies cause; counterfactual evaluates causal necessity"},
+      {"id": 13, "n": "abductive", "r": "generates hypotheses; counterfactual tests them via hypothetical removal"},
+      {"id": 73, "n": "historical-investigative", "r": "reconstructs facts; counterfactual explores alternatives"},
+      {"id": 45, "n": "decision-theoretic", "r": "forward-looking choice; counterfactual is backward-looking evaluation"}
+    ],
+    "ex": {
+      "sit": "Production outage lasted 4 hours. Incident review asks: would faster alerting have reduced impact?",
+      "model": {
+        "variables": ["alert_delay", "detection_time", "response_time", "outage_duration", "user_impact"],
+        "edges": ["alert_delay -> detection_time", "detection_time -> response_time", "response_time -> outage_duration", "outage_duration -> user_impact"],
+        "functions": "detection = incident_start + alert_delay; response = detection + triage_time; duration = response + fix_time; impact = duration * affected_users"
+      },
+      "validation": "model predicts 3.8h duration for observed inputs; actual was 4.0h; 5% error acceptable",
+      "intervention": {
+        "variable": "alert_delay",
+        "factual": "45 min (monitoring gap)",
+        "counterfactual": "5 min (continuous monitoring)",
+        "type": "surgical"
+      },
+      "propagation": "detection: 45min -> 5min; response: 60min -> 20min (40min saved); duration: 4h -> 3.3h",
+      "attribution": "faster alerting would have reduced outage by ~40 min (17% of duration); ~8500 fewer user-minutes affected",
+      "sensitivity": "if triage_time varies +/-50%, attribution ranges from 25min to 55min saved",
+      "limitations": "model assumes independent fix_time; if fix_time depends on alert quality, attribution could differ"
+    },
+    "micro_ex": {
+      "sit": "Project missed deadline by 2 weeks. Manager asks: was the scope change the cause?",
+      "model": "scope_change -> added_work -> delay; baseline_work -> delay",
+      "intervention": "scope_change: factual=yes, counterfactual=no",
+      "result": "without scope change, model predicts 1-week delay (vs 2-week actual); scope change accounts for ~50% of delay",
+      "caveat": "model excludes team velocity variation; if velocity dropped independently, attribution would be lower"
+    },
+    "quick_check": [
+      "Did I draw an explicit causal DAG with named variables and edges?",
+      "Did I validate the model against at least one observed outcome?",
+      "Is my intervention precisely defined (variable, factual value, counterfactual value)?",
+      "Did I freeze upstream variables and only propagate downstream?",
+      "Did I quantify the factual vs counterfactual difference?",
+      "Did I perform sensitivity analysis on key assumptions?",
+      "Are my conclusions hedged with 'model predicts' or similar?",
+      "Did I document model limitations and untested assumptions?"
+    ]
+  }
+}

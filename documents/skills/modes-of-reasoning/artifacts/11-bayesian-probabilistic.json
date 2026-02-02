@@ -1,0 +1,158 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/bayesian-probabilistic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 11,
+    "name": "bayesian-probabilistic",
+    "cat": "probabilistic",
+    "core": "Represent degrees of belief as probabilities and update them with evidence via Bayes' rule: P(H|E) = P(E|H) * P(H) / P(E). Posterior = (Likelihood * Prior) / Evidence. Normative standard for belief updating under uncertainty.",
+    "out": [
+      {"n": "prior_distribution", "d": "explicit beliefs before new evidence with source (base rate, expert elicitation, or previous posterior)"},
+      {"n": "likelihood_model", "d": "P(E|H) for each hypothesis, with calibration source"},
+      {"n": "posterior_distribution", "d": "updated beliefs after incorporating evidence, with computation trace"},
+      {"n": "credible_intervals", "d": "ranges containing 50%, 90%, 95% probability mass"},
+      {"n": "sensitivity_analysis", "d": "posterior under alternative priors (2x, 0.5x) and likelihoods"},
+      {"n": "decision_summary", "d": "point estimates, thresholds for action, or posterior odds"}
+    ],
+    "proc": [
+      "GATE 1 - Prior specification: state P(H) with source (base rate > expert > uniform); if base rate available but unused, halt and fetch it",
+      "GATE 2 - Likelihood construction: compute P(E|H) for each hypothesis; if likelihoods indistinguishable (<2:1 ratio), flag as weak evidence",
+      "GATE 3 - Bayes application: compute P(H|E) proportional to P(E|H) * P(H), normalize across hypotheses",
+      "GATE 4 - Interval construction: derive 50%, 90%, 95% credible intervals from posterior",
+      "GATE 5 - Sensitivity test: recompute posterior with prior at 2x and 0.5x; if posterior shifts >30%, flag prior-sensitive",
+      "GATE 6 - Decision extraction: convert posterior to decision-relevant form (point estimate, odds ratio, or threshold comparison)",
+      "GATE 7 - Iteration setup: document that today's posterior becomes tomorrow's prior; specify what new evidence would trigger update"
+    ],
+    "quick_check": [
+      "Prior stated BEFORE seeing evidence? (prevents anchor contamination)",
+      "Prior has named source? (base rate > expert > reference class > uniform)",
+      "Likelihood ratio computed? (not just single P(E|H))",
+      "P(H|E) computed, not confused with P(E|H)?",
+      "Credible intervals reported, not just point estimate?",
+      "Sensitivity to prior checked? (2x/0.5x test)",
+      "Base rate sanity check done? (if rare, posterior should still be low even with strong evidence)"
+    ],
+    "check": [
+      "prior explicitly stated with source before evidence reviewed",
+      "likelihood model specified for each hypothesis with calibration basis",
+      "posterior computed via Bayes' rule with arithmetic shown",
+      "credible intervals at multiple levels (50%, 90%, 95%)",
+      "sensitivity analysis under 2x and 0.5x prior variations",
+      "base rates checked and used if available",
+      "likelihood ratio sanity check: extreme ratios (>100:1) require justification",
+      "decision-relevant summary extracted with threshold comparison"
+    ],
+    "diff": {
+      "frequentist": {
+        "boundary": "Bayesian reports P(H|data); frequentist reports P(data|H) under repetition",
+        "when_bayesian": "need belief probability, have prior knowledge, single-case decisions",
+        "when_other": "need coverage guarantees, regulatory/legal requirements, no defensible prior"
+      },
+      "likelihood-based": {
+        "boundary": "Bayesian multiplies by prior for full posterior; likelihood compares P(E|H) without commitment to prior",
+        "when_bayesian": "need decision-ready probability, have defensible prior",
+        "when_other": "prior controversial, want to report evidence strength separate from beliefs"
+      },
+      "reference-class": {
+        "boundary": "reference-class provides the prior; Bayesian updates it with evidence",
+        "when_bayesian": "have evidence to incorporate beyond base rate",
+        "when_other": "only have base rate, no case-specific evidence yet"
+      },
+      "decision-theoretic": {
+        "boundary": "Bayesian produces posteriors; decision theory consumes them to choose actions",
+        "when_bayesian": "computing belief state, not yet choosing action",
+        "when_other": "ready to select action given beliefs and utilities"
+      },
+      "abductive": {
+        "boundary": "Bayesian quantifies hypothesis plausibility; abductive generates candidate hypotheses",
+        "when_bayesian": "hypotheses known, need to weight them",
+        "when_other": "need to generate new explanatory hypotheses"
+      }
+    },
+    "confusions": [
+      {
+        "pair": ["bayesian-probabilistic", "statistical-frequentist"],
+        "confusion": "Both produce intervals, but CI is procedure property (95% of intervals contain true value) while credible interval is belief property (95% probability true value is in range)",
+        "resolution": "Ask: do I need belief about THIS case (Bayesian) or long-run coverage guarantee (frequentist)?"
+      },
+      {
+        "pair": ["bayesian-probabilistic", "likelihood-based"],
+        "confusion": "Both use P(E|H), but Bayesian multiplies by prior while likelihood-based stops at ratio comparison",
+        "resolution": "Ask: do I have a defensible prior? If yes and need decision, use Bayesian. If prior controversial, use likelihood to report evidence strength."
+      },
+      {
+        "pair": ["bayesian-probabilistic", "reference-class-outside-view"],
+        "confusion": "Both use base rates, but reference-class IS the prior sourcing step; Bayesian is the update step",
+        "resolution": "Use reference-class to get prior, then Bayesian to update with case-specific evidence. If no case-specific evidence, reference-class alone suffices."
+      },
+      {
+        "pair": ["bayesian-probabilistic", "abductive"],
+        "confusion": "Both evaluate hypotheses, but abductive generates candidates while Bayesian weights known ones",
+        "resolution": "Abductive first (generate hypotheses), then Bayesian (weight them). Bayesian cannot score hypotheses not yet in the set."
+      }
+    ],
+    "fail": {
+      "mode": "base_rate_neglect",
+      "signals": [
+        "high confidence despite rare base rate (<5%) without explicit calculation",
+        "no explicit prior stated before evidence reviewed",
+        "prior described as 'uninformative' or 'flat' without justification when base rates exist",
+        "posterior tracks likelihood exactly (suggesting prior was effectively ignored)",
+        "dramatic update (>50% swing) from single piece of evidence",
+        "confusing P(E|H) with P(H|E) in natural language ('95% accurate test means 95% chance')"
+      ],
+      "mitigations": [
+        {"m": "pre-commit prior", "test": "prior written down before evidence file opened; timestamp or witness", "threshold": "100% of analyses"},
+        {"m": "base rate anchor", "test": "if base rate <10%, posterior must be computed with arithmetic shown", "threshold": "all rare-event cases"},
+        {"m": "likelihood ratio bounds", "test": "ratios >100:1 require calibration source citation", "threshold": "zero unsourced extreme ratios"},
+        {"m": "sensitivity analysis", "test": "posterior recomputed under 2x and 0.5x prior; if shift >30%, flag as prior-sensitive", "threshold": "all analyses"},
+        {"m": "P(E|H) vs P(H|E) separation", "test": "likelihood statement and posterior statement in separate sentences/sections", "threshold": "100% of reports"},
+        {"m": "incremental update rule", "test": "single evidence causing >50% posterior swing requires explicit justification or decomposition", "threshold": "zero unjustified large swings"}
+      ]
+    },
+    "use": [
+      "medical diagnosis with known prevalence",
+      "forecasting with updateable base rates",
+      "A/B testing interpretation (Bayesian variant)",
+      "fraud detection with rare-event priors",
+      "reliability estimation with prior failure data",
+      "scientific inference with informative priors",
+      "risk assessment combining base rates and evidence",
+      "sequential learning and adaptive experiments"
+    ],
+    "rel": [
+      {"id": 10, "n": "statistical-frequentist", "r": "alternative framework; Bayesian for beliefs, frequentist for coverage"},
+      {"id": 12, "n": "likelihood-based", "r": "comparative evidence without prior commitment; use when prior controversial"},
+      {"id": 18, "n": "reference-class", "r": "source of base-rate priors; use before Bayesian update"},
+      {"id": 45, "n": "decision-theoretic", "r": "consumes posteriors for action selection; use after Bayesian"},
+      {"id": 20, "n": "probabilistic-logic", "r": "combines Bayesian with logical structure for complex domains"},
+      {"id": 76, "n": "calibration", "r": "tracks posterior accuracy over time; essential feedback loop"},
+      {"id": 9, "n": "inductive", "r": "informal predecessor; Bayesian formalizes inductive updating"},
+      {"id": 13, "n": "abductive", "r": "generates hypotheses that Bayesian then weights"}
+    ],
+    "ex": {
+      "sit": "Rare disease (1% prevalence), test sensitivity 95%, specificity 90%. Patient tests positive.",
+      "steps": [
+        "PRIOR: P(disease) = 0.01 from population base rate (source: CDC surveillance data)",
+        "LIKELIHOOD: P(+|disease)=0.95 (sensitivity), P(+|no disease)=0.10 (1-specificity)",
+        "BAYES: P(disease|+) = (0.95 * 0.01) / [(0.95 * 0.01) + (0.10 * 0.99)] = 0.0095 / 0.1085 = 0.088",
+        "INTERPRET: only 8.8% chance of disease despite positive test; most positives are false positives",
+        "SENSITIVITY: if prevalence were 10%, posterior would be 51%; prior matters enormously",
+        "CREDIBLE: point estimate 8.8%, 90% CI approximately 5-15% given test uncertainty",
+        "DECISION: posterior below treatment threshold (say, 50%); recommend confirmatory test"
+      ],
+      "insight": "Low base rate dominates; even 95% accurate test yields mostly false positives when disease is rare. P(+|disease) of 95% does not mean P(disease|+) of 95%."
+    },
+    "micro_ex": {
+      "sit": "Email spam filter: 20% of incoming mail is spam (prior). This email contains 'FREE MONEY' which appears in 80% of spam, 1% of ham.",
+      "calc": "P(spam|phrase) = (0.80 * 0.20) / [(0.80 * 0.20) + (0.01 * 0.80)] = 0.16 / 0.168 = 95.2%",
+      "insight": "High likelihood ratio (80:1) overcomes moderate prior; but if spam rate were 1%, posterior would only be 44.7%."
+    }
+  }
+}

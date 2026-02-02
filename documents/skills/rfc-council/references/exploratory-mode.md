@@ -20,15 +20,15 @@ decision_tree:
             - SA-2 (Feasibility): Perform mock implementation runs to verify technical grounding.
             - SA-3 (Anti-Cousin): Identify exact extension points in the codebase to prevent parallel abstractions.
 
-            Constraint: Each SA selects **5 strictly random reasoning modes** from modes-of-reasoning
-            (see COUNCIL_PROTOCOL.md Step 3: Stochastic Mode Selection for algorithm).
+            Constraint: Each SA selects **2 Anchor + 3 Random reasoning modes** from modes-of-reasoning.
 
         - id: CODEBASE_INVESTIGATION
           action: |
             For each open question in 08_risks_and_open_questions.yaml:
-            1. Execute Grep/Glob/Read to find relevant code patterns.
-            2. Map findings to CCP (Codebase Component Protocol).
-            3. Update RFC sections (02, 04, 07) with evidence-backed answers.
+            1. **Mode 61 (Hermeneutic)**: Extract meaning from existing code/comments. What was the *intent* of the original author?
+            2. **Mode 40 (Mechanistic)**: Reconstruct the causal chain of the existing component. How does it work internally?
+            3. Map finding to CCP.
+            4. Update RFC sections (02, 04, 07) with evidence-backed answers that respect existing mechanisms.
 
         - id: EMIT_V2
           action: |

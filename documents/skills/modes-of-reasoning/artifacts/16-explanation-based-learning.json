@@ -1,0 +1,110 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/explanation-based-learning@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 16,
+    "name": "explanation-based-learning",
+    "cat": "ampliative",
+    "core": "Use an explanation of why a solution works to generalize a reusable rule or plan; the explanation constrains and justifies the generalization. Unlike pure induction, EBL derives generalization boundaries from causal/logical structure, not sample size.",
+    "out": [
+      {"n": "source_case", "d": "specific successful solution with context and outcome"},
+      {"n": "causal_explanation", "d": "chain of reasoning: preconditions -> mechanism -> outcome; must cite domain theory"},
+      {"n": "generalization_scope", "d": "conditions under which the rule applies (the 'if' clause derived from explanation)"},
+      {"n": "generalized_rule", "d": "reusable pattern: IF <scope conditions> THEN <action> BECAUSE <mechanism>"},
+      {"n": "boundary_conditions", "d": "explicit limits: when explanation breaks down, assumptions violated"}
+    ],
+    "proc": [
+      {"step": "select exemplar", "action": "choose a specific successful solution where you can articulate WHY it worked, not just THAT it worked", "gate": "can you name the causal mechanism?"},
+      {"step": "build explanation tree", "action": "trace backwards: outcome <- mechanism <- enabling conditions <- preconditions; each link must be deductively valid given domain theory", "gate": "does each step follow necessarily from the prior?"},
+      {"step": "identify operational features", "action": "mark which preconditions were essential to the mechanism vs incidental to this case (e.g., 'Tuesday' vs 'timeout < latency')", "gate": "can you vary the feature without breaking the explanation?"},
+      {"step": "construct generalized rule", "action": "replace specific values with variables; scope = essential preconditions; body = mechanism-preserving action", "gate": "does the rule still deductively entail success under scope?"},
+      {"step": "validate empirically", "action": "test on held-out cases or predict outcomes of hypothetical variations; track failures", "gate": ">=2 novel cases where rule predicts correctly"}
+    ],
+    "check": [
+      "explanation cites domain theory, not just post-hoc rationalization?",
+      "each step in explanation chain is deductively valid?",
+      "generalization scope derived from explanation, not arbitrary?",
+      "boundary conditions explicit (when does the mechanism fail)?",
+      "tested on case outside original context?",
+      "can articulate what would falsify the generalized rule?"
+    ],
+    "quick_checklist": [
+      "Source case: documented success with known outcome",
+      "Explanation: mechanism chain with domain-theory backing",
+      "Scope: derived from essential preconditions only",
+      "Rule: IF-THEN-BECAUSE format with variables",
+      "Boundaries: explicit failure conditions",
+      "Validation: >=1 novel prediction tested"
+    ],
+    "diff": {
+      "vs_inductive": "EBL generalizes from explanation structure (1 case can suffice); inductive generalizes from instance count (needs many cases). Use inductive when you lack domain theory to explain.",
+      "vs_analogical": "EBL requires explicit causal chain justifying transfer; analogical transfers on structural similarity without requiring mechanistic explanation. Use analogical for cross-domain insight generation.",
+      "vs_case_based": "EBL extracts a rule from the case; case-based retrieves and adapts whole cases. Use case-based when cases are too complex to reduce to rules.",
+      "vs_abductive": "abductive generates candidate explanations for observations; EBL uses a validated explanation to generalize. EBL assumes you already have the correct explanation.",
+      "vs_simplicity": "EBL constrains generalization by explanation validity; simplicity selects among hypotheses by parsimony. A simple rule is not EBL-valid unless explanation-backed.",
+      "vs_mechanistic": "mechanistic explains a specific case; EBL goes further to derive a reusable rule. EBL = mechanistic + generalization step."
+    },
+    "confusions": [
+      {"trap": "treating post-hoc rationalization as explanation", "test": "did you construct the explanation AFTER knowing the solution worked? if yes, require independent domain-theory grounding", "fix": "cite external theory or derive prediction for novel case"},
+      {"trap": "overgeneralizing because explanation is elegant", "test": "is the scope broader than explanation justifies? check each scope variable against explanation chain", "fix": "tighten scope to only features that appear in the mechanism chain"}
+    ],
+    "fail": {
+      "mode": "elegant but wrong explanations",
+      "desc": "explanations that are internally coherent but empirically incorrect; a beautiful theory of why something worked can be confabulation",
+      "signals": [
+        "explanation constructed after observing success (post-hoc)",
+        "no independent domain theory cited",
+        "explanation not tested on novel cases",
+        "cannot articulate what would falsify the explanation",
+        "scope extends beyond what explanation chain covers"
+      ],
+      "mitigations": [
+        {"m": "require domain-theory citation", "test": "explanation references established principle, not ad-hoc reasoning"},
+        {"m": "predict-then-verify", "test": "derive prediction for held-out case BEFORE checking outcome"},
+        {"m": "seek disconfirmation", "test": "actively look for cases where explanation predicts success but outcome fails"},
+        {"m": "scope audit", "test": "for each variable in generalized scope, trace to specific step in explanation chain"},
+        {"m": "alternative explanation check", "test": "generate >=1 competing explanation; if equally plausible, explanation not validated"}
+      ]
+    },
+    "use": [
+      "turning expert debugging sessions into runbooks",
+      "extracting design patterns from successful implementations",
+      "converting incident post-mortems into preventive rules",
+      "knowledge engineering from SME demonstrations",
+      "deriving SOPs where you need to know WHY (safety-critical, auditable)"
+    ],
+    "rel": [
+      {"id": 9, "name": "inductive", "link": "generalization without explanation; use when theory unavailable"},
+      {"id": 13, "name": "abductive", "link": "generates explanations; precedes EBL in workflow"},
+      {"id": 14, "name": "analogical", "link": "structural transfer without mechanistic justification"},
+      {"id": 15, "name": "case-based", "link": "reuses whole cases; use when rules are infeasible"},
+      {"id": 17, "name": "simplicity", "link": "model selection; EBL constrains, simplicity selects"},
+      {"id": 40, "name": "mechanistic", "link": "explains cases; EBL adds generalization"}
+    ],
+    "micro_ex": {
+      "case": "Expert fixed OOM crash by adding rate-limiter before batch processor",
+      "explanation": "Batch processor allocates memory proportional to queue depth. Without rate-limiter, burst arrivals create unbounded queue. Rate-limiter caps arrival rate below processing rate, bounding queue depth, bounding memory.",
+      "essential_features": ["queue-depth-proportional allocation", "burst arrivals possible", "processing rate known"],
+      "incidental_features": ["specific service name", "Java heap size", "Monday morning"],
+      "generalized_rule": "IF component allocates memory proportional to queue depth AND burst arrivals possible THEN insert rate-limiter with rate <= processing_rate BECAUSE bounds queue depth bounds memory",
+      "boundary": "Fails if allocation is not queue-proportional, or if rate-limiter itself becomes bottleneck"
+    },
+    "ex": {
+      "scenario": "expert debugs production outage: cascading timeouts causing service collapse",
+      "steps": [
+        "source case: Service A timeout waiting for B; B waiting for C; C overloaded",
+        "explanation: timeout > downstream_latency causes blocked threads; blocked threads reduce A's capacity; reduced capacity increases A's latency; cycle amplifies",
+        "essential: timeout_A > latency_B, no circuit breaker, shared thread pool",
+        "rule: IF service calls downstream with timeout > typical_latency AND no circuit breaker THEN add circuit breaker with fail-fast < timeout BECAUSE breaks amplification cycle",
+        "boundary: does not apply if downstream is synchronous-required (e.g., DB transaction)"
+      ],
+      "validation": "applied rule to Service D->E chain; predicted circuit breaker would prevent cascade; tested in staging; confirmed"
+    }
+  }
+}

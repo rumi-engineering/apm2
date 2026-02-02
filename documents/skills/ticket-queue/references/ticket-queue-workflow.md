@@ -5,14 +5,12 @@ decision_tree:
   nodes[1]:
     - id: INIT
       purpose: "Initialize orchestration posture, then loop until all tickets are merged."
-      context_files[4]:
+      context_files[3]:
         - path: documents/README.md
         - path: documents/skills/README.md
           purpose: "Root-level module index, repository-wide constraints, and canonical dev workflow."
         - path: documents/skills/ticket/SKILL.md
           purpose: "Instructions to be passed to the implementer subagent. The orchestrator MUST NOT execute this skill itself."
-        - path: xtask/src/tasks/check.rs
-          purpose: "Defines `cargo xtask check` behavior, including reviewer health auto-remediation."
         - path: xtask/src/reviewer_state.rs
           purpose: "Reviewer state schema (PID + log file) and stale thresholds."
       steps[6]:
@@ -32,6 +30,10 @@ decision_tree:
           action: command
           run: "command -v cargo git gh rg timeout >/dev/null && echo OK"
           capture_as: core_tools_ok
+        - id: OPERATIONAL_CONSTRAINTS
+          action: |
+            1) MAX_RUNTIME: Never allow a subagent to work continuously for >=15 minutes. Terminate and restart with warm handoff to prevent context rot.
+            2) CWD_DISCIPLINE: Periodically verify current directory. If inside a worktree, `cd` back to the main repository root before loop transitions.
         - id: ENTER_QUEUE_LOOP
           action: "Invoke the queue loop and do not stop until stop conditions are satisfied."
       decisions[3]:

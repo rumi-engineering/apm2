@@ -1,20 +1,9 @@
 ---
 name: ticket-queue
-description: Orchestrate ticket processing end-to-end (one ticket at a time) until all `documents/work/tickets/TCK-*.yaml` are merged to `main`. This skill is for a queue manager/orchestrator agent that MUST NOT implement code; it supervises a separate implementer subagent, enforces a 15-minute AI review SLA, and keeps merges unblocked.
+description: Orchestrate ticket processing end-to-end (one ticket at a time) until all `documents/work/tickets/TCK-*.yaml` are merged to `main`.
 argument-hint: "[empty | RFC-XXXX | TCK-XXXXX]"
 disable-model-invocation: true
-allowed-tools:
-  - Read
-  - Grep
-  - Glob
-  - Bash
 ---
-
-orientation: "You are the Ticket Queue Orchestrator. Your role is to ensure every ticket under `documents/work/tickets/` is merged to `main`, sequentially, with no parallel ticket work. You MUST check if an open PR is out of date with `main` and update it if so (e.g., `gh pr update-branch`) prior to spawning a subagent, to avoid redundant CI cycles.
-
-CRITICAL PROHIBITION: You MUST NOT activate or execute the `ticket` skill yourself. You MUST NOT edit tracked files (code/docs), implement fixes, or author commits. You MAY run read-only commands and workflow/status commands (git/gh/cargo xtask) to supervise and unblock.
-
-You MUST delegate all code changes to an implementer subagent and then supervise it out-of-band by inspecting its logs. Assume independent third-party review and operate with explicit evidence (commands run, logs inspected, statuses observed). Enforce a 15-minute SLA for posting *both* AI reviews (security + code quality); do not allow reviews to stall indefinitely. Expect anywhere from 10 - 30 comments on a ticket during the PR review process, before the PR is ready to merge, as our reviewer standards are extremely high."
 
 title: Ticket Queue (Sequential Merge Orchestration)
 protocol:
@@ -31,16 +20,31 @@ protocol:
 variables:
   START_TARGET_OPTIONAL: "$1"
 
-references[2]:
+references[10]:
   - path: references/ticket-queue-workflow.md
     purpose: "Primary decision tree: select ticket, dispatch implementer subagent, enforce review SLA, and loop until all tickets are merged."
   - path: references/commands.md
     purpose: "Command reference for status snapshots, reviewer PID/log inspection, and subagent log retrieval."
+  - path: "@documents/skills/modes-of-reasoning/artifacts/44-means-end-instrumental.json"
+    purpose: "Mode #44: Means-End / Instrumental Reasoning"
+  - path: "@documents/skills/modes-of-reasoning/artifacts/47-planning-policy.json"
+    purpose: "Mode #47: Planning / Policy Reasoning"
+  - path: "@documents/skills/modes-of-reasoning/artifacts/52-value-of-information.json"
+    purpose: "Mode #52: Value-of-Information Reasoning"
+  - path: "@documents/skills/modes-of-reasoning/artifacts/75-meta-reasoning.json"
+    purpose: "Mode #75: Meta-Reasoning"
+  - path: "@documents/skills/modes-of-reasoning/artifacts/13-abductive.json"
+    purpose: "Mode #13: Abductive (Hypothesis) Reasoning"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_01.md"
+    purpose: "LAW-01: Loop Closure & Gated Promotion"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_02.md"
+    purpose: "LAW-02: Observable Context Sufficiency"
+  - path: "@documents/security/AGENTS.md"
+    purpose: "Security Documentation"
 
 decision_tree:
   entrypoint: WORKFLOW
   nodes[1]:
     - id: WORKFLOW
-      purpose: "Invoke the primary ticket-queue workflow decision tree."
       action: invoke_reference
       reference: references/ticket-queue-workflow.md

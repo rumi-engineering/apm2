@@ -30,7 +30,7 @@ decision_tree:
               description: "Identify security controls BEFORE implementation, not after."
               items:
                 - "List ALL SCP boundaries touched (Identity, Ledger, Tool Execution, Filesystem, Network)"
-                - "For each boundary: cite required textbook controls with CTR-XXXX references"
+                - "For each boundary: cite required Rust Standards controls with CTR-XXXX references"
                 - "List ALL new Vec/HashMap/HashSet with their MAX_* constants and enforcement points"
                 - "Identify any untrusted input requiring streaming deserializers"
             negative_tests:
@@ -46,19 +46,19 @@ decision_tree:
                 - "Quote the RFC requirement being implemented (verbatim)"
                 - "Note code location that will satisfy each requirement"
                 - "Flag any RFC changes needed (bidirectional sync)"
-          validation: "Contract MUST be completed before proceeding to SELECT_RELEVANT_RUST_FRAMEWORKS."
+          validation: "Contract MUST be completed before proceeding to CONSULT_RUST_STANDARDS."
           persistence: "EPHEMERAL - kept in agent working context only, never written to repository."
-        - id: SELECT_RELEVANT_RUST_FRAMEWORKS
-          action: "Based on the planned changes, select relevant Rust Textbook frameworks (Ownership, Async, Errors, etc.)."
+        - id: CONSULT_RUST_STANDARDS
+          action: "Read relevant sections of the `documents/skills/rust-standards/` documents based on the planned changes (e.g., API design, Errors, Security)."
         - id: PLAN_TESTS
-          action: "Define a test strategy covering happy paths, edge cases, and failure modes."
+          action: "Define a test strategy covering happy paths, edge cases, and failure modes. Review the Hazard Catalog (RS-39) for relevant test vectors."
         - id: IMPLEMENT
-          action: "Implement the change following Textbook quality standards."
+          action: "Implement the change following Rust Standards quality guidelines."
         - id: UPDATE_DOCS_AND_AGENTS
           action: "Update documentation and AGENTS.md if public behavior or module invariants change."
-        - id: FIX_FORMATTING
+        - id: FIX_FORMATTING_AND_LINT
           action: command
-          run: "cargo fmt"
+          run: "cargo fmt --all && cargo clippy --fix --allow-dirty --all-targets --all-features -- -D warnings && cargo fmt --all --check"
         - id: VERIFY_AND_COMMIT
           action: command
           run: "cargo xtask commit \"Initial implementation of <TICKET_ID>\""

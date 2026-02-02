@@ -57,6 +57,12 @@
         "path": "documents/skills/rfc-council/assets/skill.rfc_council.v0.json"
       },
       {
+        "id": "remediate_mode",
+        "kind": "instruction.spec",
+        "stable_id": "dcp://apm2.local/instructions/rfc_council/remediate_mode@v0",
+        "path": "documents/skills/rfc-council/assets/instruction.rfc_council.remediate_mode.v0.json"
+      },
+      {
         "id": "finding_categories",
         "kind": "instruction.spec",
         "stable_id": "dcp://apm2.local/instructions/rfc_council/finding_categories@v0",

@@ -1,0 +1,187 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/decision-theoretic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 45,
+    "name": "decision-theoretic",
+    "cat": "decision",
+    "core": "Combine probability distributions over outcomes with utility functions to choose actions maximizing expected utility: EU(action) = sum_i P(state_i|action) * U(outcome_i). Single-agent, passive-world framework for rational choice under uncertainty.",
+    "out": [
+      {"n": "decision_matrix", "d": "actions x states table with probabilities and utilities per cell"},
+      {"n": "utility_function", "d": "mapping from outcomes to numbers, with units and elicitation method stated"},
+      {"n": "eu_ranking", "d": "ordered list of actions by expected utility with arithmetic shown"},
+      {"n": "optimal_action", "d": "highest-EU action with confidence qualifier if close runner-up"},
+      {"n": "sensitivity_analysis", "d": "how optimal action changes under +/-20% probability and utility shifts"},
+      {"n": "value_of_information", "d": "EVPI for pivotal uncertainties; cost threshold for inquiry"}
+    ],
+    "proc": [
+      "GATE 1 - Action enumeration: list all feasible actions including 'do nothing' and 'delay'; if <2 actions, not a decision problem",
+      "GATE 2 - State enumeration: list mutually exclusive, collectively exhaustive states; assign probabilities summing to 1.0; cite source (data, expert, reference class)",
+      "GATE 3 - Utility specification: define U(outcome) for each action-state pair; state units (dollars, QALYs, utils); test for nonlinear preferences (risk aversion) via certainty-equivalent check",
+      "GATE 4 - EU computation: for each action, compute EU = sum P(s)*U(a,s); show arithmetic; rank actions",
+      "GATE 5 - Sensitivity analysis: vary top 3 uncertain parameters by +/-20%; identify crossover points where ranking flips",
+      "GATE 6 - Value of information: if decision is delayable, compute EVPI for pivotal uncertainties; recommend inquiry only if EVPI > inquiry cost",
+      "GATE 7 - Decision documentation: state chosen action, EU margin over runner-up, key assumptions, and conditions that would trigger re-evaluation"
+    ],
+    "quick_check": [
+      "Actions include 'do nothing' and 'delay' options?",
+      "Probabilities sum to 1.0 and have cited source?",
+      "Utility function has explicit units (not just 'high/medium/low')?",
+      "Risk preferences tested (would you take 50% chance of 2x vs certain 1x)?",
+      "EU arithmetic shown, not just asserted?",
+      "Sensitivity tested on at least one probability and one utility?",
+      "If close call (<10% EU difference), additional inquiry considered?",
+      "Failure conditions documented (when to revisit decision)?"
+    ],
+    "check": [
+      "all feasible actions enumerated including null and delay options",
+      "states mutually exclusive and collectively exhaustive",
+      "probabilities sum to 1.0 with source citation",
+      "utility function explicit with units and elicitation method",
+      "nonlinear preferences tested via certainty-equivalent",
+      "EU computed for all actions with arithmetic visible",
+      "sensitivity analysis on top 3 parameters with crossover points",
+      "VOI estimated if decision is delayable and pivotal uncertainty exists",
+      "ranking justified with margin over runner-up",
+      "utility mismatch checked via premortem on optimal choice"
+    ],
+    "diff": {
+      "bayesian-probabilistic": {
+        "boundary": "Bayesian produces probability distributions; decision-theoretic consumes them to select actions",
+        "when_decision_theoretic": "have beliefs and utilities, need to choose action",
+        "when_other": "need to update beliefs from evidence, not yet ready to act"
+      },
+      "optimization": {
+        "boundary": "optimization assumes deterministic or known-distribution consequences; decision-theoretic handles subjective uncertainty",
+        "when_decision_theoretic": "outcomes uncertain, need probability-weighted choice",
+        "when_other": "objective function known, constraints fixed, seeking optimal point"
+      },
+      "multi-criteria-decision-analysis": {
+        "boundary": "MCDA keeps multiple criteria visible as tradeoff surface; decision-theoretic collapses into single EU",
+        "when_decision_theoretic": "can defensibly weight criteria into single utility",
+        "when_other": "stakeholders disagree on weights, need to show Pareto frontier"
+      },
+      "robust-worst-case": {
+        "boundary": "robust maximizes worst-case outcome (maximin); decision-theoretic maximizes expected value",
+        "when_decision_theoretic": "probabilities estimable, not safety-critical",
+        "when_other": "probabilities unknown or catastrophic downside must be bounded"
+      },
+      "minimax-regret": {
+        "boundary": "regret minimizes hindsight shortfall; decision-theoretic maximizes forward-looking expectation",
+        "when_decision_theoretic": "have probability estimates, comfortable with expected-value framing",
+        "when_other": "probabilities unknown, want to avoid 'I should have known' regret"
+      },
+      "means-end-instrumental": {
+        "boundary": "means-end derives what actions achieve goals qualitatively; decision-theoretic quantifies and ranks them",
+        "when_decision_theoretic": "actions known, need to rank under uncertainty",
+        "when_other": "need to discover what actions are even possible to achieve goal"
+      },
+      "game-theoretic-strategic": {
+        "boundary": "game theory models strategic opponents; decision theory treats world as passive",
+        "when_decision_theoretic": "outcomes depend only on your choice and nature",
+        "when_other": "outcomes depend on other agents' strategic responses to your choice"
+      },
+      "value-of-information": {
+        "boundary": "VOI decides what to learn before acting; decision-theoretic decides how to act given current beliefs",
+        "when_decision_theoretic": "beliefs sufficient for action, or no time/budget for inquiry",
+        "when_other": "uncertain whether to gather more information before committing"
+      }
+    },
+    "confusions": [
+      {
+        "pair": ["decision-theoretic", "bayesian-probabilistic"],
+        "confusion": "Both use probabilities, leading to conflation of 'updating beliefs' with 'choosing actions'",
+        "resolution": "Bayesian answers 'what should I believe?'; decision-theoretic answers 'what should I do?'. Run Bayesian first to get posteriors, then decision-theoretic to select action."
+      },
+      {
+        "pair": ["decision-theoretic", "multi-criteria-decision-analysis"],
+        "confusion": "Both rank alternatives, but MCDA surfaces tradeoffs while EU collapses them",
+        "resolution": "If stakeholders agree on utility weights, use decision-theoretic. If weights contested or transparency needed, use MCDA to show Pareto frontier."
+      },
+      {
+        "pair": ["decision-theoretic", "robust-worst-case"],
+        "confusion": "Both handle uncertainty, but use different objectives (expected value vs worst-case floor)",
+        "resolution": "Use decision-theoretic when you trust probability estimates and can absorb bad outcomes. Use robust when probabilities unreliable or downside is catastrophic."
+      },
+      {
+        "pair": ["decision-theoretic", "game-theoretic-strategic"],
+        "confusion": "Both model choice under uncertainty, but decision theory ignores strategic opponents",
+        "resolution": "Ask: do other agents react strategically to my choice? If yes, game theory. If world is passive or opponents non-strategic, decision theory."
+      }
+    ],
+    "fail": {
+      "mode": "utility_mismatch",
+      "desc": "The utility function used for computation diverges from actual preferences, leading to 'optimal' actions that feel wrong or cause harm when implemented",
+      "signals": [
+        "discomfort with optimal action despite arithmetic being correct",
+        "proxy metric diverges from true goal over time (Goodhart's Law)",
+        "important outcomes missing from decision matrix",
+        "utility function borrowed from literature without calibration to context",
+        "stakeholder disagreement on whether optimal action is acceptable",
+        "gaming emerges as agents optimize the metric not the goal"
+      ],
+      "mitigations": [
+        {"m": "preference elicitation", "test": "utility function derived from revealed or stated preferences, not assumed", "threshold": "3+ calibration questions asked before finalizing U()"},
+        {"m": "exclusion audit", "test": "list of outcomes explicitly not in utility function reviewed by stakeholder", "threshold": "exclusion list signed off before decision"},
+        {"m": "premortem on optimal", "test": "imagine optimal action fails badly; identify which assumption broke", "threshold": "at least 2 failure scenarios articulated"},
+        {"m": "proxy-goal alignment check", "test": "compare proxy metric to ultimate goal quarterly", "threshold": "correlation >0.7 or proxy revised"},
+        {"m": "stakeholder utility reconciliation", "test": "if >2 stakeholders, elicit utilities separately and compare", "threshold": "utility disagreement <20% or escalate to MCDA"},
+        {"m": "periodic utility review", "test": "scheduled review of utility function validity", "threshold": "every 6 months or after major context change"}
+      ]
+    },
+    "use": [
+      "investment allocation under uncertain returns",
+      "medical treatment decisions with probabilistic outcomes",
+      "product launch timing with market uncertainty",
+      "hiring decisions with candidate performance uncertainty",
+      "pricing strategies under demand uncertainty",
+      "insurance purchasing decisions",
+      "capacity planning under demand variability",
+      "make-vs-buy decisions with cost and quality uncertainty"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "provides probability inputs; run before decision-theoretic"},
+      {"id": 46, "n": "multi-criteria-decision-analysis", "r": "alternative when utility weights contested; shows tradeoffs"},
+      {"id": 49, "n": "robust-worst-case", "r": "alternative when probabilities unreliable or downside catastrophic"},
+      {"id": 50, "n": "minimax-regret", "r": "alternative when probabilities unknown but regret matters"},
+      {"id": 44, "n": "means-end-instrumental", "r": "use first to discover action space; decision-theoretic ranks"},
+      {"id": 48, "n": "optimization", "r": "use when consequences deterministic; decision-theoretic adds uncertainty"},
+      {"id": 47, "n": "planning-policy", "r": "sequences actions over time; decision-theoretic evaluates single choice"},
+      {"id": 52, "n": "value-of-information", "r": "use to decide whether to gather more data before acting"},
+      {"id": 55, "n": "game-theoretic-strategic", "r": "use when other agents respond strategically to your choice"}
+    ],
+    "ex": {
+      "situation": "Startup decides: launch product with known bugs (A), delay 3 months to fix (B), or pivot to new market (C)",
+      "actions": ["launch_now", "delay_3mo", "pivot"],
+      "states": [
+        {"name": "market_loves", "p": 0.3, "source": "analogous_product_launches"},
+        {"name": "market_lukewarm", "p": 0.5, "source": "base_rate_new_products"},
+        {"name": "market_rejects", "p": 0.2, "source": "competitor_analysis"}
+      ],
+      "utility_matrix": {
+        "launch_now":  {"loves": 100, "lukewarm": 40, "rejects": -20},
+        "delay_3mo":   {"loves": 80,  "lukewarm": 50, "rejects": 10},
+        "pivot":       {"loves": 60,  "lukewarm": 60, "rejects": 60}
+      },
+      "eu_calculation": {
+        "launch_now": "0.3*100 + 0.5*40 + 0.2*(-20) = 30 + 20 - 4 = 46",
+        "delay_3mo":  "0.3*80 + 0.5*50 + 0.2*10 = 24 + 25 + 2 = 51",
+        "pivot":      "0.3*60 + 0.5*60 + 0.2*60 = 18 + 30 + 12 = 60"
+      },
+      "ranking": ["pivot (EU=60)", "delay_3mo (EU=51)", "launch_now (EU=46)"],
+      "sensitivity": "If P(loves) rises to 0.5 (from 0.3), launch_now EU = 50+20-4=66, beating pivot. Crossover at P(loves)=0.43.",
+      "decision": "Pivot unless market research increases P(loves) above 0.43"
+    },
+    "micro_ex": {
+      "situation": "Choose umbrella (A) or no umbrella (B). P(rain)=0.4. U(dry)=10, U(wet)=-5, U(carry umbrella)=-1.",
+      "calc": "EU(A)=0.4*(10-1)+0.6*(10-1)=9. EU(B)=0.4*(-5)+0.6*10=4. Take umbrella.",
+      "insight": "Small carrying cost (-1) is worth paying to avoid large downside (-5) at 40% probability."
+    }
+  }
+}

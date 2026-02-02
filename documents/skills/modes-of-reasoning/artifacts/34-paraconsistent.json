@@ -1,0 +1,177 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/paraconsistent@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 34,
+    "name": "paraconsistent",
+    "cat": "nonmonotonic",
+    "core": "Tolerate contradictions without explosion. Classical logic derives everything from A and not-A (ex falso quodlibet); paraconsistent logics contain contradictions locally, enabling reasoning to continue in unaffected domains. Key insight: contradiction is quarantined, not ignored or resolved.",
+    "out": [
+      {"n": "contradiction_inventory", "d": "explicit list of conflicting propositions with sources, timestamps, and affected domains"},
+      {"n": "quarantine_zones", "d": "domains isolated from contradiction propagation; includes boundary predicates that block inference chains"},
+      {"n": "safe_inferences", "d": "conclusions derivable despite inconsistency; each tagged with dependency proof showing no path to quarantined propositions"},
+      {"n": "conflict_severity", "d": "ranked assessment: action-blocking (must resolve before decision) vs deferrable (can proceed with flag)"},
+      {"n": "resolution_queue", "d": "prioritized backlog of contradictions with deadlines, owners, and escalation thresholds"}
+    ],
+    "proc": [
+      "detect contradictions: scan for A and not-A pairs; record source, timestamp, first-observed context",
+      "assess impact: classify as action-blocking (halts critical path) or containable (deferrable)",
+      "define quarantine boundary: specify which predicates/domains are tainted; boundary must be minimal",
+      "verify isolation: confirm no inference chain crosses from quarantined to safe domains",
+      "continue locally: derive conclusions in consistent subdomains; tag each with 'quarantine-free' proof",
+      "schedule resolution: assign deadline based on severity; action-blocking < 1 decision cycle, containable < 3 cycles",
+      "monitor drift: track if quarantine zones grow; >20% growth triggers escalation"
+    ],
+    "check": [
+      "every contradiction has source attribution and timestamp",
+      "quarantine boundaries are explicit and minimal (no over-isolation)",
+      "no inference chain crosses quarantine boundary (verified by dependency trace)",
+      "safe inferences carry quarantine-free certification",
+      "action-blocking contradictions have resolution deadline < next decision point",
+      "resolution backlog has bounded size (alert if >10 unresolved contradictions)",
+      "quarantine zone growth rate monitored (alert if >20% expansion per cycle)"
+    ],
+    "decision_procedure": {
+      "enter_when": [
+        "data sources report conflicting values for same proposition",
+        "time pressure prevents immediate conflict resolution",
+        "blocking all operations on contradiction would cause greater harm than proceeding",
+        "multiple authoritative sources disagree and no tie-breaker exists"
+      ],
+      "exit_when": [
+        "contradiction resolved via belief-revision or source correction",
+        "quarantine zone growth exceeds 20% per cycle (escalate to belief-revision)",
+        "action-blocking contradiction encountered (switch to belief-revision or argumentation)",
+        "resolution backlog exceeds threshold (trigger systematic reconciliation)"
+      ],
+      "stay_in_if": [
+        "contradictions remain containable and deferrable",
+        "safe inferences continue to support required decisions",
+        "quarantine boundaries stable"
+      ]
+    },
+    "quick_checklist": [
+      "Can I identify both sides of the contradiction explicitly? (if vague, not ready for paraconsistent)",
+      "Is the contradiction binary (A vs not-A) or gradual (values differ)? (gradual → consider fuzzy logic)",
+      "Can I draw a boundary that isolates the conflict from my current decision? (if no → resolve first)",
+      "Do I have a deadline for resolution? (if no → set one now)",
+      "Am I tracking quarantine zone growth? (if no → start)"
+    ],
+    "common_confusions": [
+      {
+        "confused_with": "fuzzy-logic",
+        "why_confused": "both handle imperfect information",
+        "distinction": "Paraconsistent: proposition is both true AND false (contradiction). Fuzzy: proposition is partially true (degree 0.7). Paraconsistent quarantines; fuzzy aggregates.",
+        "test": "Is the conflict 'A vs not-A' (paraconsistent) or 'A to degree X' (fuzzy)?"
+      },
+      {
+        "confused_with": "belief-revision",
+        "why_confused": "both deal with contradictions",
+        "distinction": "Paraconsistent: tolerate contradiction, continue reasoning elsewhere. Belief-revision: immediately repair contradiction by retracting beliefs. Paraconsistent defers; belief-revision resolves.",
+        "test": "Do I need to act now despite the conflict (paraconsistent) or can I pause to fix it (belief-revision)?"
+      },
+      {
+        "confused_with": "defeasible",
+        "why_confused": "both allow non-classical inference",
+        "distinction": "Paraconsistent: handles outright contradiction (A and not-A both asserted). Defeasible: handles defeat (A unless B; B defeats A). Paraconsistent quarantines; defeasible computes winners.",
+        "test": "Are both claims actively asserted (paraconsistent) or does one override the other (defeasible)?"
+      },
+      {
+        "confused_with": "many-valued",
+        "why_confused": "both reject classical two-valued logic",
+        "distinction": "Paraconsistent: still uses true/false but blocks explosion. Many-valued: introduces third+ values (unknown, both, neither). Paraconsistent contains; many-valued reclassifies.",
+        "test": "Do I know both values and they conflict (paraconsistent) or is the truth status itself unclear (many-valued)?"
+      }
+    ],
+    "diff": {
+      "deductive": "tolerates contradictions (quarantines) vs explodes from them (ex falso quodlibet)",
+      "belief-revision": "defers contradiction resolution vs repairs immediately by retracting beliefs",
+      "argumentation": "isolates conflicts from other reasoning vs structures competing claims into attack/support graphs",
+      "defeasible": "blocks explosion from contradiction vs computes which defaults defeat others",
+      "fuzzy-logic": "handles binary conflict (A and not-A) vs handles degree of truth (A to degree 0.7)",
+      "many-valued": "retains true/false but contains contradiction vs introduces third+ truth values",
+      "rough-set": "quarantines inconsistent propositions vs models boundary regions of uncertain classification"
+    },
+    "fail": {
+      "mode": "indefinite_tolerance",
+      "signals": [
+        "contradictions never resolved; backlog age > 5 decision cycles",
+        "quarantine zones expand >20% per cycle",
+        "action-blocking conflicts deferred without deadline",
+        "team treats inconsistency as normal operating state",
+        "resolution backlog grows unbounded (>10 items with no resolution progress)"
+      ],
+      "mitigations": [
+        {
+          "mitigation": "severity triage on detection",
+          "test": "every new contradiction classified as action-blocking or deferrable within 1 hour",
+          "escalation": "unclassified contradiction after 1 hour → treat as action-blocking"
+        },
+        {
+          "mitigation": "mandatory resolution deadlines",
+          "test": "action-blocking: resolved before next decision; deferrable: resolved within 3 cycles",
+          "escalation": "missed deadline → escalate to belief-revision mode with forced retraction"
+        },
+        {
+          "mitigation": "quarantine growth monitoring",
+          "test": "measure zone size each cycle; alert if >20% growth",
+          "escalation": ">20% growth → pause new work, prioritize reconciliation"
+        },
+        {
+          "mitigation": "backlog size cap",
+          "test": "maximum 10 unresolved contradictions",
+          "escalation": ">10 items → block new contradictions until backlog reduced"
+        },
+        {
+          "mitigation": "periodic consistency audits",
+          "test": "weekly review of all quarantine zones; verify boundaries still minimal",
+          "escalation": "audit finds over-isolation → tighten boundaries; finds leakage → emergency containment"
+        }
+      ]
+    },
+    "use": [
+      "merging inconsistent data sources under time pressure",
+      "messy enterprise data integration (ETL with conflicting schemas)",
+      "early incident response triage (conflicting reports, act on overlap)",
+      "requirements analysis with stakeholder conflicts (proceed on agreed subset)",
+      "legacy system migration (old and new systems report different values)",
+      "multi-stakeholder input reconciliation (defer resolution, act on consensus)",
+      "regulatory compliance with conflicting standards (satisfy overlap, flag gaps)"
+    ],
+    "rel": [
+      {"id": 1, "n": "deductive", "r": "explodes on contradiction; paraconsistent blocks explosion"},
+      {"id": 33, "n": "belief-revision", "r": "repairs contradictions; paraconsistent defers repair"},
+      {"id": 35, "n": "argumentation", "r": "structures competing claims; paraconsistent isolates them"},
+      {"id": 32, "n": "defeasible", "r": "manages defeat relations; paraconsistent handles ties"},
+      {"id": 25, "n": "fuzzy-logic", "r": "handles partial truth; paraconsistent handles full contradiction"},
+      {"id": 26, "n": "many-valued", "r": "introduces new truth values; paraconsistent retains classical values"},
+      {"id": 27, "n": "rough-set", "r": "models boundary uncertainty; paraconsistent models outright conflict"},
+      {"id": 75, "n": "meta-reasoning", "r": "decides when to tolerate vs resolve"}
+    ],
+    "ex": {
+      "sit": "Database merger: Source A says customer X lives in NYC. Source B says customer X lives in LA. Need to process orders now, shipping deadline in 2 hours.",
+      "steps": [
+        "detect: address(X, NYC) contradicts address(X, LA); sources: CRM-legacy vs CRM-new; detected at 14:00",
+        "assess: shipping depends on address (action-blocking for shipping); order validity, payment, inventory do not (safe)",
+        "quarantine: isolate address predicate; boundary = {address(X, *)}; all other customer predicates unaffected",
+        "verify: order-valid(X) has no dependency on address(X, *); payment-cleared(X) has no dependency; inventory-reserved(X) has no dependency",
+        "continue: process order validation, payment, inventory reservation → all succeed",
+        "schedule: address conflict deadline = 15:30 (30 min before shipping cutoff); assigned to data-ops",
+        "flag: shipping module blocks on address resolution; if unresolved by 15:30, escalate to manual fulfillment"
+      ],
+      "insight": "business continues on consistent subset; contradiction contained to shipping domain; deadline forces resolution before action-blocking moment"
+    },
+    "micro_example": {
+      "sit": "Two config files specify different timeout values: config-prod.yaml says 30s, config-legacy.yaml says 60s. Deployment in 5 minutes.",
+      "paraconsistent_response": "Quarantine timeout predicate. Deploy with conservative value (60s). Log contradiction. Resolve post-deploy.",
+      "wrong_approach": "Block deployment until resolved (may miss window). Or ignore conflict (may cause production issue).",
+      "key_test": "Can I identify a safe default that doesn't depend on the contradiction? If yes → paraconsistent. If no → resolve first."
+    }
+  }
+}

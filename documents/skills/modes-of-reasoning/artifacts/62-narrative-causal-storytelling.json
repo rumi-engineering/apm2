@@ -1,0 +1,135 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/narrative-causal-storytelling@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 62,
+    "name": "narrative-causal-storytelling",
+    "cat": "argumentation",
+    "core": "Build coherent time-ordered explanations connecting events, motives, and causes into a story that supports prediction and action. Integrates causal chains, actor intentions, and temporal sequence into persuasive explanations. Output is a communicable narrative, not a validated causal model—use for explanation and alignment, not for causal proof.",
+    "out": [
+      {"n": "event_chronicle", "d": "timestamped sequence of key events with source attribution; gaps marked explicitly"},
+      {"n": "actor_motive_map", "d": "actors + attributed intentions + evidence basis for each attribution"},
+      {"n": "causal_chain", "d": "directed graph: event_A -> event_B with link type (enabled/triggered/accelerated) and confidence (high/medium/low)"},
+      {"n": "narrative_synthesis", "d": "prose account integrating timeline, motives, and causes; includes 'story thesis' sentence"},
+      {"n": "uncertainty_register", "d": "list of gaps, assumptions, and low-confidence links explicitly flagged"},
+      {"n": "alternative_narratives", "d": ">=1 plausible counter-story with key divergence point identified"}
+    ],
+    "proc": [
+      "CHRONICLE: enumerate events from sources; timestamp each; mark source reliability (primary/secondary/inferred); flag gaps with '?' marker",
+      "SEQUENCE: order events chronologically; identify parallel threads; note sequencing uncertainties",
+      "ACTORS: list agents with roles; attribute motives only with cited evidence (quote, action, statement); mark speculative attributions",
+      "LINK: for each adjacent event pair, state link type (enabled/triggered/accelerated/coincident) and confidence; if confidence <medium, mark as assumption",
+      "SYNTHESIZE: draft narrative with explicit 'thesis' (one sentence stating the story's causal claim); weave events, motives, links",
+      "STRESS-TEST: generate >=1 alternative narrative from same events; identify the 'fork point' where interpretations diverge",
+      "REGISTER: compile uncertainty register; list every gap, assumption, low-confidence link, and speculative motive"
+    ],
+    "check": [
+      "every event has timestamp (or explicit 'unknown') and source",
+      ">=3 events in chronicle before synthesis",
+      "motive attributions cite evidence, not intuition",
+      "causal links have explicit type and confidence level",
+      "narrative has one-sentence thesis statement",
+      ">=1 alternative narrative documented with fork point",
+      "uncertainty register is non-empty (no story is complete)",
+      "narrative does not claim causal proof—only explanation"
+    ],
+    "diff": {
+      "abductive": "narrative builds full arc with actors and timeline; abductive generates single best explanation for specific observations without temporal/actor structure",
+      "causal-inference": "narrative prioritizes coherence and communicability; causal-inference validates via intervention, conditioning, or statistical test—use after narrative to verify claims",
+      "rhetorical": "narrative explains what happened and why; rhetorical persuades audience to act—narrative supplies content, rhetorical shapes delivery",
+      "mechanistic": "narrative is actor-centric (who did what); mechanistic is process-centric (how the system behaves)—combine when actors operate within systems",
+      "historical-investigative": "narrative synthesizes into story; investigative prioritizes evidence triangulation and source critique—investigative is more skeptical, narrative more constructive",
+      "sensemaking": "narrative explains a specific event sequence; sensemaking builds general interpretive frame for a class of situations"
+    },
+    "confusions": [
+      {
+        "trap": "using narrative when causal-inference needed",
+        "symptom": "stakeholder asks 'did X cause Y?' and you respond with a story instead of a testable causal claim",
+        "correction": "if the goal is causal proof, use causal-inference (mode 37) with intervention or conditioning; narrative is for explanation and communication, not validation"
+      },
+      {
+        "trap": "conflating narrative with historical-investigative",
+        "symptom": "treating narrative coherence as evidence of truth; omitting source critique",
+        "correction": "investigative mode prioritizes evidence triangulation; narrative mode prioritizes communicable story—if evidence is contested, run investigative first, then narrative"
+      },
+      {
+        "trap": "using narrative when sensemaking needed",
+        "symptom": "building detailed story before knowing what kind of situation this is",
+        "correction": "if the situation type is unclear, use sensemaking (mode 63) to establish frame first; narrative assumes the frame is already known"
+      }
+    ],
+    "fail": {
+      "mode": "over_coherence",
+      "desc": "Narrative feels complete and inevitable; alternative explanations seem implausible; the story writes the evidence rather than evidence writing the story",
+      "signals": [
+        "story has no gaps or uncertainties—everything fits perfectly",
+        "alternative narratives dismissed in <1 sentence or not considered",
+        "hindsight bias: 'of course this happened, it was inevitable'",
+        "inconvenient facts omitted or footnoted rather than integrated",
+        "motive attributions feel obvious but lack cited evidence",
+        "narrative closure achieved before evidence review complete"
+      ],
+      "mitigations": [
+        {"m": "require uncertainty register with >=3 items", "test": "uncertainty_register.length >= 3"},
+        {"m": "document >=1 alternative narrative with explicit fork point", "test": "alternative_narratives.length >= 1 AND fork_point identified"},
+        {"m": "mark every motive attribution with evidence type (quote/action/inference)", "test": "no motive in actor_motive_map lacks evidence_type field"},
+        {"m": "assign confidence to each causal link; flag >=1 as low/medium", "test": "causal_chain contains at least one link with confidence != 'high'"},
+        {"m": "state what evidence would falsify the narrative thesis", "test": "falsification_conditions non-empty"},
+        {"m": "have second reader identify the most 'convenient' fact; justify its inclusion", "test": "convenient_fact_review completed"},
+        {"m": "time-box synthesis to prevent polish hiding gaps", "test": "synthesis drafted before 60% of time budget; remainder for stress-test"}
+      ]
+    },
+    "use": [
+      "incident postmortems requiring stakeholder alignment",
+      "executive briefings on complex event sequences",
+      "root cause communication (after causal analysis complete)",
+      "case study development for training",
+      "strategic narrative for investor/board communication",
+      "retrospectives where shared understanding matters more than precision"
+    ],
+    "rel": [
+      {"id": 13, "n": "abductive", "r": "generates candidate explanations; narrative extends into full story arc"},
+      {"id": 37, "n": "causal-inference", "r": "validates causal claims narrative asserts; use after narrative to test"},
+      {"id": 60, "n": "rhetorical", "r": "shapes delivery of narrative content for persuasion"},
+      {"id": 40, "n": "mechanistic", "r": "provides process-level detail within narrative actor actions"},
+      {"id": 39, "n": "counterfactual", "r": "tests 'what if' against narrative to identify pivotal moments"},
+      {"id": 73, "n": "historical-investigative", "r": "triangulates evidence before narrative synthesis"},
+      {"id": 63, "n": "sensemaking", "r": "establishes situation frame before narrative construction"}
+    ],
+    "ex": {
+      "sit": "Postmortem: Production outage lasted 4 hours. Engineering and leadership need aligned understanding.",
+      "steps": [
+        "CHRONICLE: deploy 14:00 (CI log), alerts 14:15 (PagerDuty), war room 14:30 (Slack), rollback 18:00 (deploy log); gap: no data 14:15-14:30",
+        "SEQUENCE: deploy -> [15 min gap] -> alerts -> war room -> rollback; parallel: customer complaints 14:20-17:00",
+        "ACTORS: Dev team (pushed deploy under deadline pressure—cited: sprint review notes); SRE (delayed escalation—cited: Slack silence 14:15-14:30); PM (set deadline—cited: roadmap doc)",
+        "LINK: deploy->alerts [triggered, high]; deadline->skipped load test [enabled, medium]; cache bypass->DB overload [triggered, high]",
+        "SYNTHESIZE: Thesis: Deadline pressure led to skipped load test, which masked a cache dependency that caused cascading DB failure. [full narrative prose follows]",
+        "STRESS-TEST: Alt narrative: SRE delay was primary cause—if escalation at 14:15, rollback by 15:00. Fork point: was 14:15-14:30 delay decisive?",
+        "REGISTER: gaps: 14:15-14:30 activity unknown; assumptions: deadline pressure caused skip (correlation, not proof); low-confidence: PM deadline was binding vs advisory"
+      ],
+      "insight": "narrative exposes systemic cause (deadline pressure) beyond proximate cause (bad code); alternative narrative surfaces SRE process gap for separate follow-up"
+    },
+    "micro_ex": {
+      "sit": "Customer churn spike last quarter—need board-ready explanation",
+      "events": ["Q1: competitor launched, Q2: support tickets up 40%, Q3: churn +15%"],
+      "actors": ["competitor (new entrant)", "support team (overwhelmed)", "product team (no response)"],
+      "thesis": "Competitor entry exposed support capacity gap; churn followed unresolved tickets, not feature gap",
+      "alt_narrative": "Churn was feature-driven; support tickets were symptom not cause",
+      "fork_point": "did churned customers cite support or features in exit surveys?"
+    },
+    "quick_check": [
+      "Does every event have a timestamp and source?",
+      "Are motive attributions backed by cited evidence?",
+      "Does the narrative have a one-sentence thesis?",
+      "Have I documented at least one alternative narrative?",
+      "Is there an uncertainty register with gaps and assumptions?",
+      "Am I claiming explanation, not causal proof?"
+    ]
+  }
+}

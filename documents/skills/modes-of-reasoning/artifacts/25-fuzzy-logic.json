@@ -1,0 +1,166 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/fuzzy-logic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 25,
+    "name": "fuzzy-logic",
+    "cat": "uncertain",
+    "core": "Truth is a degree (0-1) because predicates have blurred boundaries. Fuzzy sets assign graded membership rather than crisp true/false. Key insight: 'tall(x)=0.7' means x is 70% applicable to 'tall', NOT 70% chance x is tall. Use when: (1) domain experts describe boundaries as gradual ('somewhat', 'very'), (2) control requires smooth transitions, (3) crisp thresholds create cliff effects.",
+    "out": [
+      {"n": "membership_functions", "d": "named functions μ_A(x) → [0,1] for each fuzzy predicate, with shape (triangular/trapezoidal/gaussian) and parameters"},
+      {"n": "membership_degrees", "d": "computed values 0-1 for specific inputs against specific fuzzy sets"},
+      {"n": "fuzzy_rule_base", "d": "if-then rules with fuzzy antecedents and consequents, each with firing strength"},
+      {"n": "aggregated_output", "d": "combined fuzzy set from all fired rules before defuzzification"},
+      {"n": "defuzzified_values", "d": "crisp outputs with defuzzification method documented (centroid/max/mean-of-max)"},
+      {"n": "graded_classifications", "d": "labels with membership degrees and linguistic hedges (e.g., 'very high: 0.85')"}
+    ],
+    "proc": [
+      "identify vague predicates: list all terms with gradual boundaries (tall, near, risky, frequent); reject if predicate is inherently crisp",
+      "elicit membership functions: for each predicate, define μ(x) shape and parameters from domain experts or data clustering; document crossover points",
+      "fuzzify inputs: compute μ_A(x) for each input value x and relevant fuzzy set A; record all non-zero memberships",
+      "construct rule base: write IF-THEN rules with fuzzy antecedents; specify aggregation (min/product) and implication (min/product) operators",
+      "fire rules: for each rule, compute firing strength = aggregation of antecedent memberships; clip or scale consequent accordingly",
+      "aggregate consequents: combine all fired rule outputs into single fuzzy set (max for union, sum for overlap-tolerant)",
+      "defuzzify: select method based on use case—centroid for smooth control, max-membership for classification, mean-of-maxima for plateau outputs",
+      "attach linguistic hedges: map membership ranges to hedges (0.0-0.2 'barely', 0.3-0.7 'somewhat', 0.8-1.0 'very')"
+    ],
+    "decision_procedure": [
+      "Q1: Is the predicate inherently vague (no natural crisp boundary)? NO → use crisp logic or thresholds",
+      "Q2: Do you need smooth transitions without cliff effects? NO → crisp thresholds may suffice",
+      "Q3: Is uncertainty about category membership, not about underlying facts? NO → use probability (mode 11)",
+      "Q4: Do domain experts think in linguistic terms ('quite', 'very', 'somewhat')? YES → fuzzy is natural fit",
+      "Q5: Will output drive continuous control or graded scoring? YES → fuzzy with defuzzification; NO → consider rough sets (mode 27)"
+    ],
+    "quick_check": [
+      "every fuzzy predicate has an explicit membership function with documented parameters",
+      "all membership values reported with 'membership' or 'degree' language, never 'probability' or 'likelihood'",
+      "defuzzification method chosen before aggregation, not post-hoc",
+      "linguistic hedges consistent across outputs (same threshold mappings)",
+      "crossover points validated against domain intuition (where does 'tall' start?)",
+      "no probability calculus (Bayes rule, expected value) applied to membership degrees"
+    ],
+    "diff": {
+      "bayesian-probabilistic": {
+        "distinction": "Fuzzy: degree to which predicate applies. Bayesian: uncertainty about crisp fact. '0.7 tall' means 70% in the tall category; 'P(tall)=0.7' means 70% chance person exceeds height threshold.",
+        "test": "Ask: 'Could we resolve this with better measurement?' YES → probability. NO (vagueness is inherent) → fuzzy.",
+        "trap": "Averaging fuzzy scores as if they were probabilities; fuzzy AND uses min, not multiplication."
+      },
+      "probabilistic-logic": {
+        "distinction": "Probabilistic logic assigns probabilities to crisp propositions. Fuzzy logic assigns truth degrees to vague propositions.",
+        "test": "Is the proposition itself vague, or is the truth value uncertain? Vague proposition → fuzzy. Uncertain crisp proposition → probabilistic logic.",
+        "trap": "Using P(A ∧ B) = P(A)P(B) on fuzzy membership; fuzzy uses min(μ_A, μ_B)."
+      },
+      "many-valued-partial-logics": {
+        "distinction": "Many-valued: finite discrete truth values (true/false/unknown). Fuzzy: continuous [0,1] with smooth interpolation.",
+        "test": "Are intermediate values meaningfully different from each other? YES (0.6 ≠ 0.7 matters) → fuzzy. NO (just 'partial') → many-valued.",
+        "trap": "Discretizing fuzzy outputs loses the smooth gradation that fuzzy provides."
+      },
+      "rough-set": {
+        "distinction": "Rough sets: vagueness from granularity (can't distinguish elements). Fuzzy: vagueness from predicate definition (what counts as 'tall').",
+        "test": "Is imprecision from measurement limits or from concept boundaries? Measurement → rough. Concept → fuzzy.",
+        "trap": "Using rough set approximations when you have continuous attributes suited for fuzzy membership."
+      },
+      "qualitative-probability": {
+        "distinction": "Qualitative probability: ordering of likelihoods without numbers. Fuzzy: graded membership with explicit [0,1] values.",
+        "test": "Do you need numeric degrees or just ordinal comparisons? Ordinal → qualitative. Cardinal → fuzzy.",
+        "trap": "Treating fuzzy rankings as probability orderings; they measure different things."
+      }
+    },
+    "common_confusions": [
+      {
+        "confusion": "Using fuzzy membership as input to expected value calculations",
+        "example": "Calculating 'expected cost = 0.7 × high_cost + 0.3 × low_cost' where 0.7 is fuzzy membership",
+        "correction": "Fuzzy membership is not a probability distribution. For decisions under uncertainty, use Bayesian probability. For fuzzy control, defuzzify to a crisp action."
+      },
+      {
+        "confusion": "Believing higher membership means 'more likely to be in the category'",
+        "example": "'μ_tall(180cm) = 0.8 means 80% chance this person is tall'",
+        "correction": "Membership 0.8 means the person is 80% applicable to the 'tall' predicate—a matter of degree, not chance. There's no randomness involved."
+      },
+      {
+        "confusion": "Applying Bayes' rule to update fuzzy memberships",
+        "example": "'Given new evidence, revise μ_risky from 0.6 to 0.8 using Bayes'",
+        "correction": "Fuzzy membership updates via modified membership functions or rule weights, not Bayesian conditioning. New evidence changes the function definition, not a posterior."
+      }
+    ],
+    "fail": {
+      "mode": "fuzzy_probability_conflation",
+      "signals": [
+        "treating fuzzy 0.7 as '70% probability' or '70% confidence'",
+        "applying probability operators (×, +, Bayes) to membership degrees",
+        "expecting fuzzy scores to calibrate like probabilistic forecasts",
+        "computing expected values using fuzzy memberships as weights",
+        "describing membership as 'how likely' rather than 'how applicable'"
+      ],
+      "mitigations": [
+        {
+          "action": "terminology audit",
+          "test": "Search all outputs for 'probability', 'likely', 'chance', 'confidence' near fuzzy values; replace with 'membership', 'degree', 'applicability'",
+          "pass_criterion": "zero instances of probabilistic language applied to fuzzy membership"
+        },
+        {
+          "action": "operator verification",
+          "test": "Check every combination of fuzzy values: AND must use min (or product), OR must use max, NOT must use 1-μ; no multiplication of independent memberships",
+          "pass_criterion": "all operators match fuzzy logic algebra, not probability algebra"
+        },
+        {
+          "action": "decision pathway separation",
+          "test": "If fuzzy outputs feed into decisions, verify defuzzification occurs first OR decision uses fuzzy control surface, never raw membership in expected value",
+          "pass_criterion": "no expected value calculation uses fuzzy membership as probability weight"
+        },
+        {
+          "action": "membership function provenance",
+          "test": "Each membership function has documented source (expert elicitation, data-driven clustering, or convention); not derived from frequency data mistaken for vagueness",
+          "pass_criterion": "provenance documentation for every fuzzy set"
+        }
+      ]
+    },
+    "use": [
+      "control systems with soft thresholds (HVAC, auto-focus, anti-lock braking)",
+      "scoring rubrics with graded criteria (essay grading, code review severity)",
+      "natural language understanding (hedges, qualifiers, gradable adjectives)",
+      "policy rules with vague predicates ('high risk', 'significant delay', 'adequate performance')",
+      "image processing (edge detection with gradient, region segmentation)",
+      "expert systems translating linguistic expertise into computable rules"
+    ],
+    "anti_use": [
+      "when underlying fact is crisp but unknown (use probability)",
+      "when decisions require calibrated risk estimates (use Bayesian)",
+      "when data is sparse and membership functions would be arbitrary",
+      "when domain has natural crisp thresholds (legal age limits, pass/fail cutoffs)"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "complementary: fuzzy for vagueness, Bayesian for uncertainty about crisp facts"},
+      {"id": 26, "n": "many-valued-partial-logics", "r": "alternative: discrete truth values when continuous gradation unnecessary"},
+      {"id": 27, "n": "rough-set", "r": "alternative: granularity-based vagueness when boundaries come from measurement limits"},
+      {"id": 20, "n": "probabilistic-logic", "r": "distinct: probability over propositions vs truth degree of propositions"},
+      {"id": 24, "n": "qualitative-probability", "r": "distinct: ordinal likelihood vs cardinal membership degree"}
+    ],
+    "ex": {
+      "sit": "Classifying temperature as 'warm' when value is 22C to control fan speed in HVAC system.",
+      "steps": [
+        "identify vague predicates: 'cold', 'warm', 'hot'—inherently gradual, no natural crisp boundary",
+        "define membership functions: warm(x) trapezoidal, μ=0 at 15C, rising to μ=1 at 20C, plateau to 30C, μ=0 at 35C",
+        "fuzzify: warm(22) = 1.0 (within plateau); also compute cold(22)=0, hot(22)=0",
+        "rule base: IF warm THEN fan_speed = medium (firing strength 1.0)",
+        "aggregate: single rule fires, consequent 'medium' with full strength",
+        "defuzzify via centroid: medium fan speed maps to 50% power",
+        "report: '22C is fully warm (μ=1.0), fan at 50%'"
+      ],
+      "insight": "μ_warm(22)=1.0 means 22C is completely applicable to 'warm'—not that we're certain about temperature. Contrast: if thermometer had ±2C error, P(actual temp in warm range) would be a probability question."
+    },
+    "micro_ex": {
+      "contrast": "fuzzy vs probability for 'Is this email spam?'",
+      "fuzzy_framing": "μ_spam(email) = 0.7 means the email is 70% spam-like (has many spam characteristics)",
+      "probability_framing": "P(spam|email) = 0.7 means 70% chance this email was sent by a spammer",
+      "key_difference": "Fuzzy: degree of spam-ness. Probability: belief about origin. Same 0.7, utterly different meanings.",
+      "decision_implication": "Fuzzy 0.7 might trigger 'flag for review'; probability 0.7 might feed into expected cost calculation for auto-delete."
+    }
+  }
+}

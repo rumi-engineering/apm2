@@ -1,0 +1,85 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/case-based@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 15,
+    "name": "case-based",
+    "cat": "ampliative",
+    "core": "Retrieve similar past cases from a structured library using explicit similarity metrics; adapt their solutions to current problem via adaptation operators (substitute, delete, transform, specialize). Requires: indexed case library, retrieval function, adaptation rules.",
+    "out": [
+      {"a": "adapted_solution", "s": "source_case_id, similarity_score, adaptations_applied, validation_result", "done": "solution tested against current constraints"},
+      {"a": "playbook_action", "s": "matched_runbook, context_deltas, modified_steps", "done": "steps adjusted for current environment"},
+      {"a": "precedent_justification", "s": "retrieved_cases, relevance_ranking, distinguishing_factors", "done": "precedent applicability argued with context delta"}
+    ],
+    "proc": [
+      "Index current problem: extract feature vector (domain, symptoms, constraints, goals, environment)",
+      "Query case library: retrieve top-k cases where similarity >= threshold (typically 0.7 cosine or 3+ matching features)",
+      "Rank candidates: weight by (recency * outcome_success * feature_overlap); penalize cases with known failures in similar contexts",
+      "Select source case: choose highest-ranked case; if tie, prefer more recent or better-documented",
+      "Identify context delta: list differences in (environment, scale, constraints, stakeholders, technology)",
+      "Apply adaptation operators: SUBSTITUTE (swap components for current equivalents), DELETE (remove inapplicable steps), TRANSFORM (modify parameters), SPECIALIZE (add constraints)",
+      "Validate adapted solution: check against current constraints; run in sandbox/dry-run if possible",
+      "Retain case: if adaptation succeeds, add (problem, solution, outcome) to library for future retrieval"
+    ],
+    "check": [
+      "Similarity score documented (threshold >= 0.7 or 3+ matching features)?",
+      "Context delta explicitly enumerated (at least environment, scale, constraints)?",
+      "Each adaptation operator named and justified?",
+      "Adapted solution tested against current constraints before deployment?",
+      "Source case outcome verified (success, not just attempted)?",
+      "Case library updated with outcome for future retrieval?"
+    ],
+    "diff": {
+      "vs_analogical": "case-based uses indexed retrieval with similarity metrics; analogical uses structural mapping. Case-based emphasizes library maintenance and adaptation operators; analogical focuses on cross-domain relational transfer.",
+      "vs_reference_class": "case-based retrieves individual cases and adapts their solutions; reference-class uses aggregate base-rate statistics without accessing specific case details. Use case-based when you need the solution mechanism; use reference-class for probability estimates.",
+      "vs_prototype_similarity": "prototype classifies by typicality to exemplars; case-based retrieves exemplars to solve problems. Prototype answers 'what category?'; case-based answers 'how to solve?'",
+      "vs_explanation_based_learning": "case-based retrieves and adapts without requiring causal explanation; EBL demands explanatory justification for why the solution worked before generalizing"
+    },
+    "confusions": [
+      {"vs": "analogical", "trap": "treating structural metaphor as case retrieval", "clarify": "if you're mapping relational structure across domains without a case library, that's analogical. Case-based requires indexed past solutions."},
+      {"vs": "reference-class", "trap": "using a single case as a 'reference class'", "clarify": "one case is not a reference class. Reference-class needs 10+ cases for base-rate statistics; case-based can work with 1 well-matched case."}
+    ],
+    "fail": {
+      "mode": "cargo-culting",
+      "desc": "applying precedent without checking context changes; past solutions may not apply when circumstances differ in important ways",
+      "signals": [
+        "no explicit context delta analysis",
+        "adaptation operators absent or unjustified",
+        "source case outcome not verified",
+        "solution applied verbatim despite environment differences"
+      ],
+      "mitigations": [
+        {"m": "mandatory context delta checklist", "test": "written list of >= 3 context differences before adaptation"},
+        {"m": "adaptation operator audit", "test": "each change from source case tagged with operator name (SUBSTITUTE/DELETE/TRANSFORM/SPECIALIZE)"},
+        {"m": "source case validation", "test": "source case has verified successful outcome, not just 'we tried this'"},
+        {"m": "sandbox/dry-run before deployment", "test": "adapted solution tested in non-production environment"},
+        {"m": "recency decay", "test": "cases older than 2 years flagged for environmental obsolescence review"}
+      ]
+    },
+    "use": [
+      "legal reasoning (stare decisis, precedent matching)",
+      "customer support (ticket routing, escalation playbooks)",
+      "clinical decision support (treatment protocols from similar patients)",
+      "ops/SRE runbooks (incident response from past outages)",
+      "design reuse (architectural patterns from prior projects)",
+      "code review (known bug patterns, past PR feedback)"
+    ],
+    "rel": [
+      {"id": 14, "name": "analogical", "link": "underlying cognitive mechanism for similarity; case-based operationalizes with library and adaptation"},
+      {"id": 18, "name": "reference-class-outside-view", "link": "aggregate statistical version; provides base rates while case-based provides mechanisms"},
+      {"id": 71, "name": "legal", "link": "formal precedent system with stare decisis; adds burden of proof and adversarial structure"},
+      {"id": 16, "name": "explanation-based-learning", "link": "can explain why a retrieved case worked, enabling principled generalization"},
+      {"id": 28, "name": "prototype-similarity-based", "link": "uses similarity for classification; case-based uses similarity for problem-solving"}
+    ],
+    "ex": {
+      "scenario": "production database outage with symptoms: high latency, connection pool exhaustion, no recent deploys",
+      "approach": "Query runbook library with feature vector [database, latency, connection-pool, no-deploy]. Retrieve case #247 (0.85 similarity): 'connection leak from idle timeout mismatch'. Context delta: different database version (Postgres 14 vs 12), larger connection pool (500 vs 200). Adaptation: SUBSTITUTE pool size parameter, SPECIALIZE timeout values for Postgres 14 defaults. Validate: test config change in staging. Outcome: leak resolved, retain as case #312."
+    }
+  }
+}

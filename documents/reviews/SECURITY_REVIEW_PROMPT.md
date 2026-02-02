@@ -3,11 +3,6 @@ protocol:
   id: SECURITY-REVIEW
   version: 2.0.0
   type: executable_specification
-  constraints[4]:
-    - "Independent audit: Derive truth from diff and binding artifacts, not implementer narrative."
-    - "Fail-closed: Unverifiable security claims = BLOCK."
-    - "No local execution: Static analysis only; rely on evidence bundles if provided."
-    - "No repository edits: Raise findings; do not propose patches."
   inputs[2]:
     - PR_URL
     - HEAD_SHA
@@ -19,28 +14,51 @@ variables:
   PR_URL: "$PR_URL"
   HEAD_SHA: "$HEAD_SHA"
 
-decision_tree:
-  entrypoint: PHASE_0_BOOTSTRAP
-  nodes[8]:
-    - id: PHASE_0_BOOTSTRAP
-      purpose: "Load security baseline and onboarding context."
-      context_files[11]:
-        - path: documents/security/SECURITY_POLICY.md
-        - path: documents/security/CI_SECURITY_GATES.md
-        - path: documents/security/THREAT_MODEL.md
-        - path: documents/security/SECRETS_MANAGEMENT.md
-        - path: documents/skills/rust-standards/SKILL.md
-        - path: documents/skills/glossary/SKILL.md
-        - path: documents/skills/modes-of-reasoning/references/79-adversarial-red-team.md
-        - path: documents/skills/modes-of-reasoning/references/08-counterexample-guided.md
-        - path: documents/skills/modes-of-reasoning/references/49-robust-worst-case.md
-        - path: documents/skills/modes-of-reasoning/references/55-game-theoretic-strategic.md
-        - path: documents/skills/modes-of-reasoning/references/36-assurance-case.md
-      steps[1]:
-        - id: READ_BASELINE
-          action: "Read baseline documents and record invariants. Adopt the 5 mandatory security reasoning modes."
-      next: PHASE_1_COLLECT_PR_IDENTITY
+references[20]:
+  - path: "@documents/skills/modes-of-reasoning/artifacts/79-adversarial-red-team.json"
+    purpose: "Mode #79: Adversarial / Red-Team Reasoning"
+  - path: "@documents/skills/modes-of-reasoning/artifacts/08-counterexample-guided.json"
+    purpose: "Mode #08: Counterexample-Guided Reasoning"
+  - path: "@documents/skills/modes-of-reasoning/artifacts/49-robust-worst-case.json"
+    purpose: "Mode #49: Robust / Worst-Case Reasoning"
+  - path: "@documents/skills/modes-of-reasoning/artifacts/55-game-theoretic-strategic.json"
+    purpose: "Mode #55: Game-Theoretic Reasoning"
+  - path: "@documents/skills/modes-of-reasoning/artifacts/36-assurance-case.json"
+    purpose: "Mode #36: Assurance-Case Reasoning"
+  - path: "@documents/security/SECURITY_POLICY.md"
+    purpose: "Security Policy"
+  - path: "@documents/security/CI_SECURITY_GATES.md"
+    purpose: "CI Security Gates"
+  - path: "@documents/security/THREAT_MODEL.md"
+    purpose: "Threat Model"
+  - path: "@documents/security/SECRETS_MANAGEMENT.md"
+    purpose: "Secrets Management"
+  - path: "@documents/skills/rust-standards/SKILL.md"
+    purpose: "Rust Standards"
+  - path: "@documents/skills/glossary/SKILL.md"
+    purpose: "Project Glossary"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_03.md"
+    purpose: "LAW-03: Monotone Ledger"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_05.md"
+    purpose: "LAW-05: Dual-Axis Containment"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_06.md"
+    purpose: "LAW-06: MDL as a Gated Budget"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_07.md"
+    purpose: "LAW-07: Verifiable Summaries"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_08.md"
+    purpose: "LAW-08: Goodhart Resistance"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_09.md"
+    purpose: "LAW-09: Temporal Pinning & Freshness"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_11.md"
+    purpose: "LAW-11: Idempotent Actuation"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_12.md"
+    purpose: "LAW-12: Bounded Search and Termination"
+  - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_14.md"
+    purpose: "LAW-14: Risk-Weighted Evidence"
 
+decision_tree:
+  entrypoint: PHASE_1_COLLECT_PR_IDENTITY
+  nodes[7]:
     - id: PHASE_1_COLLECT_PR_IDENTITY
       purpose: "Gather PR metadata, diff, and ticket/RFC bindings."
       steps[3]:
@@ -97,78 +115,36 @@ decision_tree:
       purpose: "Apply domain-specific security modules and textbook chapters."
       force_multiplier_strategies[6]:
         - lens: "Holonic Blast Radius Analysis"
-          strategy: "Map compromise propagation paths across holon boundaries. Ask: 'Can a leaf-node compromise trick a parent into a confused-deputy action?'"
-          reasoning: [55, 49] # Strategic & Robust
-          laws: [5] # Dual-Axis Containment
+          strategy: "Map compromise propagation paths across holon boundaries."
+          reasoning: [55, 49]
         - lens: "Audit the 'Invisible Contract'"
-          strategy: "Search for what ISN'T there. If a protocol message enters, where is the economic cost or resource cap?"
-          reasoning: [49] # Robust
-          laws: [6] # MDL as a Gated Budget
+          strategy: "Search for missing economic costs or resource caps."
+          reasoning: [49]
         - lens: "Treat Protocol as Code"
-          strategy: "Game the protocol logic for downgrade attacks or canonicalization ambiguity (AD-VERIFY-001)."
-          reasoning: [55] # Strategic
+          strategy: "Game protocol logic for downgrade attacks or canonicalization ambiguity."
+          reasoning: [55]
         - lens: "Search for 'Entropy Leaks'"
-          strategy: "Find sequences of partial failures/restarts that leave the system in an 'impossible' state that bypasses a gate."
-          reasoning: [8] # Counterexample-Guided
-          laws: [11] # Idempotent Actuation
+          strategy: "Find sequences of partial failures that bypass gates."
+          reasoning: [8]
         - lens: "Demand 'Negative Evidence'"
-          strategy: "Reject parsers/boundaries unless they include a 'corpus of pain' proving they fail correctly under stress."
-          reasoning: [8] # Counterexample-Guided
+          strategy: "Reject parsers unless they include stress-test corpora."
+          reasoning: [8]
         - lens: "The 'Assurance Case' Mindset"
-          strategy: "Construct the final security case: 'What is the specific evidence that this PR does not degrade the branch posture?'"
-          reasoning: [36] # Assurance-Case
-        - lens: "Side-Channel & Timing Sensitivity"
-          strategy: "Search for secret-dependent branching or indexing. Demand constant-time operations for ALL sensitive comparisons."
-          reasoning: [8, 49] # Counterexample-Guided & Robust
-          references: ["documents/skills/rust-standards/references/34_security_adjacent_rust.md"]
+          strategy: "Construct Claim-Argument-Evidence justification."
+          reasoning: [36]
       audit_categories[6]:
         - category: "Identity, Cryptography, and Wire Semantics"
           focus: "Signing, verification, hashing, and deterministic representation."
-          references:
-            - documents/security/THREAT_MODEL.md
-            - documents/security/SECRETS_MANAGEMENT.md
-            - documents/skills/rust-standards/references/31_io_protocol_boundaries.md
-            - documents/skills/rust-standards/references/34_security_adjacent_rust.md
-            - documents/skills/laws-of-holonic-agent-systems/references/law_09.md (Temporal Pinning & Freshness)
         - category: "Network and IPC Boundaries"
           focus: "Parsing untrusted data, framing, and DoS mitigation."
-          references:
-            - documents/skills/rust-standards/references/31_io_protocol_boundaries.md
-            - documents/skills/rust-standards/references/21_concurrency_atomics_memory_order.md
-            - documents/skills/rust-standards/references/16_error_handling_and_panic_policy.md
-            - documents/skills/laws-of-holonic-agent-systems/references/law_05.md (Dual-Axis Containment)
-            - documents/skills/laws-of-holonic-agent-systems/references/law_06.md (MDL as a Gated Budget)
-            - documents/skills/laws-of-holonic-agent-systems/references/law_12.md (Bounded Search and Termination)
         - category: "Filesystem and Process Boundaries"
           focus: "Path traversal, temp files, shell injection, and permissions."
-          references:
-            - documents/skills/rust-standards/references/30_paths_filesystem_os.md
-            - documents/skills/rust-standards/references/24_dependency_and_build_surface.md
-            - documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md
-            - documents/skills/laws-of-holonic-agent-systems/references/law_11.md (Idempotent Actuation)
         - category: "Ledger and Evidence Integrity"
           focus: "Append-only persistence, crash recovery, and history verification."
-          references:
-            - documents/security/SECURITY_POLICY.md
-            - documents/skills/rust-standards/references/31_io_protocol_boundaries.md
-            - documents/skills/rust-standards/references/40_time_monotonicity_determinism.md
-            - documents/skills/laws-of-holonic-agent-systems/references/law_03.md (Monotone Ledger)
-            - documents/skills/laws-of-holonic-agent-systems/references/law_07.md (Verifiable Summaries)
         - category: "Memory Safety and Soundness"
           focus: "Unsafe code, async cancellation safety, and resource exhaustion."
-          references:
-            - documents/skills/rust-standards/references/12_rust_soundness_and_unsafe.md
-            - documents/skills/rust-standards/references/19_unsafe_rust_obligations.md
-            - documents/skills/rust-standards/references/23_async_pin_cancellation.md
-            - documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-system-defects/SKILL.md
         - category: "Gate, Policy, and Supply Chain"
           focus: "Changes to security docs, CI gates, and new dependencies."
-          references:
-            - documents/security/CI_SECURITY_GATES.md
-            - documents/skills/rust-standards/references/24_dependency_and_build_surface.md
-            - documents/reviews/SECURITY_REVIEW_PROMPT.md
-            - documents/skills/laws-of-holonic-agent-systems/references/law_08.md (Goodhart Resistance)
-            - documents/skills/laws-of-holonic-agent-systems/references/law_14.md (Risk-Weighted Evidence)
       steps[2]:
         - id: RUN_AUDIT
           action: "Identify applicable categories based on SCP determination and Markov blanket. Apply paired references to the diff."
@@ -208,18 +184,16 @@ decision_tree:
 
     - id: PHASE_7_EXECUTE_ACTIONS
       purpose: "Post findings (Assurance-Case format) to PR and update status check."
-      steps[2]:
+      steps[3]:
+        - id: WRITE_FINDINGS
+          action: write_file
+          path: "security_findings.md"
+          content: "$FINDINGS_ASSURANCE_CASE"
         - id: POST_COMMENT
           action: command
-          run: "gh pr comment $PR_URL --body \"$FINDINGS_ASSURANCE_CASE\""
+          run: "gh pr comment $PR_URL --body-file security_findings.md"
         - id: UPDATE_STATUS
           action: command
           run: |
-            IF verdict == PASS: "cargo xtask security-review-exec approve $PR_URL"
-            ELSE: "cargo xtask security-review-exec deny $PR_URL --reason \"$FINDINGS_ASSURANCE_CASE\""
-
-reference:
-  paths:
-    onboard: "cargo xtask security-review-exec onboard"
-    waiver_schema: "documents/standards/schemas/05_waiver.schema.yaml"
-    waiver_dir: "documents/work/waivers/"
+            IF verdict == PASS: "cargo xtask security-review-exec approve $PR_URL && rm security_findings.md"
+            ELSE: "cat security_findings.md | cargo xtask security-review-exec deny $PR_URL --reason - && rm security_findings.md"

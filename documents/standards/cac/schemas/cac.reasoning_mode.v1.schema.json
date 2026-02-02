@@ -1,0 +1,270 @@
+{
+  "$id": "cac.reasoning_mode.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "reasoning.mode"
+        },
+        "payload": {
+          "$ref": "#/$defs/reasoning_mode_payload"
+        },
+        "schema": {
+          "const": "cac.reasoning_mode.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC Reasoning Mode v1",
+  "$defs": {
+    "reasoning_mode_payload": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "Numeric mode identifier (1-80)",
+          "maximum": 99,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Kebab-case mode name",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "type": "string"
+        },
+        "cat": {
+          "description": "Category enum",
+          "enum": [
+            "formal",
+            "probabilistic",
+            "uncertain",
+            "ampliative",
+            "nonmonotonic",
+            "causal",
+            "decision",
+            "search",
+            "strategic",
+            "argumentation",
+            "domain",
+            "meta"
+          ],
+          "type": "string"
+        },
+        "core": {
+          "description": "One-line core definition",
+          "maxLength": 200,
+          "type": "string"
+        },
+        "out": {
+          "description": "Artifacts produced by this mode",
+          "items": {
+            "$ref": "#/$defs/artifact_spec"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "proc": {
+          "description": "Procedure steps (array position = step number)",
+          "items": {
+            "$ref": "#/$defs/procedure_step"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "check": {
+          "description": "Quick checklist items",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "diff": {
+          "additionalProperties": {
+            "$ref": "#/$defs/distinction"
+          },
+          "description": "Distinctions from nearby modes (keyed by mode ID)",
+          "type": "object"
+        },
+        "fail": {
+          "$ref": "#/$defs/failure_mode",
+          "description": "Common failure mode with detection and mitigation"
+        },
+        "use": {
+          "description": "Use cases/domains where this mode excels",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rel": {
+          "description": "Related mode IDs",
+          "items": {
+            "maximum": 99,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "ex": {
+          "$ref": "#/$defs/micro_example",
+          "description": "Micro-example demonstrating the procedure"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "cat",
+        "core",
+        "out",
+        "proc",
+        "check",
+        "fail"
+      ],
+      "type": "object"
+    },
+    "artifact_spec": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "Artifact identifier",
+          "type": "string"
+        },
+        "form": {
+          "description": "Structure/format description",
+          "type": "string"
+        },
+        "test": {
+          "description": "Validation test",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "form",
+        "test"
+      ],
+      "type": "object"
+    },
+    "procedure_step": {
+      "additionalProperties": false,
+      "properties": {
+        "do": {
+          "description": "Action to take",
+          "type": "string"
+        },
+        "out": {
+          "description": "Output produced",
+          "type": "string"
+        },
+        "test": {
+          "description": "Validation test for this step",
+          "type": "string"
+        }
+      },
+      "required": [
+        "do"
+      ],
+      "type": "object"
+    },
+    "distinction": {
+      "additionalProperties": false,
+      "properties": {
+        "q": {
+          "description": "Distinguishing question",
+          "type": "string"
+        },
+        "this": {
+          "description": "How this mode answers",
+          "type": "string"
+        },
+        "other": {
+          "description": "How the other mode answers",
+          "type": "string"
+        }
+      },
+      "required": [
+        "q",
+        "this",
+        "other"
+      ],
+      "type": "object"
+    },
+    "failure_mode": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "Failure mode name",
+          "type": "string"
+        },
+        "detect": {
+          "description": "Detection signals",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mit": {
+          "description": "Mitigations with testable criteria",
+          "items": {
+            "$ref": "#/$defs/mitigation"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "detect",
+        "mit"
+      ],
+      "type": "object"
+    },
+    "mitigation": {
+      "additionalProperties": false,
+      "properties": {
+        "do": {
+          "description": "Mitigation action",
+          "type": "string"
+        },
+        "test": {
+          "description": "Test to verify mitigation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "do",
+        "test"
+      ],
+      "type": "object"
+    },
+    "micro_example": {
+      "additionalProperties": false,
+      "properties": {
+        "prob": {
+          "description": "Problem statement",
+          "type": "string"
+        },
+        "steps": {
+          "description": "Procedure steps applied",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "result": {
+          "description": "Outcome",
+          "type": "string"
+        }
+      },
+      "required": [
+        "prob",
+        "steps",
+        "result"
+      ],
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,189 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/dialectical@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 59,
+    "name": "dialectical",
+    "cat": "argumentation",
+    "core": "Advance understanding through structured opposition: state thesis, generate antithesis that genuinely contradicts it, articulate the tension each captures, then synthesize into a position that preserves valid insights from both. Key property: synthesis must be novel (not mere compromise) and testable against original concerns. Repeat until convergence criteria met.",
+    "out": [
+      {"n": "thesis_statement", "d": "initial position with explicit claims, scope, and assumptions"},
+      {"n": "antithesis_statement", "d": "opposing position that contradicts thesis on at least one substantive point"},
+      {"n": "tension_analysis", "d": "structured comparison: what each position captures, what it misses, where they conflict"},
+      {"n": "synthesis", "d": "integrated position transcending the opposition; must address both original concerns without mere averaging"},
+      {"n": "convergence_log", "d": "record of rounds, progress metrics, and termination rationale"},
+      {"n": "refined_concepts", "d": "sharpened definitions emerging from dialectical process"}
+    ],
+    "proc": [
+      "state thesis: write explicit claim with scope (what it applies to) and key assumptions; thesis must be falsifiable",
+      "generate antithesis: identify position that contradicts thesis on substance, not style; antithesis must be defensible by reasonable party",
+      "articulate tension: for each point of conflict, state (a) what thesis captures, (b) what antithesis captures, (c) why both cannot simultaneously hold",
+      "attempt synthesis: propose position that (a) addresses thesis's core concern, (b) addresses antithesis's core concern, (c) is not mere splitting-the-difference",
+      "test synthesis: verify synthesis resolves original tension; if it creates new tensions, those become next round's focus",
+      "check convergence: apply stopping criteria (see decision_procedure.exit_when); if not met, synthesis becomes new thesis",
+      "document round: log thesis, antithesis, tension, synthesis, and progress metric for audit trail"
+    ],
+    "decision_procedure": {
+      "enter_when": [
+        "two or more defensible positions exist on a substantive question",
+        "simple debate produces hardening rather than refinement",
+        "conceptual clarity is the goal (not persuasion or winner selection)",
+        "parties are willing to revise positions based on argument"
+      ],
+      "exit_when": [
+        "synthesis addresses both original concerns without creating worse tensions",
+        "no defensible antithesis can be generated against current synthesis",
+        "3 consecutive rounds produce <10% conceptual change (measured by shared criteria)",
+        "time/resource budget exhausted (proceed with best synthesis and flag incompleteness)"
+      ],
+      "stay_in_if": [
+        "synthesis creates new tensions worth resolving",
+        "significant conceptual progress in last round",
+        "defensible antithesis still available"
+      ]
+    },
+    "quick_checklist": [
+      "Is my antithesis genuinely opposing (not strawman or minor variant)?",
+      "Could a reasonable person defend the antithesis?",
+      "Have I stated what each position gets RIGHT before attacking?",
+      "Is my synthesis novel (not 50/50 compromise)?",
+      "Does synthesis address BOTH original concerns?",
+      "Have I defined when to stop iterating?"
+    ],
+    "check": [
+      "thesis and antithesis contradict on substance (not just framing)",
+      "antithesis is steelmanned: strongest version, not weakest",
+      "tension articulated as explicit trade-off with named values",
+      "synthesis is testable: criteria exist to evaluate if it succeeds",
+      "synthesis is not mere compromise (averaging positions)",
+      "convergence criteria defined before starting (max rounds, progress threshold)",
+      "each round logged with progress metric",
+      "conceptual progress demonstrable (new distinctions, resolved confusions)"
+    ],
+    "common_confusions": [
+      {
+        "confused_with": "argumentation-theory",
+        "why_confused": "both structure debate and handle opposing views",
+        "distinction": "Dialectical: thesis-antithesis-synthesis aiming for conceptual refinement; positions evolve. Argumentation: attack/defense graphs computing which claims survive; positions fixed, only acceptability changes.",
+        "test": "Are you refining concepts through opposition (dialectical) or computing which fixed claims survive attacks (argumentation)?"
+      },
+      {
+        "confused_with": "reflective-equilibrium",
+        "why_confused": "both iterate toward coherence",
+        "distinction": "Dialectical: opposition between two positions drives refinement; requires antithesis. Reflective-equilibrium: tension between principles and cases drives adjustment; no opposing party needed.",
+        "test": "Is there an opposing position you're synthesizing with (dialectical) or tension between your own principles and judgments (reflective-equilibrium)?"
+      },
+      {
+        "confused_with": "rhetorical",
+        "why_confused": "both involve argumentation and opposing views",
+        "distinction": "Dialectical: goal is conceptual clarity and synthesis; success = better understanding. Rhetorical: goal is persuasion and belief-change; success = audience adoption.",
+        "test": "Is your goal to understand better (dialectical) or to convince someone (rhetorical)?"
+      },
+      {
+        "confused_with": "debate",
+        "why_confused": "common usage treats dialectic as synonym for debate",
+        "distinction": "Dialectical: collaborative truth-seeking where both parties revise positions. Debate: adversarial contest where parties defend fixed positions to win.",
+        "test": "Are participants willing to change their position based on the other's arguments (dialectical) or committed to their side (debate)?"
+      }
+    ],
+    "diff": {
+      "paraconsistent": "uses contradiction productively to drive synthesis vs tolerates contradiction without resolution",
+      "argumentation-theory": "refines concepts via thesis-antithesis-synthesis vs computes surviving claims via attack/defense graphs",
+      "reflective-equilibrium": "opposition between two parties/views vs tension between own principles and cases; dialectical requires antithesis, reflective-equilibrium is self-directed",
+      "defeasible": "conceptual evolution through synthesis vs formal defeat relations with priority ordering",
+      "rhetorical": "seeks conceptual clarity via synthesis vs seeks belief-change via persuasion",
+      "sensemaking": "structured opposition with synthesis goal vs frame-building from ambiguous data; dialectical has explicit adversary, sensemaking does not"
+    },
+    "fail": {
+      "mode": "endless_debate",
+      "desc": "Dialectical process cycles indefinitely without synthesis or convergence; positions harden rather than refine; debate becomes adversarial contest rather than collaborative inquiry.",
+      "signals": [
+        "no convergence criteria defined before starting",
+        "synthesis never attempted after 2+ rounds",
+        "participants advocate rather than inquire (defend position vs seek truth)",
+        "round N+1 thesis identical to round N thesis (no refinement)",
+        "antithesis generation becomes strawmanning",
+        "more than 5 rounds with <10% conceptual progress"
+      ],
+      "mitigations": [
+        {
+          "m": "convergence criteria upfront",
+          "how": "before first round, define: max rounds (default: 5), progress threshold (default: 10% conceptual change), termination condition (synthesis addresses both concerns)",
+          "test": "written criteria exist before thesis statement; audit can verify"
+        },
+        {
+          "m": "mandatory synthesis attempts",
+          "how": "every 2 rounds, require written synthesis attempt; if synthesis fails, document why and continue",
+          "test": "synthesis document exists after rounds 2, 4, etc.; failure rationale logged if skipped"
+        },
+        {
+          "m": "progress tracking",
+          "how": "after each round, score conceptual progress: new distinctions made, confusions resolved, scope clarified; require >10% improvement to continue",
+          "test": "progress log shows scored metrics per round; <10% triggers convergence check"
+        },
+        {
+          "m": "steelman requirement",
+          "how": "before critiquing, state strongest version of opposing view; opponent confirms accurate representation",
+          "test": "antithesis statement includes steelman; opponent sign-off recorded"
+        },
+        {
+          "m": "role rotation",
+          "how": "participants switch thesis/antithesis roles after round 2; prevents advocacy entrenchment",
+          "test": "role assignment log shows rotation"
+        },
+        {
+          "m": "timebox rounds",
+          "how": "each round has fixed duration (e.g., 30 min); forced synthesis attempt at timebox end",
+          "test": "timestamps in log show round durations within budget"
+        }
+      ]
+    },
+    "use": [
+      "strategy debates where options seem mutually exclusive",
+      "assumptions audits surfacing hidden trade-offs",
+      "resolving conceptual confusion between team members",
+      "philosophy and theory development",
+      "design critique seeking novel solutions beyond presented options",
+      "policy analysis with polarized stakeholder positions",
+      "architecture decisions with competing quality attributes"
+    ],
+    "rel": [
+      {"id": 35, "n": "argumentation-theory", "r": "structured debate with attack/defense graphs"},
+      {"id": 34, "n": "paraconsistent", "r": "tolerates contradiction vs uses it productively"},
+      {"id": 77, "n": "reflective-equilibrium", "r": "iterative coherence via principle-case tension"},
+      {"id": 60, "n": "rhetorical", "r": "persuasion-oriented vs synthesis-oriented"},
+      {"id": 63, "n": "sensemaking", "r": "frame-building without explicit adversary"},
+      {"id": 79, "n": "adversarial-red-team", "r": "attacks to find weaknesses vs opposition to drive synthesis"}
+    ],
+    "ex": {
+      "sit": "Architecture debate: monolith vs microservices for a growing startup.",
+      "steps": [
+        "thesis: 'Monolith first' - reduces operational complexity, faster initial development, single deployment unit. Scope: first 2 years. Assumption: team <10 engineers.",
+        "antithesis: 'Microservices from start' - enables independent scaling, team autonomy, technology flexibility. Contradicts: single codebase assumption, shared deployment.",
+        "tension: simplicity vs flexibility trade-off. Thesis captures: cognitive load reduction, debugging ease, deployment simplicity. Antithesis captures: scaling independence, team isolation, tech stack freedom.",
+        "synthesis attempt 1: 'Modular monolith' - single deployment but internal module boundaries enforced by build system; modules can extract to services later.",
+        "test synthesis: addresses simplicity (single deploy), addresses flexibility (module boundaries enable future extraction). Creates new tension: boundary enforcement overhead.",
+        "round 2 thesis: modular monolith with lightweight boundaries",
+        "round 2 antithesis: boundary overhead negates simplicity gains",
+        "synthesis 2: enforce boundaries only at domain aggregate level (3-5 modules max initially); automated boundary checks in CI, not runtime",
+        "convergence: synthesis 2 addresses both concerns; no defensible antithesis generated; proceed"
+      ],
+      "insight": "dialectical process produced novel 'modular monolith with aggregate-level boundaries' - not in original option set"
+    },
+    "micro_example": {
+      "sit": "Team disagrees on testing strategy: 'unit tests only' vs 'integration tests only'",
+      "thesis": "Unit tests: fast feedback, isolated failures, cheap to run",
+      "antithesis": "Integration tests: catch real bugs at boundaries, test actual behavior",
+      "tension": "speed vs realism trade-off",
+      "wrong_synthesis": "50% unit, 50% integration (mere compromise)",
+      "correct_synthesis": "Test pyramid with contract tests at boundaries - units for logic, contracts for integration points, few E2E for critical paths. Novel: contract tests address both concerns.",
+      "key_test": "Synthesis must be novel position, not average of inputs"
+    }
+  }
+}

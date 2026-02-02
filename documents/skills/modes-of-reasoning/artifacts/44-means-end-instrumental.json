@@ -1,0 +1,174 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/means-end-instrumental@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 44,
+    "name": "means-end-instrumental",
+    "cat": "decision",
+    "core": "Derive necessary subgoals and actions from a terminal goal by backward chaining: 'to achieve G, I must first achieve S1..Sn'.",
+    "key_question": "What conditions must hold for this goal to be achieved, and what actions produce those conditions?",
+    "out": [
+      "goal_tree (terminal goal -> subgoals -> leaf actions)",
+      "dependency_chain (ordered prerequisites with causal links)",
+      "action_rationales (why each action serves goal)",
+      "instrumental_requirements (resources, permissions, capabilities needed)",
+      "necessity_classification (necessary vs merely helpful)"
+    ],
+    "proc": [
+      "1. State terminal goal in testable form: 'Goal achieved iff [observable condition]'",
+      "2. Ask: 'What must be true for this goal to be achievable?' List necessary conditions",
+      "3. For each condition, ask: 'Is this already true, or must I make it true?' Tag as [satisfied/required]",
+      "4. For [required] conditions, recurse: treat each as subgoal, repeat steps 2-3 until leaf actions",
+      "5. For each leaf action, verify causal link: 'Doing A produces condition C because [mechanism]'",
+      "6. Check for blocking side-effects: 'Does any action undermine another subgoal?'",
+      "7. Order by dependency: action A before B if A's output enables B",
+      "8. Validate: trace path from each leaf action to terminal goal; no dead ends"
+    ],
+    "check": [
+      "Terminal goal has observable success criterion (not 'improve X' but 'X > threshold')",
+      "Each subgoal answers 'necessary for what?' with explicit link to parent",
+      "No subgoal is orphaned (contributes to nothing) or circular (depends on itself)",
+      "Leaf actions are executable (agent has capability and resources)",
+      "Causal links cite mechanism, not just correlation",
+      "Side-effect check performed: no action undermines another branch",
+      "Dependency order is acyclic (can be topologically sorted)"
+    ],
+    "quick_checklist": [
+      "Can I state the terminal goal as a pass/fail test?",
+      "For each subgoal, can I answer 'why this?' with a causal link?",
+      "Are any subgoals actually ends in themselves (intrinsically valued)?",
+      "If a shortcut appeared, would I take it or defend the current path?",
+      "Have I confused 'we always do X' with 'X is necessary for the goal'?"
+    ],
+    "diff": {
+      "planning-policy": "Planning orders executable actions in time with contingencies; means-end derives what actions are needed before ordering",
+      "decision-theoretic": "Decision-theoretic quantifies utilities and probabilities to pick among known options; means-end discovers what options exist",
+      "optimization": "Optimization finds best configuration given fixed option set; means-end generates the option set via backward chaining",
+      "systems-thinking": "Systems-thinking maps feedback loops and emergent behavior; means-end assumes goal is achievable and asks how",
+      "satisficing": "Satisficing sets acceptance threshold for search termination; means-end identifies what must be done regardless of threshold",
+      "heuristic": "Heuristics are rules of thumb for quick decisions; means-end derives specific action chains for specific goals"
+    },
+    "common_confusions": [
+      {
+        "confusion": "Treating means-end as planning",
+        "symptom": "Jumping to Gantt charts before identifying necessary conditions",
+        "fix": "Complete goal tree first (means-end), then sequence (planning)"
+      },
+      {
+        "confusion": "Conflating with root-cause analysis",
+        "symptom": "Using means-end to explain past failures instead of derive future actions",
+        "fix": "Means-end is forward-looking (goal->action); use diagnostic or counterfactual for backward-looking"
+      },
+      {
+        "confusion": "Mistaking correlation for instrumental necessity",
+        "symptom": "Including actions that happened alongside success but didn't cause it",
+        "fix": "Each subgoal needs causal mechanism, not just historical co-occurrence"
+      }
+    ],
+    "fail": {
+      "mode": "means_become_ends",
+      "desc": "Subgoals or processes acquire intrinsic value; original goal forgotten or deprioritized",
+      "signals": [
+        "Optimizing intermediate metric while terminal goal stagnates",
+        "Defending process when shortcut to goal appears",
+        "Cannot articulate why subgoal serves terminal goal",
+        "Resistance to sunsetting completed or obsolete subgoals",
+        "Metric fixation: celebrating subgoal hit while goal missed"
+      ],
+      "mit": [
+        {
+          "name": "Goal-chain audit",
+          "trigger": "Quarterly or when any subgoal consumes >20% of effort",
+          "action": "For each active subgoal, state in one sentence how it causes terminal goal progress",
+          "pass_criterion": "Team agrees the causal link is valid and current"
+        },
+        {
+          "name": "Shortcut test",
+          "trigger": "When new option appears that could bypass existing subgoals",
+          "action": "Ask: 'If this shortcut works, are we happy to abandon current path?'",
+          "pass_criterion": "Yes -> pursue shortcut; No -> examine why (intrinsic value leak)"
+        },
+        {
+          "name": "Intrinsic/instrumental sort",
+          "trigger": "During goal-tree construction",
+          "action": "For each subgoal, ask: 'Would we pursue this if it didn't serve the terminal goal?'",
+          "pass_criterion": "If yes, it's intrinsically valued - promote to explicit goal or remove from chain"
+        },
+        {
+          "name": "Sunset obsolete means",
+          "trigger": "When subgoal achieved or environment changed",
+          "action": "Archive subgoal with date and reason; remove from active tracking",
+          "pass_criterion": "No zombie subgoals consuming attention"
+        },
+        {
+          "name": "Terminal goal check-in",
+          "trigger": "Start of each planning cycle",
+          "action": "Re-state terminal goal; verify it's still the actual objective",
+          "pass_criterion": "If goal changed, re-derive entire chain"
+        }
+      ]
+    },
+    "use": [
+      "Strategy decomposition: break 'increase revenue 30%' into actionable initiatives",
+      "OKR development: derive Key Results from Objectives",
+      "Requirements analysis: from user goal to system capabilities",
+      "Project scoping: what must be built vs nice-to-have",
+      "Resource justification: why this budget serves this outcome",
+      "Dependency mapping: what blocks what in a complex initiative"
+    ],
+    "rel": [
+      {"id": 47, "name": "planning-policy", "handoff": "After means-end generates goal tree, planning sequences actions"},
+      {"id": 45, "name": "decision-theoretic", "handoff": "When multiple paths exist, use decision-theoretic to pick best"},
+      {"id": 48, "name": "optimization", "handoff": "When goal tree has configurable parameters, optimize them"},
+      {"id": 43, "name": "systems-thinking", "handoff": "When goal achievement has feedback effects, model loops"},
+      {"id": 39, "name": "counterfactual", "handoff": "When evaluating past: 'would goal have been achieved if...'"},
+      {"id": 41, "name": "diagnostic", "handoff": "When goal blocked: diagnose which subgoal failed and why"}
+    ],
+    "micro_example": {
+      "terminal_goal": "Deploy feature F to production by Friday",
+      "success_criterion": "F is live and serving 100% of traffic",
+      "backward_chain": [
+        {"condition": "F serving traffic", "requires": "deployment completed", "status": "required"},
+        {"condition": "deployment completed", "requires": "CI green + approval", "status": "required"},
+        {"condition": "CI green", "requires": "tests pass", "status": "required"},
+        {"condition": "tests pass", "requires": "code complete + tests written", "status": "required"},
+        {"condition": "code complete", "requires": "design approved", "status": "satisfied"},
+        {"condition": "approval", "requires": "reviewer available", "status": "required"}
+      ],
+      "leaf_actions": ["write tests", "request reviewer"],
+      "dependency_order": ["request reviewer", "write tests", "run CI", "get approval", "deploy"],
+      "side_effect_check": "Deployment to prod may cause brief latency spike - acceptable"
+    },
+    "ex": {
+      "situation": "Team wants to reduce customer churn by 20%",
+      "terminal_goal": "Churn rate drops from 5% to 4% monthly",
+      "success_criterion": "3 consecutive months at <=4% churn",
+      "goal_tree": {
+        "reduce_churn": {
+          "necessary_conditions": [
+            {"condition": "understand churn drivers", "status": "required", "mechanism": "can't fix what you don't understand"},
+            {"condition": "improve weakest driver", "status": "required", "mechanism": "highest leverage intervention"}
+          ],
+          "subgoals": {
+            "understand_churn_drivers": {
+              "actions": ["analyze exit surveys", "run cohort analysis", "interview churned customers"],
+              "output": "ranked list of churn causes with magnitude"
+            },
+            "improve_weakest_driver": {
+              "depends_on": "understand_churn_drivers",
+              "conditional": "If onboarding is top driver, then improve_onboarding",
+              "actions": ["redesign first-week flow", "add success milestones", "trigger proactive support"]
+            }
+          }
+        }
+      },
+      "result": "Dependency chain reveals: exit survey analysis must complete before intervention design; onboarding redesign is highest-leverage if exit surveys confirm hypothesis"
+    }
+  }
+}

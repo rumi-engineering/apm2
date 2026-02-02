@@ -1,0 +1,106 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/simplicity-compression@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 17,
+    "name": "simplicity-compression",
+    "cat": "ampliative",
+    "core": "Select among competing hypotheses or models by preferring those with shorter descriptions or fewer assumptions. Formalizations: Occam's razor (fewest entities), MDL (minimize description length of model + data given model), AIC/BIC (likelihood penalized by parameter count). Not a method for generating hypotheses but a selection criterion once candidates exist.",
+    "out": [
+      {"n": "candidate_ranking", "d": "hypotheses/models ordered by fit-complexity score"},
+      {"n": "complexity_metric", "d": "explicit measure: parameter count, description length, or assumption count"},
+      {"n": "fit_metric", "d": "quantified goodness-of-fit: likelihood, R-squared, or prediction error"},
+      {"n": "selection_criterion", "d": "formula combining fit and complexity: AIC, BIC, MDL, or cross-validation"},
+      {"n": "selected_model", "d": "chosen hypothesis with justification for why complexity penalty is appropriate"},
+      {"n": "sensitivity_note", "d": "how selection would change under different penalty strengths"}
+    ],
+    "proc": [
+      "enumerate candidates: list >=2 hypotheses or models to compare",
+      "define complexity metric: parameter count, description length, assumption count, or structural complexity",
+      "measure fit: compute likelihood, residuals, or prediction error for each candidate",
+      "choose selection criterion: AIC (general), BIC (large n, true model in set), MDL (compression), cross-validation (prediction focus)",
+      "compute combined scores: fit - complexity_penalty for each candidate",
+      "rank and select: choose model with best score; if tie, prefer simpler",
+      "sensitivity check: vary penalty strength; flag if selection changes under reasonable alternatives",
+      "document rationale: state why chosen complexity metric and penalty are appropriate for domain"
+    ],
+    "check": [
+      ">=2 candidate models explicitly compared",
+      "complexity metric stated (not implicit)",
+      "fit metric quantified (not 'fits well')",
+      "selection criterion named and justified",
+      "penalty strength appropriate: not so weak overfitting occurs, not so strong underfitting occurs",
+      "sensitivity analysis performed on penalty",
+      "selected model captures known essential structure",
+      "domain knowledge confirms simplest plausible, not just simplest possible"
+    ],
+    "diff": {
+      "abductive": "simplicity selects among hypotheses; abduction generates them. Use abduction first, then simplicity to choose.",
+      "bayesian": "simplicity can be encoded as priors favoring simple models, but simplicity makes the preference explicit and primary rather than implicit in prior choice.",
+      "maximum_entropy": "max-ent chooses least-committal distribution given constraints; simplicity chooses among models by description length. Max-ent is distribution-focused; simplicity is model-focused.",
+      "inductive": "induction generalizes patterns from instances; simplicity selects among generalizations. Induction proposes 'all swans are white'; simplicity prefers that over 'swans follow complex color rules'.",
+      "heuristic": "heuristics use shortcuts for speed; simplicity is a principled selection criterion with formal justifications (MDL, AIC). Heuristics may violate simplicity for speed."
+    },
+    "confusions": [
+      {"vs": "abductive", "trap": "using simplicity to generate hypotheses rather than select among them", "fix": "generate candidates first via abduction, then apply simplicity as selection filter"},
+      {"vs": "maximum_entropy", "trap": "conflating 'simple model' with 'uniform distribution'", "fix": "max-ent is about distributions; simplicity is about model structure. A max-ent distribution can be part of a complex model."},
+      {"vs": "bayesian", "trap": "believing simplicity is redundant if you have Bayesian priors", "fix": "simplicity makes the complexity-fit tradeoff explicit and auditable; Bayesian priors can hide complexity preferences"}
+    ],
+    "fail": {
+      "mode": "oversimplification",
+      "desc": "choosing too simple a model when the domain is genuinely complex; the simplest explanation that fits is not always the true one",
+      "signals": [
+        "selected model fails on held-out data despite good training fit",
+        "domain experts reject model as 'missing key factor'",
+        "residuals show systematic patterns (not random)",
+        "model cannot represent known essential structure",
+        "complexity penalty chosen to force desired simple answer",
+        "no sensitivity analysis on penalty strength"
+      ],
+      "mitigations": [
+        "cross-validate: test on held-out data to detect underfitting",
+        "domain review: have expert verify selected model captures known structure",
+        "residual analysis: check for systematic patterns indicating missing structure",
+        "penalty sensitivity: vary penalty strength and document selection stability",
+        "lower bound check: state minimum complexity required to capture known phenomena",
+        "premortem: ask 'if simpler model fails, what structure did we miss?'"
+      ]
+    },
+    "use": [
+      "model selection in regression and classification",
+      "choosing between scientific theories",
+      "configuration management: prefer simpler configs that achieve same outcome",
+      "API design: prefer fewer endpoints with same functionality",
+      "architecture decisions: prefer simpler designs meeting requirements",
+      "debugging: prefer explanations requiring fewer coincidences",
+      "regularization tuning: selecting penalty strength in ML models"
+    ],
+    "rel": [
+      {"id": 13, "n": "abductive", "r": "generates candidate hypotheses for simplicity to select from"},
+      {"id": 11, "n": "bayesian-probabilistic", "r": "complexity preferences can be encoded as priors"},
+      {"id": 23, "n": "maximum-entropy", "r": "related parsimony principle for distributions"},
+      {"id": 9, "n": "inductive", "r": "proposes generalizations that simplicity ranks"},
+      {"id": 53, "n": "heuristic", "r": "may use simplicity as a heuristic but formal simplicity is principled"}
+    ],
+    "ex": {
+      "sit": "Three models for server latency: (A) constant baseline, (B) linear trend, (C) polynomial with 10 terms. All fit training data.",
+      "steps": [
+        "candidates: A (1 param), B (2 params), C (10 params)",
+        "fit: R-squared A=0.30, B=0.85, C=0.99",
+        "complexity: param count 1, 2, 10",
+        "criterion: BIC (large dataset, prefer parsimony)",
+        "scores: BIC_A=1200, BIC_B=450, BIC_C=480",
+        "select: B wins (lowest BIC despite lower R-squared than C)",
+        "sensitivity: AIC also selects B; cross-validation confirms B generalizes best",
+        "rationale: C overfits noise; B captures real trend without memorizing fluctuations"
+      ],
+      "insight": "higher R-squared does not mean better model; complexity penalty prevents overfitting to noise"
+    }
+  }
+}

@@ -1,0 +1,90 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/inductive@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 9,
+    "name": "inductive",
+    "cat": "ampliative",
+    "core": "Infer general patterns from observations; observed many A are B implies probably all A are B. Conclusion strength scales with sample size, diversity, and absence of counterexamples.",
+    "out": [
+      "general rules with stated scope (e.g., 'all production servers' vs 'observed servers')",
+      "trend statements with confidence qualifier (e.g., 'strongly suggests', 'tentatively indicates')",
+      "predictive heuristics tied to observed base rate",
+      "pattern descriptions with sample provenance"
+    ],
+    "proc": [
+      "1. Define observation scope: what population are we sampling from? Record boundaries explicitly.",
+      "2. Gather observations: log each instance with timestamp, source, and relevant attributes.",
+      "3. Check sample diversity: confirm coverage across known subgroups; flag if any subgroup missing.",
+      "4. Identify recurring pattern: require ≥3 independent instances before calling it a pattern.",
+      "5. Formulate candidate rule: state as 'All/Most A are B' with explicit scope and qualifier.",
+      "6. Stress-test rule: actively seek counterexamples; ask 'where would this fail?'",
+      "7. Calibrate confidence: stronger if large N, diverse sources, zero counterexamples; weaker otherwise."
+    ],
+    "check": [
+      "Sample size ≥ threshold for domain? (e.g., ≥30 for rough stats, ≥5 for rare events with justification)",
+      "Sample drawn from target population, not convenience subset?",
+      "Known subgroups represented proportionally or at least present?",
+      "Pattern holds across ≥80% of observations? (if lower, note exceptions)",
+      "Conclusion explicitly scoped to observed population, not universal?",
+      "Counterexample search performed and documented?"
+    ],
+    "diff": {
+      "vs_deductive": "not truth-preserving; conclusion goes beyond premises; new data can overturn it",
+      "vs_abductive": "inductive finds 'what pattern' without explaining 'why'; abductive posits causal explanation. Inductive: 'servers spike at 9am'; abductive: 'spike caused by batch job'",
+      "vs_statistical": "inductive is informal pattern-spotting; statistical adds sampling theory, confidence intervals, p-values. Use statistical when precision or error bounds required.",
+      "vs_case_based": "inductive generalizes across cases to a rule; case-based retrieves similar past case and transfers solution without generalizing.",
+      "vs_analogical": "analogical maps structure from source to target domain; inductive stays within one domain aggregating instances."
+    },
+    "common_confusions": [
+      {
+        "confused_with": "abductive",
+        "symptom": "You state a pattern and immediately claim it explains the phenomenon.",
+        "fix": "If you're positing a cause or mechanism, you've shifted to abductive. Inductive stops at 'X correlates with Y'."
+      },
+      {
+        "confused_with": "statistical-frequentist",
+        "symptom": "You compute a p-value or confidence interval.",
+        "fix": "That's statistical reasoning. Inductive is pre-statistical: informal pattern recognition before formal inference."
+      }
+    ],
+    "fail": {
+      "mode": "overgeneralization",
+      "desc": "Generalizing from small or biased samples; 'every swan I've seen is white' doesn't mean all swans are white.",
+      "mitigations": [
+        "Require minimum sample size before stating rule (document threshold chosen).",
+        "Explicitly list populations/subgroups NOT represented in sample.",
+        "Add hedge language proportional to sample weakness: 'tentatively', 'in observed cases', 'pending broader data'.",
+        "Perform adversarial counterexample search: ask 'what conditions might break this pattern?'",
+        "Version the conclusion: note sample date range so future data can update it."
+      ]
+    },
+    "use": [
+      "learning from experience when formal data collection not yet feasible",
+      "early-stage pattern discovery before committing to statistical study",
+      "forming priors for subsequent Bayesian analysis",
+      "hypothesis generation from data to feed into abductive or experimental modes"
+    ],
+    "rel": [
+      {"id": 10, "name": "statistical-frequentist", "link": "formalized induction with error bounds; upgrade to this when precision needed"},
+      {"id": 11, "name": "bayesian-probabilistic", "link": "use inductive patterns as informative priors for Bayesian updating"},
+      {"id": 13, "name": "abductive", "link": "after inductive pattern, abductive asks 'what mechanism explains it?'"},
+      {"id": 15, "name": "case-based", "link": "case-based retrieves similar cases; inductive aggregates across them to generalize"}
+    ],
+    "ex": {
+      "scenario": "Observing server response times over a week",
+      "approach": "Log 168 hourly samples across 3 server clusters. Pattern: latency exceeds 200ms in 95% of 9am samples (N=21), but <100ms at other hours. Generalize: 'Production servers likely spike at 9am.' Scope: observed clusters only. Confidence: moderate (3 clusters, 1 week). Next step: abductive inquiry into cause."
+    },
+    "micro_example": {
+      "input": "5 customer complaints mention 'checkout timeout' on mobile; 0 complaints on desktop.",
+      "proc_trace": "Scope: complaint log, mobile vs desktop. Diversity: both iOS and Android represented. Pattern: 5/5 mobile, 0/12 desktop. Rule: 'Checkout timeout disproportionately affects mobile users.' Hedge: small N, tentative.",
+      "output": "Tentative rule: mobile checkout is more prone to timeouts than desktop (5 mobile vs 0 desktop complaints)."
+    }
+  }
+}

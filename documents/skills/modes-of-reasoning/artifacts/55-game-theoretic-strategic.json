@@ -1,0 +1,174 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/game-theoretic-strategic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 55,
+    "name": "game-theoretic-strategic",
+    "cat": "strategic",
+    "core": "Analyze situations where your outcome depends on others' choices, and theirs on yours. Core question: What should I do, given that they're optimizing too?",
+    "when_to_use": [
+      "multiple agents with conflicting or interdependent objectives",
+      "opponent actions affect your payoffs and vice versa",
+      "need to anticipate strategic responses to your moves",
+      "commitment, signaling, or reputation matter"
+    ],
+    "when_not_to_use": [
+      "single decision-maker against passive environment (use decision-theoretic)",
+      "designing rules rather than playing within them (use mechanism-design)",
+      "modeling beliefs without optimization (use theory-of-mind)",
+      "worst-case without modeling opponent strategy (use robust-worst-case)"
+    ],
+    "out": [
+      {"type": "player_map", "valid": "options mutually exclusive and collectively exhaustive", "format": "table: player -> role -> private_info -> action_set"},
+      {"type": "payoff_matrix", "valid": "preferences transitive, covers all outcomes", "format": "matrix or tree with numeric/ordinal payoffs per terminal node"},
+      {"type": "strategy_profile", "valid": "complete for every information state", "format": "mapping: info_state -> action or probability_distribution"},
+      {"type": "equilibrium_analysis", "valid": "no unilateral improvement possible", "format": "list equilibria with stability notes"},
+      {"type": "recommendation", "valid": "accounts for opponent deviations", "format": "action + fails-if clause + robustness buffer"}
+    ],
+    "proc": [
+      "1. PLAYERS: identify all players (self, competitors, regulators, nature as chance node)",
+      "2. ACTIONS: list each player's actions exhaustively; verify mutual exclusivity",
+      "3. PAYOFFS: map payoffs per action combination (ordinal if cardinal unknown); verify transitivity",
+      "4. INFO STRUCTURE: determine game type: simultaneous | sequential | repeated | private-info",
+      "5. DOMINANCE: eliminate strictly dominated strategies iteratively",
+      "6. EQUILIBRIUM: find equilibria (pure Nash first; mixed if none pure; subgame-perfect if sequential)",
+      "7. REFINEMENT: if multiple equilibria, apply focal point, risk dominance, or evolutionary stability",
+      "8. BEHAVIORAL STRESS-TEST: test L1-L2 reasoning, prospect-theory deviations, trembling-hand",
+      "9. RECOMMEND: state chosen strategy + conditions under which it fails + fallback"
+    ],
+    "quick_checklist": [
+      "[ ] all players listed including nature/chance",
+      "[ ] action sets explicit, finite, and exhaustive",
+      "[ ] payoffs at least ordinal; cardinal if mixing required",
+      "[ ] info structure labeled (simultaneous/sequential/repeated/private)",
+      "[ ] dominant strategies checked and documented",
+      "[ ] equilibrium identified or proven absent with reasoning",
+      "[ ] behavioral deviations tested with specific model (L1, prospect, epsilon)",
+      "[ ] recommendation includes explicit fails-if clause"
+    ],
+    "diff": {
+      "decision-theoretic": "treats world as passive; game theory treats other agents as strategic optimizers who respond to you",
+      "theory-of-mind": "ToM infers beliefs/intentions from behavior; game theory derives actions from payoff optimization given beliefs",
+      "mechanism-design": "MD designs game rules to achieve system goals; game theory analyzes play within given rules",
+      "negotiation-coalition": "negotiation adds norms, trust, BATNA, process; game theory provides the strategic backbone",
+      "adversarial-red-team": "adversarial asks how could this fail under attack; game theory asks what rational opponents will do",
+      "robust-worst-case": "robust optimizes against unknown/unmodeled threats; game theory models opponents explicitly with payoffs"
+    },
+    "common_confusions": [
+      {
+        "confused_with": "robust-worst-case",
+        "symptom": "treating all uncertainty as adversarial",
+        "clarification": "use game-theoretic when opponent payoffs are known/inferable; use robust when opponent model unavailable"
+      },
+      {
+        "confused_with": "theory-of-mind",
+        "symptom": "inferring beliefs without connecting to actions",
+        "clarification": "ToM builds belief models; game theory connects beliefs to optimal actions via equilibrium"
+      },
+      {
+        "confused_with": "mechanism-design",
+        "symptom": "analyzing a game you can actually redesign",
+        "clarification": "if you can change the rules, use mechanism-design; if rules are fixed, use game-theoretic"
+      }
+    ],
+    "fail": {
+      "mode": "assuming rationality and common knowledge where absent",
+      "signals": [
+        "model predicts X, reality delivers Y repeatedly",
+        "opponents leave obvious value on table",
+        "equilibrium requires implausible computation or coordination",
+        "cultural, emotional, or status factors dominate decisions"
+      ],
+      "mitigations": [
+        {
+          "id": "M1",
+          "name": "level-k calibration",
+          "action": "assume opponents reason 1-2 levels, not infinite; simulate L0 (random), L1 (best-response to L0), L2 (best-response to L1)",
+          "test": "compare predictions for L1 vs Nash; if diverge significantly, report both"
+        },
+        {
+          "id": "M2",
+          "name": "behavioral deviation audit",
+          "action": "test strategy under prospect-theory (loss aversion 2x), anchoring (+/-20% on reference), epsilon-greedy (5% random)",
+          "test": "if payoff drops >15% under any deviation, flag strategy as brittle"
+        },
+        {
+          "id": "M3",
+          "name": "common-knowledge verification",
+          "action": "list what must be mutual knowledge for equilibrium to hold; check each is actually known",
+          "test": "for each assumption, ask: would a reasonable opponent doubt this? If yes, model as Bayesian game"
+        },
+        {
+          "id": "M4",
+          "name": "historical validation",
+          "action": "find >=3 past instances of similar strategic situations; compare model predictions to actual outcomes",
+          "test": "if accuracy <60%, downgrade confidence or switch to robust-worst-case"
+        },
+        {
+          "id": "M5",
+          "name": "robustness buffer",
+          "action": "for brittle strategies, require 20% payoff margin over next-best alternative",
+          "test": "compute: (recommended_payoff - next_best) / recommended_payoff; reject if <0.2"
+        }
+      ]
+    },
+    "use": [
+      "pricing and competition analysis",
+      "negotiation preparation (BATNA, ZOPA, credible threats)",
+      "security and adversarial modeling",
+      "platform and marketplace strategy",
+      "auctions and bidding optimization",
+      "repeated interactions (reputation, commitment, punishment)",
+      "entry/exit decisions in markets",
+      "signaling and screening scenarios"
+    ],
+    "rel": [
+      {"id": 45, "name": "decision-theoretic", "note": "single-agent baseline; use when no strategic opponents"},
+      {"id": 56, "name": "theory-of-mind", "note": "richer agent belief models; combine when payoffs uncertain"},
+      {"id": 58, "name": "mechanism-design", "note": "design rules vs analyze; use MD when you control game structure"},
+      {"id": 57, "name": "negotiation-coalition", "note": "agreement-seeking; adds process/norms to game backbone"},
+      {"id": 79, "name": "adversarial-red-team", "note": "worst-case stress test; combine for attack surface analysis"},
+      {"id": 49, "name": "robust-worst-case", "note": "when opponents unmodeled; fallback when game model unreliable"}
+    ],
+    "examples": [
+      {
+        "name": "Prisoner's Dilemma (simultaneous)",
+        "problem": "Two cloud providers deciding whether to cut prices",
+        "players": ["A", "B"],
+        "actions": ["Hold", "Cut"],
+        "payoff_matrix": {
+          "Hold,Hold": [3, 3],
+          "Hold,Cut": [1, 4],
+          "Cut,Hold": [4, 1],
+          "Cut,Cut": [2, 2]
+        },
+        "analysis": "Cut strictly dominates Hold for both; unique Nash equilibrium at (Cut,Cut)",
+        "equilibrium": "Cut,Cut",
+        "recommendation": "One-shot: Cut (dominant). Repeated: Tit-for-tat (Hold initially, copy opponent's last move)",
+        "fails_if": "repeated game has uncertain end date; reputation spills to other markets"
+      },
+      {
+        "name": "Entry Deterrence (sequential, signaling)",
+        "problem": "Incumbent firm deciding capacity expansion before potential entrant decides entry",
+        "players": ["Incumbent (I)", "Entrant (E)"],
+        "sequence": "I chooses Expand/Not -> E observes -> E chooses Enter/Stay Out",
+        "payoffs": {
+          "Expand,Enter": [1, -1],
+          "Expand,Stay Out": [3, 0],
+          "Not Expand,Enter": [2, 2],
+          "Not Expand,Stay Out": [4, 0]
+        },
+        "analysis": "backward induction: if I expands, E stays out (payoff -1 < 0); if I doesn't, E enters (2 > 0). I prefers Expand,Stay Out (3) to Not,Enter (2)",
+        "equilibrium": "subgame-perfect: Expand -> Stay Out",
+        "recommendation": "Incumbent should expand to credibly deter entry",
+        "fails_if": "expansion costs exceed deterrence benefit; entrant has outside funding to absorb losses"
+      }
+    ]
+  }
+}

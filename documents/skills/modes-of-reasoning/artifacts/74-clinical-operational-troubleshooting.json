@@ -1,0 +1,223 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/clinical-operational-troubleshooting@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z",
+    "updated_at": "2026-02-02T00:00:00Z"
+  },
+  "payload": {
+    "id": 74,
+    "name": "clinical-operational-troubleshooting",
+    "cat": "domain",
+    "core": "Time-critical hybrid: blend pattern recognition, mechanistic reasoning, targeted tests, and safe interventions under pressure. Key distinction from pure diagnostic: act in parallel with diagnosis when severity demands it. Terminates with stabilized system plus root-cause hypothesis, not certainty.",
+
+    "out": [
+      {"n": "triage_decision", "d": "severity (P1-P4) + time constraint + escalation threshold; justification required"},
+      {"n": "initial_hypothesis", "d": "most likely cause from pattern match + mechanistic fit; stated before any intervention"},
+      {"n": "test_sequence", "d": "ordered tests ranked by (discriminative power / time-cost); max 3 before reassess"},
+      {"n": "intervention_log", "d": "each action with reversibility flag, expected effect, actual effect, timestamp"},
+      {"n": "escalation_record", "d": "when escalated, to whom, with what state; or why escalation not needed"},
+      {"n": "reasoning_trail", "d": "timestamped log of observations, hypotheses, tests, and pivots; survives pressure"}
+    ],
+
+    "proc": [
+      "TRIAGE (0-60s): classify severity P1-P4 using impact (users affected, revenue, safety) + urgency (degrading? time-bounded?). P1/P2: act now, diagnose in parallel. P3/P4: diagnose first, act later.",
+      "PATTERN MATCH (1-3 min): recall similar incidents; check recent changes (deploys, config, dependencies). Ask: 'Have I seen this before? What was the cause?'",
+      "FORM HYPOTHESIS (before acting): state most likely cause with mechanistic rationale. Must answer: 'What component is failing and why?' Not just 'what correlates.'",
+      "SELECT TESTS (max 3): choose tests that discriminate top 2 hypotheses. Rank by (info-gain / time-to-result). Skip tests that take longer than your time budget allows.",
+      "INTERVENE (parallel with testing): apply safe, reversible fixes. 'Safe' = won't make it worse if wrong. 'Reversible' = can undo in <5 min. Document: action, expected effect, actual effect.",
+      "ITERATE (2-5 min cycles): update hypothesis with each result. If hypothesis confirmed: fix and verify. If refuted: pivot to next hypothesis. If stuck >15 min or severity increasing: escalate immediately.",
+      "STABILIZE THEN ROOT-CAUSE: once bleeding stopped, switch to diagnostic mode (#41) for proper root-cause analysis. Clinical mode finds 'what stopped the bleeding,' not necessarily 'what caused the wound.'"
+    ],
+
+    "quick_checklist": [
+      "TRIAGE: severity justified? time constraint stated?",
+      "HYPOTHESIS: formed before first intervention?",
+      "TESTS: chosen for speed + discrimination, not thoroughness?",
+      "INTERVENTIONS: all reversible? none made things worse?",
+      "ESCALATION: criteria defined? honored if triggered?",
+      "TRAIL: can reconstruct decisions from log?"
+    ],
+
+    "check": [
+      "triage priority documented with impact + urgency rationale",
+      "hypothesis stated before any intervention (not retrofitted)",
+      "tests selected for discriminative power under time pressure, not completeness",
+      "all interventions logged with reversibility assessment",
+      "safety checks applied before any action that could worsen state",
+      "escalation criteria defined upfront; escalation executed if criteria met",
+      "reasoning trail maintained even under pressure (timestamps, pivots noted)",
+      "post-incident: handoff to diagnostic mode for root-cause confirmation"
+    ],
+
+    "diff": {
+      "diagnostic-41": {
+        "boundary": "clinical: act in parallel with diagnosis when severity demands; diagnostic: systematic hypothesis testing before action",
+        "test": "Are you intervening before you have confirmed the cause? If yes, clinical. If you must confirm before acting, diagnostic.",
+        "when_which": "P1/P2 severity → clinical; P3/P4 or post-incident → diagnostic"
+      },
+      "satisficing-51": {
+        "boundary": "clinical: domain-specific procedure for incidents; satisficing: general strategy of accepting first adequate solution",
+        "test": "Are you following incident triage procedure (clinical) or applying threshold-based stopping to a non-incident decision (satisficing)?",
+        "when_which": "time-critical operational event → clinical; general decision under resource constraint → satisficing"
+      },
+      "case-based-15": {
+        "boundary": "clinical: uses case patterns as input to hybrid reasoning; case-based: retrieves and adapts past solutions as primary method",
+        "test": "Are you blending pattern-match with mechanistic reasoning and parallel intervention (clinical), or primarily adapting a retrieved solution (case-based)?",
+        "when_which": "active incident requiring intervention → clinical; solved similar problem before, need adaptation → case-based"
+      },
+      "abductive-13": {
+        "boundary": "abductive: generates novel hypotheses for unprecedented anomalies; clinical: rapid triage with intervention, assumes some pattern recognition possible",
+        "test": "Is this a genuinely novel anomaly requiring hypothesis invention (abductive), or a recognizable incident type requiring rapid response (clinical)?",
+        "when_which": "never-seen-before behavior → abductive first, then clinical; recognizable incident pattern → clinical directly"
+      },
+      "heuristic-53": {
+        "boundary": "heuristic: applies cached rules without evaluation; clinical: structured procedure with hypothesis testing and iteration",
+        "test": "Are you applying a single rule ('if X, do Y') or following a multi-step triage-test-intervene cycle?",
+        "when_which": "initial triage may use heuristics; full incident response requires clinical mode's procedure"
+      },
+      "mechanistic-40": {
+        "boundary": "mechanistic: builds deep understanding of how components work; clinical: uses mechanistic intuition for rapid hypothesis formation under pressure",
+        "test": "Are you trying to fully understand the system (mechanistic) or quickly identify the failing component to stop the bleeding (clinical)?",
+        "when_which": "post-incident deep analysis → mechanistic; during incident → clinical"
+      }
+    },
+
+    "confusions": [
+      {
+        "trap": "using clinical mode when diagnostic mode is appropriate",
+        "symptom": "intervening without confirming hypothesis on P3/P4 issues; 'trying things' when there's no time pressure",
+        "correction": "clinical mode's parallel intervention is justified only by severity. P3/P4: use diagnostic mode's systematic approach. Check: 'Would waiting 30 min to confirm cause be acceptable?' If yes, use diagnostic."
+      },
+      {
+        "trap": "skipping hypothesis formation and jumping to 'try things'",
+        "symptom": "no stated hypothesis before intervention; cannot explain why an action should help",
+        "correction": "even under pressure, state hypothesis before acting. 'I think it's connection pool exhaustion because <evidence>; increasing pool size should help because <mechanism>.' Takes 30 seconds, prevents random actions."
+      },
+      {
+        "trap": "conflating 'bleeding stopped' with 'root cause found'",
+        "symptom": "closing incident after mitigation without understanding why it happened; same incident recurs",
+        "correction": "clinical mode finds what stopped the problem; diagnostic mode (post-incident) finds what caused it. Always hand off to diagnostic for root-cause analysis after stabilization."
+      },
+      {
+        "trap": "applying heuristics without the clinical procedure",
+        "symptom": "using rules of thumb ('restart the service') without triage, hypothesis, or logging",
+        "correction": "heuristics may inform initial actions, but clinical mode requires the full procedure: triage → hypothesis → test → intervene → iterate. A restart without reasoning trail is not clinical troubleshooting."
+      }
+    ],
+
+    "fail": {
+      "mode": "confirmation bias under pressure",
+      "desc": "Locking onto first hypothesis; skipping tests that could refute it; making things worse with untested interventions; not escalating when stuck.",
+      "signals": [
+        "only one hypothesis considered despite available time",
+        "skipped tests that could have discriminated hypotheses",
+        "intervention applied without stating expected effect",
+        "no check whether intervention helped or hurt",
+        "stuck >15 min without escalating",
+        "cannot reconstruct reasoning from log"
+      ],
+      "mitigations": [
+        {
+          "trigger": "about to intervene",
+          "mitigation": "state hypothesis and expected effect first",
+          "test": "can you complete: 'I believe the cause is X because Y; this action should help because Z'?"
+        },
+        {
+          "trigger": "hypothesis formed",
+          "mitigation": "state what evidence would disprove it",
+          "test": "is there a falsification_trigger field populated with specific observable?"
+        },
+        {
+          "trigger": "considering intervention",
+          "mitigation": "verify intervention is reversible or classify as 'risky'",
+          "test": "can you undo this action in <5 min if it makes things worse?"
+        },
+        {
+          "trigger": "time elapsed >15 min without progress",
+          "mitigation": "mandatory escalation regardless of ego",
+          "test": "was escalation_record populated when time threshold crossed?"
+        },
+        {
+          "trigger": "any action taken",
+          "mitigation": "log immediately with timestamp even under pressure",
+          "test": "does reasoning_trail have entry within 2 min of each action?"
+        },
+        {
+          "trigger": "intervention applied",
+          "mitigation": "check actual effect against expected within 2 min",
+          "test": "is there an 'actual_effect' field populated for each intervention?"
+        },
+        {
+          "trigger": "bleeding stopped",
+          "mitigation": "schedule diagnostic mode follow-up, do not close incident as 'resolved'",
+          "test": "is there a handoff to diagnostic mode in the incident record?"
+        }
+      ]
+    },
+
+    "use": [
+      "SRE/ops incident response (P1/P2 production outages)",
+      "support escalation triage (customer-impacting issues)",
+      "medical-style diagnostic workflows (ER triage, urgent care)",
+      "emergency response coordination (natural disaster, security breach)",
+      "production incident management (war room scenarios)",
+      "on-call troubleshooting (service degradation, alerts firing)"
+    ],
+
+    "rel": [
+      {"id": 41, "n": "diagnostic", "r": "systematic fault-model approach; use post-incident for root-cause confirmation"},
+      {"id": 51, "n": "satisficing", "r": "general threshold-stopping; overlaps in accepting partial info under pressure"},
+      {"id": 15, "n": "case-based", "r": "retrieves past solutions; clinical uses patterns as input to hybrid reasoning"},
+      {"id": 13, "n": "abductive", "r": "generates novel hypotheses; use before clinical if incident type unprecedented"},
+      {"id": 53, "n": "heuristic", "r": "cached rules for initial actions; clinical mode provides full procedure"},
+      {"id": 40, "n": "mechanistic", "r": "deep component understanding; clinical uses mechanistic intuition under pressure"},
+      {"id": 52, "n": "value-of-information", "r": "prioritizes tests by decision impact; use when test costs vary significantly"}
+    ],
+
+    "ex": {
+      "task": "Production service unresponsive during peak traffic",
+      "triage": {
+        "severity": "P1",
+        "impact": "customer-facing, revenue impact, 10K users affected",
+        "urgency": "degrading (error rate climbing)",
+        "decision": "escalate immediately, act in parallel with diagnosis",
+        "time_constraint": "15 min to mitigate or escalate to VP-Eng"
+      },
+      "pattern_match": "similar to last month's connection pool exhaustion incident; also check recent deploys",
+      "hypothesis": {
+        "cause": "connection pool saturated or downstream dependency timeout",
+        "mechanism": "deploy reduced pool size → requests exhaust connections → new requests queue → timeouts cascade",
+        "evidence": "deploy 2h ago, error pattern matches pool exhaustion"
+      },
+      "tests": [
+        {"test": "check connection pool metrics", "time": "30s", "discriminates": "pool exhaustion vs downstream"},
+        {"test": "verify downstream health", "time": "1min", "discriminates": "our problem vs dependency"},
+        {"test": "review recent deploys", "time": "2min", "discriminates": "change-induced vs organic"}
+      ],
+      "intervention": {
+        "action": "increase pool size from 10 to 50",
+        "reversible": true,
+        "expected_effect": "queued requests clear within 2 min",
+        "actual_effect": "error rate dropped 80% within 90s"
+      },
+      "result": "pool metrics confirmed exhaustion; recent deploy reduced pool size; rollback fully resolved",
+      "handoff": "scheduled diagnostic mode analysis to understand why pool size was reduced and add safeguards"
+    },
+
+    "micro_ex": {
+      "sit": "API latency spike during business hours, 3x normal response time",
+      "triage": "P2: degraded not down, 2K users affected, not worsening rapidly. Time budget: 20 min.",
+      "pattern": "seen before: usually DB query or downstream timeout",
+      "hypothesis": "slow DB query; evidence: latency correlates with DB-heavy endpoints",
+      "test": "check slow query log (2 min)",
+      "intervention": "none yet; P2 allows diagnosis-first approach",
+      "result": "slow query log shows missing index on frequently-joined table",
+      "action": "add index (reversible); latency normalized in 5 min",
+      "handoff": "diagnostic follow-up: why was index missing after migration?"
+    }
+  }
+}

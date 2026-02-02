@@ -19,8 +19,7 @@ decision_tree:
             - SA-2: Finalize execution strategy and resource impacts.
             - SA-3: Perform final security assurance case (CAE Tree).
 
-            Constraint: Each SA selects **5 strictly random reasoning modes** from modes-of-reasoning
-            (see COUNCIL_PROTOCOL.md Step 3: Stochastic Mode Selection for algorithm).
+            Constraint: Each SA selects **2 Anchor + 3 Random reasoning modes** from modes-of-reasoning.
 
         - id: FORCED_CONVERGENCE
           action: |
@@ -29,11 +28,15 @@ decision_tree:
             2. Explicitly defer to a future RFC (document deferral in 00_meta.yaml).
             3. Ensure all placeholders in RFC files are replaced with substantive content.
 
-        - id: FINAL_GATE_REVIEW
+        - id: FINAL_ASSURANCE_CASE
           action: |
-            Execute all 9 gates from REVIEW_RUBRIC.md.
-            Every gate must pass (APPROVED or APPROVED_WITH_REMEDIATION).
-            BLOCKER findings are terminal for v4 transition.
+            Execute **Mode 36 (Assurance-Case)** to synthesize the v4 Confidence Certificate:
+            1. TOP CLAIM: "RFC-XXXX satisfies all PRD requirements and preserves system invariants."
+            2. STRATEGY: Decompose by gate category (SCHEMA, ATOMICITY, SECURITY, etc.).
+            3. EVIDENCE: Link each sub-claim to a specific artifact (Mode 8 output, test results, CCP mapping).
+            4. REBUTTAL: Log red-team challenges (Mode 79) and their resolutions.
+
+            All claims must reach HIGH confidence before v4 approval.
 
         - id: EMIT_V4
           action: |

@@ -20,7 +20,9 @@
         "receipt.admission",
         "receipt.aat",
         "receipt.run",
-        "defect.record"
+        "defect.record",
+        "reasoning.mode",
+        "reasoning.selector"
       ],
       "type": "string"
     },

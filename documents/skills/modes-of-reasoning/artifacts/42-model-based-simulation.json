@@ -1,0 +1,160 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/model-based-simulation@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 42,
+    "name": "model-based-simulation",
+    "cat": "causal",
+    "core": "Execute a formal or semi-formal model forward in time or across parameter space to predict system behavior under specified conditions. Produces quantitative outcome distributions, not explanations or structure.",
+    "when_to_use": [
+      "need quantitative predictions, not just directional insights",
+      "model exists or can be specified with known transition rules",
+      "want to explore parameter sensitivity or boundary conditions",
+      "generating synthetic data for downstream analysis",
+      "validating design against load/stress scenarios"
+    ],
+    "when_not_to_use": [
+      "no validated model exists (use mechanistic-40 first)",
+      "need to explain why system behaves this way (use mechanistic-40)",
+      "asking 'what would have happened if X?' (use counterfactual-39)",
+      "need qualitative structure before quantitative runs (use systems-thinking-43)",
+      "optimizing a decision, not predicting outcomes (use decision-theoretic-45)"
+    ],
+    "out": [
+      "scenario traces: time-series of state variables per scenario",
+      "sensitivity matrix: parameter -> outcome delta mapping",
+      "boundary map: parameter regions where behavior changes qualitatively",
+      "outcome distribution: histogram/percentiles from Monte Carlo runs",
+      "model defects: assumptions falsified by validation checks"
+    ],
+    "proc": [
+      "1. SPECIFY MODEL: list state variables, transition rules, time step, assumptions",
+      "2. DEFINE SCENARIOS: initial conditions, parameter ranges, input sequences",
+      "3. IDENTIFY VALIDATION: what real data will you compare against?",
+      "4. RUN: execute model across scenarios, record full traces",
+      "5. ANALYZE: compute summary stats, identify boundaries, flag outliers",
+      "6. VALIDATE: compare at least one prediction to measured reality",
+      "7. SENSITIVITY: vary top 3 uncertain parameters +/-20%, document impact",
+      "8. REPORT: conclusions prefixed with 'model predicts', caveats on assumptions"
+    ],
+    "check": [
+      "model assumptions listed explicitly before first run",
+      "at least 2 boundary/stress scenarios tested",
+      "outputs include uncertainty (CI, ranges, or distributions)",
+      "at least one prediction validated against empirical data",
+      "sensitivity analysis covers top 3 uncertain parameters",
+      "conclusions use 'model predicts' not 'will' or 'is'",
+      "untested parameter regions explicitly documented"
+    ],
+    "diff": {
+      "counterfactual-39": "simulation predicts future forward; counterfactual attributes past backward. Simulation: 'what happens if we add capacity?' Counterfactual: 'would outage have occurred without the deploy?'",
+      "systems-thinking-43": "simulation runs quantitative models; systems-thinking builds qualitative structure (loops, delays). Do systems-thinking first to identify structure, then simulation to quantify.",
+      "mechanistic-40": "simulation runs a model; mechanistic explains why the model works. Mechanistic answers 'why does queue overflow?' Simulation answers 'at what load does it overflow?'",
+      "planning-policy-47": "simulation evaluates consequences of given scenarios; planning generates action sequences to achieve goals. Simulation is 'if we do X, then Y'; planning is 'what X achieves Y?'",
+      "robust-worst-case-49": "simulation explores parameter space to understand outcomes; robust optimizes decisions against worst-case bounds. Simulation maps the landscape; robust picks the safest path."
+    },
+    "confusions": [
+      {
+        "confused_with": "counterfactual-39",
+        "symptom": "using simulation to answer 'what caused the outage?'",
+        "resolution": "simulation predicts forward; for past attribution, use counterfactual with causal model"
+      },
+      {
+        "confused_with": "systems-thinking-43",
+        "symptom": "running simulations without first mapping feedback loops and delays",
+        "resolution": "systems-thinking identifies structure; simulation quantifies. Structure-first avoids garbage-in-garbage-out."
+      },
+      {
+        "confused_with": "mechanistic-40",
+        "symptom": "simulation results treated as explanations ('the system fails because the simulation shows failure')",
+        "resolution": "simulation shows what happens, not why. Use mechanistic reasoning to explain the causal mechanism."
+      }
+    ],
+    "fail": {
+      "mode": "simulation overconfidence",
+      "signal": "conclusions without caveats; no validation; no sensitivity analysis; false precision; treating model output as reality",
+      "anti_patterns": [
+        "reporting simulation results to 4 decimal places when inputs have 50% uncertainty",
+        "never comparing any prediction to measured data",
+        "running one scenario and generalizing to all conditions",
+        "assuming model captures all relevant dynamics"
+      ],
+      "mitigations": [
+        {
+          "id": "M1",
+          "action": "list top 3 assumptions before running; review after for validity",
+          "test": "assumptions document exists and is reviewed post-run"
+        },
+        {
+          "id": "M2",
+          "action": "validate at least one prediction against measured reality; document discrepancy",
+          "test": "validation section shows predicted vs actual with error magnitude"
+        },
+        {
+          "id": "M3",
+          "action": "sensitivity analysis: vary top 3 uncertain parameters +/-20%, report which change conclusions",
+          "test": "sensitivity table shows parameter, range tested, and outcome change"
+        },
+        {
+          "id": "M4",
+          "action": "use epistemic hedging: 'model predicts X' not 'X will happen'",
+          "test": "grep for 'will' and 'is' in conclusions; should find 'model predicts' instead"
+        },
+        {
+          "id": "M5",
+          "action": "document untested regions: what parameter ranges/scenarios were not explored?",
+          "test": "report includes 'not tested' section with specific gaps"
+        }
+      ]
+    },
+    "use": [
+      "capacity planning: predict system behavior under projected load growth",
+      "policy evaluation: compare outcomes of proposed interventions",
+      "failure mode exploration: find conditions that cause system breakdown",
+      "training data generation: produce synthetic examples for ML models",
+      "design validation: verify proposed architecture meets requirements"
+    ],
+    "rel": [
+      {"id": 39, "name": "counterfactual", "note": "use for past attribution, not forward prediction"},
+      {"id": 40, "name": "mechanistic", "note": "use to build/explain the model before simulating"},
+      {"id": 43, "name": "systems-thinking", "note": "use to identify structure before quantifying"},
+      {"id": 47, "name": "planning-policy", "note": "use to generate plans; simulation evaluates them"},
+      {"id": 49, "name": "robust-worst-case", "note": "use when optimizing decisions under uncertainty"}
+    ],
+    "ex": {
+      "task": "evaluate message queue for Black Friday traffic",
+      "model": {
+        "state_vars": ["queue_depth", "processing_rate", "drop_count"],
+        "transition": "queue_depth[t+1] = queue_depth[t] + arrivals[t] - min(processing_rate, queue_depth[t]); drop if queue_depth > buffer",
+        "assumptions": ["Poisson arrivals", "exponential service times", "no correlated failures", "single queue"]
+      },
+      "scenarios": [
+        {"name": "baseline", "lambda": "1x", "mu": "current", "buffer": "1k"},
+        {"name": "2x_traffic", "lambda": "2x", "mu": "current", "buffer": "1k"},
+        {"name": "5x_traffic", "lambda": "5x", "mu": "current", "buffer": "1k"},
+        {"name": "5x_mitigated", "lambda": "5x", "mu": "+20%", "buffer": "10k"}
+      ],
+      "output": {
+        "5x_traffic": "12% drops (95% CI: 9-15%), P99 latency 450ms",
+        "5x_mitigated": "<1% drops, P99 latency 180ms"
+      },
+      "validation": {
+        "predicted": "P99 450ms at 5x",
+        "observed": "P99 520ms (15% underestimate)",
+        "diagnosis": "model underestimates tail due to GC pauses not modeled"
+      },
+      "caveats": ["assumes no correlated failures", "GC pauses not modeled", "single-queue approximation"]
+    },
+    "micro_ex": {
+      "setup": "model: queue with arrival rate A, service rate S, buffer B",
+      "run": "simulate 10k arrivals at A=2x, S=current, B=1k",
+      "result": "model predicts 8% drops; observed 10%; assumption 'no bursts' violated"
+    }
+  }
+}

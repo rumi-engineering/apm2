@@ -1,0 +1,142 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/legal@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 71,
+    "name": "legal",
+    "cat": "domain",
+    "core": "Apply rules to facts, interpret texts, reason from precedents using burdens and standards of proof with adversarial argumentation under institutional constraints. Distinguishing features: (1) source hierarchy (constitution > statute > regulation > case law > contract); (2) procedural rules (standing, jurisdiction, limitations); (3) burden allocation (who proves what to what standard); (4) adversarial framing (anticipate opposing counsel).",
+    "out": [
+      {"a": "legal_position", "s": "issue statement, jurisdiction, applicable rules (with citations), factual basis, burden allocation, conclusion", "done": "position cites binding authority from correct jurisdiction; burden standard stated (preponderance/clear-and-convincing/beyond-reasonable-doubt)"},
+      {"a": "compliance_interpretation", "s": "regulation citation, ambiguous provision, interpretive canon applied, supporting precedent, conclusion", "done": "interpretation cites canon (plain meaning/noscitur a sociis/ejusdem generis) and addresses contrary interpretation"},
+      {"a": "precedent_argument", "s": "binding vs persuasive classification, material facts comparison, holding extraction, distinguishing factors, application to instant case", "done": "adverse precedent distinguished on material facts; dicta separated from holding"},
+      {"a": "risk_assessment", "s": "claim type, exposure range (min/expected/max), likelihood percentage, statute of limitations status, mitigation options ranked by cost-effectiveness", "done": "exposure quantified in dollars or categories; limitations period checked"}
+    ],
+    "proc": [
+      "Frame legal question: state issue in form 'Whether [legal conclusion] when [key facts] under [body of law]'; note jurisdiction (federal/state/international, venue)",
+      "Establish source hierarchy: identify constitution > statute > regulation > case law > contract terms; flag conflicts between levels",
+      "Check procedural gates: standing (injury, causation, redressability); statute of limitations; exhaustion of remedies; proper venue",
+      "Gather applicable rules: cite statutes with section numbers, regulations with CFR/equivalent citations, cases with reporter citations and year",
+      "Analyze facts: map each rule element to supporting facts; mark elements with insufficient evidence as 'gap'; note disputed facts",
+      "Allocate burden: identify who bears burden of proof (plaintiff/prosecution/moving party); state standard (preponderance/clear-and-convincing/beyond-reasonable-doubt/substantial-evidence)",
+      "Apply rules to facts: step through each element; cite authority for each application; distinguish adverse cases on material facts",
+      "Construct adversarial framing: draft opposing party's best arguments; identify weakest points in your position",
+      "Assess risk: estimate likelihood of adverse outcome (percentage); quantify exposure (dollar range or severity category); check for indemnification or insurance",
+      "Recommend action: propose path that balances legal risk with business objectives; identify decision points requiring escalation"
+    ],
+    "quick_check": [
+      "Jurisdiction stated? (federal/state/international + specific court)",
+      "Statute of limitations checked?",
+      "Source hierarchy respected? (no regulation overriding statute)",
+      "Burden and standard explicit?",
+      "Each rule element mapped to fact or flagged as gap?",
+      "Adverse precedent addressed or distinguished?",
+      "Holding vs dicta distinguished?",
+      "Opposing party's best argument anticipated?"
+    ],
+    "check": [
+      "Jurisdiction and choice of law stated with conflict-of-laws analysis if multi-jurisdictional",
+      "Applicable rules cited with full authority (statute section, CFR cite, case reporter)",
+      "Burden of proof explicitly allocated with standard named",
+      "Each rule element mapped to specific facts or identified as evidentiary gap requiring discovery",
+      "Adverse precedent addressed: distinguished on material facts or acknowledged as unfavorable",
+      "Procedural requirements verified: standing, limitations, exhaustion, venue",
+      "Risk quantified with exposure range and likelihood estimate",
+      "Ethical analysis separated from legal analysis when stakes are high"
+    ],
+    "diff": {
+      "case-based": "case-based retrieves similar cases with similarity metrics and adaptation operators; legal adds: (1) stare decisis hierarchy (binding vs persuasive), (2) formal burden allocation, (3) adversarial framing. Switch to case-based when you need precedent retrieval without procedural constraints; switch to legal when binding authority and burden matter.",
+      "defeasible": "defeasible resolves rule conflicts via priority ordering in argument graphs; legal adds: (1) procedural rules (standing, limitations), (2) institutional enforcement, (3) source hierarchy (constitution > statute > case). Switch to defeasible for generic rule conflict resolution; switch to legal when institutional authority and procedure constrain resolution.",
+      "hermeneutic": "hermeneutic interprets text using contextual understanding and multiple canons; legal constrains interpretation with: (1) binding canons (ejusdem generis, noscitur a sociis), (2) stare decisis (prior interpretations bind), (3) legislative intent doctrine. Switch to hermeneutic for open-ended textual interpretation; switch to legal when precedent and canons constrain meaning.",
+      "deontic": "deontic derives O/P/F from norms using formal logic (lex specialis, lex superior); legal adds: (1) institutional enforcement mechanisms, (2) remedies and sanctions, (3) procedural requirements. Switch to deontic for formal norm derivation; switch to legal when enforcement, remedies, and procedure matter.",
+      "argumentation-theory": "argumentation-theory builds dialectical structures with attack/support relations and computes acceptable extensions; legal adds: (1) rules of evidence (hearsay, authentication), (2) burden-shifting rules, (3) institutional authority of adjudicator. Switch to argumentation-theory for abstract dialectical analysis; switch to legal when evidentiary rules and adjudicator authority constrain the argument.",
+      "moral-ethical": "moral-ethical evaluates what norms should exist using ethical frameworks; legal applies institutionally-given norms regardless of ethical merit. A law can be legal but unethical; an action can be ethical but illegal. Always separate legal compliance analysis from ethical evaluation."
+    },
+    "fail": {
+      "mode": "conflating legal compliance with ethical legitimacy",
+      "desc": "Treating 'lawful' as equivalent to 'right'; failing to recognize that legal rules are institutionally contingent and may be unjust, outdated, or jurisdictionally limited.",
+      "signals": [
+        "assumes lawful equals ethical without separate moral analysis",
+        "ignores jurisdiction or choice-of-law issues in multi-jurisdictional matters",
+        "cites authority without checking current validity (may be overruled, superseded, or limited)",
+        "treats dicta as holding without distinguishing ratio decidendi",
+        "applies statute without checking limitations period",
+        "ignores standing or procedural requirements",
+        "confuses persuasive authority with binding authority"
+      ],
+      "mitigations": [
+        {"m": "separate legal and ethical analysis", "test": "document contains distinct 'legal analysis' and 'ethical considerations' sections when stakes include harm to persons"},
+        {"m": "verify authority is current", "test": "cite check performed using Shepard's/KeyCite/equivalent; no cases marked 'overruled' or 'superseded'"},
+        {"m": "distinguish holding from dicta", "test": "for each case cited, ratio decidendi (necessary to outcome) separated from obiter dicta (incidental remarks)"},
+        {"m": "state jurisdiction explicitly", "test": "issue statement includes jurisdiction; choice-of-law analysis present for multi-state/international matters"},
+        {"m": "check limitations periods", "test": "applicable statute of limitations identified with tolling analysis if relevant; claim timeliness verified"},
+        {"m": "verify binding vs persuasive authority", "test": "each cited case classified as binding (same jurisdiction, higher court) or persuasive (other jurisdiction, lower court, treatise)"},
+        {"m": "procedural checklist", "test": "standing, exhaustion, and venue requirements explicitly verified before substantive analysis"}
+      ]
+    },
+    "use": [
+      "compliance review: assess whether conduct satisfies regulatory requirements",
+      "contract drafting and interpretation: analyze terms, identify ambiguities, predict enforcement",
+      "dispute resolution and litigation strategy: evaluate claims, defenses, and settlement posture",
+      "governance and policy drafting: ensure policies comply with applicable law and survive challenge",
+      "regulatory analysis: interpret new regulations, assess enforcement risk, prepare comments",
+      "due diligence: identify legal risks in transactions (M&A, financing, partnerships)",
+      "intellectual property strategy: assess infringement risk, freedom to operate, enforcement options"
+    ],
+    "rel": [
+      {"mode": "case-based", "how": "precedent retrieval and analogical matching; legal adds stare decisis hierarchy and burden allocation"},
+      {"mode": "defeasible", "how": "rules with exceptions and rebuttable presumptions; legal adds procedural constraints and institutional authority"},
+      {"mode": "hermeneutic", "how": "statutory and contractual text interpretation; legal adds binding canons and stare decisis"},
+      {"mode": "deontic", "how": "normative structure of obligations and permissions; legal adds enforcement mechanisms and remedies"},
+      {"mode": "argumentation-theory", "how": "dialectical structure building; legal adds rules of evidence and adjudicator authority"},
+      {"mode": "moral-ethical", "how": "evaluating whether legal norms are just; legal applies norms as given"}
+    ],
+    "confusions": [
+      {
+        "vs": "deontic",
+        "trap": "using deontic logic symbols (O, P, F) and thinking you've done legal analysis",
+        "clarify": "deontic derives what's obligatory/permitted/forbidden from norms using formal logic; legal reasoning requires jurisdiction, procedural validity, burden allocation, and institutional enforcement. Deontic is necessary but not sufficient for legal analysis.",
+        "test": "if you haven't stated jurisdiction, burden of proof, and source hierarchy, you're doing deontic, not legal"
+      },
+      {
+        "vs": "case-based",
+        "trap": "treating precedent matching as legal reasoning without adversarial framing",
+        "clarify": "case-based retrieves similar cases and adapts solutions; legal adds stare decisis (binding vs persuasive), burden allocation, and requires anticipating opposing counsel's distinguishing arguments.",
+        "test": "if you haven't classified precedent as binding/persuasive and anticipated adversarial response, you're doing case-based, not legal"
+      },
+      {
+        "vs": "argumentation-theory",
+        "trap": "building dialectical argument structures without evidentiary constraints",
+        "clarify": "argumentation-theory computes acceptable extensions in attack/support graphs; legal constrains what counts as admissible evidence (hearsay rules, authentication, relevance) and assigns authority to adjudicator.",
+        "test": "if you haven't considered evidentiary admissibility and adjudicator authority, you're doing argumentation-theory, not legal"
+      }
+    ],
+    "ex": {
+      "scenario": "Software company receives cease-and-desist letter alleging patent infringement for a feature in their product.",
+      "analysis": {
+        "issue": "Whether Company X infringes Patent Y's claim 1 when implementing feature Z under 35 U.S.C. 271(a) in the Northern District of California.",
+        "jurisdiction": "Federal (patent), N.D. Cal. venue proper (defendant's principal place of business).",
+        "source_hierarchy": "35 U.S.C. 271 (statute) > Federal Circuit precedent (binding) > District court decisions (persuasive).",
+        "procedural_check": "Limitations: 6 years for damages (35 U.S.C. 286); letter dated within period. Standing: patent owner or exclusive licensee.",
+        "burden": "Patentee bears burden to prove infringement by preponderance of evidence; Company X bears burden on invalidity defenses by clear and convincing evidence.",
+        "rule_application": "Claim 1 requires elements A, B, C. Feature Z implements A (exact match), B (equivalent under doctrine of equivalents?), C (gap: no evidence feature includes this element).",
+        "adverse_precedent": "Phillips v. AWH (Fed. Cir. 2005) on claim construction; Warner-Jenkinson (SCOTUS 1997) on equivalents. Distinguish on element C gap.",
+        "adversarial_framing": "Patentee will argue DOE covers element B; will claim feature Z has undisclosed element C. Counter: prosecution history estoppel, no evidence of C.",
+        "risk_assessment": "Likelihood of infringement finding: 35% (element C gap significant). Exposure: $2-8M (reasonable royalty basis). Mitigation: design-around feature B ($500K cost), license negotiation, IPR petition on validity.",
+        "recommendation": "Initiate license negotiation while evaluating design-around feasibility; reserve IPR as leverage. Escalate to GC if demands exceed $3M."
+      }
+    },
+    "micro_ex": {
+      "contrast": "legal vs case-based",
+      "legal_approach": "Analyze claim under jurisdiction's binding precedent, allocate burden (plaintiff proves infringement by preponderance), distinguish adverse cases on material facts, anticipate defendant's best arguments.",
+      "case_based_approach": "Retrieve similar infringement cases from database, compute similarity score, adapt prior defense strategy to current facts without formal burden analysis.",
+      "key_diff": "legal requires: (1) binding/persuasive authority classification, (2) burden and standard statement, (3) adversarial anticipation. Case-based requires: similarity threshold, adaptation operators, outcome verification."
+    }
+  }
+}

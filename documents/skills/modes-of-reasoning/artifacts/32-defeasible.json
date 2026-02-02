@@ -1,0 +1,160 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/defeasible@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 32,
+    "name": "defeasible",
+    "cat": "nonmonotonic",
+    "core": "Conclusions can be defeated by counterevidence or stronger rules. Tracks explicit priority orderings and defeat relations between competing arguments. Key distinction: produces an argument graph with directed defeat edges, not just 'applies/blocked' status. Use when multiple rules conflict and you need auditable resolution.",
+    "out": [
+      {"n": "warranted_conclusions", "d": "conclusions surviving all defeat challenges; each traceable to undefeated argument chain"},
+      {"n": "defeat_relations", "d": "directed edges: argument A defeats argument B, with defeat type (rebuttal/undercut/undermine)"},
+      {"n": "priority_ordering", "d": "rule strength hierarchy with explicit ordering criteria (specificity, recency, authority, explicitness)"},
+      {"n": "argument_graph", "d": "DAG of arguments with support edges (premise->conclusion) and attack edges (defeater->target)"},
+      {"n": "undefeated_set", "d": "final defensible positions; arguments with no undefeated attackers"},
+      {"n": "defeat_audit", "d": "log of each conflict resolution: which rule won, why, what was defeated"}
+    ],
+    "proc": [
+      "enumerate rules: list all applicable rules with their antecedents, consequents, and source authority",
+      "construct arguments: chain rules into argument trees; each argument = premises + inference steps + conclusion",
+      "identify conflicts: find arguments with incompatible conclusions (logical contradiction or resource conflict)",
+      "classify defeat type: rebuttal (attacks conclusion), undercut (attacks inference), undermine (attacks premise)",
+      "establish priorities: rank conflicting rules by specificity > recency > authority > explicitness; document criteria",
+      "resolve each conflict: determine winner for each attack edge based on priority; record reasoning",
+      "propagate defeats: compute transitive closure; argument defeated if any premise-argument defeated",
+      "extract warranted set: conclusions from arguments with no undefeated attackers"
+    ],
+    "quick_check": [
+      "Have I enumerated ALL applicable rules, not just obvious ones?",
+      "Is every conflict explicit with named attacker and target?",
+      "Can I justify each priority ranking with a stated criterion?",
+      "Have I checked for cyclic defeats (A defeats B defeats C defeats A)?",
+      "Are transitive defeats traced (if X defeats Y and Y supports Z, then Z is indirectly defeated)?",
+      "Would adding a new rule change outcomes predictably?"
+    ],
+    "check": [
+      "all relevant rules enumerated with sources cited",
+      "conflicts explicitly identified as argument pairs, not just rule pairs",
+      "priority scheme stated before applying it (no post-hoc rationalization)",
+      "defeat direction determined for each conflict with documented reason",
+      "transitive defeats traced through argument dependencies",
+      "undefeated conclusions stable: re-running with same inputs yields same outputs",
+      "cyclic defeat handled: either blocked or resolved via grounded semantics"
+    ],
+    "diff": {
+      "default-typicality": "defeasible: explicit defeat graph with directed attacks; default: binary applies/blocked status per rule",
+      "argumentation-theory": "defeasible: priority-based winner selection; argumentation: dialectical acceptability via extensions (grounded/preferred/stable)",
+      "belief-revision": "defeasible: operates on rules and their interactions; belief-revision: operates on propositions in belief set",
+      "non-monotonic": "defeasible: specific mechanism with defeat relations; non-monotonic: general property that conclusions can be retracted",
+      "paraconsistent": "defeasible: resolves contradictions via defeat; paraconsistent: tolerates contradictions without explosion",
+      "assurance-case": "defeasible: generic conflict resolution; assurance-case: structured safety argument with goal-strategy-evidence hierarchy",
+      "legal": "defeasible: domain-neutral priority mechanism; legal: adds procedural rules, burdens of proof, stare decisis"
+    },
+    "confusions": [
+      {
+        "vs": "argumentation-theory",
+        "wrong": "treating defeasible and argumentation as synonyms",
+        "right": "defeasible uses fixed priority ordering to pick winners; argumentation computes multiple acceptable extensions and may not resolve all conflicts",
+        "test": "if you computed grounded/preferred/stable extensions, you used argumentation; if you applied priority ranking to pick unique winners, you used defeasible"
+      },
+      {
+        "vs": "default-typicality",
+        "wrong": "using defeasible when you only have isolated defaults without inter-rule conflicts",
+        "right": "default-typicality: 'birds fly unless penguin'; defeasible: 'rule A and rule B conflict, A wins because more specific'",
+        "test": "if no two rules produce conflicting conclusions, use default-typicality; if rules conflict and you need explicit resolution, use defeasible"
+      },
+      {
+        "vs": "belief-revision",
+        "wrong": "using defeasible when incoming information contradicts existing beliefs",
+        "right": "belief-revision updates which propositions you accept; defeasible resolves which rule conclusions to derive given fixed rules",
+        "test": "are you changing what you believe (belief-revision) or resolving which rule wins (defeasible)?"
+      }
+    ],
+    "fail": {
+      "mode": "priority_politics",
+      "desc": "Priority orderings reflect organizational power rather than epistemic relevance, making 'winning' arguments a function of who wrote the rule rather than what the evidence supports.",
+      "signals": [
+        "whose rule wins correlates with author seniority, not rule specificity",
+        "priorities fixed at system design and never revisited",
+        "specificity principle ignored in favor of 'policy override'",
+        "conflicting priority criteria left unresolved (recency vs authority)",
+        "meta-level disputes about priorities hidden from users"
+      ],
+      "mitigations": [
+        {
+          "m": "explicit priority rationale",
+          "how": "each priority ranking includes written justification citing specificity/recency/authority",
+          "test": "audit log shows rationale string for every defeat resolution"
+        },
+        {
+          "m": "specificity-first default",
+          "how": "more specific rules defeat more general unless explicit override documented",
+          "test": "no general rule defeats specific rule without override annotation"
+        },
+        {
+          "m": "separate fact disputes from rule disputes",
+          "how": "fact disagreements resolved via evidence; rule priority resolved via stated criteria",
+          "test": "defeat audit distinguishes 'premise contested' from 'rule outranked'"
+        },
+        {
+          "m": "priority provenance tracking",
+          "how": "record who set each priority, when, and under what authority",
+          "test": "every priority edge has author, timestamp, and authority citation"
+        },
+        {
+          "m": "priority challenge mechanism",
+          "how": "users can dispute priority rankings; disputes escalate to defined arbiter",
+          "test": "system logs priority challenges and their resolutions"
+        },
+        {
+          "m": "periodic priority review",
+          "how": "scheduled audit of defeat patterns; flag rules that always win or always lose",
+          "test": "monthly report shows defeat win/loss ratios per rule source"
+        }
+      ]
+    },
+    "use": [
+      "compliance and policy interpretation with conflicting regulations",
+      "medical guideline conflicts (e.g., drug interactions with treatment protocols)",
+      "requirements engineering when stakeholder rules conflict",
+      "legal reasoning with statutory exceptions and case law hierarchy",
+      "regulatory overlap across jurisdictions",
+      "access control policies with deny/allow rule conflicts",
+      "configuration management with override hierarchies"
+    ],
+    "rel": [
+      {"id": 31, "n": "default-typicality", "r": "simpler applies/blocked mechanism without explicit defeat graph"},
+      {"id": 35, "n": "argumentation-theory", "r": "computes acceptable extensions rather than priority-based winners"},
+      {"id": 71, "n": "legal", "r": "domain-specific application with procedural constraints"},
+      {"id": 33, "n": "belief-revision", "r": "updates belief sets rather than resolving rule conflicts"},
+      {"id": 30, "n": "non-monotonic", "r": "general framework; defeasible is specific mechanism"},
+      {"id": 34, "n": "paraconsistent", "r": "tolerates contradictions vs resolving them via defeat"}
+    ],
+    "ex": {
+      "sit": "Rules: R1=employees get standard leave; R2=managers get extended leave; R3=senior managers get unlimited leave. Person X is employee, manager, and senior manager.",
+      "steps": [
+        "enumerate: R1(employee->standard), R2(manager->extended), R3(senior->unlimited); sources: HR policy v3",
+        "construct: A1=R1(X)->standard, A2=R2(X)->extended, A3=R3(X)->unlimited",
+        "conflicts: A1 vs A2 (standard vs extended), A2 vs A3 (extended vs unlimited), A1 vs A3 (standard vs unlimited)",
+        "classify: all rebuttals (attack conclusions directly)",
+        "priorities: specificity ordering: senior-manager < manager < employee (senior most specific)",
+        "resolve: A3 defeats A2 (senior more specific than manager), A2 defeats A1 (manager more specific than employee)",
+        "propagate: A3 undefeated, A2 defeated by A3, A1 defeated by A2",
+        "warranted: X gets unlimited leave via A3"
+      ],
+      "insight": "defeat graph makes resolution auditable: each step has explicit justification"
+    },
+    "micro_ex": {
+      "contrast": "default-typicality vs defeasible",
+      "default_case": "'Birds fly. Tweety is bird. Tweety is penguin. Penguins don't fly.' -> penguin-default blocks bird-default; no defeat graph, just blocked status",
+      "defeasible_case": "'R1: birds->fly, R2: penguins->not-fly, R3: mechanical-penguins->fly. Tweety is mechanical penguin.' -> defeat graph: R3 defeats R2 defeats R1; A3 warranted",
+      "key_diff": "defeasible tracks directed defeat edges and handles multi-level conflicts; default-typicality handles single-level blocking"
+    }
+  }
+}

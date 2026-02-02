@@ -1,0 +1,152 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/evidential-dempster-shafer@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 22,
+    "name": "evidential-dempster-shafer",
+    "cat": "uncertain",
+    "core": "Allocate probability mass to sets of possibilities rather than single hypotheses. Combine evidence via Dempster's rule into belief (minimum support) and plausibility (maximum support) intervals, explicitly representing ignorance. Key insight: [Bel(A), Pl(A)] bounds true probability; width = ignorance about A.",
+    "when_to_use": [
+      "evidence supports sets of hypotheses, not single outcomes (e.g., 'sensor says car or truck')",
+      "sources are genuinely independent (no shared upstream data)",
+      "ignorance must be distinguished from equiprobability",
+      "multiple heterogeneous sensors/experts require fusion",
+      "partial identification suffices; precise point estimates not needed"
+    ],
+    "when_not_to_use": [
+      "sources share common information (violates Dempster independence assumption)",
+      "conflict coefficient K > 0.9 (Dempster's rule produces counterintuitive results)",
+      "frame of discernment cannot be enumerated exhaustively",
+      "downstream decision requires point probabilities (use Bayesian with explicit prior)",
+      "evidence naturally maps to single hypotheses (simpler methods suffice)"
+    ],
+    "out": [
+      {"n": "frame_of_discernment", "d": "finite set Theta = {h1, h2, ..., hn} of mutually exclusive, exhaustive hypotheses"},
+      {"n": "mass_function", "d": "m: 2^Theta -> [0,1] with m({})=0, sum(m)=1; focal elements are sets with m>0"},
+      {"n": "belief_values", "d": "Bel(A) = sum of m(B) for all B subset of A; minimum guaranteed support"},
+      {"n": "plausibility_values", "d": "Pl(A) = 1 - Bel(not A) = sum of m(B) for B intersect A non-empty; maximum possible support"},
+      {"n": "fused_mass", "d": "m12(A) = sum(m1(B)*m2(C) where B intersect C = A) / (1-K); K = conflict"},
+      {"n": "conflict_coefficient", "d": "K = sum(m1(B)*m2(C) where B intersect C = {}); measures source disagreement"},
+      {"n": "ignorance_measure", "d": "Pl(A) - Bel(A) = width of probability interval; m(Theta) = total ignorance mass"}
+    ],
+    "proc": [
+      "1. FRAME: enumerate Theta as mutually exclusive, exhaustive hypotheses; verify closure",
+      "2. ELICIT: for each source, assign mass to focal elements (sets with evidential support); ensure m({})=0 and sum=1",
+      "3. VALIDATE: check each focal element has justification; mass on Theta represents explicit 'don't know'",
+      "4. INDEPENDENCE: verify sources share no common upstream data; if dependent, use cautious rules instead",
+      "5. CONFLICT: compute K = sum of products where intersections are empty; if K > 0.3, flag for review",
+      "6. COMBINE: apply Dempster's rule m12(A) = sum(m1(B)*m2(C) for B∩C=A) / (1-K); or use Yager/PCR if K high",
+      "7. COMPUTE: Bel(A) = sum m(B) for B⊆A; Pl(A) = 1 - Bel(Ā); verify Bel(A) <= Pl(A)",
+      "8. INTERPRET: [Bel, Pl] bounds true probability; narrow interval = strong evidence; wide = high ignorance"
+    ],
+    "decision_procedure": [
+      "IF K < 0.1: use Dempster's rule directly",
+      "IF 0.1 <= K < 0.3: use Dempster but report K and sensitivity",
+      "IF 0.3 <= K < 0.7: prefer Yager's rule (assigns conflict to ignorance) or PCR",
+      "IF K >= 0.7: sources fundamentally disagree; investigate root cause before any combination",
+      "IF K >= 0.9: do not combine; treat sources as alternative hypotheses about ground truth"
+    ],
+    "quick_checklist": [
+      "[ ] Frame Theta is finite, mutually exclusive, and exhaustive",
+      "[ ] All mass functions sum to 1 with m({})=0",
+      "[ ] Each focal element has traceable evidential justification",
+      "[ ] Source independence verified (no shared sensors, data, or experts)",
+      "[ ] Conflict K computed and within acceptable threshold",
+      "[ ] Combination rule chosen appropriate to K level",
+      "[ ] Output intervals satisfy Bel(A) <= true_prob <= Pl(A)"
+    ],
+    "check": [
+      "frame is exhaustive and mutually exclusive (Theta covers all possibilities)",
+      "mass sums to 1 with m({})=0 (basic probability axiom)",
+      "focal elements justified by evidence (not arbitrary partitions)",
+      "source independence verified before Dempster combination",
+      "conflict coefficient K computed and reported",
+      "K < 0.3 or alternative combination rule used",
+      "belief <= plausibility for all sets (mathematical constraint)",
+      "ignorance explicitly represented: m(Theta) and interval widths stated",
+      "downstream use of intervals documented (decisions, further fusion)"
+    ],
+    "diff": {
+      "bayesian-probabilistic": "DS: mass on sets, explicit ignorance via m(Theta); Bayesian: point probabilities, ignorance hidden in prior choice. DS interval [0.3, 0.7] differs from Bayesian P=0.5 with uniform prior (latter claims more knowledge)",
+      "imprecise-probability": "DS: structural (mass on power set, Dempster combination); IP: any set of probability measures satisfying constraints. DS is special case of IP but with specific combination semantics",
+      "fuzzy-logic": "DS: uncertainty about which hypothesis is true (epistemic); Fuzzy: vagueness in concept boundaries (semantic). 'Probably tall' (fuzzy) vs 'evidence supports {tall, medium}' (DS)",
+      "probabilistic-logic": "DS: combines evidence via Dempster rule, explicit ignorance; ProbLog: probabilistic inference over logical rules, assumes probabilities known. DS for evidence fusion; ProbLog for reasoning with uncertain rules",
+      "belief-revision": "DS: static combination of evidence sources at one time; BR: dynamic update of beliefs over time with priority to newer information. DS for sensor fusion; BR for epistemic state evolution",
+      "assurance-case": "DS: quantifies evidential support with intervals; AC: qualitative argument structure with defeaters. DS can quantify confidence in AC leaf claims; AC structures the argument DS cannot"
+    },
+    "common_confusions": [
+      {
+        "confusion": "DS with uninformative prior equals Bayesian with uniform prior",
+        "clarification": "No: DS m(Theta)=1 means 'total ignorance' yielding Bel(A)=0, Pl(A)=1 for all proper subsets. Bayesian uniform prior P(hi)=1/n claims equal likelihood, a substantive assumption. DS ignorance is wider."
+      },
+      {
+        "confusion": "Bel(A) + Bel(not A) should equal 1",
+        "clarification": "No: Bel(A) + Bel(Ā) <= 1 always. The gap 1 - Bel(A) - Bel(Ā) = m assigned to sets overlapping both A and Ā, representing ignorance. This is the key feature distinguishing DS from probability."
+      },
+      {
+        "confusion": "High conflict K just means sources disagree",
+        "clarification": "K > 0.9 with Dempster's rule produces counterintuitive results (Zadeh's paradox). If two sources give 0.99 mass to disjoint singletons, Dempster assigns 1.0 to any tiny shared mass. This is a combination rule pathology, not just disagreement."
+      }
+    ],
+    "fail": {
+      "mode": "independence_violation",
+      "signals": [
+        "sources share common upstream data or sensors",
+        "fusion result more confident than any single source warrants",
+        "conflict K > 0.7 suggesting fundamental disagreement",
+        "mass on empty set before normalization exceeds 0.5",
+        "interval [Bel, Pl] narrower than single-source intervals (impossible without true new information)"
+      ],
+      "mitigations": [
+        "audit source provenance: trace each source to independent data; reject if common ancestor found",
+        "threshold conflict: if K > 0.3, switch to Yager (conflict -> Theta) or PCR (proportional redistribution)",
+        "report K always: include conflict coefficient in all outputs; K > 0.5 triggers mandatory review",
+        "sensitivity analysis: recompute with ±10% mass perturbations; unstable results indicate fragile fusion",
+        "cross-validate: compare DS result with simple averaging; large divergence signals combination pathology",
+        "staged combination: fuse sources incrementally, checking K at each step; halt if K spikes"
+      ]
+    },
+    "use": [
+      "multi-source sensor fusion (radar + lidar + camera with different detection capabilities)",
+      "ambiguous evidence that supports sets, not singletons (witness says 'car or SUV')",
+      "partial identification where point estimates are epistemically unjustified",
+      "expert opinion aggregation with explicit 'don't know' options",
+      "forensic analysis with incomplete evidence chains",
+      "safety-critical decisions requiring explicit ignorance quantification"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "alternative framework: point probabilities with prior; use when prior is justified and point estimates needed"},
+      {"id": 21, "n": "imprecise-probability", "r": "generalization: DS is special case; use IP when Dempster combination inappropriate"},
+      {"id": 25, "n": "fuzzy-logic", "r": "orthogonal: fuzzy for vague concepts, DS for uncertain evidence; can combine (fuzzy-DS)"},
+      {"id": 20, "n": "probabilistic-logic", "r": "complementary: ProbLog for inference, DS for evidence fusion; chain as DS-inputs -> ProbLog-reasoning"},
+      {"id": 33, "n": "belief-revision", "r": "temporal complement: DS for one-shot fusion, BR for iterated updates with recency priority"},
+      {"id": 36, "n": "assurance-case", "r": "structural complement: AC for argument structure, DS for quantifying leaf-node confidence"}
+    ],
+    "ex": {
+      "sit": "Two independent sensors assess object type: Theta = {car, truck, bus}. Sensor A (radar): 0.6 to {car}, 0.4 to {car,truck}. Sensor B (camera): 0.7 to {car,bus}, 0.3 to Theta (uncertain).",
+      "steps": [
+        "1. Frame: Theta = {car, truck, bus}, |2^Theta| = 8 subsets",
+        "2. Mass A: m_A({car})=0.6, m_A({car,truck})=0.4; Bel_A(car)=0.6, Pl_A(car)=1.0",
+        "3. Mass B: m_B({car,bus})=0.7, m_B(Theta)=0.3; Bel_B(car)=0, Pl_B(car)=1.0",
+        "4. Intersections: {car}∩{car,bus}={car}:0.42, {car}∩Theta={car}:0.18, {car,truck}∩{car,bus}={car}:0.28, {car,truck}∩Theta={car,truck}:0.12",
+        "5. Conflict: K = m_A({car,truck}) * m_B({car,bus}) where {car,truck}∩{car,bus}={car}≠{}, so check: only {truck}∩{car,bus}={} would conflict, but no mass on {truck}. K=0 (no conflict)",
+        "6. Combine: m_12({car}) = 0.42+0.18+0.28 = 0.88, m_12({car,truck}) = 0.12; sum=1.0",
+        "7. Result: Bel(car)=0.88, Pl(car)=1.0; interval [0.88, 1.0] much narrower than either source alone"
+      ],
+      "insight": "Fusion converged strongly on 'car' because both sensors' focal elements overlap there. The {car,truck} residual (0.12) represents remaining ambiguity. Zero conflict indicates consistent evidence. Compare: Bayesian with uniform prior would give different result based on prior assumptions DS avoids."
+    },
+    "micro_example": {
+      "sit": "Single source with total ignorance, then evidence arrives",
+      "before": "m(Theta)=1.0 -> Bel(car)=0, Pl(car)=1 for all hypotheses (true ignorance)",
+      "evidence": "Witness: 'definitely not a bus' -> m({car,truck})=1.0",
+      "after": "Bel(car)=0 (no mass on {car} alone), Pl(car)=1 (car in {car,truck}), but Bel(bus)=0, Pl(bus)=0 (bus ruled out)",
+      "contrast": "Bayesian uniform: P(car)=P(truck)=P(bus)=1/3 -> after evidence P(car)=P(truck)=1/2. DS says 'car or truck, but I claim no preference between them' which is epistemically weaker."
+    }
+  }
+}

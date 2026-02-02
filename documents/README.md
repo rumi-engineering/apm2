@@ -65,7 +65,7 @@ This convention enables:
 
 If you're an agent trying to understand this project:
 
-1. **Root onboarding** - `AGENTS.md` + `ROOT_ONBOARDING.cac.md` (repo-level pointers) + `SECURITY.md` (security policy summary)
+1. **Root onboarding** - `AGENTS.md` + `SECURITY.md` (security policy summary)
 2. **Start with standards** - Read `standards/00_standards_meta.yaml`
 3. **Understand schemas** - Check `standards/schemas/` for document structures
 4. **Check enums** - `standards/enums/` defines valid status codes and types

@@ -1,0 +1,119 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/mechanism-design@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 58,
+    "name": "mechanism-design",
+    "cat": "strategic",
+    "core": "Design rules, payoffs, and information structures so self-interested agents' equilibrium behavior produces desired system outcomes. The designer chooses the game; players choose strategies within it. Inverse of game theory: given desired outcome, derive rules that make it an equilibrium.",
+    "out": [
+      {"t": "incentive_map", "v": "agent_type->private_info->actions->payoffs->system_effect; one row per type"},
+      {"t": "participation_constraint", "v": "E[utility|participate] >= outside_option for each type; with numerical bounds"},
+      {"t": "ic_proof", "v": "formal argument that truth-telling (or target behavior) is dominant/Bayesian-Nash; cite revelation principle if applicable"},
+      {"t": "robustness_analysis", "v": "table: attack_vector(collusion|sybil|timing|info_leak) -> degradation_bound -> mitigation"},
+      {"t": "impossibility_check", "v": "which impossibility theorems apply (Gibbard-Satterthwaite, Myerson-Satterthwaite, Arrow); how mechanism escapes or accepts tradeoff"},
+      {"t": "implementation_spec", "v": "complete rules: timing, message space, allocation function, transfer function, dispute resolution, upgrade path"}
+    ],
+    "proc": [
+      "1. Define goal as measurable social-welfare function (efficiency, fairness, revenue, etc.); reject if goal not operationalizable",
+      "2. Enumerate agent types: private information, action space, outside options, risk preferences",
+      "3. Map each type's selfish incentives absent mechanism; identify conflicts with goal",
+      "4. Consult impossibility theorems: Gibbard-Satterthwaite (voting), Myerson-Satterthwaite (bilateral trade), Arrow (aggregation); determine which constraints apply",
+      "5. Draft mechanism: message space, allocation rule, transfer rule, timing, disclosure policy",
+      "6. Prove incentive compatibility: apply revelation principle; show truth-telling is equilibrium (dominant-strategy IC or Bayesian IC)",
+      "7. Verify participation constraints: expected utility >= outside option for each type; adjust transfers if violated",
+      "8. Stress-test adversarial scenarios: collusion (2+ agents coordinate), sybil (fake identities), timing attacks (early/late info), information leakage (private->public)",
+      "9. Decision gate: if IC or participation fails and no fix found, prove impossibility and propose second-best; else finalize spec",
+      "10. Document residual vulnerabilities and monitoring plan for gaming signals"
+    ],
+    "check": [
+      "goal is measurable system property with explicit metric",
+      "all agent types enumerated with private info and outside options",
+      "dominant-strategy IC proven, or Bayesian IC with prior specified",
+      "participation constraint verified with numerical bounds",
+      ">=3 adversarial scenarios stress-tested with outcome documented",
+      "relevant impossibility theorems cited and addressed",
+      "mechanism rules complete: no undefined edge cases",
+      "mechanism explainable to participants in <100 words",
+      "monitoring plan specifies gaming signals and response triggers"
+    ],
+    "diff": {
+      "game-theoretic": "MD designs rules to induce equilibrium; game theory predicts behavior given fixed rules. Use GT to verify MD's IC claims.",
+      "optimization": "Optimization assumes single controller; MD assumes multiple self-interested agents who will game any objective. MD requires IC proof, not just objective function.",
+      "robust-worst-case": "Robust optimizes against nature/uncertainty; MD optimizes against strategic agents with preferences. Robust has threat envelope; MD has agent types with incentives.",
+      "negotiation-coalition": "MD designs process before bargaining begins; negotiation operates within process. MD sets rules; negotiation finds agreement under rules.",
+      "systems-thinking": "Systems models flows and feedback; MD models strategic agents who anticipate and exploit flows. MD requires equilibrium analysis, not just dynamics.",
+      "deontic": "Deontic asks what is permitted/obligatory; MD asks what is incentive-compatible. A deontic rule may be unenforceable if IC fails.",
+      "mcda": "MCDA evaluates candidate mechanisms against criteria; MD designs mechanisms that satisfy criteria. MCDA selects; MD constructs."
+    },
+    "confusions": [
+      {"with": "optimization", "error": "treating agents as passive parameters rather than strategic optimizers", "test": "ask 'will agents game this objective?' If yes, need MD not optimization"},
+      {"with": "game-theoretic", "error": "analyzing existing mechanism when you should be designing a new one", "test": "ask 'can I change the rules?' If yes, use MD; if rules fixed, use GT"},
+      {"with": "robust-worst-case", "error": "modeling adversary as nature when they have preferences and respond to incentives", "test": "ask 'does adversary have goals I can shape?' If yes, use MD not robust"}
+    ],
+    "fail": {
+      "mode": "goodharting",
+      "desc": "metrics become targets and get gamed; mechanism achieves metric while subverting goal",
+      "signals": [
+        "metric improves but stakeholder complaints increase",
+        "agent behavior clusters at thresholds (e.g., exactly meeting quota)",
+        "unexpected coalitions form (agents who shouldn't cooperate do)",
+        "new agent types appear exploiting loopholes (arbitrageurs, bots)",
+        "high-value agents exit while low-value flood in"
+      ],
+      "mit": [
+        {"action": "measure outcomes not proxies", "test": "can an agent improve metric while worsening outcome? If yes, wrong metric"},
+        {"action": "use >=3 uncorrelated metrics with unknown weights", "test": "gaming requires simultaneous manipulation of multiple independent signals"},
+        {"action": "build in human review for high-stakes decisions", "test": "random audit sample shows review catches gaming not caught by rules"},
+        {"action": "make rules legible but allocation stochastic", "test": "agents cannot precisely calculate threshold to exploit"},
+        {"action": "instrument for gaming signals: threshold clustering, collusion patterns, value distribution shifts", "test": "monitoring dashboard shows detection within N periods of gaming start"},
+        {"action": "pre-commit to mechanism iteration schedule", "test": "written policy specifies review triggers and amendment process"}
+      ]
+    },
+    "antipatterns": [
+      {"name": "ignoring impossibility", "desc": "designing as if Gibbard-Satterthwaite or Myerson-Satterthwaite doesn't apply", "fix": "explicitly state which theorem applies and which property you sacrifice"},
+      {"name": "assuming benevolent agents", "desc": "mechanism works only if agents follow spirit not letter of rules", "fix": "assume agents will find any profitable deviation; prove they won't"},
+      {"name": "static mechanism in dynamic world", "desc": "no upgrade path when environment or agent population changes", "fix": "design governance layer: who can amend, under what process, with what IC guarantees"}
+    ],
+    "use": [
+      "auctions (Vickrey, combinatorial, spectrum)",
+      "platform governance (content moderation incentives, creator funds)",
+      "compensation and performance systems (sales quotas, OKRs)",
+      "voting and collective choice (budget allocation, feature prioritization)",
+      "resource allocation (cloud capacity, meeting rooms, parking)",
+      "protocol design (blockchain consensus, reputation systems)",
+      "matching markets (school choice, organ donation, residency matching)"
+    ],
+    "rel": [
+      {"id": 55, "name": "game-theoretic-strategic", "why": "analyze equilibria to verify IC claims"},
+      {"id": 46, "name": "multi-criteria-decision-analysis", "why": "evaluate candidate mechanisms against criteria"},
+      {"id": 65, "name": "deontic", "why": "normative constraints bound mechanism design space"},
+      {"id": 57, "name": "negotiation-coalition", "why": "design bargaining protocols; model coalition formation"},
+      {"id": 43, "name": "systems-thinking", "why": "trace mechanism effects through broader system"},
+      {"id": 79, "name": "adversarial-red-team", "why": "generate attack scenarios for stress-testing"},
+      {"id": 48, "name": "optimization", "why": "solve allocation subproblems once IC established"},
+      {"id": 49, "name": "robust-worst-case", "why": "handle unmodeled agent types as worst-case"}
+    ],
+    "ex": {
+      "problem": "allocate shared conference room among 5 teams claiming high priority",
+      "bad_mechanism": "first-come-first-served -> teams book speculatively and no-show",
+      "mechanism": "second-price auction with weekly-replenishing priority tokens",
+      "ic_proof": "bidding true value is dominant strategy: overbid risks winning at loss, underbid risks losing room worth having",
+      "participation": "all teams get tokens regardless of use -> no team worse off than status quo",
+      "robust": "collusion to suppress bids unstable: third team bids honestly and wins cheap, breaking cartel",
+      "residual_risk": "teams may trade tokens off-platform; monitor for concentration"
+    },
+    "micro_ex": {
+      "problem": "engineer bonus based on bugs fixed -> engineers plant bugs to fix later",
+      "failure": "metric gamed; outcome (code quality) worsens while metric improves",
+      "fix": "bonus = f(bugs_fixed, bugs_introduced, peer_review_score); weights unpublished; random deep audits",
+      "lesson": "single metric with known formula is Goodhart-vulnerable; multi-signal with opacity resists gaming"
+    }
+  }
+}

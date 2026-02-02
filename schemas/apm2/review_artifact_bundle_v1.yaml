@@ -1,0 +1,42 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://apm2.dev/schemas/apm2/review_artifact_bundle_v1.yaml"
+title: "ReviewArtifactBundleV1"
+description: "CAS-hosted review artifacts for FAC v0 (review text + tool logs)."
+type: "object"
+required:
+  - schema
+  - schema_version
+  - review_id
+  - changeset_digest
+  - review_text_hash
+  - tool_log_hashes
+  - time_envelope_ref
+properties:
+  schema:
+    type: "string"
+    const: "apm2.review_artifact_bundle.v1"
+  schema_version:
+    type: "string"
+    pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+  review_id:
+    type: "string"
+    minLength: 1
+    maxLength: 128
+  changeset_digest:
+    type: "string"
+    pattern: "^[a-f0-9]{64}$"
+  review_text_hash:
+    type: "string"
+    description: "Hex-encoded 32-byte BLAKE3 hash of review text stored in CAS."
+    pattern: "^[a-f0-9]{64}$"
+  tool_log_hashes:
+    type: "array"
+    maxItems: 1024
+    items:
+      type: "string"
+      pattern: "^[a-f0-9]{64}$"
+  time_envelope_ref:
+    type: "string"
+    description: "Hex-encoded 32-byte hash of TimeEnvelope stored in CAS."
+    pattern: "^[a-f0-9]{64}$"
+unevaluatedProperties: false

@@ -1,0 +1,127 @@
+{
+  "$id": "cac.reasoning_selector.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$ref": "cac.artifact.envelope.v1.schema.json"
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "reasoning.selector"
+        },
+        "payload": {
+          "$ref": "#/$defs/reasoning_selector_payload"
+        },
+        "schema": {
+          "const": "cac.reasoning_selector.v1"
+        }
+      }
+    }
+  ],
+  "title": "CAC Reasoning Selector v1",
+  "$defs": {
+    "reasoning_selector_payload": {
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "description": "Selector version for cache invalidation",
+          "type": "string"
+        },
+        "mode_count": {
+          "description": "Total number of modes in the taxonomy",
+          "maximum": 99,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "cats": {
+          "additionalProperties": {
+            "description": "Mode IDs in this category",
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "description": "Category to mode ID mapping",
+          "type": "object"
+        },
+        "axes": {
+          "additionalProperties": {
+            "$ref": "#/$defs/axis_mapping"
+          },
+          "description": "Reasoning axes with pole-to-mode mappings",
+          "type": "object"
+        },
+        "patterns": {
+          "additionalProperties": {
+            "description": "Ordered list of mode IDs for this pattern",
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "description": "Named hybrid patterns mapping to mode sequences",
+          "type": "object"
+        },
+        "heuristics": {
+          "description": "Selection heuristics (if/then/avoid rules)",
+          "items": {
+            "$ref": "#/$defs/heuristic_rule"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "version",
+        "mode_count",
+        "cats",
+        "axes",
+        "patterns",
+        "heuristics"
+      ],
+      "type": "object"
+    },
+    "axis_mapping": {
+      "additionalProperties": {
+        "description": "Mode IDs at this pole",
+        "items": {
+          "type": "integer"
+        },
+        "type": "array"
+      },
+      "description": "Poles of the axis mapped to mode IDs",
+      "type": "object"
+    },
+    "heuristic_rule": {
+      "additionalProperties": false,
+      "properties": {
+        "if": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Condition (key-value pairs)",
+          "type": "object"
+        },
+        "then": {
+          "description": "Recommended mode IDs",
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "avoid": {
+          "description": "Mode IDs to avoid in this context",
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "if",
+        "then"
+      ],
+      "type": "object"
+    }
+  }
+}

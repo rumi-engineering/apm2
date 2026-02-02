@@ -1,0 +1,134 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/mechanistic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 40,
+    "name": "mechanistic",
+    "cat": "causal",
+    "core": "Explain and predict system behavior by identifying constituent parts, their properties, and how they interact. Reveals intervention points and failure modes by understanding internal structure rather than just input-output correlations.",
+    "when_to_use": [
+      "Need to explain WHY something works, not just THAT it works",
+      "Black-box prediction insufficient; need intervention targets",
+      "Debugging requires tracing causal chain through components",
+      "Safety analysis requires identifying failure cascades",
+      "Must predict behavior under novel conditions outside training distribution"
+    ],
+    "when_not_to_use": [
+      "Pure prediction sufficient (use statistical/ML models)",
+      "System too complex for tractable decomposition (use systems-thinking for emergent patterns)",
+      "No access to internal structure (use causal-inference from observational data)",
+      "Time pressure demands fast heuristics over deep understanding"
+    ],
+    "out": [
+      "mechanistic_explanation: causal chain from input to output through named components",
+      "component_model: parts list with properties, capacities, and interfaces",
+      "intervention_levers: points where chain can be modified with predicted effects",
+      "failure_modes: how components fail and how failures propagate",
+      "boundary_conditions: where mechanism breaks down or assumptions fail"
+    ],
+    "proc": [
+      "1. DECOMPOSE: Identify constituent parts with clear boundaries; name each component",
+      "2. CHARACTERIZE: For each component, state properties, capacities, and constraints",
+      "3. MAP INTERFACES: Define how components connect (what triggers what, through which channel)",
+      "4. TRACE CHAIN: Follow causal path from input through components to output; no gaps allowed",
+      "5. FIND BOTTLENECKS: Identify critical dependencies, single points of failure, rate limiters",
+      "6. VALIDATE: Test mechanism against known behavior AND edge cases; derive falsifiable prediction",
+      "7. DERIVE INTERVENTIONS: Where can chain be modified? What effect would each modification have?",
+      "8. DOCUMENT ASSUMPTIONS: What component behaviors are known vs hypothesized?"
+    ],
+    "quick_checklist": [
+      "Can I draw a diagram with labeled boxes (components) and arrows (interactions)?",
+      "Can I trace any observed output back through the chain to specific component states?",
+      "Have I stated at least one condition that would break the mechanism?",
+      "Does the mechanism make a prediction I can test?",
+      "Have I distinguished measured properties from assumed properties?"
+    ],
+    "check": [
+      "All components named with clear boundaries and no overlaps",
+      "Interaction types specified (chemical, electrical, logical, temporal, etc.)",
+      "Causal chain traceable end-to-end without gaps or hand-waving",
+      "At least one intervention point identified with predicted effect",
+      "Mechanism validated against at least one known outcome",
+      "Boundary conditions stated: when does this mechanism fail?",
+      "Assumptions about component behavior explicitly flagged"
+    ],
+    "diff": {
+      "causal-inference": "Causal inference = statistical estimation of causal effects from data; Mechanistic = internal structure explanation. Use causal-inference when you have observational data but no access to internal structure; use mechanistic when you can decompose the system.",
+      "systems-thinking": "Systems-thinking = emergent behavior from feedback loops and dynamics over time; Mechanistic = how each component works inside. Mechanistic explains parts; systems-thinking explains emergent wholes that resist decomposition.",
+      "diagnostic": "Diagnostic USES mechanistic models to localize faults by testing components; Mechanistic BUILDS the models that diagnostic consumes. Diagnostic asks 'which component failed?'; Mechanistic asks 'how does this component work?'",
+      "counterfactual": "Counterfactual = what-if queries about alternative scenarios; Mechanistic = why it works that way. Counterfactual asks 'what would happen if X?'; Mechanistic explains 'why X causes Y through components A, B, C'.",
+      "model-based-simulation": "Simulation RUNS a mechanistic model forward in time; Mechanistic EXPLAINS the model's structure. Simulation answers 'what happens next?'; Mechanistic answers 'why does it happen that way?'",
+      "causal-discovery": "Causal-discovery LEARNS causal graph structure from data; Mechanistic EXPLAINS the internal workings of known structures. Use causal-discovery when graph unknown; use mechanistic when you need to open the black box."
+    },
+    "common_confusions": [
+      {
+        "confused_with": "model-based-simulation (#42)",
+        "error": "Running a simulation and calling it mechanistic explanation",
+        "fix": "Simulation is a tool; mechanistic explanation requires stating WHY the model works, not just THAT it produces output"
+      },
+      {
+        "confused_with": "causal-inference (#37)",
+        "error": "Estimating causal effect size and calling it a mechanism",
+        "fix": "Knowing 'X causes Y with effect size 0.3' is not mechanistic; you need the intermediate components through which X affects Y"
+      },
+      {
+        "confused_with": "systems-thinking (#43)",
+        "error": "Describing feedback loops without explaining component internals",
+        "fix": "Mechanistic requires opening each component box; systems-thinking can treat components as black boxes interacting"
+      }
+    ],
+    "fail": {
+      "mode": "Just-so mechanisms: plausible-sounding stories without validation",
+      "signal": "Mechanism not tested against edge cases or novel conditions; no falsifiable predictions; components vaguely defined",
+      "mit": [
+        "Require at least one validated prediction derived from mechanism (not just post-hoc fit)",
+        "Identify at least one assumption that could break the mechanism and state how to test it",
+        "Test mechanism against failure cases, not just success cases",
+        "Distinguish known vs hypothesized component behavior with explicit confidence tags",
+        "Draw mechanism diagram with labeled interfaces; if you can't draw it, you don't have a mechanism",
+        "State boundary conditions: under what inputs/conditions does this mechanism fail?",
+        "Compare mechanism predictions to black-box model predictions; if they always match, mechanism may be post-hoc rationalization"
+      ]
+    },
+    "use": [
+      "Engineering: circuit design, software architecture, failure analysis",
+      "Debugging: tracing root cause through component chain to intervention point",
+      "Safety analysis: identifying failure modes, cascades, and blast radius",
+      "Biology/medicine: drug mechanism of action, disease pathways, side effect prediction",
+      "System design: ensuring components interact correctly under all conditions",
+      "Root cause analysis: moving from symptoms to underlying structural causes"
+    ],
+    "rel": [
+      {"id": 37, "name": "causal-inference", "note": "statistical causal estimation; use when no internal access"},
+      {"id": 38, "name": "causal-discovery", "note": "learns causal graph; use when structure unknown"},
+      {"id": 41, "name": "diagnostic", "note": "consumes mechanistic models to localize faults"},
+      {"id": 42, "name": "model-based-simulation", "note": "runs mechanistic models forward"},
+      {"id": 43, "name": "systems-thinking", "note": "emergent dynamics; use when decomposition insufficient"}
+    ],
+    "micro_example": {
+      "problem": "Why does the light not turn on?",
+      "components": ["switch", "wire", "bulb", "power source"],
+      "mechanism": "Power source provides voltage -> wire conducts current when switch closed -> current flows through bulb filament -> filament heats and emits light",
+      "test": "Switch closed but no light -> test each component: is power on? is switch conducting? is wire intact? is bulb filament intact?",
+      "intervention": "Replace failed component in chain"
+    },
+    "ex": {
+      "problem": "Why does the service timeout under load?",
+      "components": [
+        {"name": "load balancer", "role": "distributes requests to backends", "capacity": "unlimited routing, no queueing"},
+        {"name": "backend pool", "role": "processes requests", "capacity": "pool size = 10 instances"},
+        {"name": "database", "role": "stores state", "capacity": "max connections = 100, 10ms avg query"}
+      ],
+      "mechanism": "Each backend holds DB connection for full request duration (avg 50ms). At >10 concurrent requests per backend (100 total), all 100 DB connections exhausted. New requests block waiting for connection; timeout after 30s.",
+      "boundary_conditions": "Mechanism assumes: (1) requests are independent, (2) DB is not the bottleneck, (3) network latency negligible. Breaks if: requests have dependencies, DB query time spikes, or network congestion.",
+      "intervention": "Add connection pooling with 5s timeout (reduces hold time), or increase DB max connections to 200, or add request queueing at load balancer",
+      "validation": "Reproduces at 100+ concurrent requests; resolved by connection pool with timeout; confirmed by monitoring connection wait time dropping from 30s to <100ms"
+    }
+  }
+}

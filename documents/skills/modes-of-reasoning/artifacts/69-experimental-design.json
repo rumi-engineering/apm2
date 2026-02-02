@@ -1,0 +1,226 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/experimental-design@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 69,
+    "name": "experimental-design",
+    "cat": "domain",
+    "core": "Choose interventions, measurements, and sampling to identify causal effects reliably. Design determines what conclusions are possible before any data is collected. Key commitment: control what can be controlled (assignment, measurement, timing) to isolate treatment effect from confounds.",
+    "terms": {
+      "internal_validity": "experiment actually tests stated hypothesis; treatment causes observed effect",
+      "external_validity": "results generalize to target population and conditions",
+      "statistical_power": "probability of detecting true effect if it exists (typically target 80%)",
+      "confound": "variable correlated with both treatment and outcome; threatens causal interpretation",
+      "randomization": "probabilistic assignment breaking confound-treatment correlations",
+      "blocking": "grouping similar units to reduce variance and increase power"
+    },
+    "out": [
+      {"a": "experiment_plan", "s": "hypothesis, treatment, control, randomization scheme, timeline, stopping rules", "done": "all threats to validity enumerated with mitigations", "fmt": "structured doc with sections per threat"},
+      {"a": "power_analysis", "s": "minimum detectable effect, sample size, alpha, power, variance estimate source", "done": "n >= required for 80% power at target effect", "fmt": "calculation with inputs and formula"},
+      {"a": "measurement_strategy", "s": "primary metric, secondary metrics, instruments, collection cadence, validation evidence", "done": "primary metric validated against construct; backup metrics specified", "fmt": "metric spec with validity evidence"},
+      {"a": "control_design", "s": "control group definition, matching/blocking variables, confound list with mitigation", "done": "each identified confound addressed by design or acknowledged as limitation", "fmt": "confound matrix: variable | threat | mitigation"},
+      {"a": "analysis_plan", "s": "pre-specified tests, correction method, decision thresholds, exploratory vs confirmatory distinction", "done": "plan timestamped before data collection", "fmt": "registered analysis protocol"}
+    ],
+    "proc": [
+      "GATE 1 - State hypothesis: specify falsifiable causal claim (X causes Y in population P); if no clear causal claim, use observational study mode instead",
+      "GATE 2 - Check feasibility: can treatment be manipulated? can units be randomized? if not, consider quasi-experimental or observational design",
+      "Define treatment precisely: operationalize intervention (dose, duration, delivery); specify what 'receiving treatment' means unambiguously",
+      "Define control condition: active control (existing treatment) vs passive (no treatment) vs placebo; justify choice",
+      "GATE 3 - Enumerate confounds: list every variable that could (a) affect assignment to treatment AND (b) affect outcome; if list incomplete, pause for domain expert input",
+      "Design randomization: specify randomization unit, method (simple, stratified, cluster), allocation ratio; verify it breaks all listed confound correlations",
+      "Choose blocking/stratification: identify high-variance covariates; block on them to reduce residual variance; verify blocks are balanced",
+      "Select primary metric: choose measure that directly captures outcome construct; require validity evidence (correlation with true outcome, prior studies, domain justification)",
+      "Select secondary metrics: add 2-3 backup metrics triangulating same construct; specify which are confirmatory vs exploratory",
+      "GATE 4 - Run power analysis: estimate expected effect size from prior data or minimum meaningful effect; compute required n; if n infeasible, reconsider design or accept lower power with explicit acknowledgment",
+      "Plan instrumentation: specify data collection procedures, timing, personnel; identify measurement error sources; add quality checks",
+      "Specify analysis plan: pre-register primary analysis, multiple comparison correction, stopping rules; distinguish exploratory analyses",
+      "Document threats to validity: internal (confounds, attrition, spillover) and external (population, setting, time); state mitigation for each"
+    ],
+    "quick_checklist": [
+      "Causal hypothesis stated before design? (not fishing expedition)",
+      "Treatment operationalized unambiguously? (another researcher could replicate)",
+      "Randomization scheme breaks all identified confounds?",
+      "Power >= 80% for minimum meaningful effect?",
+      "Primary metric validated against true construct? (not just convenient proxy)",
+      "Analysis plan pre-registered before data collection?",
+      "Control group receives comparable experience minus treatment?",
+      "Threats to validity enumerated with mitigations?"
+    ],
+    "check": [
+      "hypothesis stated as falsifiable causal claim with specified population",
+      "treatment and control operationalized such that independent team could execute",
+      "confound list explicit; each confound has randomization/blocking/matching mitigation or acknowledged limitation",
+      "power analysis shows n sufficient for 80% power at target effect (document assumptions)",
+      "primary metric has validity evidence: correlation with true outcome, face validity, or prior validation study",
+      "secondary metrics triangulate primary; at least one uses different measurement method",
+      "randomization scheme documented: unit, method, ratio, timing",
+      "blocking variables chosen based on variance explained, not convenience",
+      "analysis plan pre-registered or version-controlled with timestamp before data access",
+      "stopping rules specified: minimum runtime, interim analysis plan, early termination criteria",
+      "measurement procedures documented: who collects, when, quality checks, blinding if applicable"
+    ],
+    "diff": {
+      "scientific": {
+        "boundary": "experimental design structures data collection; scientific reasoning is full cycle including hypothesis generation and theory revision",
+        "when_experimental_design": "hypothesis already formed; need to test it rigorously",
+        "when_other": "exploring new phenomena; need to generate hypotheses; need to interpret and integrate findings into theory"
+      },
+      "causal-inference": {
+        "boundary": "experimental design plans the study; causal inference analyzes the resulting data to estimate effects",
+        "when_experimental_design": "before data collection; deciding randomization, metrics, sample size",
+        "when_other": "after data collection; applying estimators, computing effects, sensitivity analysis"
+      },
+      "value-of-information": {
+        "boundary": "VOI decides whether and which experiment to run; experimental design decides how to run chosen experiment",
+        "when_experimental_design": "experiment already prioritized; need to design protocol",
+        "when_other": "multiple possible experiments; need to prioritize by decision impact"
+      },
+      "statistical-frequentist": {
+        "boundary": "experimental design sets constraints (n, randomization, metrics); frequentist analysis operates within those constraints",
+        "when_experimental_design": "planning phase before data exists",
+        "when_other": "analysis phase after data collected; applying tests and computing intervals"
+      },
+      "diagnostic": {
+        "boundary": "experimental design tests hypotheses prospectively; diagnostic identifies root cause from existing observations",
+        "when_experimental_design": "can intervene and randomize; want to establish causation",
+        "when_other": "incident already occurred; need to find cause from evidence trail"
+      }
+    },
+    "common_confusions": [
+      {
+        "pair": ["experimental-design", "causal-inference"],
+        "error": "running analysis without pre-specified design; choosing tests based on data patterns",
+        "correction": "experimental design precedes data; causal inference follows. Design decisions (randomization, metrics, n) must be fixed before seeing outcomes. Post-hoc design changes invalidate error rate guarantees."
+      },
+      {
+        "pair": ["experimental-design", "scientific"],
+        "error": "treating experiment as complete scientific contribution; no theory building or integration",
+        "correction": "experiment is one phase. Scientific reasoning includes: abduce hypothesis, deduce predictions, design experiment, collect data, analyze, revise theory. Design alone doesn't generate or update theories."
+      },
+      {
+        "pair": ["experimental-design", "value-of-information"],
+        "error": "designing experiment without checking if results would change decision",
+        "correction": "VOI gate: before designing, ask 'if experiment shows X, will we act differently?' If no outcome changes the action, experiment has zero value. Design effort wasted."
+      },
+      {
+        "pair": ["experimental-design", "diagnostic"],
+        "error": "running experiment to diagnose past incident instead of testing prospective intervention",
+        "correction": "diagnosis reasons backward from effects to causes. Experimental design reasons forward: intervene, then observe. For past incidents, use diagnostic mode to identify cause; use experimental design only if testing a fix prospectively."
+      }
+    ],
+    "fail": {
+      "mode": "Goodhart risk: measuring proxies that don't capture real outcome; underpowered experiments that detect nothing",
+      "signals": [
+        "metric chosen for ease of collection not validity",
+        "no validation that metric correlates with true outcome",
+        "optimizing metric directly instead of underlying goal",
+        "sample size chosen by budget/convenience, not power analysis",
+        "effect size expected but study underpowered to detect it",
+        "confound list missing obvious variables; no systematic enumeration",
+        "control group differs systematically from treatment (selection bias)",
+        "analysis plan created or modified after seeing results"
+      ],
+      "mitigations": [
+        {
+          "m": "validate primary metric against ground truth before experiment",
+          "test": "documented correlation (r > 0.5) between metric and true outcome from prior data or validation study",
+          "threshold": "validation evidence present for 100% of primary metrics"
+        },
+        {
+          "m": "use multiple metrics triangulating same construct",
+          "test": "at least 2 metrics per hypothesis using different measurement methods",
+          "threshold": "secondary metric specified for every primary metric"
+        },
+        {
+          "m": "include qualitative checks for gaming and manipulation",
+          "test": "review protocol includes audit for metric gaming; human spot-check of edge cases",
+          "threshold": "gaming check documented in measurement strategy"
+        },
+        {
+          "m": "power analysis required before experiment approval",
+          "test": "power calculation documented with effect size source (prior study, minimum meaningful, domain estimate)",
+          "threshold": "no experiment launches without power >= 80% or explicit underpowered acknowledgment"
+        },
+        {
+          "m": "confound enumeration with domain expert review",
+          "test": "confound list reviewed by person not on experiment team; each confound has mitigation or acknowledged threat",
+          "threshold": "external confound review completed for experiments with high stakes"
+        },
+        {
+          "m": "pre-registration with timestamp before data access",
+          "test": "analysis plan version-controlled or registered (OSF, internal registry) with timestamp before experiment start",
+          "threshold": "100% of confirmatory analyses pre-registered"
+        },
+        {
+          "m": "balance check on control vs treatment at experiment start",
+          "test": "covariate distributions compared between groups; imbalance flagged if any variable differs by >0.1 standard deviations",
+          "threshold": "balance check run within 24h of experiment start"
+        }
+      ]
+    },
+    "use": [
+      "A/B testing: product feature experiments with user randomization",
+      "clinical trials: drug/treatment efficacy with patient randomization",
+      "policy evaluation: interventions randomized at individual, school, or region level",
+      "marketing experiments: campaign effectiveness with audience split",
+      "operations experiments: process changes with unit randomization",
+      "pricing experiments: price sensitivity with customer randomization"
+    ],
+    "rel": [
+      {"mode": "scientific", "how": "experimental design is the 'test' phase of scientific method; scientific reasoning embeds design in full hypothesis-test-revise cycle"},
+      {"mode": "causal-inference", "how": "experiments produce data; causal inference estimates effects from that data; well-designed experiments simplify inference (randomization enables simple comparison)"},
+      {"mode": "value-of-information", "how": "VOI prioritizes which experiments to run by decision impact; feeds into design once experiment selected"},
+      {"mode": "statistical-frequentist", "how": "design sets constraints (n, randomization); frequentist analysis respects those constraints to maintain error rate guarantees"},
+      {"mode": "diagnostic", "how": "diagnosis identifies candidate causes; experiments test whether manipulating cause affects outcome"}
+    ],
+    "ex": {
+      "problem": "Does a new onboarding tutorial (X) increase 7-day activation rate (Y)?",
+      "experiment_plan": {
+        "hypothesis": "Users shown new tutorial have higher 7-day activation than control (one-tailed, expecting improvement)",
+        "treatment": "New tutorial shown on first login; 3 interactive screens; ~2min duration",
+        "control": "Existing tooltip-based hints; ~30s passive exposure",
+        "randomization": "User-level; 50/50 split; stratified by signup source (organic/paid) and platform (web/mobile)",
+        "population": "New signups in US, age 18+, excluding test accounts",
+        "timeline": "2 weeks enrollment, +7 days outcome observation, 3 weeks total"
+      },
+      "confounds_addressed": [
+        {"confound": "signup source affects both assignment likelihood and activation", "mitigation": "stratified randomization balances source across groups"},
+        {"confound": "platform affects tutorial experience and activation", "mitigation": "stratified randomization; subgroup analysis planned"},
+        {"confound": "time of signup (weekday/weekend) affects activation", "mitigation": "continuous enrollment over 2 weeks averages out temporal effects"},
+        {"confound": "user intent/motivation", "mitigation": "randomization breaks correlation; not measurable directly"}
+      ],
+      "power_analysis": {
+        "baseline": "current 7-day activation = 35%",
+        "minimum_detectable_effect": "3pp absolute lift (35% -> 38%)",
+        "effect_size_source": "business requirement: <3pp not worth engineering cost",
+        "alpha": "0.05 one-tailed",
+        "power": "80%",
+        "required_n": "4,800 per group (9,600 total)",
+        "expected_enrollment": "~1,000/day => 14 days sufficient"
+      },
+      "metrics": {
+        "primary": "7-day activation (binary: completed 3+ core actions within 7 days of signup)",
+        "validation": "prior analysis shows 7-day activation correlates r=0.72 with 30-day retention",
+        "secondary": ["tutorial completion rate", "time to first core action", "7-day session count"],
+        "guardrail": "support ticket rate (should not increase)"
+      },
+      "analysis_plan": {
+        "primary_test": "two-proportion z-test, one-tailed, alpha=0.05",
+        "corrections": "no multiple comparison correction for primary; Bonferroni for 3 secondary metrics (alpha=0.017 each)",
+        "subgroups": "exploratory analysis by signup source and platform; flagged as non-confirmatory",
+        "stopping_rule": "no early stopping; full 3-week run regardless of interim results"
+      }
+    },
+    "micro_ex": {
+      "bad": "We'll run the new tutorial on some users and see if activation improves. We'll check the data after a few days and if it looks good, we'll ship it.",
+      "good": "Hypothesis: new tutorial increases 7-day activation by >= 3pp. Design: 50/50 user-level randomization stratified by source/platform. Power: 80% to detect 3pp at n=4,800/group. Primary metric: 7-day activation (validated r=0.72 vs retention). Analysis pre-registered. Runtime: 3 weeks, no early stopping. Decision: ship if p<0.05 and effect >= 3pp; iterate if significant but <3pp; abandon if not significant.",
+      "why": "Bad version: no hypothesis, no power analysis, no pre-registration, subjective stopping, no effect size threshold. Good version: falsifiable hypothesis, justified sample size, validated metric, pre-specified analysis, clear decision rules."
+    }
+  }
+}
