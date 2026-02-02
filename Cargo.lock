@@ -196,6 +196,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "criterion",
  "ctrlc",
  "directories",
  "ed25519-dalek",
