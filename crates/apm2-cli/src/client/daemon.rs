@@ -1,30 +1,25 @@
 //! Daemon client for UDS communication.
 //!
 //! This module provides the client-side implementation for communicating with
-//! the apm2 daemon via Unix domain sockets per AD-DAEMON-002.
+//! the apm2 daemon via Unix domain sockets.
 //!
-//! # Protocol
+//! # TCK-00281: Legacy JSON IPC Removed
 //!
-//! - Transport: Unix domain socket at `${XDG_RUNTIME_DIR}/apm2/apm2d.sock`
-//! - Framing: Length-prefixed (4-byte big-endian) JSON messages
-//! - Pattern: Request-response (stateless per connection)
+//! Per DD-009 (RFC-0017), legacy JSON IPC has been removed from the daemon.
+//! The CLI must be migrated to use protobuf-based communication in a
+//! subsequent ticket. Until then, all daemon communication methods return
+//! an error indicating the migration is pending.
 //!
 //! # Contract References
 //!
 //! - AD-DAEMON-002: UDS transport with length-prefixed framing
-//! - CTR-1601: Protocol framing is a first-class contract
-//! - CTR-1603: Bounded reads with max frame size
+//! - DD-009: `ProtocolServer`-only control plane (JSON IPC removed)
 
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use apm2_core::ipc::{
-    EpisodeBudgetSummary, EpisodeSummaryIpc, ErrorCode, IpcRequest, IpcResponse, frame_message,
-};
-
 /// Maximum frame size for IPC messages (16 MiB per AD-DAEMON-002).
+#[allow(dead_code)]
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// Default connection timeout.
@@ -32,20 +27,23 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Daemon client for episode operations.
 ///
-/// Provides a high-level interface for communicating with the apm2 daemon.
-/// Each operation is stateless (connect, request, response, close).
+/// # TCK-00281: Stub Implementation
+///
+/// This client is currently a stub. Legacy JSON IPC has been removed per
+/// DD-009. The CLI must be migrated to protobuf-based communication.
 pub struct DaemonClient<'a> {
+    #[allow(dead_code)]
     socket_path: &'a Path,
     timeout: Duration,
 }
 
 /// Error type for daemon client operations.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum DaemonClientError {
     /// Daemon is not running (socket does not exist).
     DaemonNotRunning,
     /// Connection failed.
-    #[allow(dead_code)] // Used in error handling path for future connection scenarios
     ConnectionFailed(String),
     /// I/O error during communication.
     IoError(std::io::Error),
@@ -57,6 +55,25 @@ pub enum DaemonClientError {
     DaemonError { code: ErrorCode, message: String },
     /// Unexpected response type.
     UnexpectedResponse(String),
+    /// Protocol migration required (TCK-00281).
+    ProtocolMigrationRequired,
+}
+
+/// Error codes for daemon responses.
+///
+/// TCK-00281: This is a minimal subset of error codes retained for CLI
+/// error handling until the CLI is migrated to protobuf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ErrorCode {
+    /// Episode not found.
+    EpisodeNotFound,
+    /// Invalid request.
+    InvalidRequest,
+    /// Internal error.
+    InternalError,
+    /// Not supported (legacy JSON IPC removed).
+    NotSupported,
 }
 
 impl std::fmt::Display for DaemonClientError {
@@ -73,6 +90,10 @@ impl std::fmt::Display for DaemonClientError {
                 write!(f, "daemon error ({code:?}): {message}")
             },
             Self::UnexpectedResponse(msg) => write!(f, "unexpected response: {msg}"),
+            Self::ProtocolMigrationRequired => write!(
+                f,
+                "CLI requires protobuf migration (DD-009). Legacy JSON IPC has been removed."
+            ),
         }
     }
 }
@@ -100,6 +121,7 @@ impl From<std::io::Error> for DaemonClientError {
 
 /// Response from episode create operation.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CreateEpisodeResponse {
     /// Daemon-generated episode ID.
     pub episode_id: String,
@@ -111,6 +133,7 @@ pub struct CreateEpisodeResponse {
 
 /// Response from episode start operation.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct StartEpisodeResponse {
     /// Episode ID.
     pub episode_id: String,
@@ -124,6 +147,7 @@ pub struct StartEpisodeResponse {
 
 /// Response from episode stop operation.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct StopEpisodeResponse {
     /// Episode ID.
     pub episode_id: String,
@@ -133,8 +157,21 @@ pub struct StopEpisodeResponse {
     pub stopped_at: String,
 }
 
+/// Budget summary for episode status.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct EpisodeBudgetSummary {
+    /// Tokens used / total.
+    pub tokens: String,
+    /// Tool calls used / total.
+    pub tool_calls: String,
+    /// Wall time used / total (ms).
+    pub wall_ms: String,
+}
+
 /// Response from episode status operation.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct EpisodeStatusResponse {
     /// Episode ID.
     pub episode_id: String,
@@ -158,8 +195,23 @@ pub struct EpisodeStatusResponse {
     pub budget: Option<EpisodeBudgetSummary>,
 }
 
+/// Episode summary for list responses.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct EpisodeSummaryIpc {
+    /// Episode ID.
+    pub episode_id: String,
+    /// Current state.
+    pub state: String,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Session ID (if running).
+    pub session_id: Option<String>,
+}
+
 /// Response from episode list operation.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ListEpisodesResponse {
     /// Episode summaries.
     pub episodes: Vec<EpisodeSummaryIpc>,
@@ -183,7 +235,7 @@ impl<'a> DaemonClient<'a> {
 
     /// Sets the connection timeout.
     #[must_use]
-    #[allow(dead_code)] // Public API for future use
+    #[allow(dead_code)]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -191,262 +243,79 @@ impl<'a> DaemonClient<'a> {
 
     /// Checks if the daemon is running (socket exists).
     #[must_use]
-    #[allow(dead_code)] // Public API for future use
+    #[allow(dead_code)]
     pub fn is_daemon_running(&self) -> bool {
         self.socket_path.exists()
     }
 
     /// Creates a new episode from an envelope.
     ///
-    /// # Arguments
+    /// # TCK-00281: Stub
     ///
-    /// * `envelope_yaml` - The envelope YAML content.
-    /// * `envelope_hash` - BLAKE3 hash of the envelope (hex-encoded).
-    ///
-    /// # Returns
-    ///
-    /// The daemon-generated episode ID and metadata.
-    pub fn create_episode(
+    /// Returns an error indicating protobuf migration is required.
+    #[allow(clippy::unused_self)]
+    pub const fn create_episode(
         &self,
-        envelope_yaml: &str,
-        envelope_hash: &str,
+        _envelope_yaml: &str,
+        _envelope_hash: &str,
     ) -> Result<CreateEpisodeResponse, DaemonClientError> {
-        let request = IpcRequest::CreateEpisode {
-            envelope_yaml: envelope_yaml.to_string(),
-            envelope_hash: envelope_hash.to_string(),
-        };
-
-        let response = self.send_request(&request)?;
-
-        match response {
-            IpcResponse::EpisodeCreated {
-                episode_id,
-                envelope_hash,
-                created_at,
-            } => Ok(CreateEpisodeResponse {
-                episode_id,
-                envelope_hash,
-                created_at,
-            }),
-            IpcResponse::Error { code, message } => {
-                Err(DaemonClientError::DaemonError { code, message })
-            },
-            other => Err(DaemonClientError::UnexpectedResponse(format!(
-                "expected EpisodeCreated, got {other:?}"
-            ))),
-        }
+        Err(DaemonClientError::ProtocolMigrationRequired)
     }
 
     /// Starts a created episode.
     ///
-    /// # Arguments
+    /// # TCK-00281: Stub
     ///
-    /// * `episode_id` - The episode ID to start.
-    /// * `lease_id` - Optional lease ID (daemon generates if not provided).
-    pub fn start_episode(
+    /// Returns an error indicating protobuf migration is required.
+    #[allow(clippy::unused_self)]
+    pub const fn start_episode(
         &self,
-        episode_id: &str,
-        lease_id: Option<&str>,
+        _episode_id: &str,
+        _lease_id: Option<&str>,
     ) -> Result<StartEpisodeResponse, DaemonClientError> {
-        let request = IpcRequest::StartEpisode {
-            episode_id: episode_id.to_string(),
-            lease_id: lease_id.map(String::from),
-        };
-
-        let response = self.send_request(&request)?;
-
-        match response {
-            IpcResponse::EpisodeStarted {
-                episode_id,
-                session_id,
-                lease_id,
-                started_at,
-            } => Ok(StartEpisodeResponse {
-                episode_id,
-                session_id,
-                lease_id,
-                started_at,
-            }),
-            IpcResponse::Error { code, message } => {
-                Err(DaemonClientError::DaemonError { code, message })
-            },
-            other => Err(DaemonClientError::UnexpectedResponse(format!(
-                "expected EpisodeStarted, got {other:?}"
-            ))),
-        }
+        Err(DaemonClientError::ProtocolMigrationRequired)
     }
 
     /// Stops a running episode.
     ///
-    /// # Arguments
+    /// # TCK-00281: Stub
     ///
-    /// * `episode_id` - The episode ID to stop.
-    /// * `reason` - Stop reason (success, cancelled, failure).
-    /// * `message` - Optional custom message.
-    pub fn stop_episode(
+    /// Returns an error indicating protobuf migration is required.
+    #[allow(clippy::unused_self)]
+    pub const fn stop_episode(
         &self,
-        episode_id: &str,
-        reason: &str,
-        message: Option<&str>,
+        _episode_id: &str,
+        _reason: &str,
+        _message: Option<&str>,
     ) -> Result<StopEpisodeResponse, DaemonClientError> {
-        let request = IpcRequest::StopEpisode {
-            episode_id: episode_id.to_string(),
-            reason: reason.to_string(),
-            message: message.map(String::from),
-        };
-
-        let response = self.send_request(&request)?;
-
-        match response {
-            IpcResponse::EpisodeStopped {
-                episode_id,
-                termination_class,
-                stopped_at,
-            } => Ok(StopEpisodeResponse {
-                episode_id,
-                termination_class,
-                stopped_at,
-            }),
-            IpcResponse::Error { code, message } => {
-                Err(DaemonClientError::DaemonError { code, message })
-            },
-            other => Err(DaemonClientError::UnexpectedResponse(format!(
-                "expected EpisodeStopped, got {other:?}"
-            ))),
-        }
+        Err(DaemonClientError::ProtocolMigrationRequired)
     }
 
     /// Gets the status of an episode.
     ///
-    /// # Arguments
+    /// # TCK-00281: Stub
     ///
-    /// * `episode_id` - The episode ID to query.
-    pub fn get_episode_status(
+    /// Returns an error indicating protobuf migration is required.
+    #[allow(clippy::unused_self)]
+    pub const fn get_episode_status(
         &self,
-        episode_id: &str,
+        _episode_id: &str,
     ) -> Result<EpisodeStatusResponse, DaemonClientError> {
-        let request = IpcRequest::GetEpisodeStatus {
-            episode_id: episode_id.to_string(),
-        };
-
-        let response = self.send_request(&request)?;
-
-        match response {
-            IpcResponse::EpisodeStatus {
-                episode_id,
-                state,
-                envelope_hash,
-                created_at,
-                started_at,
-                session_id,
-                lease_id,
-                terminated_at,
-                termination_class,
-                budget,
-            } => Ok(EpisodeStatusResponse {
-                episode_id,
-                state,
-                envelope_hash,
-                created_at,
-                started_at,
-                session_id,
-                lease_id,
-                terminated_at,
-                termination_class,
-                budget,
-            }),
-            IpcResponse::Error { code, message } => {
-                Err(DaemonClientError::DaemonError { code, message })
-            },
-            other => Err(DaemonClientError::UnexpectedResponse(format!(
-                "expected EpisodeStatus, got {other:?}"
-            ))),
-        }
+        Err(DaemonClientError::ProtocolMigrationRequired)
     }
 
     /// Lists episodes with optional state filter.
     ///
-    /// # Arguments
+    /// # TCK-00281: Stub
     ///
-    /// * `state_filter` - Optional state filter (all, created, running,
-    ///   terminated, quarantined).
-    /// * `limit` - Maximum number of episodes to return.
-    pub fn list_episodes(
+    /// Returns an error indicating protobuf migration is required.
+    #[allow(clippy::unused_self)]
+    pub const fn list_episodes(
         &self,
-        state_filter: Option<&str>,
-        limit: u32,
+        _state_filter: Option<&str>,
+        _limit: u32,
     ) -> Result<ListEpisodesResponse, DaemonClientError> {
-        let request = IpcRequest::ListEpisodes {
-            state_filter: state_filter.map(String::from),
-            limit,
-        };
-
-        let response = self.send_request(&request)?;
-
-        match response {
-            IpcResponse::EpisodeList { episodes, total } => {
-                Ok(ListEpisodesResponse { episodes, total })
-            },
-            IpcResponse::Error { code, message } => {
-                Err(DaemonClientError::DaemonError { code, message })
-            },
-            other => Err(DaemonClientError::UnexpectedResponse(format!(
-                "expected EpisodeList, got {other:?}"
-            ))),
-        }
-    }
-
-    /// Sends an IPC request and receives a response.
-    ///
-    /// Per AD-DAEMON-002: UDS transport with length-prefixed framing.
-    /// Per CTR-1603: Bounded reads with max frame size.
-    fn send_request(&self, request: &IpcRequest) -> Result<IpcResponse, DaemonClientError> {
-        // Check if daemon is running before attempting connection
-        if !self.socket_path.exists() {
-            return Err(DaemonClientError::DaemonNotRunning);
-        }
-
-        // Connect to daemon socket
-        let mut stream = UnixStream::connect(self.socket_path)?;
-        stream.set_read_timeout(Some(self.timeout))?;
-        stream.set_write_timeout(Some(self.timeout))?;
-
-        // Serialize and frame request
-        let request_json = serde_json::to_vec(request)
-            .map_err(|e| DaemonClientError::SerdeError(e.to_string()))?;
-
-        if request_json.len() > MAX_FRAME_SIZE {
-            return Err(DaemonClientError::FrameTooLarge {
-                size: request_json.len(),
-                max: MAX_FRAME_SIZE,
-            });
-        }
-
-        let framed = frame_message(&request_json);
-        stream.write_all(&framed)?;
-
-        // Read response length prefix (4 bytes, big-endian)
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf)?;
-        let response_len = u32::from_be_bytes(len_buf) as usize;
-
-        // Validate response size (CTR-1603: bounded reads)
-        if response_len > MAX_FRAME_SIZE {
-            return Err(DaemonClientError::FrameTooLarge {
-                size: response_len,
-                max: MAX_FRAME_SIZE,
-            });
-        }
-
-        // Read response body
-        let mut response_buf = vec![0u8; response_len];
-        stream.read_exact(&mut response_buf)?;
-
-        // Deserialize response
-        let response: IpcResponse = serde_json::from_slice(&response_buf)
-            .map_err(|e| DaemonClientError::SerdeError(e.to_string()))?;
-
-        Ok(response)
+        Err(DaemonClientError::ProtocolMigrationRequired)
     }
 }
 
@@ -463,11 +332,8 @@ mod tests {
         assert!(err.to_string().contains("100"));
         assert!(err.to_string().contains("50"));
 
-        let err = DaemonClientError::DaemonError {
-            code: ErrorCode::EpisodeNotFound,
-            message: "not found".to_string(),
-        };
-        assert!(err.to_string().contains("not found"));
+        let err = DaemonClientError::ProtocolMigrationRequired;
+        assert!(err.to_string().contains("protobuf migration"));
     }
 
     #[test]
@@ -503,5 +369,32 @@ mod tests {
         let io_err = std::io::Error::other("other error");
         let client_err: DaemonClientError = io_err.into();
         assert!(matches!(client_err, DaemonClientError::IoError(_)));
+    }
+
+    #[test]
+    fn test_stub_methods_return_migration_required() {
+        let path = Path::new("/tmp/test.sock");
+        let client = DaemonClient::new(path);
+
+        assert!(matches!(
+            client.create_episode("", ""),
+            Err(DaemonClientError::ProtocolMigrationRequired)
+        ));
+        assert!(matches!(
+            client.start_episode("", None),
+            Err(DaemonClientError::ProtocolMigrationRequired)
+        ));
+        assert!(matches!(
+            client.stop_episode("", "", None),
+            Err(DaemonClientError::ProtocolMigrationRequired)
+        ));
+        assert!(matches!(
+            client.get_episode_status(""),
+            Err(DaemonClientError::ProtocolMigrationRequired)
+        ));
+        assert!(matches!(
+            client.list_episodes(None, 10),
+            Err(DaemonClientError::ProtocolMigrationRequired)
+        ));
     }
 }
