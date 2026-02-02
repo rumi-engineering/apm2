@@ -517,6 +517,7 @@ mod session_registry_tests {
             ephemeral_handle: handle.to_string(),
             lease_id: format!("lease-{id}"),
             policy_resolved_ref: "policy-ref".to_string(),
+            capability_manifest_hash: vec![],
             episode_id: None,
         }
     }

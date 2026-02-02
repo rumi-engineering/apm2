@@ -3232,6 +3232,72 @@ pub fn validate_custody_domain_overlap(
     Ok(())
 }
 
+/// Extracts custody domains from a list of actor IDs using a domain resolver.
+///
+/// Per REQ-DCP-0006, this helper function maps actor IDs to their associated
+/// custody domains for `SoD` validation.
+///
+/// # Arguments
+///
+/// * `actor_ids` - List of actor identifiers to resolve
+/// * `resolver` - Function that maps an actor ID to its custody domains
+///
+/// # Returns
+///
+/// A deduplicated list of custody domains associated with the actors.
+///
+/// # Example
+///
+/// ```rust
+/// use std::collections::HashMap;
+///
+/// use apm2_daemon::episode::capability::{
+///     CustodyDomainId, extract_custody_domains,
+/// };
+///
+/// // Mock resolver: maps actor_id -> domains
+/// let domain_map: HashMap<&str, Vec<&str>> =
+///     [("alice", vec!["team-alpha"]), ("bob", vec!["team-beta"])]
+///         .into_iter()
+///         .collect();
+///
+/// let resolver = |actor_id: &str| -> Vec<CustodyDomainId> {
+///     domain_map
+///         .get(actor_id)
+///         .map(|domains| {
+///             domains
+///                 .iter()
+///                 .filter_map(|d| CustodyDomainId::new(*d).ok())
+///                 .collect()
+///         })
+///         .unwrap_or_default()
+/// };
+///
+/// let actors = vec!["alice".to_string(), "bob".to_string()];
+/// let domains = extract_custody_domains(&actors, resolver);
+/// assert_eq!(domains.len(), 2);
+/// ```
+pub fn extract_custody_domains<F>(actor_ids: &[String], resolver: F) -> Vec<CustodyDomainId>
+where
+    F: Fn(&str) -> Vec<CustodyDomainId>,
+{
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    let mut domains = Vec::new();
+
+    for actor_id in actor_ids {
+        for domain in resolver(actor_id) {
+            // Deduplicate by domain ID string
+            if seen.insert(domain.as_str().to_string()) {
+                domains.push(domain);
+            }
+        }
+    }
+
+    domains
+}
+
 #[cfg(test)]
 mod custody_domain_tests {
     use super::*;

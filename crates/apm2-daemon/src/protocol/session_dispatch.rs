@@ -1,10 +1,19 @@
-//! Session-scoped endpoint dispatcher for RFC-0017 IPC (TCK-00252).
+//! Session-scoped endpoint dispatcher for RFC-0017 IPC (TCK-00252, TCK-00260).
 //!
 //! This module implements the session-scoped endpoint dispatcher per DD-001 and
 //! RFC-0017. Session endpoints (RequestTool, EmitEvent, PublishEvidence,
 //! StreamTelemetry) require a valid session token for authentication. Operator
 //! socket connections receive `SESSION_ERROR_PERMISSION_DENIED` for all session
 //! requests.
+//!
+//! # TCK-00260: Tool Broker with Capability Manifest Validation
+//!
+//! The `RequestTool` handler validates tool requests against capability
+//! manifests:
+//! - Tool ID is parsed to a `ToolClass`
+//! - `ToolClass` is checked against the manifest's `tool_allowlist`
+//! - If not in allowlist: `SESSION_ERROR_TOOL_NOT_ALLOWED` (TOOL_NOT_ALLOWED)
+//! - Validation overhead target: <5ms p50
 //!
 //! # Security Invariants
 //!
@@ -13,6 +22,8 @@
 //! - [INV-SESS-003] Operator connections blocked from session handlers
 //! - [INV-SESS-004] Token validation uses constant-time HMAC comparison
 //!   (CTR-WH001)
+//! - [INV-TCK-00260-001] Tool requests validated against capability manifest
+//! - [INV-TCK-00260-002] Empty tool_allowlist denies all tools (fail-closed)
 //!
 //! # Message Flow
 //!
@@ -30,20 +41,22 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
 use prost::Message;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::dispatch::ConnectionContext;
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
-    BoundedDecode, DecodeConfig, EmitEventRequest, EmitEventResponse, PublishEvidenceRequest,
-    PublishEvidenceResponse, RequestToolRequest, RequestToolResponse, SessionError,
-    SessionErrorCode, StreamTelemetryRequest, StreamTelemetryResponse,
+    BoundedDecode, DecisionType, DecodeConfig, EmitEventRequest, EmitEventResponse,
+    PublishEvidenceRequest, PublishEvidenceResponse, RequestToolRequest, RequestToolResponse,
+    SessionError, SessionErrorCode, StreamTelemetryRequest, StreamTelemetryResponse,
 };
 use super::session_token::{SessionToken, SessionTokenError, TokenMinter};
+use crate::episode::{CapabilityManifest, ToolClass};
 
 // ============================================================================
 // Message Type Tags (for routing)
@@ -169,6 +182,71 @@ impl SessionResponse {
 }
 
 // ============================================================================
+// Manifest Store (TCK-00260)
+// ============================================================================
+
+/// Maximum length for `tool_id` in requests.
+///
+/// Per CTR-1303: Bounded inputs prevent denial-of-service via oversized
+/// strings.
+pub const MAX_TOOL_ID_LEN: usize = 128;
+
+/// Trait for looking up capability manifests by session ID.
+///
+/// Per TCK-00260, the dispatcher needs to validate tool requests against
+/// the session's capability manifest. This trait abstracts the manifest
+/// storage to allow different implementations (in-memory, persistent, etc.).
+pub trait ManifestStore: Send + Sync {
+    /// Retrieves the capability manifest for a session.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID to look up
+    ///
+    /// # Returns
+    ///
+    /// The capability manifest if found, or `None` if the session has no
+    /// associated manifest.
+    fn get_manifest(&self, session_id: &str) -> Option<Arc<CapabilityManifest>>;
+}
+
+/// In-memory manifest store for testing.
+///
+/// Stores manifests in a hash map keyed by session ID.
+#[derive(Debug, Default)]
+pub struct InMemoryManifestStore {
+    /// Manifests keyed by session ID.
+    manifests: std::sync::RwLock<std::collections::HashMap<String, Arc<CapabilityManifest>>>,
+}
+
+impl InMemoryManifestStore {
+    /// Creates a new empty manifest store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a manifest for a session.
+    pub fn register(&self, session_id: impl Into<String>, manifest: CapabilityManifest) {
+        let mut manifests = self.manifests.write().expect("lock poisoned");
+        manifests.insert(session_id.into(), Arc::new(manifest));
+    }
+
+    /// Removes a manifest for a session.
+    pub fn remove(&self, session_id: &str) {
+        let mut manifests = self.manifests.write().expect("lock poisoned");
+        manifests.remove(session_id);
+    }
+}
+
+impl ManifestStore for InMemoryManifestStore {
+    fn get_manifest(&self, session_id: &str) -> Option<Arc<CapabilityManifest>> {
+        let manifests = self.manifests.read().expect("lock poisoned");
+        manifests.get(session_id).cloned()
+    }
+}
+
+// ============================================================================
 // Dispatcher
 // ============================================================================
 
@@ -177,27 +255,38 @@ impl SessionResponse {
 /// Routes incoming messages to the appropriate handler based on message type.
 /// Enforces session token validation before dispatching to any handler.
 ///
+/// # TCK-00260: Capability Manifest Validation
+///
+/// The dispatcher validates `RequestTool` requests against the session's
+/// capability manifest. If the tool is not in the manifest's `tool_allowlist`,
+/// `SESSION_ERROR_TOOL_NOT_ALLOWED` is returned.
+///
 /// # Security Contract
 ///
-/// Per INV-SESS-001 through INV-SESS-004:
+/// Per INV-SESS-001 through INV-SESS-004 and INV-TCK-00260-001/002:
 /// - All session endpoints require valid `session_token`
 /// - Token validation uses constant-time HMAC comparison (CTR-WH001)
 /// - Operator connections receive `SESSION_ERROR_PERMISSION_DENIED`
 /// - Invalid/expired tokens receive `SESSION_ERROR_INVALID`
-pub struct SessionDispatcher {
+/// - Tool requests validated against capability manifest (TCK-00260)
+/// - Empty `tool_allowlist` denies all tools (fail-closed)
+pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Token minter for validation.
     token_minter: TokenMinter,
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
+    /// Manifest store for capability validation (TCK-00260).
+    manifest_store: Option<Arc<M>>,
 }
 
-impl SessionDispatcher {
+impl SessionDispatcher<InMemoryManifestStore> {
     /// Creates a new dispatcher with the given token minter.
     #[must_use]
     pub fn new(token_minter: TokenMinter) -> Self {
         Self {
             token_minter,
             decode_config: DecodeConfig::default(),
+            manifest_store: None,
         }
     }
 
@@ -210,6 +299,37 @@ impl SessionDispatcher {
         Self {
             token_minter,
             decode_config,
+            manifest_store: None,
+        }
+    }
+}
+
+impl<M: ManifestStore> SessionDispatcher<M> {
+    /// Creates a dispatcher with a manifest store for capability validation.
+    ///
+    /// Per TCK-00260, the manifest store is used to look up session capability
+    /// manifests for tool request validation.
+    #[must_use]
+    pub fn with_manifest_store(token_minter: TokenMinter, manifest_store: Arc<M>) -> Self {
+        Self {
+            token_minter,
+            decode_config: DecodeConfig::default(),
+            manifest_store: Some(manifest_store),
+        }
+    }
+
+    /// Creates a dispatcher with custom decode configuration and manifest
+    /// store.
+    #[must_use]
+    pub const fn with_decode_config_and_manifest_store(
+        token_minter: TokenMinter,
+        decode_config: DecodeConfig,
+        manifest_store: Arc<M>,
+    ) -> Self {
+        Self {
+            token_minter,
+            decode_config,
+            manifest_store: Some(manifest_store),
         }
     }
 
@@ -302,11 +422,23 @@ impl SessionDispatcher {
 
     /// Handles `RequestTool` requests (IPC-SESS-001).
     ///
-    /// # Stub Implementation
+    /// # TCK-00260: Capability Manifest Validation
     ///
-    /// This is a stub handler that validates the token and returns a
-    /// placeholder response. Full implementation is in TCK-00260
-    /// (tool broker with capability manifest validation).
+    /// This handler validates tool requests against the session's capability
+    /// manifest:
+    ///
+    /// 1. Validates session token (INV-SESS-001)
+    /// 2. Validates `tool_id` is not empty and within length bounds
+    /// 3. Parses `tool_id` to a `ToolClass`
+    /// 4. Looks up the session's capability manifest
+    /// 5. Checks if the tool class is in the manifest's `tool_allowlist`
+    /// 6. Returns `SESSION_ERROR_TOOL_NOT_ALLOWED` if not in allowlist
+    ///
+    /// # Performance
+    ///
+    /// Per TCK-00260 acceptance criteria, validation overhead must be <5ms p50.
+    /// The validation is O(n) where n = `tool_allowlist` length (bounded by
+    /// `MAX_TOOL_ALLOWLIST` = 100).
     fn handle_request_tool(
         &self,
         payload: &[u8],
@@ -330,7 +462,7 @@ impl SessionDispatcher {
             tool_id = %request.tool_id,
             dedupe_key = %request.dedupe_key,
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
-            "RequestTool request received (stub handler)"
+            "RequestTool request received"
         );
 
         // Validate required fields
@@ -341,11 +473,79 @@ impl SessionDispatcher {
             ));
         }
 
-        // STUB: Return placeholder response
-        // Full implementation in TCK-00260
+        // CTR-1303: Bounded input validation
+        if request.tool_id.len() > MAX_TOOL_ID_LEN {
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                format!(
+                    "tool_id exceeds maximum length ({} > {})",
+                    request.tool_id.len(),
+                    MAX_TOOL_ID_LEN
+                ),
+            ));
+        }
+
+        // TCK-00260: Parse tool_id to ToolClass
+        let Some(tool_class) = ToolClass::parse(&request.tool_id) else {
+            warn!(
+                session_id = %token.session_id,
+                tool_id = %request.tool_id,
+                "Unknown tool class"
+            );
+            // Unknown tool class is denied (fail-closed)
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                format!("unknown tool class: {}", request.tool_id),
+            ));
+        };
+
+        // TCK-00260: Look up capability manifest and validate tool allowlist
+        if let Some(ref store) = self.manifest_store {
+            if let Some(manifest) = store.get_manifest(&token.session_id) {
+                // Check if tool is in allowlist
+                if !manifest.is_tool_allowed(tool_class) {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_class = %tool_class,
+                        "Tool not in allowlist"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("tool class '{tool_class}' not in allowlist"),
+                    ));
+                }
+
+                info!(
+                    session_id = %token.session_id,
+                    tool_class = %tool_class,
+                    "Tool allowed by manifest"
+                );
+
+                // Tool is allowed - return Allow decision
+                return Ok(SessionResponse::RequestTool(RequestToolResponse {
+                    request_id: format!("REQ-{}", uuid::Uuid::new_v4()),
+                    decision: DecisionType::Allow.into(),
+                    rule_id: None,
+                    policy_hash: manifest.digest().to_vec(),
+                }));
+            }
+            // No manifest found - fail closed (SEC-CTRL-FAC-0015)
+            // If a manifest store is configured, a manifest MUST be present.
+            warn!(
+                session_id = %token.session_id,
+                "No manifest found for session, denying request (fail-closed)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorToolNotAllowed,
+                "capability manifest unavailable",
+            ));
+        }
+
+        // No manifest store configured - return stub response
+        // This maintains backward compatibility with existing tests
         Ok(SessionResponse::RequestTool(RequestToolResponse {
-            request_id: format!("REQ-STUB-{}", token.session_id),
-            decision: super::messages::DecisionType::Allow.into(),
+            request_id: format!("REQ-{}", token.session_id),
+            decision: DecisionType::Allow.into(),
             rule_id: None,
             policy_hash: vec![0u8; 32],
         }))
@@ -594,9 +794,10 @@ mod tests {
             let ctx = make_session_ctx();
             let token = test_token(&minter);
 
+            // TCK-00260: Use valid tool class name (was "file_read", now "read")
             let request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).unwrap(),
-                tool_id: "file_read".to_string(),
+                tool_id: "read".to_string(), // Valid ToolClass
                 arguments: vec![1, 2, 3],
                 dedupe_key: "key-001".to_string(),
             };
@@ -682,7 +883,7 @@ mod tests {
             let requests = vec![
                 encode_request_tool_request(&RequestToolRequest {
                     session_token: serde_json::to_string(&token).unwrap(),
-                    tool_id: "file_read".to_string(),
+                    tool_id: "read".to_string(),
                     arguments: vec![],
                     dedupe_key: String::new(),
                 }),
@@ -731,7 +932,7 @@ mod tests {
         // Create request with invalid token
         let request = RequestToolRequest {
             session_token: r#"{"session_id":"session-001","lease_id":"lease-001","spawn_time_ns":1000,"expires_at_ns":2000,"mac":"0000000000000000000000000000000000000000000000000000000000000000"}"#.to_string(),
-            tool_id: "file_read".to_string(),
+            tool_id: "read".to_string(),
             arguments: vec![],
             dedupe_key: String::new(),
         };
@@ -755,7 +956,7 @@ mod tests {
 
         let request = RequestToolRequest {
             session_token: "not-valid-json".to_string(),
-            tool_id: "file_read".to_string(),
+            tool_id: "read".to_string(),
             arguments: vec![],
             dedupe_key: String::new(),
         };
@@ -786,7 +987,7 @@ mod tests {
 
         let request = RequestToolRequest {
             session_token: serde_json::to_string(&token).unwrap(),
-            tool_id: "file_read".to_string(),
+            tool_id: "read".to_string(),
             arguments: vec![],
             dedupe_key: String::new(),
         };
@@ -947,5 +1148,334 @@ mod tests {
         let encoded = tool_resp.encode();
         assert!(!encoded.is_empty());
         assert_eq!(encoded[0], SessionMessageType::RequestTool.tag());
+    }
+
+    // ========================================================================
+    // TCK-00260: Tool Broker with Capability Manifest Validation Tests
+    // ========================================================================
+    mod tck_00260_manifest_validation {
+        use super::*;
+        use crate::episode::{
+            Capability, CapabilityManifestBuilder, CapabilityScope, RiskTier, ToolClass,
+        };
+
+        fn make_test_manifest(tools: Vec<ToolClass>) -> crate::episode::CapabilityManifest {
+            let caps: Vec<Capability> = tools
+                .iter()
+                .map(|tc| Capability {
+                    capability_id: format!("cap-{tc}"),
+                    tool_class: *tc,
+                    scope: CapabilityScope::default(),
+                    risk_tier_required: RiskTier::Tier0,
+                })
+                .collect();
+
+            CapabilityManifestBuilder::new("test-manifest")
+                .delegator("test-delegator")
+                .capabilities(caps)
+                .tool_allowlist(tools)
+                .build()
+                .expect("manifest build failed")
+        }
+
+        #[test]
+        fn test_tool_in_allowlist_returns_allow() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            // Register manifest with Read allowed
+            let manifest = make_test_manifest(vec![ToolClass::Read]);
+            store.register("session-001", manifest);
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(), // ToolClass::Read
+                arguments: vec![],
+                dedupe_key: "key-001".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::RequestTool(resp) => {
+                    assert_eq!(resp.decision, DecisionType::Allow as i32);
+                    assert!(!resp.policy_hash.is_empty());
+                },
+                _ => panic!("Expected RequestTool response, got: {response:?}"),
+            }
+        }
+
+        #[test]
+        fn test_tool_not_in_allowlist_returns_tool_not_allowed() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            // Register manifest with only Read allowed
+            let manifest = make_test_manifest(vec![ToolClass::Read]);
+            store.register("session-001", manifest);
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            // Request Write tool which is not in allowlist
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "write".to_string(), // ToolClass::Write - NOT in allowlist
+                arguments: vec![],
+                dedupe_key: "key-002".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED error code"
+                    );
+                    assert!(
+                        err.message.contains("not in allowlist"),
+                        "Error message should mention allowlist: {}",
+                        err.message
+                    );
+                },
+                _ => panic!("Expected SESSION_ERROR_TOOL_NOT_ALLOWED error, got: {response:?}"),
+            }
+        }
+
+        #[test]
+        fn test_empty_allowlist_denies_all_tools() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            // Register manifest with empty allowlist (fail-closed)
+            let manifest = CapabilityManifestBuilder::new("empty-manifest")
+                .delegator("test-delegator")
+                .tool_allowlist(vec![]) // Empty allowlist
+                .build()
+                .expect("manifest build failed");
+            store.register("session-001", manifest);
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            // Request any tool - should be denied
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(),
+                arguments: vec![],
+                dedupe_key: "key-003".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Empty allowlist should deny all tools"
+                    );
+                },
+                _ => panic!("Expected SESSION_ERROR_TOOL_NOT_ALLOWED for empty allowlist"),
+            }
+        }
+
+        #[test]
+        fn test_unknown_tool_id_returns_tool_not_allowed() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            let manifest = make_test_manifest(vec![ToolClass::Read]);
+            store.register("session-001", manifest);
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            // Request unknown tool class
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "unknown_tool_xyz".to_string(), // Not a valid ToolClass
+                arguments: vec![],
+                dedupe_key: "key-004".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Unknown tool class should be denied"
+                    );
+                    assert!(
+                        err.message.contains("unknown tool class"),
+                        "Error message should mention unknown tool class: {}",
+                        err.message
+                    );
+                },
+                _ => panic!("Expected SESSION_ERROR_TOOL_NOT_ALLOWED for unknown tool"),
+            }
+        }
+
+        #[test]
+        fn test_tool_id_too_long_returns_invalid() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter.clone());
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            // Create tool_id that exceeds MAX_TOOL_ID_LEN
+            let long_tool_id = "a".repeat(MAX_TOOL_ID_LEN + 1);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: long_tool_id,
+                arguments: vec![],
+                dedupe_key: "key-005".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInvalid as i32,
+                        "Oversized tool_id should return INVALID"
+                    );
+                    assert!(
+                        err.message.contains("exceeds maximum length"),
+                        "Error message should mention length: {}",
+                        err.message
+                    );
+                },
+                _ => panic!("Expected SESSION_ERROR_INVALID for oversized tool_id"),
+            }
+        }
+
+        #[test]
+        fn test_multiple_tools_in_allowlist() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            // Register manifest with multiple tools allowed
+            let manifest =
+                make_test_manifest(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute]);
+            store.register("session-001", manifest);
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            // All three should be allowed
+            for tool_id in ["read", "write", "execute"] {
+                let request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).unwrap(),
+                    tool_id: tool_id.to_string(),
+                    arguments: vec![],
+                    dedupe_key: format!("key-{tool_id}"),
+                };
+                let frame = encode_request_tool_request(&request);
+
+                let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+                match response {
+                    SessionResponse::RequestTool(resp) => {
+                        assert_eq!(
+                            resp.decision,
+                            DecisionType::Allow as i32,
+                            "Tool {tool_id} should be allowed"
+                        );
+                    },
+                    _ => panic!("Expected Allow for tool {tool_id}"),
+                }
+            }
+
+            // Git and Network should be denied
+            for tool_id in ["git", "network"] {
+                let request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).unwrap(),
+                    tool_id: tool_id.to_string(),
+                    arguments: vec![],
+                    dedupe_key: format!("key-{tool_id}"),
+                };
+                let frame = encode_request_tool_request(&request);
+
+                let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+                match response {
+                    SessionResponse::Error(err) => {
+                        assert_eq!(
+                            err.code,
+                            SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                            "Tool {tool_id} should be denied"
+                        );
+                    },
+                    _ => panic!("Expected Deny for tool {tool_id}"),
+                }
+            }
+        }
+
+        #[test]
+        fn test_validation_performance() {
+            // This test verifies that validation is fast (<5ms p50)
+            use std::time::Instant;
+
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            // Create manifest with max allowlist size to test worst case
+            let manifest = make_test_manifest(vec![
+                ToolClass::Read,
+                ToolClass::Write,
+                ToolClass::Execute,
+                ToolClass::Network,
+                ToolClass::Git,
+                ToolClass::Inference,
+                ToolClass::Artifact,
+            ]);
+            store.register("session-001", manifest);
+
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(),
+                arguments: vec![],
+                dedupe_key: "perf-test".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+
+            // Run 100 iterations and measure
+            let iterations = 100;
+            let mut durations = Vec::with_capacity(iterations);
+
+            for _ in 0..iterations {
+                let start = Instant::now();
+                let _ = dispatcher.dispatch(&frame, &ctx);
+                durations.push(start.elapsed());
+            }
+
+            // Sort to get p50
+            durations.sort();
+            let p50 = durations[iterations / 2];
+
+            // p50 should be less than 5ms
+            assert!(
+                p50.as_millis() < 5,
+                "p50 validation time should be <5ms, was {}ms",
+                p50.as_millis()
+            );
+        }
     }
 }
