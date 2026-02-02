@@ -219,20 +219,51 @@ decision_tree:
 
     - id: PHASE_7_EXECUTE_ACTIONS
       purpose: "Post findings (Assurance-Case format) to PR and update status check."
-      steps[2]:
+      comment_content:
+        structure:
+          - section: "Verdict Banner"
+            format: "## Security Review: PASS | FAIL"
+            content: "Clear verdict with SCP determination and severity summary"
+          - section: "Summary"
+            content: "1-2 paragraph overview of security scope and key conclusions"
+          - section: "SCP Determination"
+            content: "Which security-critical areas were touched and why"
+          - section: "Markov Blanket Analysis"
+            content: "Input/validation/output mapping for each boundary"
+          - section: "BLOCKER FINDINGS"
+            format: "### **BLOCKER FINDINGS**"
+            content: "Numbered list of blockers, each with:"
+            item_structure:
+              - "Issue: What security invariant is violated"
+              - "Impact: Attack surface or vulnerability exposed"
+              - "Consequence: Blast radius if exploited"
+              - "Required Fix: Clear, actionable remediation"
+          - section: "MAJOR FINDINGS"
+            format: "### **MAJOR FINDINGS**"
+            content: "Numbered list of majors with same structure as blockers"
+          - section: "POSITIVE OBSERVATIONS"
+            format: "### **POSITIVE OBSERVATIONS (PASS)**"
+            content: "Security invariants correctly upheld; defense-in-depth wins"
+          - section: "Assurance Case"
+            content: "Claim-Argument-Evidence structure for final verdict"
+          - section: "Footer"
+            format: "---"
+            content: "Reviewed commit: $HEAD_SHA"
+      steps[3]:
         - id: WRITE_FINDINGS
           action: write_file
           path: "security_findings.md"
           content: "$FINDINGS_ASSURANCE_CASE"
-        - id: UPDATE_STATUS
+        - id: POST_AND_UPDATE
           action: command
           run: |
             if [ "$verdict" == "PASS" ]; then
-              # For approvals, post the detailed findings first, then the official approval banner.
               gh pr comment $PR_URL --body-file security_findings.md
               cargo xtask security-review-exec approve $ticket_id
             else
-              # For denials, the xtask tool incorporates the reason directly into the status banner.
               cat security_findings.md | cargo xtask security-review-exec deny $ticket_id --reason -
             fi
             rm security_findings.md
+        - id: TERMINATE
+          action: output
+          content: "DONE"

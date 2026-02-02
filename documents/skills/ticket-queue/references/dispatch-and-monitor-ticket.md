@@ -7,24 +7,27 @@ decision_tree:
       purpose: "Activate implementer, supervise progress, enforce SLA, loop until merge."
       steps[15]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "Replace <TICKET_ID>, <IMPLEMENTER_LOG_FILE>, <IMPLEMENTER_PID>."
-        - id: CHECK_EXISTING_IMPLEMENTER
-          action: command
-          run: "pgrep -fa \"Follow ticket skill for <TICKET_ID>\" || true"
-          capture_as: existing_implementer_ps
+          action: "Replace <TICKET_ID>, <TASK_ID>, <OUTPUT_FILE>."
+        - id: CHECK_EXISTING_SUBAGENT
+          action: |
+            Check for existing subagent via TaskOutput (non-blocking):
+            - If task_id stored from previous dispatch, query its status.
+            - If no stored task_id, assume no active subagent.
+          capture_as: existing_subagent_status
         - id: ESTABLISH_OR_RESUME_IMPLEMENTER_CONTRACT
           action: |
-            If <existing_implementer_ps> is empty:
-              1) Spawn background implementer via `start-claude-implementer-with-log`.
-              2) Record PID, log path.
+            If no active subagent:
+              1) Spawn background implementer via Task tool:
+                 Task(subagent_type="general-purpose", description="Implement <TICKET_ID>", prompt="/ticket <TICKET_ID>", run_in_background=true)
+              2) Record task_id, output_file from response.
             Else:
-              1) Identify PID and log path from <existing_implementer_ps> and existing log files.
-        - id: REQUIRE_DEDICATED_LOG
-          action: "Ensure log exists at `$HOME/.apm2/ticket-queue/logs/<TICKET_ID>.implementer.log`."
+              1) Use existing task_id and output_file for monitoring.
+        - id: REQUIRE_OUTPUT_FILE
+          action: "Subagent output available at output_file returned by Task tool."
         - id: VERIFY_SKILL_INVOCATION
-          action: "Check log for `/ticket` call."
+          action: "Check output_file for `/ticket` skill invocation."
         - id: CHECK_CADENCE
-          action: "Follow `references/subagent-supervision.md` (60s cadence; 5m stall; 15m limit)."
+          action: "Follow `references/subagent-supervision.md` (60s cadence; 5m stall; 15m limit). Use TaskOutput to check subagent progress."
         - id: FIND_BRANCH_NAME
           action: command
           run: "git branch --all --format='%(refname:short)' | rg \"TCK-[0-9]{5}\" | rg \"<TICKET_ID>\" | head -n 1"

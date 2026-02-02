@@ -4,17 +4,30 @@ decision_tree:
   entrypoint: SUPERVISE
   nodes[1]:
     - id: SUPERVISE
-      purpose: "Supervise implementer. Ensure `/ticket` call. Monitor feedback."
+      purpose: "Supervise implementer subagent. Ensure `/ticket` skill invocation. Monitor feedback."
       steps[11]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "Replace <IMPLEMENTER_PID>, <IMPLEMENTER_LOG_FILE>."
+          action: "Replace <TASK_ID>, <OUTPUT_FILE>."
         - id: CHECK_CADENCE
-          action: "Every 60s: check log mtime, tail lines, check PR comments."
+          action: "Every 60s: check subagent status via TaskOutput, review output_file, check PR comments."
         - id: VERIFY_SKILL
-          action: "Ensure log shows `/ticket` initialization."
-        - id: CHECK_LOG
-          action: command
-          run: "bash -lc 'set -euo pipefail; if [ -f \"<IMPLEMENTER_LOG_FILE>\" ]; then stat -c \"%y %n\" <IMPLEMENTER_LOG_FILE>; tail -n 120 <IMPLEMENTER_LOG_FILE> | rg -n \"tool|Tool|Bash\\(|Read\\(|Edit\\(|Write\\(|exec|command|skill|ticket\" || true; else echo \"Log file not yet created\"; fi'"
+          action: "Ensure output shows `/ticket` skill initialization."
+        - id: CHECK_SUBAGENT_STATUS
+          action: |
+            Use TaskOutput(task_id=<TASK_ID>, block=false, timeout=5000) to check subagent status.
+            Read output_file for recent activity.
+          tool: TaskOutput
+          parameters:
+            task_id: "<TASK_ID>"
+            block: false
+            timeout: 5000
+          capture_as: subagent_status
+        - id: CHECK_OUTPUT_FILE
+          action: |
+            Read output_file (returned when Task was spawned) for recent activity:
+            - Look for tool invocations (Bash, Read, Edit, Write)
+            - Look for `/ticket` skill usage
+            - Look for progress indicators
           capture_as: implementer_recent_activity
         - id: CHECK_FEEDBACK
           action: command
@@ -29,18 +42,25 @@ decision_tree:
         - id: STUCK_DEF
           action: |
             STUCK if:
-            (a) no log update >=5m
-            (b) repeated errors/API loops
+            (a) no output_file update >=5m
+            (b) repeated errors/API loops in output
             (c) no skill call within 10m (startup allowance)
-            (d) runtime >=15m.
+            (d) runtime >=15m
+            (e) TaskOutput returns completed/failed status unexpectedly.
         - id: WARM_HANDOFF_DEF
-          action: "WARM HANDOFF: When restarting, provide the new implementer with the last 100 lines of the previous log and a summary of the current PR state."
+          action: "WARM HANDOFF: When restarting, provide the new subagent with the last 100 lines of output_file and a summary of the current PR state in the Task prompt."
         - id: MAX_RUNTIME_RESP
-          action: "If >=15m: Terminate. Start NEW implementer with WARM HANDOFF to prevent context rot."
+          action: |
+            If >=15m:
+              1) Use TaskStop(task_id=<TASK_ID>) to terminate subagent.
+              2) Start NEW subagent via Task tool with WARM HANDOFF context in prompt.
         - id: STUCK_RESP
-          action: "If STUCK: Terminate. Restart with error snippet, ticket ID."
+          action: |
+            If STUCK:
+              1) Use TaskStop(task_id=<TASK_ID>) to terminate subagent.
+              2) Restart via Task tool with error snippet and ticket ID in prompt.
         - id: NO_SELF_FIX
-          action: "DO NOT edit code or manage branches. Redirect implementer."
+          action: "DO NOT edit code or manage branches. Redirect via new subagent prompt."
         - id: RETURN
           action: "Return to references/dispatch-and-monitor-ticket.md."
       decisions[1]:
