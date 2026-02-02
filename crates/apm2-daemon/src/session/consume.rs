@@ -59,6 +59,8 @@ use apm2_core::context::{ContextPackManifest, ToolClass};
 use apm2_core::coordination::{ContextRefinementRequest, CoordinationEvent};
 use apm2_core::tool::{ToolRequest, tool_request};
 
+use crate::episode::decision::SessionTerminationInfo;
+
 /// Maximum number of refinement attempts before giving up.
 pub const MAX_REFINEMENT_ATTEMPTS: u32 = 10;
 
@@ -391,44 +393,34 @@ impl ConsumeSessionHandler {
             });
         }
 
-        let termination_info = SessionTerminationInfo {
-            session_id: self.context.session_id.clone(),
-            rationale_code: TERMINATION_RATIONALE_CONTEXT_MISS.to_string(),
-            exit_classification: EXIT_CLASSIFICATION_CONTEXT_MISS.to_string(),
-        };
+        let termination_info = SessionTerminationInfo::new(
+            &self.context.session_id,
+            TERMINATION_RATIONALE_CONTEXT_MISS,
+            EXIT_CLASSIFICATION_CONTEXT_MISS,
+        );
 
         let refinement_event = self.create_refinement_event(path);
 
         Ok((termination_info, refinement_event))
     }
-}
 
-// =============================================================================
-// SessionTerminationInfo
-// =============================================================================
-
-/// Information about a session termination due to context miss.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionTerminationInfo {
-    /// Session ID that was terminated.
-    pub session_id: String,
-
-    /// Rationale code for the termination.
-    pub rationale_code: String,
-
-    /// Exit classification (SUCCESS, FAILURE, etc.).
-    pub exit_classification: String,
-}
-
-impl SessionTerminationInfo {
-    /// Creates a new termination info for `CONTEXT_MISS`.
+    /// Terminates the session with a specific classification and rationale.
+    ///
+    /// # Arguments
+    ///
+    /// * `classification` - Exit classification (SUCCESS, FAILURE)
+    /// * `rationale` - Rationale code
+    ///
+    /// # Returns
+    ///
+    /// Session termination info.
     #[must_use]
-    pub fn context_miss(session_id: impl Into<String>) -> Self {
-        Self {
-            session_id: session_id.into(),
-            rationale_code: TERMINATION_RATIONALE_CONTEXT_MISS.to_string(),
-            exit_classification: EXIT_CLASSIFICATION_CONTEXT_MISS.to_string(),
-        }
+    pub fn terminate_session(
+        &self,
+        classification: impl Into<String>,
+        rationale: impl Into<String>,
+    ) -> SessionTerminationInfo {
+        SessionTerminationInfo::new(&self.context.session_id, rationale, classification)
     }
 }
 
@@ -896,7 +888,11 @@ mod tests {
 
     #[test]
     fn test_session_termination_info_context_miss() {
-        let info = SessionTerminationInfo::context_miss("session-001");
+        let info = SessionTerminationInfo::new(
+            "session-001",
+            TERMINATION_RATIONALE_CONTEXT_MISS,
+            EXIT_CLASSIFICATION_CONTEXT_MISS,
+        );
 
         assert_eq!(info.session_id, "session-001");
         assert_eq!(info.rationale_code, TERMINATION_RATIONALE_CONTEXT_MISS);

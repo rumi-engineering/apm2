@@ -573,6 +573,41 @@ impl AsRef<str> for DedupeKey {
 }
 
 // =============================================================================
+// SessionTerminationInfo
+// =============================================================================
+
+/// Information about a session termination.
+///
+/// Moved from `consume.rs` to support `ToolDecision::Terminate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTerminationInfo {
+    /// Session ID that was terminated.
+    pub session_id: String,
+
+    /// Rationale code for the termination.
+    pub rationale_code: String,
+
+    /// Exit classification (SUCCESS, FAILURE, etc.).
+    pub exit_classification: String,
+}
+
+impl SessionTerminationInfo {
+    /// Creates a new termination info.
+    #[must_use]
+    pub fn new(
+        session_id: impl Into<String>,
+        rationale: impl Into<String>,
+        classification: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            rationale_code: rationale.into(),
+            exit_classification: classification.into(),
+        }
+    }
+}
+
+// =============================================================================
 // ToolDecision
 // =============================================================================
 
@@ -582,7 +617,9 @@ impl AsRef<str> for DedupeKey {
 /// - `Allow`: Request is permitted, proceed with execution
 /// - `Deny`: Request is denied with a reason
 /// - `DedupeCacheHit`: Request matches a cached result (idempotent replay)
-#[derive(Debug, Clone)]
+/// - `Terminate`: Request triggered session termination (e.g., firewall
+///   violation)
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolDecision {
     /// Request is allowed. Proceed with execution.
     Allow {
@@ -625,6 +662,25 @@ pub enum ToolDecision {
         /// The cached result.
         result: Box<ToolResult>,
     },
+
+    /// Request caused session termination (e.g., context firewall violation).
+    Terminate {
+        /// The request ID.
+        request_id: String,
+
+        /// Termination info.
+        termination_info: Box<SessionTerminationInfo>,
+
+        /// Optional event to emit (e.g., refinement request).
+        /// Boxed to avoid circular dependency types if possible, but here we
+        /// use opaque bytes or similar? Actually, `CoordinationEvent`
+        /// is in `apm2_core`. We'll store it as opaque bytes or handle
+        /// it at the call site. For now, let's just use
+        /// `termination_info`. Wait, `consume.rs` needs to return the
+        /// refinement event. But `ToolDecision` is generic.
+        /// Let's add an optional opaque payload.
+        refinement_event: Option<Vec<u8>>, // Serialized CoordinationEvent
+    },
 }
 
 impl ToolDecision {
@@ -646,13 +702,20 @@ impl ToolDecision {
         matches!(self, Self::DedupeCacheHit { .. })
     }
 
+    /// Returns `true` if this is a Terminate decision.
+    #[must_use]
+    pub const fn is_terminate(&self) -> bool {
+        matches!(self, Self::Terminate { .. })
+    }
+
     /// Returns the request ID for this decision.
     #[must_use]
     pub fn request_id(&self) -> &str {
         match self {
             Self::Allow { request_id, .. }
             | Self::Deny { request_id, .. }
-            | Self::DedupeCacheHit { request_id, .. } => request_id,
+            | Self::DedupeCacheHit { request_id, .. }
+            | Self::Terminate { request_id, .. } => request_id,
         }
     }
 }
