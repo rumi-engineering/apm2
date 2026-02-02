@@ -195,6 +195,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: Check SAFETY-PROOF documentation
         run: |
           echo "Checking for unsafe blocks without SAFETY-PROOF documentation..."
@@ -231,6 +234,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
 
       - name: Check for legacy IPC patterns
         run: ./scripts/ci/legacy_ipc_guard.sh
