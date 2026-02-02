@@ -85,6 +85,8 @@ pub struct SessionState {
     pub lease_id: String,
     /// Policy resolution reference.
     pub policy_resolved_ref: String,
+    /// Hash of the capability manifest for this session.
+    pub capability_manifest_hash: Vec<u8>,
     /// Episode ID in the runtime (if created).
     pub episode_id: Option<String>,
 }
@@ -98,6 +100,10 @@ impl std::fmt::Debug for SessionState {
             .field("ephemeral_handle", &self.ephemeral_handle)
             .field("lease_id", &"[REDACTED]")
             .field("policy_resolved_ref", &self.policy_resolved_ref)
+            .field(
+                "capability_manifest_hash",
+                &hex::encode(&self.capability_manifest_hash),
+            )
             .field("episode_id", &self.episode_id)
             .finish()
     }

@@ -1942,6 +1942,7 @@ impl PrivilegedDispatcher {
             ephemeral_handle: ephemeral_handle.to_string(),
             lease_id: claim.lease_id.clone(),
             policy_resolved_ref: claim.policy_resolution.policy_resolved_ref.clone(),
+            capability_manifest_hash: claim.policy_resolution.capability_manifest_hash.to_vec(),
             episode_id: None, // Will be set when episode starts in async context
         };
 
