@@ -28,7 +28,7 @@ rfc_contracts_and_versioning:
         current_version: "0.1.0"
         compatibility_rules:
           - "Bundle encoding is canonical; field order is deterministic."
-          - "changeset_digest is derived from canonical bundle bytes."
+          - "changeset_digest is derived from canonical bundle bytes with the changeset_digest field omitted from the hash input."
       schemas:
         - id: "SCH-HEF-FAC-0001"
           path: "schemas/apm2/changeset_bundle_v1.yaml"
@@ -144,7 +144,7 @@ rfc_contracts_and_versioning:
         - "schema (const: apm2.changeset_bundle.v1)"
         - "schema_version"
         - "changeset_id (opaque)"
-        - "base_selector (resolved commit/tree id)"
+        - "base (GitObjectRef commit/tree)"
         - "changeset_digest (32 bytes)"
         - "diff_format (git_unified_diff)"
         - "diff_hash (CAS content hash)"
@@ -152,11 +152,13 @@ rfc_contracts_and_versioning:
         - "binary_detected (bool)"
       digest_rules:
         algorithm: "BLAKE3-256"
-        source: "EventHasher::hash_content over canonical ChangeSetBundle bytes"
+        source: "EventHasher::hash_content (crates/apm2-core/src/crypto/hash.rs:98-110) over canonical ChangeSetBundle bytes with changeset_digest omitted"
         notes:
-          - "Aligns with CAS hashing (BLAKE3) to avoid dual hash families."
+          - "Aligns with CAS hashing (BLAKE3) to avoid dual hash families (crates/apm2-core/src/evidence/cas.rs:1-18)."
+          - "Hash input is the canonical bundle object with the changeset_digest field omitted entirely (Option A)."
       canonicalization_rules:
         - "Canonical JSON serialization (RFC 8785/JCS) over the bundle object."
+        - "When computing changeset_digest, omit the changeset_digest field entirely from the object prior to JCS serialization."
         - "file_manifest sorted lexicographically by normalized path (no '.', '..', or backslashes)."
         - "All paths use '/' separators and are UTF-8 NFC normalized."
         - "diff_format is fixed to git_unified_diff; no alternate encodings in v0."

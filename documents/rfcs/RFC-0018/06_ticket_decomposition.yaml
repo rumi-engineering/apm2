@@ -266,7 +266,7 @@ rfc_ticket_decomposition:
         - "crates/apm2-core/src/fac/changeset_bundle.rs (bundle canonicalization)"
       acceptance_criteria:
         - "ChangeSetBundleV1 canonicalization is defined and deterministic."
-        - "Deterministic digest test exists (same bundle inputs -> same changeset_digest)."
+        - "Deterministic digest test exists (same bundle inputs -> same changeset_digest), and hash input omits the changeset_digest field."
         - "Ledger event ChangeSetPublished references changeset_digest + CAS hash."
       evidence_ids:
         - "EVID-HEF-0009"
@@ -337,6 +337,7 @@ rfc_ticket_decomposition:
         - "TCK-00310"
         - "TCK-00311"
         - "TCK-00312"
+        - "TCK-00315"
         - "RFC-0017:TCK-00256"
         - "RFC-0017:TCK-00260"
         - "RFC-0017:TCK-00252"
@@ -366,17 +367,44 @@ rfc_ticket_decomposition:
       summary: |
         Extend capability manifests/leases to include explicit allowlists for
         pulse topic subscriptions and CAS hash reads (diff bundles, snapshots,
-        review artifacts). Enforce allowlists at SubscribePulse handling and
-        CAS retrieval paths. Phase 1 session.sock forbids wildcards; allowlists
-        must enumerate exact topics.
+        review artifacts). Enforce allowlists at SubscribePulse handling and a
+        daemon-side CAS access facade (policy/broker layer) before invoking
+        core CAS APIs. Phase 1 session.sock forbids wildcards; allowlists must
+        enumerate exact topics.
       files_to_modify:
         - "crates/apm2-daemon/src/episode/capability.rs (add topic_allowlist + cas_hash_allowlist fields)"
         - "crates/apm2-daemon/src/protocol/session_dispatch.rs (enforce topic allowlist)"
-        - "crates/apm2-core/src/evidence/cas.rs or CAS access layer (enforce cas_hash_allowlist)"
-      files_to_create: []
+        - "crates/apm2-daemon/src/evidence/mod.rs (wire CAS access facade)"
+      files_to_create:
+        - "crates/apm2-daemon/src/evidence/cas_access.rs (policy-gated CAS read facade)"
       acceptance_criteria:
         - "Session subscriptions reject any topic not explicitly allowlisted."
         - "Session wildcard patterns are rejected in Phase 1."
-        - "CAS reads for ChangeSetBundle/Review artifacts are denied unless hash allowlisted."
+        - "CAS reads for ChangeSetBundle/Review artifacts are denied unless hash allowlisted at daemon CAS access facade."
       evidence_ids:
         - "EVID-HEF-0002"
+
+    - ticket_id: "TCK-00315"
+      group: "FAC v0 Preconditions"
+      title: "FAC v0 NEW WORK REQUIRED: Reviewer navigation tool surface (ListFiles/Search)"
+      requirement_ids:
+        - "REQ-HEF-0010"
+      depends_on:
+        - "RFC-0017:TCK-00252"
+        - "RFC-0017:TCK-00260"
+      risk_tier: "T2"
+      summary: |
+        Define minimal file navigation tool surfaces (ListFiles/Search) in
+        proto/tool_protocol.proto and wire them through RequestTool to the
+        tool broker. Ensure they are subject to capability allowlists and
+        context firewall rules (read-only, bounded output).
+      files_to_modify:
+        - "proto/tool_protocol.proto (add ListFiles/Search messages)"
+        - "crates/apm2-daemon/src/episode/broker.rs (handle navigation tools)"
+        - "crates/apm2-daemon/src/session/consume.rs (enforce allowlist for navigation)"
+      files_to_create: []
+      acceptance_criteria:
+        - "ListFiles/Search requests are denied unless allowlisted."
+        - "Navigation outputs are bounded and logged to CAS."
+      evidence_ids:
+        - "EVID-HEF-0011"

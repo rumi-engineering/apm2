@@ -110,7 +110,7 @@ rfc_trust_boundaries:
         - "Pulse hint -> consumer fetches CAS via policy gate"
       authn_authz:
         authn: "Session token + lease-bound capability manifest"
-        authz: "Explicit CAS hash allowlist; deny-by-default (NEW WORK REQUIRED: TCK-00314)"
+        authz: "Explicit CAS hash allowlist enforced at daemon CAS access facade; deny-by-default (NEW WORK REQUIRED: TCK-00314)"
       risks:
         - "Unauthorized CAS read of diff artifacts"
         - "Mismatched changeset_digest vs bundle hash"

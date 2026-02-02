@@ -20,6 +20,7 @@ rfc_evidence_artifact:
         constraints:
           - "GITHUB_TOKEN and GH_TOKEN must be unset."
           - "No GitHub reads for truth; CAS + ledger only."
+          - "Projection step uses local sink/receipt only (no external writes)."
   data:
     classification: "INTERNAL"
     redaction:

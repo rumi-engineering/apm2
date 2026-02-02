@@ -94,7 +94,7 @@ rfc_test_and_evidence:
           - "EVID-HEF-0011"
       - id: "IT-HEF-FAC-0004"
         name: "FAC v0 autonomous run (end-to-end)"
-        scope: "ChangeSetPublished -> reviewer episodes -> ReviewReceipt -> GateReceipt -> projection; no GitHub reads for truth (network_access=DISALLOWED)"
+        scope: "ChangeSetPublished -> reviewer episodes -> ReviewReceipt -> GateReceipt -> projection (local sink/receipt only under network_access=DISALLOWED); no GitHub reads for truth"
         test_environment: "Local daemon + fac harness"
         evidence_ids:
           - "EVID-HEF-0012"

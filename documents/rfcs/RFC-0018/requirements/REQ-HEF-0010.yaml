@@ -7,9 +7,10 @@ rfc_requirement:
   statement: |
     Reviewer episodes must receive a workspace snapshot/apply input derived from
     ChangeSetBundleV1, execute a minimal approved tool set (FileRead +
-    GitOperation{DIFF, STATUS} + ArtifactFetch), and store review outputs/logs
-    in CAS with ledger-anchored receipts. ShellExec is forbidden by default and
-    requires explicit capability allowlist.
+    GitOperation{DIFF, STATUS} + ArtifactFetch; ListFiles/Search is NEW WORK
+    REQUIRED via TCK-00315), and store review outputs/logs in CAS with
+    ledger-anchored receipts. ShellExec is forbidden by default and requires
+    explicit capability allowlist.
   acceptance_criteria:
     - "Workspace snapshot/apply succeeds for valid bundles; failures emit ReviewBlocked with CAS logs."
     - "Reviewer tool execution logs are stored in CAS and referenced by ReviewReceipt."

@@ -190,7 +190,7 @@ rfc_design_decisions:
         name: "ChangeSetBundleV1 + changeset_digest binding"
         required_artifacts:
           - "ChangeSetBundleV1 stored in CAS (canonical diff + manifest)"
-          - "changeset_digest computed via BLAKE3-256 over canonical bundle bytes"
+          - "changeset_digest computed via BLAKE3-256 over canonical bundle bytes with changeset_digest omitted from the hash input"
           - "binary_detected=true forces ReviewBlocked(BINARY_UNSUPPORTED) in v0"
         ledger_anchor:
           - "ChangeSetPublished ledger event referencing changeset_digest + cas_ref"
@@ -425,7 +425,9 @@ rfc_design_decisions:
         Pulse payloads carry only opaque IDs, hashes, and bounded metadata.
         File paths, tool arguments, diffs, or secrets are forbidden. No
         human-facing note field exists in Phase 1. CAS access remains policy
-        gated; pulses do not grant read access.
+        gated; pulses do not grant read access. CAS read authorization is
+        enforced by the daemon policy/broker layer before invoking core CAS
+        read APIs.
       context: |
         Pulse traffic is cross-boundary and must be safe by default.
       alternatives:
@@ -518,7 +520,8 @@ rfc_design_decisions:
       title: "Canonical ChangeSetBundle + changeset_digest binding"
       statement: |
         All review decisions MUST bind to a canonical ChangeSetBundleV1 stored in
-        CAS. The changeset_digest is computed from canonical bundle bytes and is
+        CAS. The changeset_digest is computed as BLAKE3-256 over canonical bundle
+        bytes with the changeset_digest field omitted from the hash input, and is
         anchored by a ledger event before any review or gate decision.
       context: |
         FAC v0 autonomy requires reviewers to see the exact diff without GitHub
@@ -545,6 +548,19 @@ rfc_design_decisions:
         artifacts/logs into CAS. ShellExec is forbidden by default and requires
         explicit capability allowlist. Reviewer decisions never depend on GitHub
         reads.
+      tool_surface_mapping:
+        - tool: "FileRead"
+          proto_ref: "proto/tool_protocol.proto:41-74"
+          handler_ref: "crates/apm2-daemon/src/protocol/session_dispatch.rs:303-351 (stub; RFC-0017 TCK-00260)"
+        - tool: "GitOperation{DIFF, STATUS}"
+          proto_ref: "proto/tool_protocol.proto:156-169"
+          handler_ref: "crates/apm2-daemon/src/protocol/session_dispatch.rs:303-351 (stub; RFC-0017 TCK-00260)"
+        - tool: "ArtifactFetch"
+          proto_ref: "proto/tool_protocol.proto:225-239"
+          handler_ref: "crates/apm2-daemon/src/protocol/session_dispatch.rs:303-351 (stub; RFC-0017 TCK-00260)"
+        - tool: "ListFiles/Search"
+          proto_ref: "proto/tool_protocol.proto:41-51 (not defined; NEW WORK REQUIRED TCK-00315)"
+          handler_ref: "NEW WORK REQUIRED (TCK-00315)"
       context: |
         Autonomy requires reviewers to operate entirely inside Forge with
         deterministic inputs and evidence-carrying outputs.
@@ -566,9 +582,9 @@ rfc_design_decisions:
       title: "ReviewBlocked semantics (explicit liveness failures)"
       statement: |
         ReviewBlocked is a first-class, ledger-anchored outcome with explicit
-        reason codes (including BINARY_UNSUPPORTED) and CAS logs. Retries are
-        bounded by HTF windows; blocked outcomes must be surfaced as durable
-        receipts.
+        reason codes (including BINARY_UNSUPPORTED, missing artifacts, invalid
+        bundles, and timeouts) and CAS logs. Retries are bounded by HTF windows;
+        blocked outcomes must be surfaced as durable receipts.
       context: |
         Liveness requires reviewers to fail loudly and reproducibly when inputs
         are missing or invalid.
@@ -590,7 +606,8 @@ rfc_design_decisions:
       statement: |
         HEF enable-by-default is blocked until FAC v0 autonomy evidence exists:
         ChangeSetBundle -> reviewer episode -> ReviewReceipt -> GateReceipt ->
-        projection, with no GitHub reads for truth.
+        projection via local sink/receipt (no external writes under
+        network_access=DISALLOWED), with no GitHub reads for truth.
       context: |
         Without end-to-end evidence, HEF risks becoming a side channel rather
         than an accelerator for autonomous FAC.

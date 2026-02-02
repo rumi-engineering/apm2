@@ -6,8 +6,9 @@ rfc_requirement:
   title: "ReviewBlocked liveness semantics"
   statement: |
     ReviewBlocked must be a ledger-anchored outcome with explicit reason codes
-    (including BINARY_UNSUPPORTED) and CAS logs. Retries are bounded by HTF
-    windows; blocked outcomes are durable receipts for liveness failures.
+    (including BINARY_UNSUPPORTED, MISSING_ARTIFACT, INVALID_BUNDLE, TIMEOUT)
+    and CAS logs. Retries are bounded by HTF windows; blocked outcomes are
+    durable receipts for liveness failures.
   acceptance_criteria:
     - "ReviewBlockedRecorded is emitted for apply/tool failures with reason_code and CAS log hash."
     - "Retries are bounded by MonotonicTicks windows; blocked outcomes persist in ledger."

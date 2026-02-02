@@ -43,6 +43,17 @@ Line ranges are from `nl -ba` output.
 - EpisodeCreated/Started/Stopped messages (IPC-only):
   `proto/apm2d_runtime_v1.proto:29-55`.
 - StreamOutput message (IPC-only): `proto/apm2d_runtime_v1.proto:92-109`.
+- RequestTool session IPC surface exists:
+  `proto/apm2d_runtime_v1.proto:392-414`.
+
+## Tool protocol surfaces
+- ToolRequest defines FileRead, GitOperation, and ArtifactFetch tool variants:
+  `proto/tool_protocol.proto:41-51`, `proto/tool_protocol.proto:64-74`,
+  `proto/tool_protocol.proto:156-169`, `proto/tool_protocol.proto:225-239`.
+- RequestTool handler is a stub pending tool broker implementation (TCK-00260):
+  `crates/apm2-daemon/src/protocol/session_dispatch.rs:303-351`.
+- No ListFiles/Search tool is defined in the ToolRequest variants list (NEW WORK REQUIRED):
+  `proto/tool_protocol.proto:41-51`. Ticket: `TCK-00315`.
 
 ## Projection-only external posture
 - Projection adapters are write-only; ledger is the source of truth:

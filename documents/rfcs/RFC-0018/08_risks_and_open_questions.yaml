@@ -48,6 +48,14 @@ rfc_risks_and_open_questions:
         - "GATE-HEF-FAC-V0 blocks enable-by-default until evidence exists."
       evidence_ids:
         - "EVID-HEF-0012"
+    - id: "RSK-HEF-0006"
+      statement: "Reviewer tool surface mismatch (missing ListFiles/Search) may block autonomous review navigation."
+      impact: "Reviewers cannot locate files or verify context; autonomy stalls."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "TCK-00315 adds ListFiles/Search tool surfaces with allowlist enforcement."
+      evidence_ids:
+        - "EVID-HEF-0011"
   open_questions:
     - id: "Q-HEF-0001"
       question: "Should episode_id be added to existing Session/Tool kernel events, or should new Episode* events be added?"
@@ -65,3 +73,7 @@ rfc_risks_and_open_questions:
       question: "Should ReviewReceiptRecorded be a new kernel event, or should review success be represented via GateReceipt evidence bundles only?"
       decision_needed_by: "2026-02-20"
       resolution_plan: "Compare schema churn vs audit clarity; keep v0 path consistent with FAC receipt semantics."
+    - id: "Q-HEF-0005"
+      question: "Should changeset_digest remain embedded in ChangeSetBundle (Option A) or move to ledger event only (Option B)?"
+      decision_needed_by: "2026-02-22"
+      resolution_plan: "Re-evaluate circularity risk vs convenience; keep Option A unless ledger-only digest simplifies validation."
