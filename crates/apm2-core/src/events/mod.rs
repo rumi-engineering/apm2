@@ -86,7 +86,11 @@ mod generated {
 mod canonical;
 pub mod ci;
 
-pub use canonical::Canonicalize;
+pub use canonical::{
+    Canonicalize, DomainSeparatedCanonical, EPISODE_SPAWNED_DOMAIN_PREFIX,
+    SESSION_TERMINATED_DOMAIN_PREFIX, TOOL_DECIDED_DOMAIN_PREFIX, TOOL_EXECUTED_DOMAIN_PREFIX,
+    WORK_CLAIMED_DOMAIN_PREFIX,
+};
 pub use generated::*;
 
 #[cfg(test)]
