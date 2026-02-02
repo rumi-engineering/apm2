@@ -1,0 +1,46 @@
+acceptance_criteria:
+  - criterion: StubPolicyEngine is removed from production ToolBroker path
+    verification: Code review confirms ToolBroker uses real policy engine
+  - criterion: Policy evaluation is deny-by-default when policy is missing or invalid
+    verification: Integration test shows RequestTool denied without policy
+  - criterion: ToolDecision includes real policy hash from policy engine
+    verification: Integration test asserts non-zero policy_hash
+
+implementation:
+  summary: |
+    Replace StubPolicyEngine with the real apm2-core policy engine and enforce policy
+    decisions in ToolBroker. This removes the current fail-open behavior and provides
+    deterministic deny-by-default enforcement.
+  files_to_modify:
+    - path: crates/apm2-daemon/src/episode/broker.rs
+      changes: |
+        - Replace StubPolicyEngine with apm2-core PolicyEngine integration
+        - Enforce policy decision results in ToolBroker
+    - path: crates/apm2-core/src/policy/engine.rs
+      changes: |
+        - Expose policy evaluation API for daemon integration (if needed)
+  implementation_steps:
+    - "Wire PolicyEngine into ToolBroker"
+    - "Remove stub policy evaluation path"
+    - "Add deny-by-default tests"
+
+notes: |
+  Phase: Layer E (policy + capability enforcement).
+  Scope: ToolBroker policy engine integration and deny-by-default enforcement.
+  Risk tier: T2 (medium).
+
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+test_requirements:
+  - test_id: IT-00292-01
+    description: ToolBroker denies without policy; policy hash is real
+    verification_command: cargo test -p apm2-daemon tool_broker_policy_engine
+
+ticket:
+  depends_on: []
+  id: TCK-00292
+  requirement_ids: []
+  rfc_id: RFC-0018
+  status: READY
+  title: "Policy engine integration: replace StubPolicyEngine in ToolBroker"

@@ -13,7 +13,8 @@ rfc_ticket_decomposition:
       requirement_ids:
         - "REQ-HEF-0002"
         - "REQ-HEF-0008"
-      depends_on: []
+      depends_on:
+        - "TCK-00287"
       risk_tier: "T3"
       summary: |
         Extend proto/apm2d_runtime_v1.proto to define PulseEnvelopeV1,
@@ -35,6 +36,7 @@ rfc_ticket_decomposition:
       requirement_ids:
         - "REQ-HEF-0007"
       depends_on:
+        - "TCK-00287"
         - "TCK-00300"
       risk_tier: "T2"
       summary: |
@@ -55,6 +57,7 @@ rfc_ticket_decomposition:
       requirement_ids:
         - "REQ-HEF-0003"
       depends_on:
+        - "TCK-00287"
         - "TCK-00300"
         - "TCK-00301"
       risk_tier: "T3"
@@ -79,6 +82,7 @@ rfc_ticket_decomposition:
       requirement_ids:
         - "REQ-HEF-0004"
       depends_on:
+        - "TCK-00287"
         - "TCK-00302"
       risk_tier: "T2"
       summary: |
@@ -101,6 +105,7 @@ rfc_ticket_decomposition:
         - "REQ-HEF-0006"
         - "REQ-HEF-0001"
       depends_on:
+        - "TCK-00287"
         - "TCK-00300"
         - "TCK-00302"
       risk_tier: "T3"
@@ -162,6 +167,7 @@ rfc_ticket_decomposition:
         - "REQ-HEF-0001"
         - "REQ-HEF-0002"
       depends_on:
+        - "TCK-00287"
         - "TCK-00304"
       risk_tier: "T2"
       summary: |
@@ -185,6 +191,7 @@ rfc_ticket_decomposition:
         - "REQ-HEF-0001"
         - "REQ-HEF-0008"
       depends_on:
+        - "TCK-00287"
         - "TCK-00300"
       risk_tier: "T3"
       preconditions:
@@ -214,6 +221,7 @@ rfc_ticket_decomposition:
       requirement_ids:
         - "REQ-HEF-0001"
       depends_on:
+        - "TCK-00287"
         - "TCK-00300"
       risk_tier: "T3"
       summary: |
@@ -240,6 +248,7 @@ rfc_ticket_decomposition:
         - "REQ-HEF-0006"
         - "REQ-HEF-0008"
       depends_on:
+        - "TCK-00287"
         - "TCK-00302"
         - "TCK-00303"
         - "TCK-00304"
@@ -268,7 +277,11 @@ rfc_ticket_decomposition:
       title: "HEF: Close xtask/GitHub status bypass surface"
       requirement_ids:
         - "REQ-HEF-0001"
-      depends_on: []
+      depends_on:
+        - "TCK-00294"
+        - "TCK-00295"
+        - "TCK-00296"
+        - "TCK-00297"
       risk_tier: "T2"
       summary: |
         Disable direct gh api /statuses writes for FAC-adjacent signals in xtask,
@@ -293,7 +306,11 @@ rfc_ticket_decomposition:
       title: "FAC v0 NEW WORK REQUIRED: ChangeSetBundleV1 + ChangeSetPublished event"
       requirement_ids:
         - "REQ-HEF-0009"
-      depends_on: []
+      depends_on:
+        - "TCK-00287"
+        - "TCK-00288"
+        - "TCK-00290"
+        - "TCK-00293"
       risk_tier: "T3"
       summary: |
         Define ChangeSetBundleV1 CAS schema and canonicalization. Add a
@@ -319,6 +336,10 @@ rfc_ticket_decomposition:
         - "REQ-HEF-0010"
         - "REQ-HEF-0011"
       depends_on:
+        - "TCK-00287"
+        - "TCK-00288"
+        - "TCK-00290"
+        - "TCK-00293"
         - "TCK-00310"
         - "TCK-00314"
         - "RFC-0017:TCK-00254"
@@ -346,6 +367,10 @@ rfc_ticket_decomposition:
       requirement_ids:
         - "REQ-HEF-0010"
       depends_on:
+        - "TCK-00287"
+        - "TCK-00288"
+        - "TCK-00290"
+        - "TCK-00293"
         - "TCK-00310"
         - "TCK-00314"
         - "RFC-0017:TCK-00254"
@@ -375,6 +400,10 @@ rfc_ticket_decomposition:
         - "REQ-HEF-0010"
         - "REQ-HEF-0011"
       depends_on:
+        - "TCK-00287"
+        - "TCK-00288"
+        - "TCK-00290"
+        - "TCK-00293"
         - "TCK-00310"
         - "TCK-00311"
         - "TCK-00312"
@@ -402,6 +431,9 @@ rfc_ticket_decomposition:
         - "REQ-HEF-0003"
         - "REQ-HEF-0005"
       depends_on:
+        - "TCK-00287"
+        - "TCK-00292"
+        - "TCK-00293"
         - "TCK-00302"
         - "RFC-0017:TCK-00254"
       risk_tier: "T3"
@@ -440,6 +472,10 @@ rfc_ticket_decomposition:
       requirement_ids:
         - "REQ-HEF-0010"
       depends_on:
+        - "TCK-00290"
+        - "TCK-00291"
+        - "TCK-00292"
+        - "TCK-00293"
         - "RFC-0017:TCK-00252"
         - "RFC-0017:TCK-00260"
       risk_tier: "T2"

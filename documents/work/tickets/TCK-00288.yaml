@@ -1,0 +1,58 @@
+acceptance_criteria:
+  - criterion: CLI uses operator_socket/session_socket from config; daemon.socket is ignored
+    verification: Unit test confirms operator/session socket selection and warns on legacy socket
+  - criterion: Privileged commands use operator_socket with tag-based protocol frames
+    verification: Integration test sends ClaimWork/SpawnEpisode via operator_socket successfully
+  - criterion: Session commands use session_socket with tag-based protocol frames
+    verification: Integration test sends RequestTool/PublishEvidence via session_socket successfully
+  - criterion: Deprecated --socket maps to operator_socket only and prints deterministic warning
+    verification: CLI help + integration test verify warning and routing
+
+implementation:
+  summary: |
+    Align CLI with dual-socket ProtocolServer: operator_socket for privileged commands and
+    session_socket for session-scoped commands. Deprecate --socket (operator-only fallback),
+    remove daemon.socket reliance, and use tag-based protocol frames instead of JSON IPC.
+  files_to_modify:
+    - path: crates/apm2-cli/src/main.rs
+      changes: |
+        - Replace config.daemon.socket usage with operator_socket/session_socket
+        - Deprecate --socket and map to operator_socket only with warning
+    - path: crates/apm2-cli/src/client/daemon.rs
+      changes: |
+        - Replace JSON IpcRequest framing with tag-based ProtocolServer clients
+    - path: crates/apm2-cli/src/commands/episode.rs
+      changes: |
+        - Route episode commands to session socket client
+    - path: crates/apm2-cli/src/commands/work.rs
+      changes: |
+        - Add privileged work claim/spawn commands over operator socket
+  implementation_steps:
+    - "Add operator/session clients for tag-based protocol"
+    - "Deprecate --socket and remove daemon.socket reliance"
+    - "Implement minimal agent command set with deterministic exit codes"
+
+notes: |
+  Phase: Layer B (CLI usability).
+  Scope: CLI socket selection + protocol clients for operator/session.
+  Risk tier: T2 (medium).
+
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+test_requirements:
+  - test_id: IT-00288-01
+    description: CLI routes privileged commands to operator_socket
+    verification_command: cargo test -p apm2-cli operator_socket_routing
+  - test_id: IT-00288-02
+    description: CLI routes session commands to session_socket
+    verification_command: cargo test -p apm2-cli session_socket_routing
+
+ticket:
+  depends_on:
+    - TCK-00287
+  id: TCK-00288
+  requirement_ids: []
+  rfc_id: RFC-0018
+  status: READY
+  title: "CLI dual-socket + protocol client alignment (no JSON IPC)"

@@ -1,0 +1,51 @@
+acceptance_criteria:
+  - criterion: IssueCapability returns HTF-compliant timestamps (non-zero) and signed capability metadata
+    verification: Integration test validates capability issuance with real timestamps and signature
+  - criterion: ClaimWork and SpawnEpisode persist state and emit ledger events via real emitter
+    verification: Integration test verifies ledger events are written and queryable
+  - criterion: StubPolicyResolver/StubWorkRegistry/StubLedgerEventEmitter/StubLeaseValidator are not used in production constructors
+    verification: Code review confirms production wiring uses real implementations
+
+implementation:
+  summary: |
+    Replace privileged dispatcher stubs with real governance integration: policy resolver,
+    work registry, ledger event emitter, and lease validator. Implement IssueCapability as a
+    real control-plane operation with HTF-compliant timestamps and durable ledger anchoring.
+  files_to_modify:
+    - path: crates/apm2-daemon/src/protocol/dispatch.rs
+      changes: |
+        - Replace stub dependencies in PrivilegedDispatcher::new
+        - Implement IssueCapability with real policy/lease validation
+        - Emit WorkClaimed/EpisodeSpawned events via real ledger emitter
+    - path: crates/apm2-core/src/ledger/
+      changes: |
+        - Add or wire ledger emitter implementation for privileged events
+    - path: crates/apm2-daemon/src/session/registry.rs
+      changes: |
+        - Persist session registry state for SpawnEpisode/IssueCapability
+  implementation_steps:
+    - "Wire governance policy resolver and work registry into PrivilegedDispatcher"
+    - "Replace StubLedgerEventEmitter with durable emitter"
+    - "Implement IssueCapability with HTF time source and lease validation"
+
+notes: |
+  Phase: Layer A/E (control-plane governance integration).
+  Scope: Privileged dispatcher real implementations (policy/work/ledger/lease).
+  Risk tier: T3 (high).
+
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+test_requirements:
+  - test_id: IT-00289-01
+    description: ClaimWork/SpawnEpisode/IssueCapability persist ledger events
+    verification_command: cargo test -p apm2-daemon privileged_dispatcher_real
+
+ticket:
+  depends_on:
+    - TCK-00287
+  id: TCK-00289
+  requirement_ids: []
+  rfc_id: RFC-0018
+  status: READY
+  title: "Privileged dispatcher: replace stubs with real governance + IssueCapability"

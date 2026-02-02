@@ -1,0 +1,46 @@
+acceptance_criteria:
+  - criterion: ReadFileHandler reads real files relative to workspace (no stub output)
+    verification: Integration test reads a temp file and returns actual contents
+  - criterion: WriteFileHandler performs real writes with atomic semantics (no stub output)
+    verification: Integration test writes to temp file and verifies content
+  - criterion: ExecuteHandler runs commands in a sandbox and returns real stdout/stderr with bounds
+    verification: Integration test executes a simple command and enforces output limits
+
+implementation:
+  summary: |
+    Replace stub tool handlers with real implementations for Read/Write/Execute. Enforce
+    workspace-relative path constraints, bounded output, and sandboxed execution. This is the
+    minimum viable tool plane for implementor/reviewer workflows.
+  files_to_modify:
+    - path: crates/apm2-daemon/src/episode/handlers.rs
+      changes: |
+        - Replace stub Read/Write/Execute implementations with real I/O
+        - Enforce bounded outputs and path traversal protection
+    - path: crates/apm2-daemon/src/episode/executor.rs
+      changes: |
+        - Ensure CAS storage is used for real tool outputs
+  implementation_steps:
+    - "Implement real Read/Write/Execute handlers with bounds"
+    - "Add sandboxed execution for ExecuteHandler"
+    - "Add integration tests for filesystem and command execution"
+
+notes: |
+  Phase: Layer D (tool plane viability).
+  Scope: Replace stub Read/Write/Execute handlers with real I/O/exec.
+  Risk tier: T2 (medium).
+
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+test_requirements:
+  - test_id: IT-00291-01
+    description: Read/Write/Execute handlers perform real I/O
+    verification_command: cargo test -p apm2-daemon tool_handlers_real_io
+
+ticket:
+  depends_on: []
+  id: TCK-00291
+  requirement_ids: []
+  rfc_id: RFC-0018
+  status: READY
+  title: "Tool handlers: replace Read/Write/Execute stubs with real implementations"

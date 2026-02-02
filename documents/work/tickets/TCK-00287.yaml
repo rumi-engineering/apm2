@@ -1,0 +1,50 @@
+acceptance_criteria:
+  - criterion: operator.sock/session.sock route tag-based ProtocolServer frames to PrivilegedDispatcher/SessionDispatcher
+    verification: Integration test shows tag-based requests succeed on both sockets
+  - criterion: JSON IpcRequest frames are rejected on operator.sock/session.sock by default
+    verification: Adversarial test rejects JSON downgrade attempts without hitting handlers::dispatch
+  - criterion: legacy JSON dispatch is disabled by default or gated behind an explicit dev-only flag and separate socket
+    verification: Running daemon without dev flag cannot use JSON IPC for privileged/session operations
+
+implementation:
+  summary: |
+    Route operator.sock and session.sock through ProtocolServer tag-based dispatchers and remove
+    JSON parsing from the default connection handler. If any legacy JSON compatibility remains,
+    it must be explicitly gated behind a dev-only switch or separate socket path (fail-closed by default).
+  files_to_modify:
+    - path: crates/apm2-daemon/src/main.rs
+      changes: |
+        - Replace JSON IpcRequest parsing in handle_dual_socket_connection
+        - Dispatch to PrivilegedDispatcher/SessionDispatcher based on socket type
+        - Remove or gate legacy JSON path behind explicit dev-only flag
+    - path: crates/apm2-daemon/src/protocol/server.rs
+      changes: |
+        - Expose tag-based dispatcher wiring for operator/session sockets
+    - path: crates/apm2-daemon/src/protocol/mod.rs
+      changes: |
+        - Ensure ProtocolServer entrypoints are used by main
+  implementation_steps:
+    - "Wire operator.sock/session.sock to ProtocolServer dispatchers"
+    - "Remove JSON parsing from default socket handler"
+    - "Add downgrade rejection test coverage (JSON frames rejected)"
+
+notes: |
+  Phase: Layer A (control-plane routing cutover).
+  Scope: Daemon entrypoint routing + ProtocolServer dispatch cutover.
+  Risk tier: T3 (high).
+
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+test_requirements:
+  - test_id: IT-00287-01
+    description: Tag-based protocol succeeds; JSON downgrade rejected
+    verification_command: cargo test -p apm2-daemon protocol_dispatch_cutover
+
+ticket:
+  depends_on: []
+  id: TCK-00287
+  requirement_ids: []
+  rfc_id: RFC-0018
+  status: READY
+  title: "Routing cutover: ProtocolServer dispatchers on operator/session sockets"

@@ -1,0 +1,49 @@
+acceptance_criteria:
+  - criterion: Durable CAS backend persists artifacts across daemon restarts
+    verification: Integration test stores artifact, restarts daemon, and retrieves content
+  - criterion: StubContentAddressedStore is not used in production paths
+    verification: Code review confirms production wiring uses durable CAS implementation
+  - criterion: CAS size limits and hash verification are enforced
+    verification: Unit tests cover size limit and hash mismatch errors
+
+implementation:
+  summary: |
+    Implement a durable CAS backend (filesystem or sqlite) and wire it into daemon
+    tool execution and evidence publishing. Replace StubContentAddressedStore and
+    MemoryCas in production paths while keeping in-memory CAS for tests only.
+  files_to_modify:
+    - path: crates/apm2-core/src/evidence/cas.rs
+      changes: |
+        - Add durable CAS backend implementation
+        - Keep MemoryCas for tests only
+    - path: crates/apm2-daemon/src/episode/broker.rs
+      changes: |
+        - Use durable CAS for tool broker storage
+    - path: crates/apm2-daemon/src/episode/executor.rs
+      changes: |
+        - Use durable CAS for tool result storage
+  implementation_steps:
+    - "Implement durable CAS backend"
+    - "Wire CAS into broker and executor"
+    - "Add restart persistence tests"
+
+notes: |
+  Phase: Layer F (evidence durability).
+  Scope: Durable CAS backend + daemon wiring.
+  Risk tier: T3 (high).
+
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+test_requirements:
+  - test_id: IT-00293-01
+    description: Durable CAS persists across daemon restarts
+    verification_command: cargo test -p apm2-daemon cas_persistence_restart
+
+ticket:
+  depends_on: []
+  id: TCK-00293
+  requirement_ids: []
+  rfc_id: RFC-0018
+  status: READY
+  title: "Durable CAS backend + wiring (replace stub/in-memory CAS in production)"

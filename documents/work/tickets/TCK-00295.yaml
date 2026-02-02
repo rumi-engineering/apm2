@@ -1,0 +1,52 @@
+acceptance_criteria:
+  - criterion: xtask can optionally emit internal receipt/event artifacts when daemon is available
+    verification: Integration test shows optional receipt emission without blocking xtask run
+  - criterion: xtask remains non-authoritative even when emitting internal artifacts
+    verification: Banner remains and docs note non-authoritative status
+  - criterion: GitHub status writes remain unchanged in Stage X1
+    verification: Existing status write behavior preserved
+
+implementation:
+  summary: |
+    Stage X1: once internal truth-plane artifacts exist, allow xtask to optionally
+    emit internal receipts/events in addition to GitHub status writes. xtask remains
+    explicitly non-authoritative and must not block on daemon availability.
+  files_to_modify:
+    - path: xtask/src/tasks/review.rs
+      changes: |
+        - Add optional --emit-internal flag to send receipt/event to daemon
+    - path: xtask/src/tasks/aat.rs
+      changes: |
+        - Add optional --emit-internal flag to send receipt/event to daemon
+    - path: xtask/src/tasks/security_review_exec.rs
+      changes: |
+        - Add optional --emit-internal flag to send receipt/event to daemon
+  implementation_steps:
+    - "Add optional internal receipt emission to xtask tasks"
+    - "Ensure daemon unavailability does not block xtask run"
+    - "Document optional internal emission as non-authoritative"
+
+notes: |
+  Phase: xtask Stage X1 (optional internal receipts).
+  Scope: Optional internal receipt emission from xtask.
+  Risk tier: T2 (medium).
+  Keeps xtask usable: YES.
+
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+test_requirements:
+  - test_id: IT-00295-01
+    description: Optional internal receipt emission does not block xtask
+    verification_command: cargo test -p xtask xtask_optional_internal_receipts
+
+ticket:
+  depends_on:
+    - TCK-00293
+    - TCK-00310
+    - TCK-00312
+  id: TCK-00295
+  requirement_ids: []
+  rfc_id: RFC-0018
+  status: READY
+  title: "xtask Stage X1: optional internal receipts/events (still non-authoritative)"

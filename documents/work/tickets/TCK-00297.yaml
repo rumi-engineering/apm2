@@ -1,0 +1,54 @@
+acceptance_criteria:
+  - criterion: Direct GitHub status writes are removed or hard-disabled
+    verification: Attempted status write fails closed with explicit error
+  - criterion: xtask remains usable for dev workflows without GitHub status writes
+    verification: xtask tasks complete with NON-AUTHORITATIVE banner and no GH writes
+  - criterion: Replacement daemon/CLI projection paths exist before removal
+    verification: Dependency checks in ticket graph confirm replacements landed
+
+implementation:
+  summary: |
+    Stage X3: remove or hard-disable direct GitHub status writes after daemon/CLI
+    replacements exist. xtask remains usable but explicitly non-authoritative and
+    must not write external status signals.
+  files_to_modify:
+    - path: xtask/src/tasks/aat.rs
+      changes: |
+        - Remove or hard-disable GitHub status writes
+    - path: xtask/src/tasks/review.rs
+      changes: |
+        - Remove or hard-disable GitHub status writes
+    - path: xtask/src/tasks/push.rs
+      changes: |
+        - Remove or hard-disable GitHub status writes
+    - path: xtask/src/tasks/security_review_exec.rs
+      changes: |
+        - Remove or hard-disable GitHub status writes
+  implementation_steps:
+    - "Disable direct GH status writes once replacements are available"
+    - "Retain NON-AUTHORITATIVE banner"
+    - "Update docs to reflect removal"
+
+notes: |
+  Phase: xtask Stage X3 (remove status writes last).
+  Scope: Remove/disable GH status writes after replacements.
+  Risk tier: T2 (medium).
+  Keeps xtask usable: YES (non-authoritative only).
+
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+test_requirements:
+  - test_id: IT-00297-01
+    description: GH status write attempts fail closed after removal
+    verification_command: cargo test -p xtask xtask_status_removed
+
+ticket:
+  depends_on:
+    - TCK-00296
+    - TCK-00313
+  id: TCK-00297
+  requirement_ids: []
+  rfc_id: RFC-0018
+  status: READY
+  title: "xtask Stage X3: remove/disable GitHub status writes after replacements"

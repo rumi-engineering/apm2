@@ -1,0 +1,59 @@
+acceptance_criteria:
+  - criterion: RequestTool executes via ToolBroker and returns ToolResult or Deny (no stub Allow)
+    verification: Integration test shows RequestTool produces ToolResult and denies without manifest
+  - criterion: EmitEvent writes real ledger events (no stub response)
+    verification: Integration test verifies event persisted in ledger
+  - criterion: PublishEvidence stores artifacts in durable CAS and returns real storage path/hash
+    verification: Integration test verifies CAS retrieval after PublishEvidence
+  - criterion: StreamTelemetry persists bounded telemetry artifacts (or is explicitly disabled until real)
+    verification: Test ensures telemetry path is non-stub and fail-closed
+
+implementation:
+  summary: |
+    Make session dispatchers viable for agents: RequestTool must invoke ToolBroker execution and
+    return ToolResult, while EmitEvent/PublishEvidence/StreamTelemetry must be real ledger/CAS
+    operations. Remove stub responses and fail-open behavior when manifests are missing.
+  files_to_modify:
+    - path: crates/apm2-daemon/src/protocol/session_dispatch.rs
+      changes: |
+        - Replace stub RequestTool allow with ToolBroker execution path
+        - Require manifest store; deny when missing (fail-closed)
+        - Replace stub EmitEvent/PublishEvidence/StreamTelemetry with real implementations
+    - path: crates/apm2-daemon/src/episode/broker.rs
+      changes: |
+        - Expose ToolBroker execution for RequestTool path
+    - path: crates/apm2-daemon/src/session/consume.rs
+      changes: |
+        - Ensure session consumption path uses real ToolBroker + CAS
+  implementation_steps:
+    - "Wire RequestTool -> ToolBroker execute with manifest validation"
+    - "Implement EmitEvent and PublishEvidence via ledger/CAS"
+    - "Remove stub responses; add fail-closed tests"
+
+notes: |
+  Phase: Layer C (session viability).
+  Scope: Session dispatcher RequestTool/EmitEvent/PublishEvidence wiring.
+  Risk tier: T3 (high).
+
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+test_requirements:
+  - test_id: IT-00290-01
+    description: RequestTool executes and returns ToolResult via ToolBroker
+    verification_command: cargo test -p apm2-daemon session_request_tool_exec
+  - test_id: IT-00290-02
+    description: EmitEvent/PublishEvidence persist to ledger/CAS
+    verification_command: cargo test -p apm2-daemon session_event_evidence_persist
+
+ticket:
+  depends_on:
+    - TCK-00287
+    - TCK-00291
+    - TCK-00292
+    - TCK-00293
+  id: TCK-00290
+  requirement_ids: []
+  rfc_id: RFC-0018
+  status: READY
+  title: "Session dispatcher viability: RequestTool execution + real EmitEvent/PublishEvidence"

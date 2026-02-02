@@ -1,0 +1,53 @@
+acceptance_criteria:
+  - criterion: GitHub status writes are gated behind an explicit dev flag in strict mode
+    verification: Without flag + strict mode, status writes fail closed with explicit error
+  - criterion: With explicit flag, GitHub status writes proceed unchanged
+    verification: Integration test confirms status writes when flag set
+  - criterion: Default behavior remains usable for dev workflows until replacements exist
+    verification: Non-strict runs continue current behavior with warning
+
+implementation:
+  summary: |
+    Stage X2: introduce explicit dev gating for GitHub status writes. In strict mode,
+    writes are fail-closed unless a dev flag is provided. Non-strict mode preserves
+    current behavior to avoid breaking dev workflows until replacements exist.
+  files_to_modify:
+    - path: xtask/src/tasks/aat.rs
+      changes: |
+        - Add --allow-gh-status or APM2_XTASK_ALLOW_STATUS gating logic
+    - path: xtask/src/tasks/review.rs
+      changes: |
+        - Add --allow-gh-status or APM2_XTASK_ALLOW_STATUS gating logic
+    - path: xtask/src/tasks/push.rs
+      changes: |
+        - Add --allow-gh-status or APM2_XTASK_ALLOW_STATUS gating logic
+    - path: xtask/src/tasks/security_review_exec.rs
+      changes: |
+        - Add --allow-gh-status or APM2_XTASK_ALLOW_STATUS gating logic
+  implementation_steps:
+    - "Implement strict-mode gating for GitHub status writes"
+    - "Document dev flag behavior and strict-mode defaults"
+    - "Add tests for fail-closed behavior when flag missing"
+
+notes: |
+  Phase: xtask Stage X2 (gated status writes).
+  Scope: Dev-flag gating for GH status writes.
+  Risk tier: T2 (medium).
+  Keeps xtask usable: YES (non-strict preserves current behavior).
+
+schema_version: "2026-01-26"
+template_version: "2026-01-26"
+
+test_requirements:
+  - test_id: IT-00296-01
+    description: Strict mode blocks status writes without dev flag
+    verification_command: cargo test -p xtask xtask_status_gating
+
+ticket:
+  depends_on:
+    - TCK-00295
+  id: TCK-00296
+  requirement_ids: []
+  rfc_id: RFC-0018
+  status: READY
+  title: "xtask Stage X2: gate GitHub status writes behind explicit dev flag"
