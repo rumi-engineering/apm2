@@ -24,6 +24,21 @@
 //! - `apm2_daemon_session_terminations_total` (counter)
 //!
 //! See RFC-0017 for architecture details.
+//!
+//! # Fork Safety (TCK-00282)
+//!
+//! Daemonization via `fork()` MUST occur BEFORE the Tokio runtime starts.
+//! The `#[tokio::main]` macro expands to code that initializes a multi-threaded
+//! runtime and spawns worker threads BEFORE the async fn body executes. Calling
+//! `fork()` in a multi-threaded process is undefined behavior because:
+//!
+//! 1. `fork()` only duplicates the calling thread, not all threads
+//! 2. Mutexes held by other threads remain locked forever in the child
+//! 3. This leads to deadlocks and undefined behavior
+//!
+//! To ensure safety, this binary uses a synchronous `fn main()` that performs
+//! all daemonization (fork, setsid, chdir) in a truly single-threaded context,
+//! THEN manually constructs and runs the Tokio runtime via `block_on()`.
 
 // mod protocol; // Use library crate instead to avoid dead code warnings
 mod state;
@@ -123,7 +138,8 @@ impl DaemonConfig {
         let config = if args.config.exists() {
             EcosystemConfig::from_file(&args.config).context("failed to load configuration")?
         } else {
-            info!("No config file found, using defaults");
+            // Note: info!() may not work here if called before tracing init,
+            // but DaemonConfig::new() is called after tracing setup in async_main
             EcosystemConfig::default()
         };
 
@@ -273,10 +289,139 @@ async fn shutdown_all_processes(state: &SharedState) {
     info!("All processes stopped");
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Perform daemonization via double-fork pattern.
+///
+/// # Safety
+///
+/// This function MUST be called BEFORE any multi-threaded runtime (like Tokio)
+/// is initialized. `fork()` in a multi-threaded process is undefined behavior
+/// because:
+///
+/// 1. `fork()` only duplicates the calling thread, not worker threads
+/// 2. Mutexes held by other threads remain locked forever in the child
+/// 3. Thread-local storage and thread IDs become inconsistent
+///
+/// By calling this function in a truly single-threaded context (before
+/// `Runtime::new()`), we ensure the child process starts with a clean slate
+/// and can safely initialize its own multi-threaded runtime afterward.
+///
+/// # Returns
+///
+/// - `Ok(true)` if daemonization succeeded (caller is the daemon child)
+/// - `Ok(false)` if daemonization is not supported on this platform
+/// - `Err(_)` if daemonization failed
+#[allow(unsafe_code)] // fork() requires unsafe
+fn daemonize() -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use nix::unistd::{ForkResult, fork, setsid};
+
+        // First fork (double-fork daemon pattern)
+        //
+        // SAFETY: This is safe because we are calling fork() BEFORE the Tokio
+        // runtime is initialized. At this point, the process is truly
+        // single-threaded:
+        // - No worker threads have been spawned
+        // - No async runtime exists
+        // - No background threads from libraries like rustls
+        //
+        // The parent process exits immediately, and the child continues to
+        // complete the daemonization sequence.
+        match unsafe { fork() }? {
+            ForkResult::Parent { .. } => {
+                // Parent exits immediately - daemon continues in child
+                std::process::exit(0);
+            },
+            ForkResult::Child => {},
+        }
+
+        // Create new session - become session leader, lose controlling terminal
+        setsid()?;
+
+        // Second fork (completes double-fork daemon pattern)
+        //
+        // SAFETY: Still single-threaded - we are the first fork's child,
+        // which inherited only the calling thread. No runtime has been
+        // started yet. This second fork ensures the daemon cannot
+        // accidentally reacquire a controlling terminal.
+        match unsafe { fork() }? {
+            ForkResult::Parent { .. } => {
+                // Intermediate parent exits - daemon continues in grandchild
+                std::process::exit(0);
+            },
+            ForkResult::Child => {},
+        }
+
+        // Change to root directory to avoid holding directory handles
+        std::env::set_current_dir("/")?;
+
+        Ok(true)
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Daemonization not supported on non-Unix platforms
+        Ok(false)
+    }
+}
+
+/// Synchronous entry point - handles daemonization BEFORE async runtime starts.
+///
+/// # Fork Safety (TCK-00282)
+///
+/// This function exists to ensure `fork()` is called in a truly single-threaded
+/// context. The previous implementation used `#[tokio::main]` which expands to:
+///
+/// ```ignore
+/// fn main() {
+///     let rt = tokio::runtime::Runtime::new().unwrap();  // Spawns worker threads!
+///     rt.block_on(async { /* user's async main */ })
+/// }
+/// ```
+///
+/// This meant `fork()` was called AFTER worker threads existed, which is
+/// undefined behavior. The fix is to:
+///
+/// 1. Parse args and handle daemonization synchronously (no threads yet)
+/// 2. THEN create the Tokio runtime
+/// 3. THEN run the async main
+fn main() -> Result<()> {
+    // Parse command-line arguments (synchronous, no threads)
     let args = Args::parse();
 
+    // Daemonize if requested - MUST happen before any async runtime!
+    //
+    // This is the critical fix for TCK-00282. By daemonizing here, we ensure
+    // fork() is called when only the main thread exists.
+    if !args.no_daemon {
+        match daemonize() {
+            // Successfully daemonized (true) or platform doesn't support it (false)
+            // Either way, continue to start the async runtime below.
+            // Unsupported platforms will log a warning after tracing is initialized.
+            Ok(true | false) => {},
+            Err(e) => {
+                // Daemonization failed - abort startup
+                // Can't use tracing here since it's not initialized yet
+                eprintln!("Daemonization failed: {e}");
+                return Err(e);
+            },
+        }
+    }
+
+    // NOW it's safe to create the multi-threaded Tokio runtime.
+    // Either we're running in foreground (--no-daemon), or we've completed
+    // the double-fork and are the daemon grandchild process.
+    let runtime = tokio::runtime::Runtime::new().context("failed to create Tokio runtime")?;
+
+    // Run the async main on the runtime
+    runtime.block_on(async_main(args))
+}
+
+/// Async entry point - runs after daemonization is complete.
+///
+/// All async initialization and the main event loop live here.
+/// This is safe because the Tokio runtime was created AFTER any `fork()` calls.
+async fn async_main(args: Args) -> Result<()> {
     // Initialize logging
     let filter = EnvFilter::try_new(&args.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -304,6 +449,17 @@ async fn main() -> Result<()> {
             .init();
     }
 
+    // Log daemonization status now that tracing is available
+    if args.no_daemon {
+        info!("Running in foreground mode (--no-daemon)");
+    } else {
+        #[cfg(unix)]
+        info!("Daemonized successfully");
+
+        #[cfg(not(unix))]
+        warn!("Daemonization not supported on this platform, running in foreground");
+    }
+
     // Install the rustls crypto provider before any TLS operations.
     // This must be done before any TLS configuration is built, otherwise
     // rustls will panic due to no default crypto provider being installed.
@@ -324,48 +480,14 @@ async fn main() -> Result<()> {
         .await
         .context("kernel schema registration failed")?;
 
-    // Daemonize if requested
-    #[allow(unsafe_code)] // fork() requires unsafe
-    if !args.no_daemon {
-        #[cfg(unix)]
-        {
-            use nix::unistd::{ForkResult, fork, setsid};
-
-            info!("Daemonizing...");
-
-            // First fork
-            match unsafe { fork() }? {
-                ForkResult::Parent { .. } => {
-                    // Parent exits
-                    std::process::exit(0);
-                },
-                ForkResult::Child => {},
-            }
-
-            // Create new session
-            setsid()?;
-
-            // Second fork
-            match unsafe { fork() }? {
-                ForkResult::Parent { .. } => {
-                    // Parent exits
-                    std::process::exit(0);
-                },
-                ForkResult::Child => {},
-            }
-
-            // Change to root directory
-            std::env::set_current_dir("/")?;
-        }
-
-        #[cfg(not(unix))]
-        {
-            warn!("Daemonization not supported on this platform, running in foreground");
-        }
-    }
-
     // Load configuration and initialize
     let daemon_config = DaemonConfig::new(&args)?;
+
+    // Log config file status
+    if !args.config.exists() {
+        info!("No config file found at {:?}, using defaults", args.config);
+    }
+
     let supervisor = init_supervisor(&daemon_config.config);
 
     // TCK-00268: Initialize Prometheus metrics registry early so we can pass it

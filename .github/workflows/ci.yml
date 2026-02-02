@@ -187,42 +187,66 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  # SAFETY-PROOF comment coverage for unsafe code (security gate)
-  # Verifies that all unsafe blocks have documented safety proofs
+  # SAFETY comment coverage for unsafe code (security gate)
+  # Verifies that all unsafe blocks have documented safety proofs per Rust convention
   safety-proof-coverage:
     name: Safety Proof Coverage
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Check SAFETY-PROOF documentation
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Check SAFETY documentation
         run: |
-          echo "Checking for unsafe blocks without SAFETY-PROOF documentation..."
+          echo "Checking for unsafe blocks without SAFETY documentation..."
 
-          # Find all files with unsafe blocks
-          UNSAFE_FILES=$(rg -l "unsafe\s*\{" crates/apm2-core crates/apm2-daemon || true)
+          # Find all Rust files in crates
+          RUST_FILES=$(find crates/apm2-core crates/apm2-daemon -name '*.rs' -type f)
 
-          if [[ -n "$UNSAFE_FILES" ]]; then
-            # Check each file has corresponding SAFETY-PROOF comments
+          if [[ -n "$RUST_FILES" ]]; then
+            # Check each file has corresponding SAFETY comments
+            # Uses standard Rust convention: "// SAFETY:" (case-insensitive)
             MISSING_PROOFS=""
-            for file in $UNSAFE_FILES; do
-              # Count unsafe blocks vs SAFETY-PROOF comments
-              UNSAFE_COUNT=$(rg -c "unsafe\s*\{" "$file" || echo "0")
-              PROOF_COUNT=$(rg -c "// SAFETY-PROOF:" "$file" || echo "0")
+            for file in $RUST_FILES; do
+              # Count actual unsafe blocks (excluding doc comments starting with /// or //!)
+              # The grep -v filters out doc comment lines before counting
+              UNSAFE_COUNT=$(rg -n "unsafe\s*\{" "$file" 2>/dev/null | grep -v "^[0-9]*:\s*///" | grep -v "^[0-9]*:\s*//!" | wc -l || echo "0")
+              PROOF_COUNT=$(rg -ci "// SAFETY:" "$file" 2>/dev/null || echo "0")
+
+              # Skip files with no unsafe blocks
+              if [[ "$UNSAFE_COUNT" -eq 0 ]]; then
+                continue
+              fi
 
               if [[ "$UNSAFE_COUNT" -gt "$PROOF_COUNT" ]]; then
-                MISSING_PROOFS="$MISSING_PROOFS\n$file: $UNSAFE_COUNT unsafe blocks, $PROOF_COUNT SAFETY-PROOF comments"
+                MISSING_PROOFS="$MISSING_PROOFS\n$file: $UNSAFE_COUNT unsafe blocks, $PROOF_COUNT SAFETY comments"
               fi
             done
 
             if [[ -n "$MISSING_PROOFS" ]]; then
-              echo "ERROR: Files with unsafe blocks missing SAFETY-PROOF documentation:"
+              echo "ERROR: Files with unsafe blocks missing SAFETY documentation:"
               echo -e "$MISSING_PROOFS"
               exit 1
             fi
           fi
 
-          echo "All unsafe blocks have SAFETY-PROOF documentation"
+          echo "All unsafe blocks have SAFETY documentation"
+
+  # Legacy IPC guard (TCK-00282)
+  # Prevents reintroduction of legacy JSON IPC code removed in TCK-00281
+  legacy-ipc-guard:
+    name: Legacy IPC Guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Check for legacy IPC patterns
+        run: ./scripts/ci/legacy_ipc_guard.sh
 
   # Release build check
   build:
@@ -241,7 +265,7 @@ jobs:
   # Final check that all CI jobs passed
   ci-success:
     name: CI Success
-    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, build, safety-proof-coverage]
+    needs: [fmt, proto-verify, clippy, doc, test, test-vectors, msrv, security, deny, coverage, build, safety-proof-coverage, legacy-ipc-guard]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -259,3 +283,4 @@ jobs:
           if [[ "${{ needs.coverage.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.build.result }}" != "success" ]]; then exit 1; fi
           if [[ "${{ needs.safety-proof-coverage.result }}" != "success" ]]; then exit 1; fi
+          if [[ "${{ needs.legacy-ipc-guard.result }}" != "success" ]]; then exit 1; fi
