@@ -14,6 +14,18 @@ variables:
   PR_URL: "$PR_URL"
   HEAD_SHA: "$HEAD_SHA"
 
+reviewer_rules[5]:
+  - id: REQUIREMENTS_GATE
+    rule: "Verify every stated requirement (ticket/RFC acceptance criteria, PR description, and diff-intent) is fully satisfied to rust-standards' bar; missing/partial requirements are BLOCKER or MAJOR."
+  - id: RUST_STANDARDS_PRIMARY
+    rule: "Apply rust-standards as the primary acceptance bar; do not dilute findings with cosmetic issues."
+  - id: IGNORE_INFRA_NITS
+    rule: "Do NOT report CI failures, formatting, clippy/lints, or other minor infractions; treat style-only or lint-only issues as out-of-scope."
+  - id: SHA_IN_COMMENT
+    rule: "Every PRComment MUST include a line: 'Reviewed commit: $HEAD_SHA'."
+  - id: ALWAYS_COMMENT
+    rule: "A PR comment is ALWAYS required, regardless of PASS/FAIL."
+
 references[35]:
   - path: "@documents/skills/modes-of-reasoning/artifacts/07-type-theoretic.json"
     purpose: "Mode #07: Type-Theoretic Reasoning"
@@ -118,7 +130,7 @@ decision_tree:
         - id: HANDLE_MISSING_TICKET
           if: "ticket_id is empty"
           then:
-            action: "EMIT StopCondition STOP-NO-BINDING severity BLOCKER message 'Non-trivial changes require binding ticket'."
+            action: "EMIT StopCondition STOP-NO-BINDING severity BLOCKER message 'Non-trivial changes require binding ticket'; record as BLOCKER finding and continue to publish results (do not halt execution)."
         - id: READ_RFC_CONTEXT
           if: "rfc_id is found"
           actions: ["Read decomposition and design decisions for RFC."]
@@ -167,8 +179,8 @@ decision_tree:
       severity_definitions:
         BLOCKER: "Unsound code, security vulnerability, data loss, scope missing."
         MAJOR: "Missing tests, API issues, criteria not met."
-        MINOR: "Non-idiomatic, missing docs."
-        NIT: "Style, optional improvements."
+        MINOR: "Out-of-scope for this review; DO NOT report."
+        NIT: "Out-of-scope for this review; DO NOT report."
       verdict_rules:
         PASS: "blocker_count == 0 AND major_count == 0"
         FAIL: "blocker_count > 0 OR major_count > 0"
@@ -176,18 +188,19 @@ decision_tree:
 
     - id: PHASE_6_PUBLISH_RESULTS
       purpose: "Post PR comment and update status checks."
-      steps[2]:
+      steps[3]:
         - id: WRITE_FINDINGS
           action: write_file
           path: "quality_findings.md"
-          content: "$FORMATTED_FINDINGS"
+          content: "Reviewed commit: $HEAD_SHA\n\n$FORMATTED_FINDINGS"
+        - id: POST_COMMENT
+          action: command
+          run: "gh pr comment $PR_URL --body-file quality_findings.md"
         - id: UPDATE_STATUS
           action: command
           run: |
             # If PASS, update status. If FAIL, the reviewer should post findings manually or via a future exec tool.
             # For now, we consolidate to avoid double-posting during automated runs.
             gh api --method POST "/repos/{owner}/{repo}/statuses/$HEAD_SHA" -f state="$VERDICT_STATE" -f context="ai-review/code-quality" -f description="Code quality review $VERDICT_STATE"
-            if [ "$VERDICT_STATE" == "failure" ]; then
-              gh pr comment $PR_URL --body-file quality_findings.md
-            fi
             rm quality_findings.md
+

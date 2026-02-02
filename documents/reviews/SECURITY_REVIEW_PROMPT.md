@@ -14,6 +14,18 @@ variables:
   PR_URL: "$PR_URL"
   HEAD_SHA: "$HEAD_SHA"
 
+reviewer_rules[5]:
+  - id: SECURITY_POLICY_PRIMARY
+    rule: "Apply SECURITY.md and documents/security/* as primary, mandatory policy inputs."
+  - id: CODING_PATTERNS_REQUIRED
+    rule: "Enforce project security coding patterns (RS-41 safe patterns and related guidance); missing or violated patterns are findings."
+  - id: IGNORE_INFRA_NITS
+    rule: "Do NOT report CI failures, formatting, clippy/lints, or other minor infractions; treat style-only or lint-only issues as out-of-scope."
+  - id: SHA_IN_COMMENT
+    rule: "Every PRComment MUST include a line: 'Reviewed commit: $HEAD_SHA'."
+  - id: ALWAYS_COMMENT
+    rule: "A PR comment is ALWAYS required, regardless of PASS/FAIL."
+
 references[40]:
   - path: "@documents/skills/modes-of-reasoning/artifacts/79-adversarial-red-team.json"
     purpose: "Mode #79: Adversarial / Red-Team Reasoning"
@@ -116,8 +128,7 @@ decision_tree:
         - id: STOP_IF_NO_BINDING
           if: "ticket_id is empty AND rfc_id is empty"
           then:
-            action: "EMIT StopCondition STOP-NO-BINDING severity BLOCK message 'Security review requires binding ticket/RFC'."
-            stop: true
+            action: "EMIT StopCondition STOP-NO-BINDING severity BLOCK message 'Security review requires binding ticket/RFC'; record as BLOCKER finding and continue to publish results (do not halt execution)."
       next: PHASE_2_SCP_DETERMINATION
 
     - id: PHASE_2_SCP_DETERMINATION
@@ -223,13 +234,18 @@ decision_tree:
         - id: WRITE_FINDINGS
           action: write_file
           path: "security_findings.md"
-          content: "$FINDINGS_ASSURANCE_CASE"
+          content: "Reviewed commit: $HEAD_SHA\n\n$FINDINGS_ASSURANCE_CASE"
         - id: UPDATE_STATUS
           action: command
           run: |
+            gh pr comment $PR_URL --body-file security_findings.md
+            if [ -z "$ticket_id" ]; then
+              # No binding available; leave comment only.
+              rm security_findings.md
+              exit 0
+            fi
             if [ "$verdict" == "PASS" ]; then
               # For approvals, post the detailed findings first, then the official approval banner.
-              gh pr comment $PR_URL --body-file security_findings.md
               cargo xtask security-review-exec approve $ticket_id
             else
               # For denials, the xtask tool incorporates the reason directly into the status banner.
