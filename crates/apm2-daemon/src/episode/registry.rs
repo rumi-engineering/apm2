@@ -818,6 +818,221 @@ fn current_timestamp_ns() -> u64 {
         .unwrap_or(0)
 }
 
+// =============================================================================
+// Persistent Session Registry (TCK-00266)
+// =============================================================================
+
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Serializable state file format for persistent session registry.
+///
+/// Per TCK-00266 and DD-005, the state file is JSON for human readability
+/// and debugging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistentStateFile {
+    /// Version of the state file format for future compatibility.
+    version: u32,
+    /// Active sessions persisted to disk.
+    sessions: Vec<SessionState>,
+}
+
+impl Default for PersistentStateFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            sessions: Vec::new(),
+        }
+    }
+}
+
+/// Error type for persistent session registry operations.
+#[derive(Debug, thiserror::Error)]
+pub enum PersistentRegistryError {
+    /// I/O error during state file operations.
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
+    /// JSON serialization/deserialization error.
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// Session registry error.
+    #[error("Session registry error: {0}")]
+    Registry(#[from] SessionRegistryError),
+
+    /// State file version mismatch.
+    #[error("State file version {found} is not supported (expected {expected})")]
+    VersionMismatch {
+        /// The version found in the file.
+        found: u32,
+        /// The expected version.
+        expected: u32,
+    },
+}
+
+/// Persistent session registry for crash recovery.
+///
+/// Per TCK-00266 and DD-005, this registry wraps [`InMemorySessionRegistry`]
+/// and persists session state to a JSON file using atomic writes
+/// (write-to-temp + rename).
+///
+/// # Atomic Writes
+///
+/// To prevent corruption from crashes during writes, this registry:
+/// 1. Serializes state to JSON
+/// 2. Writes to a temporary file (same directory, `.tmp` suffix)
+/// 3. Calls `fsync()` on the temp file
+/// 4. Atomically renames temp file to the state file path
+///
+/// # Recovery
+///
+/// On startup, call [`load_from_file`](Self::load_from_file) to restore
+/// session state from the state file.
+///
+/// # Thread Safety
+///
+/// Uses the same `RwLock` strategy as [`InMemorySessionRegistry`].
+#[derive(Debug)]
+pub struct PersistentSessionRegistry {
+    /// In-memory registry for fast lookups.
+    inner: InMemorySessionRegistry,
+    /// Path to the state file.
+    state_file_path: PathBuf,
+}
+
+impl PersistentSessionRegistry {
+    /// Creates a new persistent registry with the given state file path.
+    ///
+    /// This does NOT load existing state. Call
+    /// [`load_from_file`](Self::load_from_file) to restore state after
+    /// creation.
+    #[must_use]
+    pub fn new(state_file_path: impl AsRef<Path>) -> Self {
+        Self {
+            inner: InMemorySessionRegistry::new(),
+            state_file_path: state_file_path.as_ref().to_path_buf(),
+        }
+    }
+
+    /// Creates a new persistent registry and loads existing state from the
+    /// file.
+    ///
+    /// If the state file does not exist, returns an empty registry.
+    /// If the state file exists but cannot be parsed, returns an error.
+    pub fn load_from_file(
+        state_file_path: impl AsRef<Path>,
+    ) -> Result<Self, PersistentRegistryError> {
+        let path = state_file_path.as_ref();
+        let registry = Self::new(path);
+
+        if path.exists() {
+            let contents = fs::read_to_string(path)?;
+            let state_file: PersistentStateFile = serde_json::from_str(&contents)?;
+
+            // Version check for future compatibility
+            if state_file.version != 1 {
+                return Err(PersistentRegistryError::VersionMismatch {
+                    found: state_file.version,
+                    expected: 1,
+                });
+            }
+
+            // Load sessions into in-memory registry
+            for session in state_file.sessions {
+                // Ignore duplicate errors during recovery (shouldn't happen with valid file)
+                let _ = registry.inner.register_session(session);
+            }
+        }
+
+        Ok(registry)
+    }
+
+    /// Returns the path to the state file.
+    #[must_use]
+    pub fn state_file_path(&self) -> &Path {
+        &self.state_file_path
+    }
+
+    /// Persists the current state to the state file atomically.
+    ///
+    /// Uses write-to-temp + rename pattern to prevent corruption.
+    fn persist(&self) -> Result<(), PersistentRegistryError> {
+        let state = self.inner.state.read().expect("lock poisoned");
+
+        let state_file = PersistentStateFile {
+            version: 1,
+            sessions: state.by_id.values().cloned().collect(),
+        };
+
+        // Serialize to JSON with pretty printing for human readability
+        let json = serde_json::to_string_pretty(&state_file)?;
+
+        // Write to temp file in same directory (for atomic rename)
+        let temp_path = self.state_file_path.with_extension("tmp");
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.state_file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Write to temp file
+        {
+            let mut file = fs::File::create(&temp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?; // fsync to ensure durability
+        }
+
+        // Atomic rename
+        fs::rename(&temp_path, &self.state_file_path)?;
+
+        Ok(())
+    }
+
+    /// Returns the number of active sessions.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        let state = self.inner.state.read().expect("lock poisoned");
+        state.by_id.len()
+    }
+
+    /// Returns all active sessions.
+    ///
+    /// Useful for recovery flows that need to emit `LEASE_REVOKED` to all
+    /// sessions.
+    #[must_use]
+    pub fn all_sessions(&self) -> Vec<SessionState> {
+        let state = self.inner.state.read().expect("lock poisoned");
+        state.by_id.values().cloned().collect()
+    }
+}
+
+impl SessionRegistry for PersistentSessionRegistry {
+    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError> {
+        // Register in memory first
+        self.inner.register_session(session)?;
+
+        // Persist to disk (convert error to RegistrationFailed)
+        self.persist()
+            .map_err(|e| SessionRegistryError::RegistrationFailed {
+                message: format!("Failed to persist state: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    fn get_session(&self, session_id: &str) -> Option<SessionState> {
+        self.inner.get_session(session_id)
+    }
+
+    fn get_session_by_handle(&self, handle: &str) -> Option<SessionState> {
+        self.inner.get_session_by_handle(handle)
+    }
+}
+
 #[cfg(test)]
 mod session_registry_tests {
     use super::*;
