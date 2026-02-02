@@ -1,52 +1,56 @@
-title: Ticket Queue — Main Loop
+title: Ticket Queue — Loop
 
 decision_tree:
   entrypoint: SNAPSHOT_AND_CLASSIFY
   nodes[1]:
     - id: SNAPSHOT_AND_CLASSIFY
-      purpose: "Compute ticket state (completed/in-progress/incomplete), pick exactly one ticket to process next, and dispatch work."
+      purpose: "Compute state via High-Water Mark. Dispatch work."
       steps[8]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "References do not interpolate variables; replace <START_TARGET_OPTIONAL> with $1 (or empty). Replace <TICKET_ID>/<WORKTREE_PATH>/<BRANCH_NAME> when routed."
-        - id: VERIFY_CWD_IS_MAIN_REPO
-          action: |
-            Periodically check your current directory. If you are inside a worktree (e.g., `documents/work/worktrees/`), you MUST `cd` back to the main repository root before listing tickets or running `gh` commands.
-            Command: `pwd && [ -f Cargo.toml ] || cd ../../../..` (adjust depth as needed to reach root).
-        - id: LIST_ALL_TICKETS
+          action: "Replace $1 with <TARGET_RFC>."
+        - id: FIND_HIGH_WATER_MARK
           action: command
-          run: "ls documents/work/tickets/TCK-*.yaml | rg -o \"TCK-[0-9]{5}\" | sort -u"
-          capture_as: all_ticket_ids
-        - id: LIST_COMPLETED
+          run: "gh pr list --state merged --limit 20 --json headRefName --jq '.[].headRefName' | rg -o \"TCK-[0-9]{5}\" | sort -r | head -n 1"
+          capture_as: latest_merged_tck
+        - id: LIST_OPEN_PRS
           action: command
-          run: "timeout 30s gh pr list --state merged --limit 500 --json headRefName | rg -o \"TCK-[0-9]{5}\" | sort -u"
-          capture_as: completed_ticket_ids
-        - id: LIST_IN_PROGRESS
-          action: command
-          run: "bash -lc 'set -euo pipefail; completed=$(timeout 30s gh pr list --state merged --limit 500 --json headRefName | rg -o \"TCK-[0-9]{5}\" | sort -u || true); branches=$( (git branch --list \"*ticket/*TCK-*\"; git branch -r --list \"*ticket/*TCK-*\") | rg -o \"TCK-[0-9]{5}\" | sort -u || true); comm -23 <(printf \"%s\\n\" \"$branches\") <(printf \"%s\\n\" \"$completed\")'"
+          run: "gh pr list --state open --limit 50 --json headRefName --jq '.[].headRefName' | rg -o \"TCK-[0-9]{5}\" | sort -u"
           capture_as: in_progress_ticket_ids
-        - id: COMPUTE_INCOMPLETE
+        - id: IDENTIFY_IN_PROGRESS
+          action: "If in_progress_ticket_ids non-empty, pick lowest ID."
+        - id: DISCOVER_NEXT_FOR_RFC
           action: command
-          run: "bash -lc 'set -euo pipefail; all=$(ls documents/work/tickets/TCK-*.yaml | rg -o \"TCK-[0-9]{5}\" | sort -u); completed=$(timeout 30s gh pr list --state merged --limit 500 --json headRefName | rg -o \"TCK-[0-9]{5}\" | sort -u || true); comm -23 <(printf \"%s\\n\" \"$all\") <(printf \"%s\\n\" \"$completed\")'"
-          capture_as: incomplete_ticket_ids
-        - id: ASSERT_SEQUENTIAL
-          action: "If in_progress_ticket_ids has >1 ticket, you MUST still process tickets one-by-one: pick the lowest ID first and ignore the rest until it is merged."
-        - id: ROUTE_NEXT
-          action: "Route to the correct next step based on the snapshot."
+          run: |
+            all_tcks=$(rg -l 'rfc_id: "<TARGET_RFC>"' documents/work/tickets/ | rg -o "TCK-[0-9]{5}" | sort)
+            merged_tcks=$(gh pr list --state merged --limit 100 --json headRefName --jq '.[].headRefName' | rg -o "TCK-[0-9]{5}" | sort -u)
+            unmerged=$(echo "$all_tcks" | grep -vFf <(echo "$merged_tcks"))
+            for tck in $unmerged; do
+              deps=$(rg "tickets:" -A 10 "documents/work/tickets/$tck.yaml" | grep -o "TCK-[0-9]\{5\}")
+              blocked=0
+              for d in $deps; do
+                if ! echo "$merged_tcks" | grep -q "$d"; then blocked=1; break; fi
+              done
+              if [ $blocked -eq 0 ]; then echo "$tck"; exit 0; fi
+            done
+          capture_as: next_tck_for_rfc
+        - id: VERIFY_UNBLOCKED
+          action: "Check `dependencies.tickets` in `documents/work/tickets/<next_tck_for_rfc>.yaml`."
+        - id: ROUTE
+          action: "Route to next step."
       decisions[4]:
-        - id: ALL_DONE
-          if: "incomplete_ticket_ids is empty"
-          then:
-            next_reference: references/stop-all-tickets-merged.md
-        - id: HAS_IN_PROGRESS
-          if: "in_progress_ticket_ids is non-empty"
+        - id: MONITOR
+          if: "in_progress_ticket_ids non-empty"
           then:
             next_reference: references/process-in-progress-ticket.md
-        - id: NO_IN_PROGRESS_BUT_INCOMPLETE
-          if: "in_progress_ticket_ids is empty AND incomplete_ticket_ids is non-empty"
+        - id: START
+          if: "in_progress_ticket_ids empty AND next_tck_for_rfc non-empty"
           then:
             next_reference: references/start-and-process-next-ticket.md
-        - id: FALLBACK_STOP
-          if: "unable to classify state"
+        - id: STOP
+          if: "in_progress_ticket_ids empty AND next_tck_for_rfc empty"
+          then:
+            next_reference: references/stop-all-tickets-merged.md
+        - id: UNKNOWN
+          if: "otherwise"
           then:
             next_reference: references/stop-blocked-unknown-state.md
-

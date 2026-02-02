@@ -4,15 +4,16 @@ decision_tree:
   entrypoint: STOP
   nodes[1]:
     - id: STOP
-      purpose: "Stop when AI reviews fail to complete within the 15-minute SLA after repeated remediation."
+      purpose: "Stop on 15m review SLA failure."
       steps[5]:
         - id: OUTPUT_BLOCKER
-          action: "Output a BlockerReport: AI reviews did not complete within 15 minutes and remediation attempts failed."
+          action: "Output BlockerReport: Reviews stalled."
         - id: INCLUDE_EVIDENCE
-          action: "Include: PR URL, HEAD SHA, reviewer_state.json summary, reviewer PIDs, last 80 lines of each reviewer log, and the timestamps showing the SLA breach."
+          action: "Include: PR URL, SHA, reviewer_state summary, PIDs, log snippets."
         - id: SUGGEST_FALLBACK
-          action: "Suggest manual recovery: rerun reviews synchronously (`cargo xtask review security <PR_URL>`, `cargo xtask review quality <PR_URL>`) or run an alternative review runner, then update status checks."
+          action: "Rerun reviews: `cargo xtask review <TYPE> <PR_URL>`."
         - id: NOTE_SEQUENTIAL_BLOCK
-          action: "Note: sequential merge policy means the queue cannot proceed until this PR merges."
+          action: "Sequential policy prevents progress."
         - id: STOP
-          action: "Stop the workflow."
+          action: "Stop workflow."
+      decisions[0]: []

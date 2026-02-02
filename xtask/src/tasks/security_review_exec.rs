@@ -20,9 +20,9 @@ use crate::util::{current_branch, validate_ticket_branch};
 /// Required reading paths for security reviewers.
 pub const REQUIRED_READING: &[&str] = &[
     "documents/security/SECURITY_POLICY.md",
-    "documents/security/CI_SECURITY_GATES.md",
     "documents/security/THREAT_MODEL.md",
     "documents/security/SECRETS_MANAGEMENT.md",
+    "documents/security/NETWORK_DEFENSE.cac.json",
     "documents/skills/rust-standards/SKILL.md",
     "documents/skills/glossary/SKILL.md",
     "documents/skills/laws-of-holonic-agent-systems/SKILL.md",

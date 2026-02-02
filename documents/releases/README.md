@@ -24,7 +24,6 @@ APM2 uses a three-channel release pipeline with artifact promotion. Binaries are
 
 - [Signing & Verification](../security/SIGNING_AND_VERIFICATION.md) - Sigstore keyless signing details
 - [Release Procedure](../security/RELEASE_PROCEDURE.md) - Complete stable release checklist
-- [CI Security Gates](../security/CI_SECURITY_GATES.md) - Security checks on all PRs
 
 ## Release Artifacts
 

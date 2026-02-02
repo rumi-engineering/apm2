@@ -1,80 +1,62 @@
-acceptance_criteria:
-  - criterion: Context firewall validates Write operations against write_allowlist when configured
-    verification: Unit test test_context_firewall_terminates_on_denied_write passes
-  - criterion: Context firewall validates Execute operations against shell_allowlist when configured
-    verification: Unit test test_context_firewall_terminates_on_denied_execute passes
-  - criterion: Context firewall returns Terminate for Read operations with path None
-    verification: Unit test test_context_firewall_terminates_on_read_without_path passes
-  - criterion: ToolDecision refinement_event field has clean documentation
-    verification: Code review confirms comments are professional and explain the field's purpose
-  - criterion: All new unit tests pass
-    verification: cargo test passes for all new tests
-  - criterion: No clippy warnings
-    verification: cargo clippy passes without warnings
-
-implementation:
-  summary: |
-    Follow-up security and code quality fixes for PR #335 (TCK-00261 context firewall).
-    The original PR was merged prematurely before addressing security review findings.
-    This ticket addresses all unresolved HIGH, MEDIUM, and LOW security findings,
-    plus MAJOR code quality issues including missing unit tests and messy comments.
-  files_to_modify:
-    - path: crates/apm2-daemon/src/episode/broker.rs
-      changes: |
-        - Add context firewall checks for ToolClass::Write against write_allowlist
-        - Add context firewall checks for ToolClass::Execute against shell_allowlist
-        - Return ToolDecision::Terminate when Read has path: None with active firewall
-        - Add comment explaining DefaultContextFirewall instantiation decision
-        - Add documentation comment explaining episode_id usage as session_id
-        - Add comprehensive unit tests for firewall integration
-    - path: crates/apm2-daemon/src/episode/decision.rs
-      changes: |
-        - Replace messy internal deliberation comments on refinement_event field
-          with clean documentation explaining the field's purpose
-
-notes: |
-  Ad-hoc ticket created via one-off workflow.
-
-  This is a follow-up to PR #335 (TCK-00261) which was merged prematurely
-  before security and code quality review findings were addressed.
-
-  Security findings addressed:
-  - [HIGH] Fail-open context firewall for non-Read operations
-  - [MEDIUM] Fail-open if path is None for Read operations
-  - [LOW] ID discrepancy in SessionTerminationInfo (documented as intentional)
-
-  Code quality findings addressed:
-  - [MAJOR] Missing unit tests for broker firewall integration
-  - [MAJOR] Messy internal comments in ToolDecision
-  - [MINOR] Redundant DefaultContextFirewall instantiation (documented as acceptable)
-
-schema_version: "2026-01-26"
-template_version: "2026-01-26"
-
-test_requirements:
-  - test_id: UT-00286-01
-    description: Test context firewall terminates on denied read
-    verification_command: cargo test -p apm2-daemon test_context_firewall_terminates_on_denied_read
-  - test_id: UT-00286-02
-    description: Test context firewall allows permitted read
-    verification_command: cargo test -p apm2-daemon test_context_firewall_allows_permitted_read
-  - test_id: UT-00286-03
-    description: Test context firewall terminates on read without path
-    verification_command: cargo test -p apm2-daemon test_context_firewall_terminates_on_read_without_path
-  - test_id: UT-00286-04
-    description: Test context firewall terminates on denied write
-    verification_command: cargo test -p apm2-daemon test_context_firewall_terminates_on_denied_write
-  - test_id: UT-00286-05
-    description: Test context firewall terminates on denied execute
-    verification_command: cargo test -p apm2-daemon test_context_firewall_terminates_on_denied_execute
-  - test_id: UT-00286-06
-    description: Test initialize with context manifest
-    verification_command: cargo test -p apm2-daemon test_initialize_with_context_manifest
-
-ticket:
-  depends_on: []
-  id: TCK-00286
-  requirement_ids: []
-  rfc_id: RFC-0018
-  status: READY
-  title: "Fix context firewall security findings from PR #335"
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00286"
+    title: "Fix context firewall security findings from PR #335"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0010"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0010.yaml#rfc_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0010"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0010.yaml#rfc_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_RUNTIME"
+      - "DOMAIN_SECURITY"
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Add context firewall checks for write_allowlist and shell_allowlist."
+      - "Fail-closed when Read has no path and firewall is active."
+      - "Clean up ToolDecision refinement_event documentation."
+      - "Add unit tests for context firewall integration."
+    out_of_scope:
+      - "New capability manifest fields beyond existing allowlists."
+      - "Changing policy engine behavior outside context firewall checks."
+  plan:
+    steps:
+      - "Add firewall checks for ToolClass::Write and ToolClass::Execute."
+      - "Return ToolDecision::Terminate when Read path is None with firewall enabled."
+      - "Document DefaultContextFirewall instantiation rationale and session_id usage."
+      - "Replace informal refinement_event comments with clean documentation."
+      - "Add and run firewall integration unit tests."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0010"
+    criteria:
+      - "Context firewall validates Write operations against write_allowlist when configured."
+      - "Context firewall validates Execute operations against shell_allowlist when configured."
+      - "Context firewall terminates Read operations with missing path when firewall is active."
+      - "ToolDecision refinement_event field has clean documentation."
+      - "New unit tests pass and clippy has no warnings."
+  notes:
+    security: |
+      Fixes fail-open behavior in the context firewall for Write/Execute and
+      Read-without-path cases. The firewall must remain default-deny.
+    verification: |
+      UT-00286-01: cargo test -p apm2-daemon test_context_firewall_terminates_on_denied_read
+      UT-00286-02: cargo test -p apm2-daemon test_context_firewall_allows_permitted_read
+      UT-00286-03: cargo test -p apm2-daemon test_context_firewall_terminates_on_read_without_path
+      UT-00286-04: cargo test -p apm2-daemon test_context_firewall_terminates_on_denied_write
+      UT-00286-05: cargo test -p apm2-daemon test_context_firewall_terminates_on_denied_execute
+      UT-00286-06: cargo test -p apm2-daemon test_initialize_with_context_manifest
+    general: |
+      Follow-up to PR #335 (TCK-00261) to resolve security review findings and
+      code-quality gaps in context firewall enforcement.

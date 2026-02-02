@@ -6,7 +6,9 @@
 - `documents/rfcs/RFC-0018/03_trust_boundaries.yaml` — clarified daemon-side CAS allowlist enforcement and marked NEW WORK REQUIRED (TCK-00314).
 - `documents/rfcs/RFC-0018/04_contracts_and_versioning.yaml` — made changeset_digest non-circular (omit field from hash input), expanded artifact rules, and set ChangeSetBundle file_manifest limits.
 - `documents/rfcs/RFC-0018/05_rollout_and_ops.yaml` — kept RFC-0017 prerequisites explicit in rollout guardrails.
-- `documents/rfcs/RFC-0018/06_ticket_decomposition.yaml` — added TCK-00315 (ListFiles/Search tool surface) and corrected TCK-00314 layering; added bounds for navigation outputs.
+- `documents/rfcs/RFC-0018/06_ticket_decomposition.yaml` — added TCK-00315 (ListFiles/Search tool surface) and corrected TCK-00314 layering; added bounds for navigation outputs; updated dependencies to include prerequisite tickets (TCK-00286..TCK-00293) and xtask staging.
+- `documents/work/tickets/TCK-00286.yaml` through `documents/work/tickets/TCK-00297.yaml` — normalized prerequisite tranche to ticket_meta schema, inserted context firewall fix (TCK-00286), and staged xtask authority reduction (X0-X3).
+- `documents/rfcs/RFC-0018/PRE_RFC18_BLOCKERS.md` and `documents/rfcs/RFC-0018/CLI_USABILITY_PLAN.md` — updated prerequisite ordering summary to incorporate TCK-00286 and dependency-driven layering.
 - `documents/rfcs/RFC-0018/07_test_and_evidence.yaml` — clarified local projection sink semantics; added ChangeSetBundle determinism unit test.
 - `documents/rfcs/RFC-0018/08_risks_and_open_questions.yaml` — added tool-surface risk, digest option note, and large-bundle risk.
 - `documents/rfcs/RFC-0018/09_governance_and_gates.yaml` — aligned GATE-HEF-FAC-V0 evidence categories with security evidence IDs.

@@ -1,20 +1,20 @@
-title: No Unblocked Ticket After Start Attempt
+title: No Unblocked Tickets
 
 decision_tree:
   entrypoint: CLASSIFY
   nodes[1]:
     - id: CLASSIFY
-      purpose: "Handle the case where `cargo xtask start-ticket` did not start a new ticket."
+      purpose: "Handle start failure."
       steps[1]:
         - id: NOTE
-          action: "Inspect the `cargo xtask start-ticket` output and classify whether: (a) all tickets are complete/in-progress, or (b) you are blocked by dependencies (no unblocked tickets)."
+          action: "Classify: (a) tickets complete/in-progress, (b) dependency block."
       decisions[3]:
-        - id: BACK_TO_LOOP_IN_PROGRESS
-          if: "start-ticket output indicates 'All tickets are complete or in progress' (or equivalent)"
+        - id: LOOP
+          if: "Tickets complete/in-progress"
           then:
             next_reference: references/ticket-queue-loop.md
-        - id: BLOCKED_BY_DEPENDENCIES
-          if: "start-ticket output indicates 'No unblocked tickets found' (or equivalent dependency block)"
+        - id: BLOCKED
+          if: "Dependency block"
           then:
             next_reference: references/stop-blocked-no-unblocked.md
         - id: UNKNOWN

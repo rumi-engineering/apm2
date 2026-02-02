@@ -1,57 +1,46 @@
-title: Implementer Subagent Supervision (Cadence + Tool-Call Congruency)
+title: Implementer Supervision
 
 decision_tree:
   entrypoint: SUPERVISE
   nodes[1]:
     - id: SUPERVISE
-      purpose: "Keep the implementer subagent moving, detect stalls early, and ensure tool calls are congruent with resolving blockers (CI failures, review feedback, security/quality issues)."
-      steps[10]:
+      purpose: "Supervise implementer. Ensure `/ticket` call. Monitor feedback."
+      steps[11]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "Replace <IMPLEMENTER_PID> and <IMPLEMENTER_LOG_FILE>. Replace <WORKTREE_PATH> and <TICKET_ID> if you include status context in a restart prompt."
-        - id: CHECK_EVERY_3_MINUTES
-          action: "At least every 3 minutes: check log mtime and tail the most recent tool-ish lines."
-        - id: CHECK_LOG_ACTIVITY
+          action: "Replace <IMPLEMENTER_PID>, <IMPLEMENTER_LOG_FILE>."
+        - id: CHECK_CADENCE
+          action: "Every 60s: check log mtime, tail lines, check PR comments."
+        - id: VERIFY_SKILL
+          action: "Ensure log shows `/ticket` initialization."
+        - id: CHECK_LOG
           action: command
-          run: "bash -lc 'set -euo pipefail; stat -c \"%y %n\" <IMPLEMENTER_LOG_FILE>; tail -n 120 <IMPLEMENTER_LOG_FILE> | rg -n \"tool|Tool|Bash\\(|Read\\(|Edit\\(|Write\\(|exec|command\" || true'"
+          run: "bash -lc 'set -euo pipefail; if [ -f \"<IMPLEMENTER_LOG_FILE>\" ]; then stat -c \"%y %n\" <IMPLEMENTER_LOG_FILE>; tail -n 120 <IMPLEMENTER_LOG_FILE> | rg -n \"tool|Tool|Bash\\(|Read\\(|Edit\\(|Write\\(|exec|command|skill|ticket\" || true; else echo \"Log file not yet created\"; fi'"
           capture_as: implementer_recent_activity
-        - id: CHECK_PROCESS_ALIVE
+        - id: CHECK_FEEDBACK
           action: command
-          run: "ps -p <IMPLEMENTER_PID> -o pid=,etime=,cmd= || true"
-          capture_as: implementer_ps
-        - id: CONGRUENCY_EXPECTATIONS
+          run: "gh pr view --json comments"
+          capture_as: pr_comments
+        - id: CONGRUENCY
           action: |
-            Use the current blocker state to judge tool-call congruency:
-            - If CI failed: expect `cargo fmt/clippy/test`, reading error logs, and targeted code edits.
-            - If reviews failed: expect reading PR comments/diff, applying requested changes, re-running checks.
-            - If reviews pending: expect `cargo xtask check` polling and reviewer log inspection (not random refactors).
-            - If no PR: expect `cargo xtask push` (not more local-only edits).
-        - id: STUCK_DEFINITION
+            Expect:
+            - PR comments -> read PR, apply changes.
+            - CI fail -> fix (test/clippy/fmt).
+            - No skill -> setup phase.
+        - id: STUCK_DEF
           action: |
-            Define STUCK as:
-            (a) no log mtime change for >=5 minutes
-            (b) repeated tool errors / API 4xx/5xx loops
-            (c) repeated identical actions without new evidence
-            (d) MAX_RUNTIME_EXCEEDED: agent has worked continuously for >=15 minutes.
-        - id: MAX_RUNTIME_EXCEEDED_RESPONSE
-          action: |
-            If MAX_RUNTIME_EXCEEDED (15 minutes):
-            Context rot leads to subagents introducing problems rather than fixes. You MUST:
-            1) Terminate the old subagent (TERM then KILL).
-            2) Start a NEW subagent with a WARM HANDOFF.
-            3) Even if the git status is DIRTY, provide the new subagent with the `ticket` skill instructions and the specific <TICKET_ID>/<WORKTREE_PATH>.
-            4) The handoff prompt must include the latest `cargo xtask check` output and the explicit next goal.
-        - id: STUCK_RESPONSE
-          action: |
-            If STUCK (a, b, or c):
-            1) Verify PID is really the subagent (ps cmdline contains `claude` or `codex`).
-            2) Terminate it (TERM then KILL) and restart with a fresh, shorter prompt that includes:
-               - the current `cargo xtask check` output snippet
-               - the exact remediation command(s)
-               - the ticket ID and worktree path
-        - id: CONTEXT_EXHAUSTION_RESPONSE
-          action: "If the subagent appears confused or out of context, restart it and include only the minimal necessary context plus concrete next commands."
-        - id: DO_NOT_SELF_FIX
-          action: "Even if you see the fix, do NOT edit code yourself. Always redirect the implementer with exact next commands and acceptance criteria."
+            STUCK if:
+            (a) no log update >=5m
+            (b) repeated errors/API loops
+            (c) no skill call within 10m (startup allowance)
+            (d) runtime >=15m.
+        - id: WARM_HANDOFF_DEF
+          action: "WARM HANDOFF: When restarting, provide the new implementer with the last 100 lines of the previous log and a summary of the current PR state."
+        - id: MAX_RUNTIME_RESP
+          action: "If >=15m: Terminate. Start NEW implementer with WARM HANDOFF to prevent context rot."
+        - id: STUCK_RESP
+          action: "If STUCK: Terminate. Restart with error snippet, ticket ID."
+        - id: NO_SELF_FIX
+          action: "DO NOT edit code or manage branches. Redirect implementer."
         - id: RETURN
           action: "Return to references/dispatch-and-monitor-ticket.md."
       decisions[1]:
@@ -59,4 +48,3 @@ decision_tree:
           if: "always"
           then:
             next_reference: references/dispatch-and-monitor-ticket.md
-

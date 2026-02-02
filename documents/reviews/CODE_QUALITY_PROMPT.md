@@ -176,14 +176,18 @@ decision_tree:
 
     - id: PHASE_6_PUBLISH_RESULTS
       purpose: "Post PR comment and update status checks."
-      steps[3]:
+      steps[2]:
         - id: WRITE_FINDINGS
           action: write_file
           path: "quality_findings.md"
           content: "$FORMATTED_FINDINGS"
-        - id: POST_COMMENT
-          action: command
-          run: "gh pr comment $PR_URL --body-file quality_findings.md && rm quality_findings.md"
         - id: UPDATE_STATUS
           action: command
-          run: "gh api --method POST \"/repos/{owner}/{repo}/statuses/$HEAD_SHA\" -f state=\"$VERDICT_STATE\" -f context=\"ai-review/code-quality\""
+          run: |
+            # If PASS, update status. If FAIL, the reviewer should post findings manually or via a future exec tool.
+            # For now, we consolidate to avoid double-posting during automated runs.
+            gh api --method POST "/repos/{owner}/{repo}/statuses/$HEAD_SHA" -f state="$VERDICT_STATE" -f context="ai-review/code-quality" -f description="Code quality review $VERDICT_STATE"
+            if [ "$VERDICT_STATE" == "failure" ]; then
+              gh pr comment $PR_URL --body-file quality_findings.md
+            fi
+            rm quality_findings.md

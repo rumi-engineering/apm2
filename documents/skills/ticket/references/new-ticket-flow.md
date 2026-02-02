@@ -67,8 +67,4 @@ decision_tree:
           run: "cargo xtask push"
         - id: FINISH
           action: "Task complete. The ticket-queue will monitor for review feedback."
-      decisions[1]:
-        - id: MERGED
-          if: "status indicates merged"
-          then:
-            next_reference: references/post-merge-cleanup.md
+      decisions: []

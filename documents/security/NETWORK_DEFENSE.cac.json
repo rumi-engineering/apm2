@@ -1,0 +1,119 @@
+{
+  "schema": "cac.net.threats.v1",
+  "kind": "security.threat_matrix",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/sec/net/threats@1",
+    "status": "ACTIVE",
+    "ref": "THREAT_MODEL.md"
+  },
+  "payload": {
+    "domain": "holonic_network_threats",
+    "threats": [
+      {
+        "id": "THR-TOP-01",
+        "category": "Topology",
+        "name": "Sybil Attack",
+        "vector": "Identity Flooding",
+        "desc": "Adversary generates mass pseudonymous identities to flood peer sets, manipulate consensus, or poison routing."
+      },
+      {
+        "id": "THR-TOP-02",
+        "category": "Topology",
+        "name": "Eclipse Attack",
+        "vector": "Connection Slot Exhaustion",
+        "desc": "Adversary monopolizes victim's inbound/outbound slots to isolate them from the honest network (partition/censorship)."
+      },
+      {
+        "id": "THR-PRO-01",
+        "category": "Protocol",
+        "name": "Downgrade Attack",
+        "vector": "Handshake Manipulation",
+        "desc": "Attacker forces victim to use older, insecure protocol versions or weaker ciphers during negotiation."
+      },
+      {
+        "id": "THR-PRO-02",
+        "category": "Protocol",
+        "name": "Capability Spoofing",
+        "vector": "False Advertising",
+        "desc": "Node claims capabilities it does not possess to attract traffic or work it cannot/will not perform."
+      },
+      {
+        "id": "THR-ID-01",
+        "category": "Identity",
+        "name": "Identity Theft",
+        "vector": "Key Compromise",
+        "desc": "Exfiltration of private keys (disk/memory) allowing impersonation of a trusted node."
+      },
+      {
+        "id": "THR-ID-02",
+        "category": "Identity",
+        "name": "Replay Attack",
+        "vector": "Message Replay",
+        "desc": "Valid signed messages re-broadcast to duplicate effects or bypass nonces."
+      },
+      {
+        "id": "THR-AUTH-01",
+        "category": "Authorization",
+        "name": "Confused Deputy",
+        "vector": "Privilege Escalation",
+        "desc": "Low-trust child induces high-trust parent to perform sensitive actions on its behalf."
+      },
+      {
+        "id": "THR-AUTH-02",
+        "category": "Authorization",
+        "name": "Lease Drift",
+        "vector": "Time Manipulation",
+        "desc": "Clock skew exploited to extend authority windows or bypass expiry checks."
+      },
+      {
+        "id": "THR-INT-01",
+        "category": "Integrity",
+        "name": "History Forgery",
+        "vector": "Log Tampering",
+        "desc": "Modification of local logs or evidence to hide past actions or alter truth."
+      },
+      {
+        "id": "THR-INT-02",
+        "category": "Integrity",
+        "name": "Equivocation",
+        "vector": "Forking",
+        "desc": "Presenting conflicting versions of 'truth' (e.g., ledgers) to different peers."
+      },
+      {
+        "id": "THR-AVAIL-01",
+        "category": "Availability",
+        "name": "Computation DoS",
+        "vector": "Resource Exhaustion",
+        "desc": "Inducing expensive parsing, validation, or inference tasks to starve the node."
+      },
+      {
+        "id": "THR-AVAIL-02",
+        "category": "Availability",
+        "name": "Spawn Storm",
+        "vector": "Recursive Expansion",
+        "desc": "Malicious or buggy recursion causing unbounded creation of sub-holons/tasks."
+      },
+      {
+        "id": "THR-CONF-01",
+        "category": "Confidentiality",
+        "name": "Metadata Leakage",
+        "vector": "Traffic Analysis",
+        "desc": "Operational facts revealed by traffic patterns, timing, or volume even if payloads encrypted."
+      },
+      {
+        "id": "THR-CONF-02",
+        "category": "Confidentiality",
+        "name": "Model-Mediated Leakage",
+        "vector": "Prompt Injection / Logging",
+        "desc": "Secrets serialized into durable artifacts via tool outputs or prompt context."
+      },
+      {
+        "id": "THR-ADP-01",
+        "category": "Adaptive",
+        "name": "Metric Gaming",
+        "vector": "Goodhart's Law",
+        "desc": "Optimizing for specific gate metrics while undermining the underlying security goal."
+      }
+    ]
+  }
+}

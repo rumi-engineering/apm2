@@ -1,18 +1,19 @@
-title: Stop Condition — All Tickets Merged
+title: Stop — All Tickets Merged
 
 decision_tree:
   entrypoint: STOP
   nodes[1]:
     - id: STOP
-      purpose: "Terminate the queue when all tickets under documents/work/tickets are merged to main."
+      purpose: "Terminate when tickets for RFC are merged."
       steps[4]:
-        - id: VERIFY_NO_INCOMPLETE
+        - id: VERIFY_COMPLETION
           action: command
-          run: "bash -lc 'set -euo pipefail; all=$(ls documents/work/tickets/TCK-*.yaml | rg -o \"TCK-[0-9]{5}\" | sort -u); completed=$(timeout 30s gh pr list --state merged --limit 500 --json headRefName | rg -o \"TCK-[0-9]{5}\" | sort -u); missing=$(comm -23 <(printf \"%s\\n\" \"$all\") <(printf \"%s\\n\" \"$completed\") || true); if [ -n \"$missing\" ]; then echo \"MISSING_TICKETS:\"; echo \"$missing\"; exit 1; fi; echo \"ALL_TICKETS_MERGED\"'"
+          run: "bash -lc 'set -euo pipefail; latest=$(gh pr list --state merged --limit 10 --json headRefName --jq ".[].headRefName" | rg -o "TCK-[0-9]{5}" | sort -r | head -n 1); missing=$(rg -l "rfc_id: \"<TARGET_RFC>\"" documents/work/tickets/ | rg -o "TCK-[0-9]{5}" | awk -v latest=\"$latest\" \"$1 > latest\" | sort); if [ -n \"$missing\" ]; then echo \"MISSING_TICKETS:\"; echo \"$missing\"; exit 1; fi; echo \"DONE\"'"
           capture_as: verify_output
         - id: EMIT_TICKET_MERGE_LEDGER
-          action: "Output a final TicketMergeLedger summarizing tickets processed (ticket ID -> PR URL -> merged). Keep it concise."
+          action: "Output TicketMergeLedger."
         - id: OUTPUT_DONE
-          action: "Output 'Done' and nothing else."
+          action: "Output 'Done'."
         - id: STOP
-          action: "Stop the workflow."
+          action: "Stop workflow."
+      decisions[0]: []

@@ -14,7 +14,7 @@ variables:
   PR_URL: "$PR_URL"
   HEAD_SHA: "$HEAD_SHA"
 
-references[20]:
+references[40]:
   - path: "@documents/skills/modes-of-reasoning/artifacts/79-adversarial-red-team.json"
     purpose: "Mode #79: Adversarial / Red-Team Reasoning"
   - path: "@documents/skills/modes-of-reasoning/artifacts/08-counterexample-guided.json"
@@ -27,14 +27,54 @@ references[20]:
     purpose: "Mode #36: Assurance-Case Reasoning"
   - path: "@documents/security/SECURITY_POLICY.md"
     purpose: "Security Policy"
-  - path: "@documents/security/CI_SECURITY_GATES.md"
-    purpose: "CI Security Gates"
   - path: "@documents/security/THREAT_MODEL.md"
     purpose: "Threat Model"
   - path: "@documents/security/SECRETS_MANAGEMENT.md"
     purpose: "Secrets Management"
+  - path: "@documents/security/NETWORK_DEFENSE.cac.json"
+    purpose: "Network Threat Matrix"
   - path: "@documents/skills/rust-standards/SKILL.md"
     purpose: "Rust Standards"
+  - path: "@documents/skills/rust-standards/references/00_operating_mode.md"
+    purpose: "RS-00: Operating Mode"
+  - path: "@documents/skills/rust-standards/references/02_inputs_and_stop_conditions.md"
+    purpose: "RS-02: Inputs & Stop Conditions"
+  - path: "@documents/skills/rust-standards/references/06_triage_fast_scan.md"
+    purpose: "RS-06: Triage Fast Scan"
+  - path: "@documents/skills/rust-standards/references/08_invariant_mapping.md"
+    purpose: "RS-08: Invariant Mapping"
+  - path: "@documents/skills/rust-standards/references/12_rust_soundness_and_unsafe.md"
+    purpose: "RS-12: Soundness & Unsafe"
+  - path: "@documents/skills/rust-standards/references/14_allocator_arena_pool_review.md"
+    purpose: "RS-14: Allocators & Pools"
+  - path: "@documents/skills/rust-standards/references/16_error_handling_and_panic_policy.md"
+    purpose: "RS-16: Error & Panic Policy"
+  - path: "@documents/skills/rust-standards/references/19_unsafe_rust_obligations.md"
+    purpose: "RS-19: Unsafe Obligations"
+  - path: "@documents/skills/rust-standards/references/20_testing_evidence_and_ci.md"
+    purpose: "RS-20: Testing & CI"
+  - path: "@documents/skills/rust-standards/references/21_concurrency_atomics_memory_order.md"
+    purpose: "RS-21: Concurrency & Atomics"
+  - path: "@documents/skills/rust-standards/references/23_async_pin_cancellation.md"
+    purpose: "RS-23: Async & Cancellation"
+  - path: "@documents/skills/rust-standards/references/24_dependency_and_build_surface.md"
+    purpose: "RS-24: Dependencies & Build"
+  - path: "@documents/skills/rust-standards/references/26_severity_and_verdict.md"
+    purpose: "RS-26: Severity & Verdict"
+  - path: "@documents/skills/rust-standards/references/30_paths_filesystem_os.md"
+    purpose: "RS-30: Paths & Filesystem"
+  - path: "@documents/skills/rust-standards/references/31_io_protocol_boundaries.md"
+    purpose: "RS-31: I/O & Protocol Boundaries"
+  - path: "@documents/skills/rust-standards/references/34_security_adjacent_rust.md"
+    purpose: "RS-34: Security-Adjacent Rust"
+  - path: "@documents/skills/rust-standards/references/39_hazard_catalog_checklists.md"
+    purpose: "RS-39: Hazard Catalog"
+  - path: "@documents/skills/rust-standards/references/40_time_monotonicity_determinism.md"
+    purpose: "RS-40: Time & Monotonicity"
+  - path: "@documents/skills/rust-standards/references/41_apm2_safe_patterns_and_anti_patterns.md"
+    purpose: "RS-41: Safe Patterns"
+  - path: "@documents/skills/rust-standards/references/42_distributed_security_invariants.md"
+    purpose: "RS-42: Distributed Invariants"
   - path: "@documents/skills/glossary/SKILL.md"
     purpose: "Project Glossary"
   - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_03.md"
@@ -169,13 +209,8 @@ decision_tree:
 
     - id: PHASE_6_COMPUTE_VERDICT
       purpose: "Assign final verdict and severity using Assurance-Case reasoning."
-      severity_rubric:
-        CRITICAL: "authn/authz bypass, crypto weakness, RCE, secret exfiltration, fail-open in SCP."
-        HIGH: "DoS in SCP, corruption-stop failure, widened egress without policy."
-        MEDIUM: "Missing strict parsing (deny_unknown_fields), missing timeouts/limits."
-        LOW: "Non-SCP hygiene, refactors without boundary change."
       rules:
-        BLOCK: "any CRITICAL or HIGH findings."
+        BLOCK: "any finding that violates security invariants or lacks sufficient evidence of safety."
         RE-AUDIT: "MANDATORY if SCP == YES and changes were made."
       steps[1]:
         - id: CONSTRUCT_ASSURANCE_CASE
@@ -184,16 +219,20 @@ decision_tree:
 
     - id: PHASE_7_EXECUTE_ACTIONS
       purpose: "Post findings (Assurance-Case format) to PR and update status check."
-      steps[3]:
+      steps[2]:
         - id: WRITE_FINDINGS
           action: write_file
           path: "security_findings.md"
           content: "$FINDINGS_ASSURANCE_CASE"
-        - id: POST_COMMENT
-          action: command
-          run: "gh pr comment $PR_URL --body-file security_findings.md"
         - id: UPDATE_STATUS
           action: command
           run: |
-            IF verdict == PASS: "cargo xtask security-review-exec approve $PR_URL && rm security_findings.md"
-            ELSE: "cat security_findings.md | cargo xtask security-review-exec deny $PR_URL --reason - && rm security_findings.md"
+            if [ "$verdict" == "PASS" ]; then
+              # For approvals, post the detailed findings first, then the official approval banner.
+              gh pr comment $PR_URL --body-file security_findings.md
+              cargo xtask security-review-exec approve $ticket_id
+            else
+              # For denials, the xtask tool incorporates the reason directly into the status banner.
+              cat security_findings.md | cargo xtask security-review-exec deny $ticket_id --reason -
+            fi
+            rm security_findings.md
