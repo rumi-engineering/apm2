@@ -2,11 +2,15 @@
 //!
 //! This is the main daemon binary that manages AI CLI processes.
 //!
-//! # Dual-Socket Topology (TCK-00249)
+//! # `ProtocolServer`-Only Control Plane (TCK-00279)
 //!
-//! The daemon uses a dual-socket architecture for privilege separation:
+//! Per DD-009 (RFC-0017), the daemon uses a dual-socket `ProtocolServer`
+//! architecture:
 //! - **Operator socket** (`operator.sock`, mode 0600): Privileged operations
 //! - **Session socket** (`session.sock`, mode 0660): Session-scoped operations
+//!
+//! Legacy JSON IPC has been removed. `ProtocolServer` is the only control-plane
+//! IPC.
 //!
 //! # Prometheus Metrics (TCK-00268)
 //!
@@ -19,21 +23,9 @@
 //! - `apm2_daemon_context_firewall_denials_total` (counter)
 //! - `apm2_daemon_session_terminations_total` (counter)
 //!
-//! ## Current Integration Status
-//!
-//! Currently, only `ipc_requests_total` is actively recorded via `handlers.rs`
-//! for JSON-based IPC requests. The other metrics (sessions, tool mediation,
-//! capabilities, firewall, terminations) are defined and instrumented in
-//! `PrivilegedDispatcher` and `ToolBroker`, but those components use the binary
-//! protocol which is not yet wired into this main.rs.
-//!
-//! TODO(TCK-FUTURE): Wire `PrivilegedDispatcher` and `ToolBroker` into main.rs
-//! to enable all metrics.
-//!
 //! See RFC-0017 for architecture details.
 
 mod handlers;
-mod ipc_server;
 // mod protocol; // Use library crate instead to avoid dead code warnings
 mod state;
 
@@ -443,14 +435,15 @@ async fn main() -> Result<()> {
         info!("Managing {} processes", inner.supervisor.process_count());
     }
 
-    // Start dual-socket IPC server (TCK-00249)
-    // This replaces the legacy single-socket JSON IPC
+    // TCK-00279: Start ProtocolServer-only control plane
+    // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
+    // DD-009.
     let socket_manager = Arc::new(socket_manager);
     let ipc_state = state.clone();
     let ipc_socket_manager = Arc::clone(&socket_manager);
-    let ipc_task = tokio::spawn(async move {
+    let protocol_server_task = tokio::spawn(async move {
         if let Err(e) = run_socket_manager_server(ipc_socket_manager, ipc_state).await {
-            error!("IPC server error: {}", e);
+            error!("ProtocolServer error: {}", e);
         }
     });
 
@@ -492,8 +485,8 @@ async fn main() -> Result<()> {
 
     // Wait for shutdown
     tokio::select! {
-        _ = ipc_task => {
-            info!("IPC server exited");
+        _ = protocol_server_task => {
+            info!("ProtocolServer exited");
         }
         _ = signal_task => {
             info!("Signal handler triggered shutdown");
@@ -612,20 +605,29 @@ async fn perform_crash_recovery(_state: &SharedState) -> Result<()> {
     Ok(())
 }
 
-/// Run the dual-socket IPC server using `SocketManager` (TCK-00249).
+/// Run the `ProtocolServer`-only control plane (TCK-00279).
 ///
-/// This replaces the legacy single-socket JSON IPC with the new
-/// privilege-separated dual-socket topology defined in RFC-0017.
+/// This is the ONLY control-plane IPC listener. Per DD-009 (RFC-0017),
+/// legacy JSON IPC has been removed and `ProtocolServer` is the sole
+/// control-plane surface:
+/// - `operator.sock` (mode 0600): Privileged operations
+/// - `session.sock` (mode 0660): Session-scoped operations
+///
+/// # Acceptance Criteria (TCK-00279)
+///
+/// - No `ipc_server::run` invocation in default build
+/// - Startup logs show only operator.sock + session.sock listeners
+/// - Legacy socket path is absent
 async fn run_socket_manager_server(
     socket_manager: Arc<SocketManager>,
     state: SharedState,
 ) -> Result<()> {
-    info!("Dual-socket IPC server started");
+    info!("ProtocolServer control plane started (operator.sock + session.sock only)");
 
     loop {
         // Check for shutdown
         if state.is_shutdown_requested() {
-            info!("Dual-socket IPC server shutting down");
+            info!("ProtocolServer control plane shutting down");
             break;
         }
 
@@ -670,7 +672,7 @@ async fn handle_dual_socket_connection(
     info!(
         socket_type = %socket_type,
         privileged = connection.is_privileged(),
-        "New dual-socket connection"
+        "New ProtocolServer connection"
     );
 
     // Upgrade to full frame size after connection is established
