@@ -822,22 +822,90 @@ fn current_timestamp_ns() -> u64 {
 // Persistent Session Registry (TCK-00266)
 // =============================================================================
 
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+/// Maximum file size for state files (10 MB).
+///
+/// Per SEC-003, this prevents denial-of-service via unbounded memory allocation
+/// when loading maliciously crafted state files.
+const MAX_STATE_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 use serde::{Deserialize, Serialize};
+
+/// Persistable session state that excludes sensitive credentials.
+///
+/// Per SEC-001, the `lease_id` field is a bearer token that MUST NOT be
+/// persisted to disk. Sessions loaded from disk will need to re-authenticate
+/// with the credential broker.
+///
+/// This struct mirrors [`SessionState`] but omits the `lease_id` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistableSessionState {
+    /// Unique session identifier.
+    pub session_id: String,
+    /// Work ID this session is associated with.
+    pub work_id: String,
+    /// Role claimed for this session.
+    pub role: i32,
+    /// Ephemeral handle for IPC communication.
+    pub ephemeral_handle: String,
+    /// Policy resolution reference.
+    pub policy_resolved_ref: String,
+    /// Hash of the capability manifest for this session.
+    pub capability_manifest_hash: Vec<u8>,
+    /// Episode ID in the runtime (if created).
+    pub episode_id: Option<String>,
+}
+
+impl From<&SessionState> for PersistableSessionState {
+    fn from(session: &SessionState) -> Self {
+        Self {
+            session_id: session.session_id.clone(),
+            work_id: session.work_id.clone(),
+            role: session.role,
+            ephemeral_handle: session.ephemeral_handle.clone(),
+            policy_resolved_ref: session.policy_resolved_ref.clone(),
+            capability_manifest_hash: session.capability_manifest_hash.clone(),
+            episode_id: session.episode_id.clone(),
+        }
+    }
+}
+
+impl From<PersistableSessionState> for SessionState {
+    fn from(persistable: PersistableSessionState) -> Self {
+        Self {
+            session_id: persistable.session_id,
+            work_id: persistable.work_id,
+            role: persistable.role,
+            ephemeral_handle: persistable.ephemeral_handle,
+            // Sessions loaded from disk have no valid lease - they must re-authenticate
+            lease_id: String::new(),
+            policy_resolved_ref: persistable.policy_resolved_ref,
+            capability_manifest_hash: persistable.capability_manifest_hash,
+            episode_id: persistable.episode_id,
+        }
+    }
+}
 
 /// Serializable state file format for persistent session registry.
 ///
 /// Per TCK-00266 and DD-005, the state file is JSON for human readability
 /// and debugging.
+///
+/// # Security (SEC-001)
+///
+/// This file uses [`PersistableSessionState`] which excludes the `lease_id`
+/// bearer token to prevent credential leakage to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistentStateFile {
     /// Version of the state file format for future compatibility.
     version: u32,
-    /// Active sessions persisted to disk.
-    sessions: Vec<SessionState>,
+    /// Active sessions persisted to disk (without credentials).
+    sessions: Vec<PersistableSessionState>,
 }
 
 impl Default for PersistentStateFile {
@@ -871,6 +939,18 @@ pub enum PersistentRegistryError {
         found: u32,
         /// The expected version.
         expected: u32,
+    },
+
+    /// State file exceeds maximum allowed size.
+    ///
+    /// Per SEC-003, this prevents denial-of-service via unbounded memory
+    /// allocation.
+    #[error("State file size {size} bytes exceeds maximum allowed size {max} bytes")]
+    FileTooLarge {
+        /// The actual file size.
+        size: u64,
+        /// The maximum allowed size.
+        max: u64,
     },
 }
 
@@ -923,6 +1003,13 @@ impl PersistentSessionRegistry {
     ///
     /// If the state file does not exist, returns an empty registry.
     /// If the state file exists but cannot be parsed, returns an error.
+    ///
+    /// # Security
+    ///
+    /// - SEC-001: Sessions are loaded without `lease_id` (they must
+    ///   re-authenticate)
+    /// - SEC-003: File size is checked before reading to prevent
+    ///   denial-of-service via memory exhaustion
     pub fn load_from_file(
         state_file_path: impl AsRef<Path>,
     ) -> Result<Self, PersistentRegistryError> {
@@ -930,8 +1017,20 @@ impl PersistentSessionRegistry {
         let registry = Self::new(path);
 
         if path.exists() {
-            let contents = fs::read_to_string(path)?;
-            let state_file: PersistentStateFile = serde_json::from_str(&contents)?;
+            // SEC-003: Check file size before reading to prevent DoS
+            let metadata = fs::metadata(path)?;
+            let file_size = metadata.len();
+            if file_size > MAX_STATE_FILE_SIZE {
+                return Err(PersistentRegistryError::FileTooLarge {
+                    size: file_size,
+                    max: MAX_STATE_FILE_SIZE,
+                });
+            }
+
+            // SEC-003: Use BufReader with serde_json::from_reader for bounded reads
+            let file = File::open(path)?;
+            let reader = BufReader::new(file);
+            let state_file: PersistentStateFile = serde_json::from_reader(reader)?;
 
             // Version check for future compatibility
             if state_file.version != 1 {
@@ -942,7 +1041,9 @@ impl PersistentSessionRegistry {
             }
 
             // Load sessions into in-memory registry
-            for session in state_file.sessions {
+            // SEC-001: PersistableSessionState converts to SessionState with empty lease_id
+            for persistable_session in state_file.sessions {
+                let session = SessionState::from(persistable_session);
                 // Ignore duplicate errors during recovery (shouldn't happen with valid file)
                 let _ = registry.inner.register_session(session);
             }
@@ -960,12 +1061,24 @@ impl PersistentSessionRegistry {
     /// Persists the current state to the state file atomically.
     ///
     /// Uses write-to-temp + rename pattern to prevent corruption.
+    ///
+    /// # Security
+    ///
+    /// - SEC-001: Sessions are converted to [`PersistableSessionState`] which
+    ///   excludes the `lease_id` bearer token to prevent credential leakage.
+    /// - SEC-002: File is created with mode 0600 (owner read/write only) to
+    ///   prevent unauthorized access.
     fn persist(&self) -> Result<(), PersistentRegistryError> {
         let state = self.inner.state.read().expect("lock poisoned");
 
+        // SEC-001: Convert to PersistableSessionState to exclude lease_id
         let state_file = PersistentStateFile {
             version: 1,
-            sessions: state.by_id.values().cloned().collect(),
+            sessions: state
+                .by_id
+                .values()
+                .map(PersistableSessionState::from)
+                .collect(),
         };
 
         // Serialize to JSON with pretty printing for human readability
@@ -979,9 +1092,24 @@ impl PersistentSessionRegistry {
             fs::create_dir_all(parent)?;
         }
 
-        // Write to temp file
+        // Write to temp file with SEC-002 secure permissions
         {
-            let mut file = fs::File::create(&temp_path)?;
+            #[cfg(unix)]
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600) // SEC-002: Owner read/write only
+                .open(&temp_path)?;
+
+            #[cfg(not(unix))]
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+
+            let mut file = file;
             file.write_all(json.as_bytes())?;
             file.sync_all()?; // fsync to ensure durability
         }
@@ -1284,6 +1412,169 @@ mod session_registry_tests {
 
         // Handle index for evicted session should be cleaned up
         assert!(registry.get_session_by_handle("handle-0").is_none());
+    }
+
+    // =========================================================================
+    // Persistent Registry Security Tests (SEC-001, SEC-002, SEC-003)
+    // =========================================================================
+
+    #[test]
+    fn test_sec001_state_file_excludes_lease_id() {
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+
+        let registry = PersistentSessionRegistry::new(path);
+
+        // Register a session with a lease_id
+        let mut session = make_session("sess-1", "handle-1");
+        session.lease_id = "super-secret-lease-token".to_string();
+        registry.register_session(session).unwrap();
+
+        // Read the state file contents directly
+        let contents = std::fs::read_to_string(path).unwrap();
+
+        // SEC-001: The lease_id MUST NOT appear in the persisted file
+        assert!(
+            !contents.contains("super-secret-lease-token"),
+            "State file contains lease_id: {contents}"
+        );
+        assert!(
+            !contents.contains("lease_id"),
+            "State file contains lease_id field: {contents}"
+        );
+
+        // Verify other session data IS present
+        assert!(contents.contains("sess-1"));
+        assert!(contents.contains("handle-1"));
+        assert!(contents.contains("work-sess-1"));
+    }
+
+    #[test]
+    fn test_sec001_loaded_sessions_have_empty_lease_id() {
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+
+        // Register a session with a lease_id
+        {
+            let registry = PersistentSessionRegistry::new(path);
+            let mut session = make_session("sess-1", "handle-1");
+            session.lease_id = "original-lease-token".to_string();
+            registry.register_session(session).unwrap();
+        }
+
+        // Load from file in a new registry
+        let loaded_registry = PersistentSessionRegistry::load_from_file(path).unwrap();
+        let loaded_session = loaded_registry.get_session("sess-1").unwrap();
+
+        // SEC-001: Loaded sessions should have empty lease_id (must re-authenticate)
+        assert!(
+            loaded_session.lease_id.is_empty(),
+            "Loaded session has non-empty lease_id: {}",
+            loaded_session.lease_id
+        );
+
+        // Other fields should be preserved
+        assert_eq!(loaded_session.session_id, "sess-1");
+        assert_eq!(loaded_session.ephemeral_handle, "handle-1");
+        assert_eq!(loaded_session.work_id, "work-sess-1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sec002_state_file_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+
+        let registry = PersistentSessionRegistry::new(path);
+        registry
+            .register_session(make_session("sess-1", "handle-1"))
+            .unwrap();
+
+        // SEC-002: File permissions should be 0600 (owner read/write only)
+        let metadata = std::fs::metadata(path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "State file has wrong permissions: {mode:o} (expected 600)"
+        );
+    }
+
+    #[test]
+    fn test_sec003_rejects_oversized_files() {
+        use std::io::Write;
+
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        // Create a file larger than MAX_STATE_FILE_SIZE (10 MB)
+        #[allow(clippy::cast_possible_truncation)]
+        let oversized_size = (MAX_STATE_FILE_SIZE as usize) + 1;
+        let oversized_content = vec![b'x'; oversized_size];
+        temp_file.write_all(&oversized_content).unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path();
+
+        // SEC-003: Should reject oversized files
+        let result = PersistentSessionRegistry::load_from_file(path);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            PersistentRegistryError::FileTooLarge { size, max } => {
+                assert!(size > MAX_STATE_FILE_SIZE);
+                assert_eq!(max, MAX_STATE_FILE_SIZE);
+            },
+            other => panic!("Expected FileTooLarge error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_persistent_registry_round_trip() {
+        use tempfile::NamedTempFile;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+
+        // Register multiple sessions
+        {
+            let registry = PersistentSessionRegistry::new(path);
+            registry
+                .register_session(make_session("sess-1", "handle-1"))
+                .unwrap();
+            registry
+                .register_session(make_session("sess-2", "handle-2"))
+                .unwrap();
+        }
+
+        // Load from file in a new registry
+        let loaded_registry = PersistentSessionRegistry::load_from_file(path).unwrap();
+
+        // Verify all sessions are loaded
+        assert!(loaded_registry.get_session("sess-1").is_some());
+        assert!(loaded_registry.get_session("sess-2").is_some());
+        assert!(loaded_registry.get_session_by_handle("handle-1").is_some());
+        assert!(loaded_registry.get_session_by_handle("handle-2").is_some());
+    }
+
+    #[test]
+    fn test_persistent_registry_nonexistent_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("nonexistent.json");
+
+        // Should succeed with empty registry when file doesn't exist
+        let registry = PersistentSessionRegistry::load_from_file(&path).unwrap();
+        assert_eq!(registry.session_count(), 0);
     }
 }
 
