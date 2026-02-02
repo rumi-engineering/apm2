@@ -52,7 +52,7 @@
     },
     "patterns": {
       "science_experimentation": [13, 1, 69, 10, 33, 76],
-      "incident_response": [13, 40, 52, 51, 39],
+      "incident_response": [74, 13, 40, 52, 39],
       "policy_governance": [37, 45, 72, 35, 60, 36],
       "engineering_safety": [6, 8, 49, 79, 36, 76],
       "strategy_uncertainty": [18, 42, 50, 55, 63]

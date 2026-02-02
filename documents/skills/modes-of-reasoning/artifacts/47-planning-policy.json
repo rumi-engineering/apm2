@@ -11,73 +11,162 @@
     "id": 47,
     "name": "planning-policy",
     "cat": "decision",
-    "core": "Given goal, current state, actions, and dynamics, produce action sequence (plan) or state-to-action mapping (policy) that achieves goal via state-space traversal",
+    "core": "Given goal, current state, actions, and dynamics, produce action sequence (plan) or state-to-action mapping (policy) that achieves goal via state-space traversal. Plan = fixed sequence for deterministic case; Policy = state-conditioned rules for stochastic case.",
+    "key_distinction": "plan_answers_what_to_do_next_policy_answers_what_to_do_in_each_state",
     "out": [
-      "plan",
-      "policy",
-      "contingency_table",
-      "playbook"
+      {"type": "plan", "form": "ordered action sequence with preconditions", "test": "each step executable given prior effects"},
+      {"type": "policy", "form": "state -> action mapping for all reachable states", "test": "every reachable state has defined action"},
+      {"type": "contingency_table", "form": "failure_condition -> recovery_action pairs", "test": "top 5 failure modes have explicit handlers"},
+      {"type": "playbook", "form": "human-readable runbook with decision points", "test": "no ambiguous branch conditions"}
     ],
     "proc": [
-      "define_goal_predicate_testable",
-      "enumerate_actions_with_preconditions_effects",
-      "model_dynamics_and_failure_modes",
-      "search_action_sequence_to_goal",
-      "validate_plan_trace_preconditions",
-      "add_contingency_branches",
-      "specify_monitoring_signals"
+      "1. GOAL: define testable goal predicate with success/failure criteria",
+      "2. ACTIONS: enumerate available actions with preconditions and effects",
+      "3. DYNAMICS: model state transitions and top-5 failure modes per step",
+      "4. SEARCH: find action sequence reaching goal (forward/backward chaining)",
+      "5. VALIDATE: trace plan ensuring each precondition met by prior effects",
+      "6. CONTINGENCY: add branch for each identified failure mode",
+      "7. MONITOR: specify observable checkpoints and replanning triggers"
+    ],
+    "quick_check": [
+      "goal predicate returns true/false, not 'better/worse'",
+      "every action has at least one precondition and one effect",
+      "step N's preconditions satisfied by effects of steps 1..N-1",
+      "at least one contingency branch per high-risk step",
+      "observable checkpoint every 3-5 steps or at phase boundaries"
     ],
     "check": [
-      "goal_is_testable_predicate",
-      "actions_have_preconditions_and_effects",
-      "preconditions_satisfied_by_prior_effects",
-      "failure_contingencies_per_step",
-      "observable_checkpoints_defined",
-      "replanning_triggers_specified",
-      "rollback_for_high_risk_steps"
+      "goal_is_boolean_testable_not_optimization_target",
+      "actions_enumerated_with_explicit_preconditions_and_effects",
+      "preconditions_chain_validated_no_gaps",
+      "failure_contingencies_cover_top_5_failure_modes",
+      "checkpoints_observable_without_plan_modification",
+      "replanning_triggers_have_thresholds_not_just_conditions",
+      "rollback_defined_for_steps_with_irreversible_effects"
     ],
     "diff": {
-      "means-end": "means_end_identifies_subgoals_planning_orders_executable_actions",
-      "decision-theoretic": "decision_theory_single_action_choice_planning_chains_over_time",
-      "optimization": "optimization_finds_best_config_planning_finds_executable_path",
-      "search-based": "search_is_computational_method_planning_is_problem_type"
+      "means-end": {
+        "planning": "orders actions into executable sequence with timing",
+        "means-end": "derives what actions are needed without sequencing",
+        "test": "if output has step numbers and ordering, it's planning"
+      },
+      "decision-theoretic": {
+        "planning": "chains multiple actions over time to reach goal state",
+        "decision-theoretic": "chooses single best action given utilities and probabilities",
+        "test": "if output is one action with EU calculation, it's decision-theoretic"
+      },
+      "optimization": {
+        "planning": "finds executable path through state space to goal",
+        "optimization": "finds best configuration without execution path",
+        "test": "if output lacks step-by-step execution order, it's optimization"
+      },
+      "search-based": {
+        "planning": "problem type: what sequence achieves goal",
+        "search-based": "computational method: how to explore solution space",
+        "test": "planning uses search; search is not inherently about goals"
+      },
+      "temporal": {
+        "planning": "produces action sequence; consumes temporal constraints",
+        "temporal": "provides time logic for ordering and duration",
+        "test": "temporal says 'A before B'; planning says 'do A then B'"
+      },
+      "heuristic": {
+        "planning": "complete state-to-action map for all reachable states",
+        "heuristic": "quick rule of thumb that skips full analysis",
+        "test": "if it handles only common cases, it's heuristic not policy"
+      }
     },
     "fail": {
-      "mode": "ignores_uncertainty_execution_reality",
-      "desc": "no_plan_survives_contact_with_reality",
+      "mode": "brittle_plan_ignores_execution_uncertainty",
+      "desc": "Plan assumes perfect execution; reality introduces delays, failures, and state drift",
       "signals": [
-        "no_contingency_branches",
-        "no_monitoring_observability",
-        "fragile_timing_dependencies",
-        "vague_success_criteria"
+        "no contingency branches: plan is single linear path",
+        "no observability: cannot detect deviation until final failure",
+        "fragile timing: plan breaks if any step takes 2x expected time",
+        "vague success: 'deploy successfully' instead of 'health check returns 200'"
       ],
       "mit": [
-        "inject_failure_points_with_contingency_branches",
-        "define_observable_checkpoints_per_major_step",
-        "build_replanning_triggers_with_thresholds",
-        "validate_trace_simulation_preconditions",
-        "include_rollback_recovery_actions"
+        {
+          "name": "contingency_coverage",
+          "action": "identify top 5 failure modes per phase; add explicit branch for each",
+          "test": "count(contingency_branches) >= count(phases) * 3",
+          "example": "deployment plan: rollback branch if health check fails within 60s"
+        },
+        {
+          "name": "checkpoint_density",
+          "action": "insert observable checkpoint every 3-5 steps or at phase boundary",
+          "test": "max_steps_between_checkpoints <= 5",
+          "example": "after step 4 (db migration), verify row count within 5% of source"
+        },
+        {
+          "name": "replanning_triggers",
+          "action": "define threshold-based triggers that invoke replanning",
+          "test": "each trigger has numeric threshold, not just boolean condition",
+          "example": "if latency > 200ms for 3 consecutive checks, trigger rollback"
+        },
+        {
+          "name": "rollback_coverage",
+          "action": "define rollback for steps with irreversible or high-cost effects",
+          "test": "every step marked 'high_risk' has corresponding rollback action",
+          "example": "before DROP TABLE, ensure backup completed within last 4h"
+        },
+        {
+          "name": "timing_slack",
+          "action": "add 50% buffer to critical path timing; identify parallel opportunities",
+          "test": "critical_path_duration * 1.5 <= deadline",
+          "example": "if deploy must complete by 6pm, plan completion by 4pm"
+        }
       ]
     },
     "use": [
-      "operations_runbooks",
-      "project_execution_gantt",
-      "incident_response_playbooks",
-      "automation_state_machines",
-      "state_transformation_sequences"
+      "operations_runbooks: server migration, deployment, disaster recovery",
+      "project_execution: phased delivery with gates and rollback points",
+      "incident_response: playbooks with decision trees for common failures",
+      "automation: state machines, workflow engines, CI/CD pipelines",
+      "agentic_systems: LLM agent action sequencing with tool invocation"
     ],
     "rel": [
       "means-end-instrumental",
       "decision-theoretic",
       "optimization",
       "search-based-algorithmic",
-      "temporal"
+      "temporal",
+      "robust-worst-case"
     ],
+    "micro_ex": {
+      "scenario": "Deploy new API version with zero downtime",
+      "plan_output": [
+        "1. spin up canary instance (pre: image built, post: canary running)",
+        "2. route 5% traffic to canary (pre: canary healthy 60s)",
+        "3. monitor error rate for 10min (checkpoint: error_rate < 0.1%)",
+        "4. if error_rate > 0.5%, rollback to step 1",
+        "5. route 100% traffic (pre: checkpoint passed)",
+        "6. terminate old instances (pre: new instances healthy 5min)"
+      ],
+      "policy_variant": {
+        "state_healthy": "proceed to next step",
+        "state_degraded": "hold current step, alert on-call",
+        "state_critical": "rollback to last checkpoint"
+      }
+    },
     "ex": {
       "confusion": {
-        "vs_means_end": "goal_hierarchy_vs_executable_action_sequence",
-        "vs_optimization": "static_solution_vs_state_transition_trajectory",
-        "vs_heuristic": "policy_is_complete_state_to_action_map_not_rule_of_thumb"
+        "vs_means_end": {
+          "symptom": "output lists what to achieve but not how to sequence",
+          "resolution": "means-end gives subgoals; feed those to planning for sequencing"
+        },
+        "vs_optimization": {
+          "symptom": "output is optimal config (e.g., resource allocation) without execution steps",
+          "resolution": "optimization finds best state; planning finds path to reach it"
+        },
+        "vs_heuristic": {
+          "symptom": "policy only covers common cases, fails on edge states",
+          "resolution": "true policy maps all reachable states; heuristic is shortcut for speed"
+        },
+        "vs_temporal": {
+          "symptom": "confusing time constraints with action sequence",
+          "resolution": "temporal provides 'A before B' constraints; planning produces the sequence that satisfies them"
+        }
       }
     }
   }

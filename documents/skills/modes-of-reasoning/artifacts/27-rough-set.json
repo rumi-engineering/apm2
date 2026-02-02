@@ -11,68 +11,154 @@
     "id": 27,
     "name": "rough-set",
     "cat": "uncertain",
-    "core": "Approximate concepts via lower and upper bounds based on indiscernibility from available features",
+    "core": "Approximate concepts via lower and upper bounds based on indiscernibility: objects identical on observed features belong to the same equivalence class; lower approximation = classes wholly inside target; upper = classes overlapping target; boundary = upper minus lower (irreducible uncertainty from feature limitations)",
     "out": [
-      "lower_approximation",
-      "upper_approximation",
-      "boundary_region",
-      "feature_dependency",
-      "decision_rules"
+      "lower_approximation: set of objects definitely in concept (all equivalence-class members belong)",
+      "upper_approximation: set of objects possibly in concept (at least one class member belongs)",
+      "boundary_region: objects in upper but not lower (classification uncertain given features)",
+      "approximation_quality: |lower|/|upper| ratio (1.0 = crisp, <1 = rough)",
+      "reduct: minimal feature subset preserving classification power",
+      "decision_rules: if-then rules extracted from lower approximation (certain) and boundary (possible)"
     ],
     "proc": [
-      "define_indiscernibility_relation_from_features",
-      "compute_lower_approximation_definite_members",
-      "compute_upper_approximation_possible_members",
-      "identify_boundary_region_uncertain_cases",
-      "extract_decision_rules_from_approximations",
-      "assess_approximation_quality"
+      "1. Define universe U and feature set F; partition U into equivalence classes by indiscernibility on F",
+      "2. For target concept X, compute lower(X) = union of equivalence classes entirely contained in X",
+      "3. Compute upper(X) = union of equivalence classes overlapping X (intersection non-empty)",
+      "4. Derive boundary(X) = upper(X) - lower(X); quantify as |boundary|/|U| uncertainty ratio",
+      "5. Calculate approximation quality = |lower|/|upper|; if < threshold, seek additional features",
+      "6. Identify reducts: find minimal feature subsets that preserve the original partition granularity",
+      "7. Extract decision rules: certain rules from lower (no exceptions), possible rules from boundary (may have exceptions)"
     ],
     "check": [
-      "features_adequate_for_classification_granularity",
-      "lower_bound_membership_is_definite_not_assumed",
-      "boundary_region_acknowledged_not_forced_into_categories",
-      "approximation_quality_reported",
-      "feature_limitations_disclosed"
+      "Equivalence classes derived from actual feature values, not assumed similarity",
+      "Lower approximation membership is provable from features, not stipulated",
+      "Boundary region explicitly quantified and reported, never silently collapsed",
+      "Approximation quality ratio computed and compared to domain-appropriate threshold",
+      "Feature set adequacy assessed: would adding features shrink boundary?",
+      "Reducts identified to reveal which features are dispensable vs essential"
+    ],
+    "quick_checklist": [
+      "Did I partition by observed features, not intuited similarity?",
+      "Is my lower approximation truly certain (all class members in target)?",
+      "Have I reported boundary size as explicit uncertainty?",
+      "Did I compute approximation quality ratio?",
+      "Have I considered whether more features would reduce boundary?"
     ],
     "diff": {
-      "fuzzy-logic": "membership_from_observation_granularity_not_degree_of_truth",
-      "imprecise-probability": "bounds_on_set_membership_not_probability_intervals",
-      "prototype-similarity-based": "equivalence_class_based_not_distance_based"
+      "fuzzy-logic": {
+        "boundary": "Rough sets: uncertainty from feature granularity (epistemic) | Fuzzy: graded membership from vague predicates (semantic)",
+        "mechanism": "Rough: equivalence classes from discrete features | Fuzzy: membership function assigning degree 0-1",
+        "output": "Rough: three regions (lower/boundary/upper) | Fuzzy: continuous membership grade",
+        "choose_rough_when": "Uncertainty stems from limited observation, not inherent vagueness of concept"
+      },
+      "imprecise-probability": {
+        "boundary": "Rough sets: bounds on set membership | Imprecise prob: bounds on probability values",
+        "mechanism": "Rough: partition-based from features | Imprecise: interval [p_lower, p_upper] from incomplete elicitation",
+        "output": "Rough: definite/possible/excluded | Imprecise: probability interval",
+        "choose_rough_when": "Question is 'which set?' not 'how likely?'"
+      },
+      "prototype-similarity-based": {
+        "boundary": "Rough: equivalence classes from identical feature values | Prototype: distance to exemplar",
+        "mechanism": "Rough: crisp partition into classes | Prototype: graded similarity metric",
+        "output": "Rough: class membership certain/uncertain/excluded | Prototype: similarity score to each prototype",
+        "choose_rough_when": "Features are discrete/categorical; no meaningful distance metric exists"
+      },
+      "evidential-dempster-shafer": {
+        "boundary": "Rough: boundary from feature indiscernibility | DS: belief/plausibility gap from evidence combination",
+        "mechanism": "Rough: partition by features | DS: mass functions combined via Dempster's rule",
+        "output": "Rough: three-region membership | DS: belief ≤ probability ≤ plausibility interval",
+        "choose_rough_when": "Working with classification from features, not combining independent evidence sources"
+      }
     },
+    "common_confusions": [
+      {
+        "confusion": "Using rough sets when concept is inherently vague (e.g., 'tall')",
+        "problem": "Rough sets model epistemic uncertainty from limited features, not semantic vagueness",
+        "correct_mode": "fuzzy-logic for predicates with graded truth"
+      },
+      {
+        "confusion": "Treating boundary region as 'probably in' vs 'probably out'",
+        "problem": "Boundary means genuinely undecidable given features, not probabilistic",
+        "correct_mode": "Use imprecise-probability or Bayesian if you need probability estimates"
+      },
+      {
+        "confusion": "Computing distance between objects to form equivalence classes",
+        "problem": "Rough sets require identical feature values, not similarity",
+        "correct_mode": "prototype-similarity-based for distance/similarity metrics"
+      }
+    ],
     "fail": {
       "mode": "approximation_overconfidence",
-      "desc": "treating_weak_feature_approximations_as_definitive_classifications",
+      "desc": "Treating weak feature approximations as definitive classifications; claiming small boundary without justifying feature adequacy",
       "signals": [
-        "small_boundary_claimed_despite_limited_features",
-        "lower_approximation_asserted_without_feature_adequacy_check",
-        "feature_quality_impact_on_approximation_ignored"
+        "Small boundary claimed despite few features or coarse feature granularity",
+        "Lower approximation asserted without verifying all equivalence class members satisfy target",
+        "Boundary region collapsed into lower or upper without additional evidence",
+        "Approximation quality not computed or reported",
+        "Feature limitations not disclosed when presenting classifications"
       ],
       "mit": [
-        "assess_feature_discriminative_power_before_approximation",
-        "report_boundary_region_size_as_uncertainty_indicator",
-        "seek_additional_features_to_reduce_boundary",
-        "use_reducts_to_identify_minimal_sufficient_features"
+        {
+          "mitigation": "Compute and report approximation quality ratio |lower|/|upper|",
+          "test": "Ratio explicitly stated; if < 0.8, uncertainty prominently flagged"
+        },
+        {
+          "mitigation": "Perform reduct analysis to identify minimal sufficient features",
+          "test": "Reducts enumerated; dispensable features identified"
+        },
+        {
+          "mitigation": "Report boundary size as percentage of universe",
+          "test": "|boundary|/|U| ratio stated; > 20% triggers explicit uncertainty warning"
+        },
+        {
+          "mitigation": "List features that would reduce boundary if available",
+          "test": "At least one potential discriminating feature identified when boundary > 10%"
+        },
+        {
+          "mitigation": "Distinguish certain rules (from lower) vs possible rules (from boundary)",
+          "test": "Each decision rule tagged as 'certain' or 'possible'; no unlabeled rules"
+        }
       ]
     },
     "use": [
-      "interpretable_classification",
-      "feature_limited_domains",
-      "decision_table_analysis",
-      "rule_extraction",
-      "incomplete_information_systems"
+      "Interpretable classification when features are categorical or discretized",
+      "Rule extraction from decision tables with incomplete information",
+      "Feature reduction: finding minimal feature sets (reducts) preserving classification",
+      "Medical diagnosis with limited test results (features = available test values)",
+      "Data mining when explicit uncertainty regions are valuable",
+      "Situations where 'unknown' is a valid classification outcome"
     ],
     "rel": [
       "fuzzy-logic",
       "imprecise-probability",
       "prototype-similarity-based",
-      "inductive"
+      "inductive",
+      "evidential-dempster-shafer",
+      "many-valued-partial-logics"
     ],
-    "ex": {
-      "confusion": {
-        "vs_fuzzy": "rough_sets_bound_membership_fuzzy_grades_membership",
-        "vs_probabilistic": "rough_sets_epistemic_from_features_probability_is_aleatory",
-        "vs_crisp": "rough_sets_admit_boundary_crisp_forces_binary_decision"
-      }
+    "micro_example": {
+      "scenario": "Classify loan applications as Approve/Reject given features: Income={High,Med,Low}, History={Good,Bad}",
+      "universe": ["A1(High,Good,Approve)", "A2(High,Good,Approve)", "A3(Med,Good,Approve)", "A4(Med,Bad,Reject)", "A5(Low,Bad,Reject)", "A6(Med,Bad,Approve)"],
+      "equivalence_classes": {
+        "(High,Good)": ["A1", "A2"],
+        "(Med,Good)": ["A3"],
+        "(Med,Bad)": ["A4", "A6"],
+        "(Low,Bad)": ["A5"]
+      },
+      "target_approve": ["A1", "A2", "A3", "A6"],
+      "lower_approximation": ["A1", "A2", "A3"],
+      "lower_explanation": "(High,Good) and (Med,Good) classes entirely in Approve",
+      "upper_approximation": ["A1", "A2", "A3", "A4", "A6"],
+      "upper_explanation": "(Med,Bad) overlaps Approve (A6), so included",
+      "boundary": ["A4", "A6"],
+      "boundary_explanation": "(Med,Bad) class has both Approve and Reject; cannot classify with certainty",
+      "approximation_quality": "3/5 = 0.6 (rough concept; 2 of 6 objects uncertain)",
+      "decision_rules": [
+        "IF Income=High AND History=Good THEN Approve [certain]",
+        "IF Income=Med AND History=Good THEN Approve [certain]",
+        "IF Income=Low AND History=Bad THEN Reject [certain]",
+        "IF Income=Med AND History=Bad THEN ? [boundary - need more features]"
+      ]
     }
   }
 }

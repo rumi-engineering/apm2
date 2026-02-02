@@ -110,7 +110,7 @@ Parse `$ARGUMENTS`:
 | 71 | Legal | domain | `71-legal.json` |
 | 72 | Moral / ethical | domain | `72-moral-ethical.json` |
 | 73 | Historical / investigative | domain | `73-historical-investigative.json` |
-| 74 | Clinical / troubleshooting | domain | `74-clinical-operational-troubleshooting.json` |
+| 74 | Clinical / operational troubleshooting | domain | `74-clinical-operational-troubleshooting.json` |
 | 75 | Meta-reasoning | meta | `75-meta-reasoning.json` |
 | 76 | Calibration / epistemic humility | meta | `76-calibration-epistemic-humility.json` |
 | 77 | Reflective equilibrium | meta | `77-reflective-equilibrium.json` |
@@ -124,7 +124,7 @@ Parse `$ARGUMENTS`:
 The selector artifact contains common patterns for combining modes:
 
 - **science_experimentation**: [13, 1, 69, 10, 33, 76] - abduction → deduction → experimental design → stats → belief revision → calibration
-- **incident_response**: [13, 40, 52, 51, 39] - abduction + mechanistic + VoI + satisficing + counterfactual
+- **incident_response**: [74, 13, 40, 52, 39] - clinical + abduction + mechanistic + VoI + counterfactual
 - **policy_governance**: [37, 45, 72, 35, 60, 36] - causal + decision + moral + argumentation + rhetoric + assurance
 - **engineering_safety**: [6, 8, 49, 79, 36, 76] - constraints + counterexample + robust + red-team + assurance + calibration
 - **strategy_uncertainty**: [18, 42, 50, 55, 63] - reference-class + simulation + minimax-regret + game-theory + sensemaking

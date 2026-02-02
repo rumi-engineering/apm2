@@ -11,67 +11,131 @@
     "id": 50,
     "name": "minimax-regret",
     "cat": "decision",
-    "core": "Choose action minimizing worst-case regret: the difference between actual outcome and best outcome achievable in hindsight under each scenario",
+    "core": "Choose action minimizing worst-case regret: the difference between actual outcome and best outcome achievable in hindsight under each scenario. Regret = Best_in_scenario - Actual. Optimizes for 'least disappointment' rather than best absolute floor or expected value.",
     "out": [
-      "regret_matrix",
-      "max_regret_per_action",
-      "minimax_regret_choice",
-      "hedged_strategy",
-      "scenario_sensitivity_map"
+      {"n": "payoff_matrix", "d": "rows = actions, cols = scenarios, cells = payoff values in common units"},
+      {"n": "regret_matrix", "d": "cells = best_in_column - cell_payoff; all values >= 0"},
+      {"n": "max_regret_per_action", "d": "vector of worst regret for each action across scenarios"},
+      {"n": "minimax_regret_choice", "d": "action with smallest max-regret, with value"},
+      {"n": "tie_break_rule", "d": "secondary criterion if multiple actions share min-max-regret"},
+      {"n": "scenario_sensitivity_map", "d": "which scenarios drive the regret bound for chosen action"}
     ],
     "proc": [
-      "enumerate_actions_and_scenarios",
-      "compute_payoff_matrix",
-      "find_best_payoff_per_scenario",
-      "calculate_regret_as_difference_from_best",
-      "identify_max_regret_per_action",
-      "select_action_with_minimum_max_regret"
+      "1. enumerate actions: list all candidate actions (A1, A2, ..., An)",
+      "2. enumerate scenarios: list mutually exclusive, collectively exhaustive states of world (S1, S2, ..., Sm); no probabilities required",
+      "3. build payoff matrix: for each (action, scenario) pair, estimate payoff in common units; document estimation method",
+      "4. find column-maxima: for each scenario, identify best payoff attainable by any action",
+      "5. compute regret matrix: regret[i,j] = column_max[j] - payoff[i,j]; verify all cells >= 0",
+      "6. find row-maxima: for each action, find max regret across all scenarios",
+      "7. select minimax-regret action: choose action with smallest max-regret; if tie, apply secondary criterion (e.g., sum of regrets, robustness breadth)",
+      "8. sensitivity check: identify which scenario(s) drive the max-regret for chosen action; test scenario-set boundaries"
+    ],
+    "quick_checklist": [
+      "scenarios mutually exclusive and collectively exhaustive?",
+      "payoffs in common units with documented conversion?",
+      "regret matrix has no negative values?",
+      "catastrophic outcomes screened before applying regret framing?",
+      "chosen action's max-regret strictly less than alternatives'?"
     ],
     "check": [
-      "scenario_set_covers_plausible_states",
-      "payoff_matrix_complete_and_consistent",
-      "regret_computed_correctly_per_cell",
-      "asymmetric_catastrophic_outcomes_flagged",
-      "compromise_nature_acknowledged"
+      "scenario set covers plausible states with explicit inclusion/exclusion criteria",
+      "payoff matrix complete: no missing cells; units consistent across all entries",
+      "regret computed correctly: spot-check at least 3 cells as (column-max - cell)",
+      "asymmetric catastrophic outcomes flagged: any cell with ruin/existential loss marked for lexicographic screening",
+      "compromise nature acknowledged: minimax-regret selects hedge, not optimal for any single scenario",
+      "tie-break rule stated before applying if max-regrets are equal"
     ],
     "diff": {
-      "robust-worst-case": "optimizes_relative_regret_not_absolute_worst_outcome",
-      "decision-theoretic": "avoids_probability_weighting_uses_regret_metric",
-      "imprecise-probability": "requires_no_probability_model_only_scenario_payoffs"
+      "robust-worst-case": "robust minimizes absolute worst outcome (floor); regret minimizes relative shortfall from hindsight-best. Robust asks 'what is my floor?'; regret asks 'how much will I wish I had done differently?'",
+      "decision-theoretic": "decision-theoretic requires probability weights and maximizes expected utility; regret needs no probabilities, only payoffs. Use regret when probabilities are unknowable or contested.",
+      "imprecise-probability": "IP represents uncertainty with probability intervals then applies decision rule (maximin, Gamma-maximin); regret bypasses probability entirely, using only payoff structure.",
+      "satisficing": "satisficing accepts first option meeting threshold; regret compares all options against hindsight-best. Regret is comparative optimization; satisficing is threshold-stopping."
     },
     "fail": {
       "mode": "catastrophe_blind",
-      "desc": "regret_framing_ignores_asymmetric_catastrophic_outcomes_where_some_losses_are_unrecoverable",
+      "desc": "regret framing treats catastrophic and recoverable losses symmetrically; a scenario with ruin may have finite regret yet represent unacceptable risk",
       "signals": [
-        "scenario_contains_catastrophic_outcome_treated_as_finite_regret",
-        "regret_metric_masks_existential_risk",
-        "compromise_chosen_despite_ruin_in_one_scenario"
+        "scenario contains existential or ruin outcome but regret value is finite and comparable to ordinary losses",
+        "regret metric masks tail risk: minimax-regret choice exposes organization to unrecoverable downside",
+        "hedge chosen despite one scenario containing regulatory shutdown, bankruptcy, or irreversible harm"
       ],
       "mit": [
-        "screen_for_catastrophic_outcomes_before_regret_calc",
-        "apply_lexicographic_constraint_safety_first",
-        "combine_with_robust_worst_case_for_tail_risk",
-        "use_bounded_regret_only_above_safety_floor"
+        {
+          "m": "screen for catastrophic outcomes before regret calculation",
+          "test": "explicit list of catastrophic thresholds (e.g., >$X loss, license revocation, safety incident); any scenario-action pair exceeding threshold flagged before regret matrix constructed"
+        },
+        {
+          "m": "apply lexicographic constraint: safety first, then regret",
+          "test": "two-stage selection documented: (1) eliminate actions with catastrophic outcomes, (2) apply minimax-regret to survivors only"
+        },
+        {
+          "m": "combine with robust-worst-case for tail risk",
+          "test": "hybrid decision rule stated: 'action must satisfy robust floor constraint AND minimize regret among feasible actions'"
+        },
+        {
+          "m": "use bounded regret only above safety floor",
+          "test": "minimum acceptable outcome defined; regret calculated only for outcomes above floor; sub-floor outcomes trigger constraint violation, not regret comparison"
+        },
+        {
+          "m": "document accepted residual catastrophe exposure",
+          "test": "residual risk statement exists naming scenarios where chosen action has non-zero catastrophe probability, with justification for acceptance"
+        }
       ]
     },
     "use": [
-      "strategy_under_deep_uncertainty",
-      "irreversible_decisions",
-      "portfolio_construction",
-      "technology_choice",
-      "capacity_planning",
-      "vendor_selection"
+      {"ctx": "strategy_under_deep_uncertainty", "hint": "when scenario probabilities contested or unknowable; regret needs only payoffs"},
+      {"ctx": "irreversible_decisions", "hint": "technology lock-in, long capex cycles; regret frames opportunity cost explicitly"},
+      {"ctx": "portfolio_construction", "hint": "diversification across scenarios to bound regret; pairs with robust constraints on drawdown"},
+      {"ctx": "capacity_planning", "hint": "build capacity to hedge across demand scenarios; avoid both over- and under-investment regret"},
+      {"ctx": "vendor_selection", "hint": "when market evolution uncertain; select vendor minimizing regret across technology trajectories"},
+      {"ctx": "technology_choice", "hint": "platform bets with 5-10 year horizon; regret frames switching-cost asymmetry"}
     ],
     "rel": [
       "robust-worst-case",
       "decision-theoretic",
-      "imprecise-probability"
+      "imprecise-probability",
+      "satisficing",
+      "game-theoretic-strategic"
     ],
     "ex": {
-      "confusion": {
-        "vs_robust_worst_case": "regret_minimizes_relative_shortfall_robust_minimizes_absolute_floor",
-        "vs_expected_utility": "regret_needs_no_probabilities_only_scenario_payoffs",
-        "when_to_prefer": "use_regret_when_probabilities_unknown_and_outcomes_not_catastrophic"
+      "sit": "Startup choosing cloud provider (AWS, GCP, Azure) under uncertain regulatory and market evolution. Three scenarios: (S1) data-sovereignty regulation tightens, (S2) status quo, (S3) multi-cloud becomes standard.",
+      "payoff_matrix": {
+        "rows": ["AWS", "GCP", "Azure"],
+        "cols": ["S1_regulation", "S2_status_quo", "S3_multi_cloud"],
+        "values": [
+          [60, 90, 70],
+          [80, 85, 75],
+          [75, 80, 80]
+        ],
+        "units": "normalized utility (0-100)"
+      },
+      "regret_matrix": {
+        "note": "best_in_S1=80 (GCP), best_in_S2=90 (AWS), best_in_S3=80 (Azure)",
+        "values": [
+          [20, 0, 10],
+          [0, 5, 5],
+          [5, 10, 0]
+        ]
+      },
+      "max_regret": {"AWS": 20, "GCP": 5, "Azure": 10},
+      "choice": "GCP: max-regret=5, smallest among options",
+      "sensitivity": "GCP regret driven by S2 (status quo where AWS dominates); if S2 probability low, GCP robust across S1/S3"
+    },
+    "confusion": {
+      "vs_robust_worst_case": {
+        "symptom": "using regret when absolute floor matters more than relative disappointment",
+        "diagnostic": "ask: 'is there an outcome below which the organization cannot recover?' if yes, absolute floor trumps regret",
+        "resolution": "use robust-worst-case for safety floors; use regret for opportunity-cost comparisons above safety threshold"
+      },
+      "vs_expected_utility": {
+        "symptom": "forcing probability estimates to use decision-theoretic mode when probabilities are fabricated",
+        "diagnostic": "ask: 'are these probabilities based on data or intuition?' if intuition with >20% disagreement, probabilities are suspect",
+        "resolution": "use minimax-regret when probabilities unknowable; use decision-theoretic when defensible priors exist"
+      },
+      "vs_satisficing": {
+        "symptom": "using regret when a 'good enough' threshold would suffice and full comparison is wasteful",
+        "diagnostic": "ask: 'is the cost of full payoff analysis justified by stakes?' if stakes low, threshold-based satisficing cheaper",
+        "resolution": "use satisficing for fast, low-stakes decisions; use regret for high-stakes strategic choices requiring explicit comparison"
       }
     }
   }

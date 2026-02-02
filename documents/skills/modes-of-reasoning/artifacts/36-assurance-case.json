@@ -11,76 +11,105 @@
     "id": 36,
     "name": "assurance-case",
     "cat": "argumentation",
-    "core": "CAE tree demonstrating top-level safety/security/reliability claim via decomposition to evidence-backed leaf nodes per GSN/ISO26262/DO-178C",
+    "core": "Structured argument (GSN/CAE tree) decomposing a top-level safety, security, or reliability claim into sub-claims until each leaf is backed by traceable, dated evidence. Goal: demonstrate that system properties hold, not merely that procedures were followed.",
     "out": [
-      "safety_case_doc",
-      "evidence_index",
-      "hazard_claim_map",
-      "confidence_assessment",
-      "rebuttal_log"
+      {"n": "safety_case_doc", "d": "GSN/CAE diagram with goals, strategies, context, evidence nodes", "done": "every goal node either decomposed via strategy or linked to evidence"},
+      {"n": "evidence_index", "d": "registry mapping evidence IDs to artifacts with provenance and dates", "done": "each entry has artifact_id, source, date, and hash/version"},
+      {"n": "hazard_claim_map", "d": "traceability from identified hazards to claims that address them", "done": "every hazard has at least one claim; no orphan claims"},
+      {"n": "confidence_assessment", "d": "per-node confidence rating with gap rationale", "done": "weak links (<high confidence) have explicit rationale and remediation plan"},
+      {"n": "rebuttal_log", "d": "record of challenges raised and how each was resolved or accepted", "done": ">=3 substantive rebuttals logged with disposition (mitigated/accepted/deferred)"}
     ],
     "proc": [
-      "define_top_claim_with_boundary_and_context",
-      "identify_hazards_as_branches",
-      "decompose_via_strategies_to_evidenceable_claims",
-      "attach_evidence_with_id_provenance_date",
-      "challenge_each_link_for_support_completeness",
-      "assess_confidence_mark_weak_links",
-      "conduct_adversarial_review",
-      "iterate_until_no_undeveloped_nodes"
+      "1. Define top claim: state the property (safe, secure, reliable) with explicit scope (system boundary, operational envelope, threat model) and context assumptions",
+      "2. Identify hazards or threats: list what could violate the claim; each becomes a branch requiring sub-claims",
+      "3. Choose decomposition strategy: select argument pattern (e.g., by hazard, by subsystem, by lifecycle phase) and document rationale",
+      "4. Decompose to evidenceable claims: split until each leaf is verifiable by a single piece of evidence; avoid claims requiring multiple independent evidences",
+      "5. Attach evidence: for each leaf, link dated artifact (test report, analysis, review record) with provenance (who, when, how obtained)",
+      "6. Challenge each link: for every claim-evidence pair, ask 'could this evidence be true yet the claim false?' Document gaps",
+      "7. Assess confidence: rate each node (high/medium/low); mark weak links explicitly; require remediation plan for medium/low",
+      "8. Conduct adversarial review: invite red-team or independent reviewer to attack structure; log rebuttals",
+      "9. Iterate: repeat steps 4-8 until zero undeveloped nodes and rebuttal log has >=3 entries"
+    ],
+    "quick_check": [
+      "Top claim has explicit scope and context assumptions?",
+      "Every hazard maps to at least one sub-claim branch?",
+      "Every leaf has evidence with artifact_id, date, and source?",
+      "No undeveloped (TBD) nodes remain?",
+      "Rebuttal log contains >=3 substantive challenges with dispositions?",
+      "Weak links have documented remediation plan or explicit risk acceptance?",
+      "Independent reviewer signed off on structure?"
     ],
     "check": [
-      "top_claim_scoped",
-      "hazards_mapped_to_branches",
-      "leaves_have_traceable_dated_evidence",
-      "no_undeveloped_placeholders",
-      "rebuttal_log_gte_3_entries",
-      "independent_evidence_spot_check",
-      "confidence_gaps_documented"
+      "top_claim_scoped: claim states property, boundary, and operational envelope",
+      "hazards_mapped: every identified hazard has >=1 claim branch; traceability matrix complete",
+      "leaves_evidenced: each leaf links to artifact with id, date, source; no 'see test results' hand-waves",
+      "no_undeveloped: zero TBD/placeholder nodes in final case",
+      "rebuttal_log_populated: >=3 logged challenges with disposition (mitigated/accepted/deferred)",
+      "confidence_gaps_documented: every <high node has rationale and remediation or acceptance",
+      "independent_spot_check: reviewer verified >=3 random evidence links are accurate"
     ],
     "diff": {
-      "argumentation-theory": "requires_traceable_evidence_at_leaves_not_rhetorical_support",
-      "legal": "argues_empirical_system_properties_not_statute_interpretation",
-      "robust-worst-case": "documents_why_guarantees_hold_citing_evidence",
-      "engineering-design": "justifies_post_hoc_that_design_meets_safety_goals",
-      "adversarial-red-team": "target_of_red_teaming_must_survive_scrutiny"
+      "argumentation-theory": "assurance requires traceable dated evidence at leaves; argumentation-theory accepts rhetorical support and computes acceptability from attack/defense relations",
+      "legal": "assurance argues empirical system properties hold; legal interprets statutes and allocates burden of proof under institutional rules",
+      "robust-worst-case": "robust selects policy to survive worst-case; assurance documents post-hoc why the selected design meets claims",
+      "engineering-design": "design produces specs and prototypes; assurance justifies that the built system meets safety goals",
+      "adversarial-red-team": "red-team attacks to find weaknesses; assurance is the structured target that must survive red-team scrutiny",
+      "defeasible": "defeasible models formal defeat relations among rules; assurance builds an evidenced argument tree, not a priority-ordered rule set",
+      "mechanistic": "mechanistic explains how a system works causally; assurance argues that properties hold, citing evidence, not explaining internals",
+      "dialectical": "dialectical synthesizes thesis-antithesis; assurance decomposes a claim into evidenced sub-claims without requiring synthesis"
     },
     "fail": {
       "mode": "paper_compliance",
-      "desc": "structure_complete_but_evidence_weak_stale_or_mismatched",
+      "desc": "Structure looks complete but evidence is weak, stale, or mismatched to claims - case passes form but fails substance",
       "signals": [
-        "undated_evidence_no_artifact_ids",
-        "multiple_claims_share_single_evidence",
-        "uniform_high_confidence_no_gaps",
-        "no_rebuttal_log"
+        "evidence lacks artifact IDs or dates ('see test results' without link)",
+        "multiple claims share single evidence without justification",
+        "uniform high confidence with no gaps flagged",
+        "rebuttal log empty or contains only trivial challenges",
+        "no independent reviewer sign-off"
       ],
       "mit": [
-        "evidence_freshness_audit_within_policy_window",
-        "independent_evidence_review_3_random_leaves",
-        "adversarial_rebuttal_session_3_attacks_min",
-        "coverage_check_hazard_to_claim",
-        "undeveloped_node_sweep_count_eq_0"
+        {"m": "evidence freshness audit", "test": "every evidence artifact dated within policy window (e.g., 12 months) or has recertification note"},
+        {"m": "evidence uniqueness check", "test": "each leaf has distinct primary evidence; shared evidence explicitly justified and logged"},
+        {"m": "independent spot-check", "test": "reviewer sampled >=3 random leaves and verified evidence artifacts exist and match claims"},
+        {"m": "adversarial rebuttal session", "test": "red-team generated >=3 substantive attacks; each logged with disposition"},
+        {"m": "confidence calibration", "test": "at least one node rated <high with documented rationale; uniform-high triggers review"},
+        {"m": "undeveloped node sweep", "test": "automated or manual scan confirms zero TBD/placeholder nodes"}
       ]
     },
     "use": [
-      "safety_critical_systems",
-      "security_certification",
-      "ai_ml_governance",
-      "regulatory_submissions",
-      "internal_design_reviews"
+      "safety-critical systems: aviation (DO-178C), automotive (ISO 26262), medical devices (IEC 62304)",
+      "security certification: Common Criteria, SOC 2, FedRAMP authorization packages",
+      "AI/ML governance: model risk documentation, bias and fairness assurance",
+      "regulatory submissions: pre-market approval, safety case for novel technology",
+      "internal design reviews: architecture decision justification, go/no-go gates"
     ],
     "rel": [
-      "argumentation-theory",
-      "robust-worst-case",
-      "adversarial-red-team",
-      "legal",
-      "engineering-design"
+      {"id": 35, "name": "argumentation-theory", "role": "theoretical foundation for argument structure"},
+      {"id": 49, "name": "robust-worst-case", "role": "informs threat envelope and margin analysis"},
+      {"id": 79, "name": "adversarial-red-team", "role": "challenges assurance case to find gaps"},
+      {"id": 71, "name": "legal", "role": "regulatory context and compliance framing"},
+      {"id": 70, "name": "engineering-design", "role": "produces the artifacts that become evidence"},
+      {"id": 32, "name": "defeasible", "role": "handles exceptions and overrides in claim logic"},
+      {"id": 40, "name": "mechanistic", "role": "explains system behavior referenced in claims"}
     ],
     "ex": {
-      "confusion": {
-        "vs_risk_assessment": "risk_identifies_hazards_assurance_argues_mitigation",
-        "vs_test_plan": "test_defines_what_assurance_consumes_results_as_evidence"
-      }
+      "sit": "Autonomous vehicle perception system: argue that pedestrian detection meets ASIL-D safety requirements",
+      "steps": [
+        "Top claim: 'Perception system detects pedestrians with <=10^-8 failure rate per hour under ODD conditions'",
+        "Context: ODD = urban, daylight, dry roads, <50 km/h",
+        "Hazard branch: 'Sensor occlusion causes missed detection' -> sub-claim: 'Redundant sensors cover all angles'",
+        "Evidence: test report TR-2025-042 showing 360-degree coverage test, dated 2025-01-15, signed by test lead",
+        "Challenge: 'What if both sensors fail simultaneously?' -> sub-claim added for independent failure analysis",
+        "Confidence: coverage claim = high; simultaneous failure claim = medium (needs more data) -> remediation: schedule additional fault injection test"
+      ],
+      "insight": "Assurance case is not a one-time document; it evolves as evidence matures and challenges surface",
+      "confusion": [
+        {"vs": "risk_assessment", "clarify": "risk assessment identifies and ranks hazards; assurance case argues that mitigations are sufficient"},
+        {"vs": "test_plan", "clarify": "test plan defines what to test; assurance case consumes test results as evidence for claims"},
+        {"vs": "FMEA", "clarify": "FMEA enumerates failure modes and effects; assurance case argues that identified modes are mitigated"},
+        {"vs": "fault_tree", "clarify": "fault tree analyzes how failures propagate; assurance case argues that propagation paths are blocked"}
+      ]
     }
   }
 }

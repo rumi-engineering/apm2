@@ -11,45 +11,100 @@
     "id": 5,
     "name": "model-theoretic-semantic",
     "cat": "formal",
-    "core": "Reason by constructing/analyzing models that satisfy a theory; determine what is true in all models vs some models.",
+    "core": "Reason by constructing/analyzing mathematical structures (models) that satisfy a theory; determine validity (true in ALL models) vs satisfiability (true in SOME model); refute claims by exhibiting countermodels.",
     "out": [
-      "satisfiable/unsatisfiable verdicts",
-      "countermodels",
-      "interpretations",
-      "semantic entailment results"
+      {"id": "validity", "form": "proof that formula holds in all models", "test": "no countermodel constructible"},
+      {"id": "satisfiability", "form": "witness model + variable assignment", "test": "all axioms evaluate true under interpretation"},
+      {"id": "countermodel", "form": "structure where claim fails", "test": "axioms hold but target formula false"},
+      {"id": "entailment", "form": "T |= phi verdict", "test": "phi true in every model of T"},
+      {"id": "independence", "form": "models for phi and for not-phi", "test": "both models satisfy base theory"}
     ],
     "proc": [
-      "formalize the theory or specification",
-      "construct candidate model structures",
-      "check which statements hold in models",
-      "identify countermodels for invalid claims"
+      {"do": "specify signature (sorts, functions, relations)", "out": "vocabulary", "test": "all terms in theory have declared symbols"},
+      {"do": "list axioms/constraints the model must satisfy", "out": "theory T", "test": "axioms closed under signature"},
+      {"do": "define domain (carrier set for each sort)", "out": "universe", "test": "non-empty for each sort"},
+      {"do": "assign interpretations to function/relation symbols", "out": "interpretation I", "test": "each symbol maps to concrete set/function"},
+      {"do": "evaluate target formula under interpretation", "out": "truth value", "test": "compositional evaluation matches Tarski semantics"},
+      {"do": "if seeking countermodel: vary interpretation until axioms hold but target fails", "out": "countermodel or impossibility", "test": "all axioms true, target false"},
+      {"do": "generalize: check if result holds across model class or just specific instance", "out": "scope annotation", "test": "universal claim requires exhaustive/schematic argument"}
     ],
     "check": [
-      "model matches intended domain semantics?",
-      "all axioms satisfied in model?",
-      "countermodel genuinely refutes claim?"
+      "signature complete: every symbol in formulas has interpretation?",
+      "domain non-trivial: avoids vacuous truth via empty domains?",
+      "interpretation well-typed: functions return correct sort?",
+      "axiom satisfaction: each axiom evaluates true under I?",
+      "countermodel minimal: smallest structure exhibiting failure?",
+      "semantic vs syntactic: conclusion is about truth-in-models, not derivability?"
+    ],
+    "quick_checklist": [
+      "Did I define the signature before building the model?",
+      "Is my domain non-empty for each sort?",
+      "Have I checked ALL axioms, not just the obvious ones?",
+      "Does my countermodel actually satisfy the background theory?",
+      "Am I conflating 'true in this model' with 'valid in all models'?"
     ],
     "diff": {
-      "vs_proof_theoretic": "builds worlds where statements hold/fail rather than deriving via rules; focuses on structures making statements true"
+      "2": "model-theoretic: constructs structures where formulas hold/fail; proof-theoretic: derives formulas via syntactic rules. Use model-theoretic to show independence or find counterexamples; use proof-theoretic to certify derivability.",
+      "6": "model-theoretic: studies meta-properties (validity, satisfiability classes); constraint-sat: finds ONE satisfying assignment. Use model-theoretic for 'does any model exist where X fails?'; use constraint-sat for 'give me a concrete schedule/config'.",
+      "8": "model-theoretic: single model analysis or class reasoning; counterexample-guided: iterative abstraction-refinement loop. Use model-theoretic for one-shot semantic questions; use CEGAR for large state spaces needing progressive refinement.",
+      "1": "model-theoretic: focuses on truth-in-structures; deductive: focuses on truth-preserving inference chains. Model-theoretic asks 'what structures make this true?'; deductive asks 'can I derive this from premises?'."
     },
+    "confusions": [
+      {
+        "pair": ["model-theoretic", "constraint-satisfiability"],
+        "symptom": "treating SAT solver output as semantic validity proof",
+        "clarification": "SAT gives ONE witness; model-theoretic validity requires ALL models. SAT result 'satisfiable' means 'at least one model exists', not 'true in every model'."
+      },
+      {
+        "pair": ["model-theoretic", "proof-theoretic"],
+        "symptom": "assuming 'I cannot prove P' means 'P is false in some model'",
+        "clarification": "soundness/completeness required to equate derivability with validity. In incomplete systems, unprovable does not imply countermodel exists."
+      }
+    ],
     "fail": {
-      "mode": "semantic mismatch",
-      "desc": "mathematical model satisfies theory but diverges from real system in important ways"
+      "name": "semantic mismatch",
+      "desc": "mathematical model satisfies theory but diverges from real system in important ways",
+      "signals": [
+        "stakeholders reject 'valid' model as unrealistic",
+        "model permits behaviors real system cannot exhibit",
+        "model excludes behaviors real system does exhibit",
+        "finite model used where infinite domain required"
+      ],
+      "mitigations": [
+        {"mit": "domain expert review of carrier set and interpretation", "test": "expert confirms each relation maps to real concept"},
+        {"mit": "construct multiple diverse models to surface hidden assumptions", "test": "at least 2 structurally different models examined"},
+        {"mit": "trace each axiom to requirements document", "test": "traceability matrix has no orphan axioms"},
+        {"mit": "validate model against known test cases from real system", "test": "model correctly predicts outcome for >= 3 historical scenarios"},
+        {"mit": "document intended vs unintended models explicitly", "test": "written list of 'pathological' models theory accidentally permits"}
+      ]
     },
     "use": [
-      "consistency checks",
-      "finding hidden assumptions",
-      "generating counterexamples",
-      "understanding what specifications actually allow"
+      "consistency check: does a model satisfying all axioms exist?",
+      "independence proof: show axiom X cannot be derived by exhibiting models with/without X",
+      "specification analysis: what behaviors does this spec actually permit?",
+      "hidden assumption discovery: find minimal models revealing implicit constraints",
+      "semantic entailment: does T |= phi without syntactic derivation?",
+      "counterexample generation: refute universal claims with concrete structure"
     ],
     "rel": [
-      {"id": 2, "name": "mathematical-proof-theoretic", "link": "complementary approach"},
-      {"id": 6, "name": "constraint-satisfiability", "link": "computational model finding"},
-      {"id": 8, "name": "counterexample-guided", "link": "uses countermodels for refinement"}
+      {"id": 2, "name": "mathematical-proof-theoretic", "link": "soundness/completeness bridges: valid iff provable"},
+      {"id": 6, "name": "constraint-satisfiability", "link": "computational model finding (SAT/SMT as implementation)"},
+      {"id": 8, "name": "counterexample-guided", "link": "uses countermodels in refinement loop"},
+      {"id": 1, "name": "deductive-reasoning", "link": "semantic entailment vs syntactic derivation"},
+      {"id": 64, "name": "modal", "link": "Kripke models extend to possible-worlds semantics"}
     ],
     "ex": {
-      "scenario": "checking if a security policy is consistent",
-      "approach": "construct a model where all policy rules hold; if none exists, policy is inconsistent"
+      "prob": "Prove that commutativity of + is independent of group axioms (cannot be derived).",
+      "steps": [
+        "signature: sort G, binary op +, constant 0, unary inv",
+        "theory T: associativity, identity, inverse axioms",
+        "model M1 (commutative): integers with standard +",
+        "model M2 (non-commutative): 2x2 invertible matrices with matrix multiplication relabeled as +",
+        "check: both M1 and M2 satisfy T",
+        "M1 satisfies commutativity; M2 does not",
+        "conclusion: commutativity independent of T (neither valid nor refutable from T alone)"
+      ],
+      "artifacts": ["M1 interpretation table", "M2 interpretation table", "independence verdict"]
     }
   }
 }

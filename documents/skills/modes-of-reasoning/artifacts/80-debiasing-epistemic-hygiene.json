@@ -14,7 +14,7 @@
     "cat": "meta",
     "core": "Constraint layer applying pre-commitment checks to any reasoning mode output. Five mandatory steps: base-rate anchoring, alternative-hypothesis generation, premortem analysis, disconfirmation search, and bias audit. Not a reasoning mode itself but a quality gate that wraps other modes.",
 
-    "what_it_outputs": [
+    "out": [
       {"name": "base_rate_anchor", "desc": "External reference rate with source citation, written before any inside-view analysis begins"},
       {"name": "alternative_hypothesis_list", "desc": "≥3 competing explanations with plausibility estimates (high/medium/low or numeric)"},
       {"name": "premortem_report", "desc": "Top 3 reasons the favored conclusion could be wrong, with ≥1 internal/controllable cause"},
@@ -24,7 +24,7 @@
       {"name": "residual_uncertainty", "desc": "Statement classifying remaining uncertainty as reducible (more data helps) or irreducible (fundamental)"}
     ],
 
-    "procedure": [
+    "proc": [
       {
         "step": 1,
         "name": "Anchor on base rate",
@@ -80,7 +80,7 @@
       }
     ],
 
-    "checklist": [
+    "check": [
       "Base rate written with source citation before inside-view analysis",
       "≥3 alternatives listed with plausibility, including mundane option",
       "Premortem has ≥1 internal/controllable cause",
@@ -91,7 +91,7 @@
       "If any bias failed or load is Red: decision deferred or second opinion obtained"
     ],
 
-    "how_it_differs": {
+    "diff": {
       "meta-reasoning": {
         "boundary": "Meta-reasoning selects which mode to use; debiasing audits the output of whatever mode was used.",
         "test": "Are you choosing an approach (meta) or checking an answer (debiasing)?"
@@ -123,10 +123,10 @@
       "Any decision you cannot easily reverse"
     ],
 
-    "common_failure_mode": {
-      "name": "Ritualized checklist",
-      "description": "Checklist completed mechanically without genuine consideration—no conclusions ever change, alternatives are strawmen, premortem lists only external causes.",
-      "detection_signals": [
+    "fail": {
+      "mode": "Ritualized checklist",
+      "desc": "Checklist completed mechanically without genuine consideration—no conclusions ever change, alternatives are strawmen, premortem lists only external causes.",
+      "signals": [
         "Zero decisions reversed or modified in past quarter",
         "Checklist copy-pasted from previous analysis",
         "Alternatives are obviously inferior (strawmen)",
@@ -136,17 +136,17 @@
         "Base rates 'estimated' rather than sourced"
       ],
       "mitigations": [
-        {"mitigation": "Require ≥1 judgment change per quarter", "test": "Can you name a decision debiasing actually changed?"},
-        {"mitigation": "Rotate devil's advocate role", "test": "Different person challenges each major decision?"},
-        {"mitigation": "Blind elicitation before group discussion", "test": "Initial estimates collected before anyone speaks?"},
-        {"mitigation": "Timebox 10-15 minutes minimum for high stakes", "test": "Is there a calendar block for debiasing?"},
-        {"mitigation": "Require artifact of disconfirmation search", "test": "Is there a link/screenshot/query proving you looked?"},
-        {"mitigation": "Audit past debiasing artifacts for accuracy", "test": "Did the premortem predict the actual failure mode?"},
-        {"mitigation": "External reviewer spot-checks random decisions", "test": "Someone outside the team reviews 1 in 10 analyses?"}
+        {"m": "Require ≥1 judgment change per quarter", "test": "Can you name a decision debiasing actually changed?"},
+        {"m": "Rotate devil's advocate role", "test": "Different person challenges each major decision?"},
+        {"m": "Blind elicitation before group discussion", "test": "Initial estimates collected before anyone speaks?"},
+        {"m": "Timebox 10-15 minutes minimum for high stakes", "test": "Is there a calendar block for debiasing?"},
+        {"m": "Require artifact of disconfirmation search", "test": "Is there a link/screenshot/query proving you looked?"},
+        {"m": "Audit past debiasing artifacts for accuracy", "test": "Did the premortem predict the actual failure mode?"},
+        {"m": "External reviewer spot-checks random decisions", "test": "Someone outside the team reviews 1 in 10 analyses?"}
       ]
     },
 
-    "related_modes": [
+    "rel": [
       {"id": 75, "name": "meta-reasoning", "role": "Selects which mode to apply; debiasing audits mode outputs"},
       {"id": 76, "name": "calibration", "role": "Tracks long-run accuracy; complements single-judgment debiasing"},
       {"id": 79, "name": "adversarial-red-team", "role": "External attack simulation; debiasing is internal audit"},
@@ -159,15 +159,17 @@
       {"id": 77, "name": "reflective-equilibrium", "role": "Coherence between beliefs and principles; debiasing focuses on single judgments"}
     ],
 
-    "micro_example": {
+    "ex": {
       "situation": "Tech lead recommends rewriting legacy auth service (3 months, 2 engineers).",
-      "step_1_base_rate": "Base rate: 65% of rewrites exceed estimate by >50% (Humble & Farley). Source: 'Accelerate' book.",
-      "step_2_alternatives": "(H) Rewrite, (M) Strangler pattern incremental, (L) Buy SaaS, (L) Do nothing + workarounds.",
-      "step_3_premortem": "(1) Scope creep from undocumented edge cases [internal], (2) Key engineer leaves mid-project [internal], (3) New requirements arrive during rewrite [external].",
-      "step_4_disconfirmation": "Searched for teams who regretted rewrites: found 2 HN threads, both cited integration surprises. Strengthened strangler-pattern option.",
-      "step_5_bias_audit": "Anchoring: PASS (tech lead's 3mo didn't dominate—added 50% buffer). Availability: FAIL (recent outage made rewrite feel urgent—checked: 1 outage/year, not catastrophic). Confirmation: PASS (actively sought rewrite-failure stories).",
-      "step_6_load": "Yellow (deadline pressure from upcoming audit). Action: present options to CTO before committing.",
-      "step_7_residual": "Reducible: effort estimate (spike would help). Irreducible: whether vendor SaaS will meet compliance.",
+      "steps": [
+        "BASE RATE: 65% of rewrites exceed estimate by >50% (Source: Accelerate).",
+        "ALTERNATIVES: (H) Rewrite, (M) Strangler pattern incremental, (L) Buy SaaS, (L) Do nothing + workarounds.",
+        "PREMORTEM: (1) Scope creep from undocumented edge cases [internal], (2) Key engineer leaves mid-project [internal], (3) New requirements arrive during rewrite [external].",
+        "DISCONFIRMATION: Searched for teams who regretted rewrites: found 2 HN threads, both cited integration surprises. Strengthened strangler-pattern option.",
+        "BIAS AUDIT: Anchoring: PASS (tech lead's 3mo didn't dominate—added 50% buffer). Availability: FAIL (recent outage made rewrite feel urgent—checked: 1 outage/year, not catastrophic). Confirmation: PASS (actively sought rewrite-failure stories).",
+        "LOAD: Yellow (deadline pressure from upcoming audit). Action: present options to CTO before committing.",
+        "RESIDUAL: Reducible: effort estimate (spike would help). Irreducible: whether vendor SaaS will meet compliance."
+      ],
       "outcome": "Chose strangler pattern after debiasing; rewrite option was availability-biased."
     }
   }

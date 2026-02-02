@@ -61,15 +61,9 @@ commands[24]:
   - name: safe-kill-pid
     command: "bash -lc 'set -euo pipefail; ps -p <PID> -o pid=,cmd=; kill -TERM <PID>; sleep 5; kill -KILL <PID> 2>/dev/null || true'"
     purpose: "Terminate a stuck subagent/reviewer PID after verifying it is the expected process. SIDE EFFECTS: sends signals to a process."
-  - name: codex-history-tail
-    command: "tail -n 200 \"$HOME/.codex/history.jsonl\""
-    purpose: "Out-of-band inspection of most recent Codex tool/event logs (fallback)."
   - name: claude-history-tail
     command: "tail -n 200 \"$HOME/.claude/history.jsonl\""
     purpose: "Out-of-band inspection of most recent Claude Code logs (fallback)."
   - name: start-claude-implementer-with-log
     command: "bash -lc 'set -euo pipefail; mkdir -p \"$HOME/.apm2/ticket-queue/logs\"; log=\"$HOME/.apm2/ticket-queue/logs/<TICKET_ID>.implementer.claude.log\"; script -q \"$log\" -c \"cd <WORKTREE_PATH> && claude --agent rust-developer --verbose \\\"<PASTE_IMPLEMENTER_TASK>\\\"\" & echo \"PID=$! LOG=$log\"'"
     purpose: "Spawn a Claude Code implementer session with a durable log file (run in a separate terminal/tab; you can background it and capture PID)."
-  - name: start-codex-implementer-with-json-log
-    command: "bash -lc 'set -euo pipefail; mkdir -p \"$HOME/.apm2/ticket-queue/logs\"; log=\"$HOME/.apm2/ticket-queue/logs/<TICKET_ID>.implementer.codex.jsonl\"; cd <WORKTREE_PATH>; codex exec --json --full-auto -p \"<PASTE_IMPLEMENTER_TASK>\" | tee \"$log\"'"
-    purpose: "Run a Codex implementer subagent with JSONL event output captured to a log (out-of-band tool call visibility)."
