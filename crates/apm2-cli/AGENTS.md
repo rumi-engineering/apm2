@@ -53,7 +53,11 @@ Top-level CLI argument parser with global options.
 
 **Invariants:**
 - [INV-CLI-001] `config` defaults to `ecosystem.toml` in current directory.
-- [INV-CLI-002] `socket` path resolution: CLI arg > config file > `/var/run/apm2/apm2.sock`.
+- [INV-CLI-002] Socket path resolution follows dual-socket architecture (TCK-00249, TCK-00280):
+  - `--socket` CLI arg overrides config file settings for the operator socket
+  - Config file must specify both `operator_socket` and `session_socket` in `[daemon]` section
+  - Defaults: `${XDG_RUNTIME_DIR}/apm2/operator.sock` and `${XDG_RUNTIME_DIR}/apm2/session.sock`
+  - Falls back to `/tmp/apm2/operator.sock` and `/tmp/apm2/session.sock` if `XDG_RUNTIME_DIR` not set
 
 ### `Commands`
 
@@ -147,10 +151,22 @@ Legacy JSON IPC (`apm2_core::ipc`) is forbidden by DD-009 and must not be used.
 Until ProtocolServer wiring is complete, CLI control-plane usage is de-scoped and
 must not be treated as an authority surface.
 
+**Dual-Socket Architecture (TCK-00249, TCK-00280):**
+- `operator_socket` (mode 0600): Used for privileged operations requiring owner access
+  - Process control: start, stop, restart, reload
+  - Credential management: add, remove, refresh, switch
+  - Daemon control: kill
+- `session_socket` (mode 0660): Used for session-scoped read operations
+  - Status queries: list, status, logs
+  - Credential listing: creds list
+- Both sockets are **required** in the ecosystem config `[daemon]` section
+- Legacy single `socket` field is rejected with DD-009 validation error
+
 **Invariants:**
 - [INV-CLI-003] Uses ProtocolServer framing and handshake; JSON framing is prohibited.
 - [INV-CLI-004] Connection is closed after each request-response cycle (stateless).
 - [INV-CLI-005] Operator vs session sockets are distinct; privileged calls use operator.sock only.
+- [INV-CLI-006] Both `operator_socket` and `session_socket` must be configured (TCK-00280).
 
 **Contracts:**
 - [CTR-CLI-101] Returns `Error` with context if socket connection fails.
