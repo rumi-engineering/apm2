@@ -520,6 +520,51 @@ pub struct SessionError {
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
 }
+/// Signal sent to sessions when their lease is revoked.
+/// Sessions receiving this signal MUST re-authenticate before continuing.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LeaseRevoked {
+    /// The session whose lease is being revoked.
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// The lease that was revoked.
+    #[prost(string, tag = "2")]
+    pub lease_id: ::prost::alloc::string::String,
+    /// Why the lease is being revoked.
+    #[prost(enumeration = "LeaseRevokedReason", tag = "3")]
+    pub reason: i32,
+    /// Timestamp when the lease was revoked (nanoseconds since epoch).
+    #[prost(uint64, tag = "4")]
+    pub revoked_at_ns: u64,
+    /// Human-readable message explaining the revocation.
+    #[prost(string, optional, tag = "5")]
+    pub message: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Request to recover sessions after daemon restart.
+/// Privileged endpoint (operator.sock only).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RecoverSessionsRequest {
+    /// Maximum time to wait for recovery (milliseconds).
+    /// Default: 5000 (5 seconds per acceptance criteria).
+    #[prost(uint32, tag = "1")]
+    pub timeout_ms: u32,
+}
+/// Response from session recovery.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RecoverSessionsResponse {
+    /// Number of sessions that were recovered.
+    #[prost(uint32, tag = "1")]
+    pub sessions_recovered: u32,
+    /// Number of orphaned processes cleaned up.
+    #[prost(uint32, tag = "2")]
+    pub orphaned_processes_cleaned: u32,
+    /// Number of LEASE_REVOKED signals sent.
+    #[prost(uint32, tag = "3")]
+    pub lease_revoked_signals_sent: u32,
+    /// Time taken for recovery (milliseconds).
+    #[prost(uint32, tag = "4")]
+    pub recovery_time_ms: u32,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -931,6 +976,46 @@ impl SessionErrorCode {
             "SESSION_ERROR_BUDGET_EXHAUSTED" => Some(Self::SessionErrorBudgetExhausted),
             "SESSION_ERROR_CONTEXT_FIREWALL" => Some(Self::SessionErrorContextFirewall),
             "SESSION_ERROR_PERMISSION_DENIED" => Some(Self::SessionErrorPermissionDenied),
+            _ => None,
+        }
+    }
+}
+/// Reason for lease revocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LeaseRevokedReason {
+    Unspecified = 0,
+    /// Daemon crashed and restarted, invalidating all prior leases.
+    LeaseRevokedDaemonRestart = 1,
+    /// Lease expired during daemon downtime.
+    LeaseRevokedExpired = 2,
+    /// Explicit revocation by operator.
+    LeaseRevokedByOperator = 3,
+    /// Session violated policy (context firewall, etc.).
+    LeaseRevokedPolicyViolation = 4,
+}
+impl LeaseRevokedReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LEASE_REVOKED_REASON_UNSPECIFIED",
+            Self::LeaseRevokedDaemonRestart => "LEASE_REVOKED_DAEMON_RESTART",
+            Self::LeaseRevokedExpired => "LEASE_REVOKED_EXPIRED",
+            Self::LeaseRevokedByOperator => "LEASE_REVOKED_BY_OPERATOR",
+            Self::LeaseRevokedPolicyViolation => "LEASE_REVOKED_POLICY_VIOLATION",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LEASE_REVOKED_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "LEASE_REVOKED_DAEMON_RESTART" => Some(Self::LeaseRevokedDaemonRestart),
+            "LEASE_REVOKED_EXPIRED" => Some(Self::LeaseRevokedExpired),
+            "LEASE_REVOKED_BY_OPERATOR" => Some(Self::LeaseRevokedByOperator),
+            "LEASE_REVOKED_POLICY_VIOLATION" => Some(Self::LeaseRevokedPolicyViolation),
             _ => None,
         }
     }

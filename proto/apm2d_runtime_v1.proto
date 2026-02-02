@@ -497,3 +497,56 @@ message SessionError {
   SessionErrorCode code = 1;
   string message = 2;
 }
+
+// =============================================================================
+// CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
+// =============================================================================
+// These messages support daemon crash recovery and lease revocation.
+
+// Reason for lease revocation.
+enum LeaseRevokedReason {
+  LEASE_REVOKED_REASON_UNSPECIFIED = 0;
+  // Daemon crashed and restarted, invalidating all prior leases.
+  LEASE_REVOKED_DAEMON_RESTART = 1;
+  // Lease expired during daemon downtime.
+  LEASE_REVOKED_EXPIRED = 2;
+  // Explicit revocation by operator.
+  LEASE_REVOKED_BY_OPERATOR = 3;
+  // Session violated policy (context firewall, etc.).
+  LEASE_REVOKED_POLICY_VIOLATION = 4;
+}
+
+// Signal sent to sessions when their lease is revoked.
+// Sessions receiving this signal MUST re-authenticate before continuing.
+message LeaseRevoked {
+  // The session whose lease is being revoked.
+  string session_id = 1;
+  // The lease that was revoked.
+  string lease_id = 2;
+  // Why the lease is being revoked.
+  LeaseRevokedReason reason = 3;
+  // Timestamp when the lease was revoked (nanoseconds since epoch).
+  uint64 revoked_at_ns = 4;
+  // Human-readable message explaining the revocation.
+  optional string message = 5;
+}
+
+// Request to recover sessions after daemon restart.
+// Privileged endpoint (operator.sock only).
+message RecoverSessionsRequest {
+  // Maximum time to wait for recovery (milliseconds).
+  // Default: 5000 (5 seconds per acceptance criteria).
+  uint32 timeout_ms = 1;
+}
+
+// Response from session recovery.
+message RecoverSessionsResponse {
+  // Number of sessions that were recovered.
+  uint32 sessions_recovered = 1;
+  // Number of orphaned processes cleaned up.
+  uint32 orphaned_processes_cleaned = 2;
+  // Number of LEASE_REVOKED signals sent.
+  uint32 lease_revoked_signals_sent = 3;
+  // Time taken for recovery (milliseconds).
+  uint32 recovery_time_ms = 4;
+}

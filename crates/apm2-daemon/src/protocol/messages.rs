@@ -329,6 +329,10 @@ impl_bounded_decode_simple!(
     StreamTelemetryRequest,
     StreamTelemetryResponse,
     SessionError,
+    // CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
+    LeaseRevoked,
+    RecoverSessionsRequest,
+    RecoverSessionsResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields
