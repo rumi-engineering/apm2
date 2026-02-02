@@ -613,7 +613,10 @@ impl Reducer for LeaseReducer {
                 self.handle_conflict(e);
                 Ok(())
             },
-            None => Ok(()),
+            // TCK-00258: LeaseIssueDenied is an audit/diagnostic event.
+            // It does not modify lease state, only records that a lease was
+            // denied. The reducer acknowledges but takes no state action.
+            Some(lease_event::Event::IssueDenied(_)) | None => Ok(()),
         }
     }
 

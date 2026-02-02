@@ -168,6 +168,21 @@ pub enum EpisodeError {
         /// Error message from the clock.
         message: String,
     },
+
+    /// Custody domain violation (`SoD` enforcement).
+    ///
+    /// Per REQ-DCP-0006, spawn is rejected when executor custody domain
+    /// overlaps with author custody domains for the changeset. This enforces
+    /// Separation of Duties (`SoD`) to prevent self-review attacks.
+    #[error(
+        "custody domain violation: executor domain '{executor_domain}' overlaps with author domain '{author_domain}'"
+    )]
+    CustodyDomainViolation {
+        /// The executor's custody domain that caused the violation.
+        executor_domain: String,
+        /// The author's custody domain that overlaps.
+        author_domain: String,
+    },
 }
 
 impl EpisodeError {
@@ -190,6 +205,7 @@ impl EpisodeError {
             Self::EnvelopeValidation { .. } => "envelope_validation",
             Self::Internal { .. } => "internal",
             Self::ClockFailure { .. } => "clock_failure",
+            Self::CustodyDomainViolation { .. } => "custody_domain_violation",
         }
     }
 }

@@ -161,13 +161,97 @@ pub enum EpisodeEvent {
         /// The full `TimeEnvelope` preimage for verification.
         time_envelope: Option<TimeEnvelope>,
     },
+    /// Lease issuance was denied (TCK-00258).
+    ///
+    /// Per REQ-DCP-0006, this event is emitted when a spawn request is rejected
+    /// due to policy violations such as `SoD` (Separation of Duties) custody
+    /// domain overlap. This provides an audit trail for security-relevant
+    /// rejections.
+    ///
+    /// # Verification
+    ///
+    /// Auditors should verify that:
+    /// - All `LeaseIssueDenied` events have valid denial reasons
+    /// - `SOD_VIOLATION` events include overlapping domain information
+    LeaseIssueDenied {
+        /// Work ID that was denied.
+        work_id: String,
+        /// Reason for denial.
+        denial_reason: LeaseIssueDenialReason,
+        /// Timestamp when denied (nanoseconds since epoch).
+        denied_at_ns: u64,
+        /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
+        time_envelope_ref: Option<TimeEnvelopeRef>,
+        /// The full `TimeEnvelope` preimage for verification.
+        time_envelope: Option<TimeEnvelope>,
+    },
+}
+
+/// Reason for lease issuance denial.
+///
+/// Per REQ-DCP-0006, this enum captures the specific reason why a lease
+/// was denied, enabling diagnostic reporting and security auditing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LeaseIssueDenialReason {
+    /// Separation of Duties violation: executor custody domain overlaps
+    /// with author custody domains for the changeset.
+    SodViolation {
+        /// The executor's custody domain that caused the violation.
+        executor_domain: String,
+        /// The author's custody domain that overlaps.
+        author_domain: String,
+    },
+    /// Policy resolution is missing for the work item.
+    PolicyResolutionMissing,
+    /// Role mismatch between claim and spawn request.
+    RoleMismatch {
+        /// The claimed role.
+        claimed_role: String,
+        /// The requested role.
+        requested_role: String,
+    },
+    /// Lease ID mismatch.
+    LeaseIdMismatch,
+    /// Other policy violation.
+    PolicyViolation {
+        /// Description of the violation.
+        description: String,
+    },
+}
+
+impl std::fmt::Display for LeaseIssueDenialReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SodViolation {
+                executor_domain,
+                author_domain,
+            } => write!(
+                f,
+                "SOD_VIOLATION: executor domain '{executor_domain}' overlaps with author domain '{author_domain}'"
+            ),
+            Self::PolicyResolutionMissing => write!(f, "POLICY_RESOLUTION_MISSING"),
+            Self::RoleMismatch {
+                claimed_role,
+                requested_role,
+            } => write!(
+                f,
+                "ROLE_MISMATCH: claimed={claimed_role}, requested={requested_role}"
+            ),
+            Self::LeaseIdMismatch => write!(f, "LEASE_ID_MISMATCH"),
+            Self::PolicyViolation { description } => {
+                write!(f, "POLICY_VIOLATION: {description}")
+            },
+        }
+    }
 }
 
 impl EpisodeEvent {
     /// Returns the episode ID for this event, if applicable.
     ///
-    /// Runtime-level events like [`EpisodeEvent::ClockProfilePublished`] do not
-    /// have an associated episode and return `None`.
+    /// Runtime-level events like [`EpisodeEvent::ClockProfilePublished`] and
+    /// [`EpisodeEvent::LeaseIssueDenied`] do not have an associated episode
+    /// and return `None`.
     #[must_use]
     pub const fn episode_id(&self) -> Option<&EpisodeId> {
         match self {
@@ -175,7 +259,7 @@ impl EpisodeEvent {
             | Self::Started { episode_id, .. }
             | Self::Stopped { episode_id, .. }
             | Self::Quarantined { episode_id, .. } => Some(episode_id),
-            Self::ClockProfilePublished { .. } => None,
+            Self::ClockProfilePublished { .. } | Self::LeaseIssueDenied { .. } => None,
         }
     }
 
@@ -188,6 +272,7 @@ impl EpisodeEvent {
             Self::Stopped { .. } => "episode.stopped",
             Self::Quarantined { .. } => "episode.quarantined",
             Self::ClockProfilePublished { .. } => "clock.profile_published",
+            Self::LeaseIssueDenied { .. } => "lease.issue_denied",
         }
     }
 
@@ -209,6 +294,9 @@ impl EpisodeEvent {
             }
             | Self::ClockProfilePublished {
                 time_envelope_ref, ..
+            }
+            | Self::LeaseIssueDenied {
+                time_envelope_ref, ..
             } => time_envelope_ref.as_ref(),
         }
     }
@@ -224,7 +312,29 @@ impl EpisodeEvent {
             | Self::Started { time_envelope, .. }
             | Self::Stopped { time_envelope, .. }
             | Self::Quarantined { time_envelope, .. }
-            | Self::ClockProfilePublished { time_envelope, .. } => time_envelope.as_ref(),
+            | Self::ClockProfilePublished { time_envelope, .. }
+            | Self::LeaseIssueDenied { time_envelope, .. } => time_envelope.as_ref(),
+        }
+    }
+
+    /// Returns the work ID for this event, if applicable.
+    ///
+    /// Currently only [`EpisodeEvent::LeaseIssueDenied`] has an associated work
+    /// ID separate from episode ID.
+    #[must_use]
+    pub fn work_id(&self) -> Option<&str> {
+        match self {
+            Self::LeaseIssueDenied { work_id, .. } => Some(work_id),
+            _ => None,
+        }
+    }
+
+    /// Returns the denial reason for `LeaseIssueDenied` events.
+    #[must_use]
+    pub const fn denial_reason(&self) -> Option<&LeaseIssueDenialReason> {
+        match self {
+            Self::LeaseIssueDenied { denial_reason, .. } => Some(denial_reason),
+            _ => None,
         }
     }
 }
@@ -914,6 +1024,60 @@ impl EpisodeRuntime {
         }
 
         warn!(episode_id = %episode_id, "episode quarantined");
+        Ok(())
+    }
+
+    /// Emits a `LeaseIssueDenied` event for `SoD` violations and other spawn
+    /// rejections.
+    ///
+    /// Per TCK-00258 and REQ-DCP-0006, this method emits a diagnostic event
+    /// when a spawn request is rejected due to policy violations such as
+    /// custody domain overlap.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - The work ID that was denied
+    /// * `denial_reason` - The reason for denial
+    /// * `timestamp_ns` - Current timestamp in nanoseconds since epoch
+    ///
+    /// # Events
+    ///
+    /// Emits `lease.issue_denied` event for audit logging.
+    #[instrument(skip(self, denial_reason))]
+    pub async fn emit_lease_issue_denied(
+        &self,
+        work_id: impl Into<String> + std::fmt::Debug,
+        denial_reason: LeaseIssueDenialReason,
+        timestamp_ns: u64,
+    ) -> Result<(), EpisodeError> {
+        let work_id = work_id.into();
+
+        if self.config.emit_events {
+            // Stamp time envelope for temporal ordering (RFC-0016 HTF)
+            // Per SEC-CTRL-FAC-0015 (Fail-Closed), propagate clock errors
+            let (time_envelope, time_envelope_ref) = match self
+                .stamp_envelope(Some(format!("lease.issue_denied:{work_id}")))
+                .await?
+            {
+                Some((env, env_ref)) => (Some(env), Some(env_ref)),
+                None => (None, None),
+            };
+
+            self.emit_event(EpisodeEvent::LeaseIssueDenied {
+                work_id: work_id.clone(),
+                denial_reason: denial_reason.clone(),
+                denied_at_ns: timestamp_ns,
+                time_envelope_ref,
+                time_envelope,
+            })
+            .await;
+        }
+
+        warn!(
+            work_id = %work_id,
+            denial_reason = %denial_reason,
+            "lease issuance denied"
+        );
         Ok(())
     }
 

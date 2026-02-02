@@ -424,7 +424,7 @@ pub struct ToolExecuted {
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LeaseEvent {
-    #[prost(oneof = "lease_event::Event", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "lease_event::Event", tags = "1, 2, 3, 4, 5, 6")]
     pub event: ::core::option::Option<lease_event::Event>,
 }
 /// Nested message and enum types in `LeaseEvent`.
@@ -442,6 +442,8 @@ pub mod lease_event {
         Expired(super::LeaseExpired),
         #[prost(message, tag = "5")]
         Conflict(super::LeaseConflict),
+        #[prost(message, tag = "6")]
+        IssueDenied(super::LeaseIssueDenied),
     }
 }
 #[derive(Eq, Hash)]
@@ -535,6 +537,42 @@ pub struct LeaseConflict {
     /// CANONICAL_ROOT, ADJUDICATION_REQUIRED
     #[prost(string, tag = "3")]
     pub resolution: ::prost::alloc::string::String,
+}
+/// Emitted when a lease issuance is denied for security policy reasons.
+///
+/// Per TCK-00258, this event is emitted when a SpawnEpisode request is
+/// rejected due to policy violations such as custody domain overlap (SoD).
+/// This provides an audit trail for denied lease requests.
+///
+/// Security: All denial events are logged for non-repudiation and
+/// security audit purposes.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LeaseIssueDenied {
+    /// Work ID that was denied a lease.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Reason for denial: SOD_VIOLATION, POLICY_VIOLATION, EXPIRED_CLAIM
+    #[prost(string, tag = "2")]
+    pub denial_reason: ::prost::alloc::string::String,
+    /// Human-readable details about the denial.
+    #[prost(string, tag = "3")]
+    pub denial_details: ::prost::alloc::string::String,
+    /// OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+    /// Retained for display/audit purposes; authoritative timing uses
+    /// HTF time from the time_envelope_ref.
+    #[prost(uint64, tag = "4")]
+    pub denied_at: u64,
+    /// Executor's custody domain that caused the SoD violation (if applicable).
+    #[prost(string, tag = "5")]
+    pub executor_domain: ::prost::alloc::string::String,
+    /// Author's custody domain that caused the SoD violation (if applicable).
+    #[prost(string, tag = "6")]
+    pub author_domain: ::prost::alloc::string::String,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the denial event to verifiable HTF time.
+    #[prost(message, optional, tag = "7")]
+    pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
 }
 /// ============================================================
 /// POLICY EVENTS
