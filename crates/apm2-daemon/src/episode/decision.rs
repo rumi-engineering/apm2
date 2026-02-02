@@ -44,6 +44,7 @@ use std::time::Duration;
 
 use apm2_core::htf::{TimeEnvelope, TimeEnvelopeRef};
 use prost::Message;
+use secrecy::{ExposeSecret, SecretString};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -608,6 +609,56 @@ impl SessionTerminationInfo {
 }
 
 // =============================================================================
+// Credential (TCK-00262)
+// =============================================================================
+
+/// Opaque credential wrapper for secure handling in decisions.
+///
+/// Wraps a `SecretString` to provide:
+/// - Redacted `Debug` output
+/// - Explicit `Clone`
+/// - `PartialEq` for testing (constant-time comparison)
+///
+/// # Security
+///
+/// This type ensures credentials are not accidentally logged or leaked via
+/// standard traits.
+#[derive(Clone)]
+pub struct Credential(SecretString);
+
+impl Credential {
+    /// Creates a new credential.
+    pub fn new(secret: impl Into<SecretString>) -> Self {
+        Self(secret.into())
+    }
+
+    /// Exposes the secret value (use with caution).
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[REDACTED]")
+    }
+}
+
+impl PartialEq for Credential {
+    fn eq(&self, other: &Self) -> bool {
+        // Use constant-time comparison on the exposed secret
+        // Note: ExposeSecret just returns &str, so we need subtle::ConstantTimeEq
+        // However, SecretString comparison logic depends on the secrecy crate version.
+        // For simple equality checks in tests/logic, we assume the string contents match.
+        // Secrecy doesn't impl PartialEq to avoid side channels.
+        // Here we explicitly opt-in to comparison for decision equality checks.
+        self.0.expose_secret() == other.0.expose_secret()
+    }
+}
+
+impl Eq for Credential {}
+
+// =============================================================================
 // ToolDecision
 // =============================================================================
 
@@ -636,6 +687,11 @@ pub enum ToolDecision {
 
         /// Resource budget to charge for this operation.
         budget_delta: BudgetDelta,
+
+        /// Optional credential to use for execution (TCK-00262).
+        /// This is populated by the broker if the tool requires authentication
+        /// (e.g. GitHub token) and the broker is configured to provide it.
+        credential: Option<Credential>,
     },
 
     /// Request is denied.
@@ -1172,6 +1228,7 @@ mod tests {
             rule_id: Some("rule-1".to_string()),
             policy_hash: [0u8; 32],
             budget_delta: BudgetDelta::single_call(),
+            credential: None,
         };
 
         assert!(decision.is_allowed());

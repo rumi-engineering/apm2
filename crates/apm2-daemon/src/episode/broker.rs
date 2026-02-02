@@ -45,15 +45,17 @@ use super::capability::{
     ManifestLoadError, ManifestLoader,
 };
 use super::decision::{
-    BrokerToolRequest, BudgetDelta, DedupeKey, RequestValidationError, SessionTerminationInfo,
-    ToolDecision, ToolResult,
+    BrokerToolRequest, BudgetDelta, Credential, DedupeKey, RequestValidationError,
+    SessionTerminationInfo, ToolDecision, ToolResult,
 };
 use super::dedupe::{DedupeCache, DedupeCacheConfig, SharedDedupeCache};
 use super::error::EpisodeId;
 use super::runtime::Hash;
 
+use crate::evidence::keychain::{GitHubCredentialStore, InMemoryGitHubCredentialStore};
 use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
 use apm2_core::context::ContextPackManifest;
+use secrecy::SecretString;
 
 // =============================================================================
 // BrokerError
@@ -344,6 +346,12 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
 
     /// Context pack manifest for firewall enforcement (TCK-00261).
     context_manifest: tokio::sync::RwLock<Option<Arc<ContextPackManifest>>>,
+
+    /// GitHub credential store for authenticated operations (TCK-00262).
+    github_store: Arc<dyn GitHubCredentialStore>,
+
+    /// GitHub installation ID for this episode (TCK-00262).
+    github_installation_id: tokio::sync::RwLock<Option<String>>,
 }
 
 impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
@@ -360,6 +368,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: None,
             context_manifest: tokio::sync::RwLock::new(None),
+            github_store: Arc::new(InMemoryGitHubCredentialStore::new()),
+            github_installation_id: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -376,7 +386,36 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: Some(loader),
             context_manifest: tokio::sync::RwLock::new(None),
+            github_store: Arc::new(InMemoryGitHubCredentialStore::new()),
+            github_installation_id: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// Creates a new tool broker with a custom GitHub credential store.
+    #[must_use]
+    pub fn with_github_store(
+        config: ToolBrokerConfig,
+        github_store: Arc<dyn GitHubCredentialStore>,
+    ) -> Self {
+        let dedupe_cache = Arc::new(DedupeCache::new(config.dedupe_config.clone()));
+
+        Self {
+            config,
+            validator: tokio::sync::RwLock::new(None),
+            dedupe_cache,
+            policy: StubPolicyEngine::new(),
+            cas: Arc::new(StubContentAddressedStore::new()),
+            loader: None,
+            context_manifest: tokio::sync::RwLock::new(None),
+            github_store,
+            github_installation_id: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    /// Sets the GitHub installation ID for this episode.
+    pub async fn set_github_installation_id(&self, installation_id: impl Into<String>) {
+        let mut guard = self.github_installation_id.write().await;
+        *guard = Some(installation_id.into());
     }
 
     /// Initializes the broker with a capability manifest from CAS.
@@ -572,6 +611,29 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             }
         }
 
+        // TCK-00262: Fetch credential for authenticated operations (Git/Network)
+        // Mediate access via broker pattern - session never sees token directly
+        let credential = if request.tool_class == super::tool_class::ToolClass::Git
+            || request.tool_class == super::tool_class::ToolClass::Network
+        {
+            if let Some(installation_id) = self.github_installation_id.read().await.as_ref() {
+                match self.github_store.get_token(installation_id) {
+                    Ok(token) => Some(Credential::new(SecretString::new(token.into()))),
+                    Err(e) => {
+                        warn!(installation_id = %installation_id, error = %e, "failed to retrieve github token");
+                        // Fail open? No, if token is needed but missing, tool might fail.
+                        // But we don't know for sure if tool NEEDS it.
+                        // We return None, tool execution will likely fail if auth required.
+                        None
+                    },
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Request is authorized - return Allow decision
         debug!(capability_id = %capability_id, "request allowed");
         Ok(ToolDecision::Allow {
@@ -588,6 +650,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             },
             policy_hash: self.policy.policy_hash(),
             budget_delta: BudgetDelta::single_call(),
+            credential,
         })
     }
 

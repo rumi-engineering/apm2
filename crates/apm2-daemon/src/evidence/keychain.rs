@@ -63,6 +63,9 @@ use super::signer::{KeyId, ReceiptSigner, SignerError};
 /// Service name for keychain entries.
 pub const KEYCHAIN_SERVICE_NAME: &str = "apm2-receipt-signing";
 
+/// Service name for GitHub tokens (TCK-00262).
+pub const GITHUB_KEYCHAIN_SERVICE: &str = "apm2-github-tokens";
+
 /// Maximum number of keys to store (CTR-1303).
 pub const MAX_STORED_KEYS: usize = 100;
 
@@ -245,6 +248,47 @@ pub trait SigningKeyStore: Send + Sync {
     ///
     /// Returns an error if the key doesn't exist or the operation fails.
     fn update_version(&self, key_id: &KeyId, new_version: u32) -> Result<(), KeychainError>;
+}
+
+// =============================================================================
+// GitHubCredentialStore Trait (TCK-00262)
+// =============================================================================
+
+/// Trait for GitHub credential storage backends.
+///
+/// This trait abstracts the storage of GitHub installation access tokens
+/// to allow for OS keychain storage in production and in-memory storage
+/// for testing.
+pub trait GitHubCredentialStore: Send + Sync {
+    /// Stores a GitHub token for an installation.
+    ///
+    /// # Arguments
+    ///
+    /// * `installation_id` - GitHub installation ID
+    /// * `token` - The access token
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the keychain operation fails.
+    fn store_token(&self, installation_id: &str, token: &str) -> Result<(), KeychainError>;
+
+    /// Retrieves a GitHub token for an installation.
+    ///
+    /// # Arguments
+    ///
+    /// * `installation_id` - GitHub installation ID
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token is not found or the operation fails.
+    fn get_token(&self, installation_id: &str) -> Result<String, KeychainError>;
+
+    /// Deletes a GitHub token.
+    ///
+    /// # Arguments
+    ///
+    /// * `installation_id` - GitHub installation ID
+    fn delete_token(&self, installation_id: &str) -> Result<(), KeychainError>;
 }
 
 // =============================================================================
@@ -674,6 +718,42 @@ impl SigningKeyStore for OsKeychain {
     }
 }
 
+impl GitHubCredentialStore for OsKeychain {
+    fn store_token(&self, installation_id: &str, token: &str) -> Result<(), KeychainError> {
+        // Use a dedicated service name for GitHub tokens
+        let entry = keyring::Entry::new(GITHUB_KEYCHAIN_SERVICE, installation_id)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        entry
+            .set_password(token)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        Ok(())
+    }
+
+    fn get_token(&self, installation_id: &str) -> Result<String, KeychainError> {
+        let entry = keyring::Entry::new(GITHUB_KEYCHAIN_SERVICE, installation_id)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        entry.get_password().map_err(|e| match e {
+            keyring::Error::NoEntry => KeychainError::NotFound {
+                key_id: installation_id.to_string(),
+            },
+            _ => KeychainError::Keychain(e.to_string()),
+        })
+    }
+
+    fn delete_token(&self, installation_id: &str) -> Result<(), KeychainError> {
+        let entry = keyring::Entry::new(GITHUB_KEYCHAIN_SERVICE, installation_id)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(KeychainError::Keychain(e.to_string())),
+        }
+    }
+}
+
 // =============================================================================
 // InMemoryKeyStore
 // =============================================================================
@@ -783,6 +863,56 @@ impl SigningKeyStore for InMemoryKeyStore {
             })?;
 
         info.version = new_version;
+        Ok(())
+    }
+}
+
+/// In-memory GitHub credential store for testing.
+pub struct InMemoryGitHubCredentialStore {
+    tokens: RwLock<HashMap<String, String>>,
+}
+
+impl InMemoryGitHubCredentialStore {
+    /// Creates a new in-memory credential store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tokens: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for InMemoryGitHubCredentialStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GitHubCredentialStore for InMemoryGitHubCredentialStore {
+    fn store_token(&self, installation_id: &str, token: &str) -> Result<(), KeychainError> {
+        let mut tokens = self
+            .tokens
+            .write()
+            .map_err(|_| KeychainError::LockPoisoned)?;
+        tokens.insert(installation_id.to_string(), token.to_string());
+        Ok(())
+    }
+
+    fn get_token(&self, installation_id: &str) -> Result<String, KeychainError> {
+        let tokens = self.tokens.read().map_err(|_| KeychainError::LockPoisoned)?;
+        tokens.get(installation_id).cloned().ok_or_else(|| {
+            KeychainError::NotFound {
+                key_id: installation_id.to_string(),
+            }
+        })
+    }
+
+    fn delete_token(&self, installation_id: &str) -> Result<(), KeychainError> {
+        let mut tokens = self
+            .tokens
+            .write()
+            .map_err(|_| KeychainError::LockPoisoned)?;
+        tokens.remove(installation_id);
         Ok(())
     }
 }
