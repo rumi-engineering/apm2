@@ -478,3 +478,181 @@ mod tests {
         assert_eq!(groups.get("session-2").unwrap().len(), 1);
     }
 }
+
+// =============================================================================
+// TCK-00267: Crash Recovery Session State Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tck_00267 {
+    use super::*;
+
+    fn make_event(
+        seq_id: u64,
+        session_id: &str,
+        event_type: &str,
+        timestamp_ns: u64,
+    ) -> EventRecord {
+        EventRecord::with_timestamp(event_type, session_id, "test-actor", vec![], timestamp_ns)
+            .with_seq_id(seq_id)
+    }
+
+    /// TCK-00267: Active sessions can be identified for recovery.
+    #[test]
+    fn active_sessions_identified_for_recovery() {
+        let events = vec![
+            make_event(1, "session-1", "session.started", 1_000_000),
+            make_event(2, "session-1", "session.progress", 2_000_000),
+            make_event(3, "session-2", "session.started", 3_000_000),
+            make_event(4, "session-3", "session.started", 4_000_000),
+            make_event(5, "session-3", "session.terminated", 5_000_000),
+        ];
+
+        // Session-1: active (started + progress)
+        let state1 = replay_session_state(&events, "session-1", None).unwrap();
+        assert!(state1.is_active(), "Session-1 should be active");
+
+        // Session-2: active (just started)
+        let state2 = replay_session_state(&events, "session-2", None).unwrap();
+        assert!(state2.is_active(), "Session-2 should be active");
+
+        // Session-3: terminated (not active)
+        let state3 = replay_session_state(&events, "session-3", None).unwrap();
+        assert!(!state3.is_active(), "Session-3 should not be active");
+    }
+
+    /// TCK-00267: Recovery state tracks last progress for resume cursor.
+    #[test]
+    fn recovery_state_tracks_resume_cursor() {
+        let events = vec![
+            make_event(1, "session-1", "session.started", 1_000_000),
+            make_event(2, "session-1", "session.progress", 2_000_000),
+            make_event(3, "session-1", "tool.request", 3_000_000),
+            make_event(4, "session-1", "session.progress", 4_000_000),
+            make_event(5, "session-1", "tool.response", 5_000_000),
+        ];
+
+        let state = replay_session_state(&events, "session-1", None).unwrap();
+
+        // Resume cursor should be last progress event (seq_id 4)
+        assert_eq!(state.resume_cursor(), 4);
+        assert_eq!(state.last_progress_seq_id, Some(4));
+    }
+
+    /// TCK-00267: Sessions grouped by ID for batch recovery.
+    #[test]
+    fn sessions_grouped_for_batch_recovery() {
+        let events = vec![
+            make_event(1, "session-1", "session.started", 1_000_000),
+            make_event(2, "session-2", "session.started", 2_000_000),
+            make_event(3, "session-1", "session.progress", 3_000_000),
+            make_event(4, "session-3", "session.started", 4_000_000),
+            make_event(5, "session-2", "session.progress", 5_000_000),
+        ];
+
+        let groups = group_by_session(&events);
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups.get("session-1").unwrap().len(), 2);
+        assert_eq!(groups.get("session-2").unwrap().len(), 2);
+        assert_eq!(groups.get("session-3").unwrap().len(), 1);
+    }
+
+    /// TCK-00267: Session cursors collected for recovery point calculation.
+    #[test]
+    fn session_cursors_collected_for_recovery() {
+        let events = vec![
+            make_event(1, "session-1", "session.started", 1_000_000),
+            make_event(2, "session-1", "session.progress", 2_000_000),
+            make_event(3, "session-2", "session.started", 3_000_000),
+        ];
+
+        let cursors = collect_session_cursors(&events);
+
+        assert_eq!(cursors.len(), 3);
+
+        // Verify session-1 has cursors 1 and 2
+        let session1_cursors: Vec<u64> = cursors
+            .iter()
+            .filter(|(_, s)| s == "session-1")
+            .map(|(seq, _)| *seq)
+            .collect();
+        assert!(session1_cursors.contains(&1));
+        assert!(session1_cursors.contains(&2));
+
+        // Verify session-2 has cursor 3
+        assert!(
+            cursors
+                .iter()
+                .filter(|(_, s)| s == "session-2")
+                .any(|(seq, _)| *seq == 3)
+        );
+    }
+
+    /// TCK-00267: Quarantined sessions are not active.
+    #[test]
+    fn quarantined_sessions_not_active() {
+        let events = vec![
+            make_event(1, "session-1", "session.started", 1_000_000),
+            make_event(2, "session-1", "session.quarantined", 2_000_000),
+        ];
+
+        let state = replay_session_state(&events, "session-1", None).unwrap();
+
+        assert!(state.quarantined);
+        assert!(!state.is_active());
+    }
+
+    /// TCK-00267: Recovery state counts progress events correctly.
+    #[test]
+    fn recovery_state_counts_progress() {
+        let events = vec![
+            make_event(1, "session-1", "session.started", 1_000_000),
+            make_event(2, "session-1", "session.progress", 2_000_000),
+            make_event(3, "session-1", "session.progress", 3_000_000),
+            make_event(4, "session-1", "session.progress", 4_000_000),
+        ];
+
+        let state = replay_session_state(&events, "session-1", None).unwrap();
+
+        assert_eq!(state.progress_count, 3);
+        assert_eq!(state.event_count, 4);
+    }
+
+    /// TCK-00267: Events since a cursor can be counted for recovery assessment.
+    #[test]
+    fn count_events_since_cursor() {
+        let events = vec![
+            make_event(1, "session-1", "session.started", 1_000_000),
+            make_event(2, "session-1", "session.progress", 2_000_000),
+            make_event(3, "session-1", "session.progress", 3_000_000),
+            make_event(4, "session-1", "tool.request", 4_000_000),
+        ];
+
+        // Count events since seq_id 2
+        let count = count_events_since(&events, "session-1", 2);
+        assert_eq!(count, 2); // seq_id 3 and 4
+
+        // Count all events (since 0)
+        let all_count = count_events_since(&events, "session-1", 0);
+        assert_eq!(all_count, 4);
+    }
+
+    /// TCK-00267: Partial replay up to specific `seq_id`.
+    #[test]
+    fn partial_replay_for_recovery_point() {
+        let events = vec![
+            make_event(1, "session-1", "session.started", 1_000_000),
+            make_event(2, "session-1", "session.progress", 2_000_000),
+            make_event(3, "session-1", "session.progress", 3_000_000),
+            make_event(4, "session-1", "session.terminated", 4_000_000),
+        ];
+
+        // Replay only up to before termination
+        let state = replay_session_state(&events, "session-1", Some(3)).unwrap();
+
+        assert!(!state.terminated, "Should not see termination at seq_id 3");
+        assert!(state.is_active(), "Should be active at seq_id 3");
+        assert_eq!(state.progress_count, 2);
+    }
+}
