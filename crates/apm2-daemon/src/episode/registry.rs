@@ -584,7 +584,9 @@ mod session_registry_tests {
             SessionRegistryError::DuplicateSessionId { session_id } => {
                 assert_eq!(session_id, "sess-1");
             },
-            other @ SessionRegistryError::RegistrationFailed { .. } => panic!("Expected DuplicateSessionId, got: {other:?}"),
+            other @ SessionRegistryError::RegistrationFailed { .. } => {
+                panic!("Expected DuplicateSessionId, got: {other:?}")
+            },
         }
     }
 
