@@ -44,21 +44,28 @@ pub struct EcosystemConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default = "default_pid_file")]
-    pub pid_file: PathBuf,      // Default: /var/run/apm2/apm2.pid
-    #[serde(default = "default_socket")]
-    pub socket: PathBuf,        // Default: /var/run/apm2/apm2.sock
+    pub pid_file: PathBuf,          // Default: /var/run/apm2/apm2.pid
+    pub operator_socket: PathBuf,   // Required - privileged operations (mode 0600)
+    pub session_socket: PathBuf,    // Required - session-scoped operations (mode 0660)
     #[serde(default = "default_log_dir")]
-    pub log_dir: PathBuf,       // Default: /var/log/apm2
+    pub log_dir: PathBuf,           // Default: /var/log/apm2
     #[serde(default = "default_state_file")]
-    pub state_file: PathBuf,    // Default: /var/lib/apm2/state.json
+    pub state_file: PathBuf,        // Default: /var/lib/apm2/state.json
     #[serde(default)]
-    pub audit: AuditConfig,     // Audit event retention policy
+    pub audit: AuditConfig,         // Audit event retention policy
 }
 ```
 
+**Dual-Socket Architecture (TCK-00249, TCK-00280):**
+- `operator_socket`: Used for privileged operations (process control, credential management). Mode 0600 restricts to owner.
+- `session_socket`: Used for session-scoped operations (status queries). Mode 0660 allows group access.
+- Both fields are **required** when a `[daemon]` section is present - serde validation will fail if omitted.
+- The legacy `socket` field is no longer supported (DD-009 fail-closed validation).
+
 **Invariants:**
 - [INV-CFG-03] All paths have sensible FHS-compliant defaults for Unix systems
-- [INV-CFG-04] `Default` implementation matches field-level `serde(default)` behavior
+- [INV-CFG-04] `Default` implementation provides sensible defaults for programmatic use
+- [INV-CFG-10] `operator_socket` and `session_socket` are required in TOML config (TCK-00280)
 
 ### `AuditConfig`
 
@@ -198,7 +205,8 @@ use apm2_core::config::EcosystemConfig;
 let toml = r#"
     [daemon]
     pid_file = "/tmp/apm2.pid"
-    socket = "/tmp/apm2.sock"
+    operator_socket = "/tmp/apm2/operator.sock"
+    session_socket = "/tmp/apm2/session.sock"
 
     [[credentials]]
     id = "claude-work"
@@ -221,8 +229,49 @@ let toml = r#"
 
 let config = EcosystemConfig::from_toml(toml)?;
 assert_eq!(config.daemon.pid_file.to_str(), Some("/tmp/apm2.pid"));
+assert_eq!(config.daemon.operator_socket.to_str(), Some("/tmp/apm2/operator.sock"));
+assert_eq!(config.daemon.session_socket.to_str(), Some("/tmp/apm2/session.sock"));
 assert_eq!(config.credentials.len(), 1);
 assert_eq!(config.processes[0].instances, 2);
+```
+
+### Invalid Configuration (Missing Sockets)
+
+```rust
+use apm2_core::config::EcosystemConfig;
+
+// This will fail - operator_socket and session_socket are required
+let toml = r#"
+    [daemon]
+    pid_file = "/tmp/apm2.pid"
+
+    [[processes]]
+    name = "test"
+    command = "echo"
+"#;
+
+let result = EcosystemConfig::from_toml(toml);
+assert!(result.is_err()); // Missing required socket fields
+```
+
+### Invalid Configuration (Legacy Socket)
+
+```rust
+use apm2_core::config::EcosystemConfig;
+
+// This will fail - legacy 'socket' field is rejected (DD-009)
+let toml = r#"
+    [daemon]
+    pid_file = "/tmp/apm2.pid"
+    socket = "/tmp/apm2.sock"  # REJECTED - use operator_socket and session_socket
+
+    [[processes]]
+    name = "test"
+    command = "echo"
+"#;
+
+let result = EcosystemConfig::from_toml(toml);
+assert!(result.is_err()); // DD-009: legacy socket rejected
 ```
 
 ## Embedded Configuration Types
@@ -243,11 +292,14 @@ The following types are imported from other modules and embedded in `ProcessConf
 INV-CFG-01  serde(default) ensures partial TOML parsing
 INV-CFG-02  Process names should be unique (validation-time)
 INV-CFG-03  DaemonConfig paths have FHS-compliant defaults
-INV-CFG-04  Default impl matches serde defaults
+INV-CFG-04  Default impl provides sensible defaults for programmatic use
 INV-CFG-05  Credential profile IDs must be unique
 INV-CFG-06  Process names must be non-empty and unique
 INV-CFG-07  Process command must be non-empty
 INV-CFG-08  instances defaults to 1
+INV-CFG-09  Audit retention defaults to 30 days / 1GB
+INV-CFG-10  operator_socket and session_socket are required in TOML (TCK-00280)
+INV-CFG-11  Legacy 'socket' field is rejected with DD-009 error
 ```
 
 ## Contract Summary
