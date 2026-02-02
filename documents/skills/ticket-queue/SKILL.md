@@ -8,7 +8,7 @@ disable-model-invocation: true
 title: Ticket Queue (Sequential Merge Orchestration)
 protocol:
   id: TICKET-QUEUE
-  version: 1.0.0
+  version: 1.1.0
   type: executable_specification
   inputs[1]:
     - START_TARGET_OPTIONAL

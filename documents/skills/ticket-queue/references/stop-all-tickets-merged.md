@@ -16,3 +16,4 @@ decision_tree:
           action: "Output 'Done' and nothing else."
         - id: STOP
           action: "Stop the workflow."
+      decisions[0]: []

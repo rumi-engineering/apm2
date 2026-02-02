@@ -22,7 +22,7 @@ decision_tree:
           action: command
           run: "timeout 30s gh auth status"
           capture_as: gh_auth_status
-        - id: VERIFY_GIT_CLEAN_ENOUGH
+        - id: VERIFY_GIT_CLEAN
           action: command
           run: "git status --porcelain"
           capture_as: git_status_porcelain
@@ -33,7 +33,7 @@ decision_tree:
         - id: OPERATIONAL_CONSTRAINTS
           action: |
             1) MAX_RUNTIME: Never allow a subagent to work continuously for >=15 minutes. Terminate and restart with warm handoff to prevent context rot.
-            2) CWD_DISCIPLINE: Periodically verify current directory. If inside a worktree, `cd` back to the main repository root before loop transitions.
+            2) NO_WORKTREES: All work occurs in the primary clone. Use branch switching.
         - id: ENTER_QUEUE_LOOP
           action: "Invoke the queue loop and do not stop until stop conditions are satisfied."
       decisions[3]:
@@ -41,7 +41,7 @@ decision_tree:
           if: "gh_auth_status indicates not logged in or missing auth"
           then:
             next_reference: references/stop-blocked-gh-auth.md
-        - id: DIRTY_WORKTREE
+        - id: DIRTY_REPO
           if: "git_status_porcelain is non-empty"
           then:
             next_reference: references/stop-blocked-dirty-worktree.md

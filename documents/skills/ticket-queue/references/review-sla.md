@@ -7,18 +7,18 @@ decision_tree:
       purpose: "Ensure both AI reviews (security + code quality) post a PR comment and update their status checks within 15 minutes. If reviewers stall, remediate quickly."
       steps[12]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "Replace <WORKTREE_PATH> and <TICKET_ID>. Replace <PR_URL> if known. Replace <SEC_PID>/<QUAL_PID>/<SEC_LOG>/<QUAL_LOG> once discovered."
+          action: "Replace <TICKET_ID> and <BRANCH_NAME>. Replace <PR_URL> if known. Replace <SEC_PID>/<QUAL_PID>/<SEC_LOG>/<QUAL_LOG> once discovered."
         - id: GET_PR_URL
           action: command
-          run: "bash -lc 'set -euo pipefail; cd \"<WORKTREE_PATH>\"; b=$(git branch --show-current); timeout 30s gh pr view \"$b\" --json url --jq .url'"
+          run: "gh pr view <BRANCH_NAME> --json url --jq .url"
           capture_as: pr_url
-        - id: RUN_CHECK_FOR_REMEDIATION
+        - id: CHECK_GITHUB_STATUS
           action: command
-          run: "bash -lc 'set -euo pipefail; cd \"<WORKTREE_PATH>\" && timeout 30s cargo xtask check'"
+          run: "gh pr view <BRANCH_NAME> --json statusCheckRollup"
           capture_as: check_output
         - id: LOAD_REVIEWER_STATE
           action: command
-          run: "python3 - <<'PY'\nimport json\nfrom pathlib import Path\np = Path.home()/'.apm2'/'reviewer_state.json'\ndata = json.loads(p.read_text())\nfor k,v in (data.get('reviewers') or {}).items():\n    print(f\"{k}\\tpid={v.get('pid')}\\tstarted_at={v.get('started_at')}\\tlog_file={v.get('log_file')}\\tpr_url={v.get('pr_url')}\")\nPY"
+          run: "python3 - <<'PY'\nimport json, os, time\nfrom pathlib import Path\np = Path.home()/'.apm2'/'reviewer_state.json'\nif p.exists():\n    data = json.loads(p.read_text())\n    for k,v in (data.get('reviewers') or {}).items():\n        print(f\"{k}\\ttpid={v.get('pid')}\\tstarted_at={v.get('started_at')}\\tlog_file={v.get('log_file')}\\tpr_url={v.get('pr_url')}\")\nPY"
           capture_as: reviewer_state_summary
         - id: IDENTIFY_PIDS_AND_LOGS
           action: "From reviewer_state_summary, set <SEC_PID>/<SEC_LOG> for `security` and <QUAL_PID>/<QUAL_LOG> for `quality`. If entries are missing, reviews may not have been spawned (escalate implementer)."
@@ -35,13 +35,13 @@ decision_tree:
           run: "bash -lc 'set -euo pipefail; echo \"--- security tail ---\"; tail -n 80 <SEC_LOG> || true; echo \"--- quality tail ---\"; tail -n 80 <QUAL_LOG> || true'"
           capture_as: reviewer_log_tail
         - id: ENFORCE_15_MINUTE_DEADLINE
-          action: "Compute SLA from each reviewer entry's `started_at`. If now - started_at >= 900s and the corresponding GitHub status is still `pending`, you MUST treat this as an SLA breach and take corrective action immediately (restart reviews or switch to a manual/fallback review runner)."
+          action: "Compute SLA from each reviewer entry's `started_at`. If now - started_at >= 900s and the corresponding GitHub status is still `pending`, you MUST treat this as an SLA breach and take corrective action immediately (restart reviews)."
         - id: RESTART_IF_UNHEALTHY
-          action: "If either reviewer is STALE/DEAD or showing API/tool errors in logs, immediately run `cargo xtask check` again (it auto-remediates reviewers) and re-check within 60 seconds."
+          action: "If either reviewer is STALE/DEAD or showing API/tool errors in logs, immediately re-trigger using `cargo xtask review <TYPE> <PR_URL>`."
         - id: ESCALATE_IF_REVIEWS_NOT_RUNNING
-          action: "If reviewer_state has no entries and `check_output` shows reviews pending, the review spawn likely failed. Escalate to implementer to re-run `cargo xtask push` (or `cargo xtask push --force-review` if available) and confirm reviewers start."
+          action: "If reviewer_state has no entries and `check_output` shows reviews pending, the review spawn likely failed. Escalate to implementer to re-run `cargo xtask push --force-review`."
         - id: LOOP_UNTIL_RESOLVED
-          action: "Loop: run `cargo xtask check` every 60s, tail reviewer logs, and restart/remediate until both reviews are no longer pending and merge can proceed."
+          action: "Loop: check logs, tail reviewer logs, and restart/remediate until both reviews are no longer pending and merge can proceed."
       decisions[2]:
         - id: BACK_TO_MONITOR
           if: "reviews are no longer pending OR remediation was attempted"
@@ -51,4 +51,3 @@ decision_tree:
           if: "SLA breached AND repeated remediation failed (>=3 attempts) OR gh/gemini APIs are unavailable"
           then:
             next_reference: references/stop-blocked-review-sla.md
-

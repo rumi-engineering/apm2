@@ -11,8 +11,9 @@ decision_tree:
         - id: INCLUDE_EVIDENCE
           action: "Include: PR URL, HEAD SHA, reviewer_state.json summary, reviewer PIDs, last 80 lines of each reviewer log, and the timestamps showing the SLA breach."
         - id: SUGGEST_FALLBACK
-          action: "Suggest manual recovery: rerun reviews synchronously (`cargo xtask review security <PR_URL>`, `cargo xtask review quality <PR_URL>`) or run an alternative review runner, then update status checks."
+          action: "Suggest manual recovery: rerun reviews synchronously using `cargo xtask review <TYPE> <PR_URL>`, then update status checks."
         - id: NOTE_SEQUENTIAL_BLOCK
           action: "Note: sequential merge policy means the queue cannot proceed until this PR merges."
         - id: STOP
           action: "Stop the workflow."
+      decisions[0]: []

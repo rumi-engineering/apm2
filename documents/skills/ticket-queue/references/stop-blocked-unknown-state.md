@@ -12,3 +12,4 @@ decision_tree:
           action: "Suggestion: rerun `timeout 30s gh pr list --state merged --limit 500 --json headRefName` and `git branch --list \"*ticket/*TCK-*\"` and include outputs."
         - id: STOP
           action: "Stop the workflow."
+      decisions[0]: []

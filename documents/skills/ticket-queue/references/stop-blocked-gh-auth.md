@@ -12,3 +12,4 @@ decision_tree:
           action: "Ask the operator to run `gh auth login` (or configure a token) and then re-run the ticket-queue skill."
         - id: STOP
           action: "Stop the workflow."
+      decisions[0]: []

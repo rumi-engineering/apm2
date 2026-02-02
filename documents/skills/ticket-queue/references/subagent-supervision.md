@@ -7,7 +7,7 @@ decision_tree:
       purpose: "Keep the implementer subagent moving, detect stalls early, and ensure tool calls are congruent with resolving blockers (CI failures, review feedback, security/quality issues)."
       steps[10]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "Replace <IMPLEMENTER_PID> and <IMPLEMENTER_LOG_FILE>. Replace <WORKTREE_PATH> and <TICKET_ID> if you include status context in a restart prompt."
+          action: "Replace <IMPLEMENTER_PID> and <IMPLEMENTER_LOG_FILE>. Replace <TICKET_ID> if you include status context in a restart prompt."
         - id: CHECK_EVERY_3_MINUTES
           action: "At least every 3 minutes: check log mtime and tail the most recent tool-ish lines."
         - id: CHECK_LOG_ACTIVITY
@@ -23,7 +23,7 @@ decision_tree:
             Use the current blocker state to judge tool-call congruency:
             - If CI failed: expect `cargo fmt/clippy/test`, reading error logs, and targeted code edits.
             - If reviews failed: expect reading PR comments/diff, applying requested changes, re-running checks.
-            - If reviews pending: expect `cargo xtask check` polling and reviewer log inspection (not random refactors).
+            - If reviews pending: expect log inspection (not random refactors).
             - If no PR: expect `cargo xtask push` (not more local-only edits).
         - id: STUCK_DEFINITION
           action: |
@@ -38,18 +38,18 @@ decision_tree:
             Context rot leads to subagents introducing problems rather than fixes. You MUST:
             1) Terminate the old subagent (TERM then KILL).
             2) Start a NEW subagent with a WARM HANDOFF.
-            3) Even if the git status is DIRTY, provide the new subagent with the `ticket` skill instructions and the specific <TICKET_ID>/<WORKTREE_PATH>.
-            4) The handoff prompt must include the latest `cargo xtask check` output and the explicit next goal.
+            3) Provide the new subagent with the `ticket` skill instructions and the specific <TICKET_ID>.
+            4) The handoff prompt must include the latest error output and the explicit next goal.
         - id: STUCK_RESPONSE
           action: |
             If STUCK (a, b, or c):
             1) Verify PID is really the subagent (ps cmdline contains `claude` or `codex`).
             2) Terminate it (TERM then KILL) and restart with a fresh, shorter prompt that includes:
-               - the current `cargo xtask check` output snippet
-               - the exact remediation command(s)
-               - the ticket ID and worktree path
+               - the current error/blocker output snippet
+               - the exact remediation goal
+               - the ticket ID
         - id: CONTEXT_EXHAUSTION_RESPONSE
-          action: "If the subagent appears confused or out of context, restart it and include only the minimal necessary context plus concrete next commands."
+          action: "If the subagent appears confused or out of context, restart it and include only the minimal necessary context plus concrete next goals."
         - id: DO_NOT_SELF_FIX
           action: "Even if you see the fix, do NOT edit code yourself. Always redirect the implementer with exact next commands and acceptance criteria."
         - id: RETURN
@@ -59,4 +59,3 @@ decision_tree:
           if: "always"
           then:
             next_reference: references/dispatch-and-monitor-ticket.md
-

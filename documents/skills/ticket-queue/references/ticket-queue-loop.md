@@ -7,22 +7,22 @@ decision_tree:
       purpose: "Compute ticket state (completed/in-progress/incomplete), pick exactly one ticket to process next, and dispatch work."
       steps[8]:
         - id: NOTE_VARIABLE_SUBSTITUTION
-          action: "References do not interpolate variables; replace <START_TARGET_OPTIONAL> with $1 (or empty). Replace <TICKET_ID>/<WORKTREE_PATH>/<BRANCH_NAME> when routed."
+          action: "References do not interpolate variables; replace <START_TARGET_OPTIONAL> with $1 (or empty). Replace <TICKET_ID>/<BRANCH_NAME> when routed."
         - id: VERIFY_CWD_IS_MAIN_REPO
           action: |
-            Periodically check your current directory. If you are inside a worktree (e.g., `documents/work/worktrees/`), you MUST `cd` back to the main repository root before listing tickets or running `gh` commands.
-            Command: `pwd && [ -f Cargo.toml ] || cd ../../../..` (adjust depth as needed to reach root).
+            Periodically check your current directory. Work happens in the primary clone.
+            Command: `pwd && [ -f Cargo.toml ]`.
         - id: LIST_ALL_TICKETS
           action: command
           run: "ls documents/work/tickets/TCK-*.yaml | rg -o \"TCK-[0-9]{5}\" | sort -u"
           capture_as: all_ticket_ids
         - id: LIST_COMPLETED
           action: command
-          run: "timeout 30s gh pr list --state merged --limit 500 --json headRefName | rg -o \"TCK-[0-9]{5}\" | sort -u"
+          run: "timeout 30s gh pr list --state merged --limit 500 --json headRefName --jq '.[].headRefName' | rg -o \"TCK-[0-9]{5}\" | sort -u"
           capture_as: completed_ticket_ids
         - id: LIST_IN_PROGRESS
           action: command
-          run: "bash -lc 'set -euo pipefail; completed=$(timeout 30s gh pr list --state merged --limit 500 --json headRefName | rg -o \"TCK-[0-9]{5}\" | sort -u || true); branches=$( (git branch --list \"*ticket/*TCK-*\"; git branch -r --list \"*ticket/*TCK-*\") | rg -o \"TCK-[0-9]{5}\" | sort -u || true); comm -23 <(printf \"%s\\n\" \"$branches\") <(printf \"%s\\n\" \"$completed\")'"
+          run: "bash -lc 'set -euo pipefail; completed=$(timeout 30s gh pr list --state merged --limit 500 --json headRefName | rg -o \"TCK-[0-9]{5}\" | sort -u || true); open_prs=$(gh pr list --state open --limit 100 --json headRefName --jq \".[].headRefName\" | rg -o \"TCK-[0-9]{5}\" | sort -u || true); comm -12 <(printf \"%s\\n\" \"$open_prs\") <(printf \"%s\\n\" \"$all_ticket_ids\")'"
           capture_as: in_progress_ticket_ids
         - id: COMPUTE_INCOMPLETE
           action: command
@@ -49,4 +49,3 @@ decision_tree:
           if: "unable to classify state"
           then:
             next_reference: references/stop-blocked-unknown-state.md
-
