@@ -177,7 +177,8 @@ check_legacy_socket_config() {
 
     for file in $config_files; do
         # Skip if file doesn't contain [daemon] section
-        if ! grep -q '^\[daemon\]' "$file" 2>/dev/null; then
+        # Allow leading whitespace and optional spaces inside brackets
+        if ! grep -q '^[[:space:]]*\[[[:space:]]*daemon[[:space:]]*\]' "$file" 2>/dev/null; then
             continue
         fi
 
@@ -189,8 +190,9 @@ check_legacy_socket_config() {
             ((line_num++)) || true
 
             # Check for section headers
-            if [[ "$line" =~ ^\[.+\] ]]; then
-                if [[ "$line" =~ ^\[daemon\] ]]; then
+            # Allow leading whitespace and optional spaces inside brackets
+            if [[ "$line" =~ ^[[:space:]]*\[.+\] ]]; then
+                if [[ "$line" =~ ^[[:space:]]*\[[[:space:]]*daemon[[:space:]]*\] ]]; then
                     in_daemon=1
                 else
                     in_daemon=0
