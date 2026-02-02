@@ -143,10 +143,6 @@ constructible_struct_adds_field = "allow"
 enum_variant_added = "allow"
 
 [[bench]]
-name = "ipc_benchmarks"
-harness = false
-
-[[bench]]
 name = "supervisor_benchmarks"
 harness = false
 

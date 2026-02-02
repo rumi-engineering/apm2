@@ -112,9 +112,7 @@ pub mod socket_manager;
 // These re-exports form the public API of this module and may not be used
 // within the crate itself.
 #[allow(unused_imports)]
-pub use connection_handler::{
-    HandshakeResult, RequestDispatcher, handle_connection, perform_handshake, requires_privilege,
-};
+pub use connection_handler::{HandshakeResult, perform_handshake};
 #[allow(unused_imports)]
 pub use credentials::PeerCredentials;
 #[allow(unused_imports)]

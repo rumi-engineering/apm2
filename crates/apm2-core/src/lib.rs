@@ -13,7 +13,7 @@
 //! - **Credential Management**: Secure storage and hot-swapping of credentials
 //! - **Supervision**: Automatic restart with configurable policies
 //! - **Health Checks**: Monitor process health via HTTP, TCP, or scripts
-//! - **IPC**: Unix socket-based communication between CLI and daemon
+//! - **Protocol**: Control-plane IPC via `ProtocolServer` (DD-009)
 //!
 //! ## Example
 //!
@@ -57,7 +57,6 @@ pub mod github;
 pub mod health;
 pub mod htf;
 pub mod impact_map;
-pub mod ipc;
 pub mod lease;
 pub mod ledger;
 pub mod log;
