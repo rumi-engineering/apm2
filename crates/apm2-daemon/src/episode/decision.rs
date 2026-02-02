@@ -691,6 +691,92 @@ impl PartialEq for Credential {
 impl Eq for Credential {}
 
 // =============================================================================
+// SessionContext (TCK-00263)
+// =============================================================================
+
+/// Session context for broker-mediated credential access.
+///
+/// Per TCK-00263 code review, session-specific state MUST NOT be stored in the
+/// `ToolBroker` struct to prevent cross-session credential leaks. Instead, the
+/// daemon passes session context to each `request()` call.
+///
+/// # Security
+///
+/// This struct is passed by reference and only lives for the duration of a
+/// single request. The daemon is responsible for:
+/// 1. Creating a `SessionContext` when a session is initialized
+/// 2. Passing it to `ToolBroker::request()` for each tool request
+/// 3. Dropping it when the session ends
+///
+/// The broker never stores this context, ensuring complete session isolation.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use apm2_daemon::episode::decision::SessionContext;
+///
+/// // Create context when session starts
+/// let ctx = SessionContext::new()
+///     .with_github_installation_id("12345")
+///     .with_ssh_session_id("session-abc");
+///
+/// // Pass to each request
+/// let decision = broker.request(&req, timestamp, Some(&ctx)).await?;
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct SessionContext {
+    /// GitHub App installation ID for this session (TCK-00262).
+    ///
+    /// When set, Git/Network tool requests will use this installation ID
+    /// to fetch credentials from the GitHub credential store.
+    pub github_installation_id: Option<String>,
+
+    /// Session ID for SSH credential lookups (TCK-00263).
+    ///
+    /// When set, Git tool requests will first try to look up a per-session
+    /// `SSH_AUTH_SOCK` path from the keychain before falling back to the
+    /// daemon-wide socket.
+    pub ssh_session_id: Option<String>,
+}
+
+impl SessionContext {
+    /// Creates a new empty session context.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            github_installation_id: None,
+            ssh_session_id: None,
+        }
+    }
+
+    /// Sets the GitHub installation ID.
+    #[must_use]
+    pub fn with_github_installation_id(mut self, id: impl Into<String>) -> Self {
+        self.github_installation_id = Some(id.into());
+        self
+    }
+
+    /// Sets the SSH session ID.
+    #[must_use]
+    pub fn with_ssh_session_id(mut self, id: impl Into<String>) -> Self {
+        self.ssh_session_id = Some(id.into());
+        self
+    }
+
+    /// Returns `true` if a GitHub installation ID is set.
+    #[must_use]
+    pub const fn has_github_installation(&self) -> bool {
+        self.github_installation_id.is_some()
+    }
+
+    /// Returns `true` if an SSH session ID is set.
+    #[must_use]
+    pub const fn has_ssh_session(&self) -> bool {
+        self.ssh_session_id.is_some()
+    }
+}
+
+// =============================================================================
 // ToolDecision
 // =============================================================================
 

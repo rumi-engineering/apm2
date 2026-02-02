@@ -68,6 +68,12 @@ pub const KEYCHAIN_SERVICE_NAME: &str = "apm2-receipt-signing";
 /// Uses a dedicated service name to avoid collisions with signing keys.
 pub const GITHUB_KEYCHAIN_SERVICE: &str = "apm2-github-tokens";
 
+/// Service name for SSH agent socket path (TCK-00263).
+///
+/// Uses a dedicated service name to avoid collisions with signing keys and
+/// GitHub tokens.
+pub const SSH_KEYCHAIN_SERVICE: &str = "apm2-ssh-agent";
+
 /// Maximum number of keys to store (CTR-1303).
 pub const MAX_STORED_KEYS: usize = 100;
 
@@ -81,6 +87,13 @@ pub const MAX_STORED_TOKENS: usize = 100;
 /// GitHub tokens are typically under 100 bytes. 4KB is generous while
 /// preventing unbounded allocation from malicious input.
 pub const MAX_TOKEN_SIZE: usize = 4096;
+
+/// Maximum length for `SSH_AUTH_SOCK` path (CTR-1303, TCK-00263).
+///
+/// Unix socket paths are limited to 108 bytes on most systems
+/// (`UNIX_PATH_MAX`). We use 256 to be generous while preventing unbounded
+/// allocation.
+pub const MAX_SSH_AUTH_SOCK_LEN: usize = 256;
 
 /// Key data version for serialization compatibility.
 const KEY_DATA_VERSION: u8 = 1;
@@ -175,6 +188,19 @@ pub enum KeychainError {
         /// Maximum number of tokens.
         max: usize,
     },
+
+    /// `SSH_AUTH_SOCK` path too long (CTR-1303, TCK-00263).
+    #[error("SSH_AUTH_SOCK path too long: {len} bytes (max {max})")]
+    SshAuthSockTooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// SSH agent not available (TCK-00263).
+    #[error("SSH agent not available")]
+    SshAgentNotAvailable,
 }
 
 // =============================================================================
@@ -332,6 +358,87 @@ pub trait GitHubCredentialStore: Send + Sync {
     /// Returns an error if the keychain operation fails.
     /// Returns `Ok(())` if the token doesn't exist (idempotent delete).
     fn delete_token(&self, installation_id: &str) -> Result<(), KeychainError>;
+}
+
+// =============================================================================
+// SshCredentialStore Trait (TCK-00263)
+// =============================================================================
+
+/// Trait for SSH credential storage backends.
+///
+/// This trait abstracts the storage of SSH agent socket paths to allow for
+/// broker-mediated SSH operations. Per RFC-0017 TB-003, credentials are held
+/// by the daemon only and never exposed to session processes.
+///
+/// # Security
+///
+/// - The `SSH_AUTH_SOCK` path is stored in the daemon scope only
+/// - Sessions never see the `SSH_AUTH_SOCK` environment variable
+/// - All SSH operations are mediated through the broker
+/// - The broker sets `SSH_AUTH_SOCK` in subprocess environment for git
+///   operations
+///
+/// # Architecture
+///
+/// The daemon manages SSH agent access:
+/// 1. Daemon holds `SSH_AUTH_SOCK` reference (from environment or internal
+///    agent)
+/// 2. Git tool requests go through broker
+/// 3. Broker executes git commands with `SSH_AUTH_SOCK` set in subprocess env
+/// 4. Session process has NO access to `SSH_AUTH_SOCK` or private keys
+pub trait SshCredentialStore: Send + Sync {
+    /// Stores the `SSH_AUTH_SOCK` path for broker-mediated operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - Unique identifier for the session
+    /// * `auth_sock_path` - Path to the SSH agent socket
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is too long or storage fails.
+    fn store_ssh_auth_sock(
+        &self,
+        session_id: &str,
+        auth_sock_path: &str,
+    ) -> Result<(), KeychainError>;
+
+    /// Retrieves the `SSH_AUTH_SOCK` path for a session.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - Unique identifier for the session
+    ///
+    /// # Errors
+    ///
+    /// Returns `KeychainError::NotFound` if no path is stored for the session,
+    /// or another error if the operation fails.
+    fn get_ssh_auth_sock(&self, session_id: &str) -> Result<String, KeychainError>;
+
+    /// Clears the `SSH_AUTH_SOCK` path for a session.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - Unique identifier for the session
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
+    /// Returns `Ok(())` if no path was stored (idempotent clear).
+    fn clear_ssh_auth_sock(&self, session_id: &str) -> Result<(), KeychainError>;
+
+    /// Checks if SSH agent is available for broker-mediated operations.
+    ///
+    /// This is typically determined by checking if `SSH_AUTH_SOCK` is set in
+    /// the daemon's environment and the socket exists.
+    fn is_ssh_agent_available(&self) -> bool;
+
+    /// Gets the daemon's `SSH_AUTH_SOCK` path if available.
+    ///
+    /// Returns the `SSH_AUTH_SOCK` path from the daemon's environment for use
+    /// in broker-mediated operations. This is the path the broker will set
+    /// in subprocess environment for git SSH operations.
+    fn get_daemon_ssh_auth_sock(&self) -> Option<String>;
 }
 
 // =============================================================================
@@ -799,6 +906,64 @@ impl GitHubCredentialStore for OsKeychain {
     }
 }
 
+impl SshCredentialStore for OsKeychain {
+    fn store_ssh_auth_sock(
+        &self,
+        session_id: &str,
+        auth_sock_path: &str,
+    ) -> Result<(), KeychainError> {
+        // CTR-1303, TCK-00263: Enforce path length limit
+        if auth_sock_path.len() > MAX_SSH_AUTH_SOCK_LEN {
+            return Err(KeychainError::SshAuthSockTooLong {
+                len: auth_sock_path.len(),
+                max: MAX_SSH_AUTH_SOCK_LEN,
+            });
+        }
+
+        // Use a dedicated service name for SSH auth sockets
+        let entry = keyring::Entry::new(SSH_KEYCHAIN_SERVICE, session_id)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        entry
+            .set_password(auth_sock_path)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        Ok(())
+    }
+
+    fn get_ssh_auth_sock(&self, session_id: &str) -> Result<String, KeychainError> {
+        let entry = keyring::Entry::new(SSH_KEYCHAIN_SERVICE, session_id)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        entry.get_password().map_err(|e| match e {
+            keyring::Error::NoEntry => KeychainError::NotFound {
+                key_id: session_id.to_string(),
+            },
+            _ => KeychainError::Keychain(e.to_string()),
+        })
+    }
+
+    fn clear_ssh_auth_sock(&self, session_id: &str) -> Result<(), KeychainError> {
+        let entry = keyring::Entry::new(SSH_KEYCHAIN_SERVICE, session_id)
+            .map_err(|e| KeychainError::Keychain(e.to_string()))?;
+
+        // Idempotent delete: ignore NotFound errors
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(KeychainError::Keychain(e.to_string())),
+        }
+    }
+
+    fn is_ssh_agent_available(&self) -> bool {
+        self.get_daemon_ssh_auth_sock()
+            .is_some_and(|path| std::path::Path::new(&path).exists())
+    }
+
+    fn get_daemon_ssh_auth_sock(&self) -> Option<String> {
+        std::env::var("SSH_AUTH_SOCK").ok()
+    }
+}
+
 // =============================================================================
 // InMemoryKeyStore
 // =============================================================================
@@ -1009,6 +1174,131 @@ impl GitHubCredentialStore for InMemoryGitHubCredentialStore {
             .map_err(|_| KeychainError::LockPoisoned)?;
         tokens.remove(installation_id);
         Ok(())
+    }
+}
+
+// =============================================================================
+// InMemorySshCredentialStore (TCK-00263)
+//
+// NOTE: This is a TEST-ONLY implementation (marked with #[cfg(test)]).
+// Per TCK-00263 security review, in-memory credential stores must not be
+// available in production builds. Production code MUST use OsKeychain.
+// =============================================================================
+
+/// In-memory SSH credential store for testing.
+///
+/// This implementation does not persist `SSH_AUTH_SOCK` paths and is intended
+/// for unit tests that should not interact with the real OS keychain.
+///
+/// # Security
+///
+/// This is a **test-only** implementation, enforced via `#[cfg(test)]`.
+/// Production code should use `OsKeychain` which stores credentials securely.
+/// The `#[cfg(test)]` attribute ensures this type cannot be accidentally used
+/// in production builds.
+///
+/// Per CTR-1303, this store enforces:
+/// - Maximum path length (`MAX_SSH_AUTH_SOCK_LEN` = 256 bytes)
+#[cfg(test)]
+pub struct InMemorySshCredentialStore {
+    /// Storage for `SSH_AUTH_SOCK` paths (`session_id` -> path).
+    paths: RwLock<HashMap<String, String>>,
+    /// Mock daemon `SSH_AUTH_SOCK` path (for testing agent availability).
+    daemon_auth_sock: RwLock<Option<String>>,
+}
+
+#[cfg(test)]
+impl InMemorySshCredentialStore {
+    /// Creates a new in-memory SSH credential store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            paths: RwLock::new(HashMap::new()),
+            daemon_auth_sock: RwLock::new(None),
+        }
+    }
+
+    /// Creates a new in-memory SSH credential store with a mock daemon
+    /// `SSH_AUTH_SOCK`.
+    ///
+    /// This is useful for testing SSH agent availability.
+    #[must_use]
+    pub fn with_daemon_auth_sock(auth_sock: String) -> Self {
+        Self {
+            paths: RwLock::new(HashMap::new()),
+            daemon_auth_sock: RwLock::new(Some(auth_sock)),
+        }
+    }
+
+    /// Sets the mock daemon `SSH_AUTH_SOCK` path.
+    pub fn set_daemon_auth_sock(&self, auth_sock: Option<String>) {
+        if let Ok(mut guard) = self.daemon_auth_sock.write() {
+            *guard = auth_sock;
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for InMemorySshCredentialStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl SshCredentialStore for InMemorySshCredentialStore {
+    fn store_ssh_auth_sock(
+        &self,
+        session_id: &str,
+        auth_sock_path: &str,
+    ) -> Result<(), KeychainError> {
+        // CTR-1303, TCK-00263: Enforce path length limit
+        if auth_sock_path.len() > MAX_SSH_AUTH_SOCK_LEN {
+            return Err(KeychainError::SshAuthSockTooLong {
+                len: auth_sock_path.len(),
+                max: MAX_SSH_AUTH_SOCK_LEN,
+            });
+        }
+
+        let mut paths = self
+            .paths
+            .write()
+            .map_err(|_| KeychainError::LockPoisoned)?;
+        paths.insert(session_id.to_string(), auth_sock_path.to_string());
+        Ok(())
+    }
+
+    fn get_ssh_auth_sock(&self, session_id: &str) -> Result<String, KeychainError> {
+        let paths = self.paths.read().map_err(|_| KeychainError::LockPoisoned)?;
+        paths
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| KeychainError::NotFound {
+                key_id: session_id.to_string(),
+            })
+    }
+
+    fn clear_ssh_auth_sock(&self, session_id: &str) -> Result<(), KeychainError> {
+        let mut paths = self
+            .paths
+            .write()
+            .map_err(|_| KeychainError::LockPoisoned)?;
+        paths.remove(session_id);
+        Ok(())
+    }
+
+    fn is_ssh_agent_available(&self) -> bool {
+        self.daemon_auth_sock
+            .read()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
+    fn get_daemon_ssh_auth_sock(&self) -> Option<String> {
+        self.daemon_auth_sock
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 }
 
@@ -1428,5 +1718,176 @@ mod tests {
         store.store_token("installation-0", "token-v2").unwrap();
         let retrieved = store.get_token("installation-0").unwrap();
         assert_eq!(retrieved, "token-v2");
+    }
+
+    // =========================================================================
+    // InMemorySshCredentialStore Tests (TCK-00263)
+    // =========================================================================
+
+    #[test]
+    fn test_in_memory_ssh_store_roundtrip() {
+        let store = InMemorySshCredentialStore::new();
+        let session_id = "session-123";
+        let auth_sock_path = "/tmp/ssh-agent/agent.123";
+
+        // Store path
+        store
+            .store_ssh_auth_sock(session_id, auth_sock_path)
+            .unwrap();
+
+        // Retrieve path
+        let retrieved = store.get_ssh_auth_sock(session_id).unwrap();
+        assert_eq!(retrieved, auth_sock_path);
+    }
+
+    #[test]
+    fn test_in_memory_ssh_store_not_found() {
+        let store = InMemorySshCredentialStore::new();
+
+        let result = store.get_ssh_auth_sock("nonexistent");
+        assert!(matches!(result, Err(KeychainError::NotFound { .. })));
+    }
+
+    #[test]
+    fn test_in_memory_ssh_store_clear() {
+        let store = InMemorySshCredentialStore::new();
+        let session_id = "session-123";
+
+        // Store and then clear
+        store
+            .store_ssh_auth_sock(session_id, "/tmp/agent.sock")
+            .unwrap();
+        store.clear_ssh_auth_sock(session_id).unwrap();
+
+        // Should not be found
+        let result = store.get_ssh_auth_sock(session_id);
+        assert!(matches!(result, Err(KeychainError::NotFound { .. })));
+    }
+
+    #[test]
+    fn test_in_memory_ssh_store_clear_idempotent() {
+        let store = InMemorySshCredentialStore::new();
+
+        // Clear nonexistent path should succeed (idempotent)
+        assert!(store.clear_ssh_auth_sock("nonexistent").is_ok());
+    }
+
+    #[test]
+    fn test_in_memory_ssh_store_overwrite() {
+        let store = InMemorySshCredentialStore::new();
+        let session_id = "session-123";
+
+        // Store and overwrite
+        store
+            .store_ssh_auth_sock(session_id, "/tmp/agent1.sock")
+            .unwrap();
+        store
+            .store_ssh_auth_sock(session_id, "/tmp/agent2.sock")
+            .unwrap();
+
+        // Should get latest path
+        let retrieved = store.get_ssh_auth_sock(session_id).unwrap();
+        assert_eq!(retrieved, "/tmp/agent2.sock");
+    }
+
+    #[test]
+    fn test_in_memory_ssh_store_path_too_long() {
+        let store = InMemorySshCredentialStore::new();
+        let long_path = "/tmp/".to_owned() + &"x".repeat(MAX_SSH_AUTH_SOCK_LEN);
+
+        let result = store.store_ssh_auth_sock("session-1", &long_path);
+        assert!(matches!(
+            result,
+            Err(KeychainError::SshAuthSockTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_in_memory_ssh_store_path_at_limit() {
+        let store = InMemorySshCredentialStore::new();
+        let max_path = "x".repeat(MAX_SSH_AUTH_SOCK_LEN);
+
+        // Should succeed at exactly the limit
+        store.store_ssh_auth_sock("session-1", &max_path).unwrap();
+        let retrieved = store.get_ssh_auth_sock("session-1").unwrap();
+        assert_eq!(retrieved.len(), MAX_SSH_AUTH_SOCK_LEN);
+    }
+
+    #[test]
+    fn test_in_memory_ssh_store_agent_not_available_by_default() {
+        let store = InMemorySshCredentialStore::new();
+
+        // By default, no daemon auth sock is set
+        assert!(!store.is_ssh_agent_available());
+        assert!(store.get_daemon_ssh_auth_sock().is_none());
+    }
+
+    #[test]
+    fn test_in_memory_ssh_store_agent_available() {
+        let store =
+            InMemorySshCredentialStore::with_daemon_auth_sock("/tmp/ssh-agent.sock".to_string());
+
+        assert!(store.is_ssh_agent_available());
+        assert_eq!(
+            store.get_daemon_ssh_auth_sock(),
+            Some("/tmp/ssh-agent.sock".to_string())
+        );
+    }
+
+    #[test]
+    fn test_in_memory_ssh_store_set_daemon_auth_sock() {
+        let store = InMemorySshCredentialStore::new();
+
+        // Initially not available
+        assert!(!store.is_ssh_agent_available());
+
+        // Set daemon auth sock
+        store.set_daemon_auth_sock(Some("/run/user/1000/ssh-agent.sock".to_string()));
+        assert!(store.is_ssh_agent_available());
+        assert_eq!(
+            store.get_daemon_ssh_auth_sock(),
+            Some("/run/user/1000/ssh-agent.sock".to_string())
+        );
+
+        // Clear daemon auth sock
+        store.set_daemon_auth_sock(None);
+        assert!(!store.is_ssh_agent_available());
+        assert!(store.get_daemon_ssh_auth_sock().is_none());
+    }
+
+    #[test]
+    fn test_in_memory_ssh_store_multiple_sessions() {
+        let store = InMemorySshCredentialStore::new();
+
+        // Store paths for multiple sessions
+        store
+            .store_ssh_auth_sock("session-1", "/tmp/agent1.sock")
+            .unwrap();
+        store
+            .store_ssh_auth_sock("session-2", "/tmp/agent2.sock")
+            .unwrap();
+        store
+            .store_ssh_auth_sock("session-3", "/tmp/agent3.sock")
+            .unwrap();
+
+        // Verify each session has its own path
+        assert_eq!(
+            store.get_ssh_auth_sock("session-1").unwrap(),
+            "/tmp/agent1.sock"
+        );
+        assert_eq!(
+            store.get_ssh_auth_sock("session-2").unwrap(),
+            "/tmp/agent2.sock"
+        );
+        assert_eq!(
+            store.get_ssh_auth_sock("session-3").unwrap(),
+            "/tmp/agent3.sock"
+        );
+
+        // Clear one session, others should remain
+        store.clear_ssh_auth_sock("session-2").unwrap();
+        assert!(store.get_ssh_auth_sock("session-1").is_ok());
+        assert!(store.get_ssh_auth_sock("session-2").is_err());
+        assert!(store.get_ssh_auth_sock("session-3").is_ok());
     }
 }
