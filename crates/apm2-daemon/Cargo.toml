@@ -100,6 +100,12 @@ http-body-util.workspace = true
 # Database (persistent idempotency cache)
 rusqlite.workspace = true
 
+# Metrics / Observability (TCK-00268)
+prometheus.workspace = true
+
+# HTTP Server (metrics endpoint)
+axum.workspace = true
+
 # Futures traits (for framed streams)
 futures = "0.3"
 

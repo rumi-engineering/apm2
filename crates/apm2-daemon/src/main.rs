@@ -8,6 +8,28 @@
 //! - **Operator socket** (`operator.sock`, mode 0600): Privileged operations
 //! - **Session socket** (`session.sock`, mode 0660): Session-scoped operations
 //!
+//! # Prometheus Metrics (TCK-00268)
+//!
+//! The daemon exposes Prometheus metrics at `/metrics` (default port 9100).
+//! Per REQ-DCP-0012, the following metrics are exposed:
+//! - `apm2_daemon_sessions_active` (gauge)
+//! - `apm2_daemon_tool_mediation_latency_seconds` (histogram)
+//! - `apm2_daemon_ipc_requests_total` (counter)
+//! - `apm2_daemon_capability_grants_total` (counter)
+//! - `apm2_daemon_context_firewall_denials_total` (counter)
+//! - `apm2_daemon_session_terminations_total` (counter)
+//!
+//! ## Current Integration Status
+//!
+//! Currently, only `ipc_requests_total` is actively recorded via `handlers.rs`
+//! for JSON-based IPC requests. The other metrics (sessions, tool mediation,
+//! capabilities, firewall, terminations) are defined and instrumented in
+//! `PrivilegedDispatcher` and `ToolBroker`, but those components use the binary
+//! protocol which is not yet wired into this main.rs.
+//!
+//! TODO(TCK-FUTURE): Wire `PrivilegedDispatcher` and `ToolBroker` into main.rs
+//! to enable all metrics.
+//!
 //! See RFC-0017 for architecture details.
 
 mod handlers;
@@ -15,6 +37,7 @@ mod ipc_server;
 // mod protocol; // Use library crate instead to avoid dead code warnings
 mod state;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,8 +48,11 @@ use apm2_core::config::EcosystemConfig;
 use apm2_core::process::ProcessState;
 use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
+use apm2_daemon::metrics::{SharedMetricsRegistry, new_shared_registry};
 use apm2_daemon::protocol; // Import from library
 use apm2_daemon::protocol::socket_manager::{SocketManager, SocketManagerConfig};
+use axum::Router;
+use axum::routing::get;
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
@@ -72,7 +98,19 @@ struct Args {
     /// Log to file instead of stdout
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Port for Prometheus metrics HTTP endpoint (TCK-00268)
+    /// Default: 9100
+    #[arg(long, default_value = "9100")]
+    metrics_port: u16,
+
+    /// Disable Prometheus metrics HTTP endpoint
+    #[arg(long)]
+    no_metrics: bool,
 }
+
+/// Default port for Prometheus metrics HTTP endpoint (TCK-00268).
+pub const DEFAULT_METRICS_PORT: u16 = 9100;
 
 /// Daemon configuration derived from args and config file.
 struct DaemonConfig {
@@ -82,6 +120,10 @@ struct DaemonConfig {
     pid_path: PathBuf,
     /// State file path for persistent session registry (TCK-00266).
     state_file_path: PathBuf,
+    /// Port for Prometheus metrics HTTP endpoint (TCK-00268).
+    metrics_port: u16,
+    /// Whether to disable the metrics endpoint.
+    metrics_disabled: bool,
 }
 
 impl DaemonConfig {
@@ -118,6 +160,8 @@ impl DaemonConfig {
             session_socket_path,
             pid_path,
             state_file_path,
+            metrics_port: args.metrics_port,
+            metrics_disabled: args.no_metrics,
         })
     }
 }
@@ -333,6 +377,14 @@ async fn main() -> Result<()> {
     let daemon_config = DaemonConfig::new(&args)?;
     let supervisor = init_supervisor(&daemon_config.config);
 
+    // TCK-00268: Initialize Prometheus metrics registry early so we can pass it
+    // to DaemonStateHandle. This allows handlers to record IPC metrics.
+    let metrics_registry = if daemon_config.metrics_disabled {
+        None
+    } else {
+        Some(new_shared_registry().context("failed to initialize metrics registry")?)
+    };
+
     // Create shared state with schema registry and session registry
     // The registries persist for the daemon's lifetime (TCK-00181, TCK-00266)
     //
@@ -344,6 +396,7 @@ async fn main() -> Result<()> {
             supervisor,
             registry, // Pass the registry created during bootstrap
             &daemon_config.state_file_path,
+            metrics_registry.clone(), // TCK-00268: Pass metrics registry for handler access
         )
         .context("failed to initialize persistent session registry")?,
     );
@@ -364,6 +417,11 @@ async fn main() -> Result<()> {
         // Continue startup even if recovery fails - the daemon should still be
         // usable
     }
+
+    info!(
+        metrics_enabled = metrics_registry.is_some(),
+        "Metrics registry initialized"
+    );
 
     // Initialize dual-socket manager (TCK-00249)
     let socket_manager_config = SocketManagerConfig::new(
@@ -396,6 +454,24 @@ async fn main() -> Result<()> {
         }
     });
 
+    // TCK-00268: Start Prometheus metrics HTTP server
+    let metrics_task = if let Some(ref metrics_reg) = metrics_registry {
+        let metrics_addr: SocketAddr = ([127, 0, 0, 1], daemon_config.metrics_port).into();
+        let metrics_reg = Arc::clone(metrics_reg);
+        info!(
+            addr = %metrics_addr,
+            "Starting metrics HTTP server"
+        );
+        Some(tokio::spawn(async move {
+            if let Err(e) = run_metrics_server(metrics_reg, metrics_addr).await {
+                error!("Metrics server error: {}", e);
+            }
+        }))
+    } else {
+        info!("Metrics HTTP server disabled");
+        None
+    };
+
     // Handle Unix signals
     let signal_state = state.clone();
     let signal_task = tokio::spawn(async move {
@@ -421,6 +497,20 @@ async fn main() -> Result<()> {
         }
         _ = signal_task => {
             info!("Signal handler triggered shutdown");
+        }
+        // TCK-00268: Monitor metrics server if enabled
+        result = async {
+            if let Some(task) = metrics_task {
+                task.await
+            } else {
+                // If metrics are disabled, this branch should never complete
+                std::future::pending().await
+            }
+        } => {
+            if let Err(e) = result {
+                error!("Metrics server task failed: {}", e);
+            }
+            info!("Metrics server exited");
         }
     }
 
@@ -664,4 +754,83 @@ const fn requires_privilege(request: &apm2_core::ipc::IpcRequest) -> bool {
         // Session-safe operations (do not leak sensitive information)
         IpcRequest::Ping
     )
+}
+
+/// Run the Prometheus metrics HTTP server (TCK-00268).
+///
+/// This server exposes a `/metrics` endpoint that returns all daemon metrics
+/// in Prometheus text format. Per REQ-DCP-0012, the following metrics are
+/// exposed:
+///
+/// - `apm2_daemon_sessions_active` (gauge)
+/// - `apm2_daemon_tool_mediation_latency_seconds` (histogram)
+/// - `apm2_daemon_ipc_requests_total` (counter)
+/// - `apm2_daemon_capability_grants_total` (counter)
+/// - `apm2_daemon_context_firewall_denials_total` (counter)
+/// - `apm2_daemon_session_terminations_total` (counter)
+///
+/// # Arguments
+///
+/// * `metrics_registry` - The shared metrics registry
+/// * `addr` - The socket address to bind to (default: 127.0.0.1:9100)
+///
+/// # Security
+///
+/// The metrics endpoint binds to localhost only (127.0.0.1) by default to
+/// prevent external access. If network access is required, configure a
+/// reverse proxy with appropriate authentication.
+async fn run_metrics_server(
+    metrics_registry: SharedMetricsRegistry,
+    addr: SocketAddr,
+) -> Result<()> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    // Create the metrics handler
+    let metrics_handler = {
+        let registry = Arc::clone(&metrics_registry);
+        move || {
+            let registry = Arc::clone(&registry);
+            async move {
+                match registry.encode_text() {
+                    Ok(body) => (
+                        StatusCode::OK,
+                        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+                        body,
+                    )
+                        .into_response(),
+                    Err(e) => {
+                        error!("Failed to encode metrics: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to encode metrics: {e}"),
+                        )
+                            .into_response()
+                    },
+                }
+            }
+        }
+    };
+
+    // Build the router
+    let app = Router::new().route("/metrics", get(metrics_handler)).route(
+        "/",
+        get(|| async {
+            "apm2-daemon metrics server\n\nGET /metrics - Prometheus metrics endpoint\n"
+        }),
+    );
+
+    // Create the listener
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("failed to bind metrics server")?;
+
+    info!(addr = %addr, "Metrics HTTP server listening");
+
+    // Serve requests
+    axum::serve(listener, app)
+        .await
+        .context("metrics server error")?;
+
+    Ok(())
 }

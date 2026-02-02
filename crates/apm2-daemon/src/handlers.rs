@@ -13,6 +13,55 @@ use tracing::{info, warn};
 
 use crate::state::SharedState;
 
+/// Helper to get the endpoint name from an IPC request for metrics.
+const fn request_endpoint_name(request: &IpcRequest) -> &'static str {
+    match request {
+        IpcRequest::Ping => "Ping",
+        IpcRequest::Status => "Status",
+        IpcRequest::ListProcesses => "ListProcesses",
+        IpcRequest::GetProcess { .. } => "GetProcess",
+        IpcRequest::StartProcess { .. } => "StartProcess",
+        IpcRequest::StopProcess { .. } => "StopProcess",
+        IpcRequest::RestartProcess { .. } => "RestartProcess",
+        IpcRequest::ReloadProcess { .. } => "ReloadProcess",
+        IpcRequest::TailLogs { .. } => "TailLogs",
+        IpcRequest::ListCredentials => "ListCredentials",
+        IpcRequest::GetCredential { .. } => "GetCredential",
+        IpcRequest::AddCredential { .. } => "AddCredential",
+        IpcRequest::RemoveCredential { .. } => "RemoveCredential",
+        IpcRequest::RefreshCredential { .. } => "RefreshCredential",
+        IpcRequest::SwitchCredential { .. } => "SwitchCredential",
+        IpcRequest::Shutdown => "Shutdown",
+        IpcRequest::CreateEpisode { .. } => "CreateEpisode",
+        IpcRequest::StartEpisode { .. } => "StartEpisode",
+        IpcRequest::StopEpisode { .. } => "StopEpisode",
+        IpcRequest::GetEpisodeStatus { .. } => "GetEpisodeStatus",
+        IpcRequest::ListEpisodes { .. } => "ListEpisodes",
+    }
+}
+
+/// Helper to determine the status string from an IPC response for metrics.
+const fn response_status(response: &IpcResponse) -> &'static str {
+    match response {
+        IpcResponse::Error { code, .. } => match code {
+            ErrorCode::InvalidRequest => "invalid_request",
+            ErrorCode::ProcessNotFound => "not_found",
+            ErrorCode::ProcessAlreadyRunning => "already_running",
+            ErrorCode::ProcessNotRunning => "not_running",
+            ErrorCode::NotSupported => "not_supported",
+            ErrorCode::InternalError => "internal_error",
+            ErrorCode::CredentialNotFound => "credential_not_found",
+            ErrorCode::CredentialExists => "credential_exists",
+            ErrorCode::EpisodeNotFound => "episode_not_found",
+            ErrorCode::EpisodeExists => "episode_exists",
+            ErrorCode::InvalidEpisodeState => "invalid_episode_state",
+            ErrorCode::InvalidEnvelope => "invalid_envelope",
+        },
+        // All other responses indicate success
+        _ => "success",
+    }
+}
+
 /// Daemon version (from Cargo.toml).
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -20,8 +69,17 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Dispatch an IPC request to the appropriate handler.
+///
+/// # TCK-00268: IPC Request Metrics
+///
+/// Records `ipc_request_completed` metric for each request with the endpoint
+/// name and response status. This enables monitoring of IPC request patterns
+/// and error rates per REQ-DCP-0012.
 pub async fn dispatch(request: IpcRequest, state: &SharedState) -> IpcResponse {
-    match request {
+    // Capture endpoint name before consuming the request
+    let endpoint = request_endpoint_name(&request);
+
+    let response = match request {
         IpcRequest::Ping => handle_ping(state),
         IpcRequest::Status => handle_status(state).await,
         IpcRequest::ListProcesses => handle_list(state).await,
@@ -34,7 +92,17 @@ pub async fn dispatch(request: IpcRequest, state: &SharedState) -> IpcResponse {
             code: ErrorCode::NotSupported,
             message: "Not implemented yet".into(),
         },
+    };
+
+    // TCK-00268: Record IPC request metric
+    if let Some(metrics_registry) = state.metrics_registry() {
+        let status = response_status(&response);
+        metrics_registry
+            .daemon_metrics()
+            .ipc_request_completed(endpoint, status);
     }
+
+    response
 }
 
 /// Handle ping request.
