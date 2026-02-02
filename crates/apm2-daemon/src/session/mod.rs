@@ -65,12 +65,17 @@ impl AsRef<str> for EphemeralHandle {
 /// Per TCK-00256, the session state is persisted when `SpawnEpisode` succeeds
 /// to enable subsequent session-scoped IPC calls.
 ///
+/// # Persistence (TCK-00266)
+///
+/// This struct implements `Serialize` and `Deserialize` to support persistent
+/// session registry state files for crash recovery.
+///
 /// # Security Note
 ///
 /// The `Debug` impl manually redacts `lease_id` to prevent accidental leakage
 /// in debug logs. The `lease_id` is a security-sensitive credential that should
 /// not appear in logs or error messages.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionState {
     /// Unique session identifier.
     pub session_id: String,
@@ -82,8 +87,9 @@ pub struct SessionState {
     pub ephemeral_handle: String,
     /// Lease ID authorizing this session.
     ///
-    /// **SECURITY**: This field is redacted in Debug output to prevent
-    /// credential leakage in logs.
+    /// **SECURITY**: This field is redacted in Debug output and skipped during
+    /// serialization to prevent credential leakage.
+    #[serde(skip, default)]
     pub lease_id: String,
     /// Policy resolution reference.
     pub policy_resolved_ref: String,

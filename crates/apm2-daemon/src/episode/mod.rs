@@ -197,7 +197,9 @@ pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
 pub use raw_adapter::{
     RawAdapter, RawAdapterHolon, RawAdapterOutput, RawAdapterState, SharedAdapterState,
 };
-pub use registry::AdapterRegistry;
+pub use registry::{
+    AdapterRegistry, InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
+};
 pub use ring_buffer::{RingBuffer, tier_defaults};
 pub use runtime::{
     EpisodeEvent, EpisodeRuntime, EpisodeRuntimeConfig, Hash, LeaseIssueDenialReason,
