@@ -671,15 +671,17 @@ pub enum ToolDecision {
         /// Termination info.
         termination_info: Box<SessionTerminationInfo>,
 
-        /// Optional event to emit (e.g., refinement request).
-        /// Boxed to avoid circular dependency types if possible, but here we
-        /// use opaque bytes or similar? Actually, `CoordinationEvent`
-        /// is in `apm2_core`. We'll store it as opaque bytes or handle
-        /// it at the call site. For now, let's just use
-        /// `termination_info`. Wait, `consume.rs` needs to return the
-        /// refinement event. But `ToolDecision` is generic.
-        /// Let's add an optional opaque payload.
-        refinement_event: Option<Vec<u8>>, // Serialized CoordinationEvent
+        /// Optional serialized coordination event for session refinement.
+        ///
+        /// When a termination triggers a refinement workflow (e.g., requesting
+        /// expanded context permissions), this field carries the serialized
+        /// `CoordinationEvent` as opaque bytes. The caller (typically
+        /// `consume.rs`) is responsible for deserializing and emitting
+        /// this event.
+        ///
+        /// The opaque bytes representation avoids circular dependencies between
+        /// `apm2_daemon` decision types and `apm2_core` event types.
+        refinement_event: Option<Vec<u8>>,
     },
 }
 

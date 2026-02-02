@@ -486,34 +486,99 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // Step 1: Validate request structure
         request.validate()?;
 
-        // Step 2: Validate against context firewall (TCK-00261)
+        // Step 2: Validate against context firewall (TCK-00261, TCK-00286)
         // This must happen before capability checks because a firewall violation
         // triggers session termination, which is more severe than a capability denial.
+        //
+        // Per TCK-00286 security review:
+        // - Read operations: Check path against manifest entries (fail if path is None)
+        // - Write operations: Check path against write_allowlist (if configured)
+        // - Execute operations: Check command against shell_allowlist (if configured)
+        //
+        // NOTE: DefaultContextFirewall::new() is instantiated per-request. This is
+        // acceptable overhead since the struct is lightweight (borrows manifest
+        // reference) and avoids storing additional state in the broker.
         if let Some(context_manifest) = self.context_manifest.read().await.as_ref() {
-            // Only FileRead operations are currently subject to the context firewall
-            // allowlist in DefaultContextFirewall.
-            if request.tool_class == super::tool_class::ToolClass::Read {
-                if let Some(ref path) = request.path {
+            // Helper to create termination decision
+            // NOTE: We use episode_id as session_id here because the broker operates
+            // at the episode layer. Session-level identifiers are not available at
+            // this point in the call stack. The episode_id provides sufficient
+            // traceability for audit purposes.
+            let make_terminate = |rationale: &str| ToolDecision::Terminate {
+                request_id: request.request_id.clone(),
+                termination_info: Box::new(SessionTerminationInfo::new(
+                    request.episode_id.to_string(),
+                    rationale,
+                    "FAILURE",
+                )),
+                refinement_event: None,
+            };
+
+            match request.tool_class {
+                super::tool_class::ToolClass::Read => {
+                    // TCK-00286 [MEDIUM]: Fail-closed if path is None
+                    let Some(ref path) = request.path else {
+                        warn!(
+                            request_id = %request.request_id,
+                            "context firewall violation: Read request missing path"
+                        );
+                        return Ok(make_terminate("CONTEXT_READ_NO_PATH"));
+                    };
+
                     let firewall =
                         DefaultContextFirewall::new(context_manifest, FirewallMode::HardFail);
                     let path_str = path.to_string_lossy();
 
                     if let Err(e) = firewall.validate_read(&path_str, None) {
                         warn!(path = %path_str, error = %e, "context firewall violation");
-
-                        let termination_info = SessionTerminationInfo::new(
-                            request.episode_id.to_string(),
-                            "CONTEXT_MISS",
-                            "FAILURE",
-                        );
-
-                        return Ok(ToolDecision::Terminate {
-                            request_id: request.request_id.clone(),
-                            termination_info: Box::new(termination_info),
-                            refinement_event: None, // Can be populated by caller/runtime
-                        });
+                        return Ok(make_terminate("CONTEXT_MISS"));
                     }
-                }
+                },
+                super::tool_class::ToolClass::Write => {
+                    // TCK-00286 [HIGH]: Check write_allowlist if configured
+                    if !context_manifest.write_allowlist.is_empty() {
+                        // Fail-closed if path is None when write_allowlist is configured
+                        let Some(ref path) = request.path else {
+                            warn!(
+                                request_id = %request.request_id,
+                                "context firewall violation: Write request missing path"
+                            );
+                            return Ok(make_terminate("CONTEXT_WRITE_NO_PATH"));
+                        };
+
+                        if !context_manifest.is_write_path_allowed(path) {
+                            warn!(
+                                path = %path.display(),
+                                "context firewall violation: path not in write_allowlist"
+                            );
+                            return Ok(make_terminate("CONTEXT_WRITE_DENIED"));
+                        }
+                    }
+                },
+                super::tool_class::ToolClass::Execute => {
+                    // TCK-00286 [HIGH]: Check shell_allowlist if configured
+                    if !context_manifest.shell_allowlist.is_empty() {
+                        // Fail-closed if shell_command is None when shell_allowlist is configured
+                        let Some(ref command) = request.shell_command else {
+                            warn!(
+                                request_id = %request.request_id,
+                                "context firewall violation: Execute request missing shell_command"
+                            );
+                            return Ok(make_terminate("CONTEXT_EXEC_NO_CMD"));
+                        };
+
+                        if !context_manifest.is_shell_command_allowed(command) {
+                            warn!(
+                                command = %command,
+                                "context firewall violation: command not in shell_allowlist"
+                            );
+                            return Ok(make_terminate("CONTEXT_EXEC_DENIED"));
+                        }
+                    }
+                },
+                // Other tool classes (Network, Git, Inference, Artifact) are not
+                // currently subject to context firewall restrictions.
+                _ => {},
             }
         }
 
@@ -1312,5 +1377,537 @@ mod tests {
         if let ToolDecision::DedupeCacheHit { result, .. } = decision2 {
             assert_eq!(result.output, b"file contents");
         }
+    }
+
+    // =========================================================================
+    // Context Firewall Tests (TCK-00286)
+    //
+    // These tests verify the context firewall integration in the broker,
+    // including fail-closed behavior for Read, Write, and Execute operations.
+    // =========================================================================
+
+    /// Helper to create a context pack manifest with specified allowlists.
+    fn make_context_manifest(
+        entries: Vec<(&str, [u8; 32])>,
+        write_paths: Vec<PathBuf>,
+        shell_patterns: Vec<String>,
+    ) -> apm2_core::context::ContextPackManifest {
+        use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
+
+        let mut builder = ContextPackManifestBuilder::new("ctx-manifest-test", "profile-test");
+
+        for (path, hash) in entries {
+            builder = builder.add_entry(
+                ManifestEntryBuilder::new(path, hash)
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            );
+        }
+
+        if !write_paths.is_empty() {
+            builder = builder.write_allowlist(write_paths);
+        }
+        if !shell_patterns.is_empty() {
+            builder = builder.shell_allowlist(shell_patterns);
+        }
+
+        builder.build()
+    }
+
+    /// Helper to make a write capability.
+    fn make_write_capability(id: &str, paths: Vec<PathBuf>) -> Capability {
+        Capability {
+            capability_id: id.to_string(),
+            tool_class: ToolClass::Write,
+            scope: CapabilityScope {
+                root_paths: paths,
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        }
+    }
+
+    /// Helper to make an execute capability.
+    fn make_execute_capability(id: &str) -> Capability {
+        Capability {
+            capability_id: id.to_string(),
+            tool_class: ToolClass::Execute,
+            scope: CapabilityScope {
+                root_paths: Vec::new(),
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_initialize_with_context_manifest() {
+        // TCK-00286: Basic initialization test
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/allowed.rs", [0x42; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let result = broker
+            .initialize_with_context_manifest(context_manifest)
+            .await;
+        assert!(result.is_ok(), "should initialize with context manifest");
+    }
+
+    #[tokio::test]
+    async fn test_context_firewall_allows_permitted_read() {
+        // TCK-00286: Read request for allowed path proceeds to capability checks
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up capability manifest allowing reads from /workspace
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set up context manifest allowing /workspace/allowed.rs
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/allowed.rs", [0x42; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request should be allowed (both context firewall and capability check pass)
+        let request = make_request(
+            "req-allowed",
+            ToolClass::Read,
+            Some("/workspace/allowed.rs"),
+        );
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(
+            decision.is_allowed(),
+            "read request for allowed path should be permitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_context_firewall_terminates_on_denied_read() {
+        // TCK-00286: Read request for path NOT in manifest returns Terminate
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up capability manifest allowing reads from /workspace
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set up context manifest allowing ONLY /workspace/allowed.rs
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/allowed.rs", [0x42; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request for path NOT in context manifest should terminate
+        let request = make_request("req-denied", ToolClass::Read, Some("/workspace/secret.rs"));
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(
+            decision.is_terminate(),
+            "read request for denied path should terminate session"
+        );
+        if let ToolDecision::Terminate {
+            termination_info, ..
+        } = decision
+        {
+            assert_eq!(termination_info.rationale_code, "CONTEXT_MISS");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_firewall_terminates_on_read_without_path() {
+        // TCK-00286 [MEDIUM]: Read request with path: None when context firewall
+        // active returns Terminate (fail-closed)
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up capability manifest
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set up context manifest (any entries - the point is firewall is active)
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/allowed.rs", [0x42; 32])],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request with NO path should terminate (fail-closed)
+        let request = make_request("req-no-path", ToolClass::Read, None);
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(
+            decision.is_terminate(),
+            "read request without path should terminate when context firewall is active"
+        );
+        if let ToolDecision::Terminate {
+            termination_info, ..
+        } = decision
+        {
+            assert_eq!(termination_info.rationale_code, "CONTEXT_READ_NO_PATH");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_firewall_terminates_on_denied_write() {
+        // TCK-00286 [HIGH]: Write request outside write_allowlist returns Terminate
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up capability manifest allowing writes to /workspace
+        // We give capability manifest a broad write allowlist, so it passes capability
+        // check. The context firewall should then terminate on paths outside
+        // ITS allowlist.
+        let tool_classes = vec![ToolClass::Write];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from("/workspace")],
+            )])
+            .tool_allowlist(tool_classes)
+            .write_allowlist(vec![PathBuf::from("/workspace")]) // Broad capability
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set up context manifest with write_allowlist for /workspace/allowed ONLY
+        // This is more restrictive than the capability manifest
+        let context_manifest = make_context_manifest(
+            Vec::new(), // no read entries needed for this test
+            vec![PathBuf::from("/workspace/allowed")],
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request to write outside context's allowed path should terminate
+        let request = make_request(
+            "req-write-denied",
+            ToolClass::Write,
+            Some("/workspace/secret.txt"),
+        );
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(
+            decision.is_terminate(),
+            "write request outside context write_allowlist should terminate, got: {decision:?}"
+        );
+        if let ToolDecision::Terminate {
+            termination_info, ..
+        } = decision
+        {
+            assert_eq!(termination_info.rationale_code, "CONTEXT_WRITE_DENIED");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_firewall_allows_permitted_write() {
+        // TCK-00286: Write request within write_allowlist proceeds
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up capability manifest allowing writes to /workspace
+        // NOTE: Both CapabilityManifest and ContextPackManifest have write_allowlist
+        // Both must allow the path for the request to succeed.
+        let tool_classes = vec![ToolClass::Write];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from("/workspace")],
+            )])
+            .tool_allowlist(tool_classes)
+            .write_allowlist(vec![PathBuf::from("/workspace/allowed")])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set up context manifest with write_allowlist for /workspace/allowed
+        let context_manifest = make_context_manifest(
+            Vec::new(),
+            vec![PathBuf::from("/workspace/allowed")],
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request to write inside allowed path should proceed
+        let request = make_request(
+            "req-write-allowed",
+            ToolClass::Write,
+            Some("/workspace/allowed/file.txt"),
+        );
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(
+            decision.is_allowed(),
+            "write request within write_allowlist should be allowed, got: {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_context_firewall_terminates_on_denied_execute() {
+        // TCK-00286 [HIGH]: Execute request outside shell_allowlist returns Terminate
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up capability manifest allowing execute with broad shell allowlist
+        // The context firewall should then terminate on commands outside ITS allowlist.
+        let tool_classes = vec![ToolClass::Execute];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(tool_classes)
+            .shell_allowlist(vec!["*".to_string()]) // Broad capability (allows anything)
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set up context manifest with shell_allowlist for cargo ONLY
+        // This is more restrictive than the capability manifest
+        let context_manifest =
+            make_context_manifest(Vec::new(), Vec::new(), vec!["cargo *".to_string()]);
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request to execute rm command should terminate
+        let mut request = make_request("req-exec-denied", ToolClass::Execute, None);
+        request = request.with_shell_command("rm -rf /");
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(
+            decision.is_terminate(),
+            "execute request outside context shell_allowlist should terminate, got: {decision:?}"
+        );
+        if let ToolDecision::Terminate {
+            termination_info, ..
+        } = decision
+        {
+            assert_eq!(termination_info.rationale_code, "CONTEXT_EXEC_DENIED");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_firewall_allows_permitted_execute() {
+        // TCK-00286: Execute request matching shell_allowlist proceeds
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up capability manifest allowing execute with matching shell allowlist
+        // Both capability and context manifests must allow the command.
+        let tool_classes = vec![ToolClass::Execute];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(tool_classes)
+            .shell_allowlist(vec!["cargo *".to_string()])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set up context manifest with shell_allowlist for cargo
+        let context_manifest =
+            make_context_manifest(Vec::new(), Vec::new(), vec!["cargo *".to_string()]);
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request to execute cargo command should proceed
+        let mut request = make_request("req-exec-allowed", ToolClass::Execute, None);
+        request = request.with_shell_command("cargo build --release");
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(
+            decision.is_allowed(),
+            "execute request matching shell_allowlist should be allowed, got: {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_context_firewall_execute_no_command() {
+        // TCK-00286: Execute request without shell_command when shell_allowlist
+        // configured returns Terminate (fail-closed)
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up capability manifest allowing execute
+        // NOTE: We need to configure capability manifest's shell_allowlist too
+        // but the context firewall check happens FIRST, so it should terminate
+        // before capability validation.
+        let tool_classes = vec![ToolClass::Execute];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_execute_capability("cap-exec")])
+            .tool_allowlist(tool_classes)
+            .shell_allowlist(vec!["cargo *".to_string()])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set up context manifest with shell_allowlist
+        let context_manifest =
+            make_context_manifest(Vec::new(), Vec::new(), vec!["cargo *".to_string()]);
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request without shell_command should terminate
+        let request = make_request("req-exec-no-cmd", ToolClass::Execute, None);
+        // Note: not calling with_shell_command
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(
+            decision.is_terminate(),
+            "execute request without shell_command should terminate when shell_allowlist configured, got: {decision:?}"
+        );
+        if let ToolDecision::Terminate {
+            termination_info, ..
+        } = decision
+        {
+            assert_eq!(termination_info.rationale_code, "CONTEXT_EXEC_NO_CMD");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_firewall_write_no_path() {
+        // TCK-00286: Write request without path when write_allowlist
+        // configured returns Terminate (fail-closed)
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up capability manifest allowing writes
+        // NOTE: Context firewall check happens FIRST, so missing path will
+        // trigger terminate before capability validation.
+        let tool_classes = vec![ToolClass::Write];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![make_write_capability(
+                "cap-write",
+                vec![PathBuf::from("/workspace")],
+            )])
+            .tool_allowlist(tool_classes)
+            .write_allowlist(vec![PathBuf::from("/workspace/allowed")])
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set up context manifest with write_allowlist
+        let context_manifest = make_context_manifest(
+            Vec::new(),
+            vec![PathBuf::from("/workspace/allowed")],
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Request without path should terminate
+        let request = make_request("req-write-no-path", ToolClass::Write, None);
+        let decision = broker.request(&request, timestamp_ns(0)).await.unwrap();
+
+        assert!(
+            decision.is_terminate(),
+            "write request without path should terminate when write_allowlist configured, got: {decision:?}"
+        );
+        if let ToolDecision::Terminate {
+            termination_info, ..
+        } = decision
+        {
+            assert_eq!(termination_info.rationale_code, "CONTEXT_WRITE_NO_PATH");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_firewall_empty_allowlist_bypasses_check() {
+        // TCK-00286: When context's write_allowlist/shell_allowlist are empty,
+        // the context firewall check is bypassed (only capability check applies)
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        // Set up capability manifest allowing writes and execute
+        // The capability manifest needs its own allowlists configured.
+        let tool_classes = vec![ToolClass::Write, ToolClass::Execute];
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(vec![
+                make_write_capability("cap-write", vec![PathBuf::from("/workspace")]),
+                make_execute_capability("cap-exec"),
+            ])
+            .tool_allowlist(tool_classes)
+            .write_allowlist(vec![PathBuf::from("/workspace")]) // Capability allows /workspace
+            .shell_allowlist(vec!["*".to_string()]) // Capability allows any command
+            .build()
+            .unwrap();
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Set up context manifest with EMPTY write_allowlist and shell_allowlist
+        // Empty context allowlists = bypass context firewall for those operations
+        let context_manifest = make_context_manifest(
+            vec![("/workspace/allowed.rs", [0x42; 32])], // read entries only
+            Vec::new(),                                  /* empty write_allowlist - bypass
+                                                          * context check */
+            Vec::new(), // empty shell_allowlist - bypass context check
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Write request should proceed (empty context allowlist = no context firewall
+        // check)
+        let write_request = make_request("req-write", ToolClass::Write, Some("/workspace/any.txt"));
+        let write_decision = broker
+            .request(&write_request, timestamp_ns(0))
+            .await
+            .unwrap();
+        assert!(
+            write_decision.is_allowed(),
+            "write should be allowed when context write_allowlist is empty, got: {write_decision:?}"
+        );
+
+        // Execute request should proceed (empty context allowlist = no context firewall
+        // check)
+        let mut exec_request = make_request("req-exec", ToolClass::Execute, None);
+        exec_request = exec_request.with_shell_command("any command");
+        let exec_decision = broker
+            .request(&exec_request, timestamp_ns(1))
+            .await
+            .unwrap();
+        assert!(
+            exec_decision.is_allowed(),
+            "execute should be allowed when context shell_allowlist is empty, got: {exec_decision:?}"
+        );
     }
 }
