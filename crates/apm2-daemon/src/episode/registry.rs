@@ -423,6 +423,20 @@ use crate::session::{SessionRegistry, SessionRegistryError, SessionState};
 /// denial-of-service via memory exhaustion.
 pub const MAX_SESSIONS: usize = 10_000;
 
+/// Internal state for the session registry.
+///
+/// This struct consolidates all mutable state under a single lock to prevent
+/// deadlocks from lock ordering issues (AB/BA lock inversion).
+#[derive(Debug, Default)]
+struct RegistryState {
+    /// Insertion order queue for LRU eviction.
+    queue: VecDeque<String>,
+    /// Sessions indexed by session ID.
+    by_id: HashMap<String, SessionState>,
+    /// Session ID lookup by ephemeral handle.
+    by_handle: HashMap<String, String>,
+}
+
 /// In-memory session registry for tracking active sessions.
 ///
 /// # Capacity Limits (CTR-1303)
@@ -430,12 +444,15 @@ pub const MAX_SESSIONS: usize = 10_000;
 /// This registry enforces a maximum of [`MAX_SESSIONS`] entries to prevent
 /// memory exhaustion. When the limit is reached, the oldest entry (by insertion
 /// order) is evicted to make room for the new session.
+///
+/// # Thread Safety
+///
+/// Uses a single `RwLock<RegistryState>` to prevent deadlocks from lock
+/// ordering issues. All operations acquire only one lock.
 #[derive(Debug, Default)]
 pub struct InMemorySessionRegistry {
-    /// Sessions stored with insertion order for LRU eviction.
-    sessions: RwLock<(VecDeque<String>, HashMap<String, SessionState>)>,
-    /// Sessions indexed by ephemeral handle for efficient lookup.
-    sessions_by_handle: RwLock<HashMap<String, String>>,
+    /// Consolidated state under a single lock to prevent deadlocks.
+    state: RwLock<RegistryState>,
 }
 
 impl InMemorySessionRegistry {
@@ -448,21 +465,19 @@ impl InMemorySessionRegistry {
 
 impl SessionRegistry for InMemorySessionRegistry {
     fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError> {
-        let mut guard = self.sessions.write().expect("lock poisoned");
-        let mut handles = self.sessions_by_handle.write().expect("lock poisoned");
-        let (order, sessions) = &mut *guard;
+        let mut state = self.state.write().expect("lock poisoned");
 
-        if sessions.contains_key(&session.session_id) {
+        if state.by_id.contains_key(&session.session_id) {
             return Err(SessionRegistryError::DuplicateSessionId {
                 session_id: session.session_id,
             });
         }
 
         // CTR-1303: Evict oldest entry if at capacity
-        while sessions.len() >= MAX_SESSIONS {
-            if let Some(oldest_key) = order.pop_front() {
-                if let Some(evicted) = sessions.remove(&oldest_key) {
-                    handles.remove(&evicted.ephemeral_handle);
+        while state.by_id.len() >= MAX_SESSIONS {
+            if let Some(oldest_key) = state.queue.pop_front() {
+                if let Some(evicted) = state.by_id.remove(&oldest_key) {
+                    state.by_handle.remove(&evicted.ephemeral_handle);
                 }
             } else {
                 break;
@@ -471,21 +486,271 @@ impl SessionRegistry for InMemorySessionRegistry {
 
         let session_id = session.session_id.clone();
         let handle = session.ephemeral_handle.clone();
-        order.push_back(session_id.clone());
-        handles.insert(handle, session_id.clone());
-        sessions.insert(session_id, session);
+        state.queue.push_back(session_id.clone());
+        state.by_handle.insert(handle, session_id.clone());
+        state.by_id.insert(session_id, session);
         Ok(())
     }
 
     fn get_session(&self, session_id: &str) -> Option<SessionState> {
-        let guard = self.sessions.read().expect("lock poisoned");
-        guard.1.get(session_id).cloned()
+        let state = self.state.read().expect("lock poisoned");
+        state.by_id.get(session_id).cloned()
     }
 
     fn get_session_by_handle(&self, handle: &str) -> Option<SessionState> {
-        let handles = self.sessions_by_handle.read().expect("lock poisoned");
-        let session_id = handles.get(handle)?;
-        let guard = self.sessions.read().expect("lock poisoned");
-        guard.1.get(session_id).cloned()
+        let state = self.state.read().expect("lock poisoned");
+        let session_id = state.by_handle.get(handle)?;
+        state.by_id.get(session_id).cloned()
+    }
+}
+
+#[cfg(test)]
+mod session_registry_tests {
+    use super::*;
+
+    /// Helper to create a test session with a given ID and handle.
+    fn make_session(id: &str, handle: &str) -> SessionState {
+        SessionState {
+            session_id: id.to_string(),
+            work_id: format!("work-{id}"),
+            role: 1,
+            ephemeral_handle: handle.to_string(),
+            lease_id: format!("lease-{id}"),
+            policy_resolved_ref: "policy-ref".to_string(),
+            episode_id: None,
+        }
+    }
+
+    // =========================================================================
+    // Basic Registration and Retrieval Tests
+    // =========================================================================
+
+    #[test]
+    fn test_register_and_get_session() {
+        let registry = InMemorySessionRegistry::new();
+        let session = make_session("sess-1", "handle-1");
+
+        registry.register_session(session.clone()).unwrap();
+
+        let retrieved = registry.get_session("sess-1");
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.session_id, "sess-1");
+        assert_eq!(retrieved.ephemeral_handle, "handle-1");
+        assert_eq!(retrieved.work_id, "work-sess-1");
+    }
+
+    #[test]
+    fn test_get_nonexistent_session() {
+        let registry = InMemorySessionRegistry::new();
+        assert!(registry.get_session("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_register_multiple_sessions() {
+        let registry = InMemorySessionRegistry::new();
+
+        registry
+            .register_session(make_session("sess-1", "handle-1"))
+            .unwrap();
+        registry
+            .register_session(make_session("sess-2", "handle-2"))
+            .unwrap();
+        registry
+            .register_session(make_session("sess-3", "handle-3"))
+            .unwrap();
+
+        assert!(registry.get_session("sess-1").is_some());
+        assert!(registry.get_session("sess-2").is_some());
+        assert!(registry.get_session("sess-3").is_some());
+    }
+
+    // =========================================================================
+    // Duplicate Session ID Handling Tests
+    // =========================================================================
+
+    #[test]
+    fn test_duplicate_session_id_rejected() {
+        let registry = InMemorySessionRegistry::new();
+
+        registry
+            .register_session(make_session("sess-1", "handle-1"))
+            .unwrap();
+
+        let result = registry.register_session(make_session("sess-1", "handle-2"));
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SessionRegistryError::DuplicateSessionId { session_id } => {
+                assert_eq!(session_id, "sess-1");
+            },
+            other => panic!("Expected DuplicateSessionId, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_duplicate_session_preserves_original() {
+        let registry = InMemorySessionRegistry::new();
+
+        let original = make_session("sess-1", "handle-original");
+        registry.register_session(original).unwrap();
+
+        // Try to register duplicate
+        let duplicate = make_session("sess-1", "handle-duplicate");
+        let _ = registry.register_session(duplicate);
+
+        // Original should be preserved
+        let retrieved = registry.get_session("sess-1").unwrap();
+        assert_eq!(retrieved.ephemeral_handle, "handle-original");
+    }
+
+    // =========================================================================
+    // Lookup by Handle Tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_session_by_handle() {
+        let registry = InMemorySessionRegistry::new();
+        let session = make_session("sess-1", "handle-1");
+
+        registry.register_session(session).unwrap();
+
+        let retrieved = registry.get_session_by_handle("handle-1");
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.session_id, "sess-1");
+        assert_eq!(retrieved.ephemeral_handle, "handle-1");
+    }
+
+    #[test]
+    fn test_get_session_by_nonexistent_handle() {
+        let registry = InMemorySessionRegistry::new();
+        registry
+            .register_session(make_session("sess-1", "handle-1"))
+            .unwrap();
+
+        assert!(registry.get_session_by_handle("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_handle_lookup_with_multiple_sessions() {
+        let registry = InMemorySessionRegistry::new();
+
+        registry
+            .register_session(make_session("sess-1", "handle-1"))
+            .unwrap();
+        registry
+            .register_session(make_session("sess-2", "handle-2"))
+            .unwrap();
+        registry
+            .register_session(make_session("sess-3", "handle-3"))
+            .unwrap();
+
+        // Each handle should map to its session
+        assert_eq!(
+            registry
+                .get_session_by_handle("handle-1")
+                .unwrap()
+                .session_id,
+            "sess-1"
+        );
+        assert_eq!(
+            registry
+                .get_session_by_handle("handle-2")
+                .unwrap()
+                .session_id,
+            "sess-2"
+        );
+        assert_eq!(
+            registry
+                .get_session_by_handle("handle-3")
+                .unwrap()
+                .session_id,
+            "sess-3"
+        );
+    }
+
+    // =========================================================================
+    // LRU Eviction Tests
+    // =========================================================================
+
+    #[test]
+    fn test_lru_eviction_at_capacity() {
+        // Use a smaller capacity for testing
+        let registry = InMemorySessionRegistry::new();
+
+        // Fill to MAX_SESSIONS
+        for i in 0..MAX_SESSIONS {
+            let session = make_session(&format!("sess-{i}"), &format!("handle-{i}"));
+            registry.register_session(session).unwrap();
+        }
+
+        // Verify first session exists
+        assert!(registry.get_session("sess-0").is_some());
+
+        // Register one more - should evict sess-0 (oldest)
+        registry
+            .register_session(make_session("sess-new", "handle-new"))
+            .unwrap();
+
+        // sess-0 should be evicted
+        assert!(registry.get_session("sess-0").is_none());
+        assert!(registry.get_session_by_handle("handle-0").is_none());
+
+        // New session should exist
+        assert!(registry.get_session("sess-new").is_some());
+        assert!(registry.get_session_by_handle("handle-new").is_some());
+
+        // sess-1 should still exist (it's now the oldest)
+        assert!(registry.get_session("sess-1").is_some());
+    }
+
+    #[test]
+    fn test_lru_eviction_order() {
+        let registry = InMemorySessionRegistry::new();
+
+        // Fill to capacity
+        for i in 0..MAX_SESSIONS {
+            let session = make_session(&format!("sess-{i}"), &format!("handle-{i}"));
+            registry.register_session(session).unwrap();
+        }
+
+        // Register 3 more sessions
+        for i in 0..3 {
+            let session = make_session(&format!("new-{i}"), &format!("new-handle-{i}"));
+            registry.register_session(session).unwrap();
+        }
+
+        // First 3 sessions should be evicted (FIFO order)
+        assert!(registry.get_session("sess-0").is_none());
+        assert!(registry.get_session("sess-1").is_none());
+        assert!(registry.get_session("sess-2").is_none());
+
+        // Session 3 should still exist
+        assert!(registry.get_session("sess-3").is_some());
+
+        // All new sessions should exist
+        assert!(registry.get_session("new-0").is_some());
+        assert!(registry.get_session("new-1").is_some());
+        assert!(registry.get_session("new-2").is_some());
+    }
+
+    #[test]
+    fn test_eviction_cleans_up_handle_index() {
+        let registry = InMemorySessionRegistry::new();
+
+        // Fill to capacity
+        for i in 0..MAX_SESSIONS {
+            let session = make_session(&format!("sess-{i}"), &format!("handle-{i}"));
+            registry.register_session(session).unwrap();
+        }
+
+        // Evict first session
+        registry
+            .register_session(make_session("sess-new", "handle-new"))
+            .unwrap();
+
+        // Handle index for evicted session should be cleaned up
+        assert!(registry.get_session_by_handle("handle-0").is_none());
     }
 }
