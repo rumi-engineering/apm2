@@ -45,11 +45,15 @@ use super::capability::{
     ManifestLoadError, ManifestLoader,
 };
 use super::decision::{
-    BrokerToolRequest, BudgetDelta, DedupeKey, RequestValidationError, ToolDecision, ToolResult,
+    BrokerToolRequest, BudgetDelta, DedupeKey, RequestValidationError, SessionTerminationInfo,
+    ToolDecision, ToolResult,
 };
 use super::dedupe::{DedupeCache, DedupeCacheConfig, SharedDedupeCache};
 use super::error::EpisodeId;
 use super::runtime::Hash;
+
+use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
+use apm2_core::context::ContextPackManifest;
 
 // =============================================================================
 // BrokerError
@@ -337,6 +341,9 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// Optional manifest loader for CAS-based initialization.
     #[allow(dead_code)]
     loader: Option<Arc<L>>,
+
+    /// Context pack manifest for firewall enforcement (TCK-00261).
+    context_manifest: tokio::sync::RwLock<Option<Arc<ContextPackManifest>>>,
 }
 
 impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
@@ -352,6 +359,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             policy: StubPolicyEngine::new(),
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: None,
+            context_manifest: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -367,6 +375,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             policy: StubPolicyEngine::new(),
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: Some(loader),
+            context_manifest: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -411,6 +420,21 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         Ok(())
     }
 
+    /// Initializes the broker with a context pack manifest for firewalling.
+    ///
+    /// Per TCK-00261, this enables the context firewall which terminates
+    /// the session on any access violation.
+    #[instrument(skip(self, manifest), fields(manifest_id = %manifest.manifest_id))]
+    pub async fn initialize_with_context_manifest(
+        &self,
+        manifest: ContextPackManifest,
+    ) -> Result<(), BrokerError> {
+        let mut guard = self.context_manifest.write().await;
+        *guard = Some(Arc::new(manifest));
+        debug!("broker initialized with context pack manifest");
+        Ok(())
+    }
+
     /// Returns `true` if the broker has been initialized.
     pub async fn is_initialized(&self) -> bool {
         self.validator.read().await.is_some()
@@ -429,9 +453,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ///
     /// This is the main entry point for tool request validation. It:
     /// 1. Validates the request structure
-    /// 2. Validates against capability manifests (OCAP check)
-    /// 3. Evaluates policy rules
-    /// 4. Checks dedupe cache (only for authorized requests)
+    /// 2. Validates against context firewall (if configured) [TCK-00261]
+    /// 3. Validates against capability manifests (OCAP check)
+    /// 4. Evaluates policy rules
+    /// 5. Checks dedupe cache (only for authorized requests)
     ///
     /// # Security
     ///
@@ -447,7 +472,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     /// # Returns
     ///
     /// A `ToolDecision` indicating whether the request is allowed, denied,
-    /// or matched a cached result.
+    /// terminated, or matched a cached result.
     ///
     /// # Errors
     ///
@@ -462,7 +487,37 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // Step 1: Validate request structure
         request.validate()?;
 
-        // Step 2: Validate against capability manifest (OCAP check)
+        // Step 2: Validate against context firewall (TCK-00261)
+        // This must happen before capability checks because a firewall violation
+        // triggers session termination, which is more severe than a capability denial.
+        if let Some(context_manifest) = self.context_manifest.read().await.as_ref() {
+            // Only FileRead operations are currently subject to the context firewall allowlist
+            // in DefaultContextFirewall.
+            if request.tool_class == super::tool_class::ToolClass::Read {
+                if let Some(ref path) = request.path {
+                    let firewall = DefaultContextFirewall::new(context_manifest, FirewallMode::HardFail);
+                    let path_str = path.to_string_lossy();
+                    
+                    if let Err(e) = firewall.validate_read(&path_str, None) {
+                        warn!(path = %path_str, error = %e, "context firewall violation");
+                        
+                        let termination_info = SessionTerminationInfo::new(
+                            request.episode_id.to_string(),
+                            "CONTEXT_MISS",
+                            "FAILURE",
+                        );
+                        
+                        return Ok(ToolDecision::Terminate {
+                            request_id: request.request_id.clone(),
+                            termination_info: Box::new(termination_info),
+                            refinement_event: None, // Can be populated by caller/runtime
+                        });
+                    }
+                }
+            }
+        }
+
+        // Step 3: Validate against capability manifest (OCAP check)
         // SECURITY: This MUST happen before cache lookup to prevent authorization
         // bypass
         let validator = self.validator.read().await;
@@ -484,7 +539,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             },
         };
 
-        // Step 3: Evaluate policy (if enabled)
+        // Step 4: Evaluate policy (if enabled)
         // SECURITY: Policy evaluation must also happen before cache lookup
         if self.config.check_policy {
             if let PolicyDecision::Deny { rule_id, reason } = self.policy.evaluate(request) {
@@ -502,7 +557,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             }
         }
 
-        // Step 4: Check dedupe cache (only for authorized requests)
+        // Step 5: Check dedupe cache (only for authorized requests)
         // SECURITY: Cache lookup occurs AFTER authorization to prevent bypass attacks
         if self.config.use_dedupe_cache {
             if let Some(cached) = self
