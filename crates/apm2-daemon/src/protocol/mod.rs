@@ -87,6 +87,11 @@
 //! - Handshake required before message exchange
 //! - Version mismatch terminates connection
 
+/// Connection handler for dual-socket ProtocolServer control plane (TCK-00279).
+///
+/// This module implements the connection handling logic including the mandatory
+/// Hello/HelloAck handshake as specified in DD-001/DD-008.
+pub mod connection_handler;
 /// Peer credentials extraction from Unix sockets via `SO_PEERCRED`.
 pub mod credentials;
 /// Privileged endpoint dispatcher for RFC-0017 control-plane IPC.
@@ -106,6 +111,10 @@ pub mod socket_manager;
 // Re-export commonly used types at module level.
 // These re-exports form the public API of this module and may not be used
 // within the crate itself.
+#[allow(unused_imports)]
+pub use connection_handler::{
+    HandshakeResult, RequestDispatcher, handle_connection, perform_handshake, requires_privilege,
+};
 #[allow(unused_imports)]
 pub use credentials::PeerCredentials;
 #[allow(unused_imports)]
