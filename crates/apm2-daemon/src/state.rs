@@ -3,6 +3,7 @@
 //! Provides thread-safe shared state for the daemon.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -11,6 +12,10 @@ use apm2_core::process::ProcessId;
 use apm2_core::process::runner::ProcessRunner;
 use apm2_core::schema_registry::InMemorySchemaRegistry;
 use apm2_core::supervisor::Supervisor;
+use apm2_daemon::episode::{
+    InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
+};
+use apm2_daemon::session::SessionRegistry;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
@@ -32,11 +37,22 @@ pub struct DaemonStateHandle {
     /// Used by future handlers for schema validation (TCK-00181).
     #[allow(dead_code)]
     schema_registry: InMemorySchemaRegistry,
+    /// Session registry for RFC-0017 control-plane IPC (TCK-00266).
+    /// This is either a persistent or in-memory registry based on
+    /// configuration. Will be used when RFC-0017 protobuf IPC is fully
+    /// wired up.
+    #[allow(dead_code)]
+    session_registry: Arc<dyn SessionRegistry>,
 }
 
 impl DaemonStateHandle {
-    /// Create a new daemon state handle.
+    /// Create a new daemon state handle with an in-memory session registry.
+    ///
+    /// For production use with persistent sessions, use
+    /// [`new_with_persistent_sessions`](Self::new_with_persistent_sessions)
+    /// instead.
     #[must_use]
+    #[allow(dead_code)] // Used in tests and for in-memory mode
     pub fn new(
         config: EcosystemConfig,
         supervisor: Supervisor,
@@ -51,7 +67,42 @@ impl DaemonStateHandle {
             shutdown: AtomicBool::new(false),
             started_at: Utc::now(),
             schema_registry,
+            session_registry: Arc::new(InMemorySessionRegistry::new()),
         }
+    }
+
+    /// Create a new daemon state handle with a persistent session registry.
+    ///
+    /// # TCK-00266
+    ///
+    /// This constructor loads existing session state from the state file
+    /// (if it exists) and persists new sessions to disk. Use this for
+    /// production deployments where session state should survive daemon
+    /// restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state file exists but cannot be parsed.
+    pub fn new_with_persistent_sessions(
+        config: EcosystemConfig,
+        supervisor: Supervisor,
+        schema_registry: InMemorySchemaRegistry,
+        state_file_path: impl AsRef<Path>,
+    ) -> Result<Self, PersistentRegistryError> {
+        let session_registry =
+            Arc::new(PersistentSessionRegistry::load_from_file(state_file_path)?);
+
+        Ok(Self {
+            inner: RwLock::new(DaemonState {
+                supervisor,
+                runners: HashMap::new(),
+                config,
+            }),
+            shutdown: AtomicBool::new(false),
+            started_at: Utc::now(),
+            schema_registry,
+            session_registry,
+        })
     }
 
     /// Get a reference to the schema registry.
@@ -60,6 +111,19 @@ impl DaemonStateHandle {
     #[allow(dead_code)]
     pub const fn schema_registry(&self) -> &InMemorySchemaRegistry {
         &self.schema_registry
+    }
+
+    /// Get a reference to the session registry.
+    ///
+    /// # TCK-00266
+    ///
+    /// Returns the session registry for RFC-0017 control-plane IPC.
+    /// This may be either a persistent or in-memory registry depending
+    /// on how the daemon was configured.
+    #[must_use]
+    #[allow(dead_code)] // Will be used when RFC-0017 protobuf IPC is fully wired up
+    pub fn session_registry(&self) -> &Arc<dyn SessionRegistry> {
+        &self.session_registry
     }
 
     /// Get read access to the inner state.

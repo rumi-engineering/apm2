@@ -61,7 +61,7 @@ struct Args {
     #[arg(long)]
     session_socket: Option<PathBuf>,
 
-    /// Path to state file (reserved; not wired up yet)
+    /// Path to state file for persistent session registry (TCK-00266)
     #[arg(long)]
     state_file: Option<PathBuf>,
 
@@ -80,6 +80,8 @@ struct DaemonConfig {
     operator_socket_path: PathBuf,
     session_socket_path: PathBuf,
     pid_path: PathBuf,
+    /// State file path for persistent session registry (TCK-00266).
+    state_file_path: PathBuf,
 }
 
 impl DaemonConfig {
@@ -105,12 +107,17 @@ impl DaemonConfig {
             .pid_file
             .clone()
             .unwrap_or_else(|| config.daemon.pid_file.clone());
+        let state_file_path = args
+            .state_file
+            .clone()
+            .unwrap_or_else(|| config.daemon.state_file.clone());
 
         Ok(Self {
             config,
             operator_socket_path,
             session_socket_path,
             pid_path,
+            state_file_path,
         })
     }
 }
@@ -326,13 +333,25 @@ async fn main() -> Result<()> {
     let daemon_config = DaemonConfig::new(&args)?;
     let supervisor = init_supervisor(&daemon_config.config);
 
-    // Create shared state with schema registry
-    // The registry persists for the daemon's lifetime (TCK-00181)
-    let state: SharedState = Arc::new(DaemonStateHandle::new(
-        daemon_config.config.clone(),
-        supervisor,
-        registry, // Pass the registry created during bootstrap
-    ));
+    // Create shared state with schema registry and session registry
+    // The registries persist for the daemon's lifetime (TCK-00181, TCK-00266)
+    //
+    // TCK-00266: Use persistent session registry for crash recovery.
+    // The state file path is configured via CLI or ecosystem config.
+    let state: SharedState = Arc::new(
+        DaemonStateHandle::new_with_persistent_sessions(
+            daemon_config.config.clone(),
+            supervisor,
+            registry, // Pass the registry created during bootstrap
+            &daemon_config.state_file_path,
+        )
+        .context("failed to initialize persistent session registry")?,
+    );
+
+    info!(
+        "Session registry initialized with state file: {:?}",
+        daemon_config.state_file_path
+    );
 
     // Write PID file
     write_pid_file(&daemon_config.pid_path)?;
