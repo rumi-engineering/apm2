@@ -1962,10 +1962,7 @@ impl PrivilegedDispatcher {
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
             session_id,
             ephemeral_handle: ephemeral_handle.to_string(),
-            capability_manifest_hash: claim
-                .policy_resolution
-                .capability_manifest_hash
-                .to_vec(),
+            capability_manifest_hash: claim.policy_resolution.capability_manifest_hash.to_vec(),
             context_pack_sealed: true,
         }))
     }
