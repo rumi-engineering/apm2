@@ -413,6 +413,13 @@ fn update_status(
     success: bool,
     description: &str,
 ) -> Result<()> {
+    // TCK-00309: Gate writes on HEF projection flag
+    if crate::util::use_hef_projection() {
+        println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
+        println!("  [HEF] Status would be: {STATUS_CONTEXT} = {success} - {description}");
+        return Ok(());
+    }
+
     // TCK-00294: Print NON-AUTHORITATIVE banner before status writes
     print_non_authoritative_banner();
 
