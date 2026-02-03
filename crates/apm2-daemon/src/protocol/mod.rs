@@ -103,6 +103,8 @@ pub mod framing;
 pub mod golden_vectors;
 pub mod handshake;
 pub mod messages;
+/// ACL evaluation for HEF Pulse Plane subscriptions (RFC-0018, TCK-00302).
+pub mod pulse_acl;
 /// Topic grammar and wildcard matching for HEF Pulse Plane (RFC-0018,
 /// TCK-00301).
 pub mod pulse_topic;
@@ -217,6 +219,23 @@ pub use messages::{
     UnsubscribePulseRequest,
     UnsubscribePulseResponse,
     WorkRole,
+};
+// CTR-PROTO-010: HEF Pulse ACL (RFC-0018, TCK-00302)
+#[allow(unused_imports)]
+pub use pulse_acl::{
+    // Types
+    AclDecision,
+    AclError,
+    ConnectionType,
+    // Constants
+    MAX_CLIENT_SUB_ID_LEN,
+    MAX_SUBSCRIPTION_ID_LEN,
+    MAX_TOPIC_ALLOWLIST,
+    PulseAclEvaluator,
+    TopicAllowlist,
+    // Functions
+    validate_client_sub_id,
+    validate_subscription_id,
 };
 // CTR-PROTO-010: HEF Topic Grammar (RFC-0018, TCK-00301)
 #[allow(unused_imports)]
