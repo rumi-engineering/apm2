@@ -953,6 +953,10 @@ pub enum SessionErrorCode {
     SessionErrorContextFirewall = 5,
     /// Caller is on operator socket (session endpoints require session.sock).
     SessionErrorPermissionDenied = 6,
+    /// Endpoint not implemented (fail-closed for unimplemented features).
+    SessionErrorNotImplemented = 7,
+    /// Internal error (ledger, CAS, or other subsystem failure).
+    SessionErrorInternal = 8,
 }
 impl SessionErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -968,6 +972,8 @@ impl SessionErrorCode {
             Self::SessionErrorBudgetExhausted => "SESSION_ERROR_BUDGET_EXHAUSTED",
             Self::SessionErrorContextFirewall => "SESSION_ERROR_CONTEXT_FIREWALL",
             Self::SessionErrorPermissionDenied => "SESSION_ERROR_PERMISSION_DENIED",
+            Self::SessionErrorNotImplemented => "SESSION_ERROR_NOT_IMPLEMENTED",
+            Self::SessionErrorInternal => "SESSION_ERROR_INTERNAL",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -980,6 +986,8 @@ impl SessionErrorCode {
             "SESSION_ERROR_BUDGET_EXHAUSTED" => Some(Self::SessionErrorBudgetExhausted),
             "SESSION_ERROR_CONTEXT_FIREWALL" => Some(Self::SessionErrorContextFirewall),
             "SESSION_ERROR_PERMISSION_DENIED" => Some(Self::SessionErrorPermissionDenied),
+            "SESSION_ERROR_NOT_IMPLEMENTED" => Some(Self::SessionErrorNotImplemented),
+            "SESSION_ERROR_INTERNAL" => Some(Self::SessionErrorInternal),
             _ => None,
         }
     }

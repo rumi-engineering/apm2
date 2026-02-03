@@ -30,6 +30,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use apm2_core::determinism::canonicalize_json;
 use bytes::Bytes;
 use prost::Message;
 use subtle::ConstantTimeEq;
@@ -197,6 +198,36 @@ pub trait LedgerEventEmitter: Send + Sync {
         session_id: &str,
         work_id: &str,
         lease_id: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Emits a generic session event to the ledger (TCK-00290).
+    ///
+    /// This method handles arbitrary session events from `EmitEvent` requests,
+    /// preserving the actual `event_type` and payload from the request rather
+    /// than coercing all events into `session_started` events.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID emitting the event
+    /// * `event_type` - The actual event type from the request
+    /// * `payload` - The event payload bytes from the request
+    /// * `actor_id` - The actor emitting the event (session ID or agent ID)
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_session_event(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        payload: &[u8],
         actor_id: &str,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
@@ -483,6 +514,104 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             session_id = %session_id,
             work_id = %signed_event.work_id,
             "SessionStarted event signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_session_event(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        payload: &[u8],
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Domain prefix for generic session events (TCK-00290)
+        const SESSION_EVENT_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_event:";
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build payload as JSON with actual event type and hex-encoded payload
+        let payload_json = serde_json::json!({
+            "event_type": event_type,
+            "session_id": session_id,
+            "actor_id": actor_id,
+            "payload": hex::encode(payload),
+        });
+
+        // MAJOR 1 FIX (TCK-00290): Use JCS (RFC 8785) canonicalization for signing.
+        // This matches the production SqliteLedgerEventEmitter and ensures
+        // deterministic JSON representation per RFC-0016. Using
+        // serde_json::to_vec is non-deterministic because it does not guarantee
+        // key ordering.
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(SESSION_EVENT_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(SESSION_EVENT_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: event_type.to_string(),
+            work_id: session_id.to_string(), // Use session_id as work_id for indexing
+            actor_id: actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(session_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            session_id = %session_id,
+            event_type = %event_type,
+            actor_id = %actor_id,
+            "SessionEvent signed and persisted"
         );
 
         Ok(signed_event)

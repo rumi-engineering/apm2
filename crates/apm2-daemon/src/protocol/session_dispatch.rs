@@ -1,4 +1,5 @@
-//! Session-scoped endpoint dispatcher for RFC-0017 IPC (TCK-00252, TCK-00260).
+//! Session-scoped endpoint dispatcher for RFC-0017 IPC (TCK-00252, TCK-00260,
+//! TCK-00290).
 //!
 //! This module implements the session-scoped endpoint dispatcher per DD-001 and
 //! RFC-0017. Session endpoints (RequestTool, EmitEvent, PublishEvidence,
@@ -15,6 +16,18 @@
 //! - If not in allowlist: `SESSION_ERROR_TOOL_NOT_ALLOWED` (TOOL_NOT_ALLOWED)
 //! - Validation overhead target: <5ms p50
 //!
+//! # TCK-00290: Session Dispatcher Viability
+//!
+//! Per TCK-00290, this module implements:
+//! - **RequestTool**: Wire to ToolBroker execution (no stub Allow path)
+//! - **EmitEvent**: Real ledger event persistence (no stub response)
+//! - **PublishEvidence**: Real CAS storage with content addressing
+//! - **StreamTelemetry**: Fail-closed (SESSION_ERROR_NOT_IMPLEMENTED)
+//!
+//! All handlers require their backing stores (manifest store, ledger, CAS) to
+//! be configured. When unavailable, handlers return fail-closed errors per
+//! SEC-CTRL-FAC-0015.
+//!
 //! # Security Invariants
 //!
 //! - [INV-SESS-001] Session endpoints require valid session_token
@@ -24,17 +37,22 @@
 //!   (CTR-WH001)
 //! - [INV-TCK-00260-001] Tool requests validated against capability manifest
 //! - [INV-TCK-00260-002] Empty tool_allowlist denies all tools (fail-closed)
+//! - [INV-TCK-00290-001] RequestTool requires manifest store (fail-closed)
+//! - [INV-TCK-00290-002] EmitEvent requires ledger (fail-closed)
+//! - [INV-TCK-00290-003] PublishEvidence requires CAS (fail-closed)
+//! - [INV-TCK-00290-004] StreamTelemetry disabled until implemented
+//!   (fail-closed)
 //!
 //! # Message Flow
 //!
 //! ```text
 //! ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-//! │ session.sock    │────▶│ SessionDispatch  │──▶│ Handler Stubs   │
+//! │ session.sock    │────▶│ SessionDispatch  │──▶│ Real Handlers   │
 //! │ + session_token │     └─────────────────┘     └─────────────────┘
-//! └─────────────────┘            │
-//!                                │ Token Validation
-//!                                │ (HMAC-SHA256)
-//!                                ▼
+//! └─────────────────┘            │                       │
+//!                                │ Token Validation      ├── ToolBroker
+//!                                │ (HMAC-SHA256)         ├── Ledger
+//!                                ▼                       └── CAS
 //! ┌─────────────────┐     ┌─────────────────┐
 //! │ operator.sock   │────▶│ SESSION_ERROR_  │
 //! │ (no token)      │     │ PERMISSION_DENIED│
@@ -42,13 +60,14 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
 use prost::Message;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use super::dispatch::ConnectionContext;
+use super::dispatch::{ConnectionContext, LedgerEventEmitter};
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
     BoundedDecode, DecisionType, DecodeConfig, EmitEventRequest, EmitEventResponse,
@@ -56,7 +75,12 @@ use super::messages::{
     SessionError, SessionErrorCode, StreamTelemetryRequest, StreamTelemetryResponse,
 };
 use super::session_token::{SessionToken, SessionTokenError, TokenMinter};
-use crate::episode::{CapabilityManifest, ToolClass};
+use crate::episode::capability::StubManifestLoader;
+use crate::episode::decision::{BrokerToolRequest, DedupeKey, ToolDecision};
+use crate::episode::envelope::RiskTier;
+use crate::episode::executor::ContentAddressedStore;
+use crate::episode::{CapabilityManifest, EpisodeId, SharedToolBroker, ToolClass};
+use crate::htf::HolonicClock;
 
 // ============================================================================
 // Message Type Tags (for routing)
@@ -261,6 +285,15 @@ impl ManifestStore for InMemoryManifestStore {
 /// capability manifest. If the tool is not in the manifest's `tool_allowlist`,
 /// `SESSION_ERROR_TOOL_NOT_ALLOWED` is returned.
 ///
+/// # TCK-00290: Real Handler Implementations
+///
+/// Per TCK-00290, the dispatcher uses real backing stores:
+/// - **`RequestTool`**: Requires `manifest_store` (fail-closed without it)
+/// - **`EmitEvent`**: Requires `ledger` for persistent events (fail-closed)
+/// - **`PublishEvidence`**: Requires `cas` for artifact storage (fail-closed)
+/// - **`StreamTelemetry`**: Explicitly disabled (fail-closed, returns
+///   `NOT_IMPLEMENTED`)
+///
 /// # Security Contract
 ///
 /// Per INV-SESS-001 through INV-SESS-004 and INV-TCK-00260-001/002:
@@ -270,36 +303,76 @@ impl ManifestStore for InMemoryManifestStore {
 /// - Invalid/expired tokens receive `SESSION_ERROR_INVALID`
 /// - Tool requests validated against capability manifest (TCK-00260)
 /// - Empty `tool_allowlist` denies all tools (fail-closed)
+///
+/// Per INV-TCK-00290-001 through INV-TCK-00290-004:
+/// - `RequestTool` requires `ToolBroker` (fail-closed)
+/// - `EmitEvent` requires ledger (fail-closed)
+/// - `PublishEvidence` requires CAS (fail-closed)
+/// - `StreamTelemetry` disabled until implemented (fail-closed)
 pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// Token minter for validation.
     token_minter: TokenMinter,
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
     /// Manifest store for capability validation (TCK-00260).
+    /// NOTE: This is retained for backwards compatibility with existing tests
+    /// even though the broker now handles manifest validation.
+    #[allow(dead_code)]
     manifest_store: Option<Arc<M>>,
+    /// Ledger event emitter for `EmitEvent` persistence (TCK-00290).
+    ledger: Option<Arc<dyn LedgerEventEmitter>>,
+    /// Content-addressed store for `PublishEvidence` (TCK-00290).
+    cas: Option<Arc<dyn ContentAddressedStore>>,
+    /// Tool broker for `RequestTool` execution (TCK-00290).
+    ///
+    /// Per DOD: "`RequestTool` executes via `ToolBroker` and returns
+    /// `ToolResult` or Deny"
+    broker: Option<SharedToolBroker<StubManifestLoader>>,
+    /// Holonic clock for monotonic timestamps (TCK-00290).
+    ///
+    /// Per RFC-0016, timestamps must be monotonic. Using `SystemTime` directly
+    /// violates time monotonicity guarantees.
+    clock: Option<Arc<HolonicClock>>,
+    /// Event sequence counter (per-session, monotonic).
+    event_seq: AtomicU64,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
     /// Creates a new dispatcher with the given token minter.
+    ///
+    /// **Note**: This creates a dispatcher without backing stores. Per
+    /// TCK-00290, handlers will return fail-closed errors when their stores
+    /// are unavailable:
+    /// - `RequestTool`: Returns `TOOL_NOT_ALLOWED` (no broker)
+    /// - `EmitEvent`: Returns `SESSION_ERROR_INTERNAL` (no ledger)
+    /// - `PublishEvidence`: Returns `SESSION_ERROR_INTERNAL` (no CAS)
+    /// - `StreamTelemetry`: Returns `SESSION_ERROR_NOT_IMPLEMENTED`
     #[must_use]
     pub fn new(token_minter: TokenMinter) -> Self {
         Self {
             token_minter,
             decode_config: DecodeConfig::default(),
             manifest_store: None,
+            ledger: None,
+            cas: None,
+            broker: None,
+            clock: None,
+            event_seq: AtomicU64::new(0),
         }
     }
 
     /// Creates a new dispatcher with custom decode configuration.
     #[must_use]
-    pub const fn with_decode_config(
-        token_minter: TokenMinter,
-        decode_config: DecodeConfig,
-    ) -> Self {
+    pub fn with_decode_config(token_minter: TokenMinter, decode_config: DecodeConfig) -> Self {
         Self {
             token_minter,
             decode_config,
             manifest_store: None,
+            ledger: None,
+            cas: None,
+            broker: None,
+            clock: None,
+            event_seq: AtomicU64::new(0),
         }
     }
 }
@@ -315,13 +388,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             token_minter,
             decode_config: DecodeConfig::default(),
             manifest_store: Some(manifest_store),
+            ledger: None,
+            cas: None,
+            broker: None,
+            clock: None,
+            event_seq: AtomicU64::new(0),
         }
     }
 
     /// Creates a dispatcher with custom decode configuration and manifest
     /// store.
     #[must_use]
-    pub const fn with_decode_config_and_manifest_store(
+    pub fn with_decode_config_and_manifest_store(
         token_minter: TokenMinter,
         decode_config: DecodeConfig,
         manifest_store: Arc<M>,
@@ -330,7 +408,82 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             token_minter,
             decode_config,
             manifest_store: Some(manifest_store),
+            ledger: None,
+            cas: None,
+            broker: None,
+            clock: None,
+            event_seq: AtomicU64::new(0),
         }
+    }
+
+    /// Creates a fully-configured dispatcher with all backing stores
+    /// (TCK-00290).
+    ///
+    /// This is the production-ready constructor that configures all
+    /// dependencies for real handler implementations:
+    /// - `manifest_store`: For `RequestTool` capability validation
+    /// - `ledger`: For `EmitEvent` persistence
+    /// - `cas`: For `PublishEvidence` artifact storage
+    /// - `broker`: For `RequestTool` execution via `ToolBroker`
+    /// - `clock`: For monotonic timestamps (RFC-0016)
+    ///
+    /// # Arguments
+    ///
+    /// * `token_minter` - Token minter for session validation
+    /// * `manifest_store` - Capability manifest store for tool validation
+    /// * `ledger` - Ledger event emitter for event persistence
+    /// * `cas` - Content-addressed store for evidence artifacts
+    #[must_use]
+    pub fn with_all_stores(
+        token_minter: TokenMinter,
+        manifest_store: Arc<M>,
+        ledger: Arc<dyn LedgerEventEmitter>,
+        cas: Arc<dyn ContentAddressedStore>,
+    ) -> Self {
+        Self {
+            token_minter,
+            decode_config: DecodeConfig::default(),
+            manifest_store: Some(manifest_store),
+            ledger: Some(ledger),
+            cas: Some(cas),
+            broker: None,
+            clock: None,
+            event_seq: AtomicU64::new(0),
+        }
+    }
+
+    /// Sets the ledger event emitter for `EmitEvent` persistence.
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: Arc<dyn LedgerEventEmitter>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Sets the content-addressed store for `PublishEvidence`.
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
+        self.cas = Some(cas);
+        self
+    }
+
+    /// Sets the tool broker for `RequestTool` execution (TCK-00290).
+    ///
+    /// Per DOD: "`RequestTool` executes via `ToolBroker` and returns
+    /// `ToolResult` or Deny"
+    #[must_use]
+    pub fn with_broker(mut self, broker: SharedToolBroker<StubManifestLoader>) -> Self {
+        self.broker = Some(broker);
+        self
+    }
+
+    /// Sets the holonic clock for monotonic timestamps (TCK-00290).
+    ///
+    /// Per RFC-0016, timestamps must be monotonic. Using `SystemTime` directly
+    /// violates time monotonicity guarantees.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<HolonicClock>) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// Dispatches a session-scoped request to the appropriate handler.
@@ -439,6 +592,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// Per TCK-00260 acceptance criteria, validation overhead must be <5ms p50.
     /// The validation is O(n) where n = `tool_allowlist` length (bounded by
     /// `MAX_TOOL_ALLOWLIST` = 100).
+    ///
+    /// # TCK-00290: `ToolBroker` Integration
+    ///
+    /// Per DOD: "`RequestTool` executes via `ToolBroker` and returns
+    /// `ToolResult` or Deny" The broker validates capabilities, policy, and
+    /// returns a decision.
     fn handle_request_tool(
         &self,
         payload: &[u8],
@@ -499,7 +658,75 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         };
 
-        // TCK-00260: Look up capability manifest and validate tool allowlist
+        // TCK-00290: Use ToolBroker for request validation and execution
+        // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"
+        if let Some(ref broker) = self.broker {
+            // TCK-00290 BLOCKER 3: Get monotonic timestamp from HolonicClock
+            let timestamp_ns = self.get_htf_timestamp()?;
+
+            // Build BrokerToolRequest
+            let request_id = format!("REQ-{}", uuid::Uuid::new_v4());
+
+            // BLOCKER 1 FIX (TCK-00290): Fail-closed if session ID is not valid for
+            // EpisodeId. Per SEC-CTRL-FAC-0015, we must not use a hardcoded
+            // fallback that could cause cross-session ID collision. Return
+            // SESSION_ERROR_INVALID instead.
+            let episode_id = match EpisodeId::new(&token.session_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "Session ID not valid for EpisodeId (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInvalid,
+                        format!("session ID not valid for episode: {e}"),
+                    ));
+                },
+            };
+
+            let dedupe_key = DedupeKey::new(&request.dedupe_key);
+            let args_hash = *blake3::hash(&request.arguments).as_bytes();
+
+            // BLOCKER 2 FIX (TCK-00290): Derive risk tier from capability manifest.
+            // Per the security review, we must not hardcode Tier0. Get the risk tier
+            // from the manifest's capability for this tool class, or default to Tier0
+            // if no specific tier is configured (fail-open for tier, fail-closed for
+            // access).
+            let risk_tier = self
+                .manifest_store
+                .as_ref()
+                .and_then(|store| store.get_manifest(&token.session_id))
+                .and_then(|manifest| {
+                    manifest
+                        .find_by_tool_class(tool_class)
+                        .next()
+                        .map(|cap| cap.risk_tier_required)
+                })
+                .unwrap_or(RiskTier::Tier0);
+
+            let broker_request = BrokerToolRequest::new(
+                &request_id,
+                episode_id,
+                tool_class,
+                dedupe_key,
+                args_hash,
+                risk_tier,
+            )
+            .with_inline_args(request.arguments);
+
+            // Call broker.request() asynchronously using tokio runtime
+            let decision = tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
+            });
+
+            return Self::handle_broker_decision(decision, &token.session_id, tool_class);
+        }
+
+        // Legacy fallback: TCK-00260 manifest store validation
+        // This path is used when no broker is configured (for backwards compatibility)
         if let Some(ref store) = self.manifest_store {
             if let Some(manifest) = store.get_manifest(&token.session_id) {
                 // Check if tool is in allowlist
@@ -518,7 +745,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 info!(
                     session_id = %token.session_id,
                     tool_class = %tool_class,
-                    "Tool allowed by manifest"
+                    "Tool allowed by manifest (legacy path)"
                 );
 
                 // Tool is allowed - return Allow decision
@@ -530,7 +757,6 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 }));
             }
             // No manifest found - fail closed (SEC-CTRL-FAC-0015)
-            // If a manifest store is configured, a manifest MUST be present.
             warn!(
                 session_id = %token.session_id,
                 "No manifest found for session, denying request (fail-closed)"
@@ -541,22 +767,164 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        // No manifest store configured - return stub response
-        // This maintains backward compatibility with existing tests
-        Ok(SessionResponse::RequestTool(RequestToolResponse {
-            request_id: format!("REQ-{}", token.session_id),
-            decision: DecisionType::Allow.into(),
-            rule_id: None,
-            policy_hash: vec![0u8; 32],
-        }))
+        // INV-TCK-00290-001: Neither broker nor manifest store configured - fail closed
+        warn!(
+            session_id = %token.session_id,
+            "RequestTool denied: neither broker nor manifest store configured (fail-closed)"
+        );
+        Ok(SessionResponse::error(
+            SessionErrorCode::SessionErrorToolNotAllowed,
+            "tool broker unavailable (fail-closed)",
+        ))
+    }
+
+    /// Handles the broker decision and converts it to a `SessionResponse`.
+    #[allow(clippy::unnecessary_wraps)]
+    fn handle_broker_decision(
+        decision: Result<ToolDecision, crate::episode::BrokerError>,
+        session_id: &str,
+        tool_class: ToolClass,
+    ) -> ProtocolResult<SessionResponse> {
+        match decision {
+            Ok(ToolDecision::Allow {
+                request_id,
+                rule_id,
+                policy_hash,
+                ..
+            }) => {
+                info!(
+                    session_id = %session_id,
+                    tool_class = %tool_class,
+                    request_id = %request_id,
+                    "Tool request allowed by broker"
+                );
+                Ok(SessionResponse::RequestTool(RequestToolResponse {
+                    request_id,
+                    decision: DecisionType::Allow.into(),
+                    rule_id,
+                    policy_hash: policy_hash.to_vec(),
+                }))
+            },
+            Ok(ToolDecision::Deny {
+                request_id,
+                reason,
+                rule_id,
+                policy_hash,
+            }) => {
+                warn!(
+                    session_id = %session_id,
+                    tool_class = %tool_class,
+                    reason = %reason,
+                    "Tool request denied by broker"
+                );
+                Ok(SessionResponse::RequestTool(RequestToolResponse {
+                    request_id,
+                    decision: DecisionType::Deny.into(),
+                    rule_id,
+                    policy_hash: policy_hash.to_vec(),
+                }))
+            },
+            Ok(ToolDecision::DedupeCacheHit { request_id, result }) => {
+                info!(
+                    session_id = %session_id,
+                    tool_class = %tool_class,
+                    "Tool request hit dedupe cache"
+                );
+                // Return the cached result as Allow
+                // Use output_hash if available, otherwise empty policy hash
+                let policy_hash = result.output_hash.map(|h| h.to_vec()).unwrap_or_default();
+                Ok(SessionResponse::RequestTool(RequestToolResponse {
+                    request_id,
+                    decision: DecisionType::Allow.into(),
+                    rule_id: None,
+                    policy_hash,
+                }))
+            },
+            Ok(ToolDecision::Terminate {
+                request_id,
+                termination_info,
+                ..
+            }) => {
+                error!(
+                    session_id = %session_id,
+                    tool_class = %tool_class,
+                    reason = %termination_info.rationale_code,
+                    "Tool request triggered session termination"
+                );
+                Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    format!(
+                        "session terminated: {} ({})",
+                        termination_info.rationale_code, request_id
+                    ),
+                ))
+            },
+            Err(e) => {
+                error!(
+                    session_id = %session_id,
+                    tool_class = %tool_class,
+                    error = %e,
+                    "Broker request failed"
+                );
+                Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    format!("broker error: {e}"),
+                ))
+            },
+        }
+    }
+
+    /// Gets an HTF-compliant monotonic timestamp.
+    ///
+    /// # TCK-00290 MAJOR 2 FIX: Time Monotonicity
+    ///
+    /// Per RFC-0016 and SEC-CTRL-FAC-0015, timestamps must come from
+    /// `HolonicClock` for monotonicity. Using `SystemTime::now()` as a
+    /// fallback violates time monotonicity guarantees and creates a
+    /// security vulnerability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the clock is not configured or fails (fail-closed).
+    /// Per SEC-CTRL-FAC-0015, we must fail-closed when the clock is required
+    /// rather than falling back to an insecure `SystemTime::now()`.
+    #[allow(clippy::option_if_let_else, clippy::single_match_else)]
+    fn get_htf_timestamp(&self) -> ProtocolResult<u64> {
+        // Using match here for clarity - the error paths have important security
+        // comments that would be less readable with map_or_else or if let/else.
+        match &self.clock {
+            Some(clock) => clock.now_hlc().map(|hlc| hlc.wall_ns).map_err(|e| {
+                error!("HolonicClock failed: {}", e);
+                ProtocolError::Serialization {
+                    reason: format!("clock failure: {e}"),
+                }
+            }),
+            None => {
+                // MAJOR 2 FIX (TCK-00290): Fail-closed when clock is not configured.
+                // Per SEC-CTRL-FAC-0015, we must not fall back to SystemTime::now()
+                // as this violates time monotonicity guarantees.
+                error!("HolonicClock not configured (fail-closed per SEC-CTRL-FAC-0015)");
+                Err(ProtocolError::Serialization {
+                    reason: "holonic clock not configured (fail-closed)".to_string(),
+                })
+            },
+        }
     }
 
     /// Handles `EmitEvent` requests (IPC-SESS-002).
     ///
-    /// # Stub Implementation
+    /// # TCK-00290: Real Ledger Persistence
     ///
-    /// This is a stub handler that validates the token and returns a
-    /// placeholder response. Full implementation in future ticket.
+    /// Per TCK-00290, this handler persists events to the ledger. Events are
+    /// signed and stored with HTF-compliant timestamps. The handler requires
+    /// a ledger to be configured; without it, returns `SESSION_ERROR_INTERNAL`
+    /// (fail-closed).
+    ///
+    /// # Security (INV-TCK-00290-002)
+    ///
+    /// Per SEC-CTRL-FAC-0015, the ledger must be configured for this handler
+    /// to function. Returning stub responses without persistence would violate
+    /// the HEF requirements for event durability.
     fn handle_emit_event(
         &self,
         payload: &[u8],
@@ -580,7 +948,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             event_type = %request.event_type,
             correlation_id = %request.correlation_id,
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
-            "EmitEvent request received (stub handler)"
+            "EmitEvent request received"
         );
 
         // Validate required fields
@@ -591,31 +959,87 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        // STUB: Return placeholder response
-        #[allow(clippy::cast_possible_truncation)] // Timestamp won't overflow until year 2554
-        let now_ns = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        // INV-TCK-00290-002: Require ledger for event persistence (fail-closed)
+        let Some(ref ledger) = self.ledger else {
+            error!(
+                session_id = %token.session_id,
+                "EmitEvent denied: ledger not configured (fail-closed)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                "ledger unavailable (fail-closed)",
+            ));
+        };
 
-        Ok(SessionResponse::EmitEvent(EmitEventResponse {
-            event_id: format!("EVT-STUB-{}", token.session_id),
-            seq: 1,
-            timestamp_ns: now_ns,
-        }))
+        // TCK-00290 BLOCKER 3: Get monotonic timestamp from HolonicClock
+        let now_ns = self.get_htf_timestamp()?;
+
+        // Increment sequence counter atomically
+        let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // TCK-00290 BLOCKER 2: Use emit_session_event with proper parameters
+        // - event_type: The actual event type from the request (not coerced)
+        // - payload: The actual payload bytes from the request (not discarded)
+        // - actor_id: The session ID (proper actor identification)
+        match ledger.emit_session_event(
+            &token.session_id,
+            &request.event_type, // Actual event type
+            &request.payload,    // Actual payload (not discarded)
+            &token.session_id,   // Proper actor_id (session ID, not event_type)
+            now_ns,
+        ) {
+            Ok(signed_event) => {
+                info!(
+                    session_id = %token.session_id,
+                    event_id = %signed_event.event_id,
+                    seq = seq,
+                    "EmitEvent persisted to ledger"
+                );
+                Ok(SessionResponse::EmitEvent(EmitEventResponse {
+                    event_id: signed_event.event_id,
+                    seq,
+                    timestamp_ns: signed_event.timestamp_ns,
+                }))
+            },
+            Err(e) => {
+                error!(
+                    session_id = %token.session_id,
+                    error = %e,
+                    "EmitEvent failed to persist"
+                );
+                Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorInternal,
+                    format!("ledger persistence failed: {e}"),
+                ))
+            },
+        }
     }
 
     /// Handles `PublishEvidence` requests (IPC-SESS-003).
     ///
-    /// # Stub Implementation
+    /// # TCK-00290: Real CAS Storage
     ///
-    /// This is a stub handler that validates the token and returns a
-    /// placeholder response. Full implementation in future ticket.
+    /// Per TCK-00290, this handler stores evidence artifacts in the durable
+    /// content-addressed store. Artifacts are stored with BLAKE3 content
+    /// addressing and verified on retrieval. The handler requires a CAS to be
+    /// configured; without it, returns `SESSION_ERROR_INTERNAL` (fail-closed).
+    ///
+    /// # Security (INV-TCK-00290-003)
+    ///
+    /// Per SEC-CTRL-FAC-0015 and RFC-0018 HEF requirements, the CAS must be
+    /// configured for this handler to function. Returning stub responses
+    /// without persistence would violate evidence durability requirements.
     fn handle_publish_evidence(
         &self,
         payload: &[u8],
         ctx: &ConnectionContext,
     ) -> ProtocolResult<SessionResponse> {
+        // Default TTL: 24 hours for standard evidence, configurable in future
+        // Per RFC-0018, retention is determined by evidence kind and policy
+        const STANDARD_TTL: u64 = 86400; // 24 hours
+        const EXTENDED_TTL: u64 = 604_800; // 7 days
+        const AUDIT_TTL: u64 = 2_592_000; // 30 days
+
         let request = PublishEvidenceRequest::decode_bounded(payload, &self.decode_config)
             .map_err(|e| ProtocolError::Serialization {
                 reason: format!("invalid PublishEvidenceRequest: {e}"),
@@ -632,7 +1056,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             artifact_size = request.artifact.len(),
             kind = ?request.kind,
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
-            "PublishEvidence request received (stub handler)"
+            "PublishEvidence request received"
         );
 
         // Validate artifact is not empty
@@ -643,23 +1067,65 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        // STUB: Return placeholder response
-        // Compute Blake3 hash of artifact for content addressing
-        let hash = blake3::hash(&request.artifact);
+        // INV-TCK-00290-003: Require CAS for artifact storage (fail-closed)
+        let Some(ref cas) = self.cas else {
+            error!(
+                session_id = %token.session_id,
+                "PublishEvidence denied: CAS not configured (fail-closed)"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInternal,
+                "CAS unavailable (fail-closed)",
+            ));
+        };
+
+        // Store artifact in CAS
+        let hash = cas.store(&request.artifact);
+
+        // Build storage path using hash prefix sharding (consistent with DurableCas)
+        let hex_hash = hex::encode(hash);
+        let storage_path = format!("evidence/{}/{}", &hex_hash[..4], &hex_hash[4..]);
+
+        info!(
+            session_id = %token.session_id,
+            artifact_hash = %hex_hash,
+            storage_path = %storage_path,
+            "PublishEvidence stored in CAS"
+        );
+
+        let ttl_secs = match request.retention_hint {
+            1 => EXTENDED_TTL,
+            2 => AUDIT_TTL,
+            _ => STANDARD_TTL,
+        };
 
         Ok(SessionResponse::PublishEvidence(PublishEvidenceResponse {
-            artifact_hash: hash.as_bytes().to_vec(),
-            storage_path: format!("evidence/stub/{}", hex::encode(hash.as_bytes())),
-            ttl_secs: 86400, // 24 hours
+            artifact_hash: hash.to_vec(),
+            storage_path,
+            ttl_secs,
         }))
     }
 
     /// Handles `StreamTelemetry` requests (IPC-SESS-004).
     ///
-    /// # Stub Implementation
+    /// # TCK-00290: Fail-Closed (Not Implemented)
     ///
-    /// This is a stub handler that validates the token and returns a
-    /// placeholder response. Full implementation in future ticket.
+    /// Per TCK-00290 and SEC-CTRL-FAC-0015, `StreamTelemetry` is explicitly
+    /// disabled until a proper implementation is available. This handler
+    /// returns `SESSION_ERROR_NOT_IMPLEMENTED` for all requests.
+    ///
+    /// # Security (INV-TCK-00290-004)
+    ///
+    /// Per the fail-closed security posture, returning stub responses for
+    /// unimplemented functionality would violate security invariants. Instead,
+    /// we explicitly reject requests with a clear error code.
+    ///
+    /// # Future Work
+    ///
+    /// This handler will be implemented to support:
+    /// - Real-time telemetry streaming to observability backend
+    /// - HEF pulse subscription handling
+    /// - Metric promotion to persistent storage
     fn handle_stream_telemetry(
         &self,
         payload: &[u8],
@@ -677,26 +1143,20 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         };
 
         let frame = request.frame.as_ref();
-        info!(
+        warn!(
             session_id = %token.session_id,
             frame_seq = ?frame.map(|f| f.seq),
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
-            "StreamTelemetry request received (stub handler)"
+            "StreamTelemetry request rejected: not implemented (fail-closed)"
         );
 
-        // Validate frame is present
-        if frame.is_none() {
-            return Ok(SessionResponse::error(
-                SessionErrorCode::SessionErrorInvalid,
-                "telemetry frame is required",
-            ));
-        }
-
-        // STUB: Return placeholder response
-        Ok(SessionResponse::StreamTelemetry(StreamTelemetryResponse {
-            ack_seq: frame.map_or(0, |f| f.seq),
-            promoted: false,
-        }))
+        // INV-TCK-00290-004: StreamTelemetry disabled until implemented (fail-closed)
+        // Per SEC-CTRL-FAC-0015, we do not return stub responses for unimplemented
+        // functionality. Instead, we return a clear NOT_IMPLEMENTED error.
+        Ok(SessionResponse::error(
+            SessionErrorCode::SessionErrorNotImplemented,
+            "StreamTelemetry not implemented (fail-closed)",
+        ))
     }
 }
 
@@ -787,28 +1247,50 @@ mod tests {
     mod session_routing {
         use super::*;
 
+        /// TCK-00290: `RequestTool` without manifest store returns fail-closed
+        /// error.
+        ///
+        /// Per INV-TCK-00290-001, `RequestTool` requires a manifest store.
+        /// Without it, returns `SESSION_ERROR_TOOL_NOT_ALLOWED`.
         #[test]
-        fn test_request_tool_routing() {
+        fn test_request_tool_routing_fail_closed() {
             let minter = test_minter();
             let dispatcher = SessionDispatcher::new(minter.clone());
             let ctx = make_session_ctx();
             let token = test_token(&minter);
 
-            // TCK-00260: Use valid tool class name (was "file_read", now "read")
             let request = RequestToolRequest {
                 session_token: serde_json::to_string(&token).unwrap(),
-                tool_id: "read".to_string(), // Valid ToolClass
+                tool_id: "read".to_string(),
                 arguments: vec![1, 2, 3],
                 dedupe_key: "key-001".to_string(),
             };
             let frame = encode_request_tool_request(&request);
 
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
-            assert!(matches!(response, SessionResponse::RequestTool(_)));
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for unconfigured manifest store"
+                    );
+                    assert!(
+                        err.message.contains("fail-closed"),
+                        "Error should mention fail-closed: {}",
+                        err.message
+                    );
+                },
+                _ => panic!("Expected error for unconfigured dispatcher, got: {response:?}"),
+            }
         }
 
+        /// TCK-00290: `EmitEvent` without ledger returns fail-closed error.
+        ///
+        /// Per INV-TCK-00290-002, `EmitEvent` requires a ledger.
+        /// Without it, returns `SESSION_ERROR_INTERNAL`.
         #[test]
-        fn test_emit_event_routing() {
+        fn test_emit_event_routing_fail_closed() {
             let minter = test_minter();
             let dispatcher = SessionDispatcher::new(minter.clone());
             let ctx = make_session_ctx();
@@ -823,11 +1305,29 @@ mod tests {
             let frame = encode_emit_event_request(&request);
 
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
-            assert!(matches!(response, SessionResponse::EmitEvent(_)));
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInternal as i32,
+                        "Expected INTERNAL for unconfigured ledger"
+                    );
+                    assert!(
+                        err.message.contains("fail-closed"),
+                        "Error should mention fail-closed: {}",
+                        err.message
+                    );
+                },
+                _ => panic!("Expected error for unconfigured dispatcher, got: {response:?}"),
+            }
         }
 
+        /// TCK-00290: `PublishEvidence` without CAS returns fail-closed error.
+        ///
+        /// Per INV-TCK-00290-003, `PublishEvidence` requires a CAS.
+        /// Without it, returns `SESSION_ERROR_INTERNAL`.
         #[test]
-        fn test_publish_evidence_routing() {
+        fn test_publish_evidence_routing_fail_closed() {
             let minter = test_minter();
             let dispatcher = SessionDispatcher::new(minter.clone());
             let ctx = make_session_ctx();
@@ -842,11 +1342,30 @@ mod tests {
             let frame = encode_publish_evidence_request(&request);
 
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
-            assert!(matches!(response, SessionResponse::PublishEvidence(_)));
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInternal as i32,
+                        "Expected INTERNAL for unconfigured CAS"
+                    );
+                    assert!(
+                        err.message.contains("fail-closed"),
+                        "Error should mention fail-closed: {}",
+                        err.message
+                    );
+                },
+                _ => panic!("Expected error for unconfigured dispatcher, got: {response:?}"),
+            }
         }
 
+        /// TCK-00290: `StreamTelemetry` returns `NOT_IMPLEMENTED`
+        /// (fail-closed).
+        ///
+        /// Per INV-TCK-00290-004, `StreamTelemetry` is disabled until
+        /// implemented.
         #[test]
-        fn test_stream_telemetry_routing() {
+        fn test_stream_telemetry_routing_not_implemented() {
             let minter = test_minter();
             let dispatcher = SessionDispatcher::new(minter.clone());
             let ctx = make_session_ctx();
@@ -869,7 +1388,21 @@ mod tests {
             let frame = encode_stream_telemetry_request(&request);
 
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
-            assert!(matches!(response, SessionResponse::StreamTelemetry(_)));
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorNotImplemented as i32,
+                        "Expected NOT_IMPLEMENTED for StreamTelemetry"
+                    );
+                    assert!(
+                        err.message.contains("not implemented"),
+                        "Error should mention not implemented: {}",
+                        err.message
+                    );
+                },
+                _ => panic!("Expected NOT_IMPLEMENTED error, got: {response:?}"),
+            }
         }
 
         #[test]
@@ -1078,6 +1611,11 @@ mod tests {
         }
     }
 
+    /// TCK-00290: `StreamTelemetry` returns `NOT_IMPLEMENTED` even with missing
+    /// frame.
+    ///
+    /// Since `StreamTelemetry` is disabled (fail-closed), it doesn't validate
+    /// the frame before rejecting with `NOT_IMPLEMENTED`.
     #[test]
     fn test_stream_telemetry_requires_frame() {
         let minter = test_minter();
@@ -1094,9 +1632,15 @@ mod tests {
         let response = dispatcher.dispatch(&frame, &ctx).unwrap();
         match response {
             SessionResponse::Error(err) => {
-                assert!(err.message.contains("frame"));
+                // Per TCK-00290, StreamTelemetry is disabled, so returns NOT_IMPLEMENTED
+                // regardless of frame validation
+                assert_eq!(
+                    err.code,
+                    SessionErrorCode::SessionErrorNotImplemented as i32,
+                    "Expected NOT_IMPLEMENTED for StreamTelemetry"
+                );
             },
-            _ => panic!("Expected validation error for missing frame"),
+            _ => panic!("Expected NOT_IMPLEMENTED error for StreamTelemetry"),
         }
     }
 

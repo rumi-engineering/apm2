@@ -493,6 +493,10 @@ enum SessionErrorCode {
   SESSION_ERROR_CONTEXT_FIREWALL = 5;
   // Caller is on operator socket (session endpoints require session.sock).
   SESSION_ERROR_PERMISSION_DENIED = 6;
+  // Endpoint not implemented (fail-closed for unimplemented features).
+  SESSION_ERROR_NOT_IMPLEMENTED = 7;
+  // Internal error (ledger, CAS, or other subsystem failure).
+  SESSION_ERROR_INTERNAL = 8;
 }
 
 // Generic error response for session-scoped endpoints.
