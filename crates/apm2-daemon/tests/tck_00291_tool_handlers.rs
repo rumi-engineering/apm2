@@ -4,11 +4,16 @@
 //! - `ReadFileHandler`: real FS reads, offsets, limits, root confinement
 //! - `WriteFileHandler`: real FS writes, atomic writes, appends, parents
 //! - `ExecuteHandler`: command execution, CWD, stdin, timeout, output capture
+//! - **Sandbox security**: symlink-based escape attempts are rejected
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
 use apm2_daemon::episode::handlers::{ExecuteHandler, ReadFileHandler, WriteFileHandler};
-use apm2_daemon::episode::tool_handler::{ExecuteArgs, ReadArgs, ToolArgs, ToolHandler, WriteArgs};
+use apm2_daemon::episode::tool_handler::{
+    ExecuteArgs, ReadArgs, ToolArgs, ToolHandler, ToolHandlerError, WriteArgs,
+};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -177,4 +182,156 @@ async fn tool_handlers_real_io_execute_timeout() {
     {
         assert!(message.contains("timed out"));
     }
+}
+
+// =============================================================================
+// Sandbox escape tests (symlink-based)
+// =============================================================================
+
+/// Tests that `ExecuteHandler` rejects cwd paths that resolve outside the
+/// workspace root via symlinks.
+///
+/// This is a critical security test - an attacker could create a symlink
+/// inside the workspace that points outside (e.g., to /tmp or /), then
+/// supply that symlink path as cwd. Without proper canonicalization, the
+/// command would execute in the external directory, escaping the sandbox.
+#[cfg(unix)]
+#[tokio::test]
+async fn tool_handlers_execute_rejects_cwd_symlink_escape() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().to_path_buf();
+
+    // Create a symlink inside the workspace that points outside
+    let escape_link = root.join("escape");
+    symlink("/tmp", &escape_link).expect("failed to create symlink");
+
+    let handler = ExecuteHandler::with_root(root.clone());
+
+    // Attempt to execute with cwd set to the symlink
+    let args = ToolArgs::Execute(ExecuteArgs {
+        command: "pwd".to_string(),
+        args: vec![],
+        cwd: Some(PathBuf::from("escape")),
+        stdin: None,
+        timeout_ms: None,
+    });
+
+    let result = handler.execute(&args).await;
+
+    // Must fail with PathValidation error
+    assert!(
+        matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+        "Expected PathValidation error for symlink escape, got: {result:?}"
+    );
+
+    // Verify the error mentions symlink or escape
+    if let Err(ToolHandlerError::PathValidation { reason, .. }) = result {
+        assert!(
+            reason.contains("symlink") || reason.contains("escapes"),
+            "Error should mention symlink sandbox escape: {reason}"
+        );
+    }
+}
+
+/// Tests that `ReadFileHandler` rejects symlinks that resolve outside the
+/// workspace root.
+#[cfg(unix)]
+#[tokio::test]
+async fn tool_handlers_read_rejects_symlink_escape() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().to_path_buf();
+
+    // Create /tmp/test_escape_file for the symlink to point to
+    let external_file = std::path::Path::new("/tmp/test_escape_file_read");
+    std::fs::write(external_file, b"secret").ok();
+
+    // Create a symlink inside the workspace pointing outside
+    let escape_link = root.join("escape_file");
+    symlink(external_file, &escape_link).expect("failed to create symlink");
+
+    let handler = ReadFileHandler::with_root(root.clone());
+
+    let args = ToolArgs::Read(ReadArgs {
+        path: PathBuf::from("escape_file"),
+        offset: None,
+        limit: None,
+    });
+
+    let result = handler.execute(&args).await;
+
+    assert!(
+        matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+        "Expected PathValidation error for symlink escape, got: {result:?}"
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_file(external_file);
+}
+
+/// Tests that `WriteFileHandler` rejects symlinks that resolve outside the
+/// workspace root.
+#[cfg(unix)]
+#[tokio::test]
+async fn tool_handlers_write_rejects_symlink_escape() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().to_path_buf();
+
+    // Target file outside workspace
+    let external_file = std::path::Path::new("/tmp/test_escape_file_write");
+    std::fs::write(external_file, b"original").ok();
+
+    // Create a symlink inside the workspace pointing outside
+    let escape_link = root.join("escape_file");
+    symlink(external_file, &escape_link).expect("failed to create symlink");
+
+    let handler = WriteFileHandler::with_root(root.clone());
+
+    let args = ToolArgs::Write(WriteArgs {
+        path: PathBuf::from("escape_file"),
+        content: Some(b"malicious overwrite".to_vec()),
+        content_hash: None,
+        create_parents: false,
+        append: false,
+    });
+
+    let result = handler.execute(&args).await;
+
+    assert!(
+        matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+        "Expected PathValidation error for symlink escape, got: {result:?}"
+    );
+
+    // Verify the external file was NOT modified
+    let content = std::fs::read(external_file).unwrap_or_default();
+    assert_eq!(
+        content, b"original",
+        "External file should not have been modified"
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_file(external_file);
+}
+
+/// Tests that `ExecuteHandler` handles non-existent cwd gracefully.
+#[tokio::test]
+async fn tool_handlers_execute_nonexistent_cwd() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().to_path_buf();
+    let handler = ExecuteHandler::with_root(root.clone());
+
+    let args = ToolArgs::Execute(ExecuteArgs {
+        command: "ls".to_string(),
+        args: vec![],
+        cwd: Some(PathBuf::from("nonexistent_directory")),
+        stdin: None,
+        timeout_ms: None,
+    });
+
+    let result = handler.execute(&args).await;
+
+    // Should fail because the directory doesn't exist
+    assert!(
+        matches!(result, Err(ToolHandlerError::ExecutionFailed { .. })),
+        "Expected ExecutionFailed for non-existent cwd, got: {result:?}"
+    );
 }

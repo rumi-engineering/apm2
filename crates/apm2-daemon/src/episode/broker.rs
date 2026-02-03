@@ -300,15 +300,34 @@ impl StubPolicyEngine {
 }
 
 // =============================================================================
-// ContentAddressedStore Stub
+// ContentAddressedStore Stub (TCK-00293: TEST ONLY)
 //
-// TODO: Full CAS integration in a future ticket.
-// This stub provides the interface without actual storage.
+// Per TCK-00293, the stub is retained ONLY for tests. Production code MUST
+// use `DurableCas` via `new_shared_broker_with_cas()` or `.with_cas()`.
 // =============================================================================
 
-/// Stub content-addressed store.
+/// Stub content-addressed store for testing.
 ///
-/// TODO: Replace with actual CAS implementation in a future ticket.
+/// **WARNING**: This stub does NOT persist artifacts across daemon restarts.
+/// Per TCK-00293 and RFC-0018 HEF requirements, production code MUST use
+/// [`crate::cas::DurableCas`] instead.
+///
+/// # When to Use
+///
+/// - Unit tests where persistence is not required
+/// - Integration tests that mock CAS behavior
+///
+/// # Production Usage
+///
+/// Production code MUST use [`crate::cas::DurableCas`]:
+///
+/// ```rust,ignore
+/// use apm2_daemon::cas::{DurableCas, DurableCasConfig};
+/// use apm2_daemon::episode::{new_shared_broker_with_cas, ToolBrokerConfig};
+///
+/// let cas = Arc::new(DurableCas::new(DurableCasConfig::new("/var/lib/apm2/cas"))?);
+/// let broker = new_shared_broker_with_cas(ToolBrokerConfig::default(), cas);
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct StubContentAddressedStore;
 
@@ -632,6 +651,30 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     #[must_use]
     pub fn with_metrics(mut self, metrics: SharedMetricsRegistry) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Sets the content-addressed store for evidence artifacts (TCK-00293).
+    ///
+    /// Per RFC-0018 HEF requirements and TCK-00293, the CAS stores artifacts
+    /// durably with content addressing. In production, this should be a
+    /// `DurableCas` instance. The default `StubContentAddressedStore` is only
+    /// for tests and will not persist artifacts across restarts.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use apm2_daemon::cas::{DurableCas, DurableCasConfig};
+    /// use apm2_daemon::episode::{ToolBroker, ToolBrokerConfig};
+    ///
+    /// let cas_config = DurableCasConfig::new("/var/lib/apm2/cas");
+    /// let cas = Arc::new(DurableCas::new(cas_config)?);
+    /// let broker = ToolBroker::new(ToolBrokerConfig::default())
+    ///     .with_cas(cas);
+    /// ```
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
+        self.cas = cas;
         self
     }
 
@@ -1382,11 +1425,40 @@ impl<L: ManifestLoader> std::fmt::Debug for ToolBroker<L> {
 pub type SharedToolBroker<L = super::capability::StubManifestLoader> = Arc<ToolBroker<L>>;
 
 /// Creates a new shared tool broker.
+///
+/// **Note**: This constructor uses `StubContentAddressedStore` which does not
+/// persist artifacts across restarts. For production use, prefer
+/// [`new_shared_broker_with_cas`] with a `DurableCas` instance.
 #[must_use]
 pub fn new_shared_broker<L: ManifestLoader + Send + Sync>(
     config: ToolBrokerConfig,
 ) -> SharedToolBroker<L> {
     Arc::new(ToolBroker::new(config))
+}
+
+/// Creates a new shared tool broker with a durable CAS backend (TCK-00293).
+///
+/// Per RFC-0018 HEF requirements and TCK-00293, evidence artifacts must be
+/// durable and content-addressed for FAC v0. This constructor requires a CAS
+/// implementation to be provided, ensuring production paths use durable
+/// storage.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use apm2_daemon::cas::{DurableCas, DurableCasConfig};
+/// use apm2_daemon::episode::{new_shared_broker_with_cas, ToolBrokerConfig};
+///
+/// let cas_config = DurableCasConfig::new("/var/lib/apm2/cas");
+/// let cas = Arc::new(DurableCas::new(cas_config)?);
+/// let broker = new_shared_broker_with_cas(ToolBrokerConfig::default(), cas);
+/// ```
+#[must_use]
+pub fn new_shared_broker_with_cas<L: ManifestLoader + Send + Sync>(
+    config: ToolBrokerConfig,
+    cas: Arc<dyn ContentAddressedStore>,
+) -> SharedToolBroker<L> {
+    Arc::new(ToolBroker::new(config).with_cas(cas))
 }
 
 #[cfg(test)]
@@ -1832,6 +1904,48 @@ mod tests {
         let content = b"test content";
         let stored_hash = cas.store(content);
         assert_eq!(stored_hash.len(), 32);
+    }
+
+    // =========================================================================
+    // TCK-00293: DurableCas wiring tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_broker_with_cas() {
+        use tempfile::TempDir;
+
+        use crate::cas::{DurableCas, DurableCasConfig};
+
+        // Create a durable CAS
+        let temp_dir = TempDir::new().unwrap();
+        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas = Arc::new(DurableCas::new(cas_config).unwrap());
+
+        // Create broker with durable CAS via builder pattern
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(test_config_without_policy()).with_cas(cas);
+
+        // Verify broker is created (basic smoke test)
+        assert!(!broker.is_initialized().await);
+    }
+
+    #[tokio::test]
+    async fn test_new_shared_broker_with_cas() {
+        use tempfile::TempDir;
+
+        use crate::cas::{DurableCas, DurableCasConfig};
+
+        // Create a durable CAS
+        let temp_dir = TempDir::new().unwrap();
+        let cas_config = DurableCasConfig::new(temp_dir.path());
+        let cas = Arc::new(DurableCas::new(cas_config).unwrap());
+
+        // Create shared broker with durable CAS
+        let broker: SharedToolBroker<StubManifestLoader> =
+            new_shared_broker_with_cas(test_config_without_policy(), cas);
+
+        // Verify broker is created (basic smoke test)
+        assert!(!broker.is_initialized().await);
     }
 
     // =========================================================================
