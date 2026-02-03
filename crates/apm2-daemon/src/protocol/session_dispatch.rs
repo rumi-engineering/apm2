@@ -1654,26 +1654,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         }))
     }
 
-    /// Gets the topic allowlist for a session.
+    /// Gets the topic allowlist for a session (TCK-00314).
     ///
-    /// # TODO(TCK-00314)
+    /// Per RFC-0018, session subscriptions are gated via capability manifest
+    /// allowlist. This method extracts the `topic_allowlist` from the session's
+    /// capability manifest.
     ///
-    /// This method should extract the topic allowlist from the session's
-    /// capability manifest. For now, it returns an empty allowlist which
-    /// enforces deny-by-default for all session subscriptions.
+    /// # Security (INV-ACL-004)
+    ///
+    /// Empty allowlist = deny all (fail-closed).
     fn get_session_topic_allowlist(&self, session_id: &str) -> TopicAllowlist {
-        // Try to get manifest from store and extract topic allowlist
-        // Currently, CapabilityManifest doesn't have a topic_allowlist field
-        // (to be added in TCK-00314). Until then, return empty allowlist.
+        // TCK-00314: Extract topic_allowlist from capability manifest
         if let Some(ref store) = self.manifest_store {
-            if let Some(_manifest) = store.get_manifest(session_id) {
-                // TODO(TCK-00314): Extract topic_allowlist from manifest
-                // For now, return empty allowlist (deny-by-default)
-                return TopicAllowlist::new();
+            if let Some(manifest) = store.get_manifest(session_id) {
+                // Convert manifest's topic_allowlist to TopicAllowlist
+                return manifest.to_topic_allowlist();
             }
         }
 
-        // No manifest or no allowlist = deny all (fail-closed)
+        // No manifest = deny all (fail-closed per SEC-CTRL-FAC-0015)
         TopicAllowlist::new()
     }
 

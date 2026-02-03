@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use super::envelope::RiskTier;
 use super::scope::{CapabilityScope, ScopeError};
 // =============================================================================
-// Allowlist Resource Limits (TCK-00254)
+// Allowlist Resource Limits (TCK-00254, TCK-00314)
 //
 // Per CTR-1303, all Vec fields must have bounded sizes to prevent DoS.
 // All MAX_*_ALLOWLIST constants are defined in apm2-core and re-exported via
@@ -56,6 +56,30 @@ pub use super::tool_class::{
     MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN, MAX_TOOL_ALLOWLIST, MAX_WRITE_ALLOWLIST, ToolClass,
     shell_pattern_matches,
 };
+
+// =============================================================================
+// TCK-00314: HEF Capability Allowlist Limits
+//
+// Per RFC-0018, pulse topic and CAS hash allowlists for session access control.
+// =============================================================================
+
+/// Maximum number of topics in a session's pulse topic allowlist.
+///
+/// Per CTR-1303, bounded to prevent denial-of-service. Aligns with RFC-0018
+/// `max_total_patterns_per_connection: 64`.
+pub const MAX_TOPIC_ALLOWLIST: usize = 64;
+
+/// Maximum length for a topic in the allowlist.
+///
+/// Per CTR-1303, all string fields must be bounded. Topics follow the
+/// RFC-0018 grammar which limits segment lengths.
+pub const MAX_TOPIC_LEN: usize = 256;
+
+/// Maximum number of CAS hashes in a session's CAS hash allowlist.
+///
+/// Per CTR-1303, bounded to prevent denial-of-service. Allows sufficient hashes
+/// for diff bundles, snapshots, and review artifacts.
+pub const MAX_CAS_HASH_ALLOWLIST: usize = 1024;
 
 // =============================================================================
 // Clock Abstraction
@@ -236,6 +260,47 @@ pub enum CapabilityError {
         /// The path that contains traversal.
         path: String,
     },
+
+    // =========================================================================
+    // TCK-00314: HEF Capability Allowlist Errors
+    // =========================================================================
+    /// Topic allowlist exceeds maximum size.
+    TooManyTopicAllowlistEntries {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Topic in topic allowlist exceeds maximum length.
+    TopicAllowlistEntryTooLong {
+        /// Actual length in bytes.
+        len: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Topic in topic allowlist is invalid.
+    TopicAllowlistEntryInvalid {
+        /// The invalid topic.
+        topic: String,
+        /// The reason for invalidity.
+        reason: String,
+    },
+
+    /// Topic contains wildcard pattern (Phase 1: wildcards not allowed).
+    TopicAllowlistWildcardNotAllowed {
+        /// The topic containing wildcards.
+        topic: String,
+    },
+
+    /// CAS hash allowlist exceeds maximum size.
+    TooManyCasHashAllowlistEntries {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for CapabilityError {
@@ -285,6 +350,25 @@ impl std::fmt::Display for CapabilityError {
             },
             Self::WriteAllowlistPathTraversal { path } => {
                 write!(f, "write allowlist path contains traversal (..): {path}")
+            },
+            // TCK-00314: HEF Capability Allowlist Errors
+            Self::TooManyTopicAllowlistEntries { count, max } => {
+                write!(f, "too many topic allowlist entries: {count} (max {max})")
+            },
+            Self::TopicAllowlistEntryTooLong { len, max } => {
+                write!(f, "topic allowlist entry too long: {len} bytes (max {max})")
+            },
+            Self::TopicAllowlistEntryInvalid { topic, reason } => {
+                write!(f, "invalid topic in allowlist '{topic}': {reason}")
+            },
+            Self::TopicAllowlistWildcardNotAllowed { topic } => {
+                write!(f, "wildcard topic not allowed in Phase 1: {topic}")
+            },
+            Self::TooManyCasHashAllowlistEntries { count, max } => {
+                write!(
+                    f,
+                    "too many CAS hash allowlist entries: {count} (max {max})"
+                )
             },
         }
     }
@@ -657,6 +741,12 @@ impl CapabilityBuilder {
 /// - `write_allowlist`: Allowed filesystem write paths
 /// - `shell_allowlist`: Allowed shell command patterns
 ///
+/// # TCK-00314 Extensions
+///
+/// Per RFC-0018, the manifest includes HEF allowlists:
+/// - `topic_allowlist`: Allowed pulse topics for session subscriptions
+/// - `cas_hash_allowlist`: Allowed CAS hashes for session reads
+///
 /// # Security
 ///
 /// Uses `deny_unknown_fields` to prevent field injection attacks when
@@ -700,6 +790,45 @@ pub struct CapabilityManifest {
     /// allowlist. Patterns may use glob syntax. Empty means no shell allowed.
     #[serde(default)]
     pub shell_allowlist: Vec<String>,
+
+    // =========================================================================
+    // TCK-00314: HEF Capability Allowlists
+    // =========================================================================
+    /// Allowlist of pulse topics that this session can subscribe to.
+    ///
+    /// Per RFC-0018, session subscriptions are gated via capability manifest
+    /// allowlist. Empty means no topics allowed (fail-closed).
+    ///
+    /// # Phase 1 Restrictions
+    ///
+    /// - Only exact topic matches are allowed (no wildcards)
+    /// - Topics must follow the RFC-0018 pulse topic grammar
+    ///
+    /// # Example Topics
+    ///
+    /// - `work.W-123.events` - Work events for a specific work ID
+    /// - `episode.EP-001.lifecycle` - Lifecycle events for an episode
+    /// - `ledger.head` - Ledger head updates
+    #[serde(default)]
+    pub topic_allowlist: Vec<String>,
+
+    /// Allowlist of CAS hashes that this session can read.
+    ///
+    /// Per RFC-0018, session CAS reads are gated via capability manifest
+    /// allowlist. Empty means no CAS reads allowed (fail-closed).
+    ///
+    /// # Use Cases
+    ///
+    /// - Diff bundles for review artifacts
+    /// - Snapshots for state reconstruction
+    /// - Evidence artifacts for audit
+    ///
+    /// # Note
+    ///
+    /// CAS writes are not allowlisted (write allowlists are out of scope
+    /// per TCK-00314). Operator.sock has full CAS access.
+    #[serde(default)]
+    pub cas_hash_allowlist: Vec<[u8; 32]>,
 }
 
 impl CapabilityManifest {
@@ -748,6 +877,9 @@ impl CapabilityManifest {
             tool_allowlist,
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists default to empty (fail-closed)
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         }
     }
 
@@ -882,6 +1014,86 @@ impl CapabilityManifest {
             }
         }
 
+        // TCK-00314: Validate HEF allowlists
+        self.validate_topic_allowlist()?;
+        self.validate_cas_hash_allowlist()?;
+
+        Ok(())
+    }
+
+    /// Validates the topic allowlist (TCK-00314).
+    ///
+    /// # Phase 1 Restrictions
+    ///
+    /// - No wildcard patterns allowed
+    /// - Topics must follow RFC-0018 grammar
+    fn validate_topic_allowlist(&self) -> Result<(), CapabilityError> {
+        if self.topic_allowlist.len() > MAX_TOPIC_ALLOWLIST {
+            return Err(CapabilityError::TooManyTopicAllowlistEntries {
+                count: self.topic_allowlist.len(),
+                max: MAX_TOPIC_ALLOWLIST,
+            });
+        }
+
+        for topic in &self.topic_allowlist {
+            // Check length bounds
+            if topic.len() > MAX_TOPIC_LEN {
+                return Err(CapabilityError::TopicAllowlistEntryTooLong {
+                    len: topic.len(),
+                    max: MAX_TOPIC_LEN,
+                });
+            }
+
+            // Phase 1: Reject wildcard patterns
+            if topic.contains('*') || topic.contains('>') {
+                return Err(CapabilityError::TopicAllowlistWildcardNotAllowed {
+                    topic: topic.clone(),
+                });
+            }
+
+            // Basic topic grammar validation (RFC-0018):
+            // - Must not be empty
+            // - Must not have consecutive dots
+            // - Must not start or end with a dot
+            // - Must only contain valid ASCII characters
+            if topic.is_empty() {
+                return Err(CapabilityError::TopicAllowlistEntryInvalid {
+                    topic: topic.clone(),
+                    reason: "topic cannot be empty".to_string(),
+                });
+            }
+            if topic.starts_with('.') || topic.ends_with('.') {
+                return Err(CapabilityError::TopicAllowlistEntryInvalid {
+                    topic: topic.clone(),
+                    reason: "topic cannot start or end with a dot".to_string(),
+                });
+            }
+            if topic.contains("..") {
+                return Err(CapabilityError::TopicAllowlistEntryInvalid {
+                    topic: topic.clone(),
+                    reason: "topic cannot have consecutive dots".to_string(),
+                });
+            }
+            if !topic.is_ascii() {
+                return Err(CapabilityError::TopicAllowlistEntryInvalid {
+                    topic: topic.clone(),
+                    reason: "topic must be ASCII".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates the CAS hash allowlist (TCK-00314).
+    fn validate_cas_hash_allowlist(&self) -> Result<(), CapabilityError> {
+        if self.cas_hash_allowlist.len() > MAX_CAS_HASH_ALLOWLIST {
+            return Err(CapabilityError::TooManyCasHashAllowlistEntries {
+                count: self.cas_hash_allowlist.len(),
+                max: MAX_CAS_HASH_ALLOWLIST,
+            });
+        }
+        // Hash values are fixed 32-byte arrays, no further validation needed
         Ok(())
     }
 
@@ -1002,6 +1214,70 @@ impl CapabilityManifest {
         self.shell_allowlist
             .iter()
             .any(|pattern| shell_pattern_matches(pattern, command))
+    }
+
+    // =========================================================================
+    // TCK-00314: HEF Allowlist Enforcement Methods
+    // =========================================================================
+
+    /// Returns a reference to the topic allowlist.
+    #[must_use]
+    pub fn topic_allowlist(&self) -> &[String] {
+        &self.topic_allowlist
+    }
+
+    /// Returns a reference to the CAS hash allowlist.
+    #[must_use]
+    pub fn cas_hash_allowlist(&self) -> &[[u8; 32]] {
+        &self.cas_hash_allowlist
+    }
+
+    /// Checks if the given topic is in the topic allowlist.
+    ///
+    /// Per TCK-00314, returns `false` if the allowlist is empty (fail-closed).
+    /// Only exact matches are allowed (Phase 1: no wildcard patterns).
+    #[must_use]
+    pub fn is_topic_allowed(&self, topic: &str) -> bool {
+        if self.topic_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+        self.topic_allowlist.iter().any(|t| t == topic)
+    }
+
+    /// Checks if the given CAS hash is in the CAS hash allowlist.
+    ///
+    /// Per TCK-00314, returns `false` if the allowlist is empty (fail-closed).
+    #[must_use]
+    pub fn is_cas_hash_allowed(&self, hash: &[u8; 32]) -> bool {
+        if self.cas_hash_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+        self.cas_hash_allowlist.iter().any(|h| h == hash)
+    }
+
+    /// Converts the topic allowlist to a `TopicAllowlist` for ACL evaluation.
+    ///
+    /// Per TCK-00314, this method creates a `TopicAllowlist` from the
+    /// manifest's `topic_allowlist` field for use with `PulseAclEvaluator`.
+    ///
+    /// # Returns
+    ///
+    /// A `TopicAllowlist` containing the manifest's allowed topics.
+    /// Returns an empty allowlist if topics are invalid (fail-closed).
+    #[must_use]
+    pub fn to_topic_allowlist(&self) -> super::super::protocol::pulse_acl::TopicAllowlist {
+        use super::super::protocol::pulse_acl::TopicAllowlist;
+
+        if self.topic_allowlist.is_empty() {
+            return TopicAllowlist::new();
+        }
+
+        // Try to create TopicAllowlist; if any topic is invalid, return empty
+        // (fail-closed)
+        TopicAllowlist::try_from_iter(self.topic_allowlist.iter().map(String::as_str))
+            .unwrap_or_else(|_| TopicAllowlist::new())
     }
 
     /// Validates a tool request against this manifest.
@@ -1231,6 +1507,13 @@ struct CapabilityManifestProto {
     /// Sorted shell patterns for deterministic serialization.
     #[prost(string, repeated, tag = "8")]
     shell_allowlist: Vec<String>,
+    // TCK-00314: HEF allowlists
+    /// Sorted topic allowlist for deterministic serialization.
+    #[prost(string, repeated, tag = "9")]
+    topic_allowlist: Vec<String>,
+    /// Sorted CAS hash allowlist for deterministic serialization.
+    #[prost(bytes = "vec", repeated, tag = "10")]
+    cas_hash_allowlist: Vec<Vec<u8>>,
 }
 
 impl CapabilityManifest {
@@ -1264,6 +1547,15 @@ impl CapabilityManifest {
         let mut sorted_shell_patterns: Vec<String> = self.shell_allowlist.clone();
         sorted_shell_patterns.sort_unstable();
 
+        // TCK-00314: Sort HEF allowlists for determinism
+        let mut sorted_topics: Vec<String> = self.topic_allowlist.clone();
+        sorted_topics.sort_unstable();
+
+        // Sort CAS hashes lexicographically for determinism
+        let mut sorted_cas_hashes: Vec<Vec<u8>> =
+            self.cas_hash_allowlist.iter().map(|h| h.to_vec()).collect();
+        sorted_cas_hashes.sort_unstable();
+
         let proto = CapabilityManifestProto {
             manifest_id: self.manifest_id.clone(),
             capability_bytes: sorted_caps.iter().map(|c| c.canonical_bytes()).collect(),
@@ -1273,6 +1565,8 @@ impl CapabilityManifest {
             tool_allowlist: sorted_tools,
             write_allowlist: sorted_write_paths,
             shell_allowlist: sorted_shell_patterns,
+            topic_allowlist: sorted_topics,
+            cas_hash_allowlist: sorted_cas_hashes,
         };
         proto.encode_to_vec()
     }
@@ -1289,6 +1583,9 @@ pub struct CapabilityManifestBuilder {
     tool_allowlist: Vec<ToolClass>,
     write_allowlist: Vec<PathBuf>,
     shell_allowlist: Vec<String>,
+    // TCK-00314: HEF allowlists
+    topic_allowlist: Vec<String>,
+    cas_hash_allowlist: Vec<[u8; 32]>,
 }
 
 impl CapabilityManifestBuilder {
@@ -1309,6 +1606,9 @@ impl CapabilityManifestBuilder {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         }
     }
 
@@ -1407,6 +1707,42 @@ impl CapabilityManifestBuilder {
         self
     }
 
+    // =========================================================================
+    // TCK-00314: HEF Allowlist Builder Methods
+    // =========================================================================
+
+    /// Sets the topic allowlist for pulse subscriptions.
+    ///
+    /// Per RFC-0018, session subscriptions are gated via capability manifest.
+    #[must_use]
+    pub fn topic_allowlist(mut self, topics: Vec<String>) -> Self {
+        self.topic_allowlist = topics;
+        self
+    }
+
+    /// Adds a topic to the allowlist.
+    #[must_use]
+    pub fn allow_topic(mut self, topic: impl Into<String>) -> Self {
+        self.topic_allowlist.push(topic.into());
+        self
+    }
+
+    /// Sets the CAS hash allowlist for CAS reads.
+    ///
+    /// Per RFC-0018, session CAS reads are gated via capability manifest.
+    #[must_use]
+    pub fn cas_hash_allowlist(mut self, hashes: Vec<[u8; 32]>) -> Self {
+        self.cas_hash_allowlist = hashes;
+        self
+    }
+
+    /// Adds a CAS hash to the allowlist.
+    #[must_use]
+    pub fn allow_cas_hash(mut self, hash: [u8; 32]) -> Self {
+        self.cas_hash_allowlist.push(hash);
+        self
+    }
+
     /// Builds the manifest.
     ///
     /// # Errors
@@ -1424,6 +1760,9 @@ impl CapabilityManifestBuilder {
         self.tool_allowlist.sort_by_key(ToolClass::value);
         self.write_allowlist.sort();
         self.shell_allowlist.sort();
+        // TCK-00314: Sort HEF allowlists
+        self.topic_allowlist.sort();
+        self.cas_hash_allowlist.sort_unstable();
 
         let manifest = CapabilityManifest {
             manifest_id: self.manifest_id,
@@ -1434,6 +1773,9 @@ impl CapabilityManifestBuilder {
             tool_allowlist: self.tool_allowlist,
             write_allowlist: self.write_allowlist,
             shell_allowlist: self.shell_allowlist,
+            // TCK-00314: HEF allowlists
+            topic_allowlist: self.topic_allowlist,
+            cas_hash_allowlist: self.cas_hash_allowlist,
         };
         manifest.validate()?;
         Ok(manifest)
@@ -2066,6 +2408,9 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         };
 
         let request = ToolRequest::new(ToolClass::Read, RiskTier::Tier0);
@@ -2091,6 +2436,9 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         };
 
         let manifest2 = CapabilityManifest {
@@ -2105,6 +2453,9 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         };
 
         // Different order should produce same canonical bytes
@@ -2229,6 +2580,9 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         };
 
         // Clock is before expiration
@@ -2253,6 +2607,9 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         };
 
         // Clock is after expiration
@@ -2277,6 +2634,9 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         };
 
         // Should never expire regardless of clock
@@ -2301,6 +2661,9 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         };
 
         // Should succeed with clock before expiration
@@ -2334,6 +2697,9 @@ mod tests {
             tool_allowlist: vec![ToolClass::Read],
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         };
 
         let request = ToolRequest::new(ToolClass::Read, RiskTier::Tier0)
@@ -2382,6 +2748,9 @@ mod tests {
             tool_allowlist: Vec::new(),
             write_allowlist: Vec::new(),
             shell_allowlist: Vec::new(),
+            // TCK-00314: HEF allowlists
+            topic_allowlist: Vec::new(),
+            cas_hash_allowlist: Vec::new(),
         };
 
         // Verify behavior is deterministic with fixed clock
@@ -3471,5 +3840,348 @@ mod custody_domain_tests {
 
         let result = validate_custody_domain_overlap(&executor, &authors);
         assert!(result.is_ok());
+    }
+}
+
+// ============================================================================
+// TCK-00314: HEF Capability Allowlist Tests
+// ============================================================================
+
+#[cfg(test)]
+mod hef_allowlist_tests {
+    use super::*;
+
+    // ========================================================================
+    // Topic Allowlist Tests
+    // ========================================================================
+
+    mod topic_allowlist {
+        use super::*;
+
+        #[test]
+        fn empty_topic_allowlist_fail_closed() {
+            let manifest = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec![])
+                .build()
+                .unwrap();
+
+            assert!(!manifest.is_topic_allowed("work.W-123.events"));
+            assert!(!manifest.is_topic_allowed("ledger.head"));
+        }
+
+        #[test]
+        fn topic_allowed_when_in_allowlist() {
+            let manifest = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec![
+                    "work.W-123.events".to_string(),
+                    "ledger.head".to_string(),
+                ])
+                .build()
+                .unwrap();
+
+            assert!(manifest.is_topic_allowed("work.W-123.events"));
+            assert!(manifest.is_topic_allowed("ledger.head"));
+            assert!(!manifest.is_topic_allowed("work.W-456.events"));
+        }
+
+        #[test]
+        fn topic_allowlist_exact_match_only() {
+            let manifest = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec!["work.W-123.events".to_string()])
+                .build()
+                .unwrap();
+
+            // Exact match
+            assert!(manifest.is_topic_allowed("work.W-123.events"));
+
+            // Not a prefix match
+            assert!(!manifest.is_topic_allowed("work.W-123"));
+            assert!(!manifest.is_topic_allowed("work.W-123.events.extra"));
+        }
+
+        #[test]
+        fn topic_allowlist_rejects_wildcards() {
+            let result = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec!["work.*.events".to_string()])
+                .build();
+
+            assert!(matches!(
+                result,
+                Err(CapabilityError::TopicAllowlistWildcardNotAllowed { .. })
+            ));
+        }
+
+        #[test]
+        fn topic_allowlist_rejects_terminal_wildcard() {
+            let result = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec!["work.W-123.>".to_string()])
+                .build();
+
+            assert!(matches!(
+                result,
+                Err(CapabilityError::TopicAllowlistWildcardNotAllowed { .. })
+            ));
+        }
+
+        #[test]
+        fn topic_allowlist_rejects_empty_topic() {
+            let result = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec![String::new()])
+                .build();
+
+            assert!(matches!(
+                result,
+                Err(CapabilityError::TopicAllowlistEntryInvalid { .. })
+            ));
+        }
+
+        #[test]
+        fn topic_allowlist_rejects_consecutive_dots() {
+            let result = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec!["work..events".to_string()])
+                .build();
+
+            assert!(matches!(
+                result,
+                Err(CapabilityError::TopicAllowlistEntryInvalid { .. })
+            ));
+        }
+
+        #[test]
+        fn topic_allowlist_rejects_leading_dot() {
+            let result = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec![".work.events".to_string()])
+                .build();
+
+            assert!(matches!(
+                result,
+                Err(CapabilityError::TopicAllowlistEntryInvalid { .. })
+            ));
+        }
+
+        #[test]
+        fn topic_allowlist_rejects_trailing_dot() {
+            let result = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec!["work.events.".to_string()])
+                .build();
+
+            assert!(matches!(
+                result,
+                Err(CapabilityError::TopicAllowlistEntryInvalid { .. })
+            ));
+        }
+
+        #[test]
+        fn topic_allowlist_rejects_non_ascii() {
+            let result = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec!["work.événements".to_string()])
+                .build();
+
+            assert!(matches!(
+                result,
+                Err(CapabilityError::TopicAllowlistEntryInvalid { .. })
+            ));
+        }
+
+        #[test]
+        fn topic_allowlist_too_many_entries() {
+            let topics: Vec<String> = (0..=MAX_TOPIC_ALLOWLIST)
+                .map(|i| format!("topic.{i}"))
+                .collect();
+
+            let result = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(topics)
+                .build();
+
+            assert!(matches!(
+                result,
+                Err(CapabilityError::TooManyTopicAllowlistEntries { .. })
+            ));
+        }
+
+        #[test]
+        fn topic_allowlist_entry_too_long() {
+            let long_topic = format!("topic.{}", "x".repeat(MAX_TOPIC_LEN));
+
+            let result = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec![long_topic])
+                .build();
+
+            assert!(matches!(
+                result,
+                Err(CapabilityError::TopicAllowlistEntryTooLong { .. })
+            ));
+        }
+
+        #[test]
+        fn to_topic_allowlist_creates_valid_allowlist() {
+            let manifest = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec![
+                    "work.W-123.events".to_string(),
+                    "ledger.head".to_string(),
+                ])
+                .build()
+                .unwrap();
+
+            let allowlist = manifest.to_topic_allowlist();
+            assert_eq!(allowlist.len(), 2);
+            assert!(allowlist.contains("work.W-123.events"));
+            assert!(allowlist.contains("ledger.head"));
+        }
+    }
+
+    // ========================================================================
+    // CAS Hash Allowlist Tests
+    // ========================================================================
+
+    mod cas_hash_allowlist {
+        use super::*;
+
+        #[test]
+        fn empty_cas_hash_allowlist_fail_closed() {
+            let manifest = CapabilityManifest::builder("test")
+                .delegator("test")
+                .cas_hash_allowlist(vec![])
+                .build()
+                .unwrap();
+
+            let hash = [0u8; 32];
+            assert!(!manifest.is_cas_hash_allowed(&hash));
+        }
+
+        #[test]
+        fn cas_hash_allowed_when_in_allowlist() {
+            let hash1 = [1u8; 32];
+            let hash2 = [2u8; 32];
+            let hash3 = [3u8; 32];
+
+            let manifest = CapabilityManifest::builder("test")
+                .delegator("test")
+                .cas_hash_allowlist(vec![hash1, hash2])
+                .build()
+                .unwrap();
+
+            assert!(manifest.is_cas_hash_allowed(&hash1));
+            assert!(manifest.is_cas_hash_allowed(&hash2));
+            assert!(!manifest.is_cas_hash_allowed(&hash3));
+        }
+
+        #[test]
+        fn cas_hash_exact_match_only() {
+            let hash = [0xABu8; 32];
+            let mut similar_hash = hash;
+            similar_hash[0] = 0xCD;
+
+            let manifest = CapabilityManifest::builder("test")
+                .delegator("test")
+                .cas_hash_allowlist(vec![hash])
+                .build()
+                .unwrap();
+
+            assert!(manifest.is_cas_hash_allowed(&hash));
+            assert!(!manifest.is_cas_hash_allowed(&similar_hash));
+        }
+
+        #[test]
+        #[allow(clippy::cast_possible_truncation)]
+        fn cas_hash_allowlist_too_many_entries() {
+            let hashes: Vec<[u8; 32]> = (0..=MAX_CAS_HASH_ALLOWLIST)
+                .map(|i| {
+                    let mut hash = [0u8; 32];
+                    // Safe: i % 256 and (i / 256) % 256 are always in 0..=255
+                    hash[0] = (i % 256) as u8;
+                    hash[1] = ((i / 256) % 256) as u8;
+                    hash
+                })
+                .collect();
+
+            let result = CapabilityManifest::builder("test")
+                .delegator("test")
+                .cas_hash_allowlist(hashes)
+                .build();
+
+            assert!(matches!(
+                result,
+                Err(CapabilityError::TooManyCasHashAllowlistEntries { .. })
+            ));
+        }
+
+        #[test]
+        fn cas_hash_allowlist_builder_methods() {
+            let hash1 = [1u8; 32];
+            let hash2 = [2u8; 32];
+
+            let manifest = CapabilityManifest::builder("test")
+                .delegator("test")
+                .allow_cas_hash(hash1)
+                .allow_cas_hash(hash2)
+                .build()
+                .unwrap();
+
+            assert!(manifest.is_cas_hash_allowed(&hash1));
+            assert!(manifest.is_cas_hash_allowed(&hash2));
+        }
+    }
+
+    // ========================================================================
+    // Canonical Bytes Tests
+    // ========================================================================
+
+    mod canonical_bytes {
+        use super::*;
+
+        #[test]
+        fn canonical_bytes_includes_hef_allowlists() {
+            let manifest1 = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec!["topic.a".to_string()])
+                .cas_hash_allowlist(vec![[1u8; 32]])
+                .build()
+                .unwrap();
+
+            let manifest2 = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec!["topic.b".to_string()])
+                .cas_hash_allowlist(vec![[2u8; 32]])
+                .build()
+                .unwrap();
+
+            // Different allowlists should produce different bytes
+            assert_ne!(manifest1.canonical_bytes(), manifest2.canonical_bytes());
+        }
+
+        #[test]
+        fn canonical_bytes_sorted_for_determinism() {
+            // Create manifests with same allowlists in different order
+            let manifest1 = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec!["topic.a".to_string(), "topic.b".to_string()])
+                .cas_hash_allowlist(vec![[1u8; 32], [2u8; 32]])
+                .build()
+                .unwrap();
+
+            let manifest2 = CapabilityManifest::builder("test")
+                .delegator("test")
+                .topic_allowlist(vec!["topic.b".to_string(), "topic.a".to_string()])
+                .cas_hash_allowlist(vec![[2u8; 32], [1u8; 32]])
+                .build()
+                .unwrap();
+
+            // Should produce same bytes after sorting
+            assert_eq!(manifest1.canonical_bytes(), manifest2.canonical_bytes());
+        }
     }
 }

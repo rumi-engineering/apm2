@@ -70,6 +70,9 @@ pub mod compaction;
 pub mod summary;
 pub mod tombstone;
 
+// TCK-00314: CAS access control
+pub mod cas_access;
+
 // Re-export core receipt types
 // Re-export binding types
 // Re-export artifact types (TCK-00171)
@@ -79,6 +82,8 @@ pub use artifact::{
     MAX_PIN_REASON_LEN, PinReason, PinState, STANDARD_TTL_SECS, Timestamp,
 };
 pub use binding::{EvidenceBinding, ToolEvidenceCollector};
+// Re-export CAS access facade types (TCK-00314)
+pub use cas_access::{CasAccessError, CasAccessFacade, CasAccessType};
 // Re-export compaction types (TCK-00172)
 // Note: ArtifactId and MAX_ARTIFACT_ID_LEN are re-exported from artifact module (TCK-00171)
 pub use compaction::{
