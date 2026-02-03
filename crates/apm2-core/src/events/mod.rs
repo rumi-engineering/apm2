@@ -87,6 +87,7 @@ mod generated {
 
 mod canonical;
 pub mod ci;
+pub mod validation;
 
 pub use canonical::{
     AAT_GATE_RECEIPT_DOMAIN_PREFIX, AAT_SPEC_QUARANTINED_DOMAIN_PREFIX,
@@ -96,6 +97,7 @@ pub use canonical::{
     TOOL_DECIDED_DOMAIN_PREFIX, TOOL_EXECUTED_DOMAIN_PREFIX, WORK_CLAIMED_DOMAIN_PREFIX,
 };
 pub use generated::*;
+pub use validation::Validate;
 
 #[cfg(test)]
 mod tests;

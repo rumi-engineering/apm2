@@ -1,6 +1,34 @@
 // AGENT-AUTHORED (TCK-00213)
 //! Divergence watchdog for the FAC (Forge Admission Cycle).
 //!
+//! # TODO (TCK-00307 Security Review - BLOCKER 2)
+//!
+//! The `DivergenceWatchdog` is fully implemented but not yet wired into the
+//! daemon's main execution path. To complete the integration:
+//!
+//! 1. **Instantiate watchdog in `main.rs`**: Create a `DivergenceWatchdog` with
+//!    a signer from the daemon's key material and a `DivergenceWatchdogConfig`.
+//!
+//! 2. **Wire to ledger**: Pass the `ledger` (from `DispatcherState` or
+//!    `SqliteLedgerEventEmitter`) to emit `DefectRecorded` events via
+//!    `ledger.emit_defect_recorded()`.
+//!
+//! 3. **Source external trunk HEAD**: Implement a polling mechanism that
+//!    fetches the external trunk HEAD from GitHub (via
+//!    `GitHubProjectionAdapter` or direct API calls) and compares against the
+//!    ledger's `MergeReceipt` HEAD.
+//!
+//! 4. **Spawn background task**: Add a `tokio::spawn` that runs
+//!    `watchdog.check_divergence()` at `poll_interval` intervals.
+//!
+//! 5. **Handle results**: When divergence is detected, emit the
+//!    `DefectRecorded` event from `DivergenceResult::defect_event` to the
+//!    ledger.
+//!
+//! This integration is out of scope for TCK-00307 (which focuses on fixing the
+//! `DefectRecorded` event format), but is required for full S0 severity defect
+//! detection. See RFC-0015 for the full specification.
+//!
 //! This module implements the [`DivergenceWatchdog`] which monitors for
 //! divergence between the ledger's merge receipts and the external trunk HEAD.
 //! When divergence is detected, it emits an [`InterventionFreeze`] to halt
@@ -61,7 +89,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use apm2_core::crypto::{Signer, VerifyingKey};
 use apm2_core::events::{
-    InterventionFreeze as ProtoInterventionFreeze,
+    DefectRecorded, DefectSource, InterventionFreeze as ProtoInterventionFreeze,
     InterventionResolutionType as ProtoResolutionType, InterventionScope as ProtoScope,
     InterventionUnfreeze as ProtoInterventionUnfreeze, TimeEnvelopeRef,
 };
@@ -341,6 +369,8 @@ pub struct DivergenceResult {
     pub freeze: InterventionFreeze,
     /// The defect record to emit.
     pub defect: DefectRecord,
+    /// The defect event to emit to the ledger.
+    pub defect_event: DefectRecorded,
 }
 
 /// Default poll interval for divergence checks (30 seconds).
@@ -629,14 +659,32 @@ impl TryFrom<i32> for ResolutionType {
 
 impl From<&InterventionFreeze> for ProtoInterventionFreeze {
     fn from(freeze: &InterventionFreeze) -> Self {
-        // Convert domain time_envelope_ref (hex String) to proto TimeEnvelopeRef
-        // Empty string maps to None; non-empty hex string maps to Some(TimeEnvelopeRef)
+        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef
+        // Empty string maps to None; non-empty string maps to Some(TimeEnvelopeRef)
+        //
+        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
+        // The time_envelope_ref may be a URI like "htf:tick:{ts}" or a hex hash.
         let time_envelope_ref = if freeze.time_envelope_ref.is_empty() {
             None
         } else {
-            // Best-effort decode; if invalid hex, produce empty hash (will fail validation
-            // later)
-            let hash = hex::decode(&freeze.time_envelope_ref).unwrap_or_default();
+            // Try hex decode first; if invalid (e.g., URI format), hash the string
+            let hash = if freeze.time_envelope_ref.len() == 64
+                && freeze
+                    .time_envelope_ref
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
+            {
+                hex::decode(&freeze.time_envelope_ref).unwrap_or_else(|_| {
+                    blake3::hash(freeze.time_envelope_ref.as_bytes())
+                        .as_bytes()
+                        .to_vec()
+                })
+            } else {
+                // URI format -> hash to derive 32 bytes
+                blake3::hash(freeze.time_envelope_ref.as_bytes())
+                    .as_bytes()
+                    .to_vec()
+            };
             Some(TimeEnvelopeRef { hash })
         };
 
@@ -728,14 +776,32 @@ impl TryFrom<ProtoInterventionFreeze> for InterventionFreeze {
 
 impl From<&InterventionUnfreeze> for ProtoInterventionUnfreeze {
     fn from(unfreeze: &InterventionUnfreeze) -> Self {
-        // Convert domain time_envelope_ref (hex String) to proto TimeEnvelopeRef
-        // Empty string maps to None; non-empty hex string maps to Some(TimeEnvelopeRef)
+        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef
+        // Empty string maps to None; non-empty string maps to Some(TimeEnvelopeRef)
+        //
+        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
+        // The time_envelope_ref may be a URI like "htf:tick:{ts}" or a hex hash.
         let time_envelope_ref = if unfreeze.time_envelope_ref.is_empty() {
             None
         } else {
-            // Best-effort decode; if invalid hex, produce empty hash (will fail validation
-            // later)
-            let hash = hex::decode(&unfreeze.time_envelope_ref).unwrap_or_default();
+            // Try hex decode first; if invalid (e.g., URI format), hash the string
+            let hash = if unfreeze.time_envelope_ref.len() == 64
+                && unfreeze
+                    .time_envelope_ref
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
+            {
+                hex::decode(&unfreeze.time_envelope_ref).unwrap_or_else(|_| {
+                    blake3::hash(unfreeze.time_envelope_ref.as_bytes())
+                        .as_bytes()
+                        .to_vec()
+                })
+            } else {
+                // URI format -> hash to derive 32 bytes
+                blake3::hash(unfreeze.time_envelope_ref.as_bytes())
+                    .as_bytes()
+                    .to_vec()
+            };
             Some(TimeEnvelopeRef { hash })
         };
 
@@ -2191,7 +2257,59 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         self.registry
             .register(&freeze, &self.signer.verifying_key())?;
 
-        Ok(DivergenceResult { freeze, defect })
+        // TCK-00307: Create DefectRecorded event
+        // We compute the CAS hash by hashing the serialized DefectRecord.
+        // In a real system, this would happen after storing in CAS, but for
+        // divergence detection, we are the producer.
+        let defect_bytes = serde_json::to_vec(&defect).map_err(|e| {
+            DivergenceError::InvalidConfiguration(format!("serialization error: {e}"))
+        })?;
+        // Use BLAKE3 for CAS hash (RFC-0018)
+        let cas_hash = blake3::hash(&defect_bytes).as_bytes().to_vec();
+
+        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
+        // The time_envelope_ref is a URI like "htf:tick:{ts}", NOT a hex string.
+        // We need to derive a deterministic hash from it for the proto TimeEnvelopeRef.
+        //
+        // Strategy:
+        // 1. If it's valid hex (64 chars = 32 bytes), decode directly (future HTF
+        //    integration)
+        // 2. Otherwise, hash the URI string with BLAKE3 to get deterministic 32 bytes
+        //    that preserve temporal binding information
+        let time_ref_hash: Vec<u8> = if time_envelope_ref.len() == 64
+            && time_envelope_ref.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            // Valid 64-char hex string -> decode to 32 bytes
+            hex::decode(&time_envelope_ref).unwrap_or_else(|_| {
+                blake3::hash(time_envelope_ref.as_bytes())
+                    .as_bytes()
+                    .to_vec()
+            })
+        } else {
+            // URI format (e.g., "htf:tick:12345") -> hash to derive 32 bytes
+            blake3::hash(time_envelope_ref.as_bytes())
+                .as_bytes()
+                .to_vec()
+        };
+
+        let defect_event = DefectRecorded {
+            defect_id,
+            defect_type: defect.defect_class().to_string(),
+            cas_hash,
+            source: DefectSource::DivergenceWatchdog as i32,
+            work_id: self.config.repo_id.clone(),
+            severity: defect.severity().as_str().to_string(),
+            detected_at: timestamp,
+            time_envelope_ref: Some(TimeEnvelopeRef {
+                hash: time_ref_hash,
+            }),
+        };
+
+        Ok(DivergenceResult {
+            freeze,
+            defect,
+            defect_event,
+        })
     }
 
     /// Creates an unfreeze event for a given freeze ID.
@@ -3908,5 +4026,16 @@ pub mod tests {
 
         // Verify the freeze references the defect
         assert_eq!(result.freeze.trigger_defect_id, result.defect.defect_id());
+
+        // TCK-00307: Verify DefectRecorded event is created
+        assert_eq!(result.defect_event.defect_id, result.defect.defect_id());
+        assert_eq!(result.defect_event.defect_type, "PROJECTION_DIVERGENCE");
+        assert_eq!(
+            result.defect_event.source,
+            DefectSource::DivergenceWatchdog as i32
+        );
+        assert_eq!(result.defect_event.work_id, "test-repo");
+        assert_eq!(result.defect_event.severity, "S0");
+        assert!(!result.defect_event.cas_hash.is_empty()); // Hash should be present
     }
 }

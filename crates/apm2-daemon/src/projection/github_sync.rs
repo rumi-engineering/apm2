@@ -57,6 +57,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use apm2_core::crypto::Signer;
+use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
 use apm2_holon::defect::DefectRecord;
 use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -226,6 +227,13 @@ impl TamperEvent {
 pub struct TamperResult {
     /// The defect record emitted for this tamper event.
     pub defect: DefectRecord,
+
+    /// The `DefectRecorded` event to emit to the ledger.
+    ///
+    /// TCK-00307 MAJOR FIX: The `on_tamper` method now produces a
+    /// `DefectRecorded` event that callers should emit to the ledger via
+    /// `ledger.emit_defect_recorded(&defect_event, timestamp)`.
+    pub defect_event: DefectRecorded,
 
     /// The projection receipt from overwriting the tampered status.
     pub receipt: ProjectionReceipt,
@@ -1581,8 +1589,38 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
 
         debug!(
             defect_id = %defect.defect_id(),
-            "emitted PROJECTION_TAMPER defect"
+            "created PROJECTION_TAMPER defect"
         );
+
+        // TCK-00307 MAJOR FIX: Create DefectRecorded event for ledger emission.
+        // Per the security review, on_tamper must emit a DefectRecorded event
+        // so that PROJECTION_TAMPER defects are recorded on the ledger.
+        //
+        // We serialize the DefectRecord to JSON and compute the CAS hash.
+        // The caller is responsible for storing in CAS and emitting to the ledger.
+        let defect_json = serde_json::to_vec(&defect).map_err(|e| {
+            ProjectionError::DefectRecordFailed(format!("serialization error: {e}"))
+        })?;
+        let cas_hash = blake3::hash(&defect_json).as_bytes().to_vec();
+
+        // Create time envelope reference from the detection timestamp
+        let time_envelope_uri = format!("htf:tamper:{}", event.detected_at);
+        let time_ref_hash = blake3::hash(time_envelope_uri.as_bytes())
+            .as_bytes()
+            .to_vec();
+
+        let defect_event = DefectRecorded {
+            defect_id: defect_id.clone(),
+            defect_type: defect.defect_class().to_string(),
+            cas_hash,
+            source: DefectSource::ProjectionTamper as i32,
+            work_id: event.work_id.clone(),
+            severity: defect.severity().as_str().to_string(),
+            detected_at: event.detected_at,
+            time_envelope_ref: Some(TimeEnvelopeRef {
+                hash: time_ref_hash,
+            }),
+        };
 
         // 4. If counter exceeds threshold, freeze and return error
         if tamper_count >= self.tamper_threshold {
@@ -1621,6 +1659,7 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
 
         Ok(TamperResult {
             defect,
+            defect_event,
             receipt,
             freeze_triggered: false,
         })

@@ -42,7 +42,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -94,6 +94,8 @@ pub mod kernel_event {
         ChangesetPublished(super::ChangeSetPublished),
         #[prost(message, tag = "30")]
         IoArtifactPublished(super::IoArtifactPublished),
+        #[prost(message, tag = "31")]
+        DefectRecorded(super::DefectRecorded),
     }
 }
 /// ============================================================
@@ -1798,6 +1800,47 @@ pub struct IoArtifactPublished {
     #[prost(string, tag = "9")]
     pub classification: ::prost::alloc::string::String,
 }
+/// Emitted when a defect is detected and recorded.
+///
+/// This event is emitted by defect producers (divergence watchdog, context miss
+/// handlers, HTF regression producers) when a defect is detected. The full
+/// DefectRecord is stored in CAS and referenced by cas_hash.
+///
+/// Security: DefectRecorded events must flow through the ledger before pulse
+/// emission per REQ-HEF-0006 ordering invariant.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DefectRecorded {
+    /// Unique identifier for this defect.
+    /// Format: `DEF-{uuid}` or similar unique string.
+    #[prost(string, tag = "1")]
+    pub defect_id: ::prost::alloc::string::String,
+    /// Classification of the defect type.
+    /// Examples: PROJECTION_DIVERGENCE, UNPLANNED_CONTEXT_READ, AAT_FAIL
+    #[prost(string, tag = "2")]
+    pub defect_type: ::prost::alloc::string::String,
+    /// BLAKE3 hash of the full DefectRecord artifact in CAS (32 bytes).
+    /// The full DefectRecord can be retrieved from CAS for detailed analysis.
+    #[prost(bytes = "vec", tag = "3")]
+    pub cas_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Source that detected and emitted this defect.
+    #[prost(enumeration = "DefectSource", tag = "4")]
+    pub source: i32,
+    /// Work ID associated with this defect (if applicable).
+    #[prost(string, tag = "5")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Severity level: S0 (critical), S1 (high), S2 (medium), S3 (low).
+    #[prost(string, tag = "6")]
+    pub severity: ::prost::alloc::string::String,
+    /// Timestamp when the defect was detected (Unix nanos).
+    /// OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+    #[prost(uint64, tag = "7")]
+    pub detected_at: u64,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the defect event to verifiable HTF time.
+    #[prost(message, optional, tag = "8")]
+    pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+}
 /// Determinism status for AAT runs.
 /// Indicates whether multiple runs produced consistent terminal evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -2166,6 +2209,60 @@ impl Protocol {
             "PROTOCOL_UNSPECIFIED" => Some(Self::Unspecified),
             "PROTOCOL_TCP" => Some(Self::Tcp),
             "PROTOCOL_UDP" => Some(Self::Udp),
+            _ => None,
+        }
+    }
+}
+/// Source of the defect detection.
+/// Identifies which producer emitted the DefectRecorded event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DefectSource {
+    /// Unspecified source (invalid).
+    Unspecified = 0,
+    /// Divergence watchdog detected trunk HEAD mismatch.
+    DivergenceWatchdog = 1,
+    /// Context miss detected unplanned context read.
+    ContextMiss = 2,
+    /// HTF regression producer detected test regression.
+    HtfRegression = 3,
+    /// Projection tamper detected status spoofing.
+    ProjectionTamper = 4,
+    /// Schema validation rejected an artifact.
+    SchemaReject = 5,
+    /// AAT failure detected.
+    AatFail = 6,
+    /// Required capability unavailable.
+    CapabilityUnavailable = 7,
+}
+impl DefectSource {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "DEFECT_SOURCE_UNSPECIFIED",
+            Self::DivergenceWatchdog => "DEFECT_SOURCE_DIVERGENCE_WATCHDOG",
+            Self::ContextMiss => "DEFECT_SOURCE_CONTEXT_MISS",
+            Self::HtfRegression => "DEFECT_SOURCE_HTF_REGRESSION",
+            Self::ProjectionTamper => "DEFECT_SOURCE_PROJECTION_TAMPER",
+            Self::SchemaReject => "DEFECT_SOURCE_SCHEMA_REJECT",
+            Self::AatFail => "DEFECT_SOURCE_AAT_FAIL",
+            Self::CapabilityUnavailable => "DEFECT_SOURCE_CAPABILITY_UNAVAILABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "DEFECT_SOURCE_UNSPECIFIED" => Some(Self::Unspecified),
+            "DEFECT_SOURCE_DIVERGENCE_WATCHDOG" => Some(Self::DivergenceWatchdog),
+            "DEFECT_SOURCE_CONTEXT_MISS" => Some(Self::ContextMiss),
+            "DEFECT_SOURCE_HTF_REGRESSION" => Some(Self::HtfRegression),
+            "DEFECT_SOURCE_PROJECTION_TAMPER" => Some(Self::ProjectionTamper),
+            "DEFECT_SOURCE_SCHEMA_REJECT" => Some(Self::SchemaReject),
+            "DEFECT_SOURCE_AAT_FAIL" => Some(Self::AatFail),
+            "DEFECT_SOURCE_CAPABILITY_UNAVAILABLE" => Some(Self::CapabilityUnavailable),
             _ => None,
         }
     }

@@ -63,6 +63,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use apm2_core::coordination::ContextRefinementRequest;
+use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
+use apm2_holon::defect::DefectRecord;
 use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, error, info, warn};
@@ -86,7 +89,7 @@ use crate::episode::decision::{BrokerToolRequest, DedupeKey, ToolDecision};
 use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
 use crate::episode::{CapabilityManifest, EpisodeId, SharedToolBroker, ToolClass};
-use crate::htf::HolonicClock;
+use crate::htf::{ClockError, HolonicClock};
 
 // ============================================================================
 // Message Type Tags (for routing)
@@ -556,6 +559,164 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
+    fn emit_htf_regression_defect(&self, current: u64, previous: u64) {
+        if let Some(ref ledger) = self.ledger {
+            let defect_id = format!("DEF-REGRESSION-{}", uuid::Uuid::new_v4());
+
+            // TCK-00307 MAJOR 3 FIX: Use proper timestamps instead of zeros.
+            // Since this is called when the clock regression is detected, we use
+            // the `current` timestamp from the regression error as our best available
+            // timestamp. We cannot call the clock again since it just failed.
+            let timestamp_ns = current;
+
+            // Create a time envelope ref by hashing a timestamp-based URI
+            let time_envelope_uri = format!("htf:regression:{current}");
+            let time_envelope_hash = blake3::hash(time_envelope_uri.as_bytes())
+                .as_bytes()
+                .to_vec();
+
+            // TCK-00307 BLOCKER 1 FIX: Create structured DefectRecord and store in CAS.
+            // Per the DefectRecorded protocol, cas_hash must point to a full DefectRecord
+            // JSON artifact, not a raw string or placeholder.
+            let defect_record = match DefectRecord::clock_regression(
+                &defect_id,
+                "system",
+                current,
+                previous,
+                timestamp_ns,
+            ) {
+                Ok(record) => record,
+                Err(e) => {
+                    error!("Failed to create clock regression DefectRecord: {}", e);
+                    return;
+                },
+            };
+
+            // Serialize DefectRecord to JSON for CAS storage
+            let defect_json = match serde_json::to_vec(&defect_record) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!("Failed to serialize clock regression DefectRecord: {}", e);
+                    return;
+                },
+            };
+
+            // Store in CAS if available, otherwise compute hash for reference
+            let cas_hash = self.cas.as_ref().map_or_else(
+                || blake3::hash(&defect_json).as_bytes().to_vec(),
+                |cas| cas.store(&defect_json).to_vec(),
+            );
+
+            // Create DefectRecorded event with proper CAS hash
+            let defect = DefectRecorded {
+                defect_id,
+                defect_type: "CLOCK_REGRESSION".to_string(),
+                cas_hash,
+                source: DefectSource::HtfRegression as i32,
+                work_id: "system".to_string(),
+                severity: "S0".to_string(),
+                detected_at: timestamp_ns,
+                time_envelope_ref: Some(TimeEnvelopeRef {
+                    hash: time_envelope_hash,
+                }),
+            };
+
+            if let Err(e) = ledger.emit_defect_recorded(&defect, timestamp_ns) {
+                error!("Failed to emit clock regression defect: {}", e);
+            }
+        }
+    }
+
+    fn emit_context_miss_defect(&self, session_id: &str, path: &str) {
+        if let Some(ref ledger) = self.ledger {
+            let defect_id = format!("DEF-MISS-{}", uuid::Uuid::new_v4());
+
+            // TCK-00307 MAJOR 3 FIX: Use proper timestamps instead of zeros.
+            // Try to get timestamp from clock; if not configured, use SystemTime
+            // as a fallback for defect logging (this is observational, not authoritative).
+            #[allow(clippy::map_unwrap_or)] // Clearer with explicit closure for the fallback
+            let timestamp_ns = self
+                .clock
+                .as_ref()
+                .and_then(|c| c.now_hlc().ok())
+                .map_or_else(
+                    || {
+                        warn!("Clock not configured for context miss defect; using SystemTime fallback");
+                        SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            // Truncation is acceptable: timestamps won't exceed u64 for ~500 years
+                            .map(|d| {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let ns = d.as_nanos() as u64;
+                                ns
+                            })
+                            .unwrap_or(0)
+                    },
+                    |hlc| hlc.wall_ns,
+                );
+
+            // Create time envelope ref from timestamp
+            let time_envelope_uri = format!("htf:context-miss:{timestamp_ns}");
+            let time_envelope_hash = blake3::hash(time_envelope_uri.as_bytes())
+                .as_bytes()
+                .to_vec();
+
+            // TCK-00307 BLOCKER 1 FIX: Create structured DefectRecord and store in CAS.
+            // Per the DefectRecorded protocol, cas_hash must point to a full DefectRecord
+            // JSON artifact, not a raw description string.
+            //
+            // Note: DefectRecord::pack_miss requires a pack_hash, but for context misses
+            // detected during session dispatch, we may not have the pack hash available.
+            // We use a zero hash as a placeholder - the path in the signal details is the
+            // key information for debugging.
+            let defect_record = match DefectRecord::pack_miss(
+                &defect_id,
+                session_id,
+                path,
+                [0u8; 32], // Pack hash not available in this context
+                timestamp_ns,
+            ) {
+                Ok(record) => record,
+                Err(e) => {
+                    error!("Failed to create context miss DefectRecord: {}", e);
+                    return;
+                },
+            };
+
+            // Serialize DefectRecord to JSON for CAS storage
+            let defect_json = match serde_json::to_vec(&defect_record) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!("Failed to serialize context miss DefectRecord: {}", e);
+                    return;
+                },
+            };
+
+            // Store in CAS if available, otherwise compute hash for reference
+            let cas_hash = self.cas.as_ref().map_or_else(
+                || blake3::hash(&defect_json).as_bytes().to_vec(),
+                |cas| cas.store(&defect_json).to_vec(),
+            );
+
+            let defect = DefectRecorded {
+                defect_id,
+                defect_type: "UNPLANNED_CONTEXT_READ".to_string(),
+                cas_hash,
+                source: DefectSource::ContextMiss as i32,
+                work_id: session_id.to_string(),
+                severity: "S2".to_string(),
+                detected_at: timestamp_ns,
+                time_envelope_ref: Some(TimeEnvelopeRef {
+                    hash: time_envelope_hash,
+                }),
+            };
+
+            if let Err(e) = ledger.emit_defect_recorded(&defect, timestamp_ns) {
+                error!("Failed to emit context miss defect: {}", e);
+            }
+        }
+    }
+
     /// Dispatches a session-scoped request to the appropriate handler.
     ///
     /// # Message Format
@@ -800,7 +961,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
             });
 
-            return Self::handle_broker_decision(decision, &token.session_id, tool_class);
+            return self.handle_broker_decision(decision, &token.session_id, tool_class);
         }
 
         // Legacy fallback: TCK-00260 manifest store validation
@@ -859,6 +1020,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// Handles the broker decision and converts it to a `SessionResponse`.
     #[allow(clippy::unnecessary_wraps)]
     fn handle_broker_decision(
+        &self,
         decision: Result<ToolDecision, crate::episode::BrokerError>,
         session_id: &str,
         tool_class: ToolClass,
@@ -921,7 +1083,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             Ok(ToolDecision::Terminate {
                 request_id,
                 termination_info,
-                ..
+                refinement_event,
             }) => {
                 error!(
                     session_id = %session_id,
@@ -929,6 +1091,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     reason = %termination_info.rationale_code,
                     "Tool request triggered session termination"
                 );
+
+                // TCK-00307: Emit DefectRecorded for ContextMiss
+                if termination_info.rationale_code == "CONTEXT_MISS" {
+                    if let Some(event_bytes) = refinement_event {
+                        if let Ok(req) =
+                            serde_json::from_slice::<ContextRefinementRequest>(&event_bytes)
+                        {
+                            self.emit_context_miss_defect(session_id, &req.missed_path);
+                        }
+                    }
+                }
+
                 Ok(SessionResponse::error(
                     SessionErrorCode::SessionErrorToolNotAllowed,
                     format!(
@@ -972,6 +1146,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // comments that would be less readable with map_or_else or if let/else.
         match &self.clock {
             Some(clock) => clock.now_hlc().map(|hlc| hlc.wall_ns).map_err(|e| {
+                if let ClockError::ClockRegression { current, previous } = e {
+                    self.emit_htf_regression_defect(current, previous);
+                }
                 error!("HolonicClock failed: {}", e);
                 ProtocolError::Serialization {
                     reason: format!("clock failure: {e}"),

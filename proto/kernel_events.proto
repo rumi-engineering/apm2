@@ -1,5 +1,11 @@
 // APM2 Kernel Event Schema
-// Version: 0.4.0
+// Version: 0.5.0
+//
+// CHANGELOG (0.5.0):
+// - Added DefectRecorded event for HEF defect pulse derivation (RFC-0018, TCK-00307)
+// - Added DefectRecorded to KernelEvent payload (tag 31)
+// - Added DefectSource enum for defect source classification
+// - Enables defect.new pulse topic derivation from ledger events
 //
 // CHANGELOG (0.4.0):
 // - Added episode_id field to Session events for HEF topic derivation (RFC-0018, TCK-00306):
@@ -101,6 +107,7 @@ message KernelEvent {
     QuarantineCleared quarantine_cleared = 28;
     ChangeSetPublished changeset_published = 29;
     IoArtifactPublished io_artifact_published = 30;
+    DefectRecorded defect_recorded = 31;
   }
 }
 
@@ -1529,5 +1536,72 @@ message IoArtifactPublished {
   // Data classification: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
   // Defaults to INTERNAL if not specified.
   string classification = 9;
+}
+
+// ============================================================
+// DEFECT EVENTS (TCK-00307)
+// ============================================================
+//
+// DefectRecorded events enable the defect.new pulse topic derivation for HEF
+// Pulse Plane (RFC-0018). These events are emitted when defects are detected
+// by various producers (divergence watchdog, context miss, HTF regression).
+//
+// Key properties:
+// - Provides structured defect notification for observability
+// - References full DefectRecord in CAS via cas_hash
+// - Enables audit trail for defect detection events
+// - Supports defect.new topic derivation from ledger events
+
+// Source of the defect detection.
+// Identifies which producer emitted the DefectRecorded event.
+enum DefectSource {
+  // Unspecified source (invalid).
+  DEFECT_SOURCE_UNSPECIFIED = 0;
+  // Divergence watchdog detected trunk HEAD mismatch.
+  DEFECT_SOURCE_DIVERGENCE_WATCHDOG = 1;
+  // Context miss detected unplanned context read.
+  DEFECT_SOURCE_CONTEXT_MISS = 2;
+  // HTF regression producer detected test regression.
+  DEFECT_SOURCE_HTF_REGRESSION = 3;
+  // Projection tamper detected status spoofing.
+  DEFECT_SOURCE_PROJECTION_TAMPER = 4;
+  // Schema validation rejected an artifact.
+  DEFECT_SOURCE_SCHEMA_REJECT = 5;
+  // AAT failure detected.
+  DEFECT_SOURCE_AAT_FAIL = 6;
+  // Required capability unavailable.
+  DEFECT_SOURCE_CAPABILITY_UNAVAILABLE = 7;
+}
+
+// Emitted when a defect is detected and recorded.
+//
+// This event is emitted by defect producers (divergence watchdog, context miss
+// handlers, HTF regression producers) when a defect is detected. The full
+// DefectRecord is stored in CAS and referenced by cas_hash.
+//
+// Security: DefectRecorded events must flow through the ledger before pulse
+// emission per REQ-HEF-0006 ordering invariant.
+message DefectRecorded {
+  // Unique identifier for this defect.
+  // Format: `DEF-{uuid}` or similar unique string.
+  string defect_id = 1;
+  // Classification of the defect type.
+  // Examples: PROJECTION_DIVERGENCE, UNPLANNED_CONTEXT_READ, AAT_FAIL
+  string defect_type = 2;
+  // BLAKE3 hash of the full DefectRecord artifact in CAS (32 bytes).
+  // The full DefectRecord can be retrieved from CAS for detailed analysis.
+  bytes cas_hash = 3;
+  // Source that detected and emitted this defect.
+  DefectSource source = 4;
+  // Work ID associated with this defect (if applicable).
+  string work_id = 5;
+  // Severity level: S0 (critical), S1 (high), S2 (medium), S3 (low).
+  string severity = 6;
+  // Timestamp when the defect was detected (Unix nanos).
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  uint64 detected_at = 7;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the defect event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 8;
 }
 

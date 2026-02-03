@@ -209,6 +209,10 @@ pub enum SignalType {
     /// Projection tamper detected: external status modified by non-adapter.
     #[serde(rename = "PROJECTION_TAMPER")]
     ProjectionTamper,
+
+    /// HTF clock regression detected: monotonic time went backwards.
+    #[serde(rename = "CLOCK_REGRESSION")]
+    ClockRegression,
 }
 
 impl SignalType {
@@ -225,6 +229,7 @@ impl SignalType {
             Self::CapabilityUnavailable => "CAPABILITY_UNAVAILABLE",
             Self::ProjectionDivergence => "PROJECTION_DIVERGENCE",
             Self::ProjectionTamper => "PROJECTION_TAMPER",
+            Self::ClockRegression => "CLOCK_REGRESSION",
         }
     }
 }
@@ -613,6 +618,49 @@ impl DefectRecord {
             .add_remediation("Ensure selftest suite covers the required capability")
             .add_remediation("Verify the capability ID is correct")
             .add_remediation("Run selftest to generate new AAT receipt")
+            .build()
+    }
+
+    /// Creates a defect record for a clock regression (HTF monotonicity
+    /// violation).
+    ///
+    /// This is a convenience constructor for emitting a defect when the Holonic
+    /// Time Fabric detects that monotonic time has regressed (current tick is
+    /// less than previous tick). This is a critical S0 severity defect per
+    /// RFC-0016 DD-HTF-0001.
+    ///
+    /// # Arguments
+    ///
+    /// * `defect_id` - Unique identifier for this defect
+    /// * `work_id` - The work ID this defect is associated with (typically
+    ///   "system")
+    /// * `current_ns` - The current timestamp that caused the regression
+    /// * `previous_ns` - The previous timestamp that was higher
+    /// * `timestamp_ns` - When the regression was detected (Unix nanoseconds)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DefectError` if any input exceeds validation limits.
+    pub fn clock_regression(
+        defect_id: impl Into<String>,
+        work_id: impl Into<String>,
+        current_ns: u64,
+        previous_ns: u64,
+        timestamp_ns: u64,
+    ) -> Result<Self, DefectError> {
+        Self::builder(defect_id, "CLOCK_REGRESSION")
+            .severity(DefectSeverity::S0) // Critical - immediate intervention required
+            .work_id(work_id)
+            .detected_at(timestamp_ns)
+            .signal(DefectSignal::new(
+                SignalType::ClockRegression,
+                format!(
+                    "HTF monotonicity violation: current tick {current_ns} < previous tick {previous_ns}"
+                ),
+            ))
+            .add_remediation("Investigate the clock source for the affected node")
+            .add_remediation("Quarantine the node until clock integrity is verified")
+            .add_remediation("Fail-closed for high-risk operations until resolved")
             .build()
     }
 

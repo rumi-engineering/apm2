@@ -309,8 +309,9 @@ impl TopicDeriver {
             // IO artifact events -> episode.<episode_id>.io (TCK-00306)
             "IoArtifactPublished" => derive_io_artifact_topic(event, &sanitized_namespace),
 
-            // Defect events
-            "DefectRecord" => "defect.new".to_string(),
+            // Defect events (TCK-00307)
+            // DefectRecorded ledger events derive to defect.new topic
+            "DefectRecorded" => "defect.new".to_string(),
 
             // PolicyResolvedForChangeSet -> work topic (for observability)
             "PolicyResolvedForChangeSet" => {
@@ -997,7 +998,8 @@ mod tests {
             let deriver = TopicDeriver::new();
             let event = KernelEvent::default();
 
-            let notification = CommitNotification::new(1, [0; 32], "DefectRecord", "kernel");
+            // TCK-00307: DefectRecorded events derive to defect.new topic
+            let notification = CommitNotification::new(1, [0; 32], "DefectRecorded", "kernel");
             let result = deriver.derive_topic(&notification, &event);
             assert_eq!(result.topic(), Some("defect.new"));
         }
@@ -1645,6 +1647,202 @@ mod tests {
             // episode_id should default to empty string
             assert_eq!(decoded.episode_id, "");
             assert_eq!(decoded.session_id, "sess-old");
+        }
+    }
+
+    // ========================================================================
+    // DefectRecorded Event Tests (TCK-00307)
+    // ========================================================================
+
+    mod defect_recorded_tests {
+        use apm2_core::events::kernel_event::Payload;
+        use apm2_core::events::{DefectRecorded, DefectSource, KernelEvent};
+        use apm2_core::ledger::CommitNotification;
+        use prost::Message;
+
+        use super::*;
+
+        // --------------------------------------------------------------------
+        // DefectRecorded Serialization Tests
+        // --------------------------------------------------------------------
+
+        #[test]
+        fn defect_recorded_serializes_with_all_fields() {
+            let event = DefectRecorded {
+                defect_id: "DEF-001".to_string(),
+                defect_type: "PROJECTION_DIVERGENCE".to_string(),
+                cas_hash: vec![0xab; 32],
+                source: DefectSource::DivergenceWatchdog as i32,
+                work_id: "work-123".to_string(),
+                severity: "S0".to_string(),
+                detected_at: 1_234_567_890,
+                time_envelope_ref: None,
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = DefectRecorded::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.defect_id, "DEF-001");
+            assert_eq!(decoded.defect_type, "PROJECTION_DIVERGENCE");
+            assert_eq!(decoded.cas_hash.len(), 32);
+            assert_eq!(decoded.source, DefectSource::DivergenceWatchdog as i32);
+            assert_eq!(decoded.work_id, "work-123");
+            assert_eq!(decoded.severity, "S0");
+            assert_eq!(decoded.detected_at, 1_234_567_890);
+        }
+
+        #[test]
+        fn defect_recorded_with_context_miss_source() {
+            let event = DefectRecorded {
+                defect_id: "DEF-002".to_string(),
+                defect_type: "UNPLANNED_CONTEXT_READ".to_string(),
+                cas_hash: vec![0xcd; 32],
+                source: DefectSource::ContextMiss as i32,
+                work_id: "work-456".to_string(),
+                severity: "S2".to_string(),
+                detected_at: 1_234_567_891,
+                time_envelope_ref: None,
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = DefectRecorded::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.defect_id, "DEF-002");
+            assert_eq!(decoded.defect_type, "UNPLANNED_CONTEXT_READ");
+            assert_eq!(decoded.source, DefectSource::ContextMiss as i32);
+        }
+
+        #[test]
+        fn defect_recorded_with_htf_regression_source() {
+            let event = DefectRecorded {
+                defect_id: "DEF-003".to_string(),
+                defect_type: "AAT_FAIL".to_string(),
+                cas_hash: vec![0xef; 32],
+                source: DefectSource::HtfRegression as i32,
+                work_id: "work-789".to_string(),
+                severity: "S1".to_string(),
+                detected_at: 1_234_567_892,
+                time_envelope_ref: None,
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = DefectRecorded::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.source, DefectSource::HtfRegression as i32);
+        }
+
+        #[test]
+        fn defect_source_enum_values() {
+            // Verify all DefectSource enum values are serializable
+            assert_eq!(DefectSource::Unspecified as i32, 0);
+            assert_eq!(DefectSource::DivergenceWatchdog as i32, 1);
+            assert_eq!(DefectSource::ContextMiss as i32, 2);
+            assert_eq!(DefectSource::HtfRegression as i32, 3);
+            assert_eq!(DefectSource::ProjectionTamper as i32, 4);
+            assert_eq!(DefectSource::SchemaReject as i32, 5);
+            assert_eq!(DefectSource::AatFail as i32, 6);
+            assert_eq!(DefectSource::CapabilityUnavailable as i32, 7);
+        }
+
+        // --------------------------------------------------------------------
+        // DefectRecorded Topic Derivation Tests
+        // --------------------------------------------------------------------
+
+        #[test]
+        fn defect_recorded_derives_defect_new_topic() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::DefectRecorded(DefectRecorded {
+                    defect_id: "DEF-001".to_string(),
+                    defect_type: "PROJECTION_DIVERGENCE".to_string(),
+                    cas_hash: vec![0xab; 32],
+                    source: DefectSource::DivergenceWatchdog as i32,
+                    work_id: "work-123".to_string(),
+                    severity: "S0".to_string(),
+                    detected_at: 1_234_567_890,
+                    time_envelope_ref: None,
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "DefectRecorded", "kernel");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("defect.new"));
+        }
+
+        #[test]
+        fn defect_recorded_topic_derivation_is_deterministic() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::DefectRecorded(DefectRecorded {
+                    defect_id: "DEF-DET".to_string(),
+                    defect_type: "CONTEXT_MISS".to_string(),
+                    cas_hash: vec![0xcd; 32],
+                    source: DefectSource::ContextMiss as i32,
+                    work_id: "work-det".to_string(),
+                    severity: "S2".to_string(),
+                    detected_at: 1_000_000,
+                    time_envelope_ref: None,
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(42, [0xab; 32], "DefectRecorded", "kernel");
+
+            // Derive the same topic multiple times
+            let results: Vec<_> = (0..10)
+                .map(|_| deriver.derive_topic(&notification, &event))
+                .collect();
+
+            // All results should be identical
+            let first = results[0].topic().unwrap();
+            assert_eq!(first, "defect.new");
+            for result in &results {
+                assert_eq!(result.topic(), Some(first));
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // KernelEvent with DefectRecorded Payload Tests
+        // --------------------------------------------------------------------
+
+        #[test]
+        fn kernel_event_with_defect_recorded_payload() {
+            let defect_recorded = DefectRecorded {
+                defect_id: "DEF-KE".to_string(),
+                defect_type: "PROJECTION_TAMPER".to_string(),
+                cas_hash: vec![0x11; 32],
+                source: DefectSource::ProjectionTamper as i32,
+                work_id: "work-ke".to_string(),
+                severity: "S1".to_string(),
+                detected_at: 2_000_000,
+                time_envelope_ref: None,
+            };
+
+            let kernel_event = KernelEvent {
+                sequence: 100,
+                actor_id: "watchdog".to_string(),
+                session_id: "session-001".to_string(),
+                schema_version: 1,
+                payload: Some(Payload::DefectRecorded(defect_recorded)),
+                ..Default::default()
+            };
+
+            let bytes = kernel_event.encode_to_vec();
+            let decoded = KernelEvent::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.sequence, 100);
+            assert_eq!(decoded.actor_id, "watchdog");
+
+            if let Some(Payload::DefectRecorded(dr)) = decoded.payload {
+                assert_eq!(dr.defect_id, "DEF-KE");
+                assert_eq!(dr.defect_type, "PROJECTION_TAMPER");
+                assert_eq!(dr.source, DefectSource::ProjectionTamper as i32);
+            } else {
+                panic!("Expected DefectRecorded payload");
+            }
         }
     }
 }

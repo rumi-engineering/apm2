@@ -759,8 +759,8 @@ mod tests {
             .derive_topic(&notification, &event);
         assert_eq!(result.topic(), Some("gate.W-456.receipts"));
 
-        // Test defect topic
-        let notification = CommitNotification::new(4, [0; 32], "DefectRecord", "kernel");
+        // Test defect topic (TCK-00307)
+        let notification = CommitNotification::new(4, [0; 32], "DefectRecorded", "kernel");
         let result = publisher
             .topic_deriver()
             .derive_topic(&notification, &event);

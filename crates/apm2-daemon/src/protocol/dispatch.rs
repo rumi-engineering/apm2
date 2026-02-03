@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use apm2_core::determinism::canonicalize_json;
+use apm2_core::events::{DefectRecorded, Validate};
 use bytes::Bytes;
 use prost::Message;
 use subtle::ConstantTimeEq;
@@ -109,6 +110,15 @@ pub enum LedgerEventError {
         /// Error message.
         message: String,
     },
+
+    /// Validation failed (TCK-00307 MAJOR 4).
+    ///
+    /// Per REQ-VAL-0001: All event payloads must be validated before emission
+    /// to prevent denial-of-service via unbounded strings/bytes.
+    ValidationFailed {
+        /// Error message describing the validation failure.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for LedgerEventError {
@@ -116,6 +126,7 @@ impl std::fmt::Display for LedgerEventError {
         match self {
             Self::SigningFailed { message } => write!(f, "signing failed: {message}"),
             Self::PersistenceFailed { message } => write!(f, "persistence failed: {message}"),
+            Self::ValidationFailed { message } => write!(f, "validation failed: {message}"),
         }
     }
 }
@@ -240,6 +251,13 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
+    /// Emits a signed `DefectRecorded` event to the ledger (TCK-00307).
+    fn emit_defect_recorded(
+        &self,
+        defect: &DefectRecorded,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
     /// Queries a signed event by event ID.
     fn get_event(&self, event_id: &str) -> Option<SignedLedgerEvent>;
 
@@ -251,6 +269,9 @@ pub trait LedgerEventEmitter: Send + Sync {
 ///
 /// Per RFC-0017 and TCK-00264: domain prefixes prevent cross-context replay.
 pub const WORK_CLAIMED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_claimed:";
+
+/// Domain separation prefix for `DefectRecorded` events.
+pub const DEFECT_RECORDED_DOMAIN_PREFIX: &[u8] = b"apm2.event.defect_recorded:";
 
 /// Maximum length for ID fields (`work_id`, `lease_id`, etc.).
 ///
@@ -620,6 +641,110 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             event_type = %event_type,
             actor_id = %actor_id,
             "SessionEvent signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn emit_defect_recorded(
+        &self,
+        defect: &DefectRecorded,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // TCK-00307 MAJOR 4: Call validate() to enforce DoS protections
+        defect
+            .validate()
+            .map_err(|e| LedgerEventError::ValidationFailed { message: e })?;
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // TCK-00307 BLOCKER: Use JCS/JSON wire format (not ProtoBuf) to match
+        // SqliteLedgerEventEmitter and ensure consumer uniformity.
+        // Include time_envelope_ref for temporal binding (MAJOR 1).
+        let time_envelope_ref_hex = defect
+            .time_envelope_ref
+            .as_ref()
+            .map(|ter| hex::encode(&ter.hash));
+
+        let payload = serde_json::json!({
+            "event_type": "defect_recorded",
+            "defect_id": defect.defect_id,
+            "defect_type": defect.defect_type,
+            "cas_hash": hex::encode(&defect.cas_hash),
+            "source": defect.source,
+            "work_id": defect.work_id,
+            "severity": defect.severity,
+            "detected_at": defect.detected_at,
+            "time_envelope_ref": time_envelope_ref_hex,
+        });
+
+        // Use JCS (RFC 8785) canonicalization for deterministic signing
+        let payload_json = payload.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(DEFECT_RECORDED_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(DEFECT_RECORDED_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "defect_recorded".to_string(),
+            work_id: defect.work_id.clone(),
+            actor_id: "system".to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(defect.work_id.clone())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            defect_id = %defect.defect_id,
+            work_id = %signed_event.work_id,
+            "DefectRecorded event signed and persisted"
         );
 
         Ok(signed_event)
