@@ -122,6 +122,10 @@ pub mod session_dispatch;
 pub mod session_token;
 /// Dual-socket manager for privilege separation (TCK-00249).
 pub mod socket_manager;
+/// Topic derivation for Work and Gate events (RFC-0018, TCK-00305).
+///
+/// Maps kernel events to pulse topics with deterministic derivation.
+pub mod topic_derivation;
 
 // Re-export commonly used types at module level.
 // These re-exports form the public API of this module and may not be used
@@ -321,4 +325,17 @@ pub use session_token::{SessionToken, SessionTokenError, TokenMinter};
 pub use socket_manager::{
     SocketManager, SocketManagerConfig, SocketType, default_operator_socket_path,
     default_session_socket_path,
+};
+// CTR-PROTO-010: HEF Topic Derivation (RFC-0018, TCK-00305)
+#[allow(unused_imports)]
+pub use topic_derivation::{
+    // Types
+    ChangesetWorkIndex,
+    // Constants
+    MAX_CHANGESET_INDEX_ENTRIES,
+    TopicDerivationResult,
+    TopicDeriver,
+    // Functions
+    encode_digest_for_topic,
+    sanitize_segment,
 };
