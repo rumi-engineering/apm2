@@ -176,6 +176,7 @@ fn parse_owner_repo(remote_url: &str) -> Result<String> {
 ///
 /// * `ticket_id` - Optional ticket ID. If None, uses current branch.
 /// * `dry_run` - If true, preview without making API calls
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
 ///
 /// # Errors
 ///
@@ -183,8 +184,14 @@ fn parse_owner_repo(remote_url: &str) -> Result<String> {
 /// - The ticket/branch has no PR
 /// - The PR is not open (closed/merged/missing)
 /// - The API calls fail
-pub fn approve(ticket_id: Option<&str>, dry_run: bool) -> Result<()> {
+pub fn approve(ticket_id: Option<&str>, dry_run: bool, emit_internal: bool) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
+
+    // TCK-00295: Check if internal emission is enabled (flag or env var)
+    let should_emit_internal = emit_internal || crate::util::emit_internal_from_env();
+    if should_emit_internal {
+        println!("  [TCK-00295] Internal receipt emission enabled");
+    }
 
     println!("Security Review: APPROVE");
     if let Some(id) = ticket_id {
@@ -235,6 +242,30 @@ pub fn approve(ticket_id: Option<&str>, dry_run: bool) -> Result<()> {
 
         println!("\nSecurity review approval complete!");
         println!("  Status: {STATUS_CONTEXT} = success");
+
+        // TCK-00295: Optionally emit internal receipt (non-blocking)
+        if should_emit_internal {
+            println!("\n  [EMIT_INTERNAL] Attempting internal receipt emission...");
+            let payload = serde_json::json!({
+                "ticket_id": pr.ticket_id,
+                "pr_url": pr.pr_url,
+                "owner_repo": pr.owner_repo,
+                "pr_number": pr.pr_number,
+                "head_sha": head_sha,
+                "verdict": "approved",
+                "non_authoritative": true,
+            });
+            let correlation_id = format!("security-approve-{}-{}", pr.pr_number, head_sha);
+
+            // Non-blocking: errors are logged but don't fail the command
+            if let Err(e) = crate::util::try_emit_internal_receipt(
+                "security.review.approved",
+                payload.to_string().as_bytes(),
+                &correlation_id,
+            ) {
+                eprintln!("  [EMIT_INTERNAL] Warning: Failed to emit internal receipt: {e}");
+            }
+        }
     }
 
     Ok(())
@@ -247,6 +278,7 @@ pub fn approve(ticket_id: Option<&str>, dry_run: bool) -> Result<()> {
 /// * `ticket_id` - Optional ticket ID. If None, uses current branch.
 /// * `reason` - The reason for denial
 /// * `dry_run` - If true, preview without making API calls
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
 ///
 /// # Errors
 ///
@@ -254,8 +286,16 @@ pub fn approve(ticket_id: Option<&str>, dry_run: bool) -> Result<()> {
 /// - The ticket/branch has no PR
 /// - The PR is not open (closed/merged/missing)
 /// - The API calls fail
-pub fn deny(ticket_id: Option<&str>, reason: &str, dry_run: bool) -> Result<()> {
+pub fn deny(
+    ticket_id: Option<&str>,
+    reason: &str,
+    dry_run: bool,
+    emit_internal: bool,
+) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
+
+    // TCK-00295: Check if internal emission is enabled (flag or env var)
+    let should_emit_internal = emit_internal || crate::util::emit_internal_from_env();
 
     // If reason is "-", read from stdin [SECURITY: CTR-2616 - Safe Piping]
     let actual_reason = if reason == "-" {
@@ -327,6 +367,31 @@ pub fn deny(ticket_id: Option<&str>, reason: &str, dry_run: bool) -> Result<()> 
 
         println!("\nSecurity review denial complete!");
         println!("  Status: {STATUS_CONTEXT} = failure");
+
+        // TCK-00295: Optionally emit internal receipt (non-blocking)
+        if should_emit_internal {
+            println!("\n  [EMIT_INTERNAL] Attempting internal receipt emission...");
+            let payload = serde_json::json!({
+                "ticket_id": pr.ticket_id,
+                "pr_url": pr.pr_url,
+                "owner_repo": pr.owner_repo,
+                "pr_number": pr.pr_number,
+                "head_sha": head_sha,
+                "verdict": "denied",
+                "reason": actual_reason,
+                "non_authoritative": true,
+            });
+            let correlation_id = format!("security-deny-{}-{}", pr.pr_number, head_sha);
+
+            // Non-blocking: errors are logged but don't fail the command
+            if let Err(e) = crate::util::try_emit_internal_receipt(
+                "security.review.denied",
+                payload.to_string().as_bytes(),
+                &correlation_id,
+            ) {
+                eprintln!("  [EMIT_INTERNAL] Warning: Failed to emit internal receipt: {e}");
+            }
+        }
     }
 
     Ok(())

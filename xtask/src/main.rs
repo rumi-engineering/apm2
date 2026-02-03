@@ -164,6 +164,20 @@ enum Commands {
         /// Supported values: `gemini`, `claude-code`.
         #[arg(long, value_parser = parse_ai_tool)]
         ai_tool: Option<aat::tool_config::AiTool>,
+
+        /// Emit internal receipts/events to daemon (TCK-00295).
+        ///
+        /// When enabled, xtask will attempt to emit internal receipts to the
+        /// daemon. If the daemon is unavailable, xtask continues without
+        /// blocking.
+        ///
+        /// Also enabled via `XTASK_EMIT_INTERNAL=true` environment variable.
+        ///
+        /// NOTE: Internal emission is NON-AUTHORITATIVE scaffolding only.
+        /// Per RFC-0018, these events are hints only and must not be used
+        /// for admission decisions without ledger+CAS verification.
+        #[arg(long)]
+        emit_internal: bool,
     },
 
     /// Check for anti-patterns in the codebase.
@@ -209,6 +223,17 @@ enum SecurityReviewExecCommands {
         /// Preview what would happen without making API calls
         #[arg(long)]
         dry_run: bool,
+        /// Emit internal receipts/events to daemon (TCK-00295).
+        ///
+        /// When enabled, xtask will attempt to emit internal receipts to the
+        /// daemon. If the daemon is unavailable, xtask continues without
+        /// blocking.
+        ///
+        /// Also enabled via `XTASK_EMIT_INTERNAL=true` environment variable.
+        ///
+        /// NOTE: Internal emission is NON-AUTHORITATIVE scaffolding only.
+        #[arg(long)]
+        emit_internal: bool,
     },
     /// Deny the PR (set ai-review/security to failure).
     ///
@@ -223,6 +248,17 @@ enum SecurityReviewExecCommands {
         /// Preview what would happen without making API calls
         #[arg(long)]
         dry_run: bool,
+        /// Emit internal receipts/events to daemon (TCK-00295).
+        ///
+        /// When enabled, xtask will attempt to emit internal receipts to the
+        /// daemon. If the daemon is unavailable, xtask continues without
+        /// blocking.
+        ///
+        /// Also enabled via `XTASK_EMIT_INTERNAL=true` environment variable.
+        ///
+        /// NOTE: Internal emission is NON-AUTHORITATIVE scaffolding only.
+        #[arg(long)]
+        emit_internal: bool,
     },
     /// Show required reading for security reviewers.
     ///
@@ -242,6 +278,17 @@ enum ReviewCommands {
     Security {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,
+        /// Emit internal receipts/events to daemon (TCK-00295).
+        ///
+        /// When enabled, xtask will attempt to emit internal receipts to the
+        /// daemon. If the daemon is unavailable, xtask continues without
+        /// blocking.
+        ///
+        /// Also enabled via `XTASK_EMIT_INTERNAL=true` environment variable.
+        ///
+        /// NOTE: Internal emission is NON-AUTHORITATIVE scaffolding only.
+        #[arg(long)]
+        emit_internal: bool,
     },
 
     /// Run code quality review using Codex.
@@ -252,6 +299,17 @@ enum ReviewCommands {
     Quality {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,
+        /// Emit internal receipts/events to daemon (TCK-00295).
+        ///
+        /// When enabled, xtask will attempt to emit internal receipts to the
+        /// daemon. If the daemon is unavailable, xtask continues without
+        /// blocking.
+        ///
+        /// Also enabled via `XTASK_EMIT_INTERNAL=true` environment variable.
+        ///
+        /// NOTE: Internal emission is NON-AUTHORITATIVE scaffolding only.
+        #[arg(long)]
+        emit_internal: bool,
     },
 
     /// Run UAT (User Acceptance Testing) sign-off.
@@ -261,6 +319,17 @@ enum ReviewCommands {
     Uat {
         /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
         pr_url: String,
+        /// Emit internal receipts/events to daemon (TCK-00295).
+        ///
+        /// When enabled, xtask will attempt to emit internal receipts to the
+        /// daemon. If the daemon is unavailable, xtask continues without
+        /// blocking.
+        ///
+        /// Also enabled via `XTASK_EMIT_INTERNAL=true` environment variable.
+        ///
+        /// NOTE: Internal emission is NON-AUTHORITATIVE scaffolding only.
+        #[arg(long)]
+        emit_internal: bool,
     },
 }
 
@@ -281,26 +350,44 @@ fn main() -> Result<()> {
         Commands::Check { watch } => tasks::check(watch),
         Commands::Finish => tasks::finish(),
         Commands::Review { review_type } => match review_type {
-            ReviewCommands::Security { pr_url } => tasks::review_security(&pr_url),
-            ReviewCommands::Quality { pr_url } => tasks::review_quality(&pr_url),
-            ReviewCommands::Uat { pr_url } => tasks::review_uat(&pr_url),
+            ReviewCommands::Security {
+                pr_url,
+                emit_internal,
+            } => tasks::review_security(&pr_url, emit_internal),
+            ReviewCommands::Quality {
+                pr_url,
+                emit_internal,
+            } => tasks::review_quality(&pr_url, emit_internal),
+            ReviewCommands::Uat {
+                pr_url,
+                emit_internal,
+            } => tasks::review_uat(&pr_url, emit_internal),
         },
         Commands::SecurityReviewExec { action } => match action {
-            SecurityReviewExecCommands::Approve { ticket_id, dry_run } => {
-                tasks::security_review_exec_approve(ticket_id.as_deref(), dry_run)
-            },
+            SecurityReviewExecCommands::Approve {
+                ticket_id,
+                dry_run,
+                emit_internal,
+            } => tasks::security_review_exec_approve(ticket_id.as_deref(), dry_run, emit_internal),
             SecurityReviewExecCommands::Deny {
                 ticket_id,
                 reason,
                 dry_run,
-            } => tasks::security_review_exec_deny(ticket_id.as_deref(), &reason, dry_run),
+                emit_internal,
+            } => tasks::security_review_exec_deny(
+                ticket_id.as_deref(),
+                &reason,
+                dry_run,
+                emit_internal,
+            ),
             SecurityReviewExecCommands::Onboard => tasks::security_review_exec_onboard(),
         },
         Commands::Aat {
             pr_url,
             dry_run,
             ai_tool,
-        } => tasks::aat(&pr_url, dry_run, ai_tool),
+            emit_internal,
+        } => tasks::aat(&pr_url, dry_run, ai_tool, emit_internal),
         Commands::Lint(args) => tasks::lint::run(args),
         Commands::Capabilities(args) => tasks::capabilities::run(args),
         Commands::Selftest(args) => tasks::selftest::run(&args),
