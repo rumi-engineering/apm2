@@ -19,7 +19,7 @@ protocol:
 variables:
   TICKET_ID_OPTIONAL: "$1"
 
-references[18]:
+references[19]:
   - path: references/ticket-workflow.md
     purpose: "Primary decision tree for new ticket vs existing PR follow-up."
   - path: references/commands.md
@@ -36,12 +36,12 @@ references[18]:
     purpose: "Mode #65: Deontic (Authority) Reasoning"
   - path: "@documents/skills/modes-of-reasoning/artifacts/80-debiasing-epistemic-hygiene.json"
     purpose: "Mode #80: Debiasing / Epistemic Hygiene"
-  - path: "@documents/skills/laws-of-holonic-agent-systems/references/agent-native-software/SKILL.md"
-    purpose: "Agent-Native Software: Industry Textbook"
   - path: "@documents/security/AGENTS.md"
     purpose: "Security Documentation"
   - path: "@documents/skills/rust-standards/references/15_errors_panics_diagnostics.md"
     purpose: "RS-15: Errors, Panics, Diagnostics"
+  - path: "@documents/skills/rust-standards/references/20_testing_evidence_and_ci.md"
+    purpose: "RS-20: Testing Evidence and CI"
   - path: "@documents/skills/rust-standards/references/25_api_design_stdlib_quality.md"
     purpose: "RS-25: API Design"
   - path: "@documents/skills/rust-standards/references/27_collections_allocation_models.md"

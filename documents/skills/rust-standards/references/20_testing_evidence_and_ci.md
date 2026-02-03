@@ -80,6 +80,62 @@ reject_tests_that:
     on_match:
       severity: MAJOR
       remediation: "Test against specification, not implementation"
+
+  - id: ANTITEST-SIM-E2E
+    pattern: "E2E test simulates required runtime path (mock/stub/log-only)"
+    on_match:
+      severity: MAJOR
+      remediation: "Exercise real runtime path or add explicit waiver"
+```
+
+---
+
+## State: Runtime-Path Evidence Requirements
+
+```yaml
+requirements:
+  - id: TEST-RUNTIME-001
+    predicate: |
+      IF requirement_claims.runtime_path THEN
+        test_executes_real_runtime_path
+    on_fail:
+      severity: MAJOR
+      remediation: "Exercise real runtime path; mocks only with explicit waiver"
+
+  - id: TEST-LEDGER-001
+    predicate: |
+      IF requirement_claims.ledger_anchored THEN
+        test.appends_via_append_verified AND
+        test.reads_back AND
+        test.verifies_signature
+    on_fail:
+      severity: MAJOR
+      remediation: "Append via append_verified, read back, and verify signature"
+
+  - id: TEST-CAS-001
+    predicate: |
+      IF requirement_claims.cas_artifact THEN
+        test.stores_to_cas AND
+        test.retrieves_and_validates_hash
+    on_fail:
+      severity: MAJOR
+      remediation: "Store artifact in CAS and verify retrieval + hash match"
+```
+
+---
+
+## State: Evidence Traceability
+
+```yaml
+requirements:
+  - id: TEST-TRACE-001
+    predicate: |
+      FOR EACH bound_requirement:
+        test_matrix.references(requirement) AND
+        evidence_artifact.references(test)
+    on_fail:
+      severity: MAJOR
+      remediation: "Add requirement->test->evidence mapping (table or artifact)"
 ```
 
 ---
@@ -137,6 +193,21 @@ loom_tests:
 proposal_rule:
   IF tools_not_in_ci AND risk_justifies:
     action: "Propose as follow-on gate"
+```
+
+---
+
+## State: Security Negative Tests
+
+```yaml
+requirements:
+  - id: TEST-SEC-NEG-001
+    predicate: |
+      IF requirement_claims.security_invariant THEN
+        negative_test_exists_for_rejection_path
+    on_fail:
+      severity: MAJOR
+      remediation: "Add negative test proving rejection of invalid input"
 ```
 
 ---
