@@ -149,6 +149,17 @@ structural_checks:
     remediation:
       type: DOC
       specification: "Decompose into smaller PRs (< 500 lines, < 15 files)"
+
+  - id: STRUCT-006
+    name: "Simulated runtime evidence"
+    predicate: |
+      diff.tests_claim_runtime_path AND
+      diff.tests_are_simulated
+    severity: BLOCKER
+    message: "E2E test simulates required runtime path"
+    remediation:
+      type: TEST
+      specification: "Exercise real runtime path or add explicit waiver"
 ```
 
 ---
@@ -222,6 +233,14 @@ quick_scan_checklist:
     - "clippy.toml"
     - "[features]"
     - "[dependencies]"
+
+  evidence_simulation:
+    - "MockTool"
+    - "FakeTool"
+    - "Simulated"
+    - "simulate"
+    - "stub"
+    - "dry run"
 
   hard_coded:
     - "std::fs::"
