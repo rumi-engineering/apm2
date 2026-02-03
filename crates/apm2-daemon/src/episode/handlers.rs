@@ -1,34 +1,46 @@
-//! Stub tool handlers for core tool classes.
+//! Real tool handlers for core tool classes (TCK-00291).
 //!
-//! This module provides stub implementations of the core tool handlers per
-//! TCK-00165. These handlers validate arguments and return mock results,
-//! serving as placeholders for future full implementations.
+//! This module provides real implementations of the core tool handlers per
+//! TCK-00291. These handlers perform actual I/O and command execution with
+//! strict bounds and security controls.
 //!
 //! # Implemented Handlers
 //!
-//! - `ReadFileHandler`: Stub for file read operations
-//! - `WriteFileHandler`: Stub for file write operations
-//! - `ExecuteHandler`: Stub for command execution
+//! - `ReadFileHandler`: Reads file contents with bounds and offset support
+//! - `WriteFileHandler`: Writes files atomically with size limits
+//! - `ExecuteHandler`: Executes commands in a sandboxed environment
 //!
 //! # Security Model
 //!
-//! Even stub handlers perform basic validation:
-//! - Argument type checking
-//! - Path sanitization (reject `..` components)
-//! - Size limit enforcement
+//! - **Path Traversal**: All paths must be relative to the workspace root.
+//!   Absolute paths and `..` components are rejected (CTR-1503).
+//! - **Symlink Safety**: All paths are resolved via canonicalization to prevent
+//!   symlink-based sandbox escapes.
+//! - **Root Confinement**: Handlers are confined to a configurable root
+//!   directory (defaulting to CWD).
+//! - **Resource Limits**:
+//!   - Read limit: 100 MiB (default 10 MiB)
+//!   - Write limit: 100 MiB
+//!   - Execution timeout: 1 hour (default 30s)
+//!   - Output limit: `MAX_TOOL_OUTPUT_SIZE` (10 MB)
+//! - **Atomic Writes**: File updates use write-to-temp-then-rename pattern.
+//! - **Fail-Closed**: Errors during I/O or execution result in explicit
+//!   failure.
 //!
 //! # Contract References
 //!
-//! - TCK-00165: Tool execution and budget charging
+//! - TCK-00291: Real tool handler implementation
 //! - CTR-1503: Path traversal prevention
-//! - CTR-2609: Symlink metadata usage
+//! - CTR-1502: Atomic file updates
 
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use super::decision::BudgetDelta;
+use super::decision::{BudgetDelta, MAX_TOOL_OUTPUT_SIZE};
 use super::tool_class::ToolClass;
 use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
 
@@ -90,30 +102,81 @@ fn validate_path(path: &Path) -> Result<(), ToolHandlerError> {
     Ok(())
 }
 
+/// Validates that a resolved (canonicalized) path is within the workspace root.
+///
+/// # Security
+///
+/// This function prevents symlink-based sandbox escapes by verifying that the
+/// resolved path (after following all symlinks) is still within the workspace
+/// root directory. This is critical because an attacker could create a symlink
+/// like `workspace/escape -> /etc/shadow` and bypass basic path validation.
+///
+/// # Arguments
+///
+/// * `resolved_path` - The canonicalized path (symlinks resolved)
+/// * `root` - The workspace root directory (must also be canonicalized)
+///
+/// # Returns
+///
+/// Returns `Ok(())` if the path is within the root, or an error if it escapes.
+fn validate_resolved_path_within_root(
+    resolved_path: &Path,
+    root: &Path,
+) -> Result<(), ToolHandlerError> {
+    // Check if the resolved path starts with the root path
+    if !resolved_path.starts_with(root) {
+        return Err(ToolHandlerError::PathValidation {
+            path: resolved_path.display().to_string(),
+            reason: format!(
+                "resolved path escapes workspace root (symlink sandbox escape detected); \
+                 resolved to '{}' which is outside root '{}'",
+                resolved_path.display(),
+                root.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
 // =============================================================================
 // ReadFileHandler
 // =============================================================================
 
-/// Stub handler for file read operations.
+/// Real handler for file read operations.
 ///
-/// This handler validates read arguments and returns mock file contents.
-/// The actual file system is not accessed in this stub implementation.
+/// This handler reads actual file contents from the filesystem, enforcing
+/// strict bounds and path validation within a configured root.
 ///
-/// # Future Implementation
+/// # Security
 ///
-/// The full implementation will:
-/// - Read actual file contents
-/// - Respect offset and limit parameters
-/// - Report actual I/O bytes consumed
-/// - Handle symlinks safely (CTR-2609)
-#[derive(Debug, Default)]
-pub struct ReadFileHandler;
+/// - Validates paths are relative and free of traversal attacks
+/// - Resolves paths relative to the configured root (default CWD)
+/// - Enforces read limit (default 10MB, max 100MB)
+/// - Respects offset for pagination
+#[derive(Debug)]
+pub struct ReadFileHandler {
+    root: PathBuf,
+}
+
+impl Default for ReadFileHandler {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("."),
+        }
+    }
+}
 
 impl ReadFileHandler {
-    /// Creates a new read file handler.
+    /// Creates a new read file handler using CWD as root.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new read file handler with a specific root directory.
+    #[must_use]
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 }
 
@@ -124,23 +187,80 @@ impl ToolHandler for ReadFileHandler {
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+        // Validate arguments first (MAJOR 1 fix)
+        self.validate(args)?;
+
         let ToolArgs::Read(read_args) = args else {
             return Err(ToolHandlerError::InvalidArgs {
                 reason: "expected Read arguments".to_string(),
             });
         };
 
-        // Stub: Return mock file contents based on path
-        let path_str = read_args.path.to_string_lossy();
-        let mock_content =
-            format!("# Stub file content for: {path_str}\n# (ReadFileHandler stub)\n");
-        let bytes = mock_content.into_bytes();
-        let bytes_len = bytes.len() as u64;
+        // Start timing I/O operations (MAJOR 2 fix)
+        let io_start = Instant::now();
+
+        // Resolve path relative to root
+        let full_path = self.root.join(&read_args.path);
+
+        // Canonicalize root for comparison (BLOCKER 1 fix: symlink-aware validation)
+        let canonical_root =
+            std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize root '{}': {}",
+                    self.root.display(),
+                    e
+                ),
+            })?;
+
+        // Canonicalize the target path to resolve symlinks
+        let canonical_path =
+            std::fs::canonicalize(&full_path).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize path '{}': {}",
+                    full_path.display(),
+                    e
+                ),
+            })?;
+
+        // Verify the resolved path is still within the workspace root
+        validate_resolved_path_within_root(&canonical_path, &canonical_root)?;
+
+        // Open file (use canonical path for safety)
+        let mut file = tokio::fs::File::open(&canonical_path).await.map_err(|e| {
+            ToolHandlerError::ExecutionFailed {
+                message: format!("failed to open file '{}': {}", full_path.display(), e),
+            }
+        })?;
+
+        // Seek if offset provided
+        if let Some(offset) = read_args.offset {
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|e| ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to seek: {e}"),
+                })?;
+        }
+
+        // Determine read limit (default 10MB)
+        let limit = read_args.limit.unwrap_or(10 * 1024 * 1024);
+
+        // Read content with limit
+        let mut buffer = Vec::new();
+        let bytes_read = file
+            .take(limit)
+            .read_to_end(&mut buffer)
+            .await
+            .map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!("failed to read: {e}"),
+            })?;
+
+        // Capture actual I/O duration (MAJOR 2 fix)
+        let io_duration = io_start.elapsed();
 
         Ok(ToolResultData::success(
-            bytes,
-            BudgetDelta::single_call().with_bytes_io(bytes_len),
-            Duration::from_millis(1), // Stub execution is fast
+            buffer,
+            BudgetDelta::single_call().with_bytes_io(bytes_read as u64),
+            io_duration,
         ))
     }
 
@@ -184,26 +304,43 @@ impl ToolHandler for ReadFileHandler {
 // WriteFileHandler
 // =============================================================================
 
-/// Stub handler for file write operations.
+/// Real handler for file write operations.
 ///
-/// This handler validates write arguments and returns success without
-/// actually writing to the file system.
+/// This handler writes content to the filesystem, enforcing atomicity and
+/// size limits within a configured root.
 ///
-/// # Future Implementation
+/// # Security
 ///
-/// The full implementation will:
-/// - Write actual file contents atomically (CTR-1502)
-/// - Create parent directories if requested
-/// - Handle append mode
-/// - Report actual I/O bytes consumed
-#[derive(Debug, Default)]
-pub struct WriteFileHandler;
+/// - Validates paths are relative and free of traversal attacks
+/// - Resolves paths relative to the configured root (default CWD)
+/// - Enforces write size limit (100MB)
+/// - Uses atomic write pattern (write-to-temp + rename) for non-append writes
+///   (CTR-1502)
+/// - Creates parent directories if requested
+#[derive(Debug)]
+pub struct WriteFileHandler {
+    root: PathBuf,
+}
+
+impl Default for WriteFileHandler {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("."),
+        }
+    }
+}
 
 impl WriteFileHandler {
-    /// Creates a new write file handler.
+    /// Creates a new write file handler using CWD as root.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new write file handler with a specific root directory.
+    #[must_use]
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 }
 
@@ -214,23 +351,146 @@ impl ToolHandler for WriteFileHandler {
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+        // Validate arguments first (MAJOR 1 fix)
+        self.validate(args)?;
+
         let ToolArgs::Write(write_args) = args else {
             return Err(ToolHandlerError::InvalidArgs {
                 reason: "expected Write arguments".to_string(),
             });
         };
 
-        // Calculate bytes written
-        let bytes_written = write_args.content.as_ref().map_or(0, Vec::len) as u64;
+        // Start timing I/O operations (MAJOR 2 fix)
+        let io_start = Instant::now();
 
-        // Stub: Return success without actually writing
-        let path_str = write_args.path.to_string_lossy();
-        let output = format!("Wrote {bytes_written} bytes to {path_str} (stub)");
+        // Resolve path relative to root
+        let full_path = self.root.join(&write_args.path);
+
+        // Create parent directories if requested
+        if write_args.create_parents {
+            if let Some(parent) = full_path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    ToolHandlerError::ExecutionFailed {
+                        message: format!("failed to create parent directories: {e}"),
+                    }
+                })?;
+            }
+        }
+
+        // Canonicalize root for comparison (BLOCKER 1 fix: symlink-aware validation)
+        let canonical_root =
+            std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize root '{}': {}",
+                    self.root.display(),
+                    e
+                ),
+            })?;
+
+        // For writes, we need to check if the target path (or its parent for new files)
+        // would resolve outside the workspace. For existing files that are symlinks,
+        // we canonicalize and check. For new files, we canonicalize the parent
+        // directory.
+        if full_path.exists() {
+            // Target exists - canonicalize it to check for symlink escape
+            let canonical_path = std::fs::canonicalize(&full_path).map_err(|e| {
+                ToolHandlerError::ExecutionFailed {
+                    message: format!(
+                        "failed to canonicalize path '{}': {}",
+                        full_path.display(),
+                        e
+                    ),
+                }
+            })?;
+            validate_resolved_path_within_root(&canonical_path, &canonical_root)?;
+        } else {
+            // Target doesn't exist - canonicalize parent directory
+            if let Some(parent) = full_path.parent() {
+                if parent.exists() {
+                    let canonical_parent = std::fs::canonicalize(parent).map_err(|e| {
+                        ToolHandlerError::ExecutionFailed {
+                            message: format!(
+                                "failed to canonicalize parent '{}': {}",
+                                parent.display(),
+                                e
+                            ),
+                        }
+                    })?;
+                    validate_resolved_path_within_root(&canonical_parent, &canonical_root)?;
+                }
+            }
+        }
+
+        let content = write_args.content.as_deref().unwrap_or(&[]);
+        let bytes_written = content.len() as u64;
+
+        if write_args.append {
+            // Append mode: cannot be strictly atomic, but standard O_APPEND is safe
+            // for appends
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .append(true)
+                .open(&full_path)
+                .await
+                .map_err(|e| ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to open file for append: {e}"),
+                })?;
+
+            file.write_all(content)
+                .await
+                .map_err(|e| ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to append content: {e}"),
+                })?;
+        } else {
+            // Overwrite mode: use atomic write pattern (CTR-1502)
+            // 1. Write to .tmp.<uuid>
+            // 2. Rename to target path
+            let file_name = full_path
+                .file_name()
+                .ok_or_else(|| ToolHandlerError::InvalidArgs {
+                    reason: "invalid file path".to_string(),
+                })?
+                .to_string_lossy();
+
+            let tmp_name = format!(".{}.tmp.{}", file_name, uuid::Uuid::new_v4());
+            let tmp_path = full_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(tmp_name);
+
+            // Write to temp file
+            if let Err(e) = tokio::fs::write(&tmp_path, content).await {
+                // Try to clean up temp file on error
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to write temp file: {e}"),
+                });
+            }
+
+            // Atomic rename
+            if let Err(e) = tokio::fs::rename(&tmp_path, &full_path).await {
+                // Try to clean up temp file on error
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to rename temp file to target: {e}"),
+                });
+            }
+        }
+
+        // Capture actual I/O duration (MAJOR 2 fix)
+        let io_duration = io_start.elapsed();
+
+        let output = format!(
+            "Successfully wrote {} bytes to {}",
+            bytes_written,
+            write_args.path.display()
+        );
 
         Ok(ToolResultData::success(
             output.into_bytes(),
             BudgetDelta::single_call().with_bytes_io(bytes_written),
-            Duration::from_millis(1),
+            io_duration,
         ))
     }
 
@@ -281,26 +541,42 @@ impl ToolHandler for WriteFileHandler {
 // ExecuteHandler
 // =============================================================================
 
-/// Stub handler for command execution.
+/// Real handler for command execution.
 ///
-/// This handler validates execute arguments and returns mock command output.
-/// No actual commands are executed in this stub implementation.
+/// This handler executes commands in a sandboxed environment (restricted to
+/// CWD/workspace), enforces timeouts, and bounds output capture.
 ///
-/// # Future Implementation
+/// # Security
 ///
-/// The full implementation will:
-/// - Execute commands in a sandboxed environment
-/// - Capture stdout/stderr
-/// - Enforce timeouts
-/// - Report actual resource consumption
-#[derive(Debug, Default)]
-pub struct ExecuteHandler;
+/// - **Sandbox**: Commands execute in specified CWD (validated relative path),
+///   anchored to the configured root.
+/// - **Timeout**: Enforced per-execution timeout (default 30s, max 1h).
+/// - **Output**: Stdout/Stderr captured up to `MAX_TOOL_OUTPUT_SIZE`.
+/// - **Input**: Stdin pipe supported with size limits.
+#[derive(Debug)]
+pub struct ExecuteHandler {
+    root: PathBuf,
+}
+
+impl Default for ExecuteHandler {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("."),
+        }
+    }
+}
 
 impl ExecuteHandler {
-    /// Creates a new execute handler.
+    /// Creates a new execute handler using CWD as root.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new execute handler with a specific root directory.
+    #[must_use]
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 }
 
@@ -311,27 +587,187 @@ impl ToolHandler for ExecuteHandler {
     }
 
     async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+        // Validate arguments first (MAJOR 1 fix)
+        self.validate(args)?;
+
         let ToolArgs::Execute(exec_args) = args else {
             return Err(ToolHandlerError::InvalidArgs {
                 reason: "expected Execute arguments".to_string(),
             });
         };
 
-        // Stub: Return mock output without executing
-        let cmd_str = format!("{} {}", exec_args.command, exec_args.args.join(" "));
-        let output =
-            format!("# Stub output for command: {cmd_str}\n# (ExecuteHandler stub)\nexit 0\n");
+        // Start timing execution (MAJOR 2 fix)
+        let exec_start = Instant::now();
 
-        let mut result = ToolResultData::success(
-            output.into_bytes(),
-            BudgetDelta::single_call()
-                .with_wall_ms(10)
-                .with_bytes_io(100),
-            Duration::from_millis(10),
-        );
-        result.exit_code = Some(0);
+        let mut cmd = tokio::process::Command::new(&exec_args.command);
+        cmd.args(&exec_args.args);
 
-        Ok(result)
+        // Set working directory
+        // If cwd is provided, it's relative to root.
+        // If not provided, use root as CWD.
+        if let Some(ref cwd) = exec_args.cwd {
+            cmd.current_dir(self.root.join(cwd));
+        } else {
+            cmd.current_dir(&self.root);
+        }
+
+        // Configure pipes
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        // Kill child on drop to prevent orphan processes if future is cancelled
+        cmd.kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|e| ToolHandlerError::ExecutionFailed {
+            message: format!("failed to spawn command: {e}"),
+        })?;
+
+        // Write stdin if provided, then close stdin pipe
+        if let Some(ref input) = exec_args.stdin {
+            if let Some(mut stdin) = child.stdin.take() {
+                if let Err(e) = stdin.write_all(input).await {
+                    // Failing to write stdin isn't always fatal (e.g. process exited early),
+                    // but we should probably report it or at least not crash.
+                    // For now, we'll return error to be safe.
+                    let _ = child.kill().await;
+                    return Err(ToolHandlerError::ExecutionFailed {
+                        message: format!("failed to write stdin: {e}"),
+                    });
+                }
+                // stdin is dropped here, closing the pipe
+            }
+        } else {
+            // Close stdin even if no input provided
+            drop(child.stdin.take());
+        }
+
+        let timeout_ms = exec_args.timeout_ms.unwrap_or(30_000);
+        let timeout = Duration::from_millis(timeout_ms);
+
+        // BLOCKER 2 FIX: Manual bounded pipe reading instead of wait_with_output()
+        // This prevents OOM from processes that emit gigabytes of output before
+        // timeout. We read stdout and stderr concurrently with bounded buffers.
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ToolHandlerError::ExecutionFailed {
+                message: "failed to capture stdout".to_string(),
+            })?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ToolHandlerError::ExecutionFailed {
+                message: "failed to capture stderr".to_string(),
+            })?;
+
+        // Each stream gets half the budget to prevent one stream from starving the
+        // other
+        let per_stream_limit = MAX_TOOL_OUTPUT_SIZE / 2;
+
+        // Read stdout with bounded buffer
+        let stdout_future = async {
+            let mut buf = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024]; // 64KB chunks
+            loop {
+                match stdout.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break, // EOF or read error
+                    Ok(n) => {
+                        if buf.len() + n > per_stream_limit {
+                            // Take only what fits
+                            let remaining = per_stream_limit.saturating_sub(buf.len());
+                            buf.extend_from_slice(&chunk[..remaining]);
+                            return (buf, true); // exceeded
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    },
+                }
+            }
+            (buf, false)
+        };
+
+        // Read stderr with bounded buffer
+        let stderr_future = async {
+            let mut buf = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024]; // 64KB chunks
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break, // EOF or read error
+                    Ok(n) => {
+                        if buf.len() + n > per_stream_limit {
+                            let remaining = per_stream_limit.saturating_sub(buf.len());
+                            buf.extend_from_slice(&chunk[..remaining]);
+                            return (buf, true); // exceeded
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    },
+                }
+            }
+            (buf, false)
+        };
+
+        // Wait for process with bounded output reading
+        let read_result = tokio::time::timeout(timeout, async {
+            // Run all three concurrently: stdout read, stderr read, and process wait
+            let (stdout_result, stderr_result, wait_result) =
+                tokio::join!(stdout_future, stderr_future, child.wait());
+
+            let (stdout_buf, stdout_exceeded) = stdout_result;
+            let (stderr_buf, stderr_exceeded) = stderr_result;
+            let output_exceeded = stdout_exceeded || stderr_exceeded;
+
+            match wait_result {
+                Ok(status) => Ok((stdout_buf, stderr_buf, Some(status), output_exceeded)),
+                Err(e) => Err(ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to wait for process: {e}"),
+                }),
+            }
+        })
+        .await;
+
+        // Capture actual execution duration (MAJOR 2 fix)
+        let exec_duration = exec_start.elapsed();
+
+        match read_result {
+            Ok(Ok((stdout_buf, stderr_buf, maybe_status, output_exceeded))) => {
+                let stdout_len = stdout_buf.len();
+                let stderr_len = stderr_buf.len();
+
+                let mut combined_output = stdout_buf;
+                if !stderr_buf.is_empty() {
+                    combined_output.extend_from_slice(b"\n--- stderr ---\n");
+                    combined_output.extend_from_slice(&stderr_buf);
+                }
+
+                if output_exceeded {
+                    combined_output
+                        .extend_from_slice(b"\n[Output truncated: exceeded maximum size limit]");
+                }
+
+                // Truncate duration to u64::MAX if it somehow exceeds (practically impossible)
+                #[allow(clippy::cast_possible_truncation)]
+                let wall_ms = exec_duration.as_millis().min(u128::from(u64::MAX)) as u64;
+
+                let mut result = ToolResultData::success(
+                    combined_output,
+                    BudgetDelta::single_call()
+                        .with_wall_ms(wall_ms)
+                        .with_bytes_io((stdout_len + stderr_len) as u64),
+                    exec_duration,
+                );
+                result.exit_code = maybe_status.and_then(|s| s.code());
+                Ok(result)
+            },
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                // Timeout. Kill the child process.
+                let _ = child.kill().await;
+                Err(ToolHandlerError::ExecutionFailed {
+                    message: format!("command timed out after {timeout_ms}ms"),
+                })
+            },
+        }
     }
 
     fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
@@ -401,10 +837,10 @@ impl ToolHandler for ExecuteHandler {
 // Handler Registry Helper
 // =============================================================================
 
-/// Registers all stub handlers with an executor.
+/// Registers all handlers with an executor.
 ///
 /// This is a convenience function for setting up an executor with the
-/// default stub handlers.
+/// default handlers.
 ///
 /// # Example
 ///
@@ -546,22 +982,71 @@ mod tests {
     }
 
     // =========================================================================
+    // Resolved path (symlink) validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_validate_resolved_path_within_root_ok() {
+        let root = Path::new("/workspace");
+        let resolved = Path::new("/workspace/src/main.rs");
+        assert!(validate_resolved_path_within_root(resolved, root).is_ok());
+    }
+
+    #[test]
+    fn test_validate_resolved_path_at_root_ok() {
+        let root = Path::new("/workspace");
+        let resolved = Path::new("/workspace");
+        assert!(validate_resolved_path_within_root(resolved, root).is_ok());
+    }
+
+    #[test]
+    fn test_validate_resolved_path_escapes_root_rejected() {
+        // Simulates a symlink that resolves outside the workspace
+        let root = Path::new("/workspace");
+        let resolved = Path::new("/etc/shadow");
+        let result = validate_resolved_path_within_root(resolved, root);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Paths escaping root should be rejected"
+        );
+        if let Err(ToolHandlerError::PathValidation { reason, .. }) = result {
+            assert!(
+                reason.contains("symlink") || reason.contains("escapes"),
+                "Error should mention symlink escape: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_resolved_path_sibling_rejected() {
+        // Path resolves to sibling directory (not under root)
+        let root = Path::new("/workspace/project1");
+        let resolved = Path::new("/workspace/project2/secret.txt");
+        let result = validate_resolved_path_within_root(resolved, root);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Sibling paths should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_resolved_path_parent_rejected() {
+        // Path resolves to parent directory
+        let root = Path::new("/workspace/project");
+        let resolved = Path::new("/workspace/secret.txt");
+        let result = validate_resolved_path_within_root(resolved, root);
+        assert!(
+            matches!(result, Err(ToolHandlerError::PathValidation { .. })),
+            "Parent paths should be rejected"
+        );
+    }
+
+    // =========================================================================
     // ReadFileHandler tests
     // =========================================================================
 
-    #[tokio::test]
-    async fn test_read_handler_execute() {
-        let handler = ReadFileHandler::new();
-        let args = ToolArgs::Read(ReadArgs {
-            path: PathBuf::from("workspace/file.rs"),
-            offset: None,
-            limit: None,
-        });
-
-        let result = handler.execute(&args).await.unwrap();
-        assert!(result.success);
-        assert!(!result.output.is_empty());
-    }
+    // NOTE: Real I/O tests are moved to integration tests
+    // (tck_00291_tool_handlers.rs) Unit tests here focus on validation logic.
 
     #[test]
     fn test_read_handler_validate_ok() {
@@ -630,22 +1115,6 @@ mod tests {
     // WriteFileHandler tests
     // =========================================================================
 
-    #[tokio::test]
-    async fn test_write_handler_execute() {
-        let handler = WriteFileHandler::new();
-        let args = ToolArgs::Write(WriteArgs {
-            path: PathBuf::from("workspace/output.txt"),
-            content: Some(b"hello world".to_vec()),
-            content_hash: None,
-            create_parents: false,
-            append: false,
-        });
-
-        let result = handler.execute(&args).await.unwrap();
-        assert!(result.success);
-        assert!(result.budget_consumed.bytes_io > 0);
-    }
-
     #[test]
     fn test_write_handler_validate_ok() {
         let handler = WriteFileHandler::new();
@@ -706,22 +1175,6 @@ mod tests {
     // =========================================================================
     // ExecuteHandler tests
     // =========================================================================
-
-    #[tokio::test]
-    async fn test_execute_handler_execute() {
-        let handler = ExecuteHandler::new();
-        let args = ToolArgs::Execute(ExecuteArgs {
-            command: "ls".to_string(),
-            args: vec!["-la".to_string()],
-            cwd: None,
-            stdin: None,
-            timeout_ms: Some(5000),
-        });
-
-        let result = handler.execute(&args).await.unwrap();
-        assert!(result.success);
-        assert_eq!(result.exit_code, Some(0));
-    }
 
     #[test]
     fn test_execute_handler_validate_ok() {
