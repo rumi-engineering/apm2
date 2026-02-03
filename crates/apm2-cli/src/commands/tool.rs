@@ -59,8 +59,12 @@ pub struct RequestArgs {
     /// Session token for authentication.
     ///
     /// Obtained from `apm2 episode spawn` response.
-    #[arg(long, required = true)]
-    pub session_token: String,
+    ///
+    /// **Security (CWE-214)**: Prefer setting the `APM2_SESSION_TOKEN`
+    /// environment variable instead of using this flag. CLI arguments
+    /// are visible in process listings on multi-user systems.
+    #[arg(long, env = "APM2_SESSION_TOKEN")]
+    pub session_token: Option<String>,
 
     /// Tool identifier (e.g., "`file_read`", "`shell_exec`").
     #[arg(long, required = true)]
@@ -119,15 +123,19 @@ pub fn run_tool(cmd: &ToolCommand, socket_path: &Path) -> u8 {
 
 /// Execute the request command.
 fn run_request(args: &RequestArgs, socket_path: &Path, json_output: bool) -> u8 {
-    // Validate session token
-    if args.session_token.is_empty() {
-        return output_error(
-            json_output,
-            "invalid_session_token",
-            "Session token cannot be empty",
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
+    // Resolve session token (CWE-214 mitigation: prefer env var over CLI arg)
+    let session_token = match &args.session_token {
+        Some(token) if !token.is_empty() => token.clone(),
+        _ => {
+            return output_error(
+                json_output,
+                "missing_session_token",
+                "Session token is required. Set APM2_SESSION_TOKEN environment variable \
+                 (preferred) or use --session-token flag.",
+                exit_codes::VALIDATION_ERROR,
+            );
+        },
+    };
 
     // Validate tool ID
     if args.tool_id.is_empty() {
@@ -172,7 +180,7 @@ fn run_request(args: &RequestArgs, socket_path: &Path, json_output: bool) -> u8 
     let result = rt.block_on(async {
         let mut client = SessionClient::connect(socket_path).await?;
         client
-            .request_tool(&args.session_token, &args.tool_id, &arguments, &dedupe_key)
+            .request_tool(&session_token, &args.tool_id, &arguments, &dedupe_key)
             .await
     });
 

@@ -139,8 +139,12 @@ pub struct PublishArgs {
     /// Session token for authentication.
     ///
     /// Obtained from `apm2 episode spawn` response.
-    #[arg(long, required = true)]
-    pub session_token: String,
+    ///
+    /// **Security (CWE-214)**: Prefer setting the `APM2_SESSION_TOKEN`
+    /// environment variable instead of using this flag. CLI arguments
+    /// are visible in process listings on multi-user systems.
+    #[arg(long, env = "APM2_SESSION_TOKEN")]
+    pub session_token: Option<String>,
 
     /// Evidence kind for categorization.
     #[arg(long, value_enum, default_value = "pty-transcript")]
@@ -196,15 +200,19 @@ pub fn run_evidence(cmd: &EvidenceCommand, socket_path: &Path) -> u8 {
 
 /// Execute the publish command.
 fn run_publish(args: &PublishArgs, socket_path: &Path, json_output: bool) -> u8 {
-    // Validate session token
-    if args.session_token.is_empty() {
-        return output_error(
-            json_output,
-            "invalid_session_token",
-            "Session token cannot be empty",
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
+    // Resolve session token (CWE-214 mitigation: prefer env var over CLI arg)
+    let session_token = match &args.session_token {
+        Some(token) if !token.is_empty() => token.clone(),
+        _ => {
+            return output_error(
+                json_output,
+                "missing_session_token",
+                "Session token is required. Set APM2_SESSION_TOKEN environment variable \
+                 (preferred) or use --session-token flag.",
+                exit_codes::VALIDATION_ERROR,
+            );
+        },
+    };
 
     // Read artifact content with bounded size (CTR-1603)
     let artifact = match read_bounded_file(&args.path, MAX_EVIDENCE_FILE_SIZE) {
@@ -235,7 +243,7 @@ fn run_publish(args: &PublishArgs, socket_path: &Path, json_output: bool) -> u8 
         let mut client = SessionClient::connect(socket_path).await?;
         client
             .publish_evidence(
-                &args.session_token,
+                &session_token,
                 &artifact,
                 args.kind.into(),
                 args.retention.into(),

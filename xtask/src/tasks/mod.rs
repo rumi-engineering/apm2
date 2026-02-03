@@ -107,35 +107,50 @@ pub fn finish() -> Result<()> {
 ///
 /// Delegates to the review module for the actual implementation.
 ///
+/// # Arguments
+///
+/// * `pr_url` - GitHub PR URL
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+///
 /// # Errors
 ///
 /// Returns an error if the review fails. See [`review::run_security`] for
 /// details.
-pub fn review_security(pr_url: &str) -> Result<()> {
-    review::run_security(pr_url)
+pub fn review_security(pr_url: &str, emit_internal: bool) -> Result<()> {
+    review::run_security(pr_url, emit_internal)
 }
 
 /// Run a code quality review for a PR.
 ///
 /// Delegates to the review module for the actual implementation.
 ///
+/// # Arguments
+///
+/// * `pr_url` - GitHub PR URL
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+///
 /// # Errors
 ///
 /// Returns an error if the review fails. See [`review::run_quality`] for
 /// details.
-pub fn review_quality(pr_url: &str) -> Result<()> {
-    review::run_quality(pr_url)
+pub fn review_quality(pr_url: &str, emit_internal: bool) -> Result<()> {
+    review::run_quality(pr_url, emit_internal)
 }
 
 /// Run a UAT sign-off for a PR.
 ///
 /// Delegates to the review module for the actual implementation.
 ///
+/// # Arguments
+///
+/// * `pr_url` - GitHub PR URL
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+///
 /// # Errors
 ///
 /// Returns an error if the review fails. See [`review::run_uat`] for details.
-pub fn review_uat(pr_url: &str) -> Result<()> {
-    review::run_uat(pr_url)
+pub fn review_uat(pr_url: &str, emit_internal: bool) -> Result<()> {
+    review::run_uat(pr_url, emit_internal)
 }
 
 /// Approve a PR after security review.
@@ -146,13 +161,18 @@ pub fn review_uat(pr_url: &str) -> Result<()> {
 ///
 /// * `ticket_id` - Optional ticket ID. If None, uses current branch.
 /// * `dry_run` - If true, preview without making API calls
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
 ///
 /// # Errors
 ///
 /// Returns an error if the PR is invalid or the API calls fail.
 /// See [`security_review_exec::approve`] for details.
-pub fn security_review_exec_approve(ticket_id: Option<&str>, dry_run: bool) -> Result<()> {
-    security_review_exec::approve(ticket_id, dry_run)
+pub fn security_review_exec_approve(
+    ticket_id: Option<&str>,
+    dry_run: bool,
+    emit_internal: bool,
+) -> Result<()> {
+    security_review_exec::approve(ticket_id, dry_run, emit_internal)
 }
 
 /// Deny a PR with a required reason.
@@ -164,6 +184,7 @@ pub fn security_review_exec_approve(ticket_id: Option<&str>, dry_run: bool) -> R
 /// * `ticket_id` - Optional ticket ID. If None, uses current branch.
 /// * `reason` - The reason for denial
 /// * `dry_run` - If true, preview without making API calls
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
 ///
 /// # Errors
 ///
@@ -173,8 +194,9 @@ pub fn security_review_exec_deny(
     ticket_id: Option<&str>,
     reason: &str,
     dry_run: bool,
+    emit_internal: bool,
 ) -> Result<()> {
-    security_review_exec::deny(ticket_id, reason, dry_run)
+    security_review_exec::deny(ticket_id, reason, dry_run, emit_internal)
 }
 
 /// Show required reading for security reviewers.
@@ -198,6 +220,7 @@ pub fn security_review_exec_onboard() -> Result<()> {
 /// * `pr_url` - GitHub PR URL
 /// * `dry_run` - If true, don't set status check or write evidence
 /// * `ai_tool_override` - Optional AI tool override from CLI flag
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
 ///
 /// # Returns
 ///
@@ -214,8 +237,9 @@ pub fn aat(
     pr_url: &str,
     dry_run: bool,
     ai_tool_override: Option<crate::aat::tool_config::AiTool>,
+    emit_internal: bool,
 ) -> Result<()> {
-    let result = aat::run(pr_url, dry_run, ai_tool_override)?;
+    let result = aat::run(pr_url, dry_run, ai_tool_override, emit_internal)?;
     // Exit with appropriate code based on verdict
     match result.verdict {
         crate::aat::types::Verdict::Passed => Ok(()),

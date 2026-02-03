@@ -58,8 +58,12 @@ pub struct EmitArgs {
     /// Session token for authentication.
     ///
     /// Obtained from `apm2 episode spawn` response.
-    #[arg(long, required = true)]
-    pub session_token: String,
+    ///
+    /// **Security (CWE-214)**: Prefer setting the `APM2_SESSION_TOKEN`
+    /// environment variable instead of using this flag. CLI arguments
+    /// are visible in process listings on multi-user systems.
+    #[arg(long, env = "APM2_SESSION_TOKEN")]
+    pub session_token: Option<String>,
 
     /// Event type identifier (e.g., "work.started", "tool.executed").
     #[arg(long, required = true)]
@@ -115,15 +119,19 @@ pub fn run_event(cmd: &EventCommand, socket_path: &Path) -> u8 {
 
 /// Execute the emit command.
 fn run_emit(args: &EmitArgs, socket_path: &Path, json_output: bool) -> u8 {
-    // Validate session token
-    if args.session_token.is_empty() {
-        return output_error(
-            json_output,
-            "invalid_session_token",
-            "Session token cannot be empty",
-            exit_codes::VALIDATION_ERROR,
-        );
-    }
+    // Resolve session token (CWE-214 mitigation: prefer env var over CLI arg)
+    let session_token = match &args.session_token {
+        Some(token) if !token.is_empty() => token.clone(),
+        _ => {
+            return output_error(
+                json_output,
+                "missing_session_token",
+                "Session token is required. Set APM2_SESSION_TOKEN environment variable \
+                 (preferred) or use --session-token flag.",
+                exit_codes::VALIDATION_ERROR,
+            );
+        },
+    };
 
     // Validate event type
     if args.event_type.is_empty() {
@@ -168,12 +176,7 @@ fn run_emit(args: &EmitArgs, socket_path: &Path, json_output: bool) -> u8 {
     let result = rt.block_on(async {
         let mut client = SessionClient::connect(socket_path).await?;
         client
-            .emit_event(
-                &args.session_token,
-                &args.event_type,
-                &payload,
-                &correlation_id,
-            )
+            .emit_event(&session_token, &args.event_type, &payload, &correlation_id)
             .await
     });
 
