@@ -45,11 +45,9 @@
 //! - **Reorder**: Allowed; authoritative ordering is ledger cursor.
 //! - **Duplication**: Allowed; consumer dedupes by pulse_id + ledger_cursor.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use apm2_core::events::KernelEvent;
-use apm2_core::events::kernel_event::Payload;
 use apm2_core::ledger::{CommitNotification, CommitNotificationReceiver, LedgerBackend};
 use bytes::Bytes;
 use prost::Message;
@@ -57,8 +55,8 @@ use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use super::messages::{EntityRef, PulseEnvelopeV1, PulseEvent};
-use super::pulse_topic::{MAX_SEGMENT_LEN, validate_topic};
 use super::resource_governance::SharedSubscriptionRegistry;
+use super::topic_derivation::{TopicDerivationResult, TopicDeriver};
 
 // ============================================================================
 // Constants
@@ -159,11 +157,11 @@ pub struct PulsePublisher {
     /// Current ledger head (updated as notifications are processed).
     ledger_head: std::sync::atomic::AtomicU64,
 
-    /// Index mapping `changeset_digest` -> `work_id` (TCK-00305).
+    /// Topic deriver for Work and Gate events (TCK-00305).
     ///
-    /// Populated by observing `PolicyResolvedForChangeSet` events.
-    /// Used to derive topics for `GateReceipt` events.
-    changeset_to_work_id: Arc<RwLock<HashMap<Vec<u8>, String>>>,
+    /// Handles the mapping from kernel events to pulse topics, including
+    /// the `changeset_digest` -> `work_id` index for gate receipts.
+    topic_deriver: TopicDeriver,
 }
 
 /// Result of a non-blocking pulse send attempt.
@@ -260,8 +258,16 @@ impl PulsePublisher {
             registry,
             connection_senders: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             ledger_head: std::sync::atomic::AtomicU64::new(0),
-            changeset_to_work_id: Arc::new(RwLock::new(HashMap::new())),
+            topic_deriver: TopicDeriver::new(),
         }
+    }
+
+    /// Returns a reference to the topic deriver.
+    ///
+    /// Allows external access to the changeset index for testing or monitoring.
+    #[must_use]
+    pub const fn topic_deriver(&self) -> &TopicDeriver {
+        &self.topic_deriver
     }
 
     /// Registers a connection sender for pulse delivery.
@@ -384,18 +390,38 @@ impl PulsePublisher {
         };
 
         // Update index for TCK-00305 (PolicyResolvedForChangeSet lookup)
-        self.update_index(&kernel_event);
+        self.topic_deriver.update_index(&kernel_event);
 
-        // Build the topic from the notification and payload
-        let Some(topic) = self.derive_topic(&notification, &kernel_event) else {
-            // Topic derivation failed (invalid topic); drop the notification
-            debug!(
-                seq_id = notification.seq_id,
-                event_type = %notification.event_type,
-                namespace = %notification.namespace,
-                "Notification dropped: derived topic failed validation"
-            );
-            return;
+        // Build the topic from the notification and payload using TopicDeriver
+        // (TCK-00305)
+        let topic = match self
+            .topic_deriver
+            .derive_topic(&notification, &kernel_event)
+        {
+            TopicDerivationResult::Success(t) => t,
+            TopicDerivationResult::ValidationFailed {
+                attempted_topic,
+                error,
+            } => {
+                debug!(
+                    seq_id = notification.seq_id,
+                    event_type = %notification.event_type,
+                    namespace = %notification.namespace,
+                    attempted_topic = %attempted_topic,
+                    error = %error,
+                    "Notification dropped: derived topic failed validation"
+                );
+                return;
+            },
+            TopicDerivationResult::NoTopic => {
+                debug!(
+                    seq_id = notification.seq_id,
+                    event_type = %notification.event_type,
+                    namespace = %notification.namespace,
+                    "Notification dropped: no topic could be derived"
+                );
+                return;
+            },
         };
 
         // Build the pulse envelope
@@ -473,162 +499,6 @@ impl PulsePublisher {
                     );
                 },
             }
-        }
-    }
-
-    /// Updates internal indices based on event content.
-    ///
-    /// TCK-00305: Maintains `changeset_digest` -> `work_id` mapping from
-    /// `PolicyResolvedForChangeset` events.
-    ///
-    /// # Security (TCK-00304)
-    ///
-    /// This method implements bounded eviction to prevent unbounded memory
-    /// growth. When the map reaches `MAX_CHANGESET_MAP_ENTRIES`, an arbitrary
-    /// entry is removed before inserting the new one. This provides FIFO-like
-    /// semantics without requiring additional data structures.
-    fn update_index(&self, event: &KernelEvent) {
-        if let Some(Payload::PolicyResolvedForChangeset(p)) = &event.payload {
-            let mut map = self.changeset_to_work_id.write().unwrap();
-
-            // Bounded eviction: remove an entry if at capacity (TCK-00304 security fix)
-            if map.len() >= MAX_CHANGESET_MAP_ENTRIES {
-                // Remove an arbitrary entry (first key found)
-                // This provides simple bounded behavior without LRU overhead
-                if let Some(key_to_remove) = map.keys().next().cloned() {
-                    map.remove(&key_to_remove);
-                    debug!(
-                        evicted_entries = 1,
-                        map_size = map.len(),
-                        "Evicted changeset mapping due to capacity limit"
-                    );
-                }
-            }
-
-            map.insert(p.changeset_digest.clone(), p.work_id.clone());
-        }
-    }
-
-    /// Derives and validates the topic string from a commit notification.
-    ///
-    /// Per DD-HEF-0001 and TCK-00305:
-    /// - `work.<work_id>.events` for work events (extracted from payload)
-    /// - `gate.<work_id>.<changeset_digest>.<gate_id>` for gate receipts (via
-    ///   lookup)
-    fn derive_topic(
-        &self,
-        notification: &CommitNotification,
-        event: &KernelEvent,
-    ) -> Option<String> {
-        // Sanitize namespace
-        let sanitized_namespace = Self::sanitize_segment(&notification.namespace);
-
-        let topic = match notification.event_type.as_str() {
-            // System events -> ledger.head
-            "KernelEvent" | "LedgerEvent" => "ledger.head".to_string(),
-
-            // Work events -> work.<work_id>.events
-            "WorkOpened" | "WorkTransitioned" | "WorkCompleted" | "WorkAborted"
-            | "WorkPrAssociated" => {
-                if let Some(Payload::Work(w)) = &event.payload {
-                    let work_id = match &w.event {
-                        Some(apm2_core::events::work_event::Event::Opened(e)) => &e.work_id,
-                        Some(apm2_core::events::work_event::Event::Transitioned(e)) => &e.work_id,
-                        Some(apm2_core::events::work_event::Event::Completed(e)) => &e.work_id,
-                        Some(apm2_core::events::work_event::Event::Aborted(e)) => &e.work_id,
-                        Some(apm2_core::events::work_event::Event::PrAssociated(e)) => &e.work_id,
-                        None => return None,
-                    };
-                    format!("work.{}.events", Self::sanitize_segment(work_id))
-                } else {
-                    // Fallback if payload decode fails or doesn't match type
-                    format!("work.{sanitized_namespace}.events")
-                }
-            },
-
-            // Gate events -> gate.<work_id>.<changeset_digest>.<gate_id>
-            "GateReceipt" => {
-                if let Some(Payload::GateReceipt(g)) = &event.payload {
-                    // Lookup work_id from changeset_digest using the index built by
-                    // PolicyResolvedForChangeSet
-                    let map = self.changeset_to_work_id.read().unwrap();
-                    let work_id = map.get(&g.changeset_digest).map_or_else(
-                        || sanitized_namespace.clone(),
-                        |s| Self::sanitize_segment(s),
-                    );
-
-                    let digest_hex = hex::encode(&g.changeset_digest);
-                    let gate_id = Self::sanitize_segment(&g.gate_id);
-                    format!("gate.{work_id}.{digest_hex}.{gate_id}")
-                } else {
-                    format!("gate.{sanitized_namespace}.receipts")
-                }
-            },
-
-            // Episode events -> episode.<episode_id>.<category>
-            "EpisodeCreated" | "EpisodeStarted" | "EpisodeStopped" => {
-                format!("episode.{sanitized_namespace}.lifecycle")
-            },
-
-            "ToolRequested" | "ToolDecided" | "ToolExecuted" => {
-                format!("episode.{sanitized_namespace}.tool")
-            },
-
-            // Defect events -> defect.new
-            "DefectRecord" => "defect.new".to_string(),
-
-            // Default: namespace-based topic
-            _ => format!("{sanitized_namespace}.events"),
-        };
-
-        // Validate the derived topic against HEF Topic Grammar
-        match validate_topic(&topic) {
-            Ok(()) => Some(topic),
-            Err(e) => {
-                warn!(
-                    topic = %topic,
-                    error = %e,
-                    event_type = %notification.event_type,
-                    namespace = %notification.namespace,
-                    "Derived topic failed validation"
-                );
-                None
-            },
-        }
-    }
-
-    /// Sanitizes a string to be a valid topic segment.
-    ///
-    /// - Replaces non-ASCII and invalid characters with underscores
-    /// - Replaces dots (segment separators) with underscores
-    /// - Truncates to maximum segment length
-    /// - Ensures non-empty result (uses "_" if input produces empty)
-    fn sanitize_segment(s: &str) -> String {
-        // Per pulse_topic.rs: valid segment chars are ASCII alphanumeric and
-        // hyphen/underscore Dots are segment separators and must be replaced
-        let sanitized: String = s
-            .chars()
-            .filter_map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    Some(c)
-                } else if c == '.' {
-                    // Replace dots to avoid creating extra segments
-                    Some('_')
-                } else if c.is_ascii() {
-                    // Replace other ASCII (spaces, special chars) with underscore
-                    Some('_')
-                } else {
-                    // Skip non-ASCII characters
-                    None
-                }
-            })
-            .take(MAX_SEGMENT_LEN) // Truncate to maximum segment length (64 chars)
-            .collect();
-
-        if sanitized.is_empty() {
-            "_".to_string()
-        } else {
-            sanitized
         }
     }
 
@@ -721,6 +591,8 @@ pub fn create_commit_notification_channel() -> (
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use apm2_core::ledger::{CommitNotification, EventRecord};
 
     use super::*;
@@ -852,7 +724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_publisher_derive_topic() {
+    async fn test_publisher_topic_derivation() {
         let (_, receiver) = create_commit_notification_channel();
         let ledger = Arc::new(MockLedgerBackend::new());
         let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
@@ -868,35 +740,35 @@ mod tests {
 
         // Test ledger head topic
         let notification = CommitNotification::new(1, [0; 32], "LedgerEvent", "kernel");
-        assert_eq!(
-            publisher.derive_topic(&notification, &event),
-            Some("ledger.head".to_string())
-        );
+        let result = publisher
+            .topic_deriver()
+            .derive_topic(&notification, &event);
+        assert_eq!(result.topic(), Some("ledger.head"));
 
-        // Test work event topic
+        // Test work event topic (falls back to namespace when no payload)
         let notification = CommitNotification::new(2, [0; 32], "WorkOpened", "W-123");
-        assert_eq!(
-            publisher.derive_topic(&notification, &event),
-            Some("work.W-123.events".to_string())
-        );
+        let result = publisher
+            .topic_deriver()
+            .derive_topic(&notification, &event);
+        assert_eq!(result.topic(), Some("work.W-123.events"));
 
-        // Test gate receipt topic
+        // Test gate receipt topic (falls back when no payload or index entry)
         let notification = CommitNotification::new(3, [0; 32], "GateReceipt", "W-456");
-        assert_eq!(
-            publisher.derive_topic(&notification, &event),
-            Some("gate.W-456.receipts".to_string())
-        );
+        let result = publisher
+            .topic_deriver()
+            .derive_topic(&notification, &event);
+        assert_eq!(result.topic(), Some("gate.W-456.receipts"));
 
         // Test defect topic
         let notification = CommitNotification::new(4, [0; 32], "DefectRecord", "kernel");
-        assert_eq!(
-            publisher.derive_topic(&notification, &event),
-            Some("defect.new".to_string())
-        );
+        let result = publisher
+            .topic_deriver()
+            .derive_topic(&notification, &event);
+        assert_eq!(result.topic(), Some("defect.new"));
     }
 
     #[tokio::test]
-    async fn test_publisher_derive_topic_sanitizes_namespace() {
+    async fn test_publisher_topic_derivation_sanitizes_namespace() {
         let (_, receiver) = create_commit_notification_channel();
         let ledger = Arc::new(MockLedgerBackend::new());
         let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
@@ -912,22 +784,28 @@ mod tests {
 
         // Test namespace with special characters gets sanitized
         let notification = CommitNotification::new(1, [0; 32], "WorkOpened", "work@id#123");
-        let topic = publisher.derive_topic(&notification, &event);
-        assert!(topic.is_some());
+        let result = publisher
+            .topic_deriver()
+            .derive_topic(&notification, &event);
+        assert!(result.is_success());
         // Special characters replaced with underscores
-        assert_eq!(topic.unwrap(), "work.work_id_123.events");
+        assert_eq!(result.topic(), Some("work.work_id_123.events"));
 
         // Test namespace with dots gets sanitized (dots become underscores)
         let notification = CommitNotification::new(2, [0; 32], "WorkOpened", "ns.sub.id");
-        let topic = publisher.derive_topic(&notification, &event);
-        assert!(topic.is_some());
-        assert_eq!(topic.unwrap(), "work.ns_sub_id.events");
+        let result = publisher
+            .topic_deriver()
+            .derive_topic(&notification, &event);
+        assert!(result.is_success());
+        assert_eq!(result.topic(), Some("work.ns_sub_id.events"));
 
         // Test empty namespace gets sanitized to underscore
         let notification = CommitNotification::new(3, [0; 32], "WorkOpened", "");
-        let topic = publisher.derive_topic(&notification, &event);
-        assert!(topic.is_some());
-        assert_eq!(topic.unwrap(), "work._.events");
+        let result = publisher
+            .topic_deriver()
+            .derive_topic(&notification, &event);
+        assert!(result.is_success());
+        assert_eq!(result.topic(), Some("work._.events"));
     }
 
     #[tokio::test]
@@ -1260,8 +1138,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_changeset_map_bounded_eviction() {
+    async fn test_changeset_index_via_topic_deriver() {
         use apm2_core::events::PolicyResolvedForChangeSet;
+        use apm2_core::events::kernel_event::Payload;
 
         let (_, receiver) = create_commit_notification_channel();
         let ledger = Arc::new(MockLedgerBackend::new());
@@ -1277,13 +1156,11 @@ mod tests {
         // Insert entries up to a test limit (not the full MAX to keep tests fast)
         let test_limit = 100;
 
-        // First, verify the map is empty
-        {
-            let map = publisher.changeset_to_work_id.read().unwrap();
-            assert_eq!(map.len(), 0);
-        }
+        // First, verify the index is empty
+        assert!(publisher.topic_deriver().changeset_index().is_empty());
+        assert_eq!(publisher.topic_deriver().changeset_index().len(), 0);
 
-        // Insert entries up to the test limit
+        // Insert entries up to the test limit via update_index
         for i in 0..test_limit {
             #[allow(clippy::cast_possible_truncation)]
             let digest_byte = i as u8; // Safe: test_limit is 100, well within u8 range
@@ -1297,20 +1174,20 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            publisher.update_index(&event);
+            publisher.topic_deriver().update_index(&event);
         }
 
         // Verify all entries were inserted
-        {
-            let map = publisher.changeset_to_work_id.read().unwrap();
-            assert_eq!(map.len(), test_limit);
-        }
+        assert_eq!(
+            publisher.topic_deriver().changeset_index().len(),
+            test_limit
+        );
 
         // Verify we can look up entries
-        {
-            let map = publisher.changeset_to_work_id.read().unwrap();
-            assert_eq!(map.get(&vec![50u8; 32]), Some(&"work-50".to_string()));
-        }
+        assert_eq!(
+            publisher.topic_deriver().changeset_index().get(&[50u8; 32]),
+            Some("work-50".to_string())
+        );
     }
 
     #[test]
