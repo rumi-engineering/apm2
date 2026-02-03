@@ -151,7 +151,10 @@ async fn test_allow_decision_with_matching_capability() {
     let manifest = create_manifest_with_capabilities(vec![read_capability("/workspace")]);
 
     // Create broker and initialize with manifest
-    let broker: TestToolBroker = ToolBroker::new(ToolBrokerConfig::default());
+    // NOTE: Use without_policy_check() because this test focuses on capability
+    // validation, not policy engine integration (TCK-00292 default-deny behavior)
+    let broker: TestToolBroker =
+        ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
         .initialize_with_manifest(manifest)
         .await
@@ -202,7 +205,10 @@ async fn test_allow_multiple_tool_classes() {
         write_capability("/workspace"),
         execute_capability(),
     ]);
-    let broker: TestToolBroker = ToolBroker::new(ToolBrokerConfig::default());
+    // NOTE: Use without_policy_check() because this test focuses on capability
+    // validation, not policy engine integration (TCK-00292 default-deny behavior)
+    let broker: TestToolBroker =
+        ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
         .initialize_with_manifest(manifest)
         .await
@@ -370,7 +376,10 @@ async fn test_dedupe_cache_hit() {
 
     // Create manifest with Read capability
     let manifest = create_manifest_with_capabilities(vec![read_capability("/workspace")]);
-    let broker: TestToolBroker = ToolBroker::new(ToolBrokerConfig::default());
+    // NOTE: Use without_policy_check() because this test focuses on dedupe cache
+    // behavior, not policy engine integration (TCK-00292 default-deny behavior)
+    let broker: TestToolBroker =
+        ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
         .initialize_with_manifest(manifest)
         .await
@@ -447,7 +456,10 @@ async fn test_dedupe_cache_miss_different_key() {
 
     // Create manifest with Read capability
     let manifest = create_manifest_with_capabilities(vec![read_capability("/workspace")]);
-    let broker: TestToolBroker = ToolBroker::new(ToolBrokerConfig::default());
+    // NOTE: Use without_policy_check() because this test focuses on dedupe cache
+    // behavior, not policy engine integration (TCK-00292 default-deny behavior)
+    let broker: TestToolBroker =
+        ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
         .initialize_with_manifest(manifest)
         .await
@@ -517,7 +529,10 @@ async fn test_dedupe_cache_episode_isolation() {
 
     // Create manifest with Read capability
     let manifest = create_manifest_with_capabilities(vec![read_capability("/workspace")]);
-    let broker: TestToolBroker = ToolBroker::new(ToolBrokerConfig::default());
+    // NOTE: Use without_policy_check() because this test focuses on dedupe cache
+    // episode isolation, not policy engine integration (TCK-00292 default-deny behavior)
+    let broker: TestToolBroker =
+        ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
         .initialize_with_manifest(manifest)
         .await
@@ -728,7 +743,10 @@ async fn test_broker_with_mock_harness() {
         read_capability("/workspace"),
         write_capability("/workspace"),
     ]);
-    let broker: TestToolBroker = ToolBroker::new(ToolBrokerConfig::default());
+    // NOTE: Use without_policy_check() because this test focuses on broker/harness
+    // integration, not policy engine integration (TCK-00292 default-deny behavior)
+    let broker: TestToolBroker =
+        ToolBroker::new(ToolBrokerConfig::default().without_policy_check());
     broker
         .initialize_with_manifest(manifest)
         .await
