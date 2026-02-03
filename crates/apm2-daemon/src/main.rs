@@ -41,11 +41,11 @@
 //! THEN manually constructs and runs the Tokio runtime via `block_on()`.
 
 // mod protocol; // Use library crate instead to avoid dead code warnings
-mod state;
+// mod state; // Use library crate
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -54,19 +54,20 @@ use apm2_core::config::EcosystemConfig;
 use apm2_core::process::ProcessState;
 use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
+use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::metrics::{SharedMetricsRegistry, new_shared_registry};
 use apm2_daemon::protocol; // Import from library
 use apm2_daemon::protocol::socket_manager::{SocketManager, SocketManagerConfig};
+use apm2_daemon::state::{DaemonStateHandle, DispatcherState, SharedDispatcherState, SharedState};
 use axum::Router;
 use axum::routing::get;
 use clap::Parser;
+use rusqlite::Connection;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-
-use crate::state::{DaemonStateHandle, DispatcherState, SharedDispatcherState, SharedState};
 
 /// apm2 daemon - AI CLI process manager
 #[derive(Parser, Debug)]
@@ -97,6 +98,10 @@ struct Args {
     #[arg(long)]
     state_file: Option<PathBuf>,
 
+    /// Path to ledger database file (`SQLite`)
+    #[arg(long)]
+    ledger_db: Option<PathBuf>,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -126,6 +131,8 @@ struct DaemonConfig {
     pid_path: PathBuf,
     /// State file path for persistent session registry (TCK-00266).
     state_file_path: PathBuf,
+    /// Ledger database path (`SQLite`).
+    ledger_db_path: Option<PathBuf>,
     /// Port for Prometheus metrics HTTP endpoint (TCK-00268).
     metrics_port: u16,
     /// Whether to disable the metrics endpoint.
@@ -161,12 +168,16 @@ impl DaemonConfig {
             .clone()
             .unwrap_or_else(|| config.daemon.state_file.clone());
 
+        // Ledger DB path from args (config fallback not yet standard)
+        let ledger_db_path = args.ledger_db.clone();
+
         Ok(Self {
             config,
             operator_socket_path,
             session_socket_path,
             pid_path,
             state_file_path,
+            ledger_db_path,
             metrics_port: args.metrics_port,
             metrics_disabled: args.no_metrics,
         })
@@ -556,6 +567,21 @@ async fn async_main(args: Args) -> Result<()> {
         info!("Managing {} processes", inner.supervisor.process_count());
     }
 
+    // Initialize persistent ledger if configured (TCK-00289)
+    let sqlite_conn = if let Some(path) = &daemon_config.ledger_db_path {
+        info!("Opening ledger database at {:?}", path);
+        let conn = Connection::open(path).context("failed to open ledger database")?;
+
+        // Initialize schemas
+        SqliteLedgerEventEmitter::init_schema(&conn)
+            .context("failed to init ledger events schema")?;
+        SqliteWorkRegistry::init_schema(&conn).context("failed to init work claims schema")?;
+
+        Some(Arc::new(Mutex::new(conn)))
+    } else {
+        None
+    };
+
     // TCK-00287: Create shared dispatcher state at daemon startup.
     // Per security review:
     // - Item 1: Dispatchers persist across connections (no state loss)
@@ -565,9 +591,13 @@ async fn async_main(args: Args) -> Result<()> {
     // BLOCKER 1 FIX: Use with_session_registry to wire global session registry
     // from DaemonStateHandle into PrivilegedDispatcher. This ensures sessions
     // spawned via IPC are visible to daemon's persistent state.
-    let dispatcher_state: SharedDispatcherState = Arc::new(DispatcherState::with_session_registry(
+    //
+    // TCK-00289: Use with_persistence to wire real governance/ledger components if
+    // available.
+    let dispatcher_state: SharedDispatcherState = Arc::new(DispatcherState::with_persistence(
         state.session_registry().clone(),
         metrics_registry.clone(),
+        sqlite_conn,
     ));
 
     // TCK-00279: Start ProtocolServer-only control plane
