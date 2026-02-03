@@ -361,11 +361,15 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 // Policy Resolver Interface (TCK-00253)
 // ============================================================================
 
+use serde::{Deserialize, Serialize};
+
+// ... (existing code)
+
 /// Result of a policy resolution request.
 ///
 /// Per DD-002, the daemon delegates policy resolution to the governance holon.
 /// This struct captures the resolved policy state for work claiming.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyResolution {
     /// Unique reference to the `PolicyResolvedForChangeSet` event.
     pub policy_resolved_ref: String,
@@ -529,7 +533,7 @@ impl PolicyResolver for StubPolicyResolver {
 // ============================================================================
 
 /// A claimed work item with its associated metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkClaim {
     /// Unique work identifier.
     pub work_id: String,
@@ -541,6 +545,7 @@ pub struct WorkClaim {
     pub actor_id: String,
 
     /// Role claimed for this work.
+    #[serde(with = "work_role_serde")]
     pub role: WorkRole,
 
     /// Policy resolution for this claim.
@@ -559,6 +564,29 @@ pub struct WorkClaim {
     /// Per TCK-00258, these are the domains of the actors who authored the
     /// changeset being reviewed.
     pub author_custody_domains: Vec<String>,
+}
+
+mod work_role_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::WorkRole;
+
+    // Serde requires `&T` for custom serializers via `serialize_with`.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S>(role: &WorkRole, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_i32(*role as i32)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<WorkRole, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let val = i32::deserialize(deserializer)?;
+        WorkRole::try_from(val).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Trait for persisting and querying work claims.
@@ -1226,6 +1254,9 @@ pub struct PrivilegedDispatcher {
     /// Lease validator for `GATE_EXECUTOR` spawn validation (TCK-00257).
     lease_validator: Arc<dyn LeaseValidator>,
 
+    /// Holonic clock for HTF-compliant timestamps (TCK-00289).
+    clock: Arc<HolonicClock>,
+
     /// Token minter for session token generation (TCK-00287).
     ///
     /// Shared with `SessionDispatcher` to ensure tokens minted during
@@ -1310,6 +1341,7 @@ impl PrivilegedDispatcher {
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
+            clock: Arc::clone(&holonic_clock),
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
@@ -1338,6 +1370,7 @@ impl PrivilegedDispatcher {
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
+            clock: Arc::clone(&holonic_clock),
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
@@ -1349,9 +1382,8 @@ impl PrivilegedDispatcher {
     ///
     /// This is the production constructor for real governance integration.
     /// Does not include metrics; use `with_metrics` to add them.
-    /// Creates internal stub token minter, manifest store, and default HTF
-    /// clock.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_dependencies(
         decode_config: DecodeConfig,
         policy_resolver: Arc<dyn PolicyResolver>,
@@ -1360,12 +1392,10 @@ impl PrivilegedDispatcher {
         episode_runtime: Arc<EpisodeRuntime>,
         session_registry: Arc<dyn SessionRegistry>,
         lease_validator: Arc<dyn LeaseValidator>,
+        clock: Arc<HolonicClock>,
+        token_minter: Arc<TokenMinter>,
+        manifest_store: Arc<InMemoryManifestStore>,
     ) -> Self {
-        // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
-        let holonic_clock = Arc::new(
-            HolonicClock::new(ClockConfig::default(), None)
-                .expect("default ClockConfig should always succeed"),
-        );
         Self {
             decode_config,
             policy_resolver,
@@ -1374,10 +1404,11 @@ impl PrivilegedDispatcher {
             episode_runtime,
             session_registry,
             lease_validator,
-            token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
-            manifest_store: Arc::new(InMemoryManifestStore::new()),
+            clock: Arc::clone(&clock),
+            token_minter,
+            manifest_store,
             metrics: None,
-            holonic_clock,
+            holonic_clock: clock,
         }
     }
 
@@ -1393,17 +1424,12 @@ impl PrivilegedDispatcher {
     ///   `SpawnEpisode` are accessible for tool request validation
     /// - `session_registry`: Uses the global daemon session registry instead of
     ///   an internal stub
-    #[must_use]
     pub fn with_shared_state(
         token_minter: Arc<TokenMinter>,
         manifest_store: Arc<InMemoryManifestStore>,
         session_registry: Arc<dyn SessionRegistry>,
+        clock: Arc<HolonicClock>,
     ) -> Self {
-        // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
-        let holonic_clock = Arc::new(
-            HolonicClock::new(ClockConfig::default(), None)
-                .expect("default ClockConfig should always succeed"),
-        );
         Self {
             decode_config: DecodeConfig::default(),
             policy_resolver: Arc::new(StubPolicyResolver),
@@ -1412,10 +1438,11 @@ impl PrivilegedDispatcher {
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry,
             lease_validator: Arc::new(StubLeaseValidator::new()),
+            clock: Arc::clone(&clock),
             token_minter,
             manifest_store,
             metrics: None,
-            holonic_clock,
+            holonic_clock: clock,
         }
     }
 
@@ -2281,10 +2308,12 @@ impl PrivilegedDispatcher {
 
     /// Handles `IssueCapability` requests (IPC-PRIV-003).
     ///
-    /// # Stub Implementation
+    /// # TCK-00289 Implementation
     ///
-    /// This is a stub handler that validates the request and returns a
-    /// placeholder response. Full implementation in future ticket.
+    /// This handler implements capability issuance with:
+    /// 1. Session validation (must exist)
+    /// 2. Lease validation (session's lease must be valid for its work)
+    /// 3. HTF-compliant timestamps via `HolonicClock`
     fn handle_issue_capability(
         &self,
         payload: &[u8],
@@ -2299,7 +2328,7 @@ impl PrivilegedDispatcher {
             session_id = %request.session_id,
             has_capability_request = request.capability_request.is_some(),
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
-            "IssueCapability request received (stub handler)"
+            "IssueCapability request received"
         );
 
         // Validate required fields
@@ -2317,30 +2346,94 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // STUB: Return placeholder response
-        // RFC-0016 HTF compliance: Use UUID-derived identifier instead of
-        // SystemTime::now() The actual timestamps will be populated by proper
-        // HTF clock when implemented
-        let stub_id = uuid::Uuid::new_v4();
+        // 1. Retrieve session state
+        let Some(session) = self.session_registry.get_session(&request.session_id) else {
+            warn!(session_id = %request.session_id, "IssueCapability rejected: session not found");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::SessionNotFound,
+                format!("session not found: {}", request.session_id),
+            ));
+        };
+
+        // 2. Validate lease (TCK-00289: "Implement IssueCapability with lease
+        //    validation")
+        // Ensure the session's lease matches the authoritative work claim.
+        // This confirms the session corresponds to a valid, active work item.
+        if let Some(claim) = self.work_registry.get_claim(&session.work_id) {
+            // Verify lease_id matches
+            // Constant-time comparison is good practice for IDs
+            let lease_matches = session.lease_id.len() == claim.lease_id.len()
+                && bool::from(session.lease_id.as_bytes().ct_eq(claim.lease_id.as_bytes()));
+
+            if !lease_matches {
+                warn!(
+                    session_id = %request.session_id,
+                    expected_lease = "[REDACTED]",
+                    actual_lease = "[REDACTED]",
+                    "IssueCapability rejected: lease mismatch against work claim"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "lease validation failed: session lease does not match work claim",
+                ));
+            }
+        } else {
+            warn!(
+                session_id = %request.session_id,
+                work_id = %session.work_id,
+                "IssueCapability rejected: work claim not found"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease validation failed: work claim not found",
+            ));
+        }
+
+        // 3. Generate HTF-compliant timestamps
+        let Ok(mono_tick) = self.clock.now_mono_tick() else {
+            warn!("Clock error during IssueCapability");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PolicyResolutionFailed,
+                "clock error",
+            ));
+        };
+        let _mono_tick = mono_tick.value();
+
+        // For grant/expire times, we ideally use Wall Time or HLC Wall Time.
+        // RFC-0016 prefers HLC if available.
+        #[allow(clippy::cast_possible_truncation)]
+        let now_wall = self.clock.now_hlc().map_or_else(
+            |_| {
+                // Fallback to system time if HLC disabled (best effort)
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64
+            },
+            |hlc| hlc.wall_ns,
+        );
+
+        // Duration is in seconds, convert to nanoseconds
+        let duration_ns =
+            request.capability_request.as_ref().unwrap().duration_secs * 1_000_000_000;
+        let expires_at_ns = now_wall + duration_ns;
+
+        // Convert to seconds for response (proto uses u64 seconds)
+        let granted_at = now_wall / 1_000_000_000;
+        let expires_at = expires_at_ns / 1_000_000_000;
+
+        let capability_id = format!("C-{}", uuid::Uuid::new_v4());
 
         // TCK-00268: Emit capability_granted metric
-        // Extract role from session state for the metric label
         if let Some(ref metrics) = self.metrics {
-            // Try to get the session to determine role
-            let role = self
-                .session_registry
-                .get_session(&request.session_id)
-                .map_or("unknown", |s| {
-                    match WorkRole::try_from(s.role).unwrap_or(WorkRole::Unspecified) {
-                        WorkRole::Implementer => "implementer",
-                        WorkRole::Reviewer => "reviewer",
-                        WorkRole::GateExecutor => "gate_executor",
-                        WorkRole::Coordinator => "coordinator",
-                        WorkRole::Unspecified => "unspecified",
-                    }
-                });
+            let role_str = match WorkRole::try_from(session.role).unwrap_or(WorkRole::Unspecified) {
+                WorkRole::Implementer => "implementer",
+                WorkRole::Reviewer => "reviewer",
+                WorkRole::GateExecutor => "gate_executor",
+                WorkRole::Coordinator => "coordinator",
+                WorkRole::Unspecified => "unspecified",
+            };
 
-            // Extract capability type from request
             let capability_type = request
                 .capability_request
                 .as_ref()
@@ -2348,19 +2441,18 @@ impl PrivilegedDispatcher {
 
             metrics
                 .daemon_metrics()
-                .capability_granted(role, capability_type);
+                .capability_granted(role_str, capability_type);
         }
 
-        // TCK-00289: Use HTF-compliant timestamps from HolonicClock.
-        // Per RFC-0016, all timestamps must come from the HTF clock source to ensure
-        // monotonicity and causal ordering.
-        let granted_at = self.get_htf_timestamp_ns();
-        // Expires at granted_at + default TTL (1 hour in nanoseconds)
-        let expires_at = granted_at.saturating_add(DEFAULT_SESSION_TOKEN_TTL_SECS * 1_000_000_000);
+        info!(
+            session_id = %request.session_id,
+            capability_id = %capability_id,
+            "Capability issued"
+        );
 
         Ok(PrivilegedResponse::IssueCapability(
             IssueCapabilityResponse {
-                capability_id: format!("C-{stub_id}"),
+                capability_id,
                 granted_at,
                 expires_at,
             },
@@ -2508,6 +2600,8 @@ mod tests {
 
         #[test]
         fn test_issue_capability_routing() {
+            use crate::session::SessionState;
+
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
@@ -2515,8 +2609,46 @@ mod tests {
                 pid: Some(12345),
             }));
 
+            // TCK-00289: Register a session and work claim for IssueCapability validation
+            let work_id = "W-TEST-001";
+            let lease_id = "L-TEST-001";
+            let session_id = "S-001";
+
+            // Register work claim
+            let claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: format!("resolved-for-{work_id}"),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            // Register session
+            let session_state = SessionState {
+                session_id: session_id.to_string(),
+                work_id: work_id.to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: lease_id.to_string(),
+                ephemeral_handle: String::new(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            dispatcher
+                .session_registry
+                .register_session(session_state)
+                .unwrap();
+
             let request = IssueCapabilityRequest {
-                session_id: "S-001".to_string(),
+                session_id: session_id.to_string(),
                 capability_request: Some(super::super::super::messages::CapabilityRequest {
                     tool_class: "file_read".to_string(),
                     read_patterns: vec!["**/*.rs".to_string()],
@@ -2780,11 +2912,51 @@ mod tests {
 
     #[test]
     fn test_privileged_issue_capability_stub() {
+        use crate::session::SessionState;
+
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
+        // TCK-00289: Register a session and work claim for IssueCapability validation
+        let work_id = "W-TEST-001";
+        let lease_id = "L-TEST-001";
+        let session_id = "S-001";
+
+        // Register work claim
+        let claim = WorkClaim {
+            work_id: work_id.to_string(),
+            lease_id: lease_id.to_string(),
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: PolicyResolution {
+                policy_resolved_ref: format!("resolved-for-{work_id}"),
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
+                context_pack_hash: [0u8; 32],
+            },
+            author_custody_domains: vec![],
+            executor_custody_domains: vec![],
+        };
+        dispatcher.work_registry.register_claim(claim).unwrap();
+
+        // Register session
+        let session_state = SessionState {
+            session_id: session_id.to_string(),
+            work_id: work_id.to_string(),
+            role: WorkRole::Implementer.into(),
+            lease_id: lease_id.to_string(),
+            ephemeral_handle: String::new(),
+            policy_resolved_ref: String::new(),
+            capability_manifest_hash: vec![],
+            episode_id: None,
+        };
+        dispatcher
+            .session_registry
+            .register_session(session_state)
+            .unwrap();
+
         let request = IssueCapabilityRequest {
-            session_id: "S-001".to_string(),
+            session_id: session_id.to_string(),
             capability_request: Some(super::super::messages::CapabilityRequest {
                 tool_class: "file_read".to_string(),
                 read_patterns: vec!["**/*.rs".to_string()],
@@ -2811,12 +2983,12 @@ mod tests {
                     resp.expires_at > resp.granted_at,
                     "expires_at should be after granted_at"
                 );
-                // Verify expires_at is granted_at + 1 hour (3600 seconds in nanoseconds)
-                let expected_ttl_ns = 3600 * 1_000_000_000u64;
+                // Verify expires_at is granted_at + 1 hour (duration_secs in seconds)
+                let expected_ttl_secs = 3600u64;
                 assert_eq!(
                     resp.expires_at - resp.granted_at,
-                    expected_ttl_ns,
-                    "TTL should be 1 hour in nanoseconds"
+                    expected_ttl_secs,
+                    "TTL should be 1 hour in seconds"
                 );
             },
             PrivilegedResponse::Error(err) => {

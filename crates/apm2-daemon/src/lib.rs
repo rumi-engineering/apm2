@@ -37,9 +37,12 @@
 
 pub mod episode;
 pub mod evidence;
+pub mod governance;
 pub mod htf;
+pub mod ledger;
 pub mod metrics;
 pub mod projection;
 pub mod protocol;
 pub mod session;
+pub mod state;
 pub mod telemetry;

@@ -13,26 +13,31 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use apm2_core::config::EcosystemConfig;
 use apm2_core::process::ProcessId;
 use apm2_core::process::runner::ProcessRunner;
 use apm2_core::schema_registry::InMemorySchemaRegistry;
 use apm2_core::supervisor::Supervisor;
-use apm2_daemon::episode::{
-    CapabilityManifest, InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
-};
-use apm2_daemon::metrics::SharedMetricsRegistry;
-use apm2_daemon::protocol::dispatch::PrivilegedDispatcher;
-use apm2_daemon::protocol::session_dispatch::{
-    InMemoryManifestStore, ManifestStore, SessionDispatcher,
-};
-use apm2_daemon::protocol::session_token::TokenMinter;
-use apm2_daemon::session::SessionRegistry;
 use chrono::{DateTime, Utc};
+use rusqlite::Connection;
 use tokio::sync::RwLock;
+
+use crate::episode::{
+    CapabilityManifest, EpisodeRuntime, EpisodeRuntimeConfig, InMemorySessionRegistry,
+    PersistentRegistryError, PersistentSessionRegistry,
+};
+use crate::governance::GovernancePolicyResolver;
+use crate::htf::{ClockConfig, HolonicClock};
+use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
+use crate::metrics::SharedMetricsRegistry;
+use crate::protocol::dispatch::PrivilegedDispatcher;
+use crate::protocol::messages::DecodeConfig;
+use crate::protocol::session_dispatch::{InMemoryManifestStore, ManifestStore, SessionDispatcher};
+use crate::protocol::session_token::TokenMinter;
+use crate::session::SessionRegistry;
 
 // ============================================================================
 // TCK-00287: Fail-Closed Manifest Store (kept for potential future use)
@@ -158,11 +163,19 @@ impl DispatcherState {
         // for real)
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
 
+        // TCK-00289: Create shared HolonicClock to prevent mixed clock domain hazard
+        // (RSK-2503)
+        let clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("failed to create default clock"),
+        );
+
         // TCK-00287 BLOCKER 1 & 2: Create privileged dispatcher with shared state
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
             session_registry,
+            clock,
         );
 
         // Add metrics if provided
@@ -210,12 +223,20 @@ impl DispatcherState {
         // TCK-00287 MAJOR 3: Use shared manifest store.
         let manifest_store = Arc::new(InMemoryManifestStore::new());
 
+        // TCK-00289: Create shared HolonicClock to prevent mixed clock domain hazard
+        // (RSK-2503)
+        let clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("failed to create default clock"),
+        );
+
         // TCK-00287 BLOCKER 1: Create privileged dispatcher with global session
         // registry
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
             session_registry,
+            clock,
         );
 
         // Add metrics if provided
@@ -227,6 +248,83 @@ impl DispatcherState {
 
         // TCK-00287: Create session dispatcher with same token minter and manifest
         // store
+        let session_dispatcher =
+            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store);
+
+        Self {
+            privileged_dispatcher,
+            session_dispatcher,
+        }
+    }
+
+    /// Creates new dispatcher state with persistent ledger components
+    /// (TCK-00289).
+    ///
+    /// # Arguments
+    ///
+    /// * `session_registry` - Global session registry
+    /// * `metrics_registry` - Optional metrics registry
+    /// * `sqlite_conn` - Optional `SQLite` connection for persistent ledger. If
+    ///   provided, uses durable `Sqlite*` implementations. Otherwise uses
+    ///   stubs.
+    #[must_use]
+    pub fn with_persistence(
+        session_registry: Arc<dyn SessionRegistry>,
+        metrics_registry: Option<SharedMetricsRegistry>,
+        sqlite_conn: Option<Arc<Mutex<Connection>>>,
+    ) -> Self {
+        let token_secret = TokenMinter::generate_secret();
+        let token_minter = Arc::new(TokenMinter::new(token_secret));
+        let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+        let privileged_dispatcher = if let Some(conn) = sqlite_conn {
+            // Use real implementations
+            use rand::rngs::OsRng;
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+
+            let policy_resolver = Arc::new(GovernancePolicyResolver::new());
+            let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
+            let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
+                Arc::clone(&conn),
+                signing_key,
+            ));
+            let lease_validator = Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
+            let episode_runtime = Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default()));
+            let clock =
+                Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
+
+            PrivilegedDispatcher::with_dependencies(
+                DecodeConfig::default(),
+                policy_resolver,
+                work_registry,
+                event_emitter,
+                episode_runtime,
+                session_registry,
+                lease_validator,
+                clock,
+                token_minter.clone(),
+                manifest_store.clone(),
+            )
+        } else {
+            // Use stubs
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None)
+                    .expect("failed to create default clock"),
+            );
+            PrivilegedDispatcher::with_shared_state(
+                token_minter.clone(),
+                manifest_store.clone(),
+                session_registry,
+                clock,
+            )
+        };
+
+        let privileged_dispatcher = if let Some(metrics) = metrics_registry {
+            privileged_dispatcher.with_metrics(metrics)
+        } else {
+            privileged_dispatcher
+        };
+
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store);
 
