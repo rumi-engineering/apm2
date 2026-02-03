@@ -42,7 +42,9 @@ mod tests {
         assert_eq!(ToolClass::from_u8(4), Some(ToolClass::Git));
         assert_eq!(ToolClass::from_u8(5), Some(ToolClass::Inference));
         assert_eq!(ToolClass::from_u8(6), Some(ToolClass::Artifact));
-        assert_eq!(ToolClass::from_u8(7), None);
+        assert_eq!(ToolClass::from_u8(7), Some(ToolClass::ListFiles));
+        assert_eq!(ToolClass::from_u8(8), Some(ToolClass::Search));
+        assert_eq!(ToolClass::from_u8(9), None);
         assert_eq!(ToolClass::from_u8(255), None);
     }
 
@@ -68,6 +70,10 @@ mod tests {
         assert_eq!(ToolClass::parse("llm"), Some(ToolClass::Inference));
         assert_eq!(ToolClass::parse("artifact"), Some(ToolClass::Artifact));
         assert_eq!(ToolClass::parse("cas"), Some(ToolClass::Artifact));
+        assert_eq!(ToolClass::parse("listfiles"), Some(ToolClass::ListFiles));
+        assert_eq!(ToolClass::parse("ls"), Some(ToolClass::ListFiles));
+        assert_eq!(ToolClass::parse("search"), Some(ToolClass::Search));
+        assert_eq!(ToolClass::parse("grep"), Some(ToolClass::Search));
         assert_eq!(ToolClass::parse("unknown"), None);
     }
 
@@ -85,11 +91,15 @@ mod tests {
     fn test_properties() {
         assert!(ToolClass::Read.is_read_only());
         assert!(!ToolClass::Write.is_read_only());
+        assert!(ToolClass::ListFiles.is_read_only());
+        assert!(ToolClass::Search.is_read_only());
 
         assert!(!ToolClass::Read.can_mutate());
         assert!(ToolClass::Write.can_mutate());
         assert!(ToolClass::Execute.can_mutate());
         assert!(ToolClass::Git.can_mutate());
+        assert!(!ToolClass::ListFiles.can_mutate());
+        assert!(!ToolClass::Search.can_mutate());
 
         assert!(!ToolClass::Read.involves_network());
         assert!(ToolClass::Network.involves_network());
@@ -114,9 +124,11 @@ mod tests {
     #[test]
     fn test_all_classes() {
         let all = ToolClass::all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 9);
         assert!(all.contains(&ToolClass::Read));
         assert!(all.contains(&ToolClass::Artifact));
+        assert!(all.contains(&ToolClass::ListFiles));
+        assert!(all.contains(&ToolClass::Search));
     }
 
     #[test]

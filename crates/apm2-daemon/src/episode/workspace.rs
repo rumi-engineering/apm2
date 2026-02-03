@@ -340,7 +340,7 @@ pub fn validate_path(path: &str, workspace_root: &Path) -> Result<PathBuf, Works
     }
 
     // Check for path traversal patterns
-    if path.contains(".." ) {
+    if path.contains("..") {
         return Err(WorkspaceError::PathTraversal(format!(
             "path contains '..' traversal: {path}"
         )));

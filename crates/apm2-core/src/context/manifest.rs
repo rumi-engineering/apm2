@@ -2795,7 +2795,9 @@ pub mod tests {
         assert_eq!(ToolClass::from_u8(4), Some(ToolClass::Git));
         assert_eq!(ToolClass::from_u8(5), Some(ToolClass::Inference));
         assert_eq!(ToolClass::from_u8(6), Some(ToolClass::Artifact));
-        assert_eq!(ToolClass::from_u8(7), None);
+        assert_eq!(ToolClass::from_u8(7), Some(ToolClass::ListFiles));
+        assert_eq!(ToolClass::from_u8(8), Some(ToolClass::Search));
+        assert_eq!(ToolClass::from_u8(9), None);
         assert_eq!(ToolClass::from_u8(255), None);
     }
 
@@ -2808,6 +2810,8 @@ pub mod tests {
         assert_eq!(ToolClass::Git.value(), 4);
         assert_eq!(ToolClass::Inference.value(), 5);
         assert_eq!(ToolClass::Artifact.value(), 6);
+        assert_eq!(ToolClass::ListFiles.value(), 7);
+        assert_eq!(ToolClass::Search.value(), 8);
     }
 
     #[test]

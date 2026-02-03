@@ -1115,7 +1115,10 @@ impl EpisodeRuntime {
         if self.config.emit_events {
             // Stamp time envelope for temporal ordering (RFC-0016 HTF)
             let (time_envelope, time_envelope_ref) = match self
-                .stamp_envelope(Some(format!("review.receipt_recorded:{}", receipt.review_id)))
+                .stamp_envelope(Some(format!(
+                    "review.receipt_recorded:{}",
+                    receipt.review_id
+                )))
                 .await?
             {
                 Some((env, env_ref)) => (Some(env), Some(env_ref)),
@@ -2113,7 +2116,7 @@ mod tests {
 
         let runtime = EpisodeRuntime::new(test_config());
         let signer = Signer::generate();
-        
+
         let receipt = ReviewReceiptRecorded::create(
             "rev-001".into(),
             [0x11; 32],
@@ -2121,7 +2124,8 @@ mod tests {
             [0x33; 32],
             "actor-001".into(),
             &signer,
-        ).unwrap();
+        )
+        .unwrap();
 
         runtime
             .record_review_receipt(receipt.clone(), test_timestamp())
@@ -2131,7 +2135,11 @@ mod tests {
         let events = runtime.drain_events().await;
         assert_eq!(events.len(), 1);
         match &events[0] {
-            EpisodeEvent::ReviewReceiptRecorded { receipt: r, recorded_at_ns, .. } => {
+            EpisodeEvent::ReviewReceiptRecorded {
+                receipt: r,
+                recorded_at_ns,
+                ..
+            } => {
                 assert_eq!(r.review_id, "rev-001");
                 assert_eq!(*recorded_at_ns, test_timestamp());
             },

@@ -1,25 +1,33 @@
 // AGENT-AUTHORED
 //! Review receipt and artifact bundle types for FAC v0.
 //!
-//! This module implements the `ReviewReceiptRecorded` event and `ReviewArtifactBundleV1`
-//! used to record successful review completion and store review artifacts.
+//! This module implements the `ReviewReceiptRecorded` event and
+//! `ReviewArtifactBundleV1` used to record successful review completion and
+//! store review artifacts.
 //!
 //! # Design Overview
 //!
-//! - `ReviewArtifactBundleV1`: JSON bundle stored in CAS containing review text hash, tool logs, and metadata.
-//! - `ReviewReceiptRecorded`: Ledger event binding the changeset to the artifact bundle.
+//! - `ReviewArtifactBundleV1`: JSON bundle stored in CAS containing review text
+//!   hash, tool logs, and metadata.
+//! - `ReviewReceiptRecorded`: Ledger event binding the changeset to the
+//!   artifact bundle.
 //!
 //! # Security Properties
 //!
 //! - **Domain Separation**: `REVIEW_RECEIPT_RECORDED:` prefix for signatures.
-//! - **CAS Binding**: Artifacts are off-loaded to CAS; only hashes stored in ledger.
-//! - **Resource Limits**: Strict bounds on metadata, log counts, and string lengths.
+//! - **CAS Binding**: Artifacts are off-loaded to CAS; only hashes stored in
+//!   ledger.
+//! - **Resource Limits**: Strict bounds on metadata, log counts, and string
+//!   lengths.
 
 use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::domain_separator::{REVIEW_RECEIPT_RECORDED_PREFIX, sign_with_domain, verify_with_domain};
+use super::domain_separator::{
+    REVIEW_RECEIPT_RECORDED_PREFIX, sign_with_domain, verify_with_domain,
+};
 use crate::crypto::{Signature, Signer, VerifyingKey};
 
 // =============================================================================
@@ -113,11 +121,11 @@ pub struct ReviewArtifactBundleV1 {
     pub review_text_hash: [u8; 32],
     /// Hashes of tool logs in CAS.
     pub tool_log_hashes: Vec<String>, // Hex-encoded strings in JSON
-    
+
     /// Metadata key-value pairs.
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
-    
+
     /// HTF time envelope ref (hex encoded in JSON).
     pub time_envelope_ref: String,
 }
@@ -144,7 +152,7 @@ impl ReviewArtifactBundleV1 {
             });
         }
         if self.metadata.len() > MAX_METADATA_KEYS {
-             return Err(ReviewReceiptError::ListTooLong {
+            return Err(ReviewReceiptError::ListTooLong {
                 field: "metadata",
                 len: self.metadata.len(),
                 max: MAX_METADATA_KEYS,
@@ -158,7 +166,7 @@ impl ReviewArtifactBundleV1 {
                     max: MAX_METADATA_KEY_LEN,
                 });
             }
-             if v.len() > MAX_METADATA_VALUE_LEN {
+            if v.len() > MAX_METADATA_VALUE_LEN {
                 return Err(ReviewReceiptError::StringTooLong {
                     field: "metadata_value",
                     len: v.len(),
@@ -210,14 +218,14 @@ impl ReviewReceiptRecorded {
         signer: &Signer,
     ) -> Result<Self, ReviewReceiptError> {
         if review_id.len() > MAX_REVIEW_ID_LENGTH {
-             return Err(ReviewReceiptError::StringTooLong {
+            return Err(ReviewReceiptError::StringTooLong {
                 field: "review_id",
                 len: review_id.len(),
                 max: MAX_REVIEW_ID_LENGTH,
             });
         }
-         if reviewer_actor_id.len() > MAX_STRING_LENGTH {
-             return Err(ReviewReceiptError::StringTooLong {
+        if reviewer_actor_id.len() > MAX_STRING_LENGTH {
+            return Err(ReviewReceiptError::StringTooLong {
                 field: "reviewer_actor_id",
                 len: reviewer_actor_id.len(),
                 max: MAX_STRING_LENGTH,
@@ -236,7 +244,7 @@ impl ReviewReceiptRecorded {
         let canonical = event.canonical_bytes();
         let signature = sign_with_domain(signer, REVIEW_RECEIPT_RECORDED_PREFIX, &canonical);
         event.reviewer_signature = signature.to_bytes();
-        
+
         Ok(event)
     }
 
@@ -250,17 +258,25 @@ impl ReviewReceiptRecorded {
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        
-        bytes.extend_from_slice(&u32::try_from(self.review_id.len()).unwrap_or(u32::MAX).to_be_bytes());
+
+        bytes.extend_from_slice(
+            &u32::try_from(self.review_id.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
         bytes.extend_from_slice(self.review_id.as_bytes());
-        
+
         bytes.extend_from_slice(&self.changeset_digest);
         bytes.extend_from_slice(&self.artifact_bundle_hash);
         bytes.extend_from_slice(&self.time_envelope_ref);
-        
-        bytes.extend_from_slice(&u32::try_from(self.reviewer_actor_id.len()).unwrap_or(u32::MAX).to_be_bytes());
+
+        bytes.extend_from_slice(
+            &u32::try_from(self.reviewer_actor_id.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
         bytes.extend_from_slice(self.reviewer_actor_id.as_bytes());
-        
+
         bytes
     }
 
@@ -272,7 +288,7 @@ impl ReviewReceiptRecorded {
     pub fn verify_signature(&self, key: &VerifyingKey) -> Result<(), ReviewReceiptError> {
         let canonical = self.canonical_bytes();
         let signature = Signature::from_bytes(&self.reviewer_signature);
-        
+
         verify_with_domain(key, REVIEW_RECEIPT_RECORDED_PREFIX, &canonical, &signature)
             .map_err(|e| ReviewReceiptError::SignatureVerificationFailed(e.to_string()))
     }
@@ -289,14 +305,14 @@ impl TryFrom<ReviewReceiptRecordedProto> for ReviewReceiptRecorded {
 
     fn try_from(proto: ReviewReceiptRecordedProto) -> Result<Self, Self::Error> {
         if proto.review_id.len() > MAX_REVIEW_ID_LENGTH {
-             return Err(ReviewReceiptError::StringTooLong {
+            return Err(ReviewReceiptError::StringTooLong {
                 field: "review_id",
                 len: proto.review_id.len(),
                 max: MAX_REVIEW_ID_LENGTH,
             });
         }
         if proto.reviewer_actor_id.len() > MAX_STRING_LENGTH {
-             return Err(ReviewReceiptError::StringTooLong {
+            return Err(ReviewReceiptError::StringTooLong {
                 field: "reviewer_actor_id",
                 len: proto.reviewer_actor_id.len(),
                 max: MAX_STRING_LENGTH,
@@ -306,12 +322,12 @@ impl TryFrom<ReviewReceiptRecordedProto> for ReviewReceiptRecorded {
         let changeset_digest = proto.changeset_digest.try_into().map_err(|_| {
             ReviewReceiptError::InvalidData("changeset_digest must be 32 bytes".into())
         })?;
-        
+
         let artifact_bundle_hash = proto.artifact_bundle_hash.try_into().map_err(|_| {
             ReviewReceiptError::InvalidData("artifact_bundle_hash must be 32 bytes".into())
         })?;
 
-         let time_envelope_ref = proto
+        let time_envelope_ref = proto
             .time_envelope_ref
             .as_ref()
             .map(|ter| {
@@ -321,9 +337,9 @@ impl TryFrom<ReviewReceiptRecordedProto> for ReviewReceiptRecorded {
             })
             .transpose()?
             .unwrap_or([0u8; 32]);
-            
+
         let reviewer_signature = proto.reviewer_signature.try_into().map_err(|_| {
-             ReviewReceiptError::InvalidData("reviewer_signature must be 64 bytes".into())
+            ReviewReceiptError::InvalidData("reviewer_signature must be 64 bytes".into())
         })?;
 
         Ok(Self {
@@ -340,7 +356,7 @@ impl TryFrom<ReviewReceiptRecordedProto> for ReviewReceiptRecorded {
 impl From<ReviewReceiptRecorded> for ReviewReceiptRecordedProto {
     fn from(event: ReviewReceiptRecorded) -> Self {
         use crate::events::TimeEnvelopeRef as TimeEnvelopeRefProto;
-        
+
         Self {
             review_id: event.review_id,
             changeset_digest: event.changeset_digest.to_vec(),
@@ -372,8 +388,9 @@ mod tests {
             [0x33; 32],
             "actor-001".into(),
             &signer,
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         assert!(event.verify_signature(&signer.verifying_key()).is_ok());
     }
 
@@ -387,8 +404,9 @@ mod tests {
             [0x33; 32],
             "actor-001".into(),
             &signer,
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         event.review_id = "rev-002".into();
         assert!(event.verify_signature(&signer.verifying_key()).is_err());
     }
@@ -405,13 +423,19 @@ mod tests {
             metadata: BTreeMap::new(),
             time_envelope_ref: "00".repeat(32),
         };
-        
+
         assert!(bundle.validate().is_ok());
-        
+
         // Test metadata limit
         for i in 0..=MAX_METADATA_KEYS {
             bundle.metadata.insert(format!("k{i}"), "v".into());
         }
-        assert!(matches!(bundle.validate(), Err(ReviewReceiptError::ListTooLong { field: "metadata", .. })));
+        assert!(matches!(
+            bundle.validate(),
+            Err(ReviewReceiptError::ListTooLong {
+                field: "metadata",
+                ..
+            })
+        ));
     }
 }

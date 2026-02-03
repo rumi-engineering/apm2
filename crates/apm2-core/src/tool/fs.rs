@@ -225,7 +225,8 @@ impl FilesystemTool {
     ///
     /// # Errors
     ///
-    /// Returns a `ToolError` if the path cannot be accessed or if the glob pattern is invalid.
+    /// Returns a `ToolError` if the path cannot be accessed or if the glob
+    /// pattern is invalid.
     pub fn list_files(&self, req: &ListFiles) -> Result<Vec<u8>, ToolError> {
         // If pattern is provided, treat path/pattern as a glob.
         // If pattern is empty, just list the directory (non-recursive).
@@ -234,7 +235,11 @@ impl FilesystemTool {
 
         let mut output = String::new();
         let mut count = 0;
-        let max_entries = if req.max_entries == 0 { 2000 } else { req.max_entries };
+        let max_entries = if req.max_entries == 0 {
+            2000
+        } else {
+            req.max_entries
+        };
 
         if req.pattern.is_empty() {
             // Simple directory list
@@ -246,7 +251,7 @@ impl FilesystemTool {
                 let entry = entry.map_err(|e| Self::map_io_error(&e))?;
                 let file_name = entry.file_name();
                 let name = file_name.to_string_lossy();
-                
+
                 if !output.is_empty() {
                     output.push('\n');
                 }
@@ -271,7 +276,7 @@ impl FilesystemTool {
 
             // We construct the glob pattern: root / pattern
             let pattern_str = root.join(&req.pattern).to_string_lossy().to_string();
-            
+
             for entry in glob::glob(&pattern_str).map_err(|e| ToolError {
                 error_code: "INVALID_PATTERN".to_string(),
                 message: e.to_string(),
@@ -283,9 +288,11 @@ impl FilesystemTool {
                 }
                 match entry {
                     Ok(path) => {
-                        // Return path relative to root if possible, else just filename or full path relative to workspace?
-                        // Usually list_files expects paths relative to `path`.
-                        let display_path = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
+                        // Return path relative to root if possible, else just filename or full path
+                        // relative to workspace? Usually list_files expects
+                        // paths relative to `path`.
+                        let display_path =
+                            path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
                         if !output.is_empty() {
                             output.push('\n');
                         }
@@ -295,12 +302,14 @@ impl FilesystemTool {
                         }
                         count += 1;
                     },
-                    Err(e) => return Err(ToolError {
-                        error_code: "GLOB_ERROR".to_string(),
-                        message: e.to_string(),
-                        retryable: false,
-                        retry_after_ms: 0,
-                    }),
+                    Err(e) => {
+                        return Err(ToolError {
+                            error_code: "GLOB_ERROR".to_string(),
+                            message: e.to_string(),
+                            retryable: false,
+                            retry_after_ms: 0,
+                        });
+                    },
                 }
             }
         }

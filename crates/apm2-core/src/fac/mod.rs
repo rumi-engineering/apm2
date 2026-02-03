@@ -210,6 +210,12 @@ pub use review_blocked::{
     ReviewBlockedRecordedProto, SCHEMA_IDENTIFIER as REVIEW_BLOCKED_SCHEMA_IDENTIFIER,
     SCHEMA_VERSION as REVIEW_BLOCKED_SCHEMA_VERSION,
 };
+// Re-export review receipt types
+pub use review_receipt::{
+    BUNDLE_SCHEMA as REVIEW_ARTIFACT_BUNDLE_SCHEMA,
+    BUNDLE_VERSION as REVIEW_ARTIFACT_BUNDLE_VERSION, ReviewArtifactBundleV1, ReviewReceiptError,
+    ReviewReceiptRecorded, ReviewReceiptRecordedProto,
+};
 // Re-export risk tier classification types
 pub use risk_tier::{
     CRITICAL_MODULES, ChangeSet, DEPENDENCY_FANOUT_THRESHOLD, FILES_CHANGED_THRESHOLD,
@@ -232,10 +238,4 @@ pub use terminal_verifier::{
 pub use transcript_binding::{
     AatTranscriptBinding, MAX_CHUNK_CONTENT_BYTES, MAX_RUN_TRANSCRIPT_HASHES,
     MAX_TRANSCRIPT_CHUNKS, TranscriptBindingError, TranscriptChunk,
-};
-
-// Re-export review receipt types
-pub use review_receipt::{
-    BUNDLE_SCHEMA as REVIEW_ARTIFACT_BUNDLE_SCHEMA, BUNDLE_VERSION as REVIEW_ARTIFACT_BUNDLE_VERSION,
-    ReviewArtifactBundleV1, ReviewReceiptError, ReviewReceiptRecorded, ReviewReceiptRecordedProto,
 };
