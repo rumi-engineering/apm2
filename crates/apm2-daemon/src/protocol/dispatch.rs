@@ -49,6 +49,7 @@ use crate::episode::{
     CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
     LeaseIssueDenialReason, validate_custody_domain_overlap,
 };
+use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
 use crate::session::{EphemeralHandle, SessionRegistry, SessionState};
 
@@ -121,13 +122,15 @@ impl std::error::Error for LedgerEventError {}
 /// # Implementers
 ///
 /// - `StubLedgerEventEmitter`: In-memory storage for testing
-/// - `SqliteLedgerEventEmitter`: SQLite-backed persistence (future)
+/// - `DurableLedgerEventEmitter`: SQLite-backed persistence with HTF timestamps
+///   (TCK-00289)
 pub trait LedgerEventEmitter: Send + Sync {
     /// Emits a signed `WorkClaimed` event to the ledger.
     ///
     /// # Arguments
     ///
     /// * `claim` - The work claim to record
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
     ///
     /// # Returns
     ///
@@ -136,7 +139,11 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// # Errors
     ///
     /// Returns `LedgerEventError` if signing or persistence fails.
-    fn emit_work_claimed(&self, claim: &WorkClaim) -> Result<SignedLedgerEvent, LedgerEventError>;
+    fn emit_work_claimed(
+        &self,
+        claim: &WorkClaim,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Queries a signed event by event ID.
     fn get_event(&self, event_id: &str) -> Option<SignedLedgerEvent>;
@@ -230,7 +237,11 @@ impl StubLedgerEventEmitter {
 }
 
 impl LedgerEventEmitter for StubLedgerEventEmitter {
-    fn emit_work_claimed(&self, claim: &WorkClaim) -> Result<SignedLedgerEvent, LedgerEventError> {
+    fn emit_work_claimed(
+        &self,
+        claim: &WorkClaim,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
         // Generate unique event ID
@@ -262,12 +273,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Sign the canonical bytes
         let signature = self.signing_key.sign(&canonical_bytes);
 
-        // RFC-0016 HTF compliance: Use placeholder timestamp (0) for stub
-        // implementation. In production, this would use an HTF-compliant clock
-        // source that provides monotonic, causally-ordered timestamps. The stub
-        // uses 0 to make tests deterministic and avoid the forbidden
-        // SystemTime::now() call.
-        let timestamp_ns = 0u64;
+        // TCK-00289: Use provided HTF-compliant timestamp from HolonicClock.
+        // The timestamp_ns parameter is now provided by the caller from
+        // HolonicClock.now_hlc() ensuring RFC-0016 HTF compliance.
 
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
@@ -1192,6 +1200,10 @@ impl LeaseValidator for StubLeaseValidator {
 /// # TCK-00257 Additions
 ///
 /// - Lease validator for `GATE_EXECUTOR` spawn validation
+///
+/// # TCK-00289 Additions
+///
+/// - `HolonicClock` for HTF-compliant timestamps in `IssueCapability`
 pub struct PrivilegedDispatcher {
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
@@ -1248,6 +1260,20 @@ pub struct PrivilegedDispatcher {
     /// TODO(TCK-FUTURE): Wire `PrivilegedDispatcher` into `main.rs` to enable
     /// these metrics for binary protocol requests.
     metrics: Option<SharedMetricsRegistry>,
+
+    /// HTF-compliant clock for timestamps (TCK-00289).
+    ///
+    /// Used to generate RFC-0016 compliant timestamps for:
+    /// - `IssueCapability` `granted_at` / `expires_at` fields
+    /// - `WorkClaimed` ledger event timestamps
+    ///
+    /// # HTF Compliance
+    ///
+    /// The clock provides:
+    /// - Monotonic ticks: Never regress within a process lifetime
+    /// - HLC stamps: Hybrid logical clock for cross-node causality
+    /// - Wall time bounds: Observational only, with uncertainty interval
+    holonic_clock: Arc<HolonicClock>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -1267,9 +1293,15 @@ impl PrivilegedDispatcher {
     ///
     /// Uses stub implementations for policy resolver, work registry, event
     /// emitter, session registry, and lease validator. No metrics are emitted.
-    /// Creates internal stub token minter and manifest store for testing.
+    /// Creates internal stub token minter, manifest store, and HTF clock for
+    /// testing.
     #[must_use]
     pub fn new() -> Self {
+        // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
+        let holonic_clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default ClockConfig should always succeed"),
+        );
         Self {
             decode_config: DecodeConfig::default(),
             policy_resolver: Arc::new(StubPolicyResolver),
@@ -1281,6 +1313,7 @@ impl PrivilegedDispatcher {
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
+            holonic_clock,
         }
     }
 
@@ -1288,9 +1321,15 @@ impl PrivilegedDispatcher {
     ///
     /// Uses stub implementations for policy resolver, work registry, event
     /// emitter, session registry, and lease validator. No metrics are emitted.
-    /// Creates internal stub token minter and manifest store for testing.
+    /// Creates internal stub token minter, manifest store, and HTF clock for
+    /// testing.
     #[must_use]
     pub fn with_decode_config(decode_config: DecodeConfig) -> Self {
+        // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
+        let holonic_clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default ClockConfig should always succeed"),
+        );
         Self {
             decode_config,
             policy_resolver: Arc::new(StubPolicyResolver),
@@ -1302,6 +1341,7 @@ impl PrivilegedDispatcher {
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
+            holonic_clock,
         }
     }
 
@@ -1309,7 +1349,8 @@ impl PrivilegedDispatcher {
     ///
     /// This is the production constructor for real governance integration.
     /// Does not include metrics; use `with_metrics` to add them.
-    /// Creates internal stub token minter and manifest store.
+    /// Creates internal stub token minter, manifest store, and default HTF
+    /// clock.
     #[must_use]
     pub fn with_dependencies(
         decode_config: DecodeConfig,
@@ -1320,6 +1361,11 @@ impl PrivilegedDispatcher {
         session_registry: Arc<dyn SessionRegistry>,
         lease_validator: Arc<dyn LeaseValidator>,
     ) -> Self {
+        // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
+        let holonic_clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default ClockConfig should always succeed"),
+        );
         Self {
             decode_config,
             policy_resolver,
@@ -1331,6 +1377,7 @@ impl PrivilegedDispatcher {
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
+            holonic_clock,
         }
     }
 
@@ -1352,6 +1399,11 @@ impl PrivilegedDispatcher {
         manifest_store: Arc<InMemoryManifestStore>,
         session_registry: Arc<dyn SessionRegistry>,
     ) -> Self {
+        // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
+        let holonic_clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default ClockConfig should always succeed"),
+        );
         Self {
             decode_config: DecodeConfig::default(),
             policy_resolver: Arc::new(StubPolicyResolver),
@@ -1363,6 +1415,7 @@ impl PrivilegedDispatcher {
             token_minter,
             manifest_store,
             metrics: None,
+            holonic_clock,
         }
     }
 
@@ -1434,6 +1487,51 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub const fn manifest_store(&self) -> &Arc<InMemoryManifestStore> {
         &self.manifest_store
+    }
+
+    /// Returns a reference to the HTF-compliant clock (TCK-00289).
+    ///
+    /// This is primarily for testing to verify clock behavior.
+    #[must_use]
+    pub const fn holonic_clock(&self) -> &Arc<HolonicClock> {
+        &self.holonic_clock
+    }
+
+    // =========================================================================
+    // TCK-00289: HTF-Compliant Timestamp Generation
+    // =========================================================================
+
+    /// Returns an HTF-compliant timestamp in nanoseconds since epoch.
+    ///
+    /// Per RFC-0016, all timestamps must come from the `HolonicClock` to
+    /// ensure:
+    /// - Monotonicity: Timestamps never regress within a process lifetime
+    /// - Causality: HLC provides cross-node causal ordering
+    /// - Determinism: Clock source is injectable for replay scenarios
+    ///
+    /// # Returns
+    ///
+    /// The current HLC wall time in nanoseconds since epoch. This is a u64
+    /// value representing hybrid logical clock time, suitable for ledger
+    /// event timestamps and capability grant/expiry times.
+    ///
+    /// # Panics
+    ///
+    /// This method expects the `HolonicClock` to have HLC enabled. If HLC is
+    /// not enabled (which would be a configuration error for production),
+    /// this logs a warning and returns 0. In production, the clock should
+    /// always be configured with HLC enabled.
+    #[must_use]
+    fn get_htf_timestamp_ns(&self) -> u64 {
+        match self.holonic_clock.now_hlc() {
+            Ok(hlc) => hlc.wall_ns,
+            Err(e) => {
+                // Log warning but don't fail - return 0 as fallback.
+                // This should never happen in production as HLC should be enabled.
+                warn!(error = %e, "HLC clock error, using fallback timestamp 0");
+                0
+            },
+        }
     }
 
     // =========================================================================
@@ -1744,7 +1842,12 @@ impl PrivilegedDispatcher {
         // - Signed with the daemon's signing key (Ed25519)
         // - Includes work_id, lease_id, actor_id, role, and policy_resolved_ref
         // - Persisted to the append-only ledger for audit trail
-        let signed_event = match self.event_emitter.emit_work_claimed(&claim) {
+        //
+        // TCK-00289: Use HTF-compliant timestamp from HolonicClock.
+        // Per RFC-0016, timestamps must come from the HTF clock source to ensure
+        // monotonicity and causal ordering.
+        let timestamp_ns = self.get_htf_timestamp_ns();
+        let signed_event = match self.event_emitter.emit_work_claimed(&claim, timestamp_ns) {
             Ok(event) => event,
             Err(e) => {
                 warn!(error = %e, "WorkClaimed event emission failed");
@@ -2248,13 +2351,18 @@ impl PrivilegedDispatcher {
                 .capability_granted(role, capability_type);
         }
 
+        // TCK-00289: Use HTF-compliant timestamps from HolonicClock.
+        // Per RFC-0016, all timestamps must come from the HTF clock source to ensure
+        // monotonicity and causal ordering.
+        let granted_at = self.get_htf_timestamp_ns();
+        // Expires at granted_at + default TTL (1 hour in nanoseconds)
+        let expires_at = granted_at.saturating_add(DEFAULT_SESSION_TOKEN_TTL_SECS * 1_000_000_000);
+
         Ok(PrivilegedResponse::IssueCapability(
             IssueCapabilityResponse {
                 capability_id: format!("C-{stub_id}"),
-                // STUB: Use placeholder timestamps (0) until HTF clock is available
-                // Per RFC-0016, real timestamps must come from HTF-compliant clock source
-                granted_at: 0,
-                expires_at: 3600, // Relative offset for stub
+                granted_at,
+                expires_at,
             },
         ))
     }
@@ -2692,9 +2800,24 @@ mod tests {
             PrivilegedResponse::IssueCapability(resp) => {
                 assert!(!resp.capability_id.is_empty());
                 assert!(resp.capability_id.starts_with("C-")); // UUID-based ID
-                // STUB uses placeholder timestamps (granted_at=0, expires_at=3600)
-                assert_eq!(resp.granted_at, 0);
-                assert_eq!(resp.expires_at, 3600);
+                // TCK-00289: HTF-compliant timestamps from HolonicClock
+                // Per Definition of Done: "IssueCapability returns non-zero HTF-compliant
+                // timestamps"
+                assert!(
+                    resp.granted_at > 0,
+                    "granted_at should be non-zero HTF timestamp"
+                );
+                assert!(
+                    resp.expires_at > resp.granted_at,
+                    "expires_at should be after granted_at"
+                );
+                // Verify expires_at is granted_at + 1 hour (3600 seconds in nanoseconds)
+                let expected_ttl_ns = 3600 * 1_000_000_000u64;
+                assert_eq!(
+                    resp.expires_at - resp.granted_at,
+                    expected_ttl_ns,
+                    "TTL should be 1 hour in nanoseconds"
+                );
             },
             PrivilegedResponse::Error(err) => {
                 panic!("Unexpected error: {err:?}");
@@ -3105,11 +3228,11 @@ mod tests {
                 event.event_id.starts_with("EVT-"),
                 "Event ID should have EVT- prefix"
             );
-            // RFC-0016 HTF compliance: Stub uses placeholder timestamp (0)
-            // In production, HTF-compliant clock will provide real timestamps
-            assert_eq!(
-                event.timestamp_ns, 0,
-                "Stub timestamp should be 0 (HTF placeholder)"
+            // TCK-00289: HTF-compliant timestamps from HolonicClock
+            // Per Definition of Done: timestamps must be non-zero HTF-compliant
+            assert!(
+                event.timestamp_ns > 0,
+                "Timestamp should be non-zero HTF-compliant value"
             );
 
             // Verify payload contains expected fields
