@@ -87,6 +87,20 @@ pub use storage::{
 /// scenarios.
 pub const COMMIT_NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
 
+/// Maximum length for event type strings in commit notifications.
+///
+/// Per TCK-00304 security review: Unbounded string fields enable memory denial
+/// of service. This bound matches segment bounds in HEF topic grammar (64
+/// chars).
+pub const MAX_EVENT_TYPE_LEN: usize = 64;
+
+/// Maximum length for namespace strings in commit notifications.
+///
+/// Per TCK-00304 security review: Unbounded string fields enable memory denial
+/// of service. This bound matches segment bounds in HEF topic grammar (64
+/// chars).
+pub const MAX_NAMESPACE_LEN: usize = 64;
+
 /// Notification sent after a successful ledger commit.
 ///
 /// Per DD-HEF-0007, pulse emission order is: CAS persist -> ledger commit ->
@@ -138,6 +152,12 @@ pub struct CommitNotification {
 
 impl CommitNotification {
     /// Creates a new commit notification.
+    ///
+    /// # String Bounds (TCK-00304 Security Review)
+    ///
+    /// The `event_type` and `namespace` fields are truncated to their maximum
+    /// lengths (`MAX_EVENT_TYPE_LEN` and `MAX_NAMESPACE_LEN`) to prevent
+    /// memory DoS via unbounded string deserialization.
     #[must_use]
     pub fn new(
         seq_id: u64,
@@ -145,16 +165,25 @@ impl CommitNotification {
         event_type: impl Into<String>,
         namespace: impl Into<String>,
     ) -> Self {
+        let event_type = Self::truncate_string(event_type.into(), MAX_EVENT_TYPE_LEN);
+        let namespace = Self::truncate_string(namespace.into(), MAX_NAMESPACE_LEN);
+
         Self {
             seq_id,
             event_hash,
-            event_type: event_type.into(),
-            namespace: namespace.into(),
+            event_type,
+            namespace,
             consensus_index: None,
         }
     }
 
     /// Creates a commit notification with consensus index.
+    ///
+    /// # String Bounds (TCK-00304 Security Review)
+    ///
+    /// The `event_type` and `namespace` fields are truncated to their maximum
+    /// lengths (`MAX_EVENT_TYPE_LEN` and `MAX_NAMESPACE_LEN`) to prevent
+    /// memory DoS via unbounded string deserialization.
     #[must_use]
     pub fn with_consensus(
         seq_id: u64,
@@ -163,12 +192,33 @@ impl CommitNotification {
         namespace: impl Into<String>,
         consensus_index: ConsensusIndex,
     ) -> Self {
+        let event_type = Self::truncate_string(event_type.into(), MAX_EVENT_TYPE_LEN);
+        let namespace = Self::truncate_string(namespace.into(), MAX_NAMESPACE_LEN);
+
         Self {
             seq_id,
             event_hash,
-            event_type: event_type.into(),
-            namespace: namespace.into(),
+            event_type,
+            namespace,
             consensus_index: Some(consensus_index),
+        }
+    }
+
+    /// Truncates a string to the specified maximum length at a valid UTF-8
+    /// boundary.
+    ///
+    /// This ensures the string is bounded without panicking on multi-byte
+    /// characters.
+    fn truncate_string(s: String, max_len: usize) -> String {
+        if s.len() <= max_len {
+            s
+        } else {
+            // Find the largest valid UTF-8 boundary <= max_len
+            let mut truncate_at = max_len;
+            while truncate_at > 0 && !s.is_char_boundary(truncate_at) {
+                truncate_at -= 1;
+            }
+            s[..truncate_at].to_string()
         }
     }
 }

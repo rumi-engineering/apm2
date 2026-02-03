@@ -257,6 +257,7 @@ pub use pulse_outbox::{
     PulseFrameSink,
     PulsePublisher,
     PulsePublisherConfig,
+    TrySendResult,
     // Factory
     create_commit_notification_channel,
 };

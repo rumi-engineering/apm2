@@ -54,6 +54,7 @@ use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use super::messages::{EntityRef, PulseEnvelopeV1, PulseEvent};
+use super::pulse_topic::{MAX_TOPIC_LEN, validate_topic};
 use super::resource_governance::{DropPriority, SharedSubscriptionRegistry};
 
 // ============================================================================
@@ -140,12 +141,38 @@ pub struct PulsePublisher {
     ledger_head: std::sync::atomic::AtomicU64,
 }
 
+/// Result of a non-blocking pulse send attempt.
+///
+/// Per TCK-00304 security review: `send_pulse` must be non-blocking to prevent
+/// head-of-line blocking denial of service. A slow consumer on one connection
+/// must not stall pulse delivery to other connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySendResult {
+    /// Pulse was successfully queued for delivery.
+    Sent,
+    /// Per-connection buffer is full; pulse dropped (acceptable per HEF
+    /// semantics).
+    BufferFull,
+    /// Connection is closed; pulse dropped and connection should be cleaned up.
+    Disconnected,
+}
+
 /// Sender for pulse frames to a connection.
 ///
 /// This trait abstracts the actual frame sending mechanism to allow testing
 /// and different transport implementations.
+///
+/// # Non-Blocking Guarantee (TCK-00304 Security Review)
+///
+/// Implementations MUST be non-blocking. The `try_send_pulse` method should
+/// return immediately, using `try_send` semantics on an internal per-connection
+/// buffer/channel. If the buffer is full, return `TrySendResult::BufferFull`
+/// rather than blocking.
+///
+/// This prevents a slow consumer on one connection from blocking pulse delivery
+/// to all other connections (head-of-line blocking DoS).
 pub trait PulseFrameSink: Send + Sync {
-    /// Sends a pulse frame to the connection.
+    /// Attempts to send a pulse frame to the connection without blocking.
     ///
     /// # Arguments
     ///
@@ -153,8 +180,32 @@ pub trait PulseFrameSink: Send + Sync {
     ///
     /// # Returns
     ///
-    /// `Ok(())` if sent successfully, `Err(())` if the connection is closed.
-    fn send_pulse(&self, frame: Bytes) -> Result<(), ()>;
+    /// - `TrySendResult::Sent` if the pulse was successfully queued
+    /// - `TrySendResult::BufferFull` if the per-connection buffer is full
+    ///   (pulse dropped)
+    /// - `TrySendResult::Disconnected` if the connection is closed
+    ///
+    /// # Non-Blocking Guarantee
+    ///
+    /// This method MUST NOT block. Implementations should use `try_send` on an
+    /// internal channel/buffer. Blocking here would cause head-of-line blocking
+    /// denial of service across all connections.
+    fn try_send_pulse(&self, frame: Bytes) -> TrySendResult;
+
+    /// Legacy blocking send (deprecated, calls `try_send_pulse` internally).
+    ///
+    /// This method is provided for backward compatibility with existing code.
+    /// New code should use `try_send_pulse` directly.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use try_send_pulse() for non-blocking semantics"
+    )]
+    fn send_pulse(&self, frame: Bytes) -> Result<(), ()> {
+        match self.try_send_pulse(frame) {
+            TrySendResult::Sent => Ok(()),
+            TrySendResult::BufferFull | TrySendResult::Disconnected => Err(()),
+        }
+    }
 }
 
 /// Type alias for a boxed pulse frame sink.
@@ -273,7 +324,22 @@ impl PulsePublisher {
         );
 
         // Build the topic from the notification
-        let topic = self.derive_topic(&notification);
+        let topic = match self.derive_topic(&notification) {
+            Some(t) => t,
+            None => {
+                // Topic derivation failed (invalid topic); drop the notification
+                // Per TCK-00304 security review: notifications producing invalid
+                // topics must be dropped to maintain invariant that pulse plane
+                // only processes valid HEF topics.
+                debug!(
+                    seq_id = notification.seq_id,
+                    event_type = %notification.event_type,
+                    namespace = %notification.namespace,
+                    "Notification dropped: derived topic failed validation"
+                );
+                return;
+            },
+        };
 
         // Build the pulse envelope
         let envelope = self.build_envelope(&notification, &topic);
@@ -294,6 +360,8 @@ impl PulsePublisher {
         let _priority = DropPriority::from_topic(&topic);
 
         // Fan out to matching subscribers with backpressure
+        // NOTE: Per TCK-00304 security review, try_send_pulse is non-blocking
+        // to prevent HoL blocking DoS.
         let senders = self.connection_senders.read().expect("lock poisoned");
 
         for (connection_id, subscription_id) in matches {
@@ -303,10 +371,10 @@ impl PulsePublisher {
                 .try_reserve_enqueue(&connection_id, payload_size)
             {
                 Ok(()) => {
-                    // Reservation successful, send the pulse
+                    // Reservation successful, attempt non-blocking send
                     if let Some(sender) = senders.get(&connection_id) {
-                        match sender.send_pulse(frame.clone()) {
-                            Ok(()) => {
+                        match sender.try_send_pulse(frame.clone()) {
+                            TrySendResult::Sent => {
                                 trace!(
                                     connection_id = %connection_id,
                                     subscription_id = %subscription_id,
@@ -314,7 +382,18 @@ impl PulsePublisher {
                                     "Pulse delivered"
                                 );
                             },
-                            Err(()) => {
+                            TrySendResult::BufferFull => {
+                                // Per-connection buffer full; release reservation and drop pulse
+                                // Per HEF semantics: pulses are lossy hints, drops are acceptable
+                                self.registry.record_dequeue(&connection_id, payload_size);
+                                debug!(
+                                    connection_id = %connection_id,
+                                    subscription_id = %subscription_id,
+                                    topic = %topic,
+                                    "Pulse dropped: per-connection buffer full"
+                                );
+                            },
+                            TrySendResult::Disconnected => {
                                 // Connection closed, release reservation
                                 self.registry.record_dequeue(&connection_id, payload_size);
                                 debug!(
@@ -347,47 +426,115 @@ impl PulsePublisher {
         }
     }
 
-    /// Derives the topic string from a commit notification.
+    /// Derives and validates the topic string from a commit notification.
     ///
     /// Per DD-HEF-0001, topics are derived from ledger event types:
     /// - `ledger.head` for all commits (system topic)
     /// - `work.<work_id>.events` for work events
     /// - `gate.<work_id>.<changeset_digest>.<gate_id>` for gate receipts
     /// - etc.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(topic)` if the derived topic is valid per HEF Topic Grammar
+    /// - `None` if the derived topic fails validation (notification should be
+    ///   dropped)
+    ///
+    /// # Security Invariant (TCK-00304)
+    ///
+    /// Per security review: Topics constructed via `format!` must be validated
+    /// against HEF Topic Grammar. Topics with invalid characters violate the
+    /// invariant that the pulse plane only processes valid HEF topics.
     #[allow(clippy::unused_self)] // Will use self for topic configuration in future
-    fn derive_topic(&self, notification: &CommitNotification) -> String {
+    fn derive_topic(&self, notification: &CommitNotification) -> Option<String> {
+        // Sanitize namespace: replace invalid characters with underscores and truncate
+        // This ensures format! produces a valid topic segment
+        let sanitized_namespace = Self::sanitize_segment(&notification.namespace);
+
         // For Phase 1, derive a simple topic based on event type
         // Full topic derivation will be added as event types are defined
-        match notification.event_type.as_str() {
+        let topic = match notification.event_type.as_str() {
             // System events -> ledger.head
             "KernelEvent" | "LedgerEvent" => "ledger.head".to_string(),
 
             // Work events -> work.<work_id>.events (work_id extracted from payload later)
             "WorkOpened" | "WorkTransitioned" | "WorkCompleted" | "WorkAborted" => {
                 // For now, use namespace as a proxy until work_id extraction is implemented
-                format!("work.{}.events", notification.namespace)
+                format!("work.{sanitized_namespace}.events")
             },
 
             // Gate events -> gate.<work_id>.<changeset_digest>.<gate_id>
             "GateReceipt" => {
                 // Full topic derivation requires payload parsing; use namespace for now
-                format!("gate.{}.receipts", notification.namespace)
+                format!("gate.{sanitized_namespace}.receipts")
             },
 
             // Episode events -> episode.<episode_id>.<category>
             "EpisodeCreated" | "EpisodeStarted" | "EpisodeStopped" => {
-                format!("episode.{}.lifecycle", notification.namespace)
+                format!("episode.{sanitized_namespace}.lifecycle")
             },
 
             "ToolRequested" | "ToolDecided" | "ToolExecuted" => {
-                format!("episode.{}.tool", notification.namespace)
+                format!("episode.{sanitized_namespace}.tool")
             },
 
             // Defect events -> defect.new
             "DefectRecord" => "defect.new".to_string(),
 
             // Default: namespace-based topic
-            _ => format!("{}.events", notification.namespace),
+            _ => format!("{sanitized_namespace}.events"),
+        };
+
+        // Validate the derived topic against HEF Topic Grammar
+        // Per TCK-00304 security review: topics with invalid characters must be
+        // rejected
+        match validate_topic(&topic) {
+            Ok(()) => Some(topic),
+            Err(e) => {
+                warn!(
+                    topic = %topic,
+                    error = %e,
+                    event_type = %notification.event_type,
+                    namespace = %notification.namespace,
+                    "Derived topic failed validation"
+                );
+                None
+            },
+        }
+    }
+
+    /// Sanitizes a string to be a valid topic segment.
+    ///
+    /// - Replaces non-ASCII and invalid characters with underscores
+    /// - Replaces dots (segment separators) with underscores
+    /// - Truncates to maximum segment length
+    /// - Ensures non-empty result (uses "_" if input produces empty)
+    fn sanitize_segment(s: &str) -> String {
+        // Per pulse_topic.rs: valid segment chars are ASCII alphanumeric and
+        // hyphen/underscore Dots are segment separators and must be replaced
+        let sanitized: String = s
+            .chars()
+            .filter_map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    Some(c)
+                } else if c == '.' {
+                    // Replace dots to avoid creating extra segments
+                    Some('_')
+                } else if c.is_ascii() {
+                    // Replace other ASCII (spaces, special chars) with underscore
+                    Some('_')
+                } else {
+                    // Skip non-ASCII characters
+                    None
+                }
+            })
+            .take(MAX_TOPIC_LEN) // Conservative truncation (actual segment max is 64)
+            .collect();
+
+        if sanitized.is_empty() {
+            "_".to_string()
+        } else {
+            sanitized
         }
     }
 
@@ -492,10 +639,18 @@ mod tests {
     #[derive(Default)]
     struct MockPulseFrameSink {
         frames: std::sync::Mutex<Vec<Bytes>>,
-        should_fail: std::sync::atomic::AtomicBool,
+        failure_mode: std::sync::atomic::AtomicU8,
     }
 
     impl MockPulseFrameSink {
+        /// Normal mode - sends succeed
+        #[allow(dead_code)]
+        const MODE_NORMAL: u8 = 0;
+        /// Disconnected mode - returns `Disconnected`
+        const MODE_DISCONNECTED: u8 = 1;
+        /// Buffer full mode - returns `BufferFull`
+        const MODE_BUFFER_FULL: u8 = 2;
+
         fn new() -> Self {
             Self::default()
         }
@@ -503,7 +658,14 @@ mod tests {
         fn with_failure() -> Self {
             Self {
                 frames: std::sync::Mutex::new(Vec::new()),
-                should_fail: std::sync::atomic::AtomicBool::new(true),
+                failure_mode: std::sync::atomic::AtomicU8::new(Self::MODE_DISCONNECTED),
+            }
+        }
+
+        fn with_buffer_full() -> Self {
+            Self {
+                frames: std::sync::Mutex::new(Vec::new()),
+                failure_mode: std::sync::atomic::AtomicU8::new(Self::MODE_BUFFER_FULL),
             }
         }
 
@@ -513,12 +675,14 @@ mod tests {
     }
 
     impl PulseFrameSink for MockPulseFrameSink {
-        fn send_pulse(&self, frame: Bytes) -> Result<(), ()> {
-            if self.should_fail.load(std::sync::atomic::Ordering::Relaxed) {
-                Err(())
-            } else {
-                self.frames.lock().unwrap().push(frame);
-                Ok(())
+        fn try_send_pulse(&self, frame: Bytes) -> TrySendResult {
+            match self.failure_mode.load(std::sync::atomic::Ordering::Relaxed) {
+                Self::MODE_DISCONNECTED => TrySendResult::Disconnected,
+                Self::MODE_BUFFER_FULL => TrySendResult::BufferFull,
+                _ => {
+                    self.frames.lock().unwrap().push(frame);
+                    TrySendResult::Sent
+                },
             }
         }
     }
@@ -550,19 +714,101 @@ mod tests {
 
         // Test ledger head topic
         let notification = CommitNotification::new(1, [0; 32], "LedgerEvent", "kernel");
-        assert_eq!(publisher.derive_topic(&notification), "ledger.head");
+        assert_eq!(
+            publisher.derive_topic(&notification),
+            Some("ledger.head".to_string())
+        );
 
         // Test work event topic
         let notification = CommitNotification::new(2, [0; 32], "WorkOpened", "W-123");
-        assert_eq!(publisher.derive_topic(&notification), "work.W-123.events");
+        assert_eq!(
+            publisher.derive_topic(&notification),
+            Some("work.W-123.events".to_string())
+        );
 
         // Test gate receipt topic
         let notification = CommitNotification::new(3, [0; 32], "GateReceipt", "W-456");
-        assert_eq!(publisher.derive_topic(&notification), "gate.W-456.receipts");
+        assert_eq!(
+            publisher.derive_topic(&notification),
+            Some("gate.W-456.receipts".to_string())
+        );
 
         // Test defect topic
         let notification = CommitNotification::new(4, [0; 32], "DefectRecord", "kernel");
-        assert_eq!(publisher.derive_topic(&notification), "defect.new");
+        assert_eq!(
+            publisher.derive_topic(&notification),
+            Some("defect.new".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publisher_derive_topic_sanitizes_namespace() {
+        let (_, receiver) = create_commit_notification_channel();
+        let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
+
+        let publisher =
+            PulsePublisher::new(PulsePublisherConfig::for_testing(), receiver, registry);
+
+        // Test namespace with special characters gets sanitized
+        let notification = CommitNotification::new(1, [0; 32], "WorkOpened", "work@id#123");
+        let topic = publisher.derive_topic(&notification);
+        assert!(topic.is_some());
+        // Special characters replaced with underscores
+        assert_eq!(topic.unwrap(), "work.work_id_123.events");
+
+        // Test namespace with dots gets sanitized (dots become underscores)
+        let notification = CommitNotification::new(2, [0; 32], "WorkOpened", "ns.sub.id");
+        let topic = publisher.derive_topic(&notification);
+        assert!(topic.is_some());
+        assert_eq!(topic.unwrap(), "work.ns_sub_id.events");
+
+        // Test empty namespace gets sanitized to underscore
+        let notification = CommitNotification::new(3, [0; 32], "WorkOpened", "");
+        let topic = publisher.derive_topic(&notification);
+        assert!(topic.is_some());
+        assert_eq!(topic.unwrap(), "work._.events");
+    }
+
+    #[tokio::test]
+    async fn test_publisher_buffer_full_handling() {
+        let (sender, receiver) = create_commit_notification_channel();
+        let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
+
+        registry.register_connection("conn-1").unwrap();
+        let sub = SubscriptionState::new(
+            "sub-1",
+            "client-sub-1",
+            vec![test_pattern("ledger.head")],
+            0,
+        );
+        registry.add_subscription("conn-1", sub).unwrap();
+
+        let publisher = PulsePublisher::new(
+            PulsePublisherConfig::for_testing(),
+            receiver,
+            Arc::clone(&registry),
+        );
+
+        // Register a mock sender that simulates buffer full
+        let mock_sink = Arc::new(MockPulseFrameSink::with_buffer_full());
+        publisher.register_connection("conn-1", mock_sink.clone());
+
+        // Send a notification
+        let notification = CommitNotification::new(1, [0xab; 32], "LedgerEvent", "kernel");
+        sender.send(notification).await.unwrap();
+
+        // Process it - should handle buffer full gracefully (non-blocking)
+        let mut publisher = publisher;
+        let count = publisher.drain_batch(10);
+        assert_eq!(count, 1);
+
+        // No frames sent due to buffer full
+        let frames = mock_sink.received_frames();
+        assert_eq!(frames.len(), 0);
+
+        // Verify dequeue was called (reservation released)
+        let stats = registry.connection_stats("conn-1").unwrap();
+        assert_eq!(stats.queue_depth, 0);
     }
 
     #[tokio::test]
