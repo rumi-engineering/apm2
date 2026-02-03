@@ -19,9 +19,16 @@ path = "src/main.rs"
 [dependencies]
 # Internal crates
 apm2-core.workspace = true
+apm2-daemon.workspace = true
 
 # Async runtime
 tokio.workspace = true
+tokio-util.workspace = true
+
+# Protocol/framing
+bytes.workspace = true
+futures = "0.3"
+prost.workspace = true
 
 # Serialization
 serde.workspace = true

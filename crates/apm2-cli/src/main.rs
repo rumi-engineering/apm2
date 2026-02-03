@@ -245,7 +245,18 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .init();
 
-    // Determine socket path
+    // TCK-00288: Deprecation warning for --socket flag
+    // The --socket flag is deprecated and maps to operator_socket only.
+    // Users should migrate to using config-based socket paths.
+    if cli.socket.is_some() {
+        eprintln!(
+            "WARNING: --socket is deprecated and will be removed in a future version.\n\
+             The flag maps to operator_socket only. For dual-socket routing (operator/session),\n\
+             configure socket paths in ecosystem.toml instead."
+        );
+    }
+
+    // Determine socket path (operator socket for privileged operations)
     let socket_path = cli.socket.clone().unwrap_or_else(|| {
         // Try to load from config, or use default
         if cli.config.exists() {
