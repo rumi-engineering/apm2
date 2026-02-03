@@ -22,6 +22,12 @@
 //! - **CTR-PROTO-006 (Receipts/Evidence)**: [`Receipt`], [`PublishEvidence`],
 //!   [`EvidencePinned`], [`EvidenceTtlExpired`], [`CompactionCompleted`],
 //!   [`ReceiptKind`], [`EvidenceKind`], [`RetentionHint`]
+//! - **CTR-PROTO-010 (HEF Pulse Plane)**: [`PulseEnvelopeV1`], [`EntityRef`],
+//!   [`CasRef`], [`HlcStamp`], [`BoundedWallInterval`],
+//!   [`SubscribePulseRequest`], [`SubscribePulseResponse`],
+//!   [`PatternRejection`], [`UnsubscribePulseRequest`],
+//!   [`UnsubscribePulseResponse`], [`PulseEvent`], [`HefError`],
+//!   [`HefErrorCode`]
 //!
 //! # Canonical Encoding
 //!
@@ -333,6 +339,17 @@ impl_bounded_decode_simple!(
     LeaseRevoked,
     RecoverSessionsRequest,
     RecoverSessionsResponse,
+    // CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
+    // Simple messages without repeated fields
+    EntityRef,
+    CasRef,
+    HlcStamp,
+    BoundedWallInterval,
+    PatternRejection,
+    UnsubscribePulseRequest,
+    UnsubscribePulseResponse,
+    PulseEvent,
+    HefError,
 );
 
 // Implement BoundedDecode for messages with repeated fields
@@ -344,6 +361,305 @@ impl_bounded_decode_with_repeated!(CompactionCompleted, tombstoned_hashes);
 impl_bounded_decode_with_repeated!(TelemetryPolicy, promote_triggers);
 // CTR-PROTO-007: Privileged Endpoints (RFC-0017)
 impl_bounded_decode_with_repeated!(CapabilityRequest, read_patterns, write_patterns);
+// CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
+impl_bounded_decode_with_repeated!(PulseEnvelopeV1, entities, cas_refs);
+impl_bounded_decode_with_repeated!(SubscribePulseRequest, topic_patterns);
+impl_bounded_decode_with_repeated!(SubscribePulseResponse, accepted_patterns, rejected_patterns);
+
+// ============================================================================
+// HEF Field Bounds (CTR-HEF-0001, REQ-HEF-0002, RFC-0018)
+// ============================================================================
+
+/// Maximum size for `PulseEnvelopeV1` in bytes.
+/// Per INV-HEF-001: "`PulseEnvelopeV1` max size: 2048 bytes"
+pub const HEF_MAX_ENVELOPE_SIZE: usize = 2048;
+
+/// Maximum number of entities in a `PulseEnvelopeV1`.
+/// Per REQ-HEF-0002: "Max entities: 8"
+pub const HEF_MAX_ENTITIES: usize = 8;
+
+/// Maximum number of CAS references in a `PulseEnvelopeV1`.
+/// Per REQ-HEF-0002: "Max `cas_refs`: 8"
+pub const HEF_MAX_CAS_REFS: usize = 8;
+
+/// Maximum length for `pulse_id` in a `PulseEnvelopeV1`.
+/// Per REQ-HEF-0002: "`pulse_id`: max 64 chars, ASCII only"
+pub const HEF_MAX_PULSE_ID_LEN: usize = 64;
+
+/// Maximum length for `topic` in a `PulseEnvelopeV1`.
+/// Per REQ-HEF-0002: "`topic`: max 128 chars, ASCII only, dot-delimited"
+pub const HEF_MAX_TOPIC_LEN: usize = 128;
+
+/// Maximum length for `event_type` in a `PulseEnvelopeV1`.
+/// Per REQ-HEF-0002: "`event_type`: max 64 chars"
+pub const HEF_MAX_EVENT_TYPE_LEN: usize = 64;
+
+/// Maximum length for `kind` in an `EntityRef`.
+/// Per CTR-HEF-0001: "Max length: 16 characters, ASCII only"
+pub const HEF_MAX_ENTITY_KIND_LEN: usize = 16;
+
+/// Maximum length for `id` in an `EntityRef`.
+/// Per CTR-HEF-0001: "Max length: 128 characters, ASCII only"
+pub const HEF_MAX_ENTITY_ID_LEN: usize = 128;
+
+/// Maximum length for `kind` in a `CasRef`.
+/// Per CTR-HEF-0001: "Max length: 32 characters, ASCII only"
+pub const HEF_MAX_CAS_KIND_LEN: usize = 32;
+
+/// Maximum number of topic patterns in a `SubscribePulseRequest`.
+/// Per RFC-0018: "Max `topic_patterns`: 16"
+pub const HEF_MAX_TOPIC_PATTERNS: usize = 16;
+
+/// Maximum length for each topic pattern.
+/// Per RFC-0018: "Each pattern: max 128 chars, ASCII only"
+pub const HEF_MAX_PATTERN_LEN: usize = 128;
+
+/// Maximum length for `client_sub_id` in a `SubscribePulseRequest`.
+/// Per RFC-0018: "Max length: 64 characters"
+pub const HEF_MAX_CLIENT_SUB_ID_LEN: usize = 64;
+
+/// Error type for HEF field bounds validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HefValidationError {
+    /// Envelope exceeds maximum size.
+    EnvelopeTooLarge {
+        /// Actual size in bytes.
+        size: usize,
+        /// Maximum allowed size.
+        max: usize,
+    },
+    /// String field exceeds maximum length.
+    FieldTooLong {
+        /// Name of the field.
+        field: &'static str,
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+    /// Repeated field exceeds maximum count.
+    TooManyItems {
+        /// Name of the field.
+        field: &'static str,
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
+    /// String field contains non-ASCII characters.
+    NonAscii {
+        /// Name of the field.
+        field: &'static str,
+    },
+}
+
+impl std::fmt::Display for HefValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EnvelopeTooLarge { size, max } => {
+                write!(
+                    f,
+                    "pulse envelope too large: {size} bytes exceeds maximum {max} bytes"
+                )
+            },
+            Self::FieldTooLong { field, len, max } => {
+                write!(
+                    f,
+                    "field '{field}' too long: {len} characters exceeds maximum {max}"
+                )
+            },
+            Self::TooManyItems { field, count, max } => {
+                write!(
+                    f,
+                    "field '{field}' has too many items: {count} exceeds maximum {max}"
+                )
+            },
+            Self::NonAscii { field } => {
+                write!(f, "field '{field}' contains non-ASCII characters")
+            },
+        }
+    }
+}
+
+impl std::error::Error for HefValidationError {}
+
+/// Validates an ASCII string field.
+#[allow(clippy::missing_const_for_fn)] // str::is_ascii() prevents const
+fn validate_ascii_field(
+    value: &str,
+    field: &'static str,
+    max_len: usize,
+) -> Result<(), HefValidationError> {
+    if value.len() > max_len {
+        return Err(HefValidationError::FieldTooLong {
+            field,
+            len: value.len(),
+            max: max_len,
+        });
+    }
+    if !value.is_ascii() {
+        return Err(HefValidationError::NonAscii { field });
+    }
+    Ok(())
+}
+
+impl EntityRef {
+    /// Validates the `EntityRef` against HEF field bounds (CTR-HEF-0001).
+    ///
+    /// # Errors
+    ///
+    /// Returns `HefValidationError` if:
+    /// - `kind` exceeds 16 characters or contains non-ASCII
+    /// - `id` exceeds 128 characters or contains non-ASCII
+    pub fn validate(&self) -> Result<(), HefValidationError> {
+        validate_ascii_field(&self.kind, "EntityRef.kind", HEF_MAX_ENTITY_KIND_LEN)?;
+        validate_ascii_field(&self.id, "EntityRef.id", HEF_MAX_ENTITY_ID_LEN)?;
+        Ok(())
+    }
+}
+
+impl CasRef {
+    /// Validates the `CasRef` against HEF field bounds (CTR-HEF-0001).
+    ///
+    /// # Errors
+    ///
+    /// Returns `HefValidationError` if:
+    /// - `kind` exceeds 32 characters or contains non-ASCII
+    pub fn validate(&self) -> Result<(), HefValidationError> {
+        validate_ascii_field(&self.kind, "CasRef.kind", HEF_MAX_CAS_KIND_LEN)?;
+        Ok(())
+    }
+}
+
+impl PatternRejection {
+    /// Validates the `PatternRejection` against HEF field bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HefValidationError` if:
+    /// - `pattern` exceeds 128 characters
+    pub fn validate(&self) -> Result<(), HefValidationError> {
+        if self.pattern.len() > HEF_MAX_PATTERN_LEN {
+            return Err(HefValidationError::FieldTooLong {
+                field: "PatternRejection.pattern",
+                len: self.pattern.len(),
+                max: HEF_MAX_PATTERN_LEN,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl PulseEnvelopeV1 {
+    /// Validates the `PulseEnvelopeV1` against HEF field bounds (CTR-HEF-0001,
+    /// REQ-HEF-0002).
+    ///
+    /// # Errors
+    ///
+    /// Returns `HefValidationError` if any field constraint is violated:
+    /// - Envelope size exceeds 2048 bytes
+    /// - `entities` count exceeds 8
+    /// - `cas_refs` count exceeds 8
+    /// - `pulse_id` exceeds 64 characters or contains non-ASCII
+    /// - `topic` exceeds 128 characters or contains non-ASCII
+    /// - `event_type` exceeds 64 characters
+    pub fn validate(&self) -> Result<(), HefValidationError> {
+        // Check repeated field counts
+        if self.entities.len() > HEF_MAX_ENTITIES {
+            return Err(HefValidationError::TooManyItems {
+                field: "entities",
+                count: self.entities.len(),
+                max: HEF_MAX_ENTITIES,
+            });
+        }
+        if self.cas_refs.len() > HEF_MAX_CAS_REFS {
+            return Err(HefValidationError::TooManyItems {
+                field: "cas_refs",
+                count: self.cas_refs.len(),
+                max: HEF_MAX_CAS_REFS,
+            });
+        }
+
+        // Check string field lengths and ASCII
+        validate_ascii_field(&self.pulse_id, "pulse_id", HEF_MAX_PULSE_ID_LEN)?;
+        validate_ascii_field(&self.topic, "topic", HEF_MAX_TOPIC_LEN)?;
+        if self.event_type.len() > HEF_MAX_EVENT_TYPE_LEN {
+            return Err(HefValidationError::FieldTooLong {
+                field: "event_type",
+                len: self.event_type.len(),
+                max: HEF_MAX_EVENT_TYPE_LEN,
+            });
+        }
+
+        // Validate nested entities and CAS refs
+        for entity in &self.entities {
+            entity.validate()?;
+        }
+        for cas_ref in &self.cas_refs {
+            cas_ref.validate()?;
+        }
+
+        // Check total encoded size
+        let encoded_size = self.encode_to_vec().len();
+        if encoded_size > HEF_MAX_ENVELOPE_SIZE {
+            return Err(HefValidationError::EnvelopeTooLarge {
+                size: encoded_size,
+                max: HEF_MAX_ENVELOPE_SIZE,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+impl SubscribePulseRequest {
+    /// Validates the `SubscribePulseRequest` against HEF field bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HefValidationError` if:
+    /// - `topic_patterns` count exceeds 16
+    /// - Any pattern exceeds 128 characters or contains non-ASCII
+    /// - `client_sub_id` exceeds 64 characters
+    pub fn validate(&self) -> Result<(), HefValidationError> {
+        if self.topic_patterns.len() > HEF_MAX_TOPIC_PATTERNS {
+            return Err(HefValidationError::TooManyItems {
+                field: "topic_patterns",
+                count: self.topic_patterns.len(),
+                max: HEF_MAX_TOPIC_PATTERNS,
+            });
+        }
+
+        for pattern in &self.topic_patterns {
+            validate_ascii_field(pattern, "topic_patterns[]", HEF_MAX_PATTERN_LEN)?;
+        }
+
+        if self.client_sub_id.len() > HEF_MAX_CLIENT_SUB_ID_LEN {
+            return Err(HefValidationError::FieldTooLong {
+                field: "client_sub_id",
+                len: self.client_sub_id.len(),
+                max: HEF_MAX_CLIENT_SUB_ID_LEN,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+impl SubscribePulseResponse {
+    /// Validates the `SubscribePulseResponse` against HEF field bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HefValidationError` if any nested `PatternRejection` is
+    /// invalid.
+    pub fn validate(&self) -> Result<(), HefValidationError> {
+        for rejection in &self.rejected_patterns {
+            rejection.validate()?;
+        }
+        Ok(())
+    }
+}
 
 /// Trait for canonicalizing messages before signing.
 ///

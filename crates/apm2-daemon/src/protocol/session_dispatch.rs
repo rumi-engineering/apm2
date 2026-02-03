@@ -90,17 +90,33 @@ use crate::htf::HolonicClock;
 ///
 /// These tags are used to identify the message type before decoding,
 /// allowing the dispatcher to route to the appropriate handler.
+///
+/// # HEF Tag Range (CTR-PROTO-010)
+///
+/// HEF messages use tag range 64-79 per RFC-0018:
+/// - 64 = `SubscribePulse`
+/// - 65 = `SubscribePulseResponse` (response only)
+/// - 66 = `UnsubscribePulse`
+/// - 67 = `UnsubscribePulseResponse` (response only)
+/// - 68 = `PulseEvent` (server->client only)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SessionMessageType {
     /// `RequestTool` request (IPC-SESS-001)
-    RequestTool     = 1,
+    RequestTool      = 1,
     /// `EmitEvent` request (IPC-SESS-002)
-    EmitEvent       = 2,
+    EmitEvent        = 2,
     /// `PublishEvidence` request (IPC-SESS-003)
-    PublishEvidence = 3,
+    PublishEvidence  = 3,
     /// `StreamTelemetry` request (IPC-SESS-004)
-    StreamTelemetry = 4,
+    StreamTelemetry  = 4,
+    // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
+    /// `SubscribePulse` request (IPC-HEF-001)
+    SubscribePulse   = 64,
+    /// `UnsubscribePulse` request (IPC-HEF-002)
+    UnsubscribePulse = 66,
+    /// `PulseEvent` notification (server->client, IPC-HEF-003)
+    PulseEvent       = 68,
 }
 
 impl SessionMessageType {
@@ -112,6 +128,10 @@ impl SessionMessageType {
             2 => Some(Self::EmitEvent),
             3 => Some(Self::PublishEvidence),
             4 => Some(Self::StreamTelemetry),
+            // HEF tags (64-68)
+            64 => Some(Self::SubscribePulse),
+            66 => Some(Self::UnsubscribePulse),
+            68 => Some(Self::PulseEvent),
             _ => None,
         }
     }
@@ -539,6 +559,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             SessionMessageType::EmitEvent => self.handle_emit_event(payload, ctx),
             SessionMessageType::PublishEvidence => self.handle_publish_evidence(payload, ctx),
             SessionMessageType::StreamTelemetry => self.handle_stream_telemetry(payload, ctx),
+            // HEF Pulse Plane (TCK-00300): Placeholder handlers - will be implemented in TCK-00301
+            SessionMessageType::SubscribePulse
+            | SessionMessageType::UnsubscribePulse
+            | SessionMessageType::PulseEvent => Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorNotImplemented,
+                "HEF pulse endpoints not yet implemented (TCK-00301)",
+            )),
         }
     }
 

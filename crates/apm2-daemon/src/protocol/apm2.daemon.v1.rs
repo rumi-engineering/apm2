@@ -569,6 +569,246 @@ pub struct RecoverSessionsResponse {
     #[prost(uint32, tag = "4")]
     pub recovery_time_ms: u32,
 }
+/// Entity reference within a pulse envelope.
+/// References opaque identifiers (work_id, episode_id, gate_id, defect_id).
+/// \[CTR-HEF-0001\] ASCII-only, length-bounded identifiers.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EntityRef {
+    /// Entity kind discriminant.
+    /// Valid values: WORK, EPISODE, GATE, DEFECT, SESSION
+    /// Max length: 16 characters, ASCII only.
+    #[prost(string, tag = "1")]
+    pub kind: ::prost::alloc::string::String,
+    /// Entity identifier.
+    /// Max length: 128 characters, ASCII only.
+    #[prost(string, tag = "2")]
+    pub id: ::prost::alloc::string::String,
+    /// Optional content digest (32 bytes, typically Blake3).
+    /// Used for ChangeSet or artifact references.
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub digest: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+}
+/// Content-addressed storage reference.
+/// \[CTR-HEF-0001\] Used to reference CAS artifacts in pulse envelopes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CasRef {
+    /// Blake3 hash of the artifact (32 bytes).
+    #[prost(bytes = "vec", tag = "1")]
+    pub hash: ::prost::alloc::vec::Vec<u8>,
+    /// Size of the artifact in bytes.
+    /// Used for resource governance and prefetch decisions.
+    #[prost(uint64, tag = "2")]
+    pub size_bytes: u64,
+    /// Artifact kind discriminant.
+    /// Valid values: EVIDENCE, TIME_ENVELOPE, TOOL_RESULT, IO_CHUNK
+    /// Max length: 32 characters, ASCII only.
+    #[prost(string, tag = "3")]
+    pub kind: ::prost::alloc::string::String,
+}
+/// Hybrid Logical Clock timestamp (advisory only).
+/// \[INV-HEF-004\] HLC is observational; ledger cursor is authoritative.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HlcStamp {
+    /// Wall clock component (nanoseconds since Unix epoch).
+    #[prost(uint64, tag = "1")]
+    pub wall_ns: u64,
+    /// Logical counter component.
+    #[prost(uint32, tag = "2")]
+    pub logical: u32,
+    /// Node identifier (32 bytes, truncated from node key hash).
+    #[prost(bytes = "vec", tag = "3")]
+    pub node_id: ::prost::alloc::vec::Vec<u8>,
+}
+/// Bounded wall-clock interval (observational only).
+/// Represents the uncertainty window for event timing.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct BoundedWallInterval {
+    /// Earliest possible wall time (nanoseconds since Unix epoch).
+    #[prost(uint64, tag = "1")]
+    pub earliest_ns: u64,
+    /// Latest possible wall time (nanoseconds since Unix epoch).
+    #[prost(uint64, tag = "2")]
+    pub latest_ns: u64,
+}
+/// Lossy event hint derived from committed ledger+CAS artifacts.
+///
+/// ## Bounds (CTR-HEF-0001, REQ-HEF-0002)
+///
+/// - Max total size: 2048 bytes
+/// - Max entities: 8
+/// - Max cas_refs: 8
+/// - pulse_id: max 64 chars, ASCII only
+/// - topic: max 128 chars, ASCII only, dot-delimited
+/// - event_type: max 64 chars
+///
+/// ## Versioning
+///
+/// schema_version MUST be 1 for this version. Unknown schema versions
+/// MUST cause decode failure (fail-closed per INV-HEF-002).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PulseEnvelopeV1 {
+    /// Schema version discriminant. MUST be 1 for PulseEnvelopeV1.
+    /// Unknown versions cause decode failure.
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    /// Unique pulse identifier.
+    /// Max length: 64 characters, ASCII only.
+    /// Format: `{topic_hash}:{seq}:{random}` or daemon-assigned UUID.
+    #[prost(string, tag = "2")]
+    pub pulse_id: ::prost::alloc::string::String,
+    /// Topic string (dot-delimited hierarchy).
+    /// Max length: 128 characters, ASCII only.
+    /// Examples: "work.W-123.events", "gate.W-123.CS-abc.G-001"
+    #[prost(string, tag = "3")]
+    pub topic: ::prost::alloc::string::String,
+    /// Ledger sequence ID (cursor) at which this event was committed.
+    /// Authoritative for ordering and catch-up.
+    #[prost(uint64, tag = "4")]
+    pub ledger_cursor: u64,
+    /// Current ledger head at emission time (0 if unknown).
+    /// Advisory hint for client catch-up decisions.
+    #[prost(uint64, tag = "5")]
+    pub ledger_head: u64,
+    /// Blake3 hash of the ledger event (32 bytes, optional).
+    /// Used for content verification and deduplication.
+    #[prost(bytes = "vec", optional, tag = "6")]
+    pub event_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Event type discriminant (e.g., "WorkEvent", "GateReceipt").
+    /// Max length: 64 characters.
+    #[prost(string, tag = "7")]
+    pub event_type: ::prost::alloc::string::String,
+    /// Entity references (max 8).
+    /// Contains opaque IDs for work, episode, gate, defect, session.
+    #[prost(message, repeated, tag = "8")]
+    pub entities: ::prost::alloc::vec::Vec<EntityRef>,
+    /// CAS artifact references (max 8).
+    /// Contains hashes of related evidence, time envelopes, tool results.
+    #[prost(message, repeated, tag = "9")]
+    pub cas_refs: ::prost::alloc::vec::Vec<CasRef>,
+    /// Optional time envelope hash (32 bytes).
+    /// References the HTF time envelope for this event.
+    #[prost(bytes = "vec", optional, tag = "10")]
+    pub time_envelope_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Optional HLC timestamp (advisory only).
+    /// Not authoritative; use ledger_cursor for ordering.
+    #[prost(message, optional, tag = "11")]
+    pub hlc: ::core::option::Option<HlcStamp>,
+    /// Optional wall-clock interval (observational only).
+    /// Represents timing uncertainty bounds.
+    #[prost(message, optional, tag = "12")]
+    pub wall: ::core::option::Option<BoundedWallInterval>,
+}
+/// Pattern rejection reason in subscription responses.
+/// Explains why a specific pattern was rejected.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PatternRejection {
+    /// The pattern that was rejected.
+    /// Max length: 128 characters.
+    #[prost(string, tag = "1")]
+    pub pattern: ::prost::alloc::string::String,
+    /// Reason code for rejection.
+    /// Valid values: INVALID_PATTERN, ACL_DENY, LIMIT_EXCEEDED
+    #[prost(string, tag = "2")]
+    pub reason_code: ::prost::alloc::string::String,
+}
+/// Subscribe to pulse topics.
+/// \[REQ-HEF-0008\] since_ledger_cursor is for resume hint only; correctness
+/// requires ledger catch-up.
+///
+/// ## Bounds
+///
+/// - Max topic_patterns: 16
+/// - Each pattern: max 128 chars, ASCII only
+/// - session_token required on session.sock (INV-SESS-001)
+///
+/// ## ACL Enforcement (handled by TCK-00302)
+///
+/// - Session subscriptions: deny-by-default, capability-manifest allowlist
+/// - Operator subscriptions: full topic taxonomy access
+/// - Session wildcards: rejected in Phase 1
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SubscribePulseRequest {
+    /// Session token for authentication (required on session.sock).
+    /// Operator connections may omit (authenticated by socket type).
+    #[prost(string, tag = "1")]
+    pub session_token: ::prost::alloc::string::String,
+    /// Client-assigned subscription ID for correlation (optional).
+    /// Max length: 64 characters.
+    #[prost(string, tag = "2")]
+    pub client_sub_id: ::prost::alloc::string::String,
+    /// Topic patterns to subscribe to (max 16).
+    /// Supports dot-delimited hierarchy with bounded wildcards.
+    /// Wildcard '*' matches a single segment, '>' matches remaining segments (terminal only).
+    /// Max 2 wildcards per pattern. Session.sock rejects wildcards in Phase 1.
+    #[prost(string, repeated, tag = "3")]
+    pub topic_patterns: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Resume hint: start from this ledger cursor (0 = from now).
+    /// \[REQ-HEF-0008\] This is advisory; pulse replay is non-authoritative.
+    /// Correctness requires ledger catch-up from this cursor.
+    #[prost(uint64, tag = "4")]
+    pub since_ledger_cursor: u64,
+    /// Optional rate limit request (pulses/sec).
+    /// Server may clamp to lower value based on resource governance.
+    #[prost(uint32, tag = "5")]
+    pub max_pulses_per_sec: u32,
+}
+/// Response to pulse subscription request.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SubscribePulseResponse {
+    /// Server-assigned subscription identifier.
+    /// Used for unsubscribe and tracking.
+    #[prost(string, tag = "1")]
+    pub subscription_id: ::prost::alloc::string::String,
+    /// Effective starting cursor (may differ from requested).
+    /// Clients should use this for ledger catch-up.
+    #[prost(uint64, tag = "2")]
+    pub effective_since_cursor: u64,
+    /// Patterns that were accepted.
+    #[prost(string, repeated, tag = "3")]
+    pub accepted_patterns: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Patterns that were rejected with reasons.
+    #[prost(message, repeated, tag = "4")]
+    pub rejected_patterns: ::prost::alloc::vec::Vec<PatternRejection>,
+}
+/// Unsubscribe from a pulse subscription.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnsubscribePulseRequest {
+    /// Session token for authentication (required on session.sock).
+    #[prost(string, tag = "1")]
+    pub session_token: ::prost::alloc::string::String,
+    /// Subscription identifier from SubscribePulseResponse.
+    #[prost(string, tag = "2")]
+    pub subscription_id: ::prost::alloc::string::String,
+}
+/// Response to unsubscribe request.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct UnsubscribePulseResponse {
+    /// Whether the subscription was found and removed.
+    #[prost(bool, tag = "1")]
+    pub removed: bool,
+}
+/// Server-to-client pulse notification.
+/// Contains a PulseEnvelopeV1 delivered to matching subscribers.
+///
+/// ## Delivery Semantics
+///
+/// - Pulses are best-effort; loss does not affect correctness
+/// - Clients MUST verify via ledger catch-up
+/// - Duplicate delivery is possible; dedupe via pulse_id
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PulseEvent {
+    /// The pulse envelope being delivered.
+    #[prost(message, optional, tag = "1")]
+    pub envelope: ::core::option::Option<PulseEnvelopeV1>,
+}
+/// Error response for HEF operations.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HefError {
+    #[prost(enumeration = "HefErrorCode", tag = "1")]
+    pub code: i32,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StopReason {
@@ -1028,6 +1268,56 @@ impl LeaseRevokedReason {
             "LEASE_REVOKED_EXPIRED" => Some(Self::LeaseRevokedExpired),
             "LEASE_REVOKED_BY_OPERATOR" => Some(Self::LeaseRevokedByOperator),
             "LEASE_REVOKED_POLICY_VIOLATION" => Some(Self::LeaseRevokedPolicyViolation),
+            _ => None,
+        }
+    }
+}
+/// Error codes specific to HEF pulse operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HefErrorCode {
+    HefErrorUnspecified = 0,
+    /// Invalid topic pattern (regex, empty segments, too many wildcards).
+    HefErrorInvalidPattern = 1,
+    /// ACL denied the subscription (not in capability allowlist).
+    HefErrorAclDenied = 2,
+    /// Resource limit exceeded (max subscriptions, patterns, rate).
+    HefErrorResourceLimit = 3,
+    /// Subscription not found (for unsubscribe).
+    HefErrorSubscriptionNotFound = 4,
+    /// Pulse envelope exceeds size limit (2048 bytes).
+    HefErrorEnvelopeTooLarge = 5,
+    /// Unknown fields in strict-decode context.
+    HefErrorUnknownFields = 6,
+}
+impl HefErrorCode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::HefErrorUnspecified => "HEF_ERROR_UNSPECIFIED",
+            Self::HefErrorInvalidPattern => "HEF_ERROR_INVALID_PATTERN",
+            Self::HefErrorAclDenied => "HEF_ERROR_ACL_DENIED",
+            Self::HefErrorResourceLimit => "HEF_ERROR_RESOURCE_LIMIT",
+            Self::HefErrorSubscriptionNotFound => "HEF_ERROR_SUBSCRIPTION_NOT_FOUND",
+            Self::HefErrorEnvelopeTooLarge => "HEF_ERROR_ENVELOPE_TOO_LARGE",
+            Self::HefErrorUnknownFields => "HEF_ERROR_UNKNOWN_FIELDS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HEF_ERROR_UNSPECIFIED" => Some(Self::HefErrorUnspecified),
+            "HEF_ERROR_INVALID_PATTERN" => Some(Self::HefErrorInvalidPattern),
+            "HEF_ERROR_ACL_DENIED" => Some(Self::HefErrorAclDenied),
+            "HEF_ERROR_RESOURCE_LIMIT" => Some(Self::HefErrorResourceLimit),
+            "HEF_ERROR_SUBSCRIPTION_NOT_FOUND" => {
+                Some(Self::HefErrorSubscriptionNotFound)
+            }
+            "HEF_ERROR_ENVELOPE_TOO_LARGE" => Some(Self::HefErrorEnvelopeTooLarge),
+            "HEF_ERROR_UNKNOWN_FIELDS" => Some(Self::HefErrorUnknownFields),
             _ => None,
         }
     }

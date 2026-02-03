@@ -1143,17 +1143,33 @@ impl ConnectionContext {
 ///
 /// These tags are used to identify the message type before decoding,
 /// allowing the dispatcher to route to the appropriate handler.
+///
+/// # HEF Tag Range (CTR-PROTO-010)
+///
+/// HEF messages use tag range 64-79 per RFC-0018:
+/// - 64 = `SubscribePulse`
+/// - 65 = `SubscribePulseResponse` (response only)
+/// - 66 = `UnsubscribePulse`
+/// - 67 = `UnsubscribePulseResponse` (response only)
+/// - 68 = `PulseEvent` (server->client only)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PrivilegedMessageType {
     /// `ClaimWork` request (IPC-PRIV-001)
-    ClaimWork       = 1,
+    ClaimWork        = 1,
     /// `SpawnEpisode` request (IPC-PRIV-002)
-    SpawnEpisode    = 2,
+    SpawnEpisode     = 2,
     /// `IssueCapability` request (IPC-PRIV-003)
-    IssueCapability = 3,
+    IssueCapability  = 3,
     /// Shutdown request (IPC-PRIV-004)
-    Shutdown        = 4,
+    Shutdown         = 4,
+    // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
+    /// `SubscribePulse` request (IPC-HEF-001)
+    SubscribePulse   = 64,
+    /// `UnsubscribePulse` request (IPC-HEF-002)
+    UnsubscribePulse = 66,
+    /// `PulseEvent` notification (server->client, IPC-HEF-003)
+    PulseEvent       = 68,
 }
 
 impl PrivilegedMessageType {
@@ -1165,6 +1181,10 @@ impl PrivilegedMessageType {
             2 => Some(Self::SpawnEpisode),
             3 => Some(Self::IssueCapability),
             4 => Some(Self::Shutdown),
+            // HEF tags (64-68)
+            64 => Some(Self::SubscribePulse),
+            66 => Some(Self::UnsubscribePulse),
+            68 => Some(Self::PulseEvent),
             _ => None,
         }
     }
@@ -2053,6 +2073,13 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::SpawnEpisode => self.handle_spawn_episode(payload, ctx),
             PrivilegedMessageType::IssueCapability => self.handle_issue_capability(payload, ctx),
             PrivilegedMessageType::Shutdown => self.handle_shutdown(payload, ctx),
+            // HEF Pulse Plane (TCK-00300): Placeholder handlers - will be implemented in TCK-00301
+            PrivilegedMessageType::SubscribePulse
+            | PrivilegedMessageType::UnsubscribePulse
+            | PrivilegedMessageType::PulseEvent => Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "HEF pulse endpoints not yet implemented (TCK-00301)",
+            )),
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -2062,6 +2089,10 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::SpawnEpisode => "SpawnEpisode",
                 PrivilegedMessageType::IssueCapability => "IssueCapability",
                 PrivilegedMessageType::Shutdown => "Shutdown",
+                // HEF Pulse Plane (TCK-00300)
+                PrivilegedMessageType::SubscribePulse => "SubscribePulse",
+                PrivilegedMessageType::UnsubscribePulse => "UnsubscribePulse",
+                PrivilegedMessageType::PulseEvent => "PulseEvent",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",

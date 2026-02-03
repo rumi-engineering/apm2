@@ -557,3 +557,303 @@ message RecoverSessionsResponse {
   // Time taken for recovery (milliseconds).
   uint32 recovery_time_ms = 4;
 }
+
+// =============================================================================
+// CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
+// =============================================================================
+// Holonic Event Fabric (HEF) pulse messages for lossy event notifications.
+// Pulses are derived from committed ledger+CAS artifacts and provide hints
+// only. Correctness requires ledger catch-up; pulse loss does not affect
+// authoritative outcomes.
+//
+// ## Message Tag Range (HEF Reserved)
+//
+// HEF messages use tag range 64-79 to avoid collisions with existing messages:
+// - Session socket (session.sock): Tags 64-71 reserved for HEF
+// - Operator socket (operator.sock): Tags 64-71 reserved for HEF
+//
+// Current HEF tag assignments:
+// - 64 = SubscribePulseRequest
+// - 65 = SubscribePulseResponse
+// - 66 = UnsubscribePulseRequest
+// - 67 = UnsubscribePulseResponse
+// - 68 = PulseEvent (server->client only)
+// - 69-79 = Reserved for future HEF extensions
+//
+// ## Security Invariants
+//
+// - [INV-HEF-001] PulseEnvelopeV1 max size: 2048 bytes
+// - [INV-HEF-002] Unknown fields MUST cause decode failure (fail-closed)
+// - [INV-HEF-003] All string IDs are ASCII-only and length-bounded
+// - [INV-HEF-004] since_ledger_cursor in subscriptions is for resume hints only
+// - [INV-HEF-005] Pulse correctness requires ledger catch-up, not pulse replay
+
+// -----------------------------------------------------------------------------
+// HEF Supporting Types
+// -----------------------------------------------------------------------------
+
+// Entity reference within a pulse envelope.
+// References opaque identifiers (work_id, episode_id, gate_id, defect_id).
+// [CTR-HEF-0001] ASCII-only, length-bounded identifiers.
+message EntityRef {
+  // Entity kind discriminant.
+  // Valid values: WORK, EPISODE, GATE, DEFECT, SESSION
+  // Max length: 16 characters, ASCII only.
+  string kind = 1;
+
+  // Entity identifier.
+  // Max length: 128 characters, ASCII only.
+  string id = 2;
+
+  // Optional content digest (32 bytes, typically Blake3).
+  // Used for ChangeSet or artifact references.
+  optional bytes digest = 3;
+}
+
+// Content-addressed storage reference.
+// [CTR-HEF-0001] Used to reference CAS artifacts in pulse envelopes.
+message CasRef {
+  // Blake3 hash of the artifact (32 bytes).
+  bytes hash = 1;
+
+  // Size of the artifact in bytes.
+  // Used for resource governance and prefetch decisions.
+  uint64 size_bytes = 2;
+
+  // Artifact kind discriminant.
+  // Valid values: EVIDENCE, TIME_ENVELOPE, TOOL_RESULT, IO_CHUNK
+  // Max length: 32 characters, ASCII only.
+  string kind = 3;
+}
+
+// Hybrid Logical Clock timestamp (advisory only).
+// [INV-HEF-004] HLC is observational; ledger cursor is authoritative.
+message HlcStamp {
+  // Wall clock component (nanoseconds since Unix epoch).
+  uint64 wall_ns = 1;
+
+  // Logical counter component.
+  uint32 logical = 2;
+
+  // Node identifier (32 bytes, truncated from node key hash).
+  bytes node_id = 3;
+}
+
+// Bounded wall-clock interval (observational only).
+// Represents the uncertainty window for event timing.
+message BoundedWallInterval {
+  // Earliest possible wall time (nanoseconds since Unix epoch).
+  uint64 earliest_ns = 1;
+
+  // Latest possible wall time (nanoseconds since Unix epoch).
+  uint64 latest_ns = 2;
+}
+
+// -----------------------------------------------------------------------------
+// PulseEnvelopeV1 (Core HEF Data Structure)
+// -----------------------------------------------------------------------------
+
+// Lossy event hint derived from committed ledger+CAS artifacts.
+//
+// ## Bounds (CTR-HEF-0001, REQ-HEF-0002)
+//
+// - Max total size: 2048 bytes
+// - Max entities: 8
+// - Max cas_refs: 8
+// - pulse_id: max 64 chars, ASCII only
+// - topic: max 128 chars, ASCII only, dot-delimited
+// - event_type: max 64 chars
+//
+// ## Versioning
+//
+// schema_version MUST be 1 for this version. Unknown schema versions
+// MUST cause decode failure (fail-closed per INV-HEF-002).
+message PulseEnvelopeV1 {
+  // Schema version discriminant. MUST be 1 for PulseEnvelopeV1.
+  // Unknown versions cause decode failure.
+  uint32 schema_version = 1;
+
+  // Unique pulse identifier.
+  // Max length: 64 characters, ASCII only.
+  // Format: `{topic_hash}:{seq}:{random}` or daemon-assigned UUID.
+  string pulse_id = 2;
+
+  // Topic string (dot-delimited hierarchy).
+  // Max length: 128 characters, ASCII only.
+  // Examples: "work.W-123.events", "gate.W-123.CS-abc.G-001"
+  string topic = 3;
+
+  // Ledger sequence ID (cursor) at which this event was committed.
+  // Authoritative for ordering and catch-up.
+  uint64 ledger_cursor = 4;
+
+  // Current ledger head at emission time (0 if unknown).
+  // Advisory hint for client catch-up decisions.
+  uint64 ledger_head = 5;
+
+  // Blake3 hash of the ledger event (32 bytes, optional).
+  // Used for content verification and deduplication.
+  optional bytes event_hash = 6;
+
+  // Event type discriminant (e.g., "WorkEvent", "GateReceipt").
+  // Max length: 64 characters.
+  string event_type = 7;
+
+  // Entity references (max 8).
+  // Contains opaque IDs for work, episode, gate, defect, session.
+  repeated EntityRef entities = 8;
+
+  // CAS artifact references (max 8).
+  // Contains hashes of related evidence, time envelopes, tool results.
+  repeated CasRef cas_refs = 9;
+
+  // Optional time envelope hash (32 bytes).
+  // References the HTF time envelope for this event.
+  optional bytes time_envelope_hash = 10;
+
+  // Optional HLC timestamp (advisory only).
+  // Not authoritative; use ledger_cursor for ordering.
+  optional HlcStamp hlc = 11;
+
+  // Optional wall-clock interval (observational only).
+  // Represents timing uncertainty bounds.
+  optional BoundedWallInterval wall = 12;
+}
+
+// -----------------------------------------------------------------------------
+// Subscribe/Unsubscribe Messages
+// -----------------------------------------------------------------------------
+
+// Pattern rejection reason in subscription responses.
+// Explains why a specific pattern was rejected.
+message PatternRejection {
+  // The pattern that was rejected.
+  // Max length: 128 characters.
+  string pattern = 1;
+
+  // Reason code for rejection.
+  // Valid values: INVALID_PATTERN, ACL_DENY, LIMIT_EXCEEDED
+  string reason_code = 2;
+}
+
+// Subscribe to pulse topics.
+// [REQ-HEF-0008] since_ledger_cursor is for resume hint only; correctness
+// requires ledger catch-up.
+//
+// ## Bounds
+//
+// - Max topic_patterns: 16
+// - Each pattern: max 128 chars, ASCII only
+// - session_token required on session.sock (INV-SESS-001)
+//
+// ## ACL Enforcement (handled by TCK-00302)
+//
+// - Session subscriptions: deny-by-default, capability-manifest allowlist
+// - Operator subscriptions: full topic taxonomy access
+// - Session wildcards: rejected in Phase 1
+message SubscribePulseRequest {
+  // Session token for authentication (required on session.sock).
+  // Operator connections may omit (authenticated by socket type).
+  string session_token = 1;
+
+  // Client-assigned subscription ID for correlation (optional).
+  // Max length: 64 characters.
+  string client_sub_id = 2;
+
+  // Topic patterns to subscribe to (max 16).
+  // Supports dot-delimited hierarchy with bounded wildcards.
+  // Wildcard '*' matches a single segment, '>' matches remaining segments (terminal only).
+  // Max 2 wildcards per pattern. Session.sock rejects wildcards in Phase 1.
+  repeated string topic_patterns = 3;
+
+  // Resume hint: start from this ledger cursor (0 = from now).
+  // [REQ-HEF-0008] This is advisory; pulse replay is non-authoritative.
+  // Correctness requires ledger catch-up from this cursor.
+  uint64 since_ledger_cursor = 4;
+
+  // Optional rate limit request (pulses/sec).
+  // Server may clamp to lower value based on resource governance.
+  uint32 max_pulses_per_sec = 5;
+}
+
+// Response to pulse subscription request.
+message SubscribePulseResponse {
+  // Server-assigned subscription identifier.
+  // Used for unsubscribe and tracking.
+  string subscription_id = 1;
+
+  // Effective starting cursor (may differ from requested).
+  // Clients should use this for ledger catch-up.
+  uint64 effective_since_cursor = 2;
+
+  // Patterns that were accepted.
+  repeated string accepted_patterns = 3;
+
+  // Patterns that were rejected with reasons.
+  repeated PatternRejection rejected_patterns = 4;
+}
+
+// Unsubscribe from a pulse subscription.
+message UnsubscribePulseRequest {
+  // Session token for authentication (required on session.sock).
+  string session_token = 1;
+
+  // Subscription identifier from SubscribePulseResponse.
+  string subscription_id = 2;
+}
+
+// Response to unsubscribe request.
+message UnsubscribePulseResponse {
+  // Whether the subscription was found and removed.
+  bool removed = 1;
+}
+
+// -----------------------------------------------------------------------------
+// PulseEvent (Server-to-Client Notification)
+// -----------------------------------------------------------------------------
+
+// Server-to-client pulse notification.
+// Contains a PulseEnvelopeV1 delivered to matching subscribers.
+//
+// ## Delivery Semantics
+//
+// - Pulses are best-effort; loss does not affect correctness
+// - Clients MUST verify via ledger catch-up
+// - Duplicate delivery is possible; dedupe via pulse_id
+message PulseEvent {
+  // The pulse envelope being delivered.
+  PulseEnvelopeV1 envelope = 1;
+}
+
+// -----------------------------------------------------------------------------
+// HEF Error Codes
+// -----------------------------------------------------------------------------
+
+// Error codes specific to HEF pulse operations.
+enum HefErrorCode {
+  HEF_ERROR_UNSPECIFIED = 0;
+
+  // Invalid topic pattern (regex, empty segments, too many wildcards).
+  HEF_ERROR_INVALID_PATTERN = 1;
+
+  // ACL denied the subscription (not in capability allowlist).
+  HEF_ERROR_ACL_DENIED = 2;
+
+  // Resource limit exceeded (max subscriptions, patterns, rate).
+  HEF_ERROR_RESOURCE_LIMIT = 3;
+
+  // Subscription not found (for unsubscribe).
+  HEF_ERROR_SUBSCRIPTION_NOT_FOUND = 4;
+
+  // Pulse envelope exceeds size limit (2048 bytes).
+  HEF_ERROR_ENVELOPE_TOO_LARGE = 5;
+
+  // Unknown fields in strict-decode context.
+  HEF_ERROR_UNKNOWN_FIELDS = 6;
+}
+
+// Error response for HEF operations.
+message HefError {
+  HefErrorCode code = 1;
+  string message = 2;
+}

@@ -163,10 +163,13 @@ pub use handshake::{
 #[allow(unused_imports)]
 pub use messages::{
     BoundedDecode,
+    // CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
+    BoundedWallInterval,
     CanonicalBytes,
     Canonicalize,
     // CTR-PROTO-007: Privileged Endpoints (RFC-0017)
     CapabilityRequest,
+    CasRef,
     ClaimWorkRequest,
     ClaimWorkResponse,
     DEFAULT_MAX_MESSAGE_SIZE,
@@ -176,15 +179,22 @@ pub use messages::{
     // CTR-PROTO-008: Session-Scoped Endpoints (RFC-0017, TCK-00252)
     EmitEventRequest,
     EmitEventResponse,
+    EntityRef,
+    HefError,
+    HefErrorCode,
+    HlcStamp,
     IssueCapabilityRequest,
     IssueCapabilityResponse,
     // CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
     LeaseRevoked,
     LeaseRevokedReason,
+    PatternRejection,
     PrivilegedError,
     PrivilegedErrorCode,
     PublishEvidenceRequest,
     PublishEvidenceResponse,
+    PulseEnvelopeV1,
+    PulseEvent,
     RecoverSessionsRequest,
     RecoverSessionsResponse,
     RequestToolRequest,
@@ -197,6 +207,10 @@ pub use messages::{
     SpawnEpisodeResponse,
     StreamTelemetryRequest,
     StreamTelemetryResponse,
+    SubscribePulseRequest,
+    SubscribePulseResponse,
+    UnsubscribePulseRequest,
+    UnsubscribePulseResponse,
     WorkRole,
 };
 #[allow(unused_imports)]
