@@ -602,14 +602,40 @@ impl ToolHandler for ExecuteHandler {
         let mut cmd = tokio::process::Command::new(&exec_args.command);
         cmd.args(&exec_args.args);
 
-        // Set working directory
+        // Set working directory with symlink-aware validation (sandbox escape fix)
+        // Canonicalize root for comparison
+        let canonical_root =
+            std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize root '{}': {}",
+                    self.root.display(),
+                    e
+                ),
+            })?;
+
         // If cwd is provided, it's relative to root.
         // If not provided, use root as CWD.
-        if let Some(ref cwd) = exec_args.cwd {
-            cmd.current_dir(self.root.join(cwd));
-        } else {
-            cmd.current_dir(&self.root);
-        }
+        // In either case, we must validate the resolved path stays within the
+        // workspace.
+        let target_cwd = exec_args
+            .cwd
+            .as_ref()
+            .map_or_else(|| self.root.clone(), |cwd| self.root.join(cwd));
+
+        // Canonicalize the target cwd to resolve symlinks
+        let canonical_cwd =
+            std::fs::canonicalize(&target_cwd).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize cwd '{}': {}",
+                    target_cwd.display(),
+                    e
+                ),
+            })?;
+
+        // Verify the resolved cwd is still within the workspace root
+        validate_resolved_path_within_root(&canonical_cwd, &canonical_root)?;
+
+        cmd.current_dir(&canonical_cwd);
 
         // Configure pipes
         cmd.stdin(Stdio::piped());
