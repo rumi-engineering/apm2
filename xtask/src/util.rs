@@ -14,6 +14,27 @@ use regex::Regex;
 use xshell::{Shell, cmd};
 
 // =============================================================================
+// HEF Projection Feature Flag (TCK-00309)
+// =============================================================================
+
+/// Name of the environment variable gating HEF projection logic.
+pub const USE_HEF_PROJECTION_ENV: &str = "USE_HEF_PROJECTION";
+
+/// Checks if HEF projection logic is enabled.
+///
+/// Returns `true` if the `USE_HEF_PROJECTION` environment variable is set to
+/// "true" (case-insensitive).
+///
+/// Per TCK-00309, this flag defaults to `false`. When `true`, xtask must NOT
+/// write status checks directly to GitHub, as these should be handled by the
+/// daemon's projection logic.
+pub fn use_hef_projection() -> bool {
+    std::env::var(USE_HEF_PROJECTION_ENV)
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+// =============================================================================
 // Non-Authoritative Banner
 // =============================================================================
 
@@ -344,6 +365,39 @@ mod tests {
             path,
             PathBuf::from("/opt/apm2/documents/work/tickets/TCK-00001.yaml")
         );
+    }
+
+    // =============================================================================
+    // HEF Projection Feature Flag Tests (TCK-00309)
+    // =============================================================================
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_use_hef_projection_env_var() {
+        // SERIAL TEST: Modifies environment variables, must be single test
+
+        // 1. Default (unset) -> false
+        unsafe { std::env::remove_var(USE_HEF_PROJECTION_ENV) };
+        assert!(!use_hef_projection(), "Default should be false");
+
+        // 2. "TRUE" -> true
+        unsafe { std::env::set_var(USE_HEF_PROJECTION_ENV, "TRUE") };
+        assert!(use_hef_projection(), "TRUE should be true");
+
+        // 3. "true" -> true
+        unsafe { std::env::set_var(USE_HEF_PROJECTION_ENV, "true") };
+        assert!(use_hef_projection(), "true should be true");
+
+        // 4. "false" -> false
+        unsafe { std::env::set_var(USE_HEF_PROJECTION_ENV, "false") };
+        assert!(!use_hef_projection(), "false should be false");
+
+        // 5. "0" -> false
+        unsafe { std::env::set_var(USE_HEF_PROJECTION_ENV, "0") };
+        assert!(!use_hef_projection(), "0 should be false");
+
+        // Cleanup
+        unsafe { std::env::remove_var(USE_HEF_PROJECTION_ENV) };
     }
 
     // Integration tests that require a real git repo
