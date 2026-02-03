@@ -92,6 +92,12 @@ pub const MAX_HOST_LEN: usize = 255;
 /// We use 32 to allow for reasonable extension while preventing abuse.
 pub const MAX_GIT_OPERATION_LEN: usize = 32;
 
+/// Maximum length for `ListFiles` pattern (TCK-00315).
+pub const MAX_LIST_FILES_PATTERN_LEN: usize = 256;
+
+/// Maximum length for Search query (TCK-00315).
+pub const MAX_SEARCH_QUERY_LEN: usize = 1024;
+
 // =============================================================================
 // BrokerToolRequest
 // =============================================================================
@@ -161,6 +167,12 @@ pub struct BrokerToolRequest {
     /// branch, checkout, merge, rebase, pull, reset, stash, tag, remote.
     pub git_operation: Option<String>,
 
+    /// Optional pattern for `ListFiles` (TCK-00315).
+    pub pattern: Option<String>,
+
+    /// Optional query for Search (TCK-00315).
+    pub query: Option<String>,
+
     /// The risk tier of the current episode.
     pub risk_tier: RiskTier,
 }
@@ -226,6 +238,22 @@ pub enum RequestValidationError {
         /// Maximum allowed length.
         max: usize,
     },
+
+    /// `ListFiles` pattern exceeds maximum length (TCK-00315).
+    PatternTooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Search query exceeds maximum length (TCK-00315).
+    QueryTooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for RequestValidationError {
@@ -252,6 +280,12 @@ impl std::fmt::Display for RequestValidationError {
             },
             Self::GitOperationTooLong { len, max } => {
                 write!(f, "git operation too long: {len} bytes (max {max})")
+            },
+            Self::PatternTooLong { len, max } => {
+                write!(f, "pattern too long: {len} bytes (max {max})")
+            },
+            Self::QueryTooLong { len, max } => {
+                write!(f, "query too long: {len} bytes (max {max})")
             },
         }
     }
@@ -291,6 +325,8 @@ impl BrokerToolRequest {
             network: None,
             shell_command: None,
             git_operation: None,
+            pattern: None,
+            query: None,
             risk_tier,
         }
     }
@@ -347,6 +383,20 @@ impl BrokerToolRequest {
     #[must_use]
     pub fn with_git_operation(mut self, operation: impl Into<String>) -> Self {
         self.git_operation = Some(operation.into());
+        self
+    }
+
+    /// Sets the pattern for `ListFiles` (TCK-00315).
+    #[must_use]
+    pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.pattern = Some(pattern.into());
+        self
+    }
+
+    /// Sets the query for Search (TCK-00315).
+    #[must_use]
+    pub fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = Some(query.into());
         self
     }
 
@@ -416,6 +466,24 @@ impl BrokerToolRequest {
                 });
             }
         }
+        // Validate ListFiles pattern length (TCK-00315: boundedness check)
+        if let Some(ref pattern) = self.pattern {
+            if pattern.len() > MAX_LIST_FILES_PATTERN_LEN {
+                return Err(RequestValidationError::PatternTooLong {
+                    len: pattern.len(),
+                    max: MAX_LIST_FILES_PATTERN_LEN,
+                });
+            }
+        }
+        // Validate Search query length (TCK-00315: boundedness check)
+        if let Some(ref query) = self.query {
+            if query.len() > MAX_SEARCH_QUERY_LEN {
+                return Err(RequestValidationError::QueryTooLong {
+                    len: query.len(),
+                    max: MAX_SEARCH_QUERY_LEN,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -447,7 +515,8 @@ impl BrokerToolRequest {
     #[must_use]
     pub fn to_policy_request(&self) -> apm2_core::tool::ToolRequest {
         use apm2_core::tool::{
-            FileRead, FileWrite, GitOperation, InferenceCall, ShellExec, tool_request,
+            FileRead, FileWrite, GitOperation, InferenceCall, ListFiles, Search, ShellExec,
+            tool_request,
         };
 
         let tool = match self.tool_class {
@@ -508,6 +577,25 @@ impl BrokerToolRequest {
                     path: p.to_string_lossy().to_string(),
                     offset: 0,
                     limit: 0,
+                })
+            }),
+            ToolClass::ListFiles => self.path.as_ref().map(|p| {
+                tool_request::Tool::ListFiles(ListFiles {
+                    path: p.to_string_lossy().to_string(),
+                    pattern: self.pattern.clone().unwrap_or_default(),
+                    max_entries: self.size.unwrap_or(0),
+                })
+            }),
+            ToolClass::Search => self.query.as_ref().map(|q| {
+                tool_request::Tool::Search(Search {
+                    query: q.clone(),
+                    scope: self
+                        .path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    max_bytes: self.size.unwrap_or(0),
+                    max_lines: 0,
                 })
             }),
             // TCK-00292: Fail-closed for unknown tool classes.

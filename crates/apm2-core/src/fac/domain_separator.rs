@@ -127,6 +127,12 @@ pub const LEDGER_EVENT_PREFIX: &[u8] = b"LEDGER_EVENT:";
 /// This anchors the changeset digest and CAS hash before any review begins.
 pub const CHANGESET_PUBLISHED_PREFIX: &[u8] = b"CHANGESET_PUBLISHED:";
 
+/// Domain prefix for `ReviewBlockedRecorded` events.
+///
+/// Used when signing/verifying review blocked events.
+/// This records blocked outcomes when workspace apply or tool execution fails.
+pub const REVIEW_BLOCKED_RECORDED_PREFIX: &[u8] = b"REVIEW_BLOCKED_RECORDED:";
+
 // =============================================================================
 // Domain-Separated Signing
 // =============================================================================
@@ -341,7 +347,7 @@ pub mod tests {
 
     #[test]
     fn test_all_domain_prefixes_defined() {
-        // Verify all 13 required domain prefixes are defined
+        // Verify all 14 required domain prefixes are defined
         let prefixes = [
             GATE_LEASE_ISSUED_PREFIX,
             LEASE_REVOKED_PREFIX,
@@ -356,6 +362,7 @@ pub mod tests {
             INTERVENTION_FREEZE_PREFIX,
             INTERVENTION_UNFREEZE_PREFIX,
             CHANGESET_PUBLISHED_PREFIX,
+            REVIEW_BLOCKED_RECORDED_PREFIX,
         ];
 
         // All prefixes should be non-empty and end with ':'

@@ -1098,6 +1098,8 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             super::tool_class::ToolClass::Git => "git",
             super::tool_class::ToolClass::Inference => "inference",
             super::tool_class::ToolClass::Artifact => "artifact",
+            super::tool_class::ToolClass::ListFiles => "list_files",
+            super::tool_class::ToolClass::Search => "search",
             _ => "unknown",
         };
 
@@ -1132,12 +1134,14 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             };
 
             match request.tool_class {
-                super::tool_class::ToolClass::Read => {
+                super::tool_class::ToolClass::Read
+                | super::tool_class::ToolClass::ListFiles
+                | super::tool_class::ToolClass::Search => {
                     // TCK-00286 [MEDIUM]: Fail-closed if path is None
                     let Some(ref path) = request.path else {
                         warn!(
                             request_id = %request.request_id,
-                            "context firewall violation: Read request missing path"
+                            "context firewall violation: Read/Navigation request missing path"
                         );
                         return Ok(make_terminate("CONTEXT_READ_NO_PATH"));
                     };
@@ -3840,5 +3844,143 @@ policy:
         if let ToolDecision::Allow { policy_hash, .. } = decision {
             assert_eq!(policy_hash, expected_hash);
         }
+    }
+
+    #[tokio::test]
+    async fn test_broker_list_files_allowed() {
+        use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        // Manifest allowing /workspace/src/main.rs
+        let context_manifest = ContextPackManifestBuilder::new("ctx-1", "prof-1")
+            .add_entry(
+                ManifestEntryBuilder::new("/workspace/src/main.rs", [0u8; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Capability allowing ListFiles
+        let manifest = make_manifest(vec![Capability {
+            capability_id: "cap-ls".to_string(),
+            tool_class: ToolClass::ListFiles,
+            scope: CapabilityScope {
+                root_paths: vec![PathBuf::from("/workspace")],
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        }]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Request ListFiles for allowed path
+        let request = make_request(
+            "req-ls",
+            ToolClass::ListFiles,
+            Some("/workspace/src/main.rs"),
+        );
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        assert!(decision.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_broker_list_files_denied_by_firewall() {
+        use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        // Manifest allowing /workspace/src/main.rs
+        let context_manifest = ContextPackManifestBuilder::new("ctx-1", "prof-1")
+            .add_entry(
+                ManifestEntryBuilder::new("/workspace/src/main.rs", [0u8; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Capability allowing ListFiles
+        let manifest = make_manifest(vec![Capability {
+            capability_id: "cap-ls".to_string(),
+            tool_class: ToolClass::ListFiles,
+            scope: CapabilityScope {
+                root_paths: vec![PathBuf::from("/workspace")],
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        }]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Request ListFiles for denied path
+        let request = make_request("req-ls", ToolClass::ListFiles, Some("/etc/passwd"));
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        assert!(decision.is_terminate());
+    }
+
+    #[tokio::test]
+    async fn test_broker_search_allowed() {
+        use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        // Manifest allowing /workspace/src/main.rs
+        let context_manifest = ContextPackManifestBuilder::new("ctx-1", "prof-1")
+            .add_entry(
+                ManifestEntryBuilder::new("/workspace/src/main.rs", [0u8; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        // Capability allowing Search
+        let manifest = make_manifest(vec![Capability {
+            capability_id: "cap-search".to_string(),
+            tool_class: ToolClass::Search,
+            scope: CapabilityScope {
+                root_paths: vec![PathBuf::from("/workspace")],
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        }]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        // Request Search for allowed path
+        let request = make_request(
+            "req-search",
+            ToolClass::Search,
+            Some("/workspace/src/main.rs"),
+        )
+        .with_query("fn main");
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        assert!(decision.is_allowed());
     }
 }

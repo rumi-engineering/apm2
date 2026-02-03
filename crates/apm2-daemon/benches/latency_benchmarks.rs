@@ -69,6 +69,8 @@ fn create_tool_request(request_id: &str, episode_id: &EpisodeId) -> BrokerToolRe
         network: None,
         shell_command: None,
         git_operation: None,
+        pattern: None,
+        query: None,
         risk_tier: RiskTier::Tier2,
     }
 }

@@ -479,6 +479,24 @@ impl PolicyEngine {
                     return matches_any_path_pattern(&rule.paths, &req.path);
                 }
             },
+            tool_request::Tool::ListFiles(req) => {
+                // Security: Always block traversal, even with empty paths
+                if contains_path_traversal(&req.path) {
+                    return false;
+                }
+                if !rule.paths.is_empty() {
+                    return matches_any_path_pattern(&rule.paths, &req.path);
+                }
+            },
+            tool_request::Tool::Search(req) => {
+                // Security: Always block traversal, even with empty paths
+                if contains_path_traversal(&req.scope) {
+                    return false;
+                }
+                if !rule.paths.is_empty() {
+                    return matches_any_path_pattern(&rule.paths, &req.scope);
+                }
+            },
             tool_request::Tool::ShellExec(req) => {
                 // Check command patterns
                 if !rule.commands.is_empty() {
@@ -510,6 +528,8 @@ impl PolicyEngine {
             tool_request::Tool::FileRead(req) => &req.path,
             tool_request::Tool::FileWrite(req) => &req.path,
             tool_request::Tool::FileEdit(req) => &req.path,
+            tool_request::Tool::ListFiles(req) => &req.path,
+            tool_request::Tool::Search(req) => &req.scope,
             _ => return false,
         };
 
@@ -847,6 +867,8 @@ fn get_tool_name(tool: &tool_request::Tool) -> String {
         tool_request::Tool::FileRead(_) => "fs.read".to_string(),
         tool_request::Tool::FileWrite(_) => "fs.write".to_string(),
         tool_request::Tool::FileEdit(_) => "fs.edit".to_string(),
+        tool_request::Tool::ListFiles(_) => "fs.list_files".to_string(),
+        tool_request::Tool::Search(_) => "fs.search".to_string(),
         tool_request::Tool::ShellExec(_) => "shell.exec".to_string(),
         tool_request::Tool::GitOp(op) => format!("git.{}", op.operation.to_lowercase()),
         tool_request::Tool::Inference(_) => "inference".to_string(),

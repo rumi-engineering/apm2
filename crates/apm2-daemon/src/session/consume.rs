@@ -488,6 +488,30 @@ pub fn validate_tool_request(
                 },
             }
         },
+        tool_request::Tool::ListFiles(ls) => {
+            // Validate path against manifest entries (same as FileRead)
+            let firewall = DefaultContextFirewall::new(manifest, mode);
+            match firewall.validate_read(&ls.path, None) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(ConsumeSessionError::ContextMiss {
+                    path: ContextRefinementRequest::truncate_path_str(&ls.path),
+                    manifest_id: manifest.manifest_id.clone(),
+                    reason: e.to_string(),
+                }),
+            }
+        },
+        tool_request::Tool::Search(search) => {
+            // Validate scope against manifest entries
+            let firewall = DefaultContextFirewall::new(manifest, mode);
+            match firewall.validate_read(&search.scope, None) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(ConsumeSessionError::ContextMiss {
+                    path: ContextRefinementRequest::truncate_path_str(&search.scope),
+                    manifest_id: manifest.manifest_id.clone(),
+                    reason: e.to_string(),
+                }),
+            }
+        },
         tool_request::Tool::FileWrite(write) => {
             // TCK-00254: Validate write path against write_allowlist (fail-closed)
             let path = std::path::Path::new(&write.path);
@@ -545,6 +569,8 @@ const fn tool_to_tool_class(tool: &tool_request::Tool) -> ToolClass {
         tool_request::Tool::ArtifactPublish(_) | tool_request::Tool::ArtifactFetch(_) => {
             ToolClass::Artifact
         },
+        tool_request::Tool::ListFiles(_) => ToolClass::ListFiles,
+        tool_request::Tool::Search(_) => ToolClass::Search,
     }
 }
 

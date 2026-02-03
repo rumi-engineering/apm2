@@ -23,7 +23,10 @@ pub struct ToolRequest {
     #[prost(bool, tag = "4")]
     pub consumption_mode: bool,
     /// The specific tool operation requested.
-    #[prost(oneof = "tool_request::Tool", tags = "10, 11, 12, 13, 14, 15, 16, 17")]
+    #[prost(
+        oneof = "tool_request::Tool",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+    )]
     pub tool: ::core::option::Option<tool_request::Tool>,
 }
 /// Nested message and enum types in `ToolRequest`.
@@ -48,6 +51,10 @@ pub mod tool_request {
         ArtifactPublish(super::ArtifactPublish),
         #[prost(message, tag = "17")]
         ArtifactFetch(super::ArtifactFetch),
+        #[prost(message, tag = "18")]
+        ListFiles(super::ListFiles),
+        #[prost(message, tag = "19")]
+        Search(super::Search),
     }
 }
 /// Request to read file contents.
@@ -245,6 +252,46 @@ pub struct ArtifactFetch {
     /// The kernel may perform transcoding if supported.
     #[prost(string, tag = "5")]
     pub format: ::prost::alloc::string::String,
+}
+/// Request to list files in a directory.
+///
+/// Policy may restrict:
+/// - Allowed paths (glob patterns)
+/// - Output size limits
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListFiles {
+    /// Directory path to list.
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    /// Optional glob pattern to filter results (e.g., "*.rs").
+    #[prost(string, tag = "2")]
+    pub pattern: ::prost::alloc::string::String,
+    /// Maximum number of entries to return.
+    #[prost(uint64, tag = "3")]
+    pub max_entries: u64,
+}
+/// Request to search for text in files.
+///
+/// Policy may restrict:
+/// - Allowed scopes (glob patterns)
+/// - Output size limits
+/// - Query complexity (e.g., regex disabled)
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Search {
+    /// Text query to search for.
+    #[prost(string, tag = "1")]
+    pub query: ::prost::alloc::string::String,
+    /// Directory or glob pattern scope (e.g., "src/**/*.rs").
+    #[prost(string, tag = "2")]
+    pub scope: ::prost::alloc::string::String,
+    /// Maximum bytes of output to return.
+    #[prost(uint64, tag = "3")]
+    pub max_bytes: u64,
+    /// Maximum lines of output to return.
+    #[prost(uint64, tag = "4")]
+    pub max_lines: u64,
 }
 /// Tool response from kernel to agent.
 ///

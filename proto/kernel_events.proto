@@ -1,5 +1,11 @@
 // APM2 Kernel Event Schema
-// Version: 0.5.0
+// Version: 0.6.0
+//
+// CHANGELOG (0.6.0):
+// - Added ReviewBlockedRecorded event for FAC v0 review liveness (RFC-0018, TCK-00311)
+// - Added ReviewBlockedRecorded to KernelEvent payload (tag 32)
+// - Added ReviewBlockedReasonCode enum for failure classification
+// - Enables work.<work_id>.blocked topic derivation and durable blocked outcomes
 //
 // CHANGELOG (0.5.0):
 // - Added DefectRecorded event for HEF defect pulse derivation (RFC-0018, TCK-00307)
@@ -108,6 +114,7 @@ message KernelEvent {
     ChangeSetPublished changeset_published = 29;
     IoArtifactPublished io_artifact_published = 30;
     DefectRecorded defect_recorded = 31;
+    ReviewBlockedRecorded review_blocked_recorded = 32;
   }
 }
 
@@ -1603,5 +1610,67 @@ message DefectRecorded {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds the defect event to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 8;
+}
+
+// ============================================================
+// REVIEW BLOCKED EVENTS (TCK-00311)
+// ============================================================
+//
+// ReviewBlockedRecorded events capture workspace apply failures and tool
+// execution failures during FAC v0 review. These events ensure blocked
+// outcomes are durable in the ledger.
+//
+// Key properties:
+// - Records blocked outcomes with structured reason codes
+// - References blocked logs in CAS via blocked_log_hash
+// - Enables retry bound enforcement via HTF time envelope
+// - Supports work.<work_id>.blocked topic derivation
+
+// Reason code for review blocked events.
+// Classifies the specific failure that caused the review to be blocked.
+enum ReviewBlockedReasonCode {
+  // Unspecified reason (invalid).
+  REVIEW_BLOCKED_REASON_UNSPECIFIED = 0;
+  // Workspace apply operation failed.
+  REVIEW_BLOCKED_REASON_APPLY_FAILED = 1;
+  // Tool execution failed during review.
+  REVIEW_BLOCKED_REASON_TOOL_FAILED = 2;
+  // Binary file detected (unsupported in v0).
+  REVIEW_BLOCKED_REASON_BINARY_UNSUPPORTED = 3;
+  // Required artifact missing from CAS.
+  REVIEW_BLOCKED_REASON_MISSING_ARTIFACT = 4;
+  // Invalid changeset bundle format.
+  REVIEW_BLOCKED_REASON_INVALID_BUNDLE = 5;
+  // Operation timed out.
+  REVIEW_BLOCKED_REASON_TIMEOUT = 6;
+  // Policy denied the operation.
+  REVIEW_BLOCKED_REASON_POLICY_DENIED = 7;
+  // Context miss detected.
+  REVIEW_BLOCKED_REASON_CONTEXT_MISS = 8;
+}
+
+// Emitted when a review is blocked due to workspace apply or tool failure.
+//
+// This event captures the blocked outcome and stores it durably in the ledger.
+// It binds the failure to the changeset and provides CAS references for logs.
+//
+// Security: The signature uses REVIEW_BLOCKED_RECORDED: domain prefix.
+message ReviewBlockedRecorded {
+  // Unique identifier for this blocked event.
+  // Format: `BLK-{uuid}` or similar unique string.
+  string blocked_id = 1;
+  // BLAKE3 digest of the changeset that was being reviewed (32 bytes).
+  bytes changeset_digest = 2;
+  // Reason code classifying the failure.
+  int32 reason_code = 3;
+  // BLAKE3 hash of the blocked logs stored in CAS (32 bytes).
+  bytes blocked_log_hash = 4;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the blocked event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 5;
+  // Actor who recorded the blocked event.
+  string recorder_actor_id = 6;
+  // Ed25519 signature over canonical bytes with REVIEW_BLOCKED_RECORDED: domain (64 bytes).
+  bytes recorder_signature = 7;
 }
 

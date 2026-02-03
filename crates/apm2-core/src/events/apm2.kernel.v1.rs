@@ -42,7 +42,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -96,6 +96,8 @@ pub mod kernel_event {
         IoArtifactPublished(super::IoArtifactPublished),
         #[prost(message, tag = "31")]
         DefectRecorded(super::DefectRecorded),
+        #[prost(message, tag = "32")]
+        ReviewBlockedRecorded(super::ReviewBlockedRecorded),
     }
 }
 /// ============================================================
@@ -1841,6 +1843,39 @@ pub struct DefectRecorded {
     #[prost(message, optional, tag = "8")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
 }
+/// Emitted when a review is blocked due to workspace apply or tool failure.
+///
+/// This event captures the blocked outcome and stores it durably in the ledger.
+/// It binds the failure to the changeset and provides CAS references for logs.
+///
+/// Security: The signature uses REVIEW_BLOCKED_RECORDED: domain prefix.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReviewBlockedRecorded {
+    /// Unique identifier for this blocked event.
+    /// Format: `BLK-{uuid}` or similar unique string.
+    #[prost(string, tag = "1")]
+    pub blocked_id: ::prost::alloc::string::String,
+    /// BLAKE3 digest of the changeset that was being reviewed (32 bytes).
+    #[prost(bytes = "vec", tag = "2")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Reason code classifying the failure.
+    #[prost(int32, tag = "3")]
+    pub reason_code: i32,
+    /// BLAKE3 hash of the blocked logs stored in CAS (32 bytes).
+    #[prost(bytes = "vec", tag = "4")]
+    pub blocked_log_hash: ::prost::alloc::vec::Vec<u8>,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the blocked event to verifiable HTF time.
+    #[prost(message, optional, tag = "5")]
+    pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Actor who recorded the blocked event.
+    #[prost(string, tag = "6")]
+    pub recorder_actor_id: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with REVIEW_BLOCKED_RECORDED: domain (64 bytes).
+    #[prost(bytes = "vec", tag = "7")]
+    pub recorder_signature: ::prost::alloc::vec::Vec<u8>,
+}
 /// Determinism status for AAT runs.
 /// Indicates whether multiple runs produced consistent terminal evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -2263,6 +2298,88 @@ impl DefectSource {
             "DEFECT_SOURCE_SCHEMA_REJECT" => Some(Self::SchemaReject),
             "DEFECT_SOURCE_AAT_FAIL" => Some(Self::AatFail),
             "DEFECT_SOURCE_CAPABILITY_UNAVAILABLE" => Some(Self::CapabilityUnavailable),
+            _ => None,
+        }
+    }
+}
+/// Reason code for review blocked events.
+/// Classifies the specific failure that caused the review to be blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReviewBlockedReasonCode {
+    /// Unspecified reason (invalid).
+    ReviewBlockedReasonUnspecified = 0,
+    /// Workspace apply operation failed.
+    ReviewBlockedReasonApplyFailed = 1,
+    /// Tool execution failed during review.
+    ReviewBlockedReasonToolFailed = 2,
+    /// Binary file detected (unsupported in v0).
+    ReviewBlockedReasonBinaryUnsupported = 3,
+    /// Required artifact missing from CAS.
+    ReviewBlockedReasonMissingArtifact = 4,
+    /// Invalid changeset bundle format.
+    ReviewBlockedReasonInvalidBundle = 5,
+    /// Operation timed out.
+    ReviewBlockedReasonTimeout = 6,
+    /// Policy denied the operation.
+    ReviewBlockedReasonPolicyDenied = 7,
+    /// Context miss detected.
+    ReviewBlockedReasonContextMiss = 8,
+}
+impl ReviewBlockedReasonCode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::ReviewBlockedReasonUnspecified => "REVIEW_BLOCKED_REASON_UNSPECIFIED",
+            Self::ReviewBlockedReasonApplyFailed => "REVIEW_BLOCKED_REASON_APPLY_FAILED",
+            Self::ReviewBlockedReasonToolFailed => "REVIEW_BLOCKED_REASON_TOOL_FAILED",
+            Self::ReviewBlockedReasonBinaryUnsupported => {
+                "REVIEW_BLOCKED_REASON_BINARY_UNSUPPORTED"
+            }
+            Self::ReviewBlockedReasonMissingArtifact => {
+                "REVIEW_BLOCKED_REASON_MISSING_ARTIFACT"
+            }
+            Self::ReviewBlockedReasonInvalidBundle => {
+                "REVIEW_BLOCKED_REASON_INVALID_BUNDLE"
+            }
+            Self::ReviewBlockedReasonTimeout => "REVIEW_BLOCKED_REASON_TIMEOUT",
+            Self::ReviewBlockedReasonPolicyDenied => {
+                "REVIEW_BLOCKED_REASON_POLICY_DENIED"
+            }
+            Self::ReviewBlockedReasonContextMiss => "REVIEW_BLOCKED_REASON_CONTEXT_MISS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REVIEW_BLOCKED_REASON_UNSPECIFIED" => {
+                Some(Self::ReviewBlockedReasonUnspecified)
+            }
+            "REVIEW_BLOCKED_REASON_APPLY_FAILED" => {
+                Some(Self::ReviewBlockedReasonApplyFailed)
+            }
+            "REVIEW_BLOCKED_REASON_TOOL_FAILED" => {
+                Some(Self::ReviewBlockedReasonToolFailed)
+            }
+            "REVIEW_BLOCKED_REASON_BINARY_UNSUPPORTED" => {
+                Some(Self::ReviewBlockedReasonBinaryUnsupported)
+            }
+            "REVIEW_BLOCKED_REASON_MISSING_ARTIFACT" => {
+                Some(Self::ReviewBlockedReasonMissingArtifact)
+            }
+            "REVIEW_BLOCKED_REASON_INVALID_BUNDLE" => {
+                Some(Self::ReviewBlockedReasonInvalidBundle)
+            }
+            "REVIEW_BLOCKED_REASON_TIMEOUT" => Some(Self::ReviewBlockedReasonTimeout),
+            "REVIEW_BLOCKED_REASON_POLICY_DENIED" => {
+                Some(Self::ReviewBlockedReasonPolicyDenied)
+            }
+            "REVIEW_BLOCKED_REASON_CONTEXT_MISS" => {
+                Some(Self::ReviewBlockedReasonContextMiss)
+            }
             _ => None,
         }
     }

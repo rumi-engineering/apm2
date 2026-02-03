@@ -60,7 +60,7 @@
 
 use super::{
     ArtifactFetch, ArtifactPublish, FileEdit, FileRead, FileWrite, GitOperation, InferenceCall,
-    ShellExec, ToolRequest, ValidationError, tool_request,
+    ListFiles, Search, ShellExec, ToolRequest, ValidationError, tool_request,
 };
 
 /// Maximum length for `request_id`, `session_token`, and similar identifiers.
@@ -96,6 +96,15 @@ const HASH_SIZE: usize = 32;
 /// Maximum number of items in repeated fields (prevents denial-of-service via
 /// unbounded lists).
 const MAX_REPEATED_ITEMS: usize = 1000;
+
+/// Maximum number of entries for `ListFiles`.
+const MAX_LIST_FILES_ENTRIES: u64 = 2000;
+
+/// Maximum output bytes for Search.
+const MAX_SEARCH_BYTES: u64 = 65536;
+
+/// Maximum output lines for Search.
+const MAX_SEARCH_LINES: u64 = 2000;
 
 /// Known git operations.
 const KNOWN_GIT_OPS: &[&str] = &[
@@ -144,6 +153,8 @@ impl Validator for ToolRequest {
             Some(tool_request::Tool::ArtifactFetch(req)) => {
                 validate_artifact_fetch(req, &mut errors);
             },
+            Some(tool_request::Tool::ListFiles(req)) => validate_list_files(req, &mut errors),
+            Some(tool_request::Tool::Search(req)) => validate_search(req, &mut errors),
             None => {
                 errors.push(ValidationError {
                     field: "tool".to_string(),
@@ -525,6 +536,72 @@ fn validate_artifact_fetch(req: &ArtifactFetch, errors: &mut Vec<ValidationError
             field: "artifact_fetch.format".to_string(),
             rule: "max_length".to_string(),
             message: "format must be at most 32 characters".to_string(),
+        });
+    }
+}
+
+/// Validate a list files request.
+fn validate_list_files(req: &ListFiles, errors: &mut Vec<ValidationError>) {
+    validate_path(&req.path, "list_files.path", errors);
+
+    if req.pattern.len() > MAX_PATH_LEN {
+        errors.push(ValidationError {
+            field: "list_files.pattern".to_string(),
+            rule: "max_length".to_string(),
+            message: format!("pattern must be at most {MAX_PATH_LEN} characters"),
+        });
+    }
+
+    // Security: Validate pattern does not contain path traversal sequences
+    if contains_path_traversal(&req.pattern) {
+        errors.push(ValidationError {
+            field: "list_files.pattern".to_string(),
+            rule: "no_path_traversal".to_string(),
+            message: "pattern must not contain path traversal sequences (..)".to_string(),
+        });
+    }
+
+    if req.max_entries > MAX_LIST_FILES_ENTRIES {
+        errors.push(ValidationError {
+            field: "list_files.max_entries".to_string(),
+            rule: "max_value".to_string(),
+            message: format!("max_entries must be at most {MAX_LIST_FILES_ENTRIES}"),
+        });
+    }
+}
+
+/// Validate a search request.
+fn validate_search(req: &Search, errors: &mut Vec<ValidationError>) {
+    if req.query.is_empty() {
+        errors.push(ValidationError {
+            field: "search.query".to_string(),
+            rule: "required".to_string(),
+            message: "query must be non-empty".to_string(),
+        });
+    } else if req.query.len() > MAX_ARG_LEN {
+        errors.push(ValidationError {
+            field: "search.query".to_string(),
+            rule: "max_length".to_string(),
+            message: format!("query must be at most {MAX_ARG_LEN} bytes"),
+        });
+    }
+
+    // Scope acts like a path/glob
+    validate_path(&req.scope, "search.scope", errors);
+
+    if req.max_bytes > MAX_SEARCH_BYTES {
+        errors.push(ValidationError {
+            field: "search.max_bytes".to_string(),
+            rule: "max_value".to_string(),
+            message: format!("max_bytes must be at most {MAX_SEARCH_BYTES}"),
+        });
+    }
+
+    if req.max_lines > MAX_SEARCH_LINES {
+        errors.push(ValidationError {
+            field: "search.max_lines".to_string(),
+            rule: "max_value".to_string(),
+            message: format!("max_lines must be at most {MAX_SEARCH_LINES}"),
         });
     }
 }
@@ -1094,5 +1171,87 @@ mod artifact_fetch_tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.field == "artifact_fetch.max_bytes"));
+    }
+}
+
+#[cfg(test)]
+mod list_files_tests {
+    use super::*;
+
+    #[test]
+    fn test_list_files_valid() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ListFiles(ListFiles {
+                path: "/workspace".to_string(),
+                pattern: "**/*.rs".to_string(),
+                max_entries: 100,
+            })),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_list_files_pattern_path_traversal() {
+        // Test path traversal in pattern field
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ListFiles(ListFiles {
+                path: "/workspace".to_string(),
+                pattern: "../secret/*".to_string(),
+                max_entries: 100,
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "list_files.pattern"));
+        assert!(errors.iter().any(|e| e.rule == "no_path_traversal"));
+    }
+
+    #[test]
+    fn test_list_files_pattern_traversal_middle() {
+        // Test path traversal in the middle of pattern
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ListFiles(ListFiles {
+                path: "/workspace".to_string(),
+                pattern: "src/../../../etc/passwd".to_string(),
+                max_entries: 100,
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.rule == "no_path_traversal"));
+    }
+
+    #[test]
+    fn test_list_files_pattern_backslash_traversal() {
+        // Test path traversal with backslashes (Windows-style)
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ListFiles(ListFiles {
+                path: "/workspace".to_string(),
+                pattern: "..\\secret\\*".to_string(),
+                max_entries: 100,
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.rule == "no_path_traversal"));
     }
 }

@@ -48,6 +48,8 @@ message ToolRequest {
     InferenceCall inference = 15;
     ArtifactPublish artifact_publish = 16;
     ArtifactFetch artifact_fetch = 17;
+    ListFiles list_files = 18;
+    Search search = 19;
   }
 }
 
@@ -247,6 +249,46 @@ message ArtifactFetch {
   // Requested format (e.g., "json", "yaml", "raw").
   // The kernel may perform transcoding if supported.
   string format = 5;
+}
+
+// ============================================================
+// NAVIGATION OPERATIONS (TCK-00315)
+// ============================================================
+
+// Request to list files in a directory.
+//
+// Policy may restrict:
+// - Allowed paths (glob patterns)
+// - Output size limits
+message ListFiles {
+  // Directory path to list.
+  string path = 1;
+
+  // Optional glob pattern to filter results (e.g., "*.rs").
+  string pattern = 2;
+
+  // Maximum number of entries to return.
+  uint64 max_entries = 3;
+}
+
+// Request to search for text in files.
+//
+// Policy may restrict:
+// - Allowed scopes (glob patterns)
+// - Output size limits
+// - Query complexity (e.g., regex disabled)
+message Search {
+  // Text query to search for.
+  string query = 1;
+
+  // Directory or glob pattern scope (e.g., "src/**/*.rs").
+  string scope = 2;
+
+  // Maximum bytes of output to return.
+  uint64 max_bytes = 3;
+
+  // Maximum lines of output to return.
+  uint64 max_lines = 4;
 }
 
 // ============================================================
