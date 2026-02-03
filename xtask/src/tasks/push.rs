@@ -14,7 +14,10 @@ use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
 use crate::reviewer_state::{ReviewerSpawner, select_review_model};
-use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_ticket_branch};
+use crate::util::{
+    current_branch, main_worktree, print_non_authoritative_banner, ticket_yaml_path,
+    validate_ticket_branch,
+};
 
 /// Push branch and create PR.
 ///
@@ -351,7 +354,16 @@ fn parse_owner_repo(remote_url: &str) -> &str {
 }
 
 /// Create pending status checks for AI reviews.
+///
+/// # NON-AUTHORITATIVE OUTPUT
+///
+/// This function writes GitHub status checks as DEVELOPMENT SCAFFOLDING only.
+/// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
+/// the HEF evidence pipeline.
 fn create_pending_statuses(sh: &Shell, owner_repo: &str, head_sha: &str) {
+    // TCK-00294: Print NON-AUTHORITATIVE banner before status writes
+    print_non_authoritative_banner();
+
     let endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
     let state = "pending";
 

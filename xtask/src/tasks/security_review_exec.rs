@@ -15,7 +15,7 @@
 use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
-use crate::util::{current_branch, validate_ticket_branch};
+use crate::util::{current_branch, print_non_authoritative_banner, validate_ticket_branch};
 
 /// Required reading paths for security reviewers.
 pub const REQUIRED_READING: &[&str] = &[
@@ -400,6 +400,12 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
 }
 
 /// Update the status check for security review.
+///
+/// # NON-AUTHORITATIVE OUTPUT
+///
+/// This function writes GitHub status checks as DEVELOPMENT SCAFFOLDING only.
+/// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
+/// the HEF evidence pipeline.
 fn update_status(
     sh: &Shell,
     owner_repo: &str,
@@ -407,6 +413,9 @@ fn update_status(
     success: bool,
     description: &str,
 ) -> Result<()> {
+    // TCK-00294: Print NON-AUTHORITATIVE banner before status writes
+    print_non_authoritative_banner();
+
     let state = if success { "success" } else { "failure" };
     let endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
 

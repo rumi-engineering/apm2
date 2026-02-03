@@ -4,6 +4,7 @@
 //! - Branch validation and parsing
 //! - Worktree path finding
 //! - Ticket YAML path construction
+//! - Non-authoritative banner display
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -11,6 +12,53 @@ use std::sync::LazyLock;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use xshell::{Shell, cmd};
+
+// =============================================================================
+// Non-Authoritative Banner
+// =============================================================================
+
+/// NON-AUTHORITATIVE banner text for xtask status-writing operations.
+///
+/// This banner must be printed before any GitHub status check writes to make
+/// clear that xtask outputs are development scaffolding, NOT the source of
+/// truth for the HEF (Holonic Evidence Framework) pipeline.
+///
+/// Per RFC-0018 REQ-HEF-0001: "Pulse plane is non-authoritative" - status
+/// writes from xtask are hints only and must never be used as authoritative
+/// admission, gate, lease, or secret-backed decision signals.
+///
+/// See: TCK-00294 (Stage X0 of xtask authority reduction)
+pub const NON_AUTHORITATIVE_BANNER: &str = r"
+================================================================================
+                          NON-AUTHORITATIVE OUTPUT
+================================================================================
+  This xtask command writes GitHub status checks as DEVELOPMENT SCAFFOLDING.
+  These statuses are NOT the source of truth for the HEF evidence pipeline.
+
+  Per RFC-0018: Pulse-plane signals are lossy hints only. Consumers must verify
+  via ledger+CAS before acting on any gate, admission, or authorization decision.
+
+  For authoritative evidence, use the daemon's projection system (when available).
+================================================================================
+";
+
+/// Print the NON-AUTHORITATIVE banner to stdout.
+///
+/// Call this function before any GitHub status check API writes to ensure
+/// operators understand that xtask outputs are non-authoritative scaffolding.
+///
+/// # Example
+///
+/// ```ignore
+/// use crate::util::print_non_authoritative_banner;
+///
+/// // Before writing status checks
+/// print_non_authoritative_banner();
+/// set_status_check(&sh, &pr_info, &sha, "success", "All checks passed", None)?;
+/// ```
+pub fn print_non_authoritative_banner() {
+    eprintln!("{NON_AUTHORITATIVE_BANNER}");
+}
 
 /// Regex pattern for validating ticket branch names.
 ///
@@ -317,5 +365,43 @@ mod tests {
         if let Ok(branch) = current_branch(&sh) {
             assert!(!branch.is_empty(), "Branch name should not be empty");
         }
+    }
+
+    // =============================================================================
+    // NON-AUTHORITATIVE Banner Tests (TCK-00294)
+    // =============================================================================
+
+    #[test]
+    fn test_non_authoritative_banner_contains_key_phrases() {
+        // Verify the banner contains all required warning phrases
+        assert!(
+            NON_AUTHORITATIVE_BANNER.contains("NON-AUTHORITATIVE"),
+            "Banner must contain 'NON-AUTHORITATIVE'"
+        );
+        assert!(
+            NON_AUTHORITATIVE_BANNER.contains("DEVELOPMENT SCAFFOLDING"),
+            "Banner must mention 'DEVELOPMENT SCAFFOLDING'"
+        );
+        assert!(
+            NON_AUTHORITATIVE_BANNER.contains("RFC-0018"),
+            "Banner must reference RFC-0018"
+        );
+        assert!(
+            NON_AUTHORITATIVE_BANNER.contains("ledger+CAS"),
+            "Banner must mention ledger+CAS verification"
+        );
+    }
+
+    #[test]
+    fn test_non_authoritative_banner_is_not_empty() {
+        assert!(
+            !NON_AUTHORITATIVE_BANNER.is_empty(),
+            "Banner must not be empty"
+        );
+        // Should be a substantial warning, at least 200 characters
+        assert!(
+            NON_AUTHORITATIVE_BANNER.len() > 200,
+            "Banner should be a substantial warning"
+        );
     }
 }

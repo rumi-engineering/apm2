@@ -51,6 +51,7 @@ use crate::aat::validation::validate_pr_description;
 use crate::aat::variation::InputVariationGenerator;
 use crate::reviewer_state::select_review_model;
 use crate::shell_escape::build_script_command;
+use crate::util::print_non_authoritative_banner;
 
 // =============================================================================
 // PR URL Parsing
@@ -171,6 +172,13 @@ pub fn fetch_pr_sha(sh: &Shell, pr_info: &PrInfo) -> Result<String> {
 
 /// Set GitHub status check.
 ///
+/// # NON-AUTHORITATIVE OUTPUT
+///
+/// This function writes GitHub status checks as DEVELOPMENT SCAFFOLDING only.
+/// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
+/// the HEF evidence pipeline. A NON-AUTHORITATIVE banner is printed to stderr
+/// before each status write to make this explicit.
+///
 /// # Arguments
 ///
 /// * `sh` - Shell instance
@@ -187,6 +195,9 @@ pub fn set_status_check(
     description: &str,
     target_url: Option<&str>,
 ) -> Result<()> {
+    // TCK-00294: Print NON-AUTHORITATIVE banner before status writes
+    print_non_authoritative_banner();
+
     let owner_repo = pr_info.owner_repo();
     let endpoint = format!("/repos/{owner_repo}/statuses/{sha}");
     let context = "aat/acceptance";
