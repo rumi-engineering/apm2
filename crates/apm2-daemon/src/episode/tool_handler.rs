@@ -55,6 +55,18 @@ pub const MAX_RESULT_MESSAGE_LEN: usize = 4096;
 /// Maximum number of registered tool handlers.
 pub const MAX_HANDLERS: usize = 64;
 
+/// Maximum bytes for artifact fetch operations (4 MiB per REQ-HEF-0010).
+///
+/// This limit ensures bounded output for artifact retrieval operations.
+/// Requests for larger artifacts must be chunked or use streaming APIs.
+pub const ARTIFACT_FETCH_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// Maximum output bytes for git operations (256 KiB per REQ-HEF-0010).
+pub const GIT_OUTPUT_MAX_BYTES: usize = 256 * 1024; // 256 KiB
+
+/// Maximum output lines for git operations (4000 per REQ-HEF-0010).
+pub const GIT_OUTPUT_MAX_LINES: usize = 4000;
+
 // =============================================================================
 // ToolArgs
 // =============================================================================
@@ -95,6 +107,9 @@ pub enum ToolArgs {
     /// Arguments for inference operations.
     Inference(InferenceArgs),
 
+    /// Arguments for artifact fetch operations.
+    Artifact(ArtifactArgs),
+
     /// Raw bytes for custom handlers.
     Raw(RawArgs),
 }
@@ -109,6 +124,7 @@ impl ToolArgs {
             Self::Network(_) => ToolClass::Network,
             Self::Git(_) => ToolClass::Git,
             Self::Inference(_) => ToolClass::Inference,
+            Self::Artifact(_) => ToolClass::Artifact,
             Self::Read(_) | Self::Raw(_) => ToolClass::Read, // Default for raw
         }
     }
@@ -131,6 +147,13 @@ impl ToolArgs {
                 args.operation.len() + args.args.iter().map(String::len).sum::<usize>()
             },
             Self::Inference(args) => args.prompt.len(),
+            Self::Artifact(args) => {
+                args.stable_id.as_ref().map_or(0, String::len)
+                    + args.content_hash.map_or(0, |_| 32)
+                    + args.expected_hash.map_or(0, |_| 32)
+                    + args.format.as_ref().map_or(0, String::len)
+                    + 8 // max_bytes u64
+            },
             Self::Raw(args) => args.data.len(),
         }
     }
@@ -265,6 +288,49 @@ impl std::hash::Hash for InferenceArgs {
             state.write_u8(0);
         }
     }
+}
+
+/// Arguments for artifact fetch operations (matching proto `ArtifactFetch`).
+///
+/// Per REQ-HEF-0010, artifact fetch supports two resolution modes:
+/// - `stable_id`: Stable identifier for resolution (e.g., "org:ticket:TCK-001")
+/// - `content_hash`: Direct content hash reference (BLAKE3, 32 bytes)
+///
+/// Exactly one of these must be set (fail-closed validation).
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactArgs {
+    /// Stable identifier for resolution (e.g., "org:ticket:TCK-001").
+    ///
+    /// If set, the kernel resolves this to a content hash. Currently not
+    /// supported - requests using `stable_id` will fail closed.
+    pub stable_id: Option<String>,
+
+    /// Direct content hash reference (BLAKE3, 32 bytes).
+    ///
+    /// Policy may restrict usage in consumption mode to prevent side-channel
+    /// bypass.
+    pub content_hash: Option<Hash>,
+
+    /// Expected content hash for validation when using `stable_id`.
+    ///
+    /// If resolution yields a different hash, the fetch fails.
+    pub expected_hash: Option<Hash>,
+
+    /// Maximum bytes to return (REQUIRED, <= `ARTIFACT_FETCH_MAX_BYTES`).
+    ///
+    /// Requests exceeding this limit will fail with `OutputTooLarge`.
+    pub max_bytes: u64,
+
+    /// Requested format (e.g., "json", "yaml", "raw").
+    ///
+    /// The kernel may perform transcoding if supported.
+    pub format: Option<String>,
 }
 
 /// Raw bytes arguments for custom handlers.
@@ -458,6 +524,24 @@ pub enum ToolHandlerError {
         /// Error message.
         message: String,
     },
+
+    /// Output exceeded bounds (REQ-HEF-0010).
+    ///
+    /// Per RFC-0018 hardening requirements, handlers must fail hard when output
+    /// exceeds configured bounds rather than truncating and returning success.
+    #[error(
+        "output too large: {bytes} bytes, {lines} lines (max {max_bytes} bytes, {max_lines} lines)"
+    )]
+    OutputTooLarge {
+        /// Actual output size in bytes.
+        bytes: usize,
+        /// Actual output line count.
+        lines: usize,
+        /// Maximum allowed bytes.
+        max_bytes: usize,
+        /// Maximum allowed lines.
+        max_lines: usize,
+    },
 }
 
 impl ToolHandlerError {
@@ -475,6 +559,7 @@ impl ToolHandlerError {
             Self::NetworkError { .. } => "network_error",
             Self::IoError { .. } => "io_error",
             Self::Internal { .. } => "internal",
+            Self::OutputTooLarge { .. } => "output_too_large",
         }
     }
 
@@ -722,5 +807,18 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let handler_err: ToolHandlerError = io_err.into();
         assert_eq!(handler_err.kind(), "io_error");
+    }
+
+    #[test]
+    fn test_tool_args_artifact_class() {
+        use super::*;
+        let args = ToolArgs::Artifact(ArtifactArgs {
+            stable_id: None,
+            content_hash: Some([42u8; 32]),
+            expected_hash: None,
+            max_bytes: 1024,
+            format: None,
+        });
+        assert_eq!(args.tool_class(), ToolClass::Artifact);
     }
 }

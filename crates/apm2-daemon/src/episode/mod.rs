@@ -194,7 +194,10 @@ pub use executor::{
     new_shared_executor,
 };
 pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal};
-pub use handlers::{ExecuteHandler, ReadFileHandler, WriteFileHandler, register_stub_handlers};
+pub use handlers::{
+    ArtifactFetchHandler, ContentAddressedStore as HandlerContentAddressedStore, ExecuteHandler,
+    GitOperationHandler, ReadFileHandler, WriteFileHandler, register_stub_handlers,
+};
 // Re-export PTY types (TCK-00161)
 pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};
 pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
@@ -219,9 +222,10 @@ pub use snapshot::{PinnedSnapshot, PinnedSnapshotBuilder};
 pub use state::{EpisodeState, QuarantineReason, TerminationClass, validate_transition};
 pub use tool_class::{MAX_TOOL_ALLOWLIST, MAX_TOOL_CLASS_NAME_LEN, ToolClass, ToolClassExt};
 pub use tool_handler::{
-    ExecuteArgs, GitArgs, InferenceArgs, MAX_HANDLERS, MAX_RESULT_MESSAGE_LEN, MAX_TOOL_ARGS_SIZE,
-    NetworkArgs, RawArgs, ReadArgs, ResultMetadata, ToolArgs, ToolHandler, ToolHandlerError,
-    ToolResultData, WriteArgs,
+    ARTIFACT_FETCH_MAX_BYTES, ArtifactArgs, ExecuteArgs, GIT_OUTPUT_MAX_BYTES,
+    GIT_OUTPUT_MAX_LINES, GitArgs, InferenceArgs, MAX_HANDLERS, MAX_RESULT_MESSAGE_LEN,
+    MAX_TOOL_ARGS_SIZE, NetworkArgs, RawArgs, ReadArgs, ResultMetadata, ToolArgs, ToolHandler,
+    ToolHandlerError, ToolResultData, WriteArgs,
 };
 // Re-export workspace types (TCK-00311, TCK-00312)
 pub use workspace::{
