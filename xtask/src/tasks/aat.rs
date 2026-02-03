@@ -803,8 +803,16 @@ pub struct AatResult {
 /// - 0: Success (PASSED verdict)
 /// - 1: Failure (FAILED verdict)
 /// - 2: Invalid arguments or `NEEDS_ADJUDICATION`
-pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Result<AatResult> {
+pub fn run(
+    pr_url: &str,
+    dry_run: bool,
+    ai_tool_override: Option<AiTool>,
+    emit_internal: bool,
+) -> Result<AatResult> {
     let sh = Shell::new().context("Failed to create shell")?;
+
+    // TCK-00295: Check if internal emission is enabled (flag or env var)
+    let should_emit_internal = emit_internal || crate::util::emit_internal_from_env();
 
     // Configure AI tool backend
     let tool_config = AatToolConfig::from_env().with_override(ai_tool_override);
@@ -817,6 +825,9 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
     );
     if dry_run {
         println!("  (dry-run mode - no status check will be set)");
+    }
+    if should_emit_internal {
+        println!("  [TCK-00295] Internal receipt emission enabled");
     }
     println!();
 
@@ -1100,6 +1111,31 @@ pub fn run(pr_url: &str, dry_run: bool, ai_tool_override: Option<AiTool>) -> Res
 
     let summary = format!("AAT {verdict:?}: {verdict_reason}");
     println!("\n{summary}");
+
+    // TCK-00295: Optionally emit internal receipt (non-blocking)
+    if should_emit_internal && !dry_run {
+        println!("\n  [EMIT_INTERNAL] Attempting internal receipt emission...");
+        let payload = serde_json::json!({
+            "pr_url": pr_url,
+            "owner_repo": pr_info.owner_repo(),
+            "pr_number": pr_info.number,
+            "head_sha": sha,
+            "verdict": format!("{:?}", verdict),
+            "verdict_reason": verdict_reason,
+            "evidence_path": evidence_path.as_ref().map(|p| p.display().to_string()),
+            "non_authoritative": true,
+        });
+        let correlation_id = format!("aat-{}-{}", pr_info.number, sha);
+
+        // Non-blocking: errors are logged but don't fail the command
+        if let Err(e) = crate::util::try_emit_internal_receipt(
+            "aat.evidence.published",
+            payload.to_string().as_bytes(),
+            &correlation_id,
+        ) {
+            eprintln!("  [EMIT_INTERNAL] Warning: Failed to emit internal receipt: {e}");
+        }
+    }
 
     Ok(AatResult {
         verdict,

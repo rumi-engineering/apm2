@@ -5,6 +5,7 @@
 //! - Worktree path finding
 //! - Ticket YAML path construction
 //! - Non-authoritative banner display
+//! - Internal receipt/event emission (TCK-00295)
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -12,6 +13,152 @@ use std::sync::LazyLock;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use xshell::{Shell, cmd};
+
+// =============================================================================
+// Internal Receipt Emission Feature Flag (TCK-00295)
+// =============================================================================
+
+/// Name of the environment variable enabling optional internal receipt
+/// emission.
+pub const EMIT_INTERNAL_ENV: &str = "XTASK_EMIT_INTERNAL";
+
+/// Checks if internal receipt emission is enabled via environment variable.
+///
+/// Returns `true` if the `XTASK_EMIT_INTERNAL` environment variable is set to
+/// "true" (case-insensitive).
+///
+/// Per TCK-00295, this flag defaults to `false`. When `true`, xtask will
+/// attempt to emit internal receipts/events to the daemon. If the daemon is
+/// unavailable, xtask continues without blocking.
+///
+/// # Important
+///
+/// Internal emission is NON-AUTHORITATIVE and is additive scaffolding only.
+/// It does not elevate xtask authority. Per RFC-0018 REQ-HEF-0001, these
+/// events are hints only and must never be used for admission decisions
+/// without ledger+CAS verification.
+pub fn emit_internal_from_env() -> bool {
+    std::env::var(EMIT_INTERNAL_ENV)
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+/// Attempts to emit an internal receipt/event to the daemon.
+///
+/// This function is NON-BLOCKING: if the daemon is unavailable, it logs a
+/// warning and returns `Ok(())`. Per TCK-00295, daemon unavailability must
+/// not block xtask runs.
+///
+/// # Arguments
+///
+/// * `event_type` - Event type identifier (e.g., "aat.evidence.published",
+///   "review.completed")
+/// * `payload` - Serialized event payload (JSON)
+/// * `correlation_id` - Correlation ID for event tracing
+///
+/// # Returns
+///
+/// * `Ok(Some(event_id))` if the event was successfully emitted
+/// * `Ok(None)` if the daemon is unavailable (non-blocking)
+/// * `Err(_)` only for non-recoverable errors (should be rare)
+///
+/// # NON-AUTHORITATIVE
+///
+/// Events emitted via this function are NON-AUTHORITATIVE scaffolding.
+/// Per RFC-0018, consumers must verify via ledger+CAS before acting on
+/// any gate, admission, or authorization decision.
+pub fn try_emit_internal_receipt(
+    event_type: &str,
+    payload: &[u8],
+    correlation_id: &str,
+) -> Result<Option<String>> {
+    // Per TCK-00295: Daemon unavailability does not block xtask runs.
+    // This is a best-effort emission; we log and continue on failure.
+
+    // Get daemon socket path from environment or default
+    let socket_path = std::env::var("APM2_SESSION_SOCKET")
+        .unwrap_or_else(|_| "/var/run/apm2d/session.sock".to_string());
+
+    let socket = Path::new(&socket_path);
+
+    // Quick check: if socket doesn't exist, daemon is not running
+    if !socket.exists() {
+        eprintln!("  [EMIT_INTERNAL] Daemon not running (socket not found: {socket_path})");
+        eprintln!("  [EMIT_INTERNAL] Continuing without internal receipt emission.");
+        return Ok(None);
+    }
+
+    // Per TCK-00295: Internal emission requires a session token.
+    // For xtask scaffolding, we use an environment variable for the token.
+    // In future stages, this would be obtained via proper capability flow.
+    let Ok(session_token) = std::env::var("APM2_SESSION_TOKEN") else {
+        eprintln!("  [EMIT_INTERNAL] No session token available (APM2_SESSION_TOKEN not set)");
+        eprintln!("  [EMIT_INTERNAL] Continuing without internal receipt emission.");
+        return Ok(None);
+    };
+
+    // Attempt to emit the event using synchronous subprocess call.
+    // We use apm2 CLI to avoid pulling async runtime dependencies into xtask.
+    // This is a best-effort call; timeout after 5 seconds.
+    let sh = Shell::new().context("Failed to create shell for internal emission")?;
+
+    // Build the command using apm2 CLI (if available)
+    let event_type_arg = event_type;
+    let correlation_id_arg = correlation_id;
+
+    // Write payload to a temporary file to avoid shell injection
+    let payload_file =
+        tempfile::NamedTempFile::new().context("Failed to create temp file for event payload")?;
+    std::fs::write(payload_file.path(), payload)
+        .context("Failed to write event payload to temp file")?;
+    let payload_path = payload_file.path().to_string_lossy().to_string();
+
+    // Try to emit via apm2 CLI. If CLI is not available, log and continue.
+    let result = cmd!(
+        sh,
+        "timeout 5 apm2 emit-event --session-token {session_token} --event-type {event_type_arg} --payload-file {payload_path} --correlation-id {correlation_id_arg}"
+    )
+    .ignore_status()
+    .read();
+
+    match result {
+        Ok(output) => {
+            if output.contains("event_id") || output.contains("success") {
+                // Try to extract event_id from output (best effort)
+                let event_id = output
+                    .lines()
+                    .find(|line| line.contains("event_id"))
+                    .map(|line| line.trim().to_string());
+                eprintln!(
+                    "  [EMIT_INTERNAL] Internal receipt emitted: {}",
+                    event_id.as_deref().unwrap_or("OK")
+                );
+                Ok(event_id)
+            } else if output.contains("not found")
+                || output.contains("No such file")
+                || output.is_empty()
+            {
+                // apm2 CLI not available
+                eprintln!("  [EMIT_INTERNAL] apm2 CLI not available for internal emission");
+                eprintln!("  [EMIT_INTERNAL] Continuing without internal receipt emission.");
+                Ok(None)
+            } else {
+                // Other output - log and continue
+                eprintln!(
+                    "  [EMIT_INTERNAL] Internal emission returned: {}",
+                    output.trim()
+                );
+                Ok(None)
+            }
+        },
+        Err(e) => {
+            // Command execution failed (timeout, etc.)
+            eprintln!("  [EMIT_INTERNAL] Internal emission failed: {e}");
+            eprintln!("  [EMIT_INTERNAL] Continuing without internal receipt emission.");
+            Ok(None)
+        },
+    }
+}
 
 // =============================================================================
 // HEF Projection Feature Flag (TCK-00309)
@@ -419,6 +566,62 @@ mod tests {
         if let Ok(branch) = current_branch(&sh) {
             assert!(!branch.is_empty(), "Branch name should not be empty");
         }
+    }
+
+    // =============================================================================
+    // Internal Receipt Emission Tests (TCK-00295)
+    // =============================================================================
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_emit_internal_from_env() {
+        // SERIAL TEST: Modifies environment variables, must be single test
+
+        // 1. Default (unset) -> false
+        unsafe { std::env::remove_var(EMIT_INTERNAL_ENV) };
+        assert!(
+            !emit_internal_from_env(),
+            "Default should be false (opt-in)"
+        );
+
+        // 2. "TRUE" -> true
+        unsafe { std::env::set_var(EMIT_INTERNAL_ENV, "TRUE") };
+        assert!(emit_internal_from_env(), "TRUE should be true");
+
+        // 3. "true" -> true
+        unsafe { std::env::set_var(EMIT_INTERNAL_ENV, "true") };
+        assert!(emit_internal_from_env(), "true should be true");
+
+        // 4. "false" -> false
+        unsafe { std::env::set_var(EMIT_INTERNAL_ENV, "false") };
+        assert!(!emit_internal_from_env(), "false should be false");
+
+        // 5. "1" -> false (only "true" is accepted)
+        unsafe { std::env::set_var(EMIT_INTERNAL_ENV, "1") };
+        assert!(
+            !emit_internal_from_env(),
+            "1 should be false (only 'true' accepted)"
+        );
+
+        // Cleanup
+        unsafe { std::env::remove_var(EMIT_INTERNAL_ENV) };
+    }
+
+    #[test]
+    fn test_try_emit_internal_receipt_daemon_not_running() {
+        // Test that emission continues gracefully when daemon is not running
+        // This tests the non-blocking requirement of TCK-00295
+        let result = try_emit_internal_receipt("test.event", b"{}", "test-correlation-id");
+
+        // Should succeed with None (not an error)
+        assert!(
+            result.is_ok(),
+            "Emission should not fail when daemon is unavailable"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "Should return None when daemon is not running"
+        );
     }
 
     // =============================================================================

@@ -76,14 +76,19 @@ impl ReviewType {
 /// 4. Spawns Gemini to run the review (if available)
 /// 5. The AI reviewer will post comments and update the status
 ///
+/// # Arguments
+///
+/// * `pr_url` - GitHub PR URL
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The PR URL is invalid
 /// - The PR cannot be found
 /// - The review prompt is missing
-pub fn run_security(pr_url: &str) -> Result<()> {
-    run_review(pr_url, ReviewType::Security)
+pub fn run_security(pr_url: &str, emit_internal: bool) -> Result<()> {
+    run_review(pr_url, ReviewType::Security, emit_internal)
 }
 
 /// Run a code quality review for a PR.
@@ -95,14 +100,19 @@ pub fn run_security(pr_url: &str) -> Result<()> {
 /// 4. Spawns Gemini to run the review (if available)
 /// 5. The AI reviewer will post comments and update the status
 ///
+/// # Arguments
+///
+/// * `pr_url` - GitHub PR URL
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The PR URL is invalid
 /// - The PR cannot be found
 /// - The review prompt is missing
-pub fn run_quality(pr_url: &str) -> Result<()> {
-    run_review(pr_url, ReviewType::Quality)
+pub fn run_quality(pr_url: &str, emit_internal: bool) -> Result<()> {
+    run_review(pr_url, ReviewType::Quality, emit_internal)
 }
 
 /// Run a UAT (User Acceptance Testing) sign-off for a PR.
@@ -112,18 +122,29 @@ pub fn run_quality(pr_url: &str) -> Result<()> {
 /// 2. Posts a UAT approval comment
 /// 3. Updates the ai-review/uat status to success
 ///
+/// # Arguments
+///
+/// * `pr_url` - GitHub PR URL
+/// * `emit_internal` - If true, emit internal receipts to daemon (TCK-00295)
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The PR URL is invalid
 /// - The status update fails
-pub fn run_uat(pr_url: &str) -> Result<()> {
-    run_review(pr_url, ReviewType::Uat)
+pub fn run_uat(pr_url: &str, emit_internal: bool) -> Result<()> {
+    run_review(pr_url, ReviewType::Uat, emit_internal)
 }
 
 /// Run a review of the specified type.
-fn run_review(pr_url: &str, review_type: ReviewType) -> Result<()> {
+fn run_review(pr_url: &str, review_type: ReviewType, emit_internal: bool) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
+
+    // TCK-00295: Check if internal emission is enabled (flag or env var)
+    let should_emit_internal = emit_internal || crate::util::emit_internal_from_env();
+    if should_emit_internal {
+        println!("  [TCK-00295] Internal receipt emission enabled");
+    }
 
     println!(
         "Running {} review for: {}",
@@ -156,6 +177,35 @@ fn run_review(pr_url: &str, review_type: ReviewType) -> Result<()> {
             // AI reviews use prompts and tools
             run_ai_review(&sh, pr_url, &owner_repo, &head_sha, &repo_root, review_type)?;
         },
+    }
+
+    // TCK-00295: Optionally emit internal receipt (non-blocking)
+    if should_emit_internal {
+        println!("\n  [EMIT_INTERNAL] Attempting internal receipt emission...");
+        let event_type = match review_type {
+            ReviewType::Security => "review.security.completed",
+            ReviewType::Quality => "review.quality.completed",
+            ReviewType::Uat => "review.uat.completed",
+        };
+        let payload = serde_json::json!({
+            "pr_url": pr_url,
+            "owner_repo": owner_repo,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "review_type": review_type.display_name(),
+            "status": "completed",
+            "non_authoritative": true,
+        });
+        let correlation_id = format!("review-{pr_number}-{head_sha}");
+
+        // Non-blocking: errors are logged but don't fail the command
+        if let Err(e) = crate::util::try_emit_internal_receipt(
+            event_type,
+            payload.to_string().as_bytes(),
+            &correlation_id,
+        ) {
+            eprintln!("  [EMIT_INTERNAL] Warning: Failed to emit internal receipt: {e}");
+        }
     }
 
     Ok(())
