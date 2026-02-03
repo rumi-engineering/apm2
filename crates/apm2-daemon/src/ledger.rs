@@ -15,6 +15,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use apm2_core::determinism::canonicalize_json;
 use ed25519_dalek::Signer;
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::info;
@@ -75,7 +76,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build canonical payload (deterministic JSON)
+        // Build payload as JSON
         let payload = serde_json::json!({
             "event_type": "work_claimed",
             "work_id": claim.work_id,
@@ -87,12 +88,16 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "context_pack_hash": hex::encode(claim.policy_resolution.context_pack_hash),
         });
 
-        let payload_bytes =
-            serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("payload serialization failed: {e}"),
+        // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
+        // This ensures deterministic JSON representation per RFC-0016.
+        let payload_json = payload.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
             })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
 
-        // Build canonical bytes for signing (domain prefix + payload)
+        // Build canonical bytes for signing (domain prefix + JCS payload)
         let mut canonical_bytes =
             Vec::with_capacity(WORK_CLAIMED_DOMAIN_PREFIX.len() + payload_bytes.len());
         canonical_bytes.extend_from_slice(WORK_CLAIMED_DOMAIN_PREFIX);
@@ -177,7 +182,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build canonical payload (deterministic JSON)
+        // Build payload as JSON
         let payload = serde_json::json!({
             "event_type": "session_started",
             "session_id": session_id,
@@ -186,12 +191,16 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "actor_id": actor_id,
         });
 
-        let payload_bytes =
-            serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("payload serialization failed: {e}"),
+        // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
+        // This ensures deterministic JSON representation per RFC-0016.
+        let payload_json = payload.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
             })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
 
-        // Build canonical bytes for signing (domain prefix + payload)
+        // Build canonical bytes for signing (domain prefix + JCS payload)
         let mut canonical_bytes =
             Vec::with_capacity(SESSION_STARTED_DOMAIN_PREFIX.len() + payload_bytes.len());
         canonical_bytes.extend_from_slice(SESSION_STARTED_DOMAIN_PREFIX);
@@ -408,14 +417,16 @@ impl LeaseValidator for SqliteLeaseValidator {
 
         // If we want "real" validation against the ledger, we must query the ledger.
 
+        // TCK-00289 BLOCKER 1: Filter by work_id in SQL to avoid O(N) scan.
+        // The table has an index on work_id (idx_ledger_events_work_id).
         let mut stmt = conn
-            .prepare("SELECT payload FROM ledger_events WHERE event_type = 'gate_lease_issued'")
+            .prepare("SELECT payload FROM ledger_events WHERE event_type = 'gate_lease_issued' AND work_id = ?1")
             .map_err(|e| LeaseValidationError::LedgerQueryFailed {
                 message: e.to_string(),
             })?;
 
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params![work_id], |row| {
                 let payload: Vec<u8> = row.get(0)?;
                 Ok(payload)
             })
@@ -425,17 +436,10 @@ impl LeaseValidator for SqliteLeaseValidator {
 
         for payload_bytes in rows.flatten() {
             if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) {
-                if let (Some(l), Some(w)) = (
-                    payload.get("lease_id").and_then(|v| v.as_str()),
-                    payload.get("work_id").and_then(|v| v.as_str()),
-                ) {
+                if let Some(l) = payload.get("lease_id").and_then(|v| v.as_str()) {
                     if l == lease_id {
-                        if w == work_id {
-                            return Ok(());
-                        }
-                        return Err(LeaseValidationError::WorkIdMismatch {
-                            actual: work_id.to_string(),
-                        });
+                        // work_id already matched via SQL WHERE clause
+                        return Ok(());
                     }
                 }
             }
