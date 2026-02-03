@@ -755,24 +755,20 @@ impl CapabilityManifest {
     ///
     /// # TCK-00287
     ///
-    /// This method creates a minimal manifest with a default tool allowlist
-    /// containing common tool classes (`Read`, `Write`, `Execute`).
-    /// This is intended for testing and stub implementations.
+    /// This method creates a minimal manifest with an empty tool allowlist
+    /// by default (fail-closed).
     ///
     /// # Security Note
     ///
-    /// The default allowlist is permissive for testing purposes. Production
-    /// deployments should use `from_hash_with_allowlist` with the actual
-    /// allowlist from the resolved policy.
+    /// The default allowlist is empty (fail-closed) to ensure no implicit
+    /// privileges are granted. Production deployments should use
+    /// `from_hash_with_allowlist` with the actual allowlist from the
+    /// resolved policy.
     #[must_use]
     pub fn from_hash_with_default_allowlist(capability_manifest_hash: &[u8; 32]) -> Self {
         // Default allowlist for stub implementation
-        // Includes common tool classes for testing purposes
-        let tool_allowlist = vec![
-            ToolClass::Read,
-            ToolClass::Write,
-            ToolClass::Execute,
-        ];
+        // Empty by default (fail-closed)
+        let tool_allowlist = Vec::new();
         Self::from_hash_with_allowlist(capability_manifest_hash, tool_allowlist)
     }
 
