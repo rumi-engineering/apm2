@@ -26,12 +26,12 @@
 //! ```rust,ignore
 //! use apm2_daemon::episode::workspace::{WorkspaceManager, WorkspaceSnapshot};
 //! use apm2_core::fac::ChangeSetBundleV1;
-//!
+//! 
 //! let manager = WorkspaceManager::new(cas_store, work_dir);
-//!
+//! 
 //! // Take snapshot before apply
 //! let snapshot = manager.snapshot(&work_id).await?;
-//!
+//! 
 //! // Apply changeset bundle
 //! match manager.apply(&bundle).await {
 //!     Ok(result) => { /* proceed with review */ },
@@ -473,7 +473,7 @@ impl WorkspaceManager {
         let snapshot_hash = *blake3::hash(work_id.as_bytes()).as_bytes();
         let snapshot_at_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
+            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(0))
             .unwrap_or(0);
 
         Ok(WorkspaceSnapshot::new(
@@ -497,7 +497,7 @@ impl WorkspaceManager {
         // Stub: In production, this would actually apply the diff
         let applied_at_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
+            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(0))
             .unwrap_or(0);
 
         Ok(ApplyResult::new(
