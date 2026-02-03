@@ -128,6 +128,18 @@ enum Commands {
     /// Consensus commands for cluster status and diagnostics
     Consensus(commands::consensus::ConsensusCommand),
 
+    // === Work queue operations (TCK-00288) ===
+    /// Work queue commands (claim work from queue)
+    Work(commands::work::WorkCommand),
+
+    // === Tool operations (TCK-00288) ===
+    /// Tool commands (request tool execution via session socket)
+    Tool(commands::tool::ToolCommand),
+
+    // === Event operations (TCK-00288) ===
+    /// Event commands (emit events to ledger via session socket)
+    Event(commands::event::EventCommand),
+
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
@@ -256,24 +268,25 @@ fn main() -> Result<()> {
         );
     }
 
-    // Determine socket path (operator socket for privileged operations)
-    let socket_path = cli.socket.clone().unwrap_or_else(|| {
-        // Try to load from config, or use default
-        if cli.config.exists() {
-            if let Ok(config) = apm2_core::config::EcosystemConfig::from_file(&cli.config) {
-                return config.daemon.operator_socket;
-            }
+    // Determine socket paths (TCK-00288: dual-socket privilege separation)
+    // - operator_socket: For privileged operations (ClaimWork, SpawnEpisode,
+    //   Shutdown)
+    // - session_socket: For session-scoped operations (RequestTool, EmitEvent)
+    let (operator_socket, session_socket) = if let Some(ref socket) = cli.socket {
+        // Legacy --socket flag maps to operator_socket only
+        (socket.clone(), socket.clone())
+    } else if cli.config.exists() {
+        if let Ok(config) = apm2_core::config::EcosystemConfig::from_file(&cli.config) {
+            (config.daemon.operator_socket, config.daemon.session_socket)
+        } else {
+            (default_operator_socket(), default_session_socket())
         }
-        // Fallback: ${XDG_RUNTIME_DIR}/apm2/operator.sock or /tmp/apm2/operator.sock
-        std::env::var("XDG_RUNTIME_DIR").map_or_else(
-            |_| PathBuf::from("/tmp/apm2/operator.sock"),
-            |runtime_dir| {
-                PathBuf::from(runtime_dir)
-                    .join("apm2")
-                    .join("operator.sock")
-            },
-        )
-    });
+    } else {
+        (default_operator_socket(), default_session_socket())
+    };
+
+    // Alias for backward compatibility
+    let socket_path = operator_socket.clone();
 
     match cli.command {
         Commands::Daemon { no_daemon } => commands::daemon::run(&cli.config, no_daemon),
@@ -358,6 +371,24 @@ fn main() -> Result<()> {
             let exit_code = commands::consensus::run_consensus(&consensus_cmd, &socket_path);
             std::process::exit(i32::from(exit_code));
         },
+        Commands::Work(work_cmd) => {
+            // Work commands use operator_socket for privileged ClaimWork operation.
+            // Exit codes: 0=success, 1=error
+            let exit_code = commands::work::run_work(&work_cmd, &operator_socket);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Tool(tool_cmd) => {
+            // Tool commands use session_socket for session-scoped RequestTool operation.
+            // Exit codes: 0=success, 1=error
+            let exit_code = commands::tool::run_tool(&tool_cmd, &session_socket);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Event(event_cmd) => {
+            // Event commands use session_socket for session-scoped EmitEvent operation.
+            // Exit codes: 0=success, 1=error
+            let exit_code = commands::event::run_event(&event_cmd, &session_socket);
+            std::process::exit(i32::from(exit_code));
+        },
         Commands::Factory(cmd) => match cmd {
             FactoryCommands::Run { spec_file, format } => {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -382,4 +413,28 @@ fn main() -> Result<()> {
             },
         },
     }
+}
+
+/// Returns the default operator socket path.
+///
+/// Uses `XDG_RUNTIME_DIR` if available, otherwise /tmp/apm2.
+fn default_operator_socket() -> PathBuf {
+    std::env::var("XDG_RUNTIME_DIR").map_or_else(
+        |_| PathBuf::from("/tmp/apm2/operator.sock"),
+        |runtime_dir| {
+            PathBuf::from(runtime_dir)
+                .join("apm2")
+                .join("operator.sock")
+        },
+    )
+}
+
+/// Returns the default session socket path.
+///
+/// Uses `XDG_RUNTIME_DIR` if available, otherwise /tmp/apm2.
+fn default_session_socket() -> PathBuf {
+    std::env::var("XDG_RUNTIME_DIR").map_or_else(
+        |_| PathBuf::from("/tmp/apm2/session.sock"),
+        |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("session.sock"),
+    )
 }

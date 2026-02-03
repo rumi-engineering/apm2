@@ -84,6 +84,8 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Maximum frame size (16 MiB per AD-DAEMON-002).
 /// Used for frame validation in protocol implementations.
+///
+/// Reserved for future use when client-side frame size validation is needed.
 #[allow(dead_code)]
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -92,24 +94,29 @@ pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 // ============================================================================
 
 /// Error type for protocol client operations.
-///
-/// Some variants are currently unused but represent valid protocol error states
-/// that will be used by additional commands in subsequent tickets (e.g.,
-/// `ClaimWork`, `SpawnEpisode`, `RequestTool`, `EmitEvent`).
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum ProtocolClientError {
     /// Daemon is not running (socket does not exist).
     DaemonNotRunning,
     /// Connection failed.
+    ///
+    /// Reserved for future use (e.g., connection-level errors beyond socket not
+    /// found).
+    #[allow(dead_code)]
     ConnectionFailed(String),
     /// Handshake failed.
     HandshakeFailed(String),
     /// Protocol version mismatch.
+    ///
+    /// Reserved for future use when version negotiation is implemented.
+    #[allow(dead_code)]
     VersionMismatch { client: u32, server: u32 },
     /// I/O error during communication.
     IoError(io::Error),
     /// Frame too large.
+    ///
+    /// Reserved for future use when frame size validation is implemented.
+    #[allow(dead_code)]
     FrameTooLarge { size: usize, max: usize },
     /// Protocol error from daemon.
     ProtocolError(ProtocolError),
@@ -193,6 +200,7 @@ impl From<ProtocolError> for ProtocolClientError {
 /// - Mandatory Hello/HelloAck handshake per CTR-PROTO-001
 pub struct OperatorClient {
     framed: Framed<UnixStream, FrameCodec>,
+    /// Server info from handshake (reserved for future use in diagnostics).
     #[allow(dead_code)]
     server_info: String,
     timeout: Duration,
@@ -325,7 +333,6 @@ impl OperatorClient {
     /// * `credential_signature` - Ed25519 signature over (`actor_id` || role ||
     ///   nonce)
     /// * `nonce` - Nonce to prevent replay attacks
-    #[allow(dead_code)]
     pub async fn claim_work(
         &mut self,
         actor_id: &str,
@@ -369,7 +376,6 @@ impl OperatorClient {
     ///   REVIEWER)
     /// * `lease_id` - Required for `GATE_EXECUTOR` role; must reference valid
     ///   `GateLeaseIssued`
-    #[allow(dead_code)]
     pub async fn spawn_episode(
         &mut self,
         work_id: &str,
@@ -435,7 +441,6 @@ impl OperatorClient {
     }
 
     /// Decodes a `ClaimWork` response.
-    #[allow(dead_code)]
     fn decode_claim_work_response(frame: &Bytes) -> Result<ClaimWorkResponse, ProtocolClientError> {
         if frame.is_empty() {
             return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
@@ -468,7 +473,6 @@ impl OperatorClient {
     }
 
     /// Decodes a `SpawnEpisode` response.
-    #[allow(dead_code)]
     fn decode_spawn_episode_response(
         frame: &Bytes,
     ) -> Result<SpawnEpisodeResponse, ProtocolClientError> {
@@ -518,15 +522,14 @@ impl OperatorClient {
 /// - Session operations require a valid `session_token`
 /// - All requests use tag-based protobuf framing (no JSON)
 /// - Mandatory Hello/HelloAck handshake per CTR-PROTO-001
-#[allow(dead_code)]
 pub struct SessionClient {
     framed: Framed<UnixStream, FrameCodec>,
+    /// Server info from handshake (reserved for future use in diagnostics).
     #[allow(dead_code)]
     server_info: String,
     timeout: Duration,
 }
 
-#[allow(dead_code)]
 impl SessionClient {
     /// Connects to the session socket and performs the handshake.
     ///

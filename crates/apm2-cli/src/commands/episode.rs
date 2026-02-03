@@ -10,6 +10,8 @@
 //! - `apm2 episode stop <episode_id> [--reason]` - Stop a running episode
 //! - `apm2 episode status <episode_id>` - Show episode status
 //! - `apm2 episode list [--state]` - List episodes
+//! - `apm2 episode spawn --work-id <id> --role <role>` - Spawn episode via
+//!   protocol (TCK-00288)
 //!
 //! # JSON Output
 //!
@@ -26,15 +28,18 @@
 //! - AD-DAEMON-002: UDS transport with length-prefixed framing
 //! - AD-EPISODE-001: Immutable episode envelope
 //! - AD-EPISODE-002: Episode state machine
+//! - DD-009: Protocol-based IPC (TCK-00288)
 
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
+use apm2_daemon::protocol::WorkRole;
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::client::daemon::{DaemonClient, DaemonClientError, ErrorCode};
+use crate::client::protocol::{OperatorClient, ProtocolClientError};
 
 /// Maximum envelope file size (10 MiB).
 ///
@@ -99,6 +104,12 @@ pub enum EpisodeSubcommand {
     /// Shows all episodes or filters by state (created, running, terminated,
     /// quarantined).
     List(ListArgs),
+
+    /// Spawn an episode for work execution (TCK-00288).
+    ///
+    /// Uses protocol-based IPC via `OperatorClient::spawn_episode`.
+    /// Returns session ID and token for subsequent session-scoped operations.
+    Spawn(SpawnArgs),
 }
 
 /// Arguments for `apm2 episode create`.
@@ -204,6 +215,58 @@ pub struct ListArgs {
     /// Maximum number of episodes to return.
     #[arg(long, default_value = "100")]
     pub limit: u32,
+}
+
+/// Role for spawning episodes (TCK-00288).
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum SpawnRoleArg {
+    /// Implementer role (default).
+    #[default]
+    Implementer,
+    /// Gate executor role.
+    GateExecutor,
+    /// Reviewer role.
+    Reviewer,
+    /// Coordinator role.
+    Coordinator,
+}
+
+impl From<SpawnRoleArg> for WorkRole {
+    fn from(arg: SpawnRoleArg) -> Self {
+        match arg {
+            SpawnRoleArg::Implementer => Self::Implementer,
+            SpawnRoleArg::GateExecutor => Self::GateExecutor,
+            SpawnRoleArg::Reviewer => Self::Reviewer,
+            SpawnRoleArg::Coordinator => Self::Coordinator,
+        }
+    }
+}
+
+impl std::fmt::Display for SpawnRoleArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Implementer => write!(f, "implementer"),
+            Self::GateExecutor => write!(f, "gate_executor"),
+            Self::Reviewer => write!(f, "reviewer"),
+            Self::Coordinator => write!(f, "coordinator"),
+        }
+    }
+}
+
+/// Arguments for `apm2 episode spawn` (TCK-00288).
+#[derive(Debug, Args)]
+pub struct SpawnArgs {
+    /// Work identifier from a prior `ClaimWork`.
+    #[arg(long, required = true)]
+    pub work_id: String,
+
+    /// Role for this episode.
+    #[arg(long, value_enum, default_value = "implementer")]
+    pub role: SpawnRoleArg,
+
+    /// Lease ID (required for `GATE_EXECUTOR` role).
+    #[arg(long)]
+    pub lease_id: Option<String>,
 }
 
 // ============================================================================
@@ -327,6 +390,22 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
+/// Response for episode spawn command (TCK-00288).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnResponse {
+    /// Session identifier for IPC communication.
+    pub session_id: String,
+    /// Blake3 hash of the capability manifest (hex-encoded).
+    pub capability_manifest_hash: String,
+    /// Whether the context pack is sealed.
+    pub context_pack_sealed: bool,
+    /// Ephemeral handle for session identification.
+    pub ephemeral_handle: String,
+    /// Session token for authenticating session-scoped IPC requests.
+    pub session_token: String,
+}
+
 // ============================================================================
 // Command execution
 // ============================================================================
@@ -348,6 +427,7 @@ pub fn run_episode(cmd: &EpisodeCommand, socket_path: &std::path::Path) -> u8 {
         EpisodeSubcommand::Stop(args) => run_stop(args, socket_path, json_output),
         EpisodeSubcommand::Status(args) => run_status(args, socket_path, json_output),
         EpisodeSubcommand::List(args) => run_list(args, socket_path, json_output),
+        EpisodeSubcommand::Spawn(args) => run_spawn(args, socket_path, json_output),
     }
 }
 
@@ -663,6 +743,94 @@ fn run_list(args: &ListArgs, socket_path: &std::path::Path, json_output: bool) -
     exit_codes::SUCCESS
 }
 
+/// Execute the spawn command (TCK-00288).
+///
+/// Uses `OperatorClient::spawn_episode` for protocol-based IPC.
+fn run_spawn(args: &SpawnArgs, socket_path: &std::path::Path, json_output: bool) -> u8 {
+    // Validate work ID
+    if args.work_id.is_empty() {
+        return output_error(
+            json_output,
+            "invalid_work_id",
+            "Work ID cannot be empty",
+            exit_codes::ERROR,
+        );
+    }
+
+    // Validate GATE_EXECUTOR requires lease_id
+    if matches!(args.role, SpawnRoleArg::GateExecutor) && args.lease_id.is_none() {
+        return output_error(
+            json_output,
+            "missing_lease_id",
+            "GATE_EXECUTOR role requires --lease-id",
+            exit_codes::ERROR,
+        );
+    }
+
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::ERROR,
+            );
+        },
+    };
+
+    // Execute spawn via protocol client
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(socket_path).await?;
+        client
+            .spawn_episode(&args.work_id, args.role.into(), args.lease_id.as_deref())
+            .await
+    });
+
+    match result {
+        Ok(response) => {
+            let spawn_response = SpawnResponse {
+                session_id: response.session_id,
+                capability_manifest_hash: hex::encode(&response.capability_manifest_hash),
+                context_pack_sealed: response.context_pack_sealed,
+                ephemeral_handle: response.ephemeral_handle,
+                session_token: response.session_token,
+            };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&spawn_response)
+                        .unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Episode spawned successfully");
+                println!("  Session ID:           {}", spawn_response.session_id);
+                println!(
+                    "  Capability Manifest:  {}",
+                    spawn_response.capability_manifest_hash
+                );
+                println!(
+                    "  Context Pack Sealed:  {}",
+                    spawn_response.context_pack_sealed
+                );
+                println!(
+                    "  Ephemeral Handle:     {}",
+                    spawn_response.ephemeral_handle
+                );
+                println!("  Session Token:        {}", spawn_response.session_token);
+            }
+
+            exit_codes::SUCCESS
+        },
+        Err(e) => handle_protocol_error(json_output, &e),
+    }
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -751,6 +919,76 @@ fn handle_daemon_error(json_output: bool, error: &DaemonClientError) -> u8 {
             json_output,
             "protocol_migration_required",
             "CLI requires protobuf migration (DD-009). Legacy JSON IPC has been removed.",
+            exit_codes::ERROR,
+        ),
+    }
+}
+
+/// Handles protocol client errors and returns appropriate exit code
+/// (TCK-00288).
+fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
+    match error {
+        ProtocolClientError::DaemonNotRunning => output_error(
+            json_output,
+            "daemon_not_running",
+            "Daemon is not running. Start with: apm2 daemon",
+            exit_codes::ERROR,
+        ),
+        ProtocolClientError::ConnectionFailed(msg) => output_error(
+            json_output,
+            "connection_failed",
+            &format!("Failed to connect to daemon: {msg}"),
+            exit_codes::ERROR,
+        ),
+        ProtocolClientError::HandshakeFailed(msg) => output_error(
+            json_output,
+            "handshake_failed",
+            &format!("Protocol handshake failed: {msg}"),
+            exit_codes::ERROR,
+        ),
+        ProtocolClientError::VersionMismatch { client, server } => output_error(
+            json_output,
+            "version_mismatch",
+            &format!("Protocol version mismatch: client {client}, server {server}"),
+            exit_codes::ERROR,
+        ),
+        ProtocolClientError::DaemonError { code, message } => {
+            output_error(json_output, code, message, exit_codes::ERROR)
+        },
+        ProtocolClientError::IoError(e) => output_error(
+            json_output,
+            "io_error",
+            &format!("I/O error: {e}"),
+            exit_codes::ERROR,
+        ),
+        ProtocolClientError::ProtocolError(e) => output_error(
+            json_output,
+            "protocol_error",
+            &format!("Protocol error: {e}"),
+            exit_codes::ERROR,
+        ),
+        ProtocolClientError::DecodeError(msg) => output_error(
+            json_output,
+            "decode_error",
+            &format!("Decode error: {msg}"),
+            exit_codes::ERROR,
+        ),
+        ProtocolClientError::UnexpectedResponse(msg) => output_error(
+            json_output,
+            "unexpected_response",
+            &format!("Unexpected response: {msg}"),
+            exit_codes::ERROR,
+        ),
+        ProtocolClientError::Timeout => output_error(
+            json_output,
+            "timeout",
+            "Operation timed out",
+            exit_codes::ERROR,
+        ),
+        ProtocolClientError::FrameTooLarge { size, max } => output_error(
+            json_output,
+            "frame_too_large",
+            &format!("Frame too large: {size} bytes (max: {max})"),
             exit_codes::ERROR,
         ),
     }
