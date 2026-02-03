@@ -568,7 +568,9 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         }
 
         // Fall back to daemon-wide SSH agent check
-        store.is_ssh_agent_available()
+        // REMOVED for security: Sessions MUST NOT access the daemon's SSH agent.
+        // store.is_ssh_agent_available()
+        false
     }
 
     /// Gets the `SSH_AUTH_SOCK` path for broker-mediated Git SSH operations
@@ -597,7 +599,9 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ) -> Option<String> {
         let store = self.ssh_store.as_ref()?;
 
-        // First try per-session SSH agent socket
+        // Only use per-session SSH agent socket (TCK-00263)
+        // Per security review, we must NOT fall back to the daemon's SSH agent
+        // as that would leak operator credentials to sessions.
         if let Some(ctx) = session_context {
             if let Some(ref session_id) = ctx.ssh_session_id {
                 // Try to get per-session SSH_AUTH_SOCK from keychain using spawn_blocking
@@ -618,8 +622,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             }
         }
 
-        // Fall back to daemon-wide SSH_AUTH_SOCK
-        store.get_daemon_ssh_auth_sock()
+        None
     }
 
     /// Fetches a credential for a tool request if applicable.
@@ -2865,32 +2868,52 @@ mod tests {
     #[tokio::test]
     async fn test_ssh_broker_agent_availability() {
         // TCK-00263: Test SSH agent availability detection
+        use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemorySshCredentialStore;
 
-        // Without daemon SSH_AUTH_SOCK
-        let store_no_agent = Arc::new(InMemorySshCredentialStore::new());
-        let broker_no_agent: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store_no_agent);
-        assert!(!broker_no_agent.is_ssh_agent_available(None).await);
+        // Without SSH store
+        let broker_no_store: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default());
+        assert!(!broker_no_store.is_ssh_agent_available(None).await);
+
+        // Without per-session agent (should return false even if daemon agent exists)
+        let store_with_daemon = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
+            "/tmp/ssh-agent.sock".to_string(),
+        ));
+        let broker_with_daemon: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store_with_daemon);
+
+        // Assert broker reports unavailable because we ignore daemon agent
+        assert!(!broker_with_daemon.is_ssh_agent_available(None).await);
         assert!(
-            broker_no_agent
+            broker_with_daemon
                 .get_ssh_auth_sock_for_subprocess(None)
                 .await
                 .is_none()
         );
 
-        // With daemon SSH_AUTH_SOCK
-        let store_with_agent = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
-            "/tmp/ssh-agent.sock".to_string(),
-        ));
-        let broker_with_agent: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store_with_agent);
-        assert!(broker_with_agent.is_ssh_agent_available(None).await);
+        // With per-session agent and temp file
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("agent.sock");
+        std::fs::write(&socket_path, "").unwrap();
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let store_session = Arc::new(InMemorySshCredentialStore::new());
+        store_session
+            .store_ssh_auth_sock("session-1", &socket_path_str)
+            .unwrap();
+
+        let broker_session: ToolBroker<StubManifestLoader> =
+            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store_session);
+
+        let ctx = SessionContext::new().with_ssh_session_id("session-1");
+
+        assert!(broker_session.is_ssh_agent_available(Some(&ctx)).await);
         assert_eq!(
-            broker_with_agent
-                .get_ssh_auth_sock_for_subprocess(None)
+            broker_session
+                .get_ssh_auth_sock_for_subprocess(Some(&ctx))
                 .await,
-            Some("/tmp/ssh-agent.sock".to_string())
+            Some(socket_path_str)
         );
     }
 
@@ -2898,11 +2921,19 @@ mod tests {
     async fn test_ssh_broker_attaches_credential_for_git() {
         // TCK-00263: Git tool requests should have SSH credentials attached when
         // GitHub credentials are not available
+        use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemorySshCredentialStore;
 
-        let store = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
-            "/run/user/1000/ssh-agent.sock".to_string(),
-        ));
+        // Create a temp file for the socket so exists() returns true
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("ssh-agent.sock");
+        std::fs::write(&socket_path, "").unwrap();
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let store = Arc::new(InMemorySshCredentialStore::new());
+        store
+            .store_ssh_auth_sock("session-git", &socket_path_str)
+            .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> =
             ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
@@ -2913,6 +2944,8 @@ mod tests {
             vec![PathBuf::from("/workspace")],
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let session_ctx = SessionContext::new().with_ssh_session_id("session-git");
 
         // Make Git request (no GitHub credentials configured)
         let request = BrokerToolRequest::new(
@@ -2926,7 +2959,7 @@ mod tests {
         .with_path("/workspace/repo");
 
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), Some(&session_ctx))
             .await
             .unwrap();
 
@@ -2937,10 +2970,7 @@ mod tests {
                 "Git request should have SSH credential attached"
             );
             // The credential contains the SSH_AUTH_SOCK path
-            assert_eq!(
-                credential.unwrap().expose_secret(),
-                "/run/user/1000/ssh-agent.sock"
-            );
+            assert_eq!(credential.unwrap().expose_secret(), socket_path_str);
         }
     }
 
@@ -3037,9 +3067,10 @@ mod tests {
             .store_token("install-priority", "ghp_github_token")
             .unwrap();
 
-        let ssh_store = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
-            "/tmp/ssh-agent.sock".to_string(),
-        ));
+        let ssh_store = Arc::new(InMemorySshCredentialStore::new());
+        ssh_store
+            .store_ssh_auth_sock("session-ssh-priority", "/tmp/ssh-agent.sock")
+            .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::with_credential_stores(
             ToolBrokerConfig::default(),
@@ -3055,7 +3086,9 @@ mod tests {
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         // Create session context with GitHub installation ID
-        let session_ctx = SessionContext::new().with_github_installation_id("install-priority");
+        let session_ctx = SessionContext::new()
+            .with_github_installation_id("install-priority")
+            .with_ssh_session_id("session-ssh-priority");
 
         // Make Git request
         let request = BrokerToolRequest::new(
@@ -3089,12 +3122,21 @@ mod tests {
             InMemoryGitHubCredentialStore, InMemorySshCredentialStore,
         };
 
+        // Create a temp file for the socket so exists() returns true
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("ssh-agent.sock");
+        std::fs::write(&socket_path, "").unwrap();
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
         let github_store = Arc::new(InMemoryGitHubCredentialStore::new());
         // Note: No token stored for our installation ID
 
-        let ssh_store = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
-            "/tmp/ssh-fallback.sock".to_string(),
-        ));
+        // Use new() instead of with_daemon_auth_sock()
+        let ssh_store = Arc::new(InMemorySshCredentialStore::new());
+        // Configure per-session socket
+        ssh_store
+            .store_ssh_auth_sock("session-ssh-1", &socket_path_str)
+            .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::with_credential_stores(
             ToolBrokerConfig::default(),
@@ -3109,9 +3151,10 @@ mod tests {
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
-        // Create session context with GitHub installation ID (but no token stored for
-        // it)
-        let session_ctx = SessionContext::new().with_github_installation_id("install-missing");
+        // Create session context with GitHub installation ID AND SSH session ID
+        let session_ctx = SessionContext::new()
+            .with_github_installation_id("install-missing")
+            .with_ssh_session_id("session-ssh-1");
 
         // Make Git request
         let request = BrokerToolRequest::new(
@@ -3136,21 +3179,20 @@ mod tests {
                 "Git request should fall back to SSH credential"
             );
             // Should be SSH_AUTH_SOCK since GitHub token was not found
-            assert_eq!(
-                credential.unwrap().expose_secret(),
-                "/tmp/ssh-fallback.sock"
-            );
+            assert_eq!(credential.unwrap().expose_secret(), socket_path_str);
         }
     }
 
     #[tokio::test]
     async fn test_ssh_broker_no_credential_for_read() {
         // TCK-00263: Read tool requests should NOT have SSH credentials
+        use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemorySshCredentialStore;
 
-        let store = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
-            "/tmp/ssh-agent.sock".to_string(),
-        ));
+        let store = Arc::new(InMemorySshCredentialStore::new());
+        store
+            .store_ssh_auth_sock("session-read", "/tmp/ssh-agent.sock")
+            .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> =
             ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
@@ -3162,11 +3204,14 @@ mod tests {
         )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
+        // Session context with SSH session
+        let session_ctx = SessionContext::new().with_ssh_session_id("session-read");
+
         // Make Read request
         let request = make_request("req-read", ToolClass::Read, Some("/workspace/file.rs"));
 
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), Some(&session_ctx))
             .await
             .unwrap();
 
@@ -3183,11 +3228,13 @@ mod tests {
     async fn test_ssh_broker_no_credential_for_network() {
         // TCK-00263: Network tool requests should NOT have SSH credentials
         // (SSH is only for Git operations)
+        use super::super::decision::SessionContext;
         use crate::evidence::keychain::InMemorySshCredentialStore;
 
-        let store = Arc::new(InMemorySshCredentialStore::with_daemon_auth_sock(
-            "/tmp/ssh-agent.sock".to_string(),
-        ));
+        let store = Arc::new(InMemorySshCredentialStore::new());
+        store
+            .store_ssh_auth_sock("session-network", "/tmp/ssh-agent.sock")
+            .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> =
             ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
@@ -3202,6 +3249,9 @@ mod tests {
             .unwrap();
         broker.initialize_with_manifest(manifest).await.unwrap();
 
+        // Session context
+        let session_ctx = SessionContext::new().with_ssh_session_id("session-network");
+
         // Make Network request
         let request = BrokerToolRequest::new(
             "req-network",
@@ -3213,7 +3263,7 @@ mod tests {
         );
 
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), Some(&session_ctx))
             .await
             .unwrap();
 
