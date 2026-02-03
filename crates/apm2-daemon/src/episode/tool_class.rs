@@ -42,7 +42,9 @@ mod tests {
         assert_eq!(ToolClass::from_u8(4), Some(ToolClass::Git));
         assert_eq!(ToolClass::from_u8(5), Some(ToolClass::Inference));
         assert_eq!(ToolClass::from_u8(6), Some(ToolClass::Artifact));
-        assert_eq!(ToolClass::from_u8(7), None);
+        assert_eq!(ToolClass::from_u8(7), Some(ToolClass::ListFiles));
+        assert_eq!(ToolClass::from_u8(8), Some(ToolClass::Search));
+        assert_eq!(ToolClass::from_u8(9), None);
         assert_eq!(ToolClass::from_u8(255), None);
     }
 
@@ -114,9 +116,11 @@ mod tests {
     #[test]
     fn test_all_classes() {
         let all = ToolClass::all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 9);
         assert!(all.contains(&ToolClass::Read));
         assert!(all.contains(&ToolClass::Artifact));
+        assert!(all.contains(&ToolClass::ListFiles));
+        assert!(all.contains(&ToolClass::Search));
     }
 
     #[test]

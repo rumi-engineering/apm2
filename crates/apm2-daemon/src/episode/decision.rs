@@ -92,7 +92,7 @@ pub const MAX_HOST_LEN: usize = 255;
 /// We use 32 to allow for reasonable extension while preventing abuse.
 pub const MAX_GIT_OPERATION_LEN: usize = 32;
 
-/// Maximum length for ListFiles pattern (TCK-00315).
+/// Maximum length for `ListFiles` pattern (TCK-00315).
 pub const MAX_LIST_FILES_PATTERN_LEN: usize = 256;
 
 /// Maximum length for Search query (TCK-00315).
@@ -167,7 +167,7 @@ pub struct BrokerToolRequest {
     /// branch, checkout, merge, rebase, pull, reset, stash, tag, remote.
     pub git_operation: Option<String>,
 
-    /// Optional pattern for ListFiles (TCK-00315).
+    /// Optional pattern for `ListFiles` (TCK-00315).
     pub pattern: Option<String>,
 
     /// Optional query for Search (TCK-00315).
@@ -239,7 +239,7 @@ pub enum RequestValidationError {
         max: usize,
     },
 
-    /// ListFiles pattern exceeds maximum length (TCK-00315).
+    /// `ListFiles` pattern exceeds maximum length (TCK-00315).
     PatternTooLong {
         /// Actual length.
         len: usize,
@@ -386,7 +386,7 @@ impl BrokerToolRequest {
         self
     }
 
-    /// Sets the pattern for ListFiles (TCK-00315).
+    /// Sets the pattern for `ListFiles` (TCK-00315).
     #[must_use]
     pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
         self.pattern = Some(pattern.into());

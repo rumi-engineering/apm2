@@ -192,7 +192,7 @@ pub struct WorkspaceSnapshot {
 impl WorkspaceSnapshot {
     /// Creates a new workspace snapshot.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         work_id: String,
         snapshot_hash: [u8; 32],
         snapshot_at_ns: u64,
@@ -209,7 +209,7 @@ impl WorkspaceSnapshot {
 
     /// Sets the HTF time envelope reference.
     #[must_use]
-    pub fn with_time_envelope_ref(mut self, time_envelope_ref: TimeEnvelopeRef) -> Self {
+    pub const fn with_time_envelope_ref(mut self, time_envelope_ref: TimeEnvelopeRef) -> Self {
         self.time_envelope_ref = Some(time_envelope_ref);
         self
     }
@@ -235,7 +235,11 @@ pub struct ApplyResult {
 impl ApplyResult {
     /// Creates a new apply result.
     #[must_use]
-    pub fn new(changeset_digest: [u8; 32], files_modified: usize, applied_at_ns: u64) -> Self {
+    pub const fn new(
+        changeset_digest: [u8; 32],
+        files_modified: usize,
+        applied_at_ns: u64,
+    ) -> Self {
         Self {
             changeset_digest,
             files_modified,
@@ -246,7 +250,7 @@ impl ApplyResult {
 
     /// Sets the HTF time envelope reference.
     #[must_use]
-    pub fn with_time_envelope_ref(mut self, time_envelope_ref: TimeEnvelopeRef) -> Self {
+    pub const fn with_time_envelope_ref(mut self, time_envelope_ref: TimeEnvelopeRef) -> Self {
         self.time_envelope_ref = Some(time_envelope_ref);
         self
     }
@@ -276,7 +280,7 @@ pub struct RetryContext {
 impl RetryContext {
     /// Creates a new retry context.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         work_id: String,
         window_start_tick: u64,
         window_end_tick: u64,
@@ -297,7 +301,7 @@ impl RetryContext {
     /// # Errors
     ///
     /// Returns error if max retries exceeded or HTF window expired.
-    pub fn check_retry_allowed(&self) -> Result<(), WorkspaceError> {
+    pub const fn check_retry_allowed(&self) -> Result<(), WorkspaceError> {
         if self.attempts >= self.max_attempts {
             return Err(WorkspaceError::MaxRetriesExceeded {
                 attempts: self.attempts,
@@ -310,12 +314,12 @@ impl RetryContext {
     }
 
     /// Records a retry attempt.
-    pub fn record_attempt(&mut self) {
+    pub const fn record_attempt(&mut self) {
         self.attempts += 1;
     }
 
     /// Updates the current tick.
-    pub fn update_tick(&mut self, tick: u64) {
+    pub const fn update_tick(&mut self, tick: u64) {
         self.current_tick = tick;
     }
 }
@@ -454,7 +458,7 @@ pub struct WorkspaceManager {
 impl WorkspaceManager {
     /// Creates a new workspace manager.
     #[must_use]
-    pub fn new(workspace_root: PathBuf) -> Self {
+    pub const fn new(workspace_root: PathBuf) -> Self {
         Self { workspace_root }
     }
 
@@ -463,7 +467,8 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// Returns error if snapshot fails.
-    pub async fn snapshot(&self, work_id: &str) -> Result<WorkspaceSnapshot, WorkspaceError> {
+    #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
+    pub fn snapshot(&self, work_id: &str) -> Result<WorkspaceSnapshot, WorkspaceError> {
         // Stub: In production, this would compute actual workspace state hash
         let snapshot_hash = *blake3::hash(work_id.as_bytes()).as_bytes();
         let snapshot_at_ns = std::time::SystemTime::now()
@@ -484,7 +489,8 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// Returns error if apply fails for any reason.
-    pub async fn apply(&self, bundle: &ChangeSetBundleV1) -> Result<ApplyResult, WorkspaceError> {
+    #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
+    pub fn apply(&self, bundle: &ChangeSetBundleV1) -> Result<ApplyResult, WorkspaceError> {
         // Validate file changes first
         validate_file_changes(bundle, &self.workspace_root)?;
 
@@ -506,7 +512,7 @@ impl WorkspaceManager {
     /// # Errors
     ///
     /// Returns error if restore fails.
-    pub async fn restore(&self, _snapshot: &WorkspaceSnapshot) -> Result<(), WorkspaceError> {
+    pub const fn restore(&self, _snapshot: &WorkspaceSnapshot) -> Result<(), WorkspaceError> {
         // Stub: In production, this would restore from snapshot
         Ok(())
     }
@@ -626,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_workspace_snapshot_creation() {
-        let snapshot = WorkspaceSnapshot::new("work-001".into(), [0x42; 32], 1234567890, 10);
+        let snapshot = WorkspaceSnapshot::new("work-001".into(), [0x42; 32], 1_234_567_890, 10);
         assert_eq!(snapshot.work_id, "work-001");
         assert_eq!(snapshot.snapshot_hash, [0x42; 32]);
         assert_eq!(snapshot.file_count, 10);
@@ -635,16 +641,16 @@ mod tests {
 
     #[test]
     fn test_apply_result_creation() {
-        let result = ApplyResult::new([0x33; 32], 5, 9876543210);
+        let result = ApplyResult::new([0x33; 32], 5, 9_876_543_210);
         assert_eq!(result.changeset_digest, [0x33; 32]);
         assert_eq!(result.files_modified, 5);
         assert!(result.time_envelope_ref.is_none());
     }
 
-    #[tokio::test]
-    async fn test_workspace_manager_snapshot() {
+    #[test]
+    fn test_workspace_manager_snapshot() {
         let manager = WorkspaceManager::new(PathBuf::from("/workspace"));
-        let snapshot = manager.snapshot("work-001").await.unwrap();
+        let snapshot = manager.snapshot("work-001").unwrap();
         assert_eq!(snapshot.work_id, "work-001");
         assert_eq!(snapshot.file_count, 0); // stub returns 0
     }

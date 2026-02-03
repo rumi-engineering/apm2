@@ -185,20 +185,6 @@ pub enum EpisodeEvent {
         /// The full `TimeEnvelope` preimage for verification.
         time_envelope: Option<TimeEnvelope>,
     },
-    /// Review receipt was recorded (TCK-00312).
-    ///
-    /// This event is emitted when a review episode completes successfully
-    /// and its artifacts are bundled and stored.
-    ReviewReceiptRecorded {
-        /// The full ReviewReceiptRecorded event.
-        receipt: apm2_core::fac::ReviewReceiptRecorded,
-        /// Timestamp when recorded (nanoseconds since epoch).
-        recorded_at_ns: u64,
-        /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
-        time_envelope_ref: Option<TimeEnvelopeRef>,
-        /// The full `TimeEnvelope` preimage for verification.
-        time_envelope: Option<TimeEnvelope>,
-    },
 }
 
 /// Reason for lease issuance denial.
@@ -273,9 +259,7 @@ impl EpisodeEvent {
             | Self::Started { episode_id, .. }
             | Self::Stopped { episode_id, .. }
             | Self::Quarantined { episode_id, .. } => Some(episode_id),
-            Self::ClockProfilePublished { .. }
-            | Self::LeaseIssueDenied { .. }
-            | Self::ReviewReceiptRecorded { .. } => None,
+            Self::ClockProfilePublished { .. } | Self::LeaseIssueDenied { .. } => None,
         }
     }
 
