@@ -108,6 +108,9 @@ pub mod pulse_acl;
 /// Topic grammar and wildcard matching for HEF Pulse Plane (RFC-0018,
 /// TCK-00301).
 pub mod pulse_topic;
+/// Resource governance and backpressure/drop policy for HEF Pulse Plane
+/// (RFC-0018, TCK-00303).
+pub mod resource_governance;
 pub mod server;
 /// Session-scoped endpoint dispatcher for RFC-0017 IPC (TCK-00252).
 pub mod session_dispatch;
@@ -257,6 +260,30 @@ pub use pulse_topic::{
     // Functions
     validate_patterns,
     validate_topic,
+};
+// CTR-PROTO-010: HEF Resource Governance (RFC-0018, TCK-00303)
+#[allow(unused_imports)]
+pub use resource_governance::{
+    // Types
+    ConnectionState,
+    ConnectionStats,
+    DropPriority,
+    MAX_BURST_PULSES_PER_SUBSCRIBER,
+    // Constants
+    MAX_BYTES_IN_FLIGHT_PER_SUBSCRIBER,
+    MAX_PATTERNS_PER_SUBSCRIPTION,
+    MAX_PULSE_PAYLOAD_BYTES,
+    MAX_PULSES_PER_SEC_PER_SUBSCRIBER,
+    MAX_QUEUE_DEPTH_PER_SUBSCRIBER,
+    MAX_SUBSCRIPTIONS_PER_CONNECTION,
+    MAX_TOTAL_PATTERNS_PER_CONNECTION,
+    QueuedPulse,
+    RateLimiter,
+    ResourceError,
+    ResourceQuotaConfig,
+    SharedSubscriptionRegistry,
+    SubscriptionRegistry,
+    SubscriptionState,
 };
 #[allow(unused_imports)]
 pub use server::{

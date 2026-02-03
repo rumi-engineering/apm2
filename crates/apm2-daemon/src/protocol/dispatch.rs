@@ -48,6 +48,9 @@ use super::messages::{
 use super::pulse_acl::{
     AclDecision, AclError, PulseAclEvaluator, validate_client_sub_id, validate_subscription_id,
 };
+use super::resource_governance::{
+    SharedSubscriptionRegistry, SubscriptionRegistry, SubscriptionState,
+};
 use super::session_dispatch::InMemoryManifestStore;
 use super::session_token::TokenMinter;
 use crate::episode::registry::InMemorySessionRegistry;
@@ -1084,6 +1087,13 @@ pub fn generate_lease_id() -> String {
 /// based on the socket path:
 /// - operator.sock: `is_privileged = true`
 /// - session.sock: `is_privileged = false`
+///
+/// # TCK-00303: Connection Lifecycle Management
+///
+/// The `connection_id` field is used to track connections in the subscription
+/// registry. When a connection closes, the connection handler MUST call
+/// `subscription_registry.unregister_connection(connection_id)` to free
+/// resources and prevent connection slot leaks.
 #[derive(Debug, Clone)]
 pub struct ConnectionContext {
     /// Whether this connection is privileged (operator socket).
@@ -1095,29 +1105,61 @@ pub struct ConnectionContext {
     /// Session ID for session-scoped connections (None for operator
     /// connections).
     session_id: Option<String>,
+
+    /// Connection ID for subscription registry tracking (TCK-00303).
+    ///
+    /// Generated once when the connection is established and used consistently
+    /// across all subscribe/unsubscribe operations. Must be passed to
+    /// `unregister_connection` when the connection closes to prevent leaks.
+    connection_id: String,
 }
 
 impl ConnectionContext {
     /// Creates a new privileged connection context (operator socket).
+    ///
+    /// # TCK-00303: Connection ID Generation
+    ///
+    /// The `connection_id` is generated from peer credentials (PID-based for
+    /// operator connections) or a UUID if credentials are unavailable.
     #[must_use]
-    pub const fn privileged(peer_credentials: Option<PeerCredentials>) -> Self {
+    pub fn privileged(peer_credentials: Option<PeerCredentials>) -> Self {
+        let connection_id = peer_credentials.as_ref().and_then(|c| c.pid).map_or_else(
+            || format!("CONN-OP-{}", uuid::Uuid::new_v4()),
+            |pid| format!("CONN-OP-{pid}"),
+        );
         Self {
             is_privileged: true,
             peer_credentials,
             session_id: None,
+            connection_id,
         }
     }
 
     /// Creates a new session-scoped connection context (session socket).
+    ///
+    /// # TCK-00303: Connection ID Generation
+    ///
+    /// The `connection_id` is generated from the session ID (if available)
+    /// or peer credentials (PID-based), or a UUID if neither is available.
     #[must_use]
-    pub const fn session(
-        peer_credentials: Option<PeerCredentials>,
-        session_id: Option<String>,
-    ) -> Self {
+    pub fn session(peer_credentials: Option<PeerCredentials>, session_id: Option<String>) -> Self {
+        // For session connections, prefer session_id-based connection ID,
+        // but fall back to PID or UUID if session_id is not yet known
+        // (it may be set later via session token validation)
+        let connection_id = session_id.as_ref().map_or_else(
+            || {
+                peer_credentials.as_ref().and_then(|c| c.pid).map_or_else(
+                    || format!("CONN-SESS-{}", uuid::Uuid::new_v4()),
+                    |pid| format!("CONN-SESS-{pid}"),
+                )
+            },
+            |sid| format!("CONN-SESS-{sid}"),
+        );
         Self {
             is_privileged: false,
             peer_credentials,
             session_id,
+            connection_id,
         }
     }
 
@@ -1137,6 +1179,18 @@ impl ConnectionContext {
     #[must_use]
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Returns the connection ID for subscription registry tracking.
+    ///
+    /// # TCK-00303: Connection Lifecycle
+    ///
+    /// This ID must be passed to `unregister_connection` when the connection
+    /// closes to free subscription registry slots and prevent `DoS` via
+    /// connection slot exhaustion.
+    #[must_use]
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
     }
 }
 
@@ -1619,6 +1673,14 @@ pub struct PrivilegedDispatcher {
     /// - HLC stamps: Hybrid logical clock for cross-node causality
     /// - Wall time bounds: Observational only, with uncertainty interval
     holonic_clock: Arc<HolonicClock>,
+
+    /// Subscription registry for HEF Pulse Plane resource governance
+    /// (TCK-00303).
+    ///
+    /// Tracks per-connection subscription state and enforces limits per
+    /// RFC-0018. Shared with `SessionDispatcher` to manage subscriptions
+    /// across both operator and session sockets.
+    subscription_registry: SharedSubscriptionRegistry,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -1668,6 +1730,9 @@ impl PrivilegedDispatcher {
             HolonicClock::new(ClockConfig::default(), None)
                 .expect("default ClockConfig should always succeed"),
         );
+        // TCK-00303: Create subscription registry for HEF resource governance
+        let subscription_registry = Arc::new(SubscriptionRegistry::with_defaults());
+
         Self {
             decode_config: DecodeConfig::default(),
             policy_resolver: Arc::new(StubPolicyResolver),
@@ -1680,6 +1745,7 @@ impl PrivilegedDispatcher {
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
             holonic_clock,
+            subscription_registry,
         }
     }
 
@@ -1712,6 +1778,9 @@ impl PrivilegedDispatcher {
             HolonicClock::new(ClockConfig::default(), None)
                 .expect("default ClockConfig should always succeed"),
         );
+        // TCK-00303: Create subscription registry for HEF resource governance
+        let subscription_registry = Arc::new(SubscriptionRegistry::with_defaults());
+
         Self {
             decode_config,
             policy_resolver: Arc::new(StubPolicyResolver),
@@ -1724,6 +1793,7 @@ impl PrivilegedDispatcher {
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
             holonic_clock,
+            subscription_registry,
         }
     }
 
@@ -1776,6 +1846,7 @@ impl PrivilegedDispatcher {
         clock: Arc<HolonicClock>,
         token_minter: Arc<TokenMinter>,
         manifest_store: Arc<InMemoryManifestStore>,
+        subscription_registry: SharedSubscriptionRegistry,
     ) -> Self {
         Self {
             decode_config,
@@ -1789,6 +1860,7 @@ impl PrivilegedDispatcher {
             manifest_store,
             metrics: None,
             holonic_clock: clock,
+            subscription_registry,
         }
     }
 
@@ -1818,6 +1890,7 @@ impl PrivilegedDispatcher {
         manifest_store: Arc<InMemoryManifestStore>,
         session_registry: Arc<dyn SessionRegistry>,
         clock: Arc<HolonicClock>,
+        subscription_registry: SharedSubscriptionRegistry,
     ) -> Self {
         Self {
             decode_config: DecodeConfig::default(),
@@ -1831,6 +1904,7 @@ impl PrivilegedDispatcher {
             manifest_store,
             metrics: None,
             holonic_clock: clock,
+            subscription_registry,
         }
     }
 
@@ -1910,6 +1984,17 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub const fn holonic_clock(&self) -> &Arc<HolonicClock> {
         &self.holonic_clock
+    }
+
+    /// Returns a reference to the subscription registry (TCK-00303).
+    ///
+    /// # TCK-00303
+    ///
+    /// This is used to share the subscription registry with
+    /// `SessionDispatcher`.
+    #[must_use]
+    pub const fn subscription_registry(&self) -> &SharedSubscriptionRegistry {
+        &self.subscription_registry
     }
 
     // =========================================================================
@@ -3055,26 +3140,101 @@ impl PrivilegedDispatcher {
             }
         }
 
-        // Generate subscription ID
+        // Generate subscription ID; use connection ID from context (TCK-00303)
         let subscription_id = format!("SUB-{}", uuid::Uuid::new_v4());
+        // TCK-00303: Use connection_id from context for consistent tracking
+        // across the connection lifecycle. The connection handler will call
+        // unregister_connection with this ID when the connection closes.
+        let connection_id = ctx.connection_id();
+
+        // TCK-00303: Wire resource governance - register connection if not exists
+        // and add subscription with limit checks
+        if !accepted_patterns.is_empty() {
+            // Parse accepted patterns into TopicPattern
+            let mut parsed_patterns = Vec::new();
+            for pattern_str in &accepted_patterns {
+                match super::pulse_topic::TopicPattern::parse(pattern_str) {
+                    Ok(pattern) => parsed_patterns.push(pattern),
+                    Err(e) => {
+                        // Should not happen since ACL already validated, but be defensive
+                        warn!(
+                            pattern = %pattern_str,
+                            error = %e,
+                            "Pattern parse failed after ACL validation"
+                        );
+                        rejected_patterns.push(PatternRejection {
+                            pattern: pattern_str.clone(),
+                            reason_code: "INVALID_PATTERN".to_string(),
+                        });
+                    },
+                }
+            }
+
+            // Register connection if it doesn't exist (idempotent)
+            if let Err(e) = self
+                .subscription_registry
+                .register_connection(connection_id)
+            {
+                // Only TooManyConnections is a real error; ignore if connection already exists
+                if matches!(
+                    e,
+                    super::resource_governance::ResourceError::TooManyConnections { .. }
+                ) {
+                    warn!(
+                        connection_id = %connection_id,
+                        error = %e,
+                        "Connection registration failed: resource limit exceeded"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::PermissionDenied,
+                        format!("resource limit exceeded: {e}"),
+                    ));
+                }
+                // Connection already exists - this is fine
+            }
+
+            // Create subscription state and add to registry
+            let subscription = SubscriptionState::new(
+                &subscription_id,
+                &request.client_sub_id,
+                parsed_patterns,
+                request.since_ledger_cursor,
+            );
+
+            if let Err(e) = self
+                .subscription_registry
+                .add_subscription(connection_id, subscription)
+            {
+                warn!(
+                    connection_id = %connection_id,
+                    subscription_id = %subscription_id,
+                    error = %e,
+                    "Subscription registration failed: resource limit exceeded"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::PermissionDenied,
+                    format!("resource limit exceeded: {e}"),
+                ));
+            }
+        }
 
         // Log outcome
         if rejected_patterns.is_empty() {
             info!(
                 subscription_id = %subscription_id,
+                connection_id = %connection_id,
                 accepted_count = accepted_patterns.len(),
                 "All patterns accepted (operator)"
             );
         } else {
             warn!(
                 subscription_id = %subscription_id,
+                connection_id = %connection_id,
                 accepted_count = accepted_patterns.len(),
                 rejected_count = rejected_patterns.len(),
                 "Some patterns rejected (operator)"
             );
         }
-
-        // NOTE: Actual subscription registration is deferred to TCK-00303/TCK-00304.
 
         Ok(PrivilegedResponse::SubscribePulse(SubscribePulseResponse {
             subscription_id,
@@ -3134,18 +3294,36 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // NOTE: Actual subscription removal is deferred to TCK-00303.
-        // For now, we always return removed=true as a placeholder.
+        // TCK-00303: Wire resource governance - remove subscription from registry
+        // Use connection_id from context for consistent tracking
+        let connection_id = ctx.connection_id();
 
-        info!(
-            subscription_id = %request.subscription_id,
-            "Unsubscribe (operator) processed (subscription registry pending TCK-00303)"
-        );
+        let removed = match self
+            .subscription_registry
+            .remove_subscription(connection_id, &request.subscription_id)
+        {
+            Ok(_) => {
+                info!(
+                    subscription_id = %request.subscription_id,
+                    connection_id = %connection_id,
+                    "Unsubscribe (operator) processed successfully"
+                );
+                true
+            },
+            Err(e) => {
+                // Log but don't fail - subscription may already be removed or never existed
+                debug!(
+                    subscription_id = %request.subscription_id,
+                    connection_id = %connection_id,
+                    error = %e,
+                    "Unsubscribe (operator) - subscription not found (may already be removed)"
+                );
+                false
+            },
+        };
 
         Ok(PrivilegedResponse::UnsubscribePulse(
-            UnsubscribePulseResponse {
-                removed: true, // Placeholder until subscription registry is implemented
-            },
+            UnsubscribePulseResponse { removed },
         ))
     }
 }

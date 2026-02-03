@@ -916,9 +916,19 @@ async fn handle_dual_socket_connection(
     let privileged_dispatcher = dispatcher_state.privileged_dispatcher();
     let session_dispatcher = dispatcher_state.session_dispatcher();
 
+    // TCK-00303: Get subscription registry for connection cleanup on close.
+    // When the connection closes, we MUST call unregister_connection to free
+    // the connection slot and prevent DoS via connection slot exhaustion.
+    let subscription_registry = dispatcher_state.subscription_registry();
+    let connection_id = ctx.connection_id().to_string();
+
     // TCK-00287: Message dispatch loop
     // Process incoming frames until connection closes or error
-    info!(socket_type = %socket_type, "Entering message dispatch loop");
+    info!(
+        socket_type = %socket_type,
+        connection_id = %connection_id,
+        "Entering message dispatch loop"
+    );
 
     while let Some(frame_result) = connection.framed().next().await {
         let frame = match frame_result {
@@ -987,7 +997,16 @@ async fn handle_dual_socket_connection(
         }
     }
 
-    info!(socket_type = %socket_type, "Connection closed");
+    // TCK-00303: CRITICAL - Unregister connection to prevent DoS via slot
+    // exhaustion. Without this cleanup, connection slots leak and after
+    // max_connections (100) connections, the daemon will permanently reject all
+    // new SubscribePulse requests.
+    subscription_registry.unregister_connection(&connection_id);
+    info!(
+        socket_type = %socket_type,
+        connection_id = %connection_id,
+        "Connection closed (subscription registry cleaned up)"
+    );
     Ok(())
 }
 

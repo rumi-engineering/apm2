@@ -611,6 +611,28 @@ impl TopicPattern {
         self.match_segments(&topic_segments)
     }
 
+    /// Matches pre-split topic segments against this pattern.
+    ///
+    /// This is an optimized version for batch matching where the topic has
+    /// already been split into segments. Use this when matching the same
+    /// topic against multiple patterns to avoid repeated string splitting.
+    ///
+    /// # Arguments
+    ///
+    /// * `segments` - Pre-split topic segments
+    ///
+    /// # Returns
+    ///
+    /// `true` if the segments match the pattern.
+    ///
+    /// # Complexity
+    ///
+    /// O(n) where n is the number of segments. No backtracking.
+    #[must_use]
+    pub fn matches_segments(&self, segments: &[&str]) -> bool {
+        self.match_segments(segments)
+    }
+
     /// Internal segment-by-segment matching.
     fn match_segments(&self, topic_segments: &[&str]) -> bool {
         let pattern_len = self.segments.len();

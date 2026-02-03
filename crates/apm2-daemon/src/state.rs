@@ -35,6 +35,7 @@ use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRe
 use crate::metrics::SharedMetricsRegistry;
 use crate::protocol::dispatch::PrivilegedDispatcher;
 use crate::protocol::messages::DecodeConfig;
+use crate::protocol::resource_governance::{SharedSubscriptionRegistry, SubscriptionRegistry};
 use crate::protocol::session_dispatch::{InMemoryManifestStore, ManifestStore, SessionDispatcher};
 use crate::protocol::session_token::TokenMinter;
 use crate::session::SessionRegistry;
@@ -170,12 +171,17 @@ impl DispatcherState {
                 .expect("failed to create default clock"),
         );
 
+        // TCK-00303: Create shared subscription registry for HEF resource governance
+        let subscription_registry: SharedSubscriptionRegistry =
+            Arc::new(SubscriptionRegistry::with_defaults());
+
         // TCK-00287 BLOCKER 1 & 2: Create privileged dispatcher with shared state
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
             Arc::clone(&manifest_store),
             session_registry,
             clock,
+            Arc::clone(&subscription_registry),
         );
 
         // Add metrics if provided
@@ -189,8 +195,10 @@ impl DispatcherState {
         // store This ensures:
         // - Tokens minted during SpawnEpisode can be validated
         // - Manifests registered during SpawnEpisode are visible for tool validation
+        // TCK-00303: Share subscription registry for HEF resource governance
         let session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store);
+            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_subscription_registry(subscription_registry);
 
         Self {
             privileged_dispatcher,
@@ -230,6 +238,10 @@ impl DispatcherState {
                 .expect("failed to create default clock"),
         );
 
+        // TCK-00303: Create shared subscription registry for HEF resource governance
+        let subscription_registry: SharedSubscriptionRegistry =
+            Arc::new(SubscriptionRegistry::with_defaults());
+
         // TCK-00287 BLOCKER 1: Create privileged dispatcher with global session
         // registry
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
@@ -237,6 +249,7 @@ impl DispatcherState {
             Arc::clone(&manifest_store),
             session_registry,
             clock,
+            Arc::clone(&subscription_registry),
         );
 
         // Add metrics if provided
@@ -248,8 +261,10 @@ impl DispatcherState {
 
         // TCK-00287: Create session dispatcher with same token minter and manifest
         // store
+        // TCK-00303: Share subscription registry for HEF resource governance
         let session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store);
+            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_subscription_registry(subscription_registry);
 
         Self {
             privileged_dispatcher,
@@ -276,6 +291,10 @@ impl DispatcherState {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+        // TCK-00303: Create shared subscription registry for HEF resource governance
+        let subscription_registry: SharedSubscriptionRegistry =
+            Arc::new(SubscriptionRegistry::with_defaults());
 
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
@@ -304,6 +323,7 @@ impl DispatcherState {
                 clock,
                 token_minter.clone(),
                 manifest_store.clone(),
+                Arc::clone(&subscription_registry),
             )
         } else {
             // Use stubs
@@ -316,6 +336,7 @@ impl DispatcherState {
                 manifest_store.clone(),
                 session_registry,
                 clock,
+                Arc::clone(&subscription_registry),
             )
         };
 
@@ -325,8 +346,10 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
+        // TCK-00303: Share subscription registry for HEF resource governance
         let session_dispatcher =
-            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store);
+            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_subscription_registry(subscription_registry);
 
         Self {
             privileged_dispatcher,
@@ -344,6 +367,19 @@ impl DispatcherState {
     #[must_use]
     pub const fn session_dispatcher(&self) -> &SessionDispatcher<InMemoryManifestStore> {
         &self.session_dispatcher
+    }
+
+    /// Returns the shared subscription registry for connection lifecycle
+    /// management.
+    ///
+    /// # TCK-00303: Connection Cleanup
+    ///
+    /// When a connection closes, the connection handler MUST call
+    /// `unregister_connection(connection_id)` on this registry to free
+    /// resources and prevent `DoS` via connection slot exhaustion.
+    #[must_use]
+    pub const fn subscription_registry(&self) -> &SharedSubscriptionRegistry {
+        self.privileged_dispatcher.subscription_registry()
     }
 }
 

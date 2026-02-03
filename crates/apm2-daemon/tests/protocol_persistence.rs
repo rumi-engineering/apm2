@@ -21,7 +21,7 @@ use apm2_daemon::state::DispatcherState;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
-const fn make_privileged_ctx() -> ConnectionContext {
+fn make_privileged_ctx() -> ConnectionContext {
     ConnectionContext::privileged(Some(PeerCredentials {
         uid: 1000,
         gid: 1000,

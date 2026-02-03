@@ -377,6 +377,13 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     clock: Option<Arc<HolonicClock>>,
     /// Event sequence counter (per-session, monotonic).
     event_seq: AtomicU64,
+    /// Subscription registry for HEF Pulse Plane resource governance
+    /// (TCK-00303).
+    ///
+    /// Tracks per-connection subscription state and enforces limits per
+    /// RFC-0018. Shared with `PrivilegedDispatcher` to manage subscriptions
+    /// across both operator and session sockets.
+    subscription_registry: Option<super::resource_governance::SharedSubscriptionRegistry>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -400,6 +407,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             broker: None,
             clock: None,
             event_seq: AtomicU64::new(0),
+            subscription_registry: None,
         }
     }
 
@@ -415,6 +423,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             broker: None,
             clock: None,
             event_seq: AtomicU64::new(0),
+            subscription_registry: None,
         }
     }
 }
@@ -435,6 +444,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             broker: None,
             clock: None,
             event_seq: AtomicU64::new(0),
+            subscription_registry: None,
         }
     }
 
@@ -455,6 +465,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             broker: None,
             clock: None,
             event_seq: AtomicU64::new(0),
+            subscription_registry: None,
         }
     }
 
@@ -491,6 +502,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             broker: None,
             clock: None,
             event_seq: AtomicU64::new(0),
+            subscription_registry: None,
         }
     }
 
@@ -525,6 +537,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<HolonicClock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Sets the subscription registry for HEF Pulse Plane resource governance
+    /// (TCK-00303).
+    ///
+    /// The subscription registry tracks per-connection subscription state and
+    /// enforces limits per RFC-0018. It should be shared with
+    /// `PrivilegedDispatcher` to manage subscriptions across both operator and
+    /// session sockets.
+    #[must_use]
+    pub fn with_subscription_registry(
+        mut self,
+        registry: super::resource_governance::SharedSubscriptionRegistry,
+    ) -> Self {
+        self.subscription_registry = Some(registry);
         self
     }
 
@@ -1335,14 +1363,98 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             }
         }
 
-        // Generate subscription ID
+        // Generate subscription ID; use connection ID from context (TCK-00303)
         let subscription_id = format!("SUB-{}", uuid::Uuid::new_v4());
+        // TCK-00303: Use connection_id from context for consistent tracking
+        // across the connection lifecycle. The connection handler will call
+        // unregister_connection with this ID when the connection closes.
+        let connection_id = ctx.connection_id();
+
+        // TCK-00303: Wire resource governance - register connection if not exists
+        // and add subscription with limit checks (only if registry is configured)
+        if let Some(ref registry) = self.subscription_registry {
+            if !accepted_patterns.is_empty() {
+                // Parse accepted patterns into TopicPattern
+                let mut parsed_patterns = Vec::new();
+                for pattern_str in &accepted_patterns {
+                    match super::pulse_topic::TopicPattern::parse(pattern_str) {
+                        Ok(pattern) => parsed_patterns.push(pattern),
+                        Err(e) => {
+                            // Should not happen since ACL already validated, but be defensive
+                            warn!(
+                                session_id = %token.session_id,
+                                pattern = %pattern_str,
+                                error = %e,
+                                "Pattern parse failed after ACL validation"
+                            );
+                            rejected_patterns.push(PatternRejection {
+                                pattern: pattern_str.clone(),
+                                reason_code: "INVALID_PATTERN".to_string(),
+                            });
+                        },
+                    }
+                }
+
+                // Register connection if it doesn't exist (idempotent)
+                if let Err(e) = registry.register_connection(connection_id) {
+                    // Only TooManyConnections is a real error
+                    if matches!(
+                        e,
+                        super::resource_governance::ResourceError::TooManyConnections { .. }
+                    ) {
+                        warn!(
+                            session_id = %token.session_id,
+                            connection_id = %connection_id,
+                            error = %e,
+                            "Connection registration failed: resource limit exceeded"
+                        );
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorInvalid,
+                            format!("resource limit exceeded: {e}"),
+                        ));
+                    }
+                    // Connection already exists - this is fine
+                }
+
+                // Set session ID for the connection
+                if let Err(e) = registry.set_session_id(connection_id, &token.session_id) {
+                    debug!(
+                        connection_id = %connection_id,
+                        error = %e,
+                        "Failed to set session ID (connection may not exist)"
+                    );
+                }
+
+                // Create subscription state and add to registry
+                let subscription = super::resource_governance::SubscriptionState::new(
+                    &subscription_id,
+                    &request.client_sub_id,
+                    parsed_patterns,
+                    request.since_ledger_cursor,
+                );
+
+                if let Err(e) = registry.add_subscription(connection_id, subscription) {
+                    warn!(
+                        session_id = %token.session_id,
+                        connection_id = %connection_id,
+                        subscription_id = %subscription_id,
+                        error = %e,
+                        "Subscription registration failed: resource limit exceeded"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInvalid,
+                        format!("resource limit exceeded: {e}"),
+                    ));
+                }
+            }
+        }
 
         // Log outcome
         if rejected_patterns.is_empty() {
             info!(
                 session_id = %token.session_id,
                 subscription_id = %subscription_id,
+                connection_id = %connection_id,
                 accepted_count = accepted_patterns.len(),
                 "All patterns accepted"
             );
@@ -1350,14 +1462,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             warn!(
                 session_id = %token.session_id,
                 subscription_id = %subscription_id,
+                connection_id = %connection_id,
                 accepted_count = accepted_patterns.len(),
                 rejected_count = rejected_patterns.len(),
                 "Some patterns rejected"
             );
         }
-
-        // NOTE: Actual subscription registration is deferred to TCK-00303/TCK-00304.
-        // This handler validates ACLs and returns the response.
 
         Ok(SessionResponse::SubscribePulse(SubscribePulseResponse {
             subscription_id,
@@ -1452,22 +1562,45 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             ));
         }
 
-        // NOTE: Actual subscription removal is deferred to TCK-00303.
-        // For now, we always return removed=true as a placeholder.
-        // The real implementation will check if the subscription exists.
-        //
-        // TODO(TCK-00303): Implement subscription registry lookup
+        // TCK-00303: Wire resource governance - remove subscription from registry
+        // Use connection_id from context for consistent tracking
+        let connection_id = ctx.connection_id();
 
-        info!(
-            session_id = %token.session_id,
-            subscription_id = %request.subscription_id,
-            "Unsubscribe processed (subscription registry pending TCK-00303)"
-        );
+        let removed = if let Some(ref registry) = self.subscription_registry {
+            match registry.remove_subscription(connection_id, &request.subscription_id) {
+                Ok(_) => {
+                    info!(
+                        session_id = %token.session_id,
+                        subscription_id = %request.subscription_id,
+                        connection_id = %connection_id,
+                        "Unsubscribe processed successfully"
+                    );
+                    true
+                },
+                Err(e) => {
+                    // Log but don't fail - subscription may already be removed or never existed
+                    debug!(
+                        session_id = %token.session_id,
+                        subscription_id = %request.subscription_id,
+                        connection_id = %connection_id,
+                        error = %e,
+                        "Unsubscribe - subscription not found (may already be removed)"
+                    );
+                    false
+                },
+            }
+        } else {
+            // No registry configured - return true for backwards compatibility
+            info!(
+                session_id = %token.session_id,
+                subscription_id = %request.subscription_id,
+                "Unsubscribe processed (no registry configured)"
+            );
+            true
+        };
 
         Ok(SessionResponse::UnsubscribePulse(
-            UnsubscribePulseResponse {
-                removed: true, // Placeholder until subscription registry is implemented
-            },
+            UnsubscribePulseResponse { removed },
         ))
     }
 }
