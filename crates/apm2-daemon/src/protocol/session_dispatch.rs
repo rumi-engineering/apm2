@@ -64,7 +64,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use apm2_core::coordination::ContextRefinementRequest;
-use apm2_core::events::{DefectRecorded, DefectSource};
+use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
 use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, error, info, warn};
@@ -558,9 +558,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
-    fn emit_htf_regression_defect(&self, _current: u64, _previous: u64) {
+    fn emit_htf_regression_defect(&self, current: u64, _previous: u64) {
         if let Some(ref ledger) = self.ledger {
             let defect_id = format!("DEF-REGRESSION-{}", uuid::Uuid::new_v4());
+
+            // TCK-00307 MAJOR 3 FIX: Use proper timestamps instead of zeros.
+            // Since this is called when the clock regression is detected, we use
+            // the `current` timestamp from the regression error as our best available
+            // timestamp. We cannot call the clock again since it just failed.
+            let timestamp_ns = current;
+
+            // Create a time envelope ref by hashing a timestamp-based URI
+            let time_envelope_uri = format!("htf:regression:{current}");
+            let time_envelope_hash = blake3::hash(time_envelope_uri.as_bytes())
+                .as_bytes()
+                .to_vec();
+
             // Create DefectRecorded event
             let defect = DefectRecorded {
                 defect_id,
@@ -569,11 +582,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 source: DefectSource::HtfRegression as i32,
                 work_id: "system".to_string(),
                 severity: "S0".to_string(),
-                detected_at: 0,
-                time_envelope_ref: None,
+                detected_at: timestamp_ns,
+                time_envelope_ref: Some(TimeEnvelopeRef {
+                    hash: time_envelope_hash,
+                }),
             };
 
-            if let Err(e) = ledger.emit_defect_recorded(&defect, 0) {
+            if let Err(e) = ledger.emit_defect_recorded(&defect, timestamp_ns) {
                 error!("Failed to emit clock regression defect: {}", e);
             }
         }
@@ -582,6 +597,36 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     fn emit_context_miss_defect(&self, session_id: &str, path: &str) {
         if let Some(ref ledger) = self.ledger {
             let defect_id = format!("DEF-MISS-{}", uuid::Uuid::new_v4());
+
+            // TCK-00307 MAJOR 3 FIX: Use proper timestamps instead of zeros.
+            // Try to get timestamp from clock; if not configured, use SystemTime
+            // as a fallback for defect logging (this is observational, not authoritative).
+            #[allow(clippy::map_unwrap_or)] // Clearer with explicit closure for the fallback
+            let timestamp_ns = self
+                .clock
+                .as_ref()
+                .and_then(|c| c.now_hlc().ok())
+                .map_or_else(
+                    || {
+                        warn!("Clock not configured for context miss defect; using SystemTime fallback");
+                        SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            // Truncation is acceptable: timestamps won't exceed u64 for ~500 years
+                            .map(|d| {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let ns = d.as_nanos() as u64;
+                                ns
+                            })
+                            .unwrap_or(0)
+                    },
+                    |hlc| hlc.wall_ns,
+                );
+
+            // Create time envelope ref from timestamp
+            let time_envelope_uri = format!("htf:context-miss:{timestamp_ns}");
+            let time_envelope_hash = blake3::hash(time_envelope_uri.as_bytes())
+                .as_bytes()
+                .to_vec();
 
             // Construct payload description
             let description = format!("Context miss for path: {path}");
@@ -600,11 +645,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 source: DefectSource::ContextMiss as i32,
                 work_id: session_id.to_string(),
                 severity: "S2".to_string(),
-                detected_at: 0,
-                time_envelope_ref: None,
+                detected_at: timestamp_ns,
+                time_envelope_ref: Some(TimeEnvelopeRef {
+                    hash: time_envelope_hash,
+                }),
             };
 
-            if let Err(e) = ledger.emit_defect_recorded(&defect, 0) {
+            if let Err(e) = ledger.emit_defect_recorded(&defect, timestamp_ns) {
                 error!("Failed to emit context miss defect: {}", e);
             }
         }

@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use apm2_core::determinism::canonicalize_json;
-use apm2_core::events::DefectRecorded;
+use apm2_core::events::{DefectRecorded, Validate};
 use bytes::Bytes;
 use prost::Message;
 use subtle::ConstantTimeEq;
@@ -110,6 +110,15 @@ pub enum LedgerEventError {
         /// Error message.
         message: String,
     },
+
+    /// Validation failed (TCK-00307 MAJOR 4).
+    ///
+    /// Per REQ-VAL-0001: All event payloads must be validated before emission
+    /// to prevent denial-of-service via unbounded strings/bytes.
+    ValidationFailed {
+        /// Error message describing the validation failure.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for LedgerEventError {
@@ -117,6 +126,7 @@ impl std::fmt::Display for LedgerEventError {
         match self {
             Self::SigningFailed { message } => write!(f, "signing failed: {message}"),
             Self::PersistenceFailed { message } => write!(f, "persistence failed: {message}"),
+            Self::ValidationFailed { message } => write!(f, "validation failed: {message}"),
         }
     }
 }
@@ -643,13 +653,43 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
+        // TCK-00307 MAJOR 4: Call validate() to enforce DoS protections
+        defect
+            .validate()
+            .map_err(|e| LedgerEventError::ValidationFailed { message: e })?;
+
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Payload is the proto bytes
-        let payload_bytes = defect.encode_to_vec();
+        // TCK-00307 BLOCKER: Use JCS/JSON wire format (not ProtoBuf) to match
+        // SqliteLedgerEventEmitter and ensure consumer uniformity.
+        // Include time_envelope_ref for temporal binding (MAJOR 1).
+        let time_envelope_ref_hex = defect
+            .time_envelope_ref
+            .as_ref()
+            .map(|ter| hex::encode(&ter.hash));
 
-        // Build canonical bytes for signing (domain prefix + payload)
+        let payload = serde_json::json!({
+            "event_type": "defect_recorded",
+            "defect_id": defect.defect_id,
+            "defect_type": defect.defect_type,
+            "cas_hash": hex::encode(&defect.cas_hash),
+            "source": defect.source,
+            "work_id": defect.work_id,
+            "severity": defect.severity,
+            "detected_at": defect.detected_at,
+            "time_envelope_ref": time_envelope_ref_hex,
+        });
+
+        // Use JCS (RFC 8785) canonicalization for deterministic signing
+        let payload_json = payload.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        // Build canonical bytes for signing (domain prefix + JCS payload)
         let mut canonical_bytes =
             Vec::with_capacity(DEFECT_RECORDED_DOMAIN_PREFIX.len() + payload_bytes.len());
         canonical_bytes.extend_from_slice(DEFECT_RECORDED_DOMAIN_PREFIX);

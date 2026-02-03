@@ -16,7 +16,7 @@
 use std::sync::{Arc, Mutex};
 
 use apm2_core::determinism::canonicalize_json;
-use apm2_core::events::DefectRecorded;
+use apm2_core::events::{DefectRecorded, Validate};
 use ed25519_dalek::Signer;
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::info;
@@ -339,8 +339,20 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         defect: &DefectRecorded,
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // TCK-00307 MAJOR 4: Call validate() to enforce DoS protections
+        defect
+            .validate()
+            .map_err(|e| LedgerEventError::ValidationFailed { message: e })?;
+
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // TCK-00307 MAJOR 1: Include time_envelope_ref in JSON serialization
+        // for temporal binding per RFC-0016.
+        let time_envelope_ref_hex = defect
+            .time_envelope_ref
+            .as_ref()
+            .map(|ter| hex::encode(&ter.hash));
 
         // Build payload as JSON
         let payload = serde_json::json!({
@@ -352,6 +364,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "work_id": defect.work_id,
             "severity": defect.severity,
             "detected_at": defect.detected_at,
+            "time_envelope_ref": time_envelope_ref_hex,
         });
 
         // TCK-00307: Use JCS (RFC 8785) canonicalization for signing.

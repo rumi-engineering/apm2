@@ -631,14 +631,32 @@ impl TryFrom<i32> for ResolutionType {
 
 impl From<&InterventionFreeze> for ProtoInterventionFreeze {
     fn from(freeze: &InterventionFreeze) -> Self {
-        // Convert domain time_envelope_ref (hex String) to proto TimeEnvelopeRef
-        // Empty string maps to None; non-empty hex string maps to Some(TimeEnvelopeRef)
+        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef
+        // Empty string maps to None; non-empty string maps to Some(TimeEnvelopeRef)
+        //
+        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
+        // The time_envelope_ref may be a URI like "htf:tick:{ts}" or a hex hash.
         let time_envelope_ref = if freeze.time_envelope_ref.is_empty() {
             None
         } else {
-            // Best-effort decode; if invalid hex, produce empty hash (will fail validation
-            // later)
-            let hash = hex::decode(&freeze.time_envelope_ref).unwrap_or_default();
+            // Try hex decode first; if invalid (e.g., URI format), hash the string
+            let hash = if freeze.time_envelope_ref.len() == 64
+                && freeze
+                    .time_envelope_ref
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
+            {
+                hex::decode(&freeze.time_envelope_ref).unwrap_or_else(|_| {
+                    blake3::hash(freeze.time_envelope_ref.as_bytes())
+                        .as_bytes()
+                        .to_vec()
+                })
+            } else {
+                // URI format -> hash to derive 32 bytes
+                blake3::hash(freeze.time_envelope_ref.as_bytes())
+                    .as_bytes()
+                    .to_vec()
+            };
             Some(TimeEnvelopeRef { hash })
         };
 
@@ -730,14 +748,32 @@ impl TryFrom<ProtoInterventionFreeze> for InterventionFreeze {
 
 impl From<&InterventionUnfreeze> for ProtoInterventionUnfreeze {
     fn from(unfreeze: &InterventionUnfreeze) -> Self {
-        // Convert domain time_envelope_ref (hex String) to proto TimeEnvelopeRef
-        // Empty string maps to None; non-empty hex string maps to Some(TimeEnvelopeRef)
+        // Convert domain time_envelope_ref (String) to proto TimeEnvelopeRef
+        // Empty string maps to None; non-empty string maps to Some(TimeEnvelopeRef)
+        //
+        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
+        // The time_envelope_ref may be a URI like "htf:tick:{ts}" or a hex hash.
         let time_envelope_ref = if unfreeze.time_envelope_ref.is_empty() {
             None
         } else {
-            // Best-effort decode; if invalid hex, produce empty hash (will fail validation
-            // later)
-            let hash = hex::decode(&unfreeze.time_envelope_ref).unwrap_or_default();
+            // Try hex decode first; if invalid (e.g., URI format), hash the string
+            let hash = if unfreeze.time_envelope_ref.len() == 64
+                && unfreeze
+                    .time_envelope_ref
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
+            {
+                hex::decode(&unfreeze.time_envelope_ref).unwrap_or_else(|_| {
+                    blake3::hash(unfreeze.time_envelope_ref.as_bytes())
+                        .as_bytes()
+                        .to_vec()
+                })
+            } else {
+                // URI format -> hash to derive 32 bytes
+                blake3::hash(unfreeze.time_envelope_ref.as_bytes())
+                    .as_bytes()
+                    .to_vec()
+            };
             Some(TimeEnvelopeRef { hash })
         };
 
@@ -2203,9 +2239,30 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
         // Use BLAKE3 for CAS hash (RFC-0018)
         let cas_hash = blake3::hash(&defect_bytes).as_bytes().to_vec();
 
-        // Decode time_envelope_ref hex to bytes
-        // If it's not hex (e.g. htf:tick:...), treat as None for the proto event
-        let time_ref_hash = hex::decode(&time_envelope_ref).ok();
+        // TCK-00307 MAJOR 2 FIX: Properly handle time_envelope_ref conversion.
+        // The time_envelope_ref is a URI like "htf:tick:{ts}", NOT a hex string.
+        // We need to derive a deterministic hash from it for the proto TimeEnvelopeRef.
+        //
+        // Strategy:
+        // 1. If it's valid hex (64 chars = 32 bytes), decode directly (future HTF
+        //    integration)
+        // 2. Otherwise, hash the URI string with BLAKE3 to get deterministic 32 bytes
+        //    that preserve temporal binding information
+        let time_ref_hash: Vec<u8> = if time_envelope_ref.len() == 64
+            && time_envelope_ref.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            // Valid 64-char hex string -> decode to 32 bytes
+            hex::decode(&time_envelope_ref).unwrap_or_else(|_| {
+                blake3::hash(time_envelope_ref.as_bytes())
+                    .as_bytes()
+                    .to_vec()
+            })
+        } else {
+            // URI format (e.g., "htf:tick:12345") -> hash to derive 32 bytes
+            blake3::hash(time_envelope_ref.as_bytes())
+                .as_bytes()
+                .to_vec()
+        };
 
         let defect_event = DefectRecorded {
             defect_id,
@@ -2215,7 +2272,9 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
             work_id: self.config.repo_id.clone(),
             severity: defect.severity().as_str().to_string(),
             detected_at: timestamp,
-            time_envelope_ref: time_ref_hash.map(|hash| TimeEnvelopeRef { hash }),
+            time_envelope_ref: Some(TimeEnvelopeRef {
+                hash: time_ref_hash,
+            }),
         };
 
         Ok(DivergenceResult {
