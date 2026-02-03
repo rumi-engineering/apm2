@@ -361,10 +361,24 @@ fn parse_owner_repo(remote_url: &str) -> &str {
 /// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
 /// the HEF evidence pipeline.
 fn create_pending_statuses(sh: &Shell, owner_repo: &str, head_sha: &str) {
-    // TCK-00309: Gate writes on HEF projection flag
-    if crate::util::use_hef_projection() {
-        println!("    [HEF] Skipping pending status creation (USE_HEF_PROJECTION=true)");
-        return;
+    use crate::util::{StatusWriteDecision, check_status_write_allowed};
+
+    // TCK-00296: Check status write gating (includes TCK-00309 HEF projection)
+    match check_status_write_allowed() {
+        StatusWriteDecision::SkipHefProjection => {
+            println!("    [HEF] Skipping pending status creation (USE_HEF_PROJECTION=true)");
+            return;
+        },
+        StatusWriteDecision::BlockStrictMode => {
+            println!(
+                "    [STRICT] Status writes blocked. Set XTASK_ALLOW_STATUS_WRITES=true to allow."
+            );
+            return;
+        },
+        StatusWriteDecision::Proceed => {
+            // TCK-00296: Print non-strict mode warning
+            crate::util::print_non_strict_mode_warning();
+        },
     }
 
     // TCK-00294: Print NON-AUTHORITATIVE banner before status writes

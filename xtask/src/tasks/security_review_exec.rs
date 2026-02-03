@@ -478,11 +478,26 @@ fn update_status(
     success: bool,
     description: &str,
 ) -> Result<()> {
-    // TCK-00309: Gate writes on HEF projection flag
-    if crate::util::use_hef_projection() {
-        println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
-        println!("  [HEF] Status would be: {STATUS_CONTEXT} = {success} - {description}");
-        return Ok(());
+    use crate::util::{StatusWriteDecision, check_status_write_allowed};
+
+    // TCK-00296: Check status write gating (includes TCK-00309 HEF projection)
+    match check_status_write_allowed() {
+        StatusWriteDecision::SkipHefProjection => {
+            println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
+            println!("  [HEF] Status would be: {STATUS_CONTEXT} = {success} - {description}");
+            return Ok(());
+        },
+        StatusWriteDecision::BlockStrictMode => {
+            bail!(
+                "Status writes blocked in strict mode.\n\
+                 Set XTASK_ALLOW_STATUS_WRITES=true to allow.\n\
+                 Status would be: {STATUS_CONTEXT} = {success} - {description}"
+            );
+        },
+        StatusWriteDecision::Proceed => {
+            // TCK-00296: Print non-strict mode warning
+            crate::util::print_non_strict_mode_warning();
+        },
     }
 
     // TCK-00294: Print NON-AUTHORITATIVE banner before status writes

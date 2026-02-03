@@ -187,6 +187,139 @@ pub fn use_hef_projection() -> bool {
 }
 
 // =============================================================================
+// Status Write Gating (TCK-00296)
+// =============================================================================
+
+/// Name of the environment variable enabling strict mode.
+///
+/// Per TCK-00296, strict mode enforces fail-closed behavior for GitHub status
+/// writes. When enabled, status writes require explicit opt-in via
+/// `XTASK_ALLOW_STATUS_WRITES=true`.
+pub const XTASK_STRICT_MODE_ENV: &str = "XTASK_STRICT_MODE";
+
+/// Name of the environment variable allowing status writes in strict mode.
+///
+/// Per TCK-00296, this flag must be explicitly set to "true" to allow GitHub
+/// status writes when `XTASK_STRICT_MODE=true`. This is the "dev flag" that
+/// enables development workflows while maintaining fail-closed security
+/// posture.
+pub const XTASK_ALLOW_STATUS_WRITES_ENV: &str = "XTASK_ALLOW_STATUS_WRITES";
+
+/// Checks if strict mode is enabled.
+///
+/// Returns `true` if the `XTASK_STRICT_MODE` environment variable is set to
+/// "true" (case-insensitive).
+///
+/// Per TCK-00296:
+/// - Default is `false` (non-strict mode) to preserve existing dev workflows.
+/// - When `true`, status writes are blocked unless `XTASK_ALLOW_STATUS_WRITES`
+///   is explicitly set.
+pub fn is_strict_mode() -> bool {
+    std::env::var(XTASK_STRICT_MODE_ENV)
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+/// Checks if status writes are explicitly allowed.
+///
+/// Returns `true` if the `XTASK_ALLOW_STATUS_WRITES` environment variable is
+/// set to "true" (case-insensitive).
+///
+/// Per TCK-00296, this flag is only meaningful in strict mode. It provides
+/// explicit opt-in for development workflows.
+pub fn allow_status_writes() -> bool {
+    std::env::var(XTASK_ALLOW_STATUS_WRITES_ENV)
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+/// Result of checking whether status writes should proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusWriteDecision {
+    /// Proceed with the status write (may include warning).
+    Proceed,
+    /// Skip the status write (`USE_HEF_PROJECTION=true`).
+    SkipHefProjection,
+    /// Block the status write (strict mode without allow flag).
+    BlockStrictMode,
+}
+
+/// Determines whether a GitHub status write should proceed.
+///
+/// Per TCK-00296 and TCK-00309, this function implements the decision logic for
+/// GitHub status writes:
+///
+/// 1. If `USE_HEF_PROJECTION=true`: Skip (daemon handles projection).
+/// 2. If `XTASK_STRICT_MODE=true` and `XTASK_ALLOW_STATUS_WRITES!=true`: Block.
+/// 3. Otherwise: Proceed (non-strict mode preserves existing behavior).
+///
+/// # Returns
+///
+/// - `StatusWriteDecision::SkipHefProjection` - Status write should be skipped
+///   (HEF projection is enabled).
+/// - `StatusWriteDecision::BlockStrictMode` - Status write is blocked (strict
+///   mode without explicit allow).
+/// - `StatusWriteDecision::Proceed` - Status write may proceed.
+///
+/// # Example
+///
+/// ```ignore
+/// use crate::util::{check_status_write_allowed, StatusWriteDecision};
+///
+/// match check_status_write_allowed() {
+///     StatusWriteDecision::SkipHefProjection => {
+///         println!("[HEF] Skipping status write");
+///         return Ok(());
+///     }
+///     StatusWriteDecision::BlockStrictMode => {
+///         return Err(anyhow::anyhow!(
+///             "Status writes blocked in strict mode. Set XTASK_ALLOW_STATUS_WRITES=true to allow."
+///         ));
+///     }
+///     StatusWriteDecision::Proceed => {
+///         // Continue with status write
+///     }
+/// }
+/// ```
+pub fn check_status_write_allowed() -> StatusWriteDecision {
+    // TCK-00309: HEF projection takes precedence
+    if use_hef_projection() {
+        return StatusWriteDecision::SkipHefProjection;
+    }
+
+    // TCK-00296: Strict mode blocks without explicit allow
+    if is_strict_mode() && !allow_status_writes() {
+        return StatusWriteDecision::BlockStrictMode;
+    }
+
+    StatusWriteDecision::Proceed
+}
+
+/// Warning message printed in non-strict mode before status writes.
+///
+/// Per TCK-00296, non-strict mode preserves existing behavior but prints a
+/// warning to remind operators that status writes are development scaffolding.
+pub const NON_STRICT_MODE_WARNING: &str = r"
+  [WARNING] Status writes enabled in non-strict mode.
+  For fail-closed behavior, set XTASK_STRICT_MODE=true.
+  Then, explicitly allow writes with XTASK_ALLOW_STATUS_WRITES=true.
+";
+
+/// Prints warning message for non-strict mode status writes.
+///
+/// Per TCK-00296, this function prints a warning to stderr when status writes
+/// proceed in non-strict mode. This reminds operators that:
+/// - Status writes are development scaffolding
+/// - Strict mode provides fail-closed security
+/// - Explicit opt-in is available via `XTASK_ALLOW_STATUS_WRITES`
+pub fn print_non_strict_mode_warning() {
+    // Only print warning if NOT in strict mode (strict mode has explicit allow)
+    if !is_strict_mode() {
+        eprintln!("{NON_STRICT_MODE_WARNING}");
+    }
+}
+
+// =============================================================================
 // Non-Authoritative Banner
 // =============================================================================
 
@@ -550,6 +683,204 @@ mod tests {
 
         // Cleanup
         unsafe { std::env::remove_var(USE_HEF_PROJECTION_ENV) };
+    }
+
+    // =============================================================================
+    // Status Write Gating Tests (TCK-00296)
+    // =============================================================================
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_is_strict_mode_env_var() {
+        // SERIAL TEST: Modifies environment variables
+
+        // 1. Default (unset) -> false
+        unsafe { std::env::remove_var(XTASK_STRICT_MODE_ENV) };
+        assert!(!is_strict_mode(), "Default should be false");
+
+        // 2. "TRUE" -> true
+        unsafe { std::env::set_var(XTASK_STRICT_MODE_ENV, "TRUE") };
+        assert!(is_strict_mode(), "TRUE should be true");
+
+        // 3. "true" -> true
+        unsafe { std::env::set_var(XTASK_STRICT_MODE_ENV, "true") };
+        assert!(is_strict_mode(), "true should be true");
+
+        // 4. "false" -> false
+        unsafe { std::env::set_var(XTASK_STRICT_MODE_ENV, "false") };
+        assert!(!is_strict_mode(), "false should be false");
+
+        // Cleanup
+        unsafe { std::env::remove_var(XTASK_STRICT_MODE_ENV) };
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_allow_status_writes_env_var() {
+        // SERIAL TEST: Modifies environment variables
+
+        // 1. Default (unset) -> false
+        unsafe { std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV) };
+        assert!(!allow_status_writes(), "Default should be false");
+
+        // 2. "TRUE" -> true
+        unsafe { std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "TRUE") };
+        assert!(allow_status_writes(), "TRUE should be true");
+
+        // 3. "true" -> true
+        unsafe { std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "true") };
+        assert!(allow_status_writes(), "true should be true");
+
+        // 4. "false" -> false
+        unsafe { std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "false") };
+        assert!(!allow_status_writes(), "false should be false");
+
+        // Cleanup
+        unsafe { std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV) };
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_check_status_write_allowed_hef_projection() {
+        // HEF projection takes precedence over all other flags
+        unsafe {
+            std::env::set_var(USE_HEF_PROJECTION_ENV, "true");
+            std::env::set_var(XTASK_STRICT_MODE_ENV, "false");
+            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
+        }
+
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::SkipHefProjection,
+            "HEF projection should skip status writes"
+        );
+
+        // Even with strict mode enabled, HEF projection takes precedence
+        unsafe {
+            std::env::set_var(USE_HEF_PROJECTION_ENV, "true");
+            std::env::set_var(XTASK_STRICT_MODE_ENV, "true");
+        }
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::SkipHefProjection,
+            "HEF projection should take precedence over strict mode"
+        );
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_check_status_write_allowed_strict_mode_blocked() {
+        // Strict mode without allow flag should block
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::set_var(XTASK_STRICT_MODE_ENV, "true");
+            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
+        }
+
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::BlockStrictMode,
+            "Strict mode without allow flag should block"
+        );
+
+        // Strict mode with allow flag explicitly false should still block
+        unsafe {
+            std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "false");
+        }
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::BlockStrictMode,
+            "Strict mode with allow=false should block"
+        );
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_check_status_write_allowed_strict_mode_with_allow() {
+        // Strict mode with allow flag should proceed
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::set_var(XTASK_STRICT_MODE_ENV, "true");
+            std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "true");
+        }
+
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::Proceed,
+            "Strict mode with allow flag should proceed"
+        );
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_check_status_write_allowed_non_strict_mode() {
+        // Non-strict mode (default) should always proceed
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
+        }
+
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::Proceed,
+            "Non-strict mode should proceed"
+        );
+
+        // Non-strict mode should proceed even without allow flag
+        unsafe {
+            std::env::set_var(XTASK_STRICT_MODE_ENV, "false");
+        }
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::Proceed,
+            "Explicit non-strict mode should proceed"
+        );
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var(USE_HEF_PROJECTION_ENV);
+            std::env::remove_var(XTASK_STRICT_MODE_ENV);
+            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
+        }
+    }
+
+    #[test]
+    fn test_non_strict_mode_warning_contains_key_phrases() {
+        // Verify the warning contains all required guidance
+        assert!(
+            NON_STRICT_MODE_WARNING.contains("XTASK_STRICT_MODE"),
+            "Warning must mention XTASK_STRICT_MODE"
+        );
+        assert!(
+            NON_STRICT_MODE_WARNING.contains("XTASK_ALLOW_STATUS_WRITES"),
+            "Warning must mention XTASK_ALLOW_STATUS_WRITES"
+        );
+        assert!(
+            NON_STRICT_MODE_WARNING.contains("fail-closed"),
+            "Warning must mention fail-closed behavior"
+        );
     }
 
     // Integration tests that require a real git repo
