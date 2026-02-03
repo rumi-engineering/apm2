@@ -970,6 +970,11 @@ impl SubscriptionRegistry {
         let connection_id = connection_id.into();
         let mut connections = self.connections.write().expect("lock poisoned");
 
+        // Check if already exists - idempotent success
+        if connections.contains_key(&connection_id) {
+            return Ok(());
+        }
+
         // Check global connection limit
         if connections.len() >= self.config.max_connections {
             return Err(ResourceError::TooManyConnections {
