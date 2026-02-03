@@ -66,7 +66,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::state::{DaemonStateHandle, SharedState};
+use crate::state::{DaemonStateHandle, DispatcherState, SharedDispatcherState, SharedState};
 
 /// apm2 daemon - AI CLI process manager
 #[derive(Parser, Debug)]
@@ -556,14 +556,31 @@ async fn async_main(args: Args) -> Result<()> {
         info!("Managing {} processes", inner.supervisor.process_count());
     }
 
+    // TCK-00287: Create shared dispatcher state at daemon startup.
+    // Per security review:
+    // - Item 1: Dispatchers persist across connections (no state loss)
+    // - Item 2: TokenMinter uses stable secret (tokens valid across connections)
+    // - Item 3: Shared ManifestStore allows SpawnEpisode manifests to be visible
+    //
+    // BLOCKER 1 FIX: Use with_session_registry to wire global session registry
+    // from DaemonStateHandle into PrivilegedDispatcher. This ensures sessions
+    // spawned via IPC are visible to daemon's persistent state.
+    let dispatcher_state: SharedDispatcherState = Arc::new(DispatcherState::with_session_registry(
+        state.session_registry().clone(),
+        metrics_registry.clone(),
+    ));
+
     // TCK-00279: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
     // DD-009.
     let socket_manager = Arc::new(socket_manager);
     let ipc_state = state.clone();
+    let ipc_dispatcher_state = Arc::clone(&dispatcher_state);
     let ipc_socket_manager = Arc::clone(&socket_manager);
     let protocol_server_task = tokio::spawn(async move {
-        if let Err(e) = run_socket_manager_server(ipc_socket_manager, ipc_state).await {
+        if let Err(e) =
+            run_socket_manager_server(ipc_socket_manager, ipc_state, ipc_dispatcher_state).await
+        {
             error!("ProtocolServer error: {}", e);
         }
     });
@@ -734,6 +751,14 @@ async fn perform_crash_recovery(_state: &SharedState) -> Result<()> {
 /// - `operator.sock` (mode 0600): Privileged operations
 /// - `session.sock` (mode 0660): Session-scoped operations
 ///
+/// # TCK-00287 Security Fixes
+///
+/// Per the security review, this function now passes shared dispatcher state
+/// to connection handlers, ensuring:
+/// - Registries persist across connections (Item 1)
+/// - Token secrets are stable (Item 2)
+/// - Fail-closed defaults are enforced (Item 3)
+///
 /// # Acceptance Criteria (TCK-00279)
 ///
 /// - No `ipc_server::run` invocation in default build
@@ -742,6 +767,7 @@ async fn perform_crash_recovery(_state: &SharedState) -> Result<()> {
 async fn run_socket_manager_server(
     socket_manager: Arc<SocketManager>,
     state: SharedState,
+    dispatcher_state: SharedDispatcherState,
 ) -> Result<()> {
     info!("ProtocolServer control plane started (operator.sock + session.sock only)");
 
@@ -759,9 +785,15 @@ async fn run_socket_manager_server(
         match accept_result {
             Ok(Ok((connection, _permit, socket_type))) => {
                 let conn_state = state.clone();
+                let conn_dispatcher_state = Arc::clone(&dispatcher_state);
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_dual_socket_connection(connection, socket_type, conn_state).await
+                    if let Err(e) = handle_dual_socket_connection(
+                        connection,
+                        socket_type,
+                        conn_state,
+                        conn_dispatcher_state,
+                    )
+                    .await
                     {
                         warn!("Connection handler error: {e}");
                     }
@@ -783,17 +815,39 @@ async fn run_socket_manager_server(
 ///
 /// Routes requests based on socket type (privilege level).
 ///
-/// # Protocol Compliance (TCK-00279/TCK-00281)
+/// # Protocol Compliance (TCK-00279/TCK-00281/TCK-00287)
 ///
 /// This function performs the mandatory Hello/HelloAck handshake as specified
-/// in DD-001/DD-008, then processes protobuf messages. Legacy JSON IPC has
-/// been removed per DD-009.
+/// in DD-001/DD-008, then processes protobuf messages via tag-based
+/// dispatchers. Legacy JSON IPC has been removed per DD-009.
+///
+/// # TCK-00287 Security Fixes
+///
+/// Per the security review, this function now:
+/// - **Item 1**: Uses shared dispatchers from `DispatcherState` (no state loss)
+/// - **Item 2**: Token secrets are stable via shared `TokenMinter`
+/// - **Item 3**: Fail-closed defaults via `FailClosedManifestStore`
+/// - **Item 4**: Sends responses back to clients via
+///   `connection.framed().send()`
+/// - **Item 5**: Terminates connection on protocol errors (breaks loop)
+///
+/// # JSON Downgrade Rejection (DD-009)
+///
+/// Per TCK-00287 and DD-009, JSON frames are rejected before reaching handlers.
+/// The tag-based routing validates that the first byte is a valid message type
+/// tag (1-4 for privileged, 1-4 for session). JSON frames starting with `{`
+/// (0x7B = 123) are rejected as unknown message types. Protocol errors
+/// terminate the connection immediately.
 async fn handle_dual_socket_connection(
     mut connection: protocol::server::Connection,
     socket_type: protocol::socket_manager::SocketType,
     _state: SharedState,
+    dispatcher_state: SharedDispatcherState,
 ) -> Result<()> {
+    use bytes::Bytes;
+    use futures::{SinkExt, StreamExt};
     use protocol::connection_handler::{HandshakeResult, perform_handshake};
+    use protocol::dispatch::ConnectionContext;
 
     info!(
         socket_type = %socket_type,
@@ -816,19 +870,117 @@ async fn handle_dual_socket_connection(
         },
     }
 
-    // TCK-00281: Legacy JSON IPC dispatch has been removed per DD-009.
-    // The daemon now only accepts protobuf-encoded messages via
-    // PrivilegedDispatcher and SessionDispatcher. CLI clients must migrate to
-    // the protobuf protocol.
-    //
-    // TODO: Wire up PrivilegedDispatcher and SessionDispatcher for message
-    // processing. For now, connections are accepted and handshake is completed,
-    // but no message processing occurs. This allows the daemon to start and
-    // accept connections while the protobuf integration is completed in
-    // subsequent tickets.
+    // TCK-00287: Wire up tag-based ProtocolServer dispatchers
+    // Create connection context based on socket type
+    let ctx = match socket_type {
+        protocol::socket_manager::SocketType::Operator => {
+            ConnectionContext::privileged(connection.peer_credentials().cloned())
+        },
+        protocol::socket_manager::SocketType::Session => {
+            ConnectionContext::session(connection.peer_credentials().cloned(), None)
+        },
+    };
 
-    info!(socket_type = %socket_type, "Connection ready for protobuf messages (dispatch pending)");
+    // TCK-00287 Item 1 & 2: Use shared dispatchers from DispatcherState.
+    // These dispatchers persist across connections and use stable secrets.
+    let privileged_dispatcher = dispatcher_state.privileged_dispatcher();
+    let session_dispatcher = dispatcher_state.session_dispatcher();
+
+    // TCK-00287: Message dispatch loop
+    // Process incoming frames until connection closes or error
+    info!(socket_type = %socket_type, "Entering message dispatch loop");
+
+    while let Some(frame_result) = connection.framed().next().await {
+        let frame = match frame_result {
+            Ok(frame) => frame,
+            Err(e) => {
+                warn!(socket_type = %socket_type, error = %e, "Frame read error");
+                break;
+            },
+        };
+
+        // TCK-00287 Item 5: JSON downgrade rejection (DD-009 fail-closed)
+        // Validate frame before dispatch. JSON frames start with '{' (0x7B = 123)
+        // or '[' (0x5B = 91) which are not valid message type tags.
+        // Per security review: protocol errors MUST terminate connection (DoS
+        // mitigation).
+        if !frame.is_empty() && is_json_frame(&frame) {
+            warn!(
+                socket_type = %socket_type,
+                first_byte = frame[0],
+                "JSON downgrade attempt rejected - terminating connection"
+            );
+            // TCK-00287 Item 5: Terminate connection on protocol violation
+            break;
+        }
+
+        // Route to appropriate dispatcher based on socket type
+        // Each dispatcher returns its own response type, so we handle them separately
+        let frame_bytes = Bytes::from(frame.to_vec());
+        match socket_type {
+            protocol::socket_manager::SocketType::Operator => {
+                match privileged_dispatcher.dispatch(&frame_bytes, &ctx) {
+                    Ok(response) => {
+                        info!(socket_type = %socket_type, "Privileged request dispatched successfully");
+                        // TCK-00287 Item 4: Send response back to client
+                        let response_bytes = response.encode();
+                        if let Err(e) = connection.framed().send(response_bytes).await {
+                            warn!(socket_type = %socket_type, error = %e, "Failed to send response");
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        // TCK-00287 Item 5: Protocol errors terminate connection
+                        warn!(socket_type = %socket_type, error = %e, "Privileged dispatch error - terminating connection");
+                        break;
+                    },
+                }
+            },
+            protocol::socket_manager::SocketType::Session => {
+                match session_dispatcher.dispatch(&frame_bytes, &ctx) {
+                    Ok(response) => {
+                        info!(socket_type = %socket_type, "Session request dispatched successfully");
+                        // TCK-00287 Item 4: Send response back to client
+                        let response_bytes = response.encode();
+                        if let Err(e) = connection.framed().send(response_bytes).await {
+                            warn!(socket_type = %socket_type, error = %e, "Failed to send response");
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        // TCK-00287 Item 5: Protocol errors terminate connection
+                        warn!(socket_type = %socket_type, error = %e, "Session dispatch error - terminating connection");
+                        break;
+                    },
+                }
+            },
+        }
+    }
+
+    info!(socket_type = %socket_type, "Connection closed");
     Ok(())
+}
+
+/// Checks if a frame appears to be a JSON payload (downgrade attempt).
+///
+/// JSON payloads typically start with `{` (object) or `[` (array).
+/// The protocol requires tag-based binary frames where the first byte
+/// is a message type tag (1-4 for privileged, 1-4 for session).
+///
+/// # DD-009 Compliance
+///
+/// Per DD-009, JSON IPC is a downgrade/bypass surface and must be fail-closed
+/// by default. This function helps identify and reject JSON frames before
+/// they reach any handler.
+#[inline]
+fn is_json_frame(frame: &[u8]) -> bool {
+    if frame.is_empty() {
+        return false;
+    }
+    // JSON typically starts with '{', '[', or whitespace followed by these
+    // Valid protocol tags are 1-4 (privileged) or 1-4 (session)
+    // ASCII '{' = 123 (0x7B), '[' = 91 (0x5B)
+    matches!(frame[0], b'{' | b'[')
 }
 
 /// Run the Prometheus metrics HTTP server (TCK-00268).

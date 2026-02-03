@@ -310,6 +310,9 @@ message SpawnEpisodeResponse {
   bool context_pack_sealed = 3;
   // Ephemeral handle for session identification (not a credential).
   string ephemeral_handle = 4;
+  // HMAC-signed session token for authenticating session-scoped IPC requests.
+  // TCK-00287: Required for clients to access session endpoints.
+  string session_token = 5;
 }
 
 // IPC-PRIV-003: IssueCapability

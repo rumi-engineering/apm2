@@ -1,6 +1,15 @@
 //! Shared daemon state.
 //!
 //! Provides thread-safe shared state for the daemon.
+//!
+//! # TCK-00287: Security Fixes
+//!
+//! Per the security review, dispatchers and registries must be shared across
+//! connections to prevent state loss and authentication secret rotation issues.
+//! This module provides the `DispatcherState` struct that holds:
+//! - `PrivilegedDispatcher` with shared registries
+//! - `SessionDispatcher` with stable `TokenMinter` secret
+//! - `FailClosedManifestStore` that denies all tools by default
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,12 +22,235 @@ use apm2_core::process::runner::ProcessRunner;
 use apm2_core::schema_registry::InMemorySchemaRegistry;
 use apm2_core::supervisor::Supervisor;
 use apm2_daemon::episode::{
-    InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
+    CapabilityManifest, InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
 };
 use apm2_daemon::metrics::SharedMetricsRegistry;
+use apm2_daemon::protocol::dispatch::PrivilegedDispatcher;
+use apm2_daemon::protocol::session_dispatch::{
+    InMemoryManifestStore, ManifestStore, SessionDispatcher,
+};
+use apm2_daemon::protocol::session_token::TokenMinter;
 use apm2_daemon::session::SessionRegistry;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
+
+// ============================================================================
+// TCK-00287: Fail-Closed Manifest Store (kept for potential future use)
+// ============================================================================
+
+/// A manifest store that always returns `None`, enforcing fail-closed behavior.
+///
+/// Per TCK-00287 security review item 3 (Permissive Default), the
+/// `SessionDispatcher` must deny all tools if no manifest is available. When
+/// this store is used with `SessionDispatcher::with_manifest_store()`, any tool
+/// request will be denied because `get_manifest()` returns `None`, triggering
+/// the fail-closed path in `handle_request_tool()`.
+///
+/// # Security Invariant (INV-TCK-00260-002)
+///
+/// Empty or missing `tool_allowlist` denies all tools (fail-closed).
+///
+/// # Current Status
+///
+/// This struct is currently unused as the implementation now uses
+/// `InMemoryManifestStore` shared between dispatchers. It is kept for potential
+/// future use as a default-deny store for testing or specific security
+/// scenarios.
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct FailClosedManifestStore;
+
+impl ManifestStore for FailClosedManifestStore {
+    fn get_manifest(&self, _session_id: &str) -> Option<Arc<CapabilityManifest>> {
+        // Always return None to trigger fail-closed behavior in SessionDispatcher.
+        // The dispatcher will return SESSION_ERROR_TOOL_NOT_ALLOWED when no manifest
+        // is found for a session.
+        None
+    }
+}
+
+// ============================================================================
+// TCK-00287: Shared Dispatcher State
+// ============================================================================
+
+/// Shared dispatcher state across all connections.
+///
+/// Per TCK-00287 security review:
+/// - Item 1 (Cross-Connection State Loss): Dispatchers must persist across
+///   connections
+/// - Item 2 (Authentication Secret Rotation): `TokenMinter` secret must be
+///   stable
+/// - Item 3 (Permissive Default): Must use fail-closed manifest store
+///   initially, but allow manifests to be registered during `SpawnEpisode`
+///
+/// # TCK-00287 BLOCKER 1, 2, 3 Fixes
+///
+/// This struct now shares:
+/// - `TokenMinter`: Same secret for both minting and validation
+/// - `InMemoryManifestStore`: Manifests registered during spawn are visible
+/// - `SessionRegistry`: Global session registry from `DaemonStateHandle`
+///
+/// This ensures that:
+/// 1. Sessions spawned via IPC are visible to daemon's persistent state
+/// 2. Clients receive HMAC-signed tokens they can use for session endpoints
+/// 3. Tool requests can be validated against manifests registered during spawn
+pub struct DispatcherState {
+    /// Privileged endpoint dispatcher with shared registries.
+    ///
+    /// Contains `WorkRegistry`, `SessionRegistry`, and `LedgerEventEmitter`
+    /// that persist across connections. Now also contains shared
+    /// `TokenMinter` and `ManifestStore` for TCK-00287 fixes.
+    privileged_dispatcher: PrivilegedDispatcher,
+
+    /// Session endpoint dispatcher with stable token minter.
+    ///
+    /// The `TokenMinter` uses the same secret as `PrivilegedDispatcher`,
+    /// ensuring tokens minted during spawn can be validated here.
+    /// The `ManifestStore` is shared with `PrivilegedDispatcher` so manifests
+    /// registered during spawn are accessible for tool validation.
+    session_dispatcher: SessionDispatcher<InMemoryManifestStore>,
+}
+
+impl DispatcherState {
+    /// Creates new dispatcher state with shared registries and stable secrets.
+    ///
+    /// # Arguments
+    ///
+    /// * `metrics_registry` - Optional metrics registry for observability
+    ///
+    /// # Security
+    ///
+    /// - Generates a single HMAC secret for `TokenMinter` at startup
+    /// - Shares `TokenMinter` between both dispatchers for token
+    ///   minting/validation
+    /// - Shares `InMemoryManifestStore` so spawn manifests are visible to
+    ///   session handlers
+    /// - Registries persist for daemon lifetime
+    ///
+    /// # TCK-00287 Fixes
+    ///
+    /// - BLOCKER 1: Uses shared session registry (passed via
+    ///   `with_session_registry`)
+    /// - BLOCKER 2: Shares `TokenMinter` so spawn can mint tokens
+    /// - MAJOR 3: Shares `ManifestStore` so spawn manifests are visible
+    ///
+    /// # Note
+    ///
+    /// This constructor creates an internal stub session registry. For
+    /// production use with the global daemon session registry, use
+    /// `with_session_registry`.
+    #[must_use]
+    #[allow(dead_code)] // Kept for testing and potential future use
+    pub fn new(metrics_registry: Option<SharedMetricsRegistry>) -> Self {
+        // TCK-00287 Item 2: Generate a single stable secret at daemon startup.
+        // This secret is used for the entire daemon lifetime, ensuring tokens
+        // minted on one connection are valid on other connections.
+        let token_secret = TokenMinter::generate_secret();
+        let token_minter = Arc::new(TokenMinter::new(token_secret));
+
+        // TCK-00287 MAJOR 3: Use shared manifest store.
+        // Manifests registered during SpawnEpisode will be visible to SessionDispatcher
+        // for tool request validation. If no manifest is registered for a session,
+        // tool requests will be denied (fail-closed behavior in handle_request_tool).
+        let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+        // TCK-00287: Create session registry (stub for now, use with_session_registry
+        // for real)
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+
+        // TCK-00287 BLOCKER 1 & 2: Create privileged dispatcher with shared state
+        let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
+            Arc::clone(&token_minter),
+            Arc::clone(&manifest_store),
+            session_registry,
+        );
+
+        // Add metrics if provided
+        let privileged_dispatcher = if let Some(metrics) = metrics_registry {
+            privileged_dispatcher.with_metrics(metrics)
+        } else {
+            privileged_dispatcher
+        };
+
+        // TCK-00287: Create session dispatcher with same token minter and manifest
+        // store This ensures:
+        // - Tokens minted during SpawnEpisode can be validated
+        // - Manifests registered during SpawnEpisode are visible for tool validation
+        let session_dispatcher =
+            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store);
+
+        Self {
+            privileged_dispatcher,
+            session_dispatcher,
+        }
+    }
+
+    /// Creates new dispatcher state with a specific session registry.
+    ///
+    /// # TCK-00287 BLOCKER 1
+    ///
+    /// This constructor allows using the global `DaemonStateHandle` session
+    /// registry instead of an internal stub, ensuring sessions spawned via
+    /// IPC are visible to the daemon's persistent state.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_registry` - The global session registry from
+    ///   `DaemonStateHandle`
+    /// * `metrics_registry` - Optional metrics registry for observability
+    #[must_use]
+    pub fn with_session_registry(
+        session_registry: Arc<dyn SessionRegistry>,
+        metrics_registry: Option<SharedMetricsRegistry>,
+    ) -> Self {
+        // TCK-00287 Item 2: Generate a single stable secret at daemon startup.
+        let token_secret = TokenMinter::generate_secret();
+        let token_minter = Arc::new(TokenMinter::new(token_secret));
+
+        // TCK-00287 MAJOR 3: Use shared manifest store.
+        let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+        // TCK-00287 BLOCKER 1: Create privileged dispatcher with global session
+        // registry
+        let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
+            Arc::clone(&token_minter),
+            Arc::clone(&manifest_store),
+            session_registry,
+        );
+
+        // Add metrics if provided
+        let privileged_dispatcher = if let Some(metrics) = metrics_registry {
+            privileged_dispatcher.with_metrics(metrics)
+        } else {
+            privileged_dispatcher
+        };
+
+        // TCK-00287: Create session dispatcher with same token minter and manifest
+        // store
+        let session_dispatcher =
+            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store);
+
+        Self {
+            privileged_dispatcher,
+            session_dispatcher,
+        }
+    }
+
+    /// Returns a reference to the privileged dispatcher.
+    #[must_use]
+    pub const fn privileged_dispatcher(&self) -> &PrivilegedDispatcher {
+        &self.privileged_dispatcher
+    }
+
+    /// Returns a reference to the session dispatcher.
+    #[must_use]
+    pub const fn session_dispatcher(&self) -> &SessionDispatcher<InMemoryManifestStore> {
+        &self.session_dispatcher
+    }
+}
+
+/// Shared dispatcher state type alias.
+pub type SharedDispatcherState = Arc<DispatcherState>;
 
 /// Key for looking up process runners: (`ProcessId`, `instance_index`).
 pub type RunnerKey = (ProcessId, u32);

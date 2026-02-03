@@ -1062,3 +1062,197 @@ fn test_handshake_types_are_in_library() {
 
     // This test passing means the handshake handler is properly in the library
 }
+
+// ============================================================================
+// Protocol Dispatch Cutover Tests (TCK-00287)
+// ============================================================================
+
+/// IT-00287-01: JSON downgrade attempts are rejected.
+///
+/// This test verifies the acceptance criteria for TCK-00287:
+///
+/// 1. **JSON `IpcRequest` frames are rejected before `handlers::dispatch`**
+///    - Sending a JSON frame (starting with `{`) should trigger a dispatch
+///      error
+///    - The dispatcher should recognize this as an unknown message type
+///
+/// 2. **Fail-closed behavior (DD-009)**
+///    - JSON payloads must not be processed
+///    - The first byte validation rejects JSON before handler invocation
+///
+/// # Security Note
+///
+/// Per DD-009, JSON IPC is a downgrade/bypass surface. The protocol requires
+/// tag-based binary frames where the first byte is a message type tag (1-4).
+/// JSON frames starting with `{` (0x7B = 123) or `[` (0x5B = 91) are invalid
+/// message types and must be rejected.
+#[tokio::test]
+async fn protocol_dispatch_cutover_json_downgrade_rejection() {
+    use apm2_daemon::protocol::dispatch::{
+        ConnectionContext, PrivilegedDispatcher, PrivilegedMessageType,
+    };
+    use apm2_daemon::protocol::session_dispatch::{SessionDispatcher, SessionMessageType};
+    use apm2_daemon::protocol::session_token::TokenMinter;
+    use bytes::Bytes;
+
+    // Create dispatchers
+    let privileged_dispatcher = PrivilegedDispatcher::new();
+    let session_dispatcher =
+        SessionDispatcher::new(TokenMinter::new(TokenMinter::generate_secret()));
+
+    // Create privileged context (operator socket)
+    let privileged_ctx = ConnectionContext::privileged(None);
+
+    // Create session context (session socket)
+    let session_ctx = ConnectionContext::session(None, None);
+
+    // Test 1: JSON object frame `{"method":"shutdown"}` - should fail
+    let json_object_frame = Bytes::from(r#"{"method":"shutdown"}"#);
+    let result = privileged_dispatcher.dispatch(&json_object_frame, &privileged_ctx);
+
+    // First byte '{' = 123, which is not a valid PrivilegedMessageType (1-4)
+    assert!(
+        result.is_err(),
+        "JSON object frame should be rejected as unknown message type"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("unknown"),
+        "Error should indicate unknown message type: {err}"
+    );
+
+    // Test 2: JSON array frame `[1,2,3]` - should fail
+    let json_array_frame = Bytes::from(r"[1,2,3]");
+    let result = privileged_dispatcher.dispatch(&json_array_frame, &privileged_ctx);
+
+    // First byte '[' = 91, which is not a valid PrivilegedMessageType (1-4)
+    assert!(
+        result.is_err(),
+        "JSON array frame should be rejected as unknown message type"
+    );
+
+    // Test 3: Session socket with JSON - should also fail
+    let json_session_frame = Bytes::from(r#"{"session_token":"abc","tool_id":"bash"}"#);
+    let result = session_dispatcher.dispatch(&json_session_frame, &session_ctx);
+
+    assert!(
+        result.is_err(),
+        "JSON frame on session socket should be rejected"
+    );
+
+    // Test 4: Valid tag bytes are recognized (but may fail decoding without proper
+    // payload) This proves the tag validation works
+    let valid_tag_1 = Bytes::from(vec![PrivilegedMessageType::ClaimWork.tag()]);
+    let result = privileged_dispatcher.dispatch(&valid_tag_1, &privileged_ctx);
+    // This should fail during protobuf decoding, not tag validation
+    // The error message should be about decoding, not unknown message type
+    if let Err(e) = result {
+        // Should NOT contain "unknown" - the tag was valid
+        assert!(
+            !e.to_string().contains("unknown privileged message type"),
+            "Valid tag should not be reported as unknown: {e}"
+        );
+    }
+
+    let valid_tag_sess = Bytes::from(vec![SessionMessageType::RequestTool.tag()]);
+    let result = session_dispatcher.dispatch(&valid_tag_sess, &session_ctx);
+    if let Err(e) = result {
+        assert!(
+            !e.to_string().contains("unknown session message type"),
+            "Valid session tag should not be reported as unknown: {e}"
+        );
+    }
+}
+
+/// IT-00287-02: Tag-based protocol frames succeed on operator.sock and
+/// session.sock.
+///
+/// This test verifies that valid tag-based frames are routed correctly.
+/// Per TCK-00287 acceptance criteria:
+/// - Tag-based protocol frames succeed on operator.sock and session.sock
+///
+/// # Implementation Note
+///
+/// This test uses the dispatchers directly without socket I/O to verify
+/// the routing logic. Full end-to-end tests would require a running daemon.
+#[tokio::test]
+async fn protocol_dispatch_cutover_tag_routing() {
+    use apm2_daemon::protocol::dispatch::{
+        ConnectionContext, PrivilegedDispatcher, PrivilegedResponse,
+    };
+    use apm2_daemon::protocol::session_dispatch::{SessionDispatcher, SessionResponse};
+    use apm2_daemon::protocol::session_token::TokenMinter;
+
+    // Create dispatchers
+    let privileged_dispatcher = PrivilegedDispatcher::new();
+    let session_dispatcher =
+        SessionDispatcher::new(TokenMinter::new(TokenMinter::generate_secret()));
+
+    // Test 1: Privileged dispatcher rejects session connections
+    let session_ctx = ConnectionContext::session(None, None);
+    let privileged_ctx = ConnectionContext::privileged(None);
+
+    // Any frame to privileged dispatcher from session context should be denied
+    let dummy_frame = bytes::Bytes::from(vec![1u8]); // ClaimWork tag
+    let result = privileged_dispatcher.dispatch(&dummy_frame, &session_ctx);
+
+    assert!(result.is_ok(), "Dispatch should succeed at protocol level");
+    let response = result.unwrap();
+    // Should be PERMISSION_DENIED since session context can't access privileged
+    // endpoints
+    assert!(
+        matches!(response, PrivilegedResponse::Error(_)),
+        "Session context should get PERMISSION_DENIED for privileged endpoints"
+    );
+
+    // Test 2: Session dispatcher rejects operator connections
+    let result = session_dispatcher.dispatch(&dummy_frame, &privileged_ctx);
+    assert!(result.is_ok(), "Dispatch should succeed at protocol level");
+    let response = result.unwrap();
+    // Should be SESSION_ERROR_PERMISSION_DENIED since operator context can't access
+    // session endpoints
+    assert!(
+        matches!(response, SessionResponse::Error(_)),
+        "Operator context should get PERMISSION_DENIED for session endpoints"
+    );
+}
+
+/// IT-00287-03: Verify JSON byte values are outside valid tag range.
+///
+/// This test documents the security invariant that JSON start bytes
+/// are outside the valid message type tag range, ensuring fail-closed
+/// behavior without explicit JSON detection code in the dispatchers.
+#[test]
+fn protocol_dispatch_cutover_json_tag_validation() {
+    use apm2_daemon::protocol::dispatch::PrivilegedMessageType;
+    use apm2_daemon::protocol::session_dispatch::SessionMessageType;
+
+    // JSON object starts with '{' = 123 (0x7B)
+    let json_object_byte: u8 = b'{';
+    assert_eq!(json_object_byte, 123);
+
+    // JSON array starts with '[' = 91 (0x5B)
+    let json_array_byte: u8 = b'[';
+    assert_eq!(json_array_byte, 91);
+
+    // Valid privileged message types are 1-4
+    assert!(PrivilegedMessageType::from_tag(1).is_some()); // ClaimWork
+    assert!(PrivilegedMessageType::from_tag(2).is_some()); // SpawnEpisode
+    assert!(PrivilegedMessageType::from_tag(3).is_some()); // IssueCapability
+    assert!(PrivilegedMessageType::from_tag(4).is_some()); // Shutdown
+    assert!(PrivilegedMessageType::from_tag(5).is_none()); // Invalid
+    assert!(PrivilegedMessageType::from_tag(json_object_byte).is_none()); // JSON { = 123
+    assert!(PrivilegedMessageType::from_tag(json_array_byte).is_none()); // JSON [ = 91
+
+    // Valid session message types are 1-4
+    assert!(SessionMessageType::from_tag(1).is_some()); // RequestTool
+    assert!(SessionMessageType::from_tag(2).is_some()); // EmitEvent
+    assert!(SessionMessageType::from_tag(3).is_some()); // PublishEvidence
+    assert!(SessionMessageType::from_tag(4).is_some()); // StreamTelemetry
+    assert!(SessionMessageType::from_tag(5).is_none()); // Invalid
+    assert!(SessionMessageType::from_tag(json_object_byte).is_none()); // JSON { = 123
+    assert!(SessionMessageType::from_tag(json_array_byte).is_none()); // JSON [ = 91
+
+    // This structural property ensures JSON frames are rejected without
+    // needing explicit JSON detection - they simply fail tag validation.
+}

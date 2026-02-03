@@ -143,6 +143,7 @@ prometheus = "0.14"
 
 # Internal crates
 apm2-core = { version = "0.3.0", path = "crates/apm2-core" }
+apm2-daemon = { version = "0.3.0", path = "crates/apm2-daemon" }
 apm2-holon = { version = "0.3.0", path = "crates/apm2-holon" }
 
 [workspace.lints.rust]

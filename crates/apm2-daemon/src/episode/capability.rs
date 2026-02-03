@@ -709,6 +709,70 @@ impl CapabilityManifest {
         CapabilityManifestBuilder::new(manifest_id)
     }
 
+    /// Creates a stub manifest from a capability manifest hash.
+    ///
+    /// # TCK-00287
+    ///
+    /// This method creates a minimal manifest with the given hash as the ID and
+    /// a default permissive tool allowlist for stub/testing purposes. In
+    /// production, the full manifest should be obtained from the governance
+    /// holon via `PolicyResolver`.
+    ///
+    /// # Arguments
+    ///
+    /// * `capability_manifest_hash` - The BLAKE3 hash of the capability
+    ///   manifest
+    /// * `tool_allowlist` - The list of tool classes allowed for this session
+    ///
+    /// # Security Note
+    ///
+    /// This method is intended for the stub implementation path. Production
+    /// deployments should populate the manifest from the resolved policy.
+    #[must_use]
+    pub fn from_hash_with_allowlist(
+        capability_manifest_hash: &[u8; 32],
+        tool_allowlist: Vec<ToolClass>,
+    ) -> Self {
+        let manifest_id = format!("M-{}", hex::encode(&capability_manifest_hash[..8]));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+
+        Self {
+            manifest_id,
+            capabilities: Vec::new(),
+            delegator_id: "daemon".to_string(),
+            created_at: now,
+            expires_at: 0, // No expiration
+            tool_allowlist,
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
+        }
+    }
+
+    /// Creates a stub manifest from a capability manifest hash with default
+    /// tool allowlist.
+    ///
+    /// # TCK-00287
+    ///
+    /// This method creates a minimal manifest with an empty tool allowlist
+    /// by default (fail-closed).
+    ///
+    /// # Security Note
+    ///
+    /// The default allowlist is empty (fail-closed) to ensure no implicit
+    /// privileges are granted. Production deployments should use
+    /// `from_hash_with_allowlist` with the actual allowlist from the
+    /// resolved policy.
+    #[must_use]
+    pub fn from_hash_with_default_allowlist(capability_manifest_hash: &[u8; 32]) -> Self {
+        // Default allowlist for stub implementation
+        // Empty by default (fail-closed)
+        let tool_allowlist = Vec::new();
+        Self::from_hash_with_allowlist(capability_manifest_hash, tool_allowlist)
+    }
+
     /// Validates the manifest structure.
     ///
     /// # Errors

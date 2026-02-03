@@ -341,6 +341,10 @@ pub struct SpawnEpisodeResponse {
     /// Ephemeral handle for session identification (not a credential).
     #[prost(string, tag = "4")]
     pub ephemeral_handle: ::prost::alloc::string::String,
+    /// HMAC-signed session token for authenticating session-scoped IPC requests.
+    /// TCK-00287: Required for clients to access session endpoints.
+    #[prost(string, tag = "5")]
+    pub session_token: ::prost::alloc::string::String,
 }
 /// IPC-PRIV-003: IssueCapability
 /// Issue additional capability to an existing session.

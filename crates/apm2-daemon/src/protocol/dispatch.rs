@@ -28,6 +28,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use prost::Message;
@@ -41,9 +42,11 @@ use super::messages::{
     IssueCapabilityResponse, PrivilegedError, PrivilegedErrorCode, ShutdownRequest,
     ShutdownResponse, SpawnEpisodeRequest, SpawnEpisodeResponse, WorkRole,
 };
+use super::session_dispatch::InMemoryManifestStore;
+use super::session_token::TokenMinter;
 use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
-    CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
+    CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
     LeaseIssueDenialReason, validate_custody_domain_overlap,
 };
 use crate::metrics::SharedMetricsRegistry;
@@ -1211,6 +1214,18 @@ pub struct PrivilegedDispatcher {
     /// Lease validator for `GATE_EXECUTOR` spawn validation (TCK-00257).
     lease_validator: Arc<dyn LeaseValidator>,
 
+    /// Token minter for session token generation (TCK-00287).
+    ///
+    /// Shared with `SessionDispatcher` to ensure tokens minted during
+    /// `SpawnEpisode` can be validated on session endpoints.
+    token_minter: Arc<TokenMinter>,
+
+    /// Manifest store for capability manifest registration (TCK-00287).
+    ///
+    /// Shared with `SessionDispatcher` so that manifests registered during
+    /// `SpawnEpisode` are accessible for tool request validation.
+    manifest_store: Arc<InMemoryManifestStore>,
+
     /// Prometheus metrics registry for daemon health observability (TCK-00268).
     ///
     /// When present, the dispatcher emits metrics for:
@@ -1241,11 +1256,18 @@ impl Default for PrivilegedDispatcher {
     }
 }
 
+/// Default session token TTL (1 hour).
+///
+/// Per RFC-0017, session tokens should have a reasonable TTL that matches
+/// lease expiration. 1 hour is a sensible default for development.
+pub const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 3600;
+
 impl PrivilegedDispatcher {
     /// Creates a new dispatcher with default decode configuration.
     ///
     /// Uses stub implementations for policy resolver, work registry, event
     /// emitter, session registry, and lease validator. No metrics are emitted.
+    /// Creates internal stub token minter and manifest store for testing.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1256,6 +1278,8 @@ impl PrivilegedDispatcher {
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
+            token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
+            manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
         }
     }
@@ -1264,6 +1288,7 @@ impl PrivilegedDispatcher {
     ///
     /// Uses stub implementations for policy resolver, work registry, event
     /// emitter, session registry, and lease validator. No metrics are emitted.
+    /// Creates internal stub token minter and manifest store for testing.
     #[must_use]
     pub fn with_decode_config(decode_config: DecodeConfig) -> Self {
         Self {
@@ -1274,6 +1299,8 @@ impl PrivilegedDispatcher {
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
+            token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
+            manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
         }
     }
@@ -1282,6 +1309,7 @@ impl PrivilegedDispatcher {
     ///
     /// This is the production constructor for real governance integration.
     /// Does not include metrics; use `with_metrics` to add them.
+    /// Creates internal stub token minter and manifest store.
     #[must_use]
     pub fn with_dependencies(
         decode_config: DecodeConfig,
@@ -1300,6 +1328,40 @@ impl PrivilegedDispatcher {
             episode_runtime,
             session_registry,
             lease_validator,
+            token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
+            manifest_store: Arc::new(InMemoryManifestStore::new()),
+            metrics: None,
+        }
+    }
+
+    /// Creates a new dispatcher with shared token minter and manifest store.
+    ///
+    /// # TCK-00287
+    ///
+    /// This constructor is used by `DispatcherState` to wire up shared
+    /// dependencies between `PrivilegedDispatcher` and `SessionDispatcher`:
+    /// - `token_minter`: Ensures tokens minted during `SpawnEpisode` can be
+    ///   validated by `SessionDispatcher`
+    /// - `manifest_store`: Ensures capability manifests registered during
+    ///   `SpawnEpisode` are accessible for tool request validation
+    /// - `session_registry`: Uses the global daemon session registry instead of
+    ///   an internal stub
+    #[must_use]
+    pub fn with_shared_state(
+        token_minter: Arc<TokenMinter>,
+        manifest_store: Arc<InMemoryManifestStore>,
+        session_registry: Arc<dyn SessionRegistry>,
+    ) -> Self {
+        Self {
+            decode_config: DecodeConfig::default(),
+            policy_resolver: Arc::new(StubPolicyResolver),
+            work_registry: Arc::new(StubWorkRegistry::default()),
+            event_emitter: Arc::new(StubLedgerEventEmitter::new()),
+            episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
+            session_registry,
+            lease_validator: Arc::new(StubLeaseValidator::new()),
+            token_minter,
+            manifest_store,
             metrics: None,
         }
     }
@@ -1352,6 +1414,26 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn lease_validator(&self) -> &Arc<dyn LeaseValidator> {
         &self.lease_validator
+    }
+
+    /// Returns a reference to the token minter.
+    ///
+    /// # TCK-00287
+    ///
+    /// This is used to share the token minter with `SessionDispatcher`.
+    #[must_use]
+    pub const fn token_minter(&self) -> &Arc<TokenMinter> {
+        &self.token_minter
+    }
+
+    /// Returns a reference to the manifest store.
+    ///
+    /// # TCK-00287
+    ///
+    /// This is used to share the manifest store with `SessionDispatcher`.
+    #[must_use]
+    pub const fn manifest_store(&self) -> &Arc<InMemoryManifestStore> {
+        &self.manifest_store
     }
 
     // =========================================================================
@@ -2026,6 +2108,53 @@ impl PrivilegedDispatcher {
             "Session persisted"
         );
 
+        // TCK-00287 BLOCKER 2: Generate session token for client authentication
+        // The token is HMAC-signed and bound to this session's lease_id.
+        let spawn_time = SystemTime::now();
+        let ttl = Duration::from_secs(DEFAULT_SESSION_TOKEN_TTL_SECS);
+        let session_token =
+            match self
+                .token_minter
+                .mint(&session_id, &claim.lease_id, spawn_time, ttl)
+            {
+                Ok(token) => token,
+                Err(e) => {
+                    warn!(error = %e, "Session token minting failed");
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("session token generation failed: {e}"),
+                    ));
+                },
+            };
+
+        // Serialize the token to JSON for inclusion in the response
+        let session_token_json = match serde_json::to_string(&session_token) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!(error = %e, "Session token serialization failed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("session token serialization failed: {e}"),
+                ));
+            },
+        };
+
+        // TCK-00287 MAJOR 3: Register capability manifest in shared store
+        // This allows SessionDispatcher to validate tool requests for this session.
+        // The manifest is constructed from the policy resolution's capability manifest
+        // hash. Note: This uses the stub implementation with an empty
+        // (fail-closed) allowlist. In production, the actual allowlist should
+        // flow through PolicyResolution.
+        let manifest = CapabilityManifest::from_hash_with_default_allowlist(
+            &claim.policy_resolution.capability_manifest_hash,
+        );
+        self.manifest_store.register(&session_id, manifest);
+
+        debug!(
+            session_id = %session_id,
+            "Capability manifest registered in shared store"
+        );
+
         // TCK-00268: Emit session_spawned metric
         if let Some(ref metrics) = self.metrics {
             let role_str = match request_role {
@@ -2043,6 +2172,7 @@ impl PrivilegedDispatcher {
             ephemeral_handle: ephemeral_handle.to_string(),
             capability_manifest_hash: claim.policy_resolution.capability_manifest_hash.to_vec(),
             context_pack_sealed: true,
+            session_token: session_token_json,
         }))
     }
 
