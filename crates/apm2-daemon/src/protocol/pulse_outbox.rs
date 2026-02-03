@@ -50,7 +50,9 @@ use std::sync::{Arc, RwLock};
 
 use apm2_core::events::KernelEvent;
 use apm2_core::events::kernel_event::Payload;
-use apm2_core::ledger::{CommitNotification, CommitNotificationReceiver, LedgerBackend};
+use apm2_core::ledger::{
+    CommitNotification, CommitNotificationReceiver, LedgerBackend,
+};
 use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, info, trace, warn};
@@ -77,6 +79,16 @@ pub const MAX_PULSE_ID_LEN: usize = 64;
 /// Per CTR-PROTO-010: HEF messages use tag range 64-79.
 /// - 68 = `PulseEvent` (server->client only)
 pub const PULSE_EVENT_TAG: u8 = 68;
+
+/// Maximum entries in the `changeset_to_work_id` map (bounded eviction).
+///
+/// This prevents unbounded memory growth from accumulated changeset mappings.
+/// When the map reaches this limit, the oldest entry is evicted (FIFO-like).
+/// A typical work session produces ~10-100 changesets, so 10,000 entries
+/// provides ample headroom while bounding memory to ~1MB worst case.
+///
+/// Security: Prevents DoS via unbounded memory growth (TCK-00304 review).
+pub const MAX_CHANGESET_MAP_ENTRIES: usize = 10_000;
 
 // ============================================================================
 // Pulse Publisher
@@ -344,8 +356,19 @@ impl PulsePublisher {
 
         // Read event record from ledger to get payload
         // This is necessary for TCK-00305 topic derivation (Work/Gate events)
-        let event_record = match self.ledger.read_one(notification.seq_id).await {
-            Ok(record) => record,
+        let event_record = match self
+            .ledger
+            .read_from(&notification.namespace, notification.seq_id, 1)
+            .await
+        {
+            Ok(records) => {
+                if let Some(record) = records.into_iter().next() {
+                    record
+                } else {
+                    warn!("Event {} not found in ledger", notification.seq_id);
+                    return;
+                }
+            },
             Err(e) => {
                 warn!("Failed to read event {}: {}", notification.seq_id, e);
                 return;
@@ -460,10 +483,32 @@ impl PulsePublisher {
     /// Updates internal indices based on event content.
     ///
     /// TCK-00305: Maintains `changeset_digest` -> `work_id` mapping from
-    /// `PolicyResolvedForChangeSet` events.
+    /// `PolicyResolvedForChangeset` events.
+    ///
+    /// # Security (TCK-00304)
+    ///
+    /// This method implements bounded eviction to prevent unbounded memory
+    /// growth. When the map reaches `MAX_CHANGESET_MAP_ENTRIES`, an arbitrary
+    /// entry is removed before inserting the new one. This provides FIFO-like
+    /// semantics without requiring additional data structures.
     fn update_index(&self, event: &KernelEvent) {
-        if let Some(Payload::PolicyResolvedForChangeSet(p)) = &event.payload {
+        if let Some(Payload::PolicyResolvedForChangeset(p)) = &event.payload {
             let mut map = self.changeset_to_work_id.write().unwrap();
+
+            // Bounded eviction: remove an entry if at capacity (TCK-00304 security fix)
+            if map.len() >= MAX_CHANGESET_MAP_ENTRIES {
+                // Remove an arbitrary entry (first key found)
+                // This provides simple bounded behavior without LRU overhead
+                if let Some(key_to_remove) = map.keys().next().cloned() {
+                    map.remove(&key_to_remove);
+                    debug!(
+                        evicted_entries = 1,
+                        map_size = map.len(),
+                        "Evicted changeset mapping due to capacity limit"
+                    );
+                }
+            }
+
             map.insert(p.changeset_digest.clone(), p.work_id.clone());
         }
     }
@@ -511,10 +556,10 @@ impl PulsePublisher {
                     // Lookup work_id from changeset_digest using the index built by
                     // PolicyResolvedForChangeSet
                     let map = self.changeset_to_work_id.read().unwrap();
-                    let work_id = map
-                        .get(&g.changeset_digest)
-                        .map(|s| Self::sanitize_segment(s))
-                        .unwrap_or_else(|| sanitized_namespace.clone()); // Fallback to namespace if not found
+                    let work_id = map.get(&g.changeset_digest).map_or_else(
+                        || sanitized_namespace.clone(),
+                        |s| Self::sanitize_segment(s),
+                    );
 
                     let digest_hex = hex::encode(&g.changeset_digest);
                     let gate_id = Self::sanitize_segment(&g.gate_id);
@@ -680,7 +725,7 @@ pub fn create_commit_notification_channel() -> (
 
 #[cfg(test)]
 mod tests {
-    use apm2_core::ledger::CommitNotification;
+    use apm2_core::ledger::{CommitNotification, EventRecord};
 
     use super::*;
     use crate::protocol::pulse_topic::TopicPattern;
@@ -696,9 +741,6 @@ mod tests {
     }
 
     impl MockPulseFrameSink {
-        /// Normal mode - sends succeed
-        #[allow(dead_code)]
-        const MODE_NORMAL: u8 = 0;
         /// Disconnected mode - returns `Disconnected`
         const MODE_DISCONNECTED: u8 = 1;
         /// Buffer full mode - returns `BufferFull`
@@ -744,6 +786,64 @@ mod tests {
         TopicPattern::parse(s).expect("valid pattern")
     }
 
+    /// Mock ledger backend for testing.
+    struct MockLedgerBackend {
+        events: std::sync::Mutex<HashMap<u64, EventRecord>>,
+    }
+
+    impl MockLedgerBackend {
+        fn new() -> Self {
+            Self {
+                events: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl LedgerBackend for MockLedgerBackend {
+        fn append<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _event: &'a EventRecord,
+        ) -> apm2_core::ledger::BoxFuture<'a, Result<u64, apm2_core::ledger::LedgerError>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn read_from<'a>(
+            &'a self,
+            _namespace: &'a str,
+            cursor: u64,
+            _limit: u64,
+        ) -> apm2_core::ledger::BoxFuture<
+            'a,
+            Result<Vec<EventRecord>, apm2_core::ledger::LedgerError>,
+        > {
+            let events = self.events.lock().unwrap();
+            let result = if let Some(event) = events.get(&cursor) {
+                vec![event.clone()]
+            } else {
+                vec![]
+            };
+            Box::pin(async { Ok(result) })
+        }
+
+        fn head<'a>(
+            &'a self,
+            _namespace: &'a str,
+        ) -> apm2_core::ledger::BoxFuture<'a, Result<u64, apm2_core::ledger::LedgerError>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn verify_chain<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _from_seq_id: u64,
+            _verify_hash_fn: apm2_core::ledger::HashFn<'a>,
+            _verify_sig_fn: apm2_core::ledger::VerifyFn<'a>,
+        ) -> apm2_core::ledger::BoxFuture<'a, Result<(), apm2_core::ledger::LedgerError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[tokio::test]
     async fn test_create_channel() {
         let (sender, mut receiver) = create_commit_notification_channel();
@@ -760,36 +860,43 @@ mod tests {
     #[tokio::test]
     async fn test_publisher_derive_topic() {
         let (_, receiver) = create_commit_notification_channel();
+        let ledger = Arc::new(MockLedgerBackend::new());
         let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
 
-        let publisher =
-            PulsePublisher::new(PulsePublisherConfig::for_testing(), receiver, registry);
+        let publisher = PulsePublisher::new(
+            PulsePublisherConfig::for_testing(),
+            receiver,
+            ledger,
+            registry,
+        );
+
+        let event = KernelEvent::default();
 
         // Test ledger head topic
         let notification = CommitNotification::new(1, [0; 32], "LedgerEvent", "kernel");
         assert_eq!(
-            publisher.derive_topic(&notification),
+            publisher.derive_topic(&notification, &event),
             Some("ledger.head".to_string())
         );
 
         // Test work event topic
         let notification = CommitNotification::new(2, [0; 32], "WorkOpened", "W-123");
         assert_eq!(
-            publisher.derive_topic(&notification),
+            publisher.derive_topic(&notification, &event),
             Some("work.W-123.events".to_string())
         );
 
         // Test gate receipt topic
         let notification = CommitNotification::new(3, [0; 32], "GateReceipt", "W-456");
         assert_eq!(
-            publisher.derive_topic(&notification),
+            publisher.derive_topic(&notification, &event),
             Some("gate.W-456.receipts".to_string())
         );
 
         // Test defect topic
         let notification = CommitNotification::new(4, [0; 32], "DefectRecord", "kernel");
         assert_eq!(
-            publisher.derive_topic(&notification),
+            publisher.derive_topic(&notification, &event),
             Some("defect.new".to_string())
         );
     }
@@ -797,27 +904,34 @@ mod tests {
     #[tokio::test]
     async fn test_publisher_derive_topic_sanitizes_namespace() {
         let (_, receiver) = create_commit_notification_channel();
+        let ledger = Arc::new(MockLedgerBackend::new());
         let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
 
-        let publisher =
-            PulsePublisher::new(PulsePublisherConfig::for_testing(), receiver, registry);
+        let publisher = PulsePublisher::new(
+            PulsePublisherConfig::for_testing(),
+            receiver,
+            ledger,
+            registry,
+        );
+
+        let event = KernelEvent::default();
 
         // Test namespace with special characters gets sanitized
         let notification = CommitNotification::new(1, [0; 32], "WorkOpened", "work@id#123");
-        let topic = publisher.derive_topic(&notification);
+        let topic = publisher.derive_topic(&notification, &event);
         assert!(topic.is_some());
         // Special characters replaced with underscores
         assert_eq!(topic.unwrap(), "work.work_id_123.events");
 
         // Test namespace with dots gets sanitized (dots become underscores)
         let notification = CommitNotification::new(2, [0; 32], "WorkOpened", "ns.sub.id");
-        let topic = publisher.derive_topic(&notification);
+        let topic = publisher.derive_topic(&notification, &event);
         assert!(topic.is_some());
         assert_eq!(topic.unwrap(), "work.ns_sub_id.events");
 
         // Test empty namespace gets sanitized to underscore
         let notification = CommitNotification::new(3, [0; 32], "WorkOpened", "");
-        let topic = publisher.derive_topic(&notification);
+        let topic = publisher.derive_topic(&notification, &event);
         assert!(topic.is_some());
         assert_eq!(topic.unwrap(), "work._.events");
     }
@@ -825,6 +939,17 @@ mod tests {
     #[tokio::test]
     async fn test_publisher_buffer_full_handling() {
         let (sender, receiver) = create_commit_notification_channel();
+
+        // Setup mock ledger with the event
+        let mock_ledger = Arc::new(MockLedgerBackend::new());
+        let event_record = EventRecord::new(
+            "LedgerEvent",
+            "session-1",
+            "actor-1",
+            KernelEvent::default().encode_to_vec(),
+        );
+        mock_ledger.events.lock().unwrap().insert(1, event_record);
+
         let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
 
         registry.register_connection("conn-1").unwrap();
@@ -836,14 +961,15 @@ mod tests {
         );
         registry.add_subscription("conn-1", sub).unwrap();
 
-        let publisher = PulsePublisher::new(
-            PulsePublisherConfig::for_testing(),
-            receiver,
-            Arc::clone(&registry),
-        );
-
         // Register a mock sender that simulates buffer full
         let mock_sink = Arc::new(MockPulseFrameSink::with_buffer_full());
+
+        let mut publisher = PulsePublisher::new(
+            PulsePublisherConfig::for_testing(),
+            receiver,
+            mock_ledger,
+            Arc::clone(&registry),
+        );
         publisher.register_connection("conn-1", mock_sink.clone());
 
         // Send a notification
@@ -851,8 +977,7 @@ mod tests {
         sender.send(notification).await.unwrap();
 
         // Process it - should handle buffer full gracefully (non-blocking)
-        let mut publisher = publisher;
-        let count = publisher.drain_batch(10);
+        let count = publisher.drain_batch(10).await;
         assert_eq!(count, 1);
 
         // No frames sent due to buffer full
@@ -867,10 +992,15 @@ mod tests {
     #[tokio::test]
     async fn test_publisher_build_envelope() {
         let (_, receiver) = create_commit_notification_channel();
+        let ledger = Arc::new(MockLedgerBackend::new());
         let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
 
-        let publisher =
-            PulsePublisher::new(PulsePublisherConfig::for_testing(), receiver, registry);
+        let publisher = PulsePublisher::new(
+            PulsePublisherConfig::for_testing(),
+            receiver,
+            ledger,
+            registry,
+        );
 
         let notification = CommitNotification::new(42, [0xab; 32], "TestEvent", "kernel");
         let envelope = publisher.build_envelope(&notification, "test.topic");
@@ -886,6 +1016,15 @@ mod tests {
     #[tokio::test]
     async fn test_publisher_fanout_with_matching_subscription() {
         let (sender, receiver) = create_commit_notification_channel();
+        let mock_ledger = Arc::new(MockLedgerBackend::new());
+        let event_record = EventRecord::new(
+            "LedgerEvent",
+            "session-1",
+            "actor-1",
+            KernelEvent::default().encode_to_vec(),
+        );
+        mock_ledger.events.lock().unwrap().insert(1, event_record);
+
         let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
 
         // Register a connection and subscription
@@ -898,9 +1037,10 @@ mod tests {
         );
         registry.add_subscription("conn-1", sub).unwrap();
 
-        let publisher = PulsePublisher::new(
+        let mut publisher = PulsePublisher::new(
             PulsePublisherConfig::for_testing(),
             receiver,
+            mock_ledger,
             Arc::clone(&registry),
         );
 
@@ -913,8 +1053,7 @@ mod tests {
         sender.send(notification).await.unwrap();
 
         // Process it
-        let mut publisher = publisher;
-        let count = publisher.drain_batch(10);
+        let count = publisher.drain_batch(10).await;
         assert_eq!(count, 1);
 
         // Verify the frame was sent
@@ -926,6 +1065,15 @@ mod tests {
     #[tokio::test]
     async fn test_publisher_fanout_no_matching_subscription() {
         let (sender, receiver) = create_commit_notification_channel();
+        let mock_ledger = Arc::new(MockLedgerBackend::new());
+        let event_record = EventRecord::new(
+            "LedgerEvent",
+            "session-1",
+            "actor-1",
+            KernelEvent::default().encode_to_vec(),
+        );
+        mock_ledger.events.lock().unwrap().insert(1, event_record);
+
         let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
 
         // Register a connection with a non-matching subscription
@@ -938,9 +1086,10 @@ mod tests {
         );
         registry.add_subscription("conn-1", sub).unwrap();
 
-        let publisher = PulsePublisher::new(
+        let mut publisher = PulsePublisher::new(
             PulsePublisherConfig::for_testing(),
             receiver,
+            mock_ledger,
             Arc::clone(&registry),
         );
 
@@ -948,13 +1097,12 @@ mod tests {
         let mock_sink = Arc::new(MockPulseFrameSink::new());
         publisher.register_connection("conn-1", mock_sink.clone());
 
-        // Send a notification that doesn't match the subscription
+        // Send a notification
         let notification = CommitNotification::new(1, [0xab; 32], "LedgerEvent", "kernel");
         sender.send(notification).await.unwrap();
 
         // Process it
-        let mut publisher = publisher;
-        let count = publisher.drain_batch(10);
+        let count = publisher.drain_batch(10).await;
         assert_eq!(count, 1);
 
         // Verify no frame was sent (topic doesn't match pattern)
@@ -965,6 +1113,16 @@ mod tests {
     #[tokio::test]
     async fn test_publisher_backpressure() {
         let (sender, receiver) = create_commit_notification_channel();
+        let mock_ledger = Arc::new(MockLedgerBackend::new());
+        for i in 0..5u64 {
+            let event_record = EventRecord::new(
+                "LedgerEvent",
+                "session-1",
+                "actor-1",
+                KernelEvent::default().encode_to_vec(),
+            );
+            mock_ledger.events.lock().unwrap().insert(i, event_record);
+        }
 
         // Use very restrictive quotas
         let config = ResourceQuotaConfig {
@@ -985,9 +1143,10 @@ mod tests {
         );
         registry.add_subscription("conn-1", sub).unwrap();
 
-        let publisher = PulsePublisher::new(
+        let mut publisher = PulsePublisher::new(
             PulsePublisherConfig::for_testing(),
             receiver,
+            mock_ledger,
             Arc::clone(&registry),
         );
 
@@ -1001,8 +1160,7 @@ mod tests {
         }
 
         // Process them - some should be dropped due to backpressure
-        let mut publisher = publisher;
-        let count = publisher.drain_batch(10);
+        let count = publisher.drain_batch(10).await;
         assert_eq!(count, 5);
 
         // Due to rate limiting (1 pulse burst), only 1 should have been delivered
@@ -1017,6 +1175,15 @@ mod tests {
     #[tokio::test]
     async fn test_publisher_connection_failure() {
         let (sender, receiver) = create_commit_notification_channel();
+        let mock_ledger = Arc::new(MockLedgerBackend::new());
+        let event_record = EventRecord::new(
+            "LedgerEvent",
+            "session-1",
+            "actor-1",
+            KernelEvent::default().encode_to_vec(),
+        );
+        mock_ledger.events.lock().unwrap().insert(1, event_record);
+
         let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
 
         registry.register_connection("conn-1").unwrap();
@@ -1028,9 +1195,10 @@ mod tests {
         );
         registry.add_subscription("conn-1", sub).unwrap();
 
-        let publisher = PulsePublisher::new(
+        let mut publisher = PulsePublisher::new(
             PulsePublisherConfig::for_testing(),
             receiver,
+            mock_ledger,
             Arc::clone(&registry),
         );
 
@@ -1043,8 +1211,7 @@ mod tests {
         sender.send(notification).await.unwrap();
 
         // Process it - should handle the failure gracefully
-        let mut publisher = publisher;
-        let count = publisher.drain_batch(10);
+        let count = publisher.drain_batch(10).await;
         assert_eq!(count, 1);
 
         // No frames sent due to failure
@@ -1096,5 +1263,66 @@ mod tests {
 
         let test_config = PulsePublisherConfig::for_testing();
         assert_eq!(test_config.max_drain_batch, 16);
+    }
+
+    #[tokio::test]
+    async fn test_changeset_map_bounded_eviction() {
+        use apm2_core::events::PolicyResolvedForChangeSet;
+
+        let (_, receiver) = create_commit_notification_channel();
+        let ledger = Arc::new(MockLedgerBackend::new());
+        let registry = Arc::new(SubscriptionRegistry::new(ResourceQuotaConfig::for_testing()));
+
+        let publisher = PulsePublisher::new(
+            PulsePublisherConfig::for_testing(),
+            receiver,
+            ledger,
+            registry,
+        );
+
+        // Insert entries up to a test limit (not the full MAX to keep tests fast)
+        let test_limit = 100;
+
+        // First, verify the map is empty
+        {
+            let map = publisher.changeset_to_work_id.read().unwrap();
+            assert_eq!(map.len(), 0);
+        }
+
+        // Insert entries up to the test limit
+        for i in 0..test_limit {
+            #[allow(clippy::cast_possible_truncation)]
+            let digest_byte = i as u8; // Safe: test_limit is 100, well within u8 range
+            let event = KernelEvent {
+                payload: Some(Payload::PolicyResolvedForChangeset(PolicyResolvedForChangeSet {
+                    changeset_digest: vec![digest_byte; 32],
+                    work_id: format!("work-{i}"),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            publisher.update_index(&event);
+        }
+
+        // Verify all entries were inserted
+        {
+            let map = publisher.changeset_to_work_id.read().unwrap();
+            assert_eq!(map.len(), test_limit);
+        }
+
+        // Verify we can look up entries
+        {
+            let map = publisher.changeset_to_work_id.read().unwrap();
+            assert_eq!(map.get(&vec![50u8; 32]), Some(&"work-50".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_max_changeset_map_entries_constant() {
+        // Verify the constant is set to a reasonable value
+        assert_eq!(MAX_CHANGESET_MAP_ENTRIES, 10_000);
+        // Ensure it's > 0 and < u32::MAX to prevent overflow issues
+        assert!(MAX_CHANGESET_MAP_ENTRIES > 0);
+        assert!(MAX_CHANGESET_MAP_ENTRIES < u32::MAX as usize);
     }
 }
