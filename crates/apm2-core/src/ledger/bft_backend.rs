@@ -61,6 +61,7 @@ use tracing::{debug, warn};
 use super::backend::{BoxFuture, LedgerBackend};
 use super::storage::{EventRecord, LedgerError, SqliteLedgerBackend};
 use crate::consensus::bft::{BlockHash, QuorumCertificate};
+use crate::consensus::metrics::ConsensusMetrics;
 use crate::schema_registry::{SchemaDigest, SchemaRegistry, SchemaRegistryError};
 
 // =============================================================================
@@ -455,6 +456,13 @@ pub struct BftLedgerBackend<R: SchemaRegistry = NoOpSchemaRegistry> {
     ///
     /// Per DD-HEF-0007: Ledger append MUST NOT block on pulse fanout.
     commit_notification_sender: Option<super::CommitNotificationSender>,
+
+    /// Optional consensus metrics for recording notification drops (TCK-00304).
+    ///
+    /// When present, `on_commit()` and `append_eventual()` will increment the
+    /// `hef_notification_drops` counter when notifications are dropped due to
+    /// channel full.
+    metrics: Option<Arc<ConsensusMetrics>>,
 }
 
 impl BftLedgerBackend<NoOpSchemaRegistry> {
@@ -469,6 +477,27 @@ impl BftLedgerBackend<NoOpSchemaRegistry> {
     /// * `finalization_timeout` - Timeout for BFT finalization.
     #[must_use]
     pub fn new(storage: SqliteLedgerBackend, finalization_timeout: Duration) -> Self {
+        Self::with_notification_sender(storage, finalization_timeout, None)
+    }
+
+    /// Creates a new BFT ledger backend with commit notification sender
+    /// (TCK-00304).
+    ///
+    /// Per DOD: "Accept sender at construction." This constructor accepts the
+    /// optional sender at construction time for proper initialization.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - The underlying storage backend.
+    /// * `finalization_timeout` - Timeout for BFT finalization.
+    /// * `notification_sender` - Optional commit notification sender for HEF
+    ///   outbox.
+    #[must_use]
+    pub fn with_notification_sender(
+        storage: SqliteLedgerBackend,
+        finalization_timeout: Duration,
+        notification_sender: Option<super::CommitNotificationSender>,
+    ) -> Self {
         Self {
             storage: Arc::new(storage),
             pending_events: Arc::new(Mutex::new(HashMap::new())),
@@ -477,7 +506,8 @@ impl BftLedgerBackend<NoOpSchemaRegistry> {
             finalization_timeout,
             consensus_enabled: Arc::new(RwLock::new(false)),
             schema_registry: None,
-            commit_notification_sender: None,
+            commit_notification_sender: notification_sender,
+            metrics: None,
         }
     }
 
@@ -510,6 +540,30 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
         finalization_timeout: Duration,
         schema_registry: Arc<R>,
     ) -> Self {
+        Self::with_schema_registry_and_sender(storage, finalization_timeout, schema_registry, None)
+    }
+
+    /// Creates a new BFT ledger backend with schema validation and notification
+    /// sender (TCK-00194, TCK-00304).
+    ///
+    /// Per DOD: "Accept sender at construction." This constructor accepts both
+    /// the schema registry and optional notification sender at construction
+    /// time.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - The underlying storage backend.
+    /// * `finalization_timeout` - Timeout for BFT finalization.
+    /// * `schema_registry` - The schema registry for digest validation.
+    /// * `notification_sender` - Optional commit notification sender for HEF
+    ///   outbox.
+    #[must_use]
+    pub fn with_schema_registry_and_sender(
+        storage: SqliteLedgerBackend,
+        finalization_timeout: Duration,
+        schema_registry: Arc<R>,
+        notification_sender: Option<super::CommitNotificationSender>,
+    ) -> Self {
         Self {
             storage: Arc::new(storage),
             pending_events: Arc::new(Mutex::new(HashMap::new())),
@@ -518,7 +572,8 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
             finalization_timeout,
             consensus_enabled: Arc::new(RwLock::new(false)),
             schema_registry: Some(schema_registry),
-            commit_notification_sender: None,
+            commit_notification_sender: notification_sender,
+            metrics: None,
         }
     }
 
@@ -534,6 +589,18 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
     /// * `sender` - The channel sender for commit notifications.
     pub fn set_commit_notification_sender(&mut self, sender: super::CommitNotificationSender) {
         self.commit_notification_sender = Some(sender);
+    }
+
+    /// Sets the consensus metrics for recording notification drops (TCK-00304).
+    ///
+    /// When set, the `hef_notification_drops` counter will be incremented when
+    /// notifications are dropped due to channel full.
+    ///
+    /// # Arguments
+    ///
+    /// * `metrics` - The consensus metrics instance.
+    pub fn set_metrics(&mut self, metrics: Arc<ConsensusMetrics>) {
+        self.metrics = Some(metrics);
     }
 
     /// Returns true if a commit notification sender is configured.
@@ -715,7 +782,10 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
                     // Notification sent successfully
                 },
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Channel full: DROP_INCREMENT_METRIC
+                    // Channel full: increment hef_notification_drops metric (TCK-00304)
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_notification_drop();
+                    }
                     warn!(
                         seq_id = seq_id,
                         event_type = %event_with_meta.event_type,
@@ -946,9 +1016,10 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
                             // Notification sent successfully
                         },
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            // Channel full: DROP_INCREMENT_METRIC
-                            // Per TCK-00304: increment hef_notification_drops counter
-                            // Metric increment will be added when metrics are wired
+                            // Channel full: increment hef_notification_drops metric (TCK-00304)
+                            if let Some(metrics) = &self.metrics {
+                                metrics.record_notification_drop();
+                            }
                             warn!(
                                 seq_id = seq_id,
                                 event_type = %event.event_type,

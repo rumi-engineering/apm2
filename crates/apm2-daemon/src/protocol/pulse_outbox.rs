@@ -45,17 +45,20 @@
 //! - **Reorder**: Allowed; authoritative ordering is ledger cursor.
 //! - **Duplication**: Allowed; consumer dedupes by pulse_id + ledger_cursor.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
-use apm2_core::ledger::{CommitNotification, CommitNotificationReceiver};
+use apm2_core::events::KernelEvent;
+use apm2_core::events::kernel_event::Payload;
+use apm2_core::ledger::{CommitNotification, CommitNotificationReceiver, LedgerBackend};
 use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use super::messages::{EntityRef, PulseEnvelopeV1, PulseEvent};
-use super::pulse_topic::{MAX_TOPIC_LEN, validate_topic};
-use super::resource_governance::{DropPriority, SharedSubscriptionRegistry};
+use super::pulse_topic::{MAX_SEGMENT_LEN, validate_topic};
+use super::resource_governance::SharedSubscriptionRegistry;
 
 // ============================================================================
 // Constants
@@ -124,6 +127,12 @@ pub struct PulsePublisher {
     /// Commit notification receiver from ledger.
     receiver: CommitNotificationReceiver,
 
+    /// Ledger backend for reading event payloads (TCK-00305).
+    ///
+    /// Required to extract `work_id` and `changeset_digest` for topic
+    /// derivation.
+    ledger: Arc<dyn LedgerBackend>,
+
     /// Shared subscription registry for ACL filtering and resource governance.
     registry: SharedSubscriptionRegistry,
 
@@ -139,6 +148,12 @@ pub struct PulsePublisher {
 
     /// Current ledger head (updated as notifications are processed).
     ledger_head: std::sync::atomic::AtomicU64,
+
+    /// Index mapping `changeset_digest` -> `work_id` (TCK-00305).
+    ///
+    /// Populated by observing `PolicyResolvedForChangeSet` events.
+    /// Used to derive topics for `GateReceipt` events.
+    changeset_to_work_id: Arc<RwLock<HashMap<Vec<u8>, String>>>,
 }
 
 /// Result of a non-blocking pulse send attempt.
@@ -218,19 +233,23 @@ impl PulsePublisher {
     ///
     /// * `config` - Publisher configuration
     /// * `receiver` - Commit notification receiver from ledger
+    /// * `ledger` - Ledger backend for event payload access
     /// * `registry` - Shared subscription registry
     #[must_use]
     pub fn new(
         config: PulsePublisherConfig,
         receiver: CommitNotificationReceiver,
+        ledger: Arc<dyn LedgerBackend>,
         registry: SharedSubscriptionRegistry,
     ) -> Self {
         Self {
             config,
             receiver,
+            ledger,
             registry,
             connection_senders: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             ledger_head: std::sync::atomic::AtomicU64::new(0),
+            changeset_to_work_id: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -272,7 +291,7 @@ impl PulsePublisher {
                 .store(notification.seq_id, std::sync::atomic::Ordering::Release);
 
             // Process the notification
-            self.process_notification(notification);
+            self.process_notification(notification).await;
         }
 
         info!("Pulse publisher stopped (channel closed)");
@@ -285,7 +304,7 @@ impl PulsePublisher {
     /// # Arguments
     ///
     /// * `max_batch` - Maximum notifications to drain (0 = use config default)
-    pub fn drain_batch(&mut self, max_batch: usize) -> usize {
+    pub async fn drain_batch(&mut self, max_batch: usize) -> usize {
         let limit = if max_batch == 0 {
             self.config.max_drain_batch
         } else {
@@ -298,7 +317,7 @@ impl PulsePublisher {
                 Ok(notification) => {
                     self.ledger_head
                         .store(notification.seq_id, std::sync::atomic::Ordering::Release);
-                    self.process_notification(notification);
+                    self.process_notification(notification).await;
                     count += 1;
                 },
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
@@ -315,7 +334,7 @@ impl PulsePublisher {
     }
 
     /// Processes a single commit notification.
-    fn process_notification(&self, notification: CommitNotification) {
+    async fn process_notification(&self, notification: CommitNotification) {
         trace!(
             seq_id = notification.seq_id,
             event_type = %notification.event_type,
@@ -323,14 +342,33 @@ impl PulsePublisher {
             "Processing commit notification"
         );
 
-        // Build the topic from the notification
-        let topic = match self.derive_topic(&notification) {
+        // Read event record from ledger to get payload
+        // This is necessary for TCK-00305 topic derivation (Work/Gate events)
+        let event_record = match self.ledger.read_one(notification.seq_id).await {
+            Ok(record) => record,
+            Err(e) => {
+                warn!("Failed to read event {}: {}", notification.seq_id, e);
+                return;
+            },
+        };
+
+        // Decode KernelEvent
+        let kernel_event = match KernelEvent::decode(event_record.payload.as_slice()) {
+            Ok(event) => event,
+            Err(e) => {
+                warn!("Failed to decode event {}: {}", notification.seq_id, e);
+                return;
+            },
+        };
+
+        // Update index for TCK-00305 (PolicyResolvedForChangeSet lookup)
+        self.update_index(&kernel_event);
+
+        // Build the topic from the notification and payload
+        let topic = match self.derive_topic(&notification, &kernel_event) {
             Some(t) => t,
             None => {
                 // Topic derivation failed (invalid topic); drop the notification
-                // Per TCK-00304 security review: notifications producing invalid
-                // topics must be dropped to maintain invariant that pulse plane
-                // only processes valid HEF topics.
                 debug!(
                     seq_id = notification.seq_id,
                     event_type = %notification.event_type,
@@ -356,12 +394,7 @@ impl PulsePublisher {
         let frame = Self::encode_pulse_event(&envelope);
         let payload_size = frame.len();
 
-        // Get the drop priority for this topic
-        let _priority = DropPriority::from_topic(&topic);
-
         // Fan out to matching subscribers with backpressure
-        // NOTE: Per TCK-00304 security review, try_send_pulse is non-blocking
-        // to prevent HoL blocking DoS.
         let senders = self.connection_senders.read().expect("lock poisoned");
 
         for (connection_id, subscription_id) in matches {
@@ -384,7 +417,6 @@ impl PulsePublisher {
                             },
                             TrySendResult::BufferFull => {
                                 // Per-connection buffer full; release reservation and drop pulse
-                                // Per HEF semantics: pulses are lossy hints, drops are acceptable
                                 self.registry.record_dequeue(&connection_id, payload_size);
                                 debug!(
                                     connection_id = %connection_id,
@@ -413,7 +445,6 @@ impl PulsePublisher {
                 },
                 Err(e) => {
                     // Backpressure: drop the pulse for this subscriber
-                    // Per DD-HEF-0005: drops are expected under backpressure
                     warn!(
                         connection_id = %connection_id,
                         subscription_id = %subscription_id,
@@ -426,47 +457,71 @@ impl PulsePublisher {
         }
     }
 
+    /// Updates internal indices based on event content.
+    ///
+    /// TCK-00305: Maintains `changeset_digest` -> `work_id` mapping from
+    /// `PolicyResolvedForChangeSet` events.
+    fn update_index(&self, event: &KernelEvent) {
+        if let Some(Payload::PolicyResolvedForChangeSet(p)) = &event.payload {
+            let mut map = self.changeset_to_work_id.write().unwrap();
+            map.insert(p.changeset_digest.clone(), p.work_id.clone());
+        }
+    }
+
     /// Derives and validates the topic string from a commit notification.
     ///
-    /// Per DD-HEF-0001, topics are derived from ledger event types:
-    /// - `ledger.head` for all commits (system topic)
-    /// - `work.<work_id>.events` for work events
-    /// - `gate.<work_id>.<changeset_digest>.<gate_id>` for gate receipts
-    /// - etc.
-    ///
-    /// # Returns
-    ///
-    /// - `Some(topic)` if the derived topic is valid per HEF Topic Grammar
-    /// - `None` if the derived topic fails validation (notification should be
-    ///   dropped)
-    ///
-    /// # Security Invariant (TCK-00304)
-    ///
-    /// Per security review: Topics constructed via `format!` must be validated
-    /// against HEF Topic Grammar. Topics with invalid characters violate the
-    /// invariant that the pulse plane only processes valid HEF topics.
-    #[allow(clippy::unused_self)] // Will use self for topic configuration in future
-    fn derive_topic(&self, notification: &CommitNotification) -> Option<String> {
-        // Sanitize namespace: replace invalid characters with underscores and truncate
-        // This ensures format! produces a valid topic segment
+    /// Per DD-HEF-0001 and TCK-00305:
+    /// - `work.<work_id>.events` for work events (extracted from payload)
+    /// - `gate.<work_id>.<changeset_digest>.<gate_id>` for gate receipts (via
+    ///   lookup)
+    fn derive_topic(
+        &self,
+        notification: &CommitNotification,
+        event: &KernelEvent,
+    ) -> Option<String> {
+        // Sanitize namespace
         let sanitized_namespace = Self::sanitize_segment(&notification.namespace);
 
-        // For Phase 1, derive a simple topic based on event type
-        // Full topic derivation will be added as event types are defined
         let topic = match notification.event_type.as_str() {
             // System events -> ledger.head
             "KernelEvent" | "LedgerEvent" => "ledger.head".to_string(),
 
-            // Work events -> work.<work_id>.events (work_id extracted from payload later)
-            "WorkOpened" | "WorkTransitioned" | "WorkCompleted" | "WorkAborted" => {
-                // For now, use namespace as a proxy until work_id extraction is implemented
-                format!("work.{sanitized_namespace}.events")
+            // Work events -> work.<work_id>.events
+            "WorkOpened" | "WorkTransitioned" | "WorkCompleted" | "WorkAborted"
+            | "WorkPrAssociated" => {
+                if let Some(Payload::Work(w)) = &event.payload {
+                    let work_id = match &w.event {
+                        Some(apm2_core::events::work_event::Event::Opened(e)) => &e.work_id,
+                        Some(apm2_core::events::work_event::Event::Transitioned(e)) => &e.work_id,
+                        Some(apm2_core::events::work_event::Event::Completed(e)) => &e.work_id,
+                        Some(apm2_core::events::work_event::Event::Aborted(e)) => &e.work_id,
+                        Some(apm2_core::events::work_event::Event::PrAssociated(e)) => &e.work_id,
+                        None => return None,
+                    };
+                    format!("work.{}.events", Self::sanitize_segment(work_id))
+                } else {
+                    // Fallback if payload decode fails or doesn't match type
+                    format!("work.{sanitized_namespace}.events")
+                }
             },
 
             // Gate events -> gate.<work_id>.<changeset_digest>.<gate_id>
             "GateReceipt" => {
-                // Full topic derivation requires payload parsing; use namespace for now
-                format!("gate.{sanitized_namespace}.receipts")
+                if let Some(Payload::GateReceipt(g)) = &event.payload {
+                    // Lookup work_id from changeset_digest using the index built by
+                    // PolicyResolvedForChangeSet
+                    let map = self.changeset_to_work_id.read().unwrap();
+                    let work_id = map
+                        .get(&g.changeset_digest)
+                        .map(|s| Self::sanitize_segment(s))
+                        .unwrap_or_else(|| sanitized_namespace.clone()); // Fallback to namespace if not found
+
+                    let digest_hex = hex::encode(&g.changeset_digest);
+                    let gate_id = Self::sanitize_segment(&g.gate_id);
+                    format!("gate.{work_id}.{digest_hex}.{gate_id}")
+                } else {
+                    format!("gate.{sanitized_namespace}.receipts")
+                }
             },
 
             // Episode events -> episode.<episode_id>.<category>
@@ -486,8 +541,6 @@ impl PulsePublisher {
         };
 
         // Validate the derived topic against HEF Topic Grammar
-        // Per TCK-00304 security review: topics with invalid characters must be
-        // rejected
         match validate_topic(&topic) {
             Ok(()) => Some(topic),
             Err(e) => {
@@ -528,7 +581,7 @@ impl PulsePublisher {
                     None
                 }
             })
-            .take(MAX_TOPIC_LEN) // Conservative truncation (actual segment max is 64)
+            .take(MAX_SEGMENT_LEN) // Truncate to maximum segment length (64 chars)
             .collect();
 
         if sanitized.is_empty() {
