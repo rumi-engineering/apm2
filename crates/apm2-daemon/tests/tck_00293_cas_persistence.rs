@@ -92,11 +92,10 @@ fn cas_persistence_restart_multiple_artifacts() {
         for (i, (artifact, hash)) in artifacts.iter().zip(&hashes).enumerate() {
             assert!(
                 cas.exists(hash),
-                "Artifact {} should exist after restart",
-                i
+                "Artifact {i} should exist after restart"
             );
             let retrieved = cas.retrieve(hash).unwrap();
-            assert_eq!(&retrieved, artifact, "Artifact {} content should match", i);
+            assert_eq!(&retrieved, artifact, "Artifact {i} content should match");
         }
     }
 }
@@ -248,7 +247,7 @@ fn cas_deduplication() {
 // TCK-00293: Integration with ContentAddressedStore trait
 // =============================================================================
 
-/// Verify DurableCas implements ContentAddressedStore trait correctly.
+/// Verify `DurableCas` implements `ContentAddressedStore` trait correctly.
 #[test]
 fn cas_trait_implementation() {
     let temp_dir = TempDir::new().unwrap();

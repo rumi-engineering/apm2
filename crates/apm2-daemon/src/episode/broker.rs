@@ -649,7 +649,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
 
     /// Returns `true` if a policy is configured (TCK-00292).
     #[must_use]
-    pub fn has_policy(&self) -> bool {
+    pub const fn has_policy(&self) -> bool {
         self.policy.has_policy()
     }
 
@@ -3576,10 +3576,7 @@ policy:
             .unwrap();
 
         match decision {
-            ToolDecision::Allow { policy_hash, .. } => {
-                assert_eq!(policy_hash, expected_hash);
-            },
-            ToolDecision::Deny { policy_hash, .. } => {
+            ToolDecision::Allow { policy_hash, .. } | ToolDecision::Deny { policy_hash, .. } => {
                 assert_eq!(policy_hash, expected_hash);
             },
             _ => {},

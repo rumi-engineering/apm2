@@ -39,7 +39,7 @@
 //!
 //! - TCK-00293: Durable CAS backend + wiring
 //! - RFC-0018: HEF requirements for evidence durability
-//! - REQ-HEF-0009: ChangeSetBundle in CAS referenced by ledger
+//! - REQ-HEF-0009: `ChangeSetBundle` in CAS referenced by ledger
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -300,10 +300,10 @@ impl DurableCas {
 
         // Create directory structure
         fs::create_dir_all(&objects_path).map_err(|e| {
-            DurableCasError::io(format!("create objects directory {:?}", objects_path), e)
+            DurableCasError::io(format!("create objects directory {}", objects_path.display()), e)
         })?;
         fs::create_dir_all(&metadata_path).map_err(|e| {
-            DurableCasError::io(format!("create metadata directory {:?}", metadata_path), e)
+            DurableCasError::io(format!("create metadata directory {}", metadata_path.display()), e)
         })?;
 
         let cas = Self {
@@ -399,7 +399,7 @@ impl DurableCas {
 
         // Create shard directory if needed
         fs::create_dir_all(&dir_path).map_err(|e| {
-            DurableCasError::io(format!("create shard directory {:?}", dir_path), e)
+            DurableCasError::io(format!("create shard directory {}", dir_path.display()), e)
         })?;
 
         // Write atomically via temp file + rename
@@ -410,7 +410,7 @@ impl DurableCas {
         fs::rename(&temp_path, &file_path).map_err(|e| {
             // Clean up temp file on failure
             let _ = fs::remove_file(&temp_path);
-            DurableCasError::io(format!("rename {:?} to {:?}", temp_path, file_path), e)
+            DurableCasError::io(format!("rename {} to {}", temp_path.display(), file_path.display()), e)
         })?;
 
         // Update total size (atomic)
@@ -480,8 +480,9 @@ impl DurableCas {
         }
 
         let metadata = fs::metadata(&file_path)
-            .map_err(|e| DurableCasError::io(format!("stat {:?}", file_path), e))?;
+            .map_err(|e| DurableCasError::io(format!("stat {}", file_path.display()), e))?;
 
+        #[allow(clippy::cast_possible_truncation)]
         Ok(metadata.len() as usize)
     }
 
@@ -515,29 +516,31 @@ impl DurableCas {
     }
 
     /// Reads a file's contents.
+    #[allow(clippy::unused_self)]
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, DurableCasError> {
         let mut file =
-            File::open(path).map_err(|e| DurableCasError::io(format!("open {:?}", path), e))?;
+            File::open(path).map_err(|e| DurableCasError::io(format!("open {}", path.display()), e))?;
         let mut content = Vec::new();
         file.read_to_end(&mut content)
-            .map_err(|e| DurableCasError::io(format!("read {:?}", path), e))?;
+            .map_err(|e| DurableCasError::io(format!("read {}", path.display()), e))?;
         Ok(content)
     }
 
     /// Writes content to a file.
+    #[allow(clippy::unused_self)]
     fn write_file(&self, path: &Path, content: &[u8]) -> Result<(), DurableCasError> {
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(path)
-            .map_err(|e| DurableCasError::io(format!("create {:?}", path), e))?;
+            .map_err(|e| DurableCasError::io(format!("create {}", path.display()), e))?;
 
         file.write_all(content)
-            .map_err(|e| DurableCasError::io(format!("write {:?}", path), e))?;
+            .map_err(|e| DurableCasError::io(format!("write {}", path.display()), e))?;
 
         file.sync_all()
-            .map_err(|e| DurableCasError::io(format!("sync {:?}", path), e))?;
+            .map_err(|e| DurableCasError::io(format!("sync {}", path.display()), e))?;
 
         Ok(())
     }
@@ -582,18 +585,20 @@ impl DurableCas {
 
             if path.is_dir() {
                 let subentries = fs::read_dir(&path)
-                    .map_err(|e| DurableCasError::io(format!("read shard {:?}", path), e))?;
+                    .map_err(|e| DurableCasError::io(format!("read shard {}", path.display()), e))?;
 
                 for subentry in subentries {
                     let subentry = subentry.map_err(|e| {
-                        DurableCasError::io(format!("read shard entry {:?}", path), e)
+                        DurableCasError::io(format!("read shard entry {}", path.display()), e)
                     })?;
                     let subpath = subentry.path();
 
-                    if subpath.is_file() && !subpath.extension().is_some_and(|ext| ext == "tmp") {
+                    if subpath.is_file() && subpath.extension().is_none_or(|ext| ext != "tmp") {
                         let metadata = fs::metadata(&subpath)
-                            .map_err(|e| DurableCasError::io(format!("stat {:?}", subpath), e))?;
-                        total = total.saturating_add(metadata.len() as usize);
+                            .map_err(|e| DurableCasError::io(format!("stat {}", subpath.display()), e))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let file_size = metadata.len() as usize;
+                        total = total.saturating_add(file_size);
                     }
                 }
             }
