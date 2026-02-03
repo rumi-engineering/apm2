@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use apm2_core::context::ContextPackManifest;
 use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
+use apm2_core::policy::{Decision as CoreDecision, LoadedPolicy, PolicyEngine};
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
@@ -52,6 +53,7 @@ use super::decision::{
 };
 use super::dedupe::{DedupeCache, DedupeCacheConfig, SharedDedupeCache};
 use super::error::EpisodeId;
+use super::executor::ContentAddressedStore;
 use super::runtime::Hash;
 use super::tool_class::ToolClass;
 use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
@@ -126,16 +128,13 @@ impl BrokerError {
 }
 
 // =============================================================================
-// PolicyEngine Stub
+// PolicyEngine Integration (TCK-00292)
 //
-// TODO: Full PolicyEngine integration in a future ticket.
-// This stub provides the interface without actual policy evaluation.
+// Real policy engine integration with deny-by-default behavior.
+// Per RFC-0018 HEF requirements, policy evaluation is fail-closed.
 // =============================================================================
 
 /// Policy evaluation result.
-///
-/// TODO: This will be replaced with the actual `PolicyEngine` types in a future
-/// ticket.
 #[derive(Debug, Clone)]
 pub enum PolicyDecision {
     /// Request is allowed by policy.
@@ -153,16 +152,131 @@ pub enum PolicyDecision {
     },
 }
 
-/// Stub policy engine.
+/// Rule ID for deny-by-default when no policy is configured.
+pub const NO_POLICY_RULE_ID: &str = "NO_POLICY_CONFIGURED";
+
+/// Rationale for deny-by-default when no policy is configured.
+pub const NO_POLICY_RATIONALE: &str = "POLICY_MISSING";
+
+/// Policy engine wrapper for the tool broker (TCK-00292).
 ///
-/// TODO: Replace with actual `PolicyEngine` from `apm2_core` in a future
-/// ticket.
-#[derive(Debug, Clone, Default)]
-pub struct StubPolicyEngine {
-    /// Hash of the policy version (stub uses zeros).
+/// Integrates the real `PolicyEngine` from `apm2-core` and implements
+/// deny-by-default when policy is missing or invalid.
+///
+/// # Security Properties
+///
+/// - **Fail-closed**: Returns deny when policy is missing or evaluation fails
+/// - **Default-deny**: No stub allow path; all requests require valid policy
+/// - **Real policy hash**: Propagates actual policy content hash in decisions
+#[derive(Debug, Clone)]
+pub struct BrokerPolicyEngine {
+    /// The underlying policy engine (if configured).
+    engine: Option<PolicyEngine>,
+    /// Hash of the policy version (zeros if no policy is configured).
     policy_hash: Hash,
 }
 
+impl Default for BrokerPolicyEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BrokerPolicyEngine {
+    /// Creates a new broker policy engine with no policy configured.
+    ///
+    /// Per TCK-00292, requests will be denied by default when no policy
+    /// is configured (fail-closed behavior).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            engine: None,
+            policy_hash: [0u8; 32],
+        }
+    }
+
+    /// Creates a broker policy engine from a loaded policy.
+    #[must_use]
+    pub fn from_policy(policy: &LoadedPolicy) -> Self {
+        let engine = PolicyEngine::new(policy);
+        let policy_hash = *engine.policy_hash();
+        Self {
+            engine: Some(engine),
+            policy_hash,
+        }
+    }
+
+    /// Creates a broker policy engine from an Arc-wrapped loaded policy.
+    #[must_use]
+    pub fn from_arc(policy: Arc<LoadedPolicy>) -> Self {
+        let engine = PolicyEngine::from_arc(policy);
+        let policy_hash = *engine.policy_hash();
+        Self {
+            engine: Some(engine),
+            policy_hash,
+        }
+    }
+
+    /// Returns `true` if a policy is configured.
+    #[must_use]
+    pub const fn has_policy(&self) -> bool {
+        self.engine.is_some()
+    }
+
+    /// Evaluates a request against policy.
+    ///
+    /// Per TCK-00292, implements deny-by-default:
+    /// - If no policy is configured, the request is denied
+    /// - If policy evaluation fails, the request is denied
+    /// - Only explicit allow rules permit requests
+    #[must_use]
+    pub fn evaluate(&self, request: &BrokerToolRequest) -> PolicyDecision {
+        let Some(ref engine) = self.engine else {
+            warn!(
+                request_id = %request.request_id,
+                "policy evaluation denied: no policy configured"
+            );
+            return PolicyDecision::Deny {
+                rule_id: NO_POLICY_RULE_ID.to_string(),
+                reason: "No policy configured; deny by default".to_string(),
+            };
+        };
+
+        let policy_request = request.to_policy_request();
+        let result = engine.evaluate(&policy_request);
+
+        match result.decision {
+            CoreDecision::Allow => PolicyDecision::Allow {
+                rule_id: Some(result.rule_id),
+            },
+            CoreDecision::Deny => PolicyDecision::Deny {
+                rule_id: result.rule_id,
+                reason: result.message,
+            },
+            _ => PolicyDecision::Deny {
+                rule_id: result.rule_id,
+                reason: format!("Unknown decision; denying by default: {}", result.message),
+            },
+        }
+    }
+
+    /// Returns the policy hash.
+    #[must_use]
+    pub const fn policy_hash(&self) -> Hash {
+        self.policy_hash
+    }
+}
+
+/// Stub policy engine for test compatibility.
+///
+/// **DEPRECATED**: Use `BrokerPolicyEngine` for production code.
+#[derive(Debug, Clone, Default)]
+#[cfg(test)]
+pub struct StubPolicyEngine {
+    policy_hash: Hash,
+}
+
+#[cfg(test)]
 impl StubPolicyEngine {
     /// Creates a new stub policy engine.
     #[must_use]
@@ -172,9 +286,7 @@ impl StubPolicyEngine {
         }
     }
 
-    /// Evaluates a request against policy.
-    ///
-    /// The stub always allows requests.
+    /// Evaluates a request against policy (stub always allows).
     #[must_use]
     pub const fn evaluate(&self, _request: &BrokerToolRequest) -> PolicyDecision {
         PolicyDecision::Allow { rule_id: None }
@@ -298,7 +410,7 @@ impl ToolBrokerConfig {
 /// ```rust,ignore
 /// use apm2_daemon::episode::broker::{ToolBroker, ToolBrokerConfig};
 ///
-/// let broker = ToolBroker::new(ToolBrokerConfig::default());
+/// let broker = ToolBroker::new(test_config_without_policy());
 ///
 /// // Initialize with a capability manifest
 /// broker.initialize_with_manifest(manifest).await?;
@@ -329,16 +441,21 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// Dedupe cache for idempotent replay.
     dedupe_cache: SharedDedupeCache,
 
-    /// Policy engine.
+    /// Policy engine (TCK-00292).
     ///
-    /// TODO: Replace with `Arc<PolicyEngine>` in a future ticket.
-    policy: StubPolicyEngine,
+    /// Uses `BrokerPolicyEngine` with deny-by-default behavior.
+    /// Set via `set_policy()` or `with_policy()` before processing requests
+    /// when `check_policy` is enabled.
+    policy: BrokerPolicyEngine,
 
-    /// Content-addressed store.
+    /// Content-addressed store for evidence artifacts (TCK-00293).
     ///
-    /// TODO: Replace with `Arc<ContentAddressedStore>` in a future ticket.
+    /// Per RFC-0018 HEF requirements, the CAS stores artifacts durably with
+    /// content addressing. In production, this should be a `DurableCas`
+    /// instance. For tests, `StubContentAddressedStore` provides an
+    /// in-memory fallback.
     #[allow(dead_code)]
-    cas: Arc<StubContentAddressedStore>,
+    cas: Arc<dyn ContentAddressedStore>,
 
     /// Optional manifest loader for CAS-based initialization.
     #[allow(dead_code)]
@@ -393,7 +510,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             config,
             validator: tokio::sync::RwLock::new(None),
             dedupe_cache,
-            policy: StubPolicyEngine::new(),
+            policy: BrokerPolicyEngine::new(),
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: None,
             context_manifest: tokio::sync::RwLock::new(None),
@@ -412,7 +529,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             config,
             validator: tokio::sync::RwLock::new(None),
             dedupe_cache,
-            policy: StubPolicyEngine::new(),
+            policy: BrokerPolicyEngine::new(),
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: Some(loader),
             context_manifest: tokio::sync::RwLock::new(None),
@@ -437,7 +554,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             config,
             validator: tokio::sync::RwLock::new(None),
             dedupe_cache,
-            policy: StubPolicyEngine::new(),
+            policy: BrokerPolicyEngine::new(),
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: None,
             context_manifest: tokio::sync::RwLock::new(None),
@@ -463,7 +580,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             config,
             validator: tokio::sync::RwLock::new(None),
             dedupe_cache,
-            policy: StubPolicyEngine::new(),
+            policy: BrokerPolicyEngine::new(),
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: None,
             context_manifest: tokio::sync::RwLock::new(None),
@@ -490,7 +607,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
             config,
             validator: tokio::sync::RwLock::new(None),
             dedupe_cache,
-            policy: StubPolicyEngine::new(),
+            policy: BrokerPolicyEngine::new(),
             cas: Arc::new(StubContentAddressedStore::new()),
             loader: None,
             context_manifest: tokio::sync::RwLock::new(None),
@@ -528,6 +645,36 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     #[must_use]
     pub fn has_ssh_store(&self) -> bool {
         self.ssh_store.is_some()
+    }
+
+    /// Returns `true` if a policy is configured (TCK-00292).
+    #[must_use]
+    pub const fn has_policy(&self) -> bool {
+        self.policy.has_policy()
+    }
+
+    /// Sets the policy engine from a loaded policy (TCK-00292).
+    pub fn set_policy(&mut self, policy: &LoadedPolicy) {
+        self.policy = BrokerPolicyEngine::from_policy(policy);
+    }
+
+    /// Sets the policy engine from an Arc-wrapped loaded policy (TCK-00292).
+    pub fn set_policy_arc(&mut self, policy: Arc<LoadedPolicy>) {
+        self.policy = BrokerPolicyEngine::from_arc(policy);
+    }
+
+    /// Creates a builder-style broker with a policy configured (TCK-00292).
+    #[must_use]
+    pub fn with_policy(mut self, policy: &LoadedPolicy) -> Self {
+        self.policy = BrokerPolicyEngine::from_policy(policy);
+        self
+    }
+
+    /// Creates a builder-style broker with an Arc-wrapped policy (TCK-00292).
+    #[must_use]
+    pub fn with_policy_arc(mut self, policy: Arc<LoadedPolicy>) -> Self {
+        self.policy = BrokerPolicyEngine::from_arc(policy);
+        self
     }
 
     /// Returns `true` if SSH agent is available for broker-mediated operations
@@ -1309,9 +1456,17 @@ mod tests {
         req
     }
 
+    /// Creates a test config with policy checking disabled.
+    ///
+    /// Per TCK-00292, existing tests that focus on capability validation,
+    /// dedupe cache, credentials, etc. should disable policy checking.
+    fn test_config_without_policy() -> ToolBrokerConfig {
+        ToolBrokerConfig::default().without_policy_check()
+    }
+
     #[tokio::test]
     async fn test_broker_not_initialized() {
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         assert!(!broker.is_initialized().await);
 
@@ -1323,7 +1478,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broker_initialize_with_manifest() {
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -1338,7 +1493,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broker_request_allowed() {
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -1360,7 +1515,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broker_request_denied_no_capability() {
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -1380,7 +1535,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broker_request_denied_path_not_allowed() {
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -1403,7 +1558,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broker_dedupe_cache_hit() {
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -1454,7 +1609,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broker_evict_episode() {
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -1507,7 +1662,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broker_without_dedupe_cache() {
-        let config = ToolBrokerConfig::default().without_dedupe_cache();
+        let config = test_config_without_policy().without_dedupe_cache();
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(config);
 
         let manifest = make_manifest(vec![make_read_capability(
@@ -1578,7 +1733,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broker_request_validation_error() {
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -1602,7 +1757,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_broker_record_result_not_allowed() {
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -1688,7 +1843,7 @@ mod tests {
         // This test verifies the CRITICAL security fix: cache lookup occurs
         // AFTER capability validation. An unauthorized request must NOT
         // receive a cache hit even if a valid cached result exists.
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Initialize with Read capability only (no Write)
         let manifest = make_manifest(vec![make_read_capability(
@@ -1750,7 +1905,7 @@ mod tests {
     async fn test_security_cross_episode_cache_isolation() {
         // This test verifies the HIGH security fix: cache entries are isolated
         // by episode. One episode cannot read another episode's cached data.
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -1837,7 +1992,7 @@ mod tests {
     async fn test_security_cache_hit_after_authorization() {
         // This test verifies that authorized requests DO get cache hits
         // after authorization passes.
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -1957,7 +2112,7 @@ mod tests {
     #[tokio::test]
     async fn test_initialize_with_context_manifest() {
         // TCK-00286: Basic initialization test
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         let context_manifest = make_context_manifest(
             vec![("/workspace/allowed.rs", [0x42; 32])],
@@ -1974,7 +2129,7 @@ mod tests {
     #[tokio::test]
     async fn test_context_firewall_allows_permitted_read() {
         // TCK-00286: Read request for allowed path proceeds to capability checks
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing reads from /workspace
         let manifest = make_manifest(vec![make_read_capability(
@@ -2014,7 +2169,7 @@ mod tests {
     #[tokio::test]
     async fn test_context_firewall_terminates_on_denied_read() {
         // TCK-00286: Read request for path NOT in manifest returns Terminate
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing reads from /workspace
         let manifest = make_manifest(vec![make_read_capability(
@@ -2057,7 +2212,7 @@ mod tests {
     async fn test_context_firewall_terminates_on_read_without_path() {
         // TCK-00286 [MEDIUM]: Read request with path: None when context firewall
         // active returns Terminate (fail-closed)
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest
         let manifest = make_manifest(vec![make_read_capability(
@@ -2099,7 +2254,7 @@ mod tests {
     #[tokio::test]
     async fn test_context_firewall_terminates_on_denied_write() {
         // TCK-00286 [HIGH]: Write request outside write_allowlist returns Terminate
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing writes to /workspace
         // We give capability manifest a broad write allowlist, so it passes capability
@@ -2156,7 +2311,7 @@ mod tests {
     #[tokio::test]
     async fn test_context_firewall_allows_permitted_write() {
         // TCK-00286: Write request within write_allowlist proceeds
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing writes to /workspace
         // NOTE: Both CapabilityManifest and ContextPackManifest have write_allowlist
@@ -2205,7 +2360,7 @@ mod tests {
     #[tokio::test]
     async fn test_context_firewall_terminates_on_denied_execute() {
         // TCK-00286 [HIGH]: Execute request outside shell_allowlist returns Terminate
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing execute with broad shell allowlist
         // The context firewall should then terminate on commands outside ITS allowlist.
@@ -2251,7 +2406,7 @@ mod tests {
     #[tokio::test]
     async fn test_context_firewall_allows_permitted_execute() {
         // TCK-00286: Execute request matching shell_allowlist proceeds
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing execute with matching shell allowlist
         // Both capability and context manifests must allow the command.
@@ -2291,7 +2446,7 @@ mod tests {
     async fn test_context_firewall_execute_no_command() {
         // TCK-00286: Execute request without shell_command when shell_allowlist
         // configured returns Terminate (fail-closed)
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing execute
         // NOTE: We need to configure capability manifest's shell_allowlist too
@@ -2339,7 +2494,7 @@ mod tests {
     async fn test_context_firewall_write_no_path() {
         // TCK-00286: Write request without path when write_allowlist
         // configured returns Terminate (fail-closed)
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing writes
         // NOTE: Context firewall check happens FIRST, so missing path will
@@ -2391,7 +2546,7 @@ mod tests {
     async fn test_context_firewall_empty_allowlist_bypasses_check() {
         // TCK-00286: When context's write_allowlist/shell_allowlist are empty,
         // the context firewall check is bypassed (only capability check applies)
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up capability manifest allowing writes and execute
         // The capability manifest needs its own allowlists configured.
@@ -2493,13 +2648,13 @@ mod tests {
 
         // Without store
         let broker_no_store: ToolBroker<StubManifestLoader> =
-            ToolBroker::new(ToolBrokerConfig::default());
+            ToolBroker::new(test_config_without_policy());
         assert!(!broker_no_store.has_github_store());
 
         // With store
         let store = Arc::new(InMemoryGitHubCredentialStore::new());
         let broker_with_store: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_github_store(test_config_without_policy(), store);
         assert!(broker_with_store.has_github_store());
     }
 
@@ -2546,7 +2701,7 @@ mod tests {
             .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_github_store(test_config_without_policy(), store);
 
         // Set up manifest with Git capability
         let manifest = make_manifest(vec![make_git_capability(
@@ -2596,7 +2751,7 @@ mod tests {
             .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_github_store(test_config_without_policy(), store);
 
         // Set up manifest with Network capability
         let tool_classes = vec![ToolClass::Network];
@@ -2646,7 +2801,7 @@ mod tests {
         store.store_token("install-abc", "ghp_token").unwrap();
 
         let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_github_store(test_config_without_policy(), store);
 
         // Set up manifest with Read capability
         let manifest = make_manifest(vec![make_read_capability(
@@ -2678,7 +2833,7 @@ mod tests {
     #[tokio::test]
     async fn test_credential_broker_no_credential_without_store() {
         // TCK-00262: Without a credential store, Git requests have no credential
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up manifest with Git capability
         let manifest = make_manifest(vec![make_git_capability(
@@ -2721,7 +2876,7 @@ mod tests {
         store.store_token("install-xyz", "ghp_token").unwrap();
 
         let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_github_store(test_config_without_policy(), store);
 
         // Set up manifest with Git capability
         let manifest = make_manifest(vec![make_git_capability(
@@ -2768,7 +2923,7 @@ mod tests {
         // Do NOT store any tokens
 
         let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_github_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_github_store(test_config_without_policy(), store);
 
         // Set up manifest with Git capability
         let manifest = make_manifest(vec![make_git_capability(
@@ -2837,13 +2992,13 @@ mod tests {
 
         // Without store
         let broker_no_store: ToolBroker<StubManifestLoader> =
-            ToolBroker::new(ToolBrokerConfig::default());
+            ToolBroker::new(test_config_without_policy());
         assert!(!broker_no_store.has_ssh_store());
 
         // With store
         let store = Arc::new(InMemorySshCredentialStore::new());
         let broker_with_store: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_ssh_store(test_config_without_policy(), store);
         assert!(broker_with_store.has_ssh_store());
     }
 
@@ -2873,7 +3028,7 @@ mod tests {
 
         // Without SSH store
         let broker_no_store: ToolBroker<StubManifestLoader> =
-            ToolBroker::new(ToolBrokerConfig::default());
+            ToolBroker::new(test_config_without_policy());
         assert!(!broker_no_store.is_ssh_agent_available(None).await);
 
         // Without per-session agent (should return false even if daemon agent exists)
@@ -2881,7 +3036,7 @@ mod tests {
             "/tmp/ssh-agent.sock".to_string(),
         ));
         let broker_with_daemon: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store_with_daemon);
+            ToolBroker::with_ssh_store(test_config_without_policy(), store_with_daemon);
 
         // Assert broker reports unavailable because we ignore daemon agent
         assert!(!broker_with_daemon.is_ssh_agent_available(None).await);
@@ -2904,7 +3059,7 @@ mod tests {
             .unwrap();
 
         let broker_session: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store_session);
+            ToolBroker::with_ssh_store(test_config_without_policy(), store_session);
 
         let ctx = SessionContext::new().with_ssh_session_id("session-1");
 
@@ -2936,7 +3091,7 @@ mod tests {
             .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_ssh_store(test_config_without_policy(), store);
 
         // Set up manifest with Git capability
         let manifest = make_manifest(vec![make_git_capability(
@@ -2977,7 +3132,7 @@ mod tests {
     #[tokio::test]
     async fn test_ssh_broker_no_credential_without_store() {
         // TCK-00263: Without SSH store, Git requests have no SSH credential
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
 
         // Set up manifest with Git capability
         let manifest = make_manifest(vec![make_git_capability(
@@ -3020,7 +3175,7 @@ mod tests {
         // Note: No daemon auth sock set, so agent is not available
 
         let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_ssh_store(test_config_without_policy(), store);
 
         // Set up manifest with Git capability
         let manifest = make_manifest(vec![make_git_capability(
@@ -3073,7 +3228,7 @@ mod tests {
             .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::with_credential_stores(
-            ToolBrokerConfig::default(),
+            test_config_without_policy(),
             github_store,
             ssh_store,
         );
@@ -3139,7 +3294,7 @@ mod tests {
             .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> = ToolBroker::with_credential_stores(
-            ToolBrokerConfig::default(),
+            test_config_without_policy(),
             github_store,
             ssh_store,
         );
@@ -3195,7 +3350,7 @@ mod tests {
             .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_ssh_store(test_config_without_policy(), store);
 
         // Set up manifest with Read capability
         let manifest = make_manifest(vec![make_read_capability(
@@ -3237,7 +3392,7 @@ mod tests {
             .unwrap();
 
         let broker: ToolBroker<StubManifestLoader> =
-            ToolBroker::with_ssh_store(ToolBrokerConfig::default(), store);
+            ToolBroker::with_ssh_store(test_config_without_policy(), store);
 
         // Set up manifest with Network capability
         let tool_classes = vec![ToolClass::Network];
@@ -3290,5 +3445,286 @@ mod tests {
             debug_output.contains("[REDACTED]"),
             "Credential debug should show [REDACTED]"
         );
+    }
+
+    // =========================================================================
+    // TCK-00292: Policy Engine Integration Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn tool_broker_policy_engine_deny_when_no_policy() {
+        // TCK-00292: Broker denies requests when no policy is configured
+        let policy = BrokerPolicyEngine::new();
+
+        assert!(!policy.has_policy());
+        assert_eq!(policy.policy_hash(), [0u8; 32]);
+
+        let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
+        let decision = policy.evaluate(&request);
+
+        match decision {
+            PolicyDecision::Deny { rule_id, reason } => {
+                assert_eq!(rule_id, NO_POLICY_RULE_ID);
+                assert!(reason.contains("No policy configured"));
+            },
+            PolicyDecision::Allow { .. } => {
+                panic!("Request should be denied when no policy is configured");
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_broker_policy_engine_allow_with_valid_policy() {
+        use apm2_core::policy::LoadedPolicy;
+
+        let policy_yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test-allow-policy"
+  rules:
+    - id: "allow-workspace-read"
+      type: tool_allow
+      tool: "fs.read"
+      paths:
+        - "/workspace/**"
+      decision: allow
+  default_decision: deny
+"#;
+
+        let loaded = LoadedPolicy::from_yaml(policy_yaml).unwrap();
+        let policy = BrokerPolicyEngine::from_policy(&loaded);
+
+        assert!(policy.has_policy());
+        assert_ne!(policy.policy_hash(), [0u8; 32]);
+
+        let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
+        let decision = policy.evaluate(&request);
+
+        match decision {
+            PolicyDecision::Allow { rule_id } => {
+                assert!(rule_id.is_some());
+                assert_eq!(rule_id.unwrap(), "allow-workspace-read");
+            },
+            PolicyDecision::Deny { .. } => {
+                panic!("Request should be allowed by policy");
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_broker_policy_engine_deny_by_default() {
+        use apm2_core::policy::LoadedPolicy;
+
+        let policy_yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test-deny-policy"
+  rules:
+    - id: "allow-specific-file"
+      type: tool_allow
+      tool: "fs.read"
+      paths:
+        - "/allowed/file.txt"
+      decision: allow
+  default_decision: deny
+"#;
+
+        let loaded = LoadedPolicy::from_yaml(policy_yaml).unwrap();
+        let policy = BrokerPolicyEngine::from_policy(&loaded);
+
+        let request = make_request("req-1", ToolClass::Read, Some("/workspace/not-allowed.rs"));
+        let decision = policy.evaluate(&request);
+
+        assert!(matches!(decision, PolicyDecision::Deny { .. }));
+    }
+
+    #[tokio::test]
+    async fn tool_broker_policy_engine_real_policy_hash() {
+        use apm2_core::policy::LoadedPolicy;
+
+        let policy_yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test-hash-policy"
+  rules:
+    - id: "allow-all-read"
+      type: tool_allow
+      tool: "fs.read"
+      paths:
+        - "**"
+      decision: allow
+  default_decision: deny
+"#;
+
+        let loaded = LoadedPolicy::from_yaml(policy_yaml).unwrap();
+        let expected_hash = loaded.content_hash;
+
+        let mut broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default());
+        broker.set_policy(&loaded);
+
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        match decision {
+            ToolDecision::Allow { policy_hash, .. } | ToolDecision::Deny { policy_hash, .. } => {
+                assert_eq!(policy_hash, expected_hash);
+            },
+            _ => {},
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_broker_policy_engine_broker_integration() {
+        use apm2_core::policy::LoadedPolicy;
+
+        let policy_yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "integration-test-policy"
+  rules:
+    - id: "allow-workspace-read"
+      type: tool_allow
+      tool: "fs.read"
+      paths:
+        - "/workspace/**"
+      decision: allow
+  default_decision: deny
+"#;
+
+        let loaded = LoadedPolicy::from_yaml(policy_yaml).unwrap();
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default()).with_policy(&loaded);
+
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let allowed_request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
+        let allowed_decision = broker
+            .request(&allowed_request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+        assert!(allowed_decision.is_allowed());
+
+        let outside_request = make_request("req-2", ToolClass::Read, Some("/etc/passwd"));
+        let outside_decision = broker
+            .request(&outside_request, timestamp_ns(1), None)
+            .await
+            .unwrap();
+        assert!(outside_decision.is_denied());
+    }
+
+    #[tokio::test]
+    async fn tool_broker_policy_engine_deny_no_policy_with_check_enabled() {
+        // TCK-00292: Broker denies when check_policy is enabled but no policy is set
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        assert!(decision.is_denied());
+        if let ToolDecision::Deny {
+            reason, rule_id, ..
+        } = decision
+        {
+            assert_eq!(rule_id, Some(NO_POLICY_RULE_ID.to_string()));
+            assert!(matches!(reason, DenyReason::PolicyDenied { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_broker_policy_engine_has_policy_methods() {
+        use apm2_core::policy::LoadedPolicy;
+
+        let mut broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default());
+
+        assert!(!broker.has_policy());
+
+        let policy_yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "test-policy"
+  rules:
+    - id: "allow-read"
+      type: tool_allow
+      tool: "fs.read"
+      paths:
+        - "/workspace/**"
+      decision: allow
+  default_decision: deny
+"#;
+
+        let loaded = LoadedPolicy::from_yaml(policy_yaml).unwrap();
+        broker.set_policy(&loaded);
+
+        assert!(broker.has_policy());
+    }
+
+    #[tokio::test]
+    async fn tool_broker_policy_engine_with_policy_arc() {
+        use std::sync::Arc;
+
+        use apm2_core::policy::LoadedPolicy;
+
+        let policy_yaml = r#"
+policy:
+  version: "1.0.0"
+  name: "shared-policy"
+  rules:
+    - id: "allow-read"
+      type: tool_allow
+      tool: "fs.read"
+      paths:
+        - "**"
+      decision: allow
+  default_decision: deny
+"#;
+
+        let loaded = Arc::new(LoadedPolicy::from_yaml(policy_yaml).unwrap());
+        let expected_hash = loaded.content_hash;
+
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default()).with_policy_arc(Arc::clone(&loaded));
+
+        assert!(broker.has_policy());
+
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-read",
+            vec![PathBuf::from("/workspace")],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
+
+        if let ToolDecision::Allow { policy_hash, .. } = decision {
+            assert_eq!(policy_hash, expected_hash);
+        }
     }
 }

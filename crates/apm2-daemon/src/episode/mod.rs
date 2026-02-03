@@ -145,10 +145,10 @@ pub use adapter::{
     AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
     HarnessEventStream, HarnessHandle, OutputKind, TerminationClassification,
 };
-// Re-export broker types (TCK-00164)
+// Re-export broker types (TCK-00164, TCK-00292)
 pub use broker::{
-    BrokerError, PolicyDecision, SharedToolBroker, StubContentAddressedStore, StubPolicyEngine,
-    ToolBroker, ToolBrokerConfig, new_shared_broker,
+    BrokerError, BrokerPolicyEngine, NO_POLICY_RATIONALE, NO_POLICY_RULE_ID, PolicyDecision,
+    SharedToolBroker, StubContentAddressedStore, ToolBroker, ToolBrokerConfig, new_shared_broker,
 };
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 // Re-export tool execution types (TCK-00165)

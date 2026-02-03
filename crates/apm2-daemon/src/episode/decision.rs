@@ -85,6 +85,13 @@ pub const MAX_ERROR_MESSAGE_LEN: usize = 4096;
 /// We use 255 to allow for some flexibility while still preventing abuse.
 pub const MAX_HOST_LEN: usize = 255;
 
+/// Maximum length for git operation names (TCK-00292).
+///
+/// Git operations are short strings like "status", "push", "commit", etc.
+/// The longest standard git command is "cherry-pick" at 11 characters.
+/// We use 32 to allow for reasonable extension while preventing abuse.
+pub const MAX_GIT_OPERATION_LEN: usize = 32;
+
 // =============================================================================
 // BrokerToolRequest
 // =============================================================================
@@ -143,6 +150,17 @@ pub struct BrokerToolRequest {
     /// validation.
     pub shell_command: Option<String>,
 
+    /// Optional git operation for Git tool class (TCK-00292).
+    ///
+    /// When the tool class is Git, this field MUST be present to specify the
+    /// exact git operation (e.g., "status", "push", "commit"). This prevents
+    /// fail-open vulnerabilities where a dangerous operation like "push" could
+    /// be evaluated as "status".
+    ///
+    /// Valid operations: clone, fetch, diff, commit, push, status, log,
+    /// branch, checkout, merge, rebase, pull, reset, stash, tag, remote.
+    pub git_operation: Option<String>,
+
     /// The risk tier of the current episode.
     pub risk_tier: RiskTier,
 }
@@ -200,6 +218,14 @@ pub enum RequestValidationError {
         /// Maximum allowed length.
         max: usize,
     },
+
+    /// Git operation exceeds maximum length (TCK-00292).
+    GitOperationTooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for RequestValidationError {
@@ -223,6 +249,9 @@ impl std::fmt::Display for RequestValidationError {
             },
             Self::ShellCommandTooLong { len, max } => {
                 write!(f, "shell command too long: {len} bytes (max {max})")
+            },
+            Self::GitOperationTooLong { len, max } => {
+                write!(f, "git operation too long: {len} bytes (max {max})")
             },
         }
     }
@@ -261,6 +290,7 @@ impl BrokerToolRequest {
             size: None,
             network: None,
             shell_command: None,
+            git_operation: None,
             risk_tier,
         }
     }
@@ -301,6 +331,22 @@ impl BrokerToolRequest {
     #[must_use]
     pub fn with_shell_command(mut self, command: impl Into<String>) -> Self {
         self.shell_command = Some(command.into());
+        self
+    }
+
+    /// Sets the git operation for Git tool class (TCK-00292).
+    ///
+    /// This field MUST be set when the tool class is Git to ensure proper
+    /// policy evaluation. Without this, the request will be denied to prevent
+    /// fail-open vulnerabilities.
+    ///
+    /// # Valid Operations
+    ///
+    /// clone, fetch, diff, commit, push, status, log, branch, checkout,
+    /// merge, rebase, pull, reset, stash, tag, remote
+    #[must_use]
+    pub fn with_git_operation(mut self, operation: impl Into<String>) -> Self {
+        self.git_operation = Some(operation.into());
         self
     }
 
@@ -361,6 +407,15 @@ impl BrokerToolRequest {
                 });
             }
         }
+        // Validate git operation length (TCK-00292: boundedness check)
+        if let Some(ref operation) = self.git_operation {
+            if operation.len() > MAX_GIT_OPERATION_LEN {
+                return Err(RequestValidationError::GitOperationTooLong {
+                    len: operation.len(),
+                    max: MAX_GIT_OPERATION_LEN,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -382,6 +437,94 @@ impl BrokerToolRequest {
             req = req.with_shell_command(command.clone());
         }
         req
+    }
+
+    /// Converts to a core `ToolRequest` for policy engine evaluation
+    /// (TCK-00292).
+    ///
+    /// This enables the real `PolicyEngine` from `apm2-core` to evaluate broker
+    /// requests.
+    #[must_use]
+    pub fn to_policy_request(&self) -> apm2_core::tool::ToolRequest {
+        use apm2_core::tool::{
+            FileRead, FileWrite, GitOperation, InferenceCall, ShellExec, tool_request,
+        };
+
+        let tool = match self.tool_class {
+            ToolClass::Read => self.path.as_ref().map(|p| {
+                tool_request::Tool::FileRead(FileRead {
+                    path: p.to_string_lossy().to_string(),
+                    offset: 0,
+                    limit: self.size.unwrap_or(0),
+                })
+            }),
+            ToolClass::Write => self.path.as_ref().map(|p| {
+                tool_request::Tool::FileWrite(FileWrite {
+                    path: p.to_string_lossy().to_string(),
+                    content: Vec::new(),
+                    create_only: false,
+                    append: false,
+                })
+            }),
+            ToolClass::Execute => self.shell_command.as_ref().map(|cmd| {
+                tool_request::Tool::ShellExec(ShellExec {
+                    command: cmd.clone(),
+                    cwd: String::new(),
+                    timeout_ms: 0,
+                    network_access: self.network.is_some(),
+                    env: Vec::new(),
+                })
+            }),
+            ToolClass::Git => self.git_operation.as_ref().map(|op| {
+                tool_request::Tool::GitOp(GitOperation {
+                    operation: op.clone(),
+                    args: Vec::new(),
+                    cwd: self
+                        .path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                })
+            }),
+            ToolClass::Network => self.network.as_ref().map(|(_host, _port)| {
+                tool_request::Tool::ShellExec(ShellExec {
+                    command: String::new(),
+                    cwd: String::new(),
+                    timeout_ms: 0,
+                    network_access: true,
+                    env: Vec::new(),
+                })
+            }),
+            ToolClass::Inference => Some(tool_request::Tool::Inference(InferenceCall {
+                provider: String::new(),
+                model: String::new(),
+                prompt_hash: self.args_hash.to_vec(),
+                max_tokens: 0,
+                temperature_scaled: 0,
+                system_prompt_hash: Vec::new(),
+            })),
+            ToolClass::Artifact => self.path.as_ref().map(|p| {
+                tool_request::Tool::FileRead(FileRead {
+                    path: p.to_string_lossy().to_string(),
+                    offset: 0,
+                    limit: 0,
+                })
+            }),
+            // TCK-00292: Fail-closed for unknown tool classes.
+            // Unknown ToolClass variants return None, which triggers MISSING_TOOL
+            // denial in the core policy engine. This prevents fail-open
+            // vulnerabilities where unknown tool classes could be incorrectly
+            // permitted as a different tool type.
+            _ => None,
+        };
+
+        apm2_core::tool::ToolRequest {
+            request_id: self.request_id.clone(),
+            session_token: String::new(),
+            dedupe_key: self.dedupe_key.as_str().to_string(),
+            consumption_mode: false,
+            tool,
+        }
     }
 }
 
@@ -1815,6 +1958,265 @@ mod tests {
         if let ToolDecision::Allow { credential, .. } = decision {
             assert!(credential.is_some());
             assert_eq!(credential.unwrap().expose_secret(), "ghs_token");
+        }
+    }
+
+    // =========================================================================
+    // TCK-00292: Git Operation Fail-Closed Tests
+    // =========================================================================
+
+    #[test]
+    fn test_git_request_with_operation_produces_correct_tool() {
+        // BLOCKER 1 fix: Git requests with operation should produce GitOp with that
+        // operation
+        let request = BrokerToolRequest::new(
+            "req-git-push",
+            test_episode_id(),
+            ToolClass::Git,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier1,
+        )
+        .with_git_operation("push")
+        .with_path("/workspace/repo");
+
+        let policy_req = request.to_policy_request();
+        assert!(
+            policy_req.tool.is_some(),
+            "Git request with operation should produce a tool"
+        );
+
+        if let Some(apm2_core::tool::tool_request::Tool::GitOp(git_op)) = policy_req.tool {
+            assert_eq!(
+                git_op.operation, "push",
+                "Git operation must be 'push', not 'status'"
+            );
+            assert_eq!(git_op.cwd, "/workspace/repo");
+        } else {
+            panic!("Expected GitOp tool variant");
+        }
+    }
+
+    #[test]
+    fn test_git_request_without_operation_produces_none() {
+        // BLOCKER 1 fix: Git requests WITHOUT operation should return None
+        // (fail-closed)
+        let request = BrokerToolRequest::new(
+            "req-git-no-op",
+            test_episode_id(),
+            ToolClass::Git,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier1,
+        )
+        .with_path("/workspace/repo");
+        // Note: NO .with_git_operation() call
+
+        let policy_req = request.to_policy_request();
+        assert!(
+            policy_req.tool.is_none(),
+            "Git request without operation must return None (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn test_git_operation_validation_too_long() {
+        let long_op = "x".repeat(MAX_GIT_OPERATION_LEN + 1);
+        let request = BrokerToolRequest::new(
+            "req-git-long",
+            test_episode_id(),
+            ToolClass::Git,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_git_operation(long_op);
+
+        assert!(matches!(
+            request.validate(),
+            Err(RequestValidationError::GitOperationTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_git_operation_validation_at_limit() {
+        let op = "x".repeat(MAX_GIT_OPERATION_LEN);
+        let request = BrokerToolRequest::new(
+            "req-git-limit",
+            test_episode_id(),
+            ToolClass::Git,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_git_operation(op);
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_git_operation_error_display() {
+        let err = RequestValidationError::GitOperationTooLong { len: 50, max: 32 };
+        let msg = err.to_string();
+        assert!(msg.contains("git operation"));
+        assert!(msg.contains("50"));
+        assert!(msg.contains("32"));
+    }
+
+    // =========================================================================
+    // TCK-00292: Unknown Tool Class Fail-Closed Tests
+    // =========================================================================
+
+    // Note: We cannot easily test the catch-all `_ =>` branch since all ToolClass
+    // variants are handled explicitly in the current implementation. However, the
+    // important security property is that the catch-all returns None instead of
+    // mapping to FileEdit. This test documents the expected behavior.
+
+    #[test]
+    fn test_all_known_tool_classes_have_explicit_handling() {
+        // Verify that all known ToolClass variants produce expected tool types
+        // This ensures no tool class accidentally falls through to the catch-all
+
+        // Read -> FileRead
+        let read_req = BrokerToolRequest::new(
+            "req-read",
+            test_episode_id(),
+            ToolClass::Read,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/file.rs");
+        let read_policy = read_req.to_policy_request();
+        assert!(matches!(
+            read_policy.tool,
+            Some(apm2_core::tool::tool_request::Tool::FileRead(_))
+        ));
+
+        // Write -> FileWrite
+        let write_req = BrokerToolRequest::new(
+            "req-write",
+            test_episode_id(),
+            ToolClass::Write,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/file.rs");
+        let write_policy = write_req.to_policy_request();
+        assert!(matches!(
+            write_policy.tool,
+            Some(apm2_core::tool::tool_request::Tool::FileWrite(_))
+        ));
+
+        // Execute -> ShellExec
+        let exec_req = BrokerToolRequest::new(
+            "req-exec",
+            test_episode_id(),
+            ToolClass::Execute,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_shell_command("ls -la");
+        let exec_policy = exec_req.to_policy_request();
+        assert!(matches!(
+            exec_policy.tool,
+            Some(apm2_core::tool::tool_request::Tool::ShellExec(_))
+        ));
+
+        // Network -> ShellExec (with network_access flag)
+        let net_req = BrokerToolRequest::new(
+            "req-net",
+            test_episode_id(),
+            ToolClass::Network,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_network("example.com", 443);
+        let net_policy = net_req.to_policy_request();
+        assert!(matches!(
+            net_policy.tool,
+            Some(apm2_core::tool::tool_request::Tool::ShellExec(_))
+        ));
+
+        // Git -> GitOp (with operation)
+        let git_req = BrokerToolRequest::new(
+            "req-git",
+            test_episode_id(),
+            ToolClass::Git,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_git_operation("status");
+        let git_policy = git_req.to_policy_request();
+        assert!(matches!(
+            git_policy.tool,
+            Some(apm2_core::tool::tool_request::Tool::GitOp(_))
+        ));
+
+        // Inference -> Inference
+        let inf_req = BrokerToolRequest::new(
+            "req-inf",
+            test_episode_id(),
+            ToolClass::Inference,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        );
+        let inf_policy = inf_req.to_policy_request();
+        assert!(matches!(
+            inf_policy.tool,
+            Some(apm2_core::tool::tool_request::Tool::Inference(_))
+        ));
+
+        // Artifact -> FileRead
+        let art_req = BrokerToolRequest::new(
+            "req-art",
+            test_episode_id(),
+            ToolClass::Artifact,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/artifact");
+        let art_policy = art_req.to_policy_request();
+        assert!(matches!(
+            art_policy.tool,
+            Some(apm2_core::tool::tool_request::Tool::FileRead(_))
+        ));
+    }
+
+    #[test]
+    fn test_git_various_operations_propagate_correctly() {
+        // Test that various git operations are propagated correctly
+        let operations = [
+            "status", "push", "pull", "commit", "clone", "fetch", "diff", "log", "branch",
+            "checkout", "merge", "rebase", "reset", "stash", "tag", "remote",
+        ];
+
+        for op in operations {
+            let request = BrokerToolRequest::new(
+                format!("req-git-{op}"),
+                test_episode_id(),
+                ToolClass::Git,
+                make_dedupe_key(),
+                test_args_hash(),
+                RiskTier::Tier1,
+            )
+            .with_git_operation(op);
+
+            let policy_req = request.to_policy_request();
+            if let Some(apm2_core::tool::tool_request::Tool::GitOp(git_op)) = policy_req.tool {
+                assert_eq!(
+                    git_op.operation, op,
+                    "Git operation '{op}' must be propagated correctly"
+                );
+            } else {
+                panic!("Expected GitOp for operation '{op}'");
+            }
         }
     }
 }

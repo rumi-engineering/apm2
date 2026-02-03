@@ -35,6 +35,7 @@
 //! - [`session`]: Session handling with context firewall integration
 //! - [`telemetry`]: Cgroup-based resource telemetry collection
 
+pub mod cas;
 pub mod episode;
 pub mod evidence;
 pub mod governance;
