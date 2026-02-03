@@ -70,6 +70,7 @@ pub mod aat_reuse;
 mod aat_spec;
 pub mod anti_downgrade;
 mod artifact_manifest;
+mod changeset_bundle;
 mod ci_attestation;
 mod ci_import;
 pub mod determinism;
@@ -112,6 +113,13 @@ pub use artifact_manifest::{
     DataClassification, HygieneError, MAX_ARTIFACTS,
     MAX_STRING_LENGTH as MAX_ARTIFACT_STRING_LENGTH, validate_evidence_hygiene_for_admission,
 };
+// Re-export changeset bundle types
+pub use changeset_bundle::{
+    ChangeKind, ChangeSetBundleError, ChangeSetBundleV1, ChangeSetBundleV1Builder,
+    ChangeSetPublished, ChangeSetPublishedProto, FileChange, GitObjectRef, HashAlgo,
+    MAX_CHANGESET_ID_LENGTH, MAX_FILE_MANIFEST_SIZE, MAX_PATH_LENGTH, SCHEMA_IDENTIFIER,
+    SCHEMA_VERSION,
+};
 // Re-export CI attestation types
 pub use ci_attestation::{
     CiAttestation, CiAttestationBuilder, CiAttestationError, CiAttestationLevel,
@@ -135,11 +143,11 @@ pub use determinism::{
 };
 // Re-export domain separator constants and functions
 pub use domain_separator::{
-    AAT_RESULT_REUSED_PREFIX, CI_IMPORT_ATTESTATION_PREFIX, GATE_LEASE_ISSUED_PREFIX,
-    GATE_RECEIPT_PREFIX, GATE_RUN_COMPLETED_PREFIX, INTERVENTION_FREEZE_PREFIX,
-    INTERVENTION_UNFREEZE_PREFIX, LEASE_REVOKED_PREFIX, LEDGER_EVENT_PREFIX, MERGE_RECEIPT_PREFIX,
-    POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX, QUARANTINE_EVENT_PREFIX, sign_with_domain,
-    verify_with_domain,
+    AAT_RESULT_REUSED_PREFIX, CHANGESET_PUBLISHED_PREFIX, CI_IMPORT_ATTESTATION_PREFIX,
+    GATE_LEASE_ISSUED_PREFIX, GATE_RECEIPT_PREFIX, GATE_RUN_COMPLETED_PREFIX,
+    INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, LEASE_REVOKED_PREFIX,
+    LEDGER_EVENT_PREFIX, MERGE_RECEIPT_PREFIX, POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX,
+    QUARANTINE_EVENT_PREFIX, sign_with_domain, verify_with_domain,
 };
 // Re-export echo-trap detection types
 pub use echo_trap::{

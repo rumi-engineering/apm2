@@ -1142,6 +1142,8 @@ impl SqliteLedgerBackend {
             // CAS payloads (not kernel events, but may be stored in ledger)
             "aat_gate_receipt" => Ok(crate::events::AAT_GATE_RECEIPT_DOMAIN_PREFIX),
             "artifact_manifest" => Ok(crate::events::ARTIFACT_MANIFEST_DOMAIN_PREFIX),
+            // FAC events
+            "changeset_published" => Ok(crate::events::CHANGESET_PUBLISHED_DOMAIN_PREFIX),
             _ => Err(LedgerError::SignatureInvalid {
                 seq_id: 0,
                 details: format!(

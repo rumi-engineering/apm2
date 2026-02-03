@@ -90,6 +90,7 @@ message KernelEvent {
     RunnerPoolQuarantined runner_pool_quarantined = 26;
     AATSpecQuarantined aat_spec_quarantined = 27;
     QuarantineCleared quarantine_cleared = 28;
+    ChangeSetPublished changeset_published = 29;
   }
 }
 
@@ -1399,3 +1400,49 @@ message MergeReceipt {
   // Binds the merge receipt to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 9;
 }
+
+// ============================================================
+// CHANGESET PUBLISHED EVENTS (TCK-00310)
+// ============================================================
+//
+// ChangeSetPublished anchors a changeset before any review begins.
+// This event binds the changeset_digest (computed over canonical bundle
+// bytes with the digest field itself omitted) to its CAS hash, enabling
+// deterministic digest verification and replay protection.
+//
+// Key security properties:
+// - Anchors changeset_digest BEFORE any review activity
+// - CAS hash provides content integrity verification
+// - Domain-separated signature prevents replay attacks
+// - Deterministic digest enables independent verification
+
+// Emitted when a changeset is published to CAS and anchored in the ledger.
+//
+// This event MUST be emitted before any review activities begin for a work item.
+// The changeset_digest is computed deterministically over the canonicalized
+// bundle bytes with the changeset_digest field itself excluded from the hash
+// input (to prevent circular dependency).
+//
+// Security: The signature uses CHANGESET_PUBLISHED: domain prefix.
+message ChangeSetPublished {
+  // Unique work item ID this changeset belongs to.
+  string work_id = 1;
+  // BLAKE3 digest of the canonical bundle (32 bytes).
+  // Computed over bundle bytes with this field excluded from hash input.
+  bytes changeset_digest = 2;
+  // CAS hash of the full ChangeSetBundleV1 artifact (32 bytes).
+  // Used for content-addressed retrieval and integrity verification.
+  bytes cas_hash = 3;
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  // Retained for display/audit purposes; authoritative timing uses
+  // HTF time from the time_envelope_ref.
+  uint64 published_at = 4;
+  // Actor who published the changeset.
+  string publisher_actor_id = 5;
+  // Ed25519 signature over canonical bytes with CHANGESET_PUBLISHED: domain (64 bytes).
+  bytes publisher_signature = 6;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the changeset publication to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 7;
+}
+

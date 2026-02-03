@@ -121,6 +121,12 @@ pub const INTERVENTION_UNFREEZE_PREFIX: &[u8] = b"INTERVENTION_UNFREEZE:";
 /// and cannot be replayed in other contexts.
 pub const LEDGER_EVENT_PREFIX: &[u8] = b"LEDGER_EVENT:";
 
+/// Domain prefix for `ChangeSetPublished` events.
+///
+/// Used when signing/verifying changeset publication events.
+/// This anchors the changeset digest and CAS hash before any review begins.
+pub const CHANGESET_PUBLISHED_PREFIX: &[u8] = b"CHANGESET_PUBLISHED:";
+
 // =============================================================================
 // Domain-Separated Signing
 // =============================================================================
@@ -335,7 +341,7 @@ pub mod tests {
 
     #[test]
     fn test_all_domain_prefixes_defined() {
-        // Verify all 12 required domain prefixes are defined
+        // Verify all 13 required domain prefixes are defined
         let prefixes = [
             GATE_LEASE_ISSUED_PREFIX,
             LEASE_REVOKED_PREFIX,
@@ -349,6 +355,7 @@ pub mod tests {
             QUARANTINE_EVENT_PREFIX,
             INTERVENTION_FREEZE_PREFIX,
             INTERVENTION_UNFREEZE_PREFIX,
+            CHANGESET_PUBLISHED_PREFIX,
         ];
 
         // All prefixes should be non-empty and end with ':'

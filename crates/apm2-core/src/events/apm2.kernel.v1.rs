@@ -42,7 +42,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -90,6 +90,8 @@ pub mod kernel_event {
         AatSpecQuarantined(super::AatSpecQuarantined),
         #[prost(message, tag = "28")]
         QuarantineCleared(super::QuarantineCleared),
+        #[prost(message, tag = "29")]
+        ChangesetPublished(super::ChangeSetPublished),
     }
 }
 /// ============================================================
@@ -1676,6 +1678,44 @@ pub struct MergeReceipt {
     /// HTF time envelope reference for temporal authority (RFC-0016).
     /// Binds the merge receipt to verifiable HTF time.
     #[prost(message, optional, tag = "9")]
+    pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+}
+/// Emitted when a changeset is published to CAS and anchored in the ledger.
+///
+/// This event MUST be emitted before any review activities begin for a work item.
+/// The changeset_digest is computed deterministically over the canonicalized
+/// bundle bytes with the changeset_digest field itself excluded from the hash
+/// input (to prevent circular dependency).
+///
+/// Security: The signature uses CHANGESET_PUBLISHED: domain prefix.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChangeSetPublished {
+    /// Unique work item ID this changeset belongs to.
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// BLAKE3 digest of the canonical bundle (32 bytes).
+    /// Computed over bundle bytes with this field excluded from hash input.
+    #[prost(bytes = "vec", tag = "2")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// CAS hash of the full ChangeSetBundleV1 artifact (32 bytes).
+    /// Used for content-addressed retrieval and integrity verification.
+    #[prost(bytes = "vec", tag = "3")]
+    pub cas_hash: ::prost::alloc::vec::Vec<u8>,
+    /// OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+    /// Retained for display/audit purposes; authoritative timing uses
+    /// HTF time from the time_envelope_ref.
+    #[prost(uint64, tag = "4")]
+    pub published_at: u64,
+    /// Actor who published the changeset.
+    #[prost(string, tag = "5")]
+    pub publisher_actor_id: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with CHANGESET_PUBLISHED: domain (64 bytes).
+    #[prost(bytes = "vec", tag = "6")]
+    pub publisher_signature: ::prost::alloc::vec::Vec<u8>,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the changeset publication to verifiable HTF time.
+    #[prost(message, optional, tag = "7")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
 }
 /// Determinism status for AAT runs.

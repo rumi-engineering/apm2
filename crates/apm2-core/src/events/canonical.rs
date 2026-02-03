@@ -111,6 +111,13 @@ pub const AAT_GATE_RECEIPT_DOMAIN_PREFIX: &[u8] = b"apm2.payload.aat_gate_receip
 /// Note: `ArtifactManifest` is a CAS payload referenced by gate receipts.
 pub const ARTIFACT_MANIFEST_DOMAIN_PREFIX: &[u8] = b"apm2.payload.artifact_manifest:";
 
+/// Domain prefix for `ChangeSetPublished` events.
+///
+/// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
+/// Used when signing/verifying changeset publication events that anchor
+/// the changeset digest and CAS hash before any review begins.
+pub const CHANGESET_PUBLISHED_DOMAIN_PREFIX: &[u8] = b"apm2.event.changeset_published:";
+
 /// Trait for canonicalizing messages before signing.
 ///
 /// Types implementing this trait have repeated fields that must be sorted
@@ -505,7 +512,8 @@ impl Canonicalize for KernelEvent {
                 | kernel_event::Payload::InterventionFreeze(_)
                 | kernel_event::Payload::InterventionUnfreeze(_)
                 | kernel_event::Payload::AatResultReused(_)
-                | kernel_event::Payload::QuarantineCleared(_),
+                | kernel_event::Payload::QuarantineCleared(_)
+                | kernel_event::Payload::ChangesetPublished(_),
             )
             | None => {},
         }
