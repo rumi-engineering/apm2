@@ -3880,8 +3880,11 @@ policy:
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         // Request ListFiles for allowed path
-        let request =
-            make_request("req-ls", ToolClass::ListFiles, Some("/workspace/src/main.rs"));
+        let request = make_request(
+            "req-ls",
+            ToolClass::ListFiles,
+            Some("/workspace/src/main.rs"),
+        );
         let decision = broker
             .request(&request, timestamp_ns(0), None)
             .await
@@ -3967,9 +3970,12 @@ policy:
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         // Request Search for allowed path
-        let request =
-            make_request("req-search", ToolClass::Search, Some("/workspace/src/main.rs"))
-                .with_query("fn main");
+        let request = make_request(
+            "req-search",
+            ToolClass::Search,
+            Some("/workspace/src/main.rs"),
+        )
+        .with_query("fn main");
         let decision = broker
             .request(&request, timestamp_ns(0), None)
             .await

@@ -45,11 +45,11 @@
 
 use std::path::{Path, PathBuf};
 
+use apm2_core::crypto::Signer;
 use apm2_core::fac::{
     ChangeSetBundleV1, ReasonCode, ReviewBlockedError, ReviewBlockedRecorded,
     ReviewBlockedRecordedBuilder,
 };
-use apm2_core::crypto::Signer;
 use apm2_core::htf::TimeEnvelopeRef;
 use thiserror::Error;
 
@@ -151,10 +151,10 @@ impl WorkspaceError {
             Self::MissingArtifact(_) | Self::CasError(_) => ReasonCode::MissingArtifact,
             Self::InvalidBundle(_) | Self::PathTraversal(_) | Self::FileTooLarge { .. } => {
                 ReasonCode::InvalidBundle
-            }
+            },
             Self::Timeout(_) | Self::MaxRetriesExceeded { .. } | Self::HtfWindowExpired => {
                 ReasonCode::Timeout
-            }
+            },
             Self::PolicyDenied(_) => ReasonCode::PolicyDenied,
             Self::ContextMiss(_) => ReasonCode::ContextMiss,
         }
@@ -379,7 +379,8 @@ pub fn validate_path(path: &str, workspace_root: &Path) -> Result<PathBuf, Works
 ///
 /// # Errors
 ///
-/// Returns error if any file change has invalid paths or binary detection fails.
+/// Returns error if any file change has invalid paths or binary detection
+/// fails.
 pub fn validate_file_changes(
     bundle: &ChangeSetBundleV1,
     workspace_root: &Path,
@@ -517,8 +518,9 @@ impl WorkspaceManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     #[test]
     fn test_workspace_error_reason_code_mapping() {

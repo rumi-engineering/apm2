@@ -226,5 +226,6 @@ pub use tool_handler::{
 // Re-export workspace types (TCK-00311)
 pub use workspace::{
     ApplyResult, MAX_FILE_SIZE, MAX_PATH_DEPTH, MAX_RETRY_ATTEMPTS, RetryContext, WorkspaceError,
-    WorkspaceManager, WorkspaceSnapshot, create_blocked_event, validate_file_changes, validate_path,
+    WorkspaceManager, WorkspaceSnapshot, create_blocked_event, validate_file_changes,
+    validate_path,
 };

@@ -97,7 +97,7 @@ const HASH_SIZE: usize = 32;
 /// unbounded lists).
 const MAX_REPEATED_ITEMS: usize = 1000;
 
-/// Maximum number of entries for ListFiles.
+/// Maximum number of entries for `ListFiles`.
 const MAX_LIST_FILES_ENTRIES: u64 = 2000;
 
 /// Maximum output bytes for Search.

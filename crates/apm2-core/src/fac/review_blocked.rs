@@ -1,9 +1,9 @@
 // AGENT-AUTHORED
 //! Review blocked event types for FAC v0 workspace apply failures.
 //!
-//! This module implements the `ReviewBlockedRecorded` event which is emitted when
-//! workspace apply fails or tool execution fails during review. The blocked outcome
-//! is made durable in the ledger to ensure liveness tracking.
+//! This module implements the `ReviewBlockedRecorded` event which is emitted
+//! when workspace apply fails or tool execution fails during review. The
+//! blocked outcome is made durable in the ledger to ensure liveness tracking.
 //!
 //! # Design Overview
 //!
@@ -37,7 +37,8 @@
 //!     [0x44; 32], // time_envelope_ref hash
 //!     "recorder-001".to_string(),
 //!     &signer,
-//! ).expect("valid event");
+//! )
+//! .expect("valid event");
 //!
 //! // Verify signature
 //! assert!(event.verify_signature(&signer.verifying_key()).is_ok());
@@ -46,7 +47,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::domain_separator::{REVIEW_BLOCKED_RECORDED_PREFIX, sign_with_domain, verify_with_domain};
+use super::domain_separator::{
+    REVIEW_BLOCKED_RECORDED_PREFIX, sign_with_domain, verify_with_domain,
+};
 use crate::crypto::{Signature, Signer, VerifyingKey};
 use crate::htf::TimeEnvelopeRef;
 
@@ -219,7 +222,8 @@ impl ReasonCode {
 // ReviewBlockedRecorded
 // =============================================================================
 
-/// Event emitted when a review is blocked due to workspace apply or tool failure.
+/// Event emitted when a review is blocked due to workspace apply or tool
+/// failure.
 ///
 /// This event captures the blocked outcome and stores it durably in the ledger.
 /// It binds the failure to the changeset and provides CAS references for logs.
@@ -240,7 +244,8 @@ pub struct ReviewBlockedRecorded {
     pub time_envelope_ref: [u8; 32],
     /// Actor who recorded the blocked event.
     pub recorder_actor_id: String,
-    /// Ed25519 signature over canonical bytes with `REVIEW_BLOCKED_RECORDED:` domain.
+    /// Ed25519 signature over canonical bytes with `REVIEW_BLOCKED_RECORDED:`
+    /// domain.
     #[serde(with = "serde_bytes")]
     pub recorder_signature: [u8; 64],
 }
@@ -474,7 +479,10 @@ impl ReviewBlockedRecordedBuilder {
     /// # Errors
     ///
     /// Returns error if required fields are missing or validation fails.
-    pub fn build_and_sign(self, signer: &Signer) -> Result<ReviewBlockedRecorded, ReviewBlockedError> {
+    pub fn build_and_sign(
+        self,
+        signer: &Signer,
+    ) -> Result<ReviewBlockedRecorded, ReviewBlockedError> {
         let blocked_id = self
             .blocked_id
             .ok_or(ReviewBlockedError::MissingField("blocked_id"))?;
@@ -560,7 +568,10 @@ impl TryFrom<ReviewBlockedRecordedProto> for ReviewBlockedRecorded {
         })?;
 
         // Parse reason code from proto enum value
-        let reason_code = ReasonCode::from_code(proto.reason_code as u8)?;
+        let reason_code =
+            ReasonCode::from_code(u8::try_from(proto.reason_code).map_err(|_| {
+                ReviewBlockedError::InvalidData("reason_code must fit in u8".into())
+            })?)?;
 
         Ok(Self {
             blocked_id: proto.blocked_id,
@@ -603,14 +614,38 @@ mod tests {
 
     #[test]
     fn test_reason_code_from_str() {
-        assert_eq!("APPLY_FAILED".parse::<ReasonCode>().unwrap(), ReasonCode::ApplyFailed);
-        assert_eq!("TOOL_FAILED".parse::<ReasonCode>().unwrap(), ReasonCode::ToolFailed);
-        assert_eq!("BINARY_UNSUPPORTED".parse::<ReasonCode>().unwrap(), ReasonCode::BinaryUnsupported);
-        assert_eq!("MISSING_ARTIFACT".parse::<ReasonCode>().unwrap(), ReasonCode::MissingArtifact);
-        assert_eq!("INVALID_BUNDLE".parse::<ReasonCode>().unwrap(), ReasonCode::InvalidBundle);
-        assert_eq!("TIMEOUT".parse::<ReasonCode>().unwrap(), ReasonCode::Timeout);
-        assert_eq!("POLICY_DENIED".parse::<ReasonCode>().unwrap(), ReasonCode::PolicyDenied);
-        assert_eq!("CONTEXT_MISS".parse::<ReasonCode>().unwrap(), ReasonCode::ContextMiss);
+        assert_eq!(
+            "APPLY_FAILED".parse::<ReasonCode>().unwrap(),
+            ReasonCode::ApplyFailed
+        );
+        assert_eq!(
+            "TOOL_FAILED".parse::<ReasonCode>().unwrap(),
+            ReasonCode::ToolFailed
+        );
+        assert_eq!(
+            "BINARY_UNSUPPORTED".parse::<ReasonCode>().unwrap(),
+            ReasonCode::BinaryUnsupported
+        );
+        assert_eq!(
+            "MISSING_ARTIFACT".parse::<ReasonCode>().unwrap(),
+            ReasonCode::MissingArtifact
+        );
+        assert_eq!(
+            "INVALID_BUNDLE".parse::<ReasonCode>().unwrap(),
+            ReasonCode::InvalidBundle
+        );
+        assert_eq!(
+            "TIMEOUT".parse::<ReasonCode>().unwrap(),
+            ReasonCode::Timeout
+        );
+        assert_eq!(
+            "POLICY_DENIED".parse::<ReasonCode>().unwrap(),
+            ReasonCode::PolicyDenied
+        );
+        assert_eq!(
+            "CONTEXT_MISS".parse::<ReasonCode>().unwrap(),
+            ReasonCode::ContextMiss
+        );
         assert!("UNKNOWN".parse::<ReasonCode>().is_err());
     }
 
@@ -627,7 +662,10 @@ mod tests {
     fn test_reason_code_display() {
         assert_eq!(ReasonCode::ApplyFailed.to_string(), "APPLY_FAILED");
         assert_eq!(ReasonCode::ToolFailed.to_string(), "TOOL_FAILED");
-        assert_eq!(ReasonCode::BinaryUnsupported.to_string(), "BINARY_UNSUPPORTED");
+        assert_eq!(
+            ReasonCode::BinaryUnsupported.to_string(),
+            "BINARY_UNSUPPORTED"
+        );
         assert_eq!(ReasonCode::MissingArtifact.to_string(), "MISSING_ARTIFACT");
         assert_eq!(ReasonCode::InvalidBundle.to_string(), "INVALID_BUNDLE");
         assert_eq!(ReasonCode::Timeout.to_string(), "TIMEOUT");
@@ -716,7 +754,10 @@ mod tests {
             .time_envelope_ref([0x33; 32])
             .recorder_actor_id("recorder-002")
             .build_and_sign(&signer);
-        assert!(matches!(result, Err(ReviewBlockedError::MissingField("blocked_id"))));
+        assert!(matches!(
+            result,
+            Err(ReviewBlockedError::MissingField("blocked_id"))
+        ));
 
         // Missing reason_code
         let result = ReviewBlockedRecordedBuilder::new()
@@ -726,7 +767,10 @@ mod tests {
             .time_envelope_ref([0x33; 32])
             .recorder_actor_id("recorder-002")
             .build_and_sign(&signer);
-        assert!(matches!(result, Err(ReviewBlockedError::MissingField("reason_code"))));
+        assert!(matches!(
+            result,
+            Err(ReviewBlockedError::MissingField("reason_code"))
+        ));
     }
 
     #[test]
@@ -746,7 +790,10 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ReviewBlockedError::StringTooLong { field: "blocked_id", .. })
+            Err(ReviewBlockedError::StringTooLong {
+                field: "blocked_id",
+                ..
+            })
         ));
     }
 

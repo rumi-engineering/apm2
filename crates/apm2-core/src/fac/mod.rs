@@ -84,8 +84,8 @@ pub mod merge_receipt;
 mod policy_resolution;
 pub mod quarantine;
 mod receipt;
-mod review_blocked;
 pub mod retry_manager;
+mod review_blocked;
 pub mod risk_tier;
 pub mod selection_policy;
 mod terminal_verifier;
@@ -198,16 +198,16 @@ pub use receipt::{
     GateReceipt, GateReceiptBuilder, GateReceiptProto, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
     SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
 };
+// Re-export retry manager types
+pub use retry_manager::{
+    MAX_GATE_ATTEMPTS, MAX_GLOBAL_EPISODES, MAX_TRACKED_GATES, RetryError, RetryManager,
+};
 // Re-export review blocked types
 pub use review_blocked::{
     MAX_BLOCKED_ID_LENGTH, MAX_STRING_LENGTH as MAX_REVIEW_BLOCKED_STRING_LENGTH, ReasonCode,
     ReviewBlockedError, ReviewBlockedRecorded, ReviewBlockedRecordedBuilder,
     ReviewBlockedRecordedProto, SCHEMA_IDENTIFIER as REVIEW_BLOCKED_SCHEMA_IDENTIFIER,
     SCHEMA_VERSION as REVIEW_BLOCKED_SCHEMA_VERSION,
-};
-// Re-export retry manager types
-pub use retry_manager::{
-    MAX_GATE_ATTEMPTS, MAX_GLOBAL_EPISODES, MAX_TRACKED_GATES, RetryError, RetryManager,
 };
 // Re-export risk tier classification types
 pub use risk_tier::{

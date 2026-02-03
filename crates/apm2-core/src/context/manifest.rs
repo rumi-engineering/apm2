@@ -159,7 +159,7 @@ pub enum ToolClass {
     /// Artifact operations: CAS publish/fetch.
     Artifact  = 6,
 
-    /// ListFiles operations: directory listing.
+    /// `ListFiles` operations: directory listing.
     ListFiles = 7,
 
     /// Search operations: content search.
