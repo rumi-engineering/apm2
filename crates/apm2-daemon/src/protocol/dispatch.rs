@@ -40,8 +40,13 @@ use super::credentials::PeerCredentials;
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
     BoundedDecode, ClaimWorkRequest, ClaimWorkResponse, DecodeConfig, IssueCapabilityRequest,
-    IssueCapabilityResponse, PrivilegedError, PrivilegedErrorCode, ShutdownRequest,
-    ShutdownResponse, SpawnEpisodeRequest, SpawnEpisodeResponse, WorkRole,
+    IssueCapabilityResponse, PatternRejection, PrivilegedError, PrivilegedErrorCode,
+    ShutdownRequest, ShutdownResponse, SpawnEpisodeRequest, SpawnEpisodeResponse,
+    SubscribePulseRequest, SubscribePulseResponse, UnsubscribePulseRequest,
+    UnsubscribePulseResponse, WorkRole,
+};
+use super::pulse_acl::{
+    AclDecision, AclError, PulseAclEvaluator, validate_client_sub_id, validate_subscription_id,
 };
 use super::session_dispatch::InMemoryManifestStore;
 use super::session_token::TokenMinter;
@@ -1213,6 +1218,10 @@ pub enum PrivilegedResponse {
     IssueCapability(IssueCapabilityResponse),
     /// Successful Shutdown response.
     Shutdown(ShutdownResponse),
+    /// Successful `SubscribePulse` response (TCK-00302).
+    SubscribePulse(SubscribePulseResponse),
+    /// Successful `UnsubscribePulse` response (TCK-00302).
+    UnsubscribePulse(UnsubscribePulseResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -1242,6 +1251,10 @@ impl PrivilegedResponse {
     /// Tag 0 indicates an error response.
     #[must_use]
     pub fn encode(&self) -> Bytes {
+        // Response tags for HEF messages (request tag + 1)
+        const SUBSCRIBE_PULSE_RESPONSE_TAG: u8 = 65;
+        const UNSUBSCRIBE_PULSE_RESPONSE_TAG: u8 = 67;
+
         let mut buf = Vec::new();
         match self {
             Self::ClaimWork(resp) => {
@@ -1258,6 +1271,14 @@ impl PrivilegedResponse {
             },
             Self::Shutdown(resp) => {
                 buf.push(PrivilegedMessageType::Shutdown.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::SubscribePulse(resp) => {
+                buf.push(SUBSCRIBE_PULSE_RESPONSE_TAG);
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::UnsubscribePulse(resp) => {
+                buf.push(UNSUBSCRIBE_PULSE_RESPONSE_TAG);
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -2073,12 +2094,13 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::SpawnEpisode => self.handle_spawn_episode(payload, ctx),
             PrivilegedMessageType::IssueCapability => self.handle_issue_capability(payload, ctx),
             PrivilegedMessageType::Shutdown => self.handle_shutdown(payload, ctx),
-            // HEF Pulse Plane (TCK-00300): Placeholder handlers - will be implemented in TCK-00301
-            PrivilegedMessageType::SubscribePulse
-            | PrivilegedMessageType::UnsubscribePulse
-            | PrivilegedMessageType::PulseEvent => Ok(PrivilegedResponse::error(
+            // HEF Pulse Plane (TCK-00302): Operator subscription handlers
+            PrivilegedMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
+            PrivilegedMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
+            // PulseEvent is server-to-client only, reject if received from client
+            PrivilegedMessageType::PulseEvent => Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::PermissionDenied,
-                "HEF pulse endpoints not yet implemented (TCK-00301)",
+                "PulseEvent is server-to-client only",
             )),
         };
 
@@ -2934,6 +2956,197 @@ impl PrivilegedDispatcher {
         Ok(PrivilegedResponse::Shutdown(ShutdownResponse {
             message: "Shutdown acknowledged (stub)".to_string(),
         }))
+    }
+
+    // ========================================================================
+    // HEF Pulse Plane Handlers (TCK-00302)
+    // ========================================================================
+
+    /// Handles `SubscribePulse` requests from operator sockets (IPC-HEF-001).
+    ///
+    /// # TCK-00302: Operator Full Taxonomy Access
+    ///
+    /// Per DD-HEF-0004: "Operator connections may subscribe broadly."
+    /// Operators can subscribe to any valid pattern including wildcards.
+    ///
+    /// This handler:
+    /// 1. Validates request structure and field lengths
+    /// 2. Validates topic patterns using `pulse_topic` grammar
+    /// 3. Allows all valid patterns (no ACL restrictions for operators)
+    /// 4. Returns accepted patterns and any rejected invalid patterns
+    ///
+    /// # Note: Subscription Registry
+    ///
+    /// Actual subscription registration and pulse delivery are handled by
+    /// TCK-00303 (resource governance) and TCK-00304 (outbox + publisher).
+    fn handle_subscribe_pulse(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        // Max patterns per request per RFC-0018 (must be declared before statements)
+        const MAX_PATTERNS_PER_REQUEST: usize = 16;
+
+        let request =
+            SubscribePulseRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid SubscribePulseRequest: {e}"),
+                }
+            })?;
+
+        info!(
+            client_sub_id = %request.client_sub_id,
+            pattern_count = request.topic_patterns.len(),
+            since_cursor = request.since_ledger_cursor,
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "SubscribePulse (operator) request received"
+        );
+
+        // Validate client_sub_id length
+        if let Err(e) = validate_client_sub_id(&request.client_sub_id) {
+            warn!(error = %e, "Invalid client_sub_id");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                e.to_string(),
+            ));
+        }
+
+        // Validate topic_patterns count
+        if request.topic_patterns.len() > MAX_PATTERNS_PER_REQUEST {
+            warn!(
+                pattern_count = request.topic_patterns.len(),
+                "Too many patterns in subscribe request"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                format!(
+                    "too many patterns: {} exceeds maximum {}",
+                    request.topic_patterns.len(),
+                    MAX_PATTERNS_PER_REQUEST
+                ),
+            ));
+        }
+
+        // Create ACL evaluator for operator subscriptions
+        // Per DD-HEF-0004: "Operator connections may subscribe broadly"
+        let evaluator = PulseAclEvaluator::for_operator();
+
+        // Evaluate each pattern
+        let mut accepted_patterns = Vec::new();
+        let mut rejected_patterns = Vec::new();
+
+        for pattern in &request.topic_patterns {
+            match evaluator.check_subscribe(pattern) {
+                AclDecision::Allow => {
+                    accepted_patterns.push(pattern.clone());
+                },
+                AclDecision::Deny(err) => {
+                    let reason_code = Self::acl_error_to_reason_code(&err);
+                    rejected_patterns.push(PatternRejection {
+                        pattern: pattern.clone(),
+                        reason_code,
+                    });
+                    debug!(
+                        pattern = %pattern,
+                        reason = %err,
+                        "Pattern rejected (invalid syntax)"
+                    );
+                },
+            }
+        }
+
+        // Generate subscription ID
+        let subscription_id = format!("SUB-{}", uuid::Uuid::new_v4());
+
+        // Log outcome
+        if rejected_patterns.is_empty() {
+            info!(
+                subscription_id = %subscription_id,
+                accepted_count = accepted_patterns.len(),
+                "All patterns accepted (operator)"
+            );
+        } else {
+            warn!(
+                subscription_id = %subscription_id,
+                accepted_count = accepted_patterns.len(),
+                rejected_count = rejected_patterns.len(),
+                "Some patterns rejected (operator)"
+            );
+        }
+
+        // NOTE: Actual subscription registration is deferred to TCK-00303/TCK-00304.
+
+        Ok(PrivilegedResponse::SubscribePulse(SubscribePulseResponse {
+            subscription_id,
+            effective_since_cursor: request.since_ledger_cursor,
+            accepted_patterns,
+            rejected_patterns,
+        }))
+    }
+
+    /// Converts an `AclError` to a reason code string for `PatternRejection`.
+    fn acl_error_to_reason_code(err: &AclError) -> String {
+        match err {
+            AclError::TopicNotAllowed { .. } => "ACL_DENY".to_string(),
+            AclError::WildcardNotAllowed { .. } => "WILDCARD_NOT_ALLOWED".to_string(),
+            AclError::PublishNotAllowed => "PUBLISH_DENIED".to_string(),
+            AclError::InvalidPattern { .. } | AclError::InvalidTopic { .. } => {
+                "INVALID_PATTERN".to_string()
+            },
+            AclError::AllowlistTooLarge { .. } | AclError::SubscriptionIdTooLong { .. } => {
+                "LIMIT_EXCEEDED".to_string()
+            },
+        }
+    }
+
+    /// Handles `UnsubscribePulse` requests from operator sockets (IPC-HEF-002).
+    ///
+    /// # TCK-00302: Unsubscribe Handling
+    ///
+    /// This handler validates the unsubscribe request and returns success.
+    ///
+    /// # Note: Subscription Registry
+    ///
+    /// Actual subscription removal is handled by TCK-00303 (resource
+    /// governance).
+    fn handle_unsubscribe_pulse(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = UnsubscribePulseRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid UnsubscribePulseRequest: {e}"),
+            })?;
+
+        info!(
+            subscription_id = %request.subscription_id,
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "UnsubscribePulse (operator) request received"
+        );
+
+        // Validate subscription_id length
+        if let Err(e) = validate_subscription_id(&request.subscription_id) {
+            warn!(error = %e, "Invalid subscription_id");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                e.to_string(),
+            ));
+        }
+
+        // NOTE: Actual subscription removal is deferred to TCK-00303.
+        // For now, we always return removed=true as a placeholder.
+
+        info!(
+            subscription_id = %request.subscription_id,
+            "Unsubscribe (operator) processed (subscription registry pending TCK-00303)"
+        );
+
+        Ok(PrivilegedResponse::UnsubscribePulse(
+            UnsubscribePulseResponse {
+                removed: true, // Placeholder until subscription registry is implemented
+            },
+        ))
     }
 }
 

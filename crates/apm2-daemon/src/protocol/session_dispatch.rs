@@ -71,8 +71,14 @@ use super::dispatch::{ConnectionContext, LedgerEventEmitter};
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
     BoundedDecode, DecisionType, DecodeConfig, EmitEventRequest, EmitEventResponse,
-    PublishEvidenceRequest, PublishEvidenceResponse, RequestToolRequest, RequestToolResponse,
-    SessionError, SessionErrorCode, StreamTelemetryRequest, StreamTelemetryResponse,
+    PatternRejection, PublishEvidenceRequest, PublishEvidenceResponse, RequestToolRequest,
+    RequestToolResponse, SessionError, SessionErrorCode, StreamTelemetryRequest,
+    StreamTelemetryResponse, SubscribePulseRequest, SubscribePulseResponse,
+    UnsubscribePulseRequest, UnsubscribePulseResponse,
+};
+use super::pulse_acl::{
+    AclDecision, AclError, PulseAclEvaluator, TopicAllowlist, validate_client_sub_id,
+    validate_subscription_id,
 };
 use super::session_token::{SessionToken, SessionTokenError, TokenMinter};
 use crate::episode::capability::StubManifestLoader;
@@ -160,6 +166,10 @@ pub enum SessionResponse {
     PublishEvidence(PublishEvidenceResponse),
     /// Successful `StreamTelemetry` response.
     StreamTelemetry(StreamTelemetryResponse),
+    /// Successful `SubscribePulse` response (TCK-00302).
+    SubscribePulse(SubscribePulseResponse),
+    /// Successful `UnsubscribePulse` response (TCK-00302).
+    UnsubscribePulse(UnsubscribePulseResponse),
     /// Error response.
     Error(SessionError),
 }
@@ -198,6 +208,10 @@ impl SessionResponse {
     /// Tag 0 indicates an error response.
     #[must_use]
     pub fn encode(&self) -> Bytes {
+        // Response tags for HEF messages (request tag + 1)
+        const SUBSCRIBE_PULSE_RESPONSE_TAG: u8 = 65;
+        const UNSUBSCRIBE_PULSE_RESPONSE_TAG: u8 = 67;
+
         let mut buf = Vec::new();
         match self {
             Self::RequestTool(resp) => {
@@ -214,6 +228,14 @@ impl SessionResponse {
             },
             Self::StreamTelemetry(resp) => {
                 buf.push(SessionMessageType::StreamTelemetry.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::SubscribePulse(resp) => {
+                buf.push(SUBSCRIBE_PULSE_RESPONSE_TAG);
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::UnsubscribePulse(resp) => {
+                buf.push(UNSUBSCRIBE_PULSE_RESPONSE_TAG);
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -559,12 +581,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             SessionMessageType::EmitEvent => self.handle_emit_event(payload, ctx),
             SessionMessageType::PublishEvidence => self.handle_publish_evidence(payload, ctx),
             SessionMessageType::StreamTelemetry => self.handle_stream_telemetry(payload, ctx),
-            // HEF Pulse Plane (TCK-00300): Placeholder handlers - will be implemented in TCK-00301
-            SessionMessageType::SubscribePulse
-            | SessionMessageType::UnsubscribePulse
-            | SessionMessageType::PulseEvent => Ok(SessionResponse::error(
-                SessionErrorCode::SessionErrorNotImplemented,
-                "HEF pulse endpoints not yet implemented (TCK-00301)",
+            // HEF Pulse Plane (TCK-00302): Subscription handlers
+            SessionMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
+            SessionMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
+            // PulseEvent is server-to-client only, reject if received from client
+            SessionMessageType::PulseEvent => Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                "PulseEvent is server-to-client only",
             )),
         }
     }
@@ -1185,6 +1208,268 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             "StreamTelemetry not implemented (fail-closed)",
         ))
     }
+
+    // ========================================================================
+    // HEF Pulse Plane Handlers (TCK-00302)
+    // ========================================================================
+
+    /// Handles `SubscribePulse` requests (IPC-HEF-001).
+    ///
+    /// # TCK-00302: Session ACL Enforcement
+    ///
+    /// This handler enforces the default-deny ACL for session subscriptions:
+    ///
+    /// 1. Validates session token (INV-SESS-001)
+    /// 2. Validates subscription IDs are within bounds
+    /// 3. Validates topic patterns using `pulse_topic` grammar
+    /// 4. Checks patterns against session's topic allowlist (if session socket)
+    /// 5. Rejects wildcards for session subscriptions (Phase 1)
+    /// 6. Returns accepted patterns and rejections
+    ///
+    /// # Security (INV-ACL-001 through INV-ACL-005)
+    ///
+    /// - Session subscriptions are deny-by-default
+    /// - Session wildcards rejected in Phase 1
+    /// - Sessions cannot publish pulse topics (checked separately)
+    /// - Empty allowlist means no topics allowed (fail-closed)
+    ///
+    /// # Note: Subscription Registry
+    ///
+    /// This handler validates ACLs and returns accepted patterns, but actual
+    /// subscription registration and pulse delivery are handled by TCK-00303
+    /// (resource governance) and TCK-00304 (outbox + publisher).
+    fn handle_subscribe_pulse(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<SessionResponse> {
+        // Max patterns per request per RFC-0018 (must be declared before statements)
+        const MAX_PATTERNS_PER_REQUEST: usize = 16;
+
+        let request =
+            SubscribePulseRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid SubscribePulseRequest: {e}"),
+                }
+            })?;
+
+        // INV-SESS-001: Validate session token
+        let token = match self.validate_token(&request.session_token) {
+            Ok(t) => t,
+            Err(resp) => return Ok(resp),
+        };
+
+        info!(
+            session_id = %token.session_id,
+            client_sub_id = %request.client_sub_id,
+            pattern_count = request.topic_patterns.len(),
+            since_cursor = request.since_ledger_cursor,
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "SubscribePulse request received"
+        );
+
+        // Validate client_sub_id length
+        if let Err(e) = validate_client_sub_id(&request.client_sub_id) {
+            warn!(
+                session_id = %token.session_id,
+                error = %e,
+                "Invalid client_sub_id"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                e.to_string(),
+            ));
+        }
+
+        // Validate topic_patterns count
+        if request.topic_patterns.len() > MAX_PATTERNS_PER_REQUEST {
+            warn!(
+                session_id = %token.session_id,
+                pattern_count = request.topic_patterns.len(),
+                "Too many patterns in subscribe request"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                format!(
+                    "too many patterns: {} exceeds maximum {}",
+                    request.topic_patterns.len(),
+                    MAX_PATTERNS_PER_REQUEST
+                ),
+            ));
+        }
+
+        // Create ACL evaluator for session subscriptions
+        // Per DD-HEF-0004: "Session connections are deny-by-default"
+        //
+        // NOTE: In a full implementation, the topic allowlist would be extracted
+        // from the session's capability manifest. For now, we create an empty
+        // allowlist which enforces deny-by-default until TCK-00314 adds the
+        // topic_allowlist field to CapabilityManifest.
+        //
+        // TODO(TCK-00314): Extract topic_allowlist from capability manifest
+        let topic_allowlist = self.get_session_topic_allowlist(&token.session_id);
+        let evaluator = PulseAclEvaluator::for_session(topic_allowlist);
+
+        // Evaluate each pattern
+        let mut accepted_patterns = Vec::new();
+        let mut rejected_patterns = Vec::new();
+
+        for pattern in &request.topic_patterns {
+            match evaluator.check_subscribe(pattern) {
+                AclDecision::Allow => {
+                    accepted_patterns.push(pattern.clone());
+                },
+                AclDecision::Deny(err) => {
+                    let reason_code = Self::acl_error_to_reason_code(&err);
+                    rejected_patterns.push(PatternRejection {
+                        pattern: pattern.clone(),
+                        reason_code,
+                    });
+                    debug!(
+                        session_id = %token.session_id,
+                        pattern = %pattern,
+                        reason = %err,
+                        "Pattern rejected by ACL"
+                    );
+                },
+            }
+        }
+
+        // Generate subscription ID
+        let subscription_id = format!("SUB-{}", uuid::Uuid::new_v4());
+
+        // Log outcome
+        if rejected_patterns.is_empty() {
+            info!(
+                session_id = %token.session_id,
+                subscription_id = %subscription_id,
+                accepted_count = accepted_patterns.len(),
+                "All patterns accepted"
+            );
+        } else {
+            warn!(
+                session_id = %token.session_id,
+                subscription_id = %subscription_id,
+                accepted_count = accepted_patterns.len(),
+                rejected_count = rejected_patterns.len(),
+                "Some patterns rejected"
+            );
+        }
+
+        // NOTE: Actual subscription registration is deferred to TCK-00303/TCK-00304.
+        // This handler validates ACLs and returns the response.
+
+        Ok(SessionResponse::SubscribePulse(SubscribePulseResponse {
+            subscription_id,
+            effective_since_cursor: request.since_ledger_cursor,
+            accepted_patterns,
+            rejected_patterns,
+        }))
+    }
+
+    /// Gets the topic allowlist for a session.
+    ///
+    /// # TODO(TCK-00314)
+    ///
+    /// This method should extract the topic allowlist from the session's
+    /// capability manifest. For now, it returns an empty allowlist which
+    /// enforces deny-by-default for all session subscriptions.
+    fn get_session_topic_allowlist(&self, session_id: &str) -> TopicAllowlist {
+        // Try to get manifest from store and extract topic allowlist
+        // Currently, CapabilityManifest doesn't have a topic_allowlist field
+        // (to be added in TCK-00314). Until then, return empty allowlist.
+        if let Some(ref store) = self.manifest_store {
+            if let Some(_manifest) = store.get_manifest(session_id) {
+                // TODO(TCK-00314): Extract topic_allowlist from manifest
+                // For now, return empty allowlist (deny-by-default)
+                return TopicAllowlist::new();
+            }
+        }
+
+        // No manifest or no allowlist = deny all (fail-closed)
+        TopicAllowlist::new()
+    }
+
+    /// Converts an `AclError` to a reason code string for `PatternRejection`.
+    fn acl_error_to_reason_code(err: &AclError) -> String {
+        match err {
+            AclError::TopicNotAllowed { .. } => "ACL_DENY".to_string(),
+            AclError::WildcardNotAllowed { .. } => "WILDCARD_NOT_ALLOWED".to_string(),
+            AclError::PublishNotAllowed => "PUBLISH_DENIED".to_string(),
+            AclError::InvalidPattern { .. } | AclError::InvalidTopic { .. } => {
+                "INVALID_PATTERN".to_string()
+            },
+            AclError::AllowlistTooLarge { .. } | AclError::SubscriptionIdTooLong { .. } => {
+                "LIMIT_EXCEEDED".to_string()
+            },
+        }
+    }
+
+    /// Handles `UnsubscribePulse` requests (IPC-HEF-002).
+    ///
+    /// # TCK-00302: Unsubscribe Handling
+    ///
+    /// This handler validates the unsubscribe request and returns success.
+    ///
+    /// # Note: Subscription Registry
+    ///
+    /// Actual subscription removal is handled by TCK-00303 (resource
+    /// governance). This handler validates the request and returns a
+    /// response.
+    fn handle_unsubscribe_pulse(
+        &self,
+        payload: &[u8],
+        ctx: &ConnectionContext,
+    ) -> ProtocolResult<SessionResponse> {
+        let request = UnsubscribePulseRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid UnsubscribePulseRequest: {e}"),
+            })?;
+
+        // INV-SESS-001: Validate session token
+        let token = match self.validate_token(&request.session_token) {
+            Ok(t) => t,
+            Err(resp) => return Ok(resp),
+        };
+
+        info!(
+            session_id = %token.session_id,
+            subscription_id = %request.subscription_id,
+            peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
+            "UnsubscribePulse request received"
+        );
+
+        // Validate subscription_id length
+        if let Err(e) = validate_subscription_id(&request.subscription_id) {
+            warn!(
+                session_id = %token.session_id,
+                error = %e,
+                "Invalid subscription_id"
+            );
+            return Ok(SessionResponse::error(
+                SessionErrorCode::SessionErrorInvalid,
+                e.to_string(),
+            ));
+        }
+
+        // NOTE: Actual subscription removal is deferred to TCK-00303.
+        // For now, we always return removed=true as a placeholder.
+        // The real implementation will check if the subscription exists.
+        //
+        // TODO(TCK-00303): Implement subscription registry lookup
+
+        info!(
+            session_id = %token.session_id,
+            subscription_id = %request.subscription_id,
+            "Unsubscribe processed (subscription registry pending TCK-00303)"
+        );
+
+        Ok(SessionResponse::UnsubscribePulse(
+            UnsubscribePulseResponse {
+                removed: true, // Placeholder until subscription registry is implemented
+            },
+        ))
+    }
 }
 
 // ============================================================================
@@ -1221,6 +1506,22 @@ pub fn encode_publish_evidence_request(request: &PublishEvidenceRequest) -> Byte
 #[must_use]
 pub fn encode_stream_telemetry_request(request: &StreamTelemetryRequest) -> Bytes {
     let mut buf = vec![SessionMessageType::StreamTelemetry.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `SubscribePulse` request to bytes for sending (TCK-00302).
+#[must_use]
+pub fn encode_subscribe_pulse_request(request: &SubscribePulseRequest) -> Bytes {
+    let mut buf = vec![SessionMessageType::SubscribePulse.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes an `UnsubscribePulse` request to bytes for sending (TCK-00302).
+#[must_use]
+pub fn encode_unsubscribe_pulse_request(request: &UnsubscribePulseRequest) -> Bytes {
+    let mut buf = vec![SessionMessageType::UnsubscribePulse.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -2047,6 +2348,332 @@ mod tests {
                 "p50 validation time should be <5ms, was {}ms",
                 p50.as_millis()
             );
+        }
+    }
+
+    // ========================================================================
+    // TCK-00302: HEF Pulse Subscription ACL Tests
+    // ========================================================================
+    mod tck_00302_hef_acl {
+        use super::*;
+
+        /// TCK-00302: Session subscriptions are deny-by-default.
+        ///
+        /// Per DD-HEF-0004 and INV-ACL-001, session connections cannot
+        /// subscribe to any topics without an explicit allowlist.
+        #[test]
+        fn test_session_subscribe_deny_by_default() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter.clone());
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = SubscribePulseRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                client_sub_id: "client-sub-001".to_string(),
+                topic_patterns: vec!["work.W-123.events".to_string()],
+                since_ledger_cursor: 0,
+                max_pulses_per_sec: 100,
+            };
+            let frame = encode_subscribe_pulse_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::SubscribePulse(resp) => {
+                    // All patterns should be rejected (deny-by-default)
+                    assert!(
+                        resp.accepted_patterns.is_empty(),
+                        "Expected no accepted patterns (deny-by-default)"
+                    );
+                    assert_eq!(resp.rejected_patterns.len(), 1);
+                    assert_eq!(resp.rejected_patterns[0].pattern, "work.W-123.events");
+                    assert_eq!(resp.rejected_patterns[0].reason_code, "ACL_DENY");
+                },
+                _ => panic!("Expected SubscribePulse response, got: {response:?}"),
+            }
+        }
+
+        /// TCK-00302: Session wildcards are rejected in Phase 1.
+        ///
+        /// Per DD-HEF-0004 and INV-ACL-002, session connections cannot use
+        /// wildcard patterns in Phase 1.
+        #[test]
+        fn test_session_wildcard_rejected() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter.clone());
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = SubscribePulseRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                client_sub_id: "client-sub-002".to_string(),
+                topic_patterns: vec![
+                    "work.*.events".to_string(),    // Single wildcard
+                    "episode.EP-001.>".to_string(), // Terminal wildcard
+                ],
+                since_ledger_cursor: 0,
+                max_pulses_per_sec: 100,
+            };
+            let frame = encode_subscribe_pulse_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::SubscribePulse(resp) => {
+                    // All wildcard patterns should be rejected
+                    assert!(
+                        resp.accepted_patterns.is_empty(),
+                        "Expected no accepted patterns (wildcards rejected)"
+                    );
+                    assert_eq!(resp.rejected_patterns.len(), 2);
+                    // Check reason codes are WILDCARD_NOT_ALLOWED
+                    for rejection in &resp.rejected_patterns {
+                        assert_eq!(
+                            rejection.reason_code, "WILDCARD_NOT_ALLOWED",
+                            "Expected WILDCARD_NOT_ALLOWED for pattern: {}",
+                            rejection.pattern
+                        );
+                    }
+                },
+                _ => panic!("Expected SubscribePulse response, got: {response:?}"),
+            }
+        }
+
+        /// TCK-00302: Invalid patterns are rejected with `INVALID_PATTERN`.
+        #[test]
+        fn test_invalid_pattern_rejected() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter.clone());
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = SubscribePulseRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                client_sub_id: "client-sub-003".to_string(),
+                topic_patterns: vec![
+                    "invalid..topic".to_string(), // Empty segment
+                    "regex.[a-z]".to_string(),    // Regex pattern
+                ],
+                since_ledger_cursor: 0,
+                max_pulses_per_sec: 100,
+            };
+            let frame = encode_subscribe_pulse_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::SubscribePulse(resp) => {
+                    assert!(resp.accepted_patterns.is_empty());
+                    assert_eq!(resp.rejected_patterns.len(), 2);
+                    for rejection in &resp.rejected_patterns {
+                        assert_eq!(
+                            rejection.reason_code, "INVALID_PATTERN",
+                            "Expected INVALID_PATTERN for pattern: {}",
+                            rejection.pattern
+                        );
+                    }
+                },
+                _ => panic!("Expected SubscribePulse response, got: {response:?}"),
+            }
+        }
+
+        /// TCK-00302: Too many patterns in request returns error.
+        #[test]
+        fn test_too_many_patterns_rejected() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter.clone());
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            // Create more than 16 patterns
+            let patterns: Vec<String> = (0..17).map(|i| format!("topic.{i}")).collect();
+
+            let request = SubscribePulseRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                client_sub_id: "client-sub-004".to_string(),
+                topic_patterns: patterns,
+                since_ledger_cursor: 0,
+                max_pulses_per_sec: 100,
+            };
+            let frame = encode_subscribe_pulse_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInvalid as i32,
+                        "Expected INVALID error for too many patterns"
+                    );
+                    assert!(
+                        err.message.contains("too many patterns"),
+                        "Error message should mention too many patterns: {}",
+                        err.message
+                    );
+                },
+                _ => panic!("Expected Error response for too many patterns, got: {response:?}"),
+            }
+        }
+
+        /// TCK-00302: Client subscription ID too long returns error.
+        #[test]
+        fn test_client_sub_id_too_long() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter.clone());
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = SubscribePulseRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                client_sub_id: "a".repeat(65), // MAX_CLIENT_SUB_ID_LEN is 64
+                topic_patterns: vec!["work.W-123.events".to_string()],
+                since_ledger_cursor: 0,
+                max_pulses_per_sec: 100,
+            };
+            let frame = encode_subscribe_pulse_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInvalid as i32,
+                        "Expected INVALID error for too long client_sub_id"
+                    );
+                },
+                _ => panic!("Expected Error response, got: {response:?}"),
+            }
+        }
+
+        /// TCK-00302: Unsubscribe validates subscription ID length.
+        #[test]
+        fn test_unsubscribe_validates_subscription_id() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter.clone());
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = UnsubscribePulseRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                subscription_id: "a".repeat(65), // MAX_SUBSCRIPTION_ID_LEN is 64
+            };
+            let frame = encode_unsubscribe_pulse_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInvalid as i32,
+                        "Expected INVALID error for too long subscription_id"
+                    );
+                },
+                _ => panic!("Expected Error response, got: {response:?}"),
+            }
+        }
+
+        /// TCK-00302: Valid unsubscribe request succeeds.
+        #[test]
+        fn test_valid_unsubscribe() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter.clone());
+            let ctx = make_session_ctx();
+            let token = test_token(&minter);
+
+            let request = UnsubscribePulseRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                subscription_id: "SUB-test-123".to_string(),
+            };
+            let frame = encode_unsubscribe_pulse_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::UnsubscribePulse(resp) => {
+                    // Placeholder returns true until subscription registry is implemented
+                    assert!(resp.removed);
+                },
+                _ => panic!("Expected UnsubscribePulse response, got: {response:?}"),
+            }
+        }
+
+        /// TCK-00302: `PulseEvent` received from client is rejected.
+        #[test]
+        fn test_pulse_event_from_client_rejected() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter);
+            let ctx = make_session_ctx();
+
+            // PulseEvent is server-to-client only, tag = 68
+            let frame = Bytes::from(vec![68u8, 0, 0, 0]);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInvalid as i32,
+                        "Expected INVALID error for PulseEvent from client"
+                    );
+                    assert!(err.message.contains("server-to-client only"));
+                },
+                _ => panic!("Expected Error response for PulseEvent, got: {response:?}"),
+            }
+        }
+
+        /// TCK-00302: Subscribe with invalid token returns
+        /// `SESSION_ERROR_INVALID`.
+        #[test]
+        fn test_subscribe_invalid_token() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter);
+            let ctx = make_session_ctx();
+
+            let request = SubscribePulseRequest {
+                session_token: "invalid-token".to_string(),
+                client_sub_id: "client-sub-005".to_string(),
+                topic_patterns: vec!["work.W-123.events".to_string()],
+                since_ledger_cursor: 0,
+                max_pulses_per_sec: 100,
+            };
+            let frame = encode_subscribe_pulse_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorInvalid as i32,
+                        "Expected SESSION_ERROR_INVALID for invalid token"
+                    );
+                },
+                _ => panic!("Expected Error response for invalid token, got: {response:?}"),
+            }
+        }
+
+        /// TCK-00302: Response encoding includes correct tags.
+        #[test]
+        fn test_subscribe_response_encoding() {
+            let response = SessionResponse::SubscribePulse(SubscribePulseResponse {
+                subscription_id: "SUB-test".to_string(),
+                effective_since_cursor: 42,
+                accepted_patterns: vec!["topic.a".to_string()],
+                rejected_patterns: vec![],
+            });
+            let encoded = response.encode();
+
+            // Tag 65 is SUBSCRIBE_PULSE_RESPONSE_TAG
+            assert_eq!(encoded[0], 65);
+            assert!(encoded.len() > 1);
+        }
+
+        /// TCK-00302: Unsubscribe response encoding includes correct tag.
+        #[test]
+        fn test_unsubscribe_response_encoding() {
+            let response =
+                SessionResponse::UnsubscribePulse(UnsubscribePulseResponse { removed: true });
+            let encoded = response.encode();
+
+            // Tag 67 is UNSUBSCRIBE_PULSE_RESPONSE_TAG
+            assert_eq!(encoded[0], 67);
+            assert!(encoded.len() > 1);
         }
     }
 }
