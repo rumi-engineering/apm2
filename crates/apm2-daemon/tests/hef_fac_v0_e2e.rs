@@ -39,9 +39,10 @@
 //! cargo test -p apm2-daemon --test hef_fac_v0_e2e test_review_blocked_ledger_anchoring
 //! ```
 
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use apm2_core::crypto::Signer;
 use apm2_core::events::{
@@ -87,6 +88,45 @@ fn enforce_evid_hef_0012_env_constraints() {
         std::env::var_os("GH_TOKEN").is_none(),
         "EVID-HEF-0012 constraint: GH_TOKEN must not be set during evidence runs"
     );
+}
+
+// =============================================================================
+// Environment Guard
+// =============================================================================
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+static GIT_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+impl EnvVarGuard {
+    #[allow(unsafe_code)]
+    fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: Tests control env mutation scope; guard restores on drop.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        match self.previous.as_ref() {
+            Some(value) => unsafe {
+                // SAFETY: Tests control env mutation scope; guard restores on drop.
+                std::env::set_var(self.key, value)
+            },
+            None => unsafe {
+                // SAFETY: Tests control env mutation scope; guard restores on drop.
+                std::env::remove_var(self.key)
+            },
+        }
+    }
 }
 
 // =============================================================================
@@ -497,6 +537,7 @@ async fn test_review_receipt_ledger_anchoring() {
     enforce_evid_hef_0012_env_constraints();
 
     let mut harness = FacV0TestHarness::new();
+    let _git_lock = GIT_TEST_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
 
     // First, establish context with ChangeSetPublished
     let bundle = create_test_changeset_bundle(vec![("src/lib.rs", ChangeKind::Modify)]);
@@ -768,6 +809,7 @@ async fn test_review_blocked_tool_failure_on_git_bounds() {
     enforce_evid_hef_0012_env_constraints();
 
     let harness = FacV0TestHarness::new();
+    let _git_lock = GIT_TEST_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
     let bundle = create_test_changeset_bundle(vec![("big.txt", ChangeKind::Modify)]);
 
     let bundle_bytes = bundle.canonical_bytes().expect("serialize bundle");
@@ -843,6 +885,136 @@ async fn test_review_blocked_tool_failure_on_git_bounds() {
     );
 }
 
+/// Tests `ReviewBlockedRecorded` for tool failure on `git status` bounds.
+#[tokio::test]
+async fn test_review_blocked_tool_failure_on_git_status_bounds() {
+    enforce_evid_hef_0012_env_constraints();
+
+    let harness = FacV0TestHarness::new();
+    let _git_lock = GIT_TEST_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+    let bundle = create_test_changeset_bundle(vec![("status.txt", ChangeKind::Modify)]);
+
+    let bundle_bytes = bundle.canonical_bytes().expect("serialize bundle");
+    let cas_hash = harness.cas.store(&bundle_bytes);
+    let cs_event = harness.create_changeset_published_event(
+        "work-status-bounds",
+        bundle.changeset_digest,
+        cas_hash,
+    );
+    harness
+        .ledger
+        .append_verified(&cs_event, &harness.signer.verifying_key())
+        .expect("append changeset_published");
+
+    harness.init_git_repo();
+
+    let file_count = apm2_daemon::episode::GIT_STATUS_MAX_LINES + 25;
+    let mut tracked_paths = Vec::with_capacity(file_count);
+    for idx in 0..file_count {
+        let path = harness
+            .workspace_root()
+            .join("status")
+            .join(format!("file_{idx:04}.txt"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create status dir");
+        }
+        std::fs::write(&path, b"x").expect("write status file");
+        tracked_paths.push(path);
+    }
+
+    harness.git_commit_all("init-status");
+    for path in tracked_paths {
+        std::fs::write(&path, b"updated\n").expect("update status file");
+    }
+
+    let ctx = harness.execution_context("req-git-status-bounds");
+    let git_args = ToolArgs::Git(GitArgs {
+        operation: "status".to_string(),
+        args: vec![],
+        repo_path: None,
+    });
+
+    let result = harness
+        .tool_executor
+        .execute(&ctx, &git_args)
+        .await
+        .expect("execute git status");
+    assert!(
+        !result.success,
+        "git status should fail when output exceeds bounds"
+    );
+
+    let error_message = result
+        .error_message
+        .unwrap_or_else(|| "git status failed".to_string());
+    let error_log = serde_json::json!({
+        "error": error_message,
+        "operation": "status",
+        "changeset_digest": hex::encode(bundle.changeset_digest),
+    });
+    let cas_log_hash = harness.cas.store(error_log.to_string().as_bytes());
+
+    let blocked_event = harness.create_review_blocked_event(
+        "BLK-tool-status-001",
+        bundle.changeset_digest,
+        ReasonCode::ToolFailed,
+        cas_log_hash,
+    );
+
+    let seq_id = harness
+        .ledger
+        .append_verified(&blocked_event, &harness.signer.verifying_key())
+        .expect("append review_blocked_recorded");
+
+    let stored = harness.ledger.read_one(seq_id).expect("read_one");
+    let decoded = ReviewBlockedRecorded::decode(stored.payload.as_slice())
+        .expect("decode ReviewBlockedRecorded");
+
+    assert_eq!(
+        decoded.reason_code,
+        i32::from(ReasonCode::ToolFailed.to_code())
+    );
+}
+
+/// Tests git environment isolation (GIT_DIR/GIT_WORK_TREE ignored).
+#[tokio::test]
+async fn test_git_operation_ignores_env_overrides() {
+    enforce_evid_hef_0012_env_constraints();
+
+    let harness = FacV0TestHarness::new();
+    let _git_lock = GIT_TEST_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+    let file_path = harness.workspace_root().join("env_isolation.txt");
+    std::fs::write(&file_path, b"base\n").expect("write base file");
+    harness.init_git_repo();
+    harness.git_commit_all("init-env");
+    std::fs::write(&file_path, b"changed\n").expect("write change");
+
+    let _git_dir_guard = EnvVarGuard::set("GIT_DIR", harness.workspace_root().join("not-a-repo"));
+    let _git_work_tree_guard = EnvVarGuard::set("GIT_WORK_TREE", "/tmp");
+
+    let ctx = harness.execution_context("req-git-env-override");
+    let git_args = ToolArgs::Git(GitArgs {
+        operation: "diff".to_string(),
+        args: vec!["env_isolation.txt".to_string()],
+        repo_path: None,
+    });
+
+    let result = harness
+        .tool_executor
+        .execute(&ctx, &git_args)
+        .await
+        .expect("execute git diff");
+
+    assert!(
+        result.success,
+        "git diff should succeed despite env overrides"
+    );
+    assert!(
+        String::from_utf8_lossy(&result.output).contains("changed"),
+        "git diff should reflect workspace content"
+    );
+}
+
 /// Tests `ReviewBlockedRecorded` for missing artifact fetch.
 #[tokio::test]
 async fn test_review_blocked_missing_artifact() {
@@ -908,6 +1080,77 @@ async fn test_review_blocked_missing_artifact() {
     assert_eq!(
         decoded.reason_code,
         i32::from(ReasonCode::MissingArtifact.to_code())
+    );
+}
+
+/// Tests `ReviewBlockedRecorded` for artifact fetch max_bytes enforcement.
+#[tokio::test]
+async fn test_review_blocked_artifact_fetch_max_bytes() {
+    enforce_evid_hef_0012_env_constraints();
+
+    let harness = FacV0TestHarness::new();
+    let bundle = create_test_changeset_bundle(vec![("artifact.txt", ChangeKind::Add)]);
+
+    let bundle_bytes = bundle.canonical_bytes().expect("serialize bundle");
+    let cas_hash = harness.cas.store(&bundle_bytes);
+    let cs_event = harness.create_changeset_published_event(
+        "work-artifact-max-bytes",
+        bundle.changeset_digest,
+        cas_hash,
+    );
+    harness
+        .ledger
+        .append_verified(&cs_event, &harness.signer.verifying_key())
+        .expect("append changeset_published");
+
+    let content = vec![b'a'; 2048];
+    let content_hash = harness.cas.store(&content);
+
+    let ctx = harness.execution_context("req-artifact-max-bytes");
+    let artifact_args = ToolArgs::Artifact(ArtifactArgs {
+        stable_id: None,
+        content_hash: Some(content_hash),
+        expected_hash: None,
+        max_bytes: 512,
+        format: None,
+    });
+    let result = harness
+        .tool_executor
+        .execute(&ctx, &artifact_args)
+        .await
+        .expect("execute artifact fetch");
+    assert!(
+        !result.success,
+        "artifact fetch should fail when max_bytes is exceeded"
+    );
+
+    let error_message = result
+        .error_message
+        .unwrap_or_else(|| "artifact fetch failed".to_string());
+    let error_log = serde_json::json!({
+        "error": error_message,
+        "content_hash": hex::encode(content_hash),
+        "max_bytes": 512,
+    });
+    let cas_log_hash = harness.cas.store(error_log.to_string().as_bytes());
+
+    let blocked_event = harness.create_review_blocked_event(
+        "BLK-artifact-max-bytes-001",
+        bundle.changeset_digest,
+        ReasonCode::ToolFailed,
+        cas_log_hash,
+    );
+    let seq_id = harness
+        .ledger
+        .append_verified(&blocked_event, &harness.signer.verifying_key())
+        .expect("append review_blocked_recorded");
+
+    let stored = harness.ledger.read_one(seq_id).expect("read_one");
+    let decoded = ReviewBlockedRecorded::decode(stored.payload.as_slice())
+        .expect("decode ReviewBlockedRecorded");
+    assert_eq!(
+        decoded.reason_code,
+        i32::from(ReasonCode::ToolFailed.to_code())
     );
 }
 

@@ -1017,6 +1017,23 @@ impl ToolHandler for GitOperationHandler {
 
         // Build the git command with hardened options
         let mut cmd = tokio::process::Command::new("git");
+        // Clear inherited environment to prevent scope overrides (PROC-ENV)
+        cmd.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            cmd.env("PATH", path);
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            cmd.env("HOME", home);
+        }
+        if let Some(xdg_config) = std::env::var_os("XDG_CONFIG_HOME") {
+            cmd.env("XDG_CONFIG_HOME", xdg_config);
+        }
+        // Fail closed on global/system git config
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        // Explicitly remove repo override env vars (defense in depth)
+        cmd.env_remove("GIT_DIR");
+        cmd.env_remove("GIT_WORK_TREE");
         cmd.arg("-C").arg(&canonical_work_dir);
         cmd.args(["--no-pager", "-c", "color.ui=false", "-c", "core.pager=cat"]);
 
