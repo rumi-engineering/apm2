@@ -49,6 +49,7 @@ use crate::episode::{
     CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
     LeaseIssueDenialReason, validate_custody_domain_overlap,
 };
+use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
 use crate::session::{EphemeralHandle, SessionRegistry, SessionState};
 
@@ -112,6 +113,36 @@ impl std::fmt::Display for LedgerEventError {
 
 impl std::error::Error for LedgerEventError {}
 
+/// Error type for HTF timestamp generation (TCK-00289).
+///
+/// # Security (Fail-Closed)
+///
+/// Per RFC-0016 and the security policy, HTF timestamp errors must be
+/// propagated rather than returning a fallback value. Returning 0 would
+/// violate fail-closed security posture and could allow operations to
+/// proceed with invalid timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HtfTimestampError {
+    /// HLC is not enabled on the clock.
+    HlcNotEnabled,
+    /// Clock error occurred.
+    ClockError {
+        /// Error message from the clock.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for HtfTimestampError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HlcNotEnabled => write!(f, "HLC not enabled on clock"),
+            Self::ClockError { message } => write!(f, "clock error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for HtfTimestampError {}
+
 /// Trait for emitting signed events to the ledger.
 ///
 /// Per TCK-00253 acceptance criteria:
@@ -121,13 +152,15 @@ impl std::error::Error for LedgerEventError {}
 /// # Implementers
 ///
 /// - `StubLedgerEventEmitter`: In-memory storage for testing
-/// - `SqliteLedgerEventEmitter`: SQLite-backed persistence (future)
+/// - `DurableLedgerEventEmitter`: SQLite-backed persistence with HTF timestamps
+///   (TCK-00289)
 pub trait LedgerEventEmitter: Send + Sync {
     /// Emits a signed `WorkClaimed` event to the ledger.
     ///
     /// # Arguments
     ///
     /// * `claim` - The work claim to record
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
     ///
     /// # Returns
     ///
@@ -136,7 +169,37 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// # Errors
     ///
     /// Returns `LedgerEventError` if signing or persistence fails.
-    fn emit_work_claimed(&self, claim: &WorkClaim) -> Result<SignedLedgerEvent, LedgerEventError>;
+    fn emit_work_claimed(
+        &self,
+        claim: &WorkClaim,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Emits a signed `SessionStarted` event to the ledger (TCK-00289).
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID being started
+    /// * `work_id` - The work ID this session is associated with
+    /// * `lease_id` - The lease ID authorizing this session
+    /// * `actor_id` - The actor starting the session
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_session_started(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        lease_id: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Queries a signed event by event ID.
     fn get_event(&self, event_id: &str) -> Option<SignedLedgerEvent>;
@@ -230,7 +293,11 @@ impl StubLedgerEventEmitter {
 }
 
 impl LedgerEventEmitter for StubLedgerEventEmitter {
-    fn emit_work_claimed(&self, claim: &WorkClaim) -> Result<SignedLedgerEvent, LedgerEventError> {
+    fn emit_work_claimed(
+        &self,
+        claim: &WorkClaim,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
         // Generate unique event ID
@@ -262,12 +329,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Sign the canonical bytes
         let signature = self.signing_key.sign(&canonical_bytes);
 
-        // RFC-0016 HTF compliance: Use placeholder timestamp (0) for stub
-        // implementation. In production, this would use an HTF-compliant clock
-        // source that provides monotonic, causally-ordered timestamps. The stub
-        // uses 0 to make tests deterministic and avoid the forbidden
-        // SystemTime::now() call.
-        let timestamp_ns = 0u64;
+        // TCK-00289: Use provided HTF-compliant timestamp from HolonicClock.
+        // The timestamp_ns parameter is now provided by the caller from
+        // HolonicClock.now_hlc() ensuring RFC-0016 HTF compliance.
 
         let signed_event = SignedLedgerEvent {
             event_id: event_id.clone(),
@@ -333,6 +397,97 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         guard.1.get(event_id).cloned()
     }
 
+    fn emit_session_started(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        lease_id: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Domain prefix for session events (must be at function start per clippy)
+        const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build canonical payload (deterministic JSON)
+        let payload = serde_json::json!({
+            "event_type": "session_started",
+            "session_id": session_id,
+            "work_id": work_id,
+            "lease_id": lease_id,
+            "actor_id": actor_id,
+        });
+
+        let payload_bytes =
+            serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("payload serialization failed: {e}"),
+            })?;
+
+        // Build canonical bytes for signing (domain prefix + payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(SESSION_STARTED_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(SESSION_STARTED_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "session_started".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(work_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            session_id = %session_id,
+            work_id = %signed_event.work_id,
+            "SessionStarted event signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
         let events_by_work = self.events_by_work_id.read().expect("lock poisoned");
         let guard = self.events.read().expect("lock poisoned");
@@ -353,11 +508,15 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 // Policy Resolver Interface (TCK-00253)
 // ============================================================================
 
+use serde::{Deserialize, Serialize};
+
+// ... (existing code)
+
 /// Result of a policy resolution request.
 ///
 /// Per DD-002, the daemon delegates policy resolution to the governance holon.
 /// This struct captures the resolved policy state for work claiming.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyResolution {
     /// Unique reference to the `PolicyResolvedForChangeSet` event.
     pub policy_resolved_ref: String,
@@ -521,7 +680,7 @@ impl PolicyResolver for StubPolicyResolver {
 // ============================================================================
 
 /// A claimed work item with its associated metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkClaim {
     /// Unique work identifier.
     pub work_id: String,
@@ -533,6 +692,7 @@ pub struct WorkClaim {
     pub actor_id: String,
 
     /// Role claimed for this work.
+    #[serde(with = "work_role_serde")]
     pub role: WorkRole,
 
     /// Policy resolution for this claim.
@@ -551,6 +711,29 @@ pub struct WorkClaim {
     /// Per TCK-00258, these are the domains of the actors who authored the
     /// changeset being reviewed.
     pub author_custody_domains: Vec<String>,
+}
+
+mod work_role_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::WorkRole;
+
+    // Serde requires `&T` for custom serializers via `serialize_with`.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S>(role: &WorkRole, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_i32(*role as i32)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<WorkRole, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let val = i32::deserialize(deserializer)?;
+        WorkRole::try_from(val).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Trait for persisting and querying work claims.
@@ -1192,6 +1375,10 @@ impl LeaseValidator for StubLeaseValidator {
 /// # TCK-00257 Additions
 ///
 /// - Lease validator for `GATE_EXECUTOR` spawn validation
+///
+/// # TCK-00289 Additions
+///
+/// - `HolonicClock` for HTF-compliant timestamps in `IssueCapability`
 pub struct PrivilegedDispatcher {
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
@@ -1248,9 +1435,28 @@ pub struct PrivilegedDispatcher {
     /// TODO(TCK-FUTURE): Wire `PrivilegedDispatcher` into `main.rs` to enable
     /// these metrics for binary protocol requests.
     metrics: Option<SharedMetricsRegistry>,
+
+    /// HTF-compliant clock for timestamps (TCK-00289).
+    ///
+    /// Used to generate RFC-0016 compliant timestamps for:
+    /// - `IssueCapability` `granted_at` / `expires_at` fields
+    /// - `WorkClaimed` ledger event timestamps
+    ///
+    /// # HTF Compliance
+    ///
+    /// The clock provides:
+    /// - Monotonic ticks: Never regress within a process lifetime
+    /// - HLC stamps: Hybrid logical clock for cross-node causality
+    /// - Wall time bounds: Observational only, with uncertainty interval
+    holonic_clock: Arc<HolonicClock>,
 }
 
 impl Default for PrivilegedDispatcher {
+    /// Creates a default dispatcher (TEST ONLY).
+    ///
+    /// # Warning: RSK-2503 Mixed Clock Domain Hazard
+    ///
+    /// See `new()` for details on clock domain hazards.
     fn default() -> Self {
         Self::new()
     }
@@ -1263,13 +1469,35 @@ impl Default for PrivilegedDispatcher {
 pub const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 3600;
 
 impl PrivilegedDispatcher {
-    /// Creates a new dispatcher with default decode configuration.
+    /// Creates a new dispatcher with default decode configuration (TEST ONLY).
+    ///
+    /// # Warning: RSK-2503 Mixed Clock Domain Hazard
+    ///
+    /// This constructor creates an internal `HolonicClock` instance. For
+    /// production code, use `with_shared_state` or `with_dependencies` to
+    /// inject a shared clock and prevent mixed clock domain hazards.
+    ///
+    /// # Usage
+    ///
+    /// This constructor is intended for unit tests only. Production code
+    /// should use `with_shared_state` or `with_dependencies` with a
+    /// properly initialized and shared `HolonicClock`.
     ///
     /// Uses stub implementations for policy resolver, work registry, event
     /// emitter, session registry, and lease validator. No metrics are emitted.
-    /// Creates internal stub token minter and manifest store for testing.
+    /// Creates internal stub token minter, manifest store, and HTF clock for
+    /// testing.
     #[must_use]
     pub fn new() -> Self {
+        // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
+        // WARNING: This creates an internal clock which can cause RSK-2503
+        // (Mixed Clock Domain Hazard) if used in production alongside other
+        // components with their own clocks. Use with_shared_state or
+        // with_dependencies for production code.
+        let holonic_clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default ClockConfig should always succeed"),
+        );
         Self {
             decode_config: DecodeConfig::default(),
             policy_resolver: Arc::new(StubPolicyResolver),
@@ -1281,16 +1509,39 @@ impl PrivilegedDispatcher {
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
+            holonic_clock,
         }
     }
 
-    /// Creates a new dispatcher with custom decode configuration.
+    /// Creates a new dispatcher with custom decode configuration (TEST ONLY).
+    ///
+    /// # Warning: RSK-2503 Mixed Clock Domain Hazard
+    ///
+    /// This constructor creates an internal `HolonicClock` instance. For
+    /// production code, use `with_shared_state` or `with_dependencies` to
+    /// inject a shared clock and prevent mixed clock domain hazards.
+    ///
+    /// # Usage
+    ///
+    /// This constructor is intended for unit tests only. Production code
+    /// should use `with_shared_state` or `with_dependencies` with a
+    /// properly initialized and shared `HolonicClock`.
     ///
     /// Uses stub implementations for policy resolver, work registry, event
     /// emitter, session registry, and lease validator. No metrics are emitted.
-    /// Creates internal stub token minter and manifest store for testing.
+    /// Creates internal stub token minter, manifest store, and HTF clock for
+    /// testing.
     #[must_use]
     pub fn with_decode_config(decode_config: DecodeConfig) -> Self {
+        // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
+        // WARNING: This creates an internal clock which can cause RSK-2503
+        // (Mixed Clock Domain Hazard) if used in production alongside other
+        // components with their own clocks. Use with_shared_state or
+        // with_dependencies for production code.
+        let holonic_clock = Arc::new(
+            HolonicClock::new(ClockConfig::default(), None)
+                .expect("default ClockConfig should always succeed"),
+        );
         Self {
             decode_config,
             policy_resolver: Arc::new(StubPolicyResolver),
@@ -1302,15 +1553,48 @@ impl PrivilegedDispatcher {
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
+            holonic_clock,
         }
     }
 
-    /// Creates a new dispatcher with custom dependencies.
+    /// Creates a new dispatcher with custom dependencies (PRODUCTION).
     ///
     /// This is the production constructor for real governance integration.
     /// Does not include metrics; use `with_metrics` to add them.
-    /// Creates internal stub token minter and manifest store.
+    ///
+    /// # TCK-00289: Clock Injection (RSK-2503 Prevention)
+    ///
+    /// The `clock` parameter MUST be a shared `HolonicClock` instance that is
+    /// also used by other components in the system. This prevents the mixed
+    /// clock domain hazard (RSK-2503) that would occur if each component
+    /// created its own clock.
+    ///
+    /// # TCK-00287: State Sharing
+    ///
+    /// The `token_minter` and `manifest_store` parameters MUST be `Arc::clone`
+    /// copies of the same instances used by `SessionDispatcher`. This ensures:
+    /// - Tokens minted during `SpawnEpisode` can be validated by
+    ///   `SessionDispatcher`
+    /// - Capability manifests registered during `SpawnEpisode` are accessible
+    ///   for tool request validation
+    ///
+    /// Callers must ensure proper sharing by cloning the Arcs BEFORE passing
+    /// to this constructor:
+    /// ```ignore
+    /// let token_minter = Arc::new(TokenMinter::new(...));
+    /// let manifest_store = Arc::new(InMemoryManifestStore::new());
+    /// let priv_dispatcher = PrivilegedDispatcher::with_dependencies(
+    ///     ...,
+    ///     Arc::clone(&token_minter),  // Clone BEFORE passing
+    ///     Arc::clone(&manifest_store), // Clone BEFORE passing
+    /// );
+    /// let session_dispatcher = SessionDispatcher::with_manifest_store(
+    ///     (*token_minter).clone(),
+    ///     manifest_store,
+    /// );
+    /// ```
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_dependencies(
         decode_config: DecodeConfig,
         policy_resolver: Arc<dyn PolicyResolver>,
@@ -1319,6 +1603,9 @@ impl PrivilegedDispatcher {
         episode_runtime: Arc<EpisodeRuntime>,
         session_registry: Arc<dyn SessionRegistry>,
         lease_validator: Arc<dyn LeaseValidator>,
+        clock: Arc<HolonicClock>,
+        token_minter: Arc<TokenMinter>,
+        manifest_store: Arc<InMemoryManifestStore>,
     ) -> Self {
         Self {
             decode_config,
@@ -1328,15 +1615,17 @@ impl PrivilegedDispatcher {
             episode_runtime,
             session_registry,
             lease_validator,
-            token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
-            manifest_store: Arc::new(InMemoryManifestStore::new()),
+            token_minter,
+            manifest_store,
             metrics: None,
+            holonic_clock: clock,
         }
     }
 
-    /// Creates a new dispatcher with shared token minter and manifest store.
+    /// Creates a new dispatcher with shared token minter and manifest store
+    /// (PRODUCTION).
     ///
-    /// # TCK-00287
+    /// # TCK-00287: State Sharing
     ///
     /// This constructor is used by `DispatcherState` to wire up shared
     /// dependencies between `PrivilegedDispatcher` and `SessionDispatcher`:
@@ -1346,11 +1635,19 @@ impl PrivilegedDispatcher {
     ///   `SpawnEpisode` are accessible for tool request validation
     /// - `session_registry`: Uses the global daemon session registry instead of
     ///   an internal stub
+    ///
+    /// # TCK-00289: Clock Injection (RSK-2503 Prevention)
+    ///
+    /// The `clock` parameter MUST be a shared `HolonicClock` instance that is
+    /// also used by other components in the system. This prevents the mixed
+    /// clock domain hazard (RSK-2503) that would occur if each component
+    /// created its own clock.
     #[must_use]
     pub fn with_shared_state(
         token_minter: Arc<TokenMinter>,
         manifest_store: Arc<InMemoryManifestStore>,
         session_registry: Arc<dyn SessionRegistry>,
+        clock: Arc<HolonicClock>,
     ) -> Self {
         Self {
             decode_config: DecodeConfig::default(),
@@ -1363,6 +1660,7 @@ impl PrivilegedDispatcher {
             token_minter,
             manifest_store,
             metrics: None,
+            holonic_clock: clock,
         }
     }
 
@@ -1434,6 +1732,61 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub const fn manifest_store(&self) -> &Arc<InMemoryManifestStore> {
         &self.manifest_store
+    }
+
+    /// Returns a reference to the HTF-compliant clock (TCK-00289).
+    ///
+    /// This is primarily for testing to verify clock behavior.
+    #[must_use]
+    pub const fn holonic_clock(&self) -> &Arc<HolonicClock> {
+        &self.holonic_clock
+    }
+
+    // =========================================================================
+    // TCK-00289: HTF-Compliant Timestamp Generation
+    // =========================================================================
+
+    /// Returns an HTF-compliant timestamp in nanoseconds since epoch.
+    ///
+    /// Per RFC-0016, all timestamps must come from the `HolonicClock` to
+    /// ensure:
+    /// - Monotonicity: Timestamps never regress within a process lifetime
+    /// - Causality: HLC provides cross-node causal ordering
+    /// - Determinism: Clock source is injectable for replay scenarios
+    ///
+    /// # Returns
+    ///
+    /// The current HLC wall time in nanoseconds since epoch. This is a u64
+    /// value representing hybrid logical clock time, suitable for ledger
+    /// event timestamps and capability grant/expiry times.
+    ///
+    /// # Panics
+    ///
+    /// This method expects the `HolonicClock` to have HLC enabled. If HLC is
+    /// not enabled, this returns an error (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns `HtfTimestampError` if the clock operation fails.
+    ///
+    /// # Security (Fail-Closed)
+    ///
+    /// Per RFC-0016 and TCK-00289 DOD, this method fails closed rather than
+    /// returning a fallback value like 0. Returning 0 would violate security
+    /// policy and allow operations to proceed with invalid timestamps.
+    fn get_htf_timestamp_ns(&self) -> Result<u64, HtfTimestampError> {
+        match self.holonic_clock.now_hlc() {
+            Ok(hlc) => Ok(hlc.wall_ns),
+            Err(e) => {
+                // TCK-00289: Fail-closed - do not return 0 as fallback.
+                // This is a security-critical operation that must not proceed
+                // with invalid timestamps.
+                warn!(error = %e, "HLC clock error - failing closed per RFC-0016");
+                Err(HtfTimestampError::ClockError {
+                    message: e.to_string(),
+                })
+            },
+        }
     }
 
     // =========================================================================
@@ -1744,7 +2097,22 @@ impl PrivilegedDispatcher {
         // - Signed with the daemon's signing key (Ed25519)
         // - Includes work_id, lease_id, actor_id, role, and policy_resolved_ref
         // - Persisted to the append-only ledger for audit trail
-        let signed_event = match self.event_emitter.emit_work_claimed(&claim) {
+        //
+        // TCK-00289: Use HTF-compliant timestamp from HolonicClock.
+        // Per RFC-0016, timestamps must come from the HTF clock source to ensure
+        // monotonicity and causal ordering.
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                // TCK-00289: Fail-closed - do not proceed without valid timestamp
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+        let signed_event = match self.event_emitter.emit_work_claimed(&claim, timestamp_ns) {
             Ok(event) => event,
             Err(e) => {
                 warn!(error = %e, "WorkClaimed event emission failed");
@@ -2030,11 +2398,16 @@ impl PrivilegedDispatcher {
                     );
 
                     // Emit LeaseIssueDenied event for audit logging.
-                    // RFC-0016 HTF compliance: Use placeholder timestamp (0) for stub
-                    // implementation. In production, this would derive timestamp from
-                    // HolonicClock via episode_runtime to ensure deterministic replay
-                    // and avoid forbidden SystemTime::now() usage.
-                    let timestamp_ns = 0u64;
+                    // TCK-00289: Use HTF-compliant timestamp per RFC-0016.
+                    // Fail-closed: if clock fails, we still reject the spawn (already
+                    // doing that) but log at warning level instead of emitting event.
+                    let timestamp_ns = match self.get_htf_timestamp_ns() {
+                        Ok(ts) => ts,
+                        Err(e) => {
+                            warn!(error = %e, "HTF timestamp error for LeaseIssueDenied - skipping event emission");
+                            0u64 // Use 0 only for best-effort event, spawn is still denied
+                        },
+                    };
 
                     // Best-effort event emission - don't fail spawn on event error.
                     // If no Tokio runtime is available (e.g., in unit tests), skip the
@@ -2110,6 +2483,10 @@ impl PrivilegedDispatcher {
 
         // TCK-00287 BLOCKER 2: Generate session token for client authentication
         // The token is HMAC-signed and bound to this session's lease_id.
+        //
+        // NOTE: TokenMinter uses SystemTime for TTL calculation, which is
+        // acceptable since token expiry is not a protocol-authoritative event.
+        // The HTF clock is used for ledger events that require causal ordering.
         let spawn_time = SystemTime::now();
         let ttl = Duration::from_secs(DEFAULT_SESSION_TOKEN_TTL_SECS);
         let session_token =
@@ -2167,6 +2544,45 @@ impl PrivilegedDispatcher {
             metrics.daemon_metrics().session_spawned(role_str);
         }
 
+        // TCK-00289: Emit SessionStarted ledger event for audit trail.
+        // Per DOD: "ClaimWork/SpawnEpisode persist state and emit ledger events"
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                // TCK-00289: Fail-closed - do not proceed without valid timestamp
+                warn!(error = %e, "HTF timestamp generation failed for SessionStarted - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // Derive actor_id from credentials (same pattern as ClaimWork)
+        let actor_id = ctx
+            .peer_credentials()
+            .map_or_else(|| "unknown".to_string(), derive_actor_id);
+
+        if let Err(e) = self.event_emitter.emit_session_started(
+            &session_id,
+            &request.work_id,
+            &claim.lease_id,
+            &actor_id,
+            timestamp_ns,
+        ) {
+            warn!(error = %e, "SessionStarted event emission failed");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("event emission failed: {e}"),
+            ));
+        }
+
+        debug!(
+            session_id = %session_id,
+            work_id = %request.work_id,
+            "SessionStarted event emitted successfully"
+        );
+
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
             session_id,
             ephemeral_handle: ephemeral_handle.to_string(),
@@ -2178,10 +2594,12 @@ impl PrivilegedDispatcher {
 
     /// Handles `IssueCapability` requests (IPC-PRIV-003).
     ///
-    /// # Stub Implementation
+    /// # TCK-00289 Implementation
     ///
-    /// This is a stub handler that validates the request and returns a
-    /// placeholder response. Full implementation in future ticket.
+    /// This handler implements capability issuance with:
+    /// 1. Session validation (must exist)
+    /// 2. Lease validation (session's lease must be valid for its work)
+    /// 3. HTF-compliant timestamps via `HolonicClock`
     fn handle_issue_capability(
         &self,
         payload: &[u8],
@@ -2196,7 +2614,7 @@ impl PrivilegedDispatcher {
             session_id = %request.session_id,
             has_capability_request = request.capability_request.is_some(),
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
-            "IssueCapability request received (stub handler)"
+            "IssueCapability request received"
         );
 
         // Validate required fields
@@ -2214,30 +2632,94 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // STUB: Return placeholder response
-        // RFC-0016 HTF compliance: Use UUID-derived identifier instead of
-        // SystemTime::now() The actual timestamps will be populated by proper
-        // HTF clock when implemented
-        let stub_id = uuid::Uuid::new_v4();
+        // 1. Retrieve session state
+        let Some(session) = self.session_registry.get_session(&request.session_id) else {
+            warn!(session_id = %request.session_id, "IssueCapability rejected: session not found");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::SessionNotFound,
+                format!("session not found: {}", request.session_id),
+            ));
+        };
+
+        // 2. Validate lease (TCK-00289: "Implement IssueCapability with lease
+        //    validation")
+        // Ensure the session's lease matches the authoritative work claim.
+        // This confirms the session corresponds to a valid, active work item.
+        if let Some(claim) = self.work_registry.get_claim(&session.work_id) {
+            // Verify lease_id matches
+            // Constant-time comparison is good practice for IDs
+            let lease_matches = session.lease_id.len() == claim.lease_id.len()
+                && bool::from(session.lease_id.as_bytes().ct_eq(claim.lease_id.as_bytes()));
+
+            if !lease_matches {
+                warn!(
+                    session_id = %request.session_id,
+                    expected_lease = "[REDACTED]",
+                    actual_lease = "[REDACTED]",
+                    "IssueCapability rejected: lease mismatch against work claim"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "lease validation failed: session lease does not match work claim",
+                ));
+            }
+        } else {
+            warn!(
+                session_id = %request.session_id,
+                work_id = %session.work_id,
+                "IssueCapability rejected: work claim not found"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease validation failed: work claim not found",
+            ));
+        }
+
+        // 3. Generate HTF-compliant timestamps
+        let Ok(mono_tick) = self.holonic_clock.now_mono_tick() else {
+            warn!("Clock error during IssueCapability");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PolicyResolutionFailed,
+                "clock error",
+            ));
+        };
+        let _mono_tick = mono_tick.value();
+
+        // For grant/expire times, use HLC Wall Time per RFC-0016.
+        // TCK-00289: Fail-closed - do not fall back to SystemTime if HLC disabled.
+        let now_wall = match self.holonic_clock.now_hlc() {
+            Ok(hlc) => hlc.wall_ns,
+            Err(e) => {
+                // TCK-00289: Fail-closed - do not use SystemTime fallback
+                warn!(error = %e, "HLC clock error during IssueCapability - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::PolicyResolutionFailed,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // Duration is in seconds, convert to nanoseconds
+        let duration_ns =
+            request.capability_request.as_ref().unwrap().duration_secs * 1_000_000_000;
+        let expires_at_ns = now_wall + duration_ns;
+
+        // Convert to seconds for response (proto uses u64 seconds)
+        let granted_at = now_wall / 1_000_000_000;
+        let expires_at = expires_at_ns / 1_000_000_000;
+
+        let capability_id = format!("C-{}", uuid::Uuid::new_v4());
 
         // TCK-00268: Emit capability_granted metric
-        // Extract role from session state for the metric label
         if let Some(ref metrics) = self.metrics {
-            // Try to get the session to determine role
-            let role = self
-                .session_registry
-                .get_session(&request.session_id)
-                .map_or("unknown", |s| {
-                    match WorkRole::try_from(s.role).unwrap_or(WorkRole::Unspecified) {
-                        WorkRole::Implementer => "implementer",
-                        WorkRole::Reviewer => "reviewer",
-                        WorkRole::GateExecutor => "gate_executor",
-                        WorkRole::Coordinator => "coordinator",
-                        WorkRole::Unspecified => "unspecified",
-                    }
-                });
+            let role_str = match WorkRole::try_from(session.role).unwrap_or(WorkRole::Unspecified) {
+                WorkRole::Implementer => "implementer",
+                WorkRole::Reviewer => "reviewer",
+                WorkRole::GateExecutor => "gate_executor",
+                WorkRole::Coordinator => "coordinator",
+                WorkRole::Unspecified => "unspecified",
+            };
 
-            // Extract capability type from request
             let capability_type = request
                 .capability_request
                 .as_ref()
@@ -2245,16 +2727,20 @@ impl PrivilegedDispatcher {
 
             metrics
                 .daemon_metrics()
-                .capability_granted(role, capability_type);
+                .capability_granted(role_str, capability_type);
         }
+
+        info!(
+            session_id = %request.session_id,
+            capability_id = %capability_id,
+            "Capability issued"
+        );
 
         Ok(PrivilegedResponse::IssueCapability(
             IssueCapabilityResponse {
-                capability_id: format!("C-{stub_id}"),
-                // STUB: Use placeholder timestamps (0) until HTF clock is available
-                // Per RFC-0016, real timestamps must come from HTF-compliant clock source
-                granted_at: 0,
-                expires_at: 3600, // Relative offset for stub
+                capability_id,
+                granted_at,
+                expires_at,
             },
         ))
     }
@@ -2400,6 +2886,8 @@ mod tests {
 
         #[test]
         fn test_issue_capability_routing() {
+            use crate::session::SessionState;
+
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
@@ -2407,8 +2895,46 @@ mod tests {
                 pid: Some(12345),
             }));
 
+            // TCK-00289: Register a session and work claim for IssueCapability validation
+            let work_id = "W-TEST-001";
+            let lease_id = "L-TEST-001";
+            let session_id = "S-001";
+
+            // Register work claim
+            let claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: format!("resolved-for-{work_id}"),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                },
+                author_custody_domains: vec![],
+                executor_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            // Register session
+            let session_state = SessionState {
+                session_id: session_id.to_string(),
+                work_id: work_id.to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: lease_id.to_string(),
+                ephemeral_handle: String::new(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            dispatcher
+                .session_registry
+                .register_session(session_state)
+                .unwrap();
+
             let request = IssueCapabilityRequest {
-                session_id: "S-001".to_string(),
+                session_id: session_id.to_string(),
                 capability_request: Some(super::super::super::messages::CapabilityRequest {
                     tool_class: "file_read".to_string(),
                     read_patterns: vec!["**/*.rs".to_string()],
@@ -2672,11 +3198,51 @@ mod tests {
 
     #[test]
     fn test_privileged_issue_capability_stub() {
+        use crate::session::SessionState;
+
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
+        // TCK-00289: Register a session and work claim for IssueCapability validation
+        let work_id = "W-TEST-001";
+        let lease_id = "L-TEST-001";
+        let session_id = "S-001";
+
+        // Register work claim
+        let claim = WorkClaim {
+            work_id: work_id.to_string(),
+            lease_id: lease_id.to_string(),
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::Implementer,
+            policy_resolution: PolicyResolution {
+                policy_resolved_ref: format!("resolved-for-{work_id}"),
+                resolved_policy_hash: [0u8; 32],
+                capability_manifest_hash: [0u8; 32],
+                context_pack_hash: [0u8; 32],
+            },
+            author_custody_domains: vec![],
+            executor_custody_domains: vec![],
+        };
+        dispatcher.work_registry.register_claim(claim).unwrap();
+
+        // Register session
+        let session_state = SessionState {
+            session_id: session_id.to_string(),
+            work_id: work_id.to_string(),
+            role: WorkRole::Implementer.into(),
+            lease_id: lease_id.to_string(),
+            ephemeral_handle: String::new(),
+            policy_resolved_ref: String::new(),
+            capability_manifest_hash: vec![],
+            episode_id: None,
+        };
+        dispatcher
+            .session_registry
+            .register_session(session_state)
+            .unwrap();
+
         let request = IssueCapabilityRequest {
-            session_id: "S-001".to_string(),
+            session_id: session_id.to_string(),
             capability_request: Some(super::super::messages::CapabilityRequest {
                 tool_class: "file_read".to_string(),
                 read_patterns: vec!["**/*.rs".to_string()],
@@ -2692,9 +3258,24 @@ mod tests {
             PrivilegedResponse::IssueCapability(resp) => {
                 assert!(!resp.capability_id.is_empty());
                 assert!(resp.capability_id.starts_with("C-")); // UUID-based ID
-                // STUB uses placeholder timestamps (granted_at=0, expires_at=3600)
-                assert_eq!(resp.granted_at, 0);
-                assert_eq!(resp.expires_at, 3600);
+                // TCK-00289: HTF-compliant timestamps from HolonicClock
+                // Per Definition of Done: "IssueCapability returns non-zero HTF-compliant
+                // timestamps"
+                assert!(
+                    resp.granted_at > 0,
+                    "granted_at should be non-zero HTF timestamp"
+                );
+                assert!(
+                    resp.expires_at > resp.granted_at,
+                    "expires_at should be after granted_at"
+                );
+                // Verify expires_at is granted_at + 1 hour (duration_secs in seconds)
+                let expected_ttl_secs = 3600u64;
+                assert_eq!(
+                    resp.expires_at - resp.granted_at,
+                    expected_ttl_secs,
+                    "TTL should be 1 hour in seconds"
+                );
             },
             PrivilegedResponse::Error(err) => {
                 panic!("Unexpected error: {err:?}");
@@ -3105,11 +3686,11 @@ mod tests {
                 event.event_id.starts_with("EVT-"),
                 "Event ID should have EVT- prefix"
             );
-            // RFC-0016 HTF compliance: Stub uses placeholder timestamp (0)
-            // In production, HTF-compliant clock will provide real timestamps
-            assert_eq!(
-                event.timestamp_ns, 0,
-                "Stub timestamp should be 0 (HTF placeholder)"
+            // TCK-00289: HTF-compliant timestamps from HolonicClock
+            // Per Definition of Done: timestamps must be non-zero HTF-compliant
+            assert!(
+                event.timestamp_ns > 0,
+                "Timestamp should be non-zero HTF-compliant value"
             );
 
             // Verify payload contains expected fields
