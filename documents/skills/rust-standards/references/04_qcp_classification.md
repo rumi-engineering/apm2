@@ -23,9 +23,11 @@ flowchart TD
     D -->|YES| QCP_YES
     D -->|NO| E{Touches gates/policy?}
     E -->|YES| QCP_YES
-    E -->|NO| F{Touches platform contract?}
+    E -->|NO| F{Touches evidence/ledger/enforcement?}
     F -->|YES| QCP_YES
-    F -->|NO| QCP_NO
+    F -->|NO| G{Touches platform contract?}
+    G -->|YES| QCP_YES
+    G -->|NO| QCP_NO
 
     QCP_YES[QCP = YES]
     QCP_NO[QCP = NO]
@@ -168,6 +170,20 @@ assertions:
         remediation:
           type: TEST
           specification: "Add endianness tests for layout-sensitive code"
+
+### 1.7 Evidence and Enforcement Surfaces
+
+```yaml
+patterns:
+  - path_contains: [evidence, ledger, cas, workspace]
+  - path_contains: [tool_executor, tool_broker, tool_protocol]
+  - symbols: [ToolExecutor, ToolBroker, WorkspaceManager, append_verified]
+  - keywords: [allowlist, denylist, enforcement, signature, anchoring]
+
+on_match:
+  qcp: true
+  category: EVIDENCE_ENFORCEMENT
+```
 ```
 
 ---
@@ -188,7 +204,8 @@ type QCPCategory =
   | "PUBLIC_API"
   | "PERFORMANCE"
   | "GATE_POLICY"
-  | "PLATFORM_CONTRACT";
+  | "PLATFORM_CONTRACT"
+  | "EVIDENCE_ENFORCEMENT";
 ```
 
 ---

@@ -105,6 +105,20 @@ assertions:
         remediation:
           type: CI
           specification: "Add CI coverage for QCP paths"
+
+  - id: INPUT-004
+    predicate: |
+      IF evidence_claims.runtime_path THEN
+        ci_evidence.executes_real_runtime_path AND
+        NOT ci_evidence.simulated_runtime_path
+    on_fail:
+      EMIT StopCondition:
+        id: STOP-EVIDENCE-SIMULATION
+        severity: BLOCKER
+        message: "Evidence claims runtime path but tests simulate it"
+        remediation:
+          type: TEST
+          specification: "Exercise real runtime path or add explicit waiver"
 ```
 
 ---

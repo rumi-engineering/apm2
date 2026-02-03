@@ -3,10 +3,10 @@ title: Dev Ticket Command Reference
 commands[13]:
   - name: start-ticket-default
     command: "cargo xtask start-ticket"
-    purpose: "Setup dev environment for next unblocked ticket."
+    purpose: "Setup dev environment for next unblocked ticket. Expect an error for work already in progress."
   - name: start-ticket-rfc
     command: "cargo xtask start-ticket RFC-XXXX"
-    purpose: "Setup dev environment for next unblocked ticket in RFC."
+    purpose: "Setup dev environment for next unblocked ticket in RFC. Expect an error for work already in progress."
   - name: start-ticket-ticket
     command: "cargo xtask start-ticket TCK-XXXXX"
     purpose: "Setup dev environment for a specific ticket."
