@@ -42,7 +42,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -92,6 +92,8 @@ pub mod kernel_event {
         QuarantineCleared(super::QuarantineCleared),
         #[prost(message, tag = "29")]
         ChangesetPublished(super::ChangeSetPublished),
+        #[prost(message, tag = "30")]
+        IoArtifactPublished(super::IoArtifactPublished),
     }
 }
 /// ============================================================
@@ -185,6 +187,11 @@ pub struct SessionStarted {
     /// Binds this event to verifiable HTF time.
     #[prost(message, optional, tag = "9")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Empty string for non-episode sessions; populated from episode context.
+    /// Enables episode.<episode_id>.lifecycle topic routing.
+    #[prost(string, tag = "10")]
+    pub episode_id: ::prost::alloc::string::String,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -198,6 +205,11 @@ pub struct SessionProgress {
     pub progress_type: ::prost::alloc::string::String,
     #[prost(uint64, tag = "4")]
     pub entropy_consumed: u64,
+    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Empty string for non-episode sessions; populated from episode context.
+    /// Enables episode.<episode_id>.lifecycle topic routing.
+    #[prost(string, tag = "5")]
+    pub episode_id: ::prost::alloc::string::String,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -215,6 +227,11 @@ pub struct SessionTerminated {
     /// Binds this event to verifiable HTF time.
     #[prost(message, optional, tag = "5")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Empty string for non-episode sessions; populated from episode context.
+    /// Enables episode.<episode_id>.lifecycle topic routing.
+    #[prost(string, tag = "6")]
+    pub episode_id: ::prost::alloc::string::String,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -243,6 +260,11 @@ pub struct SessionQuarantined {
     /// Required for interpreting tick values as durations.
     #[prost(uint64, tag = "7")]
     pub tick_rate_hz: u64,
+    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Empty string for non-episode sessions; populated from episode context.
+    /// Enables episode.<episode_id>.lifecycle topic routing.
+    #[prost(string, tag = "8")]
+    pub episode_id: ::prost::alloc::string::String,
 }
 /// ============================================================
 /// WORK EVENTS
@@ -377,6 +399,11 @@ pub struct ToolRequested {
     pub tool_args_hash: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "5")]
     pub dedupe_key: ::prost::alloc::string::String,
+    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Empty string for non-episode sessions; populated from episode context.
+    /// Enables episode.<episode_id>.tool topic routing.
+    #[prost(string, tag = "6")]
+    pub episode_id: ::prost::alloc::string::String,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -398,6 +425,11 @@ pub struct ToolDecided {
     /// Binds the decision receipt to verifiable HTF time.
     #[prost(message, optional, tag = "7")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Empty string for non-episode sessions; populated from episode context.
+    /// Enables episode.<episode_id>.tool topic routing.
+    #[prost(string, tag = "8")]
+    pub episode_id: ::prost::alloc::string::String,
 }
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -419,6 +451,11 @@ pub struct ToolExecuted {
     /// Binds the execution receipt to verifiable HTF time.
     #[prost(message, optional, tag = "5")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+    /// Empty string for non-episode sessions; populated from episode context.
+    /// Enables episode.<episode_id>.tool topic routing.
+    #[prost(string, tag = "6")]
+    pub episode_id: ::prost::alloc::string::String,
 }
 /// ============================================================
 /// LEASE EVENTS
@@ -1717,6 +1754,49 @@ pub struct ChangeSetPublished {
     /// Binds the changeset publication to verifiable HTF time.
     #[prost(message, optional, tag = "7")]
     pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+}
+/// Emitted when an IO artifact is published from an episode.
+///
+/// This event captures IO operations (reads, writes, stream outputs) from
+/// episode execution, enabling the episode.<episode_id>.io pulse topic.
+///
+/// Security: IO artifacts may contain sensitive data. The artifact_hash
+/// references CAS storage; access control is enforced at the CAS layer.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IoArtifactPublished {
+    /// Episode ID this artifact belongs to.
+    /// Required; enables episode.<episode_id>.io topic routing.
+    #[prost(string, tag = "1")]
+    pub episode_id: ::prost::alloc::string::String,
+    /// Session ID for correlation with session events.
+    #[prost(string, tag = "2")]
+    pub session_id: ::prost::alloc::string::String,
+    /// Artifact type: STDIN, STDOUT, STDERR, FILE_READ, FILE_WRITE
+    #[prost(string, tag = "3")]
+    pub artifact_type: ::prost::alloc::string::String,
+    /// BLAKE3 hash of the artifact content (32 bytes).
+    /// Full content is stored in CAS for retrieval.
+    #[prost(bytes = "vec", tag = "4")]
+    pub artifact_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Size of the artifact in bytes.
+    #[prost(uint64, tag = "5")]
+    pub artifact_size: u64,
+    /// Optional path for file-based artifacts.
+    #[prost(string, tag = "6")]
+    pub path: ::prost::alloc::string::String,
+    /// Timestamp when the artifact was produced (Unix nanos).
+    /// OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+    #[prost(uint64, tag = "7")]
+    pub produced_at: u64,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the artifact event to verifiable HTF time.
+    #[prost(message, optional, tag = "8")]
+    pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Data classification: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
+    /// Defaults to INTERNAL if not specified.
+    #[prost(string, tag = "9")]
+    pub classification: ::prost::alloc::string::String,
 }
 /// Determinism status for AAT runs.
 /// Indicates whether multiple runs produced consistent terminal evidence.

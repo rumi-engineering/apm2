@@ -1,5 +1,14 @@
 // APM2 Kernel Event Schema
-// Version: 0.3.0
+// Version: 0.4.0
+//
+// CHANGELOG (0.4.0):
+// - Added episode_id field to Session events for HEF topic derivation (RFC-0018, TCK-00306):
+//   SessionStarted, SessionProgress, SessionTerminated, SessionQuarantined
+// - Added episode_id field to Tool events for HEF topic derivation (RFC-0018, TCK-00306):
+//   ToolRequested, ToolDecided, ToolExecuted
+// - Added IoArtifactPublished event for episode IO artifact tracking (TCK-00306)
+// - Added IoArtifactPublished to KernelEvent payload (tag 30)
+// - Backward compatible: episode_id defaults to empty string for existing events
 //
 // CHANGELOG (0.3.0):
 // - Added TimeEnvelopeRef message type for HTF time authority (RFC-0016)
@@ -91,6 +100,7 @@ message KernelEvent {
     AATSpecQuarantined aat_spec_quarantined = 27;
     QuarantineCleared quarantine_cleared = 28;
     ChangeSetPublished changeset_published = 29;
+    IoArtifactPublished io_artifact_published = 30;
   }
 }
 
@@ -143,6 +153,10 @@ message SessionStarted {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds this event to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 9;
+  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Empty string for non-episode sessions; populated from episode context.
+  // Enables episode.<episode_id>.lifecycle topic routing.
+  string episode_id = 10;
 }
 
 message SessionProgress {
@@ -150,6 +164,10 @@ message SessionProgress {
   uint64 progress_sequence = 2;
   string progress_type = 3;  // HEARTBEAT, TOOL_COMPLETE, MILESTONE
   uint64 entropy_consumed = 4;
+  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Empty string for non-episode sessions; populated from episode context.
+  // Enables episode.<episode_id>.lifecycle topic routing.
+  string episode_id = 5;
 }
 
 message SessionTerminated {
@@ -160,6 +178,10 @@ message SessionTerminated {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds this event to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 5;
+  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Empty string for non-episode sessions; populated from episode context.
+  // Enables episode.<episode_id>.lifecycle topic routing.
+  string episode_id = 6;
 }
 
 message SessionQuarantined {
@@ -180,6 +202,10 @@ message SessionQuarantined {
   // Tick rate in Hz for issued_at_tick and expires_at_tick.
   // Required for interpreting tick values as durations.
   uint64 tick_rate_hz = 7;
+  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Empty string for non-episode sessions; populated from episode context.
+  // Enables episode.<episode_id>.lifecycle topic routing.
+  string episode_id = 8;
 }
 
 // ============================================================
@@ -255,6 +281,10 @@ message ToolRequested {
   string tool_name = 3;
   bytes tool_args_hash = 4;  // Hash of arguments (full args stored in CAS)
   string dedupe_key = 5;
+  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Empty string for non-episode sessions; populated from episode context.
+  // Enables episode.<episode_id>.tool topic routing.
+  string episode_id = 6;
 }
 
 message ToolDecided {
@@ -267,6 +297,10 @@ message ToolDecided {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds the decision receipt to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 7;
+  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Empty string for non-episode sessions; populated from episode context.
+  // Enables episode.<episode_id>.tool topic routing.
+  string episode_id = 8;
 }
 
 message ToolExecuted {
@@ -280,6 +314,10 @@ message ToolExecuted {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds the execution receipt to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 5;
+  // Episode ID for HEF topic derivation (RFC-0018, TCK-00306).
+  // Empty string for non-episode sessions; populated from episode context.
+  // Enables episode.<episode_id>.tool topic routing.
+  string episode_id = 6;
 }
 
 // ============================================================
@@ -1444,5 +1482,52 @@ message ChangeSetPublished {
   // HTF time envelope reference for temporal authority (RFC-0016).
   // Binds the changeset publication to verifiable HTF time.
   optional TimeEnvelopeRef time_envelope_ref = 7;
+}
+
+// ============================================================
+// IO ARTIFACT EVENTS (TCK-00306)
+// ============================================================
+//
+// IoArtifactPublished records IO artifacts produced during episode execution.
+// This event enables the episode.<episode_id>.io topic derivation for HEF
+// Pulse Plane (RFC-0018).
+//
+// Key properties:
+// - Links IO artifacts to specific episodes for observability
+// - Supports multiple artifact types (stdin, stdout, stderr, files)
+// - Binds to CAS for content-addressed retrieval
+// - Enables audit trail for episode IO operations
+
+// Emitted when an IO artifact is published from an episode.
+//
+// This event captures IO operations (reads, writes, stream outputs) from
+// episode execution, enabling the episode.<episode_id>.io pulse topic.
+//
+// Security: IO artifacts may contain sensitive data. The artifact_hash
+// references CAS storage; access control is enforced at the CAS layer.
+message IoArtifactPublished {
+  // Episode ID this artifact belongs to.
+  // Required; enables episode.<episode_id>.io topic routing.
+  string episode_id = 1;
+  // Session ID for correlation with session events.
+  string session_id = 2;
+  // Artifact type: STDIN, STDOUT, STDERR, FILE_READ, FILE_WRITE
+  string artifact_type = 3;
+  // BLAKE3 hash of the artifact content (32 bytes).
+  // Full content is stored in CAS for retrieval.
+  bytes artifact_hash = 4;
+  // Size of the artifact in bytes.
+  uint64 artifact_size = 5;
+  // Optional path for file-based artifacts.
+  string path = 6;
+  // Timestamp when the artifact was produced (Unix nanos).
+  // OBSERVATIONAL - see HTF RFC-0016; not used for protocol authority.
+  uint64 produced_at = 7;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the artifact event to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 8;
+  // Data classification: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
+  // Defaults to INTERNAL if not specified.
+  string classification = 9;
 }
 

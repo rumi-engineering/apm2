@@ -596,6 +596,9 @@ pub mod helpers {
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
             // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
+            // Episode ID (RFC-0018, TCK-00306): not populated by this helper.
+            // The daemon episode runtime will populate this field at runtime.
+            episode_id: String::new(),
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Started(started)),
@@ -636,6 +639,9 @@ pub mod helpers {
             time_envelope_ref: Some(TimeEnvelopeRef {
                 hash: time_envelope_hash.to_vec(),
             }),
+            // Episode ID (RFC-0018, TCK-00306): not populated by this helper.
+            // The daemon episode runtime will populate this field at runtime.
+            episode_id: String::new(),
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Started(started)),
@@ -656,6 +662,9 @@ pub mod helpers {
             progress_sequence,
             progress_type: progress_type.to_string(),
             entropy_consumed,
+            // Episode ID (RFC-0018, TCK-00306): not populated by this helper.
+            // The daemon episode runtime will populate this field at runtime.
+            episode_id: String::new(),
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Progress(progress)),
@@ -679,6 +688,9 @@ pub mod helpers {
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
             // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
+            // Episode ID (RFC-0018, TCK-00306): not populated by this helper.
+            // The daemon episode runtime will populate this field at runtime.
+            episode_id: String::new(),
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Terminated(terminated)),
@@ -709,6 +721,9 @@ pub mod helpers {
             issued_at_tick: 0,
             expires_at_tick: 0,
             tick_rate_hz: 0,
+            // Episode ID (RFC-0018, TCK-00306): not populated by this helper.
+            // The daemon episode runtime will populate this field at runtime.
+            episode_id: String::new(),
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Quarantined(quarantined)),
@@ -740,6 +755,9 @@ pub mod helpers {
             issued_at_tick,
             expires_at_tick,
             tick_rate_hz,
+            // Episode ID (RFC-0018, TCK-00306): not populated by this helper.
+            // The daemon episode runtime will populate this field at runtime.
+            episode_id: String::new(),
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Quarantined(quarantined)),

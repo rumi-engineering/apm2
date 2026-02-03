@@ -289,15 +289,25 @@ impl TopicDeriver {
             // Gate receipts -> gate.<work_id>.<changeset_digest>.<gate_id> (TCK-00305)
             "GateReceipt" => self.derive_gate_topic(event, &sanitized_namespace),
 
-            // Episode lifecycle events
+            // Session events -> episode.<episode_id>.lifecycle if episode_id present (TCK-00306)
+            // Falls back to namespace.lifecycle for non-episode sessions
+            "SessionStarted" | "SessionProgress" | "SessionTerminated" | "SessionQuarantined" => {
+                derive_session_topic(event, &sanitized_namespace)
+            },
+
+            // Episode lifecycle events (legacy compatibility)
             "EpisodeCreated" | "EpisodeStarted" | "EpisodeStopped" => {
                 format!("episode.{sanitized_namespace}.lifecycle")
             },
 
-            // Episode tool events
+            // Tool events -> episode.<episode_id>.tool if episode_id present (TCK-00306)
+            // Falls back to namespace.tool for non-episode sessions
             "ToolRequested" | "ToolDecided" | "ToolExecuted" => {
-                format!("episode.{sanitized_namespace}.tool")
+                derive_tool_topic(event, &sanitized_namespace)
             },
+
+            // IO artifact events -> episode.<episode_id>.io (TCK-00306)
+            "IoArtifactPublished" => derive_io_artifact_topic(event, &sanitized_namespace),
 
             // Defect events
             "DefectRecord" => "defect.new".to_string(),
@@ -368,6 +378,99 @@ fn derive_work_topic(event: &KernelEvent, fallback_namespace: &str) -> String {
     } else {
         // Payload is not a Work event, fall back to namespace
         format!("work.{fallback_namespace}.events")
+    }
+}
+
+// ============================================================================
+// Session Topic Derivation (TCK-00306)
+// ============================================================================
+
+/// Derives a session topic from a session event.
+///
+/// Format: `episode.<episode_id>.lifecycle` if `episode_id` is populated
+/// Fallback: `<namespace>.lifecycle` for non-episode sessions
+///
+/// Extracts the `episode_id` from the `SessionEvent` payload variants
+/// (RFC-0018).
+fn derive_session_topic(event: &KernelEvent, fallback_namespace: &str) -> String {
+    if let Some(Payload::Session(s)) = &event.payload {
+        let episode_id = match &s.event {
+            Some(apm2_core::events::session_event::Event::Started(e)) => &e.episode_id,
+            Some(apm2_core::events::session_event::Event::Progress(e)) => &e.episode_id,
+            Some(apm2_core::events::session_event::Event::Terminated(e)) => &e.episode_id,
+            Some(apm2_core::events::session_event::Event::Quarantined(e)) => &e.episode_id,
+            // CrashDetected and RestartScheduled don't have episode_id
+            Some(
+                apm2_core::events::session_event::Event::CrashDetected(_)
+                | apm2_core::events::session_event::Event::RestartScheduled(_),
+            )
+            | None => {
+                return format!("{fallback_namespace}.lifecycle");
+            },
+        };
+
+        // Use episode_id if populated, otherwise fall back to namespace
+        if episode_id.is_empty() {
+            format!("{fallback_namespace}.lifecycle")
+        } else {
+            format!("episode.{}.lifecycle", sanitize_segment(episode_id))
+        }
+    } else {
+        format!("{fallback_namespace}.lifecycle")
+    }
+}
+
+// ============================================================================
+// Tool Topic Derivation (TCK-00306)
+// ============================================================================
+
+/// Derives a tool topic from a tool event.
+///
+/// Format: `episode.<episode_id>.tool` if `episode_id` is populated
+/// Fallback: `<namespace>.tool` for non-episode sessions
+///
+/// Extracts the `episode_id` from the `ToolEvent` payload variants (RFC-0018).
+fn derive_tool_topic(event: &KernelEvent, fallback_namespace: &str) -> String {
+    if let Some(Payload::Tool(t)) = &event.payload {
+        let episode_id = match &t.event {
+            Some(apm2_core::events::tool_event::Event::Requested(e)) => &e.episode_id,
+            Some(apm2_core::events::tool_event::Event::Decided(e)) => &e.episode_id,
+            Some(apm2_core::events::tool_event::Event::Executed(e)) => &e.episode_id,
+            None => {
+                return format!("{fallback_namespace}.tool");
+            },
+        };
+
+        // Use episode_id if populated, otherwise fall back to namespace
+        if episode_id.is_empty() {
+            format!("{fallback_namespace}.tool")
+        } else {
+            format!("episode.{}.tool", sanitize_segment(episode_id))
+        }
+    } else {
+        format!("{fallback_namespace}.tool")
+    }
+}
+
+// ============================================================================
+// IO Artifact Topic Derivation (TCK-00306)
+// ============================================================================
+
+/// Derives an IO artifact topic from an `IoArtifactPublished` event.
+///
+/// Format: `episode.<episode_id>.io`
+/// Fallback: `<namespace>.io` if `episode_id` is missing
+///
+/// Extracts the `episode_id` from the `IoArtifactPublished` event (RFC-0018).
+fn derive_io_artifact_topic(event: &KernelEvent, fallback_namespace: &str) -> String {
+    if let Some(Payload::IoArtifactPublished(io)) = &event.payload {
+        if io.episode_id.is_empty() {
+            format!("{fallback_namespace}.io")
+        } else {
+            format!("episode.{}.io", sanitize_segment(&io.episode_id))
+        }
+    } else {
+        format!("{fallback_namespace}.io")
     }
 }
 
@@ -876,14 +979,16 @@ mod tests {
         }
 
         #[test]
-        fn episode_tool_events() {
+        fn episode_tool_events_without_payload_fallback() {
+            // When there's no Tool payload in the event, tool events fall back to namespace
             let deriver = TopicDeriver::new();
             let event = KernelEvent::default();
 
             for event_type in ["ToolRequested", "ToolDecided", "ToolExecuted"] {
                 let notification = CommitNotification::new(1, [0; 32], event_type, "EP-67890");
                 let result = deriver.derive_topic(&notification, &event);
-                assert_eq!(result.topic(), Some("episode.EP-67890.tool"));
+                // Falls back to namespace.tool when no Tool payload present
+                assert_eq!(result.topic(), Some("EP-67890.tool"));
             }
         }
 
@@ -1002,6 +1107,544 @@ mod tests {
             let digest = vec![];
             let encoded = encode_digest_for_topic(&digest);
             assert_eq!(encoded, "");
+        }
+    }
+
+    // ========================================================================
+    // Episode Topic Derivation Tests (TCK-00306)
+    // ========================================================================
+
+    mod episode_topics {
+        use apm2_core::events::{
+            IoArtifactPublished, SessionEvent, SessionProgress, SessionQuarantined, SessionStarted,
+            SessionTerminated, ToolDecided, ToolEvent, ToolExecuted, ToolRequested, session_event,
+            tool_event,
+        };
+
+        use super::*;
+
+        // --------------------------------------------------------------------
+        // Session Event Tests
+        // --------------------------------------------------------------------
+
+        #[test]
+        fn session_started_with_episode_id_derives_episode_lifecycle_topic() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Session(SessionEvent {
+                    event: Some(session_event::Event::Started(SessionStarted {
+                        session_id: "sess-123".to_string(),
+                        episode_id: "EP-456".to_string(),
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "SessionStarted", "fallback");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("episode.EP-456.lifecycle"));
+        }
+
+        #[test]
+        fn session_started_without_episode_id_falls_back_to_namespace() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Session(SessionEvent {
+                    event: Some(session_event::Event::Started(SessionStarted {
+                        session_id: "sess-123".to_string(),
+                        episode_id: String::new(), // Empty = non-episode session
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "SessionStarted", "my-ns");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("my-ns.lifecycle"));
+        }
+
+        #[test]
+        fn session_progress_with_episode_id_derives_episode_lifecycle_topic() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Session(SessionEvent {
+                    event: Some(session_event::Event::Progress(SessionProgress {
+                        session_id: "sess-123".to_string(),
+                        episode_id: "EP-789".to_string(),
+                        progress_sequence: 1,
+                        progress_type: "HEARTBEAT".to_string(),
+                        entropy_consumed: 100,
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "SessionProgress", "fallback");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("episode.EP-789.lifecycle"));
+        }
+
+        #[test]
+        fn session_terminated_with_episode_id_derives_episode_lifecycle_topic() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Session(SessionEvent {
+                    event: Some(session_event::Event::Terminated(SessionTerminated {
+                        session_id: "sess-123".to_string(),
+                        episode_id: "EP-ABC".to_string(),
+                        exit_classification: "SUCCESS".to_string(),
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "SessionTerminated", "fallback");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("episode.EP-ABC.lifecycle"));
+        }
+
+        #[test]
+        fn session_quarantined_with_episode_id_derives_episode_lifecycle_topic() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Session(SessionEvent {
+                    event: Some(session_event::Event::Quarantined(SessionQuarantined {
+                        session_id: "sess-123".to_string(),
+                        episode_id: "EP-XYZ".to_string(),
+                        reason: "POLICY_VIOLATION".to_string(),
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification =
+                CommitNotification::new(1, [0; 32], "SessionQuarantined", "fallback");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("episode.EP-XYZ.lifecycle"));
+        }
+
+        // --------------------------------------------------------------------
+        // Tool Event Tests
+        // --------------------------------------------------------------------
+
+        #[test]
+        fn tool_requested_with_episode_id_derives_episode_tool_topic() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Tool(ToolEvent {
+                    event: Some(tool_event::Event::Requested(ToolRequested {
+                        request_id: "req-001".to_string(),
+                        session_id: "sess-123".to_string(),
+                        tool_name: "Read".to_string(),
+                        episode_id: "EP-TOOL-1".to_string(),
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "ToolRequested", "fallback");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("episode.EP-TOOL-1.tool"));
+        }
+
+        #[test]
+        fn tool_requested_without_episode_id_falls_back_to_namespace() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Tool(ToolEvent {
+                    event: Some(tool_event::Event::Requested(ToolRequested {
+                        request_id: "req-001".to_string(),
+                        session_id: "sess-123".to_string(),
+                        tool_name: "Read".to_string(),
+                        episode_id: String::new(), // Empty = non-episode session
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "ToolRequested", "non-episode");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("non-episode.tool"));
+        }
+
+        #[test]
+        fn tool_decided_with_episode_id_derives_episode_tool_topic() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Tool(ToolEvent {
+                    event: Some(tool_event::Event::Decided(ToolDecided {
+                        request_id: "req-001".to_string(),
+                        decision: "ALLOW".to_string(),
+                        episode_id: "EP-TOOL-2".to_string(),
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "ToolDecided", "fallback");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("episode.EP-TOOL-2.tool"));
+        }
+
+        #[test]
+        fn tool_executed_with_episode_id_derives_episode_tool_topic() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Tool(ToolEvent {
+                    event: Some(tool_event::Event::Executed(ToolExecuted {
+                        request_id: "req-001".to_string(),
+                        outcome: "SUCCESS".to_string(),
+                        episode_id: "EP-TOOL-3".to_string(),
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "ToolExecuted", "fallback");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("episode.EP-TOOL-3.tool"));
+        }
+
+        // --------------------------------------------------------------------
+        // IO Artifact Tests
+        // --------------------------------------------------------------------
+
+        #[test]
+        fn io_artifact_published_with_episode_id_derives_episode_io_topic() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::IoArtifactPublished(IoArtifactPublished {
+                    episode_id: "EP-IO-1".to_string(),
+                    session_id: "sess-123".to_string(),
+                    artifact_type: "STDOUT".to_string(),
+                    artifact_hash: vec![0xab; 32],
+                    artifact_size: 1024,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+
+            let notification =
+                CommitNotification::new(1, [0; 32], "IoArtifactPublished", "fallback");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("episode.EP-IO-1.io"));
+        }
+
+        #[test]
+        fn io_artifact_published_without_episode_id_falls_back_to_namespace() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::IoArtifactPublished(IoArtifactPublished {
+                    episode_id: String::new(), // Empty
+                    session_id: "sess-123".to_string(),
+                    artifact_type: "FILE_WRITE".to_string(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "IoArtifactPublished", "ns-io");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            assert_eq!(result.topic(), Some("ns-io.io"));
+        }
+
+        // --------------------------------------------------------------------
+        // Backward Compatibility Tests (empty episode_id)
+        // --------------------------------------------------------------------
+
+        #[test]
+        fn backward_compat_session_events_default_to_namespace() {
+            // Simulates replaying old events where episode_id defaults to empty string
+            let deriver = TopicDeriver::new();
+
+            // SessionStarted with default (empty) episode_id
+            let event = KernelEvent {
+                payload: Some(Payload::Session(SessionEvent {
+                    event: Some(session_event::Event::Started(SessionStarted::default())),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "SessionStarted", "legacy-ns");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            // Falls back to namespace because episode_id is empty
+            assert_eq!(result.topic(), Some("legacy-ns.lifecycle"));
+        }
+
+        #[test]
+        fn backward_compat_tool_events_default_to_namespace() {
+            // Simulates replaying old events where episode_id defaults to empty string
+            let deriver = TopicDeriver::new();
+
+            // ToolRequested with default (empty) episode_id
+            let event = KernelEvent {
+                payload: Some(Payload::Tool(ToolEvent {
+                    event: Some(tool_event::Event::Requested(ToolRequested::default())),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "ToolRequested", "legacy-ns");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            // Falls back to namespace because episode_id is empty
+            assert_eq!(result.topic(), Some("legacy-ns.tool"));
+        }
+
+        // --------------------------------------------------------------------
+        // Episode ID Sanitization Tests
+        // --------------------------------------------------------------------
+
+        #[test]
+        fn episode_id_with_special_chars_is_sanitized() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Session(SessionEvent {
+                    event: Some(session_event::Event::Started(SessionStarted {
+                        session_id: "sess-123".to_string(),
+                        episode_id: "EP@123#456".to_string(), // Special chars
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "SessionStarted", "fallback");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            // Special chars replaced with underscores
+            assert_eq!(result.topic(), Some("episode.EP_123_456.lifecycle"));
+        }
+
+        #[test]
+        fn episode_id_with_dots_is_sanitized() {
+            let deriver = TopicDeriver::new();
+            let event = KernelEvent {
+                payload: Some(Payload::Tool(ToolEvent {
+                    event: Some(tool_event::Event::Decided(ToolDecided {
+                        request_id: "req-001".to_string(),
+                        episode_id: "EP.123.456".to_string(), // Dots
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            };
+
+            let notification = CommitNotification::new(1, [0; 32], "ToolDecided", "fallback");
+            let result = deriver.derive_topic(&notification, &event);
+
+            assert!(result.is_success());
+            // Dots replaced with underscores to avoid extra segments
+            assert_eq!(result.topic(), Some("episode.EP_123_456.tool"));
+        }
+    }
+
+    // ========================================================================
+    // Event Serialization Tests (TCK-00306)
+    // ========================================================================
+
+    mod event_serialization {
+        use apm2_core::events::{
+            IoArtifactPublished, SessionProgress, SessionQuarantined, SessionStarted,
+            SessionTerminated, ToolDecided, ToolExecuted, ToolRequested,
+        };
+        use prost::Message;
+
+        #[test]
+        fn session_started_serializes_with_episode_id() {
+            let event = SessionStarted {
+                session_id: "sess-123".to_string(),
+                actor_id: "actor-456".to_string(),
+                episode_id: "EP-789".to_string(),
+                ..Default::default()
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = SessionStarted::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.session_id, "sess-123");
+            assert_eq!(decoded.episode_id, "EP-789");
+        }
+
+        #[test]
+        fn session_started_defaults_episode_id_to_empty() {
+            let event = SessionStarted {
+                session_id: "sess-123".to_string(),
+                ..Default::default()
+            };
+
+            assert_eq!(event.episode_id, "");
+        }
+
+        #[test]
+        fn session_progress_serializes_with_episode_id() {
+            let event = SessionProgress {
+                session_id: "sess-123".to_string(),
+                episode_id: "EP-PROG".to_string(),
+                progress_sequence: 5,
+                progress_type: "HEARTBEAT".to_string(),
+                entropy_consumed: 100,
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = SessionProgress::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.episode_id, "EP-PROG");
+        }
+
+        #[test]
+        fn session_terminated_serializes_with_episode_id() {
+            let event = SessionTerminated {
+                session_id: "sess-123".to_string(),
+                episode_id: "EP-TERM".to_string(),
+                exit_classification: "SUCCESS".to_string(),
+                ..Default::default()
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = SessionTerminated::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.episode_id, "EP-TERM");
+        }
+
+        #[test]
+        fn session_quarantined_serializes_with_episode_id() {
+            let event = SessionQuarantined {
+                session_id: "sess-123".to_string(),
+                episode_id: "EP-QUAR".to_string(),
+                reason: "POLICY".to_string(),
+                ..Default::default()
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = SessionQuarantined::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.episode_id, "EP-QUAR");
+        }
+
+        #[test]
+        fn tool_requested_serializes_with_episode_id() {
+            let event = ToolRequested {
+                request_id: "req-001".to_string(),
+                session_id: "sess-123".to_string(),
+                tool_name: "Read".to_string(),
+                episode_id: "EP-TOOL".to_string(),
+                ..Default::default()
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = ToolRequested::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.episode_id, "EP-TOOL");
+        }
+
+        #[test]
+        fn tool_decided_serializes_with_episode_id() {
+            let event = ToolDecided {
+                request_id: "req-001".to_string(),
+                decision: "ALLOW".to_string(),
+                episode_id: "EP-DECIDED".to_string(),
+                ..Default::default()
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = ToolDecided::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.episode_id, "EP-DECIDED");
+        }
+
+        #[test]
+        fn tool_executed_serializes_with_episode_id() {
+            let event = ToolExecuted {
+                request_id: "req-001".to_string(),
+                outcome: "SUCCESS".to_string(),
+                episode_id: "EP-EXEC".to_string(),
+                ..Default::default()
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = ToolExecuted::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.episode_id, "EP-EXEC");
+        }
+
+        #[test]
+        fn io_artifact_published_serializes_with_all_fields() {
+            let event = IoArtifactPublished {
+                episode_id: "EP-IO".to_string(),
+                session_id: "sess-123".to_string(),
+                artifact_type: "STDOUT".to_string(),
+                artifact_hash: vec![0xab; 32],
+                artifact_size: 1024,
+                path: "/path/to/file".to_string(),
+                produced_at: 1_234_567_890,
+                classification: "INTERNAL".to_string(),
+                ..Default::default()
+            };
+
+            let bytes = event.encode_to_vec();
+            let decoded = IoArtifactPublished::decode(bytes.as_slice()).unwrap();
+
+            assert_eq!(decoded.episode_id, "EP-IO");
+            assert_eq!(decoded.session_id, "sess-123");
+            assert_eq!(decoded.artifact_type, "STDOUT");
+            assert_eq!(decoded.artifact_hash.len(), 32);
+            assert_eq!(decoded.artifact_size, 1024);
+            assert_eq!(decoded.path, "/path/to/file");
+            assert_eq!(decoded.classification, "INTERNAL");
+        }
+
+        #[test]
+        fn backward_compat_old_events_decode_with_empty_episode_id() {
+            // Simulate old event bytes without episode_id field
+            // (proto defaults string fields to empty)
+            let old_event = SessionStarted {
+                session_id: "sess-old".to_string(),
+                actor_id: "actor-old".to_string(),
+                // episode_id not set - defaults to empty
+                ..Default::default()
+            };
+
+            let bytes = old_event.encode_to_vec();
+            let decoded = SessionStarted::decode(bytes.as_slice()).unwrap();
+
+            // episode_id should default to empty string
+            assert_eq!(decoded.episode_id, "");
+            assert_eq!(decoded.session_id, "sess-old");
         }
     }
 }
