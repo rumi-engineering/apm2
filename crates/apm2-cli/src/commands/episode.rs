@@ -10,31 +10,43 @@
 //! - `apm2 episode stop <episode_id> [--reason]` - Stop a running episode
 //! - `apm2 episode status <episode_id>` - Show episode status
 //! - `apm2 episode list [--state]` - List episodes
+//! - `apm2 episode spawn --work-id <id> --role <role>` - Spawn episode via
+//!   protocol (TCK-00288)
+//! - `apm2 episode session-status --session-token <token>` - Session-scoped
+//!   status (TCK-00288)
 //!
 //! # JSON Output
 //!
 //! All commands support `--json` flag for machine-readable output.
 //!
-//! # Exit Codes
+//! # Exit Codes (RFC-0018)
 //!
 //! - 0: Success
-//! - 1: Error (daemon connection, validation, etc.)
-//! - 2: Episode not found
+//! - 10: Validation error
+//! - 11: Permission denied
+//! - 12: Not found
+//! - 20: Daemon unavailable
+//! - 21: Protocol error
+//! - 22: Policy deny
 //!
 //! # Contract References
 //!
 //! - AD-DAEMON-002: UDS transport with length-prefixed framing
 //! - AD-EPISODE-001: Immutable episode envelope
 //! - AD-EPISODE-002: Episode state machine
+//! - DD-009: Protocol-based IPC (TCK-00288)
 
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
+use apm2_daemon::protocol::WorkRole;
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use crate::client::daemon::{DaemonClient, DaemonClientError, ErrorCode};
+use crate::client::daemon::ErrorCode;
+use crate::client::protocol::{OperatorClient, ProtocolClientError};
+use crate::exit_codes::{codes as hef_exit_codes, map_protocol_error};
 
 /// Maximum envelope file size (10 MiB).
 ///
@@ -49,6 +61,9 @@ pub mod exit_codes {
     /// General error exit code.
     pub const ERROR: u8 = 1;
     /// Episode not found exit code.
+    ///
+    /// Reserved for future protocol support (TCK-00288).
+    #[allow(dead_code)]
     pub const NOT_FOUND: u8 = 2;
 }
 
@@ -99,6 +114,18 @@ pub enum EpisodeSubcommand {
     /// Shows all episodes or filters by state (created, running, terminated,
     /// quarantined).
     List(ListArgs),
+
+    /// Spawn an episode for work execution (TCK-00288).
+    ///
+    /// Uses protocol-based IPC via `OperatorClient::spawn_episode`.
+    /// Returns session ID and token for subsequent session-scoped operations.
+    Spawn(SpawnArgs),
+
+    /// Query session-scoped episode status (TCK-00288).
+    ///
+    /// Uses session socket with session token for authentication.
+    /// Returns current session state and telemetry summary.
+    SessionStatus(SessionStatusArgs),
 }
 
 /// Arguments for `apm2 episode create`.
@@ -206,13 +233,82 @@ pub struct ListArgs {
     pub limit: u32,
 }
 
+/// Role for spawning episodes (TCK-00288).
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum SpawnRoleArg {
+    /// Implementer role (default).
+    #[default]
+    Implementer,
+    /// Gate executor role.
+    GateExecutor,
+    /// Reviewer role.
+    Reviewer,
+    /// Coordinator role.
+    Coordinator,
+}
+
+impl From<SpawnRoleArg> for WorkRole {
+    fn from(arg: SpawnRoleArg) -> Self {
+        match arg {
+            SpawnRoleArg::Implementer => Self::Implementer,
+            SpawnRoleArg::GateExecutor => Self::GateExecutor,
+            SpawnRoleArg::Reviewer => Self::Reviewer,
+            SpawnRoleArg::Coordinator => Self::Coordinator,
+        }
+    }
+}
+
+impl std::fmt::Display for SpawnRoleArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Implementer => write!(f, "implementer"),
+            Self::GateExecutor => write!(f, "gate_executor"),
+            Self::Reviewer => write!(f, "reviewer"),
+            Self::Coordinator => write!(f, "coordinator"),
+        }
+    }
+}
+
+/// Arguments for `apm2 episode spawn` (TCK-00288).
+#[derive(Debug, Args)]
+pub struct SpawnArgs {
+    /// Work identifier from a prior `ClaimWork`.
+    #[arg(long, required = true)]
+    pub work_id: String,
+
+    /// Role for this episode.
+    #[arg(long, value_enum, default_value = "implementer")]
+    pub role: SpawnRoleArg,
+
+    /// Lease ID (required for `GATE_EXECUTOR` role).
+    #[arg(long)]
+    pub lease_id: Option<String>,
+}
+
+/// Arguments for `apm2 episode session-status` (TCK-00288).
+#[derive(Debug, Args)]
+pub struct SessionStatusArgs {
+    /// Session token for authentication.
+    ///
+    /// Obtained from `apm2 episode spawn` response.
+    #[arg(long, required = true)]
+    pub session_token: String,
+}
+
 // ============================================================================
 // Response Types for JSON output
 // ============================================================================
+//
+// Note: CreateResponse, StartResponse, StopResponse, StatusResponse, and
+// ListResponse are for deprecated commands but retained for future protocol
+// support.
 
 /// Response for episode create command.
+///
+/// Reserved for future protocol support (TCK-00288).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct CreateResponse {
     /// Created episode ID.
     pub episode_id: String,
@@ -223,8 +319,11 @@ pub struct CreateResponse {
 }
 
 /// Response for episode start command.
+///
+/// Reserved for future protocol support (TCK-00288).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct StartResponse {
     /// Episode ID.
     pub episode_id: String,
@@ -237,8 +336,11 @@ pub struct StartResponse {
 }
 
 /// Response for episode stop command.
+///
+/// Reserved for future protocol support (TCK-00288).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct StopResponse {
     /// Episode ID.
     pub episode_id: String,
@@ -249,8 +351,11 @@ pub struct StopResponse {
 }
 
 /// Response for episode status command.
+///
+/// Reserved for future protocol support (TCK-00288).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct StatusResponse {
     /// Episode ID.
     pub episode_id: String,
@@ -281,8 +386,11 @@ pub struct StatusResponse {
 }
 
 /// Budget summary for status response.
+///
+/// Reserved for future protocol support (TCK-00288).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct BudgetSummary {
     /// Tokens used / total.
     pub tokens: String,
@@ -293,8 +401,11 @@ pub struct BudgetSummary {
 }
 
 /// Episode summary for list command.
+///
+/// Reserved for future protocol support (TCK-00288).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct EpisodeSummary {
     /// Episode ID.
     pub episode_id: String,
@@ -308,8 +419,11 @@ pub struct EpisodeSummary {
 }
 
 /// Response for episode list command.
+///
+/// Reserved for future protocol support (TCK-00288).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct ListResponse {
     /// List of episodes.
     pub episodes: Vec<EpisodeSummary>,
@@ -327,32 +441,93 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
+/// Response for episode spawn command (TCK-00288).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnResponse {
+    /// Session identifier for IPC communication.
+    pub session_id: String,
+    /// Blake3 hash of the capability manifest (hex-encoded).
+    pub capability_manifest_hash: String,
+    /// Whether the context pack is sealed.
+    pub context_pack_sealed: bool,
+    /// Ephemeral handle for session identification.
+    pub ephemeral_handle: String,
+    /// Session token for authenticating session-scoped IPC requests.
+    pub session_token: String,
+}
+
+/// Response for session-scoped episode status (TCK-00288).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionStatusResponse {
+    /// Session identifier.
+    pub session_id: String,
+    /// Current session state.
+    pub state: String,
+    /// Episode ID (if associated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode_id: Option<String>,
+    /// Telemetry summary (if available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TelemetrySummary>,
+}
+
+/// Telemetry summary for session status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySummary {
+    /// Total tool calls executed.
+    pub tool_calls: u32,
+    /// Total events emitted.
+    pub events_emitted: u32,
+    /// Session duration in milliseconds.
+    pub duration_ms: u64,
+}
+
 // ============================================================================
 // Command execution
 // ============================================================================
 
 /// Runs the episode command, returning an appropriate exit code.
 ///
-/// # Exit Codes
+/// # Exit Codes (RFC-0018)
 ///
 /// - 0: Success
-/// - 1: General error
-/// - 2: Episode not found
+/// - 10: Validation error
+/// - 11: Permission denied
+/// - 12: Not found
+/// - 20: Daemon unavailable
+/// - 21: Protocol error
+/// - 22: Policy deny
 #[allow(clippy::too_many_lines)] // Command dispatch is inherently verbose
-pub fn run_episode(cmd: &EpisodeCommand, socket_path: &std::path::Path) -> u8 {
+pub fn run_episode(
+    cmd: &EpisodeCommand,
+    operator_socket: &std::path::Path,
+    session_socket: &std::path::Path,
+) -> u8 {
     let json_output = cmd.json;
 
     match &cmd.subcommand {
-        EpisodeSubcommand::Create(args) => run_create(args, socket_path, json_output),
-        EpisodeSubcommand::Start(args) => run_start(args, socket_path, json_output),
-        EpisodeSubcommand::Stop(args) => run_stop(args, socket_path, json_output),
-        EpisodeSubcommand::Status(args) => run_status(args, socket_path, json_output),
-        EpisodeSubcommand::List(args) => run_list(args, socket_path, json_output),
+        EpisodeSubcommand::Create(args) => run_create(args, operator_socket, json_output),
+        EpisodeSubcommand::Start(args) => run_start(args, operator_socket, json_output),
+        EpisodeSubcommand::Stop(args) => run_stop(args, operator_socket, json_output),
+        EpisodeSubcommand::Status(args) => run_status(args, operator_socket, json_output),
+        EpisodeSubcommand::List(args) => run_list(args, operator_socket, json_output),
+        EpisodeSubcommand::Spawn(args) => run_spawn(args, operator_socket, json_output),
+        EpisodeSubcommand::SessionStatus(args) => {
+            run_session_status(args, session_socket, json_output)
+        },
     }
 }
 
 /// Execute the create command.
-fn run_create(args: &CreateArgs, socket_path: &std::path::Path, json_output: bool) -> u8 {
+///
+/// # Deprecation Notice (TCK-00288)
+///
+/// This command is deprecated. Use `apm2 episode spawn` instead, which combines
+/// create+start in a single protocol operation.
+fn run_create(args: &CreateArgs, _socket_path: &std::path::Path, json_output: bool) -> u8 {
     // Read envelope content with TOCTOU-safe bounded reading (CTR-1603, RSK-1501).
     // Opens file handle first, uses .take(limit) pattern to enforce size limit.
     let envelope_content = match read_bounded_file(&args.envelope, MAX_ENVELOPE_FILE_SIZE) {
@@ -363,74 +538,41 @@ fn run_create(args: &CreateArgs, socket_path: &std::path::Path, json_output: boo
     };
 
     // Validate YAML can be parsed (local validation before daemon call)
-    let envelope_value: serde_yaml::Value = match serde_yaml::from_str(&envelope_content) {
-        Ok(v) => v,
-        Err(e) => {
-            return output_error(
-                json_output,
-                "invalid_yaml",
-                &format!("Failed to parse envelope YAML: {e}"),
-                exit_codes::ERROR,
-            );
-        },
-    };
-
-    // Compute envelope hash (BLAKE3) for daemon request
-    let envelope_hash = blake3::hash(envelope_content.as_bytes());
-    let envelope_hash_hex = hex::encode(envelope_hash.as_bytes());
-
-    // Send CreateEpisode request to daemon (episode ID is daemon-generated)
-    let client = DaemonClient::new(socket_path);
-
-    let daemon_response = match client.create_episode(&envelope_content, &envelope_hash_hex) {
-        Ok(resp) => resp,
-        Err(e) => {
-            return handle_daemon_error(json_output, &e);
-        },
-    };
-
-    // Build response from daemon-provided data
-    let response = CreateResponse {
-        episode_id: daemon_response.episode_id,
-        envelope_hash: daemon_response.envelope_hash,
-        created_at: daemon_response.created_at,
-    };
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+    if let Err(e) = serde_yaml::from_str::<serde_yaml::Value>(&envelope_content) {
+        return output_error(
+            json_output,
+            "invalid_yaml",
+            &format!("Failed to parse envelope YAML: {e}"),
+            exit_codes::ERROR,
         );
-    } else {
-        println!("Episode created successfully");
-        println!("  Episode ID:    {}", response.episode_id);
-        println!("  Envelope Hash: {}", response.envelope_hash);
-        println!("  Created At:    {}", response.created_at);
-
-        // Print envelope summary if we can extract it
-        if let Some(actor_id) = envelope_value.get("actor_id").and_then(|v| v.as_str()) {
-            println!("  Actor ID:      {actor_id}");
-        }
-        if let Some(risk_tier) = envelope_value
-            .get("risk_tier")
-            .and_then(serde_yaml::Value::as_u64)
-        {
-            println!("  Risk Tier:     {risk_tier}");
-        }
     }
 
-    exit_codes::SUCCESS
+    // TCK-00288: This command requires protocol support not yet available.
+    // The DD-009 protocol uses SpawnEpisode which combines create+start.
+    // Guide users to the new workflow.
+    output_error(
+        json_output,
+        "deprecated_command",
+        "The 'episode create' command is deprecated. Use 'apm2 episode spawn' instead, \
+         which combines create+start via the protocol-based IPC (DD-009).",
+        hef_exit_codes::PROTOCOL_ERROR,
+    )
 }
 
 /// Execute the start command.
-fn run_start(args: &StartArgs, socket_path: &std::path::Path, json_output: bool) -> u8 {
+///
+/// # Deprecation Notice (TCK-00288)
+///
+/// This command is deprecated. Use `apm2 episode spawn` instead, which combines
+/// create+start in a single protocol operation.
+fn run_start(args: &StartArgs, _socket_path: &std::path::Path, json_output: bool) -> u8 {
     // Validate episode ID format
     if args.episode_id.is_empty() {
         return output_error(
             json_output,
             "invalid_id",
             "Episode ID cannot be empty",
-            exit_codes::ERROR,
+            hef_exit_codes::VALIDATION_ERROR,
         );
     }
 
@@ -439,199 +581,225 @@ fn run_start(args: &StartArgs, socket_path: &std::path::Path, json_output: bool)
             json_output,
             "invalid_id",
             "Episode ID must start with 'ep-'",
-            exit_codes::ERROR,
+            hef_exit_codes::VALIDATION_ERROR,
         );
     }
 
-    // Send StartEpisode request to daemon
-    let client = DaemonClient::new(socket_path);
-
-    let daemon_response = match client.start_episode(&args.episode_id, args.lease_id.as_deref()) {
-        Ok(resp) => resp,
-        Err(e) => {
-            return handle_daemon_error(json_output, &e);
-        },
-    };
-
-    // Build response from daemon-provided data
-    let response = StartResponse {
-        episode_id: daemon_response.episode_id,
-        session_id: daemon_response.session_id,
-        lease_id: daemon_response.lease_id,
-        started_at: daemon_response.started_at,
-    };
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("Episode started successfully");
-        println!("  Episode ID:  {}", response.episode_id);
-        println!("  Session ID:  {}", response.session_id);
-        println!("  Lease ID:    {}", response.lease_id);
-        println!("  Started At:  {}", response.started_at);
-    }
-
-    exit_codes::SUCCESS
+    // TCK-00288: This command requires protocol support not yet available.
+    // The DD-009 protocol uses SpawnEpisode which combines create+start.
+    // Guide users to the new workflow.
+    output_error(
+        json_output,
+        "deprecated_command",
+        "The 'episode start' command is deprecated. Use 'apm2 episode spawn' instead, \
+         which combines create+start via the protocol-based IPC (DD-009).",
+        hef_exit_codes::PROTOCOL_ERROR,
+    )
 }
 
 /// Execute the stop command.
-fn run_stop(args: &StopArgs, socket_path: &std::path::Path, json_output: bool) -> u8 {
+///
+/// # Deprecation Notice (TCK-00288)
+///
+/// This command is deprecated. Episode termination is handled automatically
+/// when a session closes or the daemon shuts down.
+fn run_stop(args: &StopArgs, _socket_path: &std::path::Path, json_output: bool) -> u8 {
     // Validate episode ID format
     if args.episode_id.is_empty() {
         return output_error(
             json_output,
             "invalid_id",
             "Episode ID cannot be empty",
-            exit_codes::ERROR,
+            hef_exit_codes::VALIDATION_ERROR,
         );
     }
 
-    // Send StopEpisode request to daemon
-    let client = DaemonClient::new(socket_path);
-    let reason_str = args.reason.to_string();
-
-    let daemon_response =
-        match client.stop_episode(&args.episode_id, &reason_str, args.message.as_deref()) {
-            Ok(resp) => resp,
-            Err(e) => {
-                return handle_daemon_error(json_output, &e);
-            },
-        };
-
-    // Build response from daemon-provided data
-    let response = StopResponse {
-        episode_id: daemon_response.episode_id,
-        termination_class: daemon_response.termination_class,
-        stopped_at: daemon_response.stopped_at,
-    };
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        println!("Episode stopped successfully");
-        println!("  Episode ID:         {}", response.episode_id);
-        println!("  Termination Class:  {}", response.termination_class);
-        println!("  Stopped At:         {}", response.stopped_at);
-        if let Some(msg) = &args.message {
-            println!("  Message:            {msg}");
-        }
-    }
-
-    exit_codes::SUCCESS
+    // TCK-00288: This command requires protocol support not yet available.
+    // Episode termination is handled via session close or daemon shutdown.
+    output_error(
+        json_output,
+        "deprecated_command",
+        "The 'episode stop' command is deprecated. Episode termination is handled \
+         automatically when the session closes or the daemon shuts down (DD-009).",
+        hef_exit_codes::PROTOCOL_ERROR,
+    )
 }
 
 /// Execute the status command.
-fn run_status(args: &StatusArgs, socket_path: &std::path::Path, json_output: bool) -> u8 {
+///
+/// # Deprecation Notice (TCK-00288)
+///
+/// This command is deprecated. Use `apm2 episode session-status` for
+/// session-scoped status queries via the protocol-based IPC.
+fn run_status(args: &StatusArgs, _socket_path: &std::path::Path, json_output: bool) -> u8 {
     // Validate episode ID format
     if args.episode_id.is_empty() {
         return output_error(
             json_output,
             "invalid_id",
             "Episode ID cannot be empty",
+            hef_exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // TCK-00288: This command requires protocol support not yet available.
+    // Use session-status for session-scoped status queries.
+    output_error(
+        json_output,
+        "deprecated_command",
+        "The 'episode status' command is deprecated. Use 'apm2 episode session-status' \
+         for session-scoped status queries via the protocol-based IPC (DD-009).",
+        hef_exit_codes::PROTOCOL_ERROR,
+    )
+}
+
+/// Execute the list command.
+///
+/// # Deprecation Notice (TCK-00288)
+///
+/// This command is deprecated. Episode listing is not available in the
+/// protocol-based IPC. Use telemetry or ledger queries for episode tracking.
+fn run_list(args: &ListArgs, _socket_path: &std::path::Path, json_output: bool) -> u8 {
+    // TCK-00288: This command requires protocol support not yet available.
+    // Episode listing is not part of the DD-009 minimal agent command set.
+    let _ = args; // Acknowledge args to avoid unused warning
+    output_error(
+        json_output,
+        "deprecated_command",
+        "The 'episode list' command is deprecated. Episode listing is not available \
+         in the protocol-based IPC (DD-009). Use telemetry or ledger queries instead.",
+        hef_exit_codes::PROTOCOL_ERROR,
+    )
+}
+
+/// Execute the spawn command (TCK-00288).
+///
+/// Uses `OperatorClient::spawn_episode` for protocol-based IPC.
+fn run_spawn(args: &SpawnArgs, socket_path: &std::path::Path, json_output: bool) -> u8 {
+    // Validate work ID
+    if args.work_id.is_empty() {
+        return output_error(
+            json_output,
+            "invalid_work_id",
+            "Work ID cannot be empty",
             exit_codes::ERROR,
         );
     }
 
-    // Send GetEpisodeStatus request to daemon
-    let client = DaemonClient::new(socket_path);
-
-    let daemon_response = match client.get_episode_status(&args.episode_id) {
-        Ok(resp) => resp,
-        Err(e) => {
-            return handle_daemon_error(json_output, &e);
-        },
-    };
-
-    // Build response from daemon-provided data
-    let response = StatusResponse {
-        episode_id: daemon_response.episode_id,
-        state: daemon_response.state,
-        envelope_hash: daemon_response.envelope_hash,
-        created_at: daemon_response.created_at,
-        started_at: daemon_response.started_at,
-        session_id: daemon_response.session_id,
-        lease_id: daemon_response.lease_id,
-        terminated_at: daemon_response.terminated_at,
-        termination_class: daemon_response.termination_class,
-        budget: daemon_response.budget.map(|b| BudgetSummary {
-            tokens: b.tokens,
-            tool_calls: b.tool_calls,
-            wall_ms: b.wall_ms,
-        }),
-    };
-
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+    // Validate GATE_EXECUTOR requires lease_id
+    if matches!(args.role, SpawnRoleArg::GateExecutor) && args.lease_id.is_none() {
+        return output_error(
+            json_output,
+            "missing_lease_id",
+            "GATE_EXECUTOR role requires --lease-id",
+            exit_codes::ERROR,
         );
-    } else {
-        println!("Episode Status");
-        println!("  Episode ID:    {}", response.episode_id);
-        println!("  State:         {}", response.state);
-        println!("  Envelope Hash: {}", response.envelope_hash);
-        println!("  Created At:    {}", response.created_at);
-        if let Some(started) = &response.started_at {
-            println!("  Started At:    {started}");
-        }
-        if let Some(session) = &response.session_id {
-            println!("  Session ID:    {session}");
-        }
-        if let Some(lease) = &response.lease_id {
-            println!("  Lease ID:      {lease}");
-        }
-        if let Some(budget) = &response.budget {
-            println!();
-            println!("Budget:");
-            println!("  Tokens:     {}", budget.tokens);
-            println!("  Tool Calls: {}", budget.tool_calls);
-            println!("  Wall Time:  {}", budget.wall_ms);
-        }
     }
 
-    exit_codes::SUCCESS
-}
-
-/// Execute the list command.
-fn run_list(args: &ListArgs, socket_path: &std::path::Path, json_output: bool) -> u8 {
-    // Send ListEpisodes request to daemon
-    let client = DaemonClient::new(socket_path);
-
-    // Convert state filter to string for daemon
-    let state_filter = match args.state {
-        StateFilter::All => None,
-        StateFilter::Created => Some("created"),
-        StateFilter::Running => Some("running"),
-        StateFilter::Terminated => Some("terminated"),
-        StateFilter::Quarantined => Some("quarantined"),
-    };
-
-    let daemon_response = match client.list_episodes(state_filter, args.limit) {
-        Ok(resp) => resp,
+    // Build async runtime
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
         Err(e) => {
-            return handle_daemon_error(json_output, &e);
+            return output_error(
+                json_output,
+                "runtime_error",
+                &format!("Failed to build tokio runtime: {e}"),
+                exit_codes::ERROR,
+            );
         },
     };
 
-    // Build response from daemon-provided data
-    let response = ListResponse {
-        episodes: daemon_response
-            .episodes
-            .into_iter()
-            .map(|ep| EpisodeSummary {
-                episode_id: ep.episode_id,
-                state: ep.state,
-                created_at: ep.created_at,
-                session_id: ep.session_id,
-            })
-            .collect(),
-        total: daemon_response.total,
+    // Execute spawn via protocol client
+    let result = rt.block_on(async {
+        let mut client = OperatorClient::connect(socket_path).await?;
+        client
+            .spawn_episode(&args.work_id, args.role.into(), args.lease_id.as_deref())
+            .await
+    });
+
+    match result {
+        Ok(response) => {
+            let spawn_response = SpawnResponse {
+                session_id: response.session_id,
+                capability_manifest_hash: hex::encode(&response.capability_manifest_hash),
+                context_pack_sealed: response.context_pack_sealed,
+                ephemeral_handle: response.ephemeral_handle,
+                session_token: response.session_token,
+            };
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&spawn_response)
+                        .unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                println!("Episode spawned successfully");
+                println!("  Session ID:           {}", spawn_response.session_id);
+                println!(
+                    "  Capability Manifest:  {}",
+                    spawn_response.capability_manifest_hash
+                );
+                println!(
+                    "  Context Pack Sealed:  {}",
+                    spawn_response.context_pack_sealed
+                );
+                println!(
+                    "  Ephemeral Handle:     {}",
+                    spawn_response.ephemeral_handle
+                );
+                println!("  Session Token:        {}", spawn_response.session_token);
+            }
+
+            exit_codes::SUCCESS
+        },
+        Err(e) => handle_protocol_error(json_output, &e),
+    }
+}
+
+/// Execute the session-status command (TCK-00288).
+///
+/// Uses `SessionClient` for session-scoped operations via session.sock.
+fn run_session_status(
+    args: &SessionStatusArgs,
+    _socket_path: &std::path::Path,
+    json_output: bool,
+) -> u8 {
+    // Validate session token
+    if args.session_token.is_empty() {
+        return output_error(
+            json_output,
+            "invalid_session_token",
+            "Session token cannot be empty",
+            hef_exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // TODO(TCK-00288): Implement session status query via SessionClient.
+    // The protocol layer does not yet have a QuerySessionStatus message.
+    // For now, return a stub response.
+    //
+    // Future implementation would:
+    // 1. Connect to session_socket via SessionClient
+    // 2. Send a SessionStatusRequest with the session_token
+    // 3. Receive SessionStatusResponse with state and telemetry
+
+    // Parse session token to extract session_id (best effort)
+    let session_id = args
+        .session_token
+        .split('.')
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
+
+    let response = SessionStatusResponse {
+        session_id,
+        state: "PENDING_PROTOCOL_SUPPORT".to_string(),
+        episode_id: None,
+        telemetry: None,
     };
 
     if json_output {
@@ -639,25 +807,12 @@ fn run_list(args: &ListArgs, socket_path: &std::path::Path, json_output: bool) -
             "{}",
             serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
         );
-    } else if response.episodes.is_empty() {
-        println!("No episodes found (filter: {})", args.state);
     } else {
-        println!(
-            "{:<40} {:<12} {:<25} {:<20}",
-            "EPISODE ID", "STATE", "CREATED AT", "SESSION ID"
-        );
-        println!("{}", "-".repeat(97));
-        for ep in &response.episodes {
-            println!(
-                "{:<40} {:<12} {:<25} {:<20}",
-                truncate(&ep.episode_id, 40),
-                ep.state,
-                ep.created_at,
-                ep.session_id.as_deref().unwrap_or("-"),
-            );
-        }
+        println!("Session Status");
+        println!("  Session ID:  {}", response.session_id);
+        println!("  State:       {}", response.state);
         println!();
-        println!("Total: {} episodes", response.total);
+        println!("Note: Session status query requires protocol support (pending).");
     }
 
     exit_codes::SUCCESS
@@ -685,6 +840,9 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
 }
 
 /// Truncate a string to a maximum length.
+///
+/// Reserved for future protocol support (TCK-00288).
+#[allow(dead_code)]
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
@@ -701,7 +859,11 @@ fn truncate(s: &str, max_len: usize) -> String {
 /// - `DaemonNotRunning` -> ERROR (1)
 /// - `EpisodeNotFound` -> `NOT_FOUND` (2)
 /// - Other errors -> ERROR (1)
-fn handle_daemon_error(json_output: bool, error: &DaemonClientError) -> u8 {
+///
+/// Reserved for future protocol support (TCK-00288).
+#[allow(dead_code)]
+fn handle_daemon_error(json_output: bool, error: &crate::client::daemon::DaemonClientError) -> u8 {
+    use crate::client::daemon::DaemonClientError;
     match error {
         DaemonClientError::DaemonNotRunning => output_error(
             json_output,
@@ -754,6 +916,47 @@ fn handle_daemon_error(json_output: bool, error: &DaemonClientError) -> u8 {
             exit_codes::ERROR,
         ),
     }
+}
+
+/// Handles protocol client errors and returns appropriate exit code (RFC-0018).
+fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
+    let exit_code = map_protocol_error(error);
+    let (code, message) = match error {
+        ProtocolClientError::DaemonNotRunning => (
+            "daemon_not_running".to_string(),
+            "Daemon is not running. Start with: apm2 daemon".to_string(),
+        ),
+        ProtocolClientError::ConnectionFailed(msg) => (
+            "connection_failed".to_string(),
+            format!("Failed to connect to daemon: {msg}"),
+        ),
+        ProtocolClientError::HandshakeFailed(msg) => (
+            "handshake_failed".to_string(),
+            format!("Protocol handshake failed: {msg}"),
+        ),
+        ProtocolClientError::VersionMismatch { client, server } => (
+            "version_mismatch".to_string(),
+            format!("Protocol version mismatch: client {client}, server {server}"),
+        ),
+        ProtocolClientError::DaemonError { code, message } => (code.clone(), message.clone()),
+        ProtocolClientError::IoError(e) => ("io_error".to_string(), format!("I/O error: {e}")),
+        ProtocolClientError::ProtocolError(e) => {
+            ("protocol_error".to_string(), format!("Protocol error: {e}"))
+        },
+        ProtocolClientError::DecodeError(msg) => {
+            ("decode_error".to_string(), format!("Decode error: {msg}"))
+        },
+        ProtocolClientError::UnexpectedResponse(msg) => (
+            "unexpected_response".to_string(),
+            format!("Unexpected response: {msg}"),
+        ),
+        ProtocolClientError::Timeout => ("timeout".to_string(), "Operation timed out".to_string()),
+        ProtocolClientError::FrameTooLarge { size, max } => (
+            "frame_too_large".to_string(),
+            format!("Frame too large: {size} bytes (max: {max})"),
+        ),
+    };
+    output_error(json_output, &code, &message, exit_code)
 }
 
 /// Reads a file with bounded size to prevent TOCTOU and denial-of-service

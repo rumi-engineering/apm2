@@ -23,6 +23,9 @@ use std::time::Duration;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// Default connection timeout.
+///
+/// Reserved for future protocol support (TCK-00288).
+#[allow(dead_code)]
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Daemon client for episode operations.
@@ -219,6 +222,8 @@ pub struct ListEpisodesResponse {
     pub total: u32,
 }
 
+/// Reserved for future protocol support (TCK-00288).
+#[allow(dead_code)]
 impl<'a> DaemonClient<'a> {
     /// Creates a new daemon client.
     ///
@@ -235,7 +240,6 @@ impl<'a> DaemonClient<'a> {
 
     /// Sets the connection timeout.
     #[must_use]
-    #[allow(dead_code)]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -243,7 +247,6 @@ impl<'a> DaemonClient<'a> {
 
     /// Checks if the daemon is running (socket exists).
     #[must_use]
-    #[allow(dead_code)]
     pub fn is_daemon_running(&self) -> bool {
         self.socket_path.exists()
     }

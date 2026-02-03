@@ -14,6 +14,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 mod client;
 mod commands;
+mod exit_codes;
 
 /// apm2 - AI CLI Process Manager
 #[derive(Parser, Debug)]
@@ -127,6 +128,26 @@ enum Commands {
     // === Consensus cluster management (RFC-0014) ===
     /// Consensus commands for cluster status and diagnostics
     Consensus(commands::consensus::ConsensusCommand),
+
+    // === Work queue operations (TCK-00288) ===
+    /// Work queue commands (claim work from queue)
+    Work(commands::work::WorkCommand),
+
+    // === Tool operations (TCK-00288) ===
+    /// Tool commands (request tool execution via session socket)
+    Tool(commands::tool::ToolCommand),
+
+    // === Event operations (TCK-00288) ===
+    /// Event commands (emit events to ledger via session socket)
+    Event(commands::event::EventCommand),
+
+    // === Capability operations (TCK-00288) ===
+    /// Capability commands (issue capabilities to sessions via operator socket)
+    Capability(commands::capability::CapabilityCommand),
+
+    // === Evidence operations (TCK-00288) ===
+    /// Evidence commands (publish evidence artifacts via session socket)
+    Evidence(commands::evidence::EvidenceCommand),
 
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
@@ -245,24 +266,36 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .init();
 
-    // Determine socket path
-    let socket_path = cli.socket.clone().unwrap_or_else(|| {
-        // Try to load from config, or use default
-        if cli.config.exists() {
-            if let Ok(config) = apm2_core::config::EcosystemConfig::from_file(&cli.config) {
-                return config.daemon.operator_socket;
-            }
+    // TCK-00288: Deprecation warning for --socket flag
+    // The --socket flag is deprecated and maps to operator_socket only.
+    // Users should migrate to using config-based socket paths.
+    if cli.socket.is_some() {
+        eprintln!(
+            "WARNING: --socket is deprecated and will be removed in a future version.\n\
+             The flag maps to operator_socket only. For dual-socket routing (operator/session),\n\
+             configure socket paths in ecosystem.toml instead."
+        );
+    }
+
+    // Determine socket paths (TCK-00288: dual-socket privilege separation)
+    // - operator_socket: For privileged operations (ClaimWork, SpawnEpisode,
+    //   Shutdown)
+    // - session_socket: For session-scoped operations (RequestTool, EmitEvent)
+    let (operator_socket, session_socket) = if let Some(ref socket) = cli.socket {
+        // Legacy --socket flag maps to operator_socket only
+        (socket.clone(), socket.clone())
+    } else if cli.config.exists() {
+        if let Ok(config) = apm2_core::config::EcosystemConfig::from_file(&cli.config) {
+            (config.daemon.operator_socket, config.daemon.session_socket)
+        } else {
+            (default_operator_socket(), default_session_socket())
         }
-        // Fallback: ${XDG_RUNTIME_DIR}/apm2/operator.sock or /tmp/apm2/operator.sock
-        std::env::var("XDG_RUNTIME_DIR").map_or_else(
-            |_| PathBuf::from("/tmp/apm2/operator.sock"),
-            |runtime_dir| {
-                PathBuf::from(runtime_dir)
-                    .join("apm2")
-                    .join("operator.sock")
-            },
-        )
-    });
+    } else {
+        (default_operator_socket(), default_session_socket())
+    };
+
+    // Alias for backward compatibility
+    let socket_path = operator_socket.clone();
 
     match cli.command {
         Commands::Daemon { no_daemon } => commands::daemon::run(&cli.config, no_daemon),
@@ -332,11 +365,11 @@ fn main() -> Result<()> {
             std::process::exit(i32::from(exit_code));
         },
         Commands::Episode(episode_cmd) => {
-            // Episode commands use specific exit codes per TCK-00174:
-            // 0=success, 1=error, 2=episode_not_found
+            // Episode commands use RFC-0018 exit codes.
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
-            let exit_code = commands::episode::run_episode(&episode_cmd, &socket_path);
+            let exit_code =
+                commands::episode::run_episode(&episode_cmd, &operator_socket, &session_socket);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Consensus(consensus_cmd) => {
@@ -345,6 +378,36 @@ fn main() -> Result<()> {
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
             let exit_code = commands::consensus::run_consensus(&consensus_cmd, &socket_path);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Work(work_cmd) => {
+            // Work commands use operator_socket for privileged ClaimWork operation.
+            // Exit codes: 0=success, 1=error
+            let exit_code = commands::work::run_work(&work_cmd, &operator_socket);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Tool(tool_cmd) => {
+            // Tool commands use session_socket for session-scoped RequestTool operation.
+            // Exit codes: 0=success, 1=error
+            let exit_code = commands::tool::run_tool(&tool_cmd, &session_socket);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Event(event_cmd) => {
+            // Event commands use session_socket for session-scoped EmitEvent operation.
+            // Exit codes: 0=success, 1=error
+            let exit_code = commands::event::run_event(&event_cmd, &session_socket);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Capability(capability_cmd) => {
+            // Capability commands use operator_socket for privileged IssueCapability
+            // operation. Exit codes per RFC-0018.
+            let exit_code = commands::capability::run_capability(&capability_cmd, &operator_socket);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Evidence(evidence_cmd) => {
+            // Evidence commands use session_socket for session-scoped PublishEvidence
+            // operation. Exit codes per RFC-0018.
+            let exit_code = commands::evidence::run_evidence(&evidence_cmd, &session_socket);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {
@@ -371,4 +434,28 @@ fn main() -> Result<()> {
             },
         },
     }
+}
+
+/// Returns the default operator socket path.
+///
+/// Uses `XDG_RUNTIME_DIR` if available, otherwise /tmp/apm2.
+fn default_operator_socket() -> PathBuf {
+    std::env::var("XDG_RUNTIME_DIR").map_or_else(
+        |_| PathBuf::from("/tmp/apm2/operator.sock"),
+        |runtime_dir| {
+            PathBuf::from(runtime_dir)
+                .join("apm2")
+                .join("operator.sock")
+        },
+    )
+}
+
+/// Returns the default session socket path.
+///
+/// Uses `XDG_RUNTIME_DIR` if available, otherwise /tmp/apm2.
+fn default_session_socket() -> PathBuf {
+    std::env::var("XDG_RUNTIME_DIR").map_or_else(
+        |_| PathBuf::from("/tmp/apm2/session.sock"),
+        |runtime_dir| PathBuf::from(runtime_dir).join("apm2").join("session.sock"),
+    )
 }
