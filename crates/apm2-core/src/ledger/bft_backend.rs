@@ -56,10 +56,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, RwLock, oneshot};
+use tracing::{debug, warn};
 
 use super::backend::{BoxFuture, LedgerBackend};
 use super::storage::{EventRecord, LedgerError, SqliteLedgerBackend};
 use crate::consensus::bft::{BlockHash, QuorumCertificate};
+use crate::consensus::metrics::ConsensusMetrics;
 use crate::schema_registry::{SchemaDigest, SchemaRegistry, SchemaRegistryError};
 
 // =============================================================================
@@ -445,6 +447,22 @@ pub struct BftLedgerBackend<R: SchemaRegistry = NoOpSchemaRegistry> {
     /// When present, events with `schema_digest` are validated against this
     /// registry. Unknown schemas cause rejection (fail-closed per DD-0004).
     schema_registry: Option<Arc<R>>,
+
+    /// Optional commit notification sender (TCK-00304: HEF Outbox).
+    ///
+    /// When present, `on_commit()` sends a [`CommitNotification`] after each
+    /// successful `tx.commit()` using `try_send()` for non-blocking delivery.
+    /// Notification failure MUST NOT fail the ledger commit (best-effort).
+    ///
+    /// Per DD-HEF-0007: Ledger append MUST NOT block on pulse fanout.
+    commit_notification_sender: Option<super::CommitNotificationSender>,
+
+    /// Optional consensus metrics for recording notification drops (TCK-00304).
+    ///
+    /// When present, `on_commit()` and `append_eventual()` will increment the
+    /// `hef_notification_drops` counter when notifications are dropped due to
+    /// channel full.
+    metrics: Option<Arc<ConsensusMetrics>>,
 }
 
 impl BftLedgerBackend<NoOpSchemaRegistry> {
@@ -459,6 +477,27 @@ impl BftLedgerBackend<NoOpSchemaRegistry> {
     /// * `finalization_timeout` - Timeout for BFT finalization.
     #[must_use]
     pub fn new(storage: SqliteLedgerBackend, finalization_timeout: Duration) -> Self {
+        Self::with_notification_sender(storage, finalization_timeout, None)
+    }
+
+    /// Creates a new BFT ledger backend with commit notification sender
+    /// (TCK-00304).
+    ///
+    /// Per DOD: "Accept sender at construction." This constructor accepts the
+    /// optional sender at construction time for proper initialization.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - The underlying storage backend.
+    /// * `finalization_timeout` - Timeout for BFT finalization.
+    /// * `notification_sender` - Optional commit notification sender for HEF
+    ///   outbox.
+    #[must_use]
+    pub fn with_notification_sender(
+        storage: SqliteLedgerBackend,
+        finalization_timeout: Duration,
+        notification_sender: Option<super::CommitNotificationSender>,
+    ) -> Self {
         Self {
             storage: Arc::new(storage),
             pending_events: Arc::new(Mutex::new(HashMap::new())),
@@ -467,6 +506,8 @@ impl BftLedgerBackend<NoOpSchemaRegistry> {
             finalization_timeout,
             consensus_enabled: Arc::new(RwLock::new(false)),
             schema_registry: None,
+            commit_notification_sender: notification_sender,
+            metrics: None,
         }
     }
 
@@ -499,6 +540,30 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
         finalization_timeout: Duration,
         schema_registry: Arc<R>,
     ) -> Self {
+        Self::with_schema_registry_and_sender(storage, finalization_timeout, schema_registry, None)
+    }
+
+    /// Creates a new BFT ledger backend with schema validation and notification
+    /// sender (TCK-00194, TCK-00304).
+    ///
+    /// Per DOD: "Accept sender at construction." This constructor accepts both
+    /// the schema registry and optional notification sender at construction
+    /// time.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - The underlying storage backend.
+    /// * `finalization_timeout` - Timeout for BFT finalization.
+    /// * `schema_registry` - The schema registry for digest validation.
+    /// * `notification_sender` - Optional commit notification sender for HEF
+    ///   outbox.
+    #[must_use]
+    pub fn with_schema_registry_and_sender(
+        storage: SqliteLedgerBackend,
+        finalization_timeout: Duration,
+        schema_registry: Arc<R>,
+        notification_sender: Option<super::CommitNotificationSender>,
+    ) -> Self {
         Self {
             storage: Arc::new(storage),
             pending_events: Arc::new(Mutex::new(HashMap::new())),
@@ -507,7 +572,41 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
             finalization_timeout,
             consensus_enabled: Arc::new(RwLock::new(false)),
             schema_registry: Some(schema_registry),
+            commit_notification_sender: notification_sender,
+            metrics: None,
         }
+    }
+
+    /// Sets the commit notification sender for HEF outbox integration
+    /// (TCK-00304).
+    ///
+    /// When set, `on_commit()` will send a [`super::CommitNotification`] via
+    /// `try_send()` after each successful commit. This is non-blocking
+    /// and best-effort per DD-HEF-0007.
+    ///
+    /// # Arguments
+    ///
+    /// * `sender` - The channel sender for commit notifications.
+    pub fn set_commit_notification_sender(&mut self, sender: super::CommitNotificationSender) {
+        self.commit_notification_sender = Some(sender);
+    }
+
+    /// Sets the consensus metrics for recording notification drops (TCK-00304).
+    ///
+    /// When set, the `hef_notification_drops` counter will be incremented when
+    /// notifications are dropped due to channel full.
+    ///
+    /// # Arguments
+    ///
+    /// * `metrics` - The consensus metrics instance.
+    pub fn set_metrics(&mut self, metrics: Arc<ConsensusMetrics>) {
+        self.metrics = Some(metrics);
+    }
+
+    /// Returns true if a commit notification sender is configured.
+    #[must_use]
+    pub const fn has_commit_notification_sender(&self) -> bool {
+        self.commit_notification_sender.is_some()
     }
 
     /// Enables consensus mode.
@@ -649,7 +748,7 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
     /// Appends an event directly to storage (eventual consistency path).
     fn append_eventual(
         &self,
-        _namespace: &str,
+        namespace: &str,
         event: &EventRecord,
         metadata: &EventMetadata,
     ) -> Result<AppendResult, BftLedgerError> {
@@ -665,6 +764,43 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
 
         // Compute event hash
         let event_hash = Self::compute_event_hash(&event_with_meta);
+
+        // TCK-00304: Send post-commit notification for HEF outbox
+        // This MUST happen AFTER storage.append() succeeds
+        // Notification failure MUST NOT fail the ledger commit (best-effort)
+        if let Some(sender) = &self.commit_notification_sender {
+            let notification = super::CommitNotification::new(
+                seq_id,
+                event_hash,
+                &event_with_meta.event_type,
+                namespace,
+            );
+
+            // Use try_send() for non-blocking notification per DD-HEF-0007
+            match sender.try_send(notification) {
+                Ok(()) => {
+                    // Notification sent successfully
+                },
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Channel full: increment hef_notification_drops metric (TCK-00304)
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_notification_drop();
+                    }
+                    warn!(
+                        seq_id = seq_id,
+                        event_type = %event_with_meta.event_type,
+                        "HEF notification dropped: channel full"
+                    );
+                },
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Channel disconnected: LOG_DEBUG_IGNORE (expected during shutdown)
+                    debug!(
+                        seq_id = seq_id,
+                        "HEF notification channel closed (shutdown)"
+                    );
+                },
+            }
+        }
 
         Ok(AppendResult {
             seq_id,
@@ -854,15 +990,58 @@ impl<R: SchemaRegistry + 'static> BftLedgerBackend<R> {
                 // Compute event hash
                 let event_hash = Self::compute_event_hash(&event);
 
+                // Build consensus index
+                let consensus_index = ConsensusIndex {
+                    epoch,
+                    round,
+                    index, // Actual index within block, not hardcoded 0
+                };
+
+                // TCK-00304: Send post-commit notification for HEF outbox
+                // This MUST happen AFTER tx.commit() succeeds (storage.append is sync)
+                // Notification failure MUST NOT fail the ledger commit (best-effort)
+                if let Some(sender) = &self.commit_notification_sender {
+                    let notification = super::CommitNotification::with_consensus(
+                        seq_id,
+                        event_hash,
+                        &event.event_type,
+                        &pending_event.metadata.namespace,
+                        consensus_index,
+                    );
+
+                    // Use try_send() for non-blocking notification per DD-HEF-0007
+                    // On failure: LOG_WARN_DROP (fire-and-forget; never fails commit)
+                    match sender.try_send(notification) {
+                        Ok(()) => {
+                            // Notification sent successfully
+                        },
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            // Channel full: increment hef_notification_drops metric (TCK-00304)
+                            if let Some(metrics) = &self.metrics {
+                                metrics.record_notification_drop();
+                            }
+                            warn!(
+                                seq_id = seq_id,
+                                event_type = %event.event_type,
+                                "HEF notification dropped: channel full"
+                            );
+                        },
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            // Channel disconnected: LOG_DEBUG_IGNORE
+                            // Expected during shutdown
+                            debug!(
+                                seq_id = seq_id,
+                                "HEF notification channel closed (shutdown)"
+                            );
+                        },
+                    }
+                }
+
                 // Notify the caller with proper sequential index (Finding 4)
                 let result = AppendResult {
                     seq_id,
                     event_hash,
-                    consensus_index: Some(ConsensusIndex {
-                        epoch,
-                        round,
-                        index, // Actual index within block, not hardcoded 0
-                    }),
+                    consensus_index: Some(consensus_index),
                 };
 
                 let _ = pending_event.notifier.send(Ok(result));
@@ -1994,5 +2173,192 @@ mod tck_00194_schema_validation_tests {
         assert!(handshake.compatible.is_empty());
         assert!(handshake.missing_local.is_empty());
         assert!(handshake.missing_remote.is_empty());
+    }
+}
+
+/// Tests for TCK-00304: Commit notification channel for HEF outbox.
+#[cfg(test)]
+mod tck_00304_commit_notification_tests {
+    use super::*;
+
+    /// AC1: `CommitNotification` struct defined with required fields.
+    #[test]
+    fn tck_00304_commit_notification_struct_fields() {
+        let notification =
+            super::super::CommitNotification::new(42, [0xab; 32], "WorkOpened", "kernel");
+
+        assert_eq!(notification.seq_id, 42);
+        assert_eq!(notification.event_hash, [0xab; 32]);
+        assert_eq!(notification.event_type, "WorkOpened");
+        assert_eq!(notification.namespace, "kernel");
+        assert!(notification.consensus_index.is_none());
+    }
+
+    /// AC2: `CommitNotification::with_consensus` includes consensus index.
+    #[test]
+    fn tck_00304_commit_notification_with_consensus() {
+        let consensus_index = ConsensusIndex {
+            epoch: 5,
+            round: 10,
+            index: 3,
+        };
+
+        let notification = super::super::CommitNotification::with_consensus(
+            100,
+            [0xcd; 32],
+            "GateReceipt",
+            "holon-1",
+            consensus_index,
+        );
+
+        assert_eq!(notification.seq_id, 100);
+        assert_eq!(notification.consensus_index, Some(consensus_index));
+    }
+
+    /// AC3: `BftLedgerBackend` initially has no commit notification sender.
+    #[tokio::test]
+    async fn tck_00304_backend_no_sender_by_default() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let backend = BftLedgerBackend::with_default_timeout(storage);
+
+        assert!(!backend.has_commit_notification_sender());
+    }
+
+    /// AC4: `set_commit_notification_sender` configures the sender.
+    #[tokio::test]
+    async fn tck_00304_backend_set_sender() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let mut backend = BftLedgerBackend::with_default_timeout(storage);
+
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1024);
+        backend.set_commit_notification_sender(sender);
+
+        assert!(backend.has_commit_notification_sender());
+    }
+
+    /// AC5: Notification sent on eventual append.
+    #[tokio::test]
+    async fn tck_00304_notification_on_eventual_append() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let mut backend = BftLedgerBackend::with_default_timeout(storage);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
+        backend.set_commit_notification_sender(sender);
+
+        let event = EventRecord::new("work.opened", "session-1", "actor-1", b"payload".to_vec());
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+
+        let result = backend
+            .append_with_metadata("kernel", &event, &metadata)
+            .await
+            .unwrap();
+
+        // Notification should be sent
+        let notification = receiver.try_recv().unwrap();
+        assert_eq!(notification.seq_id, result.seq_id);
+        assert_eq!(notification.event_hash, result.event_hash);
+        assert_eq!(notification.event_type, "work.opened");
+        assert_eq!(notification.namespace, "kernel");
+        assert!(notification.consensus_index.is_none());
+    }
+
+    /// AC6: Channel full drops notification without failing commit.
+    #[tokio::test]
+    async fn tck_00304_channel_full_drops_notification() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let mut backend = BftLedgerBackend::with_default_timeout(storage);
+
+        // Create a channel with capacity 1
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        backend.set_commit_notification_sender(sender);
+
+        // Append first event - should succeed and send notification
+        let event1 = EventRecord::new("event.first", "session-1", "actor-1", b"payload1".to_vec());
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+        let result1 = backend
+            .append_with_metadata("kernel", &event1, &metadata)
+            .await;
+        assert!(result1.is_ok());
+
+        // Append second event - notification should be dropped (channel full)
+        // but the commit should still succeed
+        let event2 = EventRecord::new("event.second", "session-1", "actor-1", b"payload2".to_vec());
+        let result2 = backend
+            .append_with_metadata("kernel", &event2, &metadata)
+            .await;
+        assert!(
+            result2.is_ok(),
+            "Commit should succeed even when notification is dropped"
+        );
+    }
+
+    /// AC7: Channel closed logs debug and continues.
+    #[tokio::test]
+    async fn tck_00304_channel_closed_continues() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let mut backend = BftLedgerBackend::with_default_timeout(storage);
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(1024);
+        backend.set_commit_notification_sender(sender);
+
+        // Drop the receiver to close the channel
+        drop(receiver);
+
+        // Append should still succeed even with closed channel
+        let event = EventRecord::new("event.test", "session-1", "actor-1", b"payload".to_vec());
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+        let result = backend
+            .append_with_metadata("kernel", &event, &metadata)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Commit should succeed with closed notification channel"
+        );
+    }
+
+    /// AC8: Multiple notifications are sent in order.
+    #[tokio::test]
+    async fn tck_00304_notifications_in_order() {
+        let storage = SqliteLedgerBackend::in_memory().unwrap();
+        let mut backend = BftLedgerBackend::with_default_timeout(storage);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
+        backend.set_commit_notification_sender(sender);
+
+        let metadata = EventMetadata::eventual("kernel", "actor-1");
+
+        // Append multiple events
+        for i in 0..5u64 {
+            let event = EventRecord::new(
+                format!("event.{i}"),
+                "session-1",
+                "actor-1",
+                format!("payload-{i}").into_bytes(),
+            );
+            backend
+                .append_with_metadata("kernel", &event, &metadata)
+                .await
+                .unwrap();
+        }
+
+        // Verify notifications are in order
+        for i in 0..5u64 {
+            let notification = receiver.try_recv().unwrap();
+            assert_eq!(notification.seq_id, i + 1);
+            assert_eq!(notification.event_type, format!("event.{i}"));
+        }
+
+        // No more notifications
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// AC9: Channel capacity constant is as specified.
+    #[test]
+    fn tck_00304_channel_capacity_constant() {
+        assert_eq!(
+            super::super::COMMIT_NOTIFICATION_CHANNEL_CAPACITY,
+            1024,
+            "Channel capacity should be 1024 per TCK-00304 spec"
+        );
     }
 }

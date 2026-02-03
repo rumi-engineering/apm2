@@ -105,6 +105,11 @@ pub mod handshake;
 pub mod messages;
 /// ACL evaluation for HEF Pulse Plane subscriptions (RFC-0018, TCK-00302).
 pub mod pulse_acl;
+/// HEF Pulse Outbox and Publisher (RFC-0018, TCK-00304).
+///
+/// Implements the daemon-owned outbox that receives post-commit notifications
+/// from the ledger and publishes `PulseEvent` messages to matching subscribers.
+pub mod pulse_outbox;
 /// Topic grammar and wildcard matching for HEF Pulse Plane (RFC-0018,
 /// TCK-00301).
 pub mod pulse_topic;
@@ -239,6 +244,22 @@ pub use pulse_acl::{
     // Functions
     validate_client_sub_id,
     validate_subscription_id,
+};
+// CTR-PROTO-010: HEF Pulse Outbox (RFC-0018, TCK-00304)
+#[allow(unused_imports)]
+pub use pulse_outbox::{
+    // Constants
+    MAX_PULSE_ID_LEN,
+    PULSE_ENVELOPE_SCHEMA_VERSION,
+    PULSE_EVENT_TAG,
+    // Types
+    PulseFrameSender,
+    PulseFrameSink,
+    PulsePublisher,
+    PulsePublisherConfig,
+    TrySendResult,
+    // Factory
+    create_commit_notification_channel,
 };
 // CTR-PROTO-010: HEF Topic Grammar (RFC-0018, TCK-00301)
 #[allow(unused_imports)]

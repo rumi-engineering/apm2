@@ -442,6 +442,13 @@ pub struct ConsensusMetrics {
     byzantine_invalid_signature: AtomicU64,
     byzantine_quorum_forgery: AtomicU64,
     byzantine_replay: AtomicU64,
+
+    // === HEF Outbox Metrics (TCK-00304) ===
+    /// Counter for HEF commit notifications dropped due to channel full.
+    ///
+    /// Per DOD: "Notification drops logged at WARN and increment
+    /// `hef_notification_drops` metric."
+    hef_notification_drops: AtomicU64,
 }
 
 impl ConsensusMetrics {
@@ -497,6 +504,7 @@ impl ConsensusMetrics {
             byzantine_invalid_signature: AtomicU64::new(0),
             byzantine_quorum_forgery: AtomicU64::new(0),
             byzantine_replay: AtomicU64::new(0),
+            hef_notification_drops: AtomicU64::new(0),
         })
     }
 
@@ -633,6 +641,25 @@ impl ConsensusMetrics {
                 self.byzantine_replay.fetch_add(1, Ordering::Relaxed);
             },
         }
+    }
+
+    // ========================================================================
+    // HEF Outbox Metrics (TCK-00304)
+    // ========================================================================
+
+    /// Increments the HEF notification drops counter.
+    ///
+    /// Called when a commit notification cannot be sent because the channel
+    /// is full. Per DOD: "Notification drops logged at WARN and increment
+    /// `hef_notification_drops` metric."
+    pub fn record_notification_drop(&self) {
+        self.hef_notification_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the current count of HEF notification drops.
+    #[must_use]
+    pub fn notification_drops(&self) -> u64 {
+        self.hef_notification_drops.load(Ordering::Relaxed)
     }
 
     // ========================================================================
@@ -853,6 +880,18 @@ impl ConsensusMetrics {
             output,
             "apm2_byzantine_evidence_total{{{node_label},fault_type=\"replay\"}} {}",
             self.byzantine_replay.load(Ordering::Relaxed)
+        );
+
+        // === HEF Outbox Metrics (TCK-00304) ===
+        let _ = writeln!(
+            output,
+            "# HELP hef_notification_drops_total HEF commit notifications dropped due to channel full"
+        );
+        let _ = writeln!(output, "# TYPE hef_notification_drops_total counter");
+        let _ = writeln!(
+            output,
+            "hef_notification_drops_total{{{node_label}}} {}",
+            self.hef_notification_drops.load(Ordering::Relaxed)
         );
 
         // Truncate output if it exceeds the maximum size to prevent unbounded memory
@@ -1142,6 +1181,34 @@ mod tests {
         assert!(
             output.contains("apm2_byzantine_evidence_total"),
             "Missing byzantine counter"
+        );
+    }
+
+    /// TCK-00304: Verify HEF notification drops metric is exported.
+    #[test]
+    fn tck_00304_hef_notification_drops_metric() {
+        let metrics = ConsensusMetrics::new("test-node");
+
+        // Initially zero
+        assert_eq!(metrics.notification_drops(), 0);
+
+        // Increment the counter
+        metrics.record_notification_drop();
+        assert_eq!(metrics.notification_drops(), 1);
+
+        metrics.record_notification_drop();
+        metrics.record_notification_drop();
+        assert_eq!(metrics.notification_drops(), 3);
+
+        // Verify it appears in the rendered output
+        let output = metrics.render();
+        assert!(
+            output.contains("hef_notification_drops_total"),
+            "Missing hef_notification_drops counter"
+        );
+        assert!(
+            output.contains("hef_notification_drops_total{node_id=\"test-node\"} 3"),
+            "hef_notification_drops should be 3"
         );
     }
 
