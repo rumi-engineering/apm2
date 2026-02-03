@@ -520,7 +520,9 @@ impl Canonicalize for KernelEvent {
                 // DefectRecorded has no repeated fields (TCK-00307)
                 | kernel_event::Payload::DefectRecorded(_)
                 // ReviewBlockedRecorded has no repeated fields (TCK-00311)
-                | kernel_event::Payload::ReviewBlockedRecorded(_),
+                | kernel_event::Payload::ReviewBlockedRecorded(_)
+                // ReviewReceiptRecorded has no repeated fields (TCK-00312)
+                | kernel_event::Payload::ReviewReceiptRecorded(_),
             )
             | None => {},
         }

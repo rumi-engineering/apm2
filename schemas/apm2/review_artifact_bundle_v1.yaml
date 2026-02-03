@@ -39,4 +39,23 @@ properties:
     type: "string"
     description: "Hex-encoded 32-byte hash of TimeEnvelope stored in CAS."
     pattern: "^[a-f0-9]{64}$"
+  metadata:
+    type: "object"
+    description: "Optional metadata for review context."
+    properties:
+      reviewer_actor_id:
+        type: "string"
+        maxLength: 256
+        description: "Actor ID of the reviewer."
+      review_verdict:
+        type: "string"
+        enum: ["APPROVE", "REQUEST_CHANGES", "COMMENT"]
+        description: "Review verdict outcome."
+      review_started_at:
+        type: "integer"
+        description: "Unix nanoseconds when review started."
+      review_completed_at:
+        type: "integer"
+        description: "Unix nanoseconds when review completed."
+    additionalProperties: false
 unevaluatedProperties: false

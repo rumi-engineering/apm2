@@ -86,6 +86,7 @@ pub mod quarantine;
 mod receipt;
 pub mod retry_manager;
 pub mod review_blocked;
+pub mod review_receipt;
 pub mod risk_tier;
 pub mod selection_policy;
 mod terminal_verifier;
@@ -148,7 +149,8 @@ pub use domain_separator::{
     GATE_LEASE_ISSUED_PREFIX, GATE_RECEIPT_PREFIX, GATE_RUN_COMPLETED_PREFIX,
     INTERVENTION_FREEZE_PREFIX, INTERVENTION_UNFREEZE_PREFIX, LEASE_REVOKED_PREFIX,
     LEDGER_EVENT_PREFIX, MERGE_RECEIPT_PREFIX, POLICY_RESOLVED_PREFIX, PROJECTION_RECEIPT_PREFIX,
-    QUARANTINE_EVENT_PREFIX, REVIEW_BLOCKED_RECORDED_PREFIX, sign_with_domain, verify_with_domain,
+    QUARANTINE_EVENT_PREFIX, REVIEW_BLOCKED_RECORDED_PREFIX, REVIEW_RECEIPT_RECORDED_PREFIX,
+    sign_with_domain, verify_with_domain,
 };
 // Re-export echo-trap detection types
 pub use echo_trap::{
@@ -208,6 +210,15 @@ pub use review_blocked::{
     ReviewBlockedError, ReviewBlockedRecorded, ReviewBlockedRecordedBuilder,
     ReviewBlockedRecordedProto, SCHEMA_IDENTIFIER as REVIEW_BLOCKED_SCHEMA_IDENTIFIER,
     SCHEMA_VERSION as REVIEW_BLOCKED_SCHEMA_VERSION,
+};
+// Re-export review receipt types
+pub use review_receipt::{
+    MAX_RECEIPT_ID_LENGTH as MAX_REVIEW_RECEIPT_ID_LENGTH, MAX_REVIEW_ID_LENGTH,
+    MAX_STRING_LENGTH as MAX_REVIEW_RECEIPT_STRING_LENGTH, MAX_TOOL_LOG_HASHES,
+    ReviewArtifactBundleV1, ReviewArtifactBundleV1Builder, ReviewMetadata, ReviewReceiptError,
+    ReviewReceiptRecorded, ReviewReceiptRecordedBuilder, ReviewReceiptRecordedProto, ReviewVerdict,
+    SCHEMA_IDENTIFIER as REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
+    SCHEMA_VERSION as REVIEW_ARTIFACT_SCHEMA_VERSION, validate_changeset_binding,
 };
 // Re-export risk tier classification types
 pub use risk_tier::{

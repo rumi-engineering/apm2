@@ -47,8 +47,9 @@ use std::path::{Path, PathBuf};
 
 use apm2_core::crypto::Signer;
 use apm2_core::fac::{
-    ChangeSetBundleV1, ReasonCode, ReviewBlockedError, ReviewBlockedRecorded,
-    ReviewBlockedRecordedBuilder,
+    ChangeSetBundleV1, ReasonCode, ReviewArtifactBundleV1, ReviewBlockedError,
+    ReviewBlockedRecorded, ReviewBlockedRecordedBuilder, ReviewMetadata, ReviewReceiptError,
+    ReviewReceiptRecorded, ReviewReceiptRecordedBuilder,
 };
 use apm2_core::htf::TimeEnvelopeRef;
 use thiserror::Error;
@@ -442,6 +443,252 @@ pub fn create_blocked_event(
 }
 
 // =============================================================================
+// Review Receipt Recording
+// =============================================================================
+
+/// Creates a `ReviewReceiptRecorded` event after successful review completion.
+///
+/// This function creates a durable ledger event that records the successful
+/// review outcome with CAS-stored artifacts.
+///
+/// # Arguments
+///
+/// * `receipt_id` - Unique identifier for this receipt
+/// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
+/// * `artifact_bundle_hash` - CAS hash of the `ReviewArtifactBundleV1`
+/// * `time_envelope_ref` - HTF time envelope reference for temporal authority
+/// * `reviewer_actor_id` - Actor ID of the reviewer
+/// * `signer` - Signer to authorize the event
+///
+/// # Errors
+///
+/// Returns error if the event cannot be created (validation failures).
+pub fn create_receipt_event(
+    receipt_id: String,
+    changeset_digest: [u8; 32],
+    artifact_bundle_hash: [u8; 32],
+    time_envelope_ref: [u8; 32],
+    reviewer_actor_id: String,
+    signer: &Signer,
+) -> Result<ReviewReceiptRecorded, ReviewReceiptError> {
+    ReviewReceiptRecordedBuilder::new()
+        .receipt_id(receipt_id)
+        .changeset_digest(changeset_digest)
+        .artifact_bundle_hash(artifact_bundle_hash)
+        .time_envelope_ref(time_envelope_ref)
+        .reviewer_actor_id(reviewer_actor_id)
+        .build_and_sign(signer)
+}
+
+/// Creates a `ReviewArtifactBundleV1` from review outputs.
+///
+/// This function packages the review outputs into a CAS-storable artifact
+/// bundle.
+///
+/// # Arguments
+///
+/// * `review_id` - Unique review identifier
+/// * `changeset_digest` - BLAKE3 digest of the reviewed changeset
+/// * `review_text_hash` - CAS hash of the review text
+/// * `tool_log_hashes` - CAS hashes of tool execution logs
+/// * `time_envelope_ref` - HTF time envelope reference
+/// * `metadata` - Optional review metadata (verdict, timestamps)
+///
+/// # Errors
+///
+/// Returns error if the bundle cannot be created (validation failures).
+pub fn create_artifact_bundle(
+    review_id: String,
+    changeset_digest: [u8; 32],
+    review_text_hash: [u8; 32],
+    tool_log_hashes: Vec<[u8; 32]>,
+    time_envelope_ref: [u8; 32],
+    metadata: Option<ReviewMetadata>,
+) -> Result<ReviewArtifactBundleV1, ReviewReceiptError> {
+    let mut builder = ReviewArtifactBundleV1::builder()
+        .review_id(review_id)
+        .changeset_digest(changeset_digest)
+        .review_text_hash(review_text_hash)
+        .tool_log_hashes(tool_log_hashes)
+        .time_envelope_ref(time_envelope_ref);
+
+    if let Some(meta) = metadata {
+        builder = builder.metadata(meta);
+    }
+
+    builder.build()
+}
+
+/// Result of successful review completion.
+///
+/// This structure packages all the outputs from a successful review episode
+/// for storage to CAS and ledger recording.
+#[derive(Debug, Clone)]
+pub struct ReviewCompletionResult {
+    /// Unique receipt ID for this review.
+    pub receipt_id: String,
+    /// BLAKE3 digest of the changeset that was reviewed.
+    pub changeset_digest: [u8; 32],
+    /// The artifact bundle containing review outputs.
+    pub artifact_bundle: ReviewArtifactBundleV1,
+    /// CAS hash of the serialized artifact bundle.
+    pub artifact_bundle_hash: [u8; 32],
+    /// HTF time envelope reference for temporal authority.
+    pub time_envelope_ref: [u8; 32],
+    /// Reviewer actor ID.
+    pub reviewer_actor_id: String,
+}
+
+impl ReviewCompletionResult {
+    /// Creates a new builder for `ReviewCompletionResult`.
+    #[must_use]
+    pub fn builder() -> ReviewCompletionResultBuilder {
+        ReviewCompletionResultBuilder::default()
+    }
+
+    /// Creates a `ReviewReceiptRecorded` event from this result.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the event cannot be created.
+    pub fn create_receipt_event(
+        &self,
+        signer: &Signer,
+    ) -> Result<ReviewReceiptRecorded, ReviewReceiptError> {
+        create_receipt_event(
+            self.receipt_id.clone(),
+            self.changeset_digest,
+            self.artifact_bundle_hash,
+            self.time_envelope_ref,
+            self.reviewer_actor_id.clone(),
+            signer,
+        )
+    }
+}
+
+/// Builder for [`ReviewCompletionResult`].
+#[derive(Debug, Default)]
+pub struct ReviewCompletionResultBuilder {
+    receipt_id: Option<String>,
+    review_id: Option<String>,
+    changeset_digest: Option<[u8; 32]>,
+    review_text_hash: Option<[u8; 32]>,
+    tool_log_hashes: Vec<[u8; 32]>,
+    time_envelope_ref: Option<[u8; 32]>,
+    reviewer_actor_id: Option<String>,
+    metadata: Option<ReviewMetadata>,
+}
+
+#[allow(clippy::missing_const_for_fn)]
+impl ReviewCompletionResultBuilder {
+    /// Sets the receipt ID.
+    #[must_use]
+    pub fn receipt_id(mut self, id: impl Into<String>) -> Self {
+        self.receipt_id = Some(id.into());
+        self
+    }
+
+    /// Sets the review ID.
+    #[must_use]
+    pub fn review_id(mut self, id: impl Into<String>) -> Self {
+        self.review_id = Some(id.into());
+        self
+    }
+
+    /// Sets the changeset digest.
+    #[must_use]
+    pub fn changeset_digest(mut self, digest: [u8; 32]) -> Self {
+        self.changeset_digest = Some(digest);
+        self
+    }
+
+    /// Sets the review text hash.
+    #[must_use]
+    pub fn review_text_hash(mut self, hash: [u8; 32]) -> Self {
+        self.review_text_hash = Some(hash);
+        self
+    }
+
+    /// Sets the tool log hashes.
+    #[must_use]
+    pub fn tool_log_hashes(mut self, hashes: Vec<[u8; 32]>) -> Self {
+        self.tool_log_hashes = hashes;
+        self
+    }
+
+    /// Sets the time envelope reference.
+    #[must_use]
+    pub fn time_envelope_ref(mut self, hash: [u8; 32]) -> Self {
+        self.time_envelope_ref = Some(hash);
+        self
+    }
+
+    /// Sets the reviewer actor ID.
+    #[must_use]
+    pub fn reviewer_actor_id(mut self, id: impl Into<String>) -> Self {
+        self.reviewer_actor_id = Some(id.into());
+        self
+    }
+
+    /// Sets the review metadata.
+    #[must_use]
+    pub fn metadata(mut self, metadata: ReviewMetadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// Builds the `ReviewCompletionResult`.
+    ///
+    /// This function computes the CAS hash of the artifact bundle and
+    /// packages all outputs for ledger recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if required fields are missing or the artifact bundle
+    /// cannot be created.
+    pub fn build(self) -> Result<ReviewCompletionResult, ReviewReceiptError> {
+        let receipt_id = self
+            .receipt_id
+            .ok_or(ReviewReceiptError::MissingField("receipt_id"))?;
+        let review_id = self
+            .review_id
+            .ok_or(ReviewReceiptError::MissingField("review_id"))?;
+        let changeset_digest = self
+            .changeset_digest
+            .ok_or(ReviewReceiptError::MissingField("changeset_digest"))?;
+        let review_text_hash = self
+            .review_text_hash
+            .ok_or(ReviewReceiptError::MissingField("review_text_hash"))?;
+        let time_envelope_ref = self
+            .time_envelope_ref
+            .ok_or(ReviewReceiptError::MissingField("time_envelope_ref"))?;
+        let reviewer_actor_id = self
+            .reviewer_actor_id
+            .ok_or(ReviewReceiptError::MissingField("reviewer_actor_id"))?;
+
+        let artifact_bundle = create_artifact_bundle(
+            review_id,
+            changeset_digest,
+            review_text_hash,
+            self.tool_log_hashes,
+            time_envelope_ref,
+            self.metadata,
+        )?;
+
+        let artifact_bundle_hash = artifact_bundle.compute_cas_hash();
+
+        Ok(ReviewCompletionResult {
+            receipt_id,
+            changeset_digest,
+            artifact_bundle,
+            artifact_bundle_hash,
+            time_envelope_ref,
+            reviewer_actor_id,
+        })
+    }
+}
+
+// =============================================================================
 // Workspace Manager (Stub)
 // =============================================================================
 
@@ -653,5 +900,141 @@ mod tests {
         let snapshot = manager.snapshot("work-001").unwrap();
         assert_eq!(snapshot.work_id, "work-001");
         assert_eq!(snapshot.file_count, 0); // stub returns 0
+    }
+
+    // =========================================================================
+    // TCK-00312: Review receipt tests
+    // =========================================================================
+
+    #[test]
+    fn test_create_artifact_bundle() {
+        let bundle = create_artifact_bundle(
+            "review-001".to_string(),
+            [0x42; 32],
+            [0x11; 32],
+            vec![[0x22; 32], [0x33; 32]],
+            [0x44; 32],
+            None,
+        )
+        .expect("should create bundle");
+
+        assert_eq!(bundle.review_id, "review-001");
+        assert_eq!(bundle.changeset_digest, hex::encode([0x42; 32]));
+        assert_eq!(bundle.review_text_hash, hex::encode([0x11; 32]));
+        assert_eq!(bundle.tool_log_hashes.len(), 2);
+        assert_eq!(bundle.time_envelope_ref, hex::encode([0x44; 32]));
+        assert!(bundle.metadata.is_none());
+    }
+
+    #[test]
+    fn test_create_artifact_bundle_with_metadata() {
+        use apm2_core::fac::ReviewVerdict;
+
+        let metadata = ReviewMetadata::new()
+            .with_reviewer_actor_id("reviewer-001")
+            .with_verdict(ReviewVerdict::Approve)
+            .with_started_at(1000)
+            .with_completed_at(2000);
+
+        let bundle = create_artifact_bundle(
+            "review-001".to_string(),
+            [0x42; 32],
+            [0x11; 32],
+            vec![],
+            [0x44; 32],
+            Some(metadata),
+        )
+        .expect("should create bundle");
+
+        assert!(bundle.metadata.is_some());
+        let meta = bundle.metadata.unwrap();
+        assert_eq!(meta.reviewer_actor_id, Some("reviewer-001".to_string()));
+        assert_eq!(meta.review_verdict, Some(ReviewVerdict::Approve));
+    }
+
+    #[test]
+    fn test_create_receipt_event() {
+        let signer = apm2_core::crypto::Signer::generate();
+
+        let receipt = create_receipt_event(
+            "RR-001".to_string(),
+            [0x42; 32],
+            [0x33; 32],
+            [0x44; 32],
+            "reviewer-001".to_string(),
+            &signer,
+        )
+        .expect("should create receipt");
+
+        assert_eq!(receipt.receipt_id, "RR-001");
+        assert_eq!(receipt.changeset_digest, [0x42; 32]);
+        assert_eq!(receipt.artifact_bundle_hash, [0x33; 32]);
+        assert_eq!(receipt.time_envelope_ref, [0x44; 32]);
+        assert_eq!(receipt.reviewer_actor_id, "reviewer-001");
+
+        // Verify signature
+        assert!(receipt.verify_signature(&signer.verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn test_review_completion_result() {
+        let signer = apm2_core::crypto::Signer::generate();
+
+        let result = ReviewCompletionResult::builder()
+            .receipt_id("RR-001")
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .tool_log_hashes(vec![[0x22; 32]])
+            .time_envelope_ref([0x44; 32])
+            .reviewer_actor_id("reviewer-001")
+            .build()
+            .expect("should create result");
+
+        assert_eq!(result.receipt_id, "RR-001");
+        assert_eq!(result.changeset_digest, [0x42; 32]);
+        assert_eq!(result.artifact_bundle.review_id, "review-001");
+
+        // CAS hash should be deterministically computed
+        let expected_hash = result.artifact_bundle.compute_cas_hash();
+        assert_eq!(result.artifact_bundle_hash, expected_hash);
+
+        // Should be able to create receipt event
+        let receipt = result
+            .create_receipt_event(&signer)
+            .expect("should create receipt");
+        assert_eq!(receipt.artifact_bundle_hash, expected_hash);
+        assert!(receipt.verify_signature(&signer.verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn test_review_completion_result_with_metadata() {
+        use apm2_core::fac::ReviewVerdict;
+
+        let signer = apm2_core::crypto::Signer::generate();
+        let metadata = ReviewMetadata::new()
+            .with_reviewer_actor_id("reviewer-001")
+            .with_verdict(ReviewVerdict::RequestChanges);
+
+        let result = ReviewCompletionResult::builder()
+            .receipt_id("RR-002")
+            .review_id("review-002")
+            .changeset_digest([0x55; 32])
+            .review_text_hash([0x66; 32])
+            .time_envelope_ref([0x77; 32])
+            .reviewer_actor_id("reviewer-002")
+            .metadata(metadata)
+            .build()
+            .expect("should create result");
+
+        assert!(result.artifact_bundle.metadata.is_some());
+        let meta = result.artifact_bundle.metadata.as_ref().unwrap();
+        assert_eq!(meta.review_verdict, Some(ReviewVerdict::RequestChanges));
+
+        // Receipt event should still be valid
+        let receipt = result
+            .create_receipt_event(&signer)
+            .expect("should create receipt");
+        assert!(receipt.verify_signature(&signer.verifying_key()).is_ok());
     }
 }

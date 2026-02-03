@@ -223,9 +223,10 @@ pub use tool_handler::{
     NetworkArgs, RawArgs, ReadArgs, ResultMetadata, ToolArgs, ToolHandler, ToolHandlerError,
     ToolResultData, WriteArgs,
 };
-// Re-export workspace types (TCK-00311)
+// Re-export workspace types (TCK-00311, TCK-00312)
 pub use workspace::{
-    ApplyResult, MAX_FILE_SIZE, MAX_PATH_DEPTH, MAX_RETRY_ATTEMPTS, RetryContext, WorkspaceError,
-    WorkspaceManager, WorkspaceSnapshot, create_blocked_event, validate_file_changes,
-    validate_path,
+    ApplyResult, MAX_FILE_SIZE, MAX_PATH_DEPTH, MAX_RETRY_ATTEMPTS, RetryContext,
+    ReviewCompletionResult, ReviewCompletionResultBuilder, WorkspaceError, WorkspaceManager,
+    WorkspaceSnapshot, create_artifact_bundle, create_blocked_event, create_receipt_event,
+    validate_file_changes, validate_path,
 };

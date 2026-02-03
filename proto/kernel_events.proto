@@ -1,5 +1,11 @@
 // APM2 Kernel Event Schema
-// Version: 0.6.0
+// Version: 0.7.0
+//
+// CHANGELOG (0.7.0):
+// - Added ReviewReceiptRecorded event for FAC v0 review receipts (RFC-0018, TCK-00312)
+// - Added ReviewReceiptRecorded to KernelEvent payload (tag 33)
+// - Binds changeset_digest + artifact_bundle_hash + time_envelope_ref for review outcomes
+// - Enables work.<work_id>.review topic derivation for successful reviews
 //
 // CHANGELOG (0.6.0):
 // - Added ReviewBlockedRecorded event for FAC v0 review liveness (RFC-0018, TCK-00311)
@@ -115,6 +121,7 @@ message KernelEvent {
     IoArtifactPublished io_artifact_published = 30;
     DefectRecorded defect_recorded = 31;
     ReviewBlockedRecorded review_blocked_recorded = 32;
+    ReviewReceiptRecorded review_receipt_recorded = 33;
   }
 }
 
@@ -1672,5 +1679,45 @@ message ReviewBlockedRecorded {
   string recorder_actor_id = 6;
   // Ed25519 signature over canonical bytes with REVIEW_BLOCKED_RECORDED: domain (64 bytes).
   bytes recorder_signature = 7;
+}
+
+// ============================================================
+// REVIEW RECEIPT EVENTS (TCK-00312)
+// ============================================================
+//
+// ReviewReceiptRecorded events capture successful review completion in the FAC v0
+// pipeline. This event binds the review artifacts (review text, tool logs) to the
+// changeset being reviewed and provides temporal anchoring via HTF.
+//
+// Key properties:
+// - Binds changeset_digest to artifact_bundle_hash for integrity
+// - References ReviewArtifactBundleV1 stored in CAS
+// - Provides time_envelope_ref for temporal authority
+// - Enables work.<work_id>.review topic derivation
+
+// Emitted when a review is successfully completed.
+//
+// This event records the successful review outcome and stores it durably in the
+// ledger. It binds the review artifacts to the changeset and provides CAS
+// references for verification.
+//
+// Security: The signature uses REVIEW_RECEIPT_RECORDED: domain prefix.
+message ReviewReceiptRecorded {
+  // Unique identifier for this receipt.
+  // Format: `RR-{uuid}` or similar unique string.
+  string receipt_id = 1;
+  // BLAKE3 digest of the changeset that was reviewed (32 bytes).
+  // This is the same digest from the ChangeSetPublished event.
+  bytes changeset_digest = 2;
+  // BLAKE3 hash of the ReviewArtifactBundleV1 stored in CAS (32 bytes).
+  // Contains review_text_hash, tool_log_hashes, and metadata.
+  bytes artifact_bundle_hash = 3;
+  // HTF time envelope reference for temporal authority (RFC-0016).
+  // Binds the receipt to verifiable HTF time.
+  optional TimeEnvelopeRef time_envelope_ref = 4;
+  // Actor who recorded the receipt (the reviewer).
+  string reviewer_actor_id = 5;
+  // Ed25519 signature over canonical bytes with REVIEW_RECEIPT_RECORDED: domain (64 bytes).
+  bytes reviewer_signature = 6;
 }
 

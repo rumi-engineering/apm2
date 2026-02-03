@@ -42,7 +42,7 @@ pub struct KernelEvent {
     /// Event payload (oneof)
     #[prost(
         oneof = "kernel_event::Payload",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33"
     )]
     pub payload: ::core::option::Option<kernel_event::Payload>,
 }
@@ -98,6 +98,8 @@ pub mod kernel_event {
         DefectRecorded(super::DefectRecorded),
         #[prost(message, tag = "32")]
         ReviewBlockedRecorded(super::ReviewBlockedRecorded),
+        #[prost(message, tag = "33")]
+        ReviewReceiptRecorded(super::ReviewReceiptRecorded),
     }
 }
 /// ============================================================
@@ -1875,6 +1877,39 @@ pub struct ReviewBlockedRecorded {
     /// Ed25519 signature over canonical bytes with REVIEW_BLOCKED_RECORDED: domain (64 bytes).
     #[prost(bytes = "vec", tag = "7")]
     pub recorder_signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// Emitted when a review is successfully completed.
+///
+/// This event records the successful review outcome and stores it durably in the
+/// ledger. It binds the review artifacts to the changeset and provides CAS
+/// references for verification.
+///
+/// Security: The signature uses REVIEW_RECEIPT_RECORDED: domain prefix.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReviewReceiptRecorded {
+    /// Unique identifier for this receipt.
+    /// Format: `RR-{uuid}` or similar unique string.
+    #[prost(string, tag = "1")]
+    pub receipt_id: ::prost::alloc::string::String,
+    /// BLAKE3 digest of the changeset that was reviewed (32 bytes).
+    /// This is the same digest from the ChangeSetPublished event.
+    #[prost(bytes = "vec", tag = "2")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the ReviewArtifactBundleV1 stored in CAS (32 bytes).
+    /// Contains review_text_hash, tool_log_hashes, and metadata.
+    #[prost(bytes = "vec", tag = "3")]
+    pub artifact_bundle_hash: ::prost::alloc::vec::Vec<u8>,
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the receipt to verifiable HTF time.
+    #[prost(message, optional, tag = "4")]
+    pub time_envelope_ref: ::core::option::Option<TimeEnvelopeRef>,
+    /// Actor who recorded the receipt (the reviewer).
+    #[prost(string, tag = "5")]
+    pub reviewer_actor_id: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with REVIEW_RECEIPT_RECORDED: domain (64 bytes).
+    #[prost(bytes = "vec", tag = "6")]
+    pub reviewer_signature: ::prost::alloc::vec::Vec<u8>,
 }
 /// Determinism status for AAT runs.
 /// Indicates whether multiple runs produced consistent terminal evidence.
