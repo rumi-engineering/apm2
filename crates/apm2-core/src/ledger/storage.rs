@@ -978,6 +978,8 @@ impl SqliteLedgerBackend {
     ///     rationale_code: "APPROVED".to_string(),
     ///     budget_consumed: 100,
     ///     time_envelope_ref: None,
+    ///     // Episode ID (RFC-0018, TCK-00306): not yet populated.
+    ///     episode_id: String::new(),
     /// };
     /// let payload = tool_decided.encode_to_vec();
     ///

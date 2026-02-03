@@ -341,6 +341,9 @@ impl FirewallDecision {
             // HTF time envelope reference (RFC-0016): not yet populated by this method.
             // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
+            // Episode ID (RFC-0018, TCK-00306): not populated by firewall validation.
+            // The daemon episode runtime will populate this from episode context.
+            episode_id: String::new(),
         }
     }
 }

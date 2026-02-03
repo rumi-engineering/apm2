@@ -158,6 +158,7 @@ pub trait Canonicalize {
 ///     rationale_code: "APPROVED".to_string(),
 ///     budget_consumed: 100,
 ///     time_envelope_ref: None,
+///     episode_id: String::new(),
 /// };
 ///
 /// // Get domain-prefixed bytes for signing (automatically canonicalizes)
@@ -513,7 +514,9 @@ impl Canonicalize for KernelEvent {
                 | kernel_event::Payload::InterventionUnfreeze(_)
                 | kernel_event::Payload::AatResultReused(_)
                 | kernel_event::Payload::QuarantineCleared(_)
-                | kernel_event::Payload::ChangesetPublished(_),
+                | kernel_event::Payload::ChangesetPublished(_)
+                // IoArtifactPublished has no repeated fields (TCK-00306)
+                | kernel_event::Payload::IoArtifactPublished(_),
             )
             | None => {},
         }
@@ -810,6 +813,7 @@ mod tests {
             rationale_code: "POLICY_APPROVED".to_string(),
             budget_consumed: 42,
             time_envelope_ref: None,
+            episode_id: String::new(),
         };
 
         decided.canonicalize();
@@ -845,6 +849,7 @@ mod tests {
             result_hash: vec![0xCD; 32],
             duration_ms: 1234,
             time_envelope_ref: None,
+            episode_id: String::new(),
         };
 
         executed.canonicalize();
@@ -880,6 +885,7 @@ mod tests {
             rationale_code: "COMPLETED_NORMALLY".to_string(),
             final_entropy: 9876,
             time_envelope_ref: None,
+            episode_id: String::new(),
         };
 
         terminated.canonicalize();
@@ -957,6 +963,7 @@ mod tests {
             rationale_code: "CODE".to_string(),
             budget_consumed: 100,
             time_envelope_ref: None,
+            episode_id: String::new(),
         };
 
         let mut executed = ToolExecuted {
@@ -965,6 +972,7 @@ mod tests {
             result_hash: vec![0x00; 32],
             duration_ms: 100,
             time_envelope_ref: None,
+            episode_id: String::new(),
         };
 
         let mut terminated = SessionTerminated {
@@ -973,6 +981,7 @@ mod tests {
             rationale_code: "CODE".to_string(),
             final_entropy: 100,
             time_envelope_ref: None,
+            episode_id: String::new(),
         };
 
         decided.canonicalize();
@@ -1014,6 +1023,7 @@ mod tests {
                     rationale_code: "APPROVED".to_string(),
                     budget_consumed: 50,
                     time_envelope_ref: None,
+                    episode_id: String::new(),
                 })),
             })),
             ..Default::default()
@@ -1040,6 +1050,7 @@ mod tests {
                     rationale_code: "COMPLETED".to_string(),
                     final_entropy: 1000,
                     time_envelope_ref: None,
+                    episode_id: String::new(),
                 })),
             })),
             ..Default::default()
@@ -1087,6 +1098,7 @@ mod tests {
             rationale_code: "OK".to_string(),
             budget_consumed: 0,
             time_envelope_ref: None,
+            episode_id: String::new(),
         };
 
         decided.canonicalize();
@@ -1119,6 +1131,7 @@ mod tests {
             result_hash: vec![0xFF; 32], // 32 0xFF bytes
             duration_ms: 100,
             time_envelope_ref: None,
+            episode_id: String::new(),
         };
 
         executed.canonicalize();
@@ -1144,6 +1157,7 @@ mod tests {
             rationale_code: "NORMAL".to_string(),
             final_entropy: 500,
             time_envelope_ref: None,
+            episode_id: String::new(),
         };
 
         terminated.canonicalize();
