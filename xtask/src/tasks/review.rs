@@ -349,11 +349,6 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
     Ok(sha)
 }
 
-/// Update the status check for a review.
-///
-/// # NON-AUTHORITATIVE OUTPUT
-///
-/// This function writes GitHub status checks as DEVELOPMENT SCAFFOLDING only.
 /// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
 /// the HEF evidence pipeline.
 fn update_status(
@@ -364,6 +359,14 @@ fn update_status(
     success: bool,
     description: &str,
 ) -> Result<()> {
+    // TCK-00309: Gate writes on HEF projection flag
+    if crate::util::use_hef_projection() {
+        let context = review_type.status_context();
+        println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
+        println!("  [HEF] Status would be: {context} = {success} - {description}");
+        return Ok(());
+    }
+
     // TCK-00294: Print NON-AUTHORITATIVE banner before status writes
     print_non_authoritative_banner();
 

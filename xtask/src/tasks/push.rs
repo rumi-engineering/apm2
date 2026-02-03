@@ -361,6 +361,12 @@ fn parse_owner_repo(remote_url: &str) -> &str {
 /// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
 /// the HEF evidence pipeline.
 fn create_pending_statuses(sh: &Shell, owner_repo: &str, head_sha: &str) {
+    // TCK-00309: Gate writes on HEF projection flag
+    if crate::util::use_hef_projection() {
+        println!("    [HEF] Skipping pending status creation (USE_HEF_PROJECTION=true)");
+        return;
+    }
+
     // TCK-00294: Print NON-AUTHORITATIVE banner before status writes
     print_non_authoritative_banner();
 
