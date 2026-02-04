@@ -1,0 +1,125 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/type-theoretic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 7,
+    "name": "type-theoretic",
+    "cat": "formal",
+    "core": "Encode invariants in types so the type checker rejects invalid states before runtime. If it compiles, entire error classes are impossible.",
+    "out": [
+      {"type": "type_signature", "verify": "States pre/postconditions and side-effect boundaries"},
+      {"type": "typing_judgment", "verify": "Proves term has claimed type"},
+      {"type": "well_typed_program", "verify": "Compiles without errors; satisfies encoded invariants"},
+      {"type": "api_contract", "verify": "Typed inputs, outputs, and error cases"},
+      {"type": "newtype", "verify": "Distinguishes semantically-different values sharing representation"},
+      {"type": "phantom_type", "verify": "Encodes state machine transitions; illegal transitions fail compilation"}
+    ],
+    "proc": [
+      "1. List invariants: What must always hold? (non-null, non-empty, in-range, valid-state)",
+      "2. Classify by checkability: Which can be encoded in your language's type system?",
+      "3. Choose encoding depth: primitive wrapper < sum type < newtype < phantom < refinement < dependent",
+      "4. Design type: Ask 'Can invalid value inhabit this type?' If yes, tighten or document runtime check",
+      "5. Implement with compiler: Treat compilation failures as specification feedback, not obstacles",
+      "6. Seal boundaries: Hide constructors; expose smart constructors that enforce invariants",
+      "7. Audit escapes: Grep for unsafe/any/as/cast; each must have invariant justification comment",
+      "8. Exit check: If >3 refactors without spec clarity, pause and write prose spec first"
+    ],
+    "quick_check": [
+      "Is domain small enough to enumerate? Use sum type",
+      "Is value semantically distinct from its representation? Use newtype",
+      "Does state machine have illegal transitions? Use phantom types",
+      "Is property numeric range? Use refinement type or smart constructor",
+      "Is property inter-field dependency? Consider dependent type or runtime validation"
+    ],
+    "check": [
+      "Every domain concept has distinct type (no raw string/int in APIs)",
+      "Illegal states unrepresentable (sum types, newtypes, non-empty wrappers)",
+      "Public modules expose opaque/abstract types; internals hidden",
+      "Escape hatches documented with invariant justification",
+      "Compile passes implies invariants hold (no redundant runtime assertions)",
+      "Type parameter nesting depth at most 3 (readability ceiling)",
+      "Smart constructors validate; raw constructors private"
+    ],
+    "diff": {
+      "01-deductive": {
+        "boundary": "Deductive: derives conclusions from premises via inference rules. Type-theoretic: embeds inference in compilation; programs are proofs.",
+        "test": "Ask: Am I deriving a conclusion or defining a structure that makes bad conclusions unwritable?"
+      },
+      "02-proof-theoretic": {
+        "boundary": "Proof-theoretic: standalone proof object is asset. Type-theoretic: runnable program is asset; types carry proof obligations.",
+        "test": "Ask: Is primary deliverable a proof document or an executable with typed API?"
+      },
+      "03-constructive": {
+        "boundary": "Constructive: must exhibit computational witness for existence. Type-theoretic: can encode invariants without extracting explicit witness.",
+        "test": "Ask: Must I produce the witness value, or just ensure no invalid value can exist?"
+      },
+      "06-constraint-sat": {
+        "boundary": "Constraint: declares constraints then runs solver at analysis/runtime. Type-theoretic: rejects ill-formed code at compile time.",
+        "test": "Ask: Am I searching for satisfying assignment or preventing invalid programs from compiling?"
+      },
+      "64-modal": {
+        "boundary": "Modal: reasons about necessity/possibility across worlds. Type-theoretic: ensures program invariants via static typing.",
+        "test": "Ask: Am I reasoning about what could/must be true, or defining what the compiler will/won't accept?"
+      }
+    },
+    "fail": {
+      "mode": "Fighting type system instead of clarifying spec it encodes",
+      "signals": [
+        "unsafe/any/cast ratio exceeds ~2% of codebase",
+        "Compile errors persist after 3 refactoring attempts without spec change",
+        "Team debates 'how to type-check' instead of 'what invariant to enforce'",
+        "Type signatures longer than function bodies",
+        "Adding type parameters to satisfy compiler without domain meaning"
+      ],
+      "exit_triggers": [
+        "Invariant is runtime-only (e.g., external API response shape)",
+        "Type encoding complexity exceeds team's type-system fluency",
+        "Domain truly has no static invariants (pure data transformation)"
+      ],
+      "mit": [
+        {"do": "Write prose spec before types", "test": "Every non-trivial type has doc comment stating invariant in English"},
+        {"do": "Introduce newtypes for domain concepts", "test": "No two domain concepts share same primitive type across module boundaries"},
+        {"do": "Refactor when casts accumulate", "test": "PR blocked if function has >1 explicit cast without justification"},
+        {"do": "Limit type parameter depth to 3", "test": "Linter/CI rule enforces signature complexity ceiling"},
+        {"do": "Use opaque types to hide internals", "test": "Public API contains no raw representation types"},
+        {"do": "Prefer sum types over boolean flags", "test": "No function takes >1 boolean parameter"},
+        {"do": "Document escape hatches at definition site", "test": "Every unsafe/cast has adjacent comment explaining why invariant holds"}
+      ]
+    },
+    "use": [
+      "API design: types document and enforce contracts without runtime overhead",
+      "Correctness-by-construction: compile-time bugs never reach production",
+      "Safe composition: modules combine freely if types align",
+      "Eliminating bug classes: null-pointer, out-of-bounds, protocol violations become type errors",
+      "Refactoring confidence: type changes propagate required fixes automatically",
+      "State machines: phantom types make illegal transitions uncompilable"
+    ],
+    "rel": [
+      {"id": 3, "name": "constructive-intuitionistic", "link": "Curry-Howard correspondence; proofs as programs"},
+      {"id": 2, "name": "mathematical-proof-theoretic", "link": "Types as proofs; proof objects as assets"},
+      {"id": 6, "name": "constraint-satisfiability", "link": "Type checking can be viewed as constraint solving"},
+      {"id": 1, "name": "deductive-reasoning", "link": "Type systems embed deductive inference in compilation"}
+    ],
+    "micro_ex": {
+      "before": {
+        "code": "fn send_email(to: String, subject: String, body: String) -> Result<(), Error>",
+        "problem": "Caller can pass empty string, malformed address, or swap arguments"
+      },
+      "after": {
+        "code": "fn send_email(to: EmailAddress, subject: NonEmptyString, body: EmailBody) -> Result<SentReceipt, SendError>",
+        "improvement": "EmailAddress validates format at construction; NonEmptyString cannot be empty; SentReceipt proves send occurred"
+      },
+      "invariants_encoded": [
+        "Email address is syntactically valid (EmailAddress newtype)",
+        "Subject is non-empty (NonEmptyString newtype)",
+        "Success is distinguishable from failure (Result + SentReceipt)"
+      ]
+    }
+  }
+}

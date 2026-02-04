@@ -1,0 +1,126 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/imprecise-probability@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 21,
+    "name": "imprecise-probability",
+    "cat": "uncertain",
+    "core": "Represent uncertainty with probability intervals [P_lower, P_upper] when evidence is insufficient to justify a point estimate. Separates 'unknown' (wide interval) from 'unlikely' (narrow interval near zero). Use when forced priors would be arbitrary or when robustness across probability assignments matters.",
+    "out": [
+      {"n": "probability_interval", "d": "[P_L, P_U] bounds on event probability with justification for each bound"},
+      {"n": "credal_set", "d": "set of probability distributions compatible with evidence constraints"},
+      {"n": "sensitivity_report", "d": "how conclusions change across the interval range"},
+      {"n": "robust_conclusion", "d": "claims that hold for all distributions in credal set"},
+      {"n": "decision_recommendation", "d": "action choice under specified ambiguity rule (maximin, Gamma-maximin, etc.)"},
+      {"n": "interval_narrowing_plan", "d": "information that would tighten bounds, with expected reduction"}
+    ],
+    "proc": [
+      "identify whether interval justified: use when (a) no defensible point prior, (b) experts disagree >20% range, or (c) stakes require robustness audit",
+      "elicit bounds separately: P_lower from minimal evidence threshold, P_upper from maximal compatible evidence",
+      "construct credal set: all distributions satisfying constraints; often convex hull of extremes",
+      "propagate intervals: lower bound of conjunction = product of lowers; upper of disjunction = min(1, sum of uppers)",
+      "identify robust conclusions: claims where sign/direction unchanged across full interval",
+      "classify non-robust cases: (a) decision-sensitive (interval spans threshold), (b) direction-uncertain, (c) order-uncertain (ranking changes)",
+      "select decision rule: maximin (pessimistic), maximax (optimistic), Gamma-maximin (weighted), E-admissibility (non-dominated set)",
+      "report ambiguity cost: expected-value difference between point estimate and robust action",
+      "plan interval reduction: identify observations that maximally reduce [P_L, P_U] width"
+    ],
+    "check": [
+      "interval bounds each have explicit evidential justification, not symmetric padding",
+      "P_lower derived from minimal supporting evidence, P_upper from absence of refuting evidence",
+      "unknown (wide interval) distinguished from unlikely (narrow near zero) in outputs",
+      "propagation rules documented (independence assumed? conjunction/disjunction method?)",
+      "decision rule stated before examining which action wins",
+      "sensitivity table shows conclusions at interval endpoints and midpoint",
+      "robust conclusions labeled; non-robust flagged with sensitivity range",
+      "ambiguity cost quantified if decision differs from point-estimate optimum"
+    ],
+    "diff": {
+      "bayesian-probabilistic": "IP uses intervals when no defensible point prior; Bayesian requires single prior (even if sensitivity-tested). IP says 'I don't know P'; Bayesian says 'P=0.5 pending evidence'.",
+      "robust-worst-case": "Robust optimizes only at worst endpoint; IP considers full interval, may use Gamma-maximin or E-admissibility. IP is uncertainty representation; robust is decision rule.",
+      "evidential-dempster-shafer": "DS allocates mass to sets, derives [Bel,Pl] structurally; IP directly elicits probability bounds. DS combines via Dempster rule; IP propagates via interval arithmetic.",
+      "qualitative-probability": "Qualitative orders events (A > B > C) without numeric bounds; IP provides numeric intervals. Use qualitative when even bounds feel arbitrary.",
+      "fuzzy-logic": "Fuzzy handles vagueness (boundary of 'tall'); IP handles uncertainty (probability of rain). Fuzzy grades membership; IP bounds probability."
+    },
+    "fail": {
+      "mode": "decision_paralysis",
+      "desc": "Intervals too wide to discriminate options; analysis stalls awaiting unattainable precision.",
+      "signals": [
+        "interval spans decision-relevant threshold (e.g., [0.3, 0.7] when threshold is 0.5)",
+        "all candidate actions have overlapping expected-utility intervals",
+        "repeated requests for more data without specifying what would suffice",
+        "no decision rule adopted despite overlapping intervals",
+        "ambiguity cost not quantified, so value of narrowing unknown"
+      ],
+      "mit": [
+        {"m": "adopt explicit decision rule before analysis", "test": "rule named (maximin/Gamma/E-admissible) and applied to select action"},
+        {"m": "compute value-of-information for interval narrowing", "test": "VoI estimate exists showing expected interval reduction and decision value"},
+        {"m": "set ambiguity budget: maximum acceptable [P_U - P_L]", "test": "threshold stated (e.g., 0.2) and intervals exceeding it flagged"},
+        {"m": "use robust satisficing: accept first option meeting threshold across full interval", "test": "satisficing threshold defined and at least one option evaluated against it"},
+        {"m": "decompose: narrow sub-intervals where evidence stronger, accept wide elsewhere", "test": "interval decomposition table shows narrowed components"},
+        {"m": "time-box analysis: decide by deadline with current intervals", "test": "deadline set and decision made despite residual ambiguity"}
+      ]
+    },
+    "use": [
+      "expert disagreement: elicit bounds from each expert, take convex hull",
+      "regulatory risk assessment: auditors require robustness, not optimistic point estimates",
+      "novel domains: no historical base rates, prior would be fabricated",
+      "high-stakes irreversibility: cost of wrong point estimate exceeds cost of wider interval",
+      "model uncertainty: ensemble of models yields probability range, not single forecast",
+      "adversarial settings: opponent may exploit known point estimate"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "alternative: use Bayesian when defensible point prior exists"},
+      {"id": 49, "n": "robust-worst-case", "r": "decision rule often paired with IP uncertainty"},
+      {"id": 22, "n": "evidential-dempster-shafer", "r": "alternative interval framework via mass functions"},
+      {"id": 52, "n": "value-of-information", "r": "guides interval narrowing investments"},
+      {"id": 45, "n": "decision-theoretic", "r": "consumes IP intervals via ambiguity-aware rules"},
+      {"id": 24, "n": "qualitative-probability", "r": "fallback when even bounds are unjustified"},
+      {"id": 50, "n": "minimax-regret", "r": "decision rule minimizing worst relative loss under IP"}
+    ],
+    "ex": {
+      "sit": "Estimating P(novel pathogen becomes pandemic) for resource allocation. No historical base rate; three experts give 5%, 25%, 40%.",
+      "steps": [
+        "reject point estimate: expert spread (5%-40%) exceeds 20% threshold for Bayesian prior",
+        "elicit bounds: P_lower=0.05 (minimum expert), P_upper=0.40 (maximum expert)",
+        "propagate to decision: expected lives saved = [50K, 400K] × P = [2.5K, 160K]",
+        "robust conclusion: intervention justified if cost < 2.5K life-equivalents (holds at lower bound)",
+        "non-robust: optimal scale varies 5× across interval—requires decision rule",
+        "apply Gamma-maximin (gamma=0.5): weight 50% to worst case, 50% to midpoint → scale decision",
+        "VoI: serology study could narrow to [0.15, 0.30], worth $X if decision changes"
+      ],
+      "asset": {
+        "event": "novel pathogen pandemic",
+        "interval": [0.05, 0.40],
+        "bounds_justification": {"lower": "minimum credible expert", "upper": "maximum credible expert"},
+        "robust_conclusions": ["intervention threshold met at lower bound"],
+        "decision_rule": "Gamma-maximin, gamma=0.5",
+        "recommended_action": "medium-scale intervention",
+        "ambiguity_cost": "expected value loss vs point-estimate optimum: $Y"
+      }
+    },
+    "confusion": {
+      "vs_bayesian": {
+        "symptom": "using IP when a defensible base rate exists",
+        "diagnostic": "can you cite a reference class with >100 instances? if yes, use Bayesian with that prior",
+        "resolution": "IP for deep uncertainty; Bayesian for actuarial uncertainty with data"
+      },
+      "vs_wide_confidence_interval": {
+        "symptom": "treating frequentist CI as probability interval",
+        "diagnostic": "CI is repeated-sampling property; IP is epistemic state about single event",
+        "resolution": "CI bounds parameter under sampling; IP bounds probability directly"
+      },
+      "vs_sensitivity_analysis": {
+        "symptom": "calling sensitivity analysis 'imprecise probability'",
+        "diagnostic": "sensitivity varies inputs to see output change; IP represents genuine uncertainty in inputs",
+        "resolution": "sensitivity is method; IP is uncertainty representation that motivates sensitivity"
+      }
+    }
+  }
+}

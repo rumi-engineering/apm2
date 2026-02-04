@@ -30,7 +30,7 @@ references[6]:
     purpose: "Stop conditions: all merged, no unblocked, dirty main, auth failure."
   - path: references/governance-principles.md
     purpose: "Holonic laws and reasoning modes governing state transitions and failure handling."
-  - path: documents/skills/modes-of-reasoning/artifacts/selector.json
+  - path: documents/skills/modes-of-reasoning/assets/selector.json
     purpose: "Reasoning mode selection heuristics for different problem types."
 
 decision_tree:

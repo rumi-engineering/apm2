@@ -1,0 +1,86 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/mathematical-proof-theoretic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 2,
+    "name": "mathematical-proof-theoretic",
+    "cat": "formal",
+    "core": "Deduction where the proof object matters: what counts as a proof and how it is constructed. The proof itself is a first-class asset, not just the conclusion. Answers: Can this statement be derived? How? What does the derivation reveal?",
+    "out": [
+      {"type": "formal_proof", "verify": "Each step justified by axiom, lemma, or inference rule; no gaps"},
+      {"type": "proof_transformation", "verify": "Input/output proofs valid; transformation preserves soundness"},
+      {"type": "derivability_result", "verify": "Meta-theorem about what can/cannot be proved in system"},
+      {"type": "proof_certificate", "verify": "Machine-checkable asset accepted by verifier"},
+      {"type": "proof_sketch", "verify": "Key steps identified; gaps marked for later filling"}
+    ],
+    "proc": [
+      "State theorem precisely: identify free variables, quantifier scope, implicit assumptions",
+      "Choose proof system: natural deduction (intuitive), sequent calculus (cut-free search), Hilbert (minimal axioms), proof assistant (machine-checked)",
+      "Select proof strategy: direct, contradiction, induction, case split, construction",
+      "Identify required lemmas; prove or cite each with explicit reference",
+      "Construct derivation: each step cites rule and predecessors",
+      "Check for holes: any 'clearly' or 'obviously' that hides non-trivial work?",
+      "Verify termination: does proof establish what theorem claims, no more, no less?"
+    ],
+    "check": [
+      "Proof syntactically valid in chosen system (parseable, well-formed)?",
+      "Every step justified by stated rule with correct premises?",
+      "All axioms and lemmas cited are themselves proved or accepted assumptions?",
+      "No hidden assumptions smuggled via natural-language glosses?",
+      "Theorem statement matches the actual claim needed by downstream work?",
+      "Proof strategy appropriate for goal (existence → construction or witness, universal → arbitrary element)?"
+    ],
+    "diff": {
+      "01-deductive-reasoning": "Deductive: focuses on truth-preservation and valid inference. Proof-theoretic: the derivation structure itself is the asset; studies what can be derived, not just what is true.",
+      "03-constructive": "Constructive: requires computational witness for existence claims. Proof-theoretic: broader; may use classical logic (excluded middle, contradiction) where constructive forbids.",
+      "05-model-theoretic": "Model-theoretic: asks 'in which structures is this true?' Proof-theoretic: asks 'can this be derived from axioms?' Soundness connects them; completeness may not hold.",
+      "07-type-theoretic": "Type-theoretic: proofs embedded in program types; compiler checks incrementally. Proof-theoretic: standalone proof objects; may not produce runnable code."
+    },
+    "fail": {
+      "mode": "spec-mismatch",
+      "desc": "Proving the wrong theorem or proving something irrelevant to actual outcomes; proof is correct but disconnected from what matters.",
+      "signals": [
+        "Theorem statement differs from informal requirement in scope or edge cases",
+        "Proof assumes idealized conditions not present in deployment",
+        "Verified component integrated with unverified code, voiding guarantees",
+        "Stakeholders cannot trace theorem back to original safety/correctness concern"
+      ],
+      "mit": [
+        {"do": "Write informal spec first, formalize second", "test": "Every theorem has one-sentence plain-language gloss reviewable by non-expert"},
+        {"do": "Trace each theorem to a requirement or risk", "test": "Traceability matrix links theorems to system requirements"},
+        {"do": "Review boundary assumptions explicitly", "test": "Proof preamble lists environmental assumptions; each is validated operationally"},
+        {"do": "Integrate verification with system boundary checks", "test": "Verified components have runtime monitors at trust boundaries"},
+        {"do": "Conduct adversarial review of theorem statement", "test": "Red-team session attempts to satisfy theorem while violating intent"}
+      ]
+    },
+    "use": [
+      "Formal methods: proving protocol correctness, compiler soundness, algorithm termination",
+      "Theorem proving: mathematical research, automated reasoning, proof search",
+      "Certified pipelines: producing machine-checkable evidence for auditors",
+      "Verified software: kernels, cryptographic libraries, safety-critical controllers",
+      "Proof-carrying code: code ships with proof certificate verifiable by recipient"
+    ],
+    "rel": [
+      {"id": 1, "name": "deductive-reasoning", "link": "underlying inference pattern; proof-theoretic adds structure"},
+      {"id": 3, "name": "constructive-intuitionistic", "link": "proofs as algorithms; restricted logic"},
+      {"id": 5, "name": "model-theoretic-semantic", "link": "complementary: derivability vs truth-in-structure"},
+      {"id": 7, "name": "type-theoretic", "link": "propositions as types; Curry-Howard correspondence"},
+      {"id": 8, "name": "counterexample-guided", "link": "failed proofs suggest counterexamples to refine spec"}
+    ],
+    "ex": {
+      "scenario": "verifying a cryptographic protocol",
+      "approach": "Formalize security property (e.g., 'attacker cannot derive key') in proof assistant. Construct proof by case analysis on attacker capabilities. Machine-check derivation. Trace theorem to threat model.",
+      "confused_with": [
+        {"mode": "01-deductive-reasoning", "distinguish": "Ask: Is the derivation structure itself the deliverable, or just the conclusion? If you need the proof object (for audit, machine-check, transformation), use proof-theoretic."},
+        {"mode": "05-model-theoretic", "distinguish": "Ask: Am I showing derivability or finding structures? If seeking countermodels or checking satisfiability, use model-theoretic. If constructing step-by-step derivation, use proof-theoretic."},
+        {"mode": "07-type-theoretic", "distinguish": "Ask: Is primary asset a standalone proof or a typed program? If proof is embedded in code and compiler checks it, use type-theoretic. If proof is separate document or certificate, use proof-theoretic."}
+      ]
+    }
+  }
+}

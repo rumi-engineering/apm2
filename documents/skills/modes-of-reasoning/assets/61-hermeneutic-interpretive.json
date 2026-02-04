@@ -1,0 +1,99 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/hermeneutic-interpretive@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 61,
+    "name": "hermeneutic-interpretive",
+    "cat": "domain",
+    "core": "Extract meaning from text, documents, and assets by applying interpretive canons (plain meaning, contextual, purposive, harmonizing) with explicit textual evidence. Input: ambiguous passage + context sources. Output: interpretation with citations, confidence, and alternatives considered.",
+    "out": [
+      {"type": "interpretation", "form": "meaning statement with supporting context citations", "test": "every claim traces to quoted passage or identified context source"},
+      {"type": "reconciled_meaning", "form": "unified reading resolving apparent contradictions", "test": "each conflict addressed: which reading wins, why, what's sacrificed"},
+      {"type": "clarified_definition", "form": "term/phrase definition with scope and boundaries", "test": "positive definition (what it means) + negative boundary (what it excludes)"},
+      {"type": "contextual_understanding", "form": "situational frame explaining why text says what it does", "test": "frame specifies author, audience, purpose, and historical moment"},
+      {"type": "confidence_assessment", "form": "certainty level with basis", "test": "states high/medium/low with specific factors driving uncertainty"}
+    ],
+    "proc": [
+      "1. LOCATE AMBIGUITY: Quote exact passage(s) requiring interpretation; specify what is unclear (term, scope, reference, intent)",
+      "2. GATHER CONTEXT SOURCES: List concrete sources consulted—document preamble, author statements, historical records, related clauses, domain conventions. Mark each as primary (same document) or secondary (external).",
+      "3. APPLY CANONS IN ORDER: (a) Plain meaning—dictionary/common usage; (b) Contextual—surrounding text modifies meaning; (c) Purposive—document's stated goals guide interpretation; (d) Harmonizing—prefer reading that reconciles with other provisions. Stop at first canon yielding clear answer; document which canon resolved it.",
+      "4. GENERATE ALTERNATIVE READINGS: Produce at least 2 distinct interpretations before selecting. For each: state the reading, cite supporting evidence, note weaknesses.",
+      "5. SELECT AND JUSTIFY: Choose interpretation that best satisfies: textual fidelity > coherence with document purpose > author intent > reader convenience. State tie-breaker if canons conflict.",
+      "6. ASSESS CONFIDENCE: High = single clear reading, strong textual support. Medium = preferred reading with plausible alternative. Low = multiple readings equally supported; flag for stakeholder input.",
+      "7. DOCUMENT OUTPUT: Produce interpretation asset with: quoted passage, context sources, canon applied, alternatives rejected, confidence level, recommended action if low confidence."
+    ],
+    "check": [
+      "every interpretive claim quotes or cites specific text",
+      "context sources listed with provenance (not assumed or invented)",
+      "at least 2 alternative readings generated before selection",
+      "author intent claims cite evidence (not imputed)",
+      "cultural/temporal distance from text acknowledged if >20 years or cross-cultural",
+      "confidence level stated with factors (not just 'medium')",
+      "interpretation distinguishes what text says vs what interpreter wishes it said"
+    ],
+    "quick_checklist": [
+      "Did I quote the ambiguous passage verbatim?",
+      "Can I name 2+ context sources I actually consulted?",
+      "Did I try at least 2 different readings?",
+      "Which interpretive canon resolved it (plain/contextual/purposive/harmonizing)?",
+      "What would falsify my interpretation?",
+      "Is my confidence level justified by evidence strength?"
+    ],
+    "diff": {
+      "legal": "legal applies institutionally-mandated canons (ejusdem generis, expressio unius) with binding precedent; hermeneutic uses general interpretive principles without legal authority. Use legal when institutional rules constrain interpretation.",
+      "narrative": "narrative constructs new meaning through story structure and plot; hermeneutic extracts existing meaning from authored text. Narrative asks 'what story does this tell?'; hermeneutic asks 'what did the author mean?'",
+      "sensemaking": "sensemaking builds new frames from ambiguous, unstructured data; hermeneutic interprets within existing textual frames. Sensemaking when no text exists yet; hermeneutic when text exists but meaning unclear.",
+      "dialectical": "dialectical resolves disagreement through thesis-antithesis-synthesis argumentation; hermeneutic resolves textual ambiguity through evidence-weighted interpretation. Dialectical for competing positions; hermeneutic for unclear text.",
+      "historical-investigative": "historical reconstructs past events from evidence fragments; hermeneutic interprets meaning of documents from the past. Historical asks 'what happened?'; hermeneutic asks 'what does this document mean?'",
+      "rhetorical": "rhetorical analyzes persuasive effect on audience; hermeneutic analyzes intended meaning by author. Rhetorical asks 'how does this persuade?'; hermeneutic asks 'what does this mean?'"
+    },
+    "common_confusions": [
+      {"modes": [61, 63], "confusion": "treating sensemaking as interpretation", "resolution": "sensemaking creates new frames from chaos; hermeneutic interprets within existing textual frames. If you have a document, use hermeneutic; if you have scattered signals, use sensemaking."},
+      {"modes": [61, 71], "confusion": "applying hermeneutic when legal constraints exist", "resolution": "in legal contexts, institutional canons override general interpretive principles. Check: is there binding precedent or statutory interpretation rules? If yes, use legal mode."},
+      {"modes": [61, 59], "confusion": "using dialectical for textual ambiguity", "resolution": "dialectical resolves disagreement between positions; hermeneutic resolves ambiguity in text. If two people disagree about meaning, first use hermeneutic to establish what text says, then dialectical if disagreement persists."}
+    ],
+    "fail": {
+      "mode": "over-interpretation: reading intent that isn't there; projecting interpreter's views onto text; finding meaning author never intended",
+      "signal": "interpretation unsupported by quoted text; context sources invented or vague; single reading asserted without alternatives; confidence stated as high without strong textual basis",
+      "mit": [
+        "TEXTUAL ANCHOR: every interpretive claim must quote the specific passage it interprets—no quote, no claim",
+        "ALTERNATIVES GATE: document cannot conclude without listing at least 2 readings considered and why one was rejected",
+        "INTENT vs INFERENCE LABEL: explicitly mark each claim as 'author stated' (with citation) or 'interpreter infers' (with reasoning)",
+        "CONFIDENCE CALIBRATION: high confidence requires single clear reading with no plausible alternative; medium requires explicit statement of what alternative exists; low requires stakeholder escalation",
+        "CONTEXT PROVENANCE: name each context source (document section, external reference, domain convention) rather than 'context suggests'",
+        "FALSIFICATION TEST: state what textual evidence would disprove the interpretation; if nothing could falsify it, confidence is too high",
+        "TEMPORAL HUMILITY: for texts >20 years old or cross-cultural, explicitly note how meaning may have shifted"
+      ]
+    },
+    "use": [
+      "contract clause interpretation (ambiguous terms, scope disputes)",
+      "policy document analysis (intent behind rules, exception boundaries)",
+      "requirements clarification (what stakeholder actually needs vs what they wrote)",
+      "qualitative feedback synthesis (what users mean vs what they said)",
+      "cross-cultural communication (meaning across cultural contexts)",
+      "legacy code comment interpretation (what did the original author intend?)",
+      "API documentation disambiguation (what does 'optional' mean in this context?)"
+    ],
+    "rel": [
+      {"id": 71, "name": "legal", "why": "formal interpretation with institutional authority and binding canons"},
+      {"id": 62, "name": "narrative-causal-storytelling", "why": "constructs meaning through story vs extracts meaning from text"},
+      {"id": 63, "name": "sensemaking-frame-building", "why": "builds frames from ambiguity vs interprets within existing frames"},
+      {"id": 59, "name": "dialectical", "why": "resolves disagreement between positions vs ambiguity in text"},
+      {"id": 73, "name": "historical-investigative", "why": "reconstructs events vs interprets document meaning"}
+    ],
+    "ex": {
+      "ctx": "Contract clause: 'Deliverables must be completed in a timely manner.' Dispute over whether 30-day delay is breach.",
+      "analysis": "AMBIGUITY: 'timely' undefined—could mean any reasonable period. CONTEXT SOURCES: (1) contract preamble states 'rapid iteration' as goal [primary]; (2) industry standard is 14 days [secondary]; (3) prior dealings between parties allowed 21 days [secondary]. CANONS APPLIED: Plain meaning yields no answer (timely = vague). Contextual: 'rapid iteration' suggests shorter periods. Purposive: clause protects against unreasonable delay harming project. ALTERNATIVES: (A) 'Timely' = industry standard 14 days → 30 days is breach; (B) 'Timely' = prior course of dealing 21 days → 30 days is breach; (C) 'Timely' = any non-abandonment → 30 days acceptable. SELECTION: Reading (A) or (B) preferred—both indicate breach. Reading (C) rejected as inconsistent with 'rapid iteration' goal. CONFIDENCE: Medium—clear breach under (A)/(B), but ambiguity in original drafting warrants negotiation before litigation."
+    },
+    "micro_ex": {
+      "ctx": "API doc: 'The timeout parameter is optional.' Developer asks: can I omit it entirely, or must I pass null?",
+      "analysis": "AMBIGUITY: 'optional' unclear—omit vs explicit null. CONTEXT: (1) other params say 'optional, defaults to X' but this one doesn't; (2) code examples omit param entirely. CANON: Contextual—examples show omission, not null. INTERPRETATION: Omit entirely; null may cause error. CONFIDENCE: Medium—test with actual API to confirm."
+    }
+  }
+}

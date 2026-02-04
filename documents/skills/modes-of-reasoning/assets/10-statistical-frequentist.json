@@ -1,0 +1,162 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/statistical-frequentist@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 10,
+    "name": "statistical-frequentist",
+    "cat": "probabilistic",
+    "core": "Inference about populations from samples using estimators, confidence intervals, hypothesis tests, and error rates. Defines probability as long-run frequency under repeated sampling. Key commitment: procedures (not individual inferences) have known error properties.",
+    "out": [
+      {"n": "point_estimate", "d": "sample statistic estimating population parameter", "fmt": "value ± SE"},
+      {"n": "confidence_interval", "d": "range with coverage guarantee under repeated sampling", "fmt": "[lower, upper] at X% level"},
+      {"n": "p_value", "d": "probability of data as extreme under null hypothesis", "fmt": "p=0.XXX (exact or inequality)"},
+      {"n": "test_decision", "d": "reject/fail-to-reject at specified alpha level", "fmt": "decision + alpha + power if available"},
+      {"n": "error_rate_bounds", "d": "Type I (alpha) and Type II (beta) error rate guarantees", "fmt": "alpha=X, power=1-beta=Y"},
+      {"n": "effect_size", "d": "magnitude of effect in standardized or practical units", "fmt": "Cohen's d, OR, RR, or domain units"}
+    ],
+    "proc": [
+      "define population parameter of interest (mu, p, sigma, correlation, etc.)",
+      "specify null and alternative hypotheses with direction (one/two-tailed)",
+      "GATE: check if sampling method supports target inferences (random sample? representative?)",
+      "select test statistic and sampling distribution (t, z, chi-sq, F, permutation)",
+      "determine required sample size for target power (typically 80%) at minimum meaningful effect",
+      "GATE: if n < required, acknowledge underpowered; proceed with caution or increase n",
+      "collect sample data following design; document any deviations",
+      "compute point estimate and standard error",
+      "construct confidence interval at chosen level (match alpha to decision threshold)",
+      "calculate test statistic and p-value",
+      "GATE: if multiple comparisons, apply correction (Bonferroni, FDR, etc.)",
+      "compare to significance threshold, report decision with effect size"
+    ],
+    "check": [
+      "sampling assumptions stated: independence, random sampling, representativeness",
+      "null hypothesis precisely operationalized (not vague 'no effect')",
+      "test matches data type: proportions→z/chi-sq, means→t, variances→F",
+      "power analysis performed: target effect size and n justified",
+      "alpha and confidence level consistent (alpha=0.05 ↔ 95% CI)",
+      "p-value interpreted as procedure property: 'if null true, X% of samples this extreme'",
+      "effect size reported in interpretable units (d, OR, raw difference)",
+      "practical significance assessed: is effect large enough to matter?",
+      "multiple comparison correction applied if >1 test",
+      "CI width evaluated: narrow enough for decision? if wide, flag uncertainty"
+    ],
+    "diff": {
+      "bayesian": "frequentist: long-run procedure error rates, no priors, P(data|H). Bayesian: degree of belief, requires priors, P(H|data). Frequentist cannot say 'probability parameter is in CI'; can only say 'procedure covers parameter X% of time'.",
+      "likelihood-based": "frequentist: uses test statistics and p-values for decisions. Likelihood: compares P(E|H) across hypotheses without making decisions. Frequentist adds decision rules; likelihood stops at evidence comparison.",
+      "inductive": "frequentist: formal probabilistic framework with error rate guarantees. Inductive: informal generalization patterns. Frequentist quantifies uncertainty; inductive describes it qualitatively.",
+      "experimental-design": "frequentist: analyzes data after collection. Experimental design: plans how to collect. They chain: design→collect→frequentist analysis. Design sets constraints frequentist must honor (randomization, blocking).",
+      "reference-class": "frequentist: infers population parameters from samples. Reference-class: provides base rates from similar cases. Reference-class might supply expected proportions; frequentist tests if sample differs from expectation.",
+      "calibration": "frequentist: evaluates single procedure's error rates. Calibration: evaluates forecaster's accuracy over many predictions. Frequentist controls Type I/II errors; calibration tracks hit rates."
+    },
+    "confusions": [
+      {
+        "pair": "frequentist vs bayesian",
+        "error": "interpreting 95% CI as '95% probability parameter is in this range'",
+        "correction": "frequentist CI: if repeated, 95% of intervals contain true value. For probability statements about parameter, use Bayesian credible intervals with explicit prior."
+      },
+      {
+        "pair": "frequentist vs likelihood-based",
+        "error": "reporting likelihood ratio as sufficient for decision without considering sample size and power",
+        "correction": "likelihood ratios quantify relative evidence; frequentist adds: was sample large enough to detect effect? Report power alongside any non-significant result."
+      },
+      {
+        "pair": "p-value vs effect size",
+        "error": "treating small p-value as evidence of large/important effect",
+        "correction": "p-value conflates effect size with sample size. Always report effect size; a p<0.001 can accompany trivial effect if n is huge."
+      }
+    ],
+    "fail": {
+      "mode": "p_value_worship",
+      "signals": [
+        "p<0.05 treated as truth threshold; p=0.049 and p=0.051 treated as categorically different",
+        "non-significant equated with 'no effect' rather than 'insufficient evidence'",
+        "confidence interval ignored while p-value spotlighted",
+        "effect size unreported or buried",
+        "practical significance ignored: statistically significant but trivially small effects celebrated",
+        "p-hacking: testing multiple comparisons until one hits significance",
+        "HARKing: hypothesizing after results known"
+      ],
+      "mitigations": [
+        {
+          "action": "always report effect size with CI",
+          "test": "asset includes Cohen's d/OR/RR or raw effect with uncertainty bounds",
+          "why": "forces attention to magnitude, not just existence"
+        },
+        {
+          "action": "interpret CI width as precision indicator",
+          "test": "report states whether CI is narrow enough for practical decision",
+          "why": "wide CI reveals low precision even if 'significant'"
+        },
+        {
+          "action": "pre-register analysis plan before data collection",
+          "test": "timestamped registration (OSF, AsPredicted, or version-controlled doc) exists before data access",
+          "why": "prevents p-hacking and HARKing by committing to specific tests"
+        },
+        {
+          "action": "distinguish statistical from practical significance explicitly",
+          "test": "asset contains sentence: 'statistically significant but [practically meaningful / trivially small / unclear importance]'",
+          "why": "forces judgment about whether effect matters for decisions"
+        },
+        {
+          "action": "report power for null results",
+          "test": "non-significant results include: 'power to detect effect of size X was Y%'",
+          "why": "distinguishes 'no effect' from 'inadequate sample to detect effect'"
+        },
+        {
+          "action": "use exact p-values, not thresholds",
+          "test": "report p=0.034, not p<0.05; report p=0.08, not 'n.s.'",
+          "why": "preserves information; avoids cliff-edge thinking"
+        }
+      ]
+    },
+    "use": [
+      "A/B testing with binary or continuous outcomes",
+      "clinical trials with pre-specified endpoints",
+      "quality assurance and process control (control charts)",
+      "survey sampling with probability designs",
+      "experimental research with randomization",
+      "regulatory submissions requiring error rate guarantees"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian", "r": "alternative framework: posteriors vs error rates"},
+      {"id": 12, "n": "likelihood-based", "r": "evidence comparison without decision rules"},
+      {"id": 9, "n": "inductive", "r": "informal precursor to formal inference"},
+      {"id": 69, "n": "experimental-design", "r": "upstream: plans data collection this mode analyzes"},
+      {"id": 18, "n": "reference-class", "r": "supplies base rates/expected proportions for testing"},
+      {"id": 76, "n": "calibration", "r": "downstream: evaluates forecaster accuracy over many inferences"}
+    ],
+    "ex": {
+      "sit": "A/B test: new checkout flow vs control. n=1000 per group. Conversion: 12% vs 10%.",
+      "steps": [
+        "H0: p_new = p_ctrl; H1: p_new > p_ctrl (one-tailed, expecting improvement)",
+        "power analysis: 80% power to detect 3pp difference requires n=1000/group ✓",
+        "z-test for proportions, one-tailed alpha=0.05",
+        "pooled p=0.11, SE=0.014, z=1.43",
+        "p-value=0.076 > 0.05, fail to reject H0",
+        "95% CI for difference: [-0.007, 0.047]",
+        "effect size: 2pp absolute lift (20% relative); OR=1.23",
+        "practical assessment: 2pp lift is meaningful for business, but CI includes zero"
+      ],
+      "asset": {
+        "point_estimate": "2pp (p_new - p_ctrl)",
+        "confidence_interval": "[-0.7pp, 4.7pp] at 95%",
+        "p_value": "p=0.076 (one-tailed)",
+        "test_decision": "fail to reject H0 at alpha=0.05",
+        "effect_size": "OR=1.23, 20% relative lift",
+        "interpretation": "effect plausible (CI covers meaningful lifts) but underpowered to confirm; recommend extending test to n=2000/group for 80% power to detect 2pp difference"
+      },
+      "insight": "2pp lift plausible but underpowered to detect at this n; CI width (5.4pp) shows low precision. Next step: continue test or accept business decision under uncertainty."
+    },
+    "micro_ex": {
+      "bad": "p=0.06, therefore no effect. Ship the old version.",
+      "good": "p=0.06 with 95% CI [-0.7pp, 4.7pp]. Effect direction consistent with hypothesis, but insufficient power to confirm. CI excludes effects <-0.7pp but allows up to 4.7pp lift. Recommend: extend test or make risk-adjusted decision.",
+      "why": "'No effect' confuses 'not proven' with 'disproven'. CI and power reveal what we actually know."
+    }
+  }
+}

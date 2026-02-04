@@ -1,11 +1,12 @@
 {
-  "schema": "cac.holonic_bundle.v1",
+  "schema": "cac.holonic_principle_bundle.v1",
   "schema_version": "1.0.0",
-  "kind": "holonic.bundle",
+  "kind": "holonic.principle_bundle",
   "meta": {
-    "stable_id": "dcp://apm2.agents/holon/selector@1",
+    "stable_id": "dcp://apm2.agents/principles/bundle@1",
     "classification": "PUBLIC",
-    "created_at": "2026-02-04T00:00:00Z"
+    "created_at": "2026-02-04T22:30:00Z",
+    "description": "Operational principles for holonic design, providing guidance and best practices for agent-native systems."
   },
   "payload": {
     "version": "1.0.0",
@@ -39,7 +40,7 @@
         "name": "Roofline Model",
         "title": "Performance is min(compute peak, bandwidth peak × arithmetic intensity)",
         "formal": "[\nP = \\min(P_{\\text{peak}}, ; BW_{\\text{peak}} \\cdot AI)\n]\nwhere (AI = \\frac{\\text{FLOPs}}{\\text{bytes moved}}). This is the cleanest “why is my code slow?” litmus test.",
-        "apm2_mapping": "APM2’s *dominant* workload is often “move bytes and validate them” (ledger/event replay, CAS retrieval, schema validation, policy eval), which is usually **bandwidth/latency bound**, not FLOP bound. That means performance wins come from: (a) fewer bytes (PRIN-005), (b) fewer round‑trips (PRIN-013), (c) deterministic compression (PRIN-066), and (d) locality (PRIN-020-PRIN-022). Treat “bytes moved per verified progress” as a first‑class metric in the observability plane.",
+        "apm2_mapping": "APM2’s *dominant* workload is often “move bytes and validate them” (ledger/event replay, CAS retrieval, schema validation, policy eval), which is usually **bandwidth/latency bound**, not FLOP bound. That means performance wins come from: (a) fewer bytes (PRIN-005), (b) fewer round‑trips (PRIN-013), (c) deterministic compression (PRIN-066), and (d) locality (PRIN-020–PRIN-022). Treat “bytes moved per verified progress” as a first‑class metric in the observability plane.",
         "connections": [
           "PRIN-003",
           "PRIN-004",
@@ -64,7 +65,7 @@
       },
       {
         "id": "PRIN-004",
-        "name": "Gemm Tiling/blocking",
+        "name": "GEMM Tiling/blocking",
         "title": "Locality engineering is *the* performance lever",
         "formal": "",
         "apm2_mapping": "",
@@ -277,7 +278,7 @@
       },
       {
         "id": "PRIN-020",
-        "name": "Numa Locality",
+        "name": "NUMA Locality",
         "title": "“one rack” isn’t uniform memory",
         "formal": "remote NUMA accesses cost more; thread/page placement matters.",
         "apm2_mapping": "the analog is “one trust domain isn’t uniform authority.” Inside a rack, some executors should still be isolated (side channels, secrets). Pin high‑risk workloads to isolated domains (PRIN-035). Also pin data-plane heavy tasks near their storage.",
@@ -302,7 +303,7 @@
       },
       {
         "id": "PRIN-022",
-        "name": "Pcie Host↔device Transfers Are Expensive",
+        "name": "PCIe Host↔device Transfers Are Expensive",
         "title": "Treat boundaries as quota’d interfaces",
         "formal": "crossing bus boundaries costs latency and bandwidth; avoid chatty transfers.",
         "apm2_mapping": "“boundary” = **tool call**. Every tool call crosses a trust boundary and should carry explicit budgets, schemas, and receipts. APM2 does this with protobuf tool requests, validation, policy evaluation, and budget consumption accounting. Don’t bypass that boundary “for convenience.”",
@@ -314,7 +315,7 @@
       },
       {
         "id": "PRIN-023",
-        "name": "Rdma/kernel-bypass Io",
+        "name": "Rdma/kernel-bypass IO",
         "title": "Higher performance, more footguns",
         "formal": "bypassing kernel reduces overhead but removes safety rails; correctness burden shifts to user code.",
         "apm2_mapping": "any “fast path” (direct executor access, privileged tools, bypassed gates) must be wrapped in **typed, verified libraries** and restricted to high-trust actors. Otherwise you just created a privileged injection surface.",
@@ -339,7 +340,7 @@
       },
       {
         "id": "PRIN-025",
-        "name": "Congestion Control + Aqm",
+        "name": "Congestion Control + AQM",
         "title": "Decide whether the system collapses under load",
         "formal": "queue discipline (RED/CoDel) and pacing prevent bufferbloat and collapse.",
         "apm2_mapping": "HEF resource governance is AQM: bounded queues, rate limits, drop priority. Extend the same design to: tool execution pools, ledger append contention, CAS retrieval, and CI import. The measurable goal is stability under load (no oscillation, bounded tail latency).",
@@ -435,7 +436,7 @@
       },
       {
         "id": "PRIN-033",
-        "name": "Ebpf",
+        "name": "eBPF",
         "title": "Programmable measurement/enforcement close to substrate",
         "formal": "attach programs at kernel hook points for observability and policy.",
         "apm2_mapping": "eBPF is an ideal *observability amplifier* for APM2: you can measure per-tool syscall patterns, detect unexpected egress, and feed that into gates as receipts. Treat this as “hardware telemetry” for the governance controller.",
@@ -985,7 +986,7 @@
       },
       {
         "id": "PRIN-080",
-        "name": "Hierarchical Rl",
+        "name": "Hierarchical RL",
         "title": "Delegation as options with initiation/termination",
         "formal": "options (o) have policies (\\pi_o), initiation sets (I_o), termination (\\beta_o).",
         "apm2_mapping": "holons supervising sub-holons are options. Encode initiation/termination conditions as contracts and stop conditions in the holon trait context. Delegation without termination conditions is how you get infinite recursion and runaway autonomy.",
@@ -1073,7 +1074,7 @@
       },
       {
         "id": "PRIN-088",
-        "name": "Adversarial Ml",
+        "name": "Adversarial ML",
         "title": "Treat inputs as attack surfaces",
         "formal": "optimize worst-case loss under bounded perturbations; in practice, treat all model inputs as untrusted.",
         "apm2_mapping": "prompts, retrieved context, tool outputs are *untrusted*. The safe design is: strict schemas, capability separation, hermetic sandboxes, and denial-by-default tools.",

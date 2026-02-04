@@ -1,0 +1,139 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/theory-of-mind@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 56,
+    "name": "theory-of-mind",
+    "cat": "strategic",
+    "core": "Infer beliefs, intentions, and knowledge states of others, including nested beliefs (what they think you think). Core question: What do they believe, want, and know—and what do they think YOU believe, want, and know?",
+    "out": [
+      {"type": "belief_model", "valid": "lists ≥3 propositions per agent; specifies depth (1st/2nd/nth); cites evidence for each"},
+      {"type": "intention_map", "valid": "≥2 goals per agent with supporting observations; no goal inferred solely from role"},
+      {"type": "knowledge_state", "valid": "partitions into: confirmed-known, believed-true, assumed, unknown; flags asymmetries"},
+      {"type": "behavior_prediction", "valid": "if-then format with triggering condition; tied to specific belief/intention"},
+      {"type": "communication_strategy", "valid": "maps message to expected belief-shift; includes fallback if update fails"}
+    ],
+    "proc": [
+      "1. SCOPE: list target agents; assign roles; set max recursion depth (default: 2nd-order)",
+      "2. EVIDENCE: gather observable actions, statements, timing, omissions; tag each as direct/indirect",
+      "3. FIRST-ORDER: for each agent, infer P(belief | evidence); require ≥2 independent signals per belief",
+      "4. SECOND-ORDER: infer what each agent believes about YOUR beliefs; check for common-knowledge gaps",
+      "5. ASYMMETRY: identify what you know that they don't, and vice versa; flag info-leak risks",
+      "6. INTENTIONS: derive goals from beliefs + observed actions; reject goals inferred only from stereotype",
+      "7. PREDICT: state behavioral predictions as falsifiable if-then; assign rough confidence (high/med/low)",
+      "8. DESIGN: craft communication or action that accounts for inferred mental state; specify success metric"
+    ],
+    "quick_checklist": {
+      "before": [
+        "have I scoped which agents matter?",
+        "is recursion depth justified (2nd-order usually sufficient; 3rd+ rare)?",
+        "do I have ≥2 observations per agent?"
+      ],
+      "during": [
+        "am I inferring from evidence or projecting my own preferences?",
+        "have I considered at least one alternative mental model?",
+        "are my predictions falsifiable with near-term observables?"
+      ],
+      "after": [
+        "did predictions match? if <50% accuracy, rebuild model",
+        "did any assumption prove wrong? update upstream beliefs",
+        "is the model still needed or can I switch to direct dialogue?"
+      ]
+    },
+    "micro_example": {
+      "setup": "Alice emails Bob a doc but CC's Carol. Bob hasn't replied in 2 days.",
+      "first_order": "Bob may not have seen it (inbox overload) OR saw it but deprioritized (believes not urgent)",
+      "second_order": "Bob may think Alice doesn't expect a fast reply (no deadline stated); Carol may think Bob is handling it",
+      "prediction": "if Alice pings Bob privately, he'll reply within 24h; if she escalates publicly, Carol will intervene first",
+      "action": "Alice pings Bob 1:1 with explicit deadline → tests prediction"
+    },
+    "check": [
+      "each belief cites ≥2 independent observations (not just role-based assumption)",
+      "depth explicitly labeled (1st, 2nd, nth) for every nested belief",
+      "uncertainty expressed with rough calibration (high/med/low), not vague hedges",
+      "≥1 alternative mental model documented; explains which evidence would flip to it",
+      "every prediction formatted as falsifiable if-then with observable trigger",
+      "cultural/individual context factors listed when agents span backgrounds",
+      "projection-check performed: would I attribute this belief to someone with opposite incentives?"
+    ],
+    "diff": {
+      "game-theoretic": "game theory assumes rational utility maximization; ToM infers actual (possibly irrational) beliefs driving behavior",
+      "negotiation": "negotiation is an application of ToM for deal-making; ToM is the inference substrate",
+      "rhetorical": "rhetoric designs persuasive messages; ToM builds the audience model rhetoric targets",
+      "adversarial": "adversarial/red-team assumes hostile intent and probes defenses; ToM infers actual intent (hostile, neutral, or friendly)",
+      "causal-inference": "causal inference explains events via mechanisms; ToM explains agent behavior via mental states (beliefs, desires, intentions)",
+      "sensemaking": "sensemaking builds a coherent frame of a situation; ToM builds a model of other agents' frames",
+      "mechanism-design": "mechanism design creates incentive structures; ToM infers how agents perceive those incentives",
+      "hermeneutic": "hermeneutics interprets texts/assets; ToM interprets agent minds"
+    },
+    "common_confusions": [
+      {
+        "pair": ["theory-of-mind", "sensemaking"],
+        "confusion": "both build mental models",
+        "resolution": "sensemaking models the situation; ToM models the agents' models of the situation"
+      },
+      {
+        "pair": ["theory-of-mind", "game-theoretic"],
+        "confusion": "both reason about strategic actors",
+        "resolution": "game theory prescribes optimal action given payoffs; ToM describes what actors actually believe (may diverge from optimal)"
+      },
+      {
+        "pair": ["theory-of-mind", "rhetorical"],
+        "confusion": "both care about audience",
+        "resolution": "rhetoric uses ToM outputs to craft messages; ToM is upstream inference, rhetoric is downstream design"
+      }
+    ],
+    "fail": {
+      "mode": "mind-reading with overconfidence; projecting own incentives onto others",
+      "signals": [
+        "≥3 predictions in a row contradict observed behavior",
+        "surprised by reactions you expected to anticipate",
+        "assuming shared knowledge without verification (curse of knowledge)",
+        "model unchanged after disconfirming evidence",
+        "all agents assigned similar beliefs despite different contexts"
+      ],
+      "mit": [
+        {"action": "direct clarification", "test": "ask the agent what they believe; compare to your model", "trigger": "when stakes are high and asking is low-cost"},
+        {"action": "hypothesis rotation", "test": "maintain ≥2 competing mental models; track which accumulates more confirming evidence", "trigger": "always; abandon single-model reasoning"},
+        {"action": "prediction audit", "test": "log predictions; if accuracy <50% over 5 trials, discard model and rebuild from scratch", "trigger": "after any surprise or failed prediction"},
+        {"action": "projection check", "test": "ask: would I attribute this belief to an agent with opposite incentives?", "trigger": "before finalizing any high-confidence inference"},
+        {"action": "cultural calibration", "test": "consult domain expert or cultural insider if agents span unfamiliar backgrounds", "trigger": "when agents are from contexts you lack firsthand experience with"},
+        {"action": "depth audit", "test": "if going beyond 2nd-order, verify each additional layer has independent evidence", "trigger": "before claiming 3rd+ order beliefs"}
+      ]
+    },
+    "use": [
+      "leadership: anticipating team reactions to decisions",
+      "UX design: modeling user mental models and expectations",
+      "collaboration: detecting misaligned assumptions before conflict",
+      "threat modeling: inferring attacker knowledge and intent",
+      "communication: tailoring message to audience's current beliefs",
+      "conflict resolution: surfacing hidden beliefs causing impasse",
+      "sales and negotiation: understanding counterparty constraints",
+      "incident response: predicting stakeholder reactions to outage updates"
+    ],
+    "rel": [
+      {"id": 55, "name": "game-theoretic-strategic", "note": "use when agents are optimizing known payoffs; ToM when inferring unknown beliefs"},
+      {"id": 57, "name": "negotiation-coalition", "note": "negotiation applies ToM to structure agreements"},
+      {"id": 60, "name": "rhetorical", "note": "rhetoric operationalizes ToM for persuasion"},
+      {"id": 79, "name": "adversarial-red-team", "note": "red-team uses ToM to model attacker mindset"},
+      {"id": 45, "name": "decision-theoretic", "note": "single-agent baseline; ToM extends to multi-agent"},
+      {"id": 63, "name": "sensemaking-frame-building", "note": "sensemaking builds situation model; ToM builds agent models"},
+      {"id": 58, "name": "mechanism-design", "note": "mechanism design shapes incentives; ToM infers perceived incentives"}
+    ],
+    "ex": {
+      "problem": "Team lead notices engineer pushing back on new process",
+      "evidence": ["engineer cites time concerns (direct)", "has met past deadlines (indirect: values efficiency)", "recently assigned to second project (context: overloaded)"],
+      "first_order": "engineer believes process adds overhead without value; confidence: high (2 signals)",
+      "second_order": "engineer thinks lead doesn't understand their workload; confidence: medium (inferred from tone)",
+      "alternative_model": "engineer actually fears process will expose gaps; would require observing defensiveness about quality",
+      "prediction": "if mandated without discussion → resistance increases within 1 week; if workload acknowledged → openness within 3 days",
+      "strategy": "acknowledge workload explicitly, explain process benefit in efficiency terms, co-design lighter version; success metric: engineer proposes modification rather than rejecting outright"
+    }
+  }
+}

@@ -31,7 +31,7 @@
       "documents/skills/rfc-council/references/review-mode.md",
       "documents/skills/rfc-council/references/REVIEW_RUBRIC.md",
       "documents/skills/rfc-council/references/COUNCIL_PROTOCOL.md",
-      "documents/skills/modes-of-reasoning/artifacts/selector.json"
+      "documents/skills/modes-of-reasoning/assets/selector.json"
     ],
     "lex": {
       "R1": "Load RFC + tickets + CCP + latest evidence bundle; extract requirement_ids, ticket_ids, file_paths.",

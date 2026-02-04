@@ -1,0 +1,121 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/many-valued-partial-logics@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 26,
+    "name": "many-valued-partial-logics",
+    "cat": "uncertain",
+    "core": "Use discrete truth values beyond {true, false} to represent unknown, undefined, null, or indeterminate states. Common systems: Kleene 3-valued (unknown propagates), Lukasiewicz 3-valued (unknown = 0.5), SQL NULL (three-valued with NULL absorption). Prevents forcing binary choices when information is genuinely missing.",
+    "out": [
+      {"n": "truth_table", "d": "mapping from input truth values to output for each connective (AND, OR, NOT, IMPLIES)"},
+      {"n": "proposition_assignments", "d": "each proposition labeled with truth value from chosen logic (T/F/U, T/F/N, etc.)"},
+      {"n": "indeterminacy_trace", "d": "which conclusions depend on unknown values vs. determined values"},
+      {"n": "gap_inventory", "d": "list of propositions with non-classical values and reason for each"},
+      {"n": "query_result_with_null_semantics", "d": "database/KB query output showing NULL handling per chosen semantics"}
+    ],
+    "proc": [
+      "select logic variant: choose Kleene (unknown propagates conservatively), Lukasiewicz (intermediate meets classical at extremes), or SQL NULL (NULL absorbs in comparisons)",
+      "enumerate propositions: list all statements requiring truth assignment",
+      "classify each proposition: assign T (known true), F (known false), U/N (unknown/null/undefined) based on available evidence",
+      "build truth tables: define AND/OR/NOT/IMPLIES for chosen logic (e.g., Kleene: U AND T = U, U OR T = T)",
+      "propagate values: compute compound statements bottom-up using truth tables",
+      "identify gap-dependent conclusions: mark which results would change if unknowns resolved to T vs F",
+      "report with provenance: output conclusions partitioned into {determined, unknown-dependent}"
+    ],
+    "check": [
+      "logic variant explicitly stated (Kleene/Lukasiewicz/SQL/other)",
+      "every unknown assigned U/N, never silently defaulted to F",
+      "truth tables documented for all connectives used",
+      "propagation follows chosen logic (test: U AND F = F in Kleene, verify this holds)",
+      "conclusions partitioned: which are robust vs. unknown-sensitive",
+      "closed-world assumption flagged if applied (CWA converts all unknowns to F)"
+    ],
+    "diff": {
+      "fuzzy-logic": "discrete values {T, F, U} vs continuous [0,1]; many-valued for gaps, fuzzy for vagueness",
+      "paraconsistent": "handles truth-value gaps (missing info) vs truth-value gluts (contradictions); many-valued says 'we dont know', paraconsistent says 'both true and false'",
+      "default-typicality": "many-valued preserves U through inference; default fills U with typical value then retracts if exception found",
+      "imprecise-probability": "many-valued uses discrete symbolic values; imprecise-probability uses numeric intervals [0.3, 0.7]",
+      "evidential-dempster-shafer": "many-valued tracks which propositions are unknown; DS tracks how much evidence supports/opposes each hypothesis"
+    },
+    "fail": {
+      "mode": "unknown_false_conflation",
+      "desc": "treating absence of knowledge as evidence of falsity (closed-world assumption applied inappropriately)",
+      "signals": [
+        "query returns FALSE for unrecorded facts instead of UNKNOWN",
+        "NOT(unknown) evaluated as TRUE instead of UNKNOWN",
+        "NULL = NULL returns TRUE instead of NULL/UNKNOWN",
+        "missing data excluded from aggregations without noting incompleteness",
+        "inference chains treat gaps as negative evidence"
+      ],
+      "mitigations": [
+        {"test": "query_unknown_fact", "action": "verify unrecorded facts return U/NULL not FALSE", "asset": "test case showing SELECT returns NULL for missing row"},
+        {"test": "negation_of_unknown", "action": "confirm NOT(U) = U in Kleene, not TRUE", "asset": "truth table with explicit NOT row"},
+        {"test": "null_equality", "action": "verify NULL = NULL yields NULL not TRUE", "asset": "SQL query demonstrating NULL comparison behavior"},
+        {"test": "cwa_documentation", "action": "if CWA used, document explicitly with justification", "asset": "assumption log entry stating CWA scope and rationale"},
+        {"test": "aggregation_completeness", "action": "COUNT/SUM on nullable columns reports how many NULLs excluded", "asset": "query result metadata showing NULL count"}
+      ]
+    },
+    "use": [
+      "SQL databases with NULL columns (mandatory for correct NULL semantics)",
+      "knowledge bases with open-world assumption (OWL/RDF)",
+      "partial specifications where some requirements undefined",
+      "presupposition failure (e.g., 'the king of France is bald' when no king exists)",
+      "sensor readings with missing/invalid values",
+      "survey data with unanswered questions"
+    ],
+    "rel": [
+      {"id": 25, "n": "fuzzy-logic", "r": "discrete vs continuous truth; use many-valued for gaps, fuzzy for vagueness"},
+      {"id": 34, "n": "paraconsistent", "r": "gaps vs gluts; combine when both missing info and contradictions present"},
+      {"id": 31, "n": "default-typicality", "r": "preserving vs filling unknowns; many-valued upstream, default for action"},
+      {"id": 21, "n": "imprecise-probability", "r": "symbolic vs numeric uncertainty; imprecise when degrees matter"},
+      {"id": 22, "n": "evidential-dempster-shafer", "r": "proposition-level vs evidence-allocation; DS when fusing sources"}
+    ],
+    "ex": {
+      "sit": "Database query: 'SELECT * FROM employees WHERE department = 'Sales' AND salary > 50000'. Employee record has department='Sales', salary=NULL.",
+      "steps": [
+        "identify propositions: P1 = (department = 'Sales'), P2 = (salary > 50000)",
+        "assign values: P1 = TRUE (known), P2 = UNKNOWN (salary is NULL)",
+        "select logic: SQL uses Kleene-like 3-valued logic for WHERE clauses",
+        "apply truth table: TRUE AND UNKNOWN = UNKNOWN (Kleene AND)",
+        "interpret: row does NOT appear in results (SQL WHERE requires TRUE, not UNKNOWN)",
+        "trace indeterminacy: result depends on unknown salary; if salary were known >50k, row would appear"
+      ],
+      "insight": "SQL correctly distinguishes 'salary is not > 50000' (FALSE) from 'salary is unknown' (NULL). Row excluded because UNKNOWN != TRUE, not because salary definitely <= 50000."
+    },
+    "common_confusions": [
+      {
+        "confusion": "treating unknown as false",
+        "wrong": "if we dont know X is true, conclude X is false",
+        "right": "if we dont know X is true, conclude X is unknown; gather more evidence or propagate uncertainty",
+        "mode_boundary": "vs deductive: deduction requires definite T/F; many-valued adds third value"
+      },
+      {
+        "confusion": "using many-valued for vague predicates",
+        "wrong": "person is 'somewhat tall' so assign truth value 0.5 or UNKNOWN",
+        "right": "'somewhat tall' is vagueness requiring fuzzy membership degree, not a truth gap",
+        "mode_boundary": "vs fuzzy-logic: gaps (missing info) need many-valued; vagueness (blurred boundaries) needs fuzzy"
+      },
+      {
+        "confusion": "conflating unknown with contradictory",
+        "wrong": "database says both X and NOT-X, so treat as unknown",
+        "right": "both X and NOT-X is a contradiction (glut), not a gap; use paraconsistent to contain it",
+        "mode_boundary": "vs paraconsistent: too little info = gap = many-valued; too much conflicting info = glut = paraconsistent"
+      }
+    ],
+    "quick_checklist": [
+      "[ ] Logic variant selected and documented (Kleene/Lukasiewicz/SQL/custom)",
+      "[ ] All propositions assigned T/F/U explicitly (no silent defaults)",
+      "[ ] Truth tables for AND/OR/NOT written out for chosen logic",
+      "[ ] Compound expressions evaluated using documented tables",
+      "[ ] Conclusions partitioned: determined vs unknown-dependent",
+      "[ ] CWA usage flagged and justified if applied",
+      "[ ] Output asset includes indeterminacy trace"
+    ]
+  }
+}
