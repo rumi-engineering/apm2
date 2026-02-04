@@ -171,7 +171,7 @@ async fn test_allow_decision_with_matching_capability() {
     .with_path("/workspace/test.txt");
 
     // Process through broker
-    let decision = broker.request(&request, current_timestamp_ns(), None).await;
+    let decision = broker.request(&request, current_timestamp_ns(), None, None).await;
     assert!(decision.is_ok(), "request should not error");
 
     let decision = decision.unwrap();
@@ -224,7 +224,7 @@ async fn test_allow_multiple_tool_classes() {
     )
     .with_path("/workspace/file.txt");
     let decision = broker
-        .request(&read_request, current_timestamp_ns(), None)
+        .request(&read_request, current_timestamp_ns(), None, None)
         .await
         .unwrap();
     assert!(decision.is_allowed(), "Read should be allowed");
@@ -239,7 +239,7 @@ async fn test_allow_multiple_tool_classes() {
     )
     .with_path("/workspace/output.txt");
     let decision = broker
-        .request(&write_request, current_timestamp_ns(), None)
+        .request(&write_request, current_timestamp_ns(), None, None)
         .await
         .unwrap();
     assert!(decision.is_allowed(), "Write should be allowed");
@@ -254,7 +254,7 @@ async fn test_allow_multiple_tool_classes() {
     )
     .with_shell_command("ls"); // Shell command required for Execute requests
     let decision = broker
-        .request(&exec_request, current_timestamp_ns(), None)
+        .request(&exec_request, current_timestamp_ns(), None, None)
         .await
         .unwrap();
     assert!(decision.is_allowed(), "Execute should be allowed");
@@ -288,7 +288,7 @@ async fn test_deny_no_matching_capability() {
     .with_path("/workspace/file.txt");
 
     let decision = broker
-        .request(&request, current_timestamp_ns(), None)
+        .request(&request, current_timestamp_ns(), None, None)
         .await
         .unwrap();
 
@@ -322,7 +322,7 @@ async fn test_deny_path_not_in_scope() {
     .with_path("/etc/passwd");
 
     let decision = broker
-        .request(&request, current_timestamp_ns(), None)
+        .request(&request, current_timestamp_ns(), None, None)
         .await
         .unwrap();
 
@@ -355,7 +355,7 @@ async fn test_deny_empty_manifest() {
     );
 
     let decision = broker
-        .request(&request, current_timestamp_ns(), None)
+        .request(&request, current_timestamp_ns(), None, None)
         .await
         .unwrap();
 
@@ -398,7 +398,7 @@ async fn test_dedupe_cache_hit() {
     .with_path("/workspace/file.txt");
 
     // Process first request - should be allowed
-    let decision1 = broker.request(&request, timestamp, None).await.unwrap();
+    let decision1 = broker.request(&request, timestamp, None, None).await.unwrap();
     assert!(decision1.is_allowed());
 
     // Simulate tool execution and store result in cache
@@ -433,7 +433,7 @@ async fn test_dedupe_cache_hit() {
     .with_path("/workspace/file.txt");
 
     let decision2 = broker
-        .request(&request2, timestamp + 1000, None)
+        .request(&request2, timestamp + 1000, None, None)
         .await
         .unwrap();
 
@@ -477,7 +477,7 @@ async fn test_dedupe_cache_miss_different_key() {
     )
     .with_path("/workspace/file1.txt");
 
-    let decision1 = broker.request(&request1, timestamp, None).await.unwrap();
+    let decision1 = broker.request(&request1, timestamp, None, None).await.unwrap();
     assert!(decision1.is_allowed());
 
     // Store result
@@ -510,7 +510,7 @@ async fn test_dedupe_cache_miss_different_key() {
     .with_path("/workspace/file2.txt");
 
     let decision2 = broker
-        .request(&request2, timestamp + 1000, None)
+        .request(&request2, timestamp + 1000, None, None)
         .await
         .unwrap();
 
@@ -551,7 +551,7 @@ async fn test_dedupe_cache_episode_isolation() {
     )
     .with_path("/workspace/file.txt");
 
-    let decision1 = broker.request(&request1, timestamp, None).await.unwrap();
+    let decision1 = broker.request(&request1, timestamp, None, None).await.unwrap();
     assert!(decision1.is_allowed());
 
     // Store result for episode 1
@@ -584,7 +584,7 @@ async fn test_dedupe_cache_episode_isolation() {
     .with_path("/workspace/file.txt");
 
     let decision2 = broker
-        .request(&request2, timestamp + 1000, None)
+        .request(&request2, timestamp + 1000, None, None)
         .await
         .unwrap();
 
@@ -778,7 +778,7 @@ async fn test_broker_with_mock_harness() {
 
         // Process through broker
         let decision = broker
-            .request(&request, current_timestamp_ns(), None)
+            .request(&request, current_timestamp_ns(), None, None)
             .await
             .unwrap();
 
@@ -829,7 +829,7 @@ async fn test_denied_tool_with_mock_harness() {
         .with_path(call.path.clone().unwrap_or_default());
 
         let decision = broker
-            .request(&request, current_timestamp_ns(), None)
+            .request(&request, current_timestamp_ns(), None, None)
             .await
             .unwrap();
 

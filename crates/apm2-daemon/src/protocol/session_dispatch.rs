@@ -948,15 +948,19 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             let dedupe_key = DedupeKey::new(&request.dedupe_key);
             let args_hash = *blake3::hash(&request.arguments).as_bytes();
 
+            // TCK-00317: Look up per-session manifest from store
+            let manifest_override = self
+                .manifest_store
+                .as_ref()
+                .and_then(|store| store.get_manifest(&token.session_id));
+
             // BLOCKER 2 FIX (TCK-00290): Derive risk tier from capability manifest.
             // Per the security review, we must not hardcode Tier0. Get the risk tier
             // from the manifest's capability for this tool class, or default to Tier0
             // if no specific tier is configured (fail-open for tier, fail-closed for
             // access).
-            let risk_tier = self
-                .manifest_store
+            let risk_tier = manifest_override
                 .as_ref()
-                .and_then(|store| store.get_manifest(&token.session_id))
                 .and_then(|manifest| {
                     manifest
                         .find_by_tool_class(tool_class)
@@ -976,9 +980,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             .with_inline_args(request.arguments.clone());
 
             // Call broker.request() asynchronously using tokio runtime
+            // TCK-00317: Pass per-session manifest override
             let decision = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
-                handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
+                handle.block_on(async {
+                    broker
+                        .request(&broker_request, timestamp_ns, None, manifest_override.as_deref())
+                        .await
+                })
             });
 
             return self.handle_broker_decision(decision, &token.session_id, tool_class, &request.arguments);

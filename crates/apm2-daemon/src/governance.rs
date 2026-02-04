@@ -9,20 +9,34 @@
 //! Implements real policy resolution wiring. Currently uses local deterministic
 //! resolution until the Governance Holon is fully integrated.
 
+use std::sync::Arc;
+
 use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
 
+use crate::episode::capability::reviewer_v0_manifest;
+use crate::episode::executor::ContentAddressedStore;
 use crate::protocol::dispatch::{PolicyResolution, PolicyResolutionError, PolicyResolver};
 use crate::protocol::messages::WorkRole;
 
 /// Resolves policy via governance integration.
 #[derive(Debug, Clone, Default)]
-pub struct GovernancePolicyResolver;
+pub struct GovernancePolicyResolver {
+    /// Content-addressed store for manifest persistence.
+    cas: Option<Arc<dyn ContentAddressedStore>>,
+}
 
 impl GovernancePolicyResolver {
     /// Creates a new policy resolver.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self { cas: None }
+    }
+
+    /// Sets the CAS for manifest storage.
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
+        self.cas = Some(cas);
+        self
     }
 }
 
@@ -36,9 +50,18 @@ impl PolicyResolver for GovernancePolicyResolver {
         // TCK-00289: In Phase 1, we use deterministic local resolution.
         // In Phase 2, this will make an IPC call to the Governance Holon.
 
-        // Generate deterministic hashes for policy and capability manifest
+        // Generate deterministic hashes for policy
         let policy_hash = blake3::hash(format!("policy:{work_id}:{actor_id}").as_bytes());
-        let manifest_hash = blake3::hash(format!("manifest:{work_id}:{actor_id}").as_bytes());
+
+        // TCK-00317: Use real reviewer manifest
+        // Store it in CAS if available to ensure it can be resolved by the session.
+        let manifest = reviewer_v0_manifest();
+        let manifest_bytes = manifest.canonical_bytes();
+        let manifest_hash = if let Some(ref cas) = self.cas {
+            cas.store(&manifest_bytes)
+        } else {
+            *blake3::hash(&manifest_bytes).as_bytes()
+        };
 
         // Create and seal a context pack manifest
         let content_hash = blake3::hash(format!("content:{work_id}:{actor_id}").as_bytes());
@@ -67,7 +90,7 @@ impl PolicyResolver for GovernancePolicyResolver {
         Ok(PolicyResolution {
             policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
             resolved_policy_hash: *policy_hash.as_bytes(),
-            capability_manifest_hash: *manifest_hash.as_bytes(),
+            capability_manifest_hash: manifest_hash,
             context_pack_hash,
         })
     }

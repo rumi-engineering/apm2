@@ -417,7 +417,8 @@ impl DispatcherState {
         // Use real implementations
         let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
 
-        let policy_resolver = Arc::new(GovernancePolicyResolver::new());
+        // TCK-00317: Configure GovernancePolicyResolver with CAS for manifest storage
+        let policy_resolver = Arc::new(GovernancePolicyResolver::new().with_cas(Arc::clone(&cas)));
         let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&sqlite_conn)));
         let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
             Arc::clone(&sqlite_conn),

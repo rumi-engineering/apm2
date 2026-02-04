@@ -45,6 +45,11 @@ use serde::{Deserialize, Serialize};
 
 use super::envelope::RiskTier;
 use super::scope::{CapabilityScope, ScopeError};
+
+/// Reviewer capability manifest (TCK-00317).
+pub mod reviewer;
+pub use reviewer::reviewer_v0_manifest;
+
 // =============================================================================
 // Allowlist Resource Limits (TCK-00254, TCK-00314)
 //

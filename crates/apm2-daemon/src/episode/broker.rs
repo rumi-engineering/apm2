@@ -1054,6 +1054,9 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     /// * `request` - The tool request to process
     /// * `timestamp_ns` - Current timestamp in nanoseconds
     /// * `session_context` - Optional session context for credential lookups
+    /// * `manifest_override` - Optional manifest override for per-session
+    ///   capabilities (TCK-00317). If provided, this manifest is used instead
+    ///   of the broker's global manifest.
     ///
     /// # Returns
     ///
@@ -1064,12 +1067,13 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     ///
     /// Returns an error if the broker is not initialized or request
     /// validation fails.
-    #[instrument(skip(self, request, session_context), fields(request_id = %request.request_id))]
+    #[instrument(skip(self, request, session_context, manifest_override), fields(request_id = %request.request_id))]
     pub async fn request(
         &self,
         request: &BrokerToolRequest,
         timestamp_ns: u64,
         session_context: Option<&super::decision::SessionContext>,
+        manifest_override: Option<&CapabilityManifest>,
     ) -> Result<ToolDecision, BrokerError> {
         // TCK-00268: Record start time for latency metrics
         let start_time = std::time::Instant::now();
@@ -1206,11 +1210,19 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // Step 3: Validate against capability manifest (OCAP check)
         // SECURITY: This MUST happen before cache lookup to prevent authorization
         // bypass
-        let validator = self.validator.read().await;
-        let validator = validator.as_ref().ok_or(BrokerError::NotInitialized)?;
-
-        let cap_request = request.to_capability_request();
-        let cap_decision = validator.validate(&cap_request);
+        let cap_decision = if let Some(manifest) = manifest_override {
+            // TCK-00317: Use per-session manifest if provided
+            // Create a temporary validator for this request
+            let validator = CapabilityValidator::new(manifest.clone())?;
+            let cap_request = request.to_capability_request();
+            validator.validate(&cap_request)
+        } else {
+            // Fall back to broker-global manifest (if initialized)
+            let validator_guard = self.validator.read().await;
+            let validator = validator_guard.as_ref().ok_or(BrokerError::NotInitialized)?;
+            let cap_request = request.to_capability_request();
+            validator.validate(&cap_request)
+        };
 
         let capability_id = match cap_decision {
             CapabilityDecision::Allow { capability_id } => capability_id,
@@ -1547,7 +1559,7 @@ mod tests {
         assert!(!broker.is_initialized().await);
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
-        let result = broker.request(&request, timestamp_ns(0), None).await;
+        let result = broker.request(&request, timestamp_ns(0), None, None).await;
 
         assert!(matches!(result, Err(BrokerError::NotInitialized)));
     }
@@ -1579,7 +1591,7 @@ mod tests {
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -1602,7 +1614,7 @@ mod tests {
         // Request Write capability when only Read is available
         let request = make_request("req-1", ToolClass::Write, Some("/workspace/file.rs"));
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -1622,7 +1634,7 @@ mod tests {
         // Request path outside of allowed scope
         let request = make_request("req-1", ToolClass::Read, Some("/etc/passwd"));
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -1646,7 +1658,7 @@ mod tests {
 
         // First request - should be allowed
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
         assert!(decision.is_allowed());
@@ -1673,7 +1685,7 @@ mod tests {
 
         // Second request with same dedupe key - should be cache hit
         let decision2 = broker
-            .request(&request, timestamp_ns(1), None)
+            .request(&request, timestamp_ns(1), None, None)
             .await
             .unwrap();
         assert!(decision2.is_cache_hit());
@@ -1701,7 +1713,7 @@ mod tests {
                 Some("/workspace/file.rs"),
             );
             let decision = broker
-                .request(&request, timestamp_ns(i), None)
+                .request(&request, timestamp_ns(i), None, None)
                 .await
                 .unwrap();
 
@@ -1751,7 +1763,7 @@ mod tests {
 
         // First request
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
         assert!(decision.is_allowed());
@@ -1777,7 +1789,7 @@ mod tests {
 
         // Second request - should still be allowed (no cache)
         let decision2 = broker
-            .request(&request, timestamp_ns(1), None)
+            .request(&request, timestamp_ns(1), None, None)
             .await
             .unwrap();
         assert!(decision2.is_allowed());
@@ -1797,7 +1809,7 @@ mod tests {
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -1827,7 +1839,7 @@ mod tests {
             RiskTier::Tier0,
         );
 
-        let result = broker.request(&request, timestamp_ns(0), None).await;
+        let result = broker.request(&request, timestamp_ns(0), None, None).await;
         assert!(matches!(result, Err(BrokerError::RequestValidation(_))));
     }
 
@@ -1973,7 +1985,7 @@ mod tests {
         // Create a valid Read request and execute it to populate the cache
         let read_request = make_request("req-read-1", ToolClass::Read, Some("/workspace/file.rs"));
         let decision = broker
-            .request(&read_request, timestamp_ns(0), None)
+            .request(&read_request, timestamp_ns(0), None, None)
             .await
             .unwrap();
         assert!(decision.is_allowed(), "read request should be allowed");
@@ -2006,7 +2018,7 @@ mod tests {
         // The Write request should be DENIED (not a cache hit)
         // Authorization check must happen before cache lookup
         let write_decision = broker
-            .request(&write_request, timestamp_ns(1), None)
+            .request(&write_request, timestamp_ns(1), None, None)
             .await
             .unwrap();
         assert!(
@@ -2046,7 +2058,7 @@ mod tests {
         .with_path("/workspace/secret.txt");
 
         let decision1 = broker
-            .request(&request1, timestamp_ns(0), None)
+            .request(&request1, timestamp_ns(0), None, None)
             .await
             .unwrap();
         assert!(decision1.is_allowed());
@@ -2072,7 +2084,7 @@ mod tests {
 
         // Episode 1 should get a cache hit
         let decision1_again = broker
-            .request(&request1, timestamp_ns(1), None)
+            .request(&request1, timestamp_ns(1), None, None)
             .await
             .unwrap();
         assert!(
@@ -2093,7 +2105,7 @@ mod tests {
 
         // Episode 2 must NOT get a cache hit from episode 1's data
         let decision2 = broker
-            .request(&request2, timestamp_ns(2), None)
+            .request(&request2, timestamp_ns(2), None, None)
             .await
             .unwrap();
         assert!(
@@ -2122,7 +2134,7 @@ mod tests {
 
         // First request - should be allowed
         let decision1 = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
         assert!(decision1.is_allowed());
@@ -2149,7 +2161,7 @@ mod tests {
         // Second request with same dedupe key - should get cache hit
         // (after authorization passes)
         let decision2 = broker
-            .request(&request, timestamp_ns(1), None)
+            .request(&request, timestamp_ns(1), None, None)
             .await
             .unwrap();
         assert!(
@@ -2274,7 +2286,7 @@ mod tests {
             Some("/workspace/allowed.rs"),
         );
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -2310,7 +2322,7 @@ mod tests {
         // Request for path NOT in context manifest should terminate
         let request = make_request("req-denied", ToolClass::Read, Some("/workspace/secret.rs"));
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -2353,7 +2365,7 @@ mod tests {
         // Request with NO path should terminate (fail-closed)
         let request = make_request("req-no-path", ToolClass::Read, None);
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -2410,7 +2422,7 @@ mod tests {
             Some("/workspace/secret.txt"),
         );
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -2465,7 +2477,7 @@ mod tests {
             Some("/workspace/allowed/file.txt"),
         );
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -2505,7 +2517,7 @@ mod tests {
         let mut request = make_request("req-exec-denied", ToolClass::Execute, None);
         request = request.with_shell_command("rm -rf /");
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -2550,7 +2562,7 @@ mod tests {
         let mut request = make_request("req-exec-allowed", ToolClass::Execute, None);
         request = request.with_shell_command("cargo build --release");
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -2592,7 +2604,7 @@ mod tests {
         let request = make_request("req-exec-no-cmd", ToolClass::Execute, None);
         // Note: not calling with_shell_command
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -2644,7 +2656,7 @@ mod tests {
         // Request without path should terminate
         let request = make_request("req-write-no-path", ToolClass::Write, None);
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -2699,7 +2711,7 @@ mod tests {
         // check)
         let write_request = make_request("req-write", ToolClass::Write, Some("/workspace/any.txt"));
         let write_decision = broker
-            .request(&write_request, timestamp_ns(0), None)
+            .request(&write_request, timestamp_ns(0), None, None)
             .await
             .unwrap();
         assert!(
@@ -2712,7 +2724,7 @@ mod tests {
         let mut exec_request = make_request("req-exec", ToolClass::Execute, None);
         exec_request = exec_request.with_shell_command("any command");
         let exec_decision = broker
-            .request(&exec_request, timestamp_ns(1), None)
+            .request(&exec_request, timestamp_ns(1), None, None)
             .await
             .unwrap();
         assert!(
@@ -2843,7 +2855,7 @@ mod tests {
         .with_path("/workspace/repo");
 
         let decision = broker
-            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .request(&request, timestamp_ns(0), Some(&session_ctx), None)
             .await
             .unwrap();
 
@@ -2895,7 +2907,7 @@ mod tests {
         );
 
         let decision = broker
-            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .request(&request, timestamp_ns(0), Some(&session_ctx), None)
             .await
             .unwrap();
 
@@ -2935,7 +2947,7 @@ mod tests {
         let request = make_request("req-read", ToolClass::Read, Some("/workspace/file.rs"));
 
         let decision = broker
-            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .request(&request, timestamp_ns(0), Some(&session_ctx), None)
             .await
             .unwrap();
 
@@ -2972,7 +2984,7 @@ mod tests {
         .with_path("/workspace/repo");
 
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -3017,7 +3029,7 @@ mod tests {
         .with_path("/workspace/repo");
 
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -3065,7 +3077,7 @@ mod tests {
         .with_path("/workspace/repo");
 
         let decision = broker
-            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .request(&request, timestamp_ns(0), Some(&session_ctx), None)
             .await
             .unwrap();
 
@@ -3232,7 +3244,7 @@ mod tests {
         .with_path("/workspace/repo");
 
         let decision = broker
-            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .request(&request, timestamp_ns(0), Some(&session_ctx), None)
             .await
             .unwrap();
 
@@ -3271,7 +3283,7 @@ mod tests {
         .with_path("/workspace/repo");
 
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -3314,7 +3326,7 @@ mod tests {
         .with_path("/workspace/repo");
 
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -3375,7 +3387,7 @@ mod tests {
         .with_path("/workspace/repo");
 
         let decision = broker
-            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .request(&request, timestamp_ns(0), Some(&session_ctx), None)
             .await
             .unwrap();
 
@@ -3441,7 +3453,7 @@ mod tests {
         .with_path("/workspace/repo");
 
         let decision = broker
-            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .request(&request, timestamp_ns(0), Some(&session_ctx), None)
             .await
             .unwrap();
 
@@ -3484,7 +3496,7 @@ mod tests {
         let request = make_request("req-read", ToolClass::Read, Some("/workspace/file.rs"));
 
         let decision = broker
-            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .request(&request, timestamp_ns(0), Some(&session_ctx), None)
             .await
             .unwrap();
 
@@ -3536,7 +3548,7 @@ mod tests {
         );
 
         let decision = broker
-            .request(&request, timestamp_ns(0), Some(&session_ctx))
+            .request(&request, timestamp_ns(0), Some(&session_ctx), None)
             .await
             .unwrap();
 
@@ -3689,7 +3701,7 @@ policy:
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -3732,14 +3744,14 @@ policy:
 
         let allowed_request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
         let allowed_decision = broker
-            .request(&allowed_request, timestamp_ns(0), None)
+            .request(&allowed_request, timestamp_ns(0), None, None)
             .await
             .unwrap();
         assert!(allowed_decision.is_allowed());
 
         let outside_request = make_request("req-2", ToolClass::Read, Some("/etc/passwd"));
         let outside_decision = broker
-            .request(&outside_request, timestamp_ns(1), None)
+            .request(&outside_request, timestamp_ns(1), None, None)
             .await
             .unwrap();
         assert!(outside_decision.is_denied());
@@ -3758,7 +3770,7 @@ policy:
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -3837,7 +3849,7 @@ policy:
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -3886,7 +3898,7 @@ policy:
             Some("/workspace/src/main.rs"),
         );
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -3929,7 +3941,7 @@ policy:
         // Request ListFiles for denied path
         let request = make_request("req-ls", ToolClass::ListFiles, Some("/etc/passwd"));
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
@@ -3977,7 +3989,7 @@ policy:
         )
         .with_query("fn main");
         let decision = broker
-            .request(&request, timestamp_ns(0), None)
+            .request(&request, timestamp_ns(0), None, None)
             .await
             .unwrap();
 
