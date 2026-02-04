@@ -914,14 +914,16 @@ impl WorkspaceConfig {
 /// - **Isolated Workspaces**: Each episode gets an isolated workspace directory
 /// - **Secure Patch Apply**: Path validation prevents outside-root writes
 /// - **Symlink Safety**: All paths are validated for symlink escapes
-/// - **Fail-Closed**: Errors during apply yield `ReviewBlockedRecorded`, not crashes
+/// - **Fail-Closed**: Errors during apply yield `ReviewBlockedRecorded`, not
+///   crashes
 ///
 /// # Security Model (TCK-00318)
 ///
-/// - **Containment Boundary**: Workspace is a containment boundary; default deny on
-///   suspicious paths
+/// - **Containment Boundary**: Workspace is a containment boundary; default
+///   deny on suspicious paths
 /// - **Path Validation**: All file paths are validated for traversal attacks
-/// - **Symlink Escapes**: Existing files are checked for symlink-based sandbox escapes
+/// - **Symlink Escapes**: Existing files are checked for symlink-based sandbox
+///   escapes
 /// - **Binary Detection**: Binary files are rejected (v0 limitation)
 #[derive(Debug)]
 pub struct WorkspaceManager {
@@ -978,7 +980,8 @@ impl WorkspaceManager {
     ///
     /// The snapshot captures:
     /// - Work ID binding
-    /// - BLAKE3 hash of the workspace state (computed from git HEAD + worktree status)
+    /// - BLAKE3 hash of the workspace state (computed from git HEAD + worktree
+    ///   status)
     /// - Timestamp
     /// - File count
     ///
@@ -1016,11 +1019,12 @@ impl WorkspaceManager {
 
     /// Applies a changeset bundle to the workspace.
     ///
-    /// This is the main entry point for workspace materialization per TCK-00318.
-    /// The implementation:
+    /// This is the main entry point for workspace materialization per
+    /// TCK-00318. The implementation:
     ///
     /// 1. Validates all file paths in the changeset (security checks)
-    /// 2. If CAS is configured, retrieves diff bytes and applies via `git apply`
+    /// 2. If CAS is configured, retrieves diff bytes and applies via `git
+    ///    apply`
     /// 3. Otherwise, performs validation-only (suitable for tests)
     ///
     /// # Security
@@ -1214,9 +1218,9 @@ impl WorkspaceManager {
             .arg(&self.workspace_root)
             .args([
                 "apply",
-                "--check",        // Dry run first to validate
-                "--verbose",      // Show what would be applied
-                "-",              // Read from stdin
+                "--check",   // Dry run first to validate
+                "--verbose", // Show what would be applied
+                "-",         // Read from stdin
             ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1230,7 +1234,9 @@ impl WorkspaceManager {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(diff_bytes).map_err(|e| {
-                WorkspaceError::GitOperationFailed(format!("failed to write diff to git apply: {e}"))
+                WorkspaceError::GitOperationFailed(format!(
+                    "failed to write diff to git apply: {e}"
+                ))
             })?;
         }
 
@@ -1267,7 +1273,9 @@ impl WorkspaceManager {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(diff_bytes).map_err(|e| {
-                WorkspaceError::GitOperationFailed(format!("failed to write diff to git apply: {e}"))
+                WorkspaceError::GitOperationFailed(format!(
+                    "failed to write diff to git apply: {e}"
+                ))
             })?;
         }
 
