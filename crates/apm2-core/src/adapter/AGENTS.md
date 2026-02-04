@@ -369,7 +369,7 @@ while let Some(event) = rx.recv().await {
 
 - [`apm2_core::supervisor`](../supervisor/AGENTS.md) - Uses adapters to supervise agent processes
 - [`apm2_core::session`](../session/AGENTS.md) - Session lifecycle management; receives adapter events
-- [`apm2_holon`](../../apm2-holon/AGENTS.md) - Defines the `Holon` trait that agents implement
+- [`apm2_holon`](../../../apm2-holon/AGENTS.md) - Defines the `Holon` trait that agents implement
 
 ## References
 

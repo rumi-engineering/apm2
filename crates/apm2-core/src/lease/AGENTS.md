@@ -392,7 +392,7 @@ for lease in expired {
 - [`apm2_core::reducer`](../reducer/AGENTS.md) - Defines the `Reducer` trait implemented by `LeaseReducer`
 - [`apm2_core::ledger`](../ledger/AGENTS.md) - Event storage and replay; source of `EventRecord`
 - [`apm2_core::work`](../work/AGENTS.md) - Work item tracking; leases grant access to work items
-- [`apm2_holon::resource::Lease`](../../../../apm2-holon/src/resource/lease.rs) - Holonic lease type with scoped budgets and derivation
+- [`apm2_holon::resource::Lease`](../../../apm2-holon/src/resource/lease.rs) - Holonic lease type with scoped budgets and derivation
 
 ### Relationship to apm2_holon::Lease
 

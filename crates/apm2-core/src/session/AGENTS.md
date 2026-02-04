@@ -511,7 +511,7 @@ pub enum RecoveryError {
 - [`apm2_core::reducer`](../reducer/AGENTS.md) - Reducer trait and checkpoint support
 - [`apm2_core::restart`](../restart/AGENTS.md) - Restart policies and backoff strategies
 - [`apm2_core::events`](../events/AGENTS.md) - Protobuf event definitions (SessionEvent, PolicyEvent)
-- [`apm2_holon::resource`](../../apm2-holon/src/resource/AGENTS.md) - Budget and lease types
+- [`apm2_holon::resource`](../../../apm2-holon/AGENTS.md) - Budget and lease types
 
 ## References
 
