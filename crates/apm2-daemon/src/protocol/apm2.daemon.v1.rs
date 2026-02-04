@@ -437,6 +437,14 @@ pub struct RequestToolResponse {
     /// Policy hash at decision time.
     #[prost(bytes = "vec", tag = "4")]
     pub policy_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Result hash from tool execution (CAS reference, populated on ALLOW after execution).
+    /// TCK-00316: Required for kernel-side execution model.
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub result_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Inline result for small outputs (bounded by MAX_INLINE_RESULT_SIZE = 64KB).
+    /// TCK-00316: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
+    #[prost(bytes = "vec", optional, tag = "6")]
+    pub inline_result: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 /// IPC-SESS-002: EmitEvent
 /// Emit a signed event to the ledger.
