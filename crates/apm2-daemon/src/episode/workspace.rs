@@ -20,6 +20,7 @@
 //! - **Path Validation**: Validates file paths to prevent traversal attacks
 //! - **CAS Binding**: All artifacts are stored in CAS with hash verification
 //! - **HTF Time Bounds**: Retries are bounded by HTF windows, not wall clock
+//! - **Diff Integrity**: Verifies that the diff only touches files listed in the manifest
 //!
 //! # Example
 //!
@@ -43,8 +44,9 @@
 //! }
 //! ```
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use apm2_core::crypto::Signer;
@@ -158,6 +160,17 @@ pub enum WorkspaceError {
     /// Base commit not found.
     #[error("base commit not found: {0}")]
     BaseCommitNotFound(String),
+
+    /// Diff contains files not present in the manifest.
+    #[error("diff/manifest mismatch: diff touches \'{diff_path}\' which is not in manifest")]
+    DiffManifestMismatch {
+        /// The path found in diff but missing from manifest.
+        diff_path: String,
+    },
+
+    /// Invalid commit reference.
+    #[error("invalid commit ref: {0}")]
+    InvalidCommitRef(String),
 }
 
 impl WorkspaceError {
@@ -168,14 +181,16 @@ impl WorkspaceError {
             Self::ApplyFailed(_)
             | Self::IoError(_)
             | Self::GitOperationFailed(_)
-            | Self::BaseCommitNotFound(_) => ReasonCode::ApplyFailed,
+            | Self::BaseCommitNotFound(_)
+            | Self::InvalidCommitRef(_) => ReasonCode::ApplyFailed,
             Self::ToolFailed(_) => ReasonCode::ToolFailed,
             Self::BinaryUnsupported(_) => ReasonCode::BinaryUnsupported,
             Self::MissingArtifact(_) | Self::CasError(_) => ReasonCode::MissingArtifact,
             Self::InvalidBundle(_)
             | Self::PathTraversal(_)
             | Self::FileTooLarge { .. }
-            | Self::SymlinkEscape { .. } => ReasonCode::InvalidBundle,
+            | Self::SymlinkEscape { .. }
+            | Self::DiffManifestMismatch { .. } => ReasonCode::InvalidBundle,
             Self::Timeout(_) | Self::MaxRetriesExceeded { .. } | Self::HtfWindowExpired => {
                 ReasonCode::Timeout
             },
@@ -362,6 +377,7 @@ impl RetryContext {
 /// - Rejects absolute paths (paths starting with `/` or `\`)
 /// - Rejects Windows-style absolute paths (e.g., `C:\`)
 /// - Rejects paths containing null bytes
+/// - Rejects paths containing control characters (e.g. `\t`, `\n`)
 /// - Rejects paths exceeding maximum depth
 /// - Validates path stays within workspace root after normalization
 ///
@@ -387,7 +403,15 @@ pub fn validate_path(path: &str, workspace_root: &Path) -> Result<PathBuf, Works
         )));
     }
 
-    // Check for path traversal patterns (explicit check for ".." anywhere)
+    // Check for control characters
+    if path.chars().any(|c| c.is_control()) {
+        return Err(WorkspaceError::PathTraversal(format!(
+            "path contains control character: {:?}",
+            path
+        )));
+    }
+
+    // Check for path traversal patterns (explicit check for "..")
     if path.contains("..") {
         return Err(WorkspaceError::PathTraversal(format!(
             "path contains '..' traversal: {path}"
@@ -538,7 +562,7 @@ pub fn validate_path_with_symlink_check(
 /// Per TCK-00318 security requirements:
 /// - Rejects bundles with binary files (v0 limitation)
 /// - Validates all paths in the file manifest for traversal attacks
-/// - Validates `old_path` for rename operations
+/// - Validates old_path for rename operations
 /// - For existing files (MODIFY, DELETE, RENAME), validates symlinks don't
 ///   escape the workspace
 ///
@@ -587,6 +611,73 @@ pub fn validate_file_changes(
                 validate_path(old_path, workspace_root)?;
             }
         }
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Commit Reference Validation
+// =============================================================================
+
+/// Validates a git commit reference to prevent command injection attacks.
+///
+/// # Security
+///
+/// This function prevents command injection via `commit_ref` by rejecting:
+/// - References starting with `-` (could be interpreted as git flags)
+/// - Empty references
+/// - References containing shell metacharacters
+///
+/// Valid commit references include:
+/// - Hex hashes (40 chars for SHA-1, 64 chars for SHA-256)
+/// - Branch/tag names (alphanumeric, hyphens, underscores, slashes, dots)
+/// - HEAD, HEAD~N, HEAD^N references
+///
+/// # Errors
+///
+/// Returns error if the commit reference is invalid or potentially malicious.
+pub fn validate_commit_ref(commit_ref: &str) -> Result<(), WorkspaceError> {
+    // Reject empty references
+    if commit_ref.is_empty() {
+        return Err(WorkspaceError::InvalidCommitRef(
+            "commit ref cannot be empty".to_string(),
+        ));
+    }
+
+    // Security: Reject references starting with '-' to prevent flag injection
+    // This is the primary security check per TCK-00318
+    if commit_ref.starts_with('-') {
+        return Err(WorkspaceError::InvalidCommitRef(format!(
+            "commit ref cannot start with '-': {commit_ref}"
+        )));
+    }
+
+    // Reject null bytes (security: prevents null byte injection)
+    if commit_ref.contains('\0') {
+        return Err(WorkspaceError::InvalidCommitRef(format!(
+            "commit ref contains null byte: {}",
+            commit_ref.replace('\0', "\\0")
+        )));
+    }
+
+    // Validate that the commit ref contains only safe characters
+    // Valid git refs: alphanumeric, hyphens, underscores, slashes, dots, tildes, carets
+    // See: https://git-scm.com/docs/git-check-ref-format
+    let valid_chars = |c: char| {
+        c.is_ascii_alphanumeric()
+            || c == '-'
+            || c == '_'
+            || c == '/'
+            || c == '.'
+            || c == '~'
+            || c == '^'
+    };
+
+    if !commit_ref.chars().all(valid_chars) {
+        return Err(WorkspaceError::InvalidCommitRef(format!(
+            "commit ref contains invalid characters: {commit_ref}"
+        )));
     }
 
     Ok(())
@@ -874,13 +965,22 @@ impl ReviewCompletionResultBuilder {
 // =============================================================================
 
 /// Configuration for workspace materialization.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WorkspaceConfig {
     /// Path to the local git repository or mirror to checkout from.
-    /// If None, assumes `workspace_root` is already a git repository.
+    /// If None, assumes workspace_root is already a git repository.
     pub repo_path: Option<PathBuf>,
     /// Whether to clean the workspace before checkout (git clean -fd).
     pub clean_before_checkout: bool,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            repo_path: None,
+            clean_before_checkout: false,
+        }
+    }
 }
 
 impl WorkspaceConfig {
@@ -905,16 +1005,14 @@ impl WorkspaceConfig {
 /// - **Isolated Workspaces**: Each episode gets an isolated workspace directory
 /// - **Secure Patch Apply**: Path validation prevents outside-root writes
 /// - **Symlink Safety**: All paths are validated for symlink escapes
-/// - **Fail-Closed**: Errors during apply yield `ReviewBlockedRecorded`, not
-///   crashes
+/// - **Fail-Closed**: Errors during apply yield `ReviewBlockedRecorded`, not crashes
 ///
 /// # Security Model (TCK-00318)
 ///
-/// - **Containment Boundary**: Workspace is a containment boundary; default
-///   deny on suspicious paths
+/// - **Containment Boundary**: Workspace is a containment boundary; default deny on
+///   suspicious paths
 /// - **Path Validation**: All file paths are validated for traversal attacks
-/// - **Symlink Escapes**: Existing files are checked for symlink-based sandbox
-///   escapes
+/// - **Symlink Escapes**: Existing files are checked for symlink-based sandbox escapes
 /// - **Binary Detection**: Binary files are rejected (v0 limitation)
 #[derive(Debug)]
 pub struct WorkspaceManager {
@@ -971,8 +1069,7 @@ impl WorkspaceManager {
     ///
     /// The snapshot captures:
     /// - Work ID binding
-    /// - BLAKE3 hash of the workspace state (computed from git HEAD + worktree
-    ///   status)
+    /// - BLAKE3 hash of the workspace state (computed from git HEAD + worktree status)
     /// - Timestamp
     /// - File count
     ///
@@ -990,9 +1087,11 @@ impl WorkspaceManager {
         let git_head = self.get_git_head();
 
         // Compute snapshot hash from work_id and git HEAD (if available)
-        let hash_input = git_head
-            .as_ref()
-            .map_or_else(|| work_id.to_string(), |head| format!("{work_id}:{head}"));
+        let hash_input = if let Some(ref head) = git_head {
+            format!("{work_id}:{head}")
+        } else {
+            work_id.to_string()
+        };
         let snapshot_hash = *blake3::hash(hash_input.as_bytes()).as_bytes();
 
         // Count files in workspace (excluding .git)
@@ -1008,12 +1107,11 @@ impl WorkspaceManager {
 
     /// Applies a changeset bundle to the workspace.
     ///
-    /// This is the main entry point for workspace materialization per
-    /// TCK-00318. The implementation:
+    /// This is the main entry point for workspace materialization per TCK-00318.
+    /// The implementation:
     ///
     /// 1. Validates all file paths in the changeset (security checks)
-    /// 2. If CAS is configured, retrieves diff bytes and applies via `git
-    ///    apply`
+    /// 2. If CAS is configured, retrieves diff bytes and applies via `git apply`
     /// 3. Otherwise, performs validation-only (suitable for tests)
     ///
     /// # Security
@@ -1087,7 +1185,7 @@ impl WorkspaceManager {
         }
 
         // Step 3: Apply the diff
-        self.apply_git_diff(diff_bytes)?;
+        self.apply_git_diff(diff_bytes, bundle)?;
 
         // Step 4: Record timestamp
         let applied_at_ns = std::time::SystemTime::now()
@@ -1111,6 +1209,17 @@ impl WorkspaceManager {
     ///
     /// Returns error if git checkout fails.
     pub fn checkout(&self, commit_ref: &str) -> Result<(), WorkspaceError> {
+        // Validate commit_ref format to prevent argument injection
+        // Allow alphanumeric, hyphens, underscores, dots, and slashes
+        // Must not start with a hyphen
+        if commit_ref.starts_with('-')
+            || !commit_ref
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        {
+            return Err(WorkspaceError::InvalidCommitRef(commit_ref.to_string()));
+        }
+
         // Optionally clean before checkout
         if self.config.clean_before_checkout {
             self.git_clean()?;
@@ -1120,7 +1229,12 @@ impl WorkspaceManager {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.workspace_root)
-            .args(["checkout", "--force", commit_ref])
+            .args([
+                "checkout",
+                "--force",
+                "--", // End of options separator
+                commit_ref,
+            ])
             .output()
             .map_err(|e| {
                 WorkspaceError::GitOperationFailed(format!("failed to run git checkout: {e}"))
@@ -1136,7 +1250,8 @@ impl WorkspaceManager {
                 return Err(WorkspaceError::BaseCommitNotFound(commit_ref.to_string()));
             }
             return Err(WorkspaceError::GitOperationFailed(format!(
-                "git checkout failed: {stderr}"
+                "git checkout failed: {}",
+                stderr
             )));
         }
 
@@ -1159,7 +1274,7 @@ impl WorkspaceManager {
         if let Some(ref git_head) = self.get_git_head() {
             // If snapshot was taken at a different HEAD, checkout that commit
             let expected_prefix = format!("{}:", snapshot.work_id);
-            let hash_input = format!("{expected_prefix}{git_head}");
+            let hash_input = format!("{}{}", expected_prefix, git_head);
             let computed_hash = *blake3::hash(hash_input.as_bytes()).as_bytes();
 
             if computed_hash != snapshot.snapshot_hash {
@@ -1194,25 +1309,143 @@ impl WorkspaceManager {
         })?;
 
         // Apply the diff
-        self.apply_git_diff(&diff_bytes)
+        self.apply_git_diff(&diff_bytes, bundle)
+    }
+
+    /// Verifies that the diff only touches files listed in the manifest.
+    fn verify_diff_against_manifest(
+        &self,
+        diff_bytes: &[u8],
+        bundle: &ChangeSetBundleV1,
+    ) -> Result<(), WorkspaceError> {
+        let mut allowed_paths = HashSet::new();
+        for change in &bundle.file_manifest {
+            allowed_paths.insert(change.path.as_str());
+            if let Some(ref old) = change.old_path {
+                allowed_paths.insert(old.as_str());
+            }
+        }
+
+        // Check 1: git apply --numstat (gives destination paths)
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace_root)
+            .args(["apply", "--numstat", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                WorkspaceError::GitOperationFailed(format!("failed to spawn git apply check: {e}"))
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(diff_bytes).map_err(|e| {
+                WorkspaceError::GitOperationFailed(format!("failed to write to git apply check: {e}"))
+            })?;
+        }
+
+        let output = child.wait_with_output().map_err(|e| {
+            WorkspaceError::GitOperationFailed(format!("failed to wait for git apply check: {e}"))
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkspaceError::ApplyFailed(format!(
+                "git apply --numstat failed: {}",
+                stderr
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // Output format: added deleted path
+            // Split by tab or whitespace
+            // NOTE: git apply --numstat separates fields by tabs
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 3 {
+                let path = parse_git_path(parts[2]);
+                if !allowed_paths.contains(path.as_str()) {
+                    return Err(WorkspaceError::DiffManifestMismatch { diff_path: path });
+                }
+            }
+        }
+
+        // Check 2: git apply --summary (gives source paths for renames/deletes)
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace_root)
+            .args(["apply", "--summary", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                WorkspaceError::GitOperationFailed(format!("failed to spawn git apply summary: {e}"))
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(diff_bytes).map_err(|e| {
+                WorkspaceError::GitOperationFailed(format!("failed to write to git apply summary: {e}"))
+            })?;
+        }
+
+        let output = child.wait_with_output().map_err(|e| {
+            WorkspaceError::GitOperationFailed(format!("failed to wait for git apply summary: {e}"))
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkspaceError::ApplyFailed(format!(
+                "git apply --summary failed: {}",
+                stderr
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // Look for " rename <old> => <new> (<percent>)"
+            if line.trim().starts_with("rename ") {
+                if let Some(arrow_idx) = line.find(" => ") {
+                    let old_part = &line[7..arrow_idx].trim(); // skip " rename "
+                    let old_path = parse_git_path(old_part);
+                    if !allowed_paths.contains(old_path.as_str()) {
+                        return Err(WorkspaceError::DiffManifestMismatch {
+                            diff_path: old_path,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Applies a git unified diff to the workspace.
-    fn apply_git_diff(&self, diff_bytes: &[u8]) -> Result<(), WorkspaceError> {
+    fn apply_git_diff(
+        &self,
+        diff_bytes: &[u8],
+        bundle: &ChangeSetBundleV1,
+    ) -> Result<(), WorkspaceError> {
+        // Security: Verify diff integrity before applying
+        self.verify_diff_against_manifest(diff_bytes, bundle)?;
+
         // Use git apply to apply the diff
-        // Security: We've already validated all paths in the diff
         let mut child = Command::new("git")
             .arg("-C")
             .arg(&self.workspace_root)
             .args([
                 "apply",
-                "--check",   // Dry run first to validate
-                "--verbose", // Show what would be applied
-                "-",         // Read from stdin
+                "--check", // Dry run first to validate
+                "--verbose",
+                "--", // End of options
+                "-",  // Read from stdin
             ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
                 WorkspaceError::GitOperationFailed(format!("failed to spawn git apply: {e}"))
@@ -1222,9 +1455,7 @@ impl WorkspaceManager {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(diff_bytes).map_err(|e| {
-                WorkspaceError::GitOperationFailed(format!(
-                    "failed to write diff to git apply: {e}"
-                ))
+                WorkspaceError::GitOperationFailed(format!("failed to write diff to git apply: {e}"))
             })?;
         }
 
@@ -1235,7 +1466,8 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::ApplyFailed(format!(
-                "git apply --check failed: {stderr}"
+                "git apply --check failed: {}",
+                stderr
             )));
         }
 
@@ -1246,11 +1478,12 @@ impl WorkspaceManager {
             .args([
                 "apply",
                 "--verbose",
-                "-", // Read from stdin
+                "--", // End of options
+                "-",  // Read from stdin
             ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
                 WorkspaceError::GitOperationFailed(format!("failed to spawn git apply: {e}"))
@@ -1260,9 +1493,7 @@ impl WorkspaceManager {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(diff_bytes).map_err(|e| {
-                WorkspaceError::GitOperationFailed(format!(
-                    "failed to write diff to git apply: {e}"
-                ))
+                WorkspaceError::GitOperationFailed(format!("failed to write diff to git apply: {e}"))
             })?;
         }
 
@@ -1273,7 +1504,8 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::ApplyFailed(format!(
-                "git apply failed: {stderr}"
+                "git apply failed: {}",
+                stderr
             )));
         }
 
@@ -1294,7 +1526,8 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::GitOperationFailed(format!(
-                "git clean failed: {stderr}"
+                "git clean failed: {}",
+                stderr
             )));
         }
 
@@ -1344,6 +1577,17 @@ impl WorkspaceManager {
     }
 }
 
+/// Helper to parse git output paths, removing quotes if present.
+fn parse_git_path(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.starts_with('"') && raw.ends_with('"') {
+        // Simple unquote for spaces
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1375,6 +1619,17 @@ mod tests {
         assert_eq!(
             WorkspaceError::InvalidBundle("test".into()).reason_code(),
             ReasonCode::InvalidBundle
+        );
+        assert_eq!(
+            WorkspaceError::DiffManifestMismatch {
+                diff_path: "p".into()
+            }
+            .reason_code(),
+            ReasonCode::InvalidBundle
+        );
+        assert_eq!(
+            WorkspaceError::InvalidCommitRef("bad".into()).reason_code(),
+            ReasonCode::ApplyFailed
         );
         assert_eq!(
             WorkspaceError::Timeout("test".into()).reason_code(),
@@ -1423,6 +1678,13 @@ mod tests {
         let workspace = PathBuf::from("/workspace");
         assert!(validate_path("/etc/passwd", &workspace).is_err());
         assert!(validate_path("\\windows\\system32", &workspace).is_err());
+    }
+
+    #[test]
+    fn test_validate_path_control_chars_rejected() {
+        let workspace = PathBuf::from("/workspace");
+        assert!(validate_path("src/lib\n.rs", &workspace).is_err());
+        assert!(validate_path("src/lib\t.rs", &workspace).is_err());
     }
 
     #[test]
@@ -1795,7 +2057,7 @@ mod tests {
         let workspace_root = temp_dir.path().to_path_buf();
 
         // Create a workspace manager (validation-only, no CAS)
-        let manager = WorkspaceManager::new(workspace_root);
+        let manager = WorkspaceManager::new(workspace_root.clone());
 
         // Create a valid bundle with ADD operations (no symlink checks needed)
         let bundle = ChangeSetBundleV1::builder()
@@ -1856,7 +2118,7 @@ mod tests {
         let symlink_path = workspace_root.join("escape_link.txt");
         symlink(&secret_file, &symlink_path).expect("create symlink");
 
-        let manager = WorkspaceManager::new(workspace_root);
+        let manager = WorkspaceManager::new(workspace_root.clone());
 
         // Create a bundle that tries to modify the symlink target
         let bundle = ChangeSetBundleV1::builder()
@@ -1885,7 +2147,7 @@ mod tests {
             Err(WorkspaceError::SymlinkEscape { path }) => {
                 assert!(path.contains("secret.txt") || path.contains("outside"));
             },
-            Err(other) => panic!("Expected SymlinkEscape, got: {other:?}"),
+            Err(other) => panic!("Expected SymlinkEscape, got: {:?}", other),
             Ok(_) => panic!("Expected error, got success"),
         }
     }
