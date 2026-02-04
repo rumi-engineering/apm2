@@ -424,14 +424,22 @@ impl DispatcherState {
             signing_key,
         ));
         let lease_validator = Arc::new(SqliteLeaseValidator::new(Arc::clone(&sqlite_conn)));
-        let episode_runtime = Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default()));
+        
+        // TCK-00316: Initialize EpisodeRuntime with CAS for tool execution
+        // Also wire clock for time envelope stamping (TCK-00240)
+        let episode_runtime = EpisodeRuntime::with_clock(
+            EpisodeRuntimeConfig::default(),
+            Arc::clone(&clock)
+        )
+        .with_cas(Arc::clone(&cas));
+        let episode_runtime = Arc::new(episode_runtime);
 
         let privileged_dispatcher = PrivilegedDispatcher::with_dependencies(
             DecodeConfig::default(),
             policy_resolver,
             work_registry,
             Arc::clone(&event_emitter) as Arc<dyn crate::protocol::dispatch::LedgerEventEmitter>,
-            episode_runtime,
+            Arc::clone(&episode_runtime),
             session_registry,
             lease_validator,
             Arc::clone(&clock),
@@ -453,7 +461,8 @@ impl DispatcherState {
                 .with_ledger(event_emitter)
                 .with_cas(cas)
                 .with_clock(clock)
-                .with_broker(broker);
+                .with_broker(broker)
+                .with_runtime(episode_runtime);
 
         Self {
             privileged_dispatcher,

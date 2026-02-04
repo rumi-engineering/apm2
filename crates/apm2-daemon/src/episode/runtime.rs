@@ -40,8 +40,12 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
 use super::error::{EpisodeError, EpisodeId};
+use super::executor::{ContentAddressedStore, ExecutionContext, ToolExecutor};
 use super::handle::{SessionHandle, StopSignal};
 use super::state::{EpisodeState, QuarantineReason, TerminationClass};
+use super::tool_class::ToolClass;
+use super::tool_handler::ToolArgs;
+use super::decision::ToolResult;
 use crate::htf::HolonicClock;
 
 /// Maximum number of concurrent episodes per runtime.
@@ -429,6 +433,8 @@ pub struct EpisodeRuntime {
     /// When present, all episode events are stamped with a `TimeEnvelopeRef`
     /// for temporal ordering and causality tracking.
     clock: Option<Arc<HolonicClock>>,
+    /// Content-addressed store for tool execution results (TCK-00316).
+    cas: Option<Arc<dyn ContentAddressedStore>>,
 }
 
 impl EpisodeRuntime {
@@ -446,6 +452,7 @@ impl EpisodeRuntime {
             session_seq: AtomicU64::new(1),
             episode_seq: AtomicU64::new(1),
             clock: None,
+            cas: None,
         }
     }
 
@@ -469,7 +476,98 @@ impl EpisodeRuntime {
             session_seq: AtomicU64::new(1),
             episode_seq: AtomicU64::new(1),
             clock: Some(clock),
+            cas: None,
         }
+    }
+
+    /// Sets the content-addressed store for tool execution (TCK-00316).
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
+        self.cas = Some(cas);
+        self
+    }
+
+    /// Executes a tool in the context of a session.
+    ///
+    /// # TCK-00316: Tool Execution
+    ///
+    /// This method implements kernel-side tool execution. It:
+    /// 1. Validates CAS availability (fail-closed)
+    /// 2. Deserializes arguments
+    /// 3. Creates a transient executor (TODO: Persistent budget)
+    /// 4. Executes the tool and stores result in CAS
+    pub async fn execute_tool(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        arguments: &[u8],
+    ) -> Result<ToolResult, EpisodeError> {
+        let Some(cas) = self.cas.clone() else {
+            return Err(EpisodeError::ExecutionFailed {
+                id: session_id.to_string(),
+                message: "CAS not configured for execution".to_string(),
+            });
+        };
+
+        // Deserialize arguments
+        // We trust the JSON to contain the 'type' field matching ToolArgs enum
+        let tool_args: ToolArgs = serde_json::from_slice(arguments).map_err(|e| {
+            EpisodeError::ExecutionFailed {
+                id: session_id.to_string(),
+                message: format!("argument deserialization failed: {e}"),
+            }
+        })?;
+
+        // Create transient executor (TODO: Persistent budget from envelope)
+        // TCK-00316: Viability closure uses infinite budget.
+        // TCK-00165: Must be upgraded to persistent budget.
+        let budget = crate::episode::budget::EpisodeBudget::builder()
+            .tokens(u64::MAX)
+            .tool_calls(u32::MAX)
+            .wall_ms(u64::MAX)
+            .bytes_io(u64::MAX)
+            .build();
+        let tracker = Arc::new(crate::episode::budget_tracker::BudgetTracker::from_envelope(
+            budget,
+        ));
+
+        let mut executor = ToolExecutor::new(tracker, Arc::clone(&cas));
+        if let Some(clock) = self.clock.clone() {
+            executor = executor.with_clock(clock);
+        }
+
+        // Register handlers
+        if let Err(e) = crate::episode::handlers::register_stub_handlers(&mut executor, Arc::clone(&cas)) {
+            return Err(EpisodeError::ExecutionFailed {
+                id: session_id.to_string(),
+                message: format!("handler registration failed: {e}"),
+            });
+        }
+
+        // Execute
+        // Note: We use the session_id as the episode_id for this transient execution context.
+        // In a full implementation, we would look up the actual EpisodeId from the session registry.
+        // If session_id is not a valid EpisodeId (e.g. too long), we fall back to a safe default
+        // to ensure execution proceeds (the context is primarily for audit logging).
+        let episode_id = EpisodeId::new(session_id)
+            .unwrap_or_else(|_| EpisodeId::new("ep-unknown").expect("valid fallback"));
+
+        let ctx = ExecutionContext::new(
+            episode_id,
+            request_id,
+            // Use current time as start time
+            self.clock
+                .as_ref()
+                .and_then(|c| c.now_hlc().ok())
+                .map_or(0, |hlc| hlc.wall_ns),
+        );
+
+        executor.execute(&ctx, &tool_args).await.map_err(|e| {
+            EpisodeError::ExecutionFailed {
+                id: session_id.to_string(),
+                message: e.to_string(),
+            }
+        })
     }
 
     /// Creates a new episode runtime with clock and emits
