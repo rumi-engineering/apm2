@@ -1046,12 +1046,21 @@ impl ToolHandler for GitOperationHandler {
             cmd.env("XDG_CONFIG_HOME", xdg_config);
         }
 
-        // TCK-00263: Set SSH_AUTH_SOCK if credential is provided and looks like a path
+        // TCK-00263: Set SSH_AUTH_SOCK if credential is provided and looks like a valid path
         if let Some(cred) = credential {
             let secret = cred.expose_secret();
-            // Simple heuristic: paths usually start with /
-            if secret.starts_with('/') {
+            // Validate path: absolute, no traversal, and in standard temp/runtime dirs
+            // This prevents injecting weird paths or malicious values
+            let path = Path::new(secret);
+            if path.is_absolute()
+                && !secret.contains("..")
+                && (secret.starts_with("/tmp/")
+                    || secret.starts_with("/run/")
+                    || secret.starts_with("/private/"))
+            {
                 cmd.env("SSH_AUTH_SOCK", secret);
+            } else {
+                warn!("Ignoring potentially unsafe SSH_AUTH_SOCK credential path pattern");
             }
         }
 
