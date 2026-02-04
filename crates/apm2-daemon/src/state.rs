@@ -26,7 +26,7 @@ use rusqlite::Connection;
 use tokio::sync::RwLock;
 
 use crate::cas::{DurableCas, DurableCasConfig};
-use crate::episode::capability::StubManifestLoader;
+use crate::episode::capability::{InMemoryCasManifestLoader, StubManifestLoader};
 use crate::episode::executor::ContentAddressedStore;
 use crate::episode::handlers::{
     ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ListFilesHandler, ReadFileHandler,
@@ -331,6 +331,8 @@ impl DispatcherState {
                 clock,
                 token_minter.clone(),
                 manifest_store.clone(),
+                // TCK-00317: Pre-seed CAS with reviewer v0 manifest
+                Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
                 Arc::clone(&subscription_registry),
             )
         } else {
@@ -472,6 +474,8 @@ impl DispatcherState {
             Arc::clone(&clock),
             token_minter.clone(),
             manifest_store.clone(),
+            // TCK-00317: Pre-seed CAS with reviewer v0 manifest
+            Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             Arc::clone(&subscription_registry),
         );
 

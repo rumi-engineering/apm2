@@ -264,7 +264,31 @@ impl ToolClass {
         matches!(self, Self::Read | Self::ListFiles | Self::Search)
     }
 
-    /// Returns `true` if this tool class can modify state.
+    /// Returns `true` if this tool class can potentially modify state.
+    ///
+    /// # TCK-00317: Handler-Layer Enforcement for Git and Artifact
+    ///
+    /// `Git` and `Artifact` return `true` because these tool classes can
+    /// potentially perform write operations (e.g., git push, artifact publish).
+    /// However, when used in the Reviewer v0 manifest, the actual read-only
+    /// enforcement is performed at the **handler layer**, not the manifest
+    /// layer:
+    ///
+    /// - `Git` capability in reviewer manifest: Handler only allows read-only
+    ///   git commands (diff, status, log) and rejects write commands (push,
+    ///   commit)
+    /// - `Artifact` capability in reviewer manifest: Handler only allows fetch
+    ///   operations and rejects publish operations
+    ///
+    /// This design follows fail-closed semantics where:
+    /// 1. The manifest allowlist controls WHICH tool classes are accessible
+    /// 2. The handler implementations control WHAT operations are permitted
+    ///
+    /// # Future Enhancement
+    ///
+    /// A more granular approach would split these into `GitRead`/`GitWrite`
+    /// and `ArtifactRead`/`ArtifactWrite` variants. This is deferred as the
+    /// handler-layer enforcement provides equivalent security guarantees.
     #[must_use]
     pub const fn can_mutate(&self) -> bool {
         matches!(

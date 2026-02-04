@@ -125,6 +125,7 @@ pub mod claude_parser;
 
 // TCK-00163: Capability manifest and validation
 pub mod capability;
+pub mod reviewer_manifest;
 pub mod scope;
 pub mod tool_class;
 
@@ -157,13 +158,14 @@ pub use broker::{
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 // Re-export tool execution types (TCK-00165)
 pub use budget_tracker::{BudgetExhaustedError, BudgetSnapshot, BudgetTracker};
-// Re-export capability types (TCK-00163, TCK-00254, TCK-00258)
+// Re-export capability types (TCK-00163, TCK-00254, TCK-00258, TCK-00317)
 pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
     CapabilityManifestBuilder, CapabilityValidator, CustodyDomainError, CustodyDomainId,
-    DenyReason, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES, MAX_CAPABILITY_ID_LEN,
-    MAX_CUSTODY_DOMAINS_PER_REQUEST, MAX_MANIFEST_ID_LEN, MAX_SHELL_ALLOWLIST,
-    MAX_SHELL_PATTERN_LEN, MAX_WRITE_ALLOWLIST, ToolRequest, validate_custody_domain_overlap,
+    DenyReason, InMemoryCasManifestLoader, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES,
+    MAX_CAPABILITY_ID_LEN, MAX_CUSTODY_DOMAINS_PER_REQUEST, MAX_MANIFEST_ID_LEN,
+    MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN, MAX_WRITE_ALLOWLIST, ManifestLoader, ToolRequest,
+    validate_custody_domain_overlap,
 };
 // Re-export Claude Code adapter types (TCK-00173)
 pub use claude_code::{
@@ -207,6 +209,12 @@ pub use raw_adapter::{
 };
 pub use registry::{
     AdapterRegistry, InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
+};
+// Re-export reviewer manifest types (TCK-00317)
+pub use reviewer_manifest::{
+    DAEMON_DELEGATOR_ID, REVIEWER_V0_MANIFEST_ID, build_reviewer_v0_manifest,
+    build_reviewer_v0_manifest_dynamic, is_reviewer_v0_manifest_hash, reviewer_v0_manifest,
+    reviewer_v0_manifest_hash,
 };
 pub use ring_buffer::{RingBuffer, tier_defaults};
 pub use runtime::{

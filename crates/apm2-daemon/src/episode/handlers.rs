@@ -452,6 +452,13 @@ impl ToolHandler for WriteFileHandler {
                 .map_err(|e| ToolHandlerError::ExecutionFailed {
                     message: format!("failed to append content: {e}"),
                 })?;
+
+            // Flush to ensure data is written to disk before returning
+            file.flush()
+                .await
+                .map_err(|e| ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to flush appended content: {e}"),
+                })?;
         } else {
             // Overwrite mode: use atomic write pattern (CTR-1502)
             // 1. Write to .tmp.<uuid>

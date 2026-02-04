@@ -57,7 +57,8 @@ use super::session_token::TokenMinter;
 use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
     CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
-    LeaseIssueDenialReason, validate_custody_domain_overlap,
+    InMemoryCasManifestLoader, LeaseIssueDenialReason, ManifestLoader,
+    validate_custody_domain_overlap,
 };
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
@@ -883,6 +884,13 @@ pub trait PolicyResolver: Send + Sync {
 /// 1. Create a `ContextPackManifest` with work-specific entries
 /// 2. Call `seal()` to get the deterministic content hash
 /// 3. Return the seal hash in the `PolicyResolution.context_pack_hash`
+///
+/// # TCK-00317: Role-Based Manifest Hash Resolution
+///
+/// Per DOD item 2 (Policy Resolution Bypass fix), this resolver now returns
+/// the canonical `reviewer_v0_manifest_hash()` for the Reviewer role. This
+/// ensures `SpawnEpisode` loads the correct manifest from CAS using the hash
+/// from `PolicyResolution`, rather than selecting manifests by role name.
 #[derive(Debug, Clone, Default)]
 pub struct StubPolicyResolver;
 
@@ -890,14 +898,32 @@ impl PolicyResolver for StubPolicyResolver {
     fn resolve_for_claim(
         &self,
         work_id: &str,
-        _role: WorkRole,
+        role: WorkRole,
         actor_id: &str,
     ) -> Result<PolicyResolution, PolicyResolutionError> {
         use apm2_core::context::{AccessLevel, ContextPackManifestBuilder, ManifestEntryBuilder};
 
-        // Generate deterministic hashes for policy and capability manifest
+        use crate::episode::reviewer_manifest::reviewer_v0_manifest_hash;
+
+        // Generate deterministic hash for policy
         let policy_hash = blake3::hash(format!("policy:{work_id}:{actor_id}").as_bytes());
-        let manifest_hash = blake3::hash(format!("manifest:{work_id}:{actor_id}").as_bytes());
+
+        // TCK-00317: Return role-appropriate manifest hash
+        //
+        // Per DOD item 2, the policy resolver must return the correct manifest
+        // hash for each role. SpawnEpisode uses this hash to load the manifest
+        // from CAS, ensuring the manifest is not bypassed by role selection.
+        //
+        // - Reviewer: Use canonical reviewer v0 manifest hash
+        // - Other roles: Use deterministic stub hash (fail-closed on CAS lookup)
+        let manifest_hash = match role {
+            WorkRole::Reviewer => *reviewer_v0_manifest_hash(),
+            _ => {
+                // For non-reviewer roles, generate a deterministic hash that will
+                // fail closed when loaded from CAS (hash doesn't exist in store)
+                *blake3::hash(format!("manifest:{work_id}:{actor_id}").as_bytes()).as_bytes()
+            },
+        };
 
         // TCK-00255: Create and seal a context pack manifest
         // In production, this would be populated with actual file entries from
@@ -931,7 +957,7 @@ impl PolicyResolver for StubPolicyResolver {
         Ok(PolicyResolution {
             policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
             resolved_policy_hash: *policy_hash.as_bytes(),
-            capability_manifest_hash: *manifest_hash.as_bytes(),
+            capability_manifest_hash: manifest_hash,
             context_pack_hash,
         })
     }
@@ -1762,6 +1788,20 @@ pub struct PrivilegedDispatcher {
     /// `SpawnEpisode` are accessible for tool request validation.
     manifest_store: Arc<InMemoryManifestStore>,
 
+    /// CAS-backed manifest loader for capability manifest retrieval
+    /// (TCK-00317).
+    ///
+    /// Per DOD item 1 (CAS Storage & Hash Loading), manifests are stored in
+    /// CAS and loaded by hash. The policy resolver returns the manifest hash,
+    /// and `handle_spawn_episode` uses this loader to retrieve the manifest.
+    ///
+    /// # Security Model
+    ///
+    /// - Manifests are stored with their BLAKE3 hash as the key
+    /// - Load operations verify the hash matches the content
+    /// - Missing manifests result in fail-closed rejection
+    manifest_loader: Arc<dyn ManifestLoader>,
+
     /// Prometheus metrics registry for daemon health observability (TCK-00268).
     ///
     /// When present, the dispatcher emits metrics for:
@@ -1868,6 +1908,8 @@ impl PrivilegedDispatcher {
             lease_validator: Arc::new(StubLeaseValidator::new()),
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
+            // TCK-00317: Pre-seed CAS with reviewer v0 manifest
+            manifest_loader: Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             metrics: None,
             holonic_clock,
             subscription_registry,
@@ -1916,6 +1958,8 @@ impl PrivilegedDispatcher {
             lease_validator: Arc::new(StubLeaseValidator::new()),
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
+            // TCK-00317: Pre-seed CAS with reviewer v0 manifest
+            manifest_loader: Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             metrics: None,
             holonic_clock,
             subscription_registry,
@@ -1971,6 +2015,7 @@ impl PrivilegedDispatcher {
         clock: Arc<HolonicClock>,
         token_minter: Arc<TokenMinter>,
         manifest_store: Arc<InMemoryManifestStore>,
+        manifest_loader: Arc<dyn ManifestLoader>,
         subscription_registry: SharedSubscriptionRegistry,
     ) -> Self {
         Self {
@@ -1983,6 +2028,7 @@ impl PrivilegedDispatcher {
             lease_validator,
             token_minter,
             manifest_store,
+            manifest_loader,
             metrics: None,
             holonic_clock: clock,
             subscription_registry,
@@ -2027,6 +2073,8 @@ impl PrivilegedDispatcher {
             lease_validator: Arc::new(StubLeaseValidator::new()),
             token_minter,
             manifest_store,
+            // TCK-00317: Pre-seed CAS with reviewer v0 manifest
+            manifest_loader: Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             metrics: None,
             holonic_clock: clock,
             subscription_registry,
@@ -2908,19 +2956,61 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // TCK-00287 MAJOR 3: Register capability manifest in shared store
-        // This allows SessionDispatcher to validate tool requests for this session.
-        // The manifest is constructed from the policy resolution's capability manifest
-        // hash. Note: This uses the stub implementation with an empty
-        // (fail-closed) allowlist. In production, the actual allowlist should
-        // flow through PolicyResolution.
-        let manifest = CapabilityManifest::from_hash_with_default_allowlist(
-            &claim.policy_resolution.capability_manifest_hash,
-        );
-        self.manifest_store.register(&session_id, manifest);
+        // TCK-00317: Load capability manifest from CAS using hash from
+        // PolicyResolution.
+        //
+        // Per DOD item 1 (CAS Storage & Hash Loading):
+        // - Manifests are stored in CAS and referenced by hash
+        // - SpawnEpisode loads the manifest using the hash from PolicyResolution
+        // - For Reviewer role: Missing manifests result in fail-closed rejection
+        // - For other roles: Fall back to minimal manifest (until their manifests are
+        //   defined in CAS)
+        //
+        // Per DOD item 2 (Policy Resolution Bypass fix):
+        // - The manifest is NOT selected by role name; it's loaded by hash
+        // - StubPolicyResolver returns reviewer_v0_manifest_hash() for Reviewer
+        // - This ensures the policy resolution controls which manifest is used
+        let manifest_hash: [u8; 32] = claim.policy_resolution.capability_manifest_hash;
+
+        let manifest = match self.manifest_loader.load_manifest(&manifest_hash) {
+            Ok(m) => m,
+            Err(e) => {
+                // TCK-00317: For Reviewer role, fail-closed if manifest not found
+                // For other roles, fall back to minimal manifest until their
+                // manifests are stored in CAS.
+                if request_role == WorkRole::Reviewer {
+                    warn!(
+                        work_id = %request.work_id,
+                        manifest_hash = %hex::encode(manifest_hash),
+                        error = %e,
+                        "SpawnEpisode rejected: reviewer manifest not found in CAS"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("reviewer capability manifest not found in CAS: {e}"),
+                    ));
+                }
+
+                // Non-Reviewer roles: fall back to minimal manifest
+                // This maintains backward compatibility until all role manifests
+                // are defined and stored in CAS.
+                debug!(
+                    work_id = %request.work_id,
+                    role = ?request_role,
+                    manifest_hash = %hex::encode(manifest_hash),
+                    "Manifest not in CAS, using minimal fallback manifest for non-reviewer role"
+                );
+                CapabilityManifest::from_hash_with_default_allowlist(&manifest_hash)
+            },
+        };
+
+        self.manifest_store.register(&session_id, manifest.clone());
 
         debug!(
             session_id = %session_id,
+            role = ?request_role,
+            manifest_id = %manifest.manifest_id,
+            tool_allowlist_len = manifest.tool_allowlist.len(),
             "Capability manifest registered in shared store"
         );
 

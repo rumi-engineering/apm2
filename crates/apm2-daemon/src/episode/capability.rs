@@ -2247,8 +2247,123 @@ impl ManifestLoader for StubManifestLoader {
     }
 }
 
+/// In-memory CAS-backed manifest loader for testing and development.
+///
+/// This loader stores manifests in memory keyed by their BLAKE3 hash.
+/// It implements the full `ManifestLoader` trait with proper hash
+/// verification and validation.
+///
+/// # TCK-00317 Implementation
+///
+/// Per DOD item 1 (CAS Storage & Hash Loading), this loader:
+/// - Stores manifests as CAS artifacts (hash-addressed)
+/// - Loads manifests by hash with verification
+/// - Validates manifests on load
+///
+/// # Security Model
+///
+/// - Manifests are stored with their computed BLAKE3 hash
+/// - Load operations verify the hash matches the content
+/// - Invalid manifests are rejected on store
+///
+/// # Thread Safety
+///
+/// Uses `RwLock` for interior mutability, safe for concurrent access.
+#[derive(Debug, Default)]
+pub struct InMemoryCasManifestLoader {
+    /// Stored manifests keyed by their BLAKE3 hash.
+    store: std::sync::RwLock<std::collections::HashMap<[u8; 32], Vec<u8>>>,
+}
+
+impl InMemoryCasManifestLoader {
+    /// Creates a new empty manifest loader.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new manifest loader pre-seeded with the canonical reviewer v0
+    /// manifest.
+    ///
+    /// This is the recommended constructor for production use, ensuring the
+    /// canonical manifest is always available.
+    ///
+    /// # TCK-00317
+    ///
+    /// Per DOD item 1, the reviewer v0 manifest must be stored in CAS and
+    /// referenced by hash. This constructor pre-seeds the store with the
+    /// canonical manifest.
+    #[must_use]
+    pub fn with_reviewer_v0_manifest() -> Self {
+        let loader = Self::new();
+        // Store the canonical reviewer v0 manifest
+        let manifest = super::reviewer_manifest::reviewer_v0_manifest();
+        // Ignore errors - the canonical manifest should always be valid
+        let _ = loader.store_manifest(manifest);
+        loader
+    }
+}
+
+impl ManifestLoader for InMemoryCasManifestLoader {
+    fn load_manifest(&self, hash: &[u8; 32]) -> Result<CapabilityManifest, ManifestLoadError> {
+        let store = self.store.read().expect("lock poisoned");
+        let bytes = store.get(hash).ok_or_else(|| ManifestLoadError::NotFound {
+            hash: hex::encode(hash),
+        })?;
+
+        // Deserialize from JSON and validate
+        let manifest: CapabilityManifest =
+            serde_json::from_slice(bytes).map_err(|e| ManifestLoadError::DeserializationError {
+                message: e.to_string(),
+            })?;
+
+        // Verify the manifest's digest matches the requested hash
+        // This ensures the content is authentic even though we store JSON
+        let computed_hash = manifest.digest();
+        if &computed_hash != hash {
+            return Err(ManifestLoadError::HashMismatch {
+                expected: hex::encode(hash),
+                actual: hex::encode(computed_hash),
+            });
+        }
+
+        manifest.validate()?;
+
+        Ok(manifest)
+    }
+
+    fn store_manifest(&self, manifest: &CapabilityManifest) -> Result<[u8; 32], ManifestLoadError> {
+        // Validate before storing
+        manifest.validate()?;
+
+        // Compute the canonical hash (same as digest())
+        // This ensures consistent hashing with reviewer_v0_manifest_hash()
+        let hash_bytes = manifest.digest();
+
+        // Serialize to JSON for storage
+        // We use JSON for easy deserialization while using canonical bytes for hashing
+        let bytes = serde_json::to_vec(manifest).map_err(|e| ManifestLoadError::StorageError {
+            message: format!("serialization failed: {e}"),
+        })?;
+
+        // Store using the canonical hash as the key
+        let mut store = self.store.write().expect("lock poisoned");
+        store.insert(hash_bytes, bytes);
+
+        Ok(hash_bytes)
+    }
+
+    fn manifest_exists(&self, hash: &[u8; 32]) -> bool {
+        let store = self.store.read().expect("lock poisoned");
+        store.contains_key(hash)
+    }
+}
+
 /// Convenience type alias for validators using the stub loader.
 pub type BasicValidator = PolicyIntegratedValidator<StubManifestLoader>;
+
+/// Convenience type alias for validators using the in-memory CAS loader.
+pub type CasValidator = PolicyIntegratedValidator<InMemoryCasManifestLoader>;
 
 #[cfg(test)]
 mod tests {
@@ -4183,5 +4298,120 @@ mod hef_allowlist_tests {
             // Should produce same bytes after sorting
             assert_eq!(manifest1.canonical_bytes(), manifest2.canonical_bytes());
         }
+    }
+}
+
+// ============================================================================
+// InMemoryCasManifestLoader Tests (TCK-00317)
+// ============================================================================
+
+#[cfg(test)]
+mod cas_loader_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::episode::reviewer_manifest::reviewer_v0_manifest_hash;
+    use crate::episode::scope::SizeLimits;
+
+    fn make_read_capability(id: &str, paths: Vec<PathBuf>) -> Capability {
+        Capability {
+            capability_id: id.to_string(),
+            tool_class: ToolClass::Read,
+            scope: CapabilityScope {
+                root_paths: paths,
+                allowed_patterns: Vec::new(),
+                size_limits: SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        }
+    }
+
+    fn make_manifest(caps: Vec<Capability>) -> CapabilityManifest {
+        let tool_classes: Vec<ToolClass> = caps.iter().map(|c| c.tool_class).collect();
+        CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capabilities(caps)
+            .tool_allowlist(tool_classes)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn store_and_load_manifest() {
+        let loader = InMemoryCasManifestLoader::new();
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-1",
+            vec![PathBuf::from("/workspace")],
+        )]);
+
+        // Store the manifest
+        let hash = loader.store_manifest(&manifest).expect("should store");
+
+        // Load it back
+        let retrieved = loader.load_manifest(&hash).expect("should load");
+
+        // Verify it matches
+        assert_eq!(retrieved.manifest_id, manifest.manifest_id);
+        assert_eq!(retrieved.delegator_id, manifest.delegator_id);
+        assert_eq!(retrieved.capabilities.len(), manifest.capabilities.len());
+    }
+
+    #[test]
+    fn load_nonexistent_returns_not_found() {
+        let loader = InMemoryCasManifestLoader::new();
+        let fake_hash = [0u8; 32];
+
+        let result = loader.load_manifest(&fake_hash);
+        assert!(matches!(result, Err(ManifestLoadError::NotFound { .. })));
+    }
+
+    #[test]
+    fn manifest_exists_returns_correct_value() {
+        let loader = InMemoryCasManifestLoader::new();
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-1",
+            vec![PathBuf::from("/workspace")],
+        )]);
+
+        let fake_hash = [0u8; 32];
+        assert!(!loader.manifest_exists(&fake_hash));
+
+        let hash = loader.store_manifest(&manifest).expect("should store");
+        assert!(loader.manifest_exists(&hash));
+    }
+
+    #[test]
+    fn with_reviewer_v0_manifest_preseeds_store() {
+        let loader = InMemoryCasManifestLoader::with_reviewer_v0_manifest();
+
+        // The reviewer v0 manifest should be loadable by its hash
+        let reviewer_hash = reviewer_v0_manifest_hash();
+        assert!(
+            loader.manifest_exists(reviewer_hash),
+            "reviewer v0 manifest should be pre-seeded"
+        );
+
+        let manifest = loader
+            .load_manifest(reviewer_hash)
+            .expect("should load reviewer v0 manifest");
+        assert_eq!(manifest.manifest_id, "reviewer-v0");
+    }
+
+    #[test]
+    fn hash_is_deterministic() {
+        let loader = InMemoryCasManifestLoader::new();
+        let manifest = make_manifest(vec![make_read_capability(
+            "cap-1",
+            vec![PathBuf::from("/workspace")],
+        )]);
+
+        let hash1 = loader.store_manifest(&manifest).expect("should store");
+        let hash2 = loader.store_manifest(&manifest).expect("should store");
+
+        assert_eq!(
+            hash1, hash2,
+            "storing same manifest should produce same hash"
+        );
     }
 }
