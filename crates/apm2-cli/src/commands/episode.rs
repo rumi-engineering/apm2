@@ -283,6 +283,13 @@ pub struct SpawnArgs {
     /// Lease ID (required for `GATE_EXECUTOR` role).
     #[arg(long)]
     pub lease_id: Option<String>,
+
+    /// Workspace root directory for this episode (TCK-00319).
+    ///
+    /// All file operations will be confined to this directory.
+    /// Must be an absolute path to an existing directory.
+    #[arg(long, required = true)]
+    pub workspace_root: String,
 }
 
 /// Arguments for `apm2 episode session-status` (TCK-00288).
@@ -720,7 +727,12 @@ fn run_spawn(args: &SpawnArgs, socket_path: &std::path::Path, json_output: bool)
     let result = rt.block_on(async {
         let mut client = OperatorClient::connect(socket_path).await?;
         client
-            .spawn_episode(&args.work_id, args.role.into(), args.lease_id.as_deref())
+            .spawn_episode(
+                &args.work_id,
+                args.role.into(),
+                args.lease_id.as_deref(),
+                &args.workspace_root,
+            )
             .await
     });
 

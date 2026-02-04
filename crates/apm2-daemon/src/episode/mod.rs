@@ -197,9 +197,14 @@ pub use executor::{
     new_shared_executor,
 };
 pub use handle::{MAX_SESSION_ID_LEN, SessionHandle, SessionSnapshot, StopSignal};
+// TCK-00319: register_stub_handlers is test-only (insecure CWD rooting)
+#[cfg(test)]
+#[allow(deprecated)]
+pub use handlers::register_stub_handlers;
+// Re-export handler types (TCK-00291, TCK-00315, TCK-00319)
 pub use handlers::{
-    ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ReadFileHandler, WriteFileHandler,
-    register_stub_handlers,
+    ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ListFilesHandler, ReadFileHandler,
+    SearchHandler, WriteFileHandler, register_handlers_with_root,
 };
 // Re-export PTY types (TCK-00161)
 pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, StreamKind};
@@ -219,7 +224,7 @@ pub use reviewer_manifest::{
 pub use ring_buffer::{RingBuffer, tier_defaults};
 pub use runtime::{
     EpisodeEvent, EpisodeRuntime, EpisodeRuntimeConfig, Hash, LeaseIssueDenialReason,
-    MAX_CONCURRENT_EPISODES, MAX_EVENTS_BUFFER_SIZE, new_shared_runtime,
+    MAX_CONCURRENT_EPISODES, MAX_EVENTS_BUFFER_SIZE, RootedHandlerFactory, new_shared_runtime,
     new_shared_runtime_with_clock, new_shared_runtime_with_clock_initialized,
 };
 pub use scope::{
