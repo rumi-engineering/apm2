@@ -1,4 +1,7 @@
-//! TCK-00318 security tests for workspace operations.
+//! TCK-00318 Security Integration Tests
+//!
+//! Tests for workspace security including argument injection prevention
+//! and path traversal prevention.
 
 use apm2_core::fac::{ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo};
 use apm2_daemon::episode::workspace::{WorkspaceError, WorkspaceManager};

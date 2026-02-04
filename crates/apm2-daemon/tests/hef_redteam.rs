@@ -763,6 +763,7 @@ async fn test_out_of_order_spawn_rejected() {
         work_id: "W-OOPS".to_string(),
         role: WorkRole::Implementer.into(),
         lease_id: None,
+        workspace_root: "/tmp".to_string(),
     };
     let frame = encode_spawn_episode_request(&req);
 

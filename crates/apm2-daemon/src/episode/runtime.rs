@@ -417,6 +417,18 @@ struct EpisodeEntry {
 /// // Stop the episode
 /// runtime.stop(&episode_id, TerminationClass::Success, timestamp_ns).await?;
 /// ```
+/// Type alias for workspace-rooted handler factory functions (TCK-00319).
+///
+/// These factories take a workspace root path and produce handlers that are
+/// confined to that workspace. This is the preferred factory type for
+/// production use.
+pub type RootedHandlerFactory = Box<dyn Fn(&std::path::Path) -> Box<dyn ToolHandler> + Send + Sync>;
+
+/// Runtime that manages episode lifecycle and execution.
+///
+/// The `EpisodeRuntime` is the central coordinator for creating, tracking, and
+/// managing episodes. It handles tool handler registration, event buffering,
+/// and workspace-rooted operation for secure file access.
 pub struct EpisodeRuntime {
     /// Configuration.
     config: EpisodeRuntimeConfig,
@@ -438,9 +450,19 @@ pub struct EpisodeRuntime {
     clock: Option<Arc<HolonicClock>>,
     /// Content-addressed store for tool execution results.
     cas: Option<Arc<dyn ContentAddressedStore>>,
-    /// Factories for creating tool handlers.
+    /// Factories for creating tool handlers (legacy, CWD-rooted).
+    ///
+    /// **DEPRECATED (TCK-00319)**: Prefer `rooted_handler_factories` for
+    /// production use. These factories create handlers rooted to CWD, which
+    /// is a security anti-pattern.
     #[allow(clippy::type_complexity)]
     handler_factories: RwLock<Vec<Box<dyn Fn() -> Box<dyn ToolHandler> + Send + Sync>>>,
+    /// Factories for creating workspace-rooted tool handlers (TCK-00319).
+    ///
+    /// These factories take a workspace root path and produce handlers that are
+    /// confined to that workspace. This is the preferred factory type for
+    /// production use.
+    rooted_handler_factories: RwLock<Vec<RootedHandlerFactory>>,
     /// Default budget for new episodes.
     default_budget: EpisodeBudget,
 }
@@ -462,6 +484,7 @@ impl EpisodeRuntime {
             clock: None,
             cas: None,
             handler_factories: RwLock::new(Vec::new()),
+            rooted_handler_factories: RwLock::new(Vec::new()),
             // SEC-CTRL-FAC-0015: Fail-closed default budget prevents DoS
             // via unbounded resource consumption. Consumers can override
             // with `with_default_budget()` if needed.
@@ -491,6 +514,7 @@ impl EpisodeRuntime {
             clock: Some(clock),
             cas: None,
             handler_factories: RwLock::new(Vec::new()),
+            rooted_handler_factories: RwLock::new(Vec::new()),
             // SEC-CTRL-FAC-0015: Fail-closed default budget
             default_budget: EpisodeBudget::default(),
         }
@@ -602,6 +626,10 @@ impl EpisodeRuntime {
     }
 
     /// Registers a factory for creating tool handlers (builder pattern).
+    ///
+    /// **DEPRECATED (TCK-00319)**: Prefer `with_rooted_handler_factory` for
+    /// production use. These factories create handlers rooted to CWD, which
+    /// is a security anti-pattern.
     #[must_use]
     pub fn with_handler_factory<F>(mut self, factory: F) -> Self
     where
@@ -611,7 +639,42 @@ impl EpisodeRuntime {
         self
     }
 
+    /// Registers a workspace-rooted handler factory (builder pattern).
+    ///
+    /// # TCK-00319: Production Handler Registration
+    ///
+    /// This is the **preferred** method for registering tool handlers in
+    /// production. The factory receives the workspace root path at episode
+    /// start time, allowing handlers to be properly isolated to the
+    /// episode's workspace.
+    ///
+    /// # Arguments
+    ///
+    /// * `factory` - A function that takes a workspace root path and returns a
+    ///   tool handler. The handler should be rooted to the provided path.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// runtime.with_rooted_handler_factory(|root| {
+    ///     Box::new(ReadFileHandler::with_root(root))
+    /// })
+    /// ```
+    #[must_use]
+    pub fn with_rooted_handler_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(&std::path::Path) -> Box<dyn ToolHandler> + Send + Sync + 'static,
+    {
+        self.rooted_handler_factories
+            .get_mut()
+            .push(Box::new(factory));
+        self
+    }
+
     /// Registers a factory for creating tool handlers.
+    ///
+    /// **DEPRECATED (TCK-00319)**: Prefer `register_rooted_handler_factory` for
+    /// production use.
     ///
     /// This allows the runtime to spawn fresh handlers for each episode
     /// (needed because handlers are consumed by the executor).
@@ -620,6 +683,19 @@ impl EpisodeRuntime {
         F: Fn() -> Box<dyn ToolHandler> + Send + Sync + 'static,
     {
         let mut factories = self.handler_factories.write().await;
+        factories.push(Box::new(factory));
+    }
+
+    /// Registers a workspace-rooted handler factory.
+    ///
+    /// # TCK-00319: Production Handler Registration
+    ///
+    /// See [`Self::with_rooted_handler_factory`] for details.
+    pub async fn register_rooted_handler_factory<F>(&self, factory: F)
+    where
+        F: Fn(&std::path::Path) -> Box<dyn ToolHandler> + Send + Sync + 'static,
+    {
+        let mut factories = self.rooted_handler_factories.write().await;
         factories.push(Box::new(factory));
     }
 
@@ -764,6 +840,10 @@ impl EpisodeRuntime {
 
     /// Starts an episode, transitioning it from CREATED to RUNNING.
     ///
+    /// **DEPRECATED (TCK-00319)**: Prefer `start_with_workspace` for production
+    /// use. This method uses CWD-rooted handlers, which is a security
+    /// anti-pattern.
+    ///
     /// # Arguments
     ///
     /// * `episode_id` - The episode to start
@@ -790,6 +870,85 @@ impl EpisodeRuntime {
         episode_id: &EpisodeId,
         lease_id: impl Into<String>,
         timestamp_ns: u64,
+    ) -> Result<SessionHandle, EpisodeError> {
+        // Delegate to internal implementation with no workspace root
+        self.start_internal(episode_id, lease_id, timestamp_ns, None)
+            .await
+    }
+
+    /// Starts an episode with a specific workspace root (TCK-00319).
+    ///
+    /// This is the **preferred** method for starting episodes in production.
+    /// Tool handlers will be rooted to the specified workspace, preventing
+    /// access to the daemon's CWD or other directories.
+    ///
+    /// # TCK-00319: Workspace Root Plumbing
+    ///
+    /// This method addresses BLOCKER 2: it accepts a workspace root and uses it
+    /// to initialize tool handlers via the rooted handler factories.
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode to start
+    /// * `lease_id` - Lease authorizing execution
+    /// * `timestamp_ns` - Current timestamp in nanoseconds since epoch
+    /// * `workspace_root` - Absolute path to the workspace directory
+    ///
+    /// # Returns
+    ///
+    /// Returns a `SessionHandle` for the running episode.
+    ///
+    /// # Errors
+    ///
+    /// - `EpisodeError::NotFound` if the episode doesn't exist
+    /// - `EpisodeError::InvalidTransition` if the episode is not in CREATED
+    ///   state
+    /// - `EpisodeError::InvalidLease` if the lease ID is invalid
+    /// - `EpisodeError::Internal` if the workspace root does not exist or
+    ///   cannot be canonicalized
+    ///
+    /// # Events
+    ///
+    /// Emits `episode.started` event (INV-ER002).
+    #[instrument(skip(self, lease_id, workspace_root))]
+    pub async fn start_with_workspace(
+        &self,
+        episode_id: &EpisodeId,
+        lease_id: impl Into<String>,
+        timestamp_ns: u64,
+        workspace_root: &std::path::Path,
+    ) -> Result<SessionHandle, EpisodeError> {
+        // Validate workspace root exists and canonicalize (fail-closed)
+        if !workspace_root.exists() {
+            return Err(EpisodeError::Internal {
+                message: format!(
+                    "workspace root does not exist: {}",
+                    workspace_root.display()
+                ),
+            });
+        }
+
+        let canonical_root =
+            std::fs::canonicalize(workspace_root).map_err(|e| EpisodeError::Internal {
+                message: format!(
+                    "failed to canonicalize workspace root '{}': {}",
+                    workspace_root.display(),
+                    e
+                ),
+            })?;
+
+        self.start_internal(episode_id, lease_id, timestamp_ns, Some(&canonical_root))
+            .await
+    }
+
+    /// Internal implementation of start with optional workspace root.
+    #[instrument(skip(self, lease_id, workspace_root))]
+    async fn start_internal(
+        &self,
+        episode_id: &EpisodeId,
+        lease_id: impl Into<String>,
+        timestamp_ns: u64,
+        workspace_root: Option<&std::path::Path>,
     ) -> Result<SessionHandle, EpisodeError> {
         let lease_id = lease_id.into();
 
@@ -864,7 +1023,22 @@ impl EpisodeRuntime {
                     executor = executor.with_clock(clock.clone());
                 }
 
-                // Register handlers from factories
+                // TCK-00319: Register handlers from rooted factories first (preferred)
+                if let Some(root) = workspace_root {
+                    let rooted_factories = self.rooted_handler_factories.read().await;
+                    for factory in rooted_factories.iter() {
+                        if let Err(e) = executor.register_handler(factory(root)) {
+                            warn!(
+                                episode_id = %episode_id,
+                                error = %e,
+                                "failed to register rooted handler for episode"
+                            );
+                        }
+                    }
+                }
+
+                // Register handlers from legacy (CWD-rooted) factories
+                // These are used when no workspace root is provided (deprecated path)
                 let factories = self.handler_factories.read().await;
                 for factory in factories.iter() {
                     if let Err(e) = executor.register_handler(factory()) {
@@ -2194,5 +2368,85 @@ mod tests {
             events[0].episode_id().is_none(),
             "ClockProfilePublished should not have an episode_id"
         );
+    }
+
+    /// TCK-00319: Verify that `start_with_workspace` correctly initializes
+    /// rooted handlers and that they are confined to the workspace.
+    #[tokio::test]
+    async fn tck_00319_start_with_workspace_roots_handlers() {
+        use std::path::PathBuf;
+
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::episode::handlers::ReadFileHandler;
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+
+        // Create a file INSIDE the workspace
+        let inside_file = workspace.join("inside.txt");
+        std::fs::write(&inside_file, "inside").expect("write inside");
+
+        // Create a file OUTSIDE the workspace
+        let outside_file = temp_dir.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside").expect("write outside");
+
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let runtime = EpisodeRuntime::new(test_config())
+            .with_cas(cas)
+            .with_rooted_handler_factory(|root| Box::new(ReadFileHandler::with_root(root)));
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        // Start with workspace
+        let _handle = runtime
+            .start_with_workspace(
+                &episode_id,
+                "lease-123",
+                test_timestamp() + 1000,
+                &workspace,
+            )
+            .await
+            .unwrap();
+
+        // Attempt to read file INSIDE workspace
+        let result = runtime
+            .execute_tool(
+                &episode_id,
+                &ToolArgs::Read(crate::episode::tool_handler::ReadArgs {
+                    path: PathBuf::from("inside.txt"),
+                    offset: None,
+                    limit: None,
+                }),
+                None,
+                test_timestamp() + 2000,
+                "req-1",
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output_str().unwrap(), "inside");
+
+        // Attempt to read file OUTSIDE workspace via path traversal
+        let result = runtime
+            .execute_tool(
+                &episode_id,
+                &ToolArgs::Read(crate::episode::tool_handler::ReadArgs {
+                    path: PathBuf::from("../outside.txt"),
+                    offset: None,
+                    limit: None,
+                }),
+                None,
+                test_timestamp() + 3000,
+                "req-2",
+            )
+            .await;
+
+        // Should be rejected by path validation
+        assert!(result.is_err());
     }
 }

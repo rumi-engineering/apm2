@@ -2615,6 +2615,10 @@ impl PrivilegedDispatcher {
         payload: &[u8],
         ctx: &ConnectionContext,
     ) -> ProtocolResult<PrivilegedResponse> {
+        // TCK-00319: Maximum path length constant (declared at function start per
+        // clippy)
+        const MAX_PATH_LENGTH: usize = 4096;
+
         let request =
             SpawnEpisodeRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
                 ProtocolError::Serialization {
@@ -2666,6 +2670,67 @@ impl PrivilegedDispatcher {
                     format!("lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
                 ));
             }
+        }
+
+        // TCK-00319: Validate workspace_root is provided
+        if request.workspace_root.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "workspace_root is required",
+            ));
+        }
+
+        // TCK-00319: Validate workspace_root path length (prevent DoS via unbounded
+        // paths)
+        if request.workspace_root.len() > MAX_PATH_LENGTH {
+            warn!(
+                workspace_root_len = request.workspace_root.len(),
+                max_len = MAX_PATH_LENGTH,
+                "SpawnEpisode rejected: workspace_root exceeds maximum length"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("workspace_root exceeds maximum length of {MAX_PATH_LENGTH} bytes"),
+            ));
+        }
+
+        // TCK-00319: Validate workspace_root is an absolute path
+        let workspace_path = std::path::Path::new(&request.workspace_root);
+        if !workspace_path.is_absolute() {
+            warn!(
+                workspace_root = %request.workspace_root,
+                "SpawnEpisode rejected: workspace_root must be an absolute path"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "workspace_root must be an absolute path",
+            ));
+        }
+
+        // TCK-00319: Validate workspace_root exists and is a directory
+        if !workspace_path.exists() {
+            warn!(
+                workspace_root = %request.workspace_root,
+                "SpawnEpisode rejected: workspace_root does not exist"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("workspace_root does not exist: {}", request.workspace_root),
+            ));
+        }
+
+        if !workspace_path.is_dir() {
+            warn!(
+                workspace_root = %request.workspace_root,
+                "SpawnEpisode rejected: workspace_root is not a directory"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "workspace_root is not a directory: {}",
+                    request.workspace_root
+                ),
+            ));
         }
 
         if request.role == WorkRole::Unspecified as i32 {
@@ -3039,6 +3104,86 @@ impl PrivilegedDispatcher {
                 ));
             },
         };
+
+        // TCK-00319: Create and start episode with workspace root.
+        // This ensures that all file/execute operations are confined to the
+        // workspace directory. The episode must be started BEFORE returning
+        // to the client so that tool handlers are properly initialized.
+        //
+        // Generate envelope hash from session_id + work_id + lease_id for uniqueness
+        let envelope_data = format!("{}{}{}", session_id, request.work_id, claim.lease_id);
+        let envelope_hash: [u8; 32] = blake3::hash(envelope_data.as_bytes()).into();
+
+        // Try to create and start the episode. This requires a Tokio runtime.
+        // In unit tests without a runtime, we skip episode creation but still
+        // return a valid session (for backward compatibility with existing tests).
+        let episode_id_opt = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            match tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    // Create the episode with envelope hash and timestamp
+                    let episode_id = self
+                        .episode_runtime
+                        .create(envelope_hash, timestamp_ns)
+                        .await?;
+
+                    // Start with workspace - this initializes rooted handlers
+                    let _session_handle = self
+                        .episode_runtime
+                        .start_with_workspace(
+                            &episode_id,
+                            &claim.lease_id,
+                            timestamp_ns,
+                            workspace_path,
+                        )
+                        .await?;
+
+                    Ok::<_, crate::episode::EpisodeError>(episode_id)
+                })
+            }) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    warn!(
+                        work_id = %request.work_id,
+                        error = %e,
+                        "SpawnEpisode failed: episode creation/start failed"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        format!("episode creation failed: {e}"),
+                    ));
+                },
+            }
+        } else {
+            // No Tokio runtime available (e.g., in sync unit tests).
+            // In production, this should never happen.
+            // For testing backward compatibility, we allow session creation
+            // without episode creation.
+            #[cfg(test)]
+            {
+                debug!(
+                    session_id = %session_id,
+                    "No Tokio runtime - skipping episode creation (test mode)"
+                );
+                None
+            }
+            #[cfg(not(test))]
+            {
+                warn!("No Tokio runtime available for episode creation");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    "episode creation failed: no async runtime available",
+                ));
+            }
+        };
+
+        if let Some(ref episode_id) = episode_id_opt {
+            debug!(
+                session_id = %session_id,
+                episode_id = %episode_id,
+                workspace_root = %request.workspace_root,
+                "Episode created and started with workspace root"
+            );
+        }
 
         // Derive actor_id from credentials (same pattern as ClaimWork)
         let actor_id = ctx
@@ -3585,6 +3730,12 @@ pub fn encode_shutdown_request(request: &ShutdownRequest) -> Bytes {
 mod tests {
     use super::*;
 
+    /// TCK-00319: Helper function to get a test workspace root.
+    /// Uses /tmp which exists on all Unix systems.
+    fn test_workspace_root() -> String {
+        "/tmp".to_string()
+    }
+
     // ========================================================================
     // INT-001: Privileged endpoint routing (TCK-00251)
     // Test name matches verification command: cargo test -p apm2-daemon
@@ -3640,6 +3791,7 @@ mod tests {
 
             // Now spawn with the claimed work_id
             let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
                 work_id,
                 role: WorkRole::Implementer.into(),
                 lease_id: Some(lease_id),
@@ -3753,6 +3905,7 @@ mod tests {
                     nonce: vec![],
                 }),
                 encode_spawn_episode_request(&SpawnEpisodeRequest {
+                    workspace_root: test_workspace_root(),
                     work_id: "W-001".to_string(),
                     role: WorkRole::Implementer.into(),
                     lease_id: None,
@@ -3833,6 +3986,7 @@ mod tests {
         let ctx = make_session_ctx();
 
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: "W-001".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: None,
@@ -3942,6 +4096,7 @@ mod tests {
 
         // Now spawn with the claimed work_id
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
@@ -4520,6 +4675,7 @@ mod tests {
         let ctx = make_privileged_ctx();
 
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: "W-001".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: None, // Missing required lease_id
@@ -4564,6 +4720,7 @@ mod tests {
 
         // Now spawn with the claimed work_id and correct lease_id
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id,
             role: WorkRole::GateExecutor.into(),
             lease_id: Some(lease_id), // Use the correct lease_id from ClaimWork
@@ -4613,6 +4770,7 @@ mod tests {
 
         // Try to spawn with a WRONG lease_id (arbitrary string)
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id,
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-WRONG-LEASE-ID".to_string()), // Wrong!
@@ -4666,6 +4824,7 @@ mod tests {
 
         // Try to spawn with NO lease_id (None)
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: None, // Missing! Should fail because claim has a lease_id
@@ -4714,6 +4873,7 @@ mod tests {
 
         // Spawn with the correct lease_id (optional for non-GateExecutor)
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id), // Correct lease_id
@@ -4756,6 +4916,7 @@ mod tests {
 
         // Spawn episode
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: work_id.clone(),
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
@@ -4807,6 +4968,7 @@ mod tests {
         // DO NOT register any lease - this simulates an unknown/invalid lease
 
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: "W-001".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-UNKNOWN".to_string()), // Not registered
@@ -4848,6 +5010,7 @@ mod tests {
 
         // Try to use that lease for W-002 (different work_id)
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: "W-002".to_string(), // Mismatched work_id
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-001".to_string()),
@@ -4890,6 +5053,7 @@ mod tests {
             .register_lease("L-VALID", "W-VALID", "gate-aat");
 
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: "W-VALID".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-VALID".to_string()),
@@ -5026,6 +5190,7 @@ mod tests {
 
         // Attempt to spawn for a non-existent work_id (no ClaimWork was called)
         let request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: "W-NONEXISTENT".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: None,
@@ -5080,6 +5245,7 @@ mod tests {
 
         // 2. Spawn Episode (should succeed because ClaimWork persisted the resolution)
         let spawn_req = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
@@ -5145,6 +5311,7 @@ mod tests {
 
         // 2. Try to spawn with Reviewer role (mismatched)
         let spawn_req = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id,
             role: WorkRole::Reviewer.into(), // Different from claimed role
             lease_id: None,
@@ -5201,6 +5368,7 @@ mod tests {
 
         // Spawn episode
         let spawn_req = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id,
             role: WorkRole::Implementer.into(),
             lease_id: Some(lease_id),
@@ -5366,6 +5534,7 @@ mod tests {
 
         // Now spawn with the overlapping domains
         let spawn_request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: "W-team-alpha-test123".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some(lease_id),
@@ -5426,6 +5595,7 @@ mod tests {
 
         // Spawn should succeed
         let spawn_request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: "W-team-dev-test456".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-non-overlap-123".to_string()),
@@ -5488,6 +5658,7 @@ mod tests {
 
         // Spawn should be denied because we can't verify SoD without author domains
         let spawn_request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: "W-unknown-work-789".to_string(),
             role: WorkRole::GateExecutor.into(),
             lease_id: Some("L-empty-authors-456".to_string()),
@@ -5540,6 +5711,7 @@ mod tests {
 
         // Spawn as IMPLEMENTER should succeed despite overlapping domains
         let spawn_request = SpawnEpisodeRequest {
+            workspace_root: test_workspace_root(),
             work_id: "W-team-alpha-impl123".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: Some("L-implementer-789".to_string()),

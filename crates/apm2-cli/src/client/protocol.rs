@@ -385,16 +385,20 @@ impl OperatorClient {
     ///   REVIEWER)
     /// * `lease_id` - Required for `GATE_EXECUTOR` role; must reference valid
     ///   `GateLeaseIssued`
+    /// * `workspace_root` - Workspace root directory for this episode. All file
+    ///   operations will be confined to this directory (TCK-00319).
     pub async fn spawn_episode(
         &mut self,
         work_id: &str,
         role: WorkRole,
         lease_id: Option<&str>,
+        workspace_root: &str,
     ) -> Result<SpawnEpisodeResponse, ProtocolClientError> {
         let request = SpawnEpisodeRequest {
             work_id: work_id.to_string(),
             role: role.into(),
             lease_id: lease_id.map(String::from),
+            workspace_root: workspace_root.to_string(),
         };
         let request_bytes = encode_spawn_episode_request(&request);
 
@@ -1009,6 +1013,7 @@ mod tests {
             work_id: "work-123".to_string(),
             role: WorkRole::Implementer.into(),
             lease_id: Some("lease-456".to_string()),
+            workspace_root: "/tmp".to_string(),
         };
         let encoded = encode_spawn_episode_request(&request);
 

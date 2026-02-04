@@ -299,6 +299,10 @@ message SpawnEpisodeRequest {
   WorkRole role = 2;
   // Required for GATE_EXECUTOR role; must reference valid GateLeaseIssued.
   optional string lease_id = 3;
+  // TCK-00319: Workspace root directory for this episode.
+  // All file operations will be confined to this directory.
+  // REQUIRED: Episodes cannot be spawned without a workspace root.
+  string workspace_root = 4;
 }
 
 message SpawnEpisodeResponse {

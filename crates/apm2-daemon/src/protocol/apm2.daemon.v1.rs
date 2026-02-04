@@ -326,6 +326,11 @@ pub struct SpawnEpisodeRequest {
     /// Required for GATE_EXECUTOR role; must reference valid GateLeaseIssued.
     #[prost(string, optional, tag = "3")]
     pub lease_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// TCK-00319: Workspace root directory for this episode.
+    /// All file operations will be confined to this directory.
+    /// REQUIRED: Episodes cannot be spawned without a workspace root.
+    #[prost(string, tag = "4")]
+    pub workspace_root: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SpawnEpisodeResponse {
