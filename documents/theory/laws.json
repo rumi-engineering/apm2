@@ -287,7 +287,7 @@
         "statement": "Convergence in a distributed holarchy requires an **explicit anti-entropy protocol** to resolve forked truths, distinguishing between **Control** and **Data** planes.",
         "operationalization": [
           {
-            "rule": "Consensus Scoping (Principle 49)",
+            "rule": "Consensus Scoping (PRIN-049)",
             "desc": "",
             "subrules": [
               "**Control Plane:** Use BFT consensus for small, critical shared-authority state (membership, policy roots, key rotation).",

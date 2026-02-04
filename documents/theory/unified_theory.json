@@ -4,9 +4,7 @@
     "classification": "INTERNAL",
     "created_at": "2026-01-27T02:14:09Z",
     "dependencies": [
-      "apm2://theory/agent_native_software",
-      "apm2://skills/glossary",
-      "apm2://theory/agent_native_protocols",
+      "apm2://theory/agent_native_architecture",
       "apm2://theory/defects",
       "apm2://theory"
     ],
@@ -3672,11 +3670,11 @@
           "node_class": "BACKGROUND"
         },
         "agent-native-software (holonic-agent-network)": {
-          "ref": "documents/theory/agent_native_software.json",
+          "ref": "documents/theory/agent_native_architecture.json",
           "node_class": "BACKGROUND"
         },
         "agent-native-software (industry textbook)": {
-          "ref": "documents/theory/agent_native_software.json",
+          "ref": "documents/theory/agent_native_architecture.json",
           "node_class": "BACKGROUND"
         },
         "defects textbook": {

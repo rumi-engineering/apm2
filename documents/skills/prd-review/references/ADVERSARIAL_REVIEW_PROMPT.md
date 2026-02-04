@@ -8,7 +8,7 @@ Before analyzing any PRD, you MUST read and internalize the following documents:
 
 ### A. The Axiomatic Constitution
 *   `documents/theory/unified_theory.json`: Grand Unified Theory (dcp://apm2.local/governance/holonic_unified_theory@v1) - Holonic axioms of Existence, Truth, and Economy.
-*   `documents/theory/agent_native_software.json`: Understand the doctrine of software designed for agent-first consumption.
+*   `documents/theory/agent_native_architecture.json`: Understand the doctrine of software designed for agent-first consumption.
 
 ### B. The Review Skill Stack
 *   `documents/skills/prd-review/SKILL.md`: The core protocol and Variable Depth logic.
