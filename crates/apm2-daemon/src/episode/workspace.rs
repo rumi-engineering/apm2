@@ -538,7 +538,7 @@ pub fn validate_path_with_symlink_check(
 /// Per TCK-00318 security requirements:
 /// - Rejects bundles with binary files (v0 limitation)
 /// - Validates all paths in the file manifest for traversal attacks
-/// - Validates old_path for rename operations
+/// - Validates `old_path` for rename operations
 /// - For existing files (MODIFY, DELETE, RENAME), validates symlinks don't
 ///   escape the workspace
 ///
@@ -874,22 +874,13 @@ impl ReviewCompletionResultBuilder {
 // =============================================================================
 
 /// Configuration for workspace materialization.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WorkspaceConfig {
     /// Path to the local git repository or mirror to checkout from.
-    /// If None, assumes workspace_root is already a git repository.
+    /// If None, assumes `workspace_root` is already a git repository.
     pub repo_path: Option<PathBuf>,
     /// Whether to clean the workspace before checkout (git clean -fd).
     pub clean_before_checkout: bool,
-}
-
-impl Default for WorkspaceConfig {
-    fn default() -> Self {
-        Self {
-            repo_path: None,
-            clean_before_checkout: false,
-        }
-    }
 }
 
 impl WorkspaceConfig {
@@ -999,11 +990,9 @@ impl WorkspaceManager {
         let git_head = self.get_git_head();
 
         // Compute snapshot hash from work_id and git HEAD (if available)
-        let hash_input = if let Some(ref head) = git_head {
-            format!("{work_id}:{head}")
-        } else {
-            work_id.to_string()
-        };
+        let hash_input = git_head
+            .as_ref()
+            .map_or_else(|| work_id.to_string(), |head| format!("{work_id}:{head}"));
         let snapshot_hash = *blake3::hash(hash_input.as_bytes()).as_bytes();
 
         // Count files in workspace (excluding .git)
@@ -1147,8 +1136,7 @@ impl WorkspaceManager {
                 return Err(WorkspaceError::BaseCommitNotFound(commit_ref.to_string()));
             }
             return Err(WorkspaceError::GitOperationFailed(format!(
-                "git checkout failed: {}",
-                stderr
+                "git checkout failed: {stderr}"
             )));
         }
 
@@ -1171,7 +1159,7 @@ impl WorkspaceManager {
         if let Some(ref git_head) = self.get_git_head() {
             // If snapshot was taken at a different HEAD, checkout that commit
             let expected_prefix = format!("{}:", snapshot.work_id);
-            let hash_input = format!("{}{}", expected_prefix, git_head);
+            let hash_input = format!("{expected_prefix}{git_head}");
             let computed_hash = *blake3::hash(hash_input.as_bytes()).as_bytes();
 
             if computed_hash != snapshot.snapshot_hash {
@@ -1247,8 +1235,7 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::ApplyFailed(format!(
-                "git apply --check failed: {}",
-                stderr
+                "git apply --check failed: {stderr}"
             )));
         }
 
@@ -1286,8 +1273,7 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::ApplyFailed(format!(
-                "git apply failed: {}",
-                stderr
+                "git apply failed: {stderr}"
             )));
         }
 
@@ -1308,8 +1294,7 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::GitOperationFailed(format!(
-                "git clean failed: {}",
-                stderr
+                "git clean failed: {stderr}"
             )));
         }
 
@@ -1810,7 +1795,7 @@ mod tests {
         let workspace_root = temp_dir.path().to_path_buf();
 
         // Create a workspace manager (validation-only, no CAS)
-        let manager = WorkspaceManager::new(workspace_root.clone());
+        let manager = WorkspaceManager::new(workspace_root);
 
         // Create a valid bundle with ADD operations (no symlink checks needed)
         let bundle = ChangeSetBundleV1::builder()
@@ -1871,7 +1856,7 @@ mod tests {
         let symlink_path = workspace_root.join("escape_link.txt");
         symlink(&secret_file, &symlink_path).expect("create symlink");
 
-        let manager = WorkspaceManager::new(workspace_root.clone());
+        let manager = WorkspaceManager::new(workspace_root);
 
         // Create a bundle that tries to modify the symlink target
         let bundle = ChangeSetBundleV1::builder()
