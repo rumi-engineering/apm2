@@ -20,7 +20,8 @@
 //! - **Path Validation**: Validates file paths to prevent traversal attacks
 //! - **CAS Binding**: All artifacts are stored in CAS with hash verification
 //! - **HTF Time Bounds**: Retries are bounded by HTF windows, not wall clock
-//! - **Diff Integrity**: Verifies that the diff only touches files listed in the manifest
+//! - **Diff Integrity**: Verifies that the diff only touches files listed in
+//!   the manifest
 //!
 //! # Example
 //!
@@ -662,8 +663,8 @@ pub fn validate_commit_ref(commit_ref: &str) -> Result<(), WorkspaceError> {
     }
 
     // Validate that the commit ref contains only safe characters
-    // Valid git refs: alphanumeric, hyphens, underscores, slashes, dots, tildes, carets
-    // See: https://git-scm.com/docs/git-check-ref-format
+    // Valid git refs: alphanumeric, hyphens, underscores, slashes, dots, tildes,
+    // carets See: https://git-scm.com/docs/git-check-ref-format
     let valid_chars = |c: char| {
         c.is_ascii_alphanumeric()
             || c == '-'
@@ -1005,14 +1006,16 @@ impl WorkspaceConfig {
 /// - **Isolated Workspaces**: Each episode gets an isolated workspace directory
 /// - **Secure Patch Apply**: Path validation prevents outside-root writes
 /// - **Symlink Safety**: All paths are validated for symlink escapes
-/// - **Fail-Closed**: Errors during apply yield `ReviewBlockedRecorded`, not crashes
+/// - **Fail-Closed**: Errors during apply yield `ReviewBlockedRecorded`, not
+///   crashes
 ///
 /// # Security Model (TCK-00318)
 ///
-/// - **Containment Boundary**: Workspace is a containment boundary; default deny on
-///   suspicious paths
+/// - **Containment Boundary**: Workspace is a containment boundary; default
+///   deny on suspicious paths
 /// - **Path Validation**: All file paths are validated for traversal attacks
-/// - **Symlink Escapes**: Existing files are checked for symlink-based sandbox escapes
+/// - **Symlink Escapes**: Existing files are checked for symlink-based sandbox
+///   escapes
 /// - **Binary Detection**: Binary files are rejected (v0 limitation)
 #[derive(Debug)]
 pub struct WorkspaceManager {
@@ -1069,7 +1072,8 @@ impl WorkspaceManager {
     ///
     /// The snapshot captures:
     /// - Work ID binding
-    /// - BLAKE3 hash of the workspace state (computed from git HEAD + worktree status)
+    /// - BLAKE3 hash of the workspace state (computed from git HEAD + worktree
+    ///   status)
     /// - Timestamp
     /// - File count
     ///
@@ -1107,11 +1111,12 @@ impl WorkspaceManager {
 
     /// Applies a changeset bundle to the workspace.
     ///
-    /// This is the main entry point for workspace materialization per TCK-00318.
-    /// The implementation:
+    /// This is the main entry point for workspace materialization per
+    /// TCK-00318. The implementation:
     ///
     /// 1. Validates all file paths in the changeset (security checks)
-    /// 2. If CAS is configured, retrieves diff bytes and applies via `git apply`
+    /// 2. If CAS is configured, retrieves diff bytes and applies via `git
+    ///    apply`
     /// 3. Otherwise, performs validation-only (suitable for tests)
     ///
     /// # Security
@@ -1205,20 +1210,20 @@ impl WorkspaceManager {
     /// This method is used to set up the workspace to the base commit
     /// before applying a diff.
     ///
+    /// # Security
+    ///
+    /// This method validates `commit_ref` to prevent command injection attacks:
+    /// - Uses `--` separator to prevent `commit_ref` from being interpreted as
+    ///   flags
+    /// - Validates that `commit_ref` matches safe patterns (hex hash or valid
+    ///   ref name)
+    ///
     /// # Errors
     ///
-    /// Returns error if git checkout fails.
+    /// Returns error if git checkout fails or `commit_ref` is invalid.
     pub fn checkout(&self, commit_ref: &str) -> Result<(), WorkspaceError> {
-        // Validate commit_ref format to prevent argument injection
-        // Allow alphanumeric, hyphens, underscores, dots, and slashes
-        // Must not start with a hyphen
-        if commit_ref.starts_with('-')
-            || !commit_ref
-                .chars()
-                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-        {
-            return Err(WorkspaceError::InvalidCommitRef(commit_ref.to_string()));
-        }
+        // Security: Validate commit_ref to prevent command injection
+        validate_commit_ref(commit_ref)?;
 
         // Optionally clean before checkout
         if self.config.clean_before_checkout {
@@ -1226,13 +1231,12 @@ impl WorkspaceManager {
         }
 
         // Run git checkout
+        // Security: Use "--" to prevent commit_ref from being interpreted as flags
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.workspace_root)
             .args([
-                "checkout",
-                "--force",
-                "--", // End of options separator
+                "checkout", "--force", "--", // End of options separator
                 commit_ref,
             ])
             .output()
@@ -1342,7 +1346,9 @@ impl WorkspaceManager {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(diff_bytes).map_err(|e| {
-                WorkspaceError::GitOperationFailed(format!("failed to write to git apply check: {e}"))
+                WorkspaceError::GitOperationFailed(format!(
+                    "failed to write to git apply check: {e}"
+                ))
             })?;
         }
 
@@ -1382,13 +1388,17 @@ impl WorkspaceManager {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
-                WorkspaceError::GitOperationFailed(format!("failed to spawn git apply summary: {e}"))
+                WorkspaceError::GitOperationFailed(format!(
+                    "failed to spawn git apply summary: {e}"
+                ))
             })?;
 
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(diff_bytes).map_err(|e| {
-                WorkspaceError::GitOperationFailed(format!("failed to write to git apply summary: {e}"))
+                WorkspaceError::GitOperationFailed(format!(
+                    "failed to write to git apply summary: {e}"
+                ))
             })?;
         }
 
@@ -1455,7 +1465,9 @@ impl WorkspaceManager {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(diff_bytes).map_err(|e| {
-                WorkspaceError::GitOperationFailed(format!("failed to write diff to git apply: {e}"))
+                WorkspaceError::GitOperationFailed(format!(
+                    "failed to write diff to git apply: {e}"
+                ))
             })?;
         }
 
@@ -1493,7 +1505,9 @@ impl WorkspaceManager {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(diff_bytes).map_err(|e| {
-                WorkspaceError::GitOperationFailed(format!("failed to write diff to git apply: {e}"))
+                WorkspaceError::GitOperationFailed(format!(
+                    "failed to write diff to git apply: {e}"
+                ))
             })?;
         }
 
