@@ -1382,7 +1382,7 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
     // =========================================================================
     let snapshot = harness
         .workspace_manager
-        .snapshot("work-fac-v0-e2e")
+        .snapshot("work-fac-v0-e2e", None)
         .expect("workspace snapshot");
 
     assert_eq!(snapshot.work_id, "work-fac-v0-e2e");
@@ -1923,10 +1923,10 @@ fn test_workspace_snapshot_captures_state() {
     let workspace_manager = WorkspaceManager::new(temp_dir.path().to_path_buf());
 
     let snapshot1 = workspace_manager
-        .snapshot("work-001")
+        .snapshot("work-001", None)
         .expect("first snapshot");
     let snapshot2 = workspace_manager
-        .snapshot("work-002")
+        .snapshot("work-002", None)
         .expect("second snapshot");
 
     // Different work IDs should produce different hashes
@@ -1937,7 +1937,7 @@ fn test_workspace_snapshot_captures_state() {
 
     // Same work ID should produce same hash (deterministic)
     let snapshot1_again = workspace_manager
-        .snapshot("work-001")
+        .snapshot("work-001", None)
         .expect("snapshot again");
     assert_eq!(
         snapshot1.snapshot_hash, snapshot1_again.snapshot_hash,

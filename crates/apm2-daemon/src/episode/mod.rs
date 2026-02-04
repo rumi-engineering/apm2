@@ -236,10 +236,11 @@ pub use tool_handler::{
     MAX_RESULT_MESSAGE_LEN, MAX_TOOL_ARGS_SIZE, NetworkArgs, RawArgs, ReadArgs, ResultMetadata,
     ToolArgs, ToolHandler, ToolHandlerError, ToolResultData, WriteArgs,
 };
-// Re-export workspace types (TCK-00311, TCK-00312)
+// Re-export workspace types (TCK-00311, TCK-00312, TCK-00318)
 pub use workspace::{
-    ApplyResult, MAX_FILE_SIZE, MAX_PATH_DEPTH, MAX_RETRY_ATTEMPTS, RetryContext,
-    ReviewCompletionResult, ReviewCompletionResultBuilder, WorkspaceError, WorkspaceManager,
-    WorkspaceSnapshot, create_artifact_bundle, create_blocked_event, create_receipt_event,
-    validate_file_changes, validate_path,
+    ApplyResult, MAX_FILE_SIZE, MAX_GIT_LINE_LEN, MAX_PATH_DEPTH, MAX_RETRY_ATTEMPTS,
+    MAX_WORKSPACE_FILES, RetryContext, ReviewCompletionResult, ReviewCompletionResultBuilder,
+    WorkspaceError, WorkspaceManager, WorkspaceSnapshot, create_artifact_bundle,
+    create_blocked_event, create_receipt_event, validate_file_changes, validate_path,
+    validate_path_filesystem_aware, validate_path_with_symlink_check,
 };
