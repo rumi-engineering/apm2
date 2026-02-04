@@ -73,6 +73,21 @@ pub const GIT_STATUS_MAX_BYTES: usize = 16 * 1024; // 16 KiB
 /// Maximum output lines for `git status` (500 per REQ-HEF-0010).
 pub const GIT_STATUS_MAX_LINES: usize = 500;
 
+/// Maximum output bytes for `ListFiles`/`Search` operations (TCK-00315).
+///
+/// Per RFC-0018 HEF requirements, navigation tool outputs are strictly bounded
+/// to prevent denial-of-service and ensure predictable resource consumption.
+pub const NAVIGATION_OUTPUT_MAX_BYTES: usize = 65_536; // 64 KiB
+
+/// Maximum output lines for `ListFiles`/`Search` operations (TCK-00315).
+pub const NAVIGATION_OUTPUT_MAX_LINES: usize = 2000;
+
+/// Maximum entries for `ListFiles` operations (TCK-00315).
+pub const LISTFILES_MAX_ENTRIES: usize = 10_000;
+
+/// Default entries for `ListFiles` operations (TCK-00315).
+pub const LISTFILES_DEFAULT_ENTRIES: usize = 1000;
+
 // =============================================================================
 // ToolArgs
 // =============================================================================
@@ -116,6 +131,12 @@ pub enum ToolArgs {
     /// Arguments for artifact fetch operations.
     Artifact(ArtifactArgs),
 
+    /// Arguments for directory listing operations (TCK-00315).
+    ListFiles(ListFilesArgs),
+
+    /// Arguments for text search operations (TCK-00315).
+    Search(SearchArgs),
+
     /// Raw bytes for custom handlers.
     Raw(RawArgs),
 }
@@ -131,6 +152,8 @@ impl ToolArgs {
             Self::Git(_) => ToolClass::Git,
             Self::Inference(_) => ToolClass::Inference,
             Self::Artifact(_) => ToolClass::Artifact,
+            Self::ListFiles(_) => ToolClass::ListFiles,
+            Self::Search(_) => ToolClass::Search,
             Self::Read(_) | Self::Raw(_) => ToolClass::Read, // Default for raw
         }
     }
@@ -159,6 +182,12 @@ impl ToolArgs {
                     + args.expected_hash.map_or(0, |_| 32)
                     + args.format.as_ref().map_or(0, String::len)
                     + 8 // max_bytes u64
+            },
+            Self::ListFiles(args) => {
+                args.path.to_string_lossy().len() + args.pattern.as_ref().map_or(0, String::len) + 8 // max_entries u64
+            },
+            Self::Search(args) => {
+                args.query.len() + args.scope.to_string_lossy().len() + 16 // max_bytes + max_lines u64
             },
             Self::Raw(args) => args.data.len(),
         }
@@ -337,6 +366,59 @@ pub struct ArtifactArgs {
     ///
     /// The kernel may perform transcoding if supported.
     pub format: Option<String>,
+}
+
+/// Arguments for directory listing operations (TCK-00315).
+///
+/// Per RFC-0018 HEF requirements, `ListFiles` provides minimal file navigation
+/// for reviewers with strict bounds and allowlist enforcement.
+///
+/// # Security
+///
+/// - Path must be relative to workspace root (no `..` traversal)
+/// - Output bounded by `max_entries` (default 1000, max 10000)
+/// - Output bounded by `LISTFILES_OUTPUT_MAX_BYTES` (65536)
+/// - Output bounded by `LISTFILES_OUTPUT_MAX_LINES` (2000)
+/// - Subject to capability allowlist in CONSUME mode
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListFilesArgs {
+    /// Directory path to list (relative to workspace root).
+    pub path: PathBuf,
+
+    /// Optional glob pattern to filter results (e.g., "*.rs").
+    pub pattern: Option<String>,
+
+    /// Maximum number of entries to return (default 1000, max 10000).
+    pub max_entries: Option<u64>,
+}
+
+/// Arguments for text search operations (TCK-00315).
+///
+/// Per RFC-0018 HEF requirements, `Search` provides minimal content search
+/// for reviewers with strict bounds and allowlist enforcement.
+///
+/// # Security
+///
+/// - Scope path must be relative to workspace root (no `..` traversal)
+/// - Output bounded by `max_bytes` (default/max 65536)
+/// - Output bounded by `max_lines` (default/max 2000)
+/// - Query is literal text only (no regex in v0)
+/// - Subject to capability allowlist in CONSUME mode
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchArgs {
+    /// Text query to search for (literal, no regex).
+    pub query: String,
+
+    /// Directory or file path scope (relative to workspace root).
+    pub scope: PathBuf,
+
+    /// Maximum bytes of output to return (default/max 65536).
+    pub max_bytes: Option<u64>,
+
+    /// Maximum lines of output to return (default/max 2000).
+    pub max_lines: Option<u64>,
 }
 
 /// Raw bytes arguments for custom handlers.

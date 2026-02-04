@@ -1412,6 +1412,812 @@ impl ToolHandler for ArtifactFetchHandler {
 }
 
 // =============================================================================
+// ListFilesHandler (TCK-00315)
+// =============================================================================
+
+/// Handler for directory listing operations per TCK-00315.
+///
+/// This handler lists files in a directory with strict bounds and security
+/// controls for FAC v0 reviewer navigation.
+///
+/// # Security Controls
+///
+/// - **Path Validation**: Paths must be relative to workspace root (no `..`
+///   traversal, no absolute paths)
+/// - **Symlink Safety**: Resolved paths are verified to stay within workspace
+/// - **Entry Limit**: Maximum 10,000 entries (default 1,000)
+/// - **Output Bounds**: Hard failure at 65,536 bytes / 2,000 lines
+/// - **Glob Safety**: Optional pattern filtering uses safe glob matching
+///
+/// # Contract References
+///
+/// - TCK-00315: Reviewer navigation tool surface
+/// - REQ-HEF-0010: Tool handler security requirements
+#[derive(Debug)]
+pub struct ListFilesHandler {
+    root: PathBuf,
+}
+
+impl Default for ListFilesHandler {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("."),
+        }
+    }
+}
+
+impl ListFilesHandler {
+    /// Creates a new list files handler using CWD as root.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new list files handler with a specific root directory.
+    #[must_use]
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Checks if a file name matches a glob pattern.
+    ///
+    /// Supports simple glob patterns:
+    /// - `*` matches any sequence of characters
+    /// - `?` matches a single character
+    fn matches_pattern(name: &str, pattern: &str) -> bool {
+        // Simple glob matching without external dependencies
+        Self::glob_match(pattern.as_bytes(), name.as_bytes())
+    }
+
+    /// Simple glob matching (recursive, safe for bounded inputs).
+    fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
+        let mut p_idx = 0;
+        let mut n_idx = 0;
+        let mut star_p = None;
+        let mut star_n = 0;
+
+        while n_idx < name.len() {
+            if p_idx < pattern.len() && pattern[p_idx] == b'*' {
+                // Record star position for backtracking
+                star_p = Some(p_idx);
+                star_n = n_idx;
+                p_idx += 1;
+            } else if p_idx < pattern.len()
+                && (pattern[p_idx] == b'?' || pattern[p_idx] == name[n_idx])
+            {
+                // Match or wildcard ?
+                p_idx += 1;
+                n_idx += 1;
+            } else if let Some(sp) = star_p {
+                // Backtrack to star
+                p_idx = sp + 1;
+                star_n += 1;
+                n_idx = star_n;
+            } else {
+                return false;
+            }
+        }
+
+        // Consume remaining stars in pattern
+        while p_idx < pattern.len() && pattern[p_idx] == b'*' {
+            p_idx += 1;
+        }
+
+        p_idx == pattern.len()
+    }
+
+    /// Counts lines in output.
+    #[allow(clippy::naive_bytecount)] // bytecount crate not needed for small buffers
+    fn count_lines(data: &[u8]) -> usize {
+        data.iter().filter(|&&b| b == b'\n').count()
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ListFilesHandler {
+    fn tool_class(&self) -> ToolClass {
+        ToolClass::ListFiles
+    }
+
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+        use super::tool_handler::{
+            LISTFILES_DEFAULT_ENTRIES, LISTFILES_MAX_ENTRIES, NAVIGATION_OUTPUT_MAX_BYTES,
+            NAVIGATION_OUTPUT_MAX_LINES,
+        };
+
+        // Validate arguments first
+        self.validate(args)?;
+
+        let ToolArgs::ListFiles(ls_args) = args else {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "expected ListFiles arguments".to_string(),
+            });
+        };
+
+        let io_start = Instant::now();
+
+        // Resolve path relative to root
+        let target_path = self.root.join(&ls_args.path);
+
+        // Canonicalize root for comparison
+        let canonical_root =
+            std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize root '{}': {}",
+                    self.root.display(),
+                    e
+                ),
+            })?;
+
+        // Canonicalize target path
+        let canonical_target =
+            std::fs::canonicalize(&target_path).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize path '{}': {}",
+                    target_path.display(),
+                    e
+                ),
+            })?;
+
+        // Verify within workspace root
+        validate_resolved_path_within_root(&canonical_target, &canonical_root)?;
+
+        // Read directory entries
+        let mut entries: Vec<String> = Vec::new();
+        #[allow(clippy::cast_possible_truncation)] // Bounded by LISTFILES_MAX_ENTRIES
+        let max_entries = ls_args.max_entries.map_or(LISTFILES_DEFAULT_ENTRIES, |n| {
+            (n as usize).min(LISTFILES_MAX_ENTRIES)
+        });
+
+        let mut dir_iter = tokio::fs::read_dir(&canonical_target).await.map_err(|e| {
+            ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to read directory '{}': {}",
+                    target_path.display(),
+                    e
+                ),
+            }
+        })?;
+
+        // TCK-00315: Bound the number of entries *scanned* (not just returned) to
+        // prevent denial-of-service on very large directories, especially when
+        // a pattern is set that matches rarely.
+        let mut scanned_entries = 0usize;
+
+        while let Some(entry) =
+            dir_iter
+                .next_entry()
+                .await
+                .map_err(|e| ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to read directory entry: {e}"),
+                })?
+        {
+            scanned_entries += 1;
+            if scanned_entries > LISTFILES_MAX_ENTRIES {
+                return Err(ToolHandlerError::InvalidArgs {
+                    reason: format!(
+                        "directory too large to list safely: scanned more than {LISTFILES_MAX_ENTRIES} entries",
+                    ),
+                });
+            }
+
+            if entries.len() >= max_entries {
+                break;
+            }
+
+            let file_name = entry.file_name().to_string_lossy().to_string();
+
+            // Apply pattern filter if specified
+            if let Some(ref pattern) = ls_args.pattern {
+                if !Self::matches_pattern(&file_name, pattern) {
+                    continue;
+                }
+            }
+
+            // Include type indicator
+            let file_type = entry.file_type().await.ok();
+            let type_indicator = if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
+                "/"
+            } else if file_type
+                .as_ref()
+                .is_some_and(std::fs::FileType::is_symlink)
+            {
+                "@"
+            } else {
+                ""
+            };
+
+            entries.push(format!("{file_name}{type_indicator}"));
+        }
+
+        // Sort entries for deterministic output
+        entries.sort();
+
+        // Build output
+        let output = entries.join("\n");
+        let output_len = output.len();
+        let line_count = Self::count_lines(output.as_bytes()) + usize::from(!output.is_empty());
+
+        // Hard failure if output exceeds bounds
+        if output_len > NAVIGATION_OUTPUT_MAX_BYTES {
+            return Err(ToolHandlerError::OutputTooLarge {
+                bytes: output_len,
+                lines: line_count,
+                max_bytes: NAVIGATION_OUTPUT_MAX_BYTES,
+                max_lines: NAVIGATION_OUTPUT_MAX_LINES,
+            });
+        }
+
+        if line_count > NAVIGATION_OUTPUT_MAX_LINES {
+            return Err(ToolHandlerError::OutputTooLarge {
+                bytes: output_len,
+                lines: line_count,
+                max_bytes: NAVIGATION_OUTPUT_MAX_BYTES,
+                max_lines: NAVIGATION_OUTPUT_MAX_LINES,
+            });
+        }
+
+        let io_duration = io_start.elapsed();
+
+        Ok(ToolResultData::success(
+            output.into_bytes(),
+            BudgetDelta::single_call().with_bytes_io(output_len as u64),
+            io_duration,
+        ))
+    }
+
+    fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
+        use super::tool_handler::LISTFILES_MAX_ENTRIES;
+
+        let ToolArgs::ListFiles(ls_args) = args else {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "expected ListFiles arguments".to_string(),
+            });
+        };
+
+        // Validate path
+        validate_path(&ls_args.path)?;
+
+        // Validate max_entries if provided
+        if let Some(max_entries) = ls_args.max_entries {
+            #[allow(clippy::cast_possible_truncation)] // Bounded by limit check
+            if max_entries as usize > LISTFILES_MAX_ENTRIES {
+                return Err(ToolHandlerError::InvalidArgs {
+                    reason: format!(
+                        "max_entries {max_entries} exceeds limit {LISTFILES_MAX_ENTRIES}",
+                    ),
+                });
+            }
+        }
+
+        // Validate pattern length (prevent ReDoS-style attacks)
+        if let Some(ref pattern) = ls_args.pattern {
+            if pattern.len() > 256 {
+                return Err(ToolHandlerError::InvalidArgs {
+                    reason: format!("pattern too long: {} chars (max 256)", pattern.len()),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "ListFilesHandler"
+    }
+
+    fn estimate_budget(&self, args: &ToolArgs) -> BudgetDelta {
+        use super::tool_handler::LISTFILES_DEFAULT_ENTRIES;
+
+        let entries = if let ToolArgs::ListFiles(ls_args) = args {
+            ls_args
+                .max_entries
+                .unwrap_or(LISTFILES_DEFAULT_ENTRIES as u64)
+        } else {
+            LISTFILES_DEFAULT_ENTRIES as u64
+        };
+        // Estimate ~50 bytes per entry
+        BudgetDelta::single_call().with_bytes_io(entries * 50)
+    }
+}
+
+// =============================================================================
+// SearchHandler (TCK-00315)
+// =============================================================================
+
+/// Handler for text search operations per TCK-00315.
+///
+/// This handler searches for text within files with strict bounds and security
+/// controls for FAC v0 reviewer navigation.
+///
+/// # Security Controls
+///
+/// - **Path Validation**: Scope path must be relative to workspace root
+/// - **Symlink Safety**: Resolved paths are verified to stay within workspace
+/// - **Literal Query**: No regex support in v0 (prevents `ReDoS`)
+/// - **Output Bounds**: Hard failure at 65,536 bytes / 2,000 lines
+/// - **File Traversal**: Bounded to prevent denial-of-service on large
+///   directories
+///
+/// # Contract References
+///
+/// - TCK-00315: Reviewer navigation tool surface
+/// - REQ-HEF-0010: Tool handler security requirements
+#[derive(Debug)]
+pub struct SearchHandler {
+    root: PathBuf,
+}
+
+impl Default for SearchHandler {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("."),
+        }
+    }
+}
+
+/// Maximum files to search (prevent denial-of-service on large directories).
+const SEARCH_MAX_FILES: usize = 10_000;
+
+/// Maximum file size to search (skip large binaries).
+const SEARCH_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
+
+/// Search timeout in milliseconds.
+const SEARCH_TIMEOUT_MS: u64 = 30_000;
+
+/// Maximum number of directory entries to visit during traversal.
+///
+/// This bounds the amount of filesystem work even when `SEARCH_MAX_FILES` is
+/// not reached (e.g., extremely deep/wide trees with many directories and few
+/// qualifying files).
+const SEARCH_MAX_VISITED_ENTRIES: usize = 100_000;
+
+/// Maximum total file bytes to scan in a single search.
+///
+/// This prevents denial-of-service via repeatedly scanning large scopes that
+/// produce little or no output.
+const SEARCH_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB
+
+#[derive(Debug)]
+struct SearchTarget {
+    path: PathBuf,
+    display_path: String,
+    size: u64,
+}
+
+#[derive(Debug)]
+struct SearchOutputState {
+    max_bytes: usize,
+    max_lines: usize,
+    current_bytes: usize,
+    current_lines: usize,
+    results: Vec<String>,
+}
+
+impl SearchHandler {
+    /// Creates a new search handler using CWD as root.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new search handler with a specific root directory.
+    #[must_use]
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Counts lines in output.
+    #[allow(clippy::naive_bytecount)] // bytecount crate not needed for small buffers
+    fn count_lines(data: &[u8]) -> usize {
+        data.iter().filter(|&&b| b == b'\n').count()
+    }
+
+    /// Recursively collects files from a directory.
+    async fn collect_files(
+        dir: &Path,
+        root: &Path,
+        files: &mut Vec<SearchTarget>,
+        max_files: usize,
+    ) -> Result<(), ToolHandlerError> {
+        let mut to_visit: Vec<PathBuf> = vec![dir.to_path_buf()];
+        let mut visited_entries = 0usize;
+
+        while let Some(current_dir) = to_visit.pop() {
+            if files.len() >= max_files {
+                return Ok(());
+            }
+
+            let mut dir_iter = tokio::fs::read_dir(&current_dir).await.map_err(|e| {
+                ToolHandlerError::ExecutionFailed {
+                    message: format!(
+                        "failed to read directory '{}': {}",
+                        current_dir.display(),
+                        e
+                    ),
+                }
+            })?;
+
+            loop {
+                if files.len() >= max_files {
+                    return Ok(());
+                }
+
+                let Some(entry) =
+                    dir_iter
+                        .next_entry()
+                        .await
+                        .map_err(|e| ToolHandlerError::ExecutionFailed {
+                            message: format!("failed to read directory entry: {e}"),
+                        })?
+                else {
+                    break;
+                };
+
+                visited_entries += 1;
+                if visited_entries > SEARCH_MAX_VISITED_ENTRIES {
+                    return Err(ToolHandlerError::InvalidArgs {
+                        reason: format!(
+                            "scope too large to search safely: visited more than {SEARCH_MAX_VISITED_ENTRIES} directory entries",
+                        ),
+                    });
+                }
+
+                let file_type =
+                    entry
+                        .file_type()
+                        .await
+                        .map_err(|e| ToolHandlerError::ExecutionFailed {
+                            message: format!("failed to stat directory entry: {e}"),
+                        })?;
+
+                // Do not follow symlinks during traversal (prevents escapes and cycles).
+                if file_type.is_symlink() {
+                    continue;
+                }
+
+                let entry_path = entry.path();
+
+                // Defense in depth: traversal must stay within root.
+                if !entry_path.starts_with(root) {
+                    continue;
+                }
+
+                if file_type.is_file() {
+                    let metadata =
+                        entry
+                            .metadata()
+                            .await
+                            .map_err(|e| ToolHandlerError::ExecutionFailed {
+                                message: format!(
+                                    "failed to stat file '{}': {}",
+                                    entry_path.display(),
+                                    e
+                                ),
+                            })?;
+
+                    // Skip large files
+                    let size = metadata.len();
+                    if size > SEARCH_MAX_FILE_SIZE {
+                        continue;
+                    }
+
+                    let display_path = entry_path
+                        .strip_prefix(root)
+                        .unwrap_or(&entry_path)
+                        .display()
+                        .to_string();
+
+                    files.push(SearchTarget {
+                        path: entry_path,
+                        display_path,
+                        size,
+                    });
+                } else if file_type.is_dir() {
+                    to_visit.push(entry_path);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Searches a file for the query and returns matching lines.
+    async fn search_file(
+        path: &Path,
+        display_path: &str,
+        query: &str,
+        out: &mut SearchOutputState,
+    ) -> Result<bool, ToolHandlerError> {
+        let Ok(content) = tokio::fs::read_to_string(path).await else {
+            return Ok(false); // Skip unreadable/binary files
+        };
+
+        for (line_num, line) in content.lines().enumerate() {
+            if line.contains(query) {
+                let result_line = format!("{display_path}:{}:{line}", line_num + 1);
+                let line_bytes = result_line.len() + 1; // +1 for newline
+
+                // Check bounds before adding
+                if out.current_bytes + line_bytes > out.max_bytes
+                    || out.current_lines + 1 > out.max_lines
+                {
+                    return Ok(true); // Signal bounds exceeded
+                }
+
+                out.results.push(result_line);
+                out.current_bytes += line_bytes;
+                out.current_lines += 1;
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SearchHandler {
+    fn tool_class(&self) -> ToolClass {
+        ToolClass::Search
+    }
+
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+        use super::tool_handler::{NAVIGATION_OUTPUT_MAX_BYTES, NAVIGATION_OUTPUT_MAX_LINES};
+
+        // Validate arguments first
+        self.validate(args)?;
+
+        let ToolArgs::Search(search_args) = args else {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "expected Search arguments".to_string(),
+            });
+        };
+
+        let search_start = Instant::now();
+
+        // Resolve scope path relative to root
+        let scope_path = self.root.join(&search_args.scope);
+
+        // Canonicalize root for comparison
+        let canonical_root =
+            std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize root '{}': {}",
+                    self.root.display(),
+                    e
+                ),
+            })?;
+
+        // Canonicalize scope path
+        let canonical_scope =
+            std::fs::canonicalize(&scope_path).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize scope '{}': {}",
+                    scope_path.display(),
+                    e
+                ),
+            })?;
+
+        // Verify within workspace root
+        validate_resolved_path_within_root(&canonical_scope, &canonical_root)?;
+
+        // Determine output bounds
+        #[allow(clippy::cast_possible_truncation)] // Bounded by NAVIGATION_OUTPUT_MAX_BYTES
+        let max_bytes = search_args
+            .max_bytes
+            .map_or(NAVIGATION_OUTPUT_MAX_BYTES, |n| {
+                (n as usize).min(NAVIGATION_OUTPUT_MAX_BYTES)
+            });
+        #[allow(clippy::cast_possible_truncation)] // Bounded by NAVIGATION_OUTPUT_MAX_LINES
+        let max_lines = search_args
+            .max_lines
+            .map_or(NAVIGATION_OUTPUT_MAX_LINES, |n| {
+                (n as usize).min(NAVIGATION_OUTPUT_MAX_LINES)
+            });
+
+        let query = &search_args.query;
+        let timeout = Duration::from_millis(SEARCH_TIMEOUT_MS);
+
+        let (output, scanned_bytes) = match tokio::time::timeout(timeout, async {
+            // Collect files to search (bounded traversal)
+            let mut targets: Vec<SearchTarget> = Vec::new();
+            let metadata = tokio::fs::metadata(&canonical_scope).await.map_err(|e| {
+                ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to stat scope '{}': {}", scope_path.display(), e),
+                }
+            })?;
+
+            if metadata.is_file() {
+                let size = metadata.len();
+                if size > SEARCH_MAX_FILE_SIZE {
+                    return Err(ToolHandlerError::InvalidArgs {
+                        reason: format!(
+                            "scope file too large to search safely: {size} bytes (max {SEARCH_MAX_FILE_SIZE})",
+                        ),
+                    });
+                }
+
+                let display_path = canonical_scope
+                    .strip_prefix(&canonical_root)
+                    .unwrap_or(&canonical_scope)
+                    .display()
+                    .to_string();
+
+                targets.push(SearchTarget {
+                    path: canonical_scope.clone(),
+                    display_path,
+                    size,
+                });
+            } else if metadata.is_dir() {
+                Self::collect_files(
+                    &canonical_scope,
+                    &canonical_root,
+                    &mut targets,
+                    SEARCH_MAX_FILES,
+                )
+                .await?;
+            }
+
+            // Deterministic traversal order
+            targets.sort_by(|a, b| a.display_path.cmp(&b.display_path));
+
+            let mut out = SearchOutputState {
+                max_bytes,
+                max_lines,
+                current_bytes: 0,
+                current_lines: 0,
+                results: Vec::new(),
+            };
+            let mut bounds_exceeded = false;
+            let mut scanned_bytes = 0u64;
+
+            for target in &targets {
+                if bounds_exceeded {
+                    break;
+                }
+
+                // Bound total bytes scanned (economics / DoS control)
+                if scanned_bytes.saturating_add(target.size) > SEARCH_MAX_TOTAL_BYTES {
+                    return Err(ToolHandlerError::InvalidArgs {
+                        reason: format!(
+                            "scope too large to search safely: would scan more than {SEARCH_MAX_TOTAL_BYTES} bytes",
+                        ),
+                    });
+                }
+
+                scanned_bytes = scanned_bytes.saturating_add(target.size);
+
+                bounds_exceeded = Self::search_file(
+                    &target.path,
+                    &target.display_path,
+                    query,
+                    &mut out,
+                )
+                .await?;
+            }
+
+            // Build output
+            let output = out.results.join("\n");
+            let output_len = output.len();
+            let final_lines =
+                Self::count_lines(output.as_bytes()) + usize::from(!output.is_empty());
+
+            // Hard failure if bounds exceeded
+            if output_len > max_bytes || final_lines > max_lines || bounds_exceeded {
+                return Err(ToolHandlerError::OutputTooLarge {
+                    bytes: output_len,
+                    lines: final_lines,
+                    max_bytes,
+                    max_lines,
+                });
+            }
+
+            Ok::<_, ToolHandlerError>((output, scanned_bytes))
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(ToolHandlerError::Timeout {
+                    timeout_ms: SEARCH_TIMEOUT_MS,
+                });
+            },
+        };
+
+        let search_duration = search_start.elapsed();
+        #[allow(clippy::cast_possible_truncation)]
+        let wall_ms = search_duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        let output_len = output.len();
+
+        Ok(ToolResultData::success(
+            output.into_bytes(),
+            BudgetDelta::single_call()
+                .with_wall_ms(wall_ms)
+                .with_bytes_io(scanned_bytes.saturating_add(output_len as u64)),
+            search_duration,
+        ))
+    }
+
+    fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
+        use super::tool_handler::{NAVIGATION_OUTPUT_MAX_BYTES, NAVIGATION_OUTPUT_MAX_LINES};
+
+        let ToolArgs::Search(search_args) = args else {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "expected Search arguments".to_string(),
+            });
+        };
+
+        // Validate scope path
+        validate_path(&search_args.scope)?;
+
+        // Validate query is not empty
+        if search_args.query.is_empty() {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "search query cannot be empty".to_string(),
+            });
+        }
+
+        // Validate query length (prevent memory exhaustion)
+        if search_args.query.len() > 1024 {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: format!(
+                    "search query too long: {} chars (max 1024)",
+                    search_args.query.len()
+                ),
+            });
+        }
+
+        // Validate max_bytes if provided
+        if let Some(max_bytes) = search_args.max_bytes {
+            #[allow(clippy::cast_possible_truncation)] // Bounded by limit check
+            if max_bytes as usize > NAVIGATION_OUTPUT_MAX_BYTES {
+                return Err(ToolHandlerError::InvalidArgs {
+                    reason: format!(
+                        "max_bytes {max_bytes} exceeds limit {NAVIGATION_OUTPUT_MAX_BYTES}",
+                    ),
+                });
+            }
+        }
+
+        // Validate max_lines if provided
+        if let Some(max_lines) = search_args.max_lines {
+            #[allow(clippy::cast_possible_truncation)] // Bounded by limit check
+            if max_lines as usize > NAVIGATION_OUTPUT_MAX_LINES {
+                return Err(ToolHandlerError::InvalidArgs {
+                    reason: format!(
+                        "max_lines {max_lines} exceeds limit {NAVIGATION_OUTPUT_MAX_LINES}",
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "SearchHandler"
+    }
+
+    fn estimate_budget(&self, args: &ToolArgs) -> BudgetDelta {
+        use super::tool_handler::NAVIGATION_OUTPUT_MAX_BYTES;
+
+        let max_output_bytes = if let ToolArgs::Search(search_args) = args {
+            search_args
+                .max_bytes
+                .unwrap_or(NAVIGATION_OUTPUT_MAX_BYTES as u64)
+                .min(NAVIGATION_OUTPUT_MAX_BYTES as u64)
+        } else {
+            NAVIGATION_OUTPUT_MAX_BYTES as u64
+        };
+
+        BudgetDelta::single_call()
+            .with_wall_ms(SEARCH_TIMEOUT_MS)
+            .with_bytes_io(SEARCH_MAX_TOTAL_BYTES.saturating_add(max_output_bytes))
+    }
+}
+
+// =============================================================================
 // Handler Registry Helper
 // =============================================================================
 
@@ -1438,6 +2244,8 @@ pub fn register_stub_handlers(
     executor.register_handler(Box::new(ExecuteHandler::new()))?;
     executor.register_handler(Box::new(GitOperationHandler::new()))?;
     executor.register_handler(Box::new(ArtifactFetchHandler::new(cas)))?;
+    executor.register_handler(Box::new(ListFilesHandler::new()))?;
+    executor.register_handler(Box::new(SearchHandler::new()))?;
     Ok(())
 }
 
@@ -2133,5 +2941,290 @@ mod tests {
             matches!(result, Err(ToolHandlerError::FileNotFound { .. })),
             "expected missing artifact"
         );
+    }
+
+    // =========================================================================
+    // ListFilesHandler tests (TCK-00315)
+    // =========================================================================
+
+    use crate::episode::tool_handler::{ListFilesArgs, SearchArgs};
+
+    #[test]
+    fn test_listfiles_validate_relative_path() {
+        let handler = ListFilesHandler::new();
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("src"),
+            pattern: None,
+            max_entries: None,
+        });
+        assert!(handler.validate(&args).is_ok());
+    }
+
+    #[test]
+    fn test_listfiles_validate_rejects_absolute_path() {
+        let handler = ListFilesHandler::new();
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("/etc"),
+            pattern: None,
+            max_entries: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(
+            result,
+            Err(ToolHandlerError::PathValidation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_listfiles_validate_rejects_traversal() {
+        let handler = ListFilesHandler::new();
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("src/../../../etc"),
+            pattern: None,
+            max_entries: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(
+            result,
+            Err(ToolHandlerError::PathValidation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_listfiles_validate_rejects_excessive_max_entries() {
+        let handler = ListFilesHandler::new();
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("src"),
+            pattern: None,
+            max_entries: Some(100_000), // Exceeds LISTFILES_MAX_ENTRIES (10,000)
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
+    }
+
+    #[test]
+    fn test_listfiles_validate_rejects_long_pattern() {
+        let handler = ListFilesHandler::new();
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("src"),
+            pattern: Some("*".repeat(300)), // Exceeds 256 char limit
+            max_entries: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
+    }
+
+    #[test]
+    fn test_listfiles_glob_matching() {
+        // Test the internal glob matcher
+        assert!(ListFilesHandler::matches_pattern("main.rs", "*.rs"));
+        assert!(ListFilesHandler::matches_pattern("lib.rs", "*.rs"));
+        assert!(!ListFilesHandler::matches_pattern("main.txt", "*.rs"));
+        assert!(ListFilesHandler::matches_pattern("test_main.rs", "test_*"));
+        assert!(ListFilesHandler::matches_pattern(
+            "foo.bar.baz",
+            "foo.*.baz"
+        ));
+        assert!(ListFilesHandler::matches_pattern("exact", "exact"));
+        assert!(!ListFilesHandler::matches_pattern("different", "exact"));
+        assert!(ListFilesHandler::matches_pattern("file", "????"));
+        assert!(!ListFilesHandler::matches_pattern("fi", "????"));
+    }
+
+    // =========================================================================
+    // SearchHandler tests (TCK-00315)
+    // =========================================================================
+
+    #[test]
+    fn test_search_validate_relative_scope() {
+        let handler = SearchHandler::new();
+        let args = ToolArgs::Search(SearchArgs {
+            query: "fn main".to_string(),
+            scope: PathBuf::from("src"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        assert!(handler.validate(&args).is_ok());
+    }
+
+    #[test]
+    fn test_search_validate_rejects_absolute_scope() {
+        let handler = SearchHandler::new();
+        let args = ToolArgs::Search(SearchArgs {
+            query: "secret".to_string(),
+            scope: PathBuf::from("/etc/shadow"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(
+            result,
+            Err(ToolHandlerError::PathValidation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_search_validate_rejects_traversal_scope() {
+        let handler = SearchHandler::new();
+        let args = ToolArgs::Search(SearchArgs {
+            query: "secret".to_string(),
+            scope: PathBuf::from("../../../etc"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(
+            result,
+            Err(ToolHandlerError::PathValidation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_search_validate_rejects_empty_query() {
+        let handler = SearchHandler::new();
+        let args = ToolArgs::Search(SearchArgs {
+            query: String::new(),
+            scope: PathBuf::from("src"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
+    }
+
+    #[test]
+    fn test_search_validate_rejects_long_query() {
+        let handler = SearchHandler::new();
+        let args = ToolArgs::Search(SearchArgs {
+            query: "a".repeat(2000), // Exceeds 1024 char limit
+            scope: PathBuf::from("src"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
+    }
+
+    #[test]
+    fn test_search_validate_rejects_excessive_max_bytes() {
+        let handler = SearchHandler::new();
+        let args = ToolArgs::Search(SearchArgs {
+            query: "fn main".to_string(),
+            scope: PathBuf::from("src"),
+            max_bytes: Some(100_000), // Exceeds NAVIGATION_OUTPUT_MAX_BYTES (65536)
+            max_lines: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
+    }
+
+    #[test]
+    fn test_search_validate_rejects_excessive_max_lines() {
+        let handler = SearchHandler::new();
+        let args = ToolArgs::Search(SearchArgs {
+            query: "fn main".to_string(),
+            scope: PathBuf::from("src"),
+            max_bytes: None,
+            max_lines: Some(5000), // Exceeds NAVIGATION_OUTPUT_MAX_LINES (2000)
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
+    }
+
+    #[test]
+    fn test_search_count_lines() {
+        assert_eq!(SearchHandler::count_lines(b""), 0);
+        assert_eq!(SearchHandler::count_lines(b"no newlines"), 0);
+        assert_eq!(SearchHandler::count_lines(b"one\n"), 1);
+        assert_eq!(SearchHandler::count_lines(b"one\ntwo\n"), 2);
+        assert_eq!(SearchHandler::count_lines(b"a\nb\nc"), 2);
+    }
+
+    #[tokio::test]
+    async fn test_search_execute_uses_relative_paths_and_charges_budget() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let file_path = temp_dir.path().join("file.txt");
+        std::fs::write(&file_path, "hello\nfn main\n").expect("write file");
+        let file_size = std::fs::metadata(&file_path).expect("stat file").len();
+
+        let handler = SearchHandler::with_root(temp_dir.path());
+        let args = ToolArgs::Search(SearchArgs {
+            query: "fn main".to_string(),
+            scope: PathBuf::from("file.txt"),
+            max_bytes: None,
+            max_lines: None,
+        });
+
+        let result = handler.execute(&args).await.expect("execute search");
+        let output = result.output_str().expect("utf8 output");
+
+        assert!(
+            output.starts_with("file.txt:"),
+            "expected relative path in output: {output:?}"
+        );
+        assert!(
+            !output.contains(&temp_dir.path().display().to_string()),
+            "output leaked absolute root path: {output:?}"
+        );
+
+        #[allow(clippy::cast_possible_truncation)]
+        let expected_wall_ms = result.duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        assert_eq!(
+            result.budget_consumed.wall_ms, expected_wall_ms,
+            "expected wall_ms to match duration"
+        );
+        assert!(
+            result.budget_consumed.bytes_io >= file_size,
+            "expected bytes_io to include scanned file bytes"
+        );
+        assert!(
+            result.budget_consumed.bytes_io >= result.output.len() as u64,
+            "expected bytes_io to include output bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_execute_rejects_large_single_file_scope() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let file_path = temp_dir.path().join("big.bin");
+        let file = std::fs::File::create(&file_path).expect("create file");
+        file.set_len(SEARCH_MAX_FILE_SIZE + 1)
+            .expect("set file length");
+
+        let handler = SearchHandler::with_root(temp_dir.path());
+        let args = ToolArgs::Search(SearchArgs {
+            query: "needle".to_string(),
+            scope: PathBuf::from("big.bin"),
+            max_bytes: None,
+            max_lines: None,
+        });
+
+        let result = handler.execute(&args).await;
+        assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
+    }
+
+    // =========================================================================
+    // ToolArgs tests for ListFiles and Search (TCK-00315)
+    // =========================================================================
+
+    #[test]
+    fn test_tool_args_listfiles_class() {
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("src"),
+            pattern: None,
+            max_entries: None,
+        });
+        assert_eq!(args.tool_class(), ToolClass::ListFiles);
+    }
+
+    #[test]
+    fn test_tool_args_search_class() {
+        let args = ToolArgs::Search(SearchArgs {
+            query: "fn main".to_string(),
+            scope: PathBuf::from("src"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        assert_eq!(args.tool_class(), ToolClass::Search);
     }
 }
