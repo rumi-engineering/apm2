@@ -439,6 +439,7 @@ pub struct EpisodeRuntime {
     /// Content-addressed store for tool execution results.
     cas: Option<Arc<dyn ContentAddressedStore>>,
     /// Factories for creating tool handlers.
+    #[allow(clippy::type_complexity)]
     handler_factories: RwLock<Vec<Box<dyn Fn() -> Box<dyn ToolHandler> + Send + Sync>>>,
     /// Default budget for new episodes.
     default_budget: EpisodeBudget,
@@ -590,6 +591,7 @@ impl EpisodeRuntime {
 
     /// Sets the default budget for new episodes.
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn with_default_budget(mut self, budget: EpisodeBudget) -> Self {
         self.default_budget = budget;
         self
@@ -852,7 +854,7 @@ impl EpisodeRuntime {
             // Initialize tool executor if CAS is configured
             if let Some(ref cas) = self.cas {
                 let budget_tracker =
-                    Arc::new(BudgetTracker::from_envelope(self.default_budget.clone()));
+                    Arc::new(BudgetTracker::from_envelope(self.default_budget));
                 let mut executor = ToolExecutor::new(budget_tracker, cas.clone());
 
                 if let Some(ref clock) = self.clock {
