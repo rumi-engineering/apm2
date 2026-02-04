@@ -39,9 +39,14 @@ use apm2_core::htf::{ClockProfile, TimeEnvelope, TimeEnvelopeRef};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
+use super::budget::EpisodeBudget;
+use super::budget_tracker::BudgetTracker;
+use super::decision::{Credential, ToolResult};
 use super::error::{EpisodeError, EpisodeId};
+use super::executor::{ContentAddressedStore, ExecutionContext, SharedToolExecutor, ToolExecutor};
 use super::handle::{SessionHandle, StopSignal};
 use super::state::{EpisodeState, QuarantineReason, TerminationClass};
+use super::tool_handler::{ToolArgs, ToolHandler};
 use crate::htf::HolonicClock;
 
 /// Maximum number of concurrent episodes per runtime.
@@ -379,6 +384,8 @@ struct EpisodeEntry {
     state: EpisodeState,
     /// Session handle if running.
     handle: Option<SessionHandle>,
+    /// Tool executor if initialized.
+    executor: Option<SharedToolExecutor>,
 }
 
 /// Episode runtime for managing daemon-hosted episodes.
@@ -429,6 +436,13 @@ pub struct EpisodeRuntime {
     /// When present, all episode events are stamped with a `TimeEnvelopeRef`
     /// for temporal ordering and causality tracking.
     clock: Option<Arc<HolonicClock>>,
+    /// Content-addressed store for tool execution results.
+    cas: Option<Arc<dyn ContentAddressedStore>>,
+    /// Factories for creating tool handlers.
+    #[allow(clippy::type_complexity)]
+    handler_factories: RwLock<Vec<Box<dyn Fn() -> Box<dyn ToolHandler> + Send + Sync>>>,
+    /// Default budget for new episodes.
+    default_budget: EpisodeBudget,
 }
 
 impl EpisodeRuntime {
@@ -446,6 +460,12 @@ impl EpisodeRuntime {
             session_seq: AtomicU64::new(1),
             episode_seq: AtomicU64::new(1),
             clock: None,
+            cas: None,
+            handler_factories: RwLock::new(Vec::new()),
+            // SEC-CTRL-FAC-0015: Fail-closed default budget prevents DoS
+            // via unbounded resource consumption. Consumers can override
+            // with `with_default_budget()` if needed.
+            default_budget: EpisodeBudget::default(),
         }
     }
 
@@ -469,6 +489,10 @@ impl EpisodeRuntime {
             session_seq: AtomicU64::new(1),
             episode_seq: AtomicU64::new(1),
             clock: Some(clock),
+            cas: None,
+            handler_factories: RwLock::new(Vec::new()),
+            // SEC-CTRL-FAC-0015: Fail-closed default budget
+            default_budget: EpisodeBudget::default(),
         }
     }
 
@@ -560,6 +584,43 @@ impl EpisodeRuntime {
     #[must_use]
     pub const fn clock(&self) -> Option<&Arc<HolonicClock>> {
         self.clock.as_ref()
+    }
+
+    /// Sets the content-addressed store for tool execution results.
+    #[must_use]
+    pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
+        self.cas = Some(cas);
+        self
+    }
+
+    /// Sets the default budget for new episodes.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn with_default_budget(mut self, budget: EpisodeBudget) -> Self {
+        self.default_budget = budget;
+        self
+    }
+
+    /// Registers a factory for creating tool handlers (builder pattern).
+    #[must_use]
+    pub fn with_handler_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Box<dyn ToolHandler> + Send + Sync + 'static,
+    {
+        self.handler_factories.get_mut().push(Box::new(factory));
+        self
+    }
+
+    /// Registers a factory for creating tool handlers.
+    ///
+    /// This allows the runtime to spawn fresh handlers for each episode
+    /// (needed because handlers are consumed by the executor).
+    pub async fn register_tool_handler_factory<F>(&self, factory: F)
+    where
+        F: Fn() -> Box<dyn ToolHandler> + Send + Sync + 'static,
+    {
+        let mut factories = self.handler_factories.write().await;
+        factories.push(Box::new(factory));
     }
 
     /// Stamps a time envelope and returns both the envelope and its reference.
@@ -670,6 +731,7 @@ impl EpisodeRuntime {
                 EpisodeEntry {
                     state,
                     handle: None,
+                    executor: None,
                 },
             );
         }
@@ -792,6 +854,30 @@ impl EpisodeRuntime {
                 timestamp_ns,
             );
             entry.handle = Some(handle.clone());
+
+            // Initialize tool executor if CAS is configured
+            if let Some(ref cas) = self.cas {
+                let budget_tracker = Arc::new(BudgetTracker::from_envelope(self.default_budget));
+                let mut executor = ToolExecutor::new(budget_tracker, cas.clone());
+
+                if let Some(ref clock) = self.clock {
+                    executor = executor.with_clock(clock.clone());
+                }
+
+                // Register handlers from factories
+                let factories = self.handler_factories.read().await;
+                for factory in factories.iter() {
+                    if let Err(e) = executor.register_handler(factory()) {
+                        warn!(
+                            episode_id = %episode_id,
+                            error = %e,
+                            "failed to register handler for episode"
+                        );
+                    }
+                }
+
+                entry.executor = Some(Arc::new(tokio::sync::RwLock::new(executor)));
+            }
 
             handle
         };
@@ -1025,6 +1111,64 @@ impl EpisodeRuntime {
 
         warn!(episode_id = %episode_id, "episode quarantined");
         Ok(())
+    }
+
+    /// Executes a tool in the context of an episode.
+    ///
+    /// # Arguments
+    ///
+    /// * `episode_id` - The episode to execute the tool in
+    /// * `args` - The tool arguments
+    /// * `credential` - Optional credential for authenticated operations
+    ///
+    /// # Returns
+    ///
+    /// The tool result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the episode is not found, not running, or if
+    /// execution fails.
+    pub async fn execute_tool(
+        &self,
+        episode_id: &EpisodeId,
+        args: &ToolArgs,
+        credential: Option<&Credential>,
+        timestamp_ns: u64,
+        request_id: &str,
+    ) -> Result<ToolResult, EpisodeError> {
+        let episodes = self.episodes.read().await;
+        let entry = episodes
+            .get(episode_id.as_str())
+            .ok_or_else(|| EpisodeError::NotFound {
+                id: episode_id.as_str().to_string(),
+            })?;
+
+        if !entry.state.is_running() {
+            return Err(EpisodeError::InvalidTransition {
+                id: episode_id.as_str().to_string(),
+                from: entry.state.state_name(),
+                to: "execute_tool",
+            });
+        }
+
+        let executor = entry.executor.as_ref().ok_or_else(|| {
+            warn!(episode_id = %episode_id, "executor not available (CAS missing?)");
+            EpisodeError::Internal {
+                message: "executor not available".to_string(),
+            }
+        })?;
+
+        let ctx = ExecutionContext::new(episode_id.clone(), request_id, timestamp_ns);
+
+        let executor_guard = executor.write().await;
+        executor_guard
+            .execute(&ctx, args, credential)
+            .await
+            .map_err(|e| EpisodeError::ExecutionFailed {
+                id: episode_id.as_str().to_string(),
+                message: e.to_string(),
+            })
     }
 
     /// Emits a `LeaseIssueDenied` event for `SoD` violations and other spawn

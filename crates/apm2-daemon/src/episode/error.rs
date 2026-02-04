@@ -183,6 +183,15 @@ pub enum EpisodeError {
         /// The author's custody domain that overlaps.
         author_domain: String,
     },
+
+    /// Tool execution failed.
+    #[error("tool execution failed for episode {id}: {message}")]
+    ExecutionFailed {
+        /// Episode identifier.
+        id: String,
+        /// Error message.
+        message: String,
+    },
 }
 
 impl EpisodeError {
@@ -206,6 +215,7 @@ impl EpisodeError {
             Self::Internal { .. } => "internal",
             Self::ClockFailure { .. } => "clock_failure",
             Self::CustodyDomainViolation { .. } => "custody_domain_violation",
+            Self::ExecutionFailed { .. } => "execution_failed",
         }
     }
 }

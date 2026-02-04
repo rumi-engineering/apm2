@@ -42,7 +42,7 @@ use tracing::{debug, instrument, warn};
 
 use super::broker::StubContentAddressedStore;
 use super::budget_tracker::{BudgetExhaustedError, BudgetTracker};
-use super::decision::{BudgetDelta, ToolResult};
+use super::decision::{BudgetDelta, Credential, ToolResult};
 use super::error::EpisodeId;
 use super::runtime::Hash;
 use super::tool_class::ToolClass;
@@ -412,6 +412,7 @@ impl ToolExecutor {
         &self,
         ctx: &ExecutionContext,
         args: &ToolArgs,
+        credential: Option<&Credential>,
     ) -> Result<ToolResult, ExecutorError> {
         let tool_class = args.tool_class();
         let start_time = Instant::now();
@@ -436,7 +437,7 @@ impl ToolExecutor {
         );
 
         // Step 4: Execute handler
-        let result_data = match handler.execute(args).await {
+        let result_data = match handler.execute(args, credential).await {
             Ok(data) => data,
             Err(err) => {
                 warn!(error = %err, "handler execution failed");
@@ -479,8 +480,8 @@ impl ToolExecutor {
         );
 
         // Step 6: Store result in CAS
-        let result_hash = self.store_result_data(&result_data)?;
-        debug!(result_hash = %hex::encode(&result_hash[..8]), "result stored in CAS");
+        let cas_hash = self.store_result_data(&result_data)?;
+        debug!(cas_hash = %hex::encode(&cas_hash[..8]), "result stored in CAS");
 
         // Step 7: Build result
         let duration = start_time.elapsed();
@@ -489,13 +490,18 @@ impl ToolExecutor {
         let duration_ns = duration.as_nanos() as u64;
         let completed_at_ns = ctx.started_at_ns.saturating_add(duration_ns);
 
+        // SEC-CTRL-FAC-0015 BLOCKER FIX: Set CAS hash for evidence integrity.
+        // The CAS hash references the full ToolResultData (output, error_output,
+        // budget) so clients can retrieve complete execution data when inline
+        // results are size-limited.
         let mut result = ToolResult::success(
             &ctx.request_id,
             result_data.output,
             result_data.budget_consumed,
             duration,
             completed_at_ns,
-        );
+        )
+        .with_cas_hash(cas_hash);
 
         // Step 8: Stamp time envelope (RFC-0016 HTF, TCK-00240)
         // Per SEC-CTRL-FAC-0015, if clock is configured, stamping must succeed
@@ -692,7 +698,11 @@ mod tests {
             ToolClass::Read
         }
 
-        async fn execute(&self, _args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+        async fn execute(
+            &self,
+            _args: &ToolArgs,
+            _credential: Option<&Credential>,
+        ) -> Result<ToolResultData, ToolHandlerError> {
             if self.should_fail {
                 return Err(ToolHandlerError::FileNotFound {
                     path: "/nonexistent".to_string(),
@@ -781,7 +791,10 @@ mod tests {
             limit: None,
         });
 
-        let result = executor.execute(&test_context(), &args).await.unwrap();
+        let result = executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         assert!(result.success);
         assert_eq!(result.output, b"file contents");
@@ -798,7 +811,7 @@ mod tests {
             limit: None,
         });
 
-        let result = executor.execute(&test_context(), &args).await;
+        let result = executor.execute(&test_context(), &args, None).await;
 
         assert!(matches!(result, Err(ExecutorError::HandlerNotFound { .. })));
     }
@@ -837,7 +850,10 @@ mod tests {
             limit: None,
         });
 
-        let result = executor.execute(&test_context(), &args).await.unwrap();
+        let result = executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         // Should return failure result, not error
         assert!(!result.success);
@@ -857,7 +873,10 @@ mod tests {
             limit: None,
         });
 
-        executor.execute(&test_context(), &args).await.unwrap();
+        executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         let consumed = executor.budget_tracker().consumed();
         assert_eq!(consumed.tool_calls, 1);
@@ -881,10 +900,13 @@ mod tests {
         });
 
         // First execution succeeds
-        executor.execute(&test_context(), &args).await.unwrap();
+        executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         // Second execution fails due to budget
-        let result = executor.execute(&test_context(), &args).await;
+        let result = executor.execute(&test_context(), &args, None).await;
         assert!(matches!(result, Err(ExecutorError::BudgetExceeded(_))));
     }
 
@@ -955,7 +977,10 @@ mod tests {
             limit: None,
         });
 
-        let result = executor.execute(&test_context(), &args).await.unwrap();
+        let result = executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         // Result should be successful
         assert!(result.success);
@@ -984,7 +1009,10 @@ mod tests {
 
         // Execute tool - MockReadHandler returns budget with bytes_io=13
         // but the estimate is based on limit (4096 default)
-        executor.execute(&test_context(), &args).await.unwrap();
+        executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         // Budget should be reconciled to actual consumption
         let consumed = executor.budget_tracker().consumed();
@@ -1013,7 +1041,10 @@ mod tests {
             limit: None,
         });
 
-        let result = executor.execute(&test_context(), &args).await.unwrap();
+        let result = executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         assert!(result.success);
         assert!(
