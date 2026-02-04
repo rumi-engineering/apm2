@@ -1,0 +1,289 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  principles:
+    - "Tickets MUST be atomic and independently verifiable."
+    - "Each ticket MUST reference requirement_ids and evidence_ids."
+    - "Cross-ticket dependencies MUST be explicit and minimal."
+    - "Each ticket is a single YAML file containing all metadata, scope, plan, and criteria."
+  ticket_plan:
+    ticket_storage_root: "documents/work/tickets/"
+    tickets:
+      - ticket_id: "TCK-00316"
+        title: "Session dispatcher viability closure"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00316.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Wire SessionDispatcher with CAS, ledger, clock, broker"
+            - "Remove legacy allow path in production"
+            - "Implement real PublishEvidence and EmitEvent"
+          out_of_scope:
+            - "Capability manifest implementation (separate ticket)"
+        binds:
+          requirement_ids:
+            - "REQ-0001"
+          evidence_ids:
+            - "EVID-0001"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_KERNEL"
+        dependencies: []
+        definition_of_done:
+          criteria:
+            - "SessionDispatcher constructed with full dependencies in production path"
+            - "RequestTool returns kernel-executed, CAS-backed results"
+            - "Legacy allow path denied in production mode"
+          evidence_ids:
+            - "EVID-0001"
+
+      - ticket_id: "TCK-00317"
+        title: "Reviewer capability manifest (real allowlist)"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00317.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Define reviewer v0 capability manifest schema"
+            - "Store manifest in CAS"
+            - "SpawnEpisode loads manifest by hash"
+          out_of_scope:
+            - "Implementor capability manifest (future)"
+        binds:
+          requirement_ids:
+            - "REQ-0002"
+          evidence_ids:
+            - "EVID-0002"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_SECURITY"
+        dependencies:
+          - "TCK-00316"
+        definition_of_done:
+          criteria:
+            - "Reviewer manifest allows: GitOperation (read), ArtifactFetch, ListFiles, Search"
+            - "Manifest stored in CAS with content hash"
+            - "SpawnEpisode resolves manifest from policy"
+          evidence_ids:
+            - "EVID-0002"
+
+      - ticket_id: "TCK-00318"
+        title: "Workspace apply implementation (safe patch apply)"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00318.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Implement apply_changeset with isolated workspace"
+            - "Base commit checkout from local mirror"
+            - "Safe patch application with path validation"
+            - "ReviewBlockedRecorded on failure"
+          out_of_scope:
+            - "Tool handler rooting (separate ticket)"
+        binds:
+          requirement_ids:
+            - "REQ-0003"
+          evidence_ids:
+            - "EVID-0003"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+        dependencies: []
+        definition_of_done:
+          criteria:
+            - "Workspace created per-episode"
+            - "Patch paths validated for root containment"
+            - "Failed apply emits ReviewBlockedRecorded"
+          evidence_ids:
+            - "EVID-0003"
+
+      - ticket_id: "TCK-00319"
+        title: "Root tool handlers per workspace"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00319.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Amend ListFiles/Search handlers to use workspace root"
+            - "Amend GitOperation handlers similarly"
+            - "Path traversal prevention"
+          out_of_scope:
+            - "Workspace creation (TCK-00318)"
+        binds:
+          requirement_ids:
+            - "REQ-0003"
+          evidence_ids:
+            - "EVID-0003"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+        dependencies:
+          - "TCK-00318"
+        definition_of_done:
+          criteria:
+            - "Tool handlers rooted to workspace, not daemon CWD"
+            - "Symlink escape blocked"
+            - "ListFiles/Search reflect patched workspace"
+          evidence_ids:
+            - "EVID-0003"
+
+      - ticket_id: "TCK-00320"
+        title: "Tool log hash propagation"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00320.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "ToolExecutor returns CAS hash per result"
+            - "Per-episode accumulator for hashes"
+            - "ToolLogIndex artifact creation"
+            - "ReviewArtifactBundle includes tool_log_hashes"
+          out_of_scope:
+            - "Receipt emission (TCK-00321)"
+        binds:
+          requirement_ids:
+            - "REQ-0004"
+          evidence_ids:
+            - "EVID-0004"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+        dependencies:
+          - "TCK-00316"
+        definition_of_done:
+          criteria:
+            - "Tool result hashes returned from executor"
+            - "ToolLogIndex stored in CAS"
+            - "ReviewArtifactBundle.tool_log_hashes populated"
+          evidence_ids:
+            - "EVID-0004"
+
+      - ticket_id: "TCK-00321"
+        title: "Episode event sink to ledger"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00321.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Episode event sink appends to ledger"
+            - "Atomic receipt emission at completion"
+            - "CAS-before-event ordering"
+          out_of_scope:
+            - "Tool log capture (TCK-00320)"
+        binds:
+          requirement_ids:
+            - "REQ-0005"
+          evidence_ids:
+            - "EVID-0005"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_KERNEL"
+        dependencies:
+          - "TCK-00316"
+          - "TCK-00320"
+        definition_of_done:
+          criteria:
+            - "Episode events persisted to ledger as they occur"
+            - "Receipt emitted atomically at completion"
+            - "Events survive daemon restart"
+          evidence_ids:
+            - "EVID-0005"
+
+      - ticket_id: "TCK-00322"
+        title: "Projection worker (daemon integration)"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00322.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Wire projection module into daemon"
+            - "Ledger tailer for projection decisions"
+            - "Work index: changeset -> work_id -> PR"
+            - "GitHub adapter for status + comment"
+          out_of_scope:
+            - "Projection receipt event (TCK-00323)"
+        binds:
+          requirement_ids:
+            - "REQ-0006"
+          evidence_ids:
+            - "EVID-0006"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_PROJECTION"
+        dependencies:
+          - "TCK-00321"
+        definition_of_done:
+          criteria:
+            - "Projection worker runs as daemon task"
+            - "ReviewReceiptRecorded triggers GitHub projection"
+            - "Status + comment posted to PR"
+          evidence_ids:
+            - "EVID-0006"
+
+      - ticket_id: "TCK-00323"
+        title: "ProjectionReceiptRecorded kernel event"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00323.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Define ProjectionReceiptRecorded event schema"
+            - "Canonicalization + topic derivation"
+            - "Durable projection receipts in CAS"
+            - "Idempotency via receipt lookup"
+          out_of_scope:
+            - "Tamper detection (optional v0.1)"
+        binds:
+          requirement_ids:
+            - "REQ-0006"
+          evidence_ids:
+            - "EVID-0006"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_KERNEL"
+          - "DOMAIN_PROJECTION"
+        dependencies:
+          - "TCK-00322"
+        definition_of_done:
+          criteria:
+            - "ProjectionReceiptRecorded event defined"
+            - "Projection receipts stored in CAS"
+            - "Idempotency prevents duplicate projections"
+          evidence_ids:
+            - "EVID-0006"
+
+      - ticket_id: "TCK-00324"
+        title: "xtask cutover stage 1"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00324.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Add --emit-receipt-only mode to xtask"
+            - "Require --allow-github-write for direct writes"
+            - "xtask triggers ingestion + waits for projection"
+          out_of_scope:
+            - "Full xtask deprecation (future stages)"
+        binds:
+          requirement_ids:
+            - "REQ-0007"
+          evidence_ids:
+            - "EVID-0007"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+        dependencies:
+          - "TCK-00322"
+          - "TCK-00323"
+        definition_of_done:
+          criteria:
+            - "xtask has --emit-receipt-only mode"
+            - "Direct writes require explicit flag"
+            - "Default path uses projection worker"
+          evidence_ids:
+            - "EVID-0007"

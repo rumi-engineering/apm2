@@ -1,0 +1,93 @@
+rfc_contracts_and_versioning:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  contracts:
+    - id: "CTR-0001"
+      name: "CapabilityManifest Schema"
+      type: "ARTIFACT_SCHEMA"
+      versioning:
+        scheme: "SEMVER"
+        current_version: "1.0.0"
+        compatibility_rules:
+          - "Adding new capability types is backward compatible"
+          - "Removing capability types requires major version bump"
+      schemas:
+        - id: "SCH-0001"
+          path: "crates/apm2-cas/src/artifact_types/capability_manifest.rs"
+          format: "RUST_STRUCT"
+          description: "CAS artifact schema for capability manifests"
+      evidence_ids: []
+
+    - id: "CTR-0002"
+      name: "ToolLogIndex Schema"
+      type: "ARTIFACT_SCHEMA"
+      versioning:
+        scheme: "SEMVER"
+        current_version: "1.0.0"
+        compatibility_rules:
+          - "Adding metadata fields is backward compatible"
+      schemas:
+        - id: "SCH-0002"
+          path: "crates/apm2-cas/src/artifact_types/tool_log_index.rs"
+          format: "RUST_STRUCT"
+          description: "CAS artifact schema for tool log indices"
+      evidence_ids: []
+
+    - id: "CTR-0003"
+      name: "ProjectionReceiptRecorded Event"
+      type: "KERNEL_EVENT"
+      versioning:
+        scheme: "SEMVER"
+        current_version: "1.0.0"
+        compatibility_rules:
+          - "Event fields are append-only"
+          - "Removing fields requires major version bump"
+      schemas:
+        - id: "SCH-0003"
+          path: "crates/apm2-ledger/src/events/projection.rs"
+          format: "RUST_STRUCT"
+          description: "Kernel event for anchoring projection receipts"
+      evidence_ids: []
+
+    - id: "CTR-0004"
+      name: "WorkspaceManager Interface"
+      type: "INTERNAL_API"
+      versioning:
+        scheme: "SEMVER"
+        current_version: "1.0.0"
+        compatibility_rules:
+          - "Method signatures stable within major version"
+      schemas:
+        - id: "SCH-0004"
+          path: "crates/apm2-daemon/src/episode/workspace.rs"
+          format: "RUST_TRAIT"
+          description: "Interface for workspace lifecycle management"
+      evidence_ids: []
+
+  outputs:
+    artifacts_produced:
+      - id: "OUT-0001"
+        name: "CapabilityManifest CAS artifact"
+        format: "Canonical JSON in CAS"
+        produced_by: "Policy resolution during SpawnEpisode"
+      - id: "OUT-0002"
+        name: "ToolLogIndex CAS artifact"
+        format: "Canonical JSON in CAS"
+        produced_by: "EpisodeRuntime on episode completion"
+      - id: "OUT-0003"
+        name: "ProjectionReceiptRecorded event"
+        format: "Canonical event bytes in ledger"
+        produced_by: "ProjectionWorker after GitHub write"
+    failure_modes:
+      - id: "FAIL-0001"
+        condition: "CAS unavailable during tool execution"
+        behavior: "Tool returns error; session continues with partial results"
+        recovery: "Retry on CAS recovery"
+      - id: "FAIL-0002"
+        condition: "Ledger unavailable during event emission"
+        behavior: "Episode blocks until ledger recovers or budget exhausted"
+        recovery: "Automatic retry with exponential backoff"
+      - id: "FAIL-0003"
+        condition: "GitHub API unavailable during projection"
+        behavior: "Projection deferred; receipt not recorded"
+        recovery: "Projection worker retries on ledger tail catch-up"

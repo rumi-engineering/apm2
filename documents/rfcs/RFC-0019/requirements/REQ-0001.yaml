@@ -1,0 +1,29 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0001"
+  title: "Session dispatcher viability (TCK-00290 closure)"
+  category: "FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    SessionDispatcher must be constructed with CAS access, ledger append, clock, and ToolBroker.
+    The legacy allow path must be removed or gated: in production mode, deny if broker absent.
+    RequestTool must cause actual execution and return kernel-produced, CAS-backed results.
+    PublishEvidence must store to CAS and return hash.
+    EmitEvent must append canonical kernel event bytes to ledger.
+  rationale: |
+    Current state: SessionDispatcher::with_persistence constructs without CAS, ledger, clock, or broker
+    (crates/apm2-daemon/src/state.rs:309-331). The legacy allow path returns ALLOW based on manifest
+    allowlist when no broker is present (crates/apm2-daemon/src/protocol/session_dispatch.rs:956-1059).
+    This makes sessions non-viable for FAC automation.
+  acceptance_criteria:
+    - "SessionDispatcher constructed with CAS, ledger, clock, and ToolBroker in production"
+    - "RequestTool returns kernel-executed, CAS-backed results"
+    - "PublishEvidence stores to CAS and returns content hash"
+    - "EmitEvent appends canonical event bytes to ledger"
+    - "Legacy allow path returns DENY when broker absent in production mode"
+  evidence_ids:
+    - "EVID-0001"
+  source_refs:
+    - "crates/apm2-daemon/src/state.rs:309-331"
+    - "crates/apm2-daemon/src/protocol/session_dispatch.rs:956-1059"

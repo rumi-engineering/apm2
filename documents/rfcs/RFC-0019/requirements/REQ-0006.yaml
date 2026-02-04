@@ -1,0 +1,33 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0006"
+  title: "Projection worker wiring (GitHub output-only)"
+  category: "FUNCTIONAL"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    Projection worker must be wired into daemon:
+    1. Long-running projection task reads ledger commits (tailer)
+    2. Build work index: changeset_digest -> work_id (from ChangeSetPublished),
+       work_id -> PR metadata (from WorkPrAssociated or config)
+    3. On ReviewReceiptRecorded: fetch review artifacts from CAS, apply projection
+       via GitHub adapter, store projection receipt (durable)
+    4. Define ProjectionReceiptRecorded kernel event referencing CAS hash of projection receipt bundle
+    5. Projection must be idempotent (restarts don't duplicate comments)
+    6. Projection can detect tamper (optional v0.1)
+  rationale: |
+    Current state: projection module exists but "not wired into main daemon"
+    (crates/apm2-daemon/src/projection/mod.rs:3-12). This means review results
+    cannot be posted to GitHub.
+  acceptance_criteria:
+    - "Projection worker runs as daemon task"
+    - "Ledger tail drives projection decisions"
+    - "ReviewReceiptRecorded triggers GitHub status + comment"
+    - "Projection receipts stored durably in CAS"
+    - "ProjectionReceiptRecorded event anchored in ledger"
+    - "Restarts don't duplicate GitHub comments (idempotency)"
+    - "Projection output matches internal review receipt"
+  evidence_ids:
+    - "EVID-0006"
+  source_refs:
+    - "crates/apm2-daemon/src/projection/mod.rs:3-12"

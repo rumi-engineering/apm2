@@ -1,0 +1,33 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0003"
+  title: "Workspace apply and isolation (TCK-00311 closure)"
+  category: "FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    WorkspaceManager::apply_changeset must be implemented to:
+    1. Create workspace dir per session (or per changeset+session)
+    2. Checkout base commit from local mirror
+    3. Apply patch bytes safely (validate paths; no outside-root writes)
+    4. Record failure as KernelEvent(ReviewBlockedRecorded) with appropriate reason
+
+    Tool handlers (including PR #389 ListFiles/Search) must be instantiated with workspace root,
+    not daemon CWD. Path traversal must be impossible (symlink escapes blocked; canonical root checks).
+  rationale: |
+    Current state: workspace apply is stubbed (crates/apm2-daemon/src/episode/workspace.rs:683-707).
+    ListFiles/Search handlers default root is "." (crates/apm2-daemon/src/episode/handlers.rs:1461-1466).
+    This means tool navigation/search occurs on wrong filesystem state, and isolated FAC runs are not possible.
+  acceptance_criteria:
+    - "apply_changeset creates isolated workspace directory"
+    - "Base commit checkout from local mirror succeeds"
+    - "Patch apply validates all paths for root containment"
+    - "Symlink escapes are blocked"
+    - "Failed apply emits ReviewBlockedRecorded event (no crash)"
+    - "ListFiles/Search reflect patched workspace state"
+    - "Tool handlers rooted to workspace, not daemon CWD"
+  evidence_ids:
+    - "EVID-0003"
+  source_refs:
+    - "crates/apm2-daemon/src/episode/workspace.rs:683-707"
+    - "crates/apm2-daemon/src/episode/handlers.rs:1461-1466"

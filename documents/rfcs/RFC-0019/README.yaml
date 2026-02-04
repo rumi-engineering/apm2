@@ -1,0 +1,40 @@
+rfc_readme:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  rfc_id: "RFC-0019"
+  title: "Automated FAC v0: End-to-end ingestion, review episode, durable receipt, GitHub projection"
+  summary: |
+    This RFC specifies the remaining integration work to reach automated FAC v0 where:
+    1. A PR/changeset is ingested into CAS+ledger
+    2. A reviewer episode runs with bounded tools over an isolated workspace
+    3. Review artifacts are stored durably in CAS and anchored by ledger events
+    4. A projection worker posts results to GitHub as output only
+
+    RFC-0019 builds on RFC-0018 (HEF/FAC v0 primitives) and addresses the missing
+    daemon control-plane wiring: session viability, workspace apply, tool log capture,
+    episode event persistence, and projection worker integration.
+  key_files:
+    - file: "00_meta.yaml"
+      purpose: "RFC metadata, bindings, dependencies"
+    - file: "01_problem_and_imports.yaml"
+      purpose: "Problem statement, PRD imports, requirements binding"
+    - file: "02_design_decisions.yaml"
+      purpose: "Key architectural decisions with alternatives"
+    - file: "03_trust_boundaries.yaml"
+      purpose: "Security boundaries and risk analysis"
+    - file: "04_contracts_and_versioning.yaml"
+      purpose: "Schema contracts and versioning policy"
+    - file: "05_rollout_and_ops.yaml"
+      purpose: "Phased rollout plan and operational runbooks"
+    - file: "06_ticket_decomposition.yaml"
+      purpose: "Engineering tickets (TCK-00316 through TCK-00324)"
+    - file: "07_test_and_evidence.yaml"
+      purpose: "Test plan and evidence registry"
+    - file: "08_risks_and_open_questions.yaml"
+      purpose: "Risk analysis and open questions"
+    - file: "09_governance_and_gates.yaml"
+      purpose: "Gate reviews and waivers"
+  status: "DRAFT"
+  version: "v0"
+  lifecycle_stage: "DISCOVERY"
+  next_action: "Council review for v0 discovery; advance to v2 (Grounded)"

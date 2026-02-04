@@ -1,0 +1,15 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0003"
+  title: "Workspace apply and isolation evidence"
+  category: "INTEGRATION_TEST_RESULT"
+  status: "PENDING"
+  description: |
+    Evidence that workspace apply creates isolated directories,
+    validates paths, and tools are rooted correctly.
+  requirement_ids:
+    - "REQ-0003"
+  source_refs:
+    - "crates/apm2-daemon/src/episode/workspace.rs"
+    - "crates/apm2-daemon/src/episode/handlers.rs"
+  artifacts: []

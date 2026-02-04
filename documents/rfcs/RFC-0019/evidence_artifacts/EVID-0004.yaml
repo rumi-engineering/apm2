@@ -1,0 +1,14 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0004"
+  title: "Tool log capture evidence"
+  category: "INTEGRATION_TEST_RESULT"
+  status: "PENDING"
+  description: |
+    Evidence that tool execution returns CAS hashes,
+    ToolLogIndex is created, and ReviewArtifactBundle includes tool_log_hashes.
+  requirement_ids:
+    - "REQ-0004"
+  source_refs:
+    - "crates/apm2-daemon/src/episode/executor.rs"
+  artifacts: []

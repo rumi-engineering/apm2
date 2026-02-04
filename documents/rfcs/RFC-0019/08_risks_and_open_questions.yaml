@@ -1,0 +1,69 @@
+rfc_risks_and_open_questions:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  risks:
+    - id: "RSK-0001"
+      statement: "Legacy allow path bypass: absent broker = client-side tool execution without kernel evidence"
+      impact: "HIGH - Violates fail-closed constraint; enables unaudited tool execution"
+      likelihood: "MEDIUM - Code path exists and is reachable"
+      mitigations:
+        - "Remove/gate legacy allow path"
+        - "Require broker in production mode"
+        - "Integration test verifies denial when broker absent"
+      evidence_ids: []
+      source_ref: "crates/apm2-daemon/src/protocol/session_dispatch.rs:956-1059"
+
+    - id: "RSK-0002"
+      statement: "Workspace escape: patch apply could write outside root or follow symlinks"
+      impact: "HIGH - Arbitrary file write from untrusted patch"
+      likelihood: "LOW - Requires malicious patch construction"
+      mitigations:
+        - "Strict path validation before apply"
+        - "Canonical root containment check"
+        - "Symlink policy (block or resolve within root)"
+        - "Fuzz testing of patch paths"
+      evidence_ids: []
+      source_ref: "crates/apm2-daemon/src/episode/workspace.rs:683-707"
+
+    - id: "RSK-0003"
+      statement: "Receipt integrity: tool logs not linked to receipts prevents audit"
+      impact: "MEDIUM - Cannot verify tool execution from receipt alone"
+      likelihood: "HIGH - Current state doesn't propagate hashes"
+      mitigations:
+        - "Propagate CAS hashes from executor"
+        - "ToolLogIndex anchors all hashes"
+        - "ReviewArtifactBundle includes tool_log_hashes"
+      evidence_ids: []
+      source_ref: "crates/apm2-daemon/src/episode/executor.rs:458-501"
+
+    - id: "RSK-0004"
+      statement: "Projection duplication: restart causes repeated comments/statuses"
+      impact: "MEDIUM - User confusion; polluted PR history"
+      likelihood: "MEDIUM - Restarts are common during development"
+      mitigations:
+        - "Durable projection receipts"
+        - "Idempotency keys based on (work_id, receipt_hash)"
+        - "Check before write pattern"
+      evidence_ids: []
+      source_ref: "crates/apm2-daemon/src/projection/mod.rs:3-12"
+
+  open_questions:
+    - id: "Q-0001"
+      question: "Should ToolLogIndex include tool invocation metadata (timestamps, input hashes) or only result hashes?"
+      decision_needed_by: "TCK-00320 implementation"
+      resolution_plan: "Design review during ticket implementation; default to result hashes only for v0"
+
+    - id: "Q-0002"
+      question: "Should workspace cleanup be eager (on episode complete) or lazy (periodic GC)?"
+      decision_needed_by: "TCK-00318 implementation"
+      resolution_plan: "Start with eager cleanup; add lazy GC if performance requires"
+
+    - id: "Q-0003"
+      question: "Should ProjectionReceiptRecorded include GitHub response data or only our intent?"
+      decision_needed_by: "TCK-00323 implementation"
+      resolution_plan: "Include minimal GitHub response (PR number, comment ID) for audit; avoid storing full response"
+
+    - id: "Q-0004"
+      question: "What is the retention policy for projection receipts?"
+      decision_needed_by: "Post-v0 operational planning"
+      resolution_plan: "Default to indefinite retention; add compaction policy in future RFC if needed"

@@ -1,0 +1,141 @@
+rfc_design_decisions:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  decisions:
+    - id: "DEC-0001"
+      title: "Session dispatcher wiring strategy"
+      statement: "SessionDispatcher will be constructed with full dependencies (CAS, ledger, clock, broker) via a new with_full_context method, preserving with_persistence for tests"
+      context: |
+        The current with_persistence method constructs SessionDispatcher without CAS, ledger, clock, or broker.
+        We need to enable real tool execution and event persistence without breaking existing tests.
+      alternatives:
+        - id: "ALT-0001"
+          name: "Modify with_persistence to require all dependencies"
+          pros:
+            - "Single construction path"
+          cons:
+            - "Breaks all existing tests"
+            - "Forces test complexity for simple dispatch tests"
+          security_tradeoffs: []
+          operability_tradeoffs:
+            - "Higher test maintenance burden"
+        - id: "ALT-0002"
+          name: "Add with_full_context method alongside with_persistence"
+          pros:
+            - "Backward compatible"
+            - "Tests can use minimal construction"
+            - "Production uses full construction"
+          cons:
+            - "Two construction paths to maintain"
+          security_tradeoffs:
+            - "Must ensure with_persistence cannot be used in production paths"
+          operability_tradeoffs: []
+      chosen_rationale: "ALT-0002 chosen: backward compatibility and test ergonomics outweigh maintenance cost; production path enforcement via compile-time feature flag or module visibility"
+      impacted_requirement_ids:
+        - "REQ-0001"
+      evidence_ids: []
+
+    - id: "DEC-0002"
+      title: "Tool log artifact format"
+      statement: "Use Option B: store ToolResultData individually AND a compact ToolLogIndex artifact listing all hashes for the session"
+      context: |
+        Tool execution stores results to CAS but doesn't surface hashes for receipts.
+        We need to decide between per-result hashes only vs. per-result + index.
+      alternatives:
+        - id: "ALT-0001"
+          name: "Option A: Each ToolResultData CAS hash is a log entry"
+          pros:
+            - "Simple implementation"
+            - "Direct CAS lookups"
+          cons:
+            - "No single artifact lists all tool invocations"
+            - "Harder to audit full session"
+          security_tradeoffs: []
+          operability_tradeoffs:
+            - "Auditing requires traversing receipt to find all hashes"
+        - id: "ALT-0002"
+          name: "Option B: Per-result hashes + ToolLogIndex artifact"
+          pros:
+            - "Single artifact for session audit"
+            - "Preserves individual result retrieval"
+            - "Index can include metadata (timestamps, tool names)"
+          cons:
+            - "Additional artifact to store"
+          security_tradeoffs: []
+          operability_tradeoffs:
+            - "Better audit ergonomics"
+      chosen_rationale: "ALT-0002 chosen: ToolLogIndex provides audit ergonomics with minimal storage overhead"
+      impacted_requirement_ids:
+        - "REQ-0004"
+      evidence_ids: []
+
+    - id: "DEC-0003"
+      title: "Workspace isolation strategy"
+      statement: "Create ephemeral workspace directories per-episode in a daemon-managed temp root, with automatic cleanup on episode completion/abort"
+      context: |
+        Workspace apply is stubbed. Need to implement isolated filesystems for reviewer episodes
+        that prevent escape and enable consistent tool behavior.
+      alternatives:
+        - id: "ALT-0001"
+          name: "Per-session workspace in /tmp"
+          pros:
+            - "Simple implementation"
+            - "OS-managed cleanup on reboot"
+          cons:
+            - "No control over cleanup timing"
+            - "Shared /tmp could leak information"
+          security_tradeoffs:
+            - "Other processes can see workspace paths"
+          operability_tradeoffs:
+            - "Disk space management depends on OS"
+        - id: "ALT-0002"
+          name: "Daemon-managed workspace root with lifecycle management"
+          pros:
+            - "Explicit cleanup on episode completion"
+            - "Controlled disk usage"
+            - "Can implement retention policies"
+          cons:
+            - "More implementation complexity"
+          security_tradeoffs:
+            - "Daemon controls cleanup timing"
+          operability_tradeoffs:
+            - "Better observability of workspace state"
+      chosen_rationale: "ALT-0002 chosen: daemon control over workspace lifecycle enables explicit cleanup and disk management"
+      impacted_requirement_ids:
+        - "REQ-0003"
+      evidence_ids: []
+
+    - id: "DEC-0004"
+      title: "Projection idempotency mechanism"
+      statement: "Use durable projection receipts keyed by (work_id, review_receipt_hash) to prevent duplicate projections"
+      context: |
+        Projection worker needs to be idempotent across restarts.
+        Must not duplicate GitHub comments or statuses.
+      alternatives:
+        - id: "ALT-0001"
+          name: "GitHub API deduplication (check before post)"
+          pros:
+            - "No local state needed"
+          cons:
+            - "Race conditions possible"
+            - "Depends on GitHub state (violates truth-is-internal)"
+          security_tradeoffs:
+            - "GitHub state could be tampered"
+          operability_tradeoffs:
+            - "Additional API calls per projection"
+        - id: "ALT-0002"
+          name: "Durable projection receipts in CAS+ledger"
+          pros:
+            - "Truth is internal"
+            - "Audit trail for all projections"
+            - "No race conditions (ledger ordering)"
+          cons:
+            - "Additional storage"
+          security_tradeoffs:
+            - "Maintains internal truth invariant"
+          operability_tradeoffs:
+            - "Clear audit trail"
+      chosen_rationale: "ALT-0002 chosen: maintains truth-is-internal constraint and provides audit trail"
+      impacted_requirement_ids:
+        - "REQ-0006"
+      evidence_ids: []

@@ -1,0 +1,30 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0007"
+  title: "xtask authority reduction staging"
+  category: "FUNCTIONAL"
+  priority: "P2"
+  status: "PROPOSED"
+  statement: |
+    xtask authority must be progressively reduced:
+    1. Add xtask mode to "emit internal receipts + request projection" instead of direct GitHub writes
+    2. Stage cutover:
+       - Stage 1: xtask does both (write + projection receipts) under explicit flags
+       - Stage 2: xtask stops writes by default; projection worker writes
+       - Stage 3: xtask write path removed or restricted to local/dev
+    3. No GitHub write occurs without explicit allow flags
+    4. FAC projection receipts are durable and independently auditable
+  rationale: |
+    xtask already has explicit guardrails for status writes (xtask/src/util.rs:287-330).
+    The goal is to shift writes from xtask to the projection worker while maintaining
+    audit trail and explicit gating.
+  acceptance_criteria:
+    - "xtask has --emit-receipt-only mode"
+    - "xtask requires explicit --allow-github-write flag for direct writes"
+    - "Projection worker can perform GitHub writes independent of xtask"
+    - "All GitHub writes have durable projection receipts"
+    - "Audit trail shows which component performed each write"
+  evidence_ids:
+    - "EVID-0007"
+  source_refs:
+    - "xtask/src/util.rs:287-330"

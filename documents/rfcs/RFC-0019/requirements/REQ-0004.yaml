@@ -1,0 +1,32 @@
+requirement:
+  schema_version: "2026-01-23"
+  id: "REQ-0004"
+  title: "Tool log capture into review artifacts (TCK-00312 closure)"
+  category: "FUNCTIONAL"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    Tool execution must propagate CAS hashes for receipts:
+    1. ToolExecutor (or broker/executor wrapper) must return CAS hash for each tool result
+    2. CAS hashes must be accumulated per-episode
+    3. ReviewArtifactBundleV1 must include tool_log_hashes = collected result hashes
+
+    Canonical "tool log artifact" format must be decided:
+    - Option A: each ToolResultData CAS hash is a log entry
+    - Option B: additionally store compact ToolLogIndex artifact listing all hashes
+  rationale: |
+    Current state: ToolExecutor::execute stores ToolResultData in CAS and obtains result_hash,
+    but does not return it or aggregate it for ReviewArtifactBundle tool logs
+    (crates/apm2-daemon/src/episode/executor.rs:458-501). ReviewArtifactBundle expects
+    tool_log_hashes (crates/apm2-daemon/src/episode/workspace.rs:480-515).
+  acceptance_criteria:
+    - "ToolExecutor returns CAS hash for each tool result"
+    - "Per-episode accumulator collects all tool result hashes"
+    - "ReviewReceiptRecorded references ReviewArtifactBundle with tool_log_hashes"
+    - "All tool_log_hashes resolve in CAS"
+    - "Tool logs can be replayed/audited offline"
+  evidence_ids:
+    - "EVID-0004"
+  source_refs:
+    - "crates/apm2-daemon/src/episode/executor.rs:458-501"
+    - "crates/apm2-daemon/src/episode/workspace.rs:480-515"

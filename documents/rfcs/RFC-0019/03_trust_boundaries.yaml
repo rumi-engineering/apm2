@@ -1,0 +1,108 @@
+rfc_trust_boundaries:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  boundaries:
+    - id: "TB-0001"
+      name: "Session-Kernel Tool Execution Boundary"
+      description: |
+        Tool requests from sessions cross into kernel execution space.
+        The kernel executes tools on behalf of sessions with capability-bounded permissions.
+      actors:
+        - "Session (reviewer agent)"
+        - "ToolBroker (kernel)"
+        - "ToolExecutor (kernel)"
+      entrypoints:
+        - "RequestTool IPC message"
+      data_flows:
+        - "Session -> RequestTool -> Broker -> Executor -> CAS -> Session (result)"
+      authn_authz:
+        authn: "Session ID bound at spawn via SpawnEpisode"
+        authz: "CapabilityManifest allowlist checked by Broker before execution"
+      risks:
+        - id: "RSK-TB-001"
+          description: "Legacy allow path bypasses capability checks"
+          mitigation: "Remove/gate legacy allow path; require broker in production"
+      evidence_ids: []
+
+    - id: "TB-0002"
+      name: "Workspace Filesystem Boundary"
+      description: |
+        Reviewer tools operate within isolated workspace directories.
+        Path traversal must be prevented to maintain isolation.
+      actors:
+        - "ToolExecutor"
+        - "ListFilesHandler"
+        - "SearchHandler"
+        - "Filesystem"
+      entrypoints:
+        - "ListFiles tool request"
+        - "Search tool request"
+        - "apply_changeset workspace creation"
+      data_flows:
+        - "Tool request -> Handler -> Workspace root -> Filesystem -> CAS-stored result"
+      authn_authz:
+        authn: "Workspace root bound per-episode"
+        authz: "Canonical path resolution within workspace root"
+      risks:
+        - id: "RSK-TB-002"
+          description: "Symlink escape from workspace"
+          mitigation: "Block symlinks pointing outside workspace; use canonical path checks"
+        - id: "RSK-TB-003"
+          description: "Patch apply writes outside root"
+          mitigation: "Validate all patch paths before apply; fail closed on suspicious paths"
+      evidence_ids: []
+
+    - id: "TB-0003"
+      name: "CAS-Ledger Persistence Boundary"
+      description: |
+        All durable state flows through CAS (content) and ledger (events).
+        External systems are projections, not sources of truth.
+      actors:
+        - "SessionDispatcher"
+        - "EpisodeRuntime"
+        - "CAS"
+        - "Ledger"
+        - "ProjectionWorker"
+      entrypoints:
+        - "PublishEvidence IPC message"
+        - "EmitEvent IPC message"
+        - "Projection worker ledger tail"
+      data_flows:
+        - "Evidence -> CAS -> hash returned"
+        - "Event -> Ledger -> commit confirmation"
+        - "Ledger commit -> ProjectionWorker -> External system"
+      authn_authz:
+        authn: "Session ID validates event origin"
+        authz: "Event type determines which sessions can emit"
+      risks:
+        - id: "RSK-TB-004"
+          description: "Events emitted without CAS artifacts existing"
+          mitigation: "Store CAS artifacts atomically before emitting referencing event"
+        - id: "RSK-TB-005"
+          description: "Projection state diverges from ledger"
+          mitigation: "Projection receipts anchor all external writes; divergence detection"
+      evidence_ids: []
+
+    - id: "TB-0004"
+      name: "GitHub Projection Boundary"
+      description: |
+        GitHub is an output target, never a source of truth.
+        All GitHub writes are derived from internal ledger state.
+      actors:
+        - "ProjectionWorker"
+        - "GitHub API"
+      entrypoints:
+        - "Projection worker GitHub adapter"
+      data_flows:
+        - "Ledger -> ProjectionWorker -> GitHub API -> ProjectionReceipt -> CAS+Ledger"
+      authn_authz:
+        authn: "GitHub token managed by projection worker"
+        authz: "Write permissions scoped to PR status/comments"
+      risks:
+        - id: "RSK-TB-006"
+          description: "GitHub state tampered externally"
+          mitigation: "Projection receipts enable tamper detection; ledger is truth"
+        - id: "RSK-TB-007"
+          description: "Duplicate projections on restart"
+          mitigation: "Durable projection receipts with idempotency keys"
+      evidence_ids: []

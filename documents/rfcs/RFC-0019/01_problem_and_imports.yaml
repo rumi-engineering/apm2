@@ -1,0 +1,69 @@
+rfc_problem_and_imports:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  imported_from_prd:
+    problem_ref: "02_problem.yaml#prd_problem"
+    goals_scope_ref: "03_goals_scope.yaml#prd_goals_scope"
+    constraints_invariants_ref: "06_constraints_invariants.yaml#prd_constraints_invariants"
+    quality_framework_ref: "10_quality_framework.yaml#prd_quality_framework"
+  protocol_profile_imports:
+    required_rfc_section_refs:
+      - "documents/prds/PRD-0009/00_meta.yaml#prd_meta.law_alignment"
+      - "documents/prds/PRD-0010/00_meta.yaml#prd_meta.law_alignment"
+  rfc_specific_problem_detail:
+    additional_context: |
+      RFC-0018 and recent PRs (387, 389) established FAC v0 primitives:
+      - ChangeSetBundleV1, ReviewArtifactBundleV1, ReviewReceiptRecorded
+      - E2E test harness in crates/apm2-daemon/tests/hef_fac_v0_e2e.rs
+      - Reviewer navigation tools ListFiles and Search
+
+      However, **automated FAC does not yet exist** because daemon control-plane wiring is incomplete:
+      - Sessions are not viable (no real RequestTool execution path, no real PublishEvidence/EmitEvent persistence)
+      - Workspace apply is stubbed
+      - Tool logs are not surfaced into receipts
+      - Projection is present but not wired
+
+      This RFC specifies the remaining integration to reach automated FAC v0.
+    out_of_scope_confirmations:
+      - "Full merge automation (MergeReceipt, auto-merge) beyond minimal review gate + projection"
+      - "Production-grade distributed scheduling"
+      - "Replacing all legacy codepaths in one sweep (incremental cutover)"
+  non_negotiable_constraints:
+    - id: "NC-001"
+      statement: "Truth is internal: ledger + CAS are the system of record; external systems (GitHub, git remote) are inputs/effects, not truth"
+      evidence_ref: "documents/prds/PRD-0009/00_meta.yaml#prd_meta.classification.notes"
+    - id: "NC-002"
+      statement: "Fail closed: no stub-allow paths for tool execution, event emission, or evidence publication in session workflows"
+      evidence_ref: "documents/prds/PRD-0009/00_meta.yaml#prd_meta.classification.notes"
+    - id: "NC-003"
+      statement: "No regression to legacy JSON IPC: new functionality lands on ProtocolServer tag-based dispatchers and structured protocols (RFC-0017 line)"
+      evidence_ref: "documents/rfcs/RFC-0017/"
+  requirement_binding:
+    bound_requirement_ids:
+      - "REQ-0001"  # Session dispatcher viability
+      - "REQ-0002"  # Capability manifests
+      - "REQ-0003"  # Workspace apply and isolation
+      - "REQ-0004"  # Tool log capture
+      - "REQ-0005"  # Episode event persistence
+      - "REQ-0006"  # Projection worker wiring
+      - "REQ-0007"  # xtask authority reduction
+    added_rfc_only_requirements:
+      mode: "FILE_PER_REQUIREMENT"
+      local_root: "requirements/"
+      local_requirements:
+        - id: "REQ-0001"
+          file_ref: "requirements/REQ-0001.yaml"
+        - id: "REQ-0002"
+          file_ref: "requirements/REQ-0002.yaml"
+        - id: "REQ-0003"
+          file_ref: "requirements/REQ-0003.yaml"
+        - id: "REQ-0004"
+          file_ref: "requirements/REQ-0004.yaml"
+        - id: "REQ-0005"
+          file_ref: "requirements/REQ-0005.yaml"
+        - id: "REQ-0006"
+          file_ref: "requirements/REQ-0006.yaml"
+        - id: "REQ-0007"
+          file_ref: "requirements/REQ-0007.yaml"
+      rationale: "RFC-0019 defines integration requirements to close FAC v0 automation gaps"
+      evidence_policy: "RFC-only requirements define evidence in 07_test_and_evidence.yaml"
