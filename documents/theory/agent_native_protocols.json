@@ -7,52 +7,6 @@
     "description": "Normative definitions, architectural doctrines, and implementation protocols for the durable, auditable work substrate."
   },
   "payload": {
-    "lexicon": [
-      {
-        "term": "Work Substrate",
-        "definition": "The authoritative coordination plane comprising: (a) work-object specs, (b) append-only durable event records (including Sub-Episode Checkpoints), and (c) deterministic projections. It MAY include Canonical State Snapshots."
-      },
-      {
-        "term": "Work Object",
-        "definition": "A typed entity with stable canonical identifier and explicit lifecycle (state machine). Foundational kinds: Plan, ChangeSet, GateRun, Finding, EvidenceBundle, Decision, Question, OracleRequest."
-      },
-      {
-        "term": "Plan-of-Record",
-        "definition": "Approved Plan specification snapshot bound by content digest. The binding surface for downstream refinement to prevent 'drift by commentary'."
-      },
-      {
-        "term": "Spec Snapshot",
-        "definition": "Deterministic representation of specification content (YAML sections, attachments, schema versions), canonicalized and hashed. Provides stable identity for 'what was reviewed'."
-      },
-      {
-        "term": "ChangeSet",
-        "definition": "Canonical unit of proposed work. Defined by input references (Plan-of-Record), patch representation (git commit range or portable patch set), and produced artifacts."
-      },
-      {
-        "term": "Gate",
-        "definition": "Formally defined verification protocol with rubric, evidence contract, allowed tools, and stop conditions."
-      },
-      {
-        "term": "GateRun",
-        "definition": "Execution instance of a Gate against a Plan or ChangeSet, producing a decision and bounded set of Findings."
-      },
-      {
-        "term": "Finding",
-        "definition": "Structured nonconformance report with severity, category, location, and deterministic FindingSignature."
-      },
-      {
-        "term": "FindingSignature",
-        "definition": "Deterministic identifier computed from normalized fields (category, rule ID, subsystem, normalized location) to cluster recurrence."
-      },
-      {
-        "term": "Countermeasure",
-        "definition": "Planned work to prevent recurrence of a FindingSignature by modifying guardrails. Validated by evidence of reduced recurrence."
-      },
-      {
-        "term": "Merge Receipt",
-        "definition": "Internal acceptance record binding approval decision to exact input digests (Plan, ChangeSet, GateRuns) and output repo state digest."
-      }
-    ],
     "doctrines": [
       {
         "id": "DOC-SPEC-STATE-SEP",
