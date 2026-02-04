@@ -41,6 +41,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::decision::{BudgetDelta, MAX_TOOL_OUTPUT_SIZE};
+use super::executor::ContentAddressedStore;
 use super::tool_class::ToolClass;
 use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
 
@@ -860,6 +861,557 @@ impl ToolHandler for ExecuteHandler {
 }
 
 // =============================================================================
+// GitOperationHandler (REQ-HEF-0010)
+// =============================================================================
+
+/// Hardened handler for git operations per REQ-HEF-0010.
+///
+/// This handler implements strict security controls for git operations:
+///
+/// # Allowed Operations
+///
+/// - `diff`: Show changes between commits, commit and working tree, etc.
+/// - `status`: Show the working tree status (porcelain v1 format).
+///
+/// All other operations are rejected with `InvalidArgs`.
+///
+/// # Security Controls
+///
+/// - **Operation Allowlist**: Only "diff" and "status" are permitted.
+/// - **Flag Rejection**: Args starting with `-` are rejected as potential
+///   policy bypass vectors. Only pathspecs are allowed.
+/// - **Pathspec Validation**: Pathspecs must be relative paths within
+///   workspace.
+/// - **Fixed Command Construction**: No user-controlled flags are passed.
+/// - **Non-Interactive Mode**: `GIT_TERMINAL_PROMPT=0` prevents prompts.
+/// - **Bounded Output**: Hard failure with `OutputTooLarge` if output exceeds
+///   limits (diff: 256KB / 4000 lines; status: 16KB / 500 lines).
+/// - **Timeout**: 30 second timeout to prevent hanging.
+/// - **Repository Verification**: Confirms `.git` directory exists.
+///
+/// # Contract References
+///
+/// - REQ-HEF-0010: Tool handler hardening requirements
+/// - TCK-00313: `GitOperation` + `ArtifactFetch` handler hardening
+#[derive(Debug)]
+pub struct GitOperationHandler {
+    root: PathBuf,
+}
+
+impl Default for GitOperationHandler {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("."),
+        }
+    }
+}
+
+/// Git operation timeout in milliseconds (30 seconds).
+const GIT_TIMEOUT_MS: u64 = 30_000;
+
+impl GitOperationHandler {
+    /// Creates a new git operation handler using CWD as root.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new git operation handler with a specific root directory.
+    #[must_use]
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Validates that args contains only valid pathspecs (no flags).
+    fn validate_args_as_pathspecs(args: &[String]) -> Result<(), ToolHandlerError> {
+        for arg in args {
+            // Reject any argument that looks like a flag
+            if arg.starts_with('-') {
+                return Err(ToolHandlerError::InvalidArgs {
+                    reason: format!("git arg '{arg}' looks like a flag; only pathspecs allowed"),
+                });
+            }
+
+            // Validate as a relative path within workspace
+            let path = Path::new(arg);
+            validate_path(path)?;
+        }
+        Ok(())
+    }
+
+    /// Counts lines in a byte buffer.
+    #[allow(clippy::naive_bytecount)] // bytecount crate not needed for small buffers
+    fn count_lines(data: &[u8]) -> usize {
+        data.iter().filter(|&&b| b == b'\n').count()
+    }
+}
+
+#[async_trait]
+impl ToolHandler for GitOperationHandler {
+    fn tool_class(&self) -> ToolClass {
+        ToolClass::Git
+    }
+
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+        use tokio::io::AsyncReadExt;
+
+        use super::tool_handler::{
+            GIT_DIFF_MAX_BYTES, GIT_DIFF_MAX_LINES, GIT_STATUS_MAX_BYTES, GIT_STATUS_MAX_LINES,
+        };
+
+        // Validate arguments first
+        self.validate(args)?;
+
+        let ToolArgs::Git(git_args) = args else {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "expected Git arguments".to_string(),
+            });
+        };
+
+        let exec_start = Instant::now();
+
+        // Determine working directory
+        let work_dir = git_args
+            .repo_path
+            .as_ref()
+            .map_or_else(|| self.root.clone(), |p| self.root.join(p));
+
+        // Canonicalize root for comparison
+        let canonical_root =
+            std::fs::canonicalize(&self.root).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize root '{}': {}",
+                    self.root.display(),
+                    e
+                ),
+            })?;
+
+        // Canonicalize the working directory
+        let canonical_work_dir =
+            std::fs::canonicalize(&work_dir).map_err(|e| ToolHandlerError::ExecutionFailed {
+                message: format!(
+                    "failed to canonicalize work dir '{}': {}",
+                    work_dir.display(),
+                    e
+                ),
+            })?;
+
+        // Verify the working directory is within the workspace root
+        validate_resolved_path_within_root(&canonical_work_dir, &canonical_root)?;
+
+        // Verify .git exists (must be a git repository)
+        let git_dir = canonical_work_dir.join(".git");
+        if !git_dir.exists() {
+            return Err(ToolHandlerError::ExecutionFailed {
+                message: format!("'{}' is not a git repository", work_dir.display()),
+            });
+        }
+
+        let operation = git_args.operation.to_lowercase();
+
+        let (max_bytes, max_lines) = match operation.as_str() {
+            "diff" => (GIT_DIFF_MAX_BYTES, GIT_DIFF_MAX_LINES),
+            "status" => (GIT_STATUS_MAX_BYTES, GIT_STATUS_MAX_LINES),
+            _ => unreachable!("validate() already rejected unknown operations"),
+        };
+
+        // Build the git command with hardened options
+        let mut cmd = tokio::process::Command::new("git");
+        // Clear inherited environment to prevent scope overrides (PROC-ENV)
+        cmd.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            cmd.env("PATH", path);
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            cmd.env("HOME", home);
+        }
+        if let Some(xdg_config) = std::env::var_os("XDG_CONFIG_HOME") {
+            cmd.env("XDG_CONFIG_HOME", xdg_config);
+        }
+        // Fail closed on global/system git config
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        // Explicitly remove repo override env vars (defense in depth)
+        cmd.env_remove("GIT_DIR");
+        cmd.env_remove("GIT_WORK_TREE");
+        cmd.arg("-C").arg(&canonical_work_dir);
+        cmd.args(["--no-pager", "-c", "color.ui=false", "-c", "core.pager=cat"]);
+
+        // Add operation-specific args with fixed safe options
+        match operation.as_str() {
+            "diff" => {
+                // Disable external diff tools
+                cmd.arg("diff");
+                cmd.arg("--no-ext-diff");
+                cmd.arg("--");
+                // Add validated pathspecs
+                for pathspec in &git_args.args {
+                    cmd.arg(pathspec);
+                }
+            },
+            "status" => {
+                cmd.arg("status");
+                cmd.arg("--porcelain=v1");
+                // Status doesn't use pathspecs from args
+            },
+            _ => unreachable!("validate() already rejected unknown operations"),
+        }
+
+        // Set non-interactive mode
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+
+        // Configure pipes
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        let mut child = cmd.spawn().map_err(|e| ToolHandlerError::ExecutionFailed {
+            message: format!("failed to spawn git: {e}"),
+        })?;
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ToolHandlerError::ExecutionFailed {
+                message: "failed to capture stdout".to_string(),
+            })?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ToolHandlerError::ExecutionFailed {
+                message: "failed to capture stderr".to_string(),
+            })?;
+
+        // Each stream gets the full budget; total is enforced after read.
+        let per_stream_limit = max_bytes;
+
+        // Bounded read for stdout
+        let stdout_future = async {
+            let mut buf = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match stdout.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if buf.len() + n > per_stream_limit {
+                            let remaining = per_stream_limit.saturating_sub(buf.len());
+                            buf.extend_from_slice(&chunk[..remaining]);
+                            return (buf, true); // exceeded
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    },
+                }
+            }
+            (buf, false)
+        };
+
+        // Bounded read for stderr
+        let stderr_future = async {
+            let mut buf = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if buf.len() + n > per_stream_limit {
+                            let remaining = per_stream_limit.saturating_sub(buf.len());
+                            buf.extend_from_slice(&chunk[..remaining]);
+                            return (buf, true); // exceeded
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    },
+                }
+            }
+            (buf, false)
+        };
+
+        // Wait for process with timeout
+        let timeout = Duration::from_millis(GIT_TIMEOUT_MS);
+        let read_result = tokio::time::timeout(timeout, async {
+            let (stdout_result, stderr_result, wait_result) =
+                tokio::join!(stdout_future, stderr_future, child.wait());
+
+            let (stdout_buf, stdout_exceeded) = stdout_result;
+            let (stderr_buf, stderr_exceeded) = stderr_result;
+            let output_exceeded = stdout_exceeded || stderr_exceeded;
+
+            match wait_result {
+                Ok(status) => Ok((stdout_buf, stderr_buf, Some(status), output_exceeded)),
+                Err(e) => Err(ToolHandlerError::ExecutionFailed {
+                    message: format!("failed to wait for git: {e}"),
+                }),
+            }
+        })
+        .await;
+
+        let exec_duration = exec_start.elapsed();
+
+        match read_result {
+            Ok(Ok((stdout_buf, stderr_buf, maybe_status, output_exceeded))) => {
+                let stdout_len = stdout_buf.len();
+                let stderr_len = stderr_buf.len();
+                let total_bytes = stdout_len + stderr_len;
+                let line_count = Self::count_lines(&stdout_buf) + Self::count_lines(&stderr_buf);
+
+                // Hard failure if output exceeded bounds
+                if output_exceeded || total_bytes > max_bytes {
+                    let _ = child.kill().await;
+                    return Err(ToolHandlerError::OutputTooLarge {
+                        bytes: total_bytes,
+                        lines: line_count,
+                        max_bytes,
+                        max_lines,
+                    });
+                }
+
+                // Hard failure if line count exceeded
+                if line_count > max_lines {
+                    return Err(ToolHandlerError::OutputTooLarge {
+                        bytes: total_bytes,
+                        lines: line_count,
+                        max_bytes,
+                        max_lines,
+                    });
+                }
+
+                // Combine output
+                let mut combined_output = stdout_buf;
+                if !stderr_buf.is_empty() {
+                    combined_output.extend_from_slice(b"\n--- stderr ---\n");
+                    combined_output.extend_from_slice(&stderr_buf);
+                }
+
+                #[allow(clippy::cast_possible_truncation)]
+                let wall_ms = exec_duration.as_millis().min(u128::from(u64::MAX)) as u64;
+
+                let mut result = ToolResultData::success(
+                    combined_output,
+                    BudgetDelta::single_call()
+                        .with_wall_ms(wall_ms)
+                        .with_bytes_io(total_bytes as u64),
+                    exec_duration,
+                );
+                result.exit_code = maybe_status.and_then(|s| s.code());
+                Ok(result)
+            },
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                let _ = child.kill().await;
+                Err(ToolHandlerError::Timeout {
+                    timeout_ms: GIT_TIMEOUT_MS,
+                })
+            },
+        }
+    }
+
+    fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
+        let ToolArgs::Git(git_args) = args else {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "expected Git arguments".to_string(),
+            });
+        };
+
+        // Validate operation is allowed (only diff and status)
+        let operation = git_args.operation.to_lowercase();
+        if operation != "diff" && operation != "status" {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: format!(
+                    "git operation '{}' not allowed; only 'diff' and 'status' are permitted",
+                    git_args.operation
+                ),
+            });
+        }
+
+        // Validate repo_path if provided
+        if let Some(ref repo_path) = git_args.repo_path {
+            validate_path(repo_path)?;
+        }
+
+        // Validate args as pathspecs only (no flags)
+        Self::validate_args_as_pathspecs(&git_args.args)?;
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "GitOperationHandler"
+    }
+
+    fn estimate_budget(&self, args: &ToolArgs) -> BudgetDelta {
+        use super::tool_handler::{GIT_DIFF_MAX_BYTES, GIT_STATUS_MAX_BYTES};
+
+        let max_bytes = match args {
+            ToolArgs::Git(git_args) if git_args.operation.eq_ignore_ascii_case("status") => {
+                GIT_STATUS_MAX_BYTES
+            },
+            _ => GIT_DIFF_MAX_BYTES,
+        };
+
+        BudgetDelta::single_call()
+            .with_wall_ms(GIT_TIMEOUT_MS)
+            .with_bytes_io(max_bytes as u64)
+    }
+}
+
+// =============================================================================
+// ArtifactFetchHandler (REQ-HEF-0010)
+// =============================================================================
+
+/// Hardened handler for artifact fetch operations per REQ-HEF-0010.
+///
+/// This handler retrieves content from the content-addressed store (CAS)
+/// with strict validation and hard failure on bounds violation.
+///
+/// # Security Controls
+///
+/// - **Exactly One Reference**: Either `stable_id` or `content_hash` must be
+///   set, not both (fail-closed validation).
+/// - **Stable ID Not Supported**: Requests using `stable_id` fail closed until
+///   a resolver is implemented.
+/// - **Max Bytes Enforcement**: Requests with `max_bytes >
+///   ARTIFACT_FETCH_MAX_BYTES` are rejected.
+/// - **Hard Failure**: If content exceeds `max_bytes`, returns `OutputTooLarge`
+///   instead of truncating.
+///
+/// # Contract References
+///
+/// - REQ-HEF-0010: Tool handler hardening requirements
+/// - TCK-00313: `GitOperation` + `ArtifactFetch` handler hardening
+#[derive(Debug)]
+pub struct ArtifactFetchHandler {
+    cas: std::sync::Arc<dyn ContentAddressedStore>,
+}
+
+impl ArtifactFetchHandler {
+    /// Creates a new artifact fetch handler with the given CAS backend.
+    pub fn new(cas: std::sync::Arc<dyn ContentAddressedStore>) -> Self {
+        Self { cas }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ArtifactFetchHandler {
+    fn tool_class(&self) -> ToolClass {
+        ToolClass::Artifact
+    }
+
+    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+        // Validate arguments first
+        self.validate(args)?;
+
+        let ToolArgs::Artifact(artifact_args) = args else {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "expected Artifact arguments".to_string(),
+            });
+        };
+
+        let fetch_start = Instant::now();
+
+        // content_hash must be present (validate ensures this)
+        let hash =
+            artifact_args
+                .content_hash
+                .as_ref()
+                .ok_or_else(|| ToolHandlerError::Internal {
+                    message: "content_hash missing after validation".to_string(),
+                })?;
+
+        // Retrieve content from CAS
+        let content = self
+            .cas
+            .retrieve(hash)
+            .ok_or_else(|| ToolHandlerError::FileNotFound {
+                path: hex::encode(hash),
+            })?;
+
+        let fetch_duration = fetch_start.elapsed();
+
+        // Hard failure if content exceeds max_bytes
+        #[allow(clippy::cast_possible_truncation)]
+        let max_bytes = artifact_args.max_bytes as usize;
+        if content.len() > max_bytes {
+            return Err(ToolHandlerError::OutputTooLarge {
+                bytes: content.len(),
+                lines: 0, // Artifacts don't have a line concept
+                max_bytes,
+                max_lines: 0,
+            });
+        }
+
+        Ok(ToolResultData::success(
+            content.clone(),
+            BudgetDelta::single_call().with_bytes_io(content.len() as u64),
+            fetch_duration,
+        ))
+    }
+
+    fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
+        use super::tool_handler::ARTIFACT_FETCH_MAX_BYTES;
+
+        let ToolArgs::Artifact(artifact_args) = args else {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "expected Artifact arguments".to_string(),
+            });
+        };
+
+        // Exactly one of stable_id or content_hash must be set
+        let has_stable_id = artifact_args.stable_id.is_some();
+        let has_content_hash = artifact_args.content_hash.is_some();
+
+        if has_stable_id && has_content_hash {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "exactly one of stable_id or content_hash must be set, not both".into(),
+            });
+        }
+        if !has_stable_id && !has_content_hash {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "exactly one of stable_id or content_hash must be set".into(),
+            });
+        }
+
+        // stable_id not supported yet (fail-closed)
+        if has_stable_id {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "stable_id not supported yet; use content_hash".into(),
+            });
+        }
+
+        // max_bytes must be within limit
+        if artifact_args.max_bytes > ARTIFACT_FETCH_MAX_BYTES as u64 {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: format!(
+                    "max_bytes {} exceeds limit {}",
+                    artifact_args.max_bytes, ARTIFACT_FETCH_MAX_BYTES
+                ),
+            });
+        }
+
+        // max_bytes must be non-zero
+        if artifact_args.max_bytes == 0 {
+            return Err(ToolHandlerError::InvalidArgs {
+                reason: "max_bytes must be greater than 0".into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "ArtifactFetchHandler"
+    }
+
+    fn estimate_budget(&self, args: &ToolArgs) -> BudgetDelta {
+        let bytes = if let ToolArgs::Artifact(artifact_args) = args {
+            artifact_args.max_bytes
+        } else {
+            4096
+        };
+        BudgetDelta::single_call().with_bytes_io(bytes)
+    }
+}
+
+// =============================================================================
 // Handler Registry Helper
 // =============================================================================
 
@@ -874,24 +1426,66 @@ impl ToolHandler for ExecuteHandler {
 /// use apm2_daemon::episode::executor::ToolExecutor;
 /// use apm2_daemon::episode::handlers::register_stub_handlers;
 ///
-/// let mut executor = ToolExecutor::new(tracker, cas);
-/// register_stub_handlers(&mut executor).expect("handlers registered");
+/// let mut executor = ToolExecutor::new(tracker, cas.clone());
+/// register_stub_handlers(&mut executor, cas).expect("handlers registered");
 /// ```
 pub fn register_stub_handlers(
     executor: &mut super::executor::ToolExecutor,
+    cas: std::sync::Arc<dyn ContentAddressedStore>,
 ) -> Result<(), super::executor::ExecutorError> {
     executor.register_handler(Box::new(ReadFileHandler::new()))?;
     executor.register_handler(Box::new(WriteFileHandler::new()))?;
     executor.register_handler(Box::new(ExecuteHandler::new()))?;
+    executor.register_handler(Box::new(GitOperationHandler::new()))?;
+    executor.register_handler(Box::new(ArtifactFetchHandler::new(cas)))?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
 
     use super::*;
-    use crate::episode::tool_handler::{ExecuteArgs, ReadArgs, WriteArgs};
+    use crate::cas::{DurableCas, DurableCasConfig};
+    use crate::episode::tool_handler::{
+        ArtifactArgs, ExecuteArgs, GIT_DIFF_MAX_BYTES, GIT_STATUS_MAX_LINES, GitArgs, ReadArgs,
+        ToolArgs, WriteArgs,
+    };
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_git_repo(root: &Path) {
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "fac-v0@example.com"]);
+        run_git(root, &["config", "user.name", "FAC V0 Harness"]);
+    }
+
+    fn git_commit_all(root: &Path, message: &str) {
+        run_git(root, &["add", "."]);
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-m", message])
+            .env("GIT_AUTHOR_NAME", "FAC V0 Harness")
+            .env("GIT_AUTHOR_EMAIL", "fac-v0@example.com")
+            .env("GIT_COMMITTER_NAME", "FAC V0 Harness")
+            .env("GIT_COMMITTER_EMAIL", "fac-v0@example.com")
+            .status()
+            .expect("git commit");
+        assert!(status.success(), "git commit failed");
+    }
 
     // =========================================================================
     // Path validation tests
@@ -1321,5 +1915,223 @@ mod tests {
         });
         let estimate = ExecuteHandler::new().estimate_budget(&exec_args);
         assert_eq!(estimate.wall_ms, 5000);
+    }
+
+    // =========================================================================
+    // GitOperationHandler tests (TCK-00313)
+    // =========================================================================
+
+    #[test]
+    fn test_git_handler_validate_diff_ok() {
+        let handler = GitOperationHandler::new();
+        let args = ToolArgs::Git(GitArgs {
+            operation: "diff".to_string(),
+            args: vec!["src/main.rs".to_string()],
+            repo_path: None,
+        });
+        assert!(handler.validate(&args).is_ok());
+    }
+
+    #[test]
+    fn test_git_handler_validate_status_ok() {
+        let handler = GitOperationHandler::new();
+        let args = ToolArgs::Git(GitArgs {
+            operation: "status".to_string(),
+            args: vec![],
+            repo_path: None,
+        });
+        assert!(handler.validate(&args).is_ok());
+    }
+
+    #[test]
+    fn test_git_handler_validate_case_insensitive() {
+        let handler = GitOperationHandler::new();
+        let args = ToolArgs::Git(GitArgs {
+            operation: "DIFF".to_string(),
+            args: vec![],
+            repo_path: None,
+        });
+        assert!(handler.validate(&args).is_ok());
+    }
+
+    #[test]
+    fn test_git_handler_rejects_push() {
+        let handler = GitOperationHandler::new();
+        let args = ToolArgs::Git(GitArgs {
+            operation: "push".to_string(),
+            args: vec![],
+            repo_path: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
+    }
+
+    #[test]
+    fn test_git_handler_rejects_flags() {
+        let handler = GitOperationHandler::new();
+        let args = ToolArgs::Git(GitArgs {
+            operation: "diff".to_string(),
+            args: vec!["--work-tree=/etc".to_string()],
+            repo_path: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
+        if let Err(ToolHandlerError::InvalidArgs { reason }) = result {
+            assert!(
+                reason.contains("flag"),
+                "Error should mention flag: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_git_handler_rejects_short_flags() {
+        let handler = GitOperationHandler::new();
+        let args = ToolArgs::Git(GitArgs {
+            operation: "diff".to_string(),
+            args: vec!["-p".to_string()],
+            repo_path: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
+    }
+
+    #[test]
+    fn test_git_handler_rejects_absolute_pathspec() {
+        let handler = GitOperationHandler::new();
+        let args = ToolArgs::Git(GitArgs {
+            operation: "diff".to_string(),
+            args: vec!["/etc/passwd".to_string()],
+            repo_path: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(
+            result,
+            Err(ToolHandlerError::PathValidation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_git_handler_rejects_traversal_pathspec() {
+        let handler = GitOperationHandler::new();
+        let args = ToolArgs::Git(GitArgs {
+            operation: "diff".to_string(),
+            args: vec!["../etc/passwd".to_string()],
+            repo_path: None,
+        });
+        let result = handler.validate(&args);
+        assert!(matches!(
+            result,
+            Err(ToolHandlerError::PathValidation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_git_diff_output_too_large() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        init_git_repo(temp_dir.path());
+
+        let file_path = temp_dir.path().join("big.txt");
+        std::fs::write(&file_path, b"base\n").expect("write base file");
+        git_commit_all(temp_dir.path(), "init-big");
+
+        let large = vec![b'x'; GIT_DIFF_MAX_BYTES + 1024];
+        std::fs::write(&file_path, &large).expect("write large diff");
+
+        let handler = GitOperationHandler::with_root(temp_dir.path());
+        let args = ToolArgs::Git(GitArgs {
+            operation: "diff".to_string(),
+            args: vec!["big.txt".to_string()],
+            repo_path: None,
+        });
+
+        let result = handler.execute(&args).await;
+        assert!(
+            matches!(result, Err(ToolHandlerError::OutputTooLarge { .. })),
+            "expected output too large"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_git_status_output_too_large() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        init_git_repo(temp_dir.path());
+
+        let base_path = temp_dir.path().join("base.txt");
+        std::fs::write(&base_path, b"base\n").expect("write base file");
+        git_commit_all(temp_dir.path(), "init-status");
+
+        let file_count = GIT_STATUS_MAX_LINES + 10;
+        for idx in 0..file_count {
+            let file_path = temp_dir.path().join(format!("untracked_{idx}.txt"));
+            std::fs::write(&file_path, b"x").expect("write untracked file");
+        }
+
+        let handler = GitOperationHandler::with_root(temp_dir.path());
+        let args = ToolArgs::Git(GitArgs {
+            operation: "status".to_string(),
+            args: Vec::new(),
+            repo_path: None,
+        });
+
+        let result = handler.execute(&args).await;
+        assert!(
+            matches!(result, Err(ToolHandlerError::OutputTooLarge { .. })),
+            "expected output too large"
+        );
+    }
+
+    // =========================================================================
+    // ArtifactFetchHandler validation tests (TCK-00313)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_artifact_fetch_output_too_large() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let cas_dir = temp_dir.path().join("cas");
+        std::fs::create_dir_all(&cas_dir).expect("create cas dir");
+        let cas: Arc<dyn ContentAddressedStore> =
+            Arc::new(DurableCas::new(DurableCasConfig::new(&cas_dir)).expect("cas"));
+        let content = vec![0u8; 64];
+        let hash = cas.store(&content);
+
+        let handler = ArtifactFetchHandler::new(cas);
+        let args = ToolArgs::Artifact(ArtifactArgs {
+            stable_id: None,
+            content_hash: Some(hash),
+            expected_hash: None,
+            max_bytes: 1,
+            format: None,
+        });
+
+        let result = handler.execute(&args).await;
+        assert!(
+            matches!(result, Err(ToolHandlerError::OutputTooLarge { .. })),
+            "expected output too large"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_artifact_fetch_missing_returns_not_found() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let cas_dir = temp_dir.path().join("cas");
+        std::fs::create_dir_all(&cas_dir).expect("create cas dir");
+        let cas: Arc<dyn ContentAddressedStore> =
+            Arc::new(DurableCas::new(DurableCasConfig::new(&cas_dir)).expect("cas"));
+        let handler = ArtifactFetchHandler::new(cas);
+        let missing_hash = [0x22; 32];
+        let args = ToolArgs::Artifact(ArtifactArgs {
+            stable_id: None,
+            content_hash: Some(missing_hash),
+            expected_hash: None,
+            max_bytes: 64,
+            format: None,
+        });
+
+        let result = handler.execute(&args).await;
+        assert!(
+            matches!(result, Err(ToolHandlerError::FileNotFound { .. })),
+            "expected missing artifact"
+        );
     }
 }

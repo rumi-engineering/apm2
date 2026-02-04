@@ -173,6 +173,9 @@ pub struct BrokerToolRequest {
     /// Optional query for Search (TCK-00315).
     pub query: Option<String>,
 
+    /// Optional artifact hash for Artifact tool class.
+    pub artifact_hash: Option<Hash>,
+
     /// The risk tier of the current episode.
     pub risk_tier: RiskTier,
 }
@@ -327,6 +330,7 @@ impl BrokerToolRequest {
             git_operation: None,
             pattern: None,
             query: None,
+            artifact_hash: None,
             risk_tier,
         }
     }
@@ -397,6 +401,13 @@ impl BrokerToolRequest {
     #[must_use]
     pub fn with_query(mut self, query: impl Into<String>) -> Self {
         self.query = Some(query.into());
+        self
+    }
+
+    /// Sets the artifact hash for Artifact operations.
+    #[must_use]
+    pub const fn with_artifact_hash(mut self, hash: Hash) -> Self {
+        self.artifact_hash = Some(hash);
         self
     }
 
@@ -515,8 +526,8 @@ impl BrokerToolRequest {
     #[must_use]
     pub fn to_policy_request(&self) -> apm2_core::tool::ToolRequest {
         use apm2_core::tool::{
-            FileRead, FileWrite, GitOperation, InferenceCall, ListFiles, Search, ShellExec,
-            tool_request,
+            ArtifactFetch, FileRead, FileWrite, GitOperation, InferenceCall, ListFiles, Search,
+            ShellExec, tool_request,
         };
 
         let tool = match self.tool_class {
@@ -572,11 +583,15 @@ impl BrokerToolRequest {
                 temperature_scaled: 0,
                 system_prompt_hash: Vec::new(),
             })),
-            ToolClass::Artifact => self.path.as_ref().map(|p| {
-                tool_request::Tool::FileRead(FileRead {
-                    path: p.to_string_lossy().to_string(),
-                    offset: 0,
-                    limit: 0,
+            ToolClass::Artifact => self.artifact_hash.as_ref().map(|hash| {
+                tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                    stable_id: String::new(),
+                    content_hash: hash.to_vec(),
+                    expected_hash: Vec::new(),
+                    max_bytes: self
+                        .size
+                        .unwrap_or(crate::episode::tool_handler::ARTIFACT_FETCH_MAX_BYTES as u64),
+                    format: String::new(),
                 })
             }),
             ToolClass::ListFiles => self.path.as_ref().map(|p| {
@@ -2260,7 +2275,7 @@ mod tests {
             Some(apm2_core::tool::tool_request::Tool::Inference(_))
         ));
 
-        // Artifact -> FileRead
+        // Artifact -> ArtifactFetch
         let art_req = BrokerToolRequest::new(
             "req-art",
             test_episode_id(),
@@ -2269,11 +2284,11 @@ mod tests {
             test_args_hash(),
             RiskTier::Tier0,
         )
-        .with_path("/workspace/artifact");
+        .with_artifact_hash([0xab; 32]);
         let art_policy = art_req.to_policy_request();
         assert!(matches!(
             art_policy.tool,
-            Some(apm2_core::tool::tool_request::Tool::FileRead(_))
+            Some(apm2_core::tool::tool_request::Tool::ArtifactFetch(_))
         ));
     }
 

@@ -118,6 +118,44 @@ pub const ARTIFACT_MANIFEST_DOMAIN_PREFIX: &[u8] = b"apm2.payload.artifact_manif
 /// the changeset digest and CAS hash before any review begins.
 pub const CHANGESET_PUBLISHED_DOMAIN_PREFIX: &[u8] = b"apm2.event.changeset_published:";
 
+/// Domain prefix for `ReviewReceiptRecorded` events **in the ledger**.
+///
+/// Per RFC-0018 HEF: domain prefixes prevent cross-context replay.
+/// Used when signing/verifying review receipt events for ledger ingestion.
+///
+/// # Security: Domain Separation
+///
+/// This prefix (`apm2.event.review_receipt_recorded:`) is intentionally
+/// **distinct** from the FAC event-level prefix (`REVIEW_RECEIPT_RECORDED:`
+/// in `crate::fac`). This separation is critical:
+///
+/// 1. **FAC prefix**: Used when creating/signing `ReviewReceiptRecorded` events
+///    at the domain layer (event creation).
+/// 2. **Ledger prefix**: Used when appending events to the ledger via
+///    `append_verified()` (ledger ingestion).
+///
+/// If these prefixes were the same, an attacker could take a valid FAC
+/// event signature and replay it as a ledger signature, potentially
+/// injecting malformed payloads that the ledger doesn't decode during
+/// verification.
+///
+/// The `apm2.event.*` namespace follows the same pattern as other kernel
+/// events (e.g., `tool_decided`, `session_terminated`).
+pub const REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX: &[u8] = b"apm2.event.review_receipt_recorded:";
+
+/// Domain prefix for `ReviewBlockedRecorded` events **in the ledger**.
+///
+/// Per RFC-0018 HEF: domain prefixes prevent cross-context replay.
+/// Used when signing/verifying review blocked events for ledger ingestion.
+///
+/// # Security: Domain Separation
+///
+/// This prefix (`apm2.event.review_blocked_recorded:`) is intentionally
+/// **distinct** from the FAC event-level prefix (`REVIEW_BLOCKED_RECORDED:`
+/// in `crate::fac`). See [`REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX`] for the
+/// security rationale.
+pub const REVIEW_BLOCKED_RECORDED_DOMAIN_PREFIX: &[u8] = b"apm2.event.review_blocked_recorded:";
+
 /// Trait for canonicalizing messages before signing.
 ///
 /// Types implementing this trait have repeated fields that must be sorted
