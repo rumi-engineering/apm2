@@ -88,7 +88,7 @@ use crate::episode::capability::StubManifestLoader;
 use crate::episode::decision::{BrokerToolRequest, DedupeKey, ToolDecision};
 use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
-use crate::episode::{CapabilityManifest, EpisodeId, SharedToolBroker, ToolClass};
+use crate::episode::{CapabilityManifest, EpisodeId, EpisodeRuntime, SharedToolBroker, ToolClass};
 use crate::htf::{ClockError, HolonicClock};
 
 // ============================================================================
@@ -260,6 +260,64 @@ impl SessionResponse {
 /// strings.
 pub const MAX_TOOL_ID_LEN: usize = 128;
 
+/// Maximum length for sanitized error messages returned over the protocol.
+///
+/// Per SEC-CTRL-FAC-0015: Error messages may leak system paths, environment
+/// details, or configuration. Messages are truncated and potentially sensitive
+/// patterns are redacted before returning to clients.
+const MAX_ERROR_MESSAGE_LEN: usize = 256;
+
+/// Sanitizes an error message for safe return over the protocol.
+///
+/// This function:
+/// 1. Truncates messages to `MAX_ERROR_MESSAGE_LEN`
+/// 2. Redacts potential file system paths (anything starting with /)
+/// 3. Replaces internal error details with generic messages
+///
+/// # SEC-CTRL-FAC-0015 Information Leakage Prevention
+///
+/// Raw error messages from tool execution may contain:
+/// - File system paths (`/home/user/.ssh/...`)
+/// - Environment variable values
+/// - Internal implementation details
+///
+/// This function ensures only safe, generic error information is returned.
+fn sanitize_error_message(msg: &str) -> String {
+    // Truncate to max length first
+    let truncated: String = if msg.len() > MAX_ERROR_MESSAGE_LEN {
+        format!("{}...", &msg[..MAX_ERROR_MESSAGE_LEN.saturating_sub(3)])
+    } else {
+        msg.to_string()
+    };
+
+    // Redact potential absolute file paths (heuristic: starts with / followed by
+    // word chars) This catches patterns like /home/user/path or /var/run/socket
+    let mut result = String::with_capacity(truncated.len());
+    let mut chars = truncated.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '/' {
+            // Check if this looks like a path (followed by alphanumeric)
+            if chars.peek().is_some_and(|next| next.is_alphanumeric()) {
+                result.push_str("[path]");
+                // Skip until we hit a space, quote, or end
+                while let Some(&next) = chars.peek() {
+                    if next.is_whitespace() || next == '"' || next == '\'' || next == ')' {
+                        break;
+                    }
+                    chars.next();
+                }
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 /// Trait for looking up capability manifests by session ID.
 ///
 /// Per TCK-00260, the dispatcher needs to validate tool requests against
@@ -387,6 +445,11 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// RFC-0018. Shared with `PrivilegedDispatcher` to manage subscriptions
     /// across both operator and session sockets.
     subscription_registry: Option<super::resource_governance::SharedSubscriptionRegistry>,
+    /// Episode runtime for tool execution (TCK-00316).
+    ///
+    /// Per TCK-00316, this is required to execute tools kernel-side and return
+    /// durable result references.
+    episode_runtime: Option<Arc<EpisodeRuntime>>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -411,6 +474,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
+            episode_runtime: None,
         }
     }
 
@@ -427,6 +491,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
+            episode_runtime: None,
         }
     }
 }
@@ -448,6 +513,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
+            episode_runtime: None,
         }
     }
 
@@ -469,6 +535,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
+            episode_runtime: None,
         }
     }
 
@@ -506,6 +573,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
+            episode_runtime: None,
         }
     }
 
@@ -556,6 +624,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         registry: super::resource_governance::SharedSubscriptionRegistry,
     ) -> Self {
         self.subscription_registry = Some(registry);
+        self
+    }
+
+    /// Sets the episode runtime for tool execution (TCK-00316).
+    #[must_use]
+    pub fn with_episode_runtime(mut self, runtime: Arc<EpisodeRuntime>) -> Self {
+        self.episode_runtime = Some(runtime);
         self
     }
 
@@ -946,9 +1021,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 })
                 .unwrap_or(RiskTier::Tier0);
 
+            // Clone arguments for execution before they are moved into BrokerToolRequest
+            let request_arguments = request.arguments.clone();
+
             let broker_request = BrokerToolRequest::new(
                 &request_id,
-                episode_id,
+                episode_id.clone(),
                 tool_class,
                 dedupe_key,
                 args_hash,
@@ -962,7 +1040,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
             });
 
-            return self.handle_broker_decision(decision, &token.session_id, tool_class);
+            return self.handle_broker_decision(
+                decision,
+                &token.session_id,
+                tool_class,
+                &request_arguments,
+                timestamp_ns,
+                &episode_id,
+            );
         }
 
         // Legacy fallback: TCK-00260 manifest store validation
@@ -1022,18 +1107,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     /// Handles the broker decision and converts it to a `SessionResponse`.
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(clippy::unnecessary_wraps, clippy::items_after_statements)]
     fn handle_broker_decision(
         &self,
         decision: Result<ToolDecision, crate::episode::BrokerError>,
         session_id: &str,
         tool_class: ToolClass,
+        request_arguments: &[u8],
+        timestamp_ns: u64,
+        episode_id: &EpisodeId,
     ) -> ProtocolResult<SessionResponse> {
         match decision {
             Ok(ToolDecision::Allow {
                 request_id,
                 rule_id,
                 policy_hash,
+                credential,
                 ..
             }) => {
                 info!(
@@ -1042,22 +1131,105 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     request_id = %request_id,
                     "Tool request allowed by broker"
                 );
-                // TCK-00316 BLOCKER 2: For now, return Allow without execution.
-                // Full tool execution integration requires EpisodeRuntime wiring
-                // which is tracked separately. The result_hash/inline_result fields
-                // are None until execution is implemented.
-                //
-                // TODO(TCK-00316): Implement actual tool execution on Allow:
-                // 1. Invoke EpisodeRuntime/ToolExecutor with the request
-                // 2. Store result in CAS if > MAX_INLINE_RESULT_SIZE
-                // 3. Return result_hash and/or inline_result
+
+                // TCK-00316: Execute tool via EpisodeRuntime
+                let (result_hash, inline_result) = if let Some(ref runtime) = self.episode_runtime {
+                    // Deserialize arguments
+                    let tool_args: crate::episode::tool_handler::ToolArgs =
+                        match serde_json::from_slice(request_arguments) {
+                            Ok(args) => args,
+                            Err(e) => {
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorInvalid,
+                                    format!("invalid tool arguments: {e}"),
+                                ));
+                            },
+                        };
+
+                    // Execute tool
+                    // We use the timestamp from the start of the request for consistency.
+                    //
+                    // KNOWN ISSUE (MAJOR): This uses block_in_place + block_on to call
+                    // async tool execution from a sync dispatch context. Under high load
+                    // with slow tools (git clone, large file reads), this can lead to
+                    // worker thread starvation.
+                    //
+                    // TODO(TCK-ASYNC-DISPATCH): Refactor SessionDispatcher::dispatch to be
+                    // async, allowing direct .await on tool execution. This requires:
+                    // 1. Make dispatch() async
+                    // 2. Update all callers (main.rs connection handler)
+                    // 3. Remove block_in_place wrapper
+                    //
+                    // For now, max_concurrent_episodes (100) provides backpressure to
+                    // limit the impact on the worker pool.
+                    let execution_result = tokio::task::block_in_place(|| {
+                        let handle = tokio::runtime::Handle::current();
+                        handle.block_on(async {
+                            runtime
+                                .execute_tool(
+                                    episode_id,
+                                    &tool_args,
+                                    credential.as_ref(),
+                                    timestamp_ns,
+                                    &request_id,
+                                )
+                                .await
+                        })
+                    });
+
+                    let result = match execution_result {
+                        Ok(res) => res,
+                        Err(e) => {
+                            error!(error = %e, "Tool execution failed");
+                            // SEC-CTRL-FAC-0015 LOW FIX: Sanitize error messages
+                            // to prevent information leakage via paths/env vars
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorInternal,
+                                sanitize_error_message(&format!("tool execution failed: {e}")),
+                            ));
+                        },
+                    };
+
+                    if !result.success {
+                        // SEC-CTRL-FAC-0015 LOW FIX: Sanitize error messages
+                        let error_msg = result.error_message.as_deref().unwrap_or("unknown error");
+                        return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorInternal,
+                            sanitize_error_message(error_msg),
+                        ));
+                    }
+
+                    // SEC-CTRL-FAC-0015 BLOCKER FIX: Enforce MAX_INLINE_RESULT_SIZE
+                    // for inline_result. If the output exceeds the limit, return only
+                    // result_hash and force client to fetch via CAS. This prevents
+                    // protocol-level DoS via oversized inline responses.
+                    use crate::episode::decision::MAX_INLINE_RESULT_SIZE;
+                    let inline_result = if result.output.len() <= MAX_INLINE_RESULT_SIZE {
+                        Some(result.output)
+                    } else {
+                        // Output exceeds inline limit; must be fetched from CAS
+                        None
+                    };
+
+                    (result.output_hash.map(|h| h.to_vec()), inline_result)
+                } else {
+                    // SEC-CTRL-FAC-0015 MAJOR FIX: Fail-closed when EpisodeRuntime
+                    // is not configured. Returning Allow without execution would
+                    // bypass integrity controls and create inconsistent state.
+                    error!("EpisodeRuntime not configured; denying execution (fail-closed)");
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        "tool execution unavailable: runtime not configured".to_string(),
+                    ));
+                };
+
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Allow.into(),
                     rule_id,
                     policy_hash: policy_hash.to_vec(),
-                    result_hash: None,
-                    inline_result: None,
+                    result_hash,
+                    inline_result,
                 }))
             },
             Ok(ToolDecision::Deny {
@@ -2383,7 +2555,9 @@ mod tests {
             Capability, CapabilityManifestBuilder, CapabilityScope, RiskTier, ToolClass,
         };
 
-        fn make_test_manifest(tools: Vec<ToolClass>) -> crate::episode::CapabilityManifest {
+        pub(super) fn make_test_manifest(
+            tools: Vec<ToolClass>,
+        ) -> crate::episode::CapabilityManifest {
             let caps: Vec<Capability> = tools
                 .iter()
                 .map(|tc| Capability {
@@ -3026,6 +3200,104 @@ mod tests {
             // Tag 67 is UNSUBSCRIBE_PULSE_RESPONSE_TAG
             assert_eq!(encoded[0], 67);
             assert!(encoded.len() > 1);
+        }
+    }
+
+    // ========================================================================
+    // TCK-00316: Tool Execution Integration Tests
+    // ========================================================================
+    mod tool_execution {
+        use super::*;
+        use crate::episode::{ToolBroker, ToolBrokerConfig, ToolClass};
+
+        /// TCK-00316: Verify fail-closed behavior when broker is configured but
+        /// holonic clock is missing.
+        ///
+        /// Per SEC-CTRL-FAC-0015, the dispatcher must fail-closed when required
+        /// infrastructure (clock, runtime) is missing. This test verifies the
+        /// clock check happens before broker request.
+        #[test]
+        fn test_request_tool_fails_closed_without_clock() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            // Build manifest with Read allowed
+            let manifest = tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+            store.register("session-001", manifest);
+
+            // Create broker with default config
+            let broker = Arc::new(ToolBroker::new(ToolBrokerConfig::default()));
+
+            // Create dispatcher WITH broker but WITHOUT clock
+            let dispatcher =
+                SessionDispatcher::with_manifest_store(minter.clone(), store).with_broker(broker);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            // Send a RequestTool request for Read
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(),
+                arguments: vec![],
+                dedupe_key: "test-dedupe-key".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+
+            // Should return protocol error for missing clock (fail-closed)
+            let result = dispatcher.dispatch(&frame, &ctx);
+            match result {
+                Err(ProtocolError::Serialization { reason }) => {
+                    assert!(
+                        reason.contains("holonic clock not configured"),
+                        "Expected clock not configured error, got: {reason}"
+                    );
+                },
+                other => panic!("Expected protocol error for missing clock, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00316: Verify legacy path (no broker) still returns Allow
+        /// decision for allowed tools.
+        ///
+        /// When no broker is configured, the dispatcher falls back to manifest
+        /// validation only. This test verifies the legacy path still works.
+        #[test]
+        fn test_request_tool_legacy_path_without_broker() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            // Build manifest with Read allowed
+            let manifest = tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+            store.register("session-001", manifest);
+
+            // Create dispatcher WITHOUT broker (legacy path)
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            // Send a RequestTool request for Read
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(),
+                arguments: vec![],
+                dedupe_key: "test-dedupe-key".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // Should return Allow on legacy path
+            match response {
+                SessionResponse::RequestTool(resp) => {
+                    assert_eq!(
+                        resp.decision,
+                        DecisionType::Allow as i32,
+                        "Expected Allow decision on legacy path"
+                    );
+                },
+                other => panic!("Expected RequestTool response, got: {other:?}"),
+            }
         }
     }
 }

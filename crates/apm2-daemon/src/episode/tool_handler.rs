@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::decision::BudgetDelta;
+use super::decision::{BudgetDelta, Credential};
 use super::runtime::Hash;
 use super::tool_class::ToolClass;
 
@@ -711,6 +711,7 @@ pub trait ToolHandler: Send + Sync + fmt::Debug {
     /// # Arguments
     ///
     /// * `args` - The validated tool arguments
+    /// * `credential` - Optional credential for authenticated operations
     ///
     /// # Returns
     ///
@@ -719,7 +720,11 @@ pub trait ToolHandler: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Returns an error if execution fails.
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError>;
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError>;
 
     /// Validates the tool arguments before execution.
     ///

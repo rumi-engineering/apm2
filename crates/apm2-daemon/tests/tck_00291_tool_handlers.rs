@@ -32,7 +32,7 @@ async fn tool_handlers_real_io_read_write() {
         create_parents: false,
         append: false,
     });
-    let result = write_handler.execute(&args).await.unwrap();
+    let result = write_handler.execute(&args, None).await.unwrap();
     assert!(result.success);
     assert_eq!(result.budget_consumed.bytes_io, 11);
 
@@ -51,7 +51,7 @@ async fn tool_handlers_real_io_read_write() {
         offset: None,
         limit: None,
     });
-    let result = read_handler.execute(&args).await.unwrap();
+    let result = read_handler.execute(&args, None).await.unwrap();
     assert!(result.success);
     assert_eq!(result.output, b"Hello World");
     assert_eq!(result.budget_consumed.bytes_io, 11);
@@ -62,7 +62,7 @@ async fn tool_handlers_real_io_read_write() {
         offset: Some(6),
         limit: Some(5),
     });
-    let result = read_handler.execute(&args).await.unwrap();
+    let result = read_handler.execute(&args, None).await.unwrap();
     assert!(result.success);
     assert_eq!(result.output, b"World");
 }
@@ -81,7 +81,7 @@ async fn tool_handlers_real_io_write_atomic_and_parents() {
         create_parents: true,
         append: false,
     });
-    let result = handler.execute(&args).await.unwrap();
+    let result = handler.execute(&args, None).await.unwrap();
     assert!(result.success);
 
     let file_path = root.join("nested/dir/file.txt");
@@ -95,7 +95,7 @@ async fn tool_handlers_real_io_write_atomic_and_parents() {
         create_parents: false,
         append: true,
     });
-    let result = handler.execute(&args).await.unwrap();
+    let result = handler.execute(&args, None).await.unwrap();
     assert!(result.success);
 
     let content = tokio::fs::read(&file_path).await.unwrap();
@@ -116,7 +116,7 @@ async fn tool_handlers_real_io_execute() {
         stdin: None,
         timeout_ms: None,
     });
-    let result = handler.execute(&args).await.unwrap();
+    let result = handler.execute(&args, None).await.unwrap();
     assert!(result.success);
     // output might contain newline
     let output_str = std::str::from_utf8(&result.output).unwrap();
@@ -137,7 +137,7 @@ async fn tool_handlers_real_io_execute() {
         stdin: None,
         timeout_ms: None,
     });
-    let result = handler.execute(&args).await.unwrap();
+    let result = handler.execute(&args, None).await.unwrap();
     assert!(result.success);
     let output_str = std::str::from_utf8(&result.output).unwrap();
     assert!(output_str.contains("marker"));
@@ -150,7 +150,7 @@ async fn tool_handlers_real_io_execute() {
         stdin: Some(b"from stdin".to_vec()),
         timeout_ms: None,
     });
-    let result = handler.execute(&args).await.unwrap();
+    let result = handler.execute(&args, None).await.unwrap();
     assert!(result.success);
     assert_eq!(result.output, b"from stdin");
 }
@@ -169,7 +169,7 @@ async fn tool_handlers_real_io_execute_timeout() {
         timeout_ms: Some(100), // Timeout 100ms
     });
 
-    let result = handler.execute(&args).await;
+    let result = handler.execute(&args, None).await;
     assert!(matches!(
         result,
         Err(apm2_daemon::episode::tool_handler::ToolHandlerError::ExecutionFailed { .. })
@@ -216,7 +216,7 @@ async fn tool_handlers_execute_rejects_cwd_symlink_escape() {
         timeout_ms: None,
     });
 
-    let result = handler.execute(&args).await;
+    let result = handler.execute(&args, None).await;
 
     // Must fail with PathValidation error
     assert!(
@@ -257,7 +257,7 @@ async fn tool_handlers_read_rejects_symlink_escape() {
         limit: None,
     });
 
-    let result = handler.execute(&args).await;
+    let result = handler.execute(&args, None).await;
 
     assert!(
         matches!(result, Err(ToolHandlerError::PathValidation { .. })),
@@ -294,7 +294,7 @@ async fn tool_handlers_write_rejects_symlink_escape() {
         append: false,
     });
 
-    let result = handler.execute(&args).await;
+    let result = handler.execute(&args, None).await;
 
     assert!(
         matches!(result, Err(ToolHandlerError::PathValidation { .. })),
@@ -327,7 +327,7 @@ async fn tool_handlers_execute_nonexistent_cwd() {
         timeout_ms: None,
     });
 
-    let result = handler.execute(&args).await;
+    let result = handler.execute(&args, None).await;
 
     // Should fail because the directory doesn't exist
     assert!(

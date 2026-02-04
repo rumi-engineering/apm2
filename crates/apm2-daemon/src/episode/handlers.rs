@@ -39,8 +39,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tracing::warn;
 
-use super::decision::{BudgetDelta, MAX_TOOL_OUTPUT_SIZE};
+use super::decision::{BudgetDelta, Credential, MAX_TOOL_OUTPUT_SIZE};
 use super::executor::ContentAddressedStore;
 use super::tool_class::ToolClass;
 use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
@@ -187,7 +188,11 @@ impl ToolHandler for ReadFileHandler {
         ToolClass::Read
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
         // Validate arguments first (MAJOR 1 fix)
         self.validate(args)?;
 
@@ -351,7 +356,11 @@ impl ToolHandler for WriteFileHandler {
         ToolClass::Write
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
         // Validate arguments first (MAJOR 1 fix)
         self.validate(args)?;
 
@@ -587,7 +596,11 @@ impl ToolHandler for ExecuteHandler {
         ToolClass::Execute
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
         // Validate arguments first (MAJOR 1 fix)
         self.validate(args)?;
 
@@ -952,7 +965,11 @@ impl ToolHandler for GitOperationHandler {
         ToolClass::Git
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
         use tokio::io::AsyncReadExt;
 
         use super::tool_handler::{
@@ -1028,6 +1045,26 @@ impl ToolHandler for GitOperationHandler {
         if let Some(xdg_config) = std::env::var_os("XDG_CONFIG_HOME") {
             cmd.env("XDG_CONFIG_HOME", xdg_config);
         }
+
+        // TCK-00263: Set SSH_AUTH_SOCK if credential is provided and looks like a valid
+        // path
+        if let Some(cred) = credential {
+            let secret = cred.expose_secret();
+            // Validate path: absolute, no traversal, and in standard temp/runtime dirs
+            // This prevents injecting weird paths or malicious values
+            let path = Path::new(secret);
+            if path.is_absolute()
+                && !secret.contains("..")
+                && (secret.starts_with("/tmp/")
+                    || secret.starts_with("/run/")
+                    || secret.starts_with("/private/"))
+            {
+                cmd.env("SSH_AUTH_SOCK", secret);
+            } else {
+                warn!("Ignoring potentially unsafe SSH_AUTH_SOCK credential path pattern");
+            }
+        }
+
         // Fail closed on global/system git config
         cmd.env("GIT_CONFIG_NOSYSTEM", "1");
         cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -1296,7 +1333,11 @@ impl ToolHandler for ArtifactFetchHandler {
         ToolClass::Artifact
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
         // Validate arguments first
         self.validate(args)?;
 
@@ -1519,7 +1560,11 @@ impl ToolHandler for ListFilesHandler {
         ToolClass::ListFiles
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
         use super::tool_handler::{
             LISTFILES_DEFAULT_ENTRIES, LISTFILES_MAX_ENTRIES, NAVIGATION_OUTPUT_MAX_BYTES,
             NAVIGATION_OUTPUT_MAX_LINES,
@@ -1961,7 +2006,11 @@ impl ToolHandler for SearchHandler {
         ToolClass::Search
     }
 
-    async fn execute(&self, args: &ToolArgs) -> Result<ToolResultData, ToolHandlerError> {
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
         use super::tool_handler::{NAVIGATION_OUTPUT_MAX_BYTES, NAVIGATION_OUTPUT_MAX_LINES};
 
         // Validate arguments first
@@ -2853,7 +2902,7 @@ mod tests {
             repo_path: None,
         });
 
-        let result = handler.execute(&args).await;
+        let result = handler.execute(&args, None).await;
         assert!(
             matches!(result, Err(ToolHandlerError::OutputTooLarge { .. })),
             "expected output too large"
@@ -2882,7 +2931,7 @@ mod tests {
             repo_path: None,
         });
 
-        let result = handler.execute(&args).await;
+        let result = handler.execute(&args, None).await;
         assert!(
             matches!(result, Err(ToolHandlerError::OutputTooLarge { .. })),
             "expected output too large"
@@ -2912,7 +2961,7 @@ mod tests {
             format: None,
         });
 
-        let result = handler.execute(&args).await;
+        let result = handler.execute(&args, None).await;
         assert!(
             matches!(result, Err(ToolHandlerError::OutputTooLarge { .. })),
             "expected output too large"
@@ -2936,7 +2985,7 @@ mod tests {
             format: None,
         });
 
-        let result = handler.execute(&args).await;
+        let result = handler.execute(&args, None).await;
         assert!(
             matches!(result, Err(ToolHandlerError::FileNotFound { .. })),
             "expected missing artifact"
@@ -3155,7 +3204,7 @@ mod tests {
             max_lines: None,
         });
 
-        let result = handler.execute(&args).await.expect("execute search");
+        let result = handler.execute(&args, None).await.expect("execute search");
         let output = result.output_str().expect("utf8 output");
 
         assert!(
@@ -3199,7 +3248,7 @@ mod tests {
             max_lines: None,
         });
 
-        let result = handler.execute(&args).await;
+        let result = handler.execute(&args, None).await;
         assert!(matches!(result, Err(ToolHandlerError::InvalidArgs { .. })));
     }
 

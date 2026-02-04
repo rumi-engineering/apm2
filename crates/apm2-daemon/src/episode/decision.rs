@@ -1397,6 +1397,24 @@ impl ToolResult {
     pub const fn time_envelope(&self) -> Option<&TimeEnvelope> {
         self.time_envelope.as_ref()
     }
+
+    /// Sets the CAS hash for this result.
+    ///
+    /// This is the hash of the full `ToolResultData` stored in the content-
+    /// addressed store, which includes output, `error_output`, and budget.
+    /// Clients can use this hash to retrieve the complete execution data
+    /// from CAS when the inline result is truncated or omitted.
+    ///
+    /// # SEC-CTRL-FAC-0015 Evidence Integrity
+    ///
+    /// The CAS hash provides a verifiable reference to the full execution
+    /// record, ensuring audit trail integrity even when inline responses
+    /// are size-limited.
+    #[must_use]
+    pub const fn with_cas_hash(mut self, hash: Hash) -> Self {
+        self.output_hash = Some(hash);
+        self
+    }
 }
 
 /// Internal protobuf representation for `ToolResult`.

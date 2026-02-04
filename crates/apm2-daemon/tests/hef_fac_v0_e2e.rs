@@ -851,7 +851,7 @@ async fn test_review_blocked_tool_failure_on_git_bounds() {
 
     let result = harness
         .tool_executor
-        .execute(&ctx, &git_args)
+        .execute(&ctx, &git_args, None)
         .await
         .expect("execute git diff");
     assert!(
@@ -945,7 +945,7 @@ async fn test_review_blocked_tool_failure_on_git_status_bounds() {
 
     let result = harness
         .tool_executor
-        .execute(&ctx, &git_args)
+        .execute(&ctx, &git_args, None)
         .await
         .expect("execute git status");
     assert!(
@@ -1013,7 +1013,7 @@ async fn test_git_operation_ignores_env_overrides() {
 
     let result = harness
         .tool_executor
-        .execute(&ctx, &git_args)
+        .execute(&ctx, &git_args, None)
         .await
         .expect("execute git diff");
 
@@ -1058,7 +1058,7 @@ async fn test_review_blocked_missing_artifact() {
     });
     let result = harness
         .tool_executor
-        .execute(&ctx, &artifact_args)
+        .execute(&ctx, &artifact_args, None)
         .await
         .expect("execute artifact fetch");
     assert!(
@@ -1128,7 +1128,7 @@ async fn test_review_blocked_artifact_fetch_max_bytes() {
     });
     let result = harness
         .tool_executor
-        .execute(&ctx, &artifact_args)
+        .execute(&ctx, &artifact_args, None)
         .await
         .expect("execute artifact fetch");
     assert!(
@@ -1447,7 +1447,7 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
 
     let read_result = harness
         .tool_executor
-        .execute(&ctx, &read_args)
+        .execute(&ctx, &read_args, None)
         .await
         .expect("tool execution");
 
@@ -1464,7 +1464,7 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
     });
     let git_result = harness
         .tool_executor
-        .execute(&ctx, &git_args)
+        .execute(&ctx, &git_args, None)
         .await
         .expect("git operation");
 
@@ -1523,7 +1523,7 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
     });
     let artifact_result = harness
         .tool_executor
-        .execute(&ctx, &artifact_args)
+        .execute(&ctx, &artifact_args, None)
         .await
         .expect("artifact fetch");
 
@@ -1813,7 +1813,7 @@ async fn test_tool_output_stored_in_cas() {
 
     let result = harness
         .tool_executor
-        .execute(&ctx, &args)
+        .execute(&ctx, &args, None)
         .await
         .expect("execute");
 
@@ -1864,11 +1864,11 @@ async fn test_tool_executor_respects_budget() {
     });
 
     // First call should succeed
-    let result1 = executor.execute(&ctx, &args).await;
+    let result1 = executor.execute(&ctx, &args, None).await;
     assert!(result1.is_ok(), "first call should succeed");
 
     // Second call should fail due to budget
-    let result2 = executor.execute(&ctx, &args).await;
+    let result2 = executor.execute(&ctx, &args, None).await;
     assert!(
         result2.is_err(),
         "second call should fail due to budget exhaustion"
@@ -1905,7 +1905,7 @@ async fn test_tool_executor_validates_arguments() {
         limit: None,
     });
 
-    let result = executor.execute(&ctx, &args).await;
+    let result = executor.execute(&ctx, &args, None).await;
     assert!(
         result.is_err(),
         "path traversal should be rejected: {result:?}"
