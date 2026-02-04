@@ -610,6 +610,159 @@
         "crates/apm2-core/src/consensus/crdt.rs"
       ],
       "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:defect_record",
+      "term": "DefectRecord",
+      "definition": "A machine-readable counterexample that falsifies an intent predicate or contract. It includes an evidence bundle, structured findings, and replay instructions.",
+      "operationalization": "Implemented as `DefectRecord` in `crates/apm2-holon/src/defect.rs` and the `DefectRecorded` event in `events/apm2.kernel.v1.rs`.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-08"
+      ],
+      "implementation_refs": [
+        "crates/apm2-holon/src/defect.rs",
+        "crates/apm2-core/src/events/apm2.kernel.v1.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:finding_signature",
+      "term": "FindingSignature",
+      "definition": "A deterministic identifier computed from normalized finding fields (category, rule ID, subsystem, location) used to cluster recurrent defects and trigger countermeasures.",
+      "operationalization": "Implemented as `FindingSignature` in `crates/apm2-core/src/fac/echo_trap.rs`.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-08"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/fac/echo_trap.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:work_substrate",
+      "term": "Work Substrate",
+      "definition": "The authoritative coordination plane comprising work-object specs, durable event records, and deterministic projections. It is the 'factory floor' for agent activity.",
+      "operationalization": "Abstract concept realized by the integration of `Ledger`, `CAS`, `WorkObject` state machines, and the `Daemon` event loop.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/work/state.rs",
+        "crates/apm2-core/src/ledger/storage.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:plan_of_record",
+      "term": "Plan-of-Record",
+      "definition": "An approved Plan specification snapshot bound by a content digest. It serves as the immutable reference for downstream implementation and verification.",
+      "operationalization": "Realized as a `Work` object with `WorkType::PrdRefinement` or `RfcRefinement` that has been approved and hashed.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-09"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/work/state.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:spec_snapshot",
+      "term": "Spec Snapshot",
+      "definition": "A deterministic representation of specification content (YAML, attachments, schema versions), canonicalized and hashed to provide stable identity.",
+      "operationalization": "Part of the `Work` state in `crates/apm2-core/src/work/state.rs`, stored as `spec_snapshot_hash`.",
+      "theory_refs": [
+        "LAW-09",
+        "LAW-13"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/work/state.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:gate_run",
+      "term": "GateRun",
+      "definition": "An execution instance of a Gate against a Plan or ChangeSet, producing a decision and a bounded set of Findings. It must emit a verifiable receipt.",
+      "operationalization": "Represented by the `GateRunCompleted` event in `documents/rfcs/RFC-0015/06_ticket_decomposition.yaml` (and likely protocol definitions).",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/events/apm2.kernel.v1.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:countermeasure",
+      "term": "Countermeasure",
+      "definition": "Planned work to prevent the recurrence of a FindingSignature by modifying system guardrails. Validated by evidence of reduced recurrence.",
+      "operationalization": "A specific `WorkType` (conceptual) or a `Ticket` triggered by recurrence analysis in `RefactorRadar` or similar subsystems.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-08"
+      ],
+      "implementation_refs": [],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:permeability_receipt",
+      "term": "PermeabilityReceipt",
+      "definition": "The only legal path for capabilities to cross a holonic boundary. It grants a narrowly-scoped capability set with TTL and audit bindings.",
+      "operationalization": "Conceptual mechanism defined in `unified_theory.json` (MECH-PERMEABILITY-RECEIPT). Implemented as part of the handshake/capability exchange protocol.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/protocol/handshake.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:oracle_request",
+      "term": "OracleRequest",
+      "definition": "An explicit escalation event for high-entropy specification gaps or irreducible human decisions. Treated as a refinement input, not a silent failure.",
+      "operationalization": "Conceptual mechanism defined in `unified_theory.json` (MECH-ORACLE-REQUEST).",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-12"
+      ],
+      "implementation_refs": [],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:holonic_mesh_protocol",
+      "term": "Holonic Mesh Protocol (HMP)",
+      "definition": "The digest-first communication standard for inter-holon messages. It enforces `Discovery -> Handshake -> Work -> Evidence` channel progression.",
+      "operationalization": "Conceptual standard defined in `unified_theory.json` (MECH-HOLON-MESH-PROTOCOL). Partially implemented by the `apm2-daemon` protocol.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-07",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/protocol"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:cell",
+      "term": "Cell",
+      "definition": "An operational and trust boundary that hosts a set of holons with a local ledger namespace, CAS, and policy. It supports federation via anti-entropy.",
+      "operationalization": "Conceptual unit of sharding defined in `unified_theory.json` (Federation Model).",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-05",
+        "LAW-10"
+      ],
+      "implementation_refs": [],
+      "node_class": "NORMATIVE"
     }
   ],
   "edges": [
@@ -777,6 +930,56 @@
       "source": "term:impact_map",
       "target": "term:gate",
       "relation": "governs"
+    },
+    {
+      "source": "term:defect_record",
+      "target": "term:finding_signature",
+      "relation": "governs"
+    },
+    {
+      "source": "term:finding_signature",
+      "target": "term:countermeasure",
+      "relation": "implements"
+    },
+    {
+      "source": "term:work_substrate",
+      "target": "term:work_object",
+      "relation": "governs"
+    },
+    {
+      "source": "term:plan_of_record",
+      "target": "term:spec_snapshot",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:gate_run",
+      "target": "term:gate",
+      "relation": "implements"
+    },
+    {
+      "source": "term:gate_run",
+      "target": "term:receipt",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:permeability_receipt",
+      "target": "term:ocap",
+      "relation": "implements"
+    },
+    {
+      "source": "term:oracle_request",
+      "target": "term:work_object",
+      "relation": "implements"
+    },
+    {
+      "source": "term:holonic_mesh_protocol",
+      "target": "term:handshake",
+      "relation": "governs"
+    },
+    {
+      "source": "term:cell",
+      "target": "term:federation",
+      "relation": "implements"
     }
   ]
 }
