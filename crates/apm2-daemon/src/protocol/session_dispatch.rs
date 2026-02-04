@@ -789,6 +789,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// - Token is parsed and validated using HMAC-SHA256
     /// - Constant-time comparison prevents timing attacks (CTR-WH001)
     /// - Returns error description without leaking internal state
+    #[allow(clippy::result_large_err)] // TCK-00316: Response enum grew with result_hash field
     fn validate_token(&self, token_json: &str) -> Result<SessionToken, SessionResponse> {
         // Parse the token JSON
         let token: SessionToken = serde_json::from_str(token_json).map_err(|e| {
@@ -964,56 +965,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             return self.handle_broker_decision(decision, &token.session_id, tool_class);
         }
 
-        // Legacy fallback: TCK-00260 manifest store validation
-        // This path is used when no broker is configured (for backwards compatibility)
-        if let Some(ref store) = self.manifest_store {
-            if let Some(manifest) = store.get_manifest(&token.session_id) {
-                // Check if tool is in allowlist
-                if !manifest.is_tool_allowed(tool_class) {
-                    warn!(
-                        session_id = %token.session_id,
-                        tool_class = %tool_class,
-                        "Tool not in allowlist"
-                    );
-                    return Ok(SessionResponse::error(
-                        SessionErrorCode::SessionErrorToolNotAllowed,
-                        format!("tool class '{tool_class}' not in allowlist"),
-                    ));
-                }
-
-                info!(
-                    session_id = %token.session_id,
-                    tool_class = %tool_class,
-                    "Tool allowed by manifest (legacy path)"
-                );
-
-                // Tool is allowed - return Allow decision
-                return Ok(SessionResponse::RequestTool(RequestToolResponse {
-                    request_id: format!("REQ-{}", uuid::Uuid::new_v4()),
-                    decision: DecisionType::Allow.into(),
-                    rule_id: None,
-                    policy_hash: manifest.digest().to_vec(),
-                }));
-            }
-            // No manifest found - fail closed (SEC-CTRL-FAC-0015)
-            warn!(
-                session_id = %token.session_id,
-                "No manifest found for session, denying request (fail-closed)"
-            );
-            return Ok(SessionResponse::error(
-                SessionErrorCode::SessionErrorToolNotAllowed,
-                "capability manifest unavailable",
-            ));
-        }
-
-        // INV-TCK-00290-001: Neither broker nor manifest store configured - fail closed
+        // TCK-00316: Legacy manifest-store allow path removed in production mode.
+        // Per RFC-0019 Workstream A: "Remove or gate the legacy allow path:
+        // In production mode: **deny if broker absent**."
+        //
+        // The legacy path returned ALLOW decisions without actual tool execution,
+        // which violates the FAC v0 requirement that tools be executed kernel-side
+        // with results stored in CAS.
+        //
+        // For tests that need manifest-only validation without broker execution,
+        // use `with_broker()` to configure a test broker, or accept that the
+        // request will be denied (fail-closed).
         warn!(
             session_id = %token.session_id,
-            "RequestTool denied: neither broker nor manifest store configured (fail-closed)"
+            tool_class = %tool_class,
+            "RequestTool denied: broker not configured (fail-closed per TCK-00316)"
         );
         Ok(SessionResponse::error(
             SessionErrorCode::SessionErrorToolNotAllowed,
-            "tool broker unavailable (fail-closed)",
+            "tool broker unavailable (fail-closed per TCK-00316)",
         ))
     }
 
@@ -1038,11 +1008,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     request_id = %request_id,
                     "Tool request allowed by broker"
                 );
+                // TCK-00316: After broker allows, kernel should execute and return result_hash.
+                // For now, the broker returns Allow without execution; execution must be
+                // wired separately via ToolExecutor (see TCK-00320 for full wiring).
+                // The result_hash and inline_result fields are None until execution is wired.
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Allow.into(),
                     rule_id,
                     policy_hash: policy_hash.to_vec(),
+                    result_hash: None, // TCK-00316: Will be populated after execution wiring
+                    inline_result: None,
                 }))
             },
             Ok(ToolDecision::Deny {
@@ -1062,6 +1038,8 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     decision: DecisionType::Deny.into(),
                     rule_id,
                     policy_hash: policy_hash.to_vec(),
+                    result_hash: None, // Not applicable for denied requests
+                    inline_result: None,
                 }))
             },
             Ok(ToolDecision::DedupeCacheHit { request_id, result }) => {
@@ -1070,14 +1048,17 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     tool_class = %tool_class,
                     "Tool request hit dedupe cache"
                 );
-                // Return the cached result as Allow
-                // Use output_hash if available, otherwise empty policy hash
-                let policy_hash = result.output_hash.map(|h| h.to_vec()).unwrap_or_default();
+                // Return the cached result as Allow with the cached result hash
+                // TCK-00316: DedupeCacheHit includes the previously-stored result hash
+                let result_hash = result.output_hash.map(|h| h.to_vec());
+                let policy_hash = result_hash.clone().unwrap_or_default();
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Allow.into(),
                     rule_id: None,
                     policy_hash,
+                    result_hash, // TCK-00316: Return cached result hash for deduped requests
+                    inline_result: None, // Cached results require CAS lookup for content
                 }))
             },
             Ok(ToolDecision::Terminate {
@@ -2325,6 +2306,8 @@ mod tests {
             decision: 0,
             rule_id: None,
             policy_hash: vec![],
+            result_hash: None,   // TCK-00316
+            inline_result: None, // TCK-00316
         });
         let encoded = tool_resp.encode();
         assert!(!encoded.is_empty());
@@ -2359,8 +2342,19 @@ mod tests {
                 .expect("manifest build failed")
         }
 
+        /// TCK-00316: Tests that manifest-only dispatch (without broker) now
+        /// fails closed.
+        ///
+        /// Prior to TCK-00316, the dispatcher had a legacy allow path that
+        /// would return ALLOW based solely on manifest validation. This
+        /// path was removed because it violated the FAC v0 requirement
+        /// that tools be executed kernel-side with results stored in
+        /// CAS.
+        ///
+        /// Post-TCK-00316, all `RequestTool` operations require a configured
+        /// broker.
         #[test]
-        fn test_tool_in_allowlist_returns_allow() {
+        fn test_tool_in_allowlist_without_broker_fails_closed() {
             let minter = test_minter();
             let store = Arc::new(InMemoryManifestStore::new());
 
@@ -2368,6 +2362,7 @@ mod tests {
             let manifest = make_test_manifest(vec![ToolClass::Read]);
             store.register("session-001", manifest);
 
+            // TCK-00316: Dispatcher without broker must fail-closed
             let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
             let ctx = make_session_ctx();
             let token = test_token(&minter);
@@ -2382,16 +2377,32 @@ mod tests {
 
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
             match response {
-                SessionResponse::RequestTool(resp) => {
-                    assert_eq!(resp.decision, DecisionType::Allow as i32);
-                    assert!(!resp.policy_hash.is_empty());
+                SessionResponse::Error(err) => {
+                    // TCK-00316: Without broker, request is denied (fail-closed)
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Without broker, tool request must be denied"
+                    );
+                    assert!(
+                        err.message.contains("broker unavailable"),
+                        "Error should mention missing broker: {}",
+                        err.message
+                    );
                 },
-                _ => panic!("Expected RequestTool response, got: {response:?}"),
+                _ => panic!("Expected TOOL_NOT_ALLOWED without broker, got: {response:?}"),
             }
         }
 
+        /// TCK-00316: Tests that allowlist validation still happens before
+        /// broker check.
+        ///
+        /// Note: Since TCK-00316 removed the legacy allow path, the dispatcher
+        /// now fails at the broker check (fail-closed). The allowlist
+        /// validation path via the broker is tested in broker-specific
+        /// tests.
         #[test]
-        fn test_tool_not_in_allowlist_returns_tool_not_allowed() {
+        fn test_tool_request_without_broker_returns_tool_not_allowed() {
             let minter = test_minter();
             let store = Arc::new(InMemoryManifestStore::new());
 
@@ -2420,9 +2431,10 @@ mod tests {
                         SessionErrorCode::SessionErrorToolNotAllowed as i32,
                         "Expected TOOL_NOT_ALLOWED error code"
                     );
+                    // TCK-00316: Now fails at broker check, not allowlist check
                     assert!(
-                        err.message.contains("not in allowlist"),
-                        "Error message should mention allowlist: {}",
+                        err.message.contains("broker unavailable"),
+                        "Error message should mention broker: {}",
                         err.message
                     );
                 },
@@ -2544,8 +2556,13 @@ mod tests {
             }
         }
 
+        /// TCK-00316: Tests that all tool requests without broker fail-closed.
+        ///
+        /// Prior to TCK-00316, the dispatcher would check the allowlist and
+        /// return ALLOW for allowed tools. Post-TCK-00316, all requests
+        /// fail-closed without a configured broker.
         #[test]
-        fn test_multiple_tools_in_allowlist() {
+        fn test_multiple_tools_without_broker_all_fail_closed() {
             let minter = test_minter();
             let store = Arc::new(InMemoryManifestStore::new());
 
@@ -2558,31 +2575,8 @@ mod tests {
             let ctx = make_session_ctx();
             let token = test_token(&minter);
 
-            // All three should be allowed
-            for tool_id in ["read", "write", "execute"] {
-                let request = RequestToolRequest {
-                    session_token: serde_json::to_string(&token).unwrap(),
-                    tool_id: tool_id.to_string(),
-                    arguments: vec![],
-                    dedupe_key: format!("key-{tool_id}"),
-                };
-                let frame = encode_request_tool_request(&request);
-
-                let response = dispatcher.dispatch(&frame, &ctx).unwrap();
-                match response {
-                    SessionResponse::RequestTool(resp) => {
-                        assert_eq!(
-                            resp.decision,
-                            DecisionType::Allow as i32,
-                            "Tool {tool_id} should be allowed"
-                        );
-                    },
-                    _ => panic!("Expected Allow for tool {tool_id}"),
-                }
-            }
-
-            // Git and Network should be denied
-            for tool_id in ["git", "network"] {
+            // TCK-00316: All tools fail-closed without broker, regardless of allowlist
+            for tool_id in ["read", "write", "execute", "git", "network"] {
                 let request = RequestToolRequest {
                     session_token: serde_json::to_string(&token).unwrap(),
                     tool_id: tool_id.to_string(),
@@ -2597,10 +2591,15 @@ mod tests {
                         assert_eq!(
                             err.code,
                             SessionErrorCode::SessionErrorToolNotAllowed as i32,
-                            "Tool {tool_id} should be denied"
+                            "Tool {tool_id} should be denied without broker"
+                        );
+                        assert!(
+                            err.message.contains("broker unavailable"),
+                            "Error for {tool_id} should mention broker: {}",
+                            err.message
                         );
                     },
-                    _ => panic!("Expected Deny for tool {tool_id}"),
+                    _ => panic!("Expected Deny for tool {tool_id} without broker"),
                 }
             }
         }

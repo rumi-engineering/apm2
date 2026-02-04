@@ -437,6 +437,15 @@ pub struct RequestToolResponse {
     /// Policy hash at decision time.
     #[prost(bytes = "vec", tag = "4")]
     pub policy_hash: ::prost::alloc::vec::Vec<u8>,
+    /// TCK-00316: Hash of executed tool result (CAS reference).
+    /// Present when decision=ALLOW and tool execution completed successfully.
+    /// Empty when decision=DENY or execution pending (legacy allow path).
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub result_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// TCK-00316: Inline result for small outputs (< 1MB).
+    /// If present, result_hash refers to the same content.
+    #[prost(bytes = "vec", optional, tag = "6")]
+    pub inline_result: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 /// IPC-SESS-002: EmitEvent
 /// Emit a signed event to the ledger.

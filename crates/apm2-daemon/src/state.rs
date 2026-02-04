@@ -25,6 +25,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use tokio::sync::RwLock;
 
+use crate::cas::{DurableCas, DurableCasConfig};
 use crate::episode::{
     CapabilityManifest, EpisodeRuntime, EpisodeRuntimeConfig, InMemorySessionRegistry,
     PersistentRegistryError, PersistentSessionRegistry,
@@ -33,7 +34,7 @@ use crate::governance::GovernancePolicyResolver;
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use crate::metrics::SharedMetricsRegistry;
-use crate::protocol::dispatch::PrivilegedDispatcher;
+use crate::protocol::dispatch::{LedgerEventEmitter, PrivilegedDispatcher};
 use crate::protocol::messages::DecodeConfig;
 use crate::protocol::resource_governance::{SharedSubscriptionRegistry, SubscriptionRegistry};
 use crate::protocol::session_dispatch::{InMemoryManifestStore, ManifestStore, SessionDispatcher};
@@ -273,7 +274,17 @@ impl DispatcherState {
     }
 
     /// Creates new dispatcher state with persistent ledger components
-    /// (TCK-00289).
+    /// (TCK-00289, TCK-00316).
+    ///
+    /// # TCK-00316: Session Dispatcher Viability
+    ///
+    /// Per TCK-00316, the `SessionDispatcher` is now wired with:
+    /// - **CAS**: For `PublishEvidence` artifact storage
+    /// - **Ledger**: For `EmitEvent` persistence
+    /// - **Clock**: For HTF-compliant monotonic timestamps
+    ///
+    /// This enables the session dispatcher to function in production mode
+    /// with fail-closed behavior when these components are available.
     ///
     /// # Arguments
     ///
@@ -282,11 +293,44 @@ impl DispatcherState {
     /// * `sqlite_conn` - Optional `SQLite` connection for persistent ledger. If
     ///   provided, uses durable `Sqlite*` implementations. Otherwise uses
     ///   stubs.
+    /// * `cas_base_path` - Optional base path for durable CAS. If provided
+    ///   along with `sqlite_conn`, enables production-mode session dispatch.
     #[must_use]
     pub fn with_persistence(
         session_registry: Arc<dyn SessionRegistry>,
         metrics_registry: Option<SharedMetricsRegistry>,
         sqlite_conn: Option<Arc<Mutex<Connection>>>,
+    ) -> Self {
+        Self::with_persistence_and_cas(session_registry, metrics_registry, sqlite_conn, None)
+    }
+
+    /// Creates new dispatcher state with persistent ledger and CAS components
+    /// (TCK-00316).
+    ///
+    /// # TCK-00316: Full Session Dispatcher Viability
+    ///
+    /// This constructor provides the full production wiring for session
+    /// dispatch:
+    /// - **CAS**: Durable content-addressed storage for evidence artifacts
+    /// - **Ledger**: SQLite-backed ledger for event persistence
+    /// - **Clock**: `HolonicClock` for HTF-compliant timestamps
+    /// - **Broker**: `ToolBroker` for capability validation (future wiring)
+    ///
+    /// When all components are provided, the session dispatcher operates in
+    /// full production mode with fail-closed behavior per SEC-CTRL-FAC-0015.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_registry` - Global session registry
+    /// * `metrics_registry` - Optional metrics registry
+    /// * `sqlite_conn` - Optional `SQLite` connection for persistent ledger
+    /// * `cas_base_path` - Optional base path for durable CAS storage
+    #[must_use]
+    pub fn with_persistence_and_cas(
+        session_registry: Arc<dyn SessionRegistry>,
+        metrics_registry: Option<SharedMetricsRegistry>,
+        sqlite_conn: Option<Arc<Mutex<Connection>>>,
+        cas_base_path: Option<&Path>,
     ) -> Self {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
@@ -296,48 +340,65 @@ impl DispatcherState {
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
-        let privileged_dispatcher = if let Some(conn) = sqlite_conn {
+        // TCK-00316: Create durable CAS if path is provided
+        let durable_cas: Option<Arc<DurableCas>> = cas_base_path.and_then(|path| {
+            let config = DurableCasConfig::new(path);
+            DurableCas::new(config)
+                .map(Arc::new)
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "Failed to create DurableCas, session CAS will be unavailable");
+                    e
+                })
+                .ok()
+        });
+
+        let (privileged_dispatcher, ledger_for_session, clock_for_session) = if let Some(conn) =
+            sqlite_conn
+        {
             // Use real implementations
             use rand::rngs::OsRng;
             let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
 
             let policy_resolver = Arc::new(GovernancePolicyResolver::new());
             let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
-            let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
-                Arc::clone(&conn),
-                signing_key,
-            ));
+            let event_emitter: Arc<dyn LedgerEventEmitter> = Arc::new(
+                SqliteLedgerEventEmitter::new(Arc::clone(&conn), signing_key),
+            );
             let lease_validator = Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
             let episode_runtime = Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default()));
             let clock =
                 Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 
-            PrivilegedDispatcher::with_dependencies(
+            let dispatcher = PrivilegedDispatcher::with_dependencies(
                 DecodeConfig::default(),
                 policy_resolver,
                 work_registry,
-                event_emitter,
+                Arc::clone(&event_emitter),
                 episode_runtime,
                 session_registry,
                 lease_validator,
-                clock,
+                Arc::clone(&clock),
                 token_minter.clone(),
                 manifest_store.clone(),
                 Arc::clone(&subscription_registry),
-            )
+            );
+
+            // TCK-00316: Return ledger and clock for session dispatcher wiring
+            (dispatcher, Some(event_emitter), Some(clock))
         } else {
-            // Use stubs
+            // Use stubs - no ledger or clock for session dispatcher
             let clock = Arc::new(
                 HolonicClock::new(ClockConfig::default(), None)
                     .expect("failed to create default clock"),
             );
-            PrivilegedDispatcher::with_shared_state(
+            let dispatcher = PrivilegedDispatcher::with_shared_state(
                 token_minter.clone(),
                 manifest_store.clone(),
                 session_registry,
                 clock,
                 Arc::clone(&subscription_registry),
-            )
+            );
+            (dispatcher, None, None)
         };
 
         let privileged_dispatcher = if let Some(metrics) = metrics_registry {
@@ -346,10 +407,26 @@ impl DispatcherState {
             privileged_dispatcher
         };
 
-        // TCK-00303: Share subscription registry for HEF resource governance
-        let session_dispatcher =
+        // TCK-00316: Wire session dispatcher with CAS, ledger, and clock
+        // This enables production-mode session dispatch with fail-closed behavior
+        let mut session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry);
+
+        // Wire CAS for PublishEvidence (TCK-00316)
+        if let Some(cas) = durable_cas {
+            session_dispatcher = session_dispatcher.with_cas(cas);
+        }
+
+        // Wire ledger for EmitEvent (TCK-00316)
+        if let Some(ledger) = ledger_for_session {
+            session_dispatcher = session_dispatcher.with_ledger(ledger);
+        }
+
+        // Wire clock for HTF-compliant timestamps (TCK-00316)
+        if let Some(clock) = clock_for_session {
+            session_dispatcher = session_dispatcher.with_clock(clock);
+        }
 
         Self {
             privileged_dispatcher,

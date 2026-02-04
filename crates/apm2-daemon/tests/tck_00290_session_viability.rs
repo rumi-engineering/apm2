@@ -2,10 +2,17 @@
 //! `EmitEvent`/`PublishEvidence`
 //!
 //! This test module verifies the session dispatcher's viability with:
-//! - `RequestTool` execution via manifest validation (no stub Allow path)
+//! - `RequestTool` execution via broker (TCK-00316: manifest-only path removed)
 //! - `EmitEvent` persistence to ledger (no stub response)
 //! - `PublishEvidence` storage in CAS (real hashes)
 //! - `StreamTelemetry` fail-closed (`SESSION_ERROR_NOT_IMPLEMENTED`)
+//!
+//! # TCK-00316 Update
+//!
+//! The legacy manifest-only path for `RequestTool` has been removed. All tool
+//! requests now require a configured broker. Tests that previously verified
+//! manifest-only Allow responses now verify fail-closed behavior without
+//! broker.
 //!
 //! # Verification Commands
 //!
@@ -16,7 +23,8 @@
 //!
 //! Per RFC-0018 and SEC-CTRL-FAC-0015:
 //! - All handlers are fail-closed (no stub responses)
-//! - Manifest store, ledger, and CAS must be configured for success
+//! - Broker must be configured for `RequestTool` success (TCK-00316)
+//! - Ledger and CAS must be configured for EmitEvent/PublishEvidence success
 //! - Missing configuration returns appropriate error codes
 
 use std::sync::Arc;
@@ -32,8 +40,8 @@ use apm2_daemon::protocol::LedgerEventEmitter;
 use apm2_daemon::protocol::credentials::PeerCredentials;
 use apm2_daemon::protocol::dispatch::{ConnectionContext, StubLedgerEventEmitter};
 use apm2_daemon::protocol::messages::{
-    DecisionType, EmitEventRequest, EvidenceKind, PublishEvidenceRequest, RequestToolRequest,
-    RetentionHint, SessionErrorCode, StreamTelemetryRequest, TelemetryFrame,
+    EmitEventRequest, EvidenceKind, PublishEvidenceRequest, RequestToolRequest, RetentionHint,
+    SessionErrorCode, StreamTelemetryRequest, TelemetryFrame,
 };
 use apm2_daemon::protocol::session_dispatch::{
     InMemoryManifestStore, SessionDispatcher, SessionResponse, encode_emit_event_request,
@@ -102,8 +110,11 @@ fn make_test_manifest(tools: Vec<ToolClass>) -> apm2_daemon::episode::Capability
 // Verification: cargo test -p apm2-daemon session_request_tool_exec
 // =============================================================================
 
-/// Verify `RequestTool` with configured manifest store returns Allow for valid
-/// tool.
+/// TCK-00316: Verify `RequestTool` without broker fails closed even with
+/// manifest.
+///
+/// The legacy manifest-only Allow path has been removed. All tool requests
+/// now require a configured broker for execution.
 #[test]
 fn session_request_tool_exec_allow_with_manifest() {
     let minter = test_minter();
@@ -113,6 +124,7 @@ fn session_request_tool_exec_allow_with_manifest() {
     let manifest = make_test_manifest(vec![ToolClass::Read, ToolClass::Write]);
     store.register("session-001", manifest);
 
+    // TCK-00316: Without broker, request fails closed
     let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
     let ctx = make_session_ctx();
     let token = test_token(&minter);
@@ -126,27 +138,29 @@ fn session_request_tool_exec_allow_with_manifest() {
     let frame = encode_request_tool_request(&request);
 
     let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+    // TCK-00316: Without broker, all requests fail-closed
     match response {
-        SessionResponse::RequestTool(resp) => {
+        SessionResponse::Error(err) => {
             assert_eq!(
-                resp.decision,
-                DecisionType::Allow as i32,
-                "Tool should be allowed"
+                err.code,
+                SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                "Without broker, request should be denied"
             );
             assert!(
-                !resp.policy_hash.is_empty(),
-                "Policy hash should be present"
-            );
-            assert!(
-                resp.request_id.starts_with("REQ-"),
-                "Request ID should have REQ- prefix"
+                err.message.contains("broker unavailable"),
+                "Error should mention broker: {}",
+                err.message
             );
         },
-        _ => panic!("Expected RequestTool response, got: {response:?}"),
+        _ => panic!("Expected error response without broker, got: {response:?}"),
     }
 }
 
-/// Verify `RequestTool` denies tool not in allowlist.
+/// TCK-00316: Verify `RequestTool` without broker fails closed (allowlist
+/// check happens in broker).
+///
+/// Without a broker, the dispatcher cannot validate against the allowlist
+/// and returns fail-closed error.
 #[test]
 fn session_request_tool_exec_deny_not_in_allowlist() {
     let minter = test_minter();
@@ -156,6 +170,7 @@ fn session_request_tool_exec_deny_not_in_allowlist() {
     let manifest = make_test_manifest(vec![ToolClass::Read]);
     store.register("session-001", manifest);
 
+    // TCK-00316: Without broker, fails before allowlist check
     let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
     let ctx = make_session_ctx();
     let token = test_token(&minter);
@@ -176,9 +191,10 @@ fn session_request_tool_exec_deny_not_in_allowlist() {
                 SessionErrorCode::SessionErrorToolNotAllowed as i32,
                 "Should be TOOL_NOT_ALLOWED"
             );
+            // TCK-00316: Now fails at broker check, not allowlist check
             assert!(
-                err.message.contains("not in allowlist"),
-                "Error should mention allowlist: {}",
+                err.message.contains("broker unavailable"),
+                "Error should mention broker: {}",
                 err.message
             );
         },
@@ -489,7 +505,12 @@ fn session_event_evidence_persist_stream_telemetry_not_implemented() {
     }
 }
 
-/// Verify full dispatcher configuration works for all viable endpoints.
+/// TCK-00316: Verify full dispatcher configuration works for `EmitEvent` and
+/// `PublishEvidence`.
+///
+/// `RequestTool` requires a broker per TCK-00316; without it, fails closed.
+/// This test verifies that `EmitEvent` and `PublishEvidence` still work with
+/// full config, and that `RequestTool` correctly fails without broker.
 #[test]
 fn session_event_evidence_persist_full_config_integration() {
     let temp_dir = TempDir::new().unwrap();
@@ -504,13 +525,13 @@ fn session_event_evidence_persist_full_config_integration() {
     let manifest = make_test_manifest(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute]);
     store.register("session-001", manifest);
 
-    // Create fully-configured dispatcher with clock
+    // Create fully-configured dispatcher with clock (but no broker)
     let dispatcher =
         SessionDispatcher::with_all_stores(minter.clone(), store, ledger, cas).with_clock(clock);
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
-    // Test RequestTool
+    // TCK-00316: RequestTool without broker should fail-closed
     let tool_request = RequestToolRequest {
         session_token: serde_json::to_string(&token).unwrap(),
         tool_id: "write".to_string(),
@@ -519,10 +540,21 @@ fn session_event_evidence_persist_full_config_integration() {
     };
     let tool_frame = encode_request_tool_request(&tool_request);
     let tool_response = dispatcher.dispatch(&tool_frame, &ctx).unwrap();
-    assert!(
-        matches!(tool_response, SessionResponse::RequestTool(_)),
-        "RequestTool should succeed with full config"
-    );
+    match tool_response {
+        SessionResponse::Error(err) => {
+            assert_eq!(
+                err.code,
+                SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                "RequestTool without broker should fail-closed"
+            );
+            assert!(
+                err.message.contains("broker unavailable"),
+                "Error should mention broker: {}",
+                err.message
+            );
+        },
+        _ => panic!("Expected error for RequestTool without broker"),
+    }
 
     // Test EmitEvent
     let event_request = EmitEventRequest {

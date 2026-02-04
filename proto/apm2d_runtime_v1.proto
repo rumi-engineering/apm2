@@ -414,6 +414,13 @@ message RequestToolResponse {
   optional string rule_id = 3;
   // Policy hash at decision time.
   bytes policy_hash = 4;
+  // TCK-00316: Hash of executed tool result (CAS reference).
+  // Present when decision=ALLOW and tool execution completed successfully.
+  // Empty when decision=DENY or execution pending (legacy allow path).
+  optional bytes result_hash = 5;
+  // TCK-00316: Inline result for small outputs (< 1MB).
+  // If present, result_hash refers to the same content.
+  optional bytes inline_result = 6;
 }
 
 // IPC-SESS-002: EmitEvent
