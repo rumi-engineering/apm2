@@ -1,0 +1,14 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0005"
+  title: "Episode event persistence evidence"
+  category: "INTEGRATION_TEST_RESULT"
+  status: "PENDING"
+  description: |
+    Evidence that episode events are persisted to ledger,
+    survive daemon restart, and receipts are atomic.
+  requirement_ids:
+    - "REQ-0005"
+  source_refs:
+    - "crates/apm2-daemon/src/episode/runtime.rs"
+  artifacts: []

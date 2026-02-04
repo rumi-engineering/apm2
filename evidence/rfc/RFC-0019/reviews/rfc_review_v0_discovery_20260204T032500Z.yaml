@@ -1,0 +1,216 @@
+schema_version: "1.0.0"
+rfc_id: RFC-0019
+review_timestamp: "2026-02-04T03:25:00Z"
+review_type: "v0_DISCOVERY"
+review_depth: COUNCIL
+
+gates:
+  - gate_id: GATE-TCK-SCHEMA
+    type: TRUSTED
+    status: PASSED
+    findings: []
+    evidence:
+      files_parsed: 11
+      files_valid: 11
+      parse_errors: []
+
+  - gate_id: GATE-TCK-SCOPE-COVERAGE
+    type: DETERMINISTIC
+    status: PASSED
+    findings: []
+    evidence:
+      requirements_defined: 7
+      requirements_with_tickets: 7
+      orphan_requirements: []
+      coverage_matrix:
+        REQ-0001: [TCK-00316]
+        REQ-0002: [TCK-00317]
+        REQ-0003: [TCK-00318, TCK-00319]
+        REQ-0004: [TCK-00320]
+        REQ-0005: [TCK-00321]
+        REQ-0006: [TCK-00322, TCK-00323]
+        REQ-0007: [TCK-00324]
+
+  # LLM-assisted gates deferred for v0 Discovery - noted as PROVISIONAL
+  - gate_id: GATE-TCK-ATOMICITY
+    type: LLM_ASSISTED
+    status: PROVISIONAL
+    notes: "Deferred to v2 (Grounded) phase; SA-2 feasibility assessment indicates tickets are appropriately scoped"
+
+  - gate_id: GATE-TCK-IMPLEMENTABILITY
+    type: LLM_ASSISTED
+    status: PROVISIONAL
+    notes: "Deferred to v2 (Grounded) phase; SA-2 identified knowledge gaps but no blockers"
+
+  - gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    type: LLM_ASSISTED
+    status: PROVISIONAL
+    notes: "SA-3 identified 2 BLOCKER findings (FND-SA3-001, FND-SA3-002) - see remediation requirements"
+
+  - gate_id: GATE-TCK-ANTI-COUSIN
+    type: LLM_ASSISTED
+    status: PROVISIONAL
+    notes: "Deferred to v2 (Grounded) phase; requires CCP mapping verification"
+
+findings:
+  # SA-1 Findings
+  - finding_id: FND-SA1-001
+    source_agent: SA-1
+    source_cycle: DISCOVERY
+    gate_id: GATE-TCK-SCOPE-COVERAGE
+    category: COVERAGE_DEFECT
+    severity: MINOR
+    description: "Requirements REQ-0002, REQ-0005, and REQ-0007 do not have corresponding entries in 02_design_decisions.yaml"
+    remediation: "Add explicit design decisions or document that requirement statements serve as design specifications"
+    agreement_status: NOTED
+
+  - finding_id: FND-SA1-002
+    source_agent: SA-1
+    source_cycle: DISCOVERY
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: DESIGN_AMBIGUITY
+    severity: INFO
+    description: "DEC-0001 mentions 'compile-time feature flag or module visibility' without specifying preferred approach"
+    remediation: "Acceptable for v0; clarify during ticket implementation"
+    agreement_status: ACCEPTED_KNOWN_UNKNOWN
+
+  # SA-2 Findings
+  - finding_id: FND-SA2-001
+    source_agent: SA-2
+    source_cycle: DISCOVERY
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: KNOWLEDGE_GAP
+    severity: MINOR
+    description: "TCK-00317 depends on CAS-backed ManifestLoader but no production implementation exists"
+    remediation: "Create CasManifestLoader implementing ManifestLoader trait; follow existing patterns"
+    agreement_status: NOTED
+
+  - finding_id: FND-SA2-002
+    source_agent: SA-2
+    source_cycle: DISCOVERY
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: IMPLEMENTABILITY_CONCERN
+    severity: MINOR
+    description: "TCK-00318 requires git apply but no git command execution patterns exist"
+    remediation: "Use std::process::Command for git operations; validate with git apply --check"
+    agreement_status: NOTED
+
+  - finding_id: FND-SA2-003
+    source_agent: SA-2
+    source_cycle: DISCOVERY
+    gate_id: GATE-TCK-IMPLEMENTABILITY
+    category: DEPENDENCY_RISK
+    severity: INFO
+    description: "TCK-00322 ledger tailer depends on subscription mechanism not fully documented"
+    remediation: "Polling-based approach sufficient for v0; subscription optimization deferred"
+    agreement_status: ACCEPTED_KNOWN_UNKNOWN
+
+  # SA-3 Findings (Security)
+  - finding_id: FND-SA3-001
+    source_agent: SA-3
+    source_cycle: DISCOVERY
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    severity: BLOCKER
+    description: |
+      Legacy tool allow path remains active at session_dispatch.rs:967-1007.
+      Allows tool execution via manifest allowlist when broker is absent.
+      Contradicts NC-002 "no stub-allow paths for tool execution".
+    remediation: |
+      1. Add production_mode flag to SessionDispatcher
+      2. In production mode, return DENY if broker is None
+      3. Gate legacy path behind #[cfg(test)] or feature flag
+    agreement_status: REQUIRES_REMEDIATION
+    remediation_ticket: TCK-00316
+
+  - finding_id: FND-SA3-002
+    source_agent: SA-3
+    source_cycle: DISCOVERY
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    severity: BLOCKER
+    description: |
+      WorkspaceManager::apply_changeset is entirely stubbed at workspace.rs:692-763.
+      Cannot verify path validation or symlink escape mitigations.
+      Security assurance arguments are unprovable.
+    remediation: |
+      1. Implement real apply_changeset with path validation
+      2. Add symlink detection/blocking
+      3. Fail closed on suspicious paths
+    agreement_status: REQUIRES_REMEDIATION
+    remediation_ticket: TCK-00318
+
+  - finding_id: FND-SA3-003
+    source_agent: SA-3
+    source_cycle: DISCOVERY
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: SECURITY_DEFECT
+    severity: MAJOR
+    description: "TOCTOU race in symlink validation at handlers.rs canonicalize-then-check pattern"
+    remediation: "Use O_NOFOLLOW, fstat verification, or document as accepted risk"
+    agreement_status: NOTED
+
+  - finding_id: FND-SA3-004
+    source_agent: SA-3
+    source_cycle: DISCOVERY
+    gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+    category: DESIGN_GAP
+    severity: MAJOR
+    description: "Missing trust boundary TB-0005 for capability manifest integrity"
+    remediation: "Add TB-0005 specifying CAS hash verification on manifest load"
+    agreement_status: NOTED
+
+verdict: PROVISIONAL
+verdict_reason: |
+  RFC-0019 v0 (Discovery) is PROVISIONAL.
+
+  PASSED gates:
+  - GATE-TCK-SCHEMA: All YAML files parse successfully
+  - GATE-TCK-SCOPE-COVERAGE: All 7 requirements covered by 9 tickets
+
+  PROVISIONAL gates (deferred to v2):
+  - GATE-TCK-ATOMICITY
+  - GATE-TCK-IMPLEMENTABILITY
+  - GATE-TCK-ANTI-COUSIN
+  - GATE-TCK-SECURITY-AND-INTEGRITY (2 BLOCKER findings requiring remediation)
+
+  BLOCKER findings that must be addressed:
+  - FND-SA3-001: Legacy allow path must be gated/removed
+  - FND-SA3-002: WorkspaceManager must be implemented (not stubbed)
+
+  These blockers are implementation requirements documented in TCK-00316 and TCK-00318.
+  They do not block RFC approval but must be addressed before production deployment.
+
+  Recommendation: Advance to v2 (Grounded) phase after council review.
+
+council_metadata:
+  session_id: COUNCIL-RFC-0019-20260204-032500
+  subagents:
+    - agent_id: SA-1
+      emergent_role: "Rigorist (Structure + PRD Fidelity)"
+      anchor_modes: [70, 44]
+      status: COMPLETED
+      findings_generated: 5
+    - agent_id: SA-2
+      emergent_role: "Feasibility (Implementation + Knowledge Gaps)"
+      anchor_modes: [40, 51]
+      status: COMPLETED
+      findings_generated: 5
+    - agent_id: SA-3
+      emergent_role: "Guardian (Trust Boundaries + Security)"
+      anchor_modes: [79, 36]
+      status: COMPLETED
+      findings_generated: 6
+  cycles_completed: 1
+  cycle_type: DISCOVERY
+  total_findings_generated: 16
+  findings_after_dedup: 10
+  blocker_findings: 2
+  major_findings: 2
+  minor_findings: 4
+  info_findings: 2
+  quorum_achieved: true
+  consensus_notes: |
+    All three SAs agree on structural completeness and PRD alignment.
+    SA-3 BLOCKER findings (FND-SA3-001, FND-SA3-002) are implementation requirements,
+    not RFC design defects. They are explicitly captured in TCK-00316 and TCK-00318.

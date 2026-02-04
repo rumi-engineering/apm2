@@ -1,0 +1,52 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: "TCK-00324"
+    title: "xtask cutover stage 1"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0019"
+    requirements:
+      - requirement_id: "REQ-0007"
+        requirement_ref: "documents/rfcs/RFC-0019/requirements/REQ-0007.yaml#requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-0007"
+        artifact_ref: "documents/rfcs/RFC-0019/evidence_artifacts/EVID-0007.yaml#evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_DAEMON"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00322"
+        reason: "Projection worker must exist for xtask to default to the projection path"
+      - ticket_id: "TCK-00323"
+        reason: "Projection receipts/events provide auditability for external writes"
+  scope:
+    in_scope:
+      - "Add --emit-receipt-only mode to xtask (no direct GitHub writes)"
+      - "Require explicit --allow-github-write flag for any direct write path"
+      - "Default xtask path triggers ingestion + waits for projection completion"
+      - "Ensure all writes are attributable via durable projection receipts"
+    out_of_scope:
+      - "Full xtask deprecation (future stages)"
+  plan:
+    steps:
+      - "Add CLI flags and enforce default-deny for GitHub write permissions"
+      - "Implement emit-receipt-only path: ingest changeset, request review episode, and wait for receipt+projection"
+      - "Retain legacy direct-write path behind explicit flag for staged migration"
+      - "Add tests for flag gating and audit attribution (write path must record receipts)"
+  definition_of_done:
+    evidence_ids:
+      - "EVID-0007"
+    criteria:
+      - "xtask has --emit-receipt-only mode."
+      - "Direct writes require explicit --allow-github-write flag."
+      - "Default path uses projection worker and produces durable projection receipts."
+  notes:
+    security: "xtask is progressively demoted; default behavior must not grant external write authority."
+    verification: "Verify flag gating and ensure writes are recorded as receipts before/after projection."
+    general: "Stage 1 preserves backwards compatibility while shifting authority to daemon reducers."
+

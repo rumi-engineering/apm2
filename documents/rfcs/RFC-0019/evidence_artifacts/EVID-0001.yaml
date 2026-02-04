@@ -1,0 +1,14 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0001"
+  title: "Session dispatcher viability evidence"
+  category: "INTEGRATION_TEST_RESULT"
+  status: "PENDING"
+  description: |
+    Evidence that SessionDispatcher is wired to CAS, ledger, clock, and broker,
+    and that tool execution is kernel-side and CAS-backed.
+  requirement_ids:
+    - "REQ-0001"
+  source_refs:
+    - "crates/apm2-daemon/tests/hef_fac_v0_e2e.rs"
+  artifacts: []

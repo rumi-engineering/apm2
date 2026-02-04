@@ -1,0 +1,481 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  principles:
+    - "Tickets MUST be atomic and independently verifiable."
+    - "Each ticket MUST reference requirement_ids and evidence_ids."
+    - "Cross-ticket dependencies MUST be explicit and minimal."
+    - "Each ticket is a single YAML file containing all metadata, scope, plan, and criteria."
+  ticket_plan:
+    ticket_storage_root: "documents/work/tickets/"
+    tickets:
+      - ticket_id: "TCK-00316"
+        title: "Session dispatcher viability closure"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00316.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Wire SessionDispatcher with CAS, ledger, clock, broker"
+            - "Remove legacy allow path in production"
+            - "Implement real PublishEvidence and EmitEvent"
+          out_of_scope:
+            - "Capability manifest implementation (separate ticket)"
+        binds:
+          requirement_ids:
+            - "REQ-0001"
+          evidence_ids:
+            - "EVID-0001"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_KERNEL"
+        dependencies: []
+        definition_of_done:
+          criteria:
+            - "SessionDispatcher constructed with full dependencies in production path"
+            - "RequestTool returns kernel-executed, CAS-backed results"
+            - "Legacy allow path denied in production mode"
+          evidence_ids:
+            - "EVID-0001"
+
+      - ticket_id: "TCK-00317"
+        title: "Reviewer capability manifest (real allowlist)"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00317.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Define reviewer v0 capability manifest schema"
+            - "Store manifest in CAS"
+            - "SpawnEpisode loads manifest by hash"
+          out_of_scope:
+            - "Implementor capability manifest (future)"
+        binds:
+          requirement_ids:
+            - "REQ-0002"
+          evidence_ids:
+            - "EVID-0002"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_SECURITY"
+        dependencies:
+          - "TCK-00316"
+        definition_of_done:
+          criteria:
+            - "Reviewer manifest allows: GitOperation (read), ArtifactFetch, ListFiles, Search"
+            - "Manifest stored in CAS with content hash"
+            - "SpawnEpisode resolves manifest from policy"
+          evidence_ids:
+            - "EVID-0002"
+
+      - ticket_id: "TCK-00318"
+        title: "Workspace apply implementation (safe patch apply)"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00318.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Implement WorkspaceManager::apply (changeset apply) with isolated workspace"
+            - "Base commit checkout from local mirror"
+            - "Safe patch application with path validation"
+            - "ReviewBlockedRecorded on failure"
+          out_of_scope:
+            - "Tool handler rooting (separate ticket)"
+        binds:
+          requirement_ids:
+            - "REQ-0003"
+          evidence_ids:
+            - "EVID-0003"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+        dependencies: []
+        definition_of_done:
+          criteria:
+            - "Workspace created per-episode"
+            - "Patch paths validated for root containment"
+            - "Failed apply emits ReviewBlockedRecorded"
+          evidence_ids:
+            - "EVID-0003"
+
+      - ticket_id: "TCK-00319"
+        title: "Root tool handlers per workspace"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00319.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Amend ListFiles/Search handlers to use workspace root"
+            - "Amend GitOperation handlers similarly"
+            - "Path traversal prevention"
+            - "TOCTOU race mitigation: use O_NOFOLLOW or fstat verification (RSK-0005)"
+          out_of_scope:
+            - "Workspace creation (TCK-00318)"
+        binds:
+          requirement_ids:
+            - "REQ-0003"
+          evidence_ids:
+            - "EVID-0003"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_SECURITY"
+        dependencies:
+          - "TCK-00318"
+        definition_of_done:
+          criteria:
+            - "Tool handlers rooted to workspace, not daemon CWD"
+            - "Symlink escape blocked"
+            - "TOCTOU race mitigated via O_NOFOLLOW or fstat verification"
+            - "ListFiles/Search reflect patched workspace"
+          evidence_ids:
+            - "EVID-0003"
+
+      - ticket_id: "TCK-00320"
+        title: "Tool result hash propagation (executor -> events -> artifacts)"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00320.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "ToolExecutor returns CAS result_hash per tool execution (ToolResultData stored in CAS)"
+            - "Propagate result_hash through tool lifecycle events (ToolExecuted) and tool responses"
+            - "Accumulate per-episode tool result hashes for downstream indexing/audit"
+          out_of_scope:
+            - "ToolExecutionReceipt + ToolLogIndexV1 + SummaryReceipt (TCK-00327)"
+        binds:
+          requirement_ids:
+            - "REQ-0004"
+          evidence_ids:
+            - "EVID-0004"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+        dependencies:
+          - "TCK-00316"
+        definition_of_done:
+          criteria:
+            - "Tool results returned from executor include CAS result_hash"
+            - "Tool lifecycle events include result_hash and resolve in CAS"
+            - "Per-episode accumulator contains complete ordered set of tool result hashes"
+          evidence_ids:
+            - "EVID-0004"
+
+      - ticket_id: "TCK-00321"
+        title: "Episode event sink to ledger"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00321.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Episode event sink appends to ledger"
+            - "Atomic receipt emission at completion"
+            - "CAS-before-event ordering"
+          out_of_scope:
+            - "Tool log capture (TCK-00320)"
+        binds:
+          requirement_ids:
+            - "REQ-0005"
+          evidence_ids:
+            - "EVID-0005"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_KERNEL"
+        dependencies:
+          - "TCK-00316"
+          - "TCK-00320"
+        definition_of_done:
+          criteria:
+            - "Episode events persisted to ledger as they occur"
+            - "Receipt emitted atomically at completion"
+            - "Events survive daemon restart"
+          evidence_ids:
+            - "EVID-0005"
+
+      - ticket_id: "TCK-00322"
+        title: "Projection worker (daemon integration)"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00322.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Wire projection module into daemon"
+            - "Ledger tailer for projection decisions"
+            - "Work index: changeset -> work_id -> PR"
+            - "GitHub adapter for status + comment"
+          out_of_scope:
+            - "Projection receipt event (TCK-00323)"
+        binds:
+          requirement_ids:
+            - "REQ-0006"
+          evidence_ids:
+            - "EVID-0006"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_PROJECTION"
+        dependencies:
+          - "TCK-00321"
+        definition_of_done:
+          criteria:
+            - "Projection worker runs as daemon task"
+            - "ReviewReceiptRecorded triggers GitHub projection"
+            - "Status + comment posted to PR"
+          evidence_ids:
+            - "EVID-0006"
+
+      - ticket_id: "TCK-00323"
+        title: "ProjectionReceiptRecorded kernel event"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00323.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Define ProjectionReceiptRecorded event schema"
+            - "Canonicalization + topic derivation"
+            - "Durable projection receipts in CAS"
+            - "Idempotency via receipt lookup"
+          out_of_scope:
+            - "Tamper detection (optional v0.1)"
+        binds:
+          requirement_ids:
+            - "REQ-0006"
+          evidence_ids:
+            - "EVID-0006"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_KERNEL"
+          - "DOMAIN_PROJECTION"
+        dependencies:
+          - "TCK-00322"
+        definition_of_done:
+          criteria:
+            - "ProjectionReceiptRecorded event defined"
+            - "Projection receipts stored in CAS"
+            - "Idempotency prevents duplicate projections"
+          evidence_ids:
+            - "EVID-0006"
+
+      - ticket_id: "TCK-00324"
+        title: "xtask cutover stage 1"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00324.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Add --emit-receipt-only mode to xtask"
+            - "Require --allow-github-write for direct writes"
+            - "xtask triggers ingestion + waits for projection"
+          out_of_scope:
+            - "Full xtask deprecation (future stages)"
+        binds:
+          requirement_ids:
+            - "REQ-0007"
+          evidence_ids:
+            - "EVID-0007"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+        dependencies:
+          - "TCK-00322"
+          - "TCK-00323"
+        definition_of_done:
+          criteria:
+            - "xtask has --emit-receipt-only mode"
+            - "Direct writes require explicit flag"
+            - "Default path uses projection worker"
+          evidence_ids:
+            - "EVID-0007"
+
+      - ticket_id: "TCK-00325"
+        title: "ViewCommitment capture + embedding in review artifacts"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00325.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Capture ViewCommitment during workspace materialization/episode execution"
+            - "Store ViewCommitment as CAS artifact (apm2.view_commitment.v1)"
+            - "Embed view_commitment_hash and policy_resolved_ref into review artifacts/receipts (holon-ready binding)"
+          out_of_scope:
+            - "Multi-cell anti-entropy replication (future)"
+        binds:
+          requirement_ids:
+            - "REQ-0008"
+          evidence_ids:
+            - "EVID-0008"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_KERNEL"
+        dependencies:
+          - "TCK-00318"
+          - "TCK-00321"
+        definition_of_done:
+          criteria:
+            - "ViewCommitment stored in CAS and referenced by hash"
+            - "Review artifacts include view_commitment_hash and policy_resolved_ref bindings"
+            - "Missing pins/view commitment causes ReviewBlockedRecorded (fail closed)"
+          evidence_ids:
+            - "EVID-0008"
+
+      - ticket_id: "TCK-00326"
+        title: "ContextPack sealing + broker firewall initialization (end-to-end)"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00326.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Seal ContextPacks as CAS artifacts and reference them by hash"
+            - "Initialize broker context firewall from context_pack_hash for every episode"
+            - "Fail closed on missing/unsealable ContextPack (ReviewBlockedRecorded)"
+            - "Embed capability_manifest_hash and context_pack_hash into review artifacts/receipts (authority binding)"
+          out_of_scope:
+            - "Cross-org policy governance (future)"
+        binds:
+          requirement_ids:
+            - "REQ-0008"
+          evidence_ids:
+            - "EVID-0008"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_SECURITY"
+        dependencies:
+          - "TCK-00316"
+          - "TCK-00317"
+        definition_of_done:
+          criteria:
+            - "ContextPacks stored in CAS and loaded by hash"
+            - "Context firewall initialized from sealed ContextPack for each episode"
+            - "Reads/tool requests outside ContextPack are denied and recorded"
+            - "Review artifacts include capability_manifest_hash and context_pack_hash bindings"
+          evidence_ids:
+            - "EVID-0008"
+
+      - ticket_id: "TCK-00327"
+        title: "ToolExecutionReceipt + ToolLogIndexV1 + SummaryReceipt integration"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00327.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Emit signed ToolExecutionReceipt per tool actuation (proof-carrying tool use)"
+            - "ToolExecutionReceipt binds episode/policy/request/capability, args_hash/result_hash, and time envelope/duration"
+            - "ToolLogIndexV1 indexes ToolExecutionReceipt hashes with canonical ordering and chunking support"
+            - "Generate SummaryReceipt (loss profile + selectors) for review outcomes"
+            - "Review artifacts reference tool_log_index_hash and summary_receipt_hash (single-pointer scaling)"
+          out_of_scope:
+            - "Exabyte-scale compaction pipelines (future RFC)"
+        binds:
+          requirement_ids:
+            - "REQ-0010"
+          evidence_ids:
+            - "EVID-0010"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_KERNEL"
+        dependencies:
+          - "TCK-00320"
+          - "TCK-00321"
+        definition_of_done:
+          criteria:
+            - "ToolExecutionReceipts stored in CAS for every tool actuation"
+            - "ToolLogIndexV1 stored in CAS referencing only resolvable ToolExecutionReceipt hashes"
+            - "Review artifacts include tool_log_index_hash and summary_receipt_hash"
+            - "Verifier can resolve ToolExecutionReceipt -> args_hash/result_hash -> CAS artifacts"
+          evidence_ids:
+            - "EVID-0010"
+
+      - ticket_id: "TCK-00328"
+        title: "AgentAdapterProfileV1 schema + registry selection by hash"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00328.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Define AgentAdapterProfileV1 schema + canonicalization"
+            - "Store profiles as CAS artifacts and load by hash"
+            - "AdapterRegistry selects profiles by hash (no ambient defaults)"
+          out_of_scope:
+            - "Vendor-specific deep integrations beyond profile-based execution"
+        binds:
+          requirement_ids:
+            - "REQ-0009"
+          evidence_ids:
+            - "EVID-0009"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_KERNEL"
+        dependencies: []
+        definition_of_done:
+          criteria:
+            - "AgentAdapterProfileV1 stored in CAS and selected by hash"
+            - "Misconfigured profile fails closed with ReviewBlockedRecorded(reason=ADAPTER_MISCONFIGURED)"
+            - "Kernel-side tool execution enforced for all profiles"
+          evidence_ids:
+            - "EVID-0009"
+
+      - ticket_id: "TCK-00329"
+        title: "Adapter profiles for claude-code, gemini-cli, codex-cli, local-inference"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00329.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Provide AgentAdapterProfileV1 artifacts for claude-code, gemini-cli, codex-cli, local-inference"
+            - "Default to black_box ledger-mediated driver where possible"
+            - "Define permission_mode_map and capability_map per profile"
+          out_of_scope:
+            - "Automated installation/configuration of vendor CLIs"
+        binds:
+          requirement_ids:
+            - "REQ-0009"
+          evidence_ids:
+            - "EVID-0009"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+        dependencies:
+          - "TCK-00328"
+        definition_of_done:
+          criteria:
+            - "Profiles exist for all target CLIs and are hash-addressed"
+            - "Each profile runs a non-interactive episode under kernel tool mediation"
+          evidence_ids:
+            - "EVID-0009"
+
+      - ticket_id: "TCK-00330"
+        title: "Adapter conformance tests + ledger attribution"
+        ticket_files:
+          meta_ref: "documents/work/tickets/TCK-00330.yaml#ticket_meta"
+        scope:
+          in_scope:
+            - "Add conformance tests for each AgentAdapterProfileV1"
+            - "Emit ledger events attributing runs by (work_id, episode_id, session_id, adapter_profile_hash)"
+            - "Demonstrate non-interactive receipt production across profiles"
+          out_of_scope:
+            - "Full evaluation benchmark suite (post-v0)"
+        binds:
+          requirement_ids:
+            - "REQ-0009"
+          evidence_ids:
+            - "EVID-0009"
+        custody_agent_roles:
+          - "AGENT_IMPLEMENTER"
+        responsibility_domains:
+          - "DOMAIN_DAEMON"
+          - "DOMAIN_KERNEL"
+        dependencies:
+          - "TCK-00328"
+        definition_of_done:
+          criteria:
+            - "Conformance tests pass for all profiles"
+            - "Ledger events include adapter_profile_hash attribution"
+          evidence_ids:
+            - "EVID-0009"

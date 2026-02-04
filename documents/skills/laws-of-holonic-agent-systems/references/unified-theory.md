@@ -59,6 +59,11 @@
         "context-as-code",
         "event-sourcing",
         "holarchy",
+        "holonic-mesh",
+        "federation",
+        "global-distribution",
+        "tiered-storage",
+        "exabyte-scale",
         "recurrence-reduction",
         "verification-economics"
       ]
@@ -128,7 +133,7 @@
         },
         "ENF-OCAP-01": {
           "node_class": "NORMATIVE",
-          "statement": "Capabilities MUST NOT be discovered; they only enter a holon via explicit delegation events/receipts (PermeabilityReceipt).",
+          "statement": "Capabilities MUST NOT be discovered; they only enter a holon via explicit delegation events/receipts (PermeabilityReceipt / permeability.receipt).",
           "violation_class": "POLICY_VIOLATION",
           "law_refs": [
             "LAW-05"
@@ -556,6 +561,52 @@
           "LAW-13"
         ],
         "node_class": "BACKGROUND"
+      },
+      "PHY-08": {
+        "name": "Coordination bandwidth: locality and digest-first communication dominate at scale",
+        "statement": "At civilizational scale, coordination latency/bandwidth—not raw compute—dominates. The holarchy must minimize cross-boundary traffic by communicating in digests, delegating locally, and escalating only compressed, auditable summaries.",
+        "derived_rules": [
+          "prefer local work execution within a holon's cell/scope; avoid global broadcast",
+          "exchange commitments/hashes/receipts first; pull full artifacts on-demand under capability",
+          "publish multi-scale indices and SummaryReceipts as the primary routing/compression layer",
+          "propagate backpressure and budgets downward; never \"spray\" tasks without capacity signals"
+        ],
+        "mechanisms": [
+          "MECH-BACKPRESSURE",
+          "MECH-FEDERATION",
+          "MECH-HOLON-DIRECTORY",
+          "MECH-INDEX-LAYERS"
+        ],
+        "law_refs": [
+          "LAW-06",
+          "LAW-07",
+          "LAW-10",
+          "LAW-12"
+        ],
+        "node_class": "BACKGROUND"
+      },
+      "PHY-09": {
+        "name": "Exabyte evidence: storage/retention is a governed budget, not an implementation detail",
+        "statement": "Exabyte-scale evidence cannot be retained naively. Evidence MUST be chunked, deduplicated, classified, and tiered; long-horizon auditability is preserved via monotone compaction (manifests + loss profiles + receipts), not infinite hot storage.",
+        "derived_rules": [
+          "store large artifacts as chunked CAS + deterministic manifests; avoid monolithic blobs",
+          "tier storage (hot/warm/cold) by policy; only commitments and summaries are required to remain universally hot",
+          "GC is allowed only after publishing a monotone derived artifact that preserves audit commitments and declares loss profile",
+          "make retention, sampling, and redaction explicit policy decisions bound to receipts"
+        ],
+        "mechanisms": [
+          "MECH-CAS",
+          "MECH-COMPACTION",
+          "MECH-EVIDENCE-TIERING",
+          "MECH-INDEX-LAYERS"
+        ],
+        "law_refs": [
+          "LAW-07",
+          "LAW-10",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "node_class": "BACKGROUND"
       }
     },
     "truth_topology": {
@@ -579,6 +630,14 @@
         "TRUTH-AX-05": {
           "statement": "Compaction and summarization are monotone operations: they publish derived artifacts as new events/artifacts referencing prior history by hash/range and declaring derivation method/version and loss profile; local archival/GC is non-semantic.",
           "node_class": "NORMATIVE"
+        },
+        "TRUTH-AX-06": {
+          "statement": "Truth is federated: each cell maintains its own monotone ledger+CAS; global truth is the union of cell truths plus explicit, receipt-bound cross-cell imports. No ambient trust exists across cells without evidence and policy.",
+          "node_class": "NORMATIVE"
+        },
+        "TRUTH-AX-07": {
+          "statement": "Cross-cell synchronization is digest-first anti-entropy: exchange commitments and summaries, then pull evidence by hash under capability. Reserve BFT consensus for shared-authority control-plane facts; treat data-plane replication as convergent and eventually consistent.",
+          "node_class": "NORMATIVE"
         }
       },
       "components": {
@@ -589,7 +648,8 @@
             "append_only",
             "causal_links (DAG)",
             "hash_chained",
-            "single_writer + many_readers (implementation detail, not semantic requirement)",
+            "namespaced (holon/cell scopes)",
+            "single_writer + many_readers (implementation detail; multi-writer shared authority requires BFT consensus)",
             "typed_events"
           ],
           "law_refs": [
@@ -627,6 +687,39 @@
           ],
           "node_class": "NORMATIVE"
         }
+      },
+      "federation_model": {
+        "statement": "Scale is achieved by sharding truth into cells (latency+trust domains) and federating them via receipts, indices, and anti-entropy. This preserves LAW-03 (monotone truth vs projection) without requiring global total order.",
+        "cell": {
+          "definition": "A cell is an operational and trust boundary that hosts a set of holons with a local ledger namespace space, local CAS, local policy evaluation, and (optionally) a local BFT control plane.",
+          "hard_invariants": [
+            "cell-local ledgers are authoritative for cell-local work scopes",
+            "cross-cell reads/writes require explicit permeability via receipts and policy (no ambient authority)",
+            "cells publish periodic checkpoints and index summaries to support digest-first routing",
+            "cells MUST tolerate partitions: operate locally when safe; reconcile explicitly via anti-entropy with conflict recording"
+          ]
+        },
+        "cross_cell_exchange": {
+          "protocol_shape": [
+            "exchange checkpoint commitments (ledger head hash, checkpoint id, summary receipts)",
+            "advertise manifests/index layers; do not push raw context by default",
+            "pull artifacts by CAS hash under delegated capability; verify hash+signature on receipt",
+            "record imports/exports as events with receipts to preserve auditability"
+          ],
+          "safety_notes": [
+            "treat cell boundaries as adversarial by default (LAW-05); verify everything (LAW-15)",
+            "prefer derived summaries for routing; require zoom-in to raw evidence for high-risk transitions (LAW-07, LAW-14)"
+          ]
+        },
+        "law_refs": [
+          "LAW-03",
+          "LAW-05",
+          "LAW-07",
+          "LAW-10",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE"
       },
       "monotone_vs_projection": {
       "monotone_substrate": {
@@ -975,6 +1068,41 @@
           }
         }
       },
+      "MECH-AGENTIC-SCAFFOLDING": {
+        "name": "Agentic scaffolding (planner/executor/critic/verifier separation)",
+        "role": "Stabilizes stochastic cognition by separating proposal from verification, using structured tool-use loops, and converting failures into durable counterexamples. Can be implemented with one model or a heterogeneous model team; the separation of duties is the invariant.",
+        "patterns": [
+          "ReAct-style propose->act->observe loops (tools as sensors/actuators) with explicit traces",
+          "separation-of-duties: proposer != verifier for high-risk promotions (no self-approval)",
+          "reflection on failures: add to counterexample corpus and strengthen verifiers/rubrics",
+          "self-consistency via independent proposals for high-impact decisions"
+        ],
+        "law_refs": [
+          "LAW-01",
+          "LAW-04",
+          "LAW-08",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true,
+              "GateReceiptGenerated": true
+            },
+            "requires": {
+              "PolicyLoaded": true,
+              "WorkOpened": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "gate.receipt": true
+            }
+          }
+        }
+      },
       "MECH-EVIDENCE-BUNDLE": {
         "name": "EvidenceBundle",
         "role": "Content-addressed artifact set sufficient to validate claims; includes provenance and replay semantics.",
@@ -997,6 +1125,39 @@
           "receipt_kinds": {}
         }
       },
+      "MECH-EVIDENCE-TIERING": {
+        "name": "Evidence tiering + manifests",
+        "role": "Exabyte-scale CAS discipline: chunking, deterministic manifests, tiered replication/retention, and redaction while preserving verifiable commitments.",
+        "properties": [
+          "chunked_blobs + deterministic_manifest",
+          "tier_policies (hot/warm/cold)",
+          "classification + encryption-at-rest",
+          "GC only after monotone compaction publishes commitments and loss profile"
+        ],
+        "law_refs": [
+          "LAW-07",
+          "LAW-10",
+          "LAW-14",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "EvidencePublished": true
+            },
+            "requires": {
+              "PolicyLoaded": true,
+              "WorkOpened": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "compaction.receipt": true
+            }
+          }
+        }
+      },
       "MECH-RECEIPTS": {
         "name": "Receipts (gate, merge, execution, summary)",
         "role": "Signed, machine-readable acceptance proofs binding claims to evidence and inputs/outputs in an attested environment (command transcript/tool versions/env digest or their hashes).",
@@ -1013,6 +1174,7 @@
               "CanonicalSnapshotPublished": true,
               "GateReceiptGenerated": true,
               "MergePromoted": true,
+              "PermeabilityGranted": true,
               "StopOrderIssued": true,
               "ToolExecuted": true
             }
@@ -1022,6 +1184,7 @@
               "compaction.receipt": true,
               "gate.receipt": true,
               "merge.receipt": true,
+              "permeability.receipt": true,
               "stop_order.receipt": true,
               "summary.receipt": true,
               "tool_execution.receipt": true
@@ -1116,7 +1279,7 @@
       },
       "MECH-ANTI-ENTROPY": {
         "name": "Anti-entropy protocol",
-        "role": "Explicit reconciliation of distributed state; periodic global convergence with conflict recording.",
+        "role": "Explicit reconciliation of distributed state across holons/cells; digest-first periodic convergence with conflict recording.",
         "law_refs": [
           "LAW-10"
         ],
@@ -1131,6 +1294,41 @@
             }
           },
           "receipt_kinds": {}
+        }
+      },
+      "MECH-FEDERATION": {
+        "name": "Federation (cells + cross-cell anti-entropy)",
+        "role": "Connects cells into a globally distributed holarchy via digest-first anti-entropy and receipt-bound imports, without requiring global total order for the data plane.",
+        "contracts": [
+          "imports/exports are explicit events bound to commitments and receipts (never ambient trust)",
+          "data-plane replication is convergent; shared-authority control-plane facts may require BFT consensus",
+          "partitions are tolerated: local safe progress continues; unsafe cross-boundary effects are denied or deferred",
+          "conflicts are recorded as defects; reconciliation is never silent"
+        ],
+        "law_refs": [
+          "LAW-03",
+          "LAW-05",
+          "LAW-10",
+          "LAW-11",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "DefectRecorded": true,
+              "EvidencePublished": true
+            },
+            "requires": {
+              "EvidencePublished": true,
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "permeability.receipt": true
+            }
+          }
         }
       },
       "MECH-MERGE-ALGEBRA": {
@@ -1195,6 +1393,78 @@
             }
           },
           "receipt_kinds": {}
+        }
+      },
+      "MECH-PERMEABILITY-RECEIPT": {
+        "name": "PermeabilityReceipt (capability delegation across holonic boundaries)",
+        "role": "The only legal path for capabilities to cross a holonic boundary. A PermeabilityReceipt grants a narrowly-scoped capability set with TTL, budgets, and audit bindings, signed by the delegator and recorded as a fact.",
+        "required_fields": [
+          "permeability_id",
+          "from_holon_id",
+          "to_holon_id",
+          "capability_set",
+          "scope",
+          "budgets",
+          "issued_at",
+          "expires_at",
+          "policy_version",
+          "signature"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "PermeabilityGranted": true,
+              "PermeabilityRevoked": true
+            },
+            "requires": {
+              "KeyRotated": true,
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {
+            "emits": {
+              "permeability.receipt": true
+            }
+          }
+        }
+      },
+      "MECH-RELAY-HOLON": {
+        "name": "Relay holon (selective permeability bridge)",
+        "role": "Perimeter bridge for contained holons/agents. Relays enforce outbound-only initiation from the contained side, mediate approved cross-boundary fetch/push operations, and log evidence for all boundary crossings.",
+        "properties": [
+          "outbound-only connectivity from contained boundary",
+          "deny-by-default; only receipt-bound delegated capabilities are honored",
+          "digest-first transfer: exchange commitments then pull/push artifacts by hash",
+          "emits auditable execution receipts and redacted transcripts as evidence"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-11",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "EvidencePublished": true,
+              "PolicyViolation": true,
+              "ToolExecuted": true
+            },
+            "requires": {
+              "PolicyLoaded": true,
+              "PermeabilityGranted": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "permeability.receipt": true
+            }
+          }
         }
       },
       "MECH-LEASES-BUDGETS": {
@@ -1363,6 +1633,116 @@
             },
             "requires": {
               "LeaseIssued": true
+            }
+          },
+          "receipt_kinds": {}
+        }
+      },
+      "MECH-HOLON-DIRECTORY": {
+        "name": "Holon directory + routing",
+        "role": "Identity->locator discovery and routing layer for holons across cells. Directory facts are treated as non-authoritative until bound to receipts/evidence; the directory primarily routes via commitments and SummaryReceipts.",
+        "properties": [
+          "event-sourced, eventually consistent",
+          "digest-first: route by commitments/hashes, not raw context",
+          "authorization gated by policy + permeability receipts",
+          "multi-scale (local->regional->global) summaries for scalability"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-07",
+          "LAW-10",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "EvidencePublished": true
+            },
+            "requires": {
+              "PolicyLoaded": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "summary.receipt": true
+            }
+          }
+        }
+      },
+      "MECH-HOLON-MESH-PROTOCOL": {
+        "name": "Holonic Mesh Protocol (HMP): digest-first inter-holon communication",
+        "role": "Defines the minimal, scalable inter-holon message shape: exchange commitments, receipts, and capability handshakes first; transfer full artifacts only by hash under delegated capability. This is the backbone for globally distributed, recursively nested holons without context flooding.",
+        "envelope_fields": [
+          "protocol_id + version",
+          "sender_holon_id + sender_cell_id",
+          "recipient_holon_id + recipient_cell_id (optional; directory-resolved)",
+          "work_id (or work_graph_id)",
+          "message_id (idempotency key) + causal_parent_ids",
+          "ledger_commitment (checkpoint/head hash) for any claims",
+          "context_pack_digest (optional) + selectors for omitted facts",
+          "receipt_digests (optional) + evidence_manifests (optional)"
+        ],
+        "message_classes": [
+          "handshake (hello, capability_request, capability_grant)",
+          "work (offer, accept, result, escalation)",
+          "evidence (advertise, request, transfer_by_hash)",
+          "governance (stop_order propagation, policy update notification)"
+        ],
+        "non_goals": [
+          "does not mandate a transport (gRPC/HTTP/queues are projections)",
+          "does not allow bypassing OCAP or policy; protocol is a shape, not an authorization"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-06",
+          "LAW-07",
+          "LAW-11",
+          "LAW-15"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "EvidencePublished": true,
+              "ToolExecuted": true
+            },
+            "requires": {
+              "PolicyLoaded": true,
+              "PermeabilityGranted": true
+            }
+          },
+          "receipt_kinds": {
+            "requires": {
+              "permeability.receipt": true
+            }
+          }
+        }
+      },
+      "MECH-BACKPRESSURE": {
+        "name": "Backpressure + capacity signaling",
+        "role": "Admission control for work intake and decomposition. Prevents coordination collapse by propagating capacity signals and budgets through the holarchy, and by making overload a first-class, observable condition.",
+        "properties": [
+          "explicit queue depth + WIP limits per holon/cell",
+          "budget propagation downwards (child work) and upwards (escalation)",
+          "drop/defer policies are risk-tiered and auditable",
+          "work stealing is explicit and policy-governed (never implicit ambient takeover)"
+        ],
+        "law_refs": [
+          "LAW-06",
+          "LAW-12",
+          "LAW-14"
+        ],
+        "node_class": "NORMATIVE",
+        "fact_bindings": {
+          "event_kinds": {
+            "emits": {
+              "BudgetExceeded": true,
+              "WorkAborted": true,
+              "WorkTransitioned": true
+            },
+            "requires": {
+              "PolicyLoaded": true
             }
           },
           "receipt_kinds": {}
@@ -2424,6 +2804,16 @@
           "domain": "key",
           "proto_ref": "proto/kernel_events.proto#KeyRotated"
         },
+        "PermeabilityGranted": {
+          "node_class": "NORMATIVE",
+          "domain": "capability",
+          "planned_extension": true
+        },
+        "PermeabilityRevoked": {
+          "node_class": "NORMATIVE",
+          "domain": "capability",
+          "planned_extension": true
+        },
         "DefectRecorded": {
           "node_class": "NORMATIVE",
           "domain": "defect",
@@ -3277,6 +3667,32 @@
         },
         "glossary": {
           "ref": "documents/skills/glossary/SKILL.md",
+          "node_class": "BACKGROUND"
+        }
+      },
+      "research_papers": {
+        "SWE-bench": {
+          "ref": "https://www.swebench.com/",
+          "node_class": "BACKGROUND"
+        },
+        "SWE-bench Verified (OpenAI)": {
+          "ref": "https://openai.com/index/swe-bench-verified/",
+          "node_class": "BACKGROUND"
+        },
+        "SWE-agent": {
+          "ref": "https://github.com/princeton-nlp/SWE-agent",
+          "node_class": "BACKGROUND"
+        },
+        "Reflexion (self-reflection agents)": {
+          "ref": "https://arxiv.org/abs/2303.11366",
+          "node_class": "BACKGROUND"
+        },
+        "Agentic Reasoning for LLMs (survey)": {
+          "ref": "https://arxiv.org/abs/2601.12538",
+          "node_class": "BACKGROUND"
+        },
+        "Hierarchical RL with explicit state abstractions": {
+          "ref": "https://arxiv.org/abs/2601.09858",
           "node_class": "BACKGROUND"
         }
       }

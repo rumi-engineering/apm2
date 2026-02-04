@@ -14,7 +14,7 @@ variables:
   PR_URL: "$PR_URL"
   HEAD_SHA: "$HEAD_SHA"
 
-references[35]:
+references[36]:
   - path: "@documents/skills/modes-of-reasoning/artifacts/07-type-theoretic.json"
     purpose: "Mode #07: Type-Theoretic Reasoning"
   - path: "@documents/skills/modes-of-reasoning/artifacts/40-mechanistic.json"
@@ -85,6 +85,8 @@ references[35]:
     purpose: "LAW-13: Semantic Typing"
   - path: "@documents/skills/laws-of-holonic-agent-systems/references/law_15.md"
     purpose: "LAW-15: Content-Addressed Evidence"
+  - path: "@documents/rfcs/RFC-0019/AUTONOMOUS_FORGE_ADMISSION_CYCLE.md"
+    purpose: "RFC-0019: Autonomous Forge Admission Cycle"
 
 decision_tree:
   entrypoint: PHASE_1_COLLECT_PR_IDENTITY

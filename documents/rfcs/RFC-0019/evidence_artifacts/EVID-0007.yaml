@@ -1,0 +1,15 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0007"
+  title: "xtask authority reduction evidence"
+  category: "INTEGRATION_TEST_RESULT"
+  status: "PENDING"
+  description: |
+    Evidence that xtask has --emit-receipt-only mode,
+    requires explicit flags for GitHub writes,
+    and uses projection worker by default.
+  requirement_ids:
+    - "REQ-0007"
+  source_refs:
+    - "xtask/src/util.rs"
+  artifacts: []

@@ -1,0 +1,20 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0008"
+  title: "Holon-ready receipts binding evidence (ViewCommitment + ContextPack)"
+  category: "INTEGRATION_TEST_RESULT"
+  status: "PENDING"
+  description: |
+    Evidence that review outcomes are holon-ready:
+    - ViewCommitment is stored in CAS and referenced by hash
+    - ContextPack is sealed/stored in CAS and loaded by hash
+    - Review artifacts/receipts bind view_commitment_hash, capability_manifest_hash,
+      context_pack_hash, and policy binding refs
+    - Missing bindings fail closed via ReviewBlockedRecorded
+  requirement_ids:
+    - "REQ-0008"
+  source_refs:
+    - "schemas/apm2/view_commitment.schema.json"
+    - "crates/apm2-core/src/fac/review_receipt.rs"
+    - "proto/kernel_events.proto"
+  artifacts: []

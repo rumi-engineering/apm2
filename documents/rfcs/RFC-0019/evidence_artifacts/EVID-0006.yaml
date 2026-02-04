@@ -1,0 +1,14 @@
+evidence_artifact:
+  schema_version: "2026-01-23"
+  id: "EVID-0006"
+  title: "Projection worker wiring evidence"
+  category: "INTEGRATION_TEST_RESULT"
+  status: "PENDING"
+  description: |
+    Evidence that projection worker is wired into daemon,
+    processes ReviewReceiptRecorded events, and posts to GitHub idempotently.
+  requirement_ids:
+    - "REQ-0006"
+  source_refs:
+    - "crates/apm2-daemon/src/projection/mod.rs"
+  artifacts: []
