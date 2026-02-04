@@ -98,6 +98,14 @@ pub const MAX_LIST_FILES_PATTERN_LEN: usize = 256;
 /// Maximum length for Search query (TCK-00315).
 pub const MAX_SEARCH_QUERY_LEN: usize = 1024;
 
+/// Maximum size for inline tool results (bytes).
+///
+/// TCK-00316: Security - enforces `DoS` protection per SEC-CTRL-FAC-0015.
+/// Inline results larger than this limit MUST be stored in CAS and
+/// referenced via `result_hash`. This prevents memory exhaustion from
+/// large tool outputs being held inline in IPC messages.
+pub const MAX_INLINE_RESULT_SIZE: usize = 64 * 1024; // 64 KB
+
 // =============================================================================
 // BrokerToolRequest
 // =============================================================================

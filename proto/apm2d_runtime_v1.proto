@@ -414,6 +414,12 @@ message RequestToolResponse {
   optional string rule_id = 3;
   // Policy hash at decision time.
   bytes policy_hash = 4;
+  // Result hash from tool execution (CAS reference, populated on ALLOW after execution).
+  // TCK-00316: Required for kernel-side execution model.
+  optional bytes result_hash = 5;
+  // Inline result for small outputs (bounded by MAX_INLINE_RESULT_SIZE = 64KB).
+  // TCK-00316: Security - enforces DoS protection per SEC-CTRL-FAC-0015.
+  optional bytes inline_result = 6;
 }
 
 // IPC-SESS-002: EmitEvent

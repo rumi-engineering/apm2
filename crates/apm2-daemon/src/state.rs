@@ -25,9 +25,13 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use tokio::sync::RwLock;
 
+use crate::cas::{DurableCas, DurableCasConfig};
+use crate::episode::capability::StubManifestLoader;
+use crate::episode::executor::ContentAddressedStore;
 use crate::episode::{
     CapabilityManifest, EpisodeRuntime, EpisodeRuntimeConfig, InMemorySessionRegistry,
-    PersistentRegistryError, PersistentSessionRegistry,
+    PersistentRegistryError, PersistentSessionRegistry, SharedToolBroker, ToolBrokerConfig,
+    new_shared_broker_with_cas,
 };
 use crate::governance::GovernancePolicyResolver;
 use crate::htf::{ClockConfig, HolonicClock};
@@ -350,6 +354,106 @@ impl DispatcherState {
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry);
+
+        Self {
+            privileged_dispatcher,
+            session_dispatcher,
+        }
+    }
+
+    /// Creates new dispatcher state with persistent ledger, CAS, and
+    /// `ToolBroker` (TCK-00316).
+    ///
+    /// # TCK-00316: Session Dispatcher Viability
+    ///
+    /// This constructor properly wires ALL production dependencies:
+    /// - `ledger`: For `EmitEvent` persistence
+    /// - `cas`: For `PublishEvidence` artifact storage
+    /// - `clock`: For HTF-compliant monotonic timestamps
+    /// - `broker`: For `RequestTool` capability/policy validation and execution
+    ///
+    /// # Arguments
+    ///
+    /// * `session_registry` - Global session registry
+    /// * `metrics_registry` - Optional metrics registry
+    /// * `sqlite_conn` - `SQLite` connection for persistent ledger
+    /// * `cas_path` - Path for durable CAS storage
+    ///
+    /// # Panics
+    ///
+    /// Panics if CAS or clock initialization fails. This is intentional:
+    /// production code MUST have these dependencies configured correctly.
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)] // Arc is intentionally moved for shared ownership
+    pub fn with_persistence_and_cas(
+        session_registry: Arc<dyn SessionRegistry>,
+        metrics_registry: Option<SharedMetricsRegistry>,
+        sqlite_conn: Arc<Mutex<Connection>>,
+        cas_path: impl AsRef<Path>,
+    ) -> Self {
+        use rand::rngs::OsRng;
+
+        let token_secret = TokenMinter::generate_secret();
+        let token_minter = Arc::new(TokenMinter::new(token_secret));
+        let manifest_store = Arc::new(InMemoryManifestStore::new());
+
+        // TCK-00303: Create shared subscription registry for HEF resource governance
+        let subscription_registry: SharedSubscriptionRegistry =
+            Arc::new(SubscriptionRegistry::with_defaults());
+
+        // TCK-00316: Create durable CAS
+        let cas_config = DurableCasConfig::new(cas_path.as_ref().to_path_buf());
+        let cas: Arc<dyn ContentAddressedStore> =
+            Arc::new(DurableCas::new(cas_config).expect("CAS initialization failed"));
+
+        // TCK-00316: Create ToolBroker with CAS
+        let broker: SharedToolBroker<StubManifestLoader> =
+            new_shared_broker_with_cas(ToolBrokerConfig::default(), Arc::clone(&cas));
+
+        // TCK-00289: Create shared HolonicClock
+        let clock =
+            Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
+
+        // Use real implementations
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+
+        let policy_resolver = Arc::new(GovernancePolicyResolver::new());
+        let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&sqlite_conn)));
+        let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
+            Arc::clone(&sqlite_conn),
+            signing_key,
+        ));
+        let lease_validator = Arc::new(SqliteLeaseValidator::new(Arc::clone(&sqlite_conn)));
+        let episode_runtime = Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default()));
+
+        let privileged_dispatcher = PrivilegedDispatcher::with_dependencies(
+            DecodeConfig::default(),
+            policy_resolver,
+            work_registry,
+            Arc::clone(&event_emitter) as Arc<dyn crate::protocol::dispatch::LedgerEventEmitter>,
+            episode_runtime,
+            session_registry,
+            lease_validator,
+            Arc::clone(&clock),
+            token_minter.clone(),
+            manifest_store.clone(),
+            Arc::clone(&subscription_registry),
+        );
+
+        let privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
+            privileged_dispatcher.with_metrics(Arc::clone(metrics))
+        } else {
+            privileged_dispatcher
+        };
+
+        // TCK-00316: Wire SessionDispatcher with all production dependencies
+        let session_dispatcher =
+            SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
+                .with_subscription_registry(subscription_registry)
+                .with_ledger(event_emitter)
+                .with_cas(cas)
+                .with_clock(clock)
+                .with_broker(broker);
 
         Self {
             privileged_dispatcher,

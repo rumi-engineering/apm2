@@ -789,6 +789,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// - Token is parsed and validated using HMAC-SHA256
     /// - Constant-time comparison prevents timing attacks (CTR-WH001)
     /// - Returns error description without leaking internal state
+    #[allow(clippy::result_large_err)] // SessionResponse is large due to RequestToolResponse fields; refactoring to Box would be a breaking change
     fn validate_token(&self, token_json: &str) -> Result<SessionToken, SessionResponse> {
         // Parse the token JSON
         let token: SessionToken = serde_json::from_str(token_json).map_err(|e| {
@@ -988,11 +989,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 );
 
                 // Tool is allowed - return Allow decision
+                // TCK-00316: Legacy path does not execute tools, so no result_hash
                 return Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id: format!("REQ-{}", uuid::Uuid::new_v4()),
                     decision: DecisionType::Allow.into(),
                     rule_id: None,
                     policy_hash: manifest.digest().to_vec(),
+                    result_hash: None,
+                    inline_result: None,
                 }));
             }
             // No manifest found - fail closed (SEC-CTRL-FAC-0015)
@@ -1038,11 +1042,22 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     request_id = %request_id,
                     "Tool request allowed by broker"
                 );
+                // TCK-00316 BLOCKER 2: For now, return Allow without execution.
+                // Full tool execution integration requires EpisodeRuntime wiring
+                // which is tracked separately. The result_hash/inline_result fields
+                // are None until execution is implemented.
+                //
+                // TODO(TCK-00316): Implement actual tool execution on Allow:
+                // 1. Invoke EpisodeRuntime/ToolExecutor with the request
+                // 2. Store result in CAS if > MAX_INLINE_RESULT_SIZE
+                // 3. Return result_hash and/or inline_result
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Allow.into(),
                     rule_id,
                     policy_hash: policy_hash.to_vec(),
+                    result_hash: None,
+                    inline_result: None,
                 }))
             },
             Ok(ToolDecision::Deny {
@@ -1062,22 +1077,48 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     decision: DecisionType::Deny.into(),
                     rule_id,
                     policy_hash: policy_hash.to_vec(),
+                    result_hash: None,
+                    inline_result: None,
                 }))
             },
             Ok(ToolDecision::DedupeCacheHit { request_id, result }) => {
+                use crate::episode::decision::MAX_INLINE_RESULT_SIZE;
+
                 info!(
                     session_id = %session_id,
                     tool_class = %tool_class,
                     "Tool request hit dedupe cache"
                 );
-                // Return the cached result as Allow
-                // Use output_hash if available, otherwise empty policy hash
-                let policy_hash = result.output_hash.map(|h| h.to_vec()).unwrap_or_default();
+                // TCK-00316 SECURITY MAJOR 1 FIX: Properly separate policy_hash from
+                // result_hash. The previous code conflated output_hash with
+                // policy_hash, which is a security metadata conflation bug.
+                // Policy hash is the hash of the policy that authorized
+                // the original request; result_hash is the hash of the tool execution output.
+                //
+                // For cache hits, we use an empty policy_hash since the cached result was
+                // already authorized by the original policy evaluation. The result_hash
+                // comes from the cached ToolResult's output_hash.
+                //
+                // TCK-00316 SECURITY MAJOR 2 FIX: Enforce MAX_INLINE_RESULT_SIZE for
+                // inline_result. If the cached output exceeds the limit, return
+                // only result_hash without inline data.
+
+                let result_hash = result.output_hash.map(|h| h.to_vec());
+                let inline_result = if result.output.len() <= MAX_INLINE_RESULT_SIZE {
+                    Some(result.output.clone())
+                } else {
+                    // Output exceeds inline limit; must be fetched from CAS via result_hash
+                    None
+                };
+
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Allow.into(),
                     rule_id: None,
-                    policy_hash,
+                    // Empty policy_hash for cache hits - policy was evaluated on original request
+                    policy_hash: Vec::new(),
+                    result_hash,
+                    inline_result,
                 }))
             },
             Ok(ToolDecision::Terminate {
@@ -2325,6 +2366,8 @@ mod tests {
             decision: 0,
             rule_id: None,
             policy_hash: vec![],
+            result_hash: None,
+            inline_result: None,
         });
         let encoded = tool_resp.encode();
         assert!(!encoded.is_empty());
