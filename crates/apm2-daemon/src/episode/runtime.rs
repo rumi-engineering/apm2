@@ -2364,4 +2364,80 @@ mod tests {
             "ClockProfilePublished should not have an episode_id"
         );
     }
+
+    /// TCK-00319: Verify that start_with_workspace correctly initializes
+    /// rooted handlers and that they are confined to the workspace.
+    #[tokio::test]
+    async fn tck_00319_start_with_workspace_roots_handlers() {
+        use std::path::PathBuf;
+        use crate::episode::broker::StubContentAddressedStore;
+        use crate::episode::handlers::ReadFileHandler;
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+
+        // Create a file INSIDE the workspace
+        let inside_file = workspace.join("inside.txt");
+        std::fs::write(&inside_file, "inside").expect("write inside");
+
+        // Create a file OUTSIDE the workspace
+        let outside_file = temp_dir.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside").expect("write outside");
+
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let runtime = EpisodeRuntime::new(test_config())
+            .with_cas(cas)
+            .with_rooted_handler_factory(|root| {
+                Box::new(ReadFileHandler::with_root(root))
+            });
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        // Start with workspace
+        let _handle = runtime
+            .start_with_workspace(&episode_id, "lease-123", test_timestamp() + 1000, &workspace)
+            .await
+            .unwrap();
+
+        // Attempt to read file INSIDE workspace
+        let result = runtime
+            .execute_tool(
+                &episode_id,
+                &ToolArgs::Read(crate::episode::tool_handler::ReadArgs {
+                    path: PathBuf::from("inside.txt"),
+                    offset: None,
+                    limit: None,
+                }),
+                None,
+                test_timestamp() + 2000,
+                "req-1",
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output_str().unwrap(), "inside");
+
+        // Attempt to read file OUTSIDE workspace via path traversal
+        let result = runtime
+            .execute_tool(
+                &episode_id,
+                &ToolArgs::Read(crate::episode::tool_handler::ReadArgs {
+                    path: PathBuf::from("../outside.txt"),
+                    offset: None,
+                    limit: None,
+                }),
+                None,
+                test_timestamp() + 3000,
+                "req-2",
+            )
+            .await;
+
+        // Should be rejected by path validation
+        assert!(result.is_err());
+    }
 }
