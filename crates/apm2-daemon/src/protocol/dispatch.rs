@@ -854,10 +854,13 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 
         // Build payload as JSON with episode event metadata
         // The payload is already JSON-serialized episode event data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal malleability
+        // per LAW-09 (Temporal Pinning & Freshness) and RS-40 (Time & Monotonicity)
         let payload_json = serde_json::json!({
             "event_type": event_type,
             "episode_id": episode_id,
             "payload": hex::encode(payload),
+            "timestamp_ns": timestamp_ns,
         });
 
         // Use JCS (RFC 8785) canonicalization for deterministic signing
@@ -944,6 +947,8 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Build payload as JSON with review receipt data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal malleability
+        // per LAW-09 (Temporal Pinning & Freshness) and RS-40 (Time & Monotonicity)
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
             "episode_id": episode_id,
@@ -951,6 +956,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "changeset_digest": hex::encode(changeset_digest),
             "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
             "reviewer_actor_id": reviewer_actor_id,
+            "timestamp_ns": timestamp_ns,
         });
 
         // Use JCS (RFC 8785) canonicalization for deterministic signing

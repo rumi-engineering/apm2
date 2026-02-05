@@ -163,6 +163,14 @@ async fn test_atomic_receipt_emission() {
     // Verify the receipt_id is in the payload
     let payload: serde_json::Value = serde_json::from_slice(&events[0].payload).unwrap();
     assert_eq!(payload["receipt_id"], receipt_id);
+
+    // SECURITY: Verify timestamp_ns is included in signed payload (LAW-09, RS-40)
+    // This prevents temporal malleability attacks
+    assert_eq!(
+        payload["timestamp_ns"].as_u64().unwrap(),
+        timestamp_ns,
+        "timestamp_ns must be included in signed payload for temporal binding"
+    );
 }
 
 /// Tests emit_episode_event method for episode event streaming.
@@ -191,6 +199,14 @@ async fn test_emit_episode_event() {
     // Verify it can be queried
     let events = emitter.get_events_by_work_id(episode_id);
     assert_eq!(events.len(), 1);
+
+    // SECURITY: Verify timestamp_ns is included in signed payload (LAW-09, RS-40)
+    let payload: serde_json::Value = serde_json::from_slice(&events[0].payload).unwrap();
+    assert_eq!(
+        payload["timestamp_ns"].as_u64().unwrap(),
+        timestamp_ns,
+        "timestamp_ns must be included in signed payload for temporal binding"
+    );
 }
 
 /// Tests that runtime works without ledger emitter (backward compatibility).

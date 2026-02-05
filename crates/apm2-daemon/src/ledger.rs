@@ -469,10 +469,13 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Build payload as JSON with episode event metadata
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal malleability
+        // per LAW-09 (Temporal Pinning & Freshness) and RS-40 (Time & Monotonicity)
         let payload_json = serde_json::json!({
             "event_type": event_type,
             "episode_id": episode_id,
             "payload": hex::encode(payload),
+            "timestamp_ns": timestamp_ns,
         });
 
         // TCK-00321: Use JCS (RFC 8785) canonicalization for signing.
@@ -552,6 +555,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Build payload as JSON with review receipt data
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal malleability
+        // per LAW-09 (Temporal Pinning & Freshness) and RS-40 (Time & Monotonicity)
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
             "episode_id": episode_id,
@@ -559,6 +564,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "changeset_digest": hex::encode(changeset_digest),
             "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
             "reviewer_actor_id": reviewer_actor_id,
+            "timestamp_ns": timestamp_ns,
         });
 
         // TCK-00321: Use JCS (RFC 8785) canonicalization for signing.
