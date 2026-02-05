@@ -203,6 +203,84 @@ fn remove_pid_file(pid_path: &PathBuf) {
     }
 }
 
+/// Load or create a persistent signer key for projection receipts.
+///
+/// TCK-00322 BLOCKER FIX: Non-Persistent Signer for Projection Receipts
+///
+/// The projection worker requires a persistent signing key to ensure receipt
+/// signatures remain valid across daemon restarts. This function:
+///
+/// 1. If the key file exists: loads the 32-byte Ed25519 secret key
+/// 2. If the key file doesn't exist: generates a new key and saves it
+///
+/// The key file is created with mode 0600 (owner read/write only) to prevent
+/// unauthorized access to the signing key material.
+///
+/// # Arguments
+///
+/// * `key_path` - Path to the signer key file
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The key file cannot be read or written
+/// - The key file contains invalid data (not 32 bytes)
+/// - File permissions cannot be set
+fn load_or_create_persistent_signer(key_path: &PathBuf) -> Result<apm2_core::crypto::Signer> {
+    use apm2_core::crypto::Signer;
+
+    // Ensure parent directory exists
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent).context("failed to create signer key directory")?;
+    }
+
+    if key_path.exists() {
+        // Load existing key
+        let key_bytes = std::fs::read(key_path).context("failed to read signer key file")?;
+
+        if key_bytes.len() != 32 {
+            anyhow::bail!(
+                "invalid signer key file: expected 32 bytes, got {}",
+                key_bytes.len()
+            );
+        }
+
+        Signer::from_bytes(&key_bytes)
+            .map_err(|e| anyhow::anyhow!("failed to parse signer key: {e}"))
+    } else {
+        // Generate new key and save it
+        let signer = Signer::generate();
+        let key_bytes = signer.secret_key_bytes();
+
+        // Write key file with secure permissions
+        // TCK-00322 BLOCKER FIX: Set mode 0600 to protect private key
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(key_path)
+                .context("failed to create signer key file")?;
+
+            file.write_all(&*key_bytes)
+                .context("failed to write signer key")?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(key_path, &*key_bytes).context("failed to write signer key")?;
+        }
+
+        info!(key_path = %key_path.display(), "Generated new persistent projection signer key");
+
+        Ok(signer)
+    }
+}
+
 /// Initialize the supervisor with processes from configuration.
 fn init_supervisor(config: &EcosystemConfig) -> Supervisor {
     let mut supervisor = Supervisor::new();
@@ -637,78 +715,118 @@ async fn async_main(args: Args) -> Result<()> {
                 &projection_config.github_repo,
             ) {
                 Ok(mut github_config) => {
-                    // Load token from environment if specified
-                    // Note: clippy::option_if_let_else is suppressed because the suggested
-                    // map_or pattern doesn't work well with mutable captures (github_config
-                    // mutation)
-                    #[allow(clippy::option_if_let_else)]
-                    let has_token = if let Some(ref token_env) = projection_config.github_token_env
-                    {
-                        // Strip leading $ if present
-                        let env_var = token_env.strip_prefix('$').unwrap_or(token_env);
-                        if let Ok(token) = std::env::var(env_var) {
-                            match github_config.clone().with_api_token(&token) {
-                                Ok(cfg_with_token) => {
-                                    github_config = cfg_with_token;
-                                    true
-                                },
-                                Err(e) => {
-                                    warn!("Invalid GitHub token: {}", e);
-                                    false
-                                },
-                            }
-                        } else {
-                            warn!(
-                                "GitHub token env var {} not set, projection will use mock mode",
-                                env_var
+                    // TCK-00322 MAJOR FIX: Fail-Open Mock Mode on Configuration Error
+                    // When `enabled = true`, missing token env var is now a FATAL error.
+                    // Previously, this would silently fall back to mock mode, which could
+                    // cause production systems to think they're projecting to GitHub when
+                    // they're not. Now we fail-closed: missing mandatory config = startup
+                    // failure.
+                    let Some(ref token_env) = projection_config.github_token_env else {
+                        // TCK-00322 MAJOR FIX: Missing token_env is fatal when enabled
+                        error!(
+                            "projection.enabled=true but github_token_env is not configured. \
+                             A GitHub token is required for production projection."
+                        );
+                        return Err(anyhow::anyhow!(
+                            "projection.enabled=true but github_token_env is not configured"
+                        ));
+                    };
+
+                    // Strip leading $ if present
+                    let env_var = token_env.strip_prefix('$').unwrap_or(token_env);
+                    let Ok(token) = std::env::var(env_var) else {
+                        // TCK-00322 MAJOR FIX: Missing token is fatal when enabled
+                        error!(
+                            env_var = %env_var,
+                            "GitHub token env var not set. \
+                             projection.enabled=true requires a valid token. \
+                             Either set the env var or disable projection."
+                        );
+                        return Err(anyhow::anyhow!(
+                            "projection.enabled=true but github_token_env ({env_var}) is not set"
+                        ));
+                    };
+
+                    github_config = match github_config.clone().with_api_token(&token) {
+                        Ok(cfg_with_token) => cfg_with_token,
+                        Err(e) => {
+                            // Invalid token format is fatal when projection is enabled
+                            error!(
+                                env_var = %env_var,
+                                error = %e,
+                                "Invalid GitHub token. Projection enabled but cannot proceed."
                             );
-                            false
-                        }
-                    } else {
-                        false
+                            return Err(anyhow::anyhow!(
+                                "projection.enabled=true but GitHub token is invalid: {e}"
+                            ));
+                        },
                     };
 
                     config = config.with_github(github_config.clone());
 
-                    // Create the actual adapter
-                    // Use a persistent signer from daemon key material for production
-                    let signer = apm2_core::crypto::Signer::generate();
+                    // TCK-00322 BLOCKER FIX: Non-Persistent Signer for Projection Receipts
+                    // Load or generate a persistent signer key from file. The key file path
+                    // is configurable via projection.signer_key_file, defaulting to
+                    // {state_file_dir}/projection_signer.key.
+                    let signer_key_path =
+                        projection_config
+                            .signer_key_file
+                            .clone()
+                            .unwrap_or_else(|| {
+                                daemon_config.state_file_path.parent().map_or_else(
+                                    || PathBuf::from("/var/lib/apm2/projection_signer.key"),
+                                    |p| p.join("projection_signer.key"),
+                                )
+                            });
+
+                    let signer = load_or_create_persistent_signer(&signer_key_path)
+                        .context("failed to load projection signer key")?;
+                    info!(
+                        key_path = %signer_key_path.display(),
+                        public_key = %hex::encode(signer.public_key_bytes()),
+                        "Loaded persistent projection signer"
+                    );
 
                     // Determine cache path for idempotency
+                    // TCK-00322 MAJOR FIX: Don't use /tmp for cache - use ledger-adjacent path
                     let cache_path = daemon_config.ledger_db_path.as_ref().map_or_else(
-                        || std::env::temp_dir().join("apm2_projection_cache.db"),
+                        || {
+                            daemon_config.state_file_path.parent().map_or_else(
+                                || PathBuf::from("/var/lib/apm2/projection_cache.db"),
+                                |p| p.join("projection_cache.db"),
+                            )
+                        },
                         |p| p.with_extension("projection_cache.db"),
                     );
 
-                    // Create adapter - use mock mode if no token, real mode otherwise
-                    let adapter_result = if has_token {
-                        GitHubProjectionAdapter::new(signer, github_config, &cache_path)
-                    } else {
-                        // Mock mode for testing without real API calls
-                        GitHubProjectionAdapter::new_mock(signer, github_config)
-                    };
-
-                    match adapter_result {
+                    // Create adapter - always real mode when enabled=true (mock mode removed)
+                    // At this point we have validated the token, so we can proceed.
+                    match GitHubProjectionAdapter::new(signer, github_config, &cache_path) {
                         Ok(adapter) => {
                             info!(
                                 owner = %projection_config.github_owner,
                                 repo = %projection_config.github_repo,
-                                mock_mode = !has_token,
+                                cache_path = %cache_path.display(),
                                 "GitHub projection adapter created"
                             );
                             github_adapter = Some(adapter);
                         },
                         Err(e) => {
-                            warn!("Failed to create GitHub adapter: {}", e);
+                            // Adapter creation failure is fatal when enabled
+                            return Err(anyhow::anyhow!("Failed to create GitHub adapter: {e}"));
                         },
                     }
                 },
                 Err(e) => {
-                    warn!("Invalid GitHub adapter config: {}, using mock mode", e);
+                    // Invalid config is fatal when enabled
+                    return Err(anyhow::anyhow!("Invalid GitHub adapter config: {e}"));
                 },
             }
         } else if projection_config.enabled {
-            warn!("Projection enabled but GitHub owner/repo not configured, using mock mode");
+            // TCK-00322 MAJOR FIX: Missing owner/repo is fatal when enabled
+            return Err(anyhow::anyhow!(
+                "projection.enabled=true but github_owner or github_repo is not configured"
+            ));
         }
 
         match ProjectionWorker::new(projection_conn, config) {
@@ -719,7 +837,8 @@ async fn async_main(args: Args) -> Result<()> {
                     worker.set_adapter(adapter);
                     info!("GitHub adapter injected into projection worker");
                 } else {
-                    warn!("No GitHub adapter available - projections will be skipped (fail-safe)");
+                    // When projection is disabled, this is expected
+                    info!("Projection worker started without adapter (projection disabled)");
                 }
 
                 let shutdown_flag = worker.shutdown_handle();

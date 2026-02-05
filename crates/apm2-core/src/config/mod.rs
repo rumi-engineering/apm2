@@ -148,6 +148,9 @@ pub struct ProjectionConfig {
     ///
     /// For security, this should reference an environment variable,
     /// e.g., `$GITHUB_TOKEN` or use a credential profile.
+    ///
+    /// **Required when `enabled = true`**: Missing token is a fatal error
+    /// to prevent fail-open security issues (TCK-00322 security review).
     #[serde(default)]
     pub github_token_env: Option<String>,
 
@@ -158,6 +161,18 @@ pub struct ProjectionConfig {
     /// Batch size for processing ledger events.
     #[serde(default = "default_projection_batch_size")]
     pub batch_size: usize,
+
+    /// Path to persistent signer key file for projection receipts.
+    ///
+    /// TCK-00322 BLOCKER FIX: The projection worker requires a persistent
+    /// signing key to ensure receipt signatures remain valid across daemon
+    /// restarts. If not specified, defaults to
+    /// `{state_file_dir}/projection_signer.key`.
+    ///
+    /// The key file contains the 32-byte Ed25519 secret key. It is created
+    /// automatically with mode 0600 if it does not exist.
+    #[serde(default)]
+    pub signer_key_file: Option<PathBuf>,
 }
 
 fn default_github_api_url() -> String {

@@ -527,14 +527,58 @@ struct IdempotencyCache {
 
 impl IdempotencyCache {
     /// Opens or creates an idempotency cache at the specified path.
+    ///
+    /// # Security (TCK-00322 MAJOR FIX)
+    ///
+    /// The cache file is created with mode 0600 (owner read/write only) to
+    /// prevent unauthorized access to projection receipts and idempotency data.
     fn open(path: impl AsRef<Path>) -> Result<Self, ProjectionError> {
+        let path = path.as_ref();
+
+        // TCK-00322 MAJOR FIX: Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ProjectionError::DatabaseError(format!("failed to create cache directory: {e}"))
+            })?;
+        }
+
+        // TCK-00322 MAJOR FIX: Set secure permissions (0600) on cache file.
+        // We need to handle two cases:
+        // 1. File doesn't exist: Create it with umask then fix permissions
+        // 2. File exists: Fix permissions if needed
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // If file already exists, fix permissions
+            if path.exists() {
+                let permissions = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(path, permissions).map_err(|e| {
+                    ProjectionError::DatabaseError(format!(
+                        "failed to set cache file permissions: {e}"
+                    ))
+                })?;
+            }
+        }
+
         let conn = Connection::open_with_flags(
-            path.as_ref(),
+            path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
+
+        // TCK-00322 MAJOR FIX: Set permissions after file creation (for new files)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let permissions = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, permissions).map_err(|e| {
+                ProjectionError::DatabaseError(format!("failed to set cache file permissions: {e}"))
+            })?;
+        }
 
         conn.execute_batch(CACHE_SCHEMA_SQL)
             .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
