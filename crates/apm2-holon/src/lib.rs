@@ -103,6 +103,7 @@ pub mod defect;
 pub mod episode;
 pub mod error;
 pub mod ledger;
+pub mod orchestration;
 pub mod receipt;
 pub mod resource;
 pub mod result;
@@ -131,6 +132,11 @@ pub use ledger::{
     ChainError, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeOutcome,
     EpisodeStarted, EventHash, EventHashError, EventType, LedgerEvent, verify_chain,
 };
+pub use orchestration::{
+    BlockedReasonCode, IterationCompleted, IterationOutcome, OrchestrationConfig,
+    OrchestrationDriver, OrchestrationEvent, OrchestrationStarted, OrchestrationStateV1,
+    OrchestrationTerminated, TerminationReason,
+};
 pub use receipt::{BudgetDelta, PackMiss, ReceiptError, RunReceipt, RunReceiptBuilder};
 pub use resource::{Budget, Lease, LeaseScope, ResourceError};
 pub use result::EpisodeResult;
@@ -158,6 +164,11 @@ pub mod prelude {
     pub use crate::ledger::{
         ChainError, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeOutcome,
         EpisodeStarted, EventHash, EventType, LedgerEvent, verify_chain,
+    };
+    pub use crate::orchestration::{
+        BlockedReasonCode, IterationCompleted, IterationOutcome, OrchestrationConfig,
+        OrchestrationDriver, OrchestrationEvent, OrchestrationStarted, OrchestrationStateV1,
+        OrchestrationTerminated, TerminationReason,
     };
     pub use crate::receipt::{BudgetDelta, PackMiss, ReceiptError, RunReceipt, RunReceiptBuilder};
     pub use crate::resource::{Budget, Lease, LeaseScope, ResourceError};
