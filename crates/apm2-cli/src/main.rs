@@ -149,6 +149,10 @@ enum Commands {
     /// Evidence commands (publish evidence artifacts via session socket)
     Evidence(commands::evidence::EvidenceCommand),
 
+    // === FAC (Forge Admission Cycle) productivity (TCK-00333) ===
+    /// FAC commands (ledger/CAS oriented debug UX)
+    Fac(commands::fac::FacCommand),
+
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
     #[command(subcommand)]
@@ -408,6 +412,12 @@ fn main() -> Result<()> {
             // Evidence commands use session_socket for session-scoped PublishEvidence
             // operation. Exit codes per RFC-0018.
             let exit_code = commands::evidence::run_evidence(&evidence_cmd, &session_socket);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Fac(fac_cmd) => {
+            // FAC commands operate directly on ledger/CAS files (no daemon required).
+            // Exit codes per RFC-0018.
+            let exit_code = commands::fac::run_fac(&fac_cmd);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {

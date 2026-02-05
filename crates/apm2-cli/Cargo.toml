@@ -55,6 +55,7 @@ regex.workspace = true
 # Cryptographic hashing
 blake3.workspace = true
 hex.workspace = true
+subtle.workspace = true
 
 [lints]
 workspace = true
