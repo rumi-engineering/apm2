@@ -380,6 +380,19 @@ impl_bounded_decode_simple!(
     ConsensusByzantineEvidenceRequest,
     ByzantineEvidenceEntry,
     ConsensusError,
+    // CTR-PROTO-012: Credential Management (RFC-0018, TCK-00343)
+    CredentialProfile,
+    ListCredentialsRequest,
+    AddCredentialRequest,
+    AddCredentialResponse,
+    RemoveCredentialRequest,
+    RemoveCredentialResponse,
+    RefreshCredentialRequest,
+    RefreshCredentialResponse,
+    SwitchCredentialRequest,
+    SwitchCredentialResponse,
+    LoginCredentialRequest,
+    LoginCredentialResponse,
 );
 
 // Implement BoundedDecode for messages with repeated fields
@@ -401,6 +414,8 @@ impl_bounded_decode_with_repeated!(StreamLogsResponse, entries);
 // CTR-PROTO-011: Consensus Query Endpoints (RFC-0014, TCK-00345)
 impl_bounded_decode_with_repeated!(ConsensusValidatorsResponse, validators);
 impl_bounded_decode_with_repeated!(ConsensusByzantineEvidenceResponse, evidence);
+// CTR-PROTO-012: Credential Management (RFC-0018, TCK-00343)
+impl_bounded_decode_with_repeated!(ListCredentialsResponse, profiles);
 
 // ============================================================================
 // HEF Field Bounds (CTR-HEF-0001, REQ-HEF-0002, RFC-0018)

@@ -160,6 +160,8 @@ pub use dispatch::{
     WorkRegistryError,
     // TCK-00253: Actor ID derivation
     derive_actor_id,
+    // CTR-PROTO-012: Credential Management encoding (TCK-00343)
+    encode_add_credential_request,
     // Request encoding helpers
     encode_claim_work_request,
     encode_consensus_byzantine_evidence_request,
@@ -168,15 +170,20 @@ pub use dispatch::{
     encode_consensus_status_request,
     encode_consensus_validators_request,
     encode_issue_capability_request,
+    encode_list_credentials_request,
     // TCK-00342: Process management encoding helpers
     encode_list_processes_request,
+    encode_login_credential_request,
     encode_process_status_request,
+    encode_refresh_credential_request,
     encode_reload_process_request,
+    encode_remove_credential_request,
     encode_restart_process_request,
     encode_shutdown_request,
     encode_spawn_episode_request,
     encode_start_process_request,
     encode_stop_process_request,
+    encode_switch_credential_request,
     encode_work_status_request,
     generate_lease_id,
     generate_work_id,
@@ -194,6 +201,9 @@ pub use handshake::{
 };
 #[allow(unused_imports)]
 pub use messages::{
+    // CTR-PROTO-012: Credential Management (RFC-0018, TCK-00343)
+    AddCredentialRequest,
+    AddCredentialResponse,
     BoundedDecode,
     // CTR-PROTO-010: HEF Pulse Plane (RFC-0018, TCK-00300)
     BoundedWallInterval,
@@ -216,6 +226,9 @@ pub use messages::{
     ConsensusStatusResponse,
     ConsensusValidatorsRequest,
     ConsensusValidatorsResponse,
+    CredentialAuthMethod,
+    CredentialProfile,
+    CredentialProvider,
     DEFAULT_MAX_MESSAGE_SIZE,
     DEFAULT_MAX_REPEATED_FIELD_COUNT,
     DecodeConfig,
@@ -232,10 +245,14 @@ pub use messages::{
     // CTR-PROTO-009: Crash Recovery Signals (TCK-00267)
     LeaseRevoked,
     LeaseRevokedReason,
+    ListCredentialsRequest,
+    ListCredentialsResponse,
     // CTR-PROTO-011: Process Management Endpoints (TCK-00342)
     ListProcessesRequest,
     ListProcessesResponse,
     LogEntry,
+    LoginCredentialRequest,
+    LoginCredentialResponse,
     PatternRejection,
     PrivilegedError,
     PrivilegedErrorCode,
@@ -250,8 +267,12 @@ pub use messages::{
     PulseEvent,
     RecoverSessionsRequest,
     RecoverSessionsResponse,
+    RefreshCredentialRequest,
+    RefreshCredentialResponse,
     ReloadProcessRequest,
     ReloadProcessResponse,
+    RemoveCredentialRequest,
+    RemoveCredentialResponse,
     RequestToolRequest,
     RequestToolResponse,
     RestartProcessRequest,
@@ -274,6 +295,8 @@ pub use messages::{
     StreamTelemetryResponse,
     SubscribePulseRequest,
     SubscribePulseResponse,
+    SwitchCredentialRequest,
+    SwitchCredentialResponse,
     UnsubscribePulseRequest,
     UnsubscribePulseResponse,
     ValidatorInfo,
