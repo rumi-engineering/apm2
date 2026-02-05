@@ -28,7 +28,7 @@
 //!     "work-001",
 //!     "abc123...def456", // BLAKE3 hash of workspace state
 //!     "policy-ref-001",
-//!     1704067200000000000, // nanoseconds since epoch
+//!     1_704_067_200_000_000_000, // nanoseconds since epoch
 //! );
 //!
 //! assert!(commitment.validate().is_ok());
@@ -312,7 +312,7 @@ mod tests {
             "work-001",
             "a".repeat(64),
             "policy-ref-001",
-            1704067200000000000,
+            1_704_067_200_000_000_000,
         );
 
         assert_eq!(commitment.schema, VIEW_COMMITMENT_V1_SCHEMA);
@@ -326,7 +326,7 @@ mod tests {
             .work_id("work-002")
             .result_digest("b".repeat(64))
             .policy_resolved_ref("policy-ref-002")
-            .committed_at_ns(1704067200000000000)
+            .committed_at_ns(1_704_067_200_000_000_000)
             .build()
             .expect("valid commitment");
 
@@ -341,7 +341,7 @@ mod tests {
             .work_id("work-003")
             .result_digest_bytes(digest)
             .policy_resolved_ref("policy-ref-003")
-            .committed_at_ns(1704067200000000000)
+            .committed_at_ns(1_704_067_200_000_000_000)
             .build()
             .expect("valid commitment");
 
@@ -425,13 +425,13 @@ mod tests {
             "work-001",
             "a".repeat(64),
             "policy-ref",
-            1704067200000000000,
+            1_704_067_200_000_000_000,
         );
         let commitment2 = ViewCommitmentV1::new(
             "work-001",
             "a".repeat(64),
             "policy-ref",
-            1704067200000000000,
+            1_704_067_200_000_000_000,
         );
 
         assert_eq!(
@@ -446,13 +446,13 @@ mod tests {
             "work-001",
             "a".repeat(64),
             "policy-ref",
-            1704067200000000000,
+            1_704_067_200_000_000_000,
         );
         let commitment2 = ViewCommitmentV1::new(
             "work-002", // Different work_id
             "a".repeat(64),
             "policy-ref",
-            1704067200000000000,
+            1_704_067_200_000_000_000,
         );
 
         assert_ne!(

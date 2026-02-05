@@ -535,7 +535,7 @@ impl ReviewArtifactBundleV1Builder {
     ///
     /// This method builds the bundle with optional `view_commitment_hash` and
     /// `policy_resolved_ref` fields. For fail-closed behavior that requires
-    /// these fields, use [`build_strict`] instead.
+    /// these fields, use [`Self::build_strict`] instead.
     ///
     /// # Errors
     ///
