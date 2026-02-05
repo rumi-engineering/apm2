@@ -30,12 +30,13 @@
 //! use apm2_core::fac::ChangeSetBundleV1;
 //!
 //! let manager = WorkspaceManager::new(cas_store, work_dir);
+//! let timestamp_ns = clock.now_ns(); // Get timestamp from HolonicClock
 //!
 //! // Take snapshot before apply
-//! let snapshot = manager.snapshot(&work_id, None)?;
+//! let snapshot = manager.snapshot(&work_id, timestamp_ns)?;
 //!
-//! // Apply changeset bundle
-//! match manager.apply(&bundle).await {
+//! // Apply changeset bundle with explicit timestamp
+//! match manager.apply_with_timestamp(&bundle, timestamp_ns) {
 //!     Ok(result) => { /* proceed with review */ },
 //!     Err(e) => {
 //!         // Record blocked outcome with reason code
@@ -1222,27 +1223,19 @@ impl WorkspaceManager {
     /// # Arguments
     ///
     /// * `work_id` - Unique work identifier
-    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses
-    ///   current system time. For HTF determinism, callers should pass a
-    ///   timestamp from `HolonicClock` instead of relying on
-    ///   `SystemTime::now()`.
+    /// * `timestamp_ns` - Timestamp in nanoseconds from `HolonicClock`
+    ///   (required for RS-40 compliance; no wall-clock fallback)
     ///
     /// # Errors
     ///
     /// Returns error if snapshot fails.
-    #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
     pub fn snapshot(
         &self,
         work_id: &str,
-        timestamp_ns: Option<u64>,
+        timestamp_ns: u64,
     ) -> Result<WorkspaceSnapshot, WorkspaceError> {
-        // MAJOR FIX #7: Accept timestamp parameter for HTF determinism
-        let snapshot_at_ns = timestamp_ns.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-        });
+        // BLOCKER 2 FIX: timestamp_ns is now required (no SystemTime::now() fallback)
+        let snapshot_at_ns = timestamp_ns;
 
         // Try to get git HEAD hash if this is a git repo
         let git_head = self.get_git_head();
@@ -1273,30 +1266,29 @@ impl WorkspaceManager {
     ///
     /// * `work_id` - Unique work identifier
     /// * `policy_resolved_ref` - The policy resolution binding
-    /// * `timestamp_ns` - Optional timestamp in nanoseconds
+    /// * `changeset_digest` - The BLAKE3 digest of the applied changeset
+    ///   (BLOCKER 1 fix: must be included in `result_digest` computation for
+    ///   proper binding)
+    /// * `timestamp_ns` - Timestamp in nanoseconds from `HolonicClock`
+    ///   (required for RS-40 compliance; no wall-clock fallback)
     ///
     /// # Errors
     ///
     /// Returns error if commit fails.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn commit_view(
         &self,
         work_id: &str,
         policy_resolved_ref: &str,
-        timestamp_ns: Option<u64>,
+        changeset_digest: &[u8; 32],
+        timestamp_ns: u64,
     ) -> Result<ViewCommitmentV1, WorkspaceError> {
-        let committed_at_ns = timestamp_ns.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-        });
-
-        // Compute result digest (same logic as snapshot hash for now)
+        // BLOCKER 1 FIX: Include changeset_digest in result_digest computation
+        // to properly bind the applied changeset to the view commitment
         let git_head = self.get_git_head();
-        let hash_input = git_head
-            .as_ref()
-            .map_or_else(|| work_id.to_string(), |head| format!("{work_id}:{head}"));
+        let hash_input = git_head.as_ref().map_or_else(
+            || format!("{}:{}", work_id, hex::encode(changeset_digest)),
+            |head| format!("{}:{}:{}", work_id, head, hex::encode(changeset_digest)),
+        );
         let result_digest = *blake3::hash(hash_input.as_bytes()).as_bytes();
         let result_digest_hex = hex::encode(result_digest);
 
@@ -1304,7 +1296,7 @@ impl WorkspaceManager {
             work_id,
             result_digest_hex,
             policy_resolved_ref,
-            committed_at_ns,
+            timestamp_ns,
         ))
     }
 
@@ -1337,39 +1329,27 @@ impl WorkspaceManager {
     ///
     /// For HTF determinism, prefer `apply_with_timestamp()` which accepts an
     /// explicit timestamp parameter from `HolonicClock`.
-    #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
-    pub fn apply(&self, bundle: &ChangeSetBundleV1) -> Result<ApplyResult, WorkspaceError> {
-        self.apply_with_timestamp(bundle, None)
-    }
-
     /// Applies a changeset bundle to the workspace with an explicit timestamp.
     ///
     /// # Arguments
     ///
     /// * `bundle` - The changeset bundle to apply
-    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses
-    ///   current system time. For HTF determinism, callers should pass a
-    ///   timestamp from `HolonicClock`.
+    /// * `timestamp_ns` - Timestamp in nanoseconds from `HolonicClock`
+    ///   (required for RS-40 compliance; no wall-clock fallback)
     ///
     /// # Errors
     ///
     /// Returns error if validation or apply fails.
-    #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
     pub fn apply_with_timestamp(
         &self,
         bundle: &ChangeSetBundleV1,
-        timestamp_ns: Option<u64>,
+        timestamp_ns: u64,
     ) -> Result<ApplyResult, WorkspaceError> {
         // Step 1: Validate all file changes (security checks)
         validate_file_changes(bundle, &self.workspace_root)?;
 
-        // MAJOR FIX #7: Accept timestamp parameter for HTF determinism
-        let applied_at_ns = timestamp_ns.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-        });
+        // BLOCKER 2 FIX: timestamp_ns is now required (no SystemTime::now() fallback)
+        let applied_at_ns = timestamp_ns;
 
         // Step 3: If CAS is available, retrieve diff and apply
         // Otherwise, this is validation-only mode (for tests or dry-run)
@@ -1389,50 +1369,23 @@ impl WorkspaceManager {
         ))
     }
 
-    /// Applies a changeset bundle with explicit diff bytes.
-    ///
-    /// This method is useful when the diff bytes are already available
-    /// (e.g., during testing or when CAS is not configured).
-    ///
-    /// # Security
-    ///
-    /// Same security guarantees as `apply()`.
-    ///
-    /// # Note
-    ///
-    /// For HTF determinism, prefer `apply_with_diff_and_timestamp()` which
-    /// accepts an explicit timestamp parameter from `HolonicClock`.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if validation or apply fails.
-    pub fn apply_with_diff(
-        &self,
-        bundle: &ChangeSetBundleV1,
-        diff_bytes: &[u8],
-    ) -> Result<ApplyResult, WorkspaceError> {
-        self.apply_with_diff_and_timestamp(bundle, diff_bytes, None)
-    }
-
     /// Applies a changeset bundle with explicit diff bytes and timestamp.
     ///
     /// # Arguments
     ///
     /// * `bundle` - The changeset bundle to apply
     /// * `diff_bytes` - The raw diff bytes
-    /// * `timestamp_ns` - Optional timestamp in nanoseconds. If None, uses
-    ///   current system time. For HTF determinism, callers should pass a
-    ///   timestamp from `HolonicClock`.
+    /// * `timestamp_ns` - Timestamp in nanoseconds from `HolonicClock`
+    ///   (required for RS-40 compliance; no wall-clock fallback)
     ///
     /// # Errors
     ///
     /// Returns error if validation or apply fails.
-    #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
     pub fn apply_with_diff_and_timestamp(
         &self,
         bundle: &ChangeSetBundleV1,
         diff_bytes: &[u8],
-        timestamp_ns: Option<u64>,
+        timestamp_ns: u64,
     ) -> Result<ApplyResult, WorkspaceError> {
         // Step 1: Validate all file changes
         validate_file_changes(bundle, &self.workspace_root)?;
@@ -1453,14 +1406,8 @@ impl WorkspaceManager {
         // MAJOR FIX #6: Enforce MAX_FILE_SIZE after apply
         self.verify_file_sizes(bundle)?;
 
-        // Step 4: Record timestamp
-        // MAJOR FIX #7: Accept timestamp parameter for HTF determinism
-        let applied_at_ns = timestamp_ns.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-        });
+        // BLOCKER 2 FIX: timestamp_ns is now required (no SystemTime::now() fallback)
+        let applied_at_ns = timestamp_ns;
 
         Ok(ApplyResult::new(
             bundle.changeset_digest,
@@ -1481,20 +1428,25 @@ impl WorkspaceManager {
     /// * `bundle` - The changeset bundle to apply
     /// * `work_id` - Unique work identifier
     /// * `policy_resolved_ref` - The policy resolution binding
-    /// * `timestamp_ns` - Optional timestamp in nanoseconds
+    /// * `timestamp_ns` - Timestamp in nanoseconds from `HolonicClock`
+    ///   (required for RS-40 compliance; no wall-clock fallback)
     pub fn apply_with_view_commitment(
         &self,
         bundle: &ChangeSetBundleV1,
         work_id: &str,
         policy_resolved_ref: &str,
-        timestamp_ns: Option<u64>,
+        timestamp_ns: u64,
     ) -> Result<ApplyResult, WorkspaceError> {
         // Delegate to existing apply logic
         let mut result = self.apply_with_timestamp(bundle, timestamp_ns)?;
 
-        // Capture view commitment
-        let commitment =
-            self.commit_view(work_id, policy_resolved_ref, Some(result.applied_at_ns))?;
+        // Capture view commitment (BLOCKER 1 FIX: pass changeset_digest)
+        let commitment = self.commit_view(
+            work_id,
+            policy_resolved_ref,
+            &bundle.changeset_digest,
+            result.applied_at_ns,
+        )?;
 
         // Store in CAS
         let commitment_hash = self.store_view_commitment(&commitment)?;
@@ -1506,19 +1458,30 @@ impl WorkspaceManager {
     }
 
     /// Stores the view commitment in CAS.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if CAS is unavailable (BLOCKER 3 fix: fail-closed).
+    #[allow(clippy::items_after_statements)] // use statement placed near usage for clarity
     fn store_view_commitment(
         &self,
         commitment: &ViewCommitmentV1,
     ) -> Result<[u8; 32], WorkspaceError> {
-        if let Some(cas) = &self.cas {
-            let json = serde_json::to_vec(commitment)
-                .map_err(|e| WorkspaceError::ApplyFailed(e.to_string()))?;
-            let hash = cas.store(&json);
-            Ok(hash)
-        } else {
-            // If no CAS, just return computed hash (validation mode)
-            Ok(commitment.compute_cas_hash())
-        }
+        // BLOCKER 3 FIX: Fail-closed - require CAS storage, don't silently succeed
+        let cas = self.cas.as_ref().ok_or_else(|| {
+            WorkspaceError::CasError(
+                "CAS storage required for view commitment but not available".to_string(),
+            )
+        })?;
+
+        // Use canonical_bytes for RFC 8785 compliance (consistent with
+        // compute_cas_hash)
+        use apm2_core::htf::Canonicalizable;
+        let json = commitment
+            .canonical_bytes()
+            .map_err(|e| WorkspaceError::ApplyFailed(e.to_string()))?;
+        let hash = cas.store(&json);
+        Ok(hash)
     }
 
     /// Checkouts the workspace to a specific commit.
@@ -2247,9 +2210,11 @@ mod tests {
     #[test]
     fn test_workspace_manager_snapshot() {
         let manager = WorkspaceManager::new(PathBuf::from("/workspace"));
-        let snapshot = manager.snapshot("work-001", None).unwrap();
+        let timestamp_ns = 1_234_567_890_123_456_789_u64;
+        let snapshot = manager.snapshot("work-001", timestamp_ns).unwrap();
         assert_eq!(snapshot.work_id, "work-001");
         assert_eq!(snapshot.file_count, 0); // stub returns 0
+        assert_eq!(snapshot.snapshot_at_ns, timestamp_ns);
     }
 
     // =========================================================================
@@ -2598,13 +2563,14 @@ mod tests {
             .expect("valid bundle");
 
         // Apply should succeed in validation-only mode
-        let result = manager.apply(&bundle);
+        let timestamp_ns = 1_234_567_890_123_456_789_u64;
+        let result = manager.apply_with_timestamp(&bundle, timestamp_ns);
         assert!(result.is_ok());
 
         let apply_result = result.unwrap();
         assert_eq!(apply_result.changeset_digest, bundle.changeset_digest);
         assert_eq!(apply_result.files_modified, 2);
-        assert!(apply_result.applied_at_ns > 0);
+        assert_eq!(apply_result.applied_at_ns, timestamp_ns);
     }
 
     /// Test symlink escape detection with real filesystem
@@ -2652,7 +2618,8 @@ mod tests {
             .expect("valid bundle");
 
         // Apply should fail with SymlinkEscape error
-        let result = manager.apply(&bundle);
+        let timestamp_ns = 1_234_567_890_123_456_789_u64;
+        let result = manager.apply_with_timestamp(&bundle, timestamp_ns);
         assert!(result.is_err());
 
         // The error should be SymlinkEscape
@@ -2866,7 +2833,8 @@ mod tests {
             .expect("valid bundle");
 
         // Apply should fail - the Add operation goes through a symlink directory
-        let result = manager.apply(&bundle);
+        let timestamp_ns = 1_234_567_890_123_456_789_u64;
+        let result = manager.apply_with_timestamp(&bundle, timestamp_ns);
         assert!(
             result.is_err(),
             "Expected error for Add via symlink directory"
@@ -2929,7 +2897,8 @@ mod tests {
             .expect("valid bundle");
 
         // Apply should fail - the Rename destination goes through a symlink
-        let result = manager.apply(&bundle);
+        let timestamp_ns = 1_234_567_890_123_456_789_u64;
+        let result = manager.apply_with_timestamp(&bundle, timestamp_ns);
         assert!(
             result.is_err(),
             "Expected error for Rename via symlink directory"
@@ -3022,23 +2991,24 @@ mod tests {
         assert!(err.to_string().contains("large_file.bin"));
     }
 
-    /// MAJOR FIX #7: Test timestamp parameter for HTF determinism
+    /// BLOCKER 2 FIX: Test required timestamp parameter for RS-40 compliance
     #[test]
-    fn test_snapshot_with_explicit_timestamp() {
+    fn test_snapshot_with_required_timestamp() {
         let temp_dir = tempfile::TempDir::new().expect("create temp dir");
         let workspace_root = temp_dir.path().to_path_buf();
         let manager = WorkspaceManager::new(workspace_root);
 
-        // Snapshot with explicit timestamp
+        // Snapshot requires explicit timestamp (no more Option<u64>)
         let explicit_ts = 12_345_678_901_234_567_u64;
-        let snapshot = manager.snapshot("work-001", Some(explicit_ts)).unwrap();
+        let snapshot = manager.snapshot("work-001", explicit_ts).unwrap();
 
         assert_eq!(snapshot.snapshot_at_ns, explicit_ts);
     }
 
-    /// MAJOR FIX #7: Test `apply_with_timestamp` for HTF determinism
+    /// BLOCKER 2 FIX: Test `apply_with_timestamp` requires timestamp for RS-40
+    /// compliance
     #[test]
-    fn test_apply_with_explicit_timestamp() {
+    fn test_apply_with_required_timestamp() {
         use apm2_core::fac::{FileChange, GitObjectRef, HashAlgo};
 
         let temp_dir = tempfile::TempDir::new().expect("create temp dir");
@@ -3062,11 +3032,9 @@ mod tests {
             .build()
             .expect("valid bundle");
 
-        // Apply with explicit timestamp
+        // Apply requires explicit timestamp (no more Option<u64>)
         let explicit_ts = 98_765_432_109_876_543_u64;
-        let result = manager
-            .apply_with_timestamp(&bundle, Some(explicit_ts))
-            .unwrap();
+        let result = manager.apply_with_timestamp(&bundle, explicit_ts).unwrap();
 
         assert_eq!(result.applied_at_ns, explicit_ts);
     }
@@ -3125,17 +3093,70 @@ mod tests {
         assert!(result.is_ok(), "Valid path should succeed: {result:?}");
     }
 
-    /// MAJOR FIX #9: Test `apply_with_view_commitment` (TCK-00325)
+    /// BLOCKER 1 FIX: Test `commit_view` includes changeset_digest in
+    /// result_digest. This verifies the view commitment properly binds to
+    /// the applied changeset.
     #[test]
-    fn test_apply_with_view_commitment() {
-        use apm2_core::fac::{FileChange, GitObjectRef, HashAlgo};
-
+    fn test_commit_view_includes_changeset_digest() {
         let temp_dir = tempfile::TempDir::new().expect("create temp dir");
         let workspace_root = temp_dir.path().to_path_buf();
         let manager = WorkspaceManager::new(workspace_root);
 
+        let work_id = "work-view-commit-001";
+        let policy_ref = "policy-ref-123";
+        let changeset_digest = [0x42u8; 32];
+        let timestamp_ns = 100_200_300_u64;
+
+        let commitment = manager
+            .commit_view(work_id, policy_ref, &changeset_digest, timestamp_ns)
+            .expect("commit_view success");
+
+        // BLOCKER 1 FIX: Verify result_digest includes changeset_digest
+        // The hash_input now includes changeset_digest for proper binding:
+        // format!("{}:{}", work_id, hex::encode(changeset_digest)) (when no git repo)
+        let hash_input = format!("{}:{}", work_id, hex::encode(changeset_digest));
+        let expected_result_digest = hex::encode(blake3::hash(hash_input.as_bytes()).as_bytes());
+
+        assert_eq!(commitment.result_digest, expected_result_digest);
+        assert_eq!(commitment.work_id, work_id);
+        assert_eq!(commitment.policy_resolved_ref, policy_ref);
+        assert_eq!(commitment.committed_at_ns, timestamp_ns);
+    }
+
+    /// BLOCKER 3 FIX: Test `store_view_commitment` stores commitment in CAS.
+    #[test]
+    fn test_store_view_commitment_with_cas() {
+        use crate::episode::broker::StubContentAddressedStore;
+
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let workspace_root = temp_dir.path().to_path_buf();
+        let test_cas = StubContentAddressedStore::default();
+        let manager = WorkspaceManager::with_cas(workspace_root, Arc::new(test_cas));
+
+        let commitment =
+            ViewCommitmentV1::new("work-001", "a".repeat(64), "policy-ref", 1_234_567_890_u64);
+
+        let hash = manager
+            .store_view_commitment(&commitment)
+            .expect("store success");
+
+        // The hash should match the canonical hash of the commitment
+        assert_eq!(hash, commitment.compute_cas_hash());
+    }
+
+    /// BLOCKER 3 FIX: Test that apply_with_view_commitment fails when CAS is
+    /// unavailable
+    #[test]
+    fn test_apply_with_view_commitment_requires_cas() {
+        use apm2_core::fac::{FileChange, GitObjectRef, HashAlgo};
+
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let workspace_root = temp_dir.path().to_path_buf();
+        // No CAS configured
+        let manager = WorkspaceManager::new(workspace_root);
+
         let bundle = ChangeSetBundleV1::builder()
-            .changeset_id("cs-view-commit")
+            .changeset_id("cs-no-cas")
             .base(GitObjectRef {
                 algo: HashAlgo::Sha1,
                 object_kind: "commit".to_string(),
@@ -3151,29 +3172,16 @@ mod tests {
             .build()
             .expect("valid bundle");
 
-        let work_id = "work-view-commit-001";
-        let policy_ref = "policy-ref-123";
-        let explicit_ts = 100_200_300_u64;
+        let result = manager.apply_with_view_commitment(&bundle, "work-id", "policy-ref", 12345);
 
-        let result = manager
-            .apply_with_view_commitment(&bundle, work_id, policy_ref, Some(explicit_ts))
-            .expect("apply success");
-
-        // Verify result contains view commitment hash
-        assert!(result.view_commitment_hash.is_some());
-        assert_eq!(result.applied_at_ns, explicit_ts);
-
-        // Verify commitment computation is deterministic
-        // In validation mode (no CAS), store_view_commitment just computes the hash
-        let expected_commitment = ViewCommitmentV1::new(
-            work_id,
-            hex::encode(blake3::hash(work_id.as_bytes()).as_bytes()), /* No git repo, so
-                                                                       * hash(work_id) */
-            policy_ref,
-            explicit_ts,
-        );
-        let expected_hash = expected_commitment.compute_cas_hash();
-
-        assert_eq!(result.view_commitment_hash.unwrap(), expected_hash);
+        // Should fail because CAS is required (BLOCKER 3 FIX: fail-closed)
+        assert!(result.is_err());
+        match result {
+            Err(WorkspaceError::CasError(msg)) => {
+                assert!(msg.contains("CAS storage required"));
+            },
+            Err(other) => panic!("Expected CasError, got: {other:?}"),
+            Ok(_) => panic!("Expected error, got success"),
+        }
     }
 }

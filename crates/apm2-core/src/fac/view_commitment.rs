@@ -202,13 +202,18 @@ impl ViewCommitmentV1 {
 
     /// Computes the CAS hash of this commitment.
     ///
+    /// Uses RFC 8785 canonical JSON serialization via the `Canonicalizable`
+    /// trait to ensure deterministic hashing.
+    ///
     /// # Panics
     ///
-    /// Panics if serialization fails (should never happen for valid struct).
+    /// Panics if canonicalization fails (should never happen for valid struct).
     #[must_use]
     pub fn compute_cas_hash(&self) -> [u8; 32] {
-        let json = serde_json::to_vec(self).expect("ViewCommitmentV1 is always serializable");
-        *blake3::hash(&json).as_bytes()
+        use crate::htf::Canonicalizable;
+        self.canonical_bytes()
+            .map(|bytes| *blake3::hash(&bytes).as_bytes())
+            .expect("ViewCommitmentV1 canonicalization should not fail")
     }
 }
 

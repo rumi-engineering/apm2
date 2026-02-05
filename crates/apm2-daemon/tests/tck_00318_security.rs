@@ -84,7 +84,8 @@ fn test_apply_rejects_diff_manifest_mismatch() {
         .expect("valid bundle");
 
     // Apply should fail
-    let result = manager.apply_with_diff(&bundle, diff_bytes);
+    let result =
+        manager.apply_with_diff_and_timestamp(&bundle, diff_bytes, 1_234_567_890_123_456_789_u64);
 
     // Assert specific error
     match result {
@@ -147,6 +148,7 @@ fn test_apply_allows_valid_diff_manifest_match() {
         .expect("valid bundle");
 
     // Apply should succeed
-    let result = manager.apply_with_diff(&bundle, diff_bytes);
+    let result =
+        manager.apply_with_diff_and_timestamp(&bundle, diff_bytes, 1_234_567_890_123_456_789_u64);
     assert!(result.is_ok());
 }
