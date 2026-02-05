@@ -651,7 +651,7 @@ impl EpisodeRuntime {
                     time_envelope_ref: Some(time_envelope_ref),
                     time_envelope: Some(time_envelope),
                 })
-                .await;
+                .await?;
 
             info!(
                 profile_hash = %clock_ref.profile_hash(),
@@ -933,7 +933,7 @@ impl EpisodeRuntime {
                 time_envelope_ref,
                 time_envelope,
             })
-            .await;
+            .await?;
         }
 
         info!(episode_id = %episode_id, "episode created");
@@ -1178,7 +1178,7 @@ impl EpisodeRuntime {
                 time_envelope_ref,
                 time_envelope,
             })
-            .await;
+            .await?;
         }
 
         info!(
@@ -1280,7 +1280,7 @@ impl EpisodeRuntime {
                 time_envelope_ref,
                 time_envelope,
             })
-            .await;
+            .await?;
         }
 
         info!(
@@ -1382,7 +1382,7 @@ impl EpisodeRuntime {
                 time_envelope_ref,
                 time_envelope,
             })
-            .await;
+            .await?;
         }
 
         warn!(episode_id = %episode_id, "episode quarantined");
@@ -1556,7 +1556,7 @@ impl EpisodeRuntime {
                 time_envelope,
             };
 
-            self.emit_event(event).await;
+            self.emit_event(event).await?;
         }
 
         Ok(())
@@ -1626,7 +1626,7 @@ impl EpisodeRuntime {
                 time_envelope_ref,
                 time_envelope,
             })
-            .await;
+            .await?;
         }
 
         warn!(
@@ -1745,18 +1745,14 @@ impl EpisodeRuntime {
     /// - Receipt event appended atomically at completion
     /// - CAS-before-ledger ordering for events referencing CAS hashes
     ///
-    /// When no ledger emitter is configured (e.g., in tests), events are
-    /// buffered in memory with the following bounded buffer behavior:
+    /// # Blocking I/O and Fail-Closed
     ///
-    /// # Bounded Buffer (CTR-1303)
+    /// Ledger emission involves blocking I/O (SQLite). This method spawns a
+    /// blocking task to avoid stalling the async runtime.
     ///
-    /// The events buffer is bounded by `MAX_EVENTS_BUFFER_SIZE`. When the
-    /// buffer reaches capacity, the oldest events are evicted to make room
-    /// for new events. This prevents unbounded memory growth.
-    ///
-    /// In production, events should be streamed to ledger via
-    /// `with_ledger_emitter` to ensure durability.
-    async fn emit_event(&self, event: EpisodeEvent) {
+    /// If ledger emission fails, this method returns an error (Fail-Closed)
+    /// to ensure the episode does not continue without audit logging.
+    async fn emit_event(&self, event: EpisodeEvent) -> Result<(), EpisodeError> {
         // TCK-00321: Stream to ledger when emitter is configured
         if let Some(emitter) = &self.ledger_emitter {
             let event_type = event.event_type();
@@ -1772,8 +1768,25 @@ impl EpisodeRuntime {
             // Get timestamp from event or use 0 as fallback
             let timestamp_ns = self.extract_timestamp(&event);
 
-            // Emit to ledger (fire-and-forget with logging)
-            match emitter.emit_episode_event(&episode_id, event_type, &payload, timestamp_ns) {
+            let emitter = emitter.clone();
+            let episode_id_cloned = episode_id.clone();
+            let payload_cloned = payload;
+
+            // Blocking I/O in async context must be spawned (TCK-00321 Quality Review)
+            let result = tokio::task::spawn_blocking(move || {
+                emitter.emit_episode_event(
+                    &episode_id_cloned,
+                    event_type,
+                    &payload_cloned,
+                    timestamp_ns,
+                )
+            })
+            .await
+            .map_err(|e| EpisodeError::Internal {
+                message: format!("ledger task join failed: {e}"),
+            })?;
+
+            match result {
                 Ok(signed_event) => {
                     debug!(
                         event_id = %signed_event.event_id,
@@ -1781,17 +1794,14 @@ impl EpisodeRuntime {
                         event_type = %event_type,
                         "Episode event streamed to ledger"
                     );
-                },
+                }
                 Err(e) => {
-                    // Log error but don't fail - ledger persistence errors should not
-                    // block episode execution. The event is still buffered locally.
-                    warn!(
-                        error = %e,
-                        episode_id = %episode_id,
-                        event_type = %event_type,
-                        "Failed to stream episode event to ledger, falling back to buffer"
-                    );
-                },
+                    // Fail-Closed: Propagate ledger errors (REQ-0005)
+                    return Err(EpisodeError::LedgerFailure {
+                        id: episode_id,
+                        message: e.to_string(),
+                    });
+                }
             }
         }
 
@@ -1812,6 +1822,7 @@ impl EpisodeRuntime {
         }
 
         events.push(event);
+        Ok(())
     }
 
     /// Serializes an `EpisodeEvent` to JSON bytes for ledger persistence.
