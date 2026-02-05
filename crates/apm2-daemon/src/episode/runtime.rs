@@ -416,10 +416,16 @@ impl EpisodeRuntimeConfig {
 }
 
 /// Maximum number of tool result hashes per episode (TCK-00320).
+/// Maximum tool result hashes per episode (TCK-00320).
 ///
 /// This limit prevents unbounded memory growth per CTR-1303. Episodes
 /// exceeding this limit will have their oldest result hashes evicted.
-pub const MAX_RESULT_HASHES_PER_EPISODE: usize = 10_000;
+///
+/// The limit is chosen to bound aggregate memory:
+/// - `MAX_CONCURRENT_EPISODES` (10,000) * `MAX_RESULT_HASHES_PER_EPISODE`
+///   (1,000) * 32 bytes
+/// - = 320 MB worst-case, well under the 1.5 GB safety threshold.
+pub const MAX_RESULT_HASHES_PER_EPISODE: usize = 1_000;
 
 /// Internal state for a tracked episode.
 struct EpisodeEntry {
