@@ -19,10 +19,16 @@ use crate::util::{current_branch, print_non_authoritative_banner, validate_ticke
 
 /// Required reading paths for security reviewers.
 pub const REQUIRED_READING: &[&str] = &[
-    "documents/security/SECURITY_POLICY.md",
-    "documents/security/THREAT_MODEL.md",
-    "documents/security/SECRETS_MANAGEMENT.md",
+    "documents/security/AGENTS.cac.json",
+    "documents/security/SECURITY_POLICY.cac.json",
+    "documents/security/THREAT_MODEL.cac.json",
+    "documents/security/INCIDENT_RESPONSE.cac.json",
+    "documents/security/SECURITY_CHECKLIST.cac.json",
+    "documents/security/SECRETS_MANAGEMENT.cac.json",
     "documents/security/NETWORK_DEFENSE.cac.json",
+    "documents/security/SIGNING_AND_VERIFICATION.cac.json",
+    "documents/security/RELEASE_PROCEDURE.cac.json",
+    "documents/security/consensus-runbook.cac.json",
     "documents/skills/rust-standards/SKILL.md",
     "documents/theory/glossary/glossary.json",
     "documents/theory/AGENTS.md",

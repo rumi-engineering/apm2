@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/capability_manifest.schema.json",
+  "title": "CapabilityManifestV1",
+  "description": "Policy-minted delegated authority for an episode (tool kinds, constraints, TTL, budgets).",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "issued_at",
+    "expires_at",
+    "risk_tier",
+    "tool_grants"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.capability_manifest.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "issued_at": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "expires_at": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "risk_tier": {
+      "type": "string",
+      "enum": [
+        "T0",
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "budgets": {
+      "type": "object",
+      "properties": {
+        "tool_calls_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cpu_ms_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wall_ms_max": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_bytes_max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "tool_grants": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "tool_kind",
+          "constraints"
+        ],
+        "properties": {
+          "tool_kind": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "constraints": {
+            "type": "object",
+            "description": "Structural constraint object interpreted by broker",
+            "maxProperties": 128
+          },
+          "budgets": {
+            "$ref": "#/properties/budgets"
+          },
+          "requires_idempotency_key": {
+            "type": "boolean",
+            "default": false
+          },
+          "notes": {
+            "type": "string",
+            "maxLength": 2048
+          }
+        },
+        "unevaluatedProperties": false
+      }
+    },
+    "attestation_policy": {
+      "type": "object",
+      "properties": {
+        "min_attestation_level": {
+          "type": "string",
+          "enum": [
+            "NONE",
+            "SOFT",
+            "HARD"
+          ],
+          "default": "SOFT"
+        },
+        "required_receipt_kinds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "default": []
+        }
+      },
+      "unevaluatedProperties": false
+    }
+  },
+  "unevaluatedProperties": false
+}

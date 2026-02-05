@@ -1574,7 +1574,7 @@ mod tests {
         // Should detect std::env::temp_dir in doc examples
         check_temp_dir_usage_in_doc(
             "let temp_path = std::env::temp_dir().join(\"file.txt\");",
-            "documents/security/SECURITY_CHECKLIST.md",
+            "documents/security/SECURITY_CHECKLIST.cac.json",
             10,
             &mut findings,
         );
@@ -1585,7 +1585,7 @@ mod tests {
         findings.clear();
         check_temp_dir_usage_in_doc(
             "// VULNERABLE: std::env::temp_dir() is predictable",
-            "documents/security/SECURITY_CHECKLIST.md",
+            "documents/security/SECURITY_CHECKLIST.cac.json",
             10,
             &mut findings,
         );

@@ -173,49 +173,16 @@
       "id": "term:receipt",
       "term": "Receipt",
       "definition": "A machine-verifiable proof of an outcome (e.g., Gate Pass, Tool Execution). It binds authority/validity to specific evidence.",
-      "operationalization": "Gate receipts are implemented in `crates/apm2-core/src/evidence/receipt.rs` and signed via `ReceiptSigner`. Tool receipts are represented in daemon protocol bindings. SummaryReceipt is a digest-first receipt form defined by schema (`schemas/apm2/summary_receipt.schema.json`) and is aspirational until fully wired through the ledger + CAS + verification stack.",
+      "operationalization": "Implemented as `GateReceipt` (`crates/apm2-core/src/evidence/receipt.rs`), `ToolReceipt`, and `SummaryReceipt`. Must be signed via `ReceiptSigner` and hash-linked.",
       "theory_refs": [
+        "LAW-01",
         "LAW-07",
-        "LAW-15",
-        "LAW-04",
-        "LAW-16"
+        "LAW-15"
       ],
       "implementation_refs": [
         "crates/apm2-core/src/evidence/receipt.rs",
-        "schemas/apm2/summary_receipt.schema.json"
-      ],
-      "node_class": "NORMATIVE"
-    },
-    {
-      "id": "term:summary_receipt",
-      "term": "SummaryReceipt",
-      "definition": "A receipt that compresses a larger body of work/evidence into a verifiable, digest-first summary with declared loss profile and zoom-in selectors.",
-      "operationalization": "Schema-defined at `schemas/apm2/summary_receipt.schema.json`. A SummaryReceipt MUST bind to a ledger commitment and provide selectors/hashes to retrieve omitted evidence under delegated capability.",
-      "theory_refs": [
-        "LAW-07",
-        "LAW-10",
-        "LAW-15",
-        "LAW-16"
-      ],
-      "implementation_refs": [
-        "schemas/apm2/summary_receipt.schema.json"
-      ],
-      "node_class": "NORMATIVE"
-    },
-    {
-      "id": "term:work_graph",
-      "term": "Work Graph",
-      "definition": "A directed acyclic graph (DAG) of WorkIDs representing decomposition: nodes are work items and edges encode dependency/parentage (e.g., parent_work_ids). It is the structured coordination fabric that allows parallelism without shared-context flooding.",
-      "operationalization": "Realized by `parent_work_ids` on Work objects/events and by deterministic projections in the core work reducer (`crates/apm2-core/src/work`).",
-      "theory_refs": [
-        "LAW-06",
-        "LAW-12",
-        "LAW-16"
-      ],
-      "implementation_refs": [
-        "crates/apm2-core/src/work",
-        "crates/apm2-core/src/work/state.rs",
-        "crates/apm2-core/src/work/reducer.rs"
+        "crates/apm2-daemon/src/protocol/apm2.daemon.v1.rs",
+        "crates/apm2-daemon/src/evidence/signer.rs"
       ],
       "node_class": "NORMATIVE"
     },
@@ -529,8 +496,8 @@
     {
       "id": "term:actor_id",
       "term": "ActorId",
-      "definition": "The cryptographic identity of an agent or component, typically a hash of a verifying key.",
-      "operationalization": "Implemented in `crates/apm2-daemon/src/projection/divergence_watchdog.rs`.",
+      "definition": "The authority-bearing identity of an acting holon. For boundary-crossing authority decisions it MUST resolve to a self-certifying HolonIdV1 (or a lossless mapping), proven by IdentityProofV1 against an authenticated directory head.",
+      "operationalization": "Bound during `hsi.session.open` identity verification flow and propagated into EpisodeEnvelope/receipts as `actor_id` commitments.",
       "theory_refs": [
         "LAW-05"
       ],
@@ -746,8 +713,8 @@
     {
       "id": "term:permeability_receipt",
       "term": "PermeabilityReceipt",
-      "definition": "The only legal path for capabilities to cross a holonic boundary. It grants a narrowly-scoped capability set with TTL and audit bindings.",
-      "operationalization": "Conceptual mechanism defined in `unified_theory.json` (MECH-PERMEABILITY-RECEIPT). Implemented as part of the handshake/capability exchange protocol.",
+      "definition": "The only legal path for capabilities to cross a holonic boundary. It binds delegator->delegatee authority with typed budgets, stop predicates, expiry, and view/context commitments. Delegation is valid only as a strict subset (meet) of parent authority across all constrained dimensions.",
+      "operationalization": "Conceptual mechanism defined in `unified_theory.json` (MECH-PERMEABILITY-RECEIPT) and RFC-0020 §8.3; consumed during handshake/capability exchange and bound into episode/receipt artifacts.",
       "theory_refs": [
         "LAW-05",
         "LAW-15"
@@ -755,6 +722,44 @@
       "implementation_refs": [
         "crates/apm2-daemon/src/protocol/handshake.rs"
       ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:authority_seal",
+      "term": "AuthoritySeal",
+      "definition": "The authenticated envelope for authoritative facts/roots. It may authenticate one artifact hash directly or a Merkle batch root with inclusion proofs, and it binds ledger/quorum/time anchors for freshness semantics.",
+      "operationalization": "Defined by `apm2.authority_seal.v1` in RFC-0020; used by receipt verification paths and proof-compression workflows.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:identity_proof",
+      "term": "IdentityProof",
+      "definition": "A proof-carrying identity artifact binding certificate hashes, directory head commitment, and authenticated-dictionary membership proof so verifiers avoid linear scans.",
+      "operationalization": "Defined by `apm2.identity_proof.v1` plus `apm2.holon_directory_head.v1`/`apm2.identity_proof_profile.v1` in RFC-0020.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:freshness_policy",
+      "term": "FreshnessPolicy",
+      "definition": "A machine-checkable policy defining maximum staleness and fail-closed actions by risk tier for identity heads, policy digests, and stop-state authority.",
+      "operationalization": "Defined by `apm2.freshness_policy.v1` in RFC-0020 and applied during identity/policy/stop verification before actuation.",
+      "theory_refs": [
+        "LAW-04",
+        "LAW-05",
+        "LAW-14"
+      ],
+      "implementation_refs": [],
       "node_class": "NORMATIVE"
     },
     {
@@ -772,13 +777,12 @@
     {
       "id": "term:holonic_mesh_protocol",
       "term": "Holonic Mesh Protocol (HMP)",
-      "definition": "The digest-first communication standard for inter-holon messages. It enforces `Discovery -> Handshake -> Work -> Evidence` progression, with a low-bandwidth signed Governance channel for stop orders and policy/contract updates.",
+      "definition": "The digest-first communication standard for inter-holon messages. It enforces `Discovery -> Handshake -> Work -> Evidence -> Governance` channel progression with explicit channel-class semantics.",
       "operationalization": "Conceptual standard defined in `unified_theory.json` (MECH-HOLON-MESH-PROTOCOL). Partially implemented by the `apm2-daemon` protocol.",
       "theory_refs": [
-        "LAW-10",
         "LAW-05",
-        "LAW-15",
-        "LAW-16"
+        "LAW-07",
+        "LAW-10"
       ],
       "implementation_refs": [
         "crates/apm2-daemon/src/protocol"
@@ -796,6 +800,1463 @@
         "LAW-10"
       ],
       "implementation_refs": [],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:hsi_non_negotiable_constraints",
+      "term": "HSI Non-Negotiable Constraints",
+      "definition": "The mandatory fail-closed interface invariants for authority, canonicalization, bounded decoding, typed quantities, freshness, and proof-carrying effects.",
+      "operationalization": "Defined in RFC-0020 section 0.1 and treated as mandatory substrate-level constraints.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#0.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:hsi_daemon_alignment",
+      "term": "HSI Daemon Alignment",
+      "definition": "The rule that daemon-enforced semantics are operational truth and interface meaning must remain stable under transport/projection changes.",
+      "operationalization": "Defined in RFC-0020 section 0.2.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#0.2"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:proof_obligation_checklist",
+      "term": "Proof Obligations Checklist",
+      "definition": "The required verification predicates for claiming that a world effect is authoritative.",
+      "operationalization": "Defined in RFC-0020 section 1.3.1.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-04",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.3.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:typed_budget_vector",
+      "term": "Typed Budget Vector",
+      "definition": "Unitful, machine-checkable quantitative budget fields used for enforcement and coordination.",
+      "operationalization": "Defined in RFC-0020 section 1.6.",
+      "theory_refs": [
+        "LAW-12",
+        "LAW-13"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.6"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:session_identity_binding",
+      "term": "Session Identity Binding",
+      "definition": "The requirement that verified identity and freshness witnesses are bound to the active daemon session and cannot be mutated by client claims.",
+      "operationalization": "Defined in RFC-0020 section 5.1.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#5.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:idempotency_keyed_actuation",
+      "term": "Idempotency-Keyed Actuation",
+      "definition": "The side-effecting tool contract requiring idempotency keys plus precondition guards for at-most-once kernel effects under at-least-once delivery.",
+      "operationalization": "Defined in RFC-0020 section 6.1.2.",
+      "theory_refs": [
+        "LAW-11",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#6.1.2"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:escalation_artifact",
+      "term": "Escalation Artifact",
+      "definition": "A typed, budgeted escalation request object (context, capability, oracle) emitted when local execution cannot safely continue.",
+      "operationalization": "Defined in RFC-0020 section 7.2.1.",
+      "theory_refs": [
+        "LAW-12",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#7.2.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:defect_ingestion",
+      "term": "Defect Ingestion",
+      "definition": "The mandatory set of machine-detectable contract and containment failures that must become structured defects.",
+      "operationalization": "Defined in RFC-0020 section 8.1.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-08",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#8.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:compaction_receipt",
+      "term": "Compaction Receipt",
+      "definition": "A receipt proving that a lossy transformation preserves verifiable audit semantics.",
+      "operationalization": "Defined in RFC-0020 section 9.3.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-07",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:selector_coverage_invariant",
+      "term": "Selector Coverage Invariant",
+      "definition": "The requirement that lossy summaries expose deterministic selectors sufficient to retrieve supporting evidence slices for material claims.",
+      "operationalization": "Defined in RFC-0020 section 9.3.1.",
+      "theory_refs": [
+        "LAW-07",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.3.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:backpressure_admission_control",
+      "term": "Backpressure Admission Control",
+      "definition": "The cross-plane budget admission regime enforcing per-episode, per-cell, and per-relay limits with deny-and-receipt behavior on exhaustion.",
+      "operationalization": "Defined in RFC-0020 section 9.4.",
+      "theory_refs": [
+        "LAW-12",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.4"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:enforcement_ratchet_stage_model",
+      "term": "Enforcement Ratchet Stage Model",
+      "definition": "The staged governance progression (observe->warn->enforce) with objective evidence gates and canary-controlled blast radius.",
+      "operationalization": "Defined in RFC-0020 section 10.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-08",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#10"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:stop_path_slo",
+      "term": "Stop-Path SLO",
+      "definition": "Time-bounded safety objective requiring emergency stop uncertainty to fail-closed and stop propagation to meet strict latency targets.",
+      "operationalization": "Defined in RFC-0020 section 11.3.1.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#11.3.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:risk_tier",
+      "term": "RiskTier",
+      "definition": "The effect-severity ladder controlling gate strength, isolation floor, and freshness/containment strictness.",
+      "operationalization": "Defined in RFC-0020 section 1.2.1.",
+      "theory_refs": [
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.2.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:federation",
+      "term": "Federation",
+      "definition": "Cross-cell coordination model using digest-first anti-entropy and receipt-bound imports without requiring global total order for all data-plane facts.",
+      "operationalization": "Defined in RFC-0020 section 2.4.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-05",
+        "LAW-10",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.4"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:hsi_contract_manifest_v1",
+      "term": "HSIContractManifestV1",
+      "definition": "Static contract artifact enumerating callable syscalls/routes, schemas, and semantics for a daemon instance.",
+      "operationalization": "Defined in RFC-0020 section 3.1.",
+      "theory_refs": [
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#3.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:capability_manifest_v1",
+      "term": "CapabilityManifestV1",
+      "definition": "Dynamic authority artifact describing delegated capabilities, scopes, budgets, and constraints for an execution context.",
+      "operationalization": "Defined in RFC-0020 section 3.2.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#3.2"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:episode_envelope_v1",
+      "term": "EpisodeEnvelopeV1",
+      "definition": "Immutable execution commitment binding risk tier, budgets, stop conditions, reproducibility pins, and manifest/view commitments.",
+      "operationalization": "Defined in RFC-0020 section 3.3.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-09",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#3.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:tool_intent_v1",
+      "term": "ToolIntentV1",
+      "definition": "Typed adapter-to-daemon tool intent object used to prevent raw string tool actuation paths.",
+      "operationalization": "Defined in RFC-0020 section 5.4.1.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#5.4.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:hmp_message_v1",
+      "term": "HMPMessageV1",
+      "definition": "Canonical envelope for inter-holon mesh messages with class/channel commitments and replay-safe identifiers.",
+      "operationalization": "Defined in RFC-0020 section 7.3.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-10",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#7.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:admission_receipt_v1",
+      "term": "AdmissionReceiptV1",
+      "definition": "Receipt proving cross-cell admission of imported authoritative facts under local trust/freshness policy.",
+      "operationalization": "Defined in RFC-0020 section 2.4.0b.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.4.0b"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:receipt_pointer_v1",
+      "term": "ReceiptPointerV1",
+      "definition": "Compact pointer object for authoritative receipt verification via direct receipt hash or batched proof path.",
+      "operationalization": "Defined in RFC-0020 section 9.5.1.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.5.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:freshness_policy_v1",
+      "term": "FreshnessPolicyV1",
+      "definition": "Versioned freshness contract defining risk-tier staleness bounds and fail-closed actions for authority checks.",
+      "operationalization": "Defined in RFC-0020 section 1.8.",
+      "theory_refs": [
+        "LAW-04",
+        "LAW-05",
+        "LAW-14"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.8"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:permeability_receipt_v1",
+      "term": "PermeabilityReceiptV1",
+      "definition": "Versioned cross-holon delegation receipt binding strict-subset authority transfer to budgets, stop conditions, expiry, and view commitments.",
+      "operationalization": "Defined in RFC-0020 section 8.3.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#8.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:authority_seal_v1",
+      "term": "AuthoritySealV1",
+      "definition": "Versioned attestation envelope for authoritative artifacts and batched roots with ledger/quorum/time anchors.",
+      "operationalization": "Defined in RFC-0020 section 1.7.8.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.8"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:agent_adapter_profile_v1",
+      "term": "AgentAdapterProfileV1",
+      "definition": "Adapter capability and behavior profile hashed into session/envelope contracts for drift detection.",
+      "operationalization": "Defined in RFC-0020 rollout stages section 10 (S0.5).",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2101"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:authority_vector_v1",
+      "term": "AuthorityVectorV1",
+      "definition": "Typed authority lattice vector used to compute strict-subset delegation meets.",
+      "operationalization": "Defined in RFC-0020 section 8.3.2.1.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#8.3.2.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:batch_epoch_root_v1",
+      "term": "BatchEpochRootV1",
+      "definition": "Root-of-roots commitment for hierarchical receipt batch forests in proof-compression pipelines.",
+      "operationalization": "Defined in RFC-0020 section 9.5.6.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.5.6"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:capability_upgrade_request_v1",
+      "term": "CapabilityUpgradeRequestV1",
+      "definition": "Typed escalation request for additional capabilities or scope widening under policy/governance review.",
+      "operationalization": "Defined in RFC-0020 section 7.2.1.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#7.2.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:cell_certificate_v1",
+      "term": "CellCertificateV1",
+      "definition": "Cell identity certificate binding trust domain and policy-root verification material.",
+      "operationalization": "Defined in RFC-0020 section 1.7.6.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-10",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.6"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:cell_genesis_v1",
+      "term": "CellGenesisV1",
+      "definition": "Canonical genesis object whose digest defines stable self-certifying cell identity.",
+      "operationalization": "Defined in RFC-0020 section 1.7.3b.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.3b"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:cell_id_v1",
+      "term": "CellIdV1",
+      "definition": "Self-certifying cell identity derived from canonical genesis commitments.",
+      "operationalization": "Defined in RFC-0020 section 1.7.3.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:context_delta_v1",
+      "term": "ContextDeltaV1",
+      "definition": "Bounded, typed incremental context transfer object used to extend a committed context view.",
+      "operationalization": "Defined by HSI context interfaces and commitments.",
+      "theory_refs": [
+        "LAW-02",
+        "LAW-06",
+        "LAW-13"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:context_index_v1",
+      "term": "ContextIndexV1",
+      "definition": "Deterministic selector index enabling bounded lookup and zoom-in for context claims.",
+      "operationalization": "Defined by HSI index/selector requirements.",
+      "theory_refs": [
+        "LAW-07",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:context_refinement_request_v1",
+      "term": "ContextRefinementRequestV1",
+      "definition": "Typed escalation request for additional selectors/slices when current context is insufficient.",
+      "operationalization": "Defined in RFC-0020 section 7.2.1.",
+      "theory_refs": [
+        "LAW-02",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#7.2.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:coordination_objective_receipt_v1",
+      "term": "CoordinationObjectiveReceiptV1",
+      "definition": "Receipt recording objective inputs and rationale for repeated/high-impact coordination escalations.",
+      "operationalization": "Defined in RFC-0020 section 7.4.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#7.4"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:directory_proof_v1",
+      "term": "DirectoryProofV1",
+      "definition": "Bounded authenticated-directory proof object for identity membership/non-membership checks.",
+      "operationalization": "Defined in RFC-0020 section 1.7.7a.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7a"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:drill_receipt_v1",
+      "term": "DrillReceiptV1",
+      "definition": "Receipt artifact capturing disaster-recovery/chaos drill execution and outcomes.",
+      "operationalization": "Defined in RFC-0020 business continuity sections.",
+      "theory_refs": [
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#11.2.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:epoch_seal_v1",
+      "term": "EpochSealV1",
+      "definition": "Freshness commitment object anchoring anti-rollback/anti-equivocation semantics across federation links.",
+      "operationalization": "Defined in RFC-0020 section 1.9.",
+      "theory_refs": [
+        "LAW-04",
+        "LAW-10",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.9"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:evidence_index_v1",
+      "term": "EvidenceIndexV1",
+      "definition": "Index artifact for deterministic retrieval of evidence chunks/selectors under digest commitments.",
+      "operationalization": "Defined by HSI index-layer requirements.",
+      "theory_refs": [
+        "LAW-07",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:fact_inclusion_proof_v1",
+      "term": "FactInclusionProofV1",
+      "definition": "Proof object showing that a specific fact digest is included under an authenticated root commitment.",
+      "operationalization": "Defined by HSI proof-compression/fact-root structures.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.5"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:fact_root_v1",
+      "term": "FactRootV1",
+      "definition": "Root commitment object for authoritative fact sets used by batched verification.",
+      "operationalization": "Defined in RFC-0020 section 9.5.0b.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.5.0b"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:freshness_pinset_v1",
+      "term": "FreshnessPinsetV1",
+      "definition": "CAS artifact binding reproducibility-critical digests used by episode and receipt commitments.",
+      "operationalization": "Defined in RFC-0020 section 1.8.1.",
+      "theory_refs": [
+        "LAW-09",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.8.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:holon_certificate_v1",
+      "term": "HolonCertificateV1",
+      "definition": "Certificate binding holon identity commitments and operational keys within a cell trust domain.",
+      "operationalization": "Defined in RFC-0020 section 1.7.6.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.6"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:holon_directory_head_v1",
+      "term": "HolonDirectoryHeadV1",
+      "definition": "Authenticated directory head commitment enabling bounded, cacheable identity verification.",
+      "operationalization": "Defined in RFC-0020 section 1.7.7.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-10",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:holon_genesis_v1",
+      "term": "HolonGenesisV1",
+      "definition": "Canonical genesis object whose digest defines stable self-certifying holon identity.",
+      "operationalization": "Defined in RFC-0020 section 1.7.4b.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.4b"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:holon_id_v1",
+      "term": "HolonIdV1",
+      "definition": "Self-certifying holon identity derived from cell and holon genesis commitments.",
+      "operationalization": "Defined in RFC-0020 section 1.7.4.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.4"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:identity_multi_proof_v1",
+      "term": "IdentityMultiProofV1",
+      "definition": "Shared multiproof format for verifying many identity memberships under a single directory head.",
+      "operationalization": "Defined in RFC-0020 section 1.7.7d.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7d"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:identity_proof_profile_v1",
+      "term": "IdentityProofProfileV1",
+      "definition": "Verifier-economics contract declaring proof byte/depth bounds and operational verification ceilings.",
+      "operationalization": "Defined in RFC-0020 section 1.7.7b.",
+      "theory_refs": [
+        "LAW-13",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7b"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:identity_proof_v1",
+      "term": "IdentityProofV1",
+      "definition": "Proof-carrying identity object binding certificates, directory head hash, and membership proof with as-of anchor.",
+      "operationalization": "Defined in RFC-0020 section 1.7.7.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:import_receipt_v1",
+      "term": "ImportReceiptV1",
+      "definition": "Receipt proving acceptance of imported remote facts under local trust and policy constraints.",
+      "operationalization": "Defined by HSI federation admission patterns.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.4.0b"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:keyset_descriptor_v1",
+      "term": "KeySetDescriptorV1",
+      "definition": "Canonical descriptor object for quorum/threshold verifier keysets.",
+      "operationalization": "Defined in RFC-0020 section 1.7.2a.",
+      "theory_refs": [
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.2a"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:keyset_id_v1",
+      "term": "KeySetIdV1",
+      "definition": "Self-certifying digest identifier for a canonical KeySetDescriptorV1.",
+      "operationalization": "Defined in RFC-0020 section 1.7.2a.",
+      "theory_refs": [
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.2a"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:oracle_request_v1",
+      "term": "OracleRequestV1",
+      "definition": "Versioned structured request object for external adjudication or irreducibly human decision points.",
+      "operationalization": "Defined in RFC-0020 section 7.2.1.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#7.2.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:public_key_id_v1",
+      "term": "PublicKeyIdV1",
+      "definition": "Canonical digest identifier for a verifying public key used across boundary-bearing identity objects.",
+      "operationalization": "Defined in RFC-0020 section 1.7.2.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.2"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:receipt_batch_descriptor_v1",
+      "term": "ReceiptBatchDescriptorV1",
+      "definition": "Descriptor artifact defining the composition and verification contract of a receipt batch.",
+      "operationalization": "Defined by HSI receipt-batching section 9.5.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.5"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:receipt_multi_proof_v1",
+      "term": "ReceiptMultiProofV1",
+      "definition": "Multiproof object for amortized verification of many receipt inclusions under a shared root.",
+      "operationalization": "Defined by HSI proof-compression section 9.5.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.5"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:role_spec_v1",
+      "term": "RoleSpecV1",
+      "definition": "Role-level behavioral/spec commitment artifact hashed into envelope and adapter/profile bindings.",
+      "operationalization": "Defined in RFC-0020 stage 0.5 binding rules.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2101"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:session_key_delegation_v1",
+      "term": "SessionKeyDelegationV1",
+      "definition": "Signed binding from operational identity key material to short-lived session key material.",
+      "operationalization": "Defined in RFC-0020 section 1.7.6.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.6"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:tool_log_index_v1",
+      "term": "ToolLogIndexV1",
+      "definition": "Bounded selector index over tool execution logs for deterministic retrieval without raw log flooding.",
+      "operationalization": "Defined by HSI receipt/log indexing constraints.",
+      "theory_refs": [
+        "LAW-07",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#3.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:view_commitment_v1",
+      "term": "ViewCommitmentV1",
+      "definition": "Cryptographic commitment that binds a bounded context/view projection to authoritative ledger state.",
+      "operationalization": "Defined in HSI context and permeability binding semantics.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-06",
+        "LAW-07",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:world_effect",
+      "term": "World Effect",
+      "definition": "Any action that can modify state outside ephemeral agent cognition and therefore requires receipt-backed proof.",
+      "operationalization": "Defined in RFC-0020 section 1.3 as the boundary of authoritative effect semantics.",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-04",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:determinism_class",
+      "term": "DeterminismClass",
+      "definition": "Replay-stability class on an episode that controls policy strictness for reproducibility and actuation.",
+      "operationalization": "Defined in RFC-0020 section 1.2.2 and bound into EpisodeEnvelope commitments.",
+      "theory_refs": [
+        "LAW-09",
+        "LAW-14"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.2.2"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:digest_first_interface",
+      "term": "Digest-First Interface",
+      "definition": "Cross-holon communication pattern that transmits hashes and deterministic selectors instead of raw payload propagation.",
+      "operationalization": "Defined in RFC-0020 section 1.4 and used by HMP, anti-entropy, and evidence zoom-in flows.",
+      "theory_refs": [
+        "LAW-07",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.4"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:content_hash",
+      "term": "ContentHash",
+      "definition": "Canonical algorithm-tagged digest identity used for cross-boundary artifact addressing and verification.",
+      "operationalization": "Defined in RFC-0020 section 1.5 with binary and text forms and mandatory algorithm identity.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.5"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:canonicalization_regime",
+      "term": "Canonicalization Regime",
+      "definition": "Deterministic serialization contract for signed or hashed artifacts that removes parser variance and unknown-field ambiguity.",
+      "operationalization": "Defined in RFC-0020 section 1.5.1 for protobuf and JSON canonical forms.",
+      "theory_refs": [
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.5.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:domain_separation",
+      "term": "Domain Separation",
+      "definition": "Hash preimage namespacing by artifact kind and schema version to prevent cross-type confused-deputy reuse.",
+      "operationalization": "Defined in RFC-0020 section 1.5.2.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.5.2"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:identity_text_grammar",
+      "term": "Canonical Identity Text Grammar",
+      "definition": "Strict canonical grammar and parsing rules for identity text forms that cross holonic boundaries.",
+      "operationalization": "Defined in RFC-0020 section 1.7.5b with ABNF and fail-closed parser requirements.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.5b"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:verifier_cache_contract",
+      "term": "Verifier Cache Contract",
+      "definition": "Mandatory head-cache and proof-cache rules that amortize identity verification at high fanout.",
+      "operationalization": "Defined in RFC-0020 section 1.7.7c with invalidation behavior under revocation and freshness upgrades.",
+      "theory_refs": [
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7c"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:session_typed_syscall_state_machine",
+      "term": "Session-Typed Syscall State Machine",
+      "definition": "Ordered interaction contract requiring discovery, handshake, work, evidence, and governance phases with channel-class validity checks.",
+      "operationalization": "Defined in RFC-0020 section 2.1.1 and enforced as message-order and class constraints.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-13",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.1.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:holonic_boundary_model",
+      "term": "Holonic Boundary Model",
+      "definition": "Five-channel decomposition (Discovery, Handshake, Work, Evidence, Governance) that constrains boundary traffic and truth semantics.",
+      "operationalization": "Defined in RFC-0020 section 2.3 as mandatory channel-class structure.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-07",
+        "LAW-10",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:channel_class",
+      "term": "Channel Class",
+      "definition": "Typed communication class that determines admissible payloads, authority semantics, and replay constraints.",
+      "operationalization": "Defined in RFC-0020 section 2.3 and embedded in HMP envelopes.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-07",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:control_data_plane_separation",
+      "term": "Control/Data Plane Separation",
+      "definition": "Federation rule that truth-plane control facts and data-plane evidence blobs have distinct replication, verification, and admission semantics.",
+      "operationalization": "Defined in RFC-0020 section 2.4.0.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.4.0"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:admission_receipt",
+      "term": "Admission Receipt",
+      "definition": "Receiving-cell proof that imported cross-cell bytes were verified and admitted into the local truth plane.",
+      "operationalization": "Defined in RFC-0020 section 2.4.0b as mandatory for authoritative cross-cell ingestion.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.4.0b"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:revocation_wins_crdt_law",
+      "term": "Revocation-Wins Signed CRDT Law",
+      "definition": "Directory merge law where revocation dominates concurrent active state unless explicit later re-admission is proven.",
+      "operationalization": "Defined in RFC-0020 section 2.4.3b.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.4.3b"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:anti_entropy_protocol",
+      "term": "Anti-Entropy Protocol",
+      "definition": "Pull-bounded reconciliation protocol for ledger ranges and CAS pointers under reordering, duplication, and Byzantine peers.",
+      "operationalization": "Defined in RFC-0020 sections 2.4.4 and 2.4.6.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-10",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.4.4",
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.4.6"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:policy_root_trust_bootstrap",
+      "term": "Policy-Root Trust Bootstrap",
+      "definition": "Cross-cell trust initialization model that admits authority only via pinned or federation-certified policy-root bindings.",
+      "operationalization": "Defined in RFC-0020 section 2.4.7.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.4.7"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:trust_liveness_coupling",
+      "term": "Trust-Liveness Coupling",
+      "definition": "Rule that federation admission requires both trust-chain validity and freshness validity, with tiered fail-closed behavior under uncertainty.",
+      "operationalization": "Defined in RFC-0020 section 2.4.8.",
+      "theory_refs": [
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.4.8"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:observational_trace",
+      "term": "Observable Trace",
+      "definition": "Authoritative externally visible execution semantics defined by admitted ledger facts, referenced CAS artifacts, and governance actions.",
+      "operationalization": "Defined in RFC-0020 section 2.6.1.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-10",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.6.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:flattening_operator",
+      "term": "Flattening Operator",
+      "definition": "Transformation that removes internal holonic boundaries while preserving authoritative facts and delegation commitments.",
+      "operationalization": "Defined in RFC-0020 section 2.6.2.",
+      "theory_refs": [
+        "LAW-10",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.6.2"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:bisimulation_gate",
+      "term": "Bisimulation Gate",
+      "definition": "Required equivalence condition that composed recursion traces and flattened traces remain weakly bisimilar up to admissible renaming and batching.",
+      "operationalization": "Defined in RFC-0020 section 2.6.3 and required for ratchet promotion evidence.",
+      "theory_refs": [
+        "LAW-10",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.6.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:functorial_observation_law",
+      "term": "Functorial Observation Law",
+      "definition": "Composition law requiring admitted optimizations to preserve observational semantics under identity, composition, and flattening naturality.",
+      "operationalization": "Defined in RFC-0020 section 2.6.5.",
+      "theory_refs": [
+        "LAW-10",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#2.6.5"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:agent_capsule",
+      "term": "Agent Capsule",
+      "definition": "Contained untrusted execution environment with no ambient authority where all side effects must transit daemon-mediated tools.",
+      "operationalization": "Defined in RFC-0020 section 4.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-11",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#4"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:capsule_profile",
+      "term": "CapsuleProfile",
+      "definition": "Content-addressed profile describing process isolation, filesystem/network policy, executable allowlists, and environment scrubbing for a capsule.",
+      "operationalization": "Defined in RFC-0020 section 4.2.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-11",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#4.2"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:context_read_firewall",
+      "term": "Context Read Firewall",
+      "definition": "Fail-closed boundary that allows context reads only through committed manifest/hash allowlists and denies covert read channels.",
+      "operationalization": "Defined in RFC-0020 section 4.5.",
+      "theory_refs": [
+        "LAW-02",
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#4.5"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:context_pack_manifest",
+      "term": "ContextPackManifest",
+      "definition": "Authority allowlist object for context reads that binds entry hashes, access levels, and zoom permissions.",
+      "operationalization": "Defined in RFC-0020 section 5.3.1.",
+      "theory_refs": [
+        "LAW-02",
+        "LAW-05",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#5.3.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:tool_kind",
+      "term": "ToolKind",
+      "definition": "Typed actuation class that defines allowed operations, argument schema, and receipt semantics without ambient shell authority.",
+      "operationalization": "Defined in RFC-0020 section 6.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-11",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#6"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:tool_argument_safety",
+      "term": "Tool Argument Safety",
+      "definition": "Validation discipline for hostile argument handling, path normalization, ref constraints, and bounded output in mediated tools.",
+      "operationalization": "Defined in RFC-0020 section 6.1.1.",
+      "theory_refs": [
+        "LAW-05",
+        "LAW-11",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#6.1.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:taint_lattice",
+      "term": "Taint Lattice",
+      "definition": "Monotone integrity-label structure for untrusted to attested evidence propagation and gating.",
+      "operationalization": "Defined in RFC-0020 section 6.4.1.",
+      "theory_refs": [
+        "LAW-11",
+        "LAW-14"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#6.4.1"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:confidentiality_lattice",
+      "term": "Confidentiality Lattice",
+      "definition": "Non-decreasing classification model for evidence and outputs unless explicitly lowered by signed declassification.",
+      "operationalization": "Defined in RFC-0020 section 6.4.1b.",
+      "theory_refs": [
+        "LAW-11",
+        "LAW-14"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#6.4.1b"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:dual_lattice_gate",
+      "term": "Dual-Lattice Gate",
+      "definition": "Boundary policy that jointly enforces minimum integrity and maximum confidentiality on outbound flows.",
+      "operationalization": "Defined in RFC-0020 section 6.4.1c.",
+      "theory_refs": [
+        "LAW-11",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#6.4.1c"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:declassification_receipt",
+      "term": "DeclassificationReceipt",
+      "definition": "Signed justification artifact required to lower confidentiality classification across boundaries.",
+      "operationalization": "Introduced as a stage deliverable in RFC-0020 section 10 (Stage 6).",
+      "theory_refs": [
+        "LAW-01",
+        "LAW-11",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#10"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:receipt_batching",
+      "term": "Receipt Batching",
+      "definition": "Merkle-batched receipt authentication model that amortizes signature or quorum verification across high-volume effects.",
+      "operationalization": "Defined in RFC-0020 section 9.5 with AuthoritySeal and pointer proof requirements.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.5"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:rate_distortion_contract",
+      "term": "Rate-Distortion Contract",
+      "definition": "Summary artifact information-economics contract requiring explicit rate, source size, loss profile, and selector coverage declarations.",
+      "operationalization": "Defined in RFC-0020 section 9.3.2.",
+      "theory_refs": [
+        "LAW-07",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.3.2"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:verification_cost_target",
+      "term": "Verification Cost Target",
+      "definition": "Asymptotic and practical verifier workload targets requiring O(1) signature checks per batch family and bounded logarithmic hash work.",
+      "operationalization": "Defined in RFC-0020 sections 1.7.7b and 9.5.3.",
+      "theory_refs": [
+        "LAW-12",
+        "LAW-14",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7b",
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#9.5.3"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:sparse_merkle_256_v1",
+      "term": "SPARSE_MERKLE_256_V1",
+      "definition": "Directory commitment kind for 256-bit sparse Merkle authenticated dictionaries.",
+      "operationalization": "Defined in RFC-0020 section 1.7.7 as an allowed HolonDirectoryHead directory kind.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:patricia_trie_v1",
+      "term": "PATRICIA_TRIE_V1",
+      "definition": "Directory commitment kind for key-compressed authenticated trie dictionaries.",
+      "operationalization": "Defined in RFC-0020 section 1.7.7 as an allowed and recommended default directory kind at scale.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:smt_256_compressed_v1",
+      "term": "SMT_256_COMPRESSED_V1",
+      "definition": "Directory proof encoding kind for compressed sparse Merkle proofs.",
+      "operationalization": "Defined in RFC-0020 section 1.7.7a as an allowed DirectoryProof kind.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7a"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:patricia_compressed_v1",
+      "term": "PATRICIA_COMPRESSED_V1",
+      "definition": "Directory proof encoding kind for compressed Patricia trie proofs.",
+      "operationalization": "Defined in RFC-0020 section 1.7.7a as an allowed DirectoryProof kind.",
+      "theory_refs": [
+        "LAW-03",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "implementation_refs": [
+        "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md#1.7.7a"
+      ],
       "node_class": "NORMATIVE"
     }
   ],
@@ -1006,21 +2467,6 @@
       "relation": "implements"
     },
     {
-      "source": "term:summary_receipt",
-      "target": "term:receipt",
-      "relation": "refines"
-    },
-    {
-      "source": "term:work_graph",
-      "target": "term:work_object",
-      "relation": "depends_on"
-    },
-    {
-      "source": "term:work_graph",
-      "target": "term:work_substrate",
-      "relation": "depends_on"
-    },
-    {
       "source": "term:holonic_mesh_protocol",
       "target": "term:handshake",
       "relation": "governs"
@@ -1029,6 +2475,321 @@
       "source": "term:cell",
       "target": "term:federation",
       "relation": "implements"
+    },
+    {
+      "source": "term:hsi_contract_manifest_v1",
+      "target": "term:daemon",
+      "relation": "governs"
+    },
+    {
+      "source": "term:capability_manifest_v1",
+      "target": "term:ocap",
+      "relation": "implements"
+    },
+    {
+      "source": "term:episode_envelope_v1",
+      "target": "term:episode",
+      "relation": "implements"
+    },
+    {
+      "source": "term:freshness_policy_v1",
+      "target": "term:freshness_policy",
+      "relation": "refines"
+    },
+    {
+      "source": "term:receipt_pointer_v1",
+      "target": "term:receipt",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:admission_receipt_v1",
+      "target": "term:receipt",
+      "relation": "implements"
+    },
+    {
+      "source": "term:tool_intent_v1",
+      "target": "term:tool",
+      "relation": "governs"
+    },
+    {
+      "source": "term:session_key_delegation_v1",
+      "target": "term:session",
+      "relation": "governs"
+    },
+    {
+      "source": "term:hmp_message_v1",
+      "target": "term:holonic_mesh_protocol",
+      "relation": "implements"
+    },
+    {
+      "source": "term:selector_coverage_invariant",
+      "target": "term:receipt",
+      "relation": "governs"
+    },
+    {
+      "source": "term:backpressure_admission_control",
+      "target": "term:budget",
+      "relation": "governs"
+    },
+    {
+      "source": "term:enforcement_ratchet_stage_model",
+      "target": "term:gate",
+      "relation": "governs"
+    },
+    {
+      "source": "term:federation",
+      "target": "term:cell",
+      "relation": "composes"
+    },
+    {
+      "source": "term:world_effect",
+      "relation": "depends_on",
+      "target": "term:receipt"
+    },
+    {
+      "source": "term:world_effect",
+      "relation": "depends_on",
+      "target": "term:episode_envelope_v1"
+    },
+    {
+      "source": "term:determinism_class",
+      "relation": "governs",
+      "target": "term:episode_envelope_v1"
+    },
+    {
+      "source": "term:digest_first_interface",
+      "relation": "governs",
+      "target": "term:holonic_mesh_protocol"
+    },
+    {
+      "source": "term:digest_first_interface",
+      "relation": "governs",
+      "target": "term:hmp_message_v1"
+    },
+    {
+      "source": "term:content_hash",
+      "relation": "governs",
+      "target": "term:evidence"
+    },
+    {
+      "source": "term:content_hash",
+      "relation": "governs",
+      "target": "term:receipt_pointer_v1"
+    },
+    {
+      "source": "term:canonicalization_regime",
+      "relation": "governs",
+      "target": "term:content_hash"
+    },
+    {
+      "source": "term:domain_separation",
+      "relation": "refines",
+      "target": "term:canonicalization_regime"
+    },
+    {
+      "source": "term:identity_text_grammar",
+      "relation": "governs",
+      "target": "term:actor_id"
+    },
+    {
+      "source": "term:identity_text_grammar",
+      "relation": "governs",
+      "target": "term:public_key_id_v1"
+    },
+    {
+      "source": "term:verifier_cache_contract",
+      "relation": "governs",
+      "target": "term:identity_proof"
+    },
+    {
+      "source": "term:session_typed_syscall_state_machine",
+      "relation": "governs",
+      "target": "term:session"
+    },
+    {
+      "source": "term:holonic_boundary_model",
+      "relation": "governs",
+      "target": "term:channel_class"
+    },
+    {
+      "source": "term:channel_class",
+      "relation": "governs",
+      "target": "term:hmp_message_v1"
+    },
+    {
+      "source": "term:control_data_plane_separation",
+      "relation": "governs",
+      "target": "term:anti_entropy_protocol"
+    },
+    {
+      "source": "term:control_data_plane_separation",
+      "relation": "governs",
+      "target": "term:admission_receipt"
+    },
+    {
+      "source": "term:admission_receipt",
+      "relation": "implements",
+      "target": "term:admission_receipt_v1"
+    },
+    {
+      "source": "term:revocation_wins_crdt_law",
+      "relation": "refines",
+      "target": "term:crdt"
+    },
+    {
+      "source": "term:anti_entropy_protocol",
+      "relation": "composes",
+      "target": "term:federation"
+    },
+    {
+      "source": "term:policy_root_trust_bootstrap",
+      "relation": "governs",
+      "target": "term:cell_certificate_v1"
+    },
+    {
+      "source": "term:trust_liveness_coupling",
+      "relation": "governs",
+      "target": "term:epoch_seal_v1"
+    },
+    {
+      "source": "term:trust_liveness_coupling",
+      "relation": "governs",
+      "target": "term:freshness_policy_v1"
+    },
+    {
+      "source": "term:observational_trace",
+      "relation": "depends_on",
+      "target": "term:ledger"
+    },
+    {
+      "source": "term:observational_trace",
+      "relation": "depends_on",
+      "target": "term:evidence"
+    },
+    {
+      "source": "term:flattening_operator",
+      "relation": "refines",
+      "target": "term:observational_trace"
+    },
+    {
+      "source": "term:bisimulation_gate",
+      "relation": "governs",
+      "target": "term:flattening_operator"
+    },
+    {
+      "source": "term:functorial_observation_law",
+      "relation": "refines",
+      "target": "term:bisimulation_gate"
+    },
+    {
+      "source": "term:agent_capsule",
+      "relation": "governs",
+      "target": "term:tool"
+    },
+    {
+      "source": "term:capsule_profile",
+      "relation": "governs",
+      "target": "term:agent_capsule"
+    },
+    {
+      "source": "term:context_pack_manifest",
+      "relation": "refines",
+      "target": "term:context_pack"
+    },
+    {
+      "source": "term:context_read_firewall",
+      "relation": "governs",
+      "target": "term:context_pack_manifest"
+    },
+    {
+      "source": "term:tool_kind",
+      "relation": "governs",
+      "target": "term:tool"
+    },
+    {
+      "source": "term:tool_kind",
+      "relation": "governs",
+      "target": "term:tool_intent_v1"
+    },
+    {
+      "source": "term:tool_argument_safety",
+      "relation": "governs",
+      "target": "term:tool_kind"
+    },
+    {
+      "source": "term:taint_lattice",
+      "relation": "governs",
+      "target": "term:tool_intent_v1"
+    },
+    {
+      "source": "term:confidentiality_lattice",
+      "relation": "governs",
+      "target": "term:tool_intent_v1"
+    },
+    {
+      "source": "term:dual_lattice_gate",
+      "relation": "depends_on",
+      "target": "term:taint_lattice"
+    },
+    {
+      "source": "term:dual_lattice_gate",
+      "relation": "depends_on",
+      "target": "term:confidentiality_lattice"
+    },
+    {
+      "source": "term:declassification_receipt",
+      "relation": "implements",
+      "target": "term:receipt"
+    },
+    {
+      "source": "term:declassification_receipt",
+      "relation": "governs",
+      "target": "term:confidentiality_lattice"
+    },
+    {
+      "source": "term:receipt_batching",
+      "relation": "governs",
+      "target": "term:receipt_pointer_v1"
+    },
+    {
+      "source": "term:receipt_batching",
+      "relation": "governs",
+      "target": "term:authority_seal_v1"
+    },
+    {
+      "source": "term:rate_distortion_contract",
+      "relation": "refines",
+      "target": "term:selector_coverage_invariant"
+    },
+    {
+      "source": "term:verification_cost_target",
+      "relation": "governs",
+      "target": "term:receipt_batching"
+    },
+    {
+      "source": "term:verification_cost_target",
+      "relation": "governs",
+      "target": "term:identity_proof_profile_v1"
+    },
+    {
+      "source": "term:holon_directory_head_v1",
+      "relation": "governs",
+      "target": "term:sparse_merkle_256_v1"
+    },
+    {
+      "source": "term:holon_directory_head_v1",
+      "relation": "governs",
+      "target": "term:patricia_trie_v1"
+    },
+    {
+      "source": "term:directory_proof_v1",
+      "relation": "governs",
+      "target": "term:smt_256_compressed_v1"
+    },
+    {
+      "source": "term:directory_proof_v1",
+      "relation": "governs",
+      "target": "term:patricia_compressed_v1"
     }
   ]
 }

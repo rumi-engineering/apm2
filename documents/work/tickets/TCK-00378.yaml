@@ -1,0 +1,60 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: TCK-00378
+    title: Dual lattice taint/classification propagation and declassification receipts
+  binds:
+    prd_id: PRD-0010
+    rfc_id: RFC-0020
+    requirements:
+    - requirement_id: REQ-0032
+      requirement_ref: documents/rfcs/RFC-0020/requirements/REQ-0032.yaml#requirement
+    evidence_artifacts:
+    - evidence_id: EVID-0032
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0032.yaml#evidence_artifact
+    - evidence_id: EVID-0308
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0308.yaml#evidence_artifact
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_SECURITY
+    - DOMAIN_POLICY
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00377
+      reason: Prerequisite per RFC-0020 ticket decomposition ordering
+  scope:
+    in_scope:
+    - Implement taint lattice and confidentiality lattice propagation rules
+    - Apply dual-lattice policy hooks at boundary crossings and actuators
+    - Introduce DeclassificationReceipt for approved confidentiality downgrades
+    out_of_scope:
+    - Attestation floor tightening for high-risk tiers (TCK-00379)
+  plan:
+    steps:
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep
+      beyond out_of_scope list.
+    - 'Implement: Implement taint lattice and confidentiality lattice propagation
+      rules'
+    - 'Implement: Apply dual-lattice policy hooks at boundary crossings and actuators'
+    - 'Implement: Introduce DeclassificationReceipt for approved confidentiality downgrades'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression
+      risks per RFC-0020/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding
+      EVID-* artifact with concrete artifact pointers.
+  definition_of_done:
+    evidence_ids:
+    - EVID-0032
+    - EVID-0308
+    criteria:
+    - Tier3+ actuators reject untrusted or over-confidential inputs
+    - Declassification requires explicit policy and receipt emission
+    - Secret leakage adversarial tests pass
+  notes:
+    security: Fail-closed, least privilege, and explicit authority proofs are mandatory.
+    verification: Prefer deterministic tests, replay/CAS evidence, and bounded-resource
+      checks; avoid process-local assumptions.
+    general: Keep scope atomic to this ticket, preserve explicit dependency ordering,
+      and avoid introducing semantic drift from RFC-0020.

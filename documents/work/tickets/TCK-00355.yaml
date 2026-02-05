@@ -1,0 +1,60 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: TCK-00355
+    title: Cell/Holon certificates and session-key delegation
+  binds:
+    prd_id: PRD-0010
+    rfc_id: RFC-0020
+    requirements:
+    - requirement_id: REQ-0009
+      requirement_ref: documents/rfcs/RFC-0020/requirements/REQ-0009.yaml#requirement
+    evidence_artifacts:
+    - evidence_id: EVID-0009
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0009.yaml#evidence_artifact
+    - evidence_id: EVID-0303
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0303.yaml#evidence_artifact
+  custody:
+    agent_roles:
+    - AGENT_IMPLEMENTER
+    responsibility_domains:
+    - DOMAIN_CRYPTO
+    - DOMAIN_SECURITY
+    - DOMAIN_DAEMON
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00354
+      reason: Prerequisite per RFC-0020 ticket decomposition ordering
+  scope:
+    in_scope:
+    - Implement CellCertificateV1 and HolonCertificateV1 validation rules
+    - Implement SessionKeyDelegationV1 for hot-path auth
+    - Enforce root vs operational vs session key role separation
+    out_of_scope:
+    - Directory proofs and proof economics (TCK-00356..TCK-00359)
+  plan:
+    steps:
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep
+      beyond out_of_scope list.
+    - 'Implement: Implement CellCertificateV1 and HolonCertificateV1 validation rules'
+    - 'Implement: Implement SessionKeyDelegationV1 for hot-path auth'
+    - 'Implement: Enforce root vs operational vs session key role separation'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression
+      risks per RFC-0020/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding
+      EVID-* artifact with concrete artifact pointers.
+  definition_of_done:
+    evidence_ids:
+    - EVID-0009
+    - EVID-0303
+    criteria:
+    - Certificate verification checks bindings and expiry constraints
+    - Session key delegation bounded by operational key authority
+    - Role overlap between root/operational/session keys is rejected
+  notes:
+    security: Fail-closed, least privilege, and explicit authority proofs are mandatory.
+    verification: Prefer deterministic tests, replay/CAS evidence, and bounded-resource
+      checks; avoid process-local assumptions.
+    general: Keep scope atomic to this ticket, preserve explicit dependency ordering,
+      and avoid introducing semantic drift from RFC-0020.

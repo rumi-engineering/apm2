@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/hmp_message.schema.json",
+  "title": "HMPMessageV1",
+  "description": "Digest-first inter-holon message envelope (FAC-local profile).",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "envelope",
+    "body_ref"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.hmp_message.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "envelope": {
+      "type": "object",
+      "required": [
+        "protocol_id",
+        "message_class",
+        "message_id",
+        "hlc_timestamp",
+        "idempotency_key",
+        "sender",
+        "parents"
+      ],
+      "properties": {
+        "protocol_id": {
+          "type": "string",
+          "const": "HMP"
+        },
+        "message_class": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "message_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "hlc_timestamp": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "idempotency_key": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "sender": {
+          "type": "object",
+          "required": [
+            "holon_id",
+            "actor_id"
+          ],
+          "properties": {
+            "holon_id": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "actor_id": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          "unevaluatedProperties": false
+        },
+        "parents": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "maxItems": 1024
+        },
+        "commitments": {
+          "type": "object",
+          "properties": {
+            "ledger_head_hash": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "context_pack_hash": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "capability_manifest_hash": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          "unevaluatedProperties": false
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "body_ref": {
+      "type": "object",
+      "required": [
+        "cas_hash",
+        "content_type"
+      ],
+      "properties": {
+        "cas_hash": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "content_type": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "selector_hints": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "default": []
+        }
+      },
+      "unevaluatedProperties": false
+    }
+  },
+  "unevaluatedProperties": false
+}

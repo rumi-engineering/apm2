@@ -1,10 +1,28 @@
 {
-  "schema": "cac.net.threats.v1",
+  "schema": "apm2.security.network_defense_matrix.v1",
   "kind": "security.threat_matrix",
   "meta": {
     "stable_id": "dcp://apm2.agents/sec/net/threats@1",
     "status": "ACTIVE",
-    "ref": "THREAT_MODEL.md"
+    "ref": "THREAT_MODEL.cac.json",
+    "source_of_truth_refs": [
+      "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+      "documents/security/THREAT_MODEL.cac.json"
+    ],
+    "created_at": "2026-02-05T00:00:00Z",
+    "updated_at": "2026-02-05T00:00:00Z",
+    "classification": "INTERNAL",
+    "last_aligned_rfc": "RFC-0020",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-SECURITY-GOVERNANCE",
+      "work_id": "DOC-SECURITY-RFC0020-ALIGN-20260205",
+      "source_receipts": []
+    }
   },
   "payload": {
     "domain": "holonic_network_threats",
@@ -114,6 +132,43 @@
         "vector": "Goodhart's Law",
         "desc": "Optimizing for specific gate metrics while undermining the underlying security goal."
       }
-    ]
-  }
+    ],
+    "control_bindings": {
+      "identity_and_replay": [
+        "Self-certifying identities with proof-carrying membership",
+        "Identity freshness enforcement for Tier2+ authority paths",
+        "Replay-protected governance and handshake messages"
+      ],
+      "delegation_and_authz": [
+        "Permeability receipts as the only cross-boundary authority entrance",
+        "Strict-subset delegation validation (no widening)"
+      ],
+      "integrity_and_admission": [
+        "Authoritative facts authenticated by signature or authority seal",
+        "Cross-cell imports require admission receipts",
+        "Pull-based anti-entropy with bounded proofs"
+      ],
+      "confidentiality_and_injection": [
+        "Dual-lattice taint/classification enforcement on boundary emissions",
+        "Context firewall and capability-gated tool mediation"
+      ],
+      "availability_and_dos": [
+        "Bounded decode + bounded collections",
+        "Per-channel/per-episode/per-relay budgets with fail-closed behavior"
+      ]
+    },
+    "scale_profile": {
+      "capacity_target": "multi-exabyte",
+      "verification_economics": [
+        "Maintain bounded decode and collection constraints on all anti-entropy and admission paths.",
+        "Preserve logarithmic proof economics for identity and receipt membership verification.",
+        "Prefer batch-anchored verification to avoid linear per-fact signature amplification."
+      ]
+    },
+    "cryptography_posture": {
+      "pqc_status": "DEFERRED",
+      "pqc_note": "PQC migration is deferred; controls align to active RFC-0020 signature and seal mechanisms."
+    }
+  },
+  "schema_version": "1.0.0"
 }

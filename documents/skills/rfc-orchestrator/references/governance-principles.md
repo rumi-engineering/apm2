@@ -154,9 +154,10 @@ holonic_laws:
 
     - id: LAW-14
       name: Risk-Weighted Evidence
-      relevance: "Tier-based gate selection (T0/T1/T2)."
+      relevance: "Tier-based gate selection (T0/T1/T2/T3)."
       application: |
-        Security-critical changes require T2 gates (full hypothesis-driven AAT).
+        Security-critical changes require T3 gates (strongest verification + fail-closed posture).
+        Production changes require T2 gates with replay/stop enforcement.
         Documentation-only changes may use T0 gates (static analysis only).
 
 reasoning_modes:

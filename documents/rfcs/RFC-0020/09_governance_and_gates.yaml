@@ -1,0 +1,216 @@
+rfc_governance_and_gates:
+  schema_version: "2026-02-05"
+  template_version: "2026-01-23"
+  governance_id: "RFC_GOVERNANCE_V2_HSI"
+  ratchet_model:
+    gate_levels:
+      - id: "G0"
+        name: "Observe"
+        semantics: "Emit receipts/defects; do not block."
+      - id: "G1"
+        name: "Warn"
+        semantics: "Warn and require waiver receipt for continuation."
+      - id: "G2"
+        name: "Enforce"
+        semantics: "Deny by default; no waivers except explicit breakglass policy."
+    invariants:
+      - "Stages MUST ratchet enforcement; no silent relaxation is allowed."
+      - "Stage promotion requires objective evidence and canary progression."
+      - "Breakglass is time-boxed, audited, and requires explicit authority signatures."
+
+  gates:
+    - gate_id: "GATE-RFC-ARCHITECTURE"
+      authority_role: "AUTH_ARCHITECTURE"
+      required_evidence_categories:
+        - "DESIGN_DECISIONS"
+        - "INTEGRATION_TEST_RESULT"
+        - "TRACEABILITY_COMPLETENESS"
+      required_evidence_ids:
+        - "EVID-0201"
+        - "EVID-0202"
+        - "EVID-0208"
+
+    - gate_id: "GATE-RFC-SECURITY"
+      authority_role: "AUTH_SECURITY"
+      required_evidence_categories:
+        - "THREAT_MODEL_ARTIFACTS"
+        - "FUZZ_TEST_RESULT"
+        - "RED_TEAM_RESULT"
+      required_evidence_ids:
+        - "EVID-0103"
+        - "EVID-0104"
+        - "EVID-0109"
+        - "EVID-0110"
+
+    - gate_id: "GATE-RFC-FORMAL"
+      authority_role: "AUTH_ARCHITECTURE"
+      required_evidence_categories:
+        - "FORMAL_MODEL_ARTIFACT"
+        - "MODEL_CHECK_RESULT"
+      required_evidence_ids:
+        - "EVID-0021"
+        - "EVID-0022"
+        - "EVID-0401"
+
+    - gate_id: "GATE-RFC-PERF"
+      authority_role: "AUTH_RELIABILITY"
+      required_evidence_categories:
+        - "PERF_BENCHMARK"
+        - "OVERHEAD_CONTRACT_RESULT"
+      required_evidence_ids:
+        - "EVID-0026"
+        - "EVID-0306"
+
+    - gate_id: "GATE-RFC-FEDERATION"
+      authority_role: "AUTH_RELIABILITY"
+      required_evidence_categories:
+        - "CHAOS_TEST_RESULT"
+        - "BYZANTINE_SIM_RESULT"
+        - "CONVERGENCE_PROOF_RESULT"
+      required_evidence_ids:
+        - "EVID-0035"
+        - "EVID-0309"
+        - "EVID-0014"
+
+    - gate_id: "GATE-RFC-BCP"
+      authority_role: "AUTH_RELIABILITY"
+      required_evidence_categories:
+        - "RECOVERY_DRILL_RESULT"
+        - "STOP_PATH_SLO_REPORT"
+      required_evidence_ids:
+        - "EVID-0036"
+        - "EVID-0402"
+
+  stage_gate_matrix:
+    - stage: "S0"
+      tier0_tier1: "G1"
+      tier2_plus: "G2"
+      required_gate_ids: ["GATE-RFC-ARCHITECTURE"]
+    - stage: "S0.5"
+      tier0_tier2: "G1"
+      tier3_plus: "G2"
+      required_gate_ids: ["GATE-RFC-ARCHITECTURE", "GATE-RFC-SECURITY"]
+    - stage: "S0.75"
+      tier0_tier1: "G1"
+      tier2_plus: "G2"
+      required_gate_ids: ["GATE-RFC-SECURITY", "GATE-RFC-PERF"]
+    - stage: "S0.9"
+      tier0_tier1: "G1"
+      tier2_plus: "G2"
+      required_gate_ids: ["GATE-RFC-SECURITY", "GATE-RFC-PERF"]
+    - stage: "S1"
+      tier0_tier2: "G1"
+      tier3_plus: "G2"
+      required_gate_ids: ["GATE-RFC-ARCHITECTURE", "GATE-RFC-SECURITY"]
+    - stage: "S2"
+      tier0_tier2: "G1"
+      tier3_plus: "G2"
+      required_gate_ids: ["GATE-RFC-SECURITY"]
+    - stage: "S2.5"
+      tier0_tier2: "G0_G1"
+      tier3_plus: "G2"
+      required_gate_ids: ["GATE-RFC-SECURITY", "GATE-RFC-PERF"]
+    - stage: "S2.6"
+      tier0_tier2: "G1"
+      tier3_plus: "G2"
+      required_gate_ids: ["GATE-RFC-PERF", "GATE-RFC-FORMAL"]
+    - stage: "S3"
+      tier3_plus: "G2"
+      required_gate_ids: ["GATE-RFC-SECURITY"]
+    - stage: "S3.5"
+      tier2_plus: "G2"
+      required_gate_ids: ["GATE-RFC-SECURITY"]
+    - stage: "S4"
+      tier2_plus: "G2"
+      required_gate_ids: ["GATE-RFC-SECURITY"]
+    - stage: "S5"
+      tier2_plus: "G2"
+      required_gate_ids: ["GATE-RFC-PERF"]
+    - stage: "S6"
+      tier3_plus: "G2"
+      required_gate_ids: ["GATE-RFC-SECURITY"]
+    - stage: "S6.5"
+      tier3_plus: "G2"
+      required_gate_ids: ["GATE-RFC-SECURITY", "GATE-RFC-FORMAL"]
+    - stage: "S7"
+      all_tiers: "G0_G1"
+      required_gate_ids: ["GATE-RFC-FEDERATION"]
+    - stage: "S7.5"
+      tier0_tier1_reads: "G1"
+      tier2_plus_authority: "G2"
+      required_gate_ids: ["GATE-RFC-FEDERATION", "GATE-RFC-SECURITY"]
+    - stage: "S8"
+      all_tiers: "G1_to_G2_RATCHET"
+      required_gate_ids: ["GATE-RFC-FEDERATION", "GATE-RFC-BCP", "GATE-RFC-FORMAL"]
+
+  gate_reviews:
+    - gate_id: "GATE-RFC-ARCHITECTURE"
+      status: "REQUESTED"
+      evidence_ids: ["EVID-0201", "EVID-0202", "EVID-0208"]
+      notes: "Pending architecture council review for contract completeness and traceability closure."
+      review_ref: "evidence/rfc/RFC-0020/reviews/architecture_gate_review.yaml"
+    - gate_id: "GATE-RFC-SECURITY"
+      status: "REQUESTED"
+      evidence_ids: ["EVID-0103", "EVID-0104", "EVID-0109", "EVID-0110"]
+      notes: "Pending security council review for identity, attestation, and capsule/no-bypass posture."
+      review_ref: "evidence/rfc/RFC-0020/reviews/security_gate_review.yaml"
+    - gate_id: "GATE-RFC-FORMAL"
+      status: "REQUESTED"
+      evidence_ids: ["EVID-0021", "EVID-0022", "EVID-0401"]
+      notes: "Pending formal methods review for bisimulation and functor-law obligations."
+      review_ref: "evidence/rfc/RFC-0020/reviews/formal_gate_review.yaml"
+    - gate_id: "GATE-RFC-PERF"
+      status: "REQUESTED"
+      evidence_ids: ["EVID-0026", "EVID-0306"]
+      notes: "Pending performance review for <1% overhead contract and fallback behavior."
+      review_ref: "evidence/rfc/RFC-0020/reviews/perf_gate_review.yaml"
+    - gate_id: "GATE-RFC-FEDERATION"
+      status: "REQUESTED"
+      evidence_ids: ["EVID-0035", "EVID-0309", "EVID-0014"]
+      notes: "Pending reliability/security review for byzantine relay and convergence behavior."
+      review_ref: "evidence/rfc/RFC-0020/reviews/federation_gate_review.yaml"
+    - gate_id: "GATE-RFC-BCP"
+      status: "REQUESTED"
+      evidence_ids: ["EVID-0036", "EVID-0402"]
+      notes: "Pending business continuity review for RPO/RTO and stop-path SLO attainment."
+      review_ref: "evidence/rfc/RFC-0020/reviews/bcp_gate_review.yaml"
+
+  waivers:
+    - id: "WVR-0020-001"
+      scope:
+        gate_ids: ["GATE-RFC-FEDERATION"]
+        requirement_ids: ["REQ-0020"]
+        quality_dimension_ids: ["FORMAL_COVERAGE"]
+      rationale: "Optional VDF profile may be deferred for non-adversarial links while epoch sealing is enforced."
+      expiration_date: "2026-06-30"
+      required_signoffs:
+        - "AUTH_ARCHITECTURE"
+        - "AUTH_SECURITY"
+      status: "REQUESTED"
+      evidence_ids: ["EVID-0019"]
+
+  breakglass_policy:
+    constraints:
+      - "Breakglass allowed only for G2 production incidents with documented impact."
+      - "Each breakglass event MUST emit signed incident and rollback receipts."
+      - "Maximum breakglass window is policy-defined and time-boxed."
+      - "Repeated breakglass for same gate condition blocks further stage promotion."
+    required_fields:
+      - "incident_id"
+      - "initiating_authority"
+      - "start_time_envelope_ref"
+      - "end_time_envelope_ref"
+      - "scope"
+      - "justification"
+      - "rollback_receipt_hash"
+
+  waiver_policy:
+    waiver_required_keys:
+      - "id"
+      - "scope"
+      - "rationale"
+      - "expiration_date"
+      - "required_signoffs"
+      - "status"
+      - "evidence_ids"
+    waiver_status_enum_ref: "standards/enums/19_waiver_status.yaml#waiver_status.values"

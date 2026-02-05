@@ -1,0 +1,101 @@
+{
+  "schema": "cac.strategy.validation_report.v1",
+  "schema_version": "1.0.0",
+  "kind": "strategy.validation_report",
+  "meta": {
+    "report_id": "STRAT-CAC-VALIDATION-HTF-0002",
+    "bundle_ref": "documents/strategy/STRATEGY_BUSINESS_BUNDLE.json",
+    "created_at": "HTF-BND-STRAT-BUNDLE-COMPILE-001",
+    "validator": "strategy-cac-validator.v1",
+    "status": "pass"
+  },
+  "payload": {
+    "gate_results": [
+      {
+        "gate_id": "CAC-VALID-01",
+        "result": "PASS",
+        "detail": "JSON parse and required schema contract fields are complete.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-02",
+        "result": "PASS",
+        "detail": "All strategic claims map to ClaimContract and valid MetricContract refs.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-03",
+        "result": "PASS",
+        "detail": "All phase transitions map to GateContract and EvidenceContract inputs.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-04",
+        "result": "PASS",
+        "detail": "No wall-clock authority in normative timing logic; timing fields use HTF boundary IDs.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-05",
+        "result": "PASS",
+        "detail": "Referential integrity passed: no dangling *_ref IDs.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-06",
+        "result": "PASS",
+        "detail": "Every strategic claim has a falsification path in physics_feasibility_model or scenario_matrix.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-07",
+        "result": "PASS",
+        "detail": "Every adjacent roadmap milestone pair maps to a RoadmapBridgeContract.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-08",
+        "result": "PASS",
+        "detail": "Bridge chains have ordered IntermediateStepContract records with complete predicates, owners, HTF boundaries, and evidence refs.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-09",
+        "result": "PASS",
+        "detail": "Dependency refs resolve and dependency graphs are acyclic.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-10",
+        "result": "PASS",
+        "detail": "Exactly one active PrincipalContract mapped to Shovon Hasan (@anveio) as sole proprietor.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-11",
+        "result": "PASS",
+        "detail": "All AgentIdentityContract records bind to the active principal and a valid DelegationContract.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-12",
+        "result": "PASS",
+        "detail": "All financial action classes map to FinancialActionContract, SpendPolicyContract, and fail-closed GateContract predicates.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-13",
+        "result": "PASS",
+        "detail": "Finance autonomy targets are quantified and evidence-bound.",
+        "severity": "none"
+      },
+      {
+        "gate_id": "CAC-VALID-14",
+        "result": "PASS",
+        "detail": "Revocation correctness controls are present with zero unresolved high-risk miss target.",
+        "severity": "none"
+      }
+    ],
+    "blocking_defects": []
+  }
+}

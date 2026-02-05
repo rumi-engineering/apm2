@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/context_delta.schema.json",
+  "title": "ContextDeltaV1",
+  "description": "Content-addressed delta from one ContextPack to another, expressed as selector adds/drops and optional summary.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "from_context_pack_hash",
+    "to_context_pack_hash",
+    "selectors_add",
+    "selectors_drop",
+    "view_commitment"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.context_delta.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "from_context_pack_hash": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "to_context_pack_hash": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "selectors_add": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 256
+      },
+      "maxItems": 100000
+    },
+    "selectors_drop": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 256
+      },
+      "maxItems": 100000
+    },
+    "view_commitment": {
+      "type": "object",
+      "required": [
+        "ledger_head_hash"
+      ],
+      "properties": {
+        "ledger_head_hash": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 2048
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "summary_receipt_hash": {
+      "type": "string",
+      "maxLength": 128
+    }
+  },
+  "unevaluatedProperties": false
+}

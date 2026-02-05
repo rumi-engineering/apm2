@@ -1,0 +1,364 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/security_release_procedure_doc_v1.schema.json",
+  "title": "SecurityReleaseProcedureDocumentV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "kind",
+    "meta",
+    "payload"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.security.release_procedure_doc.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "kind": {
+      "type": "string",
+      "const": "security.release_procedure_document"
+    },
+    "meta": {
+      "type": "object",
+      "required": [
+        "canonicalizer",
+        "classification",
+        "created_at",
+        "source_of_truth_refs",
+        "stable_id",
+        "status"
+      ],
+      "properties": {
+        "stable_id": {
+          "type": "string",
+          "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ACTIVE",
+            "DRAFT",
+            "DEPRECATED"
+          ]
+        },
+        "classification": {
+          "type": "string",
+          "enum": [
+            "PUBLIC",
+            "INTERNAL",
+            "CONFIDENTIAL",
+            "RESTRICTED"
+          ]
+        },
+        "source_of_truth_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "last_aligned_rfc": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "replaces": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "canonicalizer": {
+          "type": "object",
+          "required": [
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "vectors_ref"
+          ],
+          "properties": {
+            "canonicalizer_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "canonicalizer_version": {
+              "type": "string",
+              "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+            },
+            "vectors_ref": {
+              "type": "string",
+              "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+            }
+          },
+          "additionalProperties": false
+        },
+        "provenance": {
+          "type": "object",
+          "properties": {
+            "actor_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "work_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "source_receipts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "payload": {
+      "type": "object",
+      "required": [
+        "title",
+        "mode_requirement",
+        "precondition",
+        "authoritative_refs",
+        "procedure_steps",
+        "spot_check_command_template",
+        "incident_hook",
+        "scale_profile",
+        "cryptography_posture"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "const": "Release Procedure"
+        },
+        "mode_requirement": {
+          "type": "string",
+          "const": "MODE_HIGH_ASSURANCE"
+        },
+        "precondition": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "authoritative_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "procedure_steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/release_step"
+          }
+        },
+        "spot_check_command_template": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "incident_hook": {
+          "type": "object",
+          "required": [
+            "actions",
+            "severity_targets",
+            "acknowledgement_requirement"
+          ],
+          "properties": {
+            "actions": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "severity_targets": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/severity_target"
+              }
+            },
+            "acknowledgement_requirement": {
+              "$ref": "#/$defs/time_target"
+            }
+          },
+          "additionalProperties": false
+        },
+        "scale_profile": {
+          "type": "object",
+          "required": [
+            "capacity_target",
+            "integrity_controls"
+          ],
+          "properties": {
+            "capacity_target": {
+              "type": "string",
+              "const": "multi-exabyte"
+            },
+            "integrity_controls": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "cryptography_posture": {
+          "type": "object",
+          "required": [
+            "pqc_status",
+            "pqc_note"
+          ],
+          "properties": {
+            "pqc_status": {
+              "type": "string",
+              "const": "DEFERRED"
+            },
+            "pqc_note": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "release_step": {
+      "type": "object",
+      "required": [
+        "step_no",
+        "title",
+        "actions",
+        "failure_behavior"
+      ],
+      "properties": {
+        "step_no": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 192
+        },
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "failure_behavior": {
+          "type": "string",
+          "enum": [
+            "STOP_AND_REMEDIATE"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "severity_target": {
+      "type": "object",
+      "required": [
+        "severity",
+        "target"
+      ],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": [
+            "Critical",
+            "High",
+            "Medium",
+            "Low"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/time_target"
+        }
+      },
+      "additionalProperties": false
+    },
+    "time_target": {
+      "type": "object",
+      "required": [
+        "target_type",
+        "max_duration_ms"
+      ],
+      "properties": {
+        "target_type": {
+          "type": "string",
+          "enum": [
+            "IMMEDIATE",
+            "WITHIN"
+          ]
+        },
+        "max_duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 31536000000
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "target_type": {
+                "const": "IMMEDIATE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "max_duration_ms": {
+                "const": 0
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  "unevaluatedProperties": false
+}

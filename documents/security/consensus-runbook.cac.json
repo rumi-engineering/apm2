@@ -1,0 +1,801 @@
+{
+  "schema": "apm2.security.consensus_runbook_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "security.consensus_runbook_document",
+  "meta": {
+    "stable_id": "dcp://apm2.security/doc/consensus-runbook@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "source_of_truth_refs": [
+      "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+      "documents/security/THREAT_MODEL.cac.json",
+      "documents/security/INCIDENT_RESPONSE.cac.json"
+    ],
+    "replaces": "documents/security/consensus-runbook.md",
+    "created_at": "2026-02-05T00:00:00Z",
+    "updated_at": "2026-02-05T00:00:00Z",
+    "last_aligned_rfc": "RFC-0020",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-SECURITY-GOVERNANCE",
+      "work_id": "DOC-SECURITY-RFC0020-ALIGN-20260205",
+      "source_receipts": []
+    }
+  },
+  "payload": {
+    "title": "APM2 Consensus Layer Operations Runbook",
+    "purpose": "Incident response procedures for the distributed consensus layer including alert handling, diagnostics, and recovery.",
+    "rfc_references": [
+      "RFC-0014",
+      "RFC-0016",
+      "RFC-0020"
+    ],
+    "ticket_id": "TCK-00193",
+    "architecture": {
+      "planes": [
+        {
+          "name": "Control Plane",
+          "description": "HotStuff/PBFT BFT consensus for authority events including leases, capabilities, and key rotations."
+        },
+        {
+          "name": "Data Plane",
+          "description": "CRDT/anti-entropy for telemetry and evidence observations."
+        }
+      ],
+      "security_invariants": [
+        "No unsigned or unauthenticated authority facts are admitted.",
+        "Freshness enforcement applies to identity and governance state on high-risk paths.",
+        "Fail-closed behavior is mandatory under trust ambiguity."
+      ],
+      "components": [
+        {
+          "name": "BFT Consensus",
+          "description": "Chained HotStuff for total ordering.",
+          "metrics_prefix": "apm2_consensus_*"
+        },
+        {
+          "name": "Anti-Entropy",
+          "description": "Merkle-tree synchronization for eventual consistency.",
+          "metrics_prefix": "apm2_antientropy_*"
+        },
+        {
+          "name": "Schema Registry",
+          "description": "Distributed schema governance.",
+          "metrics_prefix": "apm2_schema_registry_*"
+        },
+        {
+          "name": "Byzantine Detection",
+          "description": "Equivocation and forgery detection.",
+          "metrics_prefix": "apm2_byzantine_*"
+        }
+      ]
+    },
+    "normal_operating_parameters": [
+      {
+        "metric": "Finalization latency p99",
+        "target": {
+          "rule_type": "NUMERIC",
+          "operator": "LT",
+          "value": 500,
+          "unit": "milliseconds"
+        },
+        "warning": {
+          "rule_type": "NUMERIC",
+          "operator": "GT",
+          "value": 500,
+          "unit": "milliseconds"
+        },
+        "critical": {
+          "rule_type": "NUMERIC",
+          "operator": "GT",
+          "value": 2000,
+          "unit": "milliseconds"
+        }
+      },
+      {
+        "metric": "Leader elections per minute",
+        "target": {
+          "rule_type": "NUMERIC",
+          "operator": "LT",
+          "value": 2,
+          "unit": "events_per_minute"
+        },
+        "warning": {
+          "rule_type": "NUMERIC",
+          "operator": "GT",
+          "value": 5,
+          "unit": "events_per_minute"
+        },
+        "critical": {
+          "rule_type": "NUMERIC",
+          "operator": "GT",
+          "value": 10,
+          "unit": "events_per_minute"
+        }
+      },
+      {
+        "metric": "Active validators",
+        "target": {
+          "rule_type": "SYMBOLIC",
+          "operator": "EQ",
+          "expression": "quorum_size + f",
+          "variables": [
+            "quorum_size",
+            "f"
+          ]
+        },
+        "warning": {
+          "rule_type": "SYMBOLIC",
+          "operator": "LT",
+          "expression": "quorum_size + 1",
+          "variables": [
+            "quorum_size"
+          ]
+        },
+        "critical": {
+          "rule_type": "SYMBOLIC",
+          "operator": "LT",
+          "expression": "quorum_size",
+          "variables": [
+            "quorum_size"
+          ]
+        }
+      },
+      {
+        "metric": "Proposal success rate",
+        "target": {
+          "rule_type": "NUMERIC",
+          "operator": "GT",
+          "value": 99,
+          "unit": "percent"
+        },
+        "warning": {
+          "rule_type": "NUMERIC",
+          "operator": "LT",
+          "value": 95,
+          "unit": "percent"
+        },
+        "critical": {
+          "rule_type": "NUMERIC",
+          "operator": "LT",
+          "value": 90,
+          "unit": "percent"
+        }
+      },
+      {
+        "metric": "Anti-entropy conflicts per hour",
+        "target": {
+          "rule_type": "NUMERIC",
+          "operator": "LT",
+          "value": 50,
+          "unit": "events_per_hour"
+        },
+        "warning": {
+          "rule_type": "NUMERIC",
+          "operator": "GT",
+          "value": 100,
+          "unit": "events_per_hour"
+        },
+        "critical": {
+          "rule_type": "NUMERIC",
+          "operator": "GT",
+          "value": 500,
+          "unit": "events_per_hour"
+        }
+      }
+    ],
+    "alerts": [
+      {
+        "alert_id": "RUNBOOK-ALERT-01",
+        "name": "ConsensusNoLeader",
+        "severity": "Warning",
+        "description": "Frequent leader elections indicate consensus instability.",
+        "symptoms": [
+          "More than 5 leader elections in 1 minute.",
+          "Increased finalization latency.",
+          "Intermittent proposal timeouts."
+        ],
+        "investigation_steps": [
+          {
+            "title": "Check network connectivity",
+            "commands": [
+              "apm2 consensus status --verbose",
+              "apm2 consensus validators"
+            ]
+          },
+          {
+            "title": "Check for validator crashes",
+            "commands": [
+              "journalctl -u apm2d --since \"1 hour ago\" | grep -i \"restart\\|crash\\|panic\""
+            ]
+          },
+          {
+            "title": "Verify time and freshness synchronization",
+            "commands": [
+              "timedatectl status",
+              "chronyc tracking"
+            ],
+            "notes": [
+              "Wall-clock health is advisory only; confirm HTF/HLC monotonic progression in daemon metrics."
+            ]
+          },
+          {
+            "title": "Review timeout configuration",
+            "commands": [
+              "apm2 consensus metrics"
+            ]
+          }
+        ],
+        "resolution": [
+          "Increase round_timeout if network latency is high.",
+          "Investigate and fix repeatedly crashing validators.",
+          "Correct NTP/skew issues across validators."
+        ],
+        "escalation": [
+          "Escalate after 15 minutes of persistent elections.",
+          "Escalate immediately if quorum risk emerges."
+        ]
+      },
+      {
+        "alert_id": "RUNBOOK-ALERT-02",
+        "name": "ConsensusQuorumLost",
+        "severity": "CRITICAL",
+        "description": "Insufficient validators for consensus; cluster is stalled.",
+        "symptoms": [
+          "active_validators < quorum_size",
+          "No new blocks committed.",
+          "Control plane operations blocked."
+        ],
+        "investigation_steps": [
+          {
+            "title": "Assess validator status",
+            "commands": [
+              "apm2 consensus status",
+              "apm2 consensus validators --active-only"
+            ]
+          },
+          {
+            "title": "Identify unreachable validators",
+            "commands": [
+              "for node in node1 node2 node3 node4; do ping -c 1 $node || echo \"$node unreachable\"; done"
+            ]
+          },
+          {
+            "title": "Check validator processes",
+            "commands": [
+              "systemctl status apm2d",
+              "journalctl -u apm2d -n 100"
+            ]
+          }
+        ],
+        "resolution": [
+          "Restart crashed validators.",
+          "Fix network/firewall/DNS/routing issues.",
+          "Replace unrecoverable hardware.",
+          "Add emergency validator with governance approval."
+        ],
+        "escalation": [
+          "Escalate to incident commander immediately.",
+          "Page all validator operators.",
+          "Prepare user communication if outage exceeds 5 minutes."
+        ]
+      },
+      {
+        "alert_id": "RUNBOOK-ALERT-03",
+        "name": "HighFinalizationLatency",
+        "severity": "Warning",
+        "description": "Consensus finalization exceeds 500ms p99 target.",
+        "symptoms": [
+          "p99 latency > 500ms for 5+ minutes.",
+          "User-perceived control-plane slowness."
+        ],
+        "investigation_steps": [
+          {
+            "title": "Measure network RTT",
+            "commands": [
+              "for peer in peer1 peer2 peer3; do ping -c 10 $peer | tail -1; done"
+            ]
+          },
+          {
+            "title": "Check validator load",
+            "commands": [
+              "top -bn1 | head -20",
+              "iostat -x 1 5"
+            ]
+          },
+          {
+            "title": "Review payload sizes",
+            "commands": [
+              "apm2 consensus metrics --period 300"
+            ]
+          }
+        ],
+        "resolution": [
+          "Address network congestion and geographic latency.",
+          "Add CPU/memory resources and optimize heavy operations.",
+          "Tune batching or split oversized transactions."
+        ],
+        "escalation": [
+          "Escalate if latency exceeds critical threshold or continues despite mitigations."
+        ]
+      },
+      {
+        "alert_id": "RUNBOOK-ALERT-04",
+        "name": "ByzantineFaultDetected",
+        "severity": "CRITICAL_SECURITY",
+        "description": "Validator is exhibiting malicious or faulty behavior.",
+        "symptoms": [
+          "Byzantine evidence counter increased.",
+          "Fault types include equivocation, invalid_signature, quorum_forgery, or replay."
+        ],
+        "investigation_steps": [
+          {
+            "title": "Preserve evidence",
+            "commands": [
+              "apm2 consensus byzantine-evidence list > /secure/evidence-$(date +%s).json"
+            ],
+            "notes": [
+              "Preserve identity_proof_hash, directory head hash, epoch seal hash, and authority seal hash when available."
+            ]
+          },
+          {
+            "title": "Identify faulty validator",
+            "commands": [
+              "apm2 consensus byzantine-evidence list --json | jq '.evidence[] | .validator_id'"
+            ]
+          },
+          {
+            "title": "Assess fault severity",
+            "notes": [
+              "Equivocation indicates potential compromise.",
+              "Invalid signature may indicate compromise or software bug.",
+              "Quorum forgery indicates likely malicious behavior.",
+              "Replay may indicate attack or misconfiguration."
+            ]
+          }
+        ],
+        "resolution": [
+          "Do not dismiss any Byzantine evidence without full investigation.",
+          "For severe faults, remove validator from quorum and revoke keys.",
+          "Conduct forensic investigation and notify security team."
+        ],
+        "escalation": [
+          "Notify security team immediately.",
+          "Involve incident commander for quorum-affecting actions.",
+          "Document all actions for post-incident review."
+        ],
+        "fault_type_response": [
+          {
+            "fault_type": "Equivocation or Quorum Forgery",
+            "actions": [
+              "apm2 consensus remove-validator --id VALIDATOR_ID",
+              "Revoke validator keys.",
+              "Run full forensic investigation.",
+              "Notify security team."
+            ]
+          },
+          {
+            "fault_type": "Invalid Signature",
+            "actions": [
+              "Check clock synchronization.",
+              "Check key file integrity.",
+              "Rotate keys if fault persists."
+            ]
+          },
+          {
+            "fault_type": "Replay",
+            "actions": [
+              "Check retransmission/network issues.",
+              "Verify replay cache behavior.",
+              "Remove validator if malicious replay is confirmed."
+            ]
+          }
+        ]
+      },
+      {
+        "alert_id": "RUNBOOK-ALERT-05",
+        "name": "AntiEntropyDivergence",
+        "severity": "Warning",
+        "description": "High merge-conflict rate during anti-entropy synchronization.",
+        "symptoms": [
+          "More than 100 conflicts per hour.",
+          "Data inconsistencies between nodes.",
+          "Increased sync traffic."
+        ],
+        "investigation_steps": [
+          {
+            "title": "Check for recent partitions",
+            "commands": [
+              "apm2 consensus status --verbose"
+            ]
+          },
+          {
+            "title": "Check clock skew and HLC/HTF monotonicity",
+            "commands": [
+              "chronyc sources -v"
+            ],
+            "notes": [
+              "Do not accept stale authority state for Tier2+ operations."
+            ]
+          },
+          {
+            "title": "Review conflict metrics",
+            "commands": [
+              "apm2 consensus metrics | grep conflicts"
+            ]
+          }
+        ],
+        "resolution": [
+          "During partition recovery, monitor for conflict decline after initial sync.",
+          "Fix NTP configuration when skew detected.",
+          "Review application-level concurrent update patterns if conflicts persist."
+        ],
+        "escalation": [
+          "Escalate when conflict rates remain elevated beyond recovery window."
+        ]
+      },
+      {
+        "alert_id": "RUNBOOK-ALERT-06",
+        "name": "ConsensusStalled",
+        "severity": "Warning",
+        "description": "No proposals committed despite quorum availability.",
+        "symptoms": [
+          "No commit progression with healthy quorum.",
+          "Potential vote or leader-path stalls."
+        ],
+        "investigation_steps": [
+          {
+            "title": "Check pending work",
+            "commands": [
+              "apm2 consensus status"
+            ],
+            "notes": [
+              "No pending transactions may indicate normal idle behavior."
+            ]
+          },
+          {
+            "title": "Check leader health",
+            "commands": [
+              "apm2 consensus validators | grep \"leader\""
+            ]
+          },
+          {
+            "title": "Check vote delivery",
+            "commands": [
+              "journalctl -u apm2d | grep -i \"vote\\|timeout\""
+            ]
+          }
+        ],
+        "resolution": [
+          "Transfer leadership to a healthy node when current leader is unhealthy.",
+          "Fix vote-delivery networking issues."
+        ],
+        "escalation": [
+          "Escalate if stall persists beyond normal idle diagnostics."
+        ]
+      },
+      {
+        "alert_id": "RUNBOOK-ALERT-07",
+        "name": "HighProposalRejectionRate",
+        "severity": "Warning",
+        "description": "More than 10% of proposals rejected.",
+        "symptoms": [
+          "Sustained proposal rejection above expected baseline."
+        ],
+        "investigation_steps": [
+          {
+            "title": "Check rejection reasons",
+            "commands": [
+              "journalctl -u apm2d | grep -i \"rejected\\|invalid\""
+            ]
+          },
+          {
+            "title": "Check leader state",
+            "commands": [
+              "apm2 consensus status --verbose"
+            ]
+          }
+        ],
+        "resolution": [
+          "If leader proposes invalid blocks, repair leader state and restart if needed.",
+          "Force leader rotation on stale-state safety-rule violations."
+        ],
+        "escalation": [
+          "Escalate if rejection rate remains high after leader correction."
+        ]
+      },
+      {
+        "alert_id": "RUNBOOK-ALERT-08",
+        "name": "SchemaRegistryEmpty",
+        "severity": "Warning",
+        "description": "No schemas registered on node.",
+        "symptoms": [
+          "Schema registry appears empty.",
+          "Schema-dependent operations degraded."
+        ],
+        "investigation_steps": [
+          {
+            "title": "Check startup logs",
+            "commands": [
+              "journalctl -u apm2d | grep -i \"schema\""
+            ]
+          },
+          {
+            "title": "Check database integrity",
+            "commands": [
+              "apm2 ledger verify-chain"
+            ]
+          }
+        ],
+        "resolution": [
+          "Restart node to trigger schema registration.",
+          "Synchronize schemas from healthy peers if still missing."
+        ],
+        "escalation": [
+          "Escalate if schema registry remains empty after restart and sync attempts."
+        ]
+      }
+    ],
+    "diagnostic_command_sets": [
+      {
+        "set_id": "RUNBOOK-CMDSET-01",
+        "title": "Quick Health Check",
+        "commands": [
+          "apm2 consensus status",
+          "apm2 consensus validators",
+          "apm2 consensus byzantine-evidence list --limit 10",
+          "apm2 consensus metrics"
+        ]
+      },
+      {
+        "set_id": "RUNBOOK-CMDSET-02",
+        "title": "Detailed Diagnostics",
+        "commands": [
+          "apm2 ledger verify-chain --namespace kernel",
+          "apm2 ledger diff --peer peer1:9090 --namespace kernel",
+          "apm2 schema list"
+        ]
+      },
+      {
+        "set_id": "RUNBOOK-CMDSET-03",
+        "title": "Network Diagnostics",
+        "commands": [
+          "for peer in $(apm2 consensus validators --json | jq -r '.validators[].address'); do nc -zv $peer 9090 2>&1 | head -1; done"
+        ]
+      }
+    ],
+    "recovery_procedures": [
+      {
+        "procedure_id": "RUNBOOK-RECOVERY-01",
+        "title": "Node Recovery After Crash",
+        "steps": [
+          {
+            "title": "Check for ledger corruption",
+            "commands": [
+              "apm2 ledger verify-chain"
+            ]
+          },
+          {
+            "title": "Restore backup if corrupted",
+            "commands": [
+              "cp /backup/ledger.db $APM2_DATA_DIR/ledger.db"
+            ]
+          },
+          {
+            "title": "Restart and sync from peers",
+            "commands": [
+              "systemctl start apm2d"
+            ],
+            "notes": [
+              "Node should synchronize via anti-entropy."
+            ]
+          }
+        ]
+      },
+      {
+        "procedure_id": "RUNBOOK-RECOVERY-02",
+        "title": "Validator Key Rotation",
+        "steps": [
+          {
+            "title": "Generate new key",
+            "commands": [
+              "apm2 consensus keygen --output /secure/new-validator-key.pem"
+            ]
+          },
+          {
+            "title": "Submit key rotation proposal",
+            "commands": [
+              "apm2 consensus rotate-key --key-file /secure/new-validator-key.pem"
+            ],
+            "notes": [
+              "Governance approval is required."
+            ]
+          },
+          {
+            "title": "Wait for quorum approval"
+          }
+        ]
+      },
+      {
+        "procedure_id": "RUNBOOK-RECOVERY-03",
+        "title": "Add New Validator (Emergency)",
+        "steps": [
+          {
+            "title": "Generate invitation token",
+            "commands": [
+              "apm2 consensus invite --id NEW_VALIDATOR --role validator"
+            ],
+            "notes": [
+              "Requires governance approval under Tier4 security-critical policy root or quorum rules."
+            ]
+          },
+          {
+            "title": "Join new node",
+            "commands": [
+              "apm2 consensus join --token <invitation_token>"
+            ]
+          }
+        ]
+      }
+    ],
+    "escalation_paths": {
+      "severity_matrix": [
+        {
+          "severity": "Warning",
+          "response_time": {
+            "target_type": "WITHIN",
+            "max_duration_ms": 3600000
+          },
+          "escalation": "On-call engineer"
+        },
+        {
+          "severity": "Critical",
+          "response_time": {
+            "target_type": "WITHIN",
+            "max_duration_ms": 900000
+          },
+          "escalation": "On-call + Incident Commander"
+        },
+        {
+          "severity": "Byzantine",
+          "response_time": {
+            "target_type": "IMMEDIATE",
+            "max_duration_ms": 0
+          },
+          "escalation": "Security Team + Incident Commander"
+        }
+      ],
+      "contacts": [
+        {
+          "role": "On-Call Engineer",
+          "channel": "PagerDuty rotation"
+        },
+        {
+          "role": "Incident Commander",
+          "channel": "@incident-commander Slack channel"
+        },
+        {
+          "role": "Security Team",
+          "channel": "security@yourorg.com"
+        }
+      ],
+      "communication_templates": [
+        {
+          "template_id": "RUNBOOK-TPL-01",
+          "title": "Quorum Loss",
+          "lines": [
+            "Subject: [INCIDENT] APM2 Consensus Quorum Lost",
+            "Impact: Control plane operations are blocked.",
+            "Start time: [TIME]",
+            "Status: Investigating",
+            "Next update: In 15 minutes"
+          ]
+        },
+        {
+          "template_id": "RUNBOOK-TPL-02",
+          "title": "Byzantine Fault",
+          "lines": [
+            "Subject: [SECURITY] Byzantine Fault Detected in APM2 Cluster",
+            "A validator has exhibited malicious behavior (type: [FAULT_TYPE]).",
+            "Preserving evidence and removing validator from quorum.",
+            "Security team has been notified."
+          ]
+        }
+      ]
+    },
+    "anti_entropy_budget_controls": {
+      "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0035.yaml#requirement",
+      "delivery_ticket": "TCK-00381",
+      "pull_only_enforcement": true,
+      "budget_scopes": [
+        {
+          "scope": "episode",
+          "exceedance_action": "DENY_ACTUATION_AND_EMIT_DEFECT"
+        },
+        {
+          "scope": "cell",
+          "exceedance_action": "DENY_ACTUATION_AND_EMIT_DEFECT"
+        },
+        {
+          "scope": "relay",
+          "exceedance_action": "DENY_ACTUATION_AND_EMIT_DEFECT"
+        }
+      ],
+      "byzantine_resilience_controls": [
+        "Relays cannot force authority admission; authority remains receiver-verified and pull-requested.",
+        "Replay and flood conditions are bounded by channel budgets, range caps, and fanout caps.",
+        "Budget exceedance is fail-closed for authority-bearing actuation paths."
+      ],
+      "convergence_guarantees": [
+        "Partition and rejoin behavior preserves revocation-wins semantics.",
+        "Convergence recovery actions must emit defects when bounded anti-entropy contracts are violated."
+      ]
+    },
+    "continuity_objectives": {
+      "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0036.yaml#requirement",
+      "delivery_ticket": "TCK-00382",
+      "recovery_targets": [
+        {
+          "asset": "ledger",
+          "rpo_ms": 300000,
+          "rto_ms": 1800000
+        },
+        {
+          "asset": "cas",
+          "rpo_ms": 900000,
+          "rto_ms": 3600000
+        },
+        {
+          "asset": "policy_root_and_tool_mediation",
+          "rto_ms": 1800000
+        }
+      ],
+      "drill_scenarios": [
+        "network_partition_simulation",
+        "ledger_append_latency_injection",
+        "cas_partial_unavailability",
+        "stop_path_degradation"
+      ],
+      "drill_receipt_requirements": [
+        "Emit DrillReceiptV1 with scenario id and scenario version.",
+        "Record observed failure modes and measured recovery time in each DrillReceiptV1.",
+        "Record stop-order failure count and require zero stop-order failures for Tier3+ posture.",
+        "Attach supporting evidence references for each drill receipt."
+      ]
+    },
+    "stop_path_slos": {
+      "minimum_tier": "Tier3",
+      "requirement_ref": "documents/rfcs/RFC-0020/requirements/REQ-0036.yaml#requirement",
+      "targets": {
+        "stop_propagation_p99_ms": 2000,
+        "stop_uncertainty_deny_ms": 250
+      },
+      "violation_actions": [
+        "Emit defect records for every stop-path SLO violation.",
+        "Block enforcement ratchet stage promotion while unresolved stop-path violations exist.",
+        "Force fail-safe deny behavior at the kernel boundary when stop-state verification is unavailable."
+      ]
+    },
+    "scale_profile": {
+      "capacity_target": "multi-exabyte",
+      "verification_economics": [
+        "Preserve digest and receipt pointers for forensic and anti-entropy workflows rather than raw evidence fanout.",
+        "Use bounded proof and verification paths to avoid linear cost explosion under high event volume.",
+        "Preserve identity, freshness, and seal artifacts required for logarithmic verification."
+      ],
+      "anti_entropy_bounds": [
+        "Use pull-based anti-entropy with bounded range and proof sizes.",
+        "Treat stale authority state as non-admissible for Tier2+ operations.",
+        "Prefer HTF/HLC monotonicity signals over wall-clock assumptions for authority freshness."
+      ]
+    },
+    "cryptography_posture": {
+      "pqc_status": "DEFERRED",
+      "pqc_note": "PQC migration is deferred; runbook operates on current signature, seal, and freshness controls in RFC-0020."
+    }
+  }
+}

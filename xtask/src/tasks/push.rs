@@ -242,8 +242,8 @@ fn create_pr(sh: &Shell, branch_name: &str, ticket_id: &str) -> Result<String> {
 /// This function:
 /// 1. Creates PENDING status checks for both reviews (blocks merge until
 ///    complete)
-/// 2. Spawns background processes to run security review (Gemini) and code
-///    quality review (Gemini) using the prompts from `documents/reviews/`
+/// 2. Spawns background processes to run security review (Codex) and code
+///    quality review (Codex) using the prompts from `documents/reviews/`
 /// 3. Writes reviewer state to `~/.apm2/reviewer_state.json` for health
 ///    monitoring
 /// 4. Redirects reviewer output to log files for mtime-based activity detection
@@ -293,10 +293,10 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
         create_pending_statuses(sh, owner_repo, &head_sha);
     }
 
-    // Try to spawn Gemini for security review
-    let gemini_available = cmd!(sh, "which gemini").ignore_status().read().is_ok();
-    if gemini_available && Path::new(&security_prompt_path).exists() {
-        println!("  Spawning Gemini security review...");
+    // Try to spawn Codex for security review
+    let codex_available = cmd!(sh, "which codex").ignore_status().read().is_ok();
+    if codex_available && Path::new(&security_prompt_path).exists() {
+        println!("  Spawning Codex security review...");
         let spawner = ReviewerSpawner::new("security", pr_url, &head_sha)
             .with_prompt_file(Path::new(&security_prompt_path))
             .map(|s| s.with_model(select_review_model()))
@@ -307,13 +307,13 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
                 println!("    Security review started in background");
             }
         }
-    } else if !gemini_available {
-        println!("  Note: Gemini CLI not available, skipping security review");
+    } else if !codex_available {
+        println!("  Note: Codex CLI not available, skipping security review");
     }
 
-    // Try to spawn Gemini for code quality review
-    if gemini_available && Path::new(&code_quality_prompt_path).exists() {
-        println!("  Spawning Gemini code quality review...");
+    // Try to spawn Codex for code quality review
+    if codex_available && Path::new(&code_quality_prompt_path).exists() {
+        println!("  Spawning Codex code quality review...");
         let spawner = ReviewerSpawner::new("quality", pr_url, &head_sha)
             .with_prompt_file(Path::new(&code_quality_prompt_path))
             .map(|s| s.with_model(select_review_model()))
@@ -326,8 +326,8 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
         }
     }
 
-    if !gemini_available {
-        println!("  No AI review tools available. Install gemini CLI to enable reviews.");
+    if !codex_available {
+        println!("  No AI review tools available. Install codex CLI to enable reviews.");
     }
 
     Ok(())

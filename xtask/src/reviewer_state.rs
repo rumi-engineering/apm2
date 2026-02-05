@@ -1,6 +1,6 @@
 //! Reviewer agent health monitoring state management.
 //!
-//! This module provides state tracking for AI reviewer agents (Gemini
+//! This module provides state tracking for AI reviewer agents (Codex
 //! processes) spawned during `cargo xtask push` and `cargo xtask review`. It
 //! enables the `cargo xtask check` command to monitor agent health and
 //! auto-remediate stale or dead agents.
@@ -176,7 +176,7 @@ impl ReviewerEntry {
     ///
     /// Uses `sysinfo` crate for cross-platform process introspection.
     /// We check for:
-    /// - "gemini" binary in the process name or command line (the AI tool)
+    /// - "codex" binary in the process name or command line (the AI tool)
     /// - "script" binary (the PTY wrapper we use)
     ///
     /// We specifically avoid matching editor processes like "vim script.rs"
@@ -199,7 +199,7 @@ impl ReviewerEntry {
         if cmd.is_empty() {
             // No command line info available, check process name as fallback
             let name = process.name().to_string_lossy().to_lowercase();
-            return name.contains("gemini") || name == "script";
+            return name.contains("codex") || name.contains("gemini") || name == "script";
         }
 
         // Join command line arguments for pattern matching
@@ -216,16 +216,16 @@ impl ReviewerEntry {
             .unwrap_or_default();
 
         // Check for our known patterns:
-        // - Contains "gemini" (the AI tool binary or script)
+        // - Contains "codex" (the AI tool binary or script)
         // - Equals "script" or ends with "/script" (the PTY wrapper)
-        // - Contains "bash" or "sh" and subsequent args contain "gemini" (shell
-        //   wrapper)
-        let is_gemini_binary = argv0.contains("gemini");
+        // - Contains "bash" or "sh" and subsequent args contain "codex" (shell
+        //   wrapper). "gemini" is also accepted for backward compatibility.
+        let is_ai_binary = argv0.contains("codex") || argv0.contains("gemini");
         let is_script_binary = argv0 == "script" || argv0.ends_with("/script");
-        let is_shell_wrapper =
-            (argv0.contains("bash") || argv0.contains("sh")) && cmdline.contains("gemini");
+        let is_shell_wrapper = (argv0.contains("bash") || argv0.contains("sh"))
+            && (cmdline.contains("codex") || cmdline.contains("gemini"));
 
-        is_gemini_binary || is_script_binary || is_shell_wrapper
+        is_ai_binary || is_script_binary || is_shell_wrapper
     }
 }
 
@@ -481,7 +481,7 @@ pub struct ReviewerSpawner<'a> {
     head_sha: &'a str,
     /// The prompt content (already interpolated with variables).
     prompt_content: Option<String>,
-    /// The AI model to use (e.g., "gemini-3-flash-preview").
+    /// The AI model to use (e.g., "gpt-5.3-codex").
     model: Option<String>,
     /// Number of times this reviewer has been restarted (for remediation).
     restart_count: u32,
@@ -753,22 +753,10 @@ pub fn cleanup_reviewer_temp_files(
 /// One hour in seconds, used as the default age threshold for orphan cleanup.
 pub const ORPHAN_CLEANUP_AGE_THRESHOLD_SECS: u64 = 3600;
 
-/// Select a review model with 50/50 distribution between pro and flash.
-///
-/// Uses the nanosecond component of the current system time to provide
-/// a roughly even distribution between the two models across invocations.
+/// Select the model used for Codex review invocations.
 #[must_use]
 pub fn select_review_model() -> &'static str {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    if nanos % 2 == 0 {
-        "gemini-3-pro-preview"
-    } else {
-        "gemini-3-flash-preview"
-    }
+    "gpt-5.3-codex"
 }
 /// Kill a process with SIGTERM, wait up to 5s, then SIGKILL if needed.
 ///
@@ -935,36 +923,10 @@ mod tests {
     #[test]
     fn test_select_review_model_returns_valid_model() {
         let model = select_review_model();
-        assert!(
-            model == "gemini-3-pro-preview" || model == "gemini-3-flash-preview",
-            "Expected 'gemini-3-pro-preview' or 'gemini-3-flash-preview', got '{model}'"
+        assert_eq!(
+            model, "gpt-5.3-codex",
+            "Expected 'gpt-5.3-codex', got '{model}'"
         );
-    }
-
-    #[test]
-    fn test_select_review_model_distribution() {
-        // Call the function many times and verify we get both models
-        // Note: This is probabilistic but extremely unlikely to fail
-        // (probability of all same in 100 trials ≈ 2^-99)
-        let mut saw_pro = false;
-        let mut saw_flash = false;
-
-        for _ in 0..100 {
-            let model = select_review_model();
-            match model {
-                "gemini-3-pro-preview" => saw_pro = true,
-                "gemini-3-flash-preview" => saw_flash = true,
-                _ => panic!("Unexpected model: {model}"),
-            }
-            if saw_pro && saw_flash {
-                break;
-            }
-            // Small sleep to ensure different nanosecond values
-            std::thread::sleep(std::time::Duration::from_nanos(1));
-        }
-
-        assert!(saw_pro, "Never saw gemini-3-pro-preview in 100 trials");
-        assert!(saw_flash, "Never saw gemini-3-flash-preview in 100 trials");
     }
 
     #[test]
@@ -1183,7 +1145,7 @@ mod tests {
     ///
     /// This test verifies that the cross-platform sysinfo API can correctly
     /// detect and inspect the current process. Note that the current test
-    /// process is not a "gemini" or "script" process, so `is_our_process()`
+    /// process is not a "codex" or "script" process, so `is_our_process()`
     /// should return false for it. This test verifies the sysinfo API works.
     #[test]
     fn test_process_check_current_process_exists() {
@@ -1228,7 +1190,7 @@ mod tests {
 
     /// Test the `is_our_process` detection for a non-reviewer process.
     ///
-    /// The current test process is not a "gemini" or "script" process,
+    /// The current test process is not a "codex" or "script" process,
     /// so `is_our_process` should return false.
     #[test]
     fn test_is_our_process_returns_false_for_non_reviewer() {
@@ -1245,7 +1207,7 @@ mod tests {
             temp_files: Vec::new(),
         };
 
-        // The current process is a test process, not gemini/script
+        // The current process is a test process, not codex/script
         // So is_our_process should return false
         assert!(
             !entry.is_our_process(),

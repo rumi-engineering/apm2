@@ -67,7 +67,7 @@ references[6]:
     purpose: "Underlying skill for RFC creation and review."
   - path: ../agent-native-software/SKILL.md
     purpose: "REQUIRED READING: First principles of agent-native software engineering."
-  - path: ../../security/AGENTS.md
+  - path: ../../security/AGENTS.cac.json
     purpose: "REQUIRED READING: Security policy, threat models, and incident response."
 
 decision_tree:

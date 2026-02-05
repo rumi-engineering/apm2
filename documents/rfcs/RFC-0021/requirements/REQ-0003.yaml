@@ -1,0 +1,20 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0003"
+  title: "AttentionDecisionReceiptV1 emission and CAS binding"
+  category: "FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Every accepted venture signal MUST produce an AttentionDecisionReceiptV1 stored
+    in CAS, signed by an authorized resolver, and linked by hash into admitted work metadata.
+  rationale: |
+    Routing must be an auditable fact, not an implicit runtime side effect.
+  acceptance_criteria:
+    - "Receipt exists for each accepted signal"
+    - "Receipt signature verifies under policy-authorized identity"
+    - "Work metadata contains receipt hash linkage"
+  evidence_ids: ["EVID-0003"]
+  source_refs:
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §3.2"
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §4.3"

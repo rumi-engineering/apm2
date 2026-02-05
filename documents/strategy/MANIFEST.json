@@ -1,0 +1,56 @@
+{
+  "schema": "cac.strategy.manifest.v1",
+  "schema_version": "1.0.0",
+  "kind": "strategy.manifest",
+  "meta": {
+    "manifest_id": "STRAT-MANIFEST-HTF-0001",
+    "created_at": "HTF-BND-STRAT-BUNDLE-COMPILE-001",
+    "status": "active",
+    "canonical_bundle_ref": "documents/strategy/STRATEGY_BUSINESS_BUNDLE.json"
+  },
+  "payload": {
+    "strategy_markdown_policy_ref": "documents/strategy/MARKDOWN_DEPRECATION.json",
+    "artifact_inventory": [
+      {
+        "path": "documents/strategy/BUSINESS_PLAN.json",
+        "sha256": "cc5202cdce02887daeaa6e455de2367b771bf08e8acb8b0251d42db294261ff9",
+        "bytes": 58536
+      },
+      {
+        "path": "documents/strategy/CAC_VALIDATION_REPORT.json",
+        "sha256": "d55195c45077ea8900823b40a18610705a961b660d193ebcb8609e2b0af190c7",
+        "bytes": 3374
+      },
+      {
+        "path": "documents/strategy/MARKDOWN_DEPRECATION.json",
+        "sha256": "e592d369c475109d614d34e2b36e5ed624733632d452481e7bef0909d6158366",
+        "bytes": 1508
+      },
+      {
+        "path": "documents/strategy/MASTER_STRATEGY.json",
+        "sha256": "99990dad83d0c2c1ecb8cc0d0e9f1b7b8dc238f5c5b111778c9e3956e7415ff7",
+        "bytes": 30950
+      },
+      {
+        "path": "documents/strategy/NORTH_STAR.json",
+        "sha256": "06e6fe2294f6b784ccae5a0b9081891321e604def4960dc183d4406ab5e4584f",
+        "bytes": 20738
+      },
+      {
+        "path": "documents/strategy/ROADMAP.json",
+        "sha256": "05ea54faac9b68cc5a3d16a55da82dbbbaa5371c49ce69935cd56e911f1064c6",
+        "bytes": 62976
+      },
+      {
+        "path": "documents/strategy/STRATEGY_BUSINESS_BUNDLE.json",
+        "sha256": "7c64b90b3dec35c47b4c3977cc1d9c0a40860d022ffd87ce59facc18d9c594c0",
+        "bytes": 231443
+      },
+      {
+        "path": "documents/strategy/STRATEGY_EXECUTION_REPORT.json",
+        "sha256": "765b4cb189f066f2197a7cdd08832ef75ae9dea44af8d08b6f1c80ca0661c448",
+        "bytes": 1204
+      }
+    ]
+  }
+}

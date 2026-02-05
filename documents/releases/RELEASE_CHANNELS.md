@@ -109,7 +109,7 @@ Stable releases include:
 - **SLSA L3 provenance**: Attestation of build origin and process
 - **SBOM**: Software bill of materials for dependency transparency
 
-See [../security/SIGNING_AND_VERIFICATION.md](../security/SIGNING_AND_VERIFICATION.md) for verification details.
+See [../security/SIGNING_AND_VERIFICATION.cac.json](../security/SIGNING_AND_VERIFICATION.cac.json) for verification details.
 
 ### Creating a Stable Release
 
@@ -120,7 +120,7 @@ Stable releases are automated via release-plz:
 3. When the release PR is merged, release-plz creates a version tag
 4. The tag triggers the release workflow
 
-See [../security/RELEASE_PROCEDURE.md](../security/RELEASE_PROCEDURE.md) for the complete checklist.
+See [../security/RELEASE_PROCEDURE.cac.json](../security/RELEASE_PROCEDURE.cac.json) for the complete checklist.
 
 ## Channel Comparison
 

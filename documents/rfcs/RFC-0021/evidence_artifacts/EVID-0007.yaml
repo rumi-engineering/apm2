@@ -1,0 +1,13 @@
+evidence_artifact:
+  schema_version: "2026-02-05"
+  id: "EVID-0007"
+  title: "Venture evidence hygiene enforcement"
+  category: "SECURITY_TEST"
+  status: "PLANNED"
+  description: "Evidence that venture artifacts enforce classification, redaction, and retention policy constraints."
+  requirement_ids: ["REQ-0009"]
+  ticket_ids: ["TCK-VPHI-0007"]
+  expected_contents:
+    - "classification validation logs"
+    - "redaction policy conformance checks"
+    - "retention contract validation outputs"

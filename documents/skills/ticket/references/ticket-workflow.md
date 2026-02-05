@@ -11,9 +11,9 @@ decision_tree:
           purpose: "Root-level module index, documentation discovery, and repository-wide constraints."
         - path: documents/skills/rust-standards/SKILL.md
           purpose: "Rust quality guidance; choose relevant sections later."
-        - path: documents/security/AGENTS.md
+        - path: documents/security/AGENTS.cac.json
           purpose: "Security documentation index and quick reference."
-        - path: documents/security/SECURITY_POLICY.md
+        - path: documents/security/SECURITY_POLICY.cac.json
           purpose: "Security invariants and modes."
         - path: documents/theory/agent_native_architecture.json
           purpose: "Core philosophy, architecture, and constraints."

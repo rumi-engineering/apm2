@@ -38,7 +38,7 @@ references[20]:
     purpose: "Mode #65: Deontic (Authority) Reasoning"
   - path: "@documents/skills/modes-of-reasoning/assets/80-debiasing-epistemic-hygiene.json"
     purpose: "Mode #80: Debiasing / Epistemic Hygiene"
-  - path: "@documents/security/AGENTS.md"
+  - path: "@documents/security/AGENTS.cac.json"
     purpose: "Security Documentation"
   - path: "@documents/skills/rust-standards/references/15_errors_panics_diagnostics.md"
     purpose: "RS-15: Errors, Panics, Diagnostics"

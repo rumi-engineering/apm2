@@ -22,9 +22,9 @@ use crate::util::print_non_authoritative_banner;
 /// Review type determines which prompt and status check to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewType {
-    /// Security review using Gemini and `SECURITY_REVIEW_PROMPT.md`
+    /// Security review using Codex and `SECURITY_REVIEW_PROMPT.md`
     Security,
-    /// Code quality review using Gemini and `CODE_QUALITY_PROMPT.md`
+    /// Code quality review using Codex and `CODE_QUALITY_PROMPT.md`
     Quality,
     /// User acceptance testing (manual sign-off)
     Uat,
@@ -61,7 +61,7 @@ impl ReviewType {
     /// Get the AI tool command for this review type.
     pub const fn ai_tool(self) -> Option<&'static str> {
         match self {
-            Self::Security | Self::Quality => Some("gemini"),
+            Self::Security | Self::Quality => Some("codex"),
             Self::Uat => None, // UAT is manual
         }
     }
@@ -73,7 +73,7 @@ impl ReviewType {
 /// 1. Parses the PR URL to extract owner/repo and PR number
 /// 2. Gets the HEAD SHA of the PR
 /// 3. Reads the security review prompt
-/// 4. Spawns Gemini to run the review (if available)
+/// 4. Spawns Codex to run the review (if available)
 /// 5. The AI reviewer will post comments and update the status
 ///
 /// # Arguments
@@ -97,7 +97,7 @@ pub fn run_security(pr_url: &str, emit_internal: bool) -> Result<()> {
 /// 1. Parses the PR URL to extract owner/repo and PR number
 /// 2. Gets the HEAD SHA of the PR
 /// 3. Reads the code quality review prompt
-/// 4. Spawns Gemini to run the review (if available)
+/// 4. Spawns Codex to run the review (if available)
 /// 5. The AI reviewer will post comments and update the status
 ///
 /// # Arguments
@@ -321,10 +321,10 @@ fn run_ai_review(
     match spawner.spawn_sync() {
         Ok(result) if result.status.success() => {
             println!(
-                "  Gemini {} review completed.",
+                "  Codex {} review completed.",
                 review_type.display_name().to_lowercase()
             );
-            println!("\n  Note: Gemini should have posted a comment and updated the status.");
+            println!("\n  Note: Codex should have posted a comment and updated the status.");
             println!("  If not, you may need to update the status manually:");
             println!("    gh api --method POST /repos/{owner_repo}/statuses/{head_sha} \\");
             println!("      -f state=success -f context={status_context} \\");
@@ -334,11 +334,11 @@ fn run_ai_review(
             );
         },
         Ok(result) => {
-            println!("  Warning: Gemini exited with status: {}", result.status);
+            println!("  Warning: Codex exited with status: {}", result.status);
             println!("  You may need to run the review manually or check the output.");
         },
         Err(e) => {
-            println!("  Warning: Failed to run Gemini: {e}");
+            println!("  Warning: Failed to run Codex: {e}");
             println!("  You may need to run the review manually or check the output.");
         },
     }
@@ -639,8 +639,8 @@ mod tests {
 
     #[test]
     fn test_review_type_ai_tool() {
-        assert_eq!(ReviewType::Security.ai_tool(), Some("gemini"));
-        assert_eq!(ReviewType::Quality.ai_tool(), Some("gemini"));
+        assert_eq!(ReviewType::Security.ai_tool(), Some("codex"));
+        assert_eq!(ReviewType::Quality.ai_tool(), Some("codex"));
         assert_eq!(ReviewType::Uat.ai_tool(), None);
     }
 

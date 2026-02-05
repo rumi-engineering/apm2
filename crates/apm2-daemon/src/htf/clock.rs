@@ -72,7 +72,8 @@ pub const MAX_NAMESPACE_LEN: usize = 128;
 
 /// Maximum allowed HLC offset from physical time in nanoseconds.
 ///
-/// Per `THREAT_MODEL.md`, time is treated as an adversarial input. This
+/// Per `documents/security/THREAT_MODEL.cac.json`, time is treated as an
+/// adversarial input. This
 /// constant defines the maximum drift tolerance when receiving HLC timestamps
 /// from remote peers. A malicious peer could attempt to push a node's HLC
 /// arbitrarily far into the future, irreversibly desynchronizing temporal
@@ -127,7 +128,8 @@ pub enum ClockError {
     ///
     /// This error indicates a potential attack where a malicious peer attempts
     /// to push the local HLC arbitrarily far into the future. Per
-    /// `THREAT_MODEL.md`, time is treated as an adversarial input.
+    /// `documents/security/THREAT_MODEL.cac.json`, time is treated as an
+    /// adversarial input.
     #[error(
         "remote HLC drift exceeded: remote_wall_ns={remote_wall_ns}, \
          physical_now={physical_now}, offset={offset_ns}ns, max_allowed={max_allowed_ns}ns"
@@ -641,7 +643,8 @@ impl HolonicClock {
     ///
     /// # Security
     ///
-    /// Per `THREAT_MODEL.md`, time is treated as an adversarial input. This
+    /// Per `documents/security/THREAT_MODEL.cac.json`, time is treated as an
+    /// adversarial input. This
     /// function validates that the remote HLC is not too far ahead of physical
     /// time to prevent malicious peers from pushing the local HLC arbitrarily
     /// far into the future.
@@ -673,7 +676,8 @@ impl HolonicClock {
             .unwrap_or(0);
 
         // SECURITY: Validate remote HLC drift against physical time.
-        // Per THREAT_MODEL.md, time is an adversarial input. A malicious peer
+        // Per documents/security/THREAT_MODEL.cac.json, time is an adversarial
+        // input. A malicious peer
         // could attempt to push our HLC arbitrarily far into the future,
         // irreversibly desynchronizing temporal ordering.
         if remote_hlc.wall_ns > physical_now {
@@ -1439,7 +1443,8 @@ mod tests {
     /// TCK-00240 security: Verify that malicious future HLC timestamps are
     /// rejected.
     ///
-    /// Per `THREAT_MODEL.md`, time is treated as an adversarial input. A
+    /// Per `documents/security/THREAT_MODEL.cac.json`, time is treated as an
+    /// adversarial input. A
     /// malicious peer could attempt to push a node's HLC arbitrarily far into
     /// the future (e.g., year 2100), irreversibly desynchronizing temporal
     /// ordering.

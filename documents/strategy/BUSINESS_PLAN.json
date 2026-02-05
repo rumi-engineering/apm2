@@ -1,0 +1,1778 @@
+{
+  "schema": "cac.strategy.business_plan.v1",
+  "schema_version": "1.0.0",
+  "kind": "strategy.business_plan",
+  "meta": {
+    "artifact_id": "STRAT-BUSINESS-PLAN-HTF-0001",
+    "authority": "normative",
+    "created_at": "HTF-BND-STRAT-BUNDLE-COMPILE-001",
+    "normalization_version": "strategy-business-normalizer.v2.cac_json",
+    "source_bundle_ref": "documents/strategy/STRATEGY_BUSINESS_BUNDLE.json",
+    "status": "active"
+  },
+  "payload": {
+    "assumptions_register": [
+      {
+        "assumption_id": "ASSUMP-STRAT-001",
+        "blocking_for_tier2plus_promotion": true,
+        "expiration_htf_boundary_id": "HTF-BND-P1-CLOSE",
+        "owner_locus": "Verification Council",
+        "statement": "Evidence paths referenced in this bundle are target intents and may not yet be populated."
+      },
+      {
+        "assumption_id": "ASSUMP-FIN-001",
+        "blocking_for_tier2plus_promotion": true,
+        "expiration_htf_boundary_id": "HTF-BND-P3-ECON-CLOSE",
+        "owner_locus": "Finance Council",
+        "statement": "Payment rail adapters can emit replay-safe receipts with deterministic ids."
+      },
+      {
+        "assumption_id": "ASSUMP-BIO-001",
+        "blocking_for_tier2plus_promotion": true,
+        "expiration_htf_boundary_id": "HTF-BND-P5-CLOSE",
+        "owner_locus": "Bio Council",
+        "statement": "External replication partners will provide signed evidence compatible with APM2 evidence contracts."
+      }
+    ],
+    "business_model": {
+      "model_id": "BUSINESS-MODEL-001",
+      "revenue_claim_refs": [
+        "BPC-01",
+        "BPC-02",
+        "BPC-03",
+        "BPC-04",
+        "BPC-05",
+        "BPC-06",
+        "MSC-06"
+      ],
+      "security_floor_policy_ref": "SPEND-POL-SECURITY-FLOOR",
+      "value_hypothesis": "Verification-grade autonomy infrastructure commands a trust premium and compounds cost/performance advantages through recursive verifier improvement.",
+      "verification_floor_policy_ref": "SPEND-POL-VERIFICATION-FLOOR"
+    },
+    "capital_allocation_model": {
+      "model_id": "CAPITAL-ALLOC-001",
+      "reinvestment_rules": [
+        {
+          "allocation_floor": {
+            "comparator": ">=",
+            "unit": "ratio_of_revenue",
+            "value": 0.22
+          },
+          "constraint": "Cannot be reduced when tier2plus_terminal_receipt_coverage < 1.0",
+          "rule_id": "CAP-RULE-VERIFICATION-COMPOUNDING"
+        },
+        {
+          "allocation_floor": {
+            "comparator": ">=",
+            "unit": "ratio_of_revenue",
+            "value": 0.10
+          },
+          "constraint": "Cannot be reduced when prompt_injection_escape_rate_tier2plus > 0",
+          "rule_id": "CAP-RULE-SECURITY-FLOOR"
+        },
+        {
+          "allocation_ceiling": {
+            "comparator": "<=",
+            "unit": "ratio_of_revenue",
+            "value": 0.24
+          },
+          "constraint": "Blocked if gross_margin < 0.65",
+          "rule_id": "CAP-RULE-GTM-SCALING"
+        }
+      ],
+      "tradeoff_constraints": [
+        "verification_floor_overrides_growth_spend",
+        "security_floor_overrides_growth_spend"
+      ]
+    },
+    "competition_and_moat_model": {
+      "moat_hypotheses": [
+        {
+          "decay_indicator_metric_ref": "MET-COMP-DECAY-VERIFIER-WORK",
+          "falsification_trigger": "competitor_verified_transition_cost_advantage_ratio > 1.0 for two consecutive governance windows",
+          "hypothesis_id": "MOAT-HYP-001",
+          "metric_ref": "MET-VERIFIER-WORK-P95",
+          "statement": "Verifier compounding reduces authoritative transition cost faster than competitors."
+        },
+        {
+          "decay_indicator_metric_ref": "MET-COMP-DECAY-TRUST-INCIDENTS",
+          "falsification_trigger": "sev0_sev1_cross_tenant_incidents > 0 in paid scope",
+          "hypothesis_id": "MOAT-HYP-002",
+          "metric_ref": "MET-NRR-RATIO",
+          "statement": "Containment trust premium sustains enterprise retention."
+        },
+        {
+          "decay_indicator_metric_ref": "MET-COMP-DECAY-FIN-EXCEPTIONS",
+          "falsification_trigger": "manual_intervention_ratio > 0.10 or fraud_loss_ratio > 0.001",
+          "hypothesis_id": "MOAT-HYP-003",
+          "metric_ref": "MET-FIN-STP-RATIO",
+          "statement": "Principal-bound finance autonomy lowers operating friction while preserving fraud containment."
+        }
+      ],
+      "model_id": "COMP-MOAT-001"
+    },
+    "contract_surface": {
+      "agent_identity_contracts": [
+        {
+          "agent_class": "governance_orchestrator",
+          "agent_id": "AGENT-ORCH-001",
+          "attestation_ref": "ATTEST-AGENT-ORCH-001",
+          "capability_scope_refs": [
+            "CAP-SCOPE-GOV-001"
+          ],
+          "confidentiality_label": "high",
+          "integrity_label": "high",
+          "principal_binding_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "status": "active"
+        },
+        {
+          "agent_class": "financial_billing",
+          "agent_id": "AGENT-BILLING-001",
+          "attestation_ref": "ATTEST-AGENT-BILLING-001",
+          "capability_scope_refs": [
+            "CAP-SCOPE-FIN-BILLING"
+          ],
+          "confidentiality_label": "high",
+          "integrity_label": "high",
+          "principal_binding_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "status": "active"
+        },
+        {
+          "agent_class": "financial_collections",
+          "agent_id": "AGENT-COLLECTIONS-001",
+          "attestation_ref": "ATTEST-AGENT-COLLECTIONS-001",
+          "capability_scope_refs": [
+            "CAP-SCOPE-FIN-COLLECTIONS"
+          ],
+          "confidentiality_label": "high",
+          "integrity_label": "high",
+          "principal_binding_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "status": "active"
+        },
+        {
+          "agent_class": "financial_vendor_payments",
+          "agent_id": "AGENT-VENDORPAY-001",
+          "attestation_ref": "ATTEST-AGENT-VENDORPAY-001",
+          "capability_scope_refs": [
+            "CAP-SCOPE-FIN-VENDORPAY"
+          ],
+          "confidentiality_label": "high",
+          "integrity_label": "high",
+          "principal_binding_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "status": "active"
+        },
+        {
+          "agent_class": "financial_treasury_transfer",
+          "agent_id": "AGENT-TREASURY-001",
+          "attestation_ref": "ATTEST-AGENT-TREASURY-001",
+          "capability_scope_refs": [
+            "CAP-SCOPE-FIN-TREASURY"
+          ],
+          "confidentiality_label": "high",
+          "integrity_label": "high",
+          "principal_binding_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "status": "active"
+        },
+        {
+          "agent_class": "financial_contractor_disbursement",
+          "agent_id": "AGENT-PAYROLL-001",
+          "attestation_ref": "ATTEST-AGENT-PAYROLL-001",
+          "capability_scope_refs": [
+            "CAP-SCOPE-FIN-PAYROLL"
+          ],
+          "confidentiality_label": "high",
+          "integrity_label": "high",
+          "principal_binding_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "status": "active"
+        },
+        {
+          "agent_class": "financial_tax_reserve",
+          "agent_id": "AGENT-TAX-001",
+          "attestation_ref": "ATTEST-AGENT-TAX-001",
+          "capability_scope_refs": [
+            "CAP-SCOPE-FIN-TAX"
+          ],
+          "confidentiality_label": "high",
+          "integrity_label": "high",
+          "principal_binding_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "status": "active"
+        }
+      ],
+      "business_claim_contracts": [
+        {
+          "claim_id": "BPC-01",
+          "claim_type": "business_growth_enterprise",
+          "evidence_refs": [
+            "EVID-BP-A-01"
+          ],
+          "gate_refs": [
+            "PHASE-3-TO-4"
+          ],
+          "law_refs": [
+            "LAW-08"
+          ],
+          "metric_refs": [
+            "MET-ENTERPRISE-CELLS-PAID",
+            "MET-NRR-RATIO"
+          ],
+          "owner_locus": "Revenue GM + Platform Council",
+          "phase_ref": "PHASE-3",
+          "statement": "Enterprise cells paid and retention reach product-line A targets.",
+          "status": "active"
+        },
+        {
+          "claim_id": "BPC-02",
+          "claim_type": "business_growth_prosumer",
+          "evidence_refs": [
+            "EVID-BP-B-01"
+          ],
+          "gate_refs": [
+            "PHASE-4-TO-5"
+          ],
+          "law_refs": [
+            "LAW-05",
+            "LAW-08"
+          ],
+          "metric_refs": [
+            "MET-PAID-USERS",
+            "MET-MONTHLY-CHURN",
+            "MET-PRIVACY-SEV0-1"
+          ],
+          "owner_locus": "Product GM + Security Council",
+          "phase_ref": "PHASE-4",
+          "statement": "Prosumer private cluster adoption reaches scale with preserved privacy.",
+          "status": "active"
+        },
+        {
+          "claim_id": "BPC-03",
+          "claim_type": "verification_economics",
+          "evidence_refs": [
+            "EVID-BP-FIN-03"
+          ],
+          "gate_refs": [
+            "PHASE-3-TO-4"
+          ],
+          "law_refs": [
+            "LAW-06",
+            "LAW-08"
+          ],
+          "metric_refs": [
+            "MET-VERIFICATION-COST-SHARE",
+            "MET-VERIFIER-WORK-P95"
+          ],
+          "owner_locus": "Runtime Council + Verification Council",
+          "phase_ref": "PHASE-3",
+          "statement": "Verification cost share remains bounded while quality does not regress.",
+          "status": "active"
+        },
+        {
+          "claim_id": "BPC-04",
+          "claim_type": "security_adjusted_margin",
+          "evidence_refs": [
+            "EVID-BP-FIN-04"
+          ],
+          "gate_refs": [
+            "PHASE-3-TO-4"
+          ],
+          "law_refs": [
+            "LAW-05",
+            "LAW-08"
+          ],
+          "metric_refs": [
+            "MET-SECURITY-ADJUSTED-MARGIN",
+            "MET-TERMINAL-RECEIPT-COVERAGE"
+          ],
+          "owner_locus": "Finance Council + Security Council",
+          "phase_ref": "PHASE-3",
+          "statement": "Security-adjusted gross margin remains above floor with zero rigor regressions.",
+          "status": "active"
+        },
+        {
+          "claim_id": "BPC-05",
+          "claim_type": "principal_bound_finance_autonomy",
+          "evidence_refs": [
+            "EVID-FIN-AUTONOMY-CONTROL"
+          ],
+          "gate_refs": [
+            "FIN-GATE-001",
+            "FIN-GATE-002",
+            "FIN-GATE-003",
+            "FIN-GATE-004",
+            "FIN-GATE-005",
+            "FIN-GATE-006"
+          ],
+          "law_refs": [
+            "LAW-05",
+            "LAW-09",
+            "LAW-15"
+          ],
+          "metric_refs": [
+            "MET-FIN-STP-RATIO",
+            "MET-FIN-MANUAL-RATIO",
+            "MET-FIN-EXCEPTION-LATENCY-P95",
+            "MET-FIN-FRAUD-LOSS-RATIO",
+            "MET-REVOCATION-MISS-COUNT"
+          ],
+          "owner_locus": "Finance Council + Security Council",
+          "phase_ref": "PHASE-3",
+          "statement": "All autonomous financial actions execute under principal-bound delegated authority with fail-closed policy and reconciliation guarantees.",
+          "status": "active"
+        },
+        {
+          "claim_id": "BPC-06",
+          "claim_type": "zero_employee_llc_automation",
+          "evidence_refs": [
+            "EVID-BP-LEGAL-001"
+          ],
+          "gate_refs": [
+            "PHASE-3-TO-4",
+            "BRIDGE-GATE-009"
+          ],
+          "law_refs": [
+            "LAW-05",
+            "LAW-09",
+            "LAW-12"
+          ],
+          "metric_refs": [
+            "MET-EMPLOYEE-COUNT",
+            "MET-LLC-LIFECYCLE-AUTOMATION-COVERAGE",
+            "MET-LLC-FORMATION-AUTOMATION-FAILURES",
+            "MET-LEGAL-HARD-CONSTRAINT-ESCALATION-RECEIPT-COVERAGE"
+          ],
+          "owner_locus": "Finance Council + Governance Council",
+          "phase_ref": "PHASE-3",
+          "statement": "Maintain employee_count == 0 while automating LLC formation and lifecycle management under principal-bound delegated control.",
+          "status": "active"
+        },
+        {
+          "claim_id": "MSC-06",
+          "claim_type": "commercial_durability",
+          "evidence_refs": [
+            "EVID-PHASE3-MSC06"
+          ],
+          "gate_refs": [
+            "PHASE-3-TO-4"
+          ],
+          "law_refs": [
+            "LAW-08",
+            "LAW-12"
+          ],
+          "metric_refs": [
+            "MET-ARR-USD",
+            "MET-GROSS-MARGIN-RATIO",
+            "MET-LOGO-RETENTION-RATIO"
+          ],
+          "owner_locus": "Board + Finance Council",
+          "phase_ref": "PHASE-3",
+          "statement": "Build commercially durable revenue from governed autonomy stack.",
+          "status": "active"
+        }
+      ],
+      "delegation_contracts": [
+        {
+          "authority_scope": "strategy_governance_and_gate_orchestration",
+          "delegate_agent_ref": "AGENT-ORCH-001",
+          "delegation_id": "DELEG-ORCH-001",
+          "financial_action_scope": "none",
+          "lease_policy_ref": "LEASE-POL-GOV-001",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "proof_ref": "PROOF-DELEG-ORCH-001",
+          "revocation_rule_ref": "REVOCATION-RULE-001",
+          "spend_limit_policy_ref": "SPEND-POL-GOV-001"
+        },
+        {
+          "authority_scope": "subscription_billing_and_invoice_generation",
+          "delegate_agent_ref": "AGENT-BILLING-001",
+          "delegation_id": "DELEG-BILLING-001",
+          "financial_action_scope": "FIN-ACT-001",
+          "lease_policy_ref": "LEASE-POL-FIN-001",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "proof_ref": "PROOF-DELEG-BILLING-001",
+          "revocation_rule_ref": "REVOCATION-RULE-001",
+          "spend_limit_policy_ref": "SPEND-POL-FIN-BILLING"
+        },
+        {
+          "authority_scope": "collections_and_dunning",
+          "delegate_agent_ref": "AGENT-COLLECTIONS-001",
+          "delegation_id": "DELEG-COLLECTIONS-001",
+          "financial_action_scope": "FIN-ACT-002",
+          "lease_policy_ref": "LEASE-POL-FIN-001",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "proof_ref": "PROOF-DELEG-COLLECTIONS-001",
+          "revocation_rule_ref": "REVOCATION-RULE-001",
+          "spend_limit_policy_ref": "SPEND-POL-FIN-COLLECTIONS"
+        },
+        {
+          "authority_scope": "approved_vendor_disbursement",
+          "delegate_agent_ref": "AGENT-VENDORPAY-001",
+          "delegation_id": "DELEG-VENDORPAY-001",
+          "financial_action_scope": "FIN-ACT-003",
+          "lease_policy_ref": "LEASE-POL-FIN-001",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "proof_ref": "PROOF-DELEG-VENDORPAY-001",
+          "revocation_rule_ref": "REVOCATION-RULE-001",
+          "spend_limit_policy_ref": "SPEND-POL-FIN-VENDORPAY"
+        },
+        {
+          "authority_scope": "intra_treasury_transfers",
+          "delegate_agent_ref": "AGENT-TREASURY-001",
+          "delegation_id": "DELEG-TREASURY-001",
+          "financial_action_scope": "FIN-ACT-004",
+          "lease_policy_ref": "LEASE-POL-FIN-001",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "proof_ref": "PROOF-DELEG-TREASURY-001",
+          "revocation_rule_ref": "REVOCATION-RULE-001",
+          "spend_limit_policy_ref": "SPEND-POL-FIN-TREASURY"
+        },
+        {
+          "authority_scope": "contractor_disbursement_only",
+          "delegate_agent_ref": "AGENT-PAYROLL-001",
+          "delegation_id": "DELEG-PAYROLL-001",
+          "financial_action_scope": "FIN-ACT-005",
+          "lease_policy_ref": "LEASE-POL-FIN-001",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "proof_ref": "PROOF-DELEG-PAYROLL-001",
+          "revocation_rule_ref": "REVOCATION-RULE-001",
+          "spend_limit_policy_ref": "SPEND-POL-FIN-PAYROLL"
+        },
+        {
+          "authority_scope": "tax_and_reserve_provisioning",
+          "delegate_agent_ref": "AGENT-TAX-001",
+          "delegation_id": "DELEG-TAX-001",
+          "financial_action_scope": "FIN-ACT-006",
+          "lease_policy_ref": "LEASE-POL-FIN-001",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "proof_ref": "PROOF-DELEG-TAX-001",
+          "revocation_rule_ref": "REVOCATION-RULE-001",
+          "spend_limit_policy_ref": "SPEND-POL-FIN-TAX"
+        }
+      ],
+      "finance_autonomy_contracts": [
+        {
+          "action_class": "FIN-ACT-001",
+          "autonomy_id": "FIN-AUT-001",
+          "exception_rate_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.02
+          },
+          "fraud_loss_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.0005
+          },
+          "ledger_reconciliation_sla": {
+            "comparator": "<=",
+            "unit": "ledger_ticks_p95",
+            "value": 45
+          },
+          "manual_intervention_target": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.02
+          },
+          "shutdown_trigger_predicates": [
+            "revocation_miss_count > 0",
+            "reconciliation_gap_count > 0"
+          ],
+          "straight_through_processing_target": {
+            "comparator": ">=",
+            "unit": "ratio",
+            "value": 0.98
+          }
+        },
+        {
+          "action_class": "FIN-ACT-002",
+          "autonomy_id": "FIN-AUT-002",
+          "exception_rate_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.04
+          },
+          "fraud_loss_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.0007
+          },
+          "ledger_reconciliation_sla": {
+            "comparator": "<=",
+            "unit": "ledger_ticks_p95",
+            "value": 60
+          },
+          "manual_intervention_target": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.04
+          },
+          "shutdown_trigger_predicates": [
+            "counterparty_allowlist_failures > 0",
+            "reconciliation_gap_count > 0"
+          ],
+          "straight_through_processing_target": {
+            "comparator": ">=",
+            "unit": "ratio",
+            "value": 0.96
+          }
+        },
+        {
+          "action_class": "FIN-ACT-003",
+          "autonomy_id": "FIN-AUT-003",
+          "exception_rate_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.08
+          },
+          "fraud_loss_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.0010
+          },
+          "ledger_reconciliation_sla": {
+            "comparator": "<=",
+            "unit": "ledger_ticks_p95",
+            "value": 75
+          },
+          "manual_intervention_target": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.10
+          },
+          "shutdown_trigger_predicates": [
+            "vendor_risk_score_high_count > 0",
+            "reconciliation_gap_count > 0"
+          ],
+          "straight_through_processing_target": {
+            "comparator": ">=",
+            "unit": "ratio",
+            "value": 0.90
+          }
+        },
+        {
+          "action_class": "FIN-ACT-004",
+          "autonomy_id": "FIN-AUT-004",
+          "exception_rate_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.05
+          },
+          "fraud_loss_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.0008
+          },
+          "ledger_reconciliation_sla": {
+            "comparator": "<=",
+            "unit": "ledger_ticks_p95",
+            "value": 75
+          },
+          "manual_intervention_target": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.08
+          },
+          "shutdown_trigger_predicates": [
+            "liquidity_buffer_below_floor == true",
+            "reconciliation_gap_count > 0"
+          ],
+          "straight_through_processing_target": {
+            "comparator": ">=",
+            "unit": "ratio",
+            "value": 0.92
+          }
+        },
+        {
+          "action_class": "FIN-ACT-005",
+          "autonomy_id": "FIN-AUT-005",
+          "exception_rate_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.06
+          },
+          "fraud_loss_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.0007
+          },
+          "ledger_reconciliation_sla": {
+            "comparator": "<=",
+            "unit": "ledger_ticks_p95",
+            "value": 90
+          },
+          "manual_intervention_target": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.12
+          },
+          "shutdown_trigger_predicates": [
+            "headcount_hash_mismatch_count > 0",
+            "revocation_miss_count > 0"
+          ],
+          "straight_through_processing_target": {
+            "comparator": ">=",
+            "unit": "ratio",
+            "value": 0.88
+          }
+        },
+        {
+          "action_class": "FIN-ACT-006",
+          "autonomy_id": "FIN-AUT-006",
+          "exception_rate_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.05
+          },
+          "fraud_loss_limit": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.0005
+          },
+          "ledger_reconciliation_sla": {
+            "comparator": "<=",
+            "unit": "ledger_ticks_p95",
+            "value": 90
+          },
+          "manual_intervention_target": {
+            "comparator": "<=",
+            "unit": "ratio",
+            "value": 0.10
+          },
+          "shutdown_trigger_predicates": [
+            "jurisdiction_mismatch_count > 0",
+            "tax_reserve_gap_ratio > 0.05"
+          ],
+          "straight_through_processing_target": {
+            "comparator": ">=",
+            "unit": "ratio",
+            "value": 0.90
+          }
+        }
+      ],
+      "financial_action_contracts": [
+        {
+          "account_ref": "ACCOUNT-AR-001",
+          "action_id": "FIN-ACT-001",
+          "action_type": "subscription_billing",
+          "amount": {
+            "comparator": "<=",
+            "unit": "usd_per_invoice",
+            "value": 50000
+          },
+          "approval_mode": "straight_through_if_all_checks_pass",
+          "counterparty_ref": "COUNTERPARTY-CUSTOMER-POOL",
+          "currency": "USD",
+          "execution_receipt_ref": "EVID-FIN-BILLING",
+          "policy_checks": [
+            "SPEND-POL-FIN-BILLING",
+            "FIN-GATE-001",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "reconciliation_ref": "RECON-BILLING-COLLECTION-001",
+          "reversal_or_compensation_ref": "COMP-FIN-001"
+        },
+        {
+          "account_ref": "ACCOUNT-AR-001",
+          "action_id": "FIN-ACT-002",
+          "action_type": "collections",
+          "amount": {
+            "comparator": "<=",
+            "unit": "usd_per_collection_event",
+            "value": 50000
+          },
+          "approval_mode": "straight_through_if_all_checks_pass",
+          "counterparty_ref": "COUNTERPARTY-CUSTOMER-POOL",
+          "currency": "USD",
+          "execution_receipt_ref": "EVID-FIN-COLLECTIONS",
+          "policy_checks": [
+            "SPEND-POL-FIN-COLLECTIONS",
+            "FIN-GATE-002",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "reconciliation_ref": "RECON-BILLING-COLLECTION-001",
+          "reversal_or_compensation_ref": "COMP-FIN-002"
+        },
+        {
+          "account_ref": "ACCOUNT-AP-001",
+          "action_id": "FIN-ACT-003",
+          "action_type": "vendor_payment",
+          "amount": {
+            "comparator": "<=",
+            "unit": "usd_per_payment",
+            "value": 250000
+          },
+          "approval_mode": "straight_through_if_all_checks_pass",
+          "counterparty_ref": "COUNTERPARTY-VENDOR-ALLOWLIST",
+          "currency": "USD",
+          "execution_receipt_ref": "EVID-FIN-VENDOR-PAY",
+          "policy_checks": [
+            "SPEND-POL-FIN-VENDORPAY",
+            "FIN-GATE-003",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "reconciliation_ref": "RECON-VENDOR-TREASURY-001",
+          "reversal_or_compensation_ref": "COMP-FIN-003"
+        },
+        {
+          "account_ref": "ACCOUNT-TREASURY-001",
+          "action_id": "FIN-ACT-004",
+          "action_type": "treasury_transfer",
+          "amount": {
+            "comparator": "<=",
+            "unit": "usd_per_transfer",
+            "value": 750000
+          },
+          "approval_mode": "straight_through_if_all_checks_pass",
+          "counterparty_ref": "COUNTERPARTY-INTERNAL-TREASURY",
+          "currency": "USD",
+          "execution_receipt_ref": "EVID-FIN-TREASURY",
+          "policy_checks": [
+            "SPEND-POL-FIN-TREASURY",
+            "FIN-GATE-004",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "reconciliation_ref": "RECON-VENDOR-TREASURY-001",
+          "reversal_or_compensation_ref": "COMP-FIN-004"
+        },
+        {
+          "account_ref": "ACCOUNT-PAYROLL-001",
+          "action_id": "FIN-ACT-005",
+          "action_type": "contractor_disbursement_only",
+          "amount": {
+            "comparator": "<=",
+            "unit": "usd_per_contractor_pay_cycle",
+            "value": 400000
+          },
+          "approval_mode": "straight_through_if_all_checks_pass",
+          "counterparty_ref": "COUNTERPARTY-PAYROLL-ALLOWLIST",
+          "currency": "USD",
+          "execution_receipt_ref": "EVID-FIN-PAYROLL",
+          "policy_checks": [
+            "SPEND-POL-FIN-PAYROLL",
+            "FIN-GATE-005",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "reconciliation_ref": "RECON-PAYROLL-TAX-001",
+          "reversal_or_compensation_ref": "COMP-FIN-005"
+        },
+        {
+          "account_ref": "ACCOUNT-TAX-001",
+          "action_id": "FIN-ACT-006",
+          "action_type": "tax_reserve_provisioning",
+          "amount": {
+            "comparator": "<=",
+            "unit": "usd_per_tax_window",
+            "value": 300000
+          },
+          "approval_mode": "straight_through_if_all_checks_pass",
+          "counterparty_ref": "COUNTERPARTY-TAX-AUTHORITY-ALLOWLIST",
+          "currency": "USD",
+          "execution_receipt_ref": "EVID-FIN-TAX",
+          "policy_checks": [
+            "SPEND-POL-FIN-TAX",
+            "FIN-GATE-006",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "reconciliation_ref": "RECON-PAYROLL-TAX-001",
+          "reversal_or_compensation_ref": "COMP-FIN-006"
+        }
+      ],
+      "principal_contracts": [
+        {
+          "jurisdiction_refs": [
+            "JUR-US-DE-001"
+          ],
+          "legal_role": "sole_proprietor",
+          "principal_handle": "Shovon Hasan (@anveio)",
+          "principal_id": "PRINCIPAL-ROOT-ANVEIO",
+          "revocation_authority_ref": "REVOCATION-AUTHORITY-ROOT-001",
+          "root_authority_key_refs": [
+            "KEY-ROOT-ED25519-001"
+          ],
+          "status": "active"
+        }
+      ],
+      "spend_policy_contracts": [
+        {
+          "anomaly_rules": [
+            "deny_if_unmapped_authority_edge"
+          ],
+          "counterparty_allowlist_ref": "ALLOWLIST-NONE",
+          "escalation_rules": [
+            "escalate_to_security_council"
+          ],
+          "hard_denials": [
+            "deny_if_principal_binding_invalid"
+          ],
+          "policy_id": "SPEND-POL-GOV-001",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "required_gate_refs": [
+            "PHASE-1-TO-2",
+            "PHASE-2-TO-3",
+            "PHASE-3-TO-4",
+            "PHASE-4-TO-5"
+          ],
+          "risk_tier_limits": "governance_actions_only_no_external_financial_effect",
+          "velocity_limits": "n_a"
+        },
+        {
+          "anomaly_rules": [
+            "deny_if_duplicate_invoice_hash",
+            "deny_if_customer_status_not_active"
+          ],
+          "counterparty_allowlist_ref": "ALLOWLIST-CUSTOMERS-001",
+          "escalation_rules": [
+            "escalate_to_finance_council_if_exception_rate>0.05"
+          ],
+          "hard_denials": [
+            "deny_if_revocation_uncertain",
+            "deny_if_freshness_fail"
+          ],
+          "policy_id": "SPEND-POL-FIN-BILLING",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "required_gate_refs": [
+            "FIN-GATE-001",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "risk_tier_limits": "tier_low amount<=50000_usd_per_invoice",
+          "velocity_limits": "daily_invoice_count<=2000"
+        },
+        {
+          "anomaly_rules": [
+            "deny_if_bank_account_mismatch",
+            "deny_if_chargeback_pattern_detected"
+          ],
+          "counterparty_allowlist_ref": "ALLOWLIST-CUSTOMERS-001",
+          "escalation_rules": [
+            "escalate_to_finance_council_if_exception_rate>0.05"
+          ],
+          "hard_denials": [
+            "deny_if_revocation_uncertain",
+            "deny_if_reconciliation_gap"
+          ],
+          "policy_id": "SPEND-POL-FIN-COLLECTIONS",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "required_gate_refs": [
+            "FIN-GATE-002",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "risk_tier_limits": "tier_low amount<=50000_usd_per_collection_event",
+          "velocity_limits": "daily_collection_events<=2500"
+        },
+        {
+          "anomaly_rules": [
+            "deny_if_po_mismatch",
+            "deny_if_vendor_risk_score_high"
+          ],
+          "counterparty_allowlist_ref": "ALLOWLIST-VENDORS-001",
+          "escalation_rules": [
+            "escalate_to_finance_council_if_single_payment>150000"
+          ],
+          "hard_denials": [
+            "deny_if_counterparty_not_allowlisted",
+            "deny_if_revocation_uncertain"
+          ],
+          "policy_id": "SPEND-POL-FIN-VENDORPAY",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "required_gate_refs": [
+            "FIN-GATE-003",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "risk_tier_limits": "tier_medium amount<=250000_usd_per_payment",
+          "velocity_limits": "daily_outflow_usd<=750000"
+        },
+        {
+          "anomaly_rules": [
+            "deny_if_liquidity_buffer_below_floor",
+            "deny_if_duplicate_transfer_nonce"
+          ],
+          "counterparty_allowlist_ref": "ALLOWLIST-INTERNAL-TREASURY-001",
+          "escalation_rules": [
+            "escalate_to_finance_council_if_transfer>500000"
+          ],
+          "hard_denials": [
+            "deny_if_revocation_uncertain",
+            "deny_if_stop_state_fail"
+          ],
+          "policy_id": "SPEND-POL-FIN-TREASURY",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "required_gate_refs": [
+            "FIN-GATE-004",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "risk_tier_limits": "tier_medium amount<=750000_usd_per_transfer",
+          "velocity_limits": "daily_transfer_usd<=2000000"
+        },
+        {
+          "anomaly_rules": [
+            "deny_if_contractor_registry_hash_mismatch",
+            "deny_if_bank_change_without_dual_receipt"
+          ],
+          "counterparty_allowlist_ref": "ALLOWLIST-PAYROLL-001",
+          "escalation_rules": [
+            "escalate_to_principal_if_contractor_variance>0.10"
+          ],
+          "hard_denials": [
+            "deny_if_revocation_uncertain",
+            "deny_if_reconciliation_gap"
+          ],
+          "policy_id": "SPEND-POL-FIN-PAYROLL",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "required_gate_refs": [
+            "FIN-GATE-005",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "risk_tier_limits": "tier_high amount<=400000_usd_per_contractor_pay_cycle",
+          "velocity_limits": "contractor_pay_cycle_count<=2_per_month"
+        },
+        {
+          "anomaly_rules": [
+            "deny_if_liability_basis_unverified",
+            "deny_if_jurisdiction_mismatch"
+          ],
+          "counterparty_allowlist_ref": "ALLOWLIST-TAX-AUTHORITY-001",
+          "escalation_rules": [
+            "escalate_to_finance_council_if_tax_reserve_gap>0.05"
+          ],
+          "hard_denials": [
+            "deny_if_revocation_uncertain",
+            "deny_if_policy_freshness_fail"
+          ],
+          "policy_id": "SPEND-POL-FIN-TAX",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "required_gate_refs": [
+            "FIN-GATE-006",
+            "FIN-GATE-STOP-STATE"
+          ],
+          "risk_tier_limits": "tier_high amount<=300000_usd_per_tax_window",
+          "velocity_limits": "tax_reserve_rebalance<=1_per_week"
+        },
+        {
+          "anomaly_rules": [
+            "deny_if_security_spend_floor_breached"
+          ],
+          "counterparty_allowlist_ref": "ALLOWLIST-SECURITY-VENDORS-001",
+          "escalation_rules": [
+            "escalate_to_board"
+          ],
+          "hard_denials": [
+            "deny_if_security_floor_not_met"
+          ],
+          "policy_id": "SPEND-POL-SECURITY-FLOOR",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "required_gate_refs": [
+            "PHASE-3-TO-4"
+          ],
+          "risk_tier_limits": "security_spend_ratio>=0.10",
+          "velocity_limits": "n_a"
+        },
+        {
+          "anomaly_rules": [
+            "deny_if_verification_spend_floor_breached"
+          ],
+          "counterparty_allowlist_ref": "ALLOWLIST-VERIFICATION-INFRA-001",
+          "escalation_rules": [
+            "escalate_to_board"
+          ],
+          "hard_denials": [
+            "deny_if_verification_floor_not_met"
+          ],
+          "policy_id": "SPEND-POL-VERIFICATION-FLOOR",
+          "principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+          "required_gate_refs": [
+            "PHASE-3-TO-4"
+          ],
+          "risk_tier_limits": "verification_spend_ratio>=0.22",
+          "velocity_limits": "n_a"
+        }
+      ]
+    },
+    "cost_structure_model": {
+      "cost_buckets": [
+        {
+          "bucket_id": "COST-COMPUTE",
+          "share_target": {
+            "comparator": "<=",
+            "unit": "ratio_of_revenue",
+            "value": 0.34
+          }
+        },
+        {
+          "bucket_id": "COST-VERIFICATION",
+          "share_target": {
+            "comparator": "<=",
+            "unit": "ratio_of_revenue",
+            "value": 0.22
+          }
+        },
+        {
+          "bucket_id": "COST-SECURITY",
+          "share_target": {
+            "comparator": ">=",
+            "unit": "ratio_of_revenue",
+            "value": 0.10
+          }
+        },
+        {
+          "bucket_id": "COST-GTM",
+          "share_target": {
+            "comparator": "<=",
+            "unit": "ratio_of_revenue",
+            "value": 0.20
+          }
+        },
+        {
+          "bucket_id": "COST-GA",
+          "share_target": {
+            "comparator": "<=",
+            "unit": "ratio_of_revenue",
+            "value": 0.14
+          }
+        }
+      ],
+      "model_id": "COST-STRUCTURE-001"
+    },
+    "customer_model": {
+      "model_id": "CUSTOMER-MODEL-001",
+      "segments": [
+        {
+          "name": "Regulated Enterprise Platform Teams",
+          "pain_points": [
+            "unverifiable AI outputs in compliance-critical workflows",
+            "high governance labor per release",
+            "identity and revocation ambiguity"
+          ],
+          "segment_id": "CUST-ENT-001",
+          "target_metrics": [
+            "MET-ARR-USD",
+            "MET-NRR-RATIO",
+            "MET-TRUST-LATENCY-P95"
+          ]
+        },
+        {
+          "name": "Private Cluster Power Users",
+          "pain_points": [
+            "privacy risk from centralized tooling",
+            "lack of auditable policy controls",
+            "manual intervention burden"
+          ],
+          "segment_id": "CUST-PROSUMER-001",
+          "target_metrics": [
+            "MET-PAID-USERS",
+            "MET-MONTHLY-CHURN",
+            "MET-PRIVACY-SEV0-1"
+          ]
+        }
+      ]
+    },
+    "delegation_and_authority_graph_model": {
+      "authority_invariants": [
+        "delegation_narrowing_violations == 0",
+        "authority_graph_coverage == 1.0",
+        "revocation_miss_count == 0"
+      ],
+      "delegation_refs": [
+        "DELEG-ORCH-001",
+        "DELEG-BILLING-001",
+        "DELEG-COLLECTIONS-001",
+        "DELEG-VENDORPAY-001",
+        "DELEG-TREASURY-001",
+        "DELEG-PAYROLL-001",
+        "DELEG-TAX-001"
+      ],
+      "graph_id": "AUTH-GRAPH-001",
+      "nodes": [
+        "PRINCIPAL-ROOT-ANVEIO",
+        "AGENT-ORCH-001",
+        "AGENT-BILLING-001",
+        "AGENT-COLLECTIONS-001",
+        "AGENT-VENDORPAY-001",
+        "AGENT-TREASURY-001",
+        "AGENT-PAYROLL-001",
+        "AGENT-TAX-001"
+      ]
+    },
+    "finance_autonomy_model": {
+      "action_classes": [
+        "FIN-ACT-001",
+        "FIN-ACT-002",
+        "FIN-ACT-003",
+        "FIN-ACT-004",
+        "FIN-ACT-005",
+        "FIN-ACT-006"
+      ],
+      "exception_latency_metric_ref": "MET-FIN-EXCEPTION-LATENCY-P95",
+      "fraud_loss_limit_metric_ref": "MET-FIN-FRAUD-LOSS-RATIO",
+      "manual_intervention_metric_ref": "MET-FIN-MANUAL-RATIO",
+      "model_id": "FIN-AUTONOMY-MODEL-001",
+      "stp_target_metric_ref": "MET-FIN-STP-RATIO"
+    },
+    "go_to_market_model": {
+      "capacity_bottleneck_refs": [
+        "RISK-GTM-SOLUTION-ENGINEER-CAPACITY",
+        "RISK-VERIFIER-CAPACITY",
+        "RISK-SECURITY-REVIEW-CAPACITY"
+      ],
+      "channels": [
+        "direct_enterprise_sales",
+        "security_partner_integrators",
+        "developer_self_serve"
+      ],
+      "funnel_stages": [
+        {
+          "metric_refs": [
+            "MET-PIPELINE-USD",
+            "MET-MQL-TO-SQL-RATIO"
+          ],
+          "name": "Qualified Pipeline",
+          "stage_id": "GTM-STAGE-01"
+        },
+        {
+          "metric_refs": [
+            "MET-PILOT-CONVERSION-RATIO",
+            "MET-PILOT-CYCLE-TICKS-P95"
+          ],
+          "name": "Pilot Conversion",
+          "stage_id": "GTM-STAGE-02"
+        },
+        {
+          "metric_refs": [
+            "MET-EXPANSION-RATE",
+            "MET-SALES-CAPACITY-UTILIZATION"
+          ],
+          "name": "Production Expansion",
+          "stage_id": "GTM-STAGE-03"
+        }
+      ],
+      "model_id": "GTM-MODEL-001"
+    },
+    "market_model": {
+      "competitive_axes": [
+        "verification_cost_per_authoritative_transition",
+        "containment_integrity",
+        "decision_to_receipt_latency",
+        "delegation_and_revocation_correctness"
+      ],
+      "model_id": "MARKET-MODEL-001",
+      "segments": [
+        {
+          "adoption_gate_ref": "GTM-GATE-ENTERPRISE-001",
+          "description": "Regulated enterprises requiring verifiable autonomous operations.",
+          "segment_id": "SEG-ENTERPRISE-HIGH-ASSURANCE",
+          "serviceable_market": {
+            "comparator": ">=",
+            "unit": "usd_annual",
+            "value": 35000000000
+          }
+        },
+        {
+          "adoption_gate_ref": "GTM-GATE-PROSUMER-001",
+          "description": "Individual and small-team private clusters with strict confidentiality controls.",
+          "segment_id": "SEG-PROSUMER-PRIVATE-HOLON",
+          "serviceable_market": {
+            "comparator": ">=",
+            "unit": "usd_annual",
+            "value": 12000000000
+          }
+        }
+      ]
+    },
+    "operating_model": {
+      "councils": [
+        "Security Council",
+        "Verification Council",
+        "Runtime Council",
+        "Governance Council",
+        "Finance Council",
+        "Research Council",
+        "IP Council",
+        "Platform Council",
+        "Bio Council"
+      ],
+      "decision_latency_target": {
+        "comparator": "<=",
+        "unit": "ledger_ticks_p95",
+        "value": 180
+      },
+      "employment_constraint": "employee_count == 0 (no W-2 employees); operations run through principal-bound agent lanes and contractor channels.",
+      "model_id": "OPERATING-MODEL-001",
+      "promotion_rule": "Tier2+ promotion requires signed evidence, policy freshness pass, stop-state pass, and quorum-valid authority graph."
+    },
+    "pricing_and_packaging_model": {
+      "model_id": "PRICING-MODEL-001",
+      "price_guardrail_policy_ref": "SPEND-POL-SECURITY-FLOOR",
+      "tiers": [
+        {
+          "included_capacity": {
+            "comparator": ">=",
+            "unit": "cells",
+            "value": 3
+          },
+          "price": {
+            "comparator": ">=",
+            "unit": "usd_per_year",
+            "value": 180000
+          },
+          "segment_ref": "SEG-ENTERPRISE-HIGH-ASSURANCE",
+          "tier_id": "PRICE-ENT-CORE"
+        },
+        {
+          "included_capacity": {
+            "comparator": ">=",
+            "unit": "cells",
+            "value": 8
+          },
+          "price": {
+            "comparator": ">=",
+            "unit": "usd_per_year",
+            "value": 420000
+          },
+          "segment_ref": "SEG-ENTERPRISE-HIGH-ASSURANCE",
+          "tier_id": "PRICE-ENT-ASSURED"
+        },
+        {
+          "included_capacity": {
+            "comparator": ">=",
+            "unit": "cells",
+            "value": 20
+          },
+          "price": {
+            "comparator": ">=",
+            "unit": "usd_per_year",
+            "value": 900000
+          },
+          "segment_ref": "SEG-ENTERPRISE-HIGH-ASSURANCE",
+          "tier_id": "PRICE-ENT-FEDERATED"
+        },
+        {
+          "included_capacity": {
+            "comparator": ">=",
+            "unit": "active_agents",
+            "value": 3
+          },
+          "price": {
+            "comparator": ">=",
+            "unit": "usd_per_month",
+            "value": 39
+          },
+          "segment_ref": "SEG-PROSUMER-PRIVATE-HOLON",
+          "tier_id": "PRICE-PROSUMER-PRO"
+        },
+        {
+          "included_capacity": {
+            "comparator": ">=",
+            "unit": "active_agents",
+            "value": 10
+          },
+          "price": {
+            "comparator": ">=",
+            "unit": "usd_per_month",
+            "value": 129
+          },
+          "segment_ref": "SEG-PROSUMER-PRIVATE-HOLON",
+          "tier_id": "PRICE-PROSUMER-TEAM"
+        }
+      ]
+    },
+    "principal_and_identity_model": {
+      "active_principal_ref": "PRINCIPAL-ROOT-ANVEIO",
+      "agent_identity_refs": [
+        "AGENT-ORCH-001",
+        "AGENT-BILLING-001",
+        "AGENT-COLLECTIONS-001",
+        "AGENT-VENDORPAY-001",
+        "AGENT-TREASURY-001",
+        "AGENT-PAYROLL-001",
+        "AGENT-TAX-001"
+      ],
+      "root_revocation_ref": "REVOCATION-AUTHORITY-ROOT-001"
+    },
+    "product_portfolio": [
+      {
+        "claim_refs": [
+          "BPC-01",
+          "BPC-03",
+          "BPC-04"
+        ],
+        "name": "Holonic Governance Substrate",
+        "pricing_tier_refs": [
+          "PRICE-ENT-CORE",
+          "PRICE-ENT-ASSURED",
+          "PRICE-ENT-FEDERATED"
+        ],
+        "product_id": "PROD-A-HOLONIC-GOVERNANCE-SUBSTRATE",
+        "segment_refs": [
+          "SEG-ENTERPRISE-HIGH-ASSURANCE"
+        ],
+        "target_metrics": [
+          "MET-ENTERPRISE-CELLS-PAID",
+          "MET-NRR-RATIO",
+          "MET-ARR-USD",
+          "MET-GROSS-MARGIN-RATIO"
+        ]
+      },
+      {
+        "claim_refs": [
+          "BPC-02",
+          "BPC-05"
+        ],
+        "name": "Teammate Private Holon Cluster",
+        "pricing_tier_refs": [
+          "PRICE-PROSUMER-PRO",
+          "PRICE-PROSUMER-TEAM"
+        ],
+        "product_id": "PROD-B-PRIVATE-HOLON-CLUSTER",
+        "segment_refs": [
+          "SEG-PROSUMER-PRIVATE-HOLON"
+        ],
+        "target_metrics": [
+          "MET-PAID-USERS",
+          "MET-MONTHLY-CHURN",
+          "MET-PRIVACY-SEV0-1"
+        ]
+      }
+    ],
+    "revenue_model": {
+      "decomposition": [
+        {
+          "annual_revenue_target": {
+            "comparator": ">=",
+            "unit": "usd_annual",
+            "value": 11200000
+          },
+          "channel": "direct_enterprise_sales",
+          "pricing_tier_ref": "PRICE-ENT-ASSURED",
+          "product_ref": "PROD-A-HOLONIC-GOVERNANCE-SUBSTRATE",
+          "segment_ref": "SEG-ENTERPRISE-HIGH-ASSURANCE"
+        },
+        {
+          "annual_revenue_target": {
+            "comparator": ">=",
+            "unit": "usd_annual",
+            "value": 2800000
+          },
+          "channel": "security_partner_integrators",
+          "pricing_tier_ref": "PRICE-ENT-FEDERATED",
+          "product_ref": "PROD-A-HOLONIC-GOVERNANCE-SUBSTRATE",
+          "segment_ref": "SEG-ENTERPRISE-HIGH-ASSURANCE"
+        },
+        {
+          "annual_revenue_target": {
+            "comparator": ">=",
+            "unit": "usd_annual",
+            "value": 1000000
+          },
+          "channel": "developer_self_serve",
+          "pricing_tier_ref": "PRICE-PROSUMER-PRO",
+          "product_ref": "PROD-B-PRIVATE-HOLON-CLUSTER",
+          "segment_ref": "SEG-PROSUMER-PRIVATE-HOLON"
+        }
+      ],
+      "model_id": "REVENUE-MODEL-001",
+      "target_metric_ref": "MET-ARR-USD"
+    },
+    "risk_register": [
+      {
+        "detection_signal": "byzantine_quorum_divergence_events > 0",
+        "fail_closed_rule": "deny promotion until quorum divergence zeroed with signed remediation receipt",
+        "impact": "critical",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "PHASE-4-TO-5",
+          "BRIDGE-GATE-011"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-BYZANTINE-BEHAVIOR",
+        "threat_type": "byzantine_behavior"
+      },
+      {
+        "detection_signal": "independent_replication_queue_ticks_p95 > 720",
+        "fail_closed_rule": "deny terminal impact promotion until replication latency returns below threshold",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-012"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-EXTERNAL-REPLICATION-BANDWIDTH",
+        "threat_type": "external_validation_capacity"
+      },
+      {
+        "detection_signal": "fraud_loss_ratio > 0.001 or unreconciled_financial_events > 0",
+        "fail_closed_rule": "deny all autonomous financial actions until reconciliation and compensation receipts are complete",
+        "impact": "critical",
+        "likelihood": "low",
+        "mitigation_control_refs": [
+          "FIN-GATE-001",
+          "FIN-GATE-002",
+          "FIN-GATE-003",
+          "FIN-GATE-004",
+          "FIN-GATE-005",
+          "FIN-GATE-006"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-FINANCE-FRAUD",
+        "threat_type": "financial_fraud_or_orphaned_liability"
+      },
+      {
+        "detection_signal": "authority_graph_coverage < 1.0 or quorum_valid == false",
+        "fail_closed_rule": "deny transition and require authority graph repair receipt",
+        "impact": "high",
+        "likelihood": "low",
+        "mitigation_control_refs": [
+          "PHASE-1-TO-2",
+          "BRIDGE-GATE-003"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-GOVERNANCE-FAILURE",
+        "threat_type": "governance_failure_mode"
+      },
+      {
+        "detection_signal": "sales_engineering_capacity_utilization > 0.90",
+        "fail_closed_rule": "deny expansion promotions until capacity relief passes gate",
+        "impact": "medium",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-009"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-GTM-SOLUTION-ENGINEER-CAPACITY",
+        "threat_type": "gtm_capacity"
+      },
+      {
+        "detection_signal": "oracle_queue_tick_budget_p95_miss_streak >= 2",
+        "fail_closed_rule": "deny new phase admission until oracle backlog normalized",
+        "impact": "medium",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-006"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-HUMAN-ORACLE-BANDWIDTH",
+        "threat_type": "human_oracle_capacity"
+      },
+      {
+        "detection_signal": "confidentiality_integrity_labeling_violations > 0",
+        "fail_closed_rule": "deny transition and freeze affected capability scope",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "PHASE-2-TO-3",
+          "BRIDGE-GATE-007"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-LABELING-INTEGRITY",
+        "threat_type": "confidentiality_integrity_label_violation"
+      },
+      {
+        "detection_signal": "llc_lifecycle_automation_coverage < 0.95 or llc_formation_automation_pass == false",
+        "fail_closed_rule": "deny phase promotion and route to legal hard-constraint escalation lane",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-009",
+          "PHASE-3-TO-4"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-LLC-COMPLIANCE-AUTOMATION",
+        "threat_type": "legal_compliance_automation_failure"
+      },
+      {
+        "detection_signal": "methods_ge_2x < 4",
+        "fail_closed_rule": "deny novelty promotion and require stronger prior-art replay evidence",
+        "impact": "medium",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-005"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-MARKET-NOVELTY-NOISE-FLOOR",
+        "threat_type": "novelty_signal_noise"
+      },
+      {
+        "detection_signal": "prompt_injection_escape_rate_tier2plus > 0",
+        "fail_closed_rule": "deny promotion and deny financial execution when escape rate is non-zero",
+        "impact": "critical",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "FIN-GATE-STOP-STATE",
+          "PHASE-1-TO-2"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-PROMPT-INJECTION",
+        "threat_type": "prompt_injection"
+      },
+      {
+        "detection_signal": "freshness_ok == false or replay_rejection_rate < 1.0",
+        "fail_closed_rule": "deny authoritative transition and deny finance settlement",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "PHASE-2-TO-3",
+          "BRIDGE-GATE-007"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-REPLAY-STALE",
+        "threat_type": "replay_or_staleness"
+      },
+      {
+        "detection_signal": "revocation_miss_count > 0",
+        "fail_closed_rule": "deny any delegated action when revocation uncertainty exists",
+        "impact": "critical",
+        "likelihood": "low",
+        "mitigation_control_refs": [
+          "PHASE-2-TO-3",
+          "FIN-GATE-005"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-REVOCATION-CORRECTNESS",
+        "threat_type": "revocation_failure"
+      },
+      {
+        "detection_signal": "security_review_queue_ticks_p95 > 240",
+        "fail_closed_rule": "deny promotion to next milestone until queue is within budget",
+        "impact": "medium",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-002",
+          "BRIDGE-GATE-010"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-SECURITY-REVIEW-CAPACITY",
+        "threat_type": "security_review_capacity"
+      },
+      {
+        "detection_signal": "semantic_drift_escape_rate > 0.001",
+        "fail_closed_rule": "deny promotion and lock deployment scope to prior valid boundary",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-008",
+          "PHASE-3-TO-4"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-SEMANTIC-DRIFT",
+        "threat_type": "recursive_semantic_drift"
+      },
+      {
+        "detection_signal": "verifier_work_ticks_per_passed_transition_p95 > 1800",
+        "fail_closed_rule": "deny milestone promotion and reallocate compute to verification",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-001",
+          "BRIDGE-GATE-004"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-VERIFIER-CAPACITY",
+        "threat_type": "verification_capacity"
+      },
+      {
+        "detection_signal": "employee_count > 0",
+        "fail_closed_rule": "deny promotion and deny new payroll obligations when employee_count deviates from zero",
+        "impact": "high",
+        "likelihood": "low",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-009",
+          "PHASE-3-TO-4"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-ZERO-EMPLOYEE-DRIFT",
+        "threat_type": "operating_model_drift"
+      }
+    ],
+    "scenario_matrix": [
+      {
+        "assumptions": [
+          "ASSUMP-STRAT-001"
+        ],
+        "expected_metric_ranges": [
+          {
+            "max": {
+              "comparator": "<=",
+              "unit": "usd_annual",
+              "value": 22000000
+            },
+            "metric_ref": "MET-ARR-USD",
+            "min": {
+              "comparator": ">=",
+              "unit": "usd_annual",
+              "value": 15000000
+            }
+          },
+          {
+            "max": {
+              "comparator": "==",
+              "unit": "count",
+              "value": 0
+            },
+            "metric_ref": "MET-EMPLOYEE-COUNT",
+            "min": {
+              "comparator": "==",
+              "unit": "count",
+              "value": 0
+            }
+          },
+          {
+            "max": {
+              "comparator": "<=",
+              "unit": "ratio",
+              "value": 0.98
+            },
+            "metric_ref": "MET-FIN-STP-RATIO",
+            "min": {
+              "comparator": ">=",
+              "unit": "ratio",
+              "value": 0.93
+            }
+          }
+        ],
+        "falsification_trigger": "MET-ARR-USD below 15000000 or MET-FIN-STP-RATIO below 0.93 or MET-EMPLOYEE-COUNT != 0",
+        "scenario_id": "SCN-BASELINE",
+        "sensitivity_axes": [
+          "verification_compute_share",
+          "sales_capacity",
+          "revocation_latency"
+        ]
+      },
+      {
+        "assumptions": [
+          "ASSUMP-STRAT-001"
+        ],
+        "expected_metric_ranges": [
+          {
+            "max": {
+              "comparator": "==",
+              "unit": "count",
+              "value": 0
+            },
+            "metric_ref": "MET-PRIVACY-SEV0-1",
+            "min": {
+              "comparator": "==",
+              "unit": "count",
+              "value": 0
+            }
+          },
+          {
+            "max": {
+              "comparator": "<=",
+              "unit": "ratio",
+              "value": 0.001
+            },
+            "metric_ref": "MET-FIN-FRAUD-LOSS-RATIO",
+            "min": {
+              "comparator": ">=",
+              "unit": "ratio",
+              "value": 0
+            }
+          }
+        ],
+        "falsification_trigger": "prompt_injection_escape_rate_tier2plus > 0 or fraud_loss_ratio > 0.001",
+        "scenario_id": "SCN-ADVERSARIAL",
+        "sensitivity_axes": [
+          "prompt_injection_pressure",
+          "byzantine_peer_rate",
+          "fraud_attempt_rate"
+        ]
+      },
+      {
+        "assumptions": [
+          "ASSUMP-FIN-001"
+        ],
+        "expected_metric_ranges": [
+          {
+            "max": {
+              "comparator": "<=",
+              "unit": "requests_per_100_work_items",
+              "value": 3
+            },
+            "metric_ref": "MET-ORACLE-REQ-PER-100",
+            "min": {
+              "comparator": ">=",
+              "unit": "requests_per_100_work_items",
+              "value": 0
+            }
+          },
+          {
+            "max": {
+              "comparator": "<=",
+              "unit": "ledger_ticks",
+              "value": 1800
+            },
+            "metric_ref": "MET-VERIFIER-WORK-P95",
+            "min": {
+              "comparator": ">=",
+              "unit": "ledger_ticks",
+              "value": 0
+            }
+          }
+        ],
+        "falsification_trigger": "oracle_queue_tick_budget_p95_miss_streak >= 2 or verifier_work_ticks_per_passed_transition_p95 > 1800",
+        "scenario_id": "SCN-CAPACITY-SHOCK",
+        "sensitivity_axes": [
+          "oracle_queue_ticks",
+          "verifier_queue_ticks",
+          "sales_engineering_capacity"
+        ]
+      }
+    ],
+    "treasury_and_payment_operations_model": {
+      "flows": [
+        {
+          "action_refs": [
+            "FIN-ACT-001",
+            "FIN-ACT-002"
+          ],
+          "flow_id": "FLOW-BILLING-COLLECTION",
+          "reconciliation_ref": "RECON-BILLING-COLLECTION-001"
+        },
+        {
+          "action_refs": [
+            "FIN-ACT-003",
+            "FIN-ACT-004"
+          ],
+          "flow_id": "FLOW-VENDOR-TREASURY",
+          "reconciliation_ref": "RECON-VENDOR-TREASURY-001"
+        },
+        {
+          "action_refs": [
+            "FIN-ACT-005",
+            "FIN-ACT-006"
+          ],
+          "flow_id": "FLOW-CONTRACTOR-TAX",
+          "reconciliation_ref": "RECON-PAYROLL-TAX-001"
+        }
+      ],
+      "model_id": "TREASURY-OPS-001",
+      "stop_state_gate_ref": "FIN-GATE-STOP-STATE"
+    },
+    "unit_economics_model": {
+      "drivers": {
+        "cogs_drivers": [
+          "inference_compute_ticks",
+          "verification_compute_ticks",
+          "storage_retention_tiers",
+          "support_resolution_ticks"
+        ],
+        "revenue_drivers": [
+          "enterprise_cells_paid",
+          "average_contract_value",
+          "prosumer_paid_users"
+        ],
+        "security_cost_share_metric_ref": "MET-SECURITY-COST-SHARE",
+        "verification_cost_share_metric_ref": "MET-VERIFICATION-COST-SHARE"
+      },
+      "margin_constraints": {
+        "gross_margin_floor": {
+          "comparator": ">=",
+          "unit": "ratio",
+          "value": 0.65
+        },
+        "security_adjusted_margin_floor": {
+          "comparator": ">=",
+          "unit": "ratio",
+          "value": 0.55
+        }
+      },
+      "model_id": "UNIT-ECONOMICS-001"
+    }
+  }
+}

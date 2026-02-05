@@ -1,0 +1,527 @@
+{
+  "kind": "instruction.spec",
+  "schema": "cac.instruction_spec.v1",
+  "schema_version": "1.0.0",
+  "meta": {
+    "classification": "INTERNAL",
+    "created_at": "2026-02-05T00:00:00Z",
+    "dependencies": [
+      "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1",
+      "dcp://apm2.agents/laws/bundle@1",
+      "dcp://apm2.agents/principles/bundle@1"
+    ],
+    "labels": [
+      "alien-engineering",
+      "rfc-refinement",
+      "rfc-0021",
+      "fac",
+      "aat-biz",
+      "strategy-coupling",
+      "v1"
+    ],
+    "provenance": {
+      "actor_id": "HOLON-INSTR-EMITTER",
+      "work_id": "rfc_0021_refinement_prompt_v1"
+    },
+    "stable_id": "dcp://apm2.local/instructions/rfc_0021/refinement@v1"
+  },
+  "payload": {
+    "i": "RFC-0021 refinement CAC instruction: pressure-test and strengthen Holonic Venture Proving Interface against its own goals under Alien Engineering Protocol constraints.",
+    "pb": "RFC-0021 is drafted but must be iteratively refined so its goals are explicit, machine-checkable, FAC-compatible, and strategy-coupled without weakening containment or evidence authority.",
+    "t": {
+      "sys": "APM2",
+      "repo": "/Users/shovonhasan/Documents/workspaces/apm2",
+      "scope": [
+        "documents/rfcs/RFC-0021",
+        "documents/strategy",
+        "documents/rfcs/RFC-0015",
+        "documents/rfcs/RFC-0019",
+        "documents/rfcs/RFC-0020",
+        "proto/kernel_events.proto",
+        "documents/work/prompts/instruction.alien_engineering_protocol.v1.json"
+      ]
+    },
+    "ctx": [
+      "documents/work/prompts/instruction.alien_engineering_protocol.v1.json",
+      "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md",
+      "documents/rfcs/RFC-0021/00_meta.yaml",
+      "documents/rfcs/RFC-0021/01_problem_and_imports.yaml",
+      "documents/rfcs/RFC-0021/02_design_decisions.yaml",
+      "documents/rfcs/RFC-0021/03_trust_boundaries.yaml",
+      "documents/rfcs/RFC-0021/04_contracts_and_versioning.yaml",
+      "documents/rfcs/RFC-0021/05_rollout_and_ops.yaml",
+      "documents/rfcs/RFC-0021/06_ticket_decomposition.yaml",
+      "documents/rfcs/RFC-0021/07_test_and_evidence.yaml",
+      "documents/rfcs/RFC-0021/08_risks_and_open_questions.yaml",
+      "documents/rfcs/RFC-0021/09_governance_and_gates.yaml",
+      "documents/rfcs/RFC-0021/requirements/README.yaml",
+      "documents/rfcs/RFC-0021/requirements/REQ-0001.yaml",
+      "documents/rfcs/RFC-0021/requirements/REQ-0002.yaml",
+      "documents/rfcs/RFC-0021/requirements/REQ-0003.yaml",
+      "documents/rfcs/RFC-0021/requirements/REQ-0004.yaml",
+      "documents/rfcs/RFC-0021/requirements/REQ-0005.yaml",
+      "documents/rfcs/RFC-0021/requirements/REQ-0006.yaml",
+      "documents/rfcs/RFC-0021/requirements/REQ-0007.yaml",
+      "documents/rfcs/RFC-0021/requirements/REQ-0008.yaml",
+      "documents/rfcs/RFC-0021/requirements/REQ-0009.yaml",
+      "documents/rfcs/RFC-0021/requirements/REQ-0010.yaml",
+      "documents/rfcs/RFC-0021/evidence_artifacts/README.yaml",
+      "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0001.yaml",
+      "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0002.yaml",
+      "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0003.yaml",
+      "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0004.yaml",
+      "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0005.yaml",
+      "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0006.yaml",
+      "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0007.yaml",
+      "documents/rfcs/RFC-0021/evidence_artifacts/EVID-0008.yaml",
+      "documents/strategy/MASTER_STRATEGY.json",
+      "documents/strategy/NORTH_STAR.json",
+      "documents/strategy/ROADMAP.json",
+      "documents/strategy/BUSINESS_PLAN.json",
+      "documents/rfcs/RFC-0015/00_meta.yaml",
+      "documents/rfcs/RFC-0019/00_meta.yaml",
+      "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+      "documents/theory/laws.json",
+      "documents/theory/principles.json",
+      "documents/theory/unified_theory.json",
+      "proto/kernel_events.proto"
+    ],
+    "lex": {
+      "GOAL_VPH_PARALLEL": "Venture Proving Holon (VPH) is a separate parallel subsystem with bounded capabilities and no direct promotion authority.",
+      "GOAL_THREE_SOURCE_INTAKE": "Intake is explicitly three-source: DEFECT + INTENT + DRIFT. Two-source intake is non-compliant.",
+      "GOAL_FAC_AUTHORITY": "FAC remains sole promotion authority; VPH/SIAR may propose and route but cannot merge or promote.",
+      "GOAL_AAT_BIZ": "AAT-BIZ is a mandatory Stage-5 extension for strategy-critical or policy-classified work sourced from venture signals.",
+      "GOAL_STRATEGY_COUPLING": "VPHI outputs must map to strategy evidence and support MSC-03, MSC-05, and MSC-06 progression without narrative-only gates.",
+      "GOAL_MACHINE_CHECKABLE": "Every major VPHI objective must have baseline, quantitative target, boundary ID/time authority, owner locus, transition predicate, and evidence path.",
+      "GOAL_ANTI_GOODHART": "Every optimized KPI must have independent countermetrics and fail-closed acceptance semantics.",
+      "GOAL_EVIDENCE_FIRST": "No signal, route, or promotion claim is authoritative without signed receipts and replayable evidence bindings.",
+      "GOAL_FAIL_CLOSED": "Unknown, stale, missing, parse-error, schema-invalid, or signature-invalid states are automatic deny outcomes.",
+      "GOAL_DOMINANCE_ORDER": "Constraint precedence is non-negotiable: containment/security > verification/correctness > liveness/progress.",
+      "GOAL_TIME_AUTHORITY": "Normative time logic uses HTF boundary/time-envelope authority; wall-clock is display-only.",
+      "GOAL_SCALE_ENVELOPE": "Design must remain admissible under globally distributed multi-exabyte to zettabyte evidence and coordination envelopes.",
+      "AEP_01": "Physics-first admissibility is mandatory; conventional execution anxiety cannot downscope goals.",
+      "AEP_02": "Only physical, information-theoretic, computability, causality, biological, or explicit APM2 invariant limits can block proposals.",
+      "AEP_03": "Novel engineering is required; analogies without mechanism-level contracts are invalid.",
+      "AEP_04": "Compounding closure is mandatory: failure must strengthen verifiers/contracts/policies/primitives.",
+      "AEP_05": "Bounded search discipline is mandatory: budgets, stop conditions, and escalation paths for every exploration.",
+      "AEP_06": "Digest-first, typed, canonical, low-variety interfaces across holonic boundaries are mandatory.",
+      "AEP_07": "Anti-Goodhart posture is mandatory: KPI + countermetric + independent oversight channel triplet.",
+      "AEP_08": "Recursive semantic stability is mandatory: depth-bounded admissibility and composition-preserving interfaces.",
+      "NOVELTY_METHOD": "Generate at least three divergent refinement tracks: (A) maximum ambition under physics, (B) maximum precision/testability, (C) maximum compounding velocity; synthesize dominant output.",
+      "MECHANIZATION_RULE": "Every refinement claim must include mechanism, typed contract, threat mode addressed, measurable predicate, and evidence artifact path.",
+      "OUTPUT_CONTRACT": "Deliver goal-coverage matrix, blocker/major/minor gap report, unified diffs, per-hunk rationale, physics feasibility ledger, AAT-BIZ coupling ledger, and fast experiments."
+    },
+    "dir": [
+      [
+        "D01",
+        3,
+        "@GOAL_VPH_PARALLEL",
+        ["goal", "parallel-subsystem", "vph"],
+        [
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md",
+          "documents/rfcs/RFC-0021/00_meta.yaml",
+          "documents/rfcs/RFC-0021/03_trust_boundaries.yaml"
+        ]
+      ],
+      [
+        "D02",
+        3,
+        "@GOAL_THREE_SOURCE_INTAKE",
+        ["goal", "signal-intake", "defect-intent-drift"],
+        [
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md",
+          "documents/rfcs/RFC-0021/02_design_decisions.yaml",
+          "documents/rfcs/RFC-0021/04_contracts_and_versioning.yaml"
+        ]
+      ],
+      [
+        "D03",
+        3,
+        "@GOAL_FAC_AUTHORITY",
+        ["goal", "fac", "authority"],
+        [
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md",
+          "documents/rfcs/RFC-0015/00_meta.yaml",
+          "documents/rfcs/RFC-0019/00_meta.yaml",
+          "proto/kernel_events.proto"
+        ]
+      ],
+      [
+        "D04",
+        3,
+        "@GOAL_AAT_BIZ",
+        ["goal", "aat", "verification"],
+        [
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md",
+          "documents/rfcs/RFC-0021/07_test_and_evidence.yaml"
+        ]
+      ],
+      [
+        "D05",
+        3,
+        "@GOAL_STRATEGY_COUPLING",
+        ["goal", "strategy", "msc"],
+        [
+          "documents/strategy/MASTER_STRATEGY.json",
+          "documents/strategy/BUSINESS_PLAN.json",
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ]
+      ],
+      [
+        "D06",
+        3,
+        "@GOAL_MACHINE_CHECKABLE",
+        ["goal", "predicates", "evidence"],
+        [
+          "documents/rfcs/RFC-0021/requirements",
+          "documents/rfcs/RFC-0021/evidence_artifacts",
+          "documents/rfcs/RFC-0021/09_governance_and_gates.yaml"
+        ]
+      ],
+      [
+        "D07",
+        3,
+        "@GOAL_ANTI_GOODHART",
+        ["goal", "countermetrics", "anti-gaming"],
+        [
+          "documents/strategy/BUSINESS_PLAN.json",
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ]
+      ],
+      [
+        "D08",
+        3,
+        "@GOAL_EVIDENCE_FIRST",
+        ["goal", "receipts", "cas"],
+        [
+          "documents/theory/laws.json",
+          "documents/rfcs/RFC-0015/00_meta.yaml",
+          "documents/rfcs/RFC-0021/04_contracts_and_versioning.yaml"
+        ]
+      ],
+      [
+        "D09",
+        3,
+        "@GOAL_TIME_AUTHORITY",
+        ["goal", "htf", "freshness"],
+        [
+          "documents/strategy/MASTER_STRATEGY.json",
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ]
+      ],
+      [
+        "D10",
+        3,
+        "@AEP_01",
+        ["alien-engineering", "physics"],
+        [
+          "documents/work/prompts/instruction.alien_engineering_protocol.v1.json",
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ]
+      ],
+      [
+        "D11",
+        3,
+        "@AEP_04",
+        ["alien-engineering", "compounding-closure"],
+        [
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md",
+          "documents/strategy/MASTER_STRATEGY.json"
+        ]
+      ],
+      [
+        "D12",
+        3,
+        "@GOAL_SCALE_ENVELOPE",
+        ["scale", "verifier-economics", "anti-entropy"],
+        [
+          "documents/theory/unified_theory.json",
+          "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ]
+      ]
+    ],
+    "g": [
+      [
+        "G01",
+        "D",
+        1,
+        [
+          "@GOAL_VPH_PARALLEL",
+          "@GOAL_THREE_SOURCE_INTAKE",
+          "@GOAL_FAC_AUTHORITY",
+          "@GOAL_AAT_BIZ",
+          "@GOAL_STRATEGY_COUPLING"
+        ],
+        ["E01", "E02", "E03", "E04", "E05"],
+        "BLOCK_IF_ANY_STATED_RFC_GOAL_IS_UNMAPPED_OR_NARRATIVE_ONLY"
+      ],
+      [
+        "G02",
+        "D",
+        1,
+        [
+          "@GOAL_MACHINE_CHECKABLE",
+          "@GOAL_EVIDENCE_FIRST",
+          "@GOAL_FAIL_CLOSED"
+        ],
+        ["E06", "E07"],
+        "BLOCK_IF_OBJECTIVES_LACK_PREDICATE_OR_EVIDENCE_PATH_OR_FAIL_CLOSED_BEHAVIOR"
+      ],
+      [
+        "G03",
+        "D",
+        1,
+        [
+          "@GOAL_DOMINANCE_ORDER",
+          "@GOAL_TIME_AUTHORITY",
+          "@GOAL_SCALE_ENVELOPE"
+        ],
+        ["E08", "E09", "E10"],
+        "BLOCK_IF_CONSTRAINT_PRECEDENCE_TIME_AUTHORITY_OR_SCALE_MECHANICS_UNSPECIFIED"
+      ],
+      [
+        "G04",
+        "T",
+        1,
+        [
+          "@AEP_01",
+          "@AEP_02",
+          "@AEP_03",
+          "@AEP_04",
+          "@AEP_05",
+          "@AEP_06",
+          "@AEP_07",
+          "@AEP_08"
+        ],
+        ["E11"],
+        "BLOCK_IF_ALIEN_ENGINEERING_CLAUSES_ARE_NOT_EXPLICIT_AND_TESTABLE"
+      ],
+      [
+        "G05",
+        "D",
+        1,
+        ["@GOAL_ANTI_GOODHART", "@GOAL_AAT_BIZ"],
+        ["E12"],
+        "BLOCK_IF_KPI_COUNTERMETRIC_COUPLING_OR_AAT_BIZ_GATING_IS_WEAK"
+      ],
+      [
+        "G06",
+        "L",
+        1,
+        ["@NOVELTY_METHOD", "@MECHANIZATION_RULE", "@OUTPUT_CONTRACT"],
+        ["E13"],
+        "BLOCK_IF_REFINEMENT_OUTPUT_LACKS_MULTI_TRACK_SYNTHESIS_OR_MECHANIZED_DIFF_OUTPUT"
+      ]
+    ],
+    "r": {
+      "depth": "D",
+      "modes": [79, 70, 59, 51, 47, 44, 40, 36],
+      "ob": ["H", "A", "R", "I", "V", "E", "D", "S"],
+      "trace": "F"
+    },
+    "out": [
+      [
+        "instruction.spec",
+        "dcp://apm2.local/instructions/rfc_0021/refinement@v1",
+        "cac.instruction_spec.v1"
+      ],
+      [
+        "refinement.report",
+        "dcp://apm2.local/reports/rfc_0021/refinement@v1",
+        "cac.refinement_report.v1"
+      ]
+    ],
+    "ev": [
+      [
+        "E01",
+        "rfc_goal_surface",
+        true,
+        "md",
+        ["documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"],
+        [
+          "rg -n \"Venture Proving Holon|DEFECT|INTENT|DRIFT|FAC|AAT-BIZ|parallel subsystem\" documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ]
+      ],
+      [
+        "E02",
+        "design_decision_surface",
+        true,
+        "yaml",
+        ["documents/rfcs/RFC-0021/02_design_decisions.yaml"],
+        [
+          "rg -n \"DEC-0001|DEC-0002|DEC-0003|DEC-0004|DEC-0005\" documents/rfcs/RFC-0021/02_design_decisions.yaml"
+        ]
+      ],
+      [
+        "E03",
+        "contracts_surface",
+        true,
+        "yaml",
+        ["documents/rfcs/RFC-0021/04_contracts_and_versioning.yaml"],
+        [
+          "rg -n \"VentureSignalBundleV1|AttentionDecisionReceiptV1|AatBusinessReceiptV1|kernel event\" documents/rfcs/RFC-0021/04_contracts_and_versioning.yaml"
+        ]
+      ],
+      [
+        "E04",
+        "fac_alignment_surface",
+        true,
+        "proto+yaml",
+        [
+          "proto/kernel_events.proto",
+          "documents/rfcs/RFC-0015/00_meta.yaml",
+          "documents/rfcs/RFC-0019/00_meta.yaml"
+        ],
+        [
+          "rg -n \"DefectRecorded|WorkOpened|PolicyResolvedForChangeSet|ReviewReceiptRecorded\" proto/kernel_events.proto"
+        ]
+      ],
+      [
+        "E05",
+        "strategy_binding_surface",
+        true,
+        "md",
+        [
+          "documents/strategy/MASTER_STRATEGY.json",
+          "documents/strategy/BUSINESS_PLAN.json",
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ],
+        [
+          "rg -n \"MSC-03|MSC-05|MSC-06|countermetric|Stage 5|AAT\" documents/strategy/MASTER_STRATEGY.json documents/strategy/BUSINESS_PLAN.json documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ]
+      ],
+      [
+        "E06",
+        "requirements_coverage_surface",
+        true,
+        "yaml",
+        ["documents/rfcs/RFC-0021/requirements"],
+        [
+          "rg -n \"^  id: \\\"REQ-\" documents/rfcs/RFC-0021/requirements/REQ-*.yaml",
+          "rg -n \"AAT-BIZ|FAC|signal|attention|strategy\" documents/rfcs/RFC-0021/requirements/REQ-*.yaml"
+        ]
+      ],
+      [
+        "E07",
+        "evidence_binding_surface",
+        true,
+        "yaml",
+        [
+          "documents/rfcs/RFC-0021/07_test_and_evidence.yaml",
+          "documents/rfcs/RFC-0021/evidence_artifacts"
+        ],
+        [
+          "rg -n \"EVID-000[1-8]|file_ref|coverage_target\" documents/rfcs/RFC-0021/07_test_and_evidence.yaml documents/rfcs/RFC-0021/evidence_artifacts/*.yaml"
+        ]
+      ],
+      [
+        "E08",
+        "dominance_order_surface",
+        true,
+        "md",
+        ["documents/strategy/MASTER_STRATEGY.json"],
+        [
+          "rg -n \"containment/security > verification/correctness > liveness/progress|dominance\" documents/strategy/MASTER_STRATEGY.json"
+        ]
+      ],
+      [
+        "E09",
+        "time_authority_surface",
+        true,
+        "md+yaml",
+        [
+          "documents/strategy/MASTER_STRATEGY.json",
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ],
+        [
+          "rg -n \"HTF|time_envelope_ref|wall-clock\" documents/strategy/MASTER_STRATEGY.json documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ]
+      ],
+      [
+        "E10",
+        "scale_mechanics_surface",
+        true,
+        "md+json",
+        [
+          "documents/theory/unified_theory.json",
+          "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ],
+        [
+          "rg -n \"exabyte|zettabyte|anti-entropy|verifier economics\" documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ]
+      ],
+      [
+        "E11",
+        "alien_protocol_surface",
+        true,
+        "json+md",
+        [
+          "documents/work/prompts/instruction.alien_engineering_protocol.v1.json",
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ],
+        [
+          "rg -n \"Alien Engineering|Physics-first|fail-closed|compounding|Goodhart\" documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md"
+        ]
+      ],
+      [
+        "E12",
+        "aat_biz_countermetric_surface",
+        true,
+        "md+yaml",
+        [
+          "documents/strategy/BUSINESS_PLAN.json",
+          "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md",
+          "documents/rfcs/RFC-0021/07_test_and_evidence.yaml"
+        ],
+        [
+          "rg -n \"countermetric|AAT-BIZ|pass/fail|promotion blocked\" documents/strategy/BUSINESS_PLAN.json documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md documents/rfcs/RFC-0021/07_test_and_evidence.yaml"
+        ]
+      ],
+      [
+        "E13",
+        "output_contract_surface",
+        true,
+        "report",
+        ["documents/rfcs/RFC-0021"],
+        []
+      ]
+    ],
+    "dep": [
+      [
+        "DP01",
+        ["C01"],
+        "Base alien-engineering instruction must be loaded before RFC-0021 refinement passes are evaluated."
+      ]
+    ],
+    "q": [
+      "Goal coverage matrix maps each stated RFC-0021 goal to concrete mechanism, predicate, evidence path, and owner locus.",
+      "No blocker gaps remain for FAC authority separation, three-source intake, or AAT-BIZ mandatory paths.",
+      "Every new or revised requirement has at least one test target and one evidence artifact binding.",
+      "Every gate and transition claim is machine-checkable and fail-closed under unknown/missing states.",
+      "Dominance order and HTF time authority are explicit in normative sections and gating logic.",
+      "Alien Engineering clauses AEP_01..AEP_08 are materially reflected in design, not only in prose declarations.",
+      "Physics feasibility ledger exists for major VPHI claims with falsification tests and admissibility assumptions.",
+      "AAT-BIZ coupling ledger maps venture signal classes to Stage-5 verification obligations and promotion outcomes.",
+      "Unified diffs and per-hunk rationale are provided for all refinement edits."
+    ],
+    "chg": [
+      [
+        "C01",
+        "ADD",
+        ["work/prompts/instruction.rfc_0021_refinement.alien_engineering_protocol.v1.json"],
+        ["work/prompts/instruction.rfc_0021_refinement.alien_engineering_protocol.v1.json:1"],
+        "Add dedicated alien-engineering refinement prompt for RFC-0021 against its stated goals."
+      ]
+    ],
+    "x": {
+      "tools": ["rg", "jq", "cargo"],
+      "bud": {
+        "tok": 180000,
+        "tc": 600,
+        "ms": 3600000
+      }
+    }
+  }
+}

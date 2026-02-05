@@ -161,7 +161,7 @@ enum Commands {
         /// AI tool backend to use for hypothesis generation.
         ///
         /// Overrides the `AAT_AI_TOOL` environment variable.
-        /// Supported values: `gemini`, `claude-code`.
+        /// Supported values: `codex`, `claude-code`.
         #[arg(long, value_parser = parse_ai_tool)]
         ai_tool: Option<aat::tool_config::AiTool>,
 
@@ -270,7 +270,7 @@ enum SecurityReviewExecCommands {
 /// Review subcommands.
 #[derive(Subcommand)]
 enum ReviewCommands {
-    /// Run security review using Gemini.
+    /// Run security review using Codex.
     ///
     /// Reads `SECURITY_REVIEW_PROMPT.md`, runs the review,
     /// posts findings as a PR comment, and updates the

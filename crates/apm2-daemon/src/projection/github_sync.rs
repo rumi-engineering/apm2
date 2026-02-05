@@ -347,7 +347,8 @@ pub struct GitHubAdapterConfig {
 
     /// GitHub API token for authentication.
     /// Uses `SecretString` to prevent accidental exposure in logs/debug output.
-    /// (AD-SEC-001: Proper secret type per `SECRETS_MANAGEMENT.md`)
+    /// (AD-SEC-001: Proper secret type per
+    /// `documents/security/SECRETS_MANAGEMENT.cac.json`)
     pub api_token: Option<SecretString>,
 
     /// Connection timeout.
@@ -435,7 +436,8 @@ impl GitHubAdapterConfig {
     /// Sets the GitHub API token for authentication.
     ///
     /// The token is stored as a `SecretString` to prevent accidental exposure
-    /// in logs and debug output, per `SECRETS_MANAGEMENT.md` requirements.
+    /// in logs and debug output, per
+    /// `documents/security/SECRETS_MANAGEMENT.cac.json` requirements.
     ///
     /// # Errors
     ///

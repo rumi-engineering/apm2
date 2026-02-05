@@ -1,0 +1,20 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0006"
+  title: "Mandatory AAT-BIZ enforcement for required work classes"
+  category: "VERIFICATION"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    For work classes marked AAT-BIZ-required by policy, promotion MUST fail closed unless
+    a valid AAT-BIZ receipt is present and all required predicates pass.
+  rationale: |
+    Prevents strategy-critical work from bypassing business-domain verification.
+  acceptance_criteria:
+    - "Required paths without AAT-BIZ receipt are blocked"
+    - "Receipt present but failing predicates blocks promotion"
+    - "Tier2+ bypass count remains zero"
+  evidence_ids: ["EVID-0006"]
+  source_refs:
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §5.3"
+    - "HOLONIC_VENTURE_PROVING_INTERFACE.md §6.4"

@@ -1,0 +1,1976 @@
+{
+  "schema": "cac.strategy.roadmap.v1",
+  "schema_version": "1.0.0",
+  "kind": "strategy.roadmap",
+  "meta": {
+    "artifact_id": "STRAT-ROADMAP-HTF-0001",
+    "authority": "normative",
+    "created_at": "HTF-BND-STRAT-BUNDLE-COMPILE-001",
+    "normalization_version": "strategy-business-normalizer.v2.cac_json",
+    "source_bundle_ref": "documents/strategy/STRATEGY_BUSINESS_BUNDLE.json",
+    "status": "active"
+  },
+  "payload": {
+    "gate_contracts": [
+      {
+        "authority_requirements": [
+          "quorum_valid == true",
+          "delegation_narrowing_violations == 0"
+        ],
+        "fail_closed_conditions": [
+          "missing_input",
+          "parse_error",
+          "unknown_state",
+          "signature_failure"
+        ],
+        "gate_id": "PHASE-1-TO-2",
+        "inputs": [
+          "EVID-TRANS-PHASE-1-2"
+        ],
+        "output_receipts": [
+          "RECEIPT-GATE-PHASE-1-2"
+        ],
+        "predicate": ".msc01_pass == true and .msc02_pass == true and .msc03_progress_ratio >= 0.60 and .freshness_ok == true and .revocation_ok == true and .authority_graph_complete == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "quorum_valid == true",
+          "authority_graph_complete == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_input",
+          "parse_error",
+          "unknown_state",
+          "freshness_failure"
+        ],
+        "gate_id": "PHASE-2-TO-3",
+        "inputs": [
+          "EVID-TRANS-PHASE-2-3"
+        ],
+        "output_receipts": [
+          "RECEIPT-GATE-PHASE-2-3"
+        ],
+        "predicate": ".msc03_pass == true and .msc04_pass == true and .msc05_pass == true and .msc09_pass == true and .msc10_pass == true and .freshness_ok == true and .revocation_ok == true and .authority_graph_complete == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "quorum_valid == true",
+          "authority_graph_complete == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_input",
+          "parse_error",
+          "unknown_state",
+          "signature_failure"
+        ],
+        "gate_id": "PHASE-3-TO-4",
+        "inputs": [
+          "EVID-TRANS-PHASE-3-4"
+        ],
+        "output_receipts": [
+          "RECEIPT-GATE-PHASE-3-4"
+        ],
+        "predicate": ".msc06_pass == true and .msc11_pass == true and .tier2plus_promotions_without_terminal_receipt == 0 and .window_tick_floor_met == true and .semantic_equivalence_ok == true and .employee_count == 0 and .llc_lifecycle_automation_coverage >= 0.95 and .llc_formation_automation_pass == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "quorum_valid == true",
+          "authority_graph_complete == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_input",
+          "parse_error",
+          "unknown_state",
+          "freshness_failure"
+        ],
+        "gate_id": "PHASE-4-TO-5",
+        "inputs": [
+          "EVID-TRANS-PHASE-4-5"
+        ],
+        "output_receipts": [
+          "RECEIPT-GATE-PHASE-4-5"
+        ],
+        "predicate": ".msc07_pass == true and .msc12_pass == true and .external_safety_audit_pass == true and .partition_drill_receipt_ok == true and .revocation_ok == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "external_ethics_signer_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_input",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "PHASE-5-TERMINAL",
+        "inputs": [
+          "EVID-PHASE5-MSC08"
+        ],
+        "output_receipts": [
+          "RECEIPT-GATE-PHASE-5-TERMINAL"
+        ],
+        "predicate": ".msc08_pass == true and .independent_replication_success_rate >= 0.80 and .external_ethics_board_signoff == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "verification_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-001",
+        "inputs": [
+          "EVID-BRIDGE-001"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-001"
+        ],
+        "predicate": ".step_brg_001_a_pass == true and .step_brg_001_b_pass == true and .verifier_work_ticks_per_passed_transition_p95 <= 1800",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "security_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-002",
+        "inputs": [
+          "EVID-BRIDGE-002"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-002"
+        ],
+        "predicate": ".step_brg_002_a_pass == true and .step_brg_002_b_pass == true and .revocation_miss_count == 0",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "authority_graph_complete == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-003",
+        "inputs": [
+          "EVID-BRIDGE-003"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-003"
+        ],
+        "predicate": ".step_brg_003_a_pass == true and .step_brg_003_b_pass == true and .authority_graph_coverage == 1.0",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "verification_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-004",
+        "inputs": [
+          "EVID-BRIDGE-004"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-004"
+        ],
+        "predicate": ".step_brg_004_a_pass == true and .step_brg_004_b_pass == true and .sev12_defects_with_replay_proven_verifier_delta_ratio >= 0.85",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "research_ip_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-005",
+        "inputs": [
+          "EVID-BRIDGE-005"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-005"
+        ],
+        "predicate": ".step_brg_005_a_pass == true and .step_brg_005_b_pass == true and .prior_art_replay_pass == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "governance_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-006",
+        "inputs": [
+          "EVID-BRIDGE-006"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-006"
+        ],
+        "predicate": ".step_brg_006_a_pass == true and .step_brg_006_b_pass == true and .oracle_requests_per_100_work_items <= 3",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "security_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state",
+          "freshness_failure"
+        ],
+        "gate_id": "BRIDGE-GATE-007",
+        "inputs": [
+          "EVID-BRIDGE-007"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-007"
+        ],
+        "predicate": ".step_brg_007_a_pass == true and .step_brg_007_b_pass == true and .freshness_ok == true and .revocation_miss_count == 0",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "runtime_research_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-008",
+        "inputs": [
+          "EVID-BRIDGE-008"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-008"
+        ],
+        "predicate": ".step_brg_008_a_pass == true and .step_brg_008_b_pass == true and .bisimulation_pass_rate_depth_le_12 >= 0.99 and .semantic_drift_escape_rate <= 0.001",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "finance_board_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-009",
+        "inputs": [
+          "EVID-BRIDGE-009"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-009"
+        ],
+        "predicate": ".step_brg_009_a_pass == true and .step_brg_009_b_pass == true and .arr_usd >= 15000000 and .gross_margin >= 0.65 and .employee_count == 0 and .llc_lifecycle_automation_coverage >= 0.95 and .llc_formation_automation_pass == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "platform_security_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-010",
+        "inputs": [
+          "EVID-BRIDGE-010"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-010"
+        ],
+        "predicate": ".step_brg_010_a_pass == true and .step_brg_010_b_pass == true and .sev0_sev1_cross_tenant_incidents == 0",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "platform_security_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-011",
+        "inputs": [
+          "EVID-BRIDGE-011"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-011"
+        ],
+        "predicate": ".step_brg_011_a_pass == true and .step_brg_011_b_pass == true and .unsafe_promotions_during_partition == 0 and .byzantine_quorum_divergence_events == 0",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "bio_ethics_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_step_receipt",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "BRIDGE-GATE-012",
+        "inputs": [
+          "EVID-BRIDGE-012"
+        ],
+        "output_receipts": [
+          "RECEIPT-BRIDGE-012"
+        ],
+        "predicate": ".step_brg_012_a_pass == true and .step_brg_012_b_pass == true and .independent_replication_success_rate >= 0.80",
+        "predicate_language": "jq"
+      }
+    ],
+    "intermediate_step_contracts": [
+      {
+        "dependency_refs": [],
+        "entry_predicate": "baseline_manifest_exists == true",
+        "evidence_refs": [
+          "EVID-BRIDGE-001"
+        ],
+        "exit_predicate": "baseline_metric_coverage_ratio >= 0.95",
+        "htf_boundary_id": "HTF-BND-P1-BASELINE-LOCK",
+        "metric_refs": [
+          "MET-TERMINAL-RECEIPT-COVERAGE"
+        ],
+        "objective": "Pin baseline metric coverage to signed manifests.",
+        "owner_locus": "Verification Council",
+        "risk_refs": [
+          "RISK-VERIFIER-CAPACITY"
+        ],
+        "roadmap_from": "RM-P1-01",
+        "roadmap_to": "RM-P1-02",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-001-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-001-A"
+        ],
+        "entry_predicate": "baseline_metric_coverage_ratio >= 0.95",
+        "evidence_refs": [
+          "EVID-BRIDGE-001"
+        ],
+        "exit_predicate": "autonomous_tier1_merge_ratio >= 0.70",
+        "htf_boundary_id": "HTF-BND-P1-CLOSE",
+        "metric_refs": [
+          "MET-AUTONOMOUS-TIER1-MERGE-RATIO",
+          "MET-AGENT-DEFECT-RATE"
+        ],
+        "objective": "Execute shadow autonomous merges with replay verification.",
+        "owner_locus": "Runtime Council",
+        "risk_refs": [
+          "RISK-VERIFIER-CAPACITY"
+        ],
+        "roadmap_from": "RM-P1-01",
+        "roadmap_to": "RM-P1-02",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-001-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-001-B"
+        ],
+        "entry_predicate": "autonomous_tier1_merge_ratio >= 0.70",
+        "evidence_refs": [
+          "EVID-BRIDGE-002"
+        ],
+        "exit_predicate": "tier2plus_terminal_receipt_coverage == 1.0",
+        "htf_boundary_id": "HTF-BND-P1-SECURITY-CLOSE",
+        "metric_refs": [
+          "MET-TERMINAL-RECEIPT-COVERAGE"
+        ],
+        "objective": "Roll out terminal-receipt enforcement across Tier2+ pipelines.",
+        "owner_locus": "Security Council",
+        "risk_refs": [
+          "RISK-REVOCATION-CORRECTNESS"
+        ],
+        "roadmap_from": "RM-P1-02",
+        "roadmap_to": "RM-P1-03",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-002-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-002-A"
+        ],
+        "entry_predicate": "tier2plus_terminal_receipt_coverage == 1.0",
+        "evidence_refs": [
+          "EVID-BRIDGE-002"
+        ],
+        "exit_predicate": "tier2plus_promotions_without_terminal_receipt == 0",
+        "htf_boundary_id": "HTF-BND-P1-SECURITY-CLOSE",
+        "metric_refs": [
+          "MET-TIER2PLUS-NO-TERMINAL-RECEIPT"
+        ],
+        "objective": "Drive Tier2+ unauthorized promotions to zero under fail-closed policy.",
+        "owner_locus": "Security Council",
+        "risk_refs": [
+          "RISK-REVOCATION-CORRECTNESS",
+          "RISK-GOVERNANCE-FAILURE"
+        ],
+        "roadmap_from": "RM-P1-02",
+        "roadmap_to": "RM-P1-03",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-002-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-002-B"
+        ],
+        "entry_predicate": "tier2plus_promotions_without_terminal_receipt == 0",
+        "evidence_refs": [
+          "EVID-BRIDGE-003"
+        ],
+        "exit_predicate": "authority_graph_coverage >= 0.95",
+        "htf_boundary_id": "HTF-BND-P1-CLOSE",
+        "metric_refs": [
+          "MET-AUTHORITY-GRAPH-COVERAGE"
+        ],
+        "objective": "Produce authority graph snapshots for every authority-bearing transition.",
+        "owner_locus": "Security Council",
+        "risk_refs": [
+          "RISK-GOVERNANCE-FAILURE"
+        ],
+        "roadmap_from": "RM-P1-03",
+        "roadmap_to": "RM-P1-04",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-003-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-003-A"
+        ],
+        "entry_predicate": "authority_graph_coverage >= 0.95",
+        "evidence_refs": [
+          "EVID-BRIDGE-003"
+        ],
+        "exit_predicate": "delegation_narrowing_violations == 0 and authority_graph_coverage == 1.0",
+        "htf_boundary_id": "HTF-BND-P1-CLOSE",
+        "metric_refs": [
+          "MET-DELEGATION-NARROWING-VIOLATIONS",
+          "MET-AUTHORITY-GRAPH-COVERAGE"
+        ],
+        "objective": "Eliminate delegation narrowing violations.",
+        "owner_locus": "Verification Council",
+        "risk_refs": [
+          "RISK-GOVERNANCE-FAILURE"
+        ],
+        "roadmap_from": "RM-P1-03",
+        "roadmap_to": "RM-P1-04",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-003-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-003-B"
+        ],
+        "entry_predicate": "authority_graph_coverage == 1.0",
+        "evidence_refs": [
+          "EVID-BRIDGE-004"
+        ],
+        "exit_predicate": "defect_replay_corpus_seed_count >= 200",
+        "htf_boundary_id": "HTF-BND-P2-EARLY-CLOSE",
+        "metric_refs": [
+          "MET-SEV12-REPLAY-CLOSURE-RATIO"
+        ],
+        "objective": "Seed replay corpus with severity-weighted defect traces.",
+        "owner_locus": "Reliability Council",
+        "risk_refs": [
+          "RISK-VERIFIER-CAPACITY"
+        ],
+        "roadmap_from": "RM-P1-04",
+        "roadmap_to": "RM-P2-01",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-004-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-004-A"
+        ],
+        "entry_predicate": "defect_replay_corpus_seed_count >= 200",
+        "evidence_refs": [
+          "EVID-BRIDGE-004"
+        ],
+        "exit_predicate": "sev12_defects_with_replay_proven_verifier_delta_ratio >= 0.85",
+        "htf_boundary_id": "HTF-BND-P2-EARLY-CLOSE",
+        "metric_refs": [
+          "MET-SEV12-REPLAY-CLOSURE-RATIO"
+        ],
+        "objective": "Compile counterexamples into verifier upgrades and close Sev1/2 defects.",
+        "owner_locus": "Reliability Council",
+        "risk_refs": [
+          "RISK-VERIFIER-CAPACITY"
+        ],
+        "roadmap_from": "RM-P1-04",
+        "roadmap_to": "RM-P2-01",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-004-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-004-B"
+        ],
+        "entry_predicate": "sev12_defects_with_replay_proven_verifier_delta_ratio >= 0.85",
+        "evidence_refs": [
+          "EVID-BRIDGE-005"
+        ],
+        "exit_predicate": "prior_art_replay_pass == true",
+        "htf_boundary_id": "HTF-BND-P2-CLOSE",
+        "metric_refs": [
+          "MET-NOVEL-METHODS-PER-EPOCH"
+        ],
+        "objective": "Build prior-art ingest and replay line for novelty checks.",
+        "owner_locus": "IP Council",
+        "risk_refs": [
+          "RISK-MARKET-NOVELTY-NOISE-FLOOR"
+        ],
+        "roadmap_from": "RM-P2-01",
+        "roadmap_to": "RM-P2-02",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-005-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-005-A"
+        ],
+        "entry_predicate": "prior_art_replay_pass == true",
+        "evidence_refs": [
+          "EVID-BRIDGE-005"
+        ],
+        "exit_predicate": "novel_methods_per_htf_epoch >= 12 and methods_ge_2x >= 4",
+        "htf_boundary_id": "HTF-BND-P2-CLOSE",
+        "metric_refs": [
+          "MET-NOVEL-METHODS-PER-EPOCH",
+          "MET-METHODS-GE-2X"
+        ],
+        "objective": "Scale admissible novelty outputs above superiority threshold.",
+        "owner_locus": "Research Council",
+        "risk_refs": [
+          "RISK-MARKET-NOVELTY-NOISE-FLOOR"
+        ],
+        "roadmap_from": "RM-P2-01",
+        "roadmap_to": "RM-P2-02",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-005-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-005-B"
+        ],
+        "entry_predicate": "novel_methods_per_htf_epoch >= 12",
+        "evidence_refs": [
+          "EVID-BRIDGE-006"
+        ],
+        "exit_predicate": "oracle_decision_logging_coverage >= 0.95",
+        "htf_boundary_id": "HTF-BND-P2-CLOSE",
+        "metric_refs": [
+          "MET-ORACLE-REQ-PER-100"
+        ],
+        "objective": "Instrument oracle decisions for compiler extraction.",
+        "owner_locus": "Governance Council",
+        "risk_refs": [
+          "RISK-HUMAN-ORACLE-BANDWIDTH"
+        ],
+        "roadmap_from": "RM-P2-02",
+        "roadmap_to": "RM-P2-03",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-006-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-006-A"
+        ],
+        "entry_predicate": "oracle_decision_logging_coverage >= 0.95",
+        "evidence_refs": [
+          "EVID-BRIDGE-006"
+        ],
+        "exit_predicate": "oracle_requests_per_100_work_items <= 3 and oracle_to_primitive_tick_budget_p95_met == true",
+        "htf_boundary_id": "HTF-BND-P2-CLOSE",
+        "metric_refs": [
+          "MET-ORACLE-REQ-PER-100",
+          "MET-ORACLE-TO-PRIMITIVE-P95"
+        ],
+        "objective": "Meet oracle-to-primitive SLA and reduce oracle load.",
+        "owner_locus": "Governance Council",
+        "risk_refs": [
+          "RISK-HUMAN-ORACLE-BANDWIDTH"
+        ],
+        "roadmap_from": "RM-P2-02",
+        "roadmap_to": "RM-P2-03",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-006-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-006-B"
+        ],
+        "entry_predicate": "oracle_requests_per_100_work_items <= 3",
+        "evidence_refs": [
+          "EVID-BRIDGE-007"
+        ],
+        "exit_predicate": "tier2plus_freshness_violations == 0",
+        "htf_boundary_id": "HTF-BND-P2-CONTROL-CLOSE",
+        "metric_refs": [
+          "MET-FRESHNESS-VIOLATIONS-TIER2PLUS"
+        ],
+        "objective": "Bind freshness and revocation checks into policy snapshots.",
+        "owner_locus": "Security Council",
+        "risk_refs": [
+          "RISK-REPLAY-STALE"
+        ],
+        "roadmap_from": "RM-P2-03",
+        "roadmap_to": "RM-P2-04",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-007-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-007-A"
+        ],
+        "entry_predicate": "tier2plus_freshness_violations == 0",
+        "evidence_refs": [
+          "EVID-BRIDGE-007"
+        ],
+        "exit_predicate": "revocation_miss_count == 0",
+        "htf_boundary_id": "HTF-BND-P2-CONTROL-CLOSE",
+        "metric_refs": [
+          "MET-REVOCATION-P99-MET",
+          "MET-REVOCATION-MISS-COUNT"
+        ],
+        "objective": "Enforce replay-safe receipts and zero revocation misses.",
+        "owner_locus": "Security Council",
+        "risk_refs": [
+          "RISK-REPLAY-STALE",
+          "RISK-REVOCATION-CORRECTNESS"
+        ],
+        "roadmap_from": "RM-P2-03",
+        "roadmap_to": "RM-P2-04",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-007-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-007-B"
+        ],
+        "entry_predicate": "revocation_miss_count == 0",
+        "evidence_refs": [
+          "EVID-BRIDGE-008"
+        ],
+        "exit_predicate": "bisimulation_pass_rate_depth_le_12 >= 0.97",
+        "htf_boundary_id": "HTF-BND-P2-SEMANTICS-CLOSE",
+        "metric_refs": [
+          "MET-BISIMULATION-PASS-RATE-D12"
+        ],
+        "objective": "Deploy depth-bounded bisimulation harness.",
+        "owner_locus": "Runtime Council",
+        "risk_refs": [
+          "RISK-SEMANTIC-DRIFT"
+        ],
+        "roadmap_from": "RM-P2-04",
+        "roadmap_to": "RM-P2-05",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-008-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-008-A"
+        ],
+        "entry_predicate": "bisimulation_pass_rate_depth_le_12 >= 0.97",
+        "evidence_refs": [
+          "EVID-BRIDGE-008"
+        ],
+        "exit_predicate": "bisimulation_pass_rate_depth_le_12 >= 0.99 and semantic_drift_escape_rate <= 0.001",
+        "htf_boundary_id": "HTF-BND-P2-SEMANTICS-CLOSE",
+        "metric_refs": [
+          "MET-BISIMULATION-PASS-RATE-D12",
+          "MET-SEMANTIC-DRIFT-ESCAPE-RATE"
+        ],
+        "objective": "Lower semantic drift escape rate to threshold.",
+        "owner_locus": "Runtime Council + Research Council",
+        "risk_refs": [
+          "RISK-SEMANTIC-DRIFT"
+        ],
+        "roadmap_from": "RM-P2-04",
+        "roadmap_to": "RM-P2-05",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-008-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-008-B"
+        ],
+        "entry_predicate": "semantic_drift_escape_rate <= 0.001",
+        "evidence_refs": [
+          "EVID-BRIDGE-009"
+        ],
+        "exit_predicate": "qualified_pipeline_usd >= 30000000",
+        "htf_boundary_id": "HTF-BND-P3-CLOSE",
+        "metric_refs": [
+          "MET-PIPELINE-USD",
+          "MET-PILOT-CONVERSION-RATIO"
+        ],
+        "objective": "Close enterprise design partners with signed security and verification obligations.",
+        "owner_locus": "Revenue GM + Security Council",
+        "risk_refs": [
+          "RISK-GTM-SOLUTION-ENGINEER-CAPACITY"
+        ],
+        "roadmap_from": "RM-P2-05",
+        "roadmap_to": "RM-P3-01",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-009-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-009-A"
+        ],
+        "entry_predicate": "qualified_pipeline_usd >= 30000000",
+        "evidence_refs": [
+          "EVID-BRIDGE-009"
+        ],
+        "exit_predicate": "arr_usd >= 15000000 and gross_margin >= 0.65 and logo_retention >= 0.90 and employee_count == 0 and llc_lifecycle_automation_coverage >= 0.95 and llc_formation_automation_pass == true",
+        "htf_boundary_id": "HTF-BND-P3-CLOSE",
+        "metric_refs": [
+          "MET-ARR-USD",
+          "MET-EMPLOYEE-COUNT",
+          "MET-GROSS-MARGIN-RATIO",
+          "MET-LLC-FORMATION-AUTOMATION-FAILURES",
+          "MET-LLC-LIFECYCLE-AUTOMATION-COVERAGE",
+          "MET-LOGO-RETENTION-RATIO"
+        ],
+        "objective": "Launch pricing, legal automation, and contracts with margin floor, zero-employee constraint, and anti-gaming checks.",
+        "owner_locus": "Finance Council",
+        "risk_refs": [
+          "RISK-GTM-SOLUTION-ENGINEER-CAPACITY",
+          "RISK-LLC-COMPLIANCE-AUTOMATION",
+          "RISK-ZERO-EMPLOYEE-DRIFT"
+        ],
+        "roadmap_from": "RM-P2-05",
+        "roadmap_to": "RM-P3-01",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-009-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-009-B"
+        ],
+        "entry_predicate": "arr_usd >= 15000000",
+        "evidence_refs": [
+          "EVID-BRIDGE-010"
+        ],
+        "exit_predicate": "active_federated_cells >= 5",
+        "htf_boundary_id": "HTF-BND-P4-READINESS-CLOSE",
+        "metric_refs": [
+          "MET-ACTIVE-FEDERATED-CELLS"
+        ],
+        "objective": "Deploy federated reference architecture with scoped trust roots.",
+        "owner_locus": "Platform Council",
+        "risk_refs": [
+          "RISK-BYZANTINE-BEHAVIOR",
+          "RISK-SECURITY-REVIEW-CAPACITY"
+        ],
+        "roadmap_from": "RM-P3-01",
+        "roadmap_to": "RM-P4-01",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-010-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-010-A"
+        ],
+        "entry_predicate": "active_federated_cells >= 5",
+        "evidence_refs": [
+          "EVID-BRIDGE-010"
+        ],
+        "exit_predicate": "active_federated_cells >= 10 and sev0_sev1_cross_tenant_incidents == 0",
+        "htf_boundary_id": "HTF-BND-P4-CLOSE",
+        "metric_refs": [
+          "MET-ACTIVE-FEDERATED-CELLS",
+          "MET-CROSS-TENANT-SEV0-1"
+        ],
+        "objective": "Complete cross-tenant red-team run with zero severe incidents.",
+        "owner_locus": "Security Council",
+        "risk_refs": [
+          "RISK-BYZANTINE-BEHAVIOR",
+          "RISK-SECURITY-REVIEW-CAPACITY"
+        ],
+        "roadmap_from": "RM-P3-01",
+        "roadmap_to": "RM-P4-01",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-010-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-010-B"
+        ],
+        "entry_predicate": "active_federated_cells >= 10",
+        "evidence_refs": [
+          "EVID-BRIDGE-011"
+        ],
+        "exit_predicate": "partition_drill_receipt_coverage == 1.0",
+        "htf_boundary_id": "HTF-BND-P4-CLOSE",
+        "metric_refs": [
+          "MET-UNSAFE-PROMOTIONS-PARTITION"
+        ],
+        "objective": "Run partition drills with receipt coverage.",
+        "owner_locus": "Platform Council",
+        "risk_refs": [
+          "RISK-BYZANTINE-BEHAVIOR"
+        ],
+        "roadmap_from": "RM-P4-01",
+        "roadmap_to": "RM-P4-02",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-011-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-011-A"
+        ],
+        "entry_predicate": "partition_drill_receipt_coverage == 1.0",
+        "evidence_refs": [
+          "EVID-BRIDGE-011"
+        ],
+        "exit_predicate": "unsafe_promotions_during_partition == 0 and byzantine_quorum_divergence_events == 0",
+        "htf_boundary_id": "HTF-BND-P4-CLOSE",
+        "metric_refs": [
+          "MET-UNSAFE-PROMOTIONS-PARTITION",
+          "MET-BYZANTINE-QUORUM-DIVERGENCE"
+        ],
+        "objective": "Pass Byzantine chaos tests with zero unsafe promotions.",
+        "owner_locus": "Platform Council + Security Council",
+        "risk_refs": [
+          "RISK-BYZANTINE-BEHAVIOR"
+        ],
+        "roadmap_from": "RM-P4-01",
+        "roadmap_to": "RM-P4-02",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-011-B"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-011-B"
+        ],
+        "entry_predicate": "unsafe_promotions_during_partition == 0",
+        "evidence_refs": [
+          "EVID-BRIDGE-012"
+        ],
+        "exit_predicate": "active_disease_programs >= 3",
+        "htf_boundary_id": "HTF-BND-P5-CLOSE",
+        "metric_refs": [
+          "MET-ACTIVE-DISEASE-PROGRAMS"
+        ],
+        "objective": "Admit life-science programs through governed safety gate.",
+        "owner_locus": "Bio Council",
+        "risk_refs": [
+          "RISK-EXTERNAL-REPLICATION-BANDWIDTH"
+        ],
+        "roadmap_from": "RM-P4-02",
+        "roadmap_to": "RM-P5-01",
+        "sequence_index": 1,
+        "status": "planned",
+        "step_id": "STEP-BRG-012-A"
+      },
+      {
+        "dependency_refs": [
+          "STEP-BRG-012-A"
+        ],
+        "entry_predicate": "active_disease_programs >= 3",
+        "evidence_refs": [
+          "EVID-BRIDGE-012"
+        ],
+        "exit_predicate": "independent_replication_success_rate >= 0.80",
+        "htf_boundary_id": "HTF-BND-P5-CLOSE",
+        "metric_refs": [
+          "MET-INDEPENDENT-REPLICATION-RATE"
+        ],
+        "objective": "Reach independent replication success threshold.",
+        "owner_locus": "Bio Council + External Ethics Board",
+        "risk_refs": [
+          "RISK-EXTERNAL-REPLICATION-BANDWIDTH"
+        ],
+        "roadmap_from": "RM-P4-02",
+        "roadmap_to": "RM-P5-01",
+        "sequence_index": 2,
+        "status": "planned",
+        "step_id": "STEP-BRG-012-B"
+      }
+    ],
+    "intermediate_step_ladder": [
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-001",
+            "risk_ref": "RISK-VERIFIER-CAPACITY"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-001",
+        "bridge_id": "BRIDGE-001",
+        "critical_path_step_ids": [
+          "STEP-BRG-001-B"
+        ],
+        "from_milestone_id": "RM-P1-01",
+        "ordered_step_ids": [
+          "STEP-BRG-001-A",
+          "STEP-BRG-001-B"
+        ],
+        "to_milestone_id": "RM-P1-02"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-002",
+            "risk_ref": "RISK-REVOCATION-CORRECTNESS"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-002",
+        "bridge_id": "BRIDGE-002",
+        "critical_path_step_ids": [
+          "STEP-BRG-002-B"
+        ],
+        "from_milestone_id": "RM-P1-02",
+        "ordered_step_ids": [
+          "STEP-BRG-002-A",
+          "STEP-BRG-002-B"
+        ],
+        "to_milestone_id": "RM-P1-03"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-003",
+            "risk_ref": "RISK-GOVERNANCE-FAILURE"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-003",
+        "bridge_id": "BRIDGE-003",
+        "critical_path_step_ids": [
+          "STEP-BRG-003-B"
+        ],
+        "from_milestone_id": "RM-P1-03",
+        "ordered_step_ids": [
+          "STEP-BRG-003-A",
+          "STEP-BRG-003-B"
+        ],
+        "to_milestone_id": "RM-P1-04"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-004",
+            "risk_ref": "RISK-VERIFIER-CAPACITY"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-004",
+        "bridge_id": "BRIDGE-004",
+        "critical_path_step_ids": [
+          "STEP-BRG-004-B"
+        ],
+        "from_milestone_id": "RM-P1-04",
+        "ordered_step_ids": [
+          "STEP-BRG-004-A",
+          "STEP-BRG-004-B"
+        ],
+        "to_milestone_id": "RM-P2-01"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-005",
+            "risk_ref": "RISK-MARKET-NOVELTY-NOISE-FLOOR"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-005",
+        "bridge_id": "BRIDGE-005",
+        "critical_path_step_ids": [
+          "STEP-BRG-005-B"
+        ],
+        "from_milestone_id": "RM-P2-01",
+        "ordered_step_ids": [
+          "STEP-BRG-005-A",
+          "STEP-BRG-005-B"
+        ],
+        "to_milestone_id": "RM-P2-02"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-006",
+            "risk_ref": "RISK-HUMAN-ORACLE-BANDWIDTH"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-006",
+        "bridge_id": "BRIDGE-006",
+        "critical_path_step_ids": [
+          "STEP-BRG-006-B"
+        ],
+        "from_milestone_id": "RM-P2-02",
+        "ordered_step_ids": [
+          "STEP-BRG-006-A",
+          "STEP-BRG-006-B"
+        ],
+        "to_milestone_id": "RM-P2-03"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-007",
+            "risk_ref": "RISK-REPLAY-STALE"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-007",
+        "bridge_id": "BRIDGE-007",
+        "critical_path_step_ids": [
+          "STEP-BRG-007-B"
+        ],
+        "from_milestone_id": "RM-P2-03",
+        "ordered_step_ids": [
+          "STEP-BRG-007-A",
+          "STEP-BRG-007-B"
+        ],
+        "to_milestone_id": "RM-P2-04"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-008",
+            "risk_ref": "RISK-SEMANTIC-DRIFT"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-008",
+        "bridge_id": "BRIDGE-008",
+        "critical_path_step_ids": [
+          "STEP-BRG-008-B"
+        ],
+        "from_milestone_id": "RM-P2-04",
+        "ordered_step_ids": [
+          "STEP-BRG-008-A",
+          "STEP-BRG-008-B"
+        ],
+        "to_milestone_id": "RM-P2-05"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-009",
+            "risk_ref": "RISK-GTM-SOLUTION-ENGINEER-CAPACITY"
+          },
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-009",
+            "risk_ref": "RISK-LLC-COMPLIANCE-AUTOMATION"
+          },
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-009",
+            "risk_ref": "RISK-ZERO-EMPLOYEE-DRIFT"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-009",
+        "bridge_id": "BRIDGE-009",
+        "critical_path_step_ids": [
+          "STEP-BRG-009-B"
+        ],
+        "from_milestone_id": "RM-P2-05",
+        "ordered_step_ids": [
+          "STEP-BRG-009-A",
+          "STEP-BRG-009-B"
+        ],
+        "to_milestone_id": "RM-P3-01"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-010",
+            "risk_ref": "RISK-BYZANTINE-BEHAVIOR"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-010",
+        "bridge_id": "BRIDGE-010",
+        "critical_path_step_ids": [
+          "STEP-BRG-010-B"
+        ],
+        "from_milestone_id": "RM-P3-01",
+        "ordered_step_ids": [
+          "STEP-BRG-010-A",
+          "STEP-BRG-010-B"
+        ],
+        "to_milestone_id": "RM-P4-01"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-011",
+            "risk_ref": "RISK-BYZANTINE-BEHAVIOR"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-011",
+        "bridge_id": "BRIDGE-011",
+        "critical_path_step_ids": [
+          "STEP-BRG-011-B"
+        ],
+        "from_milestone_id": "RM-P4-01",
+        "ordered_step_ids": [
+          "STEP-BRG-011-A",
+          "STEP-BRG-011-B"
+        ],
+        "to_milestone_id": "RM-P4-02"
+      },
+      {
+        "bottleneck_risks": [
+          {
+            "mitigation_gate_ref": "BRIDGE-GATE-012",
+            "risk_ref": "RISK-EXTERNAL-REPLICATION-BANDWIDTH"
+          }
+        ],
+        "bridge_gate_predicate": "BRIDGE-GATE-012",
+        "bridge_id": "BRIDGE-012",
+        "critical_path_step_ids": [
+          "STEP-BRG-012-B"
+        ],
+        "from_milestone_id": "RM-P4-02",
+        "ordered_step_ids": [
+          "STEP-BRG-012-A",
+          "STEP-BRG-012-B"
+        ],
+        "to_milestone_id": "RM-P5-01"
+      }
+    ],
+    "milestone_dependency_graph": {
+      "edges": [
+        {
+          "from": "RM-P1-01",
+          "to": "RM-P1-02"
+        },
+        {
+          "from": "RM-P1-02",
+          "to": "RM-P1-03"
+        },
+        {
+          "from": "RM-P1-03",
+          "to": "RM-P1-04"
+        },
+        {
+          "from": "RM-P1-04",
+          "to": "RM-P2-01"
+        },
+        {
+          "from": "RM-P2-01",
+          "to": "RM-P2-02"
+        },
+        {
+          "from": "RM-P2-02",
+          "to": "RM-P2-03"
+        },
+        {
+          "from": "RM-P2-03",
+          "to": "RM-P2-04"
+        },
+        {
+          "from": "RM-P2-04",
+          "to": "RM-P2-05"
+        },
+        {
+          "from": "RM-P2-05",
+          "to": "RM-P3-01"
+        },
+        {
+          "from": "RM-P3-01",
+          "to": "RM-P4-01"
+        },
+        {
+          "from": "RM-P4-01",
+          "to": "RM-P4-02"
+        },
+        {
+          "from": "RM-P4-02",
+          "to": "RM-P5-01"
+        }
+      ],
+      "graph_id": "MILESTONE-DEP-GRAPH-001",
+      "nodes": [
+        "RM-P1-01",
+        "RM-P1-02",
+        "RM-P1-03",
+        "RM-P1-04",
+        "RM-P2-01",
+        "RM-P2-02",
+        "RM-P2-03",
+        "RM-P2-04",
+        "RM-P2-05",
+        "RM-P3-01",
+        "RM-P4-01",
+        "RM-P4-02",
+        "RM-P5-01"
+      ]
+    },
+    "phase_model": [
+      {
+        "claim_refs": [
+          "MSC-01",
+          "MSC-02",
+          "MSC-09"
+        ],
+        "entry_boundary_ref": "HTF-BND-P1-BASELINE-LOCK",
+        "exit_boundary_ref": "HTF-BND-P1-CLOSE",
+        "gate_ref": "PHASE-1-TO-2",
+        "name": "Recursive Self-Improvement",
+        "objective": "Increase Tier1 autonomous delivery under bounded authority and fail-closed Tier2+ promotion.",
+        "owner_locus": "Runtime Council + Verification Council + Security Council",
+        "phase_id": "PHASE-1"
+      },
+      {
+        "claim_refs": [
+          "MSC-03",
+          "MSC-04",
+          "MSC-05",
+          "MSC-10",
+          "MSC-11"
+        ],
+        "entry_boundary_ref": "HTF-BND-P2-EARLY-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P2-CLOSE",
+        "gate_ref": "PHASE-2-TO-3",
+        "name": "Novel Methods Generation",
+        "objective": "Produce reproducible novelty while lowering oracle dependence and strengthening temporal trust.",
+        "owner_locus": "Research Council + IP Council + Governance Council",
+        "phase_id": "PHASE-2"
+      },
+      {
+        "claim_refs": [
+          "BPC-01",
+          "BPC-03",
+          "BPC-04",
+          "BPC-05",
+          "BPC-06",
+          "MSC-06"
+        ],
+        "entry_boundary_ref": "HTF-BND-P3-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P3-ECON-CLOSE",
+        "gate_ref": "PHASE-3-TO-4",
+        "name": "Company Formation",
+        "objective": "Build durable governed-autonomy revenue while preserving security and verification spend floors, with employee_count == 0 and automated LLC lifecycle management.",
+        "owner_locus": "Board + Finance Council",
+        "phase_id": "PHASE-3"
+      },
+      {
+        "claim_refs": [
+          "MSC-07",
+          "MSC-12",
+          "BPC-02"
+        ],
+        "entry_boundary_ref": "HTF-BND-P4-READINESS-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P4-CLOSE",
+        "gate_ref": "PHASE-4-TO-5",
+        "name": "Federated Partnerships",
+        "objective": "Scale multi-cell deployment without containment regression and with partition survivability.",
+        "owner_locus": "Platform Council + Security Council",
+        "phase_id": "PHASE-4"
+      },
+      {
+        "claim_refs": [
+          "MSC-08"
+        ],
+        "entry_boundary_ref": "HTF-BND-P5-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P5-CLOSE",
+        "gate_ref": "PHASE-5-TERMINAL",
+        "name": "Planetary Impact",
+        "objective": "Deliver externally replicated governed discovery in life-science programs.",
+        "owner_locus": "Bio Council + External Ethics Board",
+        "phase_id": "PHASE-5"
+      }
+    ],
+    "risk_register": [
+      {
+        "detection_signal": "byzantine_quorum_divergence_events > 0",
+        "fail_closed_rule": "deny promotion until quorum divergence zeroed with signed remediation receipt",
+        "impact": "critical",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "PHASE-4-TO-5",
+          "BRIDGE-GATE-011"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-BYZANTINE-BEHAVIOR",
+        "threat_type": "byzantine_behavior"
+      },
+      {
+        "detection_signal": "independent_replication_queue_ticks_p95 > 720",
+        "fail_closed_rule": "deny terminal impact promotion until replication latency returns below threshold",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-012"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-EXTERNAL-REPLICATION-BANDWIDTH",
+        "threat_type": "external_validation_capacity"
+      },
+      {
+        "detection_signal": "fraud_loss_ratio > 0.001 or unreconciled_financial_events > 0",
+        "fail_closed_rule": "deny all autonomous financial actions until reconciliation and compensation receipts are complete",
+        "impact": "critical",
+        "likelihood": "low",
+        "mitigation_control_refs": [
+          "FIN-GATE-001",
+          "FIN-GATE-002",
+          "FIN-GATE-003",
+          "FIN-GATE-004",
+          "FIN-GATE-005",
+          "FIN-GATE-006"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-FINANCE-FRAUD",
+        "threat_type": "financial_fraud_or_orphaned_liability"
+      },
+      {
+        "detection_signal": "authority_graph_coverage < 1.0 or quorum_valid == false",
+        "fail_closed_rule": "deny transition and require authority graph repair receipt",
+        "impact": "high",
+        "likelihood": "low",
+        "mitigation_control_refs": [
+          "PHASE-1-TO-2",
+          "BRIDGE-GATE-003"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-GOVERNANCE-FAILURE",
+        "threat_type": "governance_failure_mode"
+      },
+      {
+        "detection_signal": "sales_engineering_capacity_utilization > 0.90",
+        "fail_closed_rule": "deny expansion promotions until capacity relief passes gate",
+        "impact": "medium",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-009"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-GTM-SOLUTION-ENGINEER-CAPACITY",
+        "threat_type": "gtm_capacity"
+      },
+      {
+        "detection_signal": "oracle_queue_tick_budget_p95_miss_streak >= 2",
+        "fail_closed_rule": "deny new phase admission until oracle backlog normalized",
+        "impact": "medium",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-006"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-HUMAN-ORACLE-BANDWIDTH",
+        "threat_type": "human_oracle_capacity"
+      },
+      {
+        "detection_signal": "confidentiality_integrity_labeling_violations > 0",
+        "fail_closed_rule": "deny transition and freeze affected capability scope",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "PHASE-2-TO-3",
+          "BRIDGE-GATE-007"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-LABELING-INTEGRITY",
+        "threat_type": "confidentiality_integrity_label_violation"
+      },
+      {
+        "detection_signal": "llc_lifecycle_automation_coverage < 0.95 or llc_formation_automation_pass == false",
+        "fail_closed_rule": "deny phase promotion and route to legal hard-constraint escalation lane",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-009",
+          "PHASE-3-TO-4"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-LLC-COMPLIANCE-AUTOMATION",
+        "threat_type": "legal_compliance_automation_failure"
+      },
+      {
+        "detection_signal": "methods_ge_2x < 4",
+        "fail_closed_rule": "deny novelty promotion and require stronger prior-art replay evidence",
+        "impact": "medium",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-005"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-MARKET-NOVELTY-NOISE-FLOOR",
+        "threat_type": "novelty_signal_noise"
+      },
+      {
+        "detection_signal": "prompt_injection_escape_rate_tier2plus > 0",
+        "fail_closed_rule": "deny promotion and deny financial execution when escape rate is non-zero",
+        "impact": "critical",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "FIN-GATE-STOP-STATE",
+          "PHASE-1-TO-2"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-PROMPT-INJECTION",
+        "threat_type": "prompt_injection"
+      },
+      {
+        "detection_signal": "freshness_ok == false or replay_rejection_rate < 1.0",
+        "fail_closed_rule": "deny authoritative transition and deny finance settlement",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "PHASE-2-TO-3",
+          "BRIDGE-GATE-007"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-REPLAY-STALE",
+        "threat_type": "replay_or_staleness"
+      },
+      {
+        "detection_signal": "revocation_miss_count > 0",
+        "fail_closed_rule": "deny any delegated action when revocation uncertainty exists",
+        "impact": "critical",
+        "likelihood": "low",
+        "mitigation_control_refs": [
+          "PHASE-2-TO-3",
+          "FIN-GATE-005"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-REVOCATION-CORRECTNESS",
+        "threat_type": "revocation_failure"
+      },
+      {
+        "detection_signal": "security_review_queue_ticks_p95 > 240",
+        "fail_closed_rule": "deny promotion to next milestone until queue is within budget",
+        "impact": "medium",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-002",
+          "BRIDGE-GATE-010"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-SECURITY-REVIEW-CAPACITY",
+        "threat_type": "security_review_capacity"
+      },
+      {
+        "detection_signal": "semantic_drift_escape_rate > 0.001",
+        "fail_closed_rule": "deny promotion and lock deployment scope to prior valid boundary",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-008",
+          "PHASE-3-TO-4"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-SEMANTIC-DRIFT",
+        "threat_type": "recursive_semantic_drift"
+      },
+      {
+        "detection_signal": "verifier_work_ticks_per_passed_transition_p95 > 1800",
+        "fail_closed_rule": "deny milestone promotion and reallocate compute to verification",
+        "impact": "high",
+        "likelihood": "medium",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-001",
+          "BRIDGE-GATE-004"
+        ],
+        "residual_risk": "medium",
+        "risk_id": "RISK-VERIFIER-CAPACITY",
+        "threat_type": "verification_capacity"
+      },
+      {
+        "detection_signal": "employee_count > 0",
+        "fail_closed_rule": "deny promotion and deny new payroll obligations when employee_count deviates from zero",
+        "impact": "high",
+        "likelihood": "low",
+        "mitigation_control_refs": [
+          "BRIDGE-GATE-009",
+          "PHASE-3-TO-4"
+        ],
+        "residual_risk": "low",
+        "risk_id": "RISK-ZERO-EMPLOYEE-DRIFT",
+        "threat_type": "operating_model_drift"
+      }
+    ],
+    "roadmap_bridge_contracts": [
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-001",
+        "bridge_gate_predicate": "BRIDGE-GATE-001",
+        "bridge_id": "BRIDGE-001",
+        "capacity_constraints": [
+          "verifier_work_ticks_per_passed_transition_p95 <= 1800"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-001-B"
+        ],
+        "from_milestone_id": "RM-P1-01",
+        "hand_off_contract": "HANDOFF-BRIDGE-001",
+        "required_step_ids": [
+          "STEP-BRG-001-A",
+          "STEP-BRG-001-B"
+        ],
+        "to_milestone_id": "RM-P1-02"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-002",
+        "bridge_gate_predicate": "BRIDGE-GATE-002",
+        "bridge_id": "BRIDGE-002",
+        "capacity_constraints": [
+          "security_review_queue_ticks_p95 <= 240"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-002-B"
+        ],
+        "from_milestone_id": "RM-P1-02",
+        "hand_off_contract": "HANDOFF-BRIDGE-002",
+        "required_step_ids": [
+          "STEP-BRG-002-A",
+          "STEP-BRG-002-B"
+        ],
+        "to_milestone_id": "RM-P1-03"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-003",
+        "bridge_gate_predicate": "BRIDGE-GATE-003",
+        "bridge_id": "BRIDGE-003",
+        "capacity_constraints": [
+          "authority_graph_coverage == 1.0"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-003-B"
+        ],
+        "from_milestone_id": "RM-P1-03",
+        "hand_off_contract": "HANDOFF-BRIDGE-003",
+        "required_step_ids": [
+          "STEP-BRG-003-A",
+          "STEP-BRG-003-B"
+        ],
+        "to_milestone_id": "RM-P1-04"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-004",
+        "bridge_gate_predicate": "BRIDGE-GATE-004",
+        "bridge_id": "BRIDGE-004",
+        "capacity_constraints": [
+          "defect_replay_corpus_seed_count >= 200"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-004-B"
+        ],
+        "from_milestone_id": "RM-P1-04",
+        "hand_off_contract": "HANDOFF-BRIDGE-004",
+        "required_step_ids": [
+          "STEP-BRG-004-A",
+          "STEP-BRG-004-B"
+        ],
+        "to_milestone_id": "RM-P2-01"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-005",
+        "bridge_gate_predicate": "BRIDGE-GATE-005",
+        "bridge_id": "BRIDGE-005",
+        "capacity_constraints": [
+          "prior_art_replay_pass == true"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-005-B"
+        ],
+        "from_milestone_id": "RM-P2-01",
+        "hand_off_contract": "HANDOFF-BRIDGE-005",
+        "required_step_ids": [
+          "STEP-BRG-005-A",
+          "STEP-BRG-005-B"
+        ],
+        "to_milestone_id": "RM-P2-02"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-006",
+        "bridge_gate_predicate": "BRIDGE-GATE-006",
+        "bridge_id": "BRIDGE-006",
+        "capacity_constraints": [
+          "oracle_requests_per_100_work_items <= 3"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-006-B"
+        ],
+        "from_milestone_id": "RM-P2-02",
+        "hand_off_contract": "HANDOFF-BRIDGE-006",
+        "required_step_ids": [
+          "STEP-BRG-006-A",
+          "STEP-BRG-006-B"
+        ],
+        "to_milestone_id": "RM-P2-03"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-007",
+        "bridge_gate_predicate": "BRIDGE-GATE-007",
+        "bridge_id": "BRIDGE-007",
+        "capacity_constraints": [
+          "revocation_miss_count == 0"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-007-B"
+        ],
+        "from_milestone_id": "RM-P2-03",
+        "hand_off_contract": "HANDOFF-BRIDGE-007",
+        "required_step_ids": [
+          "STEP-BRG-007-A",
+          "STEP-BRG-007-B"
+        ],
+        "to_milestone_id": "RM-P2-04"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-008",
+        "bridge_gate_predicate": "BRIDGE-GATE-008",
+        "bridge_id": "BRIDGE-008",
+        "capacity_constraints": [
+          "semantic_drift_escape_rate <= 0.001"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-008-B"
+        ],
+        "from_milestone_id": "RM-P2-04",
+        "hand_off_contract": "HANDOFF-BRIDGE-008",
+        "required_step_ids": [
+          "STEP-BRG-008-A",
+          "STEP-BRG-008-B"
+        ],
+        "to_milestone_id": "RM-P2-05"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-009",
+        "bridge_gate_predicate": "BRIDGE-GATE-009",
+        "bridge_id": "BRIDGE-009",
+        "capacity_constraints": [
+          "employee_count == 0",
+          "llc_lifecycle_automation_coverage >= 0.95",
+          "sales_engineering_capacity_utilization <= 0.85"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-009-B"
+        ],
+        "from_milestone_id": "RM-P2-05",
+        "hand_off_contract": "HANDOFF-BRIDGE-009",
+        "required_step_ids": [
+          "STEP-BRG-009-A",
+          "STEP-BRG-009-B"
+        ],
+        "to_milestone_id": "RM-P3-01"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-010",
+        "bridge_gate_predicate": "BRIDGE-GATE-010",
+        "bridge_id": "BRIDGE-010",
+        "capacity_constraints": [
+          "cross_tenant_incidents_sev0_sev1 == 0"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-010-B"
+        ],
+        "from_milestone_id": "RM-P3-01",
+        "hand_off_contract": "HANDOFF-BRIDGE-010",
+        "required_step_ids": [
+          "STEP-BRG-010-A",
+          "STEP-BRG-010-B"
+        ],
+        "to_milestone_id": "RM-P4-01"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-011",
+        "bridge_gate_predicate": "BRIDGE-GATE-011",
+        "bridge_id": "BRIDGE-011",
+        "capacity_constraints": [
+          "byzantine_quorum_divergence_events == 0"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-011-B"
+        ],
+        "from_milestone_id": "RM-P4-01",
+        "hand_off_contract": "HANDOFF-BRIDGE-011",
+        "required_step_ids": [
+          "STEP-BRG-011-A",
+          "STEP-BRG-011-B"
+        ],
+        "to_milestone_id": "RM-P4-02"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-012",
+        "bridge_gate_predicate": "BRIDGE-GATE-012",
+        "bridge_id": "BRIDGE-012",
+        "capacity_constraints": [
+          "independent_replication_queue_ticks_p95 <= 720"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-012-B"
+        ],
+        "from_milestone_id": "RM-P4-02",
+        "hand_off_contract": "HANDOFF-BRIDGE-012",
+        "required_step_ids": [
+          "STEP-BRG-012-A",
+          "STEP-BRG-012-B"
+        ],
+        "to_milestone_id": "RM-P5-01"
+      }
+    ],
+    "roadmap_bridge_model": [
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-001",
+        "bridge_gate_predicate": "BRIDGE-GATE-001",
+        "bridge_id": "BRIDGE-001",
+        "capacity_constraints": [
+          "verifier_work_ticks_per_passed_transition_p95 <= 1800"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-001-B"
+        ],
+        "from_milestone_id": "RM-P1-01",
+        "hand_off_contract": "HANDOFF-BRIDGE-001",
+        "required_step_ids": [
+          "STEP-BRG-001-A",
+          "STEP-BRG-001-B"
+        ],
+        "to_milestone_id": "RM-P1-02"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-002",
+        "bridge_gate_predicate": "BRIDGE-GATE-002",
+        "bridge_id": "BRIDGE-002",
+        "capacity_constraints": [
+          "security_review_ticks_p95 <= 240"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-002-B"
+        ],
+        "from_milestone_id": "RM-P1-02",
+        "hand_off_contract": "HANDOFF-BRIDGE-002",
+        "required_step_ids": [
+          "STEP-BRG-002-A",
+          "STEP-BRG-002-B"
+        ],
+        "to_milestone_id": "RM-P1-03"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-003",
+        "bridge_gate_predicate": "BRIDGE-GATE-003",
+        "bridge_id": "BRIDGE-003",
+        "capacity_constraints": [
+          "authority_graph_rebuild_ticks_p95 <= 300"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-003-B"
+        ],
+        "from_milestone_id": "RM-P1-03",
+        "hand_off_contract": "HANDOFF-BRIDGE-003",
+        "required_step_ids": [
+          "STEP-BRG-003-A",
+          "STEP-BRG-003-B"
+        ],
+        "to_milestone_id": "RM-P1-04"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-004",
+        "bridge_gate_predicate": "BRIDGE-GATE-004",
+        "bridge_id": "BRIDGE-004",
+        "capacity_constraints": [
+          "defect_replay_ingest_per_epoch >= 50"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-004-B"
+        ],
+        "from_milestone_id": "RM-P1-04",
+        "hand_off_contract": "HANDOFF-BRIDGE-004",
+        "required_step_ids": [
+          "STEP-BRG-004-A",
+          "STEP-BRG-004-B"
+        ],
+        "to_milestone_id": "RM-P2-01"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-005",
+        "bridge_gate_predicate": "BRIDGE-GATE-005",
+        "bridge_id": "BRIDGE-005",
+        "capacity_constraints": [
+          "prior_art_replay_pass_ratio == 1.0"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-005-B"
+        ],
+        "from_milestone_id": "RM-P2-01",
+        "hand_off_contract": "HANDOFF-BRIDGE-005",
+        "required_step_ids": [
+          "STEP-BRG-005-A",
+          "STEP-BRG-005-B"
+        ],
+        "to_milestone_id": "RM-P2-02"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-006",
+        "bridge_gate_predicate": "BRIDGE-GATE-006",
+        "bridge_id": "BRIDGE-006",
+        "capacity_constraints": [
+          "oracle_to_primitive_tick_budget_p95_met == true"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-006-B"
+        ],
+        "from_milestone_id": "RM-P2-02",
+        "hand_off_contract": "HANDOFF-BRIDGE-006",
+        "required_step_ids": [
+          "STEP-BRG-006-A",
+          "STEP-BRG-006-B"
+        ],
+        "to_milestone_id": "RM-P2-03"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-007",
+        "bridge_gate_predicate": "BRIDGE-GATE-007",
+        "bridge_id": "BRIDGE-007",
+        "capacity_constraints": [
+          "revocation_tick_budget_p99_met == true"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-007-B"
+        ],
+        "from_milestone_id": "RM-P2-03",
+        "hand_off_contract": "HANDOFF-BRIDGE-007",
+        "required_step_ids": [
+          "STEP-BRG-007-A",
+          "STEP-BRG-007-B"
+        ],
+        "to_milestone_id": "RM-P2-04"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-008",
+        "bridge_gate_predicate": "BRIDGE-GATE-008",
+        "bridge_id": "BRIDGE-008",
+        "capacity_constraints": [
+          "bisimulation_pass_rate_depth_le_12 >= 0.99"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-008-B"
+        ],
+        "from_milestone_id": "RM-P2-04",
+        "hand_off_contract": "HANDOFF-BRIDGE-008",
+        "required_step_ids": [
+          "STEP-BRG-008-A",
+          "STEP-BRG-008-B"
+        ],
+        "to_milestone_id": "RM-P2-05"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-009",
+        "bridge_gate_predicate": "BRIDGE-GATE-009",
+        "bridge_id": "BRIDGE-009",
+        "capacity_constraints": [
+          "employee_count == 0",
+          "llc_lifecycle_automation_coverage >= 0.95",
+          "sales_engineering_capacity_utilization <= 0.85"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-009-B"
+        ],
+        "from_milestone_id": "RM-P2-05",
+        "hand_off_contract": "HANDOFF-BRIDGE-009",
+        "required_step_ids": [
+          "STEP-BRG-009-A",
+          "STEP-BRG-009-B"
+        ],
+        "to_milestone_id": "RM-P3-01"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-010",
+        "bridge_gate_predicate": "BRIDGE-GATE-010",
+        "bridge_id": "BRIDGE-010",
+        "capacity_constraints": [
+          "federated_cell_bootstrap_ticks_p95 <= 480"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-010-B"
+        ],
+        "from_milestone_id": "RM-P3-01",
+        "hand_off_contract": "HANDOFF-BRIDGE-010",
+        "required_step_ids": [
+          "STEP-BRG-010-A",
+          "STEP-BRG-010-B"
+        ],
+        "to_milestone_id": "RM-P4-01"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-011",
+        "bridge_gate_predicate": "BRIDGE-GATE-011",
+        "bridge_id": "BRIDGE-011",
+        "capacity_constraints": [
+          "chaos_drill_recovery_tick_budget_p95_met == true"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-011-B"
+        ],
+        "from_milestone_id": "RM-P4-01",
+        "hand_off_contract": "HANDOFF-BRIDGE-011",
+        "required_step_ids": [
+          "STEP-BRG-011-A",
+          "STEP-BRG-011-B"
+        ],
+        "to_milestone_id": "RM-P4-02"
+      },
+      {
+        "bridge_evidence_ref": "EVID-BRIDGE-012",
+        "bridge_gate_predicate": "BRIDGE-GATE-012",
+        "bridge_id": "BRIDGE-012",
+        "capacity_constraints": [
+          "external_replication_queue_ticks_p95 <= 720"
+        ],
+        "critical_path_step_ids": [
+          "STEP-BRG-012-B"
+        ],
+        "from_milestone_id": "RM-P4-02",
+        "hand_off_contract": "HANDOFF-BRIDGE-012",
+        "required_step_ids": [
+          "STEP-BRG-012-A",
+          "STEP-BRG-012-B"
+        ],
+        "to_milestone_id": "RM-P5-01"
+      }
+    ]
+  }
+}

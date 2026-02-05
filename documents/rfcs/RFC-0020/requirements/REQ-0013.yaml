@@ -1,0 +1,23 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0013"
+  title: "Verifier cache safety contract"
+  category: "PERFORMANCE"
+  priority: "P1"
+  status: "PROPOSED"
+  statement: |
+    Verifiers MUST support cache amortization from verified heads across multiple identity checks and MUST invalidate deterministically on revocation, rotation, and head advancement.
+
+    Primary delivery ticket: TCK-00359
+  rationale: |
+    Cache reuse is required for throughput, but stale cache safety is non-negotiable for security.
+  acceptance_criteria:
+    - "Cache reuse measurably reduces repeated verification cost"
+    - "Stale cache entries cannot authorize revoked identities"
+    - "Invalidation path is deterministic and auditable"
+    - "Primary implementation ticket TCK-00359 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0013"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.7.7c"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §0.1(10)"

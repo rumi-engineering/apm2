@@ -1,0 +1,26 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0011"
+  title: "O(log n) identity verification with bounded economics"
+  category: "PERFORMANCE"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Identity membership and non-membership verification MUST remain O(log n) or better with explicit proof byte, depth, and node-count caps and benchmarked behavior for a 10^12 namespace model; verifiers MUST support head-cache amortization such that verifying K identities against one admitted head requires O(1) signature/quorum checks plus O(K log n) hashing.
+
+    Primary delivery ticket: TCK-00357
+  rationale: |
+    Asymptotic guarantees must be operationally constrained by bounded proof economics.
+  acceptance_criteria:
+    - "Verifier work class validated as O(log n) for membership and non-membership under admitted profiles"
+    - "Head-cache amortization demonstrates O(1) signature/quorum checks per cached head across K identity verifications"
+    - "Bound violations fail closed before memory amplification"
+    - "Forged/malformed proofs consistently denied"
+    - "Primary implementation ticket TCK-00357 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0011"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §0.1(10)"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.7.7"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.7.7b"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §10 Stage 0.9"

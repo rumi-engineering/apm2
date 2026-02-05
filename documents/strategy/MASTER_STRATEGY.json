@@ -1,0 +1,948 @@
+{
+  "schema": "cac.strategy.master.v1",
+  "schema_version": "1.0.0",
+  "kind": "strategy.master",
+  "meta": {
+    "artifact_id": "STRAT-MASTER-HTF-0001",
+    "authority": "normative",
+    "created_at": "HTF-BND-STRAT-BUNDLE-COMPILE-001",
+    "normalization_version": "strategy-business-normalizer.v2.cac_json",
+    "source_bundle_ref": "documents/strategy/STRATEGY_BUSINESS_BUNDLE.json",
+    "status": "active"
+  },
+  "payload": {
+    "contract_surface": {
+      "claim_contract_ids": [
+        "BPC-01",
+        "BPC-02",
+        "BPC-03",
+        "BPC-04",
+        "BPC-05",
+        "BPC-06",
+        "MSC-01",
+        "MSC-02",
+        "MSC-03",
+        "MSC-04",
+        "MSC-05",
+        "MSC-06",
+        "MSC-07",
+        "MSC-08",
+        "MSC-09",
+        "MSC-10",
+        "MSC-11",
+        "MSC-12"
+      ],
+      "evidence_contract_ids": [
+        "EVID-BP-A-01",
+        "EVID-BP-B-01",
+        "EVID-BP-FIN-03",
+        "EVID-BP-FIN-04",
+        "EVID-BP-FIN-05",
+        "EVID-BP-LEGAL-001",
+        "EVID-BRIDGE-001",
+        "EVID-BRIDGE-002",
+        "EVID-BRIDGE-003",
+        "EVID-BRIDGE-004",
+        "EVID-BRIDGE-005",
+        "EVID-BRIDGE-006",
+        "EVID-BRIDGE-007",
+        "EVID-BRIDGE-008",
+        "EVID-BRIDGE-009",
+        "EVID-BRIDGE-010",
+        "EVID-BRIDGE-011",
+        "EVID-BRIDGE-012",
+        "EVID-CAC-BUNDLE-COMPILE",
+        "EVID-CTRL-MSC09",
+        "EVID-CTRL-MSC10",
+        "EVID-CTRL-MSC11",
+        "EVID-CTRL-MSC12",
+        "EVID-CTRL-REPLAY-EQUIVALENCE",
+        "EVID-CTRL-TERMINAL-RECEIPTS",
+        "EVID-CTRL-VE-02",
+        "EVID-FIN-AUTONOMY-CONTROL",
+        "EVID-FIN-BILLING",
+        "EVID-FIN-COLLECTIONS",
+        "EVID-FIN-PAYROLL",
+        "EVID-FIN-REVOCATION-CORRECTNESS",
+        "EVID-FIN-TAX",
+        "EVID-FIN-TREASURY",
+        "EVID-FIN-VENDOR-PAY",
+        "EVID-GTM-01",
+        "EVID-GTM-02",
+        "EVID-GTM-03",
+        "EVID-MOAT-01",
+        "EVID-MOAT-03",
+        "EVID-MOAT-04",
+        "EVID-PHASE1-MSC01",
+        "EVID-PHASE1-MSC02",
+        "EVID-PHASE2-MSC03",
+        "EVID-PHASE2-MSC04",
+        "EVID-PHASE2-MSC05",
+        "EVID-PHASE3-MSC06",
+        "EVID-PHASE4-MSC07",
+        "EVID-PHASE5-MSC08",
+        "EVID-TIME-BND-FOUNDATION",
+        "EVID-TIME-BND-P1",
+        "EVID-TIME-BND-P1-BASELINE",
+        "EVID-TIME-BND-P1-SECURITY",
+        "EVID-TIME-BND-P2",
+        "EVID-TIME-BND-P2-CONTROL",
+        "EVID-TIME-BND-P2-EARLY",
+        "EVID-TIME-BND-P2-SEMANTICS",
+        "EVID-TIME-BND-P3",
+        "EVID-TIME-BND-P3-ECON",
+        "EVID-TIME-BND-P4",
+        "EVID-TIME-BND-P4-READINESS",
+        "EVID-TIME-BND-P5",
+        "EVID-TRANS-PHASE-1-2",
+        "EVID-TRANS-PHASE-2-3",
+        "EVID-TRANS-PHASE-3-4",
+        "EVID-TRANS-PHASE-4-5"
+      ],
+      "gate_contract_ids": [
+        "PHASE-1-TO-2",
+        "PHASE-2-TO-3",
+        "PHASE-3-TO-4",
+        "PHASE-4-TO-5",
+        "PHASE-5-TERMINAL",
+        "BRIDGE-GATE-001",
+        "BRIDGE-GATE-002",
+        "BRIDGE-GATE-003",
+        "BRIDGE-GATE-004",
+        "BRIDGE-GATE-005",
+        "BRIDGE-GATE-006",
+        "BRIDGE-GATE-007",
+        "BRIDGE-GATE-008",
+        "BRIDGE-GATE-009",
+        "BRIDGE-GATE-010",
+        "BRIDGE-GATE-011",
+        "BRIDGE-GATE-012",
+        "FIN-GATE-STOP-STATE",
+        "FIN-GATE-001",
+        "FIN-GATE-002",
+        "FIN-GATE-003",
+        "FIN-GATE-004",
+        "FIN-GATE-005",
+        "FIN-GATE-006",
+        "GTM-GATE-ENTERPRISE-001",
+        "GTM-GATE-PROSUMER-001"
+      ],
+      "metric_contract_ids": [
+        "MET-ACTIVE-DISEASE-PROGRAMS",
+        "MET-ACTIVE-FEDERATED-CELLS",
+        "MET-AGENT-DEFECT-RATE",
+        "MET-ARR-USD",
+        "MET-AUTHORITY-GRAPH-COVERAGE",
+        "MET-AUTONOMOUS-TIER1-MERGE-RATIO",
+        "MET-BISIMULATION-PASS-RATE-D12",
+        "MET-BYZANTINE-QUORUM-DIVERGENCE",
+        "MET-COMP-DECAY-FIN-EXCEPTIONS",
+        "MET-COMP-DECAY-TRUST-INCIDENTS",
+        "MET-COMP-DECAY-VERIFIER-WORK",
+        "MET-CROSS-TENANT-SEV0-1",
+        "MET-DELEGATION-NARROWING-VIOLATIONS",
+        "MET-EMPLOYEE-COUNT",
+        "MET-ENTERPRISE-CELLS-PAID",
+        "MET-EXPANSION-RATE",
+        "MET-FIN-EXCEPTION-LATENCY-P95",
+        "MET-FIN-FRAUD-LOSS-RATIO",
+        "MET-FIN-MANUAL-RATIO",
+        "MET-FIN-STP-RATIO",
+        "MET-FRESHNESS-VIOLATIONS-TIER2PLUS",
+        "MET-GROSS-MARGIN-RATIO",
+        "MET-INDEPENDENT-REPLICATION-RATE",
+        "MET-LEGAL-HARD-CONSTRAINT-ESCALATION-RECEIPT-COVERAGE",
+        "MET-LLC-FORMATION-AUTOMATION-FAILURES",
+        "MET-LLC-LIFECYCLE-AUTOMATION-COVERAGE",
+        "MET-LOGO-RETENTION-RATIO",
+        "MET-METHODS-GE-2X",
+        "MET-MONTHLY-CHURN",
+        "MET-MQL-TO-SQL-RATIO",
+        "MET-NOVEL-METHODS-PER-EPOCH",
+        "MET-NRR-RATIO",
+        "MET-ORACLE-REQ-PER-100",
+        "MET-ORACLE-TO-PRIMITIVE-P95",
+        "MET-PAID-USERS",
+        "MET-PILOT-CONVERSION-RATIO",
+        "MET-PILOT-CYCLE-TICKS-P95",
+        "MET-PIPELINE-USD",
+        "MET-PRIVACY-SEV0-1",
+        "MET-REPLAY-EQUIVALENCE-RATIO",
+        "MET-REVOCATION-MISS-COUNT",
+        "MET-REVOCATION-P99-MET",
+        "MET-SALES-CAPACITY-UTILIZATION",
+        "MET-SECURITY-ADJUSTED-MARGIN",
+        "MET-SECURITY-COST-SHARE",
+        "MET-SEMANTIC-DRIFT-ESCAPE-RATE",
+        "MET-SEV12-REPLAY-CLOSURE-RATIO",
+        "MET-TERMINAL-RECEIPT-COVERAGE",
+        "MET-TIER2PLUS-NO-TERMINAL-RECEIPT",
+        "MET-TRUST-LATENCY-P95",
+        "MET-UNSAFE-PROMOTIONS-PARTITION",
+        "MET-VERIFICATION-COST-SHARE",
+        "MET-VERIFIER-WORK-P95",
+        "MET-WINDOW-TICK-FLOOR-MET"
+      ]
+    },
+    "governance_and_authority_model": {
+      "authority_gate_refs": [
+        "PHASE-1-TO-2",
+        "PHASE-2-TO-3",
+        "PHASE-3-TO-4",
+        "PHASE-4-TO-5"
+      ],
+      "decision_rights": [
+        {
+          "domain": "containment",
+          "owner": "Security Council",
+          "veto_power": true
+        },
+        {
+          "domain": "verification",
+          "owner": "Verification Council",
+          "veto_power": true
+        },
+        {
+          "domain": "liveness_and_economics",
+          "owner": "Runtime Council",
+          "veto_power": false
+        },
+        {
+          "domain": "capital_allocation",
+          "owner": "Finance Council",
+          "veto_power": false
+        }
+      ],
+      "model_id": "GOV-AUTH-001",
+      "principal_binding_rule": "All agent identities must include principal_binding_ref == PRINCIPAL-ROOT-ANVEIO and an active delegation contract."
+    },
+    "htf_time_boundary_registry": [
+      {
+        "evidence_ref": "EVID-CAC-BUNDLE-COMPILE",
+        "htf_boundary_id": "HTF-BND-STRAT-BUNDLE-COMPILE-001",
+        "intent": "Compile strategy business CAC bundle",
+        "predicate": "jq -e '.bundle_parse_ok == true and .bundle_signature_valid == true' evidence/strategy/cac_bundle/HTF-BND-STRAT-BUNDLE-COMPILE-001/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P1-BASELINE",
+        "htf_boundary_id": "HTF-BND-P1-BASELINE-LOCK",
+        "intent": "Lock phase 1 baseline bundle",
+        "predicate": "jq -e '.baseline_complete == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P1-BASELINE-LOCK/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-FOUNDATION",
+        "htf_boundary_id": "HTF-BND-FOUNDATION-CLOSE",
+        "intent": "Close strategy foundation hardening",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-FOUNDATION-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P1-SECURITY",
+        "htf_boundary_id": "HTF-BND-P1-SECURITY-CLOSE",
+        "intent": "Close phase 1 containment hardening",
+        "predicate": "jq -e '.tick_floor_met == true and .revocation_ok == true' evidence/strategy/time_boundaries/HTF-BND-P1-SECURITY-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P1",
+        "htf_boundary_id": "HTF-BND-P1-CLOSE",
+        "intent": "Close phase 1",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P1-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P2-EARLY",
+        "htf_boundary_id": "HTF-BND-P2-EARLY-CLOSE",
+        "intent": "Close early phase 2 reliability outcomes",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P2-EARLY-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P2-CONTROL",
+        "htf_boundary_id": "HTF-BND-P2-CONTROL-CLOSE",
+        "intent": "Close phase 2 control-plane integrity",
+        "predicate": "jq -e '.tick_floor_met == true and .authority_graph_complete == true' evidence/strategy/time_boundaries/HTF-BND-P2-CONTROL-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P2",
+        "htf_boundary_id": "HTF-BND-P2-CLOSE",
+        "intent": "Close phase 2",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P2-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P2-SEMANTICS",
+        "htf_boundary_id": "HTF-BND-P2-SEMANTICS-CLOSE",
+        "intent": "Close recursive semantics hardening",
+        "predicate": "jq -e '.semantic_equivalence_ok == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P2-SEMANTICS-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P3",
+        "htf_boundary_id": "HTF-BND-P3-CLOSE",
+        "intent": "Close phase 3",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P3-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P3-ECON",
+        "htf_boundary_id": "HTF-BND-P3-ECON-CLOSE",
+        "intent": "Close phase 3 economics and finance autonomy controls",
+        "predicate": "jq -e '.stp_controls_verified == true and .reconciliation_sla_met == true' evidence/strategy/time_boundaries/HTF-BND-P3-ECON-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P4-READINESS",
+        "htf_boundary_id": "HTF-BND-P4-READINESS-CLOSE",
+        "intent": "Close federated readiness runway",
+        "predicate": "jq -e '.cross_tenant_incidents_sev0_sev1 == 0 and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P4-READINESS-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P4",
+        "htf_boundary_id": "HTF-BND-P4-CLOSE",
+        "intent": "Close phase 4",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P4-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P5",
+        "htf_boundary_id": "HTF-BND-P5-CLOSE",
+        "intent": "Close terminal phase 5 mission",
+        "predicate": "jq -e '.independent_replication_success_rate >= 0.80 and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P5-CLOSE/summary.json"
+      }
+    ],
+    "mission_model": {
+      "claim_refs": [
+        "BPC-05",
+        "BPC-06",
+        "MSC-01",
+        "MSC-02",
+        "MSC-03",
+        "MSC-04",
+        "MSC-05",
+        "MSC-06",
+        "MSC-07",
+        "MSC-08",
+        "MSC-09",
+        "MSC-10",
+        "MSC-11",
+        "MSC-12"
+      ],
+      "dominance_order": [
+        "containment_security",
+        "verification_correctness",
+        "liveness_progress"
+      ],
+      "law_refs": [
+        "LAW-01",
+        "LAW-02",
+        "LAW-04",
+        "LAW-05",
+        "LAW-06",
+        "LAW-07",
+        "LAW-08",
+        "LAW-09",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "mission_id": "MISSION-ROOT-001",
+      "objective": "Maximize governed autonomy at civilizational scale while preserving mechanical verifiability, recursive composability, physical realizability, and containment-first governance.",
+      "principal_objective": "Operate all authority-bearing and financial actions as delegated agency under sole proprietor principal authority with fail-closed policy enforcement, while preserving employee_count == 0 and autonomous LLC lifecycle management."
+    },
+    "phase_model": [
+      {
+        "claim_refs": [
+          "MSC-01",
+          "MSC-02",
+          "MSC-09"
+        ],
+        "entry_boundary_ref": "HTF-BND-P1-BASELINE-LOCK",
+        "exit_boundary_ref": "HTF-BND-P1-CLOSE",
+        "gate_ref": "PHASE-1-TO-2",
+        "name": "Recursive Self-Improvement",
+        "objective": "Increase Tier1 autonomous delivery under bounded authority and fail-closed Tier2+ promotion.",
+        "owner_locus": "Runtime Council + Verification Council + Security Council",
+        "phase_id": "PHASE-1"
+      },
+      {
+        "claim_refs": [
+          "MSC-03",
+          "MSC-04",
+          "MSC-05",
+          "MSC-10",
+          "MSC-11"
+        ],
+        "entry_boundary_ref": "HTF-BND-P2-EARLY-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P2-CLOSE",
+        "gate_ref": "PHASE-2-TO-3",
+        "name": "Novel Methods Generation",
+        "objective": "Produce reproducible novelty while lowering oracle dependence and strengthening temporal trust.",
+        "owner_locus": "Research Council + IP Council + Governance Council",
+        "phase_id": "PHASE-2"
+      },
+      {
+        "claim_refs": [
+          "BPC-01",
+          "BPC-03",
+          "BPC-04",
+          "BPC-05",
+          "BPC-06",
+          "MSC-06"
+        ],
+        "entry_boundary_ref": "HTF-BND-P3-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P3-ECON-CLOSE",
+        "gate_ref": "PHASE-3-TO-4",
+        "name": "Company Formation",
+        "objective": "Build durable governed-autonomy revenue while preserving security and verification spend floors, with employee_count == 0 and automated LLC lifecycle management.",
+        "owner_locus": "Board + Finance Council",
+        "phase_id": "PHASE-3"
+      },
+      {
+        "claim_refs": [
+          "MSC-07",
+          "MSC-12",
+          "BPC-02"
+        ],
+        "entry_boundary_ref": "HTF-BND-P4-READINESS-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P4-CLOSE",
+        "gate_ref": "PHASE-4-TO-5",
+        "name": "Federated Partnerships",
+        "objective": "Scale multi-cell deployment without containment regression and with partition survivability.",
+        "owner_locus": "Platform Council + Security Council",
+        "phase_id": "PHASE-4"
+      },
+      {
+        "claim_refs": [
+          "MSC-08"
+        ],
+        "entry_boundary_ref": "HTF-BND-P5-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P5-CLOSE",
+        "gate_ref": "PHASE-5-TERMINAL",
+        "name": "Planetary Impact",
+        "objective": "Deliver externally replicated governed discovery in life-science programs.",
+        "owner_locus": "Bio Council + External Ethics Board",
+        "phase_id": "PHASE-5"
+      }
+    ],
+    "physics_feasibility_model": {
+      "claim_feasibility": [
+        {
+          "admissibility_assumptions": [
+            "enterprise_cells_paid >= 25",
+            "net_revenue_retention >= 1.20"
+          ],
+          "claim_id": "BPC-01",
+          "falsification_test": "enterprise_cells_paid < 25 or net_revenue_retention < 1.20",
+          "governing_constraints": [
+            "enterprise_sales_capacity",
+            "customer_value_realization"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "paid_users >= 100000",
+            "privacy_incidents_sev0_sev1 == 0"
+          ],
+          "claim_id": "BPC-02",
+          "falsification_test": "paid_users < 100000 or privacy_incidents_sev0_sev1 > 0",
+          "governing_constraints": [
+            "privacy_safety",
+            "support_bandwidth"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "verification_compute_share <= 0.45",
+            "verification_escape_rate_non_increasing == true"
+          ],
+          "claim_id": "BPC-03",
+          "falsification_test": "verification_compute_share > 0.45 with quality regression",
+          "governing_constraints": [
+            "verification_compute_share",
+            "quality_non_regression"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "security_adjusted_margin >= 0.55",
+            "tier2plus_terminal_receipt_coverage == 1.0"
+          ],
+          "claim_id": "BPC-04",
+          "falsification_test": "security_adjusted_margin < 0.55 or tier2plus_terminal_receipt_coverage < 1.0",
+          "governing_constraints": [
+            "security_spend_floor",
+            "verification_spend_floor"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "stp_ratio >= 0.93",
+            "manual_intervention_ratio <= 0.07",
+            "reconciliation_sla_met == true"
+          ],
+          "claim_id": "BPC-05",
+          "falsification_test": "unreconciled_financial_events > 0 or revocation_miss_count > 0",
+          "governing_constraints": [
+            "financial_reconciliation_latency",
+            "revocation_correctness",
+            "idempotent_settlement"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "employee_count == 0",
+            "llc_lifecycle_automation_coverage >= 0.95",
+            "legal_hard_constraint_escalations_receipted == true"
+          ],
+          "claim_id": "BPC-06",
+          "falsification_test": "employee_count > 0 or llc_lifecycle_automation_coverage < 0.95",
+          "governing_constraints": [
+            "legal_process_state_machine_constraints",
+            "jurisdictional_filing_rules",
+            "automation_reliability"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "tiered_gate_rigor",
+            "replayable_test_artifacts",
+            "no bypass of tier2plus receipts"
+          ],
+          "claim_id": "MSC-01",
+          "falsification_test": "autonomous_tier1_merge_ratio fails to reach 0.70 without increasing defect rate above 1.05x human baseline",
+          "governing_constraints": [
+            "compute_budget",
+            "verification_throughput",
+            "bounded_autonomy"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "revocation_tick_budget_p99_met",
+            "authority_graph_complete == true"
+          ],
+          "claim_id": "MSC-02",
+          "falsification_test": "tier2plus_promotions_without_terminal_receipt > 0",
+          "governing_constraints": [
+            "causal_ordering",
+            "identity_freshness",
+            "revocation_latency"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "defect_replay_corpus_seed_count >= 200",
+            "verifier_upgrade_pipeline_capacity_sufficient"
+          ],
+          "claim_id": "MSC-03",
+          "falsification_test": "sev12_defects_with_replay_proven_verifier_delta_ratio < 0.85",
+          "governing_constraints": [
+            "verification_compute_budget",
+            "counterexample_density"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "prior_art_replay_pass == true",
+            "methods_ge_2x >= 4"
+          ],
+          "claim_id": "MSC-04",
+          "falsification_test": "novel_methods_per_htf_epoch < 12 for two consecutive governance windows",
+          "governing_constraints": [
+            "novelty_signal_to_noise",
+            "human_lab_throughput",
+            "benchmark_reproducibility"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "oracle_decision_logging_coverage >= 0.95",
+            "oracle_to_primitive_tick_budget_p95_met == true"
+          ],
+          "claim_id": "MSC-05",
+          "falsification_test": "oracle_requests_per_100_work_items > 3",
+          "governing_constraints": [
+            "human_oracle_bandwidth",
+            "compiler_latency"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "gross_margin >= 0.65",
+            "security_adjusted_margin >= 0.55"
+          ],
+          "claim_id": "MSC-06",
+          "falsification_test": "ARR growth requires reducing security or verification floors",
+          "governing_constraints": [
+            "market_conversion_capacity",
+            "security_and_verification_fixed_cost_floors"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "cross_tenant_incidents_sev0_sev1 == 0",
+            "byzantine_quorum_divergence_events == 0"
+          ],
+          "claim_id": "MSC-07",
+          "falsification_test": "any severe cross-tenant containment incident",
+          "governing_constraints": [
+            "isolation_boundaries",
+            "network_partition_behavior",
+            "byzantine_quorum"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "independent_replication_success_rate >= 0.80",
+            "external_ethics_review_receipts_complete"
+          ],
+          "claim_id": "MSC-08",
+          "falsification_test": "replication_success_rate < 0.80",
+          "governing_constraints": [
+            "biological_experiment_throughput",
+            "external_replication_capacity",
+            "causal_validity"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "authority_graph_coverage == 1.0",
+            "delegation_narrowing_violations == 0"
+          ],
+          "claim_id": "MSC-09",
+          "falsification_test": "authority_graph_coverage < 1.0 or delegation_narrowing_violations > 0",
+          "governing_constraints": [
+            "authority_graph_completeness",
+            "signature_verification"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "tier2plus_freshness_violations == 0",
+            "revocation_miss_count == 0"
+          ],
+          "claim_id": "MSC-10",
+          "falsification_test": "tier2plus_freshness_violations > 0 or revocation_miss_count > 0",
+          "governing_constraints": [
+            "clock_freshness",
+            "revocation_propagation_latency"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "bisimulation_pass_rate_depth_le_12 >= 0.99",
+            "semantic_drift_escape_rate <= 0.001"
+          ],
+          "claim_id": "MSC-11",
+          "falsification_test": "semantic_drift_escape_rate > 0.001",
+          "governing_constraints": [
+            "bounded_semantic_equivalence",
+            "finite_context"
+          ],
+          "status": "ADMISSIBLE"
+        },
+        {
+          "admissibility_assumptions": [
+            "unsafe_promotions_during_partition == 0",
+            "byzantine_quorum_divergence_events == 0"
+          ],
+          "claim_id": "MSC-12",
+          "falsification_test": "unsafe_promotions_during_partition > 0 or byzantine_quorum_divergence_events > 0",
+          "governing_constraints": [
+            "partition_tolerance",
+            "byzantine_quorum"
+          ],
+          "status": "ADMISSIBLE"
+        }
+      ],
+      "model_id": "PHYSICS-FEAS-001"
+    },
+    "reference_registry": {
+      "account_registry": [
+        {
+          "account_id": "ACCOUNT-AR-001",
+          "account_type": "accounts_receivable"
+        },
+        {
+          "account_id": "ACCOUNT-AP-001",
+          "account_type": "accounts_payable"
+        },
+        {
+          "account_id": "ACCOUNT-TREASURY-001",
+          "account_type": "treasury"
+        },
+        {
+          "account_id": "ACCOUNT-PAYROLL-001",
+          "account_type": "payroll"
+        },
+        {
+          "account_id": "ACCOUNT-TAX-001",
+          "account_type": "tax_reserve"
+        }
+      ],
+      "allowlist_registry": [
+        {
+          "allowlist_id": "ALLOWLIST-NONE"
+        },
+        {
+          "allowlist_id": "ALLOWLIST-CUSTOMERS-001"
+        },
+        {
+          "allowlist_id": "ALLOWLIST-VENDORS-001"
+        },
+        {
+          "allowlist_id": "ALLOWLIST-INTERNAL-TREASURY-001"
+        },
+        {
+          "allowlist_id": "ALLOWLIST-PAYROLL-001"
+        },
+        {
+          "allowlist_id": "ALLOWLIST-TAX-AUTHORITY-001"
+        },
+        {
+          "allowlist_id": "ALLOWLIST-SECURITY-VENDORS-001"
+        },
+        {
+          "allowlist_id": "ALLOWLIST-VERIFICATION-INFRA-001"
+        }
+      ],
+      "attestation_registry": [
+        {
+          "attestation_id": "ATTEST-AGENT-ORCH-001"
+        },
+        {
+          "attestation_id": "ATTEST-AGENT-BILLING-001"
+        },
+        {
+          "attestation_id": "ATTEST-AGENT-COLLECTIONS-001"
+        },
+        {
+          "attestation_id": "ATTEST-AGENT-VENDORPAY-001"
+        },
+        {
+          "attestation_id": "ATTEST-AGENT-TREASURY-001"
+        },
+        {
+          "attestation_id": "ATTEST-AGENT-PAYROLL-001"
+        },
+        {
+          "attestation_id": "ATTEST-AGENT-TAX-001"
+        }
+      ],
+      "capability_scope_registry": [
+        {
+          "capability_scope_id": "CAP-SCOPE-GOV-001"
+        },
+        {
+          "capability_scope_id": "CAP-SCOPE-FIN-BILLING"
+        },
+        {
+          "capability_scope_id": "CAP-SCOPE-FIN-COLLECTIONS"
+        },
+        {
+          "capability_scope_id": "CAP-SCOPE-FIN-VENDORPAY"
+        },
+        {
+          "capability_scope_id": "CAP-SCOPE-FIN-TREASURY"
+        },
+        {
+          "capability_scope_id": "CAP-SCOPE-FIN-PAYROLL"
+        },
+        {
+          "capability_scope_id": "CAP-SCOPE-FIN-TAX"
+        }
+      ],
+      "compensation_registry": [
+        {
+          "compensation_id": "COMP-FIN-001"
+        },
+        {
+          "compensation_id": "COMP-FIN-002"
+        },
+        {
+          "compensation_id": "COMP-FIN-003"
+        },
+        {
+          "compensation_id": "COMP-FIN-004"
+        },
+        {
+          "compensation_id": "COMP-FIN-005"
+        },
+        {
+          "compensation_id": "COMP-FIN-006"
+        }
+      ],
+      "counterparty_registry": [
+        {
+          "counterparty_id": "COUNTERPARTY-CUSTOMER-POOL"
+        },
+        {
+          "counterparty_id": "COUNTERPARTY-VENDOR-ALLOWLIST"
+        },
+        {
+          "counterparty_id": "COUNTERPARTY-INTERNAL-TREASURY"
+        },
+        {
+          "counterparty_id": "COUNTERPARTY-PAYROLL-ALLOWLIST"
+        },
+        {
+          "counterparty_id": "COUNTERPARTY-TAX-AUTHORITY-ALLOWLIST"
+        }
+      ],
+      "experiment_registry": [
+        {
+          "experiment_id": "EXP-001"
+        },
+        {
+          "experiment_id": "EXP-002"
+        },
+        {
+          "experiment_id": "EXP-003"
+        },
+        {
+          "experiment_id": "EXP-004"
+        },
+        {
+          "experiment_id": "EXP-005"
+        }
+      ],
+      "freshness_policy_registry": [
+        {
+          "freshness_policy_id": "FRESHNESS-POL-001",
+          "policy": "authoritative_artifacts_expire_if_policy_or_identity_snapshot_older_than_allowed_tick_window"
+        }
+      ],
+      "jurisdiction_registry": [
+        {
+          "jurisdiction_id": "JUR-US-DE-001",
+          "name": "United States / Delaware"
+        }
+      ],
+      "key_registry": [
+        {
+          "key_id": "KEY-ROOT-ED25519-001",
+          "key_role": "principal_root_authority"
+        }
+      ],
+      "law_registry": [
+        {
+          "law_id": "LAW-01",
+          "source_doc": "documents/theory/laws.json"
+        },
+        {
+          "law_id": "LAW-02",
+          "source_doc": "documents/theory/laws.json"
+        },
+        {
+          "law_id": "LAW-04",
+          "source_doc": "documents/theory/laws.json"
+        },
+        {
+          "law_id": "LAW-05",
+          "source_doc": "documents/theory/laws.json"
+        },
+        {
+          "law_id": "LAW-06",
+          "source_doc": "documents/theory/laws.json"
+        },
+        {
+          "law_id": "LAW-07",
+          "source_doc": "documents/theory/laws.json"
+        },
+        {
+          "law_id": "LAW-08",
+          "source_doc": "documents/theory/laws.json"
+        },
+        {
+          "law_id": "LAW-09",
+          "source_doc": "documents/theory/laws.json"
+        },
+        {
+          "law_id": "LAW-12",
+          "source_doc": "documents/theory/laws.json"
+        },
+        {
+          "law_id": "LAW-15",
+          "source_doc": "documents/theory/laws.json"
+        }
+      ],
+      "lease_policy_registry": [
+        {
+          "lease_policy_id": "LEASE-POL-GOV-001",
+          "max_lease": "governance_window"
+        },
+        {
+          "lease_policy_id": "LEASE-POL-FIN-001",
+          "max_lease": "finance_window"
+        }
+      ],
+      "proof_registry": [
+        {
+          "proof_id": "PROOF-DELEG-ORCH-001"
+        },
+        {
+          "proof_id": "PROOF-DELEG-BILLING-001"
+        },
+        {
+          "proof_id": "PROOF-DELEG-COLLECTIONS-001"
+        },
+        {
+          "proof_id": "PROOF-DELEG-VENDORPAY-001"
+        },
+        {
+          "proof_id": "PROOF-DELEG-TREASURY-001"
+        },
+        {
+          "proof_id": "PROOF-DELEG-PAYROLL-001"
+        },
+        {
+          "proof_id": "PROOF-DELEG-TAX-001"
+        }
+      ],
+      "reconciliation_registry": [
+        {
+          "reconciliation_id": "RECON-BILLING-COLLECTION-001"
+        },
+        {
+          "reconciliation_id": "RECON-VENDOR-TREASURY-001"
+        },
+        {
+          "reconciliation_id": "RECON-PAYROLL-TAX-001"
+        }
+      ],
+      "revocation_registry": [
+        {
+          "owner": "PRINCIPAL-ROOT-ANVEIO",
+          "revocation_authority_id": "REVOCATION-AUTHORITY-ROOT-001"
+        },
+        {
+          "revocation_rule_id": "REVOCATION-RULE-001",
+          "rule": "deny_if_revocation_uncertain"
+        }
+      ]
+    },
+    "verification_and_evidence_model": {
+      "freshness_policy_ref": "FRESHNESS-POL-001",
+      "model_id": "VERIF-EVID-001",
+      "quality_metrics": [
+        "MET-TERMINAL-RECEIPT-COVERAGE",
+        "MET-REPLAY-EQUIVALENCE-RATIO",
+        "MET-VERIFIER-WORK-P95"
+      ],
+      "receipt_policy": "All authoritative transitions must emit signed receipts in CAS with replay-safe IDs.",
+      "required_evidence_types": [
+        "summary_receipt",
+        "gate_run_receipt",
+        "authority_graph_diff",
+        "financial_reconciliation_report"
+      ]
+    }
+  }
+}

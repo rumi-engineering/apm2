@@ -1,0 +1,24 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0001"
+  title: "HSIContractManifest deterministic generation and semantics coverage"
+  category: "FUNCTIONAL"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Implementations MUST generate HSIContractManifestV1 deterministically from daemon and CLI dispatch metadata; build pipelines MUST fail when authoritative routes lack semantics annotations; manifest bytes and hash outputs MUST be reproducible across equivalent builds.
+
+    Primary delivery ticket: TCK-00347
+  rationale: |
+    Deterministic contract materialization is required to prevent interface drift across recursive holons and to make handshake compatibility machine-checkable.
+  acceptance_criteria:
+    - "Manifest generation deterministic across repeat builds"
+    - "Missing route semantics annotation fails CI/build"
+    - "Golden hash fixture tests pass"
+    - "Primary implementation ticket TCK-00347 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0001"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §3.1"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §3.1.1"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §10 Stage 0"

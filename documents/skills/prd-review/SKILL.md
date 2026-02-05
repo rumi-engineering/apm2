@@ -43,7 +43,7 @@ references[17]:
     purpose: "Adversarial meta-review protocol for DEEP reviews."
   - path: references/COUNCIL_PROTOCOL.md
     purpose: "Multi-agent deliberation protocol for COUNCIL reviews."
-  - path: `documents/strategy/NORTH_STAR.md`
+  - path: `documents/strategy/NORTH_STAR.json`
     purpose: "5-phase vision document for council alignment."
   - path: references/FEEDBACK_LOOPS.md
     purpose: "Recursive improvement mechanisms and SNR checks."
@@ -55,7 +55,7 @@ references[17]:
     purpose: "CLI command reference."
   - path: ../agent-native-software/SKILL.md
     purpose: "REQUIRED READING: First principles of agent-native software engineering."
-  - path: ../../security/AGENTS.md
+  - path: ../../security/AGENTS.cac.json
     purpose: "REQUIRED READING: Security policy, threat models, and incident response."
 
 decision_tree:

@@ -1,0 +1,59 @@
+ticket_meta:
+  schema_version: "2026-01-24"
+  template_version: "2026-01-24"
+  ticket:
+    id: TCK-00368
+    title: Functorial observation law checks for admitted rewrites
+  binds:
+    prd_id: PRD-0010
+    rfc_id: RFC-0020
+    requirements:
+    - requirement_id: REQ-0022
+      requirement_ref: documents/rfcs/RFC-0020/requirements/REQ-0022.yaml#requirement
+    evidence_artifacts:
+    - evidence_id: EVID-0022
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0022.yaml#evidence_artifact
+    - evidence_id: EVID-0401
+      artifact_ref: documents/rfcs/RFC-0020/evidence_artifacts/EVID-0401.yaml#evidence_artifact
+  custody:
+    agent_roles:
+    - AGENT_FORMAL_METHODS
+    responsibility_domains:
+    - DOMAIN_PROTOCOL
+    - DOMAIN_RELIABILITY
+  dependencies:
+    tickets:
+    - ticket_id: TCK-00367
+      reason: Prerequisite per RFC-0020 ticket decomposition ordering
+  scope:
+    in_scope:
+    - Encode functorial law constraints for optimization rewrites
+    - Admit rewrite classes only when observation preservation is proven
+    - Link rewrite policy to formal artifact review gate
+    out_of_scope:
+    - Active-inference planner objective integration (TCK-00369)
+  plan:
+    steps:
+    - Read the bound requirement(s) and this ticket scope; confirm no scope creep
+      beyond out_of_scope list.
+    - 'Implement: Encode functorial law constraints for optimization rewrites'
+    - 'Implement: Admit rewrite classes only when observation preservation is proven'
+    - 'Implement: Link rewrite policy to formal artifact review gate'
+    - Add/adjust unit/integration tests to cover acceptance criteria and regression
+      risks per RFC-0020/07_test_and_evidence.yaml.
+    - Capture evidence artifacts (logs, receipts, test outputs) and update the corresponding
+      EVID-* artifact with concrete artifact pointers.
+  definition_of_done:
+    evidence_ids:
+    - EVID-0022
+    - EVID-0401
+    criteria:
+    - Admitted rewrite catalog references proof obligations
+    - Non-proven rewrites are blocked from release pipelines
+    - Optimization does not change observable HSI truth semantics
+  notes:
+    security: Fail-closed, least privilege, and explicit authority proofs are mandatory.
+    verification: Prefer deterministic tests, replay/CAS evidence, and bounded-resource
+      checks; avoid process-local assumptions.
+    general: Keep scope atomic to this ticket, preserve explicit dependency ordering,
+      and avoid introducing semantic drift from RFC-0020.

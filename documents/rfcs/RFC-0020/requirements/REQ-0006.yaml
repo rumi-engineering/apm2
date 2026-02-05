@@ -1,0 +1,24 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0006"
+  title: "Policy-only capability minting and non-discoverability"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    CapabilityManifestV1 MUST be minted only by policy resolver or admissible permeability delegation; requester-authored manifests are forbidden; broker MUST enforce scope, host, path, and quantitative constraints fail-closed.
+
+    Primary delivery ticket: TCK-00352
+  rationale: |
+    Authority laundering prevention depends on strict origin and scope enforcement for capability artifacts.
+  acceptance_criteria:
+    - "Capability manifests cannot be minted by requester surfaces"
+    - "Out-of-scope tool/path/host attempts denied with defects"
+    - "Envelope-manifest hash mismatch always denies actuation"
+    - "Primary implementation ticket TCK-00352 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0006"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §3.2"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §3.2.1"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §10 Stage 2"

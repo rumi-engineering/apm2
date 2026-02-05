@@ -1,0 +1,251 @@
+{
+  "schema": "apm2.security.incident_response_doc.v1",
+  "schema_version": "1.0.0",
+  "kind": "security.incident_response_document",
+  "meta": {
+    "stable_id": "dcp://apm2.security/doc/incident-response@1",
+    "status": "ACTIVE",
+    "classification": "INTERNAL",
+    "source_of_truth_refs": [
+      "documents/rfcs/RFC-0020/HOLONIC_SUBSTRATE_INTERFACE.md",
+      "documents/security/THREAT_MODEL.cac.json"
+    ],
+    "last_aligned_rfc": "RFC-0020",
+    "replaces": "documents/security/INCIDENT_RESPONSE.md",
+    "created_at": "2026-02-05T00:00:00Z",
+    "updated_at": "2026-02-05T00:00:00Z",
+    "canonicalizer": {
+      "canonicalizer_id": "apm2.canonicalizer.jcs",
+      "canonicalizer_version": "1.0.0",
+      "vectors_ref": "dcp://apm2.cac/canonicalizer/vectors@v1"
+    },
+    "provenance": {
+      "actor_id": "HOLON-SECURITY-GOVERNANCE",
+      "work_id": "DOC-SECURITY-RFC0020-ALIGN-20260205",
+      "source_receipts": []
+    }
+  },
+  "payload": {
+    "title": "Incident Response",
+    "alignment": "Security incident procedures aligned with RFC-0020 fail-closed semantics.",
+    "severity_model": [
+      {
+        "level": "Critical",
+        "description": "Active exploitation or immediate safety/integrity risk.",
+        "examples": [
+          "Secret leak with abuse evidence.",
+          "Quorum forgery.",
+          "Authority bypass."
+        ],
+        "containment_target": {
+          "target_type": "IMMEDIATE",
+          "max_duration_ms": 0
+        }
+      },
+      {
+        "level": "High",
+        "description": "Major security impact without confirmed active exploitation.",
+        "examples": [
+          "Identity replay path.",
+          "Stale-authority actuation.",
+          "Critical dependency vulnerability."
+        ],
+        "containment_target": {
+          "target_type": "WITHIN",
+          "max_duration_ms": 86400000
+        }
+      },
+      {
+        "level": "Medium",
+        "description": "Material but bounded security weakness.",
+        "examples": [
+          "Policy misconfiguration.",
+          "Incomplete logging controls."
+        ],
+        "containment_target": {
+          "target_type": "WITHIN",
+          "max_duration_ms": 604800000
+        }
+      },
+      {
+        "level": "Low",
+        "description": "Minor security debt or process gap.",
+        "examples": [
+          "Hardening backlog.",
+          "Non-blocking documentation issue."
+        ],
+        "containment_target": {
+          "target_type": "WITHIN",
+          "max_duration_ms": 2592000000
+        }
+      }
+    ],
+    "universal_rules": [
+      "Contain first and investigate second.",
+      "Prefer fail-closed degradation over uncertain continuation.",
+      "Preserve evidence as digests plus logs plus receipt pointers without mutating originals.",
+      "Record timeline, scope, decisions, and recovery actions.",
+      "Open follow-up remediation work with explicit verification criteria."
+    ],
+    "playbooks": [
+      {
+        "playbook_id": "IR-SECRET-LEAK",
+        "title": "Secret Leak",
+        "triggers": [
+          "Credential exposure in repository, logs, artifacts, or external channels."
+        ],
+        "immediate_actions": [
+          "Revoke leaked credentials.",
+          "Rotate adjacent credentials that may also be exposed.",
+          "Audit access and usage logs for abuse.",
+          "Preserve evidence and incident timeline."
+        ],
+        "containment_checks": [
+          "Disable affected automation paths if credential scope is unclear.",
+          "Confirm no secrets appear in release artifacts, logs, or error channels."
+        ]
+      },
+      {
+        "playbook_id": "IR-IDENTITY-FRESHNESS",
+        "title": "Identity/Freshness Incident (HSI-Critical)",
+        "triggers": [
+          "Replayed identity proofs.",
+          "Stale or unverifiable directory heads accepted.",
+          "Suspected revocation bypass."
+        ],
+        "immediate_actions": [
+          "Deny Tier2+ actuation paths dependent on affected trust state.",
+          "Force refresh and revalidation of identity trust anchors.",
+          "Invalidate verifier caches tied to suspect head or proof artifacts.",
+          "Preserve proof artifacts and verification logs."
+        ],
+        "containment_goal": "No actuation under stale or unverifiable identity authority."
+      },
+      {
+        "playbook_id": "IR-RECEIPT-AUTH",
+        "title": "Receipt Authentication Failure",
+        "triggers": [
+          "Invalid signatures.",
+          "Failed authority-seal verification.",
+          "Mismatched inclusion proofs or invalid batch-root anchoring."
+        ],
+        "immediate_actions": [
+          "Treat affected facts as non-authoritative.",
+          "Halt promotion and actuation paths consuming those facts.",
+          "Fall back to stricter verification paths where available.",
+          "Emit defects and isolate impacted producers."
+        ]
+      },
+      {
+        "playbook_id": "IR-DELEGATION-WIDENING",
+        "title": "Delegation Widening / Confused Deputy",
+        "triggers": [
+          "Downstream capability wider than parent authority.",
+          "Stop predicate weakening.",
+          "Unauthorized scope or budget expansion."
+        ],
+        "immediate_actions": [
+          "Revoke affected delegation chain.",
+          "Deny dependent episodes.",
+          "Preserve delegation artifacts and policy evaluation traces.",
+          "Patch and test strict-subset and meet enforcement."
+        ]
+      },
+      {
+        "playbook_id": "IR-DEPENDENCY-VULN",
+        "title": "Dependency / Supply-Chain Vulnerability",
+        "triggers": [
+          "Known vulnerability in direct or transitive dependency."
+        ],
+        "immediate_actions": [
+          "Assess exploitability in APM2 context.",
+          "Block release for affected versions until mitigated.",
+          "Upgrade or replace dependency and add regression test.",
+          "Publish advisory where required."
+        ]
+      },
+      {
+        "playbook_id": "IR-MALICIOUS-DEPENDENCY",
+        "title": "Malicious Dependency",
+        "triggers": [
+          "Evidence of dependency compromise or malicious behavior."
+        ],
+        "immediate_actions": [
+          "Remove dependency immediately.",
+          "Rebuild from clean state.",
+          "Audit build-script, network, and file-system behavior.",
+          "Report upstream through RustSec and ecosystem channels as appropriate."
+        ]
+      }
+    ],
+    "evidence_preservation_checklist": [
+      "Record incident start time and detection source.",
+      "Record hashes of key artifacts and log bundles.",
+      "Capture relevant receipt IDs and hashes.",
+      "Capture affected identity, capability, and policy version data.",
+      "Timestamp containment actions."
+    ],
+    "communication_templates": {
+      "internal_notification": {
+        "template_id": "IR-TPL-INTERNAL-01",
+        "required_fields": [
+          "severity",
+          "what",
+          "impact",
+          "containment",
+          "next_actions_owner_eta"
+        ]
+      },
+      "external_advisory": {
+        "template_id": "IR-TPL-EXTERNAL-01",
+        "required_fields": [
+          "severity",
+          "cve_if_assigned",
+          "affected_versions",
+          "patched_in",
+          "description",
+          "impact",
+          "mitigation",
+          "credit_optional"
+        ],
+        "notes": [
+          "Advisory format corresponds to GitHub Security Advisory publication flow."
+        ]
+      }
+    },
+    "closure_criteria": [
+      "Containment is verified.",
+      "Root cause is documented.",
+      "Regression controls (tests, policy, tooling) are in place.",
+      "Remediation evidence is linked."
+    ],
+    "contacts": [
+      {
+        "role": "Maintainer",
+        "responsibility": "Triage and coordinate response."
+      },
+      {
+        "role": "Security contact",
+        "responsibility": "Receive external reports and coordinate disclosure."
+      }
+    ],
+    "reporting_channel": "GitHub Security Advisories private disclosure workflow.",
+    "scale_and_forensics": {
+      "capacity_target": "multi-exabyte",
+      "evidence_strategy": [
+        "Store and exchange digest-addressed evidence pointers instead of raw payload replication by default.",
+        "Use receipt pointers and Merkle-batch references for high-volume incident traces.",
+        "Preserve canonical hashes first, then selectively hydrate detailed artifacts for investigation."
+      ],
+      "verification_cost_controls": [
+        "Use logarithmic membership proofs for receipt inclusion where available.",
+        "Bound decode and proof-size acceptance during incident ingestion.",
+        "Prefer cached trust roots and batch verification for large-scale evidence sets."
+      ]
+    },
+    "cryptography_posture": {
+      "pqc_status": "DEFERRED",
+      "pqc_note": "PQC migration work is deferred; current response procedures align to active RFC-0020 trust and freshness primitives."
+    }
+  }
+}

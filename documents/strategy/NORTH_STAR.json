@@ -1,0 +1,617 @@
+{
+  "schema": "cac.strategy.north_star.v1",
+  "schema_version": "1.0.0",
+  "kind": "strategy.north_star",
+  "meta": {
+    "artifact_id": "STRAT-NORTH-STAR-HTF-0001",
+    "authority": "normative",
+    "created_at": "HTF-BND-STRAT-BUNDLE-COMPILE-001",
+    "normalization_version": "strategy-business-normalizer.v2.cac_json",
+    "source_bundle_ref": "documents/strategy/STRATEGY_BUSINESS_BUNDLE.json",
+    "status": "active"
+  },
+  "payload": {
+    "governance_and_authority_model": {
+      "authority_gate_refs": [
+        "PHASE-1-TO-2",
+        "PHASE-2-TO-3",
+        "PHASE-3-TO-4",
+        "PHASE-4-TO-5"
+      ],
+      "decision_rights": [
+        {
+          "domain": "containment",
+          "owner": "Security Council",
+          "veto_power": true
+        },
+        {
+          "domain": "verification",
+          "owner": "Verification Council",
+          "veto_power": true
+        },
+        {
+          "domain": "liveness_and_economics",
+          "owner": "Runtime Council",
+          "veto_power": false
+        },
+        {
+          "domain": "capital_allocation",
+          "owner": "Finance Council",
+          "veto_power": false
+        }
+      ],
+      "model_id": "GOV-AUTH-001",
+      "principal_binding_rule": "All agent identities must include principal_binding_ref == PRINCIPAL-ROOT-ANVEIO and an active delegation contract."
+    },
+    "htf_time_boundary_registry": [
+      {
+        "evidence_ref": "EVID-CAC-BUNDLE-COMPILE",
+        "htf_boundary_id": "HTF-BND-STRAT-BUNDLE-COMPILE-001",
+        "intent": "Compile strategy business CAC bundle",
+        "predicate": "jq -e '.bundle_parse_ok == true and .bundle_signature_valid == true' evidence/strategy/cac_bundle/HTF-BND-STRAT-BUNDLE-COMPILE-001/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P1-BASELINE",
+        "htf_boundary_id": "HTF-BND-P1-BASELINE-LOCK",
+        "intent": "Lock phase 1 baseline bundle",
+        "predicate": "jq -e '.baseline_complete == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P1-BASELINE-LOCK/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-FOUNDATION",
+        "htf_boundary_id": "HTF-BND-FOUNDATION-CLOSE",
+        "intent": "Close strategy foundation hardening",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-FOUNDATION-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P1-SECURITY",
+        "htf_boundary_id": "HTF-BND-P1-SECURITY-CLOSE",
+        "intent": "Close phase 1 containment hardening",
+        "predicate": "jq -e '.tick_floor_met == true and .revocation_ok == true' evidence/strategy/time_boundaries/HTF-BND-P1-SECURITY-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P1",
+        "htf_boundary_id": "HTF-BND-P1-CLOSE",
+        "intent": "Close phase 1",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P1-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P2-EARLY",
+        "htf_boundary_id": "HTF-BND-P2-EARLY-CLOSE",
+        "intent": "Close early phase 2 reliability outcomes",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P2-EARLY-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P2-CONTROL",
+        "htf_boundary_id": "HTF-BND-P2-CONTROL-CLOSE",
+        "intent": "Close phase 2 control-plane integrity",
+        "predicate": "jq -e '.tick_floor_met == true and .authority_graph_complete == true' evidence/strategy/time_boundaries/HTF-BND-P2-CONTROL-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P2",
+        "htf_boundary_id": "HTF-BND-P2-CLOSE",
+        "intent": "Close phase 2",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P2-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P2-SEMANTICS",
+        "htf_boundary_id": "HTF-BND-P2-SEMANTICS-CLOSE",
+        "intent": "Close recursive semantics hardening",
+        "predicate": "jq -e '.semantic_equivalence_ok == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P2-SEMANTICS-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P3",
+        "htf_boundary_id": "HTF-BND-P3-CLOSE",
+        "intent": "Close phase 3",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P3-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P3-ECON",
+        "htf_boundary_id": "HTF-BND-P3-ECON-CLOSE",
+        "intent": "Close phase 3 economics and finance autonomy controls",
+        "predicate": "jq -e '.stp_controls_verified == true and .reconciliation_sla_met == true' evidence/strategy/time_boundaries/HTF-BND-P3-ECON-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P4-READINESS",
+        "htf_boundary_id": "HTF-BND-P4-READINESS-CLOSE",
+        "intent": "Close federated readiness runway",
+        "predicate": "jq -e '.cross_tenant_incidents_sev0_sev1 == 0 and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P4-READINESS-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P4",
+        "htf_boundary_id": "HTF-BND-P4-CLOSE",
+        "intent": "Close phase 4",
+        "predicate": "jq -e '.tick_floor_met == true and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P4-CLOSE/summary.json"
+      },
+      {
+        "evidence_ref": "EVID-TIME-BND-P5",
+        "htf_boundary_id": "HTF-BND-P5-CLOSE",
+        "intent": "Close terminal phase 5 mission",
+        "predicate": "jq -e '.independent_replication_success_rate >= 0.80 and .signature_valid == true' evidence/strategy/time_boundaries/HTF-BND-P5-CLOSE/summary.json"
+      }
+    ],
+    "master_claim_contracts": [
+      {
+        "claim_id": "MSC-01",
+        "claim_type": "autonomy_quality",
+        "evidence_refs": [
+          "EVID-PHASE1-MSC01"
+        ],
+        "gate_refs": [
+          "PHASE-1-TO-2"
+        ],
+        "law_refs": [
+          "LAW-01",
+          "LAW-12"
+        ],
+        "metric_refs": [
+          "MET-AUTONOMOUS-TIER1-MERGE-RATIO",
+          "MET-AGENT-DEFECT-RATE"
+        ],
+        "owner_locus": "Runtime Council + Verification Council",
+        "phase_ref": "PHASE-1",
+        "statement": "Increase Tier1 autonomous delivery without degrading quality.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-02",
+        "claim_type": "fail_closed_containment",
+        "evidence_refs": [
+          "EVID-PHASE1-MSC02"
+        ],
+        "gate_refs": [
+          "PHASE-1-TO-2"
+        ],
+        "law_refs": [
+          "LAW-04",
+          "LAW-05",
+          "LAW-09"
+        ],
+        "metric_refs": [
+          "MET-TIER2PLUS-NO-TERMINAL-RECEIPT",
+          "MET-WINDOW-TICK-FLOOR-MET"
+        ],
+        "owner_locus": "Security Council",
+        "phase_ref": "PHASE-1",
+        "statement": "Enforce fail-closed promotion for Tier2+ changes.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-03",
+        "claim_type": "verifier_compounding",
+        "evidence_refs": [
+          "EVID-PHASE2-MSC03"
+        ],
+        "gate_refs": [
+          "PHASE-2-TO-3"
+        ],
+        "law_refs": [
+          "LAW-01",
+          "LAW-08"
+        ],
+        "metric_refs": [
+          "MET-SEV12-REPLAY-CLOSURE-RATIO"
+        ],
+        "owner_locus": "Reliability Council",
+        "phase_ref": "PHASE-2",
+        "statement": "Convert counterexamples into stronger verifiers.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-04",
+        "claim_type": "novelty_generation",
+        "evidence_refs": [
+          "EVID-PHASE2-MSC04"
+        ],
+        "gate_refs": [
+          "PHASE-2-TO-3"
+        ],
+        "law_refs": [
+          "LAW-06",
+          "LAW-12"
+        ],
+        "metric_refs": [
+          "MET-NOVEL-METHODS-PER-EPOCH",
+          "MET-METHODS-GE-2X"
+        ],
+        "owner_locus": "Research Council + IP Council",
+        "phase_ref": "PHASE-2",
+        "statement": "Generate novel admissible methods with reproducible superiority.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-05",
+        "claim_type": "oracle_compilation",
+        "evidence_refs": [
+          "EVID-PHASE2-MSC05"
+        ],
+        "gate_refs": [
+          "PHASE-2-TO-3"
+        ],
+        "law_refs": [
+          "LAW-06",
+          "LAW-15"
+        ],
+        "metric_refs": [
+          "MET-ORACLE-REQ-PER-100",
+          "MET-ORACLE-TO-PRIMITIVE-P95"
+        ],
+        "owner_locus": "Governance Council",
+        "phase_ref": "PHASE-2",
+        "statement": "Industrialize oracle compilation to reduce human bottlenecks.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-06",
+        "claim_type": "commercial_durability",
+        "evidence_refs": [
+          "EVID-PHASE3-MSC06"
+        ],
+        "gate_refs": [
+          "PHASE-3-TO-4"
+        ],
+        "law_refs": [
+          "LAW-08",
+          "LAW-12"
+        ],
+        "metric_refs": [
+          "MET-ARR-USD",
+          "MET-GROSS-MARGIN-RATIO",
+          "MET-LOGO-RETENTION-RATIO"
+        ],
+        "owner_locus": "Board + Finance Council",
+        "phase_ref": "PHASE-3",
+        "statement": "Build commercially durable revenue from governed autonomy stack.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-07",
+        "claim_type": "federated_deployment",
+        "evidence_refs": [
+          "EVID-PHASE4-MSC07"
+        ],
+        "gate_refs": [
+          "PHASE-4-TO-5"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-09"
+        ],
+        "metric_refs": [
+          "MET-ACTIVE-FEDERATED-CELLS",
+          "MET-CROSS-TENANT-SEV0-1"
+        ],
+        "owner_locus": "Platform Council + Security Council",
+        "phase_ref": "PHASE-4",
+        "statement": "Establish federated enterprise deployment with zero severe cross-tenant incidents.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-08",
+        "claim_type": "planetary_impact",
+        "evidence_refs": [
+          "EVID-PHASE5-MSC08"
+        ],
+        "gate_refs": [
+          "PHASE-5-TERMINAL"
+        ],
+        "law_refs": [
+          "LAW-01",
+          "LAW-15"
+        ],
+        "metric_refs": [
+          "MET-ACTIVE-DISEASE-PROGRAMS",
+          "MET-INDEPENDENT-REPLICATION-RATE"
+        ],
+        "owner_locus": "Bio Council + External Ethics Board",
+        "phase_ref": "PHASE-5",
+        "statement": "Achieve externally replicated life-science discovery utility.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-09",
+        "claim_type": "authority_calculus",
+        "evidence_refs": [
+          "EVID-CTRL-MSC09"
+        ],
+        "gate_refs": [
+          "PHASE-2-TO-3"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-09"
+        ],
+        "metric_refs": [
+          "MET-AUTHORITY-GRAPH-COVERAGE",
+          "MET-DELEGATION-NARROWING-VIOLATIONS"
+        ],
+        "owner_locus": "Security Council + Verification Council",
+        "phase_ref": "PHASE-2",
+        "statement": "Mechanical authority calculus closure.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-10",
+        "claim_type": "temporal_trust",
+        "evidence_refs": [
+          "EVID-CTRL-MSC10"
+        ],
+        "gate_refs": [
+          "PHASE-2-TO-3"
+        ],
+        "law_refs": [
+          "LAW-09"
+        ],
+        "metric_refs": [
+          "MET-FRESHNESS-VIOLATIONS-TIER2PLUS",
+          "MET-REVOCATION-P99-MET"
+        ],
+        "owner_locus": "Security Council",
+        "phase_ref": "PHASE-2",
+        "statement": "Temporal trust integrity with freshness and revocation enforcement.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-11",
+        "claim_type": "recursive_semantics",
+        "evidence_refs": [
+          "EVID-CTRL-MSC11"
+        ],
+        "gate_refs": [
+          "PHASE-3-TO-4"
+        ],
+        "law_refs": [
+          "LAW-06",
+          "LAW-12"
+        ],
+        "metric_refs": [
+          "MET-BISIMULATION-PASS-RATE-D12",
+          "MET-SEMANTIC-DRIFT-ESCAPE-RATE"
+        ],
+        "owner_locus": "Runtime Council + Research Council",
+        "phase_ref": "PHASE-2",
+        "statement": "Recursive semantics equivalence under depth bounds.",
+        "status": "active"
+      },
+      {
+        "claim_id": "MSC-12",
+        "claim_type": "partition_survivability",
+        "evidence_refs": [
+          "EVID-CTRL-MSC12"
+        ],
+        "gate_refs": [
+          "PHASE-4-TO-5"
+        ],
+        "law_refs": [
+          "LAW-05",
+          "LAW-09"
+        ],
+        "metric_refs": [
+          "MET-UNSAFE-PROMOTIONS-PARTITION",
+          "MET-BYZANTINE-QUORUM-DIVERGENCE"
+        ],
+        "owner_locus": "Platform Council + Security Council",
+        "phase_ref": "PHASE-4",
+        "statement": "Partition and Byzantine survivability for authoritative promotions.",
+        "status": "active"
+      }
+    ],
+    "mission_model": {
+      "claim_refs": [
+        "BPC-05",
+        "BPC-06",
+        "MSC-01",
+        "MSC-02",
+        "MSC-03",
+        "MSC-04",
+        "MSC-05",
+        "MSC-06",
+        "MSC-07",
+        "MSC-08",
+        "MSC-09",
+        "MSC-10",
+        "MSC-11",
+        "MSC-12"
+      ],
+      "dominance_order": [
+        "containment_security",
+        "verification_correctness",
+        "liveness_progress"
+      ],
+      "law_refs": [
+        "LAW-01",
+        "LAW-02",
+        "LAW-04",
+        "LAW-05",
+        "LAW-06",
+        "LAW-07",
+        "LAW-08",
+        "LAW-09",
+        "LAW-12",
+        "LAW-15"
+      ],
+      "mission_id": "MISSION-ROOT-001",
+      "objective": "Maximize governed autonomy at civilizational scale while preserving mechanical verifiability, recursive composability, physical realizability, and containment-first governance.",
+      "principal_objective": "Operate all authority-bearing and financial actions as delegated agency under sole proprietor principal authority with fail-closed policy enforcement, while preserving employee_count == 0 and autonomous LLC lifecycle management."
+    },
+    "phase_model": [
+      {
+        "claim_refs": [
+          "MSC-01",
+          "MSC-02",
+          "MSC-09"
+        ],
+        "entry_boundary_ref": "HTF-BND-P1-BASELINE-LOCK",
+        "exit_boundary_ref": "HTF-BND-P1-CLOSE",
+        "gate_ref": "PHASE-1-TO-2",
+        "name": "Recursive Self-Improvement",
+        "objective": "Increase Tier1 autonomous delivery under bounded authority and fail-closed Tier2+ promotion.",
+        "owner_locus": "Runtime Council + Verification Council + Security Council",
+        "phase_id": "PHASE-1"
+      },
+      {
+        "claim_refs": [
+          "MSC-03",
+          "MSC-04",
+          "MSC-05",
+          "MSC-10",
+          "MSC-11"
+        ],
+        "entry_boundary_ref": "HTF-BND-P2-EARLY-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P2-CLOSE",
+        "gate_ref": "PHASE-2-TO-3",
+        "name": "Novel Methods Generation",
+        "objective": "Produce reproducible novelty while lowering oracle dependence and strengthening temporal trust.",
+        "owner_locus": "Research Council + IP Council + Governance Council",
+        "phase_id": "PHASE-2"
+      },
+      {
+        "claim_refs": [
+          "BPC-01",
+          "BPC-03",
+          "BPC-04",
+          "BPC-05",
+          "BPC-06",
+          "MSC-06"
+        ],
+        "entry_boundary_ref": "HTF-BND-P3-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P3-ECON-CLOSE",
+        "gate_ref": "PHASE-3-TO-4",
+        "name": "Company Formation",
+        "objective": "Build durable governed-autonomy revenue while preserving security and verification spend floors, with employee_count == 0 and automated LLC lifecycle management.",
+        "owner_locus": "Board + Finance Council",
+        "phase_id": "PHASE-3"
+      },
+      {
+        "claim_refs": [
+          "MSC-07",
+          "MSC-12",
+          "BPC-02"
+        ],
+        "entry_boundary_ref": "HTF-BND-P4-READINESS-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P4-CLOSE",
+        "gate_ref": "PHASE-4-TO-5",
+        "name": "Federated Partnerships",
+        "objective": "Scale multi-cell deployment without containment regression and with partition survivability.",
+        "owner_locus": "Platform Council + Security Council",
+        "phase_id": "PHASE-4"
+      },
+      {
+        "claim_refs": [
+          "MSC-08"
+        ],
+        "entry_boundary_ref": "HTF-BND-P5-CLOSE",
+        "exit_boundary_ref": "HTF-BND-P5-CLOSE",
+        "gate_ref": "PHASE-5-TERMINAL",
+        "name": "Planetary Impact",
+        "objective": "Deliver externally replicated governed discovery in life-science programs.",
+        "owner_locus": "Bio Council + External Ethics Board",
+        "phase_id": "PHASE-5"
+      }
+    ],
+    "transition_gate_contracts": [
+      {
+        "authority_requirements": [
+          "quorum_valid == true",
+          "delegation_narrowing_violations == 0"
+        ],
+        "fail_closed_conditions": [
+          "missing_input",
+          "parse_error",
+          "unknown_state",
+          "signature_failure"
+        ],
+        "gate_id": "PHASE-1-TO-2",
+        "inputs": [
+          "EVID-TRANS-PHASE-1-2"
+        ],
+        "output_receipts": [
+          "RECEIPT-GATE-PHASE-1-2"
+        ],
+        "predicate": ".msc01_pass == true and .msc02_pass == true and .msc03_progress_ratio >= 0.60 and .freshness_ok == true and .revocation_ok == true and .authority_graph_complete == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "quorum_valid == true",
+          "authority_graph_complete == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_input",
+          "parse_error",
+          "unknown_state",
+          "freshness_failure"
+        ],
+        "gate_id": "PHASE-2-TO-3",
+        "inputs": [
+          "EVID-TRANS-PHASE-2-3"
+        ],
+        "output_receipts": [
+          "RECEIPT-GATE-PHASE-2-3"
+        ],
+        "predicate": ".msc03_pass == true and .msc04_pass == true and .msc05_pass == true and .msc09_pass == true and .msc10_pass == true and .freshness_ok == true and .revocation_ok == true and .authority_graph_complete == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "quorum_valid == true",
+          "authority_graph_complete == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_input",
+          "parse_error",
+          "unknown_state",
+          "signature_failure"
+        ],
+        "gate_id": "PHASE-3-TO-4",
+        "inputs": [
+          "EVID-TRANS-PHASE-3-4"
+        ],
+        "output_receipts": [
+          "RECEIPT-GATE-PHASE-3-4"
+        ],
+        "predicate": ".msc06_pass == true and .msc11_pass == true and .tier2plus_promotions_without_terminal_receipt == 0 and .window_tick_floor_met == true and .semantic_equivalence_ok == true and .employee_count == 0 and .llc_lifecycle_automation_coverage >= 0.95 and .llc_formation_automation_pass == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "quorum_valid == true",
+          "authority_graph_complete == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_input",
+          "parse_error",
+          "unknown_state",
+          "freshness_failure"
+        ],
+        "gate_id": "PHASE-4-TO-5",
+        "inputs": [
+          "EVID-TRANS-PHASE-4-5"
+        ],
+        "output_receipts": [
+          "RECEIPT-GATE-PHASE-4-5"
+        ],
+        "predicate": ".msc07_pass == true and .msc12_pass == true and .external_safety_audit_pass == true and .partition_drill_receipt_ok == true and .revocation_ok == true",
+        "predicate_language": "jq"
+      },
+      {
+        "authority_requirements": [
+          "external_ethics_signer_quorum_valid == true"
+        ],
+        "fail_closed_conditions": [
+          "missing_input",
+          "parse_error",
+          "unknown_state"
+        ],
+        "gate_id": "PHASE-5-TERMINAL",
+        "inputs": [
+          "EVID-PHASE5-MSC08"
+        ],
+        "output_receipts": [
+          "RECEIPT-GATE-PHASE-5-TERMINAL"
+        ],
+        "predicate": ".msc08_pass == true and .independent_replication_success_rate >= 0.80 and .external_ethics_board_signoff == true",
+        "predicate_language": "jq"
+      }
+    ]
+  }
+}

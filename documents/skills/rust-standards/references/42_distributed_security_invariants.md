@@ -6,7 +6,7 @@
   - Validated `ActorID` cryptographic binding.
   - Costly entry barrier (Proof-of-Work, Stake, or signed delegation from a trusted Holarchy root).
   - Multi-stage handshake that verifies peer "liveness" before allocating significant session resources.
-[PROVENANCE] THREAT_MODEL.md: Discovery mechanisms are high-risk entry points for Sybil attacks.
+[PROVENANCE] documents/security/THREAT_MODEL.cac.json: Discovery mechanisms are high-risk entry points for Sybil attacks.
 
 [INVARIANT: INV-2701] Identity-Bound Resource Quotas.
 - REJECT IF: resource consumption (tasks, memory, bandwidth, storage) is tracked globally or per-connection without being keyed by a verified `ActorID`.
@@ -14,7 +14,7 @@
 - ENFORCE BY:
   - Use `DashMap<ActorID, QuotaState>` to track cross-connection resource usage.
   - Enforce limits at the ingress point of every major subsystem (routing, replication, command execution).
-[PROVENANCE] THREAT_MODEL.md: Bounded work issuance and admission control prevent the network from becoming an involuntary compute sink.
+[PROVENANCE] documents/security/THREAT_MODEL.cac.json: Bounded work issuance and admission control prevent the network from becoming an involuntary compute sink.
 
 [HAZARD: RSK-2701] Eclipse-Prone Peer Selection (Homogeneity).
 - TRIGGER: Peer sets populated primarily from a single IP subnet, cloud provider, or geographic region.
@@ -24,14 +24,14 @@
   - Cap active connections from the same `/24` (IPv4) or `/48` (IPv6) subnet.
   - Implement "Outbound Peer Diversity": prioritize connections to seeds from diverse Autonomous Systems (ASNs).
   - Use a "Reputation-Weighted" peer bucket system where no single identity group can occupy >20% of the active routing table.
-[PROVENANCE] THREAT_MODEL.md: Sybil and eclipse attacks flood the peer set to isolate victims.
+[PROVENANCE] documents/security/THREAT_MODEL.cac.json: Sybil and eclipse attacks flood the peer set to isolate victims.
 
 [CONTRACT: CTR-2702] Deterministic Holonic Identity Continuity.
 - REJECT IF: `ActorID` rotation or key update logic permits "split-brain" identities or allows an old key to retain authority after revocation.
 - ENFORCE BY:
   - Monotonic sequence numbers in identity update manifests.
   - Explicit revocation evidence that is replicated with higher priority than standard state.
-[PROVENANCE] THREAT_MODEL.md: Identity threats dominate; revocation must handle long-lived partitions.
+[PROVENANCE] documents/security/THREAT_MODEL.cac.json: Identity threats dominate; revocation must handle long-lived partitions.
 
 [CONTRACT: CTR-2703] Cryptographically Bound ActorID.
 - REJECT IF: `ActorId` is represented as a raw primitive (e.g., `String`, `Uuid`, `u64`) in public APIs, signature payloads, or ledger events.
@@ -47,10 +47,10 @@
 - ENFORCE BY:
   - Bound tokens to specific `CapabilityScope`.
   - Verify that every relayed command includes the full delegation chain for audit.
-[PROVENANCE] THREAT_MODEL.md: Authorization threats in holarchies are typically delegation bugs.
+[PROVENANCE] documents/security/THREAT_MODEL.cac.json: Authorization threats in holarchies are typically delegation bugs.
 
 ## References (Normative Anchors)
 
-- THREAT_MODEL.md: Distributed holonic threat posture.
+- documents/security/THREAT_MODEL.cac.json: Distributed holonic threat posture.
 - RFC-0010: Identity and ActorID specification.
 - RFC-0014: Capability-based authorization protocol.

@@ -1,0 +1,24 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0005"
+  title: "Pre-actuation stop and budget proof obligations"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    Stop conditions and typed budgets MUST be evaluated before tool actuation and represented by explicit receipt evidence or mandatory receipt fields proving precondition evaluation order.
+
+    Primary delivery ticket: TCK-00351
+  rationale: |
+    Safety-critical gating requires proving preconditions before side effects.
+  acceptance_criteria:
+    - "No tool actuation occurs without prior stop/budget evaluation"
+    - "Replay harness verifies ordering invariants"
+    - "Stop uncertainty triggers deny in configured deadline path"
+    - "Primary implementation ticket TCK-00351 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0005"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.3.1"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.6"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §10 Stage 1"

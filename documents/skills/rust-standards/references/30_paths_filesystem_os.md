@@ -53,7 +53,7 @@ pub fn reject_if_any_symlink(path: &Path) -> io::Result<()> {
 - REJECT IF: secret material (keys, session tokens) appears in logs or error dumps.
 - REJECT IF: key files are created with permissive (non-0600) permissions.
 - ENFORCE BY: `secrecy` crate; explicit `umask` or restrictive `mode` at create-time; filter logs for sensitive patterns.
-[PROVENANCE] SECRETS_MANAGEMENT.md; CTR-2611.
+[PROVENANCE] documents/security/SECRETS_MANAGEMENT.cac.json; CTR-2611.
 
 ```rust
 // Pattern: Path Sanitization

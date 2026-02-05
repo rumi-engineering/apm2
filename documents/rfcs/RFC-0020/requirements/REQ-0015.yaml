@@ -1,0 +1,26 @@
+requirement:
+  schema_version: "2026-02-05"
+  id: "REQ-0015"
+  title: "Session-open proof-carrying identity enforcement"
+  category: "SECURITY"
+  priority: "P0"
+  status: "PROPOSED"
+  statement: |
+    hsi.session.open MUST require client holon_id with identity_proof_hash and daemon cell certificate plus directory head bindings; the daemon MUST bind verified holon_id to session_id and reject identity switching; when session keys are used, session_key_id MUST be bound for replay protection; Tier2+ sessions MUST return an identity freshness witness and freshness-policy pointer, and non-discovery authority paths MUST deny on freshness uncertainty.
+
+    Primary delivery ticket: TCK-00361
+  rationale: |
+    Session open is the canonical authority admission gate and must be strictly proof-carrying.
+  acceptance_criteria:
+    - "Tier2+ authority denied on stale/missing identity freshness proofs"
+    - "Session record pins verified holon_id and rejects post-open identity mutation attempts"
+    - "Tier2+ responses include epoch/freshness witness plus freshness-policy pointer used by actuation checks"
+    - "Discovery-only surfaces can proceed under configured degraded policy"
+    - "Session-open path is fully receipt/defect-instrumented"
+    - "Primary implementation ticket TCK-00361 is completed with linked evidence."
+  evidence_ids:
+    - "EVID-0015"
+  source_refs:
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §5.1"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.7.7"
+    - "HOLONIC_SUBSTRATE_INTERFACE.md §1.8"

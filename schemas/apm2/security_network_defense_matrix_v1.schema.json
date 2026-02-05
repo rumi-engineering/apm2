@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apm2.dev/schemas/apm2/security_network_defense_matrix_v1.schema.json",
+  "title": "SecurityNetworkDefenseMatrixV1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "kind",
+    "meta",
+    "payload"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "apm2.security.network_defense_matrix.v1"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "kind": {
+      "type": "string",
+      "const": "security.threat_matrix"
+    },
+    "meta": {
+      "type": "object",
+      "required": [
+        "canonicalizer",
+        "classification",
+        "created_at",
+        "ref",
+        "source_of_truth_refs",
+        "stable_id",
+        "status"
+      ],
+      "properties": {
+        "stable_id": {
+          "type": "string",
+          "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ACTIVE",
+            "DRAFT",
+            "DEPRECATED"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "source_of_truth_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "classification": {
+          "type": "string",
+          "enum": [
+            "PUBLIC",
+            "INTERNAL",
+            "CONFIDENTIAL",
+            "RESTRICTED"
+          ]
+        },
+        "last_aligned_rfc": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "canonicalizer": {
+          "type": "object",
+          "required": [
+            "canonicalizer_id",
+            "canonicalizer_version",
+            "vectors_ref"
+          ],
+          "properties": {
+            "canonicalizer_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "canonicalizer_version": {
+              "type": "string",
+              "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+            },
+            "vectors_ref": {
+              "type": "string",
+              "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+            }
+          },
+          "additionalProperties": false
+        },
+        "provenance": {
+          "type": "object",
+          "properties": {
+            "actor_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "work_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "source_receipts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^dcp://[a-z0-9.-]+/[A-Za-z0-9_./:-]+(@[A-Za-z0-9_.-]+)?$"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "payload": {
+      "type": "object",
+      "required": [
+        "domain",
+        "threats",
+        "control_bindings",
+        "scale_profile",
+        "cryptography_posture"
+      ],
+      "properties": {
+        "domain": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "threats": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/threat"
+          }
+        },
+        "control_bindings": {
+          "type": "object",
+          "required": [
+            "identity_and_replay",
+            "delegation_and_authz",
+            "integrity_and_admission",
+            "confidentiality_and_injection",
+            "availability_and_dos"
+          ],
+          "properties": {
+            "identity_and_replay": {
+              "$ref": "#/$defs/control_list"
+            },
+            "delegation_and_authz": {
+              "$ref": "#/$defs/control_list"
+            },
+            "integrity_and_admission": {
+              "$ref": "#/$defs/control_list"
+            },
+            "confidentiality_and_injection": {
+              "$ref": "#/$defs/control_list"
+            },
+            "availability_and_dos": {
+              "$ref": "#/$defs/control_list"
+            }
+          },
+          "additionalProperties": false
+        },
+        "scale_profile": {
+          "type": "object",
+          "required": [
+            "capacity_target",
+            "verification_economics"
+          ],
+          "properties": {
+            "capacity_target": {
+              "type": "string",
+              "const": "multi-exabyte"
+            },
+            "verification_economics": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "cryptography_posture": {
+          "type": "object",
+          "required": [
+            "pqc_status",
+            "pqc_note"
+          ],
+          "properties": {
+            "pqc_status": {
+              "type": "string",
+              "const": "DEFERRED"
+            },
+            "pqc_note": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "threat": {
+      "type": "object",
+      "required": [
+        "id",
+        "category",
+        "name",
+        "vector",
+        "desc"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^THR-[A-Z]+-[0-9]{2}$"
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "vector": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "desc": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "additionalProperties": false
+    },
+    "control_list": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      }
+    }
+  },
+  "unevaluatedProperties": false
+}

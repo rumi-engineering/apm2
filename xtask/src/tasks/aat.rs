@@ -284,7 +284,7 @@ struct RawHypothesis {
 ///
 /// * `pr_description` - The raw PR description text
 /// * `diff` - The PR diff text
-/// * `tool_config` - AI tool configuration (gemini or claude-code)
+/// * `tool_config` - AI tool configuration (codex or claude-code)
 /// * `repo_root` - Repository root path for loading prompt template
 ///
 /// # Returns
@@ -470,12 +470,12 @@ fn invoke_ai_tool(prompt_path: &Path, tool_config: &AatToolConfig) -> Result<Str
 /// Build the script command for AI tool invocation.
 ///
 /// This handles the differences between AI tools:
-/// - Gemini: Uses `--yolo` flag for non-interactive mode
+/// - Codex: Uses `codex exec --dangerously-bypass-approvals-and-sandbox`
 /// - Claude: Uses standard input without special flags
 fn build_ai_script_command(prompt_path: &Path, tool_config: &AatToolConfig) -> String {
     match tool_config.ai_tool {
-        AiTool::Gemini => {
-            // Gemini uses build_script_command from shell_escape module
+        AiTool::Codex => {
+            // Codex uses build_script_command from shell_escape module
             build_script_command(prompt_path, None, Some(select_review_model()))
         },
         AiTool::ClaudeCode => {
