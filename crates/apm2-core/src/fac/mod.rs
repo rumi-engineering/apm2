@@ -371,3 +371,59 @@ pub use view_commitment::{
 pub mod role_routing;
 // Re-export role routing types for convenient access
 pub use role_routing::{RoutingDecision, classify_changeset};
+/// Efficiency primitives for context deltas, caching, and summary-first
+/// iteration.
+///
+/// This module implements TCK-00335 with:
+/// - **Context Deltas**: Capture minimal state changes between iterations (N ->
+///   N+1)
+/// - **Tool Output Caching**: CAS-backed caches for Search/FileRead outputs
+///   when safe
+/// - **Summary-first Iteration**: Use summary receipts as iteration interfaces
+///
+/// # Budget Enforcement
+///
+/// The primitives ensure a 20-iteration loop stays within a fixed context
+/// budget envelope through:
+/// - Delta-based context injection (not full history)
+/// - Tool output deduplication via CAS caching
+/// - Automatic compaction when budget is exceeded
+///
+/// # Example
+///
+/// ```rust
+/// use apm2_core::fac::efficiency_primitives::{
+///     ContextBudgetEnvelope, ContextDeltaBuilder, IterationContextBuilder,
+/// };
+///
+/// let mut envelope = ContextBudgetEnvelope::for_twenty_iterations();
+///
+/// for i in 0..20 {
+///     let delta = ContextDeltaBuilder::new(i, i + 1)
+///         .add_changed_file("/src/main.rs", [0x42; 32])
+///         .tokens_consumed(1000)
+///         .build()
+///         .unwrap();
+///
+///     let ctx = IterationContextBuilder::new("work-123", i + 1)
+///         .add_delta(delta)
+///         .build()
+///         .unwrap();
+///
+///     envelope
+///         .record_iteration(ctx.estimated_size_bytes())
+///         .unwrap();
+/// }
+///
+/// assert_eq!(envelope.iterations_completed, 20);
+/// ```
+pub mod efficiency_primitives;
+// Re-export efficiency primitives for convenient access (TCK-00335)
+pub use efficiency_primitives::{
+    CacheKey, CacheStats, ChangeType, ChangedFile, ContextBudgetEnvelope, ContextDelta,
+    ContextDeltaBuilder, DEFAULT_CACHE_TTL_SECS, DEFAULT_CONTEXT_BUDGET_BYTES,
+    EFFICIENCY_PRIMITIVES_SCHEMA, EFFICIENCY_PRIMITIVES_VERSION, EfficiencyError, Finding,
+    IterationContext, IterationContextBuilder, MAX_CACHE_ENTRIES, MAX_CHANGED_FILES,
+    MAX_CONTEXT_BUDGET_BYTES, MAX_DELTAS, MAX_FINDINGS, MAX_TOOL_OUTPUTS, MAX_ZOOM_SELECTORS,
+    ToolOutputCache, ToolOutputCacheConfig, ToolOutputRef, ZoomSelector, ZoomSelectorType,
+};

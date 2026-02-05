@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use apm2_core::fac::efficiency_primitives::{CacheKey, ToolOutputCache};
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
@@ -284,6 +285,12 @@ pub struct ToolExecutor {
     /// When present, tool executions are stamped with a `TimeEnvelopeRef`
     /// for temporal ordering and causality tracking.
     clock: Option<Arc<HolonicClock>>,
+
+    /// Optional tool output cache (TCK-00335).
+    ///
+    /// If configured, cacheable tool executions (Search, FileRead) are checked
+    /// against this cache before execution.
+    output_cache: Option<ToolOutputCache>,
 }
 
 impl ToolExecutor {
@@ -300,6 +307,7 @@ impl ToolExecutor {
             cas,
             handlers: HashMap::new(),
             clock: None,
+            output_cache: None,
         }
     }
 
