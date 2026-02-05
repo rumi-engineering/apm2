@@ -810,7 +810,8 @@ mod tests {
 
     #[test]
     fn test_reason_code_to_code_roundtrip() {
-        // Values 1-11 are valid (0 is UNSPECIFIED per protobuf, TCK-00325 added 9, TCK-00326 added 10-11)
+        // Values 1-11 are valid (0 is UNSPECIFIED per protobuf, TCK-00325 added 9,
+        // TCK-00326 added 10-11)
         for code in 1..=11u8 {
             let reason = ReasonCode::from_code(code).unwrap();
             assert_eq!(reason.to_code(), code);
@@ -1124,7 +1125,8 @@ mod tests {
             ReasonCode::ContextPackInvalid.to_string(),
             "CONTEXT_PACK_INVALID"
         );
-        // TCK-00325 reserved code 9 for MissingViewCommitment, so ContextPack codes are 10-11
+        // TCK-00325 reserved code 9 for MissingViewCommitment, so ContextPack codes are
+        // 10-11
         assert_eq!(ReasonCode::ContextPackMissing.to_code(), 10);
         assert_eq!(ReasonCode::ContextPackInvalid.to_code(), 11);
         // Context pack errors are not retryable
