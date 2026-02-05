@@ -71,6 +71,7 @@ mod aat_spec;
 mod agent_adapter_profile;
 pub mod anti_downgrade;
 mod artifact_manifest;
+pub mod builtin_profiles;
 mod changeset_bundle;
 mod ci_attestation;
 mod ci_import;
@@ -128,6 +129,12 @@ pub use artifact_manifest::{
     ArtifactDigest, ArtifactManifest, ArtifactManifestBuilder, ArtifactManifestError, ArtifactType,
     DataClassification, HygieneError, MAX_ARTIFACTS,
     MAX_STRING_LENGTH as MAX_ARTIFACT_STRING_LENGTH, validate_evidence_hygiene_for_admission,
+};
+// Re-export builtin profile types (TCK-00329)
+pub use builtin_profiles::{
+    CLAUDE_CODE_PROFILE_ID, CODEX_CLI_PROFILE_ID, GEMINI_CLI_PROFILE_ID,
+    LOCAL_INFERENCE_PROFILE_ID, all_builtin_profiles, claude_code_profile, codex_cli_profile,
+    gemini_cli_profile, get_builtin_profile, local_inference_profile,
 };
 // Re-export changeset bundle types
 pub use changeset_bundle::{

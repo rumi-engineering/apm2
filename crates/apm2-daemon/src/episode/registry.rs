@@ -52,7 +52,7 @@
 use std::collections::HashMap;
 
 use apm2_core::evidence::ContentAddressedStore;
-use apm2_core::fac::{AdapterMode, AgentAdapterProfileError, AgentAdapterProfileV1};
+use apm2_core::fac::{AgentAdapterProfileError, AgentAdapterProfileV1};
 
 use super::adapter::{AdapterType, HarnessAdapter};
 use super::claude_code::{ClaudeCodeAdapter, ClaudeCodeHolon};
@@ -68,13 +68,6 @@ pub enum AdapterRegistryError {
     /// Profile validation failed.
     #[error("profile validation failed: {0}")]
     ProfileInvalid(String),
-
-    /// Unsupported adapter mode for this profile.
-    #[error("unsupported adapter mode: {mode}")]
-    UnsupportedAdapterMode {
-        /// The unsupported mode.
-        mode: String,
-    },
 
     /// No profile hash available (legacy mode).
     #[error("no profile hash available: registry was created in legacy mode")]
@@ -209,24 +202,14 @@ impl AdapterRegistry {
         let mut registry = Self {
             adapters: HashMap::new(),
             profile_hash: Some(*profile_hash),
-            profile: Some(profile.clone()),
+            profile: Some(profile),
         };
 
-        // Register adapters based on adapter_mode
-        match profile.adapter_mode {
-            AdapterMode::BlackBox | AdapterMode::StructuredOutput => {
-                // Black-box and structured output modes use ClaudeCode adapter
-                // with kernel-side tool execution
-                registry.register(Box::new(ClaudeCodeAdapter::new()));
-                registry.register(Box::new(RawAdapter::new()));
-            },
-            AdapterMode::McpBridge | AdapterMode::HookedVendor => {
-                // MCP bridge and hooked vendor modes are allowed but not
-                // preferred for FAC v0. Register basic adapters.
-                registry.register(Box::new(ClaudeCodeAdapter::new()));
-                registry.register(Box::new(RawAdapter::new()));
-            },
-        }
+        // Register adapters
+        // Note: All adapter modes currently use the same set of adapters for FAC v0.
+        // As we implement specific bridging logic (e.g. MCP), this may diverge.
+        registry.register(Box::new(ClaudeCodeAdapter::new()));
+        registry.register(Box::new(RawAdapter::new()));
 
         Ok(registry)
     }
