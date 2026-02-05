@@ -728,10 +728,21 @@ impl EpisodeRuntime {
 
     /// Registers a factory for creating tool handlers (builder pattern).
     ///
-    /// **DEPRECATED (TCK-00319)**: Prefer `with_rooted_handler_factory` for
-    /// production use. These factories create handlers rooted to CWD, which
-    /// is a security anti-pattern.
+    /// **DEPRECATED (TCK-00319, TCK-00336)**: Prefer
+    /// `with_rooted_handler_factory` for production use. These factories
+    /// create handlers rooted to CWD, which is a security anti-pattern.
+    ///
+    /// # Security Warning (TCK-00336)
+    ///
+    /// CWD-rooted handlers violate workspace isolation. Using this method
+    /// in production creates a security vulnerability where tool handlers
+    /// can access files outside the intended workspace. Use
+    /// `with_rooted_handler_factory` instead.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "TCK-00336: Use with_rooted_handler_factory for workspace isolation"
+    )]
     pub fn with_handler_factory<F>(mut self, factory: F) -> Self
     where
         F: Fn() -> Box<dyn ToolHandler> + Send + Sync + 'static,
@@ -774,11 +785,20 @@ impl EpisodeRuntime {
 
     /// Registers a factory for creating tool handlers.
     ///
-    /// **DEPRECATED (TCK-00319)**: Prefer `register_rooted_handler_factory` for
-    /// production use.
+    /// **DEPRECATED (TCK-00319, TCK-00336)**: Prefer
+    /// `register_rooted_handler_factory` for production use.
     ///
     /// This allows the runtime to spawn fresh handlers for each episode
     /// (needed because handlers are consumed by the executor).
+    ///
+    /// # Security Warning (TCK-00336)
+    ///
+    /// CWD-rooted handlers violate workspace isolation. See
+    /// `with_handler_factory` for details.
+    #[deprecated(
+        since = "0.1.0",
+        note = "TCK-00336: Use register_rooted_handler_factory for workspace isolation"
+    )]
     pub async fn register_tool_handler_factory<F>(&self, factory: F)
     where
         F: Fn() -> Box<dyn ToolHandler> + Send + Sync + 'static,
@@ -942,9 +962,17 @@ impl EpisodeRuntime {
 
     /// Starts an episode, transitioning it from CREATED to RUNNING.
     ///
-    /// **DEPRECATED (TCK-00319)**: Prefer `start_with_workspace` for production
-    /// use. This method uses CWD-rooted handlers, which is a security
-    /// anti-pattern.
+    /// **DEPRECATED (TCK-00319, TCK-00336)**: Prefer `start_with_workspace` for
+    /// production use. This method uses CWD-rooted handlers, which is a
+    /// security anti-pattern that violates workspace isolation.
+    ///
+    /// # Security Warning (TCK-00336)
+    ///
+    /// Using this method in production creates a security vulnerability where
+    /// tool handlers can access files outside the intended workspace. The
+    /// CWD-rooted handlers registered via `with_handler_factory` or
+    /// `register_tool_handler_factory` will have access to the daemon's CWD,
+    /// not the episode's workspace.
     ///
     /// # Arguments
     ///
@@ -966,6 +994,10 @@ impl EpisodeRuntime {
     /// # Events
     ///
     /// Emits `episode.started` event (INV-ER002).
+    #[deprecated(
+        since = "0.1.0",
+        note = "TCK-00336: Use start_with_workspace for workspace isolation"
+    )]
     #[instrument(skip(self, lease_id))]
     pub async fn start(
         &self,
@@ -1144,8 +1176,20 @@ impl EpisodeRuntime {
                 }
 
                 // Register handlers from legacy (CWD-rooted) factories
-                // These are used when no workspace root is provided (deprecated path)
+                // TCK-00336: These are deprecated and should only be used in tests.
+                // Production code MUST use rooted_handler_factories with a workspace root.
                 let factories = self.handler_factories.read().await;
+                if !factories.is_empty() && workspace_root.is_none() {
+                    // TCK-00336: Emit security warning when using CWD-rooted handlers
+                    // without workspace isolation in non-test contexts.
+                    warn!(
+                        episode_id = %episode_id,
+                        factory_count = factories.len(),
+                        "SECURITY: Using deprecated CWD-rooted handler factories without workspace root. \
+                         This violates workspace isolation (TCK-00336). Use start_with_workspace() \
+                         and register_rooted_handler_factory() for production."
+                    );
+                }
                 for factory in factories.iter() {
                     if let Err(e) = executor.register_handler(factory()) {
                         warn!(
@@ -2019,6 +2063,7 @@ pub async fn new_shared_runtime_with_clock_initialized(
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // TCK-00336: Tests use deprecated methods intentionally for coverage
 mod tests {
     use super::*;
 

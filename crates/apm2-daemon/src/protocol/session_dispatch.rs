@@ -3276,4 +3276,286 @@ mod tests {
             }
         }
     }
+
+    // ========================================================================
+    // TCK-00336: Broker Mediation Regression Tests
+    // ========================================================================
+
+    /// TCK-00336: Regression tests ensuring no tool executes without broker
+    /// mediation.
+    ///
+    /// These tests verify that:
+    /// 1. All tool requests go through the broker (fail-closed without it)
+    /// 2. No legacy bypass paths exist that allow tool execution
+    /// 3. The dispatcher enforces broker mediation for all tool classes
+    mod tck_00336_broker_mediation_regression {
+        use super::*;
+
+        /// TCK-00336: Verify that ALL tool classes fail closed without broker.
+        ///
+        /// This test ensures that no tool class has a special bypass path.
+        #[test]
+        fn test_all_tool_classes_require_broker() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            // Register manifest with ALL tool classes allowed
+            let all_tools = vec![
+                ToolClass::Read,
+                ToolClass::Write,
+                ToolClass::Execute,
+                ToolClass::Network,
+                ToolClass::Git,
+                ToolClass::Inference,
+                ToolClass::Artifact,
+            ];
+            let manifest = tck_00260_manifest_validation::make_test_manifest(all_tools);
+            store.register("session-001", manifest);
+
+            // Create dispatcher WITHOUT broker
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            // Test each tool class - ALL should be denied without broker
+            let tool_ids = [
+                "read",
+                "write",
+                "execute",
+                "network",
+                "git",
+                "inference",
+                "artifact",
+            ];
+            for tool_id in tool_ids {
+                let request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).unwrap(),
+                    tool_id: tool_id.to_string(),
+                    arguments: vec![],
+                    dedupe_key: format!("dedupe-{tool_id}"),
+                };
+                let frame = encode_request_tool_request(&request);
+                let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+                match response {
+                    SessionResponse::Error(err) => {
+                        assert_eq!(
+                            err.code,
+                            SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                            "Tool class '{tool_id}' should be denied without broker"
+                        );
+                        assert!(
+                            err.message.contains("broker unavailable"),
+                            "Tool class '{tool_id}' error should mention broker: {}",
+                            err.message
+                        );
+                    },
+                    other => panic!(
+                        "Tool class '{tool_id}' should fail closed without broker, got: {other:?}"
+                    ),
+                }
+            }
+        }
+
+        /// TCK-00336: Verify fail-closed behavior with no manifest store.
+        ///
+        /// When neither broker nor manifest store is configured, tool requests
+        /// must still fail closed.
+        #[test]
+        fn test_fails_closed_without_manifest_store_or_broker() {
+            let minter = test_minter();
+
+            // Create dispatcher with NEITHER broker NOR manifest store
+            let dispatcher = SessionDispatcher::new(minter.clone());
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(),
+                arguments: vec![],
+                dedupe_key: "test-dedupe".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // Should fail closed
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Should deny without broker/manifest store"
+                    );
+                },
+                other => panic!("Expected fail-closed error, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00336: Verify that manifest-only validation doesn't allow
+        /// execution.
+        ///
+        /// Even if a tool is in the manifest's allowlist, without a broker
+        /// the request MUST be denied (no legacy manifest-based allow path).
+        #[test]
+        fn test_manifest_allowlist_insufficient_without_broker() {
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            // Register manifest with Read explicitly allowed
+            let manifest = tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+            store.register("session-001", manifest);
+
+            // Create dispatcher with manifest store but WITHOUT broker
+            let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            // Request Read tool (which IS in the manifest allowlist)
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(),
+                arguments: vec![],
+                dedupe_key: "manifest-test".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // MUST fail - manifest validation alone is NOT sufficient
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Manifest allowlist should NOT be sufficient without broker"
+                    );
+                    // Verify the error explicitly states broker is required
+                    assert!(
+                        err.message.contains("broker unavailable")
+                            || err.message.contains("fail-closed"),
+                        "Error should indicate broker mediation is required: {}",
+                        err.message
+                    );
+                },
+                SessionResponse::RequestTool(_) => {
+                    panic!(
+                        "SECURITY REGRESSION: Tool executed without broker mediation! \
+                         Manifest-based validation alone should NOT allow tool execution."
+                    );
+                },
+                other => panic!("Unexpected response: {other:?}"),
+            }
+        }
+
+        /// TCK-00336: Verify `EpisodeRuntime` requires broker for tool
+        /// execution.
+        ///
+        /// The `handle_broker_decision` path checks that `EpisodeRuntime` is
+        /// configured and fails closed if not.
+        #[test]
+        fn test_broker_allow_requires_episode_runtime() {
+            use crate::episode::broker::{ToolBroker, ToolBrokerConfig};
+
+            let minter = test_minter();
+            let store = Arc::new(InMemoryManifestStore::new());
+
+            let manifest = tck_00260_manifest_validation::make_test_manifest(vec![ToolClass::Read]);
+            store.register("session-001", manifest);
+
+            // Create broker with minimal config
+            let broker = Arc::new(ToolBroker::new(ToolBrokerConfig::default()));
+
+            // Create dispatcher WITH broker but WITHOUT episode_runtime
+            let dispatcher =
+                SessionDispatcher::with_manifest_store(minter.clone(), store).with_broker(broker);
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            let request = RequestToolRequest {
+                session_token: serde_json::to_string(&token).unwrap(),
+                tool_id: "read".to_string(),
+                arguments: vec![],
+                dedupe_key: "runtime-test".to_string(),
+            };
+            let frame = encode_request_tool_request(&request);
+
+            // The request will fail because:
+            // 1. No clock configured (required for HTF timestamp)
+            // The test verifies we don't bypass broker mediation
+            let result = dispatcher.dispatch(&frame, &ctx);
+
+            // Either fails at clock check or later at runtime check - both are valid
+            // fail-closed
+            match result {
+                Err(ProtocolError::Serialization { reason }) => {
+                    assert!(
+                        reason.contains("clock"),
+                        "Should fail at clock check: {reason}"
+                    );
+                },
+                Ok(SessionResponse::Error(err)) => {
+                    // Acceptable - failed at some point in the mediation chain
+                    assert!(
+                        err.code != 0,
+                        "Should return non-zero error code for mediation failure"
+                    );
+                },
+                Ok(SessionResponse::RequestTool(_)) => {
+                    panic!(
+                        "SECURITY REGRESSION: Tool request succeeded without proper runtime! \
+                         This indicates a bypass in broker mediation."
+                    );
+                },
+                other => panic!("Unexpected result: {other:?}"),
+            }
+        }
+
+        /// TCK-00336: Verify that unknown tool classes fail closed.
+        ///
+        /// Unknown tool classes should be denied before even checking the
+        /// broker.
+        #[test]
+        fn test_unknown_tool_class_fails_closed() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter.clone());
+
+            let token = test_token(&minter);
+            let ctx = make_session_ctx();
+
+            // Test various invalid/unknown tool IDs
+            let invalid_tool_ids = [
+                "UNKNOWN_TOOL",
+                "hack_tool",
+                "../../etc/passwd", // Path traversal attempt
+            ];
+
+            for tool_id in invalid_tool_ids {
+                let request = RequestToolRequest {
+                    session_token: serde_json::to_string(&token).unwrap(),
+                    tool_id: tool_id.to_string(),
+                    arguments: vec![],
+                    dedupe_key: format!("unknown-{}", tool_id.chars().take(10).collect::<String>()),
+                };
+                let frame = encode_request_tool_request(&request);
+                let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+                match response {
+                    SessionResponse::Error(err) => {
+                        assert_eq!(
+                            err.code,
+                            SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                            "Unknown tool ID '{tool_id}' should be denied"
+                        );
+                    },
+                    other => {
+                        panic!("Unknown tool ID '{tool_id}' should fail closed, got: {other:?}")
+                    },
+                }
+            }
+        }
+    }
 }

@@ -497,9 +497,14 @@ impl DispatcherState {
                 Box::new(GitOperationHandler::with_root(root))
             })
             // ArtifactFetchHandler - CAS operations (not workspace-rooted)
-            .with_handler_factory(move || {
-                Box::new(ArtifactFetchHandler::new(cas_for_handlers.clone()))
-            })
+            // TCK-00336: Intentionally uses deprecated with_handler_factory because
+            // ArtifactFetchHandler accesses CAS (content-addressed store), not the
+            // filesystem workspace. CAS access is safe without workspace rooting.
+            ;
+        #[allow(deprecated)]
+        let episode_runtime = episode_runtime.with_handler_factory(move || {
+            Box::new(ArtifactFetchHandler::new(cas_for_handlers.clone()))
+        })
             // ListFilesHandler - lists files within workspace
             .with_rooted_handler_factory(|root| {
                 Box::new(ListFilesHandler::with_root(root))

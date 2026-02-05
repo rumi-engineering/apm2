@@ -6,6 +6,9 @@
 //! - CAS-before-event ordering is maintained
 //! - Events survive daemon restart (ledger-backed durability)
 
+// TCK-00336: This test uses deprecated methods for backward compatibility
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use apm2_daemon::episode::{
