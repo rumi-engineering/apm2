@@ -1149,6 +1149,10 @@ impl SqliteLedgerBackend {
             // RFC-0018 HEF review events (TCK-00313)
             "review_receipt_recorded" => Ok(crate::events::REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX),
             "review_blocked_recorded" => Ok(crate::events::REVIEW_BLOCKED_RECORDED_DOMAIN_PREFIX),
+            // TCK-00323: Projection receipt event
+            "projection_receipt_recorded" => {
+                Ok(crate::events::PROJECTION_RECEIPT_RECORDED_DOMAIN_PREFIX)
+            },
             _ => Err(LedgerError::SignatureInvalid {
                 seq_id: 0,
                 details: format!(

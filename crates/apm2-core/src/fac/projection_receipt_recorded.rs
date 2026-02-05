@@ -222,6 +222,7 @@ impl ProjectedStatusCode {
 
 /// Metadata for a projection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectionMetadata {
     /// Actor ID of the projector.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -309,6 +310,7 @@ impl ProjectionMetadata {
 /// This structure represents the canonical form of projection outputs that are
 /// stored in CAS and referenced by `ProjectionReceiptRecorded` events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectionArtifactBundleV1 {
     /// Schema identifier (always `apm2.projection_artifact_bundle.v1`).
     pub schema: String,
