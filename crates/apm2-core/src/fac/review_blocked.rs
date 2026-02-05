@@ -131,6 +131,12 @@ pub enum ReasonCode {
     PolicyDenied,
     /// Context miss detected.
     ContextMiss,
+    /// View commitment missing or invalid (TCK-00325).
+    ///
+    /// This code is emitted when the view commitment hash is missing from the
+    /// review artifacts. Per SEC-CTRL-FAC-0015, review outcomes MUST bind to
+    /// a verifiable view commitment. Missing this binding is a hard failure.
+    MissingViewCommitment,
 }
 
 impl std::fmt::Display for ReasonCode {
@@ -144,6 +150,7 @@ impl std::fmt::Display for ReasonCode {
             Self::Timeout => write!(f, "TIMEOUT"),
             Self::PolicyDenied => write!(f, "POLICY_DENIED"),
             Self::ContextMiss => write!(f, "CONTEXT_MISS"),
+            Self::MissingViewCommitment => write!(f, "MISSING_VIEW_COMMITMENT"),
         }
     }
 }
@@ -161,6 +168,7 @@ impl std::str::FromStr for ReasonCode {
             "TIMEOUT" => Ok(Self::Timeout),
             "POLICY_DENIED" => Ok(Self::PolicyDenied),
             "CONTEXT_MISS" => Ok(Self::ContextMiss),
+            "MISSING_VIEW_COMMITMENT" => Ok(Self::MissingViewCommitment),
             _ => Err(ReviewBlockedError::InvalidReasonCode(s.to_string())),
         }
     }
@@ -175,6 +183,7 @@ impl ReasonCode {
     /// - 1 = `APPLY_FAILED`
     /// - 2 = `TOOL_FAILED`
     /// - etc.
+    /// - 9 = `MISSING_VIEW_COMMITMENT` (TCK-00325)
     #[must_use]
     pub const fn to_code(self) -> u8 {
         match self {
@@ -186,6 +195,7 @@ impl ReasonCode {
             Self::Timeout => 6,
             Self::PolicyDenied => 7,
             Self::ContextMiss => 8,
+            Self::MissingViewCommitment => 9,
         }
     }
 
@@ -204,6 +214,7 @@ impl ReasonCode {
             6 => Ok(Self::Timeout),
             7 => Ok(Self::PolicyDenied),
             8 => Ok(Self::ContextMiss),
+            9 => Ok(Self::MissingViewCommitment),
             0 => Err(ReviewBlockedError::InvalidReasonCode(
                 "UNSPECIFIED (0) is not a valid reason code".to_string(),
             )),
@@ -654,19 +665,23 @@ mod tests {
             "CONTEXT_MISS".parse::<ReasonCode>().unwrap(),
             ReasonCode::ContextMiss
         );
+        assert_eq!(
+            "MISSING_VIEW_COMMITMENT".parse::<ReasonCode>().unwrap(),
+            ReasonCode::MissingViewCommitment
+        );
         assert!("UNKNOWN".parse::<ReasonCode>().is_err());
     }
 
     #[test]
     fn test_reason_code_to_code_roundtrip() {
-        // Values 1-8 are valid (0 is UNSPECIFIED per protobuf)
-        for code in 1..=8u8 {
+        // Values 1-9 are valid (0 is UNSPECIFIED per protobuf)
+        for code in 1..=9u8 {
             let reason = ReasonCode::from_code(code).unwrap();
             assert_eq!(reason.to_code(), code);
         }
-        // 0 (UNSPECIFIED) and 9+ are invalid
+        // 0 (UNSPECIFIED) and 10+ are invalid
         assert!(ReasonCode::from_code(0).is_err());
-        assert!(ReasonCode::from_code(9).is_err());
+        assert!(ReasonCode::from_code(10).is_err());
     }
 
     #[test]
@@ -682,6 +697,10 @@ mod tests {
         assert_eq!(ReasonCode::Timeout.to_string(), "TIMEOUT");
         assert_eq!(ReasonCode::PolicyDenied.to_string(), "POLICY_DENIED");
         assert_eq!(ReasonCode::ContextMiss.to_string(), "CONTEXT_MISS");
+        assert_eq!(
+            ReasonCode::MissingViewCommitment.to_string(),
+            "MISSING_VIEW_COMMITMENT"
+        );
     }
 
     #[test]
@@ -694,6 +713,8 @@ mod tests {
         assert!(!ReasonCode::InvalidBundle.is_retryable());
         assert!(!ReasonCode::PolicyDenied.is_retryable());
         assert!(!ReasonCode::ContextMiss.is_retryable());
+        // MissingViewCommitment is NOT retryable - it indicates a structural issue
+        assert!(!ReasonCode::MissingViewCommitment.is_retryable());
     }
 
     #[test]

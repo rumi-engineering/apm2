@@ -255,3 +255,10 @@ pub use transcript_binding::{
     AatTranscriptBinding, MAX_CHUNK_CONTENT_BYTES, MAX_RUN_TRANSCRIPT_HASHES,
     MAX_TRANSCRIPT_CHUNKS, TranscriptBindingError, TranscriptChunk,
 };
+pub mod view_commitment;
+// Re-export view commitment types
+pub use view_commitment::{
+    MAX_POLICY_REF_LENGTH as MAX_VIEW_COMMITMENT_POLICY_REF_LENGTH,
+    MAX_WORK_ID_LENGTH as MAX_VIEW_COMMITMENT_WORK_ID_LENGTH, VIEW_COMMITMENT_V1_SCHEMA,
+    ViewCommitmentError, ViewCommitmentV1, ViewCommitmentV1Builder,
+};
