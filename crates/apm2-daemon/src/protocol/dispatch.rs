@@ -296,13 +296,27 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
-    /// Emits a `ReviewReceiptRecorded` event to the ledger (TCK-00321).
+    /// Emits a `ReviewReceiptRecorded` ledger event (TCK-00321).
     ///
     /// Per REQ-0005, receipt events must be emitted atomically at episode
     /// completion. This method:
     /// - Validates that referenced CAS artifacts exist (CAS-before-event)
     /// - Persists the receipt to the ledger atomically
     /// - Returns the signed event for verification
+    ///
+    /// # Ledger Event vs Protocol Event
+    ///
+    /// This produces a **ledger event** (JCS-canonicalized JSON) for persistence
+    /// and audit, which is distinct from the FAC protocol's `ReviewReceiptRecorded`
+    /// event (binary canonical format) defined in `apm2_core::fac::review_receipt`.
+    ///
+    /// The ledger event format includes:
+    /// - `event_type`: Event discriminant for querying
+    /// - `timestamp_ns`: HTF-compliant timestamp in the signed payload
+    /// - All required fields for audit trail reconstruction
+    ///
+    /// Both formats use the same domain prefix (`REVIEW_RECEIPT_RECORDED:`) to
+    /// ensure namespace consistency, but serve different purposes in the system.
     ///
     /// # Arguments
     ///
