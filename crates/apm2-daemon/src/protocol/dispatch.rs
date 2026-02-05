@@ -4024,6 +4024,30 @@ impl PrivilegedDispatcher {
         })
     }
 
+    /// Tries to acquire a write lock on daemon state.
+    ///
+    /// Returns an error response if daemon state is not configured (test mode)
+    /// or if any lock is currently held.
+    #[allow(clippy::result_large_err)] // PrivilegedResponse is large by design; boxing would be a breaking change
+    fn try_write_daemon_state(
+        &self,
+    ) -> Result<tokio::sync::RwLockWriteGuard<'_, crate::state::DaemonState>, PrivilegedResponse>
+    {
+        let state = self.daemon_state.as_ref().ok_or_else(|| {
+            PrivilegedResponse::error(
+                PrivilegedErrorCode::PrivilegedErrorUnspecified,
+                "process management not available (daemon state not configured)",
+            )
+        })?;
+
+        state.try_write().ok_or_else(|| {
+            PrivilegedResponse::error(
+                PrivilegedErrorCode::PrivilegedErrorUnspecified,
+                "daemon state temporarily unavailable (lock held)",
+            )
+        })
+    }
+
     /// Handles `ListProcesses` requests (IPC-PRIV-005).
     ///
     /// Returns a list of all configured processes with their current state
@@ -4118,8 +4142,8 @@ impl PrivilegedDispatcher {
     /// Handles `StartProcess` requests (IPC-PRIV-007).
     ///
     /// Marks all stopped/crashed instances of a configured process as
-    /// starting. Actual OS process spawning is performed by the daemon's
-    /// run loop; this handler transitions the state machine.
+    /// starting. Transitions instance states via the `Supervisor` so the
+    /// daemon's run loop can pick them up for actual OS process spawning.
     fn handle_start_process(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
         let request =
             StartProcessRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
@@ -4142,7 +4166,7 @@ impl PrivilegedDispatcher {
 
         info!(name = %request.name, "StartProcess request received");
 
-        let daemon_state = match self.try_read_daemon_state() {
+        let mut daemon_state = match self.try_write_daemon_state() {
             Ok(state) => state,
             Err(err_resp) => return Ok(err_resp),
         };
@@ -4154,27 +4178,39 @@ impl PrivilegedDispatcher {
                 format!("process not found: {}", request.name),
             ));
         };
+        let spec_instances = spec.instances;
 
-        // Count instances that are not already running
+        // Collect instances that are not already running
         let handles = supervisor.get_handles(&request.name);
+        let startable_indices: Vec<u32> = handles
+            .iter()
+            .filter(|h| !h.state.is_running())
+            .map(|h| h.instance)
+            .collect();
         #[allow(clippy::cast_possible_truncation)] // bounded by spec.instances (u32)
-        let startable = handles.iter().filter(|h| !h.state.is_running()).count() as u32;
+        let startable_count = startable_indices.len() as u32;
 
-        // Note: actual state transitions to Starting are performed by the
-        // daemon run loop. This handler acknowledges the intent.
+        // Transition each startable instance to Starting state
+        let supervisor = daemon_state.supervisor_mut();
+        for idx in &startable_indices {
+            supervisor.update_state(&request.name, *idx, ProcessState::Starting);
+        }
+
         Ok(PrivilegedResponse::StartProcess(StartProcessResponse {
             name: request.name.clone(),
-            instances_started: startable,
+            instances_started: startable_count,
             message: format!(
                 "scheduled {} instance(s) of '{}' for start (total configured: {})",
-                startable, request.name, spec.instances
+                startable_count, request.name, spec_instances
             ),
         }))
     }
 
     /// Handles `StopProcess` requests (IPC-PRIV-008).
     ///
-    /// Marks all running instances of a process for graceful shutdown.
+    /// Marks all running instances of a process as stopping. Transitions
+    /// instance states via the `Supervisor` for the daemon's run loop to
+    /// perform actual shutdown.
     fn handle_stop_process(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
         let request =
             StopProcessRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
@@ -4197,7 +4233,7 @@ impl PrivilegedDispatcher {
 
         info!(name = %request.name, "StopProcess request received");
 
-        let daemon_state = match self.try_read_daemon_state() {
+        let mut daemon_state = match self.try_write_daemon_state() {
             Ok(state) => state,
             Err(err_resp) => return Ok(err_resp),
         };
@@ -4210,23 +4246,37 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // Collect running instance indices
         let handles = supervisor.get_handles(&request.name);
+        let running_indices: Vec<u32> = handles
+            .iter()
+            .filter(|h| h.state.is_running())
+            .map(|h| h.instance)
+            .collect();
         #[allow(clippy::cast_possible_truncation)] // bounded by spec.instances (u32)
-        let running = handles.iter().filter(|h| h.state.is_running()).count() as u32;
+        let running_count = running_indices.len() as u32;
+
+        // Transition each running instance to Stopping state
+        let supervisor = daemon_state.supervisor_mut();
+        for idx in &running_indices {
+            supervisor.update_state(&request.name, *idx, ProcessState::Stopping);
+        }
 
         Ok(PrivilegedResponse::StopProcess(StopProcessResponse {
             name: request.name.clone(),
-            instances_stopped: running,
+            instances_stopped: running_count,
             message: format!(
                 "scheduled {} running instance(s) of '{}' for stop",
-                running, request.name
+                running_count, request.name
             ),
         }))
     }
 
     /// Handles `RestartProcess` requests (IPC-PRIV-009).
     ///
-    /// Schedules a stop-then-start cycle for all instances.
+    /// Transitions all instances through a stop-then-start cycle. Running
+    /// instances are marked as stopping first; stopped/crashed instances
+    /// are marked as starting directly.
     fn handle_restart_process(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
         let request =
             RestartProcessRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
@@ -4249,7 +4299,7 @@ impl PrivilegedDispatcher {
 
         info!(name = %request.name, "RestartProcess request received");
 
-        let daemon_state = match self.try_read_daemon_state() {
+        let mut daemon_state = match self.try_write_daemon_state() {
             Ok(state) => state,
             Err(err_resp) => return Ok(err_resp),
         };
@@ -4261,21 +4311,40 @@ impl PrivilegedDispatcher {
                 format!("process not found: {}", request.name),
             ));
         };
+        let spec_instances = spec.instances;
+
+        // Collect all instance indices and their current running status
+        let handles = supervisor.get_handles(&request.name);
+        let instance_transitions: Vec<(u32, bool)> = handles
+            .iter()
+            .map(|h| (h.instance, h.state.is_running()))
+            .collect();
+
+        // Transition: running -> Stopping, stopped/crashed -> Starting
+        let supervisor = daemon_state.supervisor_mut();
+        for (idx, is_running) in &instance_transitions {
+            if *is_running {
+                supervisor.update_state(&request.name, *idx, ProcessState::Stopping);
+            } else {
+                supervisor.update_state(&request.name, *idx, ProcessState::Starting);
+            }
+        }
 
         Ok(PrivilegedResponse::RestartProcess(RestartProcessResponse {
             name: request.name.clone(),
-            instances_restarted: spec.instances,
+            instances_restarted: spec_instances,
             message: format!(
                 "scheduled {} instance(s) of '{}' for restart",
-                spec.instances, request.name
+                spec_instances, request.name
             ),
         }))
     }
 
     /// Handles `ReloadProcess` requests (IPC-PRIV-010).
     ///
-    /// Performs a rolling restart (graceful reload) by scheduling sequential
-    /// instance restarts to maintain availability.
+    /// Performs a rolling restart (graceful reload) by marking the first
+    /// running instance as stopping. The daemon's run loop handles the
+    /// sequential restart of remaining instances to maintain availability.
     fn handle_reload_process(&self, payload: &[u8]) -> ProtocolResult<PrivilegedResponse> {
         let request =
             ReloadProcessRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
@@ -4298,7 +4367,7 @@ impl PrivilegedDispatcher {
 
         info!(name = %request.name, "ReloadProcess request received");
 
-        let daemon_state = match self.try_read_daemon_state() {
+        let mut daemon_state = match self.try_write_daemon_state() {
             Ok(state) => state,
             Err(err_resp) => return Ok(err_resp),
         };
@@ -4309,6 +4378,20 @@ impl PrivilegedDispatcher {
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!("process not found: {}", request.name),
             ));
+        }
+
+        // For rolling restart, mark the first running instance as stopping.
+        // The daemon run loop will restart it and proceed to the next instance
+        // sequentially.
+        let handles = supervisor.get_handles(&request.name);
+        let first_running = handles
+            .iter()
+            .find(|h| h.state.is_running())
+            .map(|h| h.instance);
+
+        if let Some(idx) = first_running {
+            let supervisor = daemon_state.supervisor_mut();
+            supervisor.update_state(&request.name, idx, ProcessState::Stopping);
         }
 
         Ok(PrivilegedResponse::ReloadProcess(ReloadProcessResponse {
@@ -6741,8 +6824,9 @@ mod tests {
     // ========================================================================
 
     /// Creates a `PrivilegedDispatcher` with a `DaemonState` containing
-    /// registered processes for testing.
-    fn create_dispatcher_with_processes() -> PrivilegedDispatcher {
+    /// registered processes for testing. Returns both the dispatcher and
+    /// the shared state so tests can verify state mutations.
+    fn create_dispatcher_with_processes() -> (PrivilegedDispatcher, crate::state::SharedState) {
         use apm2_core::process::ProcessSpec;
         use apm2_core::schema_registry::InMemorySchemaRegistry;
         use apm2_core::supervisor::Supervisor;
@@ -6774,7 +6858,9 @@ mod tests {
         let state = DaemonStateHandle::new(config, supervisor, schema_registry, None);
         let shared_state = std::sync::Arc::new(state);
 
-        PrivilegedDispatcher::new().with_daemon_state(shared_state)
+        let dispatcher =
+            PrivilegedDispatcher::new().with_daemon_state(std::sync::Arc::clone(&shared_state));
+        (dispatcher, shared_state)
     }
 
     /// IT-00342-05: Process management handler tests.
@@ -6784,7 +6870,7 @@ mod tests {
         /// Tests that `ListProcesses` returns all registered processes.
         #[test]
         fn test_list_processes_returns_all() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -6829,7 +6915,7 @@ mod tests {
         /// process.
         #[test]
         fn test_process_status_found() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -6858,7 +6944,7 @@ mod tests {
         /// Tests that `ProcessStatus` returns error for unknown process.
         #[test]
         fn test_process_status_not_found() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -6877,7 +6963,7 @@ mod tests {
         /// Tests that `ProcessStatus` rejects oversized name (CTR-1303).
         #[test]
         fn test_process_status_name_too_long() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -6901,7 +6987,7 @@ mod tests {
         /// Tests that `StartProcess` returns count of startable instances.
         #[test]
         fn test_start_process_found() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -6927,7 +7013,7 @@ mod tests {
         /// Tests that `StartProcess` returns error for unknown process.
         #[test]
         fn test_start_process_not_found() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -6946,7 +7032,7 @@ mod tests {
         /// Tests that `StopProcess` returns count of running instances.
         #[test]
         fn test_stop_process_found() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -6971,7 +7057,7 @@ mod tests {
         /// Tests that `StopProcess` returns error for unknown process.
         #[test]
         fn test_stop_process_not_found() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -6990,7 +7076,7 @@ mod tests {
         /// Tests that `RestartProcess` returns instance count.
         #[test]
         fn test_restart_process_found() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -7015,7 +7101,7 @@ mod tests {
         /// Tests that `RestartProcess` returns error for unknown process.
         #[test]
         fn test_restart_process_not_found() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -7034,7 +7120,7 @@ mod tests {
         /// Tests that `ReloadProcess` returns success for a known process.
         #[test]
         fn test_reload_process_found() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -7060,7 +7146,7 @@ mod tests {
         /// Tests that `ReloadProcess` returns error for unknown process.
         #[test]
         fn test_reload_process_not_found() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -7080,7 +7166,7 @@ mod tests {
         /// commands.
         #[test]
         fn test_session_cannot_list_processes() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::session(
                 Some(PeerCredentials {
                     uid: 1000,
@@ -7154,7 +7240,7 @@ mod tests {
         /// processes.
         #[test]
         fn test_list_processes_shows_running_state() {
-            let dispatcher = create_dispatcher_with_processes();
+            let (dispatcher, _shared_state) = create_dispatcher_with_processes();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -7186,6 +7272,108 @@ mod tests {
                 },
                 other => panic!("expected ListProcesses, got {other:?}"),
             }
+        }
+
+        /// Tests that `StartProcess` actually mutates supervisor state to
+        /// `Starting`.
+        #[test]
+        fn test_start_process_mutates_state() {
+            let (dispatcher, shared_state) = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // web-server has 2 instances in Stopped state (default)
+            let request = StartProcessRequest {
+                name: "web-server".to_string(),
+            };
+            let frame = encode_start_process_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match &response {
+                PrivilegedResponse::StartProcess(resp) => {
+                    assert_eq!(resp.instances_started, 2);
+                },
+                other => panic!("expected StartProcess, got {other:?}"),
+            }
+
+            // Verify state was actually mutated
+            let state = shared_state.try_read().unwrap();
+            let handles = state.supervisor().get_handles("web-server");
+            for h in &handles {
+                assert!(
+                    h.state == apm2_core::process::ProcessState::Starting,
+                    "expected Starting state after StartProcess, got {:?}",
+                    h.state
+                );
+            }
+        }
+
+        /// Tests that `StopProcess` actually mutates supervisor state to
+        /// `Stopping`.
+        #[test]
+        fn test_stop_process_mutates_state() {
+            let (dispatcher, shared_state) = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // worker has 1 instance in Running state
+            let request = StopProcessRequest {
+                name: "worker".to_string(),
+            };
+            let frame = encode_stop_process_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match &response {
+                PrivilegedResponse::StopProcess(resp) => {
+                    assert_eq!(resp.instances_stopped, 1);
+                },
+                other => panic!("expected StopProcess, got {other:?}"),
+            }
+
+            // Verify state was actually mutated
+            let state = shared_state.try_read().unwrap();
+            let handles = state.supervisor().get_handles("worker");
+            assert_eq!(handles.len(), 1);
+            assert!(
+                handles[0].state == apm2_core::process::ProcessState::Stopping,
+                "expected Stopping state after StopProcess, got {:?}",
+                handles[0].state
+            );
+        }
+
+        /// Tests that `RestartProcess` mutates state: running -> `Stopping`,
+        /// stopped -> `Starting`.
+        #[test]
+        fn test_restart_process_mutates_state() {
+            let (dispatcher, shared_state) = create_dispatcher_with_processes();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // worker has 1 instance in Running state
+            let request = RestartProcessRequest {
+                name: "worker".to_string(),
+            };
+            let frame = encode_restart_process_request(&request);
+            let _response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // Running instance should transition to Stopping
+            let state = shared_state.try_read().unwrap();
+            let handles = state.supervisor().get_handles("worker");
+            assert_eq!(handles.len(), 1);
+            assert!(
+                handles[0].state == apm2_core::process::ProcessState::Stopping,
+                "expected Stopping state for running instance after restart, got {:?}",
+                handles[0].state
+            );
         }
 
         /// Tests encoding roundtrip for process management messages.

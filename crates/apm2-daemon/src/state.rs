@@ -567,6 +567,18 @@ impl DispatcherState {
         }
     }
 
+    /// Sets the daemon state for process management (TCK-00342).
+    ///
+    /// When set, process management handlers (`ListProcesses`,
+    /// `ProcessStatus`, `StartProcess`, `StopProcess`, `RestartProcess`,
+    /// `ReloadProcess`) query the `Supervisor` within `DaemonState` for
+    /// live process information instead of returning stub responses.
+    #[must_use]
+    pub fn with_daemon_state(mut self, state: SharedState) -> Self {
+        self.privileged_dispatcher = self.privileged_dispatcher.with_daemon_state(state);
+        self
+    }
+
     /// Returns a reference to the privileged dispatcher.
     #[must_use]
     pub const fn privileged_dispatcher(&self) -> &PrivilegedDispatcher {
@@ -735,6 +747,16 @@ impl DaemonStateHandle {
     #[must_use]
     pub fn try_read(&self) -> Option<tokio::sync::RwLockReadGuard<'_, DaemonState>> {
         self.inner.try_read().ok()
+    }
+
+    /// Try to get write access to the inner state without blocking (TCK-00342).
+    ///
+    /// Returns `None` if any lock (read or write) is currently held. This is
+    /// used by synchronous dispatch handlers for process state mutations
+    /// that cannot `.await`.
+    #[must_use]
+    pub fn try_write(&self) -> Option<tokio::sync::RwLockWriteGuard<'_, DaemonState>> {
+        self.inner.try_write().ok()
     }
 
     /// Get write access to the inner state.
