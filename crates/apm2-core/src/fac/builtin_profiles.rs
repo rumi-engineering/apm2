@@ -12,8 +12,8 @@
 //! # Overview
 //!
 //! Per RFC-0019 Addendum (section 11), these profiles implement the "Option C -
-//! Black-box ledger-mediated driver" approach by default, which is the preferred
-//! integration mode for FAC v0.
+//! Black-box ledger-mediated driver" approach by default, which is the
+//! preferred integration mode for FAC v0.
 //!
 //! All profiles:
 //! - Use `AdapterMode::BlackBox` (default for FAC v0)
@@ -33,8 +33,8 @@
 //! # Example
 //!
 //! ```rust
-//! use apm2_core::fac::builtin_profiles;
 //! use apm2_core::evidence::MemoryCas;
+//! use apm2_core::fac::builtin_profiles;
 //!
 //! // Get the Claude Code profile
 //! let profile = builtin_profiles::claude_code_profile();
@@ -465,7 +465,8 @@ pub fn codex_cli_profile() -> AgentAdapterProfileV1 {
 ///
 /// - `restricted`: Read-only mode, no shell access
 /// - `standard`: Default mode with read/write file access
-/// - `elevated`: Full access including shell (requires explicit policy approval)
+/// - `elevated`: Full access including shell (requires explicit policy
+///   approval)
 ///
 /// # Capability Map
 ///
@@ -494,10 +495,7 @@ pub fn local_inference_profile() -> AgentAdapterProfileV1 {
         .profile_id(LOCAL_INFERENCE_PROFILE_ID)
         .adapter_mode(AdapterMode::BlackBox)
         .command("ollama")
-        .args_template(vec![
-            "run".to_string(),
-            "{model}".to_string(),
-        ])
+        .args_template(vec!["run".to_string(), "{model}".to_string()])
         .env_template(vec![
             ("OLLAMA_HEADLESS".to_string(), "1".to_string()),
             ("NO_COLOR".to_string(), "1".to_string()),
@@ -521,23 +519,23 @@ pub fn local_inference_profile() -> AgentAdapterProfileV1 {
             r"ollama\s+version\s+(\d+\.\d+\.\d+)",
         ))
         .health_checks(HealthChecks {
-            startup_timeout_ms: 60_000,   // Longer startup for model loading
+            startup_timeout_ms: 60_000,    // Longer startup for model loading
             heartbeat_interval_ms: 10_000, // Longer intervals for local inference
             heartbeat_timeout_ms: 30_000,
-            stall_threshold_ms: 300_000,  // 5 minutes (local inference may be slow)
+            stall_threshold_ms: 300_000, // 5 minutes (local inference may be slow)
             max_stalls: 3,
         })
         .budget_defaults(BudgetDefaults {
-            max_tool_calls: 50,          // Lower limit for local inference
-            max_tokens: 500_000,         // Lower token limit for local models
-            max_wall_clock_ms: 7_200_000, // 2 hours (local inference is slower)
+            max_tool_calls: 50,                   // Lower limit for local inference
+            max_tokens: 500_000,                  // Lower token limit for local models
+            max_wall_clock_ms: 7_200_000,         // 2 hours (local inference is slower)
             max_evidence_bytes: 50 * 1024 * 1024, // 50 MB
         })
         .evidence_policy(EvidencePolicy {
             record_full_output: true,
             record_tool_traces: true,
             record_timing: true,
-            record_token_usage: false,    // Token usage may not be available locally
+            record_token_usage: false, // Token usage may not be available locally
             max_recorded_output_bytes: 10 * 1024 * 1024, // 10 MB
             redact_sensitive: true,
         })
@@ -608,7 +606,11 @@ mod tests {
         let profile = claude_code_profile();
         assert!(profile.args_template.contains(&"-p".to_string()));
         assert!(profile.args_template.contains(&"--tools".to_string()));
-        assert!(profile.args_template.contains(&"--no-session-persistence".to_string()));
+        assert!(
+            profile
+                .args_template
+                .contains(&"--no-session-persistence".to_string())
+        );
     }
 
     #[test]
@@ -700,9 +702,21 @@ mod tests {
         let profile = codex_cli_profile();
         assert!(profile.args_template.contains(&"exec".to_string()));
         assert!(profile.args_template.contains(&"--config".to_string()));
-        assert!(profile.args_template.contains(&"features.shell_tool=false".to_string()));
-        assert!(profile.args_template.contains(&"web_search=disabled".to_string()));
-        assert!(profile.args_template.contains(&"history.persistence=none".to_string()));
+        assert!(
+            profile
+                .args_template
+                .contains(&"features.shell_tool=false".to_string())
+        );
+        assert!(
+            profile
+                .args_template
+                .contains(&"web_search=disabled".to_string())
+        );
+        assert!(
+            profile
+                .args_template
+                .contains(&"history.persistence=none".to_string())
+        );
     }
 
     #[test]
@@ -827,7 +841,9 @@ mod tests {
     #[test]
     fn test_all_profiles_have_tool_bridge() {
         for profile in all_builtin_profiles() {
-            let tool_bridge = profile.tool_bridge.expect("all profiles should have tool_bridge");
+            let tool_bridge = profile
+                .tool_bridge
+                .expect("all profiles should have tool_bridge");
             assert!(tool_bridge.enabled);
             assert_eq!(tool_bridge.protocol_version, "TI1");
         }
