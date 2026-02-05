@@ -387,6 +387,156 @@ message WorkStatusResponse {
 }
 
 // =============================================================================
+// CTR-PROTO-012: Credential Management Endpoints (RFC-0018, TCK-00343)
+// =============================================================================
+// These endpoints manage credential profiles for agent authentication.
+// All credential operations are privileged and require operator.sock (mode 0600).
+// Credential secrets are never exposed in responses or logged.
+
+// Credential provider enumeration.
+enum CredentialProvider {
+  CREDENTIAL_PROVIDER_UNSPECIFIED = 0;
+  // GitHub OAuth/PAT authentication.
+  CREDENTIAL_PROVIDER_GITHUB = 1;
+  // Anthropic API key authentication.
+  CREDENTIAL_PROVIDER_ANTHROPIC = 2;
+  // OpenAI API key authentication.
+  CREDENTIAL_PROVIDER_OPENAI = 3;
+  // Generic API key authentication.
+  CREDENTIAL_PROVIDER_API_KEY = 4;
+}
+
+// Authentication method enumeration.
+enum CredentialAuthMethod {
+  CREDENTIAL_AUTH_METHOD_UNSPECIFIED = 0;
+  // OAuth 2.0 flow.
+  CREDENTIAL_AUTH_METHOD_OAUTH = 1;
+  // Personal Access Token.
+  CREDENTIAL_AUTH_METHOD_PAT = 2;
+  // API key.
+  CREDENTIAL_AUTH_METHOD_API_KEY = 3;
+  // SSH key (agent-based).
+  CREDENTIAL_AUTH_METHOD_SSH = 4;
+}
+
+// Credential profile metadata (secrets are never included).
+message CredentialProfile {
+  // Unique identifier for this profile.
+  string profile_id = 1;
+  // Credential provider.
+  CredentialProvider provider = 2;
+  // Authentication method.
+  CredentialAuthMethod auth_method = 3;
+  // Unix timestamp when credential was created.
+  uint64 created_at = 4;
+  // Unix timestamp when credential expires (0 = never).
+  uint64 expires_at = 5;
+  // Whether the credential is currently active.
+  bool is_active = 6;
+  // Optional display name for the profile.
+  string display_name = 7;
+}
+
+// IPC-PRIV-021: ListCredentials
+// List all credential profiles (secrets are never included).
+message ListCredentialsRequest {
+  // Optional filter by provider.
+  optional CredentialProvider provider_filter = 1;
+}
+
+message ListCredentialsResponse {
+  // List of credential profiles.
+  repeated CredentialProfile profiles = 1;
+  // Total count of profiles (may differ from list if filtered).
+  uint32 total_count = 2;
+}
+
+// IPC-PRIV-022: AddCredential
+// Add a new credential profile.
+message AddCredentialRequest {
+  // Unique identifier for this profile.
+  string profile_id = 1;
+  // Credential provider.
+  CredentialProvider provider = 2;
+  // Authentication method.
+  CredentialAuthMethod auth_method = 3;
+  // Credential secret (will be stored securely, never logged).
+  // For OAuth: access token; for PAT/API_KEY: the key itself.
+  bytes credential_secret = 4;
+  // Optional display name for the profile.
+  string display_name = 5;
+  // Optional expiration time (Unix timestamp, 0 = never).
+  uint64 expires_at = 6;
+}
+
+message AddCredentialResponse {
+  // The created profile metadata (secret is never returned).
+  CredentialProfile profile = 1;
+}
+
+// IPC-PRIV-023: RemoveCredential
+// Remove a credential profile.
+message RemoveCredentialRequest {
+  // Profile ID to remove.
+  string profile_id = 1;
+}
+
+message RemoveCredentialResponse {
+  // Whether the profile was removed (false if not found).
+  bool removed = 1;
+}
+
+// IPC-PRIV-024: RefreshCredential
+// Refresh an OAuth credential (request new token).
+message RefreshCredentialRequest {
+  // Profile ID to refresh.
+  string profile_id = 1;
+}
+
+message RefreshCredentialResponse {
+  // The updated profile metadata (secret is never returned).
+  CredentialProfile profile = 1;
+  // New expiration time (0 = never).
+  uint64 new_expires_at = 2;
+}
+
+// IPC-PRIV-025: SwitchCredential
+// Switch active credential for a process.
+message SwitchCredentialRequest {
+  // Target process name or session ID.
+  string process_name = 1;
+  // Profile ID to switch to.
+  string profile_id = 2;
+}
+
+message SwitchCredentialResponse {
+  // Previous active profile ID (empty if none).
+  string previous_profile_id = 1;
+  // Whether the switch was successful.
+  bool success = 2;
+}
+
+// IPC-PRIV-026: LoginCredential
+// Interactive login for a provider (initiates OAuth flow or prompts for key).
+message LoginCredentialRequest {
+  // Provider to login with.
+  CredentialProvider provider = 1;
+  // Optional profile ID to create/update (auto-generated if not provided).
+  optional string profile_id = 2;
+  // Optional display name for the profile.
+  string display_name = 3;
+}
+
+message LoginCredentialResponse {
+  // The created/updated profile metadata.
+  CredentialProfile profile = 1;
+  // Login URL for OAuth flows (empty for non-OAuth).
+  string login_url = 2;
+  // Whether login completed immediately (false if OAuth redirect required).
+  bool completed = 3;
+}
+
+// =============================================================================
 // Error Codes for Privileged Endpoints
 // =============================================================================
 enum PrivilegedErrorCode {
@@ -409,6 +559,16 @@ enum PrivilegedErrorCode {
   CAPABILITY_DENIED = 8;
   // Referenced work item not found.
   WORK_NOT_FOUND = 9;
+  // Credential profile not found.
+  CREDENTIAL_NOT_FOUND = 14;
+  // Credential profile already exists.
+  CREDENTIAL_ALREADY_EXISTS = 15;
+  // Credential operation failed (keychain error).
+  CREDENTIAL_OPERATION_FAILED = 16;
+  // Credential refresh not supported for this auth method.
+  CREDENTIAL_REFRESH_NOT_SUPPORTED = 17;
+  // Invalid credential provider or auth method.
+  CREDENTIAL_INVALID_CONFIG = 18;
 }
 
 // Generic error response for privileged endpoints.

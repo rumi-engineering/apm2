@@ -438,6 +438,155 @@ pub struct WorkStatusResponse {
     #[prost(uint64, optional, tag = "8")]
     pub claimed_at_ns: ::core::option::Option<u64>,
 }
+/// Credential profile metadata (secrets are never included).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CredentialProfile {
+    /// Unique identifier for this profile.
+    #[prost(string, tag = "1")]
+    pub profile_id: ::prost::alloc::string::String,
+    /// Credential provider.
+    #[prost(enumeration = "CredentialProvider", tag = "2")]
+    pub provider: i32,
+    /// Authentication method.
+    #[prost(enumeration = "CredentialAuthMethod", tag = "3")]
+    pub auth_method: i32,
+    /// Unix timestamp when credential was created.
+    #[prost(uint64, tag = "4")]
+    pub created_at: u64,
+    /// Unix timestamp when credential expires (0 = never).
+    #[prost(uint64, tag = "5")]
+    pub expires_at: u64,
+    /// Whether the credential is currently active.
+    #[prost(bool, tag = "6")]
+    pub is_active: bool,
+    /// Optional display name for the profile.
+    #[prost(string, tag = "7")]
+    pub display_name: ::prost::alloc::string::String,
+}
+/// IPC-PRIV-021: ListCredentials
+/// List all credential profiles (secrets are never included).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ListCredentialsRequest {
+    /// Optional filter by provider.
+    #[prost(enumeration = "CredentialProvider", optional, tag = "1")]
+    pub provider_filter: ::core::option::Option<i32>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListCredentialsResponse {
+    /// List of credential profiles.
+    #[prost(message, repeated, tag = "1")]
+    pub profiles: ::prost::alloc::vec::Vec<CredentialProfile>,
+    /// Total count of profiles (may differ from list if filtered).
+    #[prost(uint32, tag = "2")]
+    pub total_count: u32,
+}
+/// IPC-PRIV-022: AddCredential
+/// Add a new credential profile.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AddCredentialRequest {
+    /// Unique identifier for this profile.
+    #[prost(string, tag = "1")]
+    pub profile_id: ::prost::alloc::string::String,
+    /// Credential provider.
+    #[prost(enumeration = "CredentialProvider", tag = "2")]
+    pub provider: i32,
+    /// Authentication method.
+    #[prost(enumeration = "CredentialAuthMethod", tag = "3")]
+    pub auth_method: i32,
+    /// Credential secret (will be stored securely, never logged).
+    /// For OAuth: access token; for PAT/API_KEY: the key itself.
+    #[prost(bytes = "vec", tag = "4")]
+    pub credential_secret: ::prost::alloc::vec::Vec<u8>,
+    /// Optional display name for the profile.
+    #[prost(string, tag = "5")]
+    pub display_name: ::prost::alloc::string::String,
+    /// Optional expiration time (Unix timestamp, 0 = never).
+    #[prost(uint64, tag = "6")]
+    pub expires_at: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AddCredentialResponse {
+    /// The created profile metadata (secret is never returned).
+    #[prost(message, optional, tag = "1")]
+    pub profile: ::core::option::Option<CredentialProfile>,
+}
+/// IPC-PRIV-023: RemoveCredential
+/// Remove a credential profile.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RemoveCredentialRequest {
+    /// Profile ID to remove.
+    #[prost(string, tag = "1")]
+    pub profile_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RemoveCredentialResponse {
+    /// Whether the profile was removed (false if not found).
+    #[prost(bool, tag = "1")]
+    pub removed: bool,
+}
+/// IPC-PRIV-024: RefreshCredential
+/// Refresh an OAuth credential (request new token).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RefreshCredentialRequest {
+    /// Profile ID to refresh.
+    #[prost(string, tag = "1")]
+    pub profile_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RefreshCredentialResponse {
+    /// The updated profile metadata (secret is never returned).
+    #[prost(message, optional, tag = "1")]
+    pub profile: ::core::option::Option<CredentialProfile>,
+    /// New expiration time (0 = never).
+    #[prost(uint64, tag = "2")]
+    pub new_expires_at: u64,
+}
+/// IPC-PRIV-025: SwitchCredential
+/// Switch active credential for a process.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SwitchCredentialRequest {
+    /// Target process name or session ID.
+    #[prost(string, tag = "1")]
+    pub process_name: ::prost::alloc::string::String,
+    /// Profile ID to switch to.
+    #[prost(string, tag = "2")]
+    pub profile_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SwitchCredentialResponse {
+    /// Previous active profile ID (empty if none).
+    #[prost(string, tag = "1")]
+    pub previous_profile_id: ::prost::alloc::string::String,
+    /// Whether the switch was successful.
+    #[prost(bool, tag = "2")]
+    pub success: bool,
+}
+/// IPC-PRIV-026: LoginCredential
+/// Interactive login for a provider (initiates OAuth flow or prompts for key).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoginCredentialRequest {
+    /// Provider to login with.
+    #[prost(enumeration = "CredentialProvider", tag = "1")]
+    pub provider: i32,
+    /// Optional profile ID to create/update (auto-generated if not provided).
+    #[prost(string, optional, tag = "2")]
+    pub profile_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional display name for the profile.
+    #[prost(string, tag = "3")]
+    pub display_name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LoginCredentialResponse {
+    /// The created/updated profile metadata.
+    #[prost(message, optional, tag = "1")]
+    pub profile: ::core::option::Option<CredentialProfile>,
+    /// Login URL for OAuth flows (empty for non-OAuth).
+    #[prost(string, tag = "2")]
+    pub login_url: ::prost::alloc::string::String,
+    /// Whether login completed immediately (false if OAuth redirect required).
+    #[prost(bool, tag = "3")]
+    pub completed: bool,
+}
 /// Generic error response for privileged endpoints.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrivilegedError {
@@ -1581,6 +1730,86 @@ impl WorkRole {
         }
     }
 }
+/// Credential provider enumeration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CredentialProvider {
+    Unspecified = 0,
+    /// GitHub OAuth/PAT authentication.
+    Github = 1,
+    /// Anthropic API key authentication.
+    Anthropic = 2,
+    /// OpenAI API key authentication.
+    Openai = 3,
+    /// Generic API key authentication.
+    ApiKey = 4,
+}
+impl CredentialProvider {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CREDENTIAL_PROVIDER_UNSPECIFIED",
+            Self::Github => "CREDENTIAL_PROVIDER_GITHUB",
+            Self::Anthropic => "CREDENTIAL_PROVIDER_ANTHROPIC",
+            Self::Openai => "CREDENTIAL_PROVIDER_OPENAI",
+            Self::ApiKey => "CREDENTIAL_PROVIDER_API_KEY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CREDENTIAL_PROVIDER_UNSPECIFIED" => Some(Self::Unspecified),
+            "CREDENTIAL_PROVIDER_GITHUB" => Some(Self::Github),
+            "CREDENTIAL_PROVIDER_ANTHROPIC" => Some(Self::Anthropic),
+            "CREDENTIAL_PROVIDER_OPENAI" => Some(Self::Openai),
+            "CREDENTIAL_PROVIDER_API_KEY" => Some(Self::ApiKey),
+            _ => None,
+        }
+    }
+}
+/// Authentication method enumeration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CredentialAuthMethod {
+    Unspecified = 0,
+    /// OAuth 2.0 flow.
+    Oauth = 1,
+    /// Personal Access Token.
+    Pat = 2,
+    /// API key.
+    ApiKey = 3,
+    /// SSH key (agent-based).
+    Ssh = 4,
+}
+impl CredentialAuthMethod {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CREDENTIAL_AUTH_METHOD_UNSPECIFIED",
+            Self::Oauth => "CREDENTIAL_AUTH_METHOD_OAUTH",
+            Self::Pat => "CREDENTIAL_AUTH_METHOD_PAT",
+            Self::ApiKey => "CREDENTIAL_AUTH_METHOD_API_KEY",
+            Self::Ssh => "CREDENTIAL_AUTH_METHOD_SSH",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CREDENTIAL_AUTH_METHOD_UNSPECIFIED" => Some(Self::Unspecified),
+            "CREDENTIAL_AUTH_METHOD_OAUTH" => Some(Self::Oauth),
+            "CREDENTIAL_AUTH_METHOD_PAT" => Some(Self::Pat),
+            "CREDENTIAL_AUTH_METHOD_API_KEY" => Some(Self::ApiKey),
+            "CREDENTIAL_AUTH_METHOD_SSH" => Some(Self::Ssh),
+            _ => None,
+        }
+    }
+}
 /// =============================================================================
 /// Error Codes for Privileged Endpoints
 /// =============================================================================
@@ -1606,6 +1835,16 @@ pub enum PrivilegedErrorCode {
     CapabilityDenied = 8,
     /// Referenced work item not found.
     WorkNotFound = 9,
+    /// Credential profile not found.
+    CredentialNotFound = 14,
+    /// Credential profile already exists.
+    CredentialAlreadyExists = 15,
+    /// Credential operation failed (keychain error).
+    CredentialOperationFailed = 16,
+    /// Credential refresh not supported for this auth method.
+    CredentialRefreshNotSupported = 17,
+    /// Invalid credential provider or auth method.
+    CredentialInvalidConfig = 18,
 }
 impl PrivilegedErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1624,6 +1863,11 @@ impl PrivilegedErrorCode {
             Self::SessionNotFound => "SESSION_NOT_FOUND",
             Self::CapabilityDenied => "CAPABILITY_DENIED",
             Self::WorkNotFound => "WORK_NOT_FOUND",
+            Self::CredentialNotFound => "CREDENTIAL_NOT_FOUND",
+            Self::CredentialAlreadyExists => "CREDENTIAL_ALREADY_EXISTS",
+            Self::CredentialOperationFailed => "CREDENTIAL_OPERATION_FAILED",
+            Self::CredentialRefreshNotSupported => "CREDENTIAL_REFRESH_NOT_SUPPORTED",
+            Self::CredentialInvalidConfig => "CREDENTIAL_INVALID_CONFIG",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1639,6 +1883,13 @@ impl PrivilegedErrorCode {
             "SESSION_NOT_FOUND" => Some(Self::SessionNotFound),
             "CAPABILITY_DENIED" => Some(Self::CapabilityDenied),
             "WORK_NOT_FOUND" => Some(Self::WorkNotFound),
+            "CREDENTIAL_NOT_FOUND" => Some(Self::CredentialNotFound),
+            "CREDENTIAL_ALREADY_EXISTS" => Some(Self::CredentialAlreadyExists),
+            "CREDENTIAL_OPERATION_FAILED" => Some(Self::CredentialOperationFailed),
+            "CREDENTIAL_REFRESH_NOT_SUPPORTED" => {
+                Some(Self::CredentialRefreshNotSupported)
+            }
+            "CREDENTIAL_INVALID_CONFIG" => Some(Self::CredentialInvalidConfig),
             _ => None,
         }
     }

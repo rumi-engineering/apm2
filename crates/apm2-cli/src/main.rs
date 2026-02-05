@@ -334,7 +334,7 @@ fn main() -> Result<()> {
             CredsCommands::Login {
                 provider,
                 profile_id,
-            } => commands::creds::login(&provider, profile_id.as_deref()),
+            } => commands::creds::login(&socket_path, &provider, profile_id.as_deref()),
         },
         Commands::Cac(cac_cmd) => {
             // CAC commands use specific exit codes per TCK-00133:

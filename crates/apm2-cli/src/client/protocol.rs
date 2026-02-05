@@ -33,6 +33,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use apm2_daemon::protocol::{
+    // Credential management types (CTR-PROTO-011, TCK-00343)
+    AddCredentialRequest,
+    AddCredentialResponse,
     // Message decoding
     BoundedDecode,
     // Capability request
@@ -61,9 +64,13 @@ use apm2_daemon::protocol::{
     HandshakeMessage,
     IssueCapabilityRequest,
     IssueCapabilityResponse,
+    ListCredentialsRequest,
+    ListCredentialsResponse,
     // TCK-00342: Process management types
     ListProcessesRequest,
     ListProcessesResponse,
+    LoginCredentialRequest,
+    LoginCredentialResponse,
     PrivilegedError,
     PrivilegedErrorCode,
     PrivilegedMessageType,
@@ -74,8 +81,12 @@ use apm2_daemon::protocol::{
     // Evidence publishing
     PublishEvidenceRequest,
     PublishEvidenceResponse,
+    RefreshCredentialRequest,
+    RefreshCredentialResponse,
     ReloadProcessRequest,
     ReloadProcessResponse,
+    RemoveCredentialRequest,
+    RemoveCredentialResponse,
     // Session endpoint messages
     RequestToolRequest,
     RequestToolResponse,
@@ -98,11 +109,15 @@ use apm2_daemon::protocol::{
     // TCK-00342: Log streaming types
     StreamLogsRequest,
     StreamLogsResponse,
+    SwitchCredentialRequest,
+    SwitchCredentialResponse,
     // Work types
     WorkRole,
     // TCK-00344: Work status messages
     WorkStatusRequest,
     WorkStatusResponse,
+    // Encoding helpers
+    encode_add_credential_request,
     encode_claim_work_request,
     // TCK-00345: Consensus query encoding
     encode_consensus_byzantine_evidence_request,
@@ -111,11 +126,15 @@ use apm2_daemon::protocol::{
     encode_consensus_validators_request,
     encode_emit_event_request,
     encode_issue_capability_request,
+    encode_list_credentials_request,
     // TCK-00342: Process management encoding
     encode_list_processes_request,
+    encode_login_credential_request,
     encode_process_status_request,
     encode_publish_evidence_request,
+    encode_refresh_credential_request,
     encode_reload_process_request,
+    encode_remove_credential_request,
     encode_request_tool_request,
     encode_restart_process_request,
     // TCK-00344: Status query encoding
@@ -126,6 +145,7 @@ use apm2_daemon::protocol::{
     encode_stop_process_request,
     // TCK-00342: Log streaming encoding
     encode_stream_logs_request,
+    encode_switch_credential_request,
     encode_work_status_request,
     parse_handshake_message,
     serialize_handshake_message,
@@ -1453,7 +1473,6 @@ impl OperatorClient {
         let payload = &frame[1..];
 
         if tag == 0 {
-            // Error response
             let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
                 .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
             let code = PrivilegedErrorCode::try_from(err.code)
@@ -1472,6 +1491,398 @@ impl OperatorClient {
         }
 
         WorkStatusResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    // =========================================================================
+    // Credential Management Methods (CTR-PROTO-012, TCK-00343)
+    // =========================================================================
+
+    /// Lists all credential profiles.
+    ///
+    /// Secrets are never included in the response.
+    pub async fn list_credentials(
+        &mut self,
+        provider_filter: Option<i32>,
+    ) -> Result<ListCredentialsResponse, ProtocolClientError> {
+        let request = ListCredentialsRequest { provider_filter };
+        let request_bytes = encode_list_credentials_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_list_credentials_response(&response_frame)
+    }
+
+    /// Adds a new credential profile.
+    ///
+    /// The secret is stored securely and never logged or returned.
+    pub async fn add_credential(
+        &mut self,
+        profile_id: &str,
+        provider: i32,
+        auth_method: i32,
+        credential_secret: &[u8],
+        display_name: &str,
+        expires_at: u64,
+    ) -> Result<AddCredentialResponse, ProtocolClientError> {
+        let request = AddCredentialRequest {
+            profile_id: profile_id.to_string(),
+            provider,
+            auth_method,
+            credential_secret: credential_secret.to_vec(),
+            display_name: display_name.to_string(),
+            expires_at,
+        };
+        let request_bytes = encode_add_credential_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_add_credential_response(&response_frame)
+    }
+
+    /// Removes a credential profile.
+    pub async fn remove_credential(
+        &mut self,
+        profile_id: &str,
+    ) -> Result<RemoveCredentialResponse, ProtocolClientError> {
+        let request = RemoveCredentialRequest {
+            profile_id: profile_id.to_string(),
+        };
+        let request_bytes = encode_remove_credential_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_remove_credential_response(&response_frame)
+    }
+
+    /// Refreshes an OAuth credential.
+    pub async fn refresh_credential(
+        &mut self,
+        profile_id: &str,
+    ) -> Result<RefreshCredentialResponse, ProtocolClientError> {
+        let request = RefreshCredentialRequest {
+            profile_id: profile_id.to_string(),
+        };
+        let request_bytes = encode_refresh_credential_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_refresh_credential_response(&response_frame)
+    }
+
+    /// Switches the active credential for a process.
+    pub async fn switch_credential(
+        &mut self,
+        process_name: &str,
+        profile_id: &str,
+    ) -> Result<SwitchCredentialResponse, ProtocolClientError> {
+        let request = SwitchCredentialRequest {
+            process_name: process_name.to_string(),
+            profile_id: profile_id.to_string(),
+        };
+        let request_bytes = encode_switch_credential_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_switch_credential_response(&response_frame)
+    }
+
+    /// Initiates an interactive login for a provider.
+    pub async fn login_credential(
+        &mut self,
+        provider: i32,
+        profile_id: Option<&str>,
+        display_name: &str,
+    ) -> Result<LoginCredentialResponse, ProtocolClientError> {
+        let request = LoginCredentialRequest {
+            provider,
+            profile_id: profile_id.map(String::from),
+            display_name: display_name.to_string(),
+        };
+        let request_bytes = encode_login_credential_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_login_credential_response(&response_frame)
+    }
+
+    // =========================================================================
+    // Credential Response Decoders
+    // =========================================================================
+
+    fn decode_list_credentials_response(
+        frame: &Bytes,
+    ) -> Result<ListCredentialsResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::ListCredentials.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected ListCredentials response (tag {}), got tag {tag}",
+                PrivilegedMessageType::ListCredentials.tag()
+            )));
+        }
+
+        ListCredentialsResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    fn decode_add_credential_response(
+        frame: &Bytes,
+    ) -> Result<AddCredentialResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::AddCredential.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected AddCredential response (tag {}), got tag {tag}",
+                PrivilegedMessageType::AddCredential.tag()
+            )));
+        }
+
+        AddCredentialResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    fn decode_remove_credential_response(
+        frame: &Bytes,
+    ) -> Result<RemoveCredentialResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::RemoveCredential.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected RemoveCredential response (tag {}), got tag {tag}",
+                PrivilegedMessageType::RemoveCredential.tag()
+            )));
+        }
+
+        RemoveCredentialResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    fn decode_refresh_credential_response(
+        frame: &Bytes,
+    ) -> Result<RefreshCredentialResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::RefreshCredential.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected RefreshCredential response (tag {}), got tag {tag}",
+                PrivilegedMessageType::RefreshCredential.tag()
+            )));
+        }
+
+        RefreshCredentialResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    fn decode_switch_credential_response(
+        frame: &Bytes,
+    ) -> Result<SwitchCredentialResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::SwitchCredential.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected SwitchCredential response (tag {}), got tag {tag}",
+                PrivilegedMessageType::SwitchCredential.tag()
+            )));
+        }
+
+        SwitchCredentialResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    fn decode_login_credential_response(
+        frame: &Bytes,
+    ) -> Result<LoginCredentialResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::LoginCredential.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected LoginCredential response (tag {}), got tag {tag}",
+                PrivilegedMessageType::LoginCredential.tag()
+            )));
+        }
+
+        LoginCredentialResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 }
