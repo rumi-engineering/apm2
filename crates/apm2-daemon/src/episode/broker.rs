@@ -130,6 +130,18 @@ pub enum BrokerError {
         /// Reason for deserialization failure.
         reason: String,
     },
+
+    /// Context pack integrity check failed (TCK-00326).
+    ///
+    /// The blake3 hash of the retrieved content does not match the expected
+    /// `context_pack_hash`. This could indicate CAS corruption or tampering.
+    #[error("context pack integrity mismatch: expected {expected}, computed {computed}")]
+    ContextPackIntegrityMismatch {
+        /// Expected hash (from the request).
+        expected: String,
+        /// Computed hash (from blake3 of the retrieved content).
+        computed: String,
+    },
 }
 
 impl BrokerError {
@@ -147,6 +159,7 @@ impl BrokerError {
             Self::ContextPackNotFound { .. } => "context_pack_not_found",
             Self::ContextPackSealInvalid { .. } => "context_pack_seal_invalid",
             Self::ContextPackDeserializationFailed { .. } => "context_pack_deserialization_failed",
+            Self::ContextPackIntegrityMismatch { .. } => "context_pack_integrity_mismatch",
         }
     }
 
@@ -168,6 +181,7 @@ impl BrokerError {
             Self::ContextPackNotFound { .. }
                 | Self::ContextPackSealInvalid { .. }
                 | Self::ContextPackDeserializationFailed { .. }
+                | Self::ContextPackIntegrityMismatch { .. }
         )
     }
 }
@@ -1100,6 +1114,17 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 hash: hex::encode(context_pack_hash),
             }
         })?;
+
+        // TCK-00326: Verify content integrity - compute blake3(content) and assert
+        // it matches context_pack_hash before processing. This prevents CAS poisoning
+        // attacks where a malicious actor could substitute content.
+        let computed_hash = blake3::hash(&content);
+        if computed_hash.as_bytes() != context_pack_hash {
+            return Err(BrokerError::ContextPackIntegrityMismatch {
+                expected: hex::encode(context_pack_hash),
+                computed: hex::encode(computed_hash.as_bytes()),
+            });
+        }
 
         // Deserialize
         let mut manifest: ContextPackManifest = serde_json::from_slice(&content).map_err(|e| {

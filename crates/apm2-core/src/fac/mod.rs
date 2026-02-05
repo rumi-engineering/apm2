@@ -90,6 +90,7 @@ pub mod review_blocked;
 pub mod review_receipt;
 pub mod risk_tier;
 pub mod selection_policy;
+pub mod serde_helpers;
 mod terminal_verifier;
 pub mod transcript_binding;
 

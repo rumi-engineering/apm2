@@ -36,8 +36,8 @@
 //!     [0x33; 32], // blocked_log_hash
 //!     [0x44; 32], // time_envelope_ref hash
 //!     "recorder-001".to_string(),
-//!     [0x55; 32], // capability_manifest_hash (TCK-00326)
-//!     [0x66; 32], // context_pack_hash (TCK-00326)
+//!     Some([0x55; 32]), // capability_manifest_hash (TCK-00326, optional)
+//!     Some([0x66; 32]), // context_pack_hash (TCK-00326, optional)
 //!     &signer,
 //! )
 //! .expect("valid event");
@@ -286,13 +286,29 @@ pub struct ReviewBlockedRecorded {
     /// BLAKE3 hash of the `CapabilityManifest` in effect (32 bytes, TCK-00326).
     /// Binds the blocked event to the authority under which the review was
     /// attempted.
-    #[serde(with = "serde_bytes")]
-    pub capability_manifest_hash: [u8; 32],
+    ///
+    /// This field is `Option` for backward compatibility with events created
+    /// before TCK-00326. When `None`, it is not included in `canonical_bytes()`
+    /// to preserve signature verification for historical events.
+    #[serde(
+        with = "crate::fac::serde_helpers::option_hash32",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capability_manifest_hash: Option<[u8; 32]>,
     /// BLAKE3 hash of the sealed `ContextPackManifest` in effect (32 bytes,
     /// TCK-00326). Binds the blocked event to the context firewall
     /// configuration.
-    #[serde(with = "serde_bytes")]
-    pub context_pack_hash: [u8; 32],
+    ///
+    /// This field is `Option` for backward compatibility with events created
+    /// before TCK-00326. When `None`, it is not included in `canonical_bytes()`
+    /// to preserve signature verification for historical events.
+    #[serde(
+        with = "crate::fac::serde_helpers::option_hash32",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_pack_hash: Option<[u8; 32]>,
 }
 
 impl ReviewBlockedRecorded {
@@ -307,9 +323,9 @@ impl ReviewBlockedRecorded {
     /// * `time_envelope_ref` - HTF time envelope reference hash
     /// * `recorder_actor_id` - ID of the recording actor
     /// * `capability_manifest_hash` - Hash of the `CapabilityManifest` in
-    ///   effect
+    ///   effect (optional for backward compatibility)
     /// * `context_pack_hash` - Hash of the sealed `ContextPackManifest` in
-    ///   effect
+    ///   effect (optional for backward compatibility)
     /// * `signer` - Signer to authorize the event
     ///
     /// # Errors
@@ -323,8 +339,8 @@ impl ReviewBlockedRecorded {
         blocked_log_hash: [u8; 32],
         time_envelope_ref: [u8; 32],
         recorder_actor_id: String,
-        capability_manifest_hash: [u8; 32],
-        context_pack_hash: [u8; 32],
+        capability_manifest_hash: Option<[u8; 32]>,
+        context_pack_hash: Option<[u8; 32]>,
         signer: &Signer,
     ) -> Result<Self, ReviewBlockedError> {
         // Validate inputs
@@ -386,8 +402,8 @@ impl ReviewBlockedRecorded {
         blocked_log_hash: [u8; 32],
         envelope_ref: &TimeEnvelopeRef,
         recorder_actor_id: String,
-        capability_manifest_hash: [u8; 32],
-        context_pack_hash: [u8; 32],
+        capability_manifest_hash: Option<[u8; 32]>,
+        context_pack_hash: Option<[u8; 32]>,
         signer: &Signer,
     ) -> Result<Self, ReviewBlockedError> {
         let time_envelope_ref: [u8; 32] = *envelope_ref.as_bytes();
@@ -413,8 +429,14 @@ impl ReviewBlockedRecorded {
     /// - `blocked_log_hash` (32 bytes)
     /// - `time_envelope_ref` (32 bytes)
     /// - `recorder_actor_id` (len + bytes)
-    /// - `capability_manifest_hash` (32 bytes, TCK-00326)
-    /// - `context_pack_hash` (32 bytes, TCK-00326)
+    /// - `capability_manifest_hash` (32 bytes, TCK-00326, only if present)
+    /// - `context_pack_hash` (32 bytes, TCK-00326, only if present)
+    ///
+    /// # Backward Compatibility
+    ///
+    /// The `capability_manifest_hash` and `context_pack_hash` fields are only
+    /// included in the canonical encoding when they are `Some`. This preserves
+    /// signature verification for historical events created before TCK-00326.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -440,11 +462,15 @@ impl ReviewBlockedRecorded {
         bytes.extend_from_slice(&(self.recorder_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.recorder_actor_id.as_bytes());
 
-        // 7. capability_manifest_hash (TCK-00326)
-        bytes.extend_from_slice(&self.capability_manifest_hash);
+        // 7. capability_manifest_hash (TCK-00326, only if present for backward compat)
+        if let Some(ref hash) = self.capability_manifest_hash {
+            bytes.extend_from_slice(hash);
+        }
 
-        // 8. context_pack_hash (TCK-00326)
-        bytes.extend_from_slice(&self.context_pack_hash);
+        // 8. context_pack_hash (TCK-00326, only if present for backward compat)
+        if let Some(ref hash) = self.context_pack_hash {
+            bytes.extend_from_slice(hash);
+        }
 
         bytes
     }
@@ -562,6 +588,12 @@ impl ReviewBlockedRecordedBuilder {
     /// # Errors
     ///
     /// Returns error if required fields are missing or validation fails.
+    ///
+    /// # Note
+    ///
+    /// The `capability_manifest_hash` and `context_pack_hash` fields are
+    /// optional for backward compatibility with events created before
+    /// TCK-00326.
     pub fn build_and_sign(
         self,
         signer: &Signer,
@@ -584,12 +616,9 @@ impl ReviewBlockedRecordedBuilder {
         let recorder_actor_id = self
             .recorder_actor_id
             .ok_or(ReviewBlockedError::MissingField("recorder_actor_id"))?;
-        let capability_manifest_hash = self
-            .capability_manifest_hash
-            .ok_or(ReviewBlockedError::MissingField("capability_manifest_hash"))?;
-        let context_pack_hash = self
-            .context_pack_hash
-            .ok_or(ReviewBlockedError::MissingField("context_pack_hash"))?;
+        // These are optional for backward compatibility (TCK-00326)
+        let capability_manifest_hash = self.capability_manifest_hash;
+        let context_pack_hash = self.context_pack_hash;
 
         ReviewBlockedRecorded::create(
             blocked_id,
@@ -665,21 +694,29 @@ impl TryFrom<ReviewBlockedRecordedProto> for ReviewBlockedRecorded {
             })?)?;
 
         // TCK-00326: Parse capability_manifest_hash and context_pack_hash
-        // Default to zeros if empty (backward compatibility)
-        let capability_manifest_hash: [u8; 32] = if proto.capability_manifest_hash.is_empty() {
-            [0u8; 32]
+        // Map empty or all-zero fields to None for backward compatibility.
+        // This ensures signature verification succeeds for historical events.
+        let capability_manifest_hash: Option<[u8; 32]> = if proto
+            .capability_manifest_hash
+            .is_empty()
+        {
+            None
         } else {
-            proto.capability_manifest_hash.try_into().map_err(|_| {
+            let hash: [u8; 32] = proto.capability_manifest_hash.try_into().map_err(|_| {
                 ReviewBlockedError::InvalidData("capability_manifest_hash must be 32 bytes".into())
-            })?
+            })?;
+            // Treat all-zeros as absent (backward compat)
+            if hash == [0u8; 32] { None } else { Some(hash) }
         };
 
-        let context_pack_hash: [u8; 32] = if proto.context_pack_hash.is_empty() {
-            [0u8; 32]
+        let context_pack_hash: Option<[u8; 32]> = if proto.context_pack_hash.is_empty() {
+            None
         } else {
-            proto.context_pack_hash.try_into().map_err(|_| {
+            let hash: [u8; 32] = proto.context_pack_hash.try_into().map_err(|_| {
                 ReviewBlockedError::InvalidData("context_pack_hash must be 32 bytes".into())
-            })?
+            })?;
+            // Treat all-zeros as absent (backward compat)
+            if hash == [0u8; 32] { None } else { Some(hash) }
         };
 
         Ok(Self {
@@ -711,9 +748,13 @@ impl From<ReviewBlockedRecorded> for ReviewBlockedRecordedProto {
             }),
             recorder_actor_id: event.recorder_actor_id,
             recorder_signature: event.recorder_signature.to_vec(),
-            // TCK-00326: Authority binding fields
-            capability_manifest_hash: event.capability_manifest_hash.to_vec(),
-            context_pack_hash: event.context_pack_hash.to_vec(),
+            // TCK-00326: Authority binding fields (empty Vec if None)
+            capability_manifest_hash: event
+                .capability_manifest_hash
+                .map_or_else(Vec::new, |h| h.to_vec()),
+            context_pack_hash: event
+                .context_pack_hash
+                .map_or_else(Vec::new, |h| h.to_vec()),
         }
     }
 }
@@ -822,8 +863,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            [0x55; 32], // capability_manifest_hash (TCK-00326)
-            [0x66; 32], // context_pack_hash (TCK-00326)
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -842,8 +883,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            [0x55; 32], // capability_manifest_hash (TCK-00326)
-            [0x66; 32], // context_pack_hash (TCK-00326)
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -872,8 +913,8 @@ mod tests {
 
         assert_eq!(event.blocked_id, "blocked-002");
         assert_eq!(event.reason_code, ReasonCode::ToolFailed);
-        assert_eq!(event.capability_manifest_hash, [0x55; 32]);
-        assert_eq!(event.context_pack_hash, [0x66; 32]);
+        assert_eq!(event.capability_manifest_hash, Some([0x55; 32]));
+        assert_eq!(event.context_pack_hash, Some([0x66; 32]));
         assert!(event.verify_signature(&signer.verifying_key()).is_ok());
     }
 
@@ -911,7 +952,8 @@ mod tests {
             Err(ReviewBlockedError::MissingField("reason_code"))
         ));
 
-        // Missing capability_manifest_hash (TCK-00326)
+        // capability_manifest_hash and context_pack_hash are now optional for backward
+        // compat so they should NOT cause MissingField errors
         let result = ReviewBlockedRecordedBuilder::new()
             .blocked_id("blocked-002")
             .changeset_digest([0x11; 32])
@@ -919,27 +961,12 @@ mod tests {
             .blocked_log_hash([0x22; 32])
             .time_envelope_ref([0x33; 32])
             .recorder_actor_id("recorder-002")
-            .context_pack_hash([0x66; 32])
+            // No capability_manifest_hash or context_pack_hash
             .build_and_sign(&signer);
-        assert!(matches!(
-            result,
-            Err(ReviewBlockedError::MissingField("capability_manifest_hash"))
-        ));
-
-        // Missing context_pack_hash (TCK-00326)
-        let result = ReviewBlockedRecordedBuilder::new()
-            .blocked_id("blocked-002")
-            .changeset_digest([0x11; 32])
-            .reason_code(ReasonCode::ToolFailed)
-            .blocked_log_hash([0x22; 32])
-            .time_envelope_ref([0x33; 32])
-            .recorder_actor_id("recorder-002")
-            .capability_manifest_hash([0x55; 32])
-            .build_and_sign(&signer);
-        assert!(matches!(
-            result,
-            Err(ReviewBlockedError::MissingField("context_pack_hash"))
-        ));
+        assert!(result.is_ok());
+        let event = result.unwrap();
+        assert!(event.capability_manifest_hash.is_none());
+        assert!(event.context_pack_hash.is_none());
     }
 
     #[test]
@@ -954,8 +981,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            [0x55; 32], // capability_manifest_hash (TCK-00326)
-            [0x66; 32], // context_pack_hash (TCK-00326)
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         );
 
@@ -978,8 +1005,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            [0x55; 32], // capability_manifest_hash (TCK-00326)
-            [0x66; 32], // context_pack_hash (TCK-00326)
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -991,8 +1018,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            [0x55; 32], // capability_manifest_hash (TCK-00326)
-            [0x66; 32], // context_pack_hash (TCK-00326)
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -1013,8 +1040,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            [0x55; 32], // capability_manifest_hash (TCK-00326)
-            [0x66; 32], // context_pack_hash (TCK-00326)
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
@@ -1026,14 +1053,56 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            [0x55; 32], // capability_manifest_hash (TCK-00326)
-            [0x66; 32], // context_pack_hash (TCK-00326)
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("valid event");
 
         // Different reason codes produce different canonical bytes
         assert_ne!(event1.canonical_bytes(), event2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_backward_compat_none_fields() {
+        // TCK-00326: Events without capability_manifest_hash/context_pack_hash
+        // should have shorter canonical bytes and verify correctly
+        let signer = Signer::generate();
+        let event_with = ReviewBlockedRecorded::create(
+            "blocked-001".to_string(),
+            [0x42; 32],
+            ReasonCode::ApplyFailed,
+            [0x33; 32],
+            [0x44; 32],
+            "recorder-001".to_string(),
+            Some([0x55; 32]),
+            Some([0x66; 32]),
+            &signer,
+        )
+        .expect("valid event");
+
+        let event_without = ReviewBlockedRecorded::create(
+            "blocked-001".to_string(),
+            [0x42; 32],
+            ReasonCode::ApplyFailed,
+            [0x33; 32],
+            [0x44; 32],
+            "recorder-001".to_string(),
+            None,
+            None,
+            &signer,
+        )
+        .expect("valid event");
+
+        // Events without optional fields have shorter canonical bytes
+        assert!(event_without.canonical_bytes().len() < event_with.canonical_bytes().len());
+        // Both should verify correctly
+        assert!(event_with.verify_signature(&signer.verifying_key()).is_ok());
+        assert!(
+            event_without
+                .verify_signature(&signer.verifying_key())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1075,8 +1144,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            [0x55; 32], // capability_manifest_hash
-            [0x66; 32], // context_pack_hash
+            Some([0x55; 32]), // capability_manifest_hash
+            Some([0x66; 32]), // context_pack_hash
             &signer,
         )
         .expect("valid event");
@@ -1088,8 +1157,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "recorder-001".to_string(),
-            [0xAA; 32], // Different capability_manifest_hash
-            [0x66; 32], // Same context_pack_hash
+            Some([0xAA; 32]), // Different capability_manifest_hash
+            Some([0x66; 32]), // Same context_pack_hash
             &signer,
         )
         .expect("valid event");

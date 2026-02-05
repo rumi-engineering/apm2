@@ -825,9 +825,9 @@ pub fn validate_commit_ref(commit_ref: &str) -> Result<(), WorkspaceError> {
 /// * `time_envelope_ref` - HTF time envelope reference hash
 /// * `recorder_actor_id` - ID of the recording actor
 /// * `capability_manifest_hash` - Hash of the `CapabilityManifest` in effect
-///   (TCK-00326)
+///   (TCK-00326, optional for backward compatibility)
 /// * `context_pack_hash` - Hash of the sealed `ContextPackManifest` in effect
-///   (TCK-00326)
+///   (TCK-00326, optional for backward compatibility)
 /// * `signer` - Signer to authorize the event
 ///
 /// # Errors
@@ -841,20 +841,26 @@ pub fn create_blocked_event(
     blocked_log_hash: [u8; 32],
     time_envelope_ref: [u8; 32],
     recorder_actor_id: String,
-    capability_manifest_hash: [u8; 32],
-    context_pack_hash: [u8; 32],
+    capability_manifest_hash: Option<[u8; 32]>,
+    context_pack_hash: Option<[u8; 32]>,
     signer: &Signer,
 ) -> Result<ReviewBlockedRecorded, ReviewBlockedError> {
-    ReviewBlockedRecordedBuilder::new()
+    let mut builder = ReviewBlockedRecordedBuilder::new()
         .blocked_id(blocked_id)
         .changeset_digest(changeset_digest)
         .reason_code(error.reason_code())
         .blocked_log_hash(blocked_log_hash)
         .time_envelope_ref(time_envelope_ref)
-        .recorder_actor_id(recorder_actor_id)
-        .capability_manifest_hash(capability_manifest_hash)
-        .context_pack_hash(context_pack_hash)
-        .build_and_sign(signer)
+        .recorder_actor_id(recorder_actor_id);
+
+    if let Some(hash) = capability_manifest_hash {
+        builder = builder.capability_manifest_hash(hash);
+    }
+    if let Some(hash) = context_pack_hash {
+        builder = builder.context_pack_hash(hash);
+    }
+
+    builder.build_and_sign(signer)
 }
 
 // =============================================================================
@@ -874,9 +880,9 @@ pub fn create_blocked_event(
 /// * `time_envelope_ref` - HTF time envelope reference for temporal authority
 /// * `reviewer_actor_id` - Actor ID of the reviewer
 /// * `capability_manifest_hash` - Hash of the `CapabilityManifest` in effect
-///   (TCK-00326)
+///   (TCK-00326, optional for backward compatibility)
 /// * `context_pack_hash` - Hash of the sealed `ContextPackManifest` in effect
-///   (TCK-00326)
+///   (TCK-00326, optional for backward compatibility)
 /// * `signer` - Signer to authorize the event
 ///
 /// # Errors
@@ -889,19 +895,25 @@ pub fn create_receipt_event(
     artifact_bundle_hash: [u8; 32],
     time_envelope_ref: [u8; 32],
     reviewer_actor_id: String,
-    capability_manifest_hash: [u8; 32],
-    context_pack_hash: [u8; 32],
+    capability_manifest_hash: Option<[u8; 32]>,
+    context_pack_hash: Option<[u8; 32]>,
     signer: &Signer,
 ) -> Result<ReviewReceiptRecorded, ReviewReceiptError> {
-    ReviewReceiptRecordedBuilder::new()
+    let mut builder = ReviewReceiptRecordedBuilder::new()
         .receipt_id(receipt_id)
         .changeset_digest(changeset_digest)
         .artifact_bundle_hash(artifact_bundle_hash)
         .time_envelope_ref(time_envelope_ref)
-        .reviewer_actor_id(reviewer_actor_id)
-        .capability_manifest_hash(capability_manifest_hash)
-        .context_pack_hash(context_pack_hash)
-        .build_and_sign(signer)
+        .reviewer_actor_id(reviewer_actor_id);
+
+    if let Some(hash) = capability_manifest_hash {
+        builder = builder.capability_manifest_hash(hash);
+    }
+    if let Some(hash) = context_pack_hash {
+        builder = builder.context_pack_hash(hash);
+    }
+
+    builder.build_and_sign(signer)
 }
 
 /// Creates a `ReviewArtifactBundleV1` from review outputs.
@@ -973,9 +985,13 @@ pub struct ReviewCompletionResult {
     /// Reviewer actor ID.
     pub reviewer_actor_id: String,
     /// BLAKE3 hash of the `CapabilityManifest` in effect (TCK-00326).
-    pub capability_manifest_hash: [u8; 32],
+    /// Optional for backward compatibility with events created before
+    /// TCK-00326.
+    pub capability_manifest_hash: Option<[u8; 32]>,
     /// BLAKE3 hash of the sealed `ContextPackManifest` in effect (TCK-00326).
-    pub context_pack_hash: [u8; 32],
+    /// Optional for backward compatibility with events created before
+    /// TCK-00326.
+    pub context_pack_hash: Option<[u8; 32]>,
 }
 
 impl ReviewCompletionResult {
@@ -1138,12 +1154,9 @@ impl ReviewCompletionResultBuilder {
         let reviewer_actor_id = self
             .reviewer_actor_id
             .ok_or(ReviewReceiptError::MissingField("reviewer_actor_id"))?;
-        let capability_manifest_hash = self
-            .capability_manifest_hash
-            .ok_or(ReviewReceiptError::MissingField("capability_manifest_hash"))?;
-        let context_pack_hash = self
-            .context_pack_hash
-            .ok_or(ReviewReceiptError::MissingField("context_pack_hash"))?;
+        // These are optional for backward compatibility (TCK-00326)
+        let capability_manifest_hash = self.capability_manifest_hash;
+        let context_pack_hash = self.context_pack_hash;
 
         let artifact_bundle = create_artifact_bundle(
             review_id,
@@ -2339,8 +2352,8 @@ mod tests {
             [0x33; 32],
             [0x44; 32],
             "reviewer-001".to_string(),
-            [0x55; 32], // capability_manifest_hash (TCK-00326)
-            [0x66; 32], // context_pack_hash (TCK-00326)
+            Some([0x55; 32]), // capability_manifest_hash (TCK-00326)
+            Some([0x66; 32]), // context_pack_hash (TCK-00326)
             &signer,
         )
         .expect("should create receipt");
@@ -2350,8 +2363,8 @@ mod tests {
         assert_eq!(receipt.artifact_bundle_hash, [0x33; 32]);
         assert_eq!(receipt.time_envelope_ref, [0x44; 32]);
         assert_eq!(receipt.reviewer_actor_id, "reviewer-001");
-        assert_eq!(receipt.capability_manifest_hash, [0x55; 32]);
-        assert_eq!(receipt.context_pack_hash, [0x66; 32]);
+        assert_eq!(receipt.capability_manifest_hash, Some([0x55; 32]));
+        assert_eq!(receipt.context_pack_hash, Some([0x66; 32]));
 
         // Verify signature
         assert!(receipt.verify_signature(&signer.verifying_key()).is_ok());
@@ -2377,8 +2390,8 @@ mod tests {
         assert_eq!(result.receipt_id, "RR-001");
         assert_eq!(result.changeset_digest, [0x42; 32]);
         assert_eq!(result.artifact_bundle.review_id, "review-001");
-        assert_eq!(result.capability_manifest_hash, [0x55; 32]);
-        assert_eq!(result.context_pack_hash, [0x66; 32]);
+        assert_eq!(result.capability_manifest_hash, Some([0x55; 32]));
+        assert_eq!(result.context_pack_hash, Some([0x66; 32]));
 
         // CAS hash should be deterministically computed
         let expected_hash = result.artifact_bundle.compute_cas_hash();
@@ -2389,8 +2402,8 @@ mod tests {
             .create_receipt_event(&signer)
             .expect("should create receipt");
         assert_eq!(receipt.artifact_bundle_hash, expected_hash);
-        assert_eq!(receipt.capability_manifest_hash, [0x55; 32]);
-        assert_eq!(receipt.context_pack_hash, [0x66; 32]);
+        assert_eq!(receipt.capability_manifest_hash, Some([0x55; 32]));
+        assert_eq!(receipt.context_pack_hash, Some([0x66; 32]));
         assert!(receipt.verify_signature(&signer.verifying_key()).is_ok());
     }
 
