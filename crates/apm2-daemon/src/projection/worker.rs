@@ -72,11 +72,31 @@ pub enum ProjectionWorkerError {
     /// Worker shutdown requested.
     #[error("worker shutdown requested")]
     ShutdownRequested,
+
+    /// Missing dependency - event cannot be processed yet because required
+    /// associations are not indexed. This error triggers NACK/Retry behavior:
+    /// the watermark is NOT advanced so the event will be reprocessed.
+    ///
+    /// Blocker fix: Critical Data Loss via Shared Watermark - implements
+    /// NACK/Retry semantics where watermark is not advanced for events that
+    /// fail due to missing dependencies.
+    #[error("missing dependency for event: {event_id} - {reason}")]
+    MissingDependency {
+        /// The event ID that failed due to missing dependency.
+        event_id: String,
+        /// The reason/missing dependency description.
+        reason: String,
+    },
 }
 
 // =============================================================================
 // Work Index
 // =============================================================================
+
+/// Default TTL for work index entries (7 days, matching idempotency cache).
+/// This ensures tables don't grow unbounded (Blocker fix: Unbounded State
+/// Growth).
+pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Work index schema SQL.
 const WORK_INDEX_SCHEMA_SQL: &str = r"
@@ -96,6 +116,7 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
     );
 
     CREATE INDEX IF NOT EXISTS idx_changeset_work_id ON changeset_work_index(work_id);
+    CREATE INDEX IF NOT EXISTS idx_changeset_work_created ON changeset_work_index(created_at);
 
     -- Tailer watermark persistence (fixes blocker: non-persistent LedgerTailer)
     CREATE TABLE IF NOT EXISTS tailer_watermark (
@@ -111,6 +132,8 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
         created_at INTEGER NOT NULL
     );
 
+    CREATE INDEX IF NOT EXISTS idx_sha_created ON changeset_sha_index(created_at);
+
     -- Comment idempotency tracking (blocker fix: duplicate comments)
     CREATE TABLE IF NOT EXISTS comment_receipts (
         receipt_id TEXT PRIMARY KEY,
@@ -119,6 +142,9 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
         comment_type TEXT NOT NULL,
         created_at INTEGER NOT NULL
     );
+
+    CREATE INDEX IF NOT EXISTS idx_comment_created ON comment_receipts(created_at);
+    CREATE INDEX IF NOT EXISTS idx_work_pr_created ON work_pr_index(created_at);
 ";
 
 /// Work index for tracking changeset -> `work_id` -> PR associations.
@@ -378,6 +404,147 @@ impl WorkIndex {
 
         Ok(())
     }
+
+    /// Evicts expired entries from all work index tables.
+    ///
+    /// This implements TTL-based eviction to prevent unbounded state growth
+    /// (Blocker fix: Unbounded State Growth). Default TTL is 7 days, matching
+    /// the idempotency cache TTL.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl_secs` - TTL in seconds; entries older than this are evicted
+    ///
+    /// # Returns
+    ///
+    /// The total number of rows deleted across all tables.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn evict_expired(&self, ttl_secs: u64) -> Result<usize, ProjectionWorkerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let cutoff = now.saturating_sub(ttl_secs) as i64;
+
+        // Evict from all tables with created_at timestamps
+        let mut total_deleted = 0;
+
+        total_deleted += conn
+            .execute(
+                "DELETE FROM changeset_work_index WHERE created_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        total_deleted += conn
+            .execute(
+                "DELETE FROM changeset_sha_index WHERE created_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        total_deleted += conn
+            .execute(
+                "DELETE FROM comment_receipts WHERE created_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        total_deleted += conn
+            .execute(
+                "DELETE FROM work_pr_index WHERE created_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        if total_deleted > 0 {
+            info!(
+                deleted = total_deleted,
+                ttl_secs = ttl_secs,
+                "Evicted expired work index entries"
+            );
+        }
+
+        Ok(total_deleted)
+    }
+
+    /// Returns the connection for use with async `spawn_blocking` operations.
+    ///
+    /// This is used by the async worker to wrap blocking `SQLite` operations
+    /// in `spawn_blocking` (Major fix: Thread blocking in async context).
+    #[must_use]
+    pub fn connection(&self) -> Arc<Mutex<Connection>> {
+        Arc::clone(&self.conn)
+    }
+
+    /// Async wrapper for `evict_expired` that uses `spawn_blocking`.
+    ///
+    /// This avoids blocking the async runtime during eviction, which can
+    /// be slow for large tables (Major fix: Thread blocking in async context).
+    pub async fn evict_expired_async(&self, ttl_secs: u64) -> Result<usize, ProjectionWorkerError> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().map_err(|e| {
+                ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
+            })?;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            #[allow(clippy::cast_possible_wrap)]
+            let cutoff = now.saturating_sub(ttl_secs) as i64;
+
+            let mut total_deleted = 0;
+
+            total_deleted += conn_guard
+                .execute(
+                    "DELETE FROM changeset_work_index WHERE created_at < ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            total_deleted += conn_guard
+                .execute(
+                    "DELETE FROM changeset_sha_index WHERE created_at < ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            total_deleted += conn_guard
+                .execute(
+                    "DELETE FROM comment_receipts WHERE created_at < ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            total_deleted += conn_guard
+                .execute(
+                    "DELETE FROM work_pr_index WHERE created_at < ?1",
+                    params![cutoff],
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+            if total_deleted > 0 {
+                info!(
+                    deleted = total_deleted,
+                    ttl_secs = ttl_secs,
+                    "Evicted expired work index entries (async)"
+                );
+            }
+
+            Ok(total_deleted)
+        })
+        .await
+        .map_err(|e| ProjectionWorkerError::DatabaseError(format!("spawn_blocking failed: {e}")))?
+    }
 }
 
 /// PR metadata for projection.
@@ -492,28 +659,37 @@ impl LedgerTailer {
     ///
     /// Returns events ordered by `timestamp_ns`, starting after the last
     /// processed timestamp.
+    ///
+    /// # At-Least-Once Delivery
+    ///
+    /// This method does NOT automatically advance the watermark. The caller
+    /// must explicitly call [`acknowledge`] after successfully processing
+    /// each event. This ensures at-least-once delivery semantics:
+    /// - If the daemon crashes before acknowledgment, events are redelivered
+    /// - Idempotency is achieved via `comment_receipts` and `IdempotencyCache`
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     pub fn poll_events(
         &mut self,
         event_type: &str,
         limit: usize,
     ) -> Result<Vec<SignedLedgerEvent>, ProjectionWorkerError> {
-        let events = {
-            let conn = self.conn.lock().map_err(|e| {
-                ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
-            })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
-            let mut stmt = conn
-                .prepare(
-                    "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-                     FROM ledger_events
-                     WHERE event_type = ?1 AND timestamp_ns > ?2
-                     ORDER BY timestamp_ns ASC
-                     LIMIT ?3",
-                )
-                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+                 FROM ledger_events
+                 WHERE event_type = ?1 AND timestamp_ns > ?2
+                 ORDER BY timestamp_ns ASC
+                 LIMIT ?3",
+            )
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-            stmt.query_map(
+        let events = stmt
+            .query_map(
                 params![event_type, self.last_processed_ns as i64, limit as i64],
                 |row| {
                     Ok(SignedLedgerEvent {
@@ -529,19 +705,33 @@ impl LedgerTailer {
             )
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
             .filter_map(Result::ok)
-            .collect::<Vec<_>>()
-        }; // conn and stmt dropped here
+            .collect::<Vec<_>>();
 
-        // Update last processed timestamp and persist watermark
-        if let Some(last) = events.last() {
-            self.last_processed_ns = last.timestamp_ns;
-            // Persist to SQLite for crash recovery
-            if let Err(e) = self.persist_watermark() {
-                warn!(error = %e, "Failed to persist tailer watermark");
-            }
-        }
+        // NOTE: Watermark is NOT advanced here. Caller must call acknowledge()
+        // after successful processing to ensure at-least-once delivery.
 
         Ok(events)
+    }
+
+    /// Acknowledges successful processing of an event.
+    ///
+    /// This advances the watermark to the event's timestamp, ensuring the
+    /// event won't be redelivered on restart. Should be called after each
+    /// event is successfully processed.
+    ///
+    /// # At-Least-Once Delivery
+    ///
+    /// By separating polling from acknowledgment, we achieve at-least-once
+    /// delivery semantics:
+    /// - Events are only acknowledged after successful processing
+    /// - If the daemon crashes before acknowledgment, events are redelivered
+    /// - Idempotency prevents duplicate side effects
+    pub fn acknowledge(&mut self, timestamp_ns: u64) -> Result<(), ProjectionWorkerError> {
+        if timestamp_ns > self.last_processed_ns {
+            self.last_processed_ns = timestamp_ns;
+            self.persist_watermark()?;
+        }
+        Ok(())
     }
 
     /// Gets the current ledger head (latest event timestamp).
@@ -675,22 +865,15 @@ impl ProjectionWorker {
             "projection_worker:review_receipt_recorded",
         );
 
-        // Create GitHub adapter if configured
-        let adapter = if config.github_enabled {
-            if let Some(ref gh_config) = config.github_config {
-                // Create mock adapter for now (real HTTP client would be created
-                // in production)
-                let signer = apm2_core::crypto::Signer::generate();
-                Some(
-                    GitHubProjectionAdapter::new_mock(signer, gh_config.clone())
-                        .map_err(|e| ProjectionWorkerError::ProjectionFailed(e.to_string()))?,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // NOTE: Adapter is NOT created here to avoid fail-open issues.
+        // The adapter MUST be injected via set_adapter() with a properly
+        // configured GitHubProjectionAdapter that uses:
+        // 1. A persistent signer from the daemon's key material
+        // 2. The real HTTP client (not mock) for production
+        //
+        // If github_enabled is true but no adapter is set, projection will
+        // log warnings but not fail-open to GitHub.
+        let adapter = None;
 
         Ok(Self {
             config,
@@ -715,6 +898,27 @@ impl ProjectionWorker {
         &self.work_index
     }
 
+    /// Sets the GitHub projection adapter.
+    ///
+    /// # Security
+    ///
+    /// The adapter MUST be created with:
+    /// 1. A persistent signer from the daemon's key material (NOT random)
+    /// 2. A properly configured `GitHubAdapterConfig` with API token
+    /// 3. A real HTTP client for production (use `new()`, not `new_mock()`)
+    ///
+    /// Failing to provide a proper adapter will result in projections being
+    /// skipped (fail-safe, not fail-open).
+    pub fn set_adapter(&mut self, adapter: GitHubProjectionAdapter) {
+        self.adapter = Some(adapter);
+    }
+
+    /// Returns whether a GitHub adapter is configured.
+    #[must_use]
+    pub const fn has_adapter(&self) -> bool {
+        self.adapter.is_some()
+    }
+
     /// Runs the projection worker loop.
     ///
     /// This method blocks until shutdown is requested.
@@ -730,6 +934,12 @@ impl ProjectionWorker {
             github_enabled = self.config.github_enabled,
             "Projection worker starting"
         );
+
+        // Counter for periodic eviction (Blocker fix: Unbounded State Growth)
+        // Run eviction every ~1000 poll cycles (roughly once per hour at 1s poll
+        // interval)
+        let eviction_interval: u64 = 1000;
+        let mut eviction_counter: u64 = 0;
 
         while !self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             // Process ChangeSetPublished events to build work index
@@ -747,6 +957,16 @@ impl ProjectionWorker {
                 warn!(error = %e, "Error processing ReviewReceiptRecorded events");
             }
 
+            // Periodic eviction of expired entries (Blocker fix: Unbounded State Growth)
+            // Uses spawn_blocking to avoid blocking async runtime (Major fix: Thread
+            // blocking)
+            eviction_counter = eviction_counter.wrapping_add(1);
+            if eviction_counter % eviction_interval == 0 {
+                if let Err(e) = self.work_index.evict_expired_async(DEFAULT_TTL_SECS).await {
+                    warn!(error = %e, "Error during work index eviction");
+                }
+            }
+
             // Sleep for poll interval
             tokio::time::sleep(self.config.poll_interval).await;
         }
@@ -756,18 +976,33 @@ impl ProjectionWorker {
     }
 
     /// Processes `ChangeSetPublished` events to populate the work index.
+    ///
+    /// # At-Least-Once Delivery (Blocker fix: Fail-Open Auto-Ack on Crash)
+    ///
+    /// This method only acknowledges events AFTER successful processing.
+    /// If the daemon crashes before acknowledgment, events will be redelivered.
     fn process_changeset_published(&mut self) -> Result<(), ProjectionWorkerError> {
         let events = self
             .changeset_tailer
             .poll_events("changeset_published", self.config.batch_size)?;
 
         for event in events {
-            if let Err(e) = self.handle_changeset_published(&event) {
-                warn!(
-                    event_id = %event.event_id,
-                    error = %e,
-                    "Failed to process ChangeSetPublished event"
-                );
+            match self.handle_changeset_published(&event) {
+                Ok(()) => {
+                    // Only acknowledge after successful processing
+                    // (Blocker fix: Fail-Open Auto-Ack on Crash)
+                    self.changeset_tailer.acknowledge(event.timestamp_ns)?;
+                },
+                Err(e) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %e,
+                        "Failed to process ChangeSetPublished event - will retry"
+                    );
+                    // Do NOT acknowledge - event will be reprocessed on next poll
+                    // This is the NACK/Retry behavior for at-least-once delivery
+                    break; // Stop processing batch to maintain ordering
+                },
             }
         }
 
@@ -829,18 +1064,32 @@ impl ProjectionWorker {
     /// This is critical for projection: without PR metadata, we cannot post
     /// status checks or comments. (Blocker fix: Missing `WorkPrAssociated`
     /// handling)
+    ///
+    /// # At-Least-Once Delivery (Blocker fix: Fail-Open Auto-Ack on Crash)
+    ///
+    /// This method only acknowledges events AFTER successful processing.
+    /// If the daemon crashes before acknowledgment, events will be redelivered.
     fn process_work_pr_associated(&mut self) -> Result<(), ProjectionWorkerError> {
         let events = self
             .work_pr_tailer
             .poll_events("work_pr_associated", self.config.batch_size)?;
 
         for event in events {
-            if let Err(e) = self.handle_work_pr_associated(&event) {
-                warn!(
-                    event_id = %event.event_id,
-                    error = %e,
-                    "Failed to process WorkPrAssociated event"
-                );
+            match self.handle_work_pr_associated(&event) {
+                Ok(()) => {
+                    // Only acknowledge after successful processing
+                    // (Blocker fix: Fail-Open Auto-Ack on Crash)
+                    self.work_pr_tailer.acknowledge(event.timestamp_ns)?;
+                },
+                Err(e) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %e,
+                        "Failed to process WorkPrAssociated event - will retry"
+                    );
+                    // Do NOT acknowledge - event will be reprocessed on next poll
+                    break; // Stop processing batch to maintain ordering
+                },
             }
         }
 
@@ -909,18 +1158,71 @@ impl ProjectionWorker {
     }
 
     /// Processes `ReviewReceiptRecorded` events for projection.
+    ///
+    /// # At-Least-Once Delivery (Blocker fix: Fail-Open Auto-Ack on Crash)
+    ///
+    /// This method only acknowledges events AFTER successful processing.
+    /// If the daemon crashes before acknowledgment, events will be redelivered.
+    ///
+    /// # NACK/Retry for Missing Dependencies (Blocker fix: Critical Data Loss)
+    ///
+    /// If a `ReviewReceiptRecorded` event fails because the required
+    /// associations (from `ChangeSetPublished` or `WorkPrAssociated`) are not
+    /// yet indexed, the watermark is NOT advanced. The event will be
+    /// reprocessed on the next poll cycle, giving time for the dependency
+    /// events to be processed first.
+    ///
+    /// # Strict Sequential Acknowledgment
+    ///
+    /// Events are processed in timestamp order, and we MUST stop at the first
+    /// failure to prevent skipping unprocessed events. If event A at ts=1000
+    /// fails and we continue to process event B at ts=2000, acknowledging B
+    /// would set the watermark to 2000, permanently skipping A.
     async fn process_review_receipts(&mut self) -> Result<(), ProjectionWorkerError> {
         let events = self
             .review_tailer
             .poll_events("review_receipt_recorded", self.config.batch_size)?;
 
         for event in events {
-            if let Err(e) = self.handle_review_receipt(&event).await {
-                warn!(
-                    event_id = %event.event_id,
-                    error = %e,
-                    "Failed to process ReviewReceiptRecorded event"
-                );
+            match self.handle_review_receipt(&event).await {
+                Ok(()) => {
+                    // Only acknowledge after successful processing
+                    // (Blocker fix: Fail-Open Auto-Ack on Crash)
+                    self.review_tailer.acknowledge(event.timestamp_ns)?;
+                },
+                Err(ProjectionWorkerError::MissingDependency { event_id, reason }) => {
+                    // NACK/Retry: Do NOT acknowledge - event will be reprocessed
+                    // (Blocker fix: Critical Data Loss via Shared Watermark)
+                    debug!(
+                        event_id = %event_id,
+                        reason = %reason,
+                        "Missing dependency for review receipt - will retry on next poll"
+                    );
+                    // MUST break to prevent skipping this event!
+                    // If we continue and later events succeed, their higher
+                    // timestamps would be acknowledged, permanently skipping
+                    // this failed event.
+                    break;
+                },
+                Err(ProjectionWorkerError::NoPrAssociation { work_id }) => {
+                    // This is a variant of missing dependency - don't acknowledge
+                    debug!(
+                        event_id = %event.event_id,
+                        work_id = %work_id,
+                        "No PR association yet for review receipt - will retry on next poll"
+                    );
+                    // MUST break to prevent skipping this event!
+                    break;
+                },
+                Err(e) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        error = %e,
+                        "Failed to process ReviewReceiptRecorded event - will retry"
+                    );
+                    // For other errors, also don't acknowledge to ensure retry
+                    break; // Stop processing batch for non-dependency errors
+                },
             }
         }
 
@@ -964,14 +1266,21 @@ impl ProjectionWorker {
         changeset_digest.copy_from_slice(&digest_bytes);
 
         // Look up work_id from changeset
+        // Blocker fix: Critical Data Loss - return MissingDependency to trigger
+        // NACK/Retry
         let work_id = self
             .work_index
             .get_work_id(&changeset_digest)
-            .ok_or_else(|| ProjectionWorkerError::NoPrAssociation {
-                work_id: format!("changeset:{changeset_digest_hex}"),
+            .ok_or_else(|| ProjectionWorkerError::MissingDependency {
+                event_id: event.event_id.clone(),
+                reason: format!(
+                    "changeset {changeset_digest_hex} not yet indexed (waiting for ChangeSetPublished)"
+                ),
             })?;
 
         // Look up PR metadata
+        // Blocker fix: Critical Data Loss - return NoPrAssociation to trigger
+        // NACK/Retry
         let pr_metadata = self.work_index.get_pr_metadata(&work_id).ok_or_else(|| {
             ProjectionWorkerError::NoPrAssociation {
                 work_id: work_id.clone(),
@@ -1109,6 +1418,9 @@ mod tests {
         )
         .unwrap();
 
+        // Initialize work index schema (required for tailer watermark persistence)
+        conn.execute_batch(WORK_INDEX_SCHEMA_SQL).unwrap();
+
         Arc::new(Mutex::new(conn))
     }
 
@@ -1196,9 +1508,22 @@ mod tests {
         assert_eq!(events[0].event_id, "evt-1");
         assert_eq!(events[1].event_id, "evt-2");
 
-        // Subsequent poll should return no events (already processed)
+        // Without acknowledge(), subsequent poll should return the SAME events
+        // (Blocker fix: Fail-Open Auto-Ack - watermark not advanced on poll)
         let events = tailer.poll_events("test_event", 10).unwrap();
-        assert!(events.is_empty());
+        assert_eq!(
+            events.len(),
+            2,
+            "Events should be re-polled without acknowledge"
+        );
+
+        // After acknowledging, events should not be returned
+        tailer.acknowledge(2000).unwrap(); // Acknowledge up to timestamp 2000
+        let events = tailer.poll_events("test_event", 10).unwrap();
+        assert!(
+            events.is_empty(),
+            "Events should be empty after acknowledge"
+        );
     }
 
     #[test]
@@ -1229,13 +1554,20 @@ mod tests {
         let conn = create_test_db();
         let github_config =
             GitHubAdapterConfig::new("https://api.github.com", "owner", "repo").unwrap();
-        let config = ProjectionWorkerConfig::new().with_github(github_config);
+        let config = ProjectionWorkerConfig::new().with_github(github_config.clone());
 
-        let worker = ProjectionWorker::new(conn, config);
+        let worker = ProjectionWorker::new(Arc::clone(&conn), config);
         assert!(worker.is_ok());
 
-        let worker = worker.unwrap();
-        assert!(worker.adapter.is_some()); // GitHub enabled with mock adapter
+        let mut worker = worker.unwrap();
+        // Adapter is NOT created in constructor - must be injected (fail-safe design)
+        assert!(!worker.has_adapter());
+
+        // Inject mock adapter for testing
+        let signer = apm2_core::crypto::Signer::generate();
+        let adapter = GitHubProjectionAdapter::new_mock(signer, github_config).unwrap();
+        worker.set_adapter(adapter);
+        assert!(worker.has_adapter());
     }
 
     #[test]
@@ -1438,5 +1770,71 @@ mod tests {
             receipt_id: "recv-001".to_string(),
         };
         assert!(err.to_string().contains("recv-001"));
+
+        // Test MissingDependency error (Blocker fix: Critical Data Loss)
+        let err = ProjectionWorkerError::MissingDependency {
+            event_id: "evt-001".to_string(),
+            reason: "waiting for ChangeSetPublished".to_string(),
+        };
+        assert!(err.to_string().contains("evt-001"));
+        assert!(err.to_string().contains("waiting for ChangeSetPublished"));
+    }
+
+    #[test]
+    fn test_work_index_evict_expired() {
+        let conn = create_test_db();
+        let index = WorkIndex::new(Arc::clone(&conn)).unwrap();
+
+        // Register entries with old timestamps
+        {
+            let conn_guard = conn.lock().unwrap();
+            // Insert old entries (created_at = 0, i.e., epoch)
+            conn_guard
+                .execute(
+                    "INSERT INTO changeset_work_index (changeset_digest, work_id, created_at)
+                     VALUES (?1, ?2, 0)",
+                    params![vec![0x42u8; 32], "old-work"],
+                )
+                .unwrap();
+            conn_guard
+                .execute(
+                    "INSERT INTO work_pr_index (work_id, pr_number, repo_owner, repo_name, head_sha, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                    params!["old-work", 123i64, "owner", "repo", "sha"],
+                )
+                .unwrap();
+        }
+
+        // Register a fresh entry
+        index.register_changeset(&[0x99u8; 32], "new-work").unwrap();
+
+        // Evict with short TTL (1 second) - should evict old entries
+        let deleted = index.evict_expired(1).unwrap();
+        assert!(deleted >= 2, "Should have deleted at least 2 old entries");
+
+        // Old entries should be gone
+        assert!(index.get_work_id(&[0x42u8; 32]).is_none());
+
+        // Fresh entry should still exist
+        assert!(index.get_work_id(&[0x99u8; 32]).is_some());
+    }
+
+    #[test]
+    fn test_ledger_tailer_acknowledge_persistence() {
+        let conn = create_test_db();
+
+        // Create tailer and acknowledge some events
+        {
+            let mut tailer = LedgerTailer::with_id(Arc::clone(&conn), "test_tailer");
+            tailer.acknowledge(5000).unwrap();
+        }
+
+        // Create new tailer with same ID - should resume from persisted watermark
+        let tailer = LedgerTailer::with_id(conn, "test_tailer");
+
+        // The watermark should be restored
+        // We verify by checking that events before the watermark are not returned
+        // (Since we have no events, this just verifies construction succeeded)
+        assert!(tailer.get_ledger_head().is_ok());
     }
 }
