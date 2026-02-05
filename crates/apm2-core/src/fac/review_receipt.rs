@@ -310,6 +310,16 @@ pub struct ReviewArtifactBundleV1 {
     pub tool_log_hashes: Vec<String>,
     /// HTF time envelope reference hash (32 bytes, hex-encoded).
     pub time_envelope_ref: String,
+    /// View commitment hash (from CAS).
+    ///
+    /// Represents the materialized workspace state at the time of review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_commitment_hash: Option<String>,
+    /// Policy resolved reference.
+    ///
+    /// The policy resolution binding used for the review session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_resolved_ref: Option<String>,
     /// Optional metadata for review context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ReviewMetadata>,
@@ -405,6 +415,31 @@ impl ReviewArtifactBundleV1 {
             ));
         }
 
+        // Validate view_commitment_hash if present
+        if let Some(ref hash) = self.view_commitment_hash {
+            if hash.len() != 64 {
+                return Err(ReviewReceiptError::InvalidData(
+                    "view_commitment_hash must be 64 hex characters".into(),
+                ));
+            }
+        }
+
+        // Validate policy_resolved_ref if present
+        if let Some(ref reference) = self.policy_resolved_ref {
+            if reference.is_empty() {
+                return Err(ReviewReceiptError::InvalidData(
+                    "policy_resolved_ref must not be empty".into(),
+                ));
+            }
+            if reference.len() > MAX_STRING_LENGTH {
+                return Err(ReviewReceiptError::StringTooLong {
+                    field: "policy_resolved_ref",
+                    len: reference.len(),
+                    max: MAX_STRING_LENGTH,
+                });
+            }
+        }
+
         // Validate metadata if present
         if let Some(ref metadata) = self.metadata {
             metadata.validate()?;
@@ -426,6 +461,8 @@ pub struct ReviewArtifactBundleV1Builder {
     review_text_hash: Option<[u8; 32]>,
     tool_log_hashes: Vec<[u8; 32]>,
     time_envelope_ref: Option<[u8; 32]>,
+    view_commitment_hash: Option<[u8; 32]>,
+    policy_resolved_ref: Option<String>,
     metadata: Option<ReviewMetadata>,
 }
 
@@ -473,6 +510,20 @@ impl ReviewArtifactBundleV1Builder {
         self
     }
 
+    /// Sets the view commitment hash.
+    #[must_use]
+    pub fn view_commitment_hash(mut self, hash: [u8; 32]) -> Self {
+        self.view_commitment_hash = Some(hash);
+        self
+    }
+
+    /// Sets the policy resolved reference.
+    #[must_use]
+    pub fn policy_resolved_ref(mut self, reference: impl Into<String>) -> Self {
+        self.policy_resolved_ref = Some(reference.into());
+        self
+    }
+
     /// Sets the metadata.
     #[must_use]
     pub fn metadata(mut self, metadata: ReviewMetadata) -> Self {
@@ -481,6 +532,10 @@ impl ReviewArtifactBundleV1Builder {
     }
 
     /// Builds the `ReviewArtifactBundleV1`.
+    ///
+    /// This method builds the bundle with optional `view_commitment_hash` and
+    /// `policy_resolved_ref` fields. For fail-closed behavior that requires
+    /// these fields, use [`Self::build_strict`] instead.
     ///
     /// # Errors
     ///
@@ -516,11 +571,92 @@ impl ReviewArtifactBundleV1Builder {
             review_text_hash: hex::encode(review_text_hash),
             tool_log_hashes: self.tool_log_hashes.iter().map(hex::encode).collect(),
             time_envelope_ref: hex::encode(time_envelope_ref),
+            view_commitment_hash: self.view_commitment_hash.map(hex::encode),
+            policy_resolved_ref: self.policy_resolved_ref,
             metadata: self.metadata,
         };
 
         bundle.validate()?;
         Ok(bundle)
+    }
+
+    /// Builds the `ReviewArtifactBundleV1` with strict holon-ready requirements
+    /// (TCK-00325).
+    ///
+    /// This method enforces the fail-closed requirement from SEC-CTRL-FAC-0015:
+    /// review outcomes MUST bind to a verifiable view commitment and policy
+    /// resolution. Missing these bindings is a hard failure that should result
+    /// in `ReviewBlockedRecorded` with `ReasonCode::MissingViewCommitment`.
+    ///
+    /// # Required Fields (in addition to base `build()` requirements)
+    ///
+    /// - `view_commitment_hash`: CAS hash of the `ViewCommitmentV1`
+    /// - `policy_resolved_ref`: Reference to `PolicyResolvedForChangeSet`
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Any required field from `build()` is missing
+    /// - `view_commitment_hash` is missing
+    /// - `policy_resolved_ref` is missing
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::fac::ReviewArtifactBundleV1;
+    ///
+    /// let bundle = ReviewArtifactBundleV1::builder()
+    ///     .review_id("review-001")
+    ///     .changeset_digest([0x42; 32])
+    ///     .review_text_hash([0x11; 32])
+    ///     .time_envelope_ref([0x44; 32])
+    ///     .view_commitment_hash([0x55; 32])
+    ///     .policy_resolved_ref("policy-ref-001")
+    ///     .build_strict()
+    ///     .expect("valid bundle with holon-ready bindings");
+    ///
+    /// assert!(bundle.view_commitment_hash.is_some());
+    /// assert!(bundle.policy_resolved_ref.is_some());
+    /// ```
+    pub fn build_strict(self) -> Result<ReviewArtifactBundleV1, ReviewReceiptError> {
+        // First validate that holon-ready fields are present
+        if self.view_commitment_hash.is_none() {
+            return Err(ReviewReceiptError::MissingField("view_commitment_hash"));
+        }
+        if self.policy_resolved_ref.is_none() {
+            return Err(ReviewReceiptError::MissingField("policy_resolved_ref"));
+        }
+
+        // Delegate to normal build
+        self.build()
+    }
+
+    /// Checks if the builder has holon-ready bindings set.
+    ///
+    /// Returns `true` if both `view_commitment_hash` and `policy_resolved_ref`
+    /// are set. This can be used to decide whether to proceed with
+    /// `build_strict()` or emit `ReviewBlockedRecorded`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::fac::ReviewArtifactBundleV1;
+    ///
+    /// let builder = ReviewArtifactBundleV1::builder()
+    ///     .review_id("review-001")
+    ///     .changeset_digest([0x42; 32])
+    ///     .review_text_hash([0x11; 32])
+    ///     .time_envelope_ref([0x44; 32]);
+    ///
+    /// if builder.has_holon_ready_bindings() {
+    ///     // Proceed with build_strict()
+    /// } else {
+    ///     // Emit ReviewBlockedRecorded with MissingViewCommitment
+    /// }
+    /// ```
+    #[must_use]
+    pub fn has_holon_ready_bindings(&self) -> bool {
+        self.view_commitment_hash.is_some() && self.policy_resolved_ref.is_some()
     }
 }
 
@@ -1198,5 +1334,135 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ==========================================================================
+    // TCK-00325: build_strict and holon-ready bindings tests
+    // ==========================================================================
+
+    #[test]
+    fn test_artifact_bundle_build_strict_success() {
+        let bundle = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32])
+            .view_commitment_hash([0x55; 32])
+            .policy_resolved_ref("policy-ref-001")
+            .build_strict()
+            .expect("valid bundle with holon-ready bindings");
+
+        assert!(bundle.view_commitment_hash.is_some());
+        assert!(bundle.policy_resolved_ref.is_some());
+        assert_eq!(
+            bundle.view_commitment_hash.unwrap(),
+            hex::encode([0x55; 32])
+        );
+        assert_eq!(bundle.policy_resolved_ref.unwrap(), "policy-ref-001");
+    }
+
+    #[test]
+    fn test_artifact_bundle_build_strict_missing_view_commitment() {
+        // Missing view_commitment_hash should fail
+        let result = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32])
+            .policy_resolved_ref("policy-ref-001")
+            // Note: view_commitment_hash NOT set
+            .build_strict();
+
+        assert!(matches!(
+            result,
+            Err(ReviewReceiptError::MissingField("view_commitment_hash"))
+        ));
+    }
+
+    #[test]
+    fn test_artifact_bundle_build_strict_missing_policy_ref() {
+        // Missing policy_resolved_ref should fail
+        let result = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32])
+            .view_commitment_hash([0x55; 32])
+            // Note: policy_resolved_ref NOT set
+            .build_strict();
+
+        assert!(matches!(
+            result,
+            Err(ReviewReceiptError::MissingField("policy_resolved_ref"))
+        ));
+    }
+
+    #[test]
+    fn test_artifact_bundle_has_holon_ready_bindings() {
+        // Without bindings
+        let builder = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32]);
+
+        assert!(!builder.has_holon_ready_bindings());
+
+        // With only view_commitment_hash
+        let builder = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32])
+            .view_commitment_hash([0x55; 32]);
+
+        assert!(!builder.has_holon_ready_bindings());
+
+        // With only policy_resolved_ref
+        let builder = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32])
+            .policy_resolved_ref("policy-ref");
+
+        assert!(!builder.has_holon_ready_bindings());
+
+        // With both bindings
+        let builder = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32])
+            .view_commitment_hash([0x55; 32])
+            .policy_resolved_ref("policy-ref");
+
+        assert!(builder.has_holon_ready_bindings());
+    }
+
+    #[test]
+    fn test_artifact_bundle_build_vs_build_strict() {
+        // Regular build() succeeds without holon-ready bindings
+        let result = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32])
+            .build();
+
+        assert!(result.is_ok());
+        let bundle = result.unwrap();
+        assert!(bundle.view_commitment_hash.is_none());
+        assert!(bundle.policy_resolved_ref.is_none());
+
+        // build_strict() fails without holon-ready bindings
+        let result = ReviewArtifactBundleV1::builder()
+            .review_id("review-001")
+            .changeset_digest([0x42; 32])
+            .review_text_hash([0x11; 32])
+            .time_envelope_ref([0x44; 32])
+            .build_strict();
+
+        assert!(result.is_err());
     }
 }

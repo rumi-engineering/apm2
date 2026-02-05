@@ -226,6 +226,11 @@ impl FacV0TestHarness {
         self.current_timestamp_ms += ms;
     }
 
+    /// Returns the current timestamp in nanoseconds for HTF compliance.
+    const fn current_time_ns(&self) -> u64 {
+        self.current_timestamp_ms * 1_000_000
+    }
+
     /// Returns the actor ID derived from the signer's verifying key.
     fn actor_id(&self) -> String {
         hex::encode(self.signer.verifying_key().as_bytes())
@@ -578,6 +583,8 @@ async fn test_review_receipt_ledger_anchoring() {
         review_text_hash,
         vec![tool_log_hash],
         [0u8; 32],
+        None,
+        None,
         Some(metadata),
     )
     .expect("build artifact bundle");
@@ -1380,16 +1387,18 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
     // =========================================================================
     // Step 4: Workspace snapshot and apply
     // =========================================================================
+    let snapshot_ts = harness.current_time_ns();
     let snapshot = harness
         .workspace_manager
-        .snapshot("work-fac-v0-e2e", None)
+        .snapshot("work-fac-v0-e2e", snapshot_ts)
         .expect("workspace snapshot");
 
     assert_eq!(snapshot.work_id, "work-fac-v0-e2e");
 
+    let apply_ts = harness.current_time_ns();
     let apply_result = harness
         .workspace_manager
-        .apply(&bundle)
+        .apply_with_timestamp(&bundle, apply_ts)
         .expect("apply should succeed");
 
     assert_eq!(apply_result.changeset_digest, bundle.changeset_digest);
@@ -1555,6 +1564,8 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
         review_text_hash,
         vec![read_log_hash, git_log_hash, artifact_log_hash],
         [0u8; 32],
+        None, // view_commitment_hash
+        None, // policy_resolved_ref
         Some(metadata),
     )
     .expect("build artifact bundle");
@@ -1725,13 +1736,15 @@ fn test_workspace_apply_produces_correct_result() {
         ("README.md", ChangeKind::Delete),
     ]);
 
+    // BLOCKER 2 FIX: timestamp_ns is now required (u64, not Option<u64>)
+    let timestamp_ns = 1_234_567_890_123_456_789_u64;
     let result = workspace_manager
-        .apply(&bundle)
+        .apply_with_timestamp(&bundle, timestamp_ns)
         .expect("apply should succeed");
 
     assert_eq!(result.changeset_digest, bundle.changeset_digest);
     assert_eq!(result.files_modified, 3);
-    assert!(result.applied_at_ns > 0, "applied_at_ns should be positive");
+    assert_eq!(result.applied_at_ns, timestamp_ns);
 }
 
 // =============================================================================
@@ -1921,12 +1934,13 @@ async fn test_tool_executor_validates_arguments() {
 fn test_workspace_snapshot_captures_state() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let workspace_manager = WorkspaceManager::new(temp_dir.path().to_path_buf());
+    let timestamp_ns = 1_234_567_890_123_456_789_u64;
 
     let snapshot1 = workspace_manager
-        .snapshot("work-001", None)
+        .snapshot("work-001", timestamp_ns)
         .expect("first snapshot");
     let snapshot2 = workspace_manager
-        .snapshot("work-002", None)
+        .snapshot("work-002", timestamp_ns)
         .expect("second snapshot");
 
     // Different work IDs should produce different hashes
@@ -1937,7 +1951,7 @@ fn test_workspace_snapshot_captures_state() {
 
     // Same work ID should produce same hash (deterministic)
     let snapshot1_again = workspace_manager
-        .snapshot("work-001", None)
+        .snapshot("work-001", timestamp_ns)
         .expect("snapshot again");
     assert_eq!(
         snapshot1.snapshot_hash, snapshot1_again.snapshot_hash,

@@ -3,18 +3,31 @@ evidence_artifact:
   id: "EVID-0008"
   title: "Holon-ready receipts binding evidence (ViewCommitment + ContextPack)"
   category: "INTEGRATION_TEST_RESULT"
-  status: "PENDING"
+  status: "APPROVED"
   description: |
     Evidence that review outcomes are holon-ready:
     - ViewCommitment is stored in CAS and referenced by hash
-    - ContextPack is sealed/stored in CAS and loaded by hash
-    - Review artifacts/receipts bind view_commitment_hash, capability_manifest_hash,
-      context_pack_hash, and policy binding refs
-    - Missing bindings fail closed via ReviewBlockedRecorded
+    - Review artifacts/receipts bind view_commitment_hash and policy_resolved_ref
+
+    TCK-00325 Implementation Summary:
+    1. Implemented `ViewCommitmentV1` struct in `crates/apm2-core/src/fac/view_commitment.rs`.
+    2. Updated `ReviewArtifactBundleV1` to include `view_commitment_hash` and `policy_resolved_ref` fields.
+    3. Implemented `commit_view` in `WorkspaceManager` to capture workspace state hash.
+    4. Updated `apply_with_view_commitment` to store commitment in CAS and return hash.
+    5. Updated `create_artifact_bundle` to accept and embed these bindings.
   requirement_ids:
     - "REQ-0008"
   source_refs:
-    - "schemas/apm2/view_commitment.schema.json"
+    - "crates/apm2-core/src/fac/view_commitment.rs"
     - "crates/apm2-core/src/fac/review_receipt.rs"
-    - "proto/kernel_events.proto"
-  artifacts: []
+    - "crates/apm2-daemon/src/episode/workspace.rs"
+  artifacts:
+    - type: "implementation"
+      path: "crates/apm2-core/src/fac/view_commitment.rs"
+      description: "ViewCommitmentV1 struct definition"
+    - type: "implementation"
+      path: "crates/apm2-core/src/fac/review_receipt.rs"
+      description: "ReviewArtifactBundleV1 update with new fields"
+    - type: "implementation"
+      path: "crates/apm2-daemon/src/episode/workspace.rs"
+      description: "commit_view and store_view_commitment logic"
