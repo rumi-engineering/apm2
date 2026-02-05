@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use apm2_core::config::EcosystemConfig;
+use apm2_core::credentials::CredentialStore;
 use apm2_core::process::ProcessId;
 use apm2_core::process::runner::ProcessRunner;
 use apm2_core::schema_registry::InMemorySchemaRegistry;
@@ -47,6 +48,19 @@ use crate::protocol::resource_governance::{SharedSubscriptionRegistry, Subscript
 use crate::protocol::session_dispatch::{InMemoryManifestStore, ManifestStore, SessionDispatcher};
 use crate::protocol::session_token::TokenMinter;
 use crate::session::SessionRegistry;
+
+// ============================================================================
+// TCK-00343: Credential Store Service Name
+// ============================================================================
+
+/// Service name for the credential store keyring entries (TCK-00343).
+///
+/// This service name is used when creating the `CredentialStore` that backs
+/// the credential management IPC commands (`ListCredentials`, `AddCredential`,
+/// `RemoveCredential`, etc.). It is distinct from the signing key service name
+/// (`apm2-receipt-signing`) and GitHub token service name
+/// (`apm2-github-tokens`) to avoid keyring entry collisions.
+const CREDENTIAL_STORE_SERVICE_NAME: &str = "apm2-credentials";
 
 // ============================================================================
 // TCK-00287: Fail-Closed Manifest Store (kept for potential future use)
@@ -183,6 +197,10 @@ impl DispatcherState {
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
+        // TCK-00343: Create credential store for credential management
+        let credential_store =
+            Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
+
         // TCK-00287 BLOCKER 1 & 2: Create privileged dispatcher with shared state
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
             Arc::clone(&token_minter),
@@ -190,7 +208,8 @@ impl DispatcherState {
             Arc::clone(&session_registry),
             clock,
             Arc::clone(&subscription_registry),
-        );
+        )
+        .with_credential_store(credential_store);
 
         // Add metrics if provided
         let privileged_dispatcher = if let Some(metrics) = metrics_registry {
@@ -252,6 +271,10 @@ impl DispatcherState {
         let subscription_registry: SharedSubscriptionRegistry =
             Arc::new(SubscriptionRegistry::with_defaults());
 
+        // TCK-00343: Create credential store for credential management
+        let credential_store =
+            Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
+
         // TCK-00287 BLOCKER 1: Create privileged dispatcher with global session
         // registry
         let privileged_dispatcher = PrivilegedDispatcher::with_shared_state(
@@ -260,7 +283,8 @@ impl DispatcherState {
             Arc::clone(&session_registry),
             clock,
             Arc::clone(&subscription_registry),
-        );
+        )
+        .with_credential_store(credential_store);
 
         // Add metrics if provided
         let privileged_dispatcher = if let Some(metrics) = metrics_registry {
@@ -311,6 +335,10 @@ impl DispatcherState {
         // TCK-00344: Clone session_registry before it is moved into the
         // privileged dispatcher so we can also wire it into the session dispatcher.
         let session_registry_for_session = Arc::clone(&session_registry);
+
+        // TCK-00343: Create credential store for credential management
+        let credential_store =
+            Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
 
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
@@ -396,7 +424,8 @@ impl DispatcherState {
                 clock,
                 Arc::clone(&subscription_registry),
             )
-        };
+        }
+        .with_credential_store(credential_store);
 
         let privileged_dispatcher = if let Some(metrics) = metrics_registry {
             privileged_dispatcher.with_metrics(metrics)
@@ -543,6 +572,10 @@ impl DispatcherState {
 
         let episode_runtime = Arc::new(episode_runtime);
 
+        // TCK-00343: Create credential store for credential management
+        let credential_store =
+            Arc::new(CredentialStore::new(CREDENTIAL_STORE_SERVICE_NAME));
+
         let privileged_dispatcher = PrivilegedDispatcher::with_dependencies(
             DecodeConfig::default(),
             policy_resolver,
@@ -557,7 +590,8 @@ impl DispatcherState {
             // TCK-00317: Pre-seed CAS with reviewer v0 manifest
             Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest()),
             Arc::clone(&subscription_registry),
-        );
+        )
+        .with_credential_store(credential_store);
 
         let privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
             privileged_dispatcher.with_metrics(Arc::clone(metrics))
