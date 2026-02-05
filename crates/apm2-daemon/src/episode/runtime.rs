@@ -49,7 +49,6 @@ use super::state::{EpisodeState, QuarantineReason, TerminationClass};
 use super::tool_handler::{ToolArgs, ToolHandler};
 use crate::htf::HolonicClock;
 use crate::protocol::dispatch::LedgerEventEmitter;
-use apm2_core::fac::ToolOutputCache;
 
 /// Maximum number of concurrent episodes per runtime.
 ///

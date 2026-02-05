@@ -121,6 +121,12 @@ pub const MAX_CATEGORY_LENGTH: usize = 64;
 /// Maximum number of zoom-in selectors.
 pub const MAX_ZOOM_SELECTORS: usize = 50;
 
+/// Maximum string length for zoom selector values.
+pub const MAX_SELECTOR_VALUE_LENGTH: usize = 4096;
+
+/// Maximum string length for work IDs.
+pub const MAX_WORK_ID_LENGTH: usize = 256;
+
 /// Maximum number of deltas in an iteration context.
 pub const MAX_DELTAS: usize = 100;
 
@@ -469,10 +475,21 @@ impl Finding {
     }
 
     /// Sets the file path for the finding.
-    #[must_use]
-    pub fn with_file_path(mut self, path: impl Into<String>) -> Self {
-        self.file_path = Some(path.into());
-        self
+    ///
+    /// # Errors
+    ///
+    /// Returns error if path exceeds `MAX_PATH_LENGTH`.
+    pub fn with_file_path(mut self, path: impl Into<String>) -> Result<Self, EfficiencyError> {
+        let path = path.into();
+        if path.len() > MAX_PATH_LENGTH {
+            return Err(EfficiencyError::StringTooLong {
+                field: "file_path",
+                len: path.len(),
+                max: MAX_PATH_LENGTH,
+            });
+        }
+        self.file_path = Some(path);
+        Ok(self)
     }
 
     /// Sets the line number for the finding.
@@ -945,9 +962,22 @@ impl CacheKey {
     }
 
     /// Returns the cache key as a string.
+    ///
+    /// The string format includes the isolation key when present:
+    /// - Without isolation: `"tool_type:input_hash_hex"`
+    /// - With isolation: `"tool_type:input_hash_hex:isolation_key"`
     #[must_use]
+    #[allow(clippy::option_if_let_else)]
     pub fn as_string(&self) -> String {
-        format!("{}:{}", self.tool_type, hex::encode(self.input_hash))
+        match &self.isolation_key {
+            Some(iso) => format!(
+                "{}:{}:{}",
+                self.tool_type,
+                hex::encode(self.input_hash),
+                iso
+            ),
+            None => format!("{}:{}", self.tool_type, hex::encode(self.input_hash)),
+        }
     }
 }
 
@@ -1253,36 +1283,74 @@ pub enum ZoomSelectorType {
 
 impl ZoomSelector {
     /// Creates a file zoom selector.
-    #[must_use]
-    pub fn file(path: impl Into<String>) -> Self {
-        Self {
-            selector_type: ZoomSelectorType::File,
-            value: path.into(),
-            detail_hash: None,
+    ///
+    /// # Errors
+    ///
+    /// Returns error if path exceeds `MAX_SELECTOR_VALUE_LENGTH`.
+    pub fn file(path: impl Into<String>) -> Result<Self, EfficiencyError> {
+        let value = path.into();
+        if value.len() > MAX_SELECTOR_VALUE_LENGTH {
+            return Err(EfficiencyError::StringTooLong {
+                field: "selector_value",
+                len: value.len(),
+                max: MAX_SELECTOR_VALUE_LENGTH,
+            });
         }
+        Ok(Self {
+            selector_type: ZoomSelectorType::File,
+            value,
+            detail_hash: None,
+        })
     }
 
     /// Creates a finding zoom selector.
-    #[must_use]
-    pub fn finding(id: impl Into<String>) -> Self {
-        Self {
-            selector_type: ZoomSelectorType::Finding,
-            value: id.into(),
-            detail_hash: None,
+    ///
+    /// # Errors
+    ///
+    /// Returns error if id exceeds `MAX_SELECTOR_VALUE_LENGTH`.
+    pub fn finding(id: impl Into<String>) -> Result<Self, EfficiencyError> {
+        let value = id.into();
+        if value.len() > MAX_SELECTOR_VALUE_LENGTH {
+            return Err(EfficiencyError::StringTooLong {
+                field: "selector_value",
+                len: value.len(),
+                max: MAX_SELECTOR_VALUE_LENGTH,
+            });
         }
+        Ok(Self {
+            selector_type: ZoomSelectorType::Finding,
+            value,
+            detail_hash: None,
+        })
     }
 
     /// Creates a tool output zoom selector.
-    #[must_use]
-    pub fn tool_output(id: impl Into<String>, detail_hash: [u8; 32]) -> Self {
-        Self {
-            selector_type: ZoomSelectorType::ToolOutput,
-            value: id.into(),
-            detail_hash: Some(detail_hash),
+    ///
+    /// # Errors
+    ///
+    /// Returns error if id exceeds `MAX_SELECTOR_VALUE_LENGTH`.
+    pub fn tool_output(
+        id: impl Into<String>,
+        detail_hash: [u8; 32],
+    ) -> Result<Self, EfficiencyError> {
+        let value = id.into();
+        if value.len() > MAX_SELECTOR_VALUE_LENGTH {
+            return Err(EfficiencyError::StringTooLong {
+                field: "selector_value",
+                len: value.len(),
+                max: MAX_SELECTOR_VALUE_LENGTH,
+            });
         }
+        Ok(Self {
+            selector_type: ZoomSelectorType::ToolOutput,
+            value,
+            detail_hash: Some(detail_hash),
+        })
     }
 
     /// Creates an iteration zoom selector.
+    ///
+    /// This cannot fail as iteration numbers are bounded.
     #[must_use]
     pub fn iteration(iteration: u64) -> Self {
         Self {
@@ -1509,12 +1577,23 @@ impl IterationContextBuilder {
     ///
     /// # Errors
     ///
-    /// Returns error if required fields are missing or validation fails.
+    /// Returns error if required fields are missing, validation fails, or
+    /// `work_id` exceeds `MAX_WORK_ID_LENGTH`.
     #[allow(clippy::cast_possible_truncation)]
     pub fn build(self) -> Result<IterationContext, EfficiencyError> {
         let work_id = self
             .work_id
             .ok_or(EfficiencyError::MissingField("work_id"))?;
+
+        // SEC-CTRL-FAC-0016: Validate work_id length
+        if work_id.len() > MAX_WORK_ID_LENGTH {
+            return Err(EfficiencyError::StringTooLong {
+                field: "work_id",
+                len: work_id.len(),
+                max: MAX_WORK_ID_LENGTH,
+            });
+        }
+
         let current_iteration = self
             .current_iteration
             .ok_or(EfficiencyError::MissingField("current_iteration"))?;
@@ -1744,6 +1823,45 @@ mod tests {
         assert_ne!(key1.input_hash, key3.input_hash);
     }
 
+    /// SEC-CTRL-FAC-0017: Test isolation key prevents cross-session leakage.
+    #[test]
+    fn test_cache_key_isolation() {
+        let cas: Arc<dyn ContentAddressedStore> = Arc::new(MemoryCas::new());
+        let cache = ToolOutputCache::with_defaults(cas);
+
+        // Same tool and input, different isolation keys
+        let key_session_a = CacheKey::with_isolation("FileRead", [0x11; 32], "episode-A");
+        let key_session_b = CacheKey::with_isolation("FileRead", [0x11; 32], "episode-B");
+        let key_no_isolation = CacheKey::new("FileRead", [0x11; 32]);
+
+        // Store content for session A
+        cache.store(&key_session_a, b"secret data A").unwrap();
+
+        // Session B should NOT see session A's data
+        assert!(cache.retrieve(&key_session_b).is_err());
+
+        // Unisolated key should also NOT see session A's data
+        assert!(cache.retrieve(&key_no_isolation).is_err());
+
+        // But session A should still see its own data
+        let retrieved = cache.retrieve(&key_session_a).unwrap();
+        assert_eq!(retrieved, b"secret data A");
+
+        // Verify key strings include isolation key
+        assert!(key_session_a.as_string().contains("episode-A"));
+        assert!(key_session_b.as_string().contains("episode-B"));
+        assert!(!key_no_isolation.as_string().contains("episode"));
+    }
+
+    #[test]
+    fn test_cache_key_with_isolation_builder() {
+        let key =
+            CacheKey::for_file_read("/src/main.rs", &[0x42; 32]).with_isolation_key("episode-123");
+
+        assert_eq!(key.isolation_key, Some("episode-123".to_string()));
+        assert!(key.as_string().contains("episode-123"));
+    }
+
     #[test]
     fn test_iteration_context_builder() {
         let delta = ContextDeltaBuilder::new(0, 1)
@@ -1755,7 +1873,7 @@ mod tests {
         let ctx = IterationContextBuilder::new("work-123", 1)
             .context_budget_bytes(100_000)
             .add_delta(delta)
-            .add_zoom_selector(ZoomSelector::file("/src/main.rs"))
+            .add_zoom_selector(ZoomSelector::file("/src/main.rs").unwrap())
             .build()
             .unwrap();
 
@@ -1839,7 +1957,7 @@ mod tests {
 
     #[test]
     fn test_zoom_selector_types() {
-        let file_selector = ZoomSelector::file("/src/main.rs");
+        let file_selector = ZoomSelector::file("/src/main.rs").unwrap();
         assert_eq!(file_selector.selector_type, ZoomSelectorType::File);
 
         let iteration_selector = ZoomSelector::iteration(5);
@@ -1848,6 +1966,26 @@ mod tests {
             ZoomSelectorType::Iteration
         );
         assert_eq!(iteration_selector.value, "5");
+    }
+
+    #[test]
+    fn test_zoom_selector_validation() {
+        let long_value = "a".repeat(MAX_SELECTOR_VALUE_LENGTH + 1);
+        let result = ZoomSelector::file(long_value);
+        assert!(matches!(result, Err(EfficiencyError::StringTooLong { .. })));
+    }
+
+    /// SEC-CTRL-FAC-0016: Test work_id length validation.
+    #[test]
+    fn test_work_id_length_validation() {
+        let long_work_id = "x".repeat(MAX_WORK_ID_LENGTH + 1);
+        let result = IterationContextBuilder::new(long_work_id, 1).build();
+        assert!(matches!(result, Err(EfficiencyError::StringTooLong { .. })));
+
+        // Valid length should succeed
+        let valid_work_id = "x".repeat(MAX_WORK_ID_LENGTH);
+        let result = IterationContextBuilder::new(valid_work_id, 1).build();
+        assert!(result.is_ok());
     }
 
     #[test]

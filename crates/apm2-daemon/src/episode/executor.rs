@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use apm2_core::fac::{CacheKey, ToolOutputCache};
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
@@ -48,7 +49,6 @@ use super::runtime::Hash;
 use super::tool_class::ToolClass;
 use super::tool_handler::{MAX_HANDLERS, ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
 use crate::htf::{ClockError, HolonicClock};
-use apm2_core::fac::{CacheKey, ToolOutputCache};
 
 // =============================================================================
 // ExecutorError
@@ -176,6 +176,20 @@ impl From<ClockError> for ExecutorError {
 /// # Thread Safety
 ///
 /// Implementations must be `Send + Sync` for use with async executors.
+///
+/// # Note on Trait Divergence
+///
+/// This trait differs from `apm2_core::evidence::ContentAddressedStore`:
+/// - This trait returns `Hash` and `Option<Vec<u8>>` directly
+/// - The core trait returns `Result<StoreResult, CasError>` and
+///   `Result<Vec<u8>, CasError>`
+///
+/// This divergence exists because the daemon requires infallible storage for
+/// tool results during execution (budget already charged), while the core
+/// trait supports fallible operations for disk-backed CAS implementations.
+///
+/// TODO(TCK-future): Unify these traits by extracting a common interface
+/// or providing adapters between the two representations.
 pub trait ContentAddressedStore: Send + Sync + std::fmt::Debug {
     /// Stores content and returns its BLAKE3 hash.
     fn store(&self, content: &[u8]) -> Hash;
@@ -430,21 +444,21 @@ impl ToolExecutor {
         let start_time = Instant::now();
 
         // TCK-00335: Check cache for Read/Search
-        let cache_key = if let Some(cache) = &self.output_cache {
-            Self::compute_cache_key(args)
-        } else {
-            None
-        };
+        let cache_key = self
+            .output_cache
+            .as_ref()
+            .and_then(|_| Self::compute_cache_key(args));
 
         if let Some(ref key) = cache_key {
             if let Some(cache) = &self.output_cache {
                 if let Ok(cached_bytes) = cache.retrieve(key) {
-                    if let Ok(cached_data) = serde_json::from_slice::<ToolResultData>(&cached_bytes) {
+                    if let Ok(cached_data) = serde_json::from_slice::<ToolResultData>(&cached_bytes)
+                    {
                         debug!(
                             tool_class = %tool_class,
                             "cache hit"
                         );
-                        
+
                         let cas_hash = self.cas.store(&cached_bytes); // Deduplicate
 
                         let mut result = ToolResult::success(
@@ -458,10 +472,11 @@ impl ToolExecutor {
 
                         if let Some(ref clock) = self.clock {
                             let notes = format!("tool.executed:{}", ctx.request_id);
-                            let (envelope, envelope_ref) = clock.stamp_envelope(Some(notes)).await?;
+                            let (envelope, envelope_ref) =
+                                clock.stamp_envelope(Some(notes)).await?;
                             result = result.with_time_envelope(envelope, envelope_ref);
                         }
-                        
+
                         return Ok(result);
                     }
                 }
@@ -529,7 +544,7 @@ impl ToolExecutor {
         if let Some(cache) = &self.output_cache {
             if let Some(key) = cache_key {
                 if let Ok(bytes) = serde_json::to_vec(&result_data) {
-                     let _ = cache.store(&key, &bytes);
+                    let _ = cache.store(&key, &bytes);
                 }
             }
             self.invalidate_cache(args, cache);
@@ -625,6 +640,7 @@ impl ToolExecutor {
     }
 
     /// Invalidates cache based on tool execution.
+    #[allow(clippy::unused_self)]
     fn invalidate_cache(&self, args: &ToolArgs, cache: &ToolOutputCache) {
         match args {
             ToolArgs::Write(_) => {
