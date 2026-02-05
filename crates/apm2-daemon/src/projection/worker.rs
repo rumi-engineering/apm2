@@ -138,9 +138,15 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
     CREATE INDEX IF NOT EXISTS idx_changeset_work_created ON changeset_work_index(created_at);
 
     -- Tailer watermark persistence (fixes blocker: non-persistent LedgerTailer)
+    -- MAJOR FIX: Potential Data Loss via Non-Unique Watermark
+    -- Now tracks (timestamp_ns, event_id) as a composite cursor to handle
+    -- multiple events with the same timestamp. Previously, if events A and B
+    -- both had timestamp 1000, acknowledging A would advance watermark to 1000,
+    -- causing B to be skipped on the next poll (since we query timestamp > 1000).
     CREATE TABLE IF NOT EXISTS tailer_watermark (
         tailer_id TEXT PRIMARY KEY,
         last_processed_ns INTEGER NOT NULL,
+        last_event_id TEXT NOT NULL DEFAULT '',
         updated_at INTEGER NOT NULL
     );
 
@@ -591,10 +597,22 @@ const DEFAULT_TAILER_ID: &str = "projection_worker";
 /// Tracks the last processed event sequence and polls for new events.
 /// Persists the watermark to `SQLite` for crash recovery (fixes blocker:
 /// non-persistent tailer).
+///
+/// # MAJOR FIX: Potential Data Loss via Non-Unique Watermark
+///
+/// The watermark now tracks `(timestamp_ns, event_id)` as a composite cursor
+/// instead of just `timestamp_ns`. This ensures that if multiple events share
+/// the same timestamp, acknowledging one won't skip the others.
+///
+/// The polling query uses `(timestamp_ns, event_id) > (last_ns, last_id)`
+/// to correctly handle timestamp collisions.
 pub struct LedgerTailer {
     conn: Arc<Mutex<Connection>>,
     /// Last processed event timestamp (for ordering).
     last_processed_ns: u64,
+    /// Last processed event ID (for deterministic ordering within same timestamp).
+    /// MAJOR FIX: Together with timestamp, forms a composite cursor.
+    last_event_id: String,
     /// Tailer identifier for watermark persistence.
     tailer_id: String,
 }
@@ -609,24 +627,28 @@ impl LedgerTailer {
     }
 
     /// Creates a new ledger tailer with a custom ID.
+    ///
+    /// MAJOR FIX: Potential Data Loss via Non-Unique Watermark
+    /// Now loads both timestamp_ns and event_id for composite cursor.
     #[allow(clippy::cast_sign_loss)]
     pub fn with_id(conn: Arc<Mutex<Connection>>, tailer_id: &str) -> Self {
-        // Load persisted watermark if available
-        let last_processed_ns = conn.lock().map_or(0, |conn_guard| {
+        // Load persisted watermark if available (now includes event_id)
+        let (last_processed_ns, last_event_id) = conn.lock().map_or((0, String::new()), |conn_guard| {
             conn_guard
                 .query_row(
-                    "SELECT last_processed_ns FROM tailer_watermark WHERE tailer_id = ?1",
+                    "SELECT last_processed_ns, COALESCE(last_event_id, '') FROM tailer_watermark WHERE tailer_id = ?1",
                     params![tailer_id],
-                    |row| row.get::<_, i64>(0),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 )
-                .map(|ns| ns as u64)
-                .unwrap_or(0)
+                .map(|(ns, event_id)| (ns as u64, event_id))
+                .unwrap_or((0, String::new()))
         });
 
         if last_processed_ns > 0 {
             info!(
                 tailer_id = %tailer_id,
                 last_processed_ns = last_processed_ns,
+                last_event_id = %last_event_id,
                 "Resumed ledger tailer from persisted watermark"
             );
         }
@@ -634,6 +656,7 @@ impl LedgerTailer {
         Self {
             conn,
             last_processed_ns,
+            last_event_id,
             tailer_id: tailer_id.to_string(),
         }
     }
@@ -644,6 +667,7 @@ impl LedgerTailer {
         Self {
             conn,
             last_processed_ns: timestamp_ns,
+            last_event_id: String::new(),
             tailer_id: DEFAULT_TAILER_ID.to_string(),
         }
     }
@@ -651,6 +675,9 @@ impl LedgerTailer {
     /// Persists the current watermark to `SQLite`.
     ///
     /// Called after processing events to ensure crash recovery.
+    ///
+    /// MAJOR FIX: Potential Data Loss via Non-Unique Watermark
+    /// Now persists both timestamp_ns and event_id for composite cursor.
     #[allow(clippy::cast_possible_wrap)]
     fn persist_watermark(&self) -> Result<(), ProjectionWorkerError> {
         let conn = self
@@ -665,9 +692,14 @@ impl LedgerTailer {
 
         conn.execute(
             "INSERT OR REPLACE INTO tailer_watermark
-             (tailer_id, last_processed_ns, updated_at)
-             VALUES (?1, ?2, ?3)",
-            params![self.tailer_id, self.last_processed_ns as i64, now as i64],
+             (tailer_id, last_processed_ns, last_event_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                self.tailer_id,
+                self.last_processed_ns as i64,
+                &self.last_event_id,
+                now as i64
+            ],
         )
         .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
@@ -676,8 +708,14 @@ impl LedgerTailer {
 
     /// Gets the next batch of unprocessed events of a given type.
     ///
-    /// Returns events ordered by `timestamp_ns`, starting after the last
-    /// processed timestamp.
+    /// Returns events ordered by `(timestamp_ns, event_id)`, starting after
+    /// the last processed cursor.
+    ///
+    /// # MAJOR FIX: Potential Data Loss via Non-Unique Watermark
+    ///
+    /// Uses a composite cursor `(timestamp_ns, event_id)` to handle timestamp
+    /// collisions. Events are ordered by timestamp first, then by event_id
+    /// (lexicographically) for deterministic ordering within the same timestamp.
     ///
     /// # At-Least-Once Delivery
     ///
@@ -697,18 +735,40 @@ impl LedgerTailer {
             .lock()
             .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
+        // MAJOR FIX: Use composite cursor (timestamp_ns, event_id) to handle
+        // timestamp collisions. The query selects events where:
+        // - timestamp > last_timestamp, OR
+        // - timestamp == last_timestamp AND event_id > last_event_id (only if last_event_id is set)
+        // This ensures no events are skipped when multiple events share a timestamp.
+        //
+        // When last_event_id is empty (e.g., from_timestamp or fresh start), we only use
+        // timestamp comparison to maintain backward compatibility and correct semantics:
+        // timestamp_ns > last means "everything after this timestamp".
+        let query = if self.last_event_id.is_empty() {
+            // No event_id cursor - use timestamp-only comparison
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM ledger_events
+             WHERE event_type = ?1 AND timestamp_ns > ?2
+             ORDER BY timestamp_ns ASC, event_id ASC
+             LIMIT ?3"
+        } else {
+            // Have event_id cursor - use composite comparison
+            "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+             FROM ledger_events
+             WHERE event_type = ?1 AND (
+                 timestamp_ns > ?2 OR
+                 (timestamp_ns = ?2 AND event_id > ?3)
+             )
+             ORDER BY timestamp_ns ASC, event_id ASC
+             LIMIT ?4"
+        };
+
         let mut stmt = conn
-            .prepare(
-                "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-                 FROM ledger_events
-                 WHERE event_type = ?1 AND timestamp_ns > ?2
-                 ORDER BY timestamp_ns ASC
-                 LIMIT ?3",
-            )
+            .prepare(query)
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-        let events = stmt
-            .query_map(
+        let events = if self.last_event_id.is_empty() {
+            stmt.query_map(
                 params![event_type, self.last_processed_ns as i64, limit as i64],
                 |row| {
                     Ok(SignedLedgerEvent {
@@ -724,7 +784,31 @@ impl LedgerTailer {
             )
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
             .filter_map(Result::ok)
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+        } else {
+            stmt.query_map(
+                params![
+                    event_type,
+                    self.last_processed_ns as i64,
+                    &self.last_event_id,
+                    limit as i64
+                ],
+                |row| {
+                    Ok(SignedLedgerEvent {
+                        event_id: row.get(0)?,
+                        event_type: row.get(1)?,
+                        work_id: row.get(2)?,
+                        actor_id: row.get(3)?,
+                        payload: row.get(4)?,
+                        signature: row.get(5)?,
+                        timestamp_ns: row.get::<_, i64>(6)? as u64,
+                    })
+                },
+            )
+            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+        };
 
         // NOTE: Watermark is NOT advanced here. Caller must call acknowledge()
         // after successful processing to ensure at-least-once delivery.
@@ -734,9 +818,14 @@ impl LedgerTailer {
 
     /// Acknowledges successful processing of an event.
     ///
-    /// This advances the watermark to the event's timestamp, ensuring the
-    /// event won't be redelivered on restart. Should be called after each
-    /// event is successfully processed.
+    /// This advances the watermark to the event's `(timestamp_ns, event_id)`,
+    /// ensuring the event won't be redelivered on restart. Should be called
+    /// after each event is successfully processed.
+    ///
+    /// # MAJOR FIX: Potential Data Loss via Non-Unique Watermark
+    ///
+    /// Now accepts both timestamp_ns and event_id to form a composite cursor.
+    /// This ensures correct ordering when multiple events share a timestamp.
     ///
     /// # At-Least-Once Delivery
     ///
@@ -745,9 +834,19 @@ impl LedgerTailer {
     /// - Events are only acknowledged after successful processing
     /// - If the daemon crashes before acknowledgment, events are redelivered
     /// - Idempotency prevents duplicate side effects
-    pub fn acknowledge(&mut self, timestamp_ns: u64) -> Result<(), ProjectionWorkerError> {
-        if timestamp_ns > self.last_processed_ns {
+    pub fn acknowledge(
+        &mut self,
+        timestamp_ns: u64,
+        event_id: &str,
+    ) -> Result<(), ProjectionWorkerError> {
+        // Advance watermark if this event is strictly after the current cursor.
+        // Use composite comparison: (ts, event_id) > (last_ts, last_event_id)
+        let should_advance = timestamp_ns > self.last_processed_ns
+            || (timestamp_ns == self.last_processed_ns && event_id > self.last_event_id.as_str());
+
+        if should_advance {
             self.last_processed_ns = timestamp_ns;
+            self.last_event_id = event_id.to_string();
             self.persist_watermark()?;
         }
         Ok(())
@@ -757,6 +856,9 @@ impl LedgerTailer {
     ///
     /// This avoids blocking the async runtime during `SQLite` I/O
     /// (Major fix: Thread blocking in async context).
+    ///
+    /// MAJOR FIX: Potential Data Loss via Non-Unique Watermark
+    /// Uses composite cursor (timestamp_ns, event_id) in the query.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     pub async fn poll_events_async(
         &self,
@@ -766,24 +868,38 @@ impl LedgerTailer {
         let conn = Arc::clone(&self.conn);
         let event_type = event_type.to_string();
         let last_processed_ns = self.last_processed_ns;
+        let last_event_id = self.last_event_id.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn_guard = conn.lock().map_err(|e| {
                 ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
             })?;
 
+            // MAJOR FIX: Use composite cursor (timestamp_ns, event_id)
+            // When last_event_id is empty, use timestamp-only comparison for backward compat.
+            let query = if last_event_id.is_empty() {
+                "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+                 FROM ledger_events
+                 WHERE event_type = ?1 AND timestamp_ns > ?2
+                 ORDER BY timestamp_ns ASC, event_id ASC
+                 LIMIT ?3"
+            } else {
+                "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+                 FROM ledger_events
+                 WHERE event_type = ?1 AND (
+                     timestamp_ns > ?2 OR
+                     (timestamp_ns = ?2 AND event_id > ?3)
+                 )
+                 ORDER BY timestamp_ns ASC, event_id ASC
+                 LIMIT ?4"
+            };
+
             let mut stmt = conn_guard
-                .prepare(
-                    "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-                     FROM ledger_events
-                     WHERE event_type = ?1 AND timestamp_ns > ?2
-                     ORDER BY timestamp_ns ASC
-                     LIMIT ?3",
-                )
+                .prepare(query)
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-            let events = stmt
-                .query_map(
+            let events = if last_event_id.is_empty() {
+                stmt.query_map(
                     params![event_type, last_processed_ns as i64, limit as i64],
                     |row| {
                         Ok(SignedLedgerEvent {
@@ -799,7 +915,26 @@ impl LedgerTailer {
                 )
                 .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
                 .filter_map(Result::ok)
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+            } else {
+                stmt.query_map(
+                    params![event_type, last_processed_ns as i64, last_event_id, limit as i64],
+                    |row| {
+                        Ok(SignedLedgerEvent {
+                            event_id: row.get(0)?,
+                            event_type: row.get(1)?,
+                            work_id: row.get(2)?,
+                            actor_id: row.get(3)?,
+                            payload: row.get(4)?,
+                            signature: row.get(5)?,
+                            timestamp_ns: row.get::<_, i64>(6)? as u64,
+                        })
+                    },
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+            };
 
             Ok(events)
         })
@@ -811,17 +946,27 @@ impl LedgerTailer {
     ///
     /// This avoids blocking the async runtime during `SQLite` I/O
     /// (Major fix: Thread blocking in async context).
+    ///
+    /// MAJOR FIX: Potential Data Loss via Non-Unique Watermark
+    /// Now accepts both timestamp_ns and event_id for composite cursor.
     #[allow(clippy::cast_possible_wrap)]
     pub async fn acknowledge_async(
         &mut self,
         timestamp_ns: u64,
+        event_id: &str,
     ) -> Result<(), ProjectionWorkerError> {
-        if timestamp_ns > self.last_processed_ns {
+        // Advance watermark if this event is strictly after the current cursor.
+        let should_advance = timestamp_ns > self.last_processed_ns
+            || (timestamp_ns == self.last_processed_ns && event_id > self.last_event_id.as_str());
+
+        if should_advance {
             self.last_processed_ns = timestamp_ns;
+            self.last_event_id = event_id.to_string();
 
             let conn = Arc::clone(&self.conn);
             let tailer_id = self.tailer_id.clone();
             let last_processed_ns = self.last_processed_ns;
+            let last_event_id = self.last_event_id.clone();
 
             tokio::task::spawn_blocking(move || {
                 let conn_guard = conn.lock().map_err(|e| {
@@ -836,9 +981,9 @@ impl LedgerTailer {
                 conn_guard
                     .execute(
                         "INSERT OR REPLACE INTO tailer_watermark
-                         (tailer_id, last_processed_ns, updated_at)
-                         VALUES (?1, ?2, ?3)",
-                        params![tailer_id, last_processed_ns as i64, now as i64],
+                         (tailer_id, last_processed_ns, last_event_id, updated_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![tailer_id, last_processed_ns as i64, last_event_id, now as i64],
                     )
                     .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
@@ -1119,8 +1264,9 @@ impl ProjectionWorker {
                 Ok(()) => {
                     // Only acknowledge after successful processing
                     // (Blocker fix: Fail-Open Auto-Ack on Crash)
+                    // MAJOR FIX: Pass event_id for composite cursor
                     self.changeset_tailer
-                        .acknowledge_async(event.timestamp_ns)
+                        .acknowledge_async(event.timestamp_ns, &event.event_id)
                         .await?;
                 },
                 Err(e) => {
@@ -1227,8 +1373,9 @@ impl ProjectionWorker {
                 Ok(()) => {
                     // Only acknowledge after successful processing
                     // (Blocker fix: Fail-Open Auto-Ack on Crash)
+                    // MAJOR FIX: Pass event_id for composite cursor
                     self.work_pr_tailer
-                        .acknowledge_async(event.timestamp_ns)
+                        .acknowledge_async(event.timestamp_ns, &event.event_id)
                         .await?;
                 },
                 Err(e) => {
@@ -1359,8 +1506,9 @@ impl ProjectionWorker {
                 Ok(()) => {
                     // Only acknowledge after successful processing
                     // (Blocker fix: Fail-Open Auto-Ack on Crash)
+                    // MAJOR FIX: Pass event_id for composite cursor
                     self.review_tailer
-                        .acknowledge_async(event.timestamp_ns)
+                        .acknowledge_async(event.timestamp_ns, &event.event_id)
                         .await?;
                 },
                 Err(ProjectionWorkerError::MissingDependency { event_id, reason }) => {
@@ -1444,23 +1592,32 @@ impl ProjectionWorker {
         let mut changeset_digest = [0u8; 32];
         changeset_digest.copy_from_slice(&digest_bytes);
 
-        // Look up work_id from changeset
-        // Blocker fix: Critical Data Loss - return MissingDependency to trigger
-        // NACK/Retry
-        let work_id = self
-            .work_index
-            .get_work_id(&changeset_digest)
-            .ok_or_else(|| ProjectionWorkerError::MissingDependency {
-                event_id: event.event_id.clone(),
-                reason: format!(
-                    "changeset {changeset_digest_hex} not yet indexed (waiting for ChangeSetPublished)"
-                ),
-            })?;
+        // BLOCKER FIX: Cross-PR Review Leakage / Spoofing via Digest Collision
+        //
+        // Security: Use `event.work_id` directly from the SignedLedgerEvent envelope
+        // instead of looking it up from the changeset_digest. The changeset_work_index
+        // table uses changeset_digest as PRIMARY KEY, so if two PRs share the same
+        // commit, the second PR overwrites the first. Looking up work_id via digest
+        // could resolve to the wrong PR.
+        //
+        // The SignedLedgerEvent envelope contains the authoritative work_id that was
+        // set when the event was emitted. This is cryptographically bound to the
+        // event signature, preventing spoofing.
+        let work_id = &event.work_id;
 
-        // Look up PR metadata
-        // Blocker fix: Critical Data Loss - return NoPrAssociation to trigger
-        // NACK/Retry
-        let pr_metadata = self.work_index.get_pr_metadata(&work_id).ok_or_else(|| {
+        // Validate work_id from envelope
+        validate_string_length("work_id", work_id)?;
+
+        if work_id.is_empty() {
+            return Err(ProjectionWorkerError::InvalidPayload(
+                "work_id in event envelope is empty".to_string(),
+            ));
+        }
+
+        // Look up PR metadata using the authoritative work_id from the event envelope.
+        // This prevents cross-PR review leakage via digest collision.
+        // NACK/Retry: return NoPrAssociation if not yet indexed.
+        let pr_metadata = self.work_index.get_pr_metadata(work_id).ok_or_else(|| {
             ProjectionWorkerError::NoPrAssociation {
                 work_id: work_id.clone(),
             }
@@ -1706,7 +1863,8 @@ mod tests {
         );
 
         // After acknowledging, events should not be returned
-        tailer.acknowledge(2000).unwrap(); // Acknowledge up to timestamp 2000
+        // MAJOR FIX: Pass event_id for composite cursor
+        tailer.acknowledge(2000, "evt-2").unwrap(); // Acknowledge up to (timestamp 2000, evt-2)
         let events = tailer.poll_events("test_event", 10).unwrap();
         assert!(
             events.is_empty(),
@@ -2012,9 +2170,10 @@ mod tests {
         let conn = create_test_db();
 
         // Create tailer and acknowledge some events
+        // MAJOR FIX: Pass event_id for composite cursor
         {
             let mut tailer = LedgerTailer::with_id(Arc::clone(&conn), "test_tailer");
-            tailer.acknowledge(5000).unwrap();
+            tailer.acknowledge(5000, "evt-test").unwrap();
         }
 
         // Create new tailer with same ID - should resume from persisted watermark
@@ -2120,7 +2279,10 @@ mod tests {
         assert_eq!(events.len(), 3);
 
         // Acknowledge only the first event (simulate: first succeeded, second failed)
-        tailer.acknowledge(events[0].timestamp_ns).unwrap();
+        // MAJOR FIX: Pass event_id for composite cursor
+        tailer
+            .acknowledge(events[0].timestamp_ns, &events[0].event_id)
+            .unwrap();
 
         // Poll again - should get events 2 and 3 (event 1 was acknowledged)
         let events = tailer.poll_events("review_receipt_recorded", 10).unwrap();

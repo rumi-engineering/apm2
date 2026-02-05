@@ -803,6 +803,21 @@ impl IdempotencyCache {
 // GitHub HTTP Client
 // =============================================================================
 
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
+use std::sync::OnceLock;
+
+/// Type alias for the persistent HTTPS client.
+///
+/// MAJOR FIX: Network Resource Exhaustion (Self-DoS)
+/// Previously, each request created a new HttpsConnector and Client,
+/// exhausting network resources under load. Now we reuse a single client.
+type PersistentHttpsClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+
 /// HTTP client for GitHub API calls.
 ///
 /// Security controls:
@@ -810,14 +825,54 @@ impl IdempotencyCache {
 /// - AD-NET-001: Request timeouts via `tokio::time::timeout`
 /// - AD-SEC-001: API token uses `SecretString` (via config)
 /// - AD-CMP-001: Cognitive complexity reduced via helper methods
+///
+/// MAJOR FIX: Network Resource Exhaustion (Self-DoS)
+/// The client now uses a persistent HttpsConnector and Client that are
+/// lazily initialized once and reused for all requests. This prevents
+/// resource exhaustion from creating new TLS connections per request.
 struct GitHubClient {
     config: GitHubAdapterConfig,
+    /// Lazily-initialized persistent HTTPS client for connection reuse.
+    /// Using std::sync::OnceLock for thread-safe lazy initialization.
+    http_client: OnceLock<PersistentHttpsClient>,
 }
 
 impl GitHubClient {
-    /// Creates a new GitHub client.
-    const fn new(config: GitHubAdapterConfig) -> Self {
-        Self { config }
+    /// Creates a new GitHub client with lazy-initialized persistent connection.
+    fn new(config: GitHubAdapterConfig) -> Self {
+        Self {
+            config,
+            http_client: OnceLock::new(),
+        }
+    }
+
+    /// Gets or initializes the persistent HTTPS client.
+    ///
+    /// MAJOR FIX: Network Resource Exhaustion (Self-DoS)
+    /// This method lazily creates a single HTTPS client that is reused for
+    /// all subsequent requests, preventing the creation of new connections
+    /// and TLS handshakes per request.
+    ///
+    /// # Security
+    ///
+    /// - HTTPS-only mode prevents secret exfiltration via HTTP fallback
+    /// - HTTP/2 support enables connection multiplexing
+    fn get_or_init_client(&self) -> &PersistentHttpsClient {
+        self.http_client.get_or_init(|| {
+            use hyper_rustls::HttpsConnectorBuilder;
+
+            // Build persistent HTTPS connector
+            // SECURITY: Use https_only() to prevent secret exfiltration via HTTP fallback.
+            // API tokens must never be sent over unencrypted connections.
+            let https = HttpsConnectorBuilder::new()
+                .with_webpki_roots()
+                .https_only()
+                .enable_http1()
+                .enable_http2()
+                .build();
+
+            Client::builder(TokioExecutor::new()).build(https)
+        })
     }
 
     /// Builds the GitHub API URL for posting a commit status.
@@ -929,31 +984,21 @@ impl GitHubClient {
     /// - AD-NET-001: Request timeout via `tokio::time::timeout`
     /// - AD-SEC-001: API token uses `SecretString` (via config)
     /// - AD-CMP-001: Logic split into helper methods
+    ///
+    /// # MAJOR FIX: Network Resource Exhaustion (Self-DoS)
+    ///
+    /// Now uses a persistent HTTPS client instead of creating a new connector
+    /// and client for every request. This prevents resource exhaustion.
     async fn post_commit_status(
         &self,
         sha: &str,
         status: ProjectedStatus,
     ) -> Result<(), ProjectionError> {
-        use bytes::Bytes;
-        use http_body_util::Full;
-        use hyper_rustls::HttpsConnectorBuilder;
-        use hyper_util::client::legacy::Client;
-        use hyper_util::rt::TokioExecutor;
-
         let url = self.build_status_url(sha);
         let body_bytes = self.build_status_body(status)?;
 
-        // Build the HTTPS connector
-        // SECURITY: Use https_only() to prevent secret exfiltration via HTTP fallback.
-        // API tokens must never be sent over unencrypted connections.
-        let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_only()
-            .enable_http1()
-            .enable_http2()
-            .build();
-
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+        // MAJOR FIX: Use persistent client instead of creating new one per request
+        let client = self.get_or_init_client();
 
         let request = self.build_request(&url, Full::new(Bytes::from(body_bytes)))?;
 
@@ -1026,26 +1071,17 @@ impl GitHubClient {
     ///
     /// Per RFC-0019, the projection worker posts review comments to PRs.
     /// This enables automated code review feedback from the FAC.
+    ///
+    /// # MAJOR FIX: Network Resource Exhaustion (Self-DoS)
+    ///
+    /// Now uses a persistent HTTPS client instead of creating a new connector
+    /// and client for every request. This prevents resource exhaustion.
     async fn post_pr_comment(&self, pr_number: u64, body: &str) -> Result<(), ProjectionError> {
-        use bytes::Bytes;
-        use http_body_util::Full;
-        use hyper_rustls::HttpsConnectorBuilder;
-        use hyper_util::client::legacy::Client;
-        use hyper_util::rt::TokioExecutor;
-
         let url = self.build_comment_url(pr_number);
         let body_bytes = self.build_comment_body(body)?;
 
-        // Build the HTTPS connector
-        // SECURITY: Use https_only() to prevent secret exfiltration via HTTP fallback.
-        let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_only()
-            .enable_http1()
-            .enable_http2()
-            .build();
-
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+        // MAJOR FIX: Use persistent client instead of creating new one per request
+        let client = self.get_or_init_client();
 
         let request = self.build_request(&url, Full::new(Bytes::from(body_bytes)))?;
 
