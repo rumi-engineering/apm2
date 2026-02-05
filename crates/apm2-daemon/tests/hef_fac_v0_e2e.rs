@@ -327,6 +327,9 @@ impl FacV0TestHarness {
             time_envelope_ref: None,
             reviewer_actor_id: self.actor_id(),
             reviewer_signature: vec![], // Set below
+            // TCK-00326: Authority binding fields
+            capability_manifest_hash: vec![0x55; 32],
+            context_pack_hash: vec![0x66; 32],
         };
 
         let payload = event.encode_to_vec();
@@ -367,6 +370,9 @@ impl FacV0TestHarness {
             time_envelope_ref: None,
             recorder_actor_id: self.actor_id(),
             recorder_signature: vec![], // Set below
+            // TCK-00326: Authority binding fields
+            capability_manifest_hash: vec![0x55; 32],
+            context_pack_hash: vec![0x66; 32],
         };
 
         let payload = event.encode_to_vec();
@@ -1278,6 +1284,9 @@ async fn test_domain_separation_rejects_fac_prefix() {
         time_envelope_ref: None,
         reviewer_actor_id: harness.actor_id(),
         reviewer_signature: vec![],
+        // TCK-00326: Authority binding fields
+        capability_manifest_hash: vec![0x55; 32],
+        context_pack_hash: vec![0x66; 32],
     };
     let payload = event_proto.encode_to_vec();
 

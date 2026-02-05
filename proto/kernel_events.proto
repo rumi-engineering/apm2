@@ -1,5 +1,11 @@
 // APM2 Kernel Event Schema
-// Version: 0.8.0
+// Version: 0.9.0
+//
+// CHANGELOG (0.9.0):
+// - Added capability_manifest_hash and context_pack_hash to ReviewBlockedRecorded (RFC-0019, TCK-00326)
+// - Added capability_manifest_hash and context_pack_hash to ReviewReceiptRecorded (RFC-0019, TCK-00326)
+// - These fields bind authority hashes for audit traceability per RFC-0019 sealing requirements
+// - Added REVIEW_BLOCKED_REASON_CONTEXT_PACK_MISSING and REVIEW_BLOCKED_REASON_CONTEXT_PACK_INVALID
 //
 // CHANGELOG (0.8.0):
 // - Added ProjectionReceiptRecorded event for FAC projection receipts (RFC-0019, TCK-00323)
@@ -1662,6 +1668,10 @@ enum ReviewBlockedReasonCode {
   REVIEW_BLOCKED_REASON_POLICY_DENIED = 7;
   // Context miss detected.
   REVIEW_BLOCKED_REASON_CONTEXT_MISS = 8;
+  // Context pack not found in CAS (TCK-00326).
+  REVIEW_BLOCKED_REASON_CONTEXT_PACK_MISSING = 9;
+  // Context pack seal verification failed (TCK-00326).
+  REVIEW_BLOCKED_REASON_CONTEXT_PACK_INVALID = 10;
 }
 
 // Emitted when a review is blocked due to workspace apply or tool failure.
@@ -1687,6 +1697,12 @@ message ReviewBlockedRecorded {
   string recorder_actor_id = 6;
   // Ed25519 signature over canonical bytes with REVIEW_BLOCKED_RECORDED: domain (64 bytes).
   bytes recorder_signature = 7;
+  // BLAKE3 hash of the CapabilityManifest in effect (32 bytes, TCK-00326).
+  // Binds the blocked event to the authority under which the review was attempted.
+  bytes capability_manifest_hash = 8;
+  // BLAKE3 hash of the sealed ContextPackManifest in effect (32 bytes, TCK-00326).
+  // Binds the blocked event to the context firewall configuration.
+  bytes context_pack_hash = 9;
 }
 
 // ============================================================
@@ -1727,6 +1743,12 @@ message ReviewReceiptRecorded {
   string reviewer_actor_id = 5;
   // Ed25519 signature over canonical bytes with REVIEW_RECEIPT_RECORDED: domain (64 bytes).
   bytes reviewer_signature = 6;
+  // BLAKE3 hash of the CapabilityManifest used during review (32 bytes, TCK-00326).
+  // Binds the review to the authority under which it was performed.
+  bytes capability_manifest_hash = 7;
+  // BLAKE3 hash of the sealed ContextPackManifest used during review (32 bytes, TCK-00326).
+  // Binds the review to the context firewall configuration.
+  bytes context_pack_hash = 8;
 }
 
 // ============================================================

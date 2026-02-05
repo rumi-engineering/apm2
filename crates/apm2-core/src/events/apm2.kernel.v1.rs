@@ -1879,6 +1879,14 @@ pub struct ReviewBlockedRecorded {
     /// Ed25519 signature over canonical bytes with REVIEW_BLOCKED_RECORDED: domain (64 bytes).
     #[prost(bytes = "vec", tag = "7")]
     pub recorder_signature: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the CapabilityManifest in effect (32 bytes, TCK-00326).
+    /// Binds the blocked event to the authority under which the review was attempted.
+    #[prost(bytes = "vec", tag = "8")]
+    pub capability_manifest_hash: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the sealed ContextPackManifest in effect (32 bytes, TCK-00326).
+    /// Binds the blocked event to the context firewall configuration.
+    #[prost(bytes = "vec", tag = "9")]
+    pub context_pack_hash: ::prost::alloc::vec::Vec<u8>,
 }
 /// Emitted when a review is successfully completed.
 ///
@@ -1912,6 +1920,14 @@ pub struct ReviewReceiptRecorded {
     /// Ed25519 signature over canonical bytes with REVIEW_RECEIPT_RECORDED: domain (64 bytes).
     #[prost(bytes = "vec", tag = "6")]
     pub reviewer_signature: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the CapabilityManifest used during review (32 bytes, TCK-00326).
+    /// Binds the review to the authority under which it was performed.
+    #[prost(bytes = "vec", tag = "7")]
+    pub capability_manifest_hash: ::prost::alloc::vec::Vec<u8>,
+    /// BLAKE3 hash of the sealed ContextPackManifest used during review (32 bytes, TCK-00326).
+    /// Binds the review to the context firewall configuration.
+    #[prost(bytes = "vec", tag = "8")]
+    pub context_pack_hash: ::prost::alloc::vec::Vec<u8>,
 }
 /// Emitted when a projection is successfully completed.
 ///
@@ -2395,6 +2411,10 @@ pub enum ReviewBlockedReasonCode {
     ReviewBlockedReasonPolicyDenied = 7,
     /// Context miss detected.
     ReviewBlockedReasonContextMiss = 8,
+    /// Context pack not found in CAS (TCK-00326).
+    ReviewBlockedReasonContextPackMissing = 9,
+    /// Context pack seal verification failed (TCK-00326).
+    ReviewBlockedReasonContextPackInvalid = 10,
 }
 impl ReviewBlockedReasonCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2420,6 +2440,12 @@ impl ReviewBlockedReasonCode {
                 "REVIEW_BLOCKED_REASON_POLICY_DENIED"
             }
             Self::ReviewBlockedReasonContextMiss => "REVIEW_BLOCKED_REASON_CONTEXT_MISS",
+            Self::ReviewBlockedReasonContextPackMissing => {
+                "REVIEW_BLOCKED_REASON_CONTEXT_PACK_MISSING"
+            }
+            Self::ReviewBlockedReasonContextPackInvalid => {
+                "REVIEW_BLOCKED_REASON_CONTEXT_PACK_INVALID"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2449,6 +2475,12 @@ impl ReviewBlockedReasonCode {
             }
             "REVIEW_BLOCKED_REASON_CONTEXT_MISS" => {
                 Some(Self::ReviewBlockedReasonContextMiss)
+            }
+            "REVIEW_BLOCKED_REASON_CONTEXT_PACK_MISSING" => {
+                Some(Self::ReviewBlockedReasonContextPackMissing)
+            }
+            "REVIEW_BLOCKED_REASON_CONTEXT_PACK_INVALID" => {
+                Some(Self::ReviewBlockedReasonContextPackInvalid)
             }
             _ => None,
         }
